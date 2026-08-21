@@ -18,9 +18,14 @@ pub const ERROR_INTERNAL: i32 = -32603;
 pub const ERROR_NOT_INITIALIZED: i32 = -32000;
 pub const ERROR_SERVER_OVERLOADED: i32 = -32001;
 pub const ERROR_ALREADY_INITIALIZED: i32 = -32002;
+pub const ERROR_REQUEST_CONFLICT: i32 = -32010;
+pub const ERROR_SESSION_NOT_FOUND: i32 = -32004;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RequestId(String);
+pub enum RequestId {
+    String(String),
+    Number(String),
+}
 
 impl RequestId {
     pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
@@ -30,11 +35,13 @@ impl RequestId {
                 "request id 不能为空".to_string(),
             ));
         }
-        Ok(Self(value))
+        Ok(Self::String(value))
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match self {
+            Self::String(value) | Self::Number(value) => value,
+        }
     }
 }
 
@@ -43,7 +50,15 @@ impl Serialize for RequestId {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.0)
+        match self {
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Number(value) => {
+                let number = value
+                    .parse::<serde_json::Number>()
+                    .map_err(|_| serde::ser::Error::custom("request id 数字无法序列化"))?;
+                number.serialize(serializer)
+            }
+        }
     }
 }
 
@@ -53,14 +68,11 @@ impl<'de> Deserialize<'de> for RequestId {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        let text = match value {
-            Value::String(value) => value,
-            Value::Number(value) => value.to_string(),
-            _ => {
-                return Err(serde::de::Error::custom("request id 必须是字符串或数字"));
-            }
-        };
-        RequestId::new(text).map_err(serde::de::Error::custom)
+        match value {
+            Value::String(value) => RequestId::new(value).map_err(serde::de::Error::custom),
+            Value::Number(value) => Ok(Self::Number(value.to_string())),
+            _ => Err(serde::de::Error::custom("request id 必须是字符串或数字")),
+        }
     }
 }
 
@@ -317,7 +329,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numeric_request_id_is_normalized_without_losing_correlation() {
+    fn numeric_request_id_keeps_numeric_json_type_in_response() {
         let message = serde_json::json!({
             "id": 7,
             "method": "initialize",
@@ -328,6 +340,10 @@ mod tests {
         };
         assert_eq!(request.id.as_str(), "7");
         assert!(request.is_initialize());
+        assert_eq!(
+            serde_json::to_value(response(request.id, serde_json::json!({}))).unwrap()["id"],
+            7
+        );
     }
 
     #[test]

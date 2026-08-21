@@ -51,6 +51,7 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+tokio-tungstenite = "0.29.0"
 magi-skill-runtime = { path = "../magi-skill-runtime" }
 magi-worker-runtime = { path = "../magi-worker-runtime" }
 tempfile = "3"

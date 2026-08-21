@@ -71,9 +71,44 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use tokio::sync::watch;
+use tokio::sync::{OwnedMutexGuard, watch};
 
 static RUNTIME_EPOCH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct AppServerRequestLockEntry {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    references: usize,
+}
+
+/// 以显式业务 requestId 为粒度串行化 App Server Turn 的“查找并提交”事务。
+///
+/// 该锁只服务 App Server，不改变 HTTP 路由的并发模型。引用计数让空闲 requestId
+/// 不会永久留在注册表中，同时在有等待者时保证后续调用仍复用同一把锁。
+pub(crate) struct AppServerRequestLockGuard {
+    registry: Arc<Mutex<HashMap<String, AppServerRequestLockEntry>>>,
+    request_id: String,
+    _guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for AppServerRequestLockGuard {
+    fn drop(&mut self) {
+        // 先释放底层锁，再删除注册表条目。否则新请求可能在条目删除和
+        // OwnedMutexGuard 自动析构之间创建第二把锁，破坏 requestId 串行性。
+        self._guard.take();
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("app server request lock registry poisoned");
+        let Some(entry) = registry.get_mut(&self.request_id) else {
+            return;
+        };
+        if entry.references <= 1 {
+            registry.remove(&self.request_id);
+        } else {
+            entry.references -= 1;
+        }
+    }
+}
 
 /// Tracks the state of a single running Runner instance.
 pub struct RunnerHandle {
@@ -1075,6 +1110,7 @@ pub struct ApiState {
     pub browser_authority: Arc<Mutex<BrowserAuthority>>,
     browser_write_lock: Arc<Mutex<()>>,
     pub(crate) browser_control_lock: Arc<tokio::sync::Mutex<()>>,
+    app_server_request_locks: Arc<Mutex<HashMap<String, AppServerRequestLockEntry>>>,
     browser_state_writable: Arc<AtomicBool>,
     browser_host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
     browser_host_connection: Arc<watch::Sender<Option<BrowserHostConnectionConfig>>>,
@@ -1373,6 +1409,38 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
 }
 
 impl ApiState {
+    pub(crate) async fn lock_app_server_request(
+        &self,
+        request_id: &str,
+    ) -> AppServerRequestLockGuard {
+        let request_id = request_id.trim().to_string();
+        debug_assert!(!request_id.is_empty());
+        let lock = {
+            let mut registry = self
+                .app_server_request_locks
+                .lock()
+                .expect("app server request lock registry poisoned");
+            let entry =
+                registry
+                    .entry(request_id.clone())
+                    .or_insert_with(|| AppServerRequestLockEntry {
+                        lock: Arc::new(tokio::sync::Mutex::new(())),
+                        references: 0,
+                    });
+            entry.references += 1;
+            Arc::clone(&entry.lock)
+        };
+        let mut lease = AppServerRequestLockGuard {
+            registry: Arc::clone(&self.app_server_request_locks),
+            request_id,
+            _guard: None,
+        };
+        // lease 在等待期间已经持有引用；若这个 future 被取消，Drop 会回收
+        // 引用计数，不会把已取消的 requestId 永久留在注册表中。
+        lease._guard = Some(lock.lock_owned().await);
+        lease
+    }
+
     pub fn new(
         service_name: impl Into<String>,
         event_bus: Arc<InMemoryEventBus>,
@@ -1429,6 +1497,7 @@ impl ApiState {
             browser_authority,
             browser_write_lock,
             browser_control_lock,
+            app_server_request_locks: Arc::new(Mutex::new(HashMap::new())),
             browser_state_writable: Arc::new(AtomicBool::new(true)),
             browser_host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             browser_host_connection: Arc::new(watch::channel(None).0),
@@ -3409,6 +3478,31 @@ impl ApiState {
             .unwrap_or_default()
     }
 
+    /// 按 requestId 查找仍在队列中的 Turn，并返回当前队列位置。
+    ///
+    /// App Server 重试可能发生在首轮尚未出队时；这段状态还未进入
+    /// SessionStore 的 canonical turn，因此必须和持久化队列使用同一个幂等查询面。
+    pub(crate) fn queued_regular_session_turn_for_request_id(
+        &self,
+        request_id: &str,
+    ) -> Option<(QueuedRegularSessionTurn, usize)> {
+        let request_id = request_id.trim();
+        if request_id.is_empty() {
+            return None;
+        }
+        let queues = self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned");
+        queues.values().find_map(|queue| {
+            queue
+                .iter()
+                .enumerate()
+                .find(|(_, turn)| turn.request.request_id().as_deref() == Some(request_id))
+                .map(|(index, turn)| (turn.clone(), index + 1))
+        })
+    }
+
     pub(crate) fn remove_regular_session_turn(
         &self,
         session_id: &SessionId,
@@ -4158,6 +4252,46 @@ mod tests {
             queue_id: queue_id.to_string(),
             retry_count: 0,
         }
+    }
+
+    #[test]
+    fn queued_turn_request_id_lookup_returns_stable_queue_position() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let session_id = SessionId::new("session-queued-request-lookup");
+        let workspace_id = WorkspaceId::new("workspace-queued-request-lookup");
+        state
+            .enqueue_regular_session_turn(queued_turn_fixture(
+                &session_id,
+                &workspace_id,
+                "queue-first",
+                10,
+            ))
+            .expect("首条队列消息应入队");
+        state
+            .enqueue_regular_session_turn(queued_turn_fixture(
+                &session_id,
+                &workspace_id,
+                "queue-second",
+                20,
+            ))
+            .expect("第二条队列消息应入队");
+
+        let (queued, position) = state
+            .queued_regular_session_turn_for_request_id("request-queue-second")
+            .expect("应按 requestId 找到队列消息");
+        assert_eq!(queued.queue_id, "queue-second");
+        assert_eq!(position, 2);
+        assert!(
+            state
+                .queued_regular_session_turn_for_request_id("missing-request")
+                .is_none()
+        );
     }
 
     #[test]

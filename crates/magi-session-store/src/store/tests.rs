@@ -2099,6 +2099,50 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
 }
 
 #[test]
+fn canonical_turn_request_id_lookup_survives_normalization_and_restore() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-request-id-lookup");
+    store
+        .create_session(session_id.clone(), "Request ID Lookup")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-request-id", "running", 10),
+        )
+        .expect("turn should be accepted");
+
+    let mut item = test_turn_item("item-request-id", "幂等请求");
+    item.request_id = Some("request-id-1".to_string());
+    item.item_seq = 2;
+    store
+        .upsert_current_turn_item(&session_id, item)
+        .expect("request item should be persisted");
+
+    let found = store
+        .canonical_turn_for_request_id(" request-id-1 ")
+        .expect("request id should resolve canonical turn");
+    assert_eq!(found.turn_id, "turn-request-id");
+    assert_eq!(found.items[0].item_seq, 2);
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    );
+    assert_eq!(
+        restored
+            .canonical_turn_for_request_id("request-id-1")
+            .map(|turn| turn.turn_id),
+        Some("turn-request-id".to_string())
+    );
+    assert!(
+        restored
+            .canonical_turn_for_request_id("unknown-request")
+            .is_none()
+    );
+}
+
+#[test]
 fn completed_current_turn_marks_session_completion_unread() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-unread-completion");

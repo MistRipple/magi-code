@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { arch, platform } from "node:os";
+import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { arch, platform, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { downloadArtifact } from "@electron/get";
+import { extract as extractZip } from "@electron-internal/extract-zip";
 import { build as esbuild } from "esbuild";
 
 const execFileAsync = promisify(execFile);
@@ -298,14 +300,42 @@ async function stageRuntimeLicenses(destination) {
       await cp(license, join(destination, `${packageName.replaceAll("/", "-")}-LICENSE${licenseExtension(license)}`));
     }
   }
-  const chromiumLicenses = join(repositoryRoot, "node_modules", "electron", "dist", "LICENSES.chromium.html");
-  await access(chromiumLicenses);
+  const chromiumLicenses = await ensureChromiumLicenses();
   await cp(chromiumLicenses, join(destination, "Chromium-THIRD-PARTY-LICENSES.html"));
   await writeFile(
     join(destination, "THIRD-PARTY-NOTICES.json"),
     `${JSON.stringify(notices, null, 2)}\n`,
     "utf8",
   );
+}
+
+async function ensureChromiumLicenses() {
+  const chromiumLicenses = join(repositoryRoot, "node_modules", "electron", "dist", "LICENSES.chromium.html");
+  try {
+    await access(chromiumLicenses);
+    return chromiumLicenses;
+  } catch {
+    // 某些 CI 环境会得到完整 Electron 可执行文件，但解压时遗漏大体积的许可证文件。
+    // 从同版本、同平台的官方发行归档恢复，确保发行物不会在缺少第三方声明时继续构建。
+  }
+
+  const electronPackage = await readJson(join(repositoryRoot, "node_modules", "electron", "package.json"));
+  const archive = await downloadArtifact({
+    version: electronPackage.version,
+    artifactName: "electron",
+    platform: process.platform,
+    arch: process.arch,
+  });
+  const extractionRoot = await mkdtemp(join(tmpdir(), "magi-electron-license-"));
+  try {
+    await extractZip(archive, { dir: extractionRoot });
+    const extractedLicenses = join(extractionRoot, "LICENSES.chromium.html");
+    await assertFile(extractedLicenses, "Electron Chromium 第三方许可证");
+    await cp(extractedLicenses, chromiumLicenses);
+    return chromiumLicenses;
+  } finally {
+    await rm(extractionRoot, { recursive: true, force: true });
+  }
 }
 
 async function stageSbom(destination, productVersion, gitCommit) {

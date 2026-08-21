@@ -17,6 +17,8 @@
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
+    "@electron-internal/extract-zip": "1.0.5",
+    "@electron/get": "5.1.0",
     "@magi/desktop-browser-contracts": "0.0.0",
     "@types/node": "22.15.30",
     "@types/ws": "8.18.1",

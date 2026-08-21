@@ -17,21 +17,26 @@ use futures_util::{SinkExt, StreamExt};
 use magi_app_server_protocol::{
     ClientCapabilities, ClientInfo, ClientMessage, ClientNotification, ClientRequest,
     ERROR_ALREADY_INITIALIZED, ERROR_INTERNAL, ERROR_INVALID_PARAMS, ERROR_INVALID_REQUEST,
-    ERROR_METHOD_NOT_FOUND, ERROR_NOT_INITIALIZED, ERROR_SERVER_OVERLOADED, ErrorObject,
-    InitializeParams, InitializeResult, ProtocolVersion, RequestId, ServerCapabilities,
-    classify_client_message, error_response, notification, response,
+    ERROR_METHOD_NOT_FOUND, ERROR_NOT_INITIALIZED, ERROR_REQUEST_CONFLICT, ERROR_SERVER_OVERLOADED,
+    ERROR_SESSION_NOT_FOUND, ErrorObject, InitializeParams, InitializeResult, ProtocolVersion,
+    RequestId, ServerCapabilities, classify_client_message, error_response, notification, response,
 };
 use magi_core::{SessionId, WorkspaceId};
 use magi_event_bus::{EventEnvelope, EventStreamSnapshot};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
+use std::collections::BTreeMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc};
 
 use crate::{errors::ApiError, routes::sessions, state::ApiState};
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
-const OUTGOING_QUEUE_CAPACITY: usize = 64;
+const CONTROL_QUEUE_CAPACITY: usize = MAX_IN_FLIGHT_REQUESTS + 16;
+const EVENT_QUEUE_CAPACITY: usize = 64;
 
 pub fn routes() -> Router<ApiState> {
     Router::new().route("/app-server", get(connect))
@@ -58,15 +63,108 @@ struct ConnectionState {
     subscription: EventSubscription,
 }
 
-type OutgoingSender = mpsc::Sender<String>;
+#[derive(Clone)]
+struct OutgoingChannels {
+    control: mpsc::Sender<SequencedMessage>,
+    events: mpsc::Sender<SequencedMessage>,
+    next_sequence: Arc<std::sync::atomic::AtomicU64>,
+    disconnected: Arc<AtomicBool>,
+    disconnect_notify: Arc<Notify>,
+}
+
+struct SequencedMessage {
+    sequence: u64,
+    message: Message,
+}
+
+impl OutgoingChannels {
+    fn control_message(&self, message: Message) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        self.control
+            .try_send(SequencedMessage { sequence, message })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(message) => {
+                    mpsc::error::TrySendError::Full(message.message)
+                }
+                mpsc::error::TrySendError::Closed(message) => {
+                    mpsc::error::TrySendError::Closed(message.message)
+                }
+            })
+    }
+
+    fn event_message(&self, message: Message) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        self.events
+            .try_send(SequencedMessage { sequence, message })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(message) => {
+                    mpsc::error::TrySendError::Full(message.message)
+                }
+                mpsc::error::TrySendError::Closed(message) => {
+                    mpsc::error::TrySendError::Closed(message.message)
+                }
+            })
+    }
+
+    fn disconnect(&self) {
+        if !self.disconnected.swap(true, Ordering::SeqCst) {
+            self.disconnect_notify.notify_one();
+        }
+    }
+}
 
 async fn run_connection(socket: WebSocket, state: ApiState) {
     let (mut sink, mut stream) = socket.split();
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<String>(OUTGOING_QUEUE_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel::<SequencedMessage>(CONTROL_QUEUE_CAPACITY);
+    let (event_tx, mut event_rx) = mpsc::channel::<SequencedMessage>(EVENT_QUEUE_CAPACITY);
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let disconnect_notify = Arc::new(Notify::new());
+    let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let outgoing = OutgoingChannels {
+        control: control_tx,
+        events: event_tx,
+        next_sequence,
+        disconnected: Arc::clone(&disconnected),
+        disconnect_notify: Arc::clone(&disconnect_notify),
+    };
+    let writer_disconnected = Arc::clone(&disconnected);
+    let writer_disconnect_notify = Arc::clone(&disconnect_notify);
     let writer = tokio::spawn(async move {
-        while let Some(message) = outgoing_rx.recv().await {
-            if sink.send(Message::Text(message.into())).await.is_err() {
+        let mut control_open = true;
+        let mut events_open = true;
+        let mut pending = BTreeMap::<u64, Message>::new();
+        let mut next_sequence = 1;
+        while control_open || events_open {
+            if writer_disconnected.load(Ordering::SeqCst) {
                 break;
+            }
+            if let Some(message) = pending.remove(&next_sequence) {
+                if sink.send(message).await.is_err() {
+                    writer_disconnected.store(true, Ordering::SeqCst);
+                    writer_disconnect_notify.notify_one();
+                }
+                next_sequence = next_sequence.saturating_add(1);
+                continue;
+            }
+            tokio::select! {
+                biased;
+                message = control_rx.recv(), if control_open => {
+                    match message {
+                        Some(message) => {
+                            pending.insert(message.sequence, message.message);
+                        }
+                        None => control_open = false,
+                    }
+                }
+                message = event_rx.recv(), if events_open => {
+                    match message {
+                        Some(message) => {
+                            pending.insert(message.sequence, message.message);
+                        }
+                        None => events_open = false,
+                    }
+                }
+                _ = writer_disconnect_notify.notified() => break,
             }
         }
     });
@@ -77,6 +175,7 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
     let request_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
     let mut request_tasks = tokio::task::JoinSet::new();
     let mut initial_snapshot = Some(initial_snapshot);
+    let mut event_subscription_active = false;
 
     loop {
         tokio::select! {
@@ -88,12 +187,12 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                             Ok(value) => value,
                             Err(error) => {
                                 let _ = send_protocol_error(
-                                    &outgoing_tx,
+                                    &outgoing,
                                     None,
                                     ERROR_INVALID_REQUEST,
                                     format!("JSON 无效: {error}"),
                                     false,
-                                ).await;
+                                );
                                 continue;
                             }
                         };
@@ -101,12 +200,12 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                             Ok(message) => message,
                             Err(error) => {
                                 let _ = send_protocol_error(
-                                    &outgoing_tx,
+                                    &outgoing,
                                     None,
                                     ERROR_INVALID_REQUEST,
                                     error.to_string(),
                                     false,
-                                ).await;
+                                );
                                 continue;
                             }
                         };
@@ -117,28 +216,42 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                     &connection_state,
                                     request,
                                 ).await;
-                                if send_json(&outgoing_tx, response).await.is_err() {
+                                if try_send_json(&outgoing, response).is_err() {
                                     break;
                                 }
                             }
                             ClientMessage::Request(request) if request.method == "events/subscribe" => {
+                                if initial_snapshot.is_none() {
+                                    let (snapshot, replacement) = state.event_bus.snapshot_and_subscribe();
+                                    event_rx = replacement;
+                                    initial_snapshot = Some(snapshot);
+                                }
                                 let response = subscribe_events(
                                     &state,
                                     &connection_state,
                                     &mut initial_snapshot,
                                     request,
-                                    &outgoing_tx,
+                                    &outgoing,
                                 ).await;
-                                if send_json(&outgoing_tx, response).await.is_err() {
+                                event_subscription_active = is_subscribed(&connection_state).await;
+                                if try_send_json(&outgoing, response).is_err() {
                                     break;
                                 }
                             }
                             ClientMessage::Request(request) => {
+                                // 普通请求在进入异步任务前必须完成握手检查，避免
+                                // initialized 与业务请求的到达顺序在不同任务间产生竞态。
+                                if let Some(error) = require_initialized(&connection_state).await {
+                                    if try_send_json(&outgoing, error_response(request.id, error)).is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 let slot = match request_slots.clone().try_acquire_owned() {
                                     Ok(slot) => slot,
                                     Err(_) => {
-                                        let _ = send_json(
-                                            &outgoing_tx,
+                                        let _ = try_send_json(
+                                            &outgoing,
                                             error_response(
                                                 request.id,
                                                 ErrorObject::new(
@@ -146,13 +259,13 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                                     "服务端请求过多，请稍后重试",
                                                 ).retryable(true),
                                             ),
-                                        ).await;
+                                        );
                                         continue;
                                     }
                                 };
                                 let state_for_request = state.clone();
                                 let connection_for_request = connection_state.clone();
-                                let outgoing_for_request = outgoing_tx.clone();
+                                let outgoing_for_request = outgoing.clone();
                                 request_tasks.spawn(async move {
                                     let _slot = slot;
                                     let response = dispatch_request(
@@ -160,7 +273,9 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                         &connection_for_request,
                                         request,
                                     ).await;
-                                    let _ = send_json(&outgoing_for_request, response).await;
+                                    if try_send_json(&outgoing_for_request, response).is_err() {
+                                        outgoing_for_request.disconnect();
+                                    }
                                 });
                             }
                             ClientMessage::Notification(notification) => {
@@ -168,24 +283,26 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                             }
                             ClientMessage::Response(_) => {
                                 let _ = send_protocol_error(
-                                    &outgoing_tx,
+                                    &outgoing,
                                     None,
                                     ERROR_INVALID_REQUEST,
                                     "当前连接没有待处理的服务端请求".to_string(),
                                     false,
-                                ).await;
+                                );
                             }
                         }
                     }
                     Message::Ping(payload) => {
-                        let _ = payload;
-                        let _ = outgoing_tx.send("{\"type\":\"pong\"}".to_string()).await;
+                        if outgoing.control_message(Message::Pong(payload)).is_err() {
+                            outgoing.disconnect();
+                            break;
+                        }
                     }
                     Message::Close(_) => break,
                     Message::Binary(_) | Message::Pong(_) => {}
                 }
             }
-            event = event_rx.recv() => {
+            event = event_rx.recv(), if event_subscription_active => {
                 match event {
                     Ok(event) => {
                         let should_send = {
@@ -200,18 +317,27 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                 &format!("event/{}", event.event_type),
                             )
                             .await
-                            && send_json(
-                                &outgoing_tx,
+                            && try_send_event_json(
+                                &outgoing,
                                 notification(
                                     format!("event/{}", event.event_type),
                                     json!({"sequence": event.sequence, "event": event}),
                                 ),
                             )
-                            .await
                             .is_err()
                         {
-                            connection_state.lock().await.subscription.after_sequence = event.sequence;
+                            let _ = try_send_json(
+                                &outgoing,
+                                notification(
+                                    "events/resyncRequired",
+                                    json!({"reason": "clientTooSlow"}),
+                                ),
+                            );
+                            outgoing.disconnect();
                             break;
+                        }
+                        if should_send {
+                            connection_state.lock().await.subscription.after_sequence = event.sequence;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -220,16 +346,25 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                         if is_subscribed(&connection_state).await {
                             connection_state.lock().await.subscription.after_sequence =
                                 snapshot.next_sequence.saturating_sub(1);
-                            let _ = send_json(&outgoing_tx, notification(
+                            if try_send_json(&outgoing, notification(
                                 "events/resyncRequired",
                                 json!({
                                     "skipped": skipped,
                                     "snapshot": filtered_snapshot(&snapshot, &connection_state).await,
                                 }),
-                            )).await;
+                            )).is_err() {
+                                outgoing.disconnect();
+                                break;
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = disconnect_notify.notified() => break,
+            completed = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::debug!(?error, "App Server 请求任务结束");
                 }
             }
         }
@@ -237,7 +372,7 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
 
     request_tasks.abort_all();
     while request_tasks.join_next().await.is_some() {}
-    drop(outgoing_tx);
+    drop(outgoing);
     let _ = writer.await;
 }
 
@@ -306,7 +441,9 @@ async fn initialize_connection(
                 turns: true,
                 events: true,
                 approvals: false,
-                browser_tools: true,
+                // 浏览器工具仍由现有 Browser Tool Runtime 负责；App Server 尚未暴露
+                // 对应方法时不能提前宣称能力，否则客户端会把请求发到不存在的方法。
+                browser_tools: false,
             },
         })
         .expect("初始化响应必须可序列化"),
@@ -318,7 +455,7 @@ async fn subscribe_events(
     connection_state: &Arc<Mutex<ConnectionState>>,
     initial_snapshot: &mut Option<EventStreamSnapshot>,
     request: ClientRequest,
-    outgoing: &OutgoingSender,
+    outgoing: &OutgoingChannels,
 ) -> magi_app_server_protocol::ServerResponse {
     if let Some(error) = require_initialized(connection_state).await {
         return error_response(request.id, error);
@@ -354,18 +491,43 @@ async fn subscribe_events(
     let snapshot = initial_snapshot
         .take()
         .unwrap_or_else(|| state.event_bus.snapshot());
+    let resync_required = snapshot_requires_resync(&snapshot, after_sequence);
     let snapshot = filter_snapshot(snapshot, after_sequence, connection_state).await;
-    let _ = send_json(
+    let next_sequence = snapshot.next_sequence;
+    // snapshot_and_subscribe 的快照与实时 receiver 是一个连续切面。快照已经
+    // 包含截至 nextSequence - 1 的事件，游标必须前移到该边界，否则同一事件
+    // 会先出现在 snapshot、随后又从 broadcast receiver 重复投递一次。
+    connection_state.lock().await.subscription.after_sequence =
+        after_sequence.max(next_sequence.saturating_sub(1));
+    let notification_method = if resync_required {
+        "events/resyncRequired"
+    } else {
+        "events/snapshot"
+    };
+    let mut notification_params = if resync_required {
+        json!({"snapshot": snapshot})
+    } else {
+        serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}))
+    };
+    if resync_required {
+        notification_params["reason"] = json!("afterSequenceExpired");
+        notification_params["requestedAfterSequence"] = json!(after_sequence);
+    }
+    if try_send_json(
         outgoing,
-        notification(
-            "events/snapshot",
-            serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
-        ),
+        notification(notification_method, notification_params),
     )
-    .await;
+    .is_err()
+    {
+        outgoing.disconnect();
+    }
     response(
         request.id,
-        json!({"subscribed": true, "nextSequence": snapshot.next_sequence}),
+        json!({
+            "subscribed": true,
+            "nextSequence": next_sequence,
+            "resyncRequired": resync_required,
+        }),
     )
 }
 
@@ -437,7 +599,10 @@ async fn read_session(
     };
     let session_id = SessionId::new(params.session_id.trim());
     let Some(session) = state.session_store.session(&session_id) else {
-        return error_response(request_id, ErrorObject::new(-32004, "会话不存在"));
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_SESSION_NOT_FOUND, "会话不存在"),
+        );
     };
     let turns = if params.include_turns {
         serde_json::to_value(state.session_store.canonical_turns_for_session(&session_id))
@@ -454,19 +619,8 @@ async fn read_session(
 async fn start_turn(
     state: &ApiState,
     request_id: RequestId,
-    mut params: Value,
+    params: Value,
 ) -> magi_app_server_protocol::ServerResponse {
-    let Some(object) = params.as_object_mut() else {
-        return error_response(
-            request_id,
-            ErrorObject::new(ERROR_INVALID_PARAMS, "turn/start 参数必须是对象"),
-        );
-    };
-    // 协议 request id 是重试相关性的唯一最低保证。若调用方没有业务 requestId，
-    // 使用同一个 id 重试时会命中现有 session turn 的幂等识别逻辑。
-    object
-        .entry("requestId")
-        .or_insert_with(|| json!(request_id.as_str()));
     let request = match serde_json::from_value::<crate::dto::SessionTurnRequestDto>(params) {
         Ok(request) => request,
         Err(error) => {
@@ -476,36 +630,222 @@ async fn start_turn(
             );
         }
     };
-    if request.requested_session_id().is_none()
-        && let Some(existing_turn) = request.request_id().as_deref().and_then(|request_id| {
-            state
-                .session_store
-                .canonical_turn_for_request_id(request_id)
-        })
-    {
+    let business_request_id = request.request_id();
+    if let Some(business_request_id) = business_request_id.as_deref() {
+        let _request_lock = state.lock_app_server_request(business_request_id).await;
+        return start_turn_once(state, request_id, request).await;
+    }
+    start_turn_once(state, request_id, request).await
+}
+
+async fn start_turn_once(
+    state: &ApiState,
+    request_id: RequestId,
+    request: crate::dto::SessionTurnRequestDto,
+) -> magi_app_server_protocol::ServerResponse {
+    if let Some(existing_turn) = request.request_id().as_deref().and_then(|request_id| {
+        state
+            .session_store
+            .canonical_turn_for_request_id(request_id)
+    }) {
+        if !request_matches_canonical_turn(state, &request, &existing_turn) {
+            return error_response(
+                request_id,
+                ErrorObject::new(
+                    ERROR_REQUEST_CONFLICT,
+                    "requestId 已绑定另一份 Turn，请为新请求生成新的 requestId",
+                )
+                .retryable(false),
+            );
+        }
         response(
             request_id,
             json!({
-                "replayed": true,
-                "sessionId": existing_turn.session_id,
-                "turnId": existing_turn.turn_id,
-                "acceptedAt": existing_turn.accepted_at,
+                    "replayed": true,
+                    "entryId": format!("timeline-{}-{}", existing_turn.session_id, existing_turn.accepted_at.0),
+                    "eventId": format!("event-session-turn-task-{}", existing_turn.accepted_at.0),
+                    "sessionId": existing_turn.session_id,
+                    "turnId": existing_turn.turn_id,
+                    "acceptedAt": existing_turn.accepted_at,
+                    "createdSession": false,
+                    "route": "task",
+                    "queued": false,
+                    "userMessageItemId": existing_turn.items.iter()
+                        .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage)
+                        .map(|item| item.item_id.clone()),
+                    "runtimeEpoch": state.runtime_epoch(),
+                    "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
+                    "canonicalTurn": existing_turn,
+            }),
+        )
+    } else if let Some((queued_turn, queue_position)) = request
+        .request_id()
+        .as_deref()
+        .and_then(|request_id| state.queued_regular_session_turn_for_request_id(request_id))
+    {
+        if !request_matches_queued_turn(&request, &queued_turn) {
+            return error_response(
+                request_id,
+                ErrorObject::new(
+                    ERROR_REQUEST_CONFLICT,
+                    "requestId 已绑定另一份排队 Turn，请为新请求生成新的 requestId",
+                )
+                .retryable(false),
+            );
+        }
+        let queue_id = queued_turn.queue_id.clone();
+        let user_message_item_id = queued_turn.request.user_message_id();
+        response(
+            request_id,
+            json!({
+                    "replayed": true,
+                    "entryId": queue_id,
+                    "eventId": format!("event-session-turn-queued-{}", queued_turn.accepted_at.0),
+                    "queued": true,
+                    "queueId": queued_turn.queue_id,
+                    "queuePosition": queue_position,
+                    "sessionId": queued_turn.session_id,
+                    "workspaceId": queued_turn.workspace_id,
+                    "acceptedAt": queued_turn.accepted_at,
+                    "route": queued_turn.route,
+                    "createdSession": false,
+                    "userMessageItemId": user_message_item_id,
                 "runtimeEpoch": state.runtime_epoch(),
                 "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
-                "canonicalTurn": existing_turn,
             }),
         )
     } else {
-        match sessions::submit_session_turn(axum::extract::State(state.clone()), axum::Json(request))
-            .await
+        let business_request_id = request.request_id();
+        match sessions::submit_session_turn(
+            axum::extract::State(state.clone()),
+            axum::Json(request),
+        )
+        .await
         {
-            Ok(axum::Json(result)) => response(
-                request_id,
-                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            ),
+            Ok(axum::Json(result)) => {
+                let mut result = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
+                result["replayed"] = json!(false);
+                if let Some(business_request_id) = business_request_id {
+                    result["requestId"] = json!(business_request_id);
+                }
+                response(request_id, result)
+            }
             Err(error) => error_response(request_id, api_error_to_protocol(error)),
         }
     }
+}
+
+fn request_matches_canonical_turn(
+    state: &ApiState,
+    request: &crate::dto::SessionTurnRequestDto,
+    turn: &magi_session_store::CanonicalTurn,
+) -> bool {
+    if let Some(requested_session_id) = request.requested_session_id()
+        && requested_session_id != turn.session_id
+    {
+        return false;
+    }
+    let Some(session) = state.session_store.session(&turn.session_id) else {
+        return false;
+    };
+    let requested_workspace_id = request.requested_workspace_id();
+    let scope_matches = match request.scope {
+        crate::dto::SessionScopeKindDto::Personal => session.workspace_id.is_none(),
+        crate::dto::SessionScopeKindDto::Workspace => {
+            session.workspace_id.as_deref() == requested_workspace_id.as_deref()
+        }
+    };
+    if !scope_matches {
+        return false;
+    }
+    let Some(user_item) = turn
+        .items
+        .iter()
+        .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage)
+    else {
+        return false;
+    };
+    if user_item.content.as_deref()
+        != Some(
+            request
+                .timeline_message(request.trimmed_text().as_deref())
+                .as_str(),
+        )
+    {
+        return false;
+    }
+    let metadata = &user_item.metadata;
+    if let Some(user_message_id) = request.user_message_id()
+        && metadata.get("userMessageId").and_then(Value::as_str) != Some(user_message_id.as_str())
+    {
+        return false;
+    }
+    if let Some(placeholder_message_id) = request.placeholder_message_id()
+        && metadata.get("placeholderMessageId").and_then(Value::as_str)
+            != Some(placeholder_message_id.as_str())
+    {
+        return false;
+    }
+    if request
+        .skill_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        != metadata.get("skillName").and_then(Value::as_str)
+    {
+        return false;
+    }
+    if request.goal_mode
+        != metadata
+            .get("goalMode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    let request_images = serde_json::to_value(&request.images).unwrap_or_else(|_| json!([]));
+    let stored_images = metadata.get("images").cloned().unwrap_or_else(|| json!([]));
+    if request_images != stored_images {
+        return false;
+    }
+    let request_annotations = json!(request.browser_annotation_refs);
+    let stored_annotations = metadata
+        .get("browserAnnotationRefs")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    if request_annotations != stored_annotations {
+        return false;
+    }
+    true
+}
+
+fn request_matches_queued_turn(
+    request: &crate::dto::SessionTurnRequestDto,
+    queued: &crate::state::QueuedRegularSessionTurn,
+) -> bool {
+    if let Some(requested_session_id) = request.requested_session_id()
+        && requested_session_id != queued.session_id
+    {
+        return false;
+    }
+    if request.scope == crate::dto::SessionScopeKindDto::Personal && queued.workspace_id.is_some() {
+        return false;
+    }
+    if request.scope == crate::dto::SessionScopeKindDto::Workspace {
+        let requested_workspace_id = request.requested_workspace_id();
+        let queued_workspace_id = queued.workspace_id.as_ref().map(ToString::to_string);
+        if queued_workspace_id.as_deref() != requested_workspace_id.as_deref() {
+            return false;
+        }
+    }
+    request.timeline_message(request.trimmed_text().as_deref())
+        == queued
+            .request
+            .timeline_message(queued.request.trimmed_text().as_deref())
+        && request.user_message_id() == queued.request.user_message_id()
+        && request.skill_name.as_deref().map(str::trim)
+            == queued.request.skill_name.as_deref().map(str::trim)
+        && request.goal_mode == queued.request.goal_mode
 }
 
 async fn handle_notification(
@@ -574,6 +914,18 @@ async fn filter_snapshot(
     }
 }
 
+fn snapshot_requires_resync(snapshot: &EventStreamSnapshot, after_sequence: u64) -> bool {
+    if after_sequence == 0 {
+        return false;
+    }
+    let expected_next = after_sequence.saturating_add(1);
+    snapshot
+        .recent_events
+        .first()
+        .map(|event| event.sequence > expected_next)
+        .unwrap_or(snapshot.next_sequence > expected_next)
+}
+
 fn event_matches(event: &EventEnvelope, subscription: &EventSubscription) -> bool {
     if let Some(session_id) = subscription.session_id.as_ref()
         && event.session_id.as_ref() != Some(session_id)
@@ -640,11 +992,11 @@ fn api_error_to_protocol(error: ApiError) -> ErrorObject {
         ApiError::InvalidInput(message) => ErrorObject::new(ERROR_INVALID_PARAMS, message),
         ApiError::InvalidRequestBody(message) => ErrorObject::new(ERROR_INVALID_PARAMS, message),
         ApiError::SessionNotFound(message) | ApiError::NotFound(message) => {
-            ErrorObject::new(-32004, message)
+            ErrorObject::new(ERROR_SESSION_NOT_FOUND, message)
         }
-        ApiError::RecoveryNotFound(message) => ErrorObject::new(-32004, message),
+        ApiError::RecoveryNotFound(message) => ErrorObject::new(ERROR_SESSION_NOT_FOUND, message),
         ApiError::Conflict(message) | ApiError::TurnConflict { message, .. } => {
-            ErrorObject::new(-32010, message).retryable(true)
+            ErrorObject::new(ERROR_REQUEST_CONFLICT, message).retryable(true)
         }
         ApiError::CapabilityUnavailable { message, .. } => {
             ErrorObject::new(-32011, message).retryable(false)
@@ -655,10 +1007,10 @@ fn api_error_to_protocol(error: ApiError) -> ErrorObject {
     }
 }
 
-async fn send_json<T: serde::Serialize>(
-    outgoing: &OutgoingSender,
+fn try_send_json<T: serde::Serialize>(
+    outgoing: &OutgoingChannels,
     value: T,
-) -> Result<(), mpsc::error::SendError<String>> {
+) -> Result<(), mpsc::error::TrySendError<Message>> {
     let text = serde_json::to_string(&value).unwrap_or_else(|_| {
         serde_json::to_string(&error_response(
             RequestId::new("serialization-error").expect("固定 request id 合法"),
@@ -666,30 +1018,52 @@ async fn send_json<T: serde::Serialize>(
         ))
         .expect("内部错误响应必须可序列化")
     });
-    outgoing.send(text).await
+    outgoing.control_message(Message::Text(text.into()))
 }
 
-async fn send_protocol_error(
-    outgoing: &OutgoingSender,
+fn try_send_event_json<T: serde::Serialize>(
+    outgoing: &OutgoingChannels,
+    value: T,
+) -> Result<(), mpsc::error::TrySendError<Message>> {
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| {
+        serde_json::to_string(&error_response(
+            RequestId::new("serialization-error").expect("固定 request id 合法"),
+            ErrorObject::new(ERROR_INTERNAL, "响应序列化失败"),
+        ))
+        .expect("内部错误响应必须可序列化")
+    });
+    outgoing.event_message(Message::Text(text.into()))
+}
+
+fn send_protocol_error(
+    outgoing: &OutgoingChannels,
     request_id: Option<RequestId>,
     code: i32,
     message: String,
     retryable: bool,
-) -> Result<(), mpsc::error::SendError<String>> {
+) -> Result<(), mpsc::error::TrySendError<Message>> {
     let id = request_id
         .unwrap_or_else(|| RequestId::new("protocol-error").expect("固定 request id 合法"));
-    send_json(
+    try_send_json(
         outgoing,
         error_response(id, ErrorObject::new(code, message).retryable(retryable)),
     )
-    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use magi_core::{EventId, UtcMillis};
     use magi_event_bus::EventCategory;
+    use magi_governance::GovernanceService;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
     fn event(sequence: u64, session_id: Option<&str>, workspace_id: Option<&str>) -> EventEnvelope {
         EventEnvelope {
@@ -738,5 +1112,201 @@ mod tests {
             &event(3, Some("session-1"), Some("workspace-2")),
             &subscription
         ));
+    }
+
+    #[test]
+    fn expired_event_cursor_requires_resync() {
+        let snapshot = EventStreamSnapshot {
+            next_sequence: 11,
+            recent_events: vec![event(5, Some("session-1"), Some("workspace-1"))],
+        };
+        assert!(snapshot_requires_resync(&snapshot, 3));
+        assert!(!snapshot_requires_resync(&snapshot, 4));
+        assert!(!snapshot_requires_resync(&snapshot, 0));
+    }
+
+    #[tokio::test]
+    async fn app_server_request_lock_serializes_same_business_request_id() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let first = state.lock_app_server_request("same-request").await;
+        let state_for_waiter = state.clone();
+        let ready = Arc::new(Notify::new());
+        let ready_for_waiter = Arc::clone(&ready);
+        let waiter = tokio::spawn(async move {
+            let _second = state_for_waiter
+                .lock_app_server_request("same-request")
+                .await;
+            ready_for_waiter.notify_one();
+        });
+        assert!(
+            timeout(Duration::from_millis(50), ready.notified())
+                .await
+                .is_err()
+        );
+        drop(first);
+        timeout(Duration::from_secs(1), ready.notified())
+            .await
+            .expect("同一 requestId 的等待者应被释放");
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("同一 requestId 的等待者应被释放")
+            .expect("等待任务不应失败");
+    }
+
+    async fn next_text_message(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Value {
+        loop {
+            let message = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("WebSocket 响应不能超时")
+                .expect("WebSocket 应保持连接")
+                .expect("WebSocket 帧应有效");
+            if let ClientMessage::Text(text) = message {
+                return serde_json::from_str(&text).expect("文本帧应为 JSON");
+            }
+        }
+    }
+
+    async fn send_request(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        request: Value,
+        request_id: &str,
+    ) -> Value {
+        socket
+            .send(ClientMessage::Text(request.to_string().into()))
+            .await
+            .expect("请求应发送");
+        loop {
+            let response = next_text_message(socket).await;
+            if response.get("id").and_then(Value::as_str) == Some(request_id)
+                || response
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .map(|id| id.to_string() == request_id)
+                    .unwrap_or(false)
+            {
+                return response;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_route_completes_handshake_subscription_and_control_ping() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试监听器应绑定");
+        let address = listener.local_addr().expect("应读取测试端口");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::routes::build_router(state))
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("测试路由应正常退出");
+        });
+
+        let (mut socket, _) = connect_async(format!("ws://{address}/api/app-server"))
+            .await
+            .expect("应成功连接 App Server WebSocket");
+        let before_initialized = send_request(
+            &mut socket,
+            serde_json::json!({
+                "id": "before-initialized",
+                "method": "session/list",
+                "params": {}
+            }),
+            "before-initialized",
+        )
+        .await;
+        assert_eq!(before_initialized["error"]["code"], ERROR_NOT_INITIALIZED);
+
+        let initialize = send_request(
+            &mut socket,
+            serde_json::json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "integration-test"},
+                    "protocol": {"major": 1, "minor": 0},
+                    "capabilities": {"streaming": true}
+                }
+            }),
+            "1",
+        )
+        .await;
+        assert_eq!(initialize["id"], 1);
+        assert_eq!(initialize["result"]["capabilities"]["events"], true);
+        assert_eq!(initialize["result"]["capabilities"]["browserTools"], false);
+
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"method": "initialized", "params": {}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("initialized 通知应发送");
+
+        let subscribe = send_request(
+            &mut socket,
+            serde_json::json!({
+                "id": "subscribe-1",
+                "method": "events/subscribe",
+                "params": {"workspaceId": "workspace-test", "afterSequence": 0}
+            }),
+            "subscribe-1",
+        )
+        .await;
+        assert_eq!(subscribe["result"]["subscribed"], true);
+
+        let listed = send_request(
+            &mut socket,
+            serde_json::json!({
+                "id": 2,
+                "method": "session/list",
+                "params": {"workspaceId": "workspace-test"}
+            }),
+            "2",
+        )
+        .await;
+        assert_eq!(listed["id"], 2);
+        assert_eq!(
+            listed["result"]["sessions"].as_array().map(Vec::len),
+            Some(0)
+        );
+
+        socket
+            .send(ClientMessage::Ping(vec![1, 2, 3].into()))
+            .await
+            .expect("WebSocket Ping 应发送");
+        let pong = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("Pong 不能超时")
+            .expect("连接应保持")
+            .expect("Pong 帧应有效");
+        assert_eq!(pong, ClientMessage::Pong(vec![1, 2, 3].into()));
+
+        drop(socket);
+        shutdown_tx.send(()).expect("测试服务应收到停止信号");
+        server.await.expect("测试服务任务应正常结束");
     }
 }
