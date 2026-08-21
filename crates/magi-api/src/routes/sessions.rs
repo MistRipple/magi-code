@@ -25,7 +25,7 @@ use serde_json::json;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::dispatch_flow::accepted_session_directory_entry;
+use super::dispatch_flow::{accepted_session_directory_entry, session_turn_route_name};
 use super::session_scope::{
     SessionScope, parse_session_id, require_session_record_in_scope, require_session_request_scope,
     resolve_existing_session_scope, resolve_explicit_session_scope, resolve_session_scope,
@@ -729,7 +729,10 @@ async fn submit_steer_current_turn(
             request_id: request_id.clone(),
             user_message_id: user_message_id.clone(),
             placeholder_message_id: None,
-            metadata: Default::default(),
+            metadata: std::collections::HashMap::from([(
+                "route".to_string(),
+                serde_json::Value::String("steer".to_string()),
+            )]),
             task_id: None,
             source_thread_id: orchestrator_thread_id,
         });
@@ -2251,6 +2254,7 @@ async fn submit_mainline_session_turn(
             completion_contract: decision.completion_contract.clone(),
             recovery_checkpoint: decision.recovery_checkpoint.clone(),
             denied_tools: session_turn_denied_tools(&request),
+            route: Some(session_turn_route_name(route).to_string()),
         },
     )
     .await?;
@@ -3079,7 +3083,10 @@ fn write_continue_user_message(
             request_id,
             user_message_id,
             placeholder_message_id,
-            metadata: Default::default(),
+            metadata: std::collections::HashMap::from([(
+                "route".to_string(),
+                serde_json::Value::String("continue".to_string()),
+            )]),
             task_id: Some(accepted.action_task_id.clone()),
             source_thread_id: orchestrator_thread_id,
         });

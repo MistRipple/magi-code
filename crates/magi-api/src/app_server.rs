@@ -68,6 +68,7 @@ struct OutgoingChannels {
     control: mpsc::Sender<SequencedMessage>,
     events: mpsc::Sender<SequencedMessage>,
     next_sequence: Arc<std::sync::atomic::AtomicU64>,
+    sequence_lock: Arc<std::sync::Mutex<()>>,
     disconnected: Arc<AtomicBool>,
     disconnect_notify: Arc<Notify>,
 }
@@ -79,28 +80,40 @@ struct SequencedMessage {
 
 impl OutgoingChannels {
     fn control_message(&self, message: Message) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let _sequence_guard = self
+            .sequence_lock
+            .lock()
+            .expect("App Server 出站序列锁不能中毒");
         let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
         self.control
             .try_send(SequencedMessage { sequence, message })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(message) => {
+                    self.next_sequence.fetch_sub(1, Ordering::SeqCst);
                     mpsc::error::TrySendError::Full(message.message)
                 }
                 mpsc::error::TrySendError::Closed(message) => {
+                    self.next_sequence.fetch_sub(1, Ordering::SeqCst);
                     mpsc::error::TrySendError::Closed(message.message)
                 }
             })
     }
 
     fn event_message(&self, message: Message) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let _sequence_guard = self
+            .sequence_lock
+            .lock()
+            .expect("App Server 出站序列锁不能中毒");
         let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
         self.events
             .try_send(SequencedMessage { sequence, message })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(message) => {
+                    self.next_sequence.fetch_sub(1, Ordering::SeqCst);
                     mpsc::error::TrySendError::Full(message.message)
                 }
                 mpsc::error::TrySendError::Closed(message) => {
+                    self.next_sequence.fetch_sub(1, Ordering::SeqCst);
                     mpsc::error::TrySendError::Closed(message.message)
                 }
             })
@@ -120,10 +133,12 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
     let disconnected = Arc::new(AtomicBool::new(false));
     let disconnect_notify = Arc::new(Notify::new());
     let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let sequence_lock = Arc::new(std::sync::Mutex::new(()));
     let outgoing = OutgoingChannels {
         control: control_tx,
         events: event_tx,
         next_sequence,
+        sequence_lock,
         disconnected: Arc::clone(&disconnected),
         disconnect_notify: Arc::clone(&disconnect_notify),
     };
@@ -134,14 +149,14 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
         let mut events_open = true;
         let mut pending = BTreeMap::<u64, Message>::new();
         let mut next_sequence = 1;
-        while control_open || events_open {
-            if writer_disconnected.load(Ordering::SeqCst) {
-                break;
-            }
+        let mut drain_requested = false;
+        while control_open || events_open || !pending.is_empty() {
+            drain_requested |= writer_disconnected.load(Ordering::SeqCst);
             if let Some(message) = pending.remove(&next_sequence) {
                 if sink.send(message).await.is_err() {
                     writer_disconnected.store(true, Ordering::SeqCst);
                     writer_disconnect_notify.notify_one();
+                    break;
                 }
                 next_sequence = next_sequence.saturating_add(1);
                 continue;
@@ -164,7 +179,12 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                         None => events_open = false,
                     }
                 }
-                _ = writer_disconnect_notify.notified() => break,
+                _ = writer_disconnect_notify.notified() => {
+                    drain_requested = true;
+                },
+            }
+            if drain_requested && !control_open && !events_open && pending.is_empty() {
+                break;
             }
         }
     });
@@ -658,6 +678,10 @@ async fn start_turn_once(
                 .retryable(false),
             );
         }
+        let user_message_item = existing_turn
+            .items
+            .iter()
+            .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage);
         response(
             request_id,
             json!({
@@ -668,11 +692,11 @@ async fn start_turn_once(
                     "turnId": existing_turn.turn_id,
                     "acceptedAt": existing_turn.accepted_at,
                     "createdSession": false,
-                    "route": "task",
+                    "route": user_message_item.and_then(|item| {
+                        item.metadata.get("route").and_then(Value::as_str)
+                    }),
                     "queued": false,
-                    "userMessageItemId": existing_turn.items.iter()
-                        .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage)
-                        .map(|item| item.item_id.clone()),
+                    "userMessageItemId": user_message_item.map(|item| item.item_id.clone()),
                     "runtimeEpoch": state.runtime_epoch(),
                     "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
                     "canonicalTurn": existing_turn,
@@ -1230,6 +1254,7 @@ mod tests {
         let before_initialized = send_request(
             &mut socket,
             serde_json::json!({
+                "jsonrpc": "2.0",
                 "id": "before-initialized",
                 "method": "session/list",
                 "params": {}
@@ -1237,11 +1262,13 @@ mod tests {
             "before-initialized",
         )
         .await;
+        assert_eq!(before_initialized["jsonrpc"], "2.0");
         assert_eq!(before_initialized["error"]["code"], ERROR_NOT_INITIALIZED);
 
         let initialize = send_request(
             &mut socket,
             serde_json::json!({
+                "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
                 "params": {
@@ -1253,13 +1280,14 @@ mod tests {
             "1",
         )
         .await;
+        assert_eq!(initialize["jsonrpc"], "2.0");
         assert_eq!(initialize["id"], 1);
         assert_eq!(initialize["result"]["capabilities"]["events"], true);
         assert_eq!(initialize["result"]["capabilities"]["browserTools"], false);
 
         socket
             .send(ClientMessage::Text(
-                serde_json::json!({"method": "initialized", "params": {}})
+                serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})
                     .to_string()
                     .into(),
             ))
@@ -1269,6 +1297,7 @@ mod tests {
         let subscribe = send_request(
             &mut socket,
             serde_json::json!({
+                "jsonrpc": "2.0",
                 "id": "subscribe-1",
                 "method": "events/subscribe",
                 "params": {"workspaceId": "workspace-test", "afterSequence": 0}
@@ -1281,6 +1310,7 @@ mod tests {
         let listed = send_request(
             &mut socket,
             serde_json::json!({
+                "jsonrpc": "2.0",
                 "id": 2,
                 "method": "session/list",
                 "params": {"workspaceId": "workspace-test"}

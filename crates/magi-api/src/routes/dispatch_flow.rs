@@ -29,6 +29,16 @@ use magi_session_store::{
     SessionGoal,
 };
 
+pub(super) fn session_turn_route_name(route: crate::dto::SessionTurnRouteDto) -> &'static str {
+    match route {
+        crate::dto::SessionTurnRouteDto::Chat => "chat",
+        crate::dto::SessionTurnRouteDto::Execute => "execute",
+        crate::dto::SessionTurnRouteDto::Task => "task",
+        crate::dto::SessionTurnRouteDto::Continue => "continue",
+        crate::dto::SessionTurnRouteDto::Steer => "steer",
+    }
+}
+
 pub(super) async fn accept_session_task_submission(
     state: &ApiState,
     request: &SessionTurnRequestDto,
@@ -52,6 +62,7 @@ pub(super) async fn accept_session_task_submission(
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            route: None,
         },
     )
     .await
@@ -68,6 +79,8 @@ pub(super) struct SessionTaskSubmissionInput {
     pub completion_contract: TaskCompletionContract,
     pub recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     pub denied_tools: Vec<String>,
+    /// 提交路由属于 API 语义，写入 canonical user item 供 App Server 重放。
+    pub route: Option<String>,
 }
 
 pub(super) async fn accept_session_task_submission_at(
@@ -86,6 +99,7 @@ pub(super) async fn accept_session_task_submission_at(
         completion_contract,
         recovery_checkpoint,
         denied_tools,
+        route,
     } = input;
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
@@ -120,6 +134,7 @@ pub(super) async fn accept_session_task_submission_at(
             completion_contract,
             recovery_checkpoint,
             denied_tools,
+            route,
         },
     )
     .await
@@ -181,6 +196,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         completion_contract: TaskCompletionContract::default(),
         recovery_checkpoint: None,
         denied_tools: Vec::new(),
+        user_message_metadata: Default::default(),
         turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
@@ -208,6 +224,7 @@ struct ExecuteDispatchSubmissionInput<'a> {
     completion_contract: TaskCompletionContract,
     recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     denied_tools: Vec<String>,
+    route: Option<String>,
 }
 
 fn initial_session_orchestrator_config(
@@ -264,6 +281,7 @@ async fn execute_dispatch_submission(
         completion_contract,
         recovery_checkpoint,
         denied_tools,
+        route,
     } = input;
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
@@ -355,6 +373,14 @@ async fn execute_dispatch_submission(
         recovery_checkpoint,
         denied_tools,
         turn_origin: DispatchTurnOrigin::User,
+        user_message_metadata: route
+            .map(|route| {
+                std::collections::HashMap::from([(
+                    "route".to_string(),
+                    serde_json::Value::String(route),
+                )])
+            })
+            .unwrap_or_default(),
     };
     let accepted = match submit_dispatch_submission(state, dispatch) {
         Ok(accepted) => accepted,

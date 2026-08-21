@@ -105,6 +105,8 @@ pub struct DispatchSubmissionRequest {
     pub completion_contract: TaskCompletionContract,
     pub recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     pub denied_tools: Vec<String>,
+    /// 需要随 user message 原子持久化的 API 语义元数据。
+    pub user_message_metadata: std::collections::HashMap<String, serde_json::Value>,
     pub turn_origin: DispatchTurnOrigin,
 }
 
@@ -617,6 +619,7 @@ pub fn run_dispatch_submission(
                             serde_json::Value::String(skill_name.to_string()),
                         );
                     }
+                    metadata.extend(request.user_message_metadata.clone());
                     metadata.insert(
                         "goalMode".to_string(),
                         serde_json::Value::Bool(request.goal_mode),
@@ -936,6 +939,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1024,6 +1028,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
 
@@ -1115,6 +1120,10 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: std::collections::HashMap::from([(
+                "route".to_string(),
+                serde_json::json!("chat"),
+            )]),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1165,6 +1174,24 @@ mod tests {
         assert_eq!(
             user_item.metadata.get("browserAnnotationRefs"),
             Some(&serde_json::Value::Array(vec![annotation]))
+        );
+        accept_dispatch_submission(
+            &session_store,
+            Some(&task_store),
+            &execution_registry,
+            request,
+            graph,
+        )
+        .expect("dispatch acceptance should persist the complete user item atomically");
+        let canonical_user_item = session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .flat_map(|turn| turn.items)
+            .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+            .expect("canonical user item should be restored");
+        assert_eq!(
+            canonical_user_item.metadata.get("route"),
+            Some(&serde_json::json!("chat"))
         );
     }
 
@@ -1312,6 +1339,7 @@ mod tests {
                 source_thread_id: source_thread_id.clone(),
             }),
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1462,6 +1490,7 @@ mod tests {
                 source_thread_id: orchestrator_thread_id,
             }),
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1557,6 +1586,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1665,6 +1695,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1733,6 +1764,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1807,6 +1839,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -1887,6 +1920,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let workspace_root = std::path::PathBuf::from("/tmp/workspace");
@@ -1990,6 +2024,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
         };
         let runtime = DispatchSubmissionRuntime {
@@ -2105,6 +2140,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
             turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
         };
         let runtime = DispatchSubmissionRuntime {

@@ -10,6 +10,7 @@ use serde_json::Value;
 pub const PROTOCOL_NAME: &str = "magi.app-server";
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
+pub const JSONRPC_VERSION: &str = "2.0";
 
 pub const ERROR_INVALID_REQUEST: i32 = -32600;
 pub const ERROR_METHOD_NOT_FOUND: i32 = -32601;
@@ -266,7 +267,7 @@ impl std::error::Error for ProtocolError {}
 
 pub fn response(id: RequestId, result: Value) -> ServerResponse {
     ServerResponse {
-        jsonrpc: None,
+        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id,
         result: Some(result),
         error: None,
@@ -275,7 +276,7 @@ pub fn response(id: RequestId, result: Value) -> ServerResponse {
 
 pub fn error_response(id: RequestId, error: ErrorObject) -> ServerResponse {
     ServerResponse {
-        jsonrpc: None,
+        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id,
         result: None,
         error: Some(error),
@@ -284,7 +285,7 @@ pub fn error_response(id: RequestId, error: ErrorObject) -> ServerResponse {
 
 pub fn notification(method: impl Into<String>, params: Value) -> ServerNotification {
     ServerNotification {
-        jsonrpc: None,
+        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         method: method.into(),
         params,
     }
@@ -294,6 +295,11 @@ pub fn classify_client_message(value: &Value) -> Result<ClientMessage, ProtocolE
     let object = value
         .as_object()
         .ok_or_else(|| ProtocolError::InvalidRequest("消息必须是 JSON 对象".to_string()))?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
+        return Err(ProtocolError::InvalidRequest(
+            "jsonrpc 必须是 \"2.0\"".to_string(),
+        ));
+    }
     if object.get("method").is_some() {
         if object.get("id").is_some() {
             serde_json::from_value(value.clone())
@@ -331,6 +337,7 @@ mod tests {
     #[test]
     fn numeric_request_id_keeps_numeric_json_type_in_response() {
         let message = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
             "id": 7,
             "method": "initialize",
             "params": {}
@@ -341,9 +348,24 @@ mod tests {
         assert_eq!(request.id.as_str(), "7");
         assert!(request.is_initialize());
         assert_eq!(
-            serde_json::to_value(response(request.id, serde_json::json!({}))).unwrap()["id"],
+            serde_json::to_value(response(request.id.clone(), serde_json::json!({}))).unwrap()["id"],
             7
         );
+        assert_eq!(
+            serde_json::to_value(response(request.id, serde_json::json!({}))).unwrap()["jsonrpc"],
+            JSONRPC_VERSION
+        );
+    }
+
+    #[test]
+    fn missing_jsonrpc_version_is_rejected() {
+        let error = classify_client_message(&serde_json::json!({
+            "id": "missing-jsonrpc",
+            "method": "ping",
+            "params": {}
+        }))
+        .expect_err("缺少 JSON-RPC 版本必须失败");
+        assert!(error.to_string().contains("jsonrpc"));
     }
 
     #[test]
