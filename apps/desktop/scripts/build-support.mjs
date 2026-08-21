@@ -255,6 +255,7 @@ async function readElectronVersions() {
 
 async function resolveElectronExecutable() {
   const electronRoot = join(repositoryRoot, "node_modules", "electron");
+  await ensureElectronRuntime();
   const relativePath = (await readFile(join(electronRoot, "path.txt"), "utf8")).trim();
   const executable = join(electronRoot, "dist", relativePath);
   await assertFile(executable, "Electron 可执行文件");
@@ -285,6 +286,7 @@ async function readDesktopProtocolVersion() {
 }
 
 async function stageRuntimeLicenses(destination) {
+  await ensureElectronRuntime();
   const notices = [];
   for (const packageName of runtimePackages) {
     const packageRoot = join(repositoryRoot, "node_modules", packageName);
@@ -335,6 +337,17 @@ async function ensureChromiumLicenses() {
     return chromiumLicenses;
   } finally {
     await rm(extractionRoot, { recursive: true, force: true });
+  }
+}
+
+async function ensureElectronRuntime() {
+  const electronRoot = join(repositoryRoot, "node_modules", "electron");
+  const pathFile = join(electronRoot, "path.txt");
+  try {
+    const relativePath = (await readFile(pathFile, "utf8")).trim();
+    await assertFile(join(electronRoot, "dist", relativePath), "Electron 可执行文件");
+  } catch {
+    await run(process.execPath, [join(electronRoot, "install.js")], repositoryRoot);
   }
 }
 
