@@ -36,20 +36,6 @@ jobs:
       - name: 安装锁定依赖
         run: npm ci
 
-      - name: TypeScript 与 Svelte 检查
-        run: npm run check
-
-      - name: Desktop、Worker 与 Web 测试
-        run: npm run test
-
-      - name: Web 与 Worker 生产构建
-        run: |
-          npm run build --workspace magi-web
-          npm run build --workspace @magi/browser-automation-worker
-
-      - name: 单一 Electron 发行边界
-        run: npm run release:guard
-
       - name: 安装 Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy && rustup default "$RUST_TOOLCHAIN"
 
@@ -58,11 +44,8 @@ jobs:
         with:
           shared-key: ci-ubuntu-22.04-rust-1.97
 
-      - name: Rust Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Rust 全量测试
-        run: cargo test --workspace --locked
+      - name: 执行发布前置校验
+        run: npm run release:preflight
 
   windows-desktop:
     name: Windows 桌面与进程策略

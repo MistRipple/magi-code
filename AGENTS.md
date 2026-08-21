@@ -99,6 +99,14 @@ npm --prefix web run check
 cargo check -p magi-daemon
 ```
 
+准备 GitHub Desktop 发布时，先在本地执行完整发布前置校验，减少推送后才发现 CI 失败的往返：
+
+```bash
+npm run release:preflight:full -- --tag vX.Y.Z
+```
+
+其中 `--package` 会构建当前操作系统的 Electron 发行包，跨平台安装包和 GitHub Release 仍由发布工作流负责。
+
 涉及 daemon 托管前端时，建议额外确认：
 
 ```bash

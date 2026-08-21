@@ -15,6 +15,8 @@
     "test:browser-core": "node scripts/verify-browser-core-acceptance.mjs",
     "desktop:dev": "npm run dev --workspace @magi/desktop",
     "desktop:package": "npm run package --workspace @magi/desktop --",
+    "release:preflight": "node scripts/release-preflight.mjs",
+    "release:preflight:full": "node scripts/release-preflight.mjs --package --audit",
     "test:browser-core-live": "node scripts/verify-browser-core-live.mjs",
     "release:guard": "node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs"
   },

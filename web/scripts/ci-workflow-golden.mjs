@@ -3,10 +3,11 @@ import { execFileSync } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
-const [ci, security, release, cargo, rootPackage, webPackage, desktopPackage, lock] = await Promise.all([
+const [ci, security, release, preflight, cargo, rootPackage, webPackage, desktopPackage, lock] = await Promise.all([
   readFile(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8'),
   readFile(new URL('../../.github/workflows/security.yml', import.meta.url), 'utf8'),
   readFile(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8'),
+  readFile(new URL('../../scripts/release-preflight.mjs', import.meta.url), 'utf8'),
   readFile(new URL('../../Cargo.toml', import.meta.url), 'utf8'),
   readFile(new URL('../../package.json', import.meta.url), 'utf8').then(JSON.parse),
   readFile(new URL('../package.json', import.meta.url), 'utf8').then(JSON.parse),
@@ -23,10 +24,12 @@ assert.equal(rootPackage.version, '0.0.0', 'npm workspace 只能使用非产品�
 assert.equal(desktopPackage.version, '0.0.0', 'Electron package 版本必须在构建时由 Cargo 注入');
 assert.equal(webPackage.version, undefined, 'Web 不得复制产品版本');
 
-assert.match(ci, /npm ci[\s\S]*npm run check[\s\S]*npm run test/, 'CI 必须从根 lockfile 验证全部 workspace');
-assert.match(ci, /npm run release:guard/, 'CI 必须执行废码门禁');
-assert.match(ci, /cargo clippy --workspace --all-targets --locked -- -D warnings/, 'CI 必须执行 Rust 全量 Clippy');
-assert.match(ci, /cargo test --workspace --locked/, 'CI 必须执行 Rust workspace 测试');
+assert.match(ci, /npm ci[\s\S]*npm run release:preflight/, 'CI 必须从根 lockfile 执行统一发布前置校验');
+assert.match(preflight, /npm, \["run", "check"\]/, '发布前置校验必须执行 workspace 检查');
+assert.match(preflight, /npm, \["run", "test"\]/, '发布前置校验必须执行 workspace 测试');
+assert.match(preflight, /npm, \["run", "release:guard"\]/, '发布前置校验必须执行废码门禁');
+assert.match(preflight, /clippy[\s\S]*--workspace[\s\S]*--locked/, '发布前置校验必须执行 Rust 全量 Clippy');
+assert.match(preflight, /test[\s\S]*--workspace[\s\S]*--locked/, '发布前置校验必须执行 Rust workspace 测试');
 assert.match(security, /package-lock\.json[\s\S]*npm audit --omit=dev --workspaces/, '安全检查必须使用根 lockfile 审计生产依赖');
 
 assert.match(release, /verify-ci:[\s\S]*gh run list[\s\S]*--commit "\$GITHUB_SHA"/, '发布必须校验同一提交的 CI');
@@ -46,7 +49,7 @@ assert.match(release, /GitHub Desktop 更新源[\s\S]*releases\/latest[\s\S]*lat
 assert.match(release, /build-legacy-desktop-bridge\.mjs[\s\S]*latest\.json/, '发布流程必须生成旧版客户端无感迁移桥');
 assert.match(release, /真实启动解包 Desktop[\s\S]*\/health[\s\S]*\/web\.html/, '发布链必须真实启动解包 Desktop');
 assert.doesNotMatch(
-  `${ci}\n${security}\n${release}`,
+  `${ci}\n${security}\n${release}\n${preflight}`,
   /@tauri-apps|\btauri\b|chromium embedded framework|\bcef\b|browser-runtime-release|browser-host|native-browser-runtime|playwright/i,
   '工作流不得残留旧桌面宿主、独立 Runtime 或生产 Playwright',
 );
