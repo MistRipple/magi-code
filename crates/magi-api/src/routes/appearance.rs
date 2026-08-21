@@ -16,27 +16,27 @@ use serde_json::{Value, json};
 use crate::{errors::ApiError, state::ApiState};
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RevisionRequest {
     expected_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ActivateThemeRequest {
     expected_revision: u64,
     theme_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SaveThemeRequest {
     expected_revision: u64,
     pack: ThemePack,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateThemeRequest {
     expected_revision: u64,
     theme_id: String,
@@ -44,7 +44,7 @@ struct UpdateThemeRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImportThemeRequest {
     expected_revision: u64,
     package_base64: String,
@@ -72,7 +72,7 @@ impl From<ImportConflictStrategyDto> for ImportConflictStrategy {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UploadAssetRequest {
     data_base64: String,
 }

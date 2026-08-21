@@ -57,13 +57,29 @@ export interface SessionTurnRequestDto {
   replaceTurnId?: string | null;
 }
 
+export interface SessionDirectoryEntryDto {
+  sessionId: string;
+  workspaceId?: string | null;
+  title: string;
+  status: string;
+  createdAt: number;
+  updatedAt: number;
+  messageCount: number;
+  isRunning: boolean;
+  runningTaskCount: number;
+  hasUnreadCompletion: boolean;
+}
+
 export interface SessionTurnResponseDto {
   sessionId: string;
   entryId: string;
   eventId: string;
   acceptedAt: number;
+  runtimeEpoch: string;
+  eventStreamNextSequence: number;
   createdSession: boolean;
   route: SessionTurnRouteDto;
+  sessionSummary?: SessionDirectoryEntryDto | null;
   /** Root task ID when the backend created an agent run for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */

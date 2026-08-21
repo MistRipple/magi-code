@@ -12,7 +12,7 @@ use super::{
     session_scope::resolve_session_workspace_binding,
 };
 use crate::{
-    dto::SessionTurnRequestDto,
+    dto::{SessionDirectoryEntryDto, SessionTurnRequestDto},
     errors::ApiError,
     state::ApiState,
     task_dispatch::{
@@ -441,6 +441,17 @@ pub(super) fn dispatch_accepted_canonical_event(
     (canonical_turn, canonical_item)
 }
 
+pub(super) fn accepted_session_directory_entry(
+    state: &ApiState,
+    accepted: &DispatchSubmissionAccepted,
+) -> Option<SessionDirectoryEntryDto> {
+    if !accepted.created_session {
+        return None;
+    }
+    let session = state.session_store.session(&accepted.session_id)?;
+    Some(SessionDirectoryEntryDto::from_record(session, true, 1))
+}
+
 pub(super) fn publish_goal_continuation_task_accepted_event(
     state: &ApiState,
     accepted: &DispatchSubmissionAccepted,
@@ -450,6 +461,7 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
         .execution_ownership(&accepted.session_id)
         .and_then(|ownership| ownership.workspace_id);
     let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(state, accepted);
+    let session_summary = accepted_session_directory_entry(state, accepted);
     let event_id = EventId::new(format!(
         "event-session-turn-task-{}",
         accepted.accepted_at.0
@@ -460,6 +472,7 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
         json!({
             "session_id": accepted.session_id,
             "entry_id": accepted.entry_id,
+            "accepted_at": accepted.accepted_at.0,
             "workspace_id": workspace_id.as_ref().map(ToString::to_string),
             "text": serde_json::Value::Null,
             "skill_name": serde_json::Value::Null,
@@ -468,6 +481,7 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
             "placeholder_message_id": serde_json::Value::Null,
             "image_count": 0,
             "created_session": false,
+            "session_summary": session_summary,
             "route": "task",
             "goal_continuation": true,
             "root_task_id": accepted.root_task_id.to_string(),
@@ -585,6 +599,7 @@ fn publish_session_turn_task_accepted_event(
         .or_else(|| request.requested_workspace_id().map(WorkspaceId::new));
     let workspace_id_payload = workspace_id.as_ref().map(ToString::to_string);
     let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(state, accepted);
+    let session_summary = accepted_session_directory_entry(state, accepted);
     let event_id = EventId::new(format!(
         "event-session-turn-task-{}",
         accepted.accepted_at.0
@@ -595,6 +610,7 @@ fn publish_session_turn_task_accepted_event(
         json!({
             "session_id": accepted.session_id,
             "entry_id": accepted.entry_id,
+            "accepted_at": accepted.accepted_at.0,
             "workspace_id": workspace_id_payload,
             "text": request.trimmed_text(),
             "skill_name": request.skill_name.clone(),
@@ -603,6 +619,7 @@ fn publish_session_turn_task_accepted_event(
             "placeholder_message_id": request.placeholder_message_id(),
             "image_count": request.images.len(),
             "created_session": accepted.created_session,
+            "session_summary": session_summary,
             "route": "task",
             "root_task_id": accepted.root_task_id.to_string(),
             "action_task_id": accepted.action_task_id.to_string(),

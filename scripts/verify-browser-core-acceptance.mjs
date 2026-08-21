@@ -130,13 +130,44 @@ assert.match(
 );
 assert.match(
   surfaceManager,
-  /Emulation\.setDeviceMetricsOverride[\s\S]*?scale: fitScale/u,
-  "固定响应式视口必须使用 Chromium 原生 scale 等比适配右栏内容槽",
+  /Emulation\.setDeviceMetricsOverride[\s\S]*?deviceScaleFactor: viewport\.device_scale_factor_millis \/ 1_000[\s\S]*?screenWidth: width[\s\S]*?screenHeight: height/u,
+  "固定响应式视口必须使用 Chromium 原生设备指标和设备像素比",
+);
+assert.doesNotMatch(
+  surfaceManager,
+  /Emulation\.setTouchEmulationEnabled/u,
+  "桌面 WebContentsView 不应调用会阻塞 CDP lane 的触控仿真命令",
 );
 assert.match(
   surfaceManager,
-  /record\.viewport\.mode === "fixed"[\s\S]*?scheduleViewportApply\(record\)/u,
-  "右栏尺寸变化必须重新应用固定视口的原生适配比例",
+  /focusOnNavigation:\s*false/u,
+  "浏览器导航不得自动抢占 App Renderer 焦点",
+);
+assert.match(
+  surfaceManager,
+  /record\.viewport\.mode === "auto"[\s\S]*?Emulation\.clearDeviceMetricsOverride/u,
+  "auto 视口必须清理固定设备仿真，固定视口才使用 Tab 级设备指标",
+);
+assert.match(
+  surfaceManager,
+  /const viewport = record\.viewport;[\s\S]*?if \(viewport\.mode !== "fixed"\) return;/u,
+  "固定视口必须只读取当前 Browser Tab 的逻辑视口配置",
+);
+const applySlotSection = section(
+  surfaceManager,
+  "private applySlot(",
+  "private async loadPage(",
+  "BrowserSurfaceManager.applySlot",
+);
+assert.match(
+  applySlotSection,
+  /内容槽只管理原生 View 的物理承载范围[\s\S]*?不能重新提交[\s\S]*?fixed/u,
+  "右栏尺寸变化只能更新原生内容槽，不得改写 Tab 级 CSS viewport",
+);
+assert.doesNotMatch(
+  applySlotSection,
+  /scheduleViewportApply\(record\)/u,
+  "右栏尺寸变化不得重新提交 viewport",
 );
 assert.match(
   surfaceManager,

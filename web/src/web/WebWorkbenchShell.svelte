@@ -181,6 +181,8 @@
     rect: DesktopDropRect;
   } | null>(null);
   let workspaceSessionRequestSeq = 0;
+  let workspaceListRequestSeq = 0;
+  let personalSessionRequestSeq = 0;
   const workspaceSessionRequestSeqByWorkspace = new Map<string, number>();
   const workspaceSessionCursorByWorkspace = new Map<string, WorkspaceSessionProjectionCursor>();
   const sessionViewedRequests = new Set<string>();
@@ -686,13 +688,19 @@
   }
 
   async function refreshPersonalSessions(): Promise<void> {
+    const requestSeq = ++personalSessionRequestSeq;
     try {
       const snapshot = await getPersonalSessions();
-      recentSessions = snapshot.sessions;
-      replacePersonalSessionProjection(snapshot.sessions, {
+      if (requestSeq !== personalSessionRequestSeq) {
+        return;
+      }
+      const applied = replacePersonalSessionProjection(snapshot.sessions, {
         runtimeEpoch: snapshot.runtimeEpoch,
         eventStreamNextSequence: snapshot.eventStreamNextSequence,
       });
+      if (applied) {
+        recentSessions = snapshot.sessions;
+      }
     } catch (error) {
       console.warn('[WebWorkbenchShell] 刷新个人会话失败:', error);
     }
@@ -1319,7 +1327,9 @@
       }
       applyWorkspaceSessionsSnapshot(requestedWorkspaceId, snapshot);
     } catch (error) {
-      notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
+      if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) === requestSeq) {
+        notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
+      }
     } finally {
       finishWorkspaceSessionRequest(requestedWorkspaceId, requestSeq);
     }
@@ -1339,7 +1349,9 @@
       commitSidebarWorkspaceSessionsSnapshot(requestedWorkspaceId, snapshot);
       return true;
     } catch (error) {
-      notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
+      if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) === requestSeq) {
+        notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
+      }
       return false;
     } finally {
       finishWorkspaceSessionRequest(requestedWorkspaceId, requestSeq);
@@ -1347,15 +1359,26 @@
   }
 
   async function refreshWorkspaces(): Promise<void> {
+    const requestSeq = ++workspaceListRequestSeq;
     loading = true;
     loadError = '';
     agentBaseUrl = resolveAgentBaseUrl();
     try {
       const next = await listAgentWorkspaces();
+      if (requestSeq !== workspaceListRequestSeq) {
+        return;
+      }
       workspaces = next;
       invalidateWorkspaceSessionRequests();
-      workspaceSessionCursorByWorkspace.clear();
-      sessionsByWorkspace = {};
+      const nextWorkspaceIds = new Set(next.map((workspace) => workspace.workspaceId));
+      sessionsByWorkspace = Object.fromEntries(
+        Object.entries(sessionsByWorkspace).filter(([workspaceId]) => nextWorkspaceIds.has(workspaceId)),
+      );
+      for (const workspaceId of workspaceSessionCursorByWorkspace.keys()) {
+        if (!nextWorkspaceIds.has(workspaceId)) {
+          workspaceSessionCursorByWorkspace.delete(workspaceId);
+        }
+      }
       expandedWorkspaceIds = {};
       // 首次启动时 bootstrap 尚未返回，工作区列表的 isActive 只是工作区管理状态，
       // 不能抢先作为会话导航真值。否则会发起显式 workspace bootstrap，覆盖 daemon
@@ -1379,10 +1402,15 @@
         }
       }
     } catch (error) {
+      if (requestSeq !== workspaceListRequestSeq) {
+        return;
+      }
       loadError = i18n.t('web.workspaceUnavailable');
       notifyWorkbenchError(i18n.t('web.action.loadWorkspaceList'), error);
     } finally {
-      loading = false;
+      if (requestSeq === workspaceListRequestSeq) {
+        loading = false;
+      }
     }
   }
 
@@ -1488,7 +1516,7 @@
   }
 
   function openRemoveWorkspaceDialog(workspace: AgentWorkspaceSummary): void {
-    if (workspaceActionPending) {
+    if (workspaceActionPending || workspaceSelectionPending || pendingNavigation) {
       return;
     }
     workspaceDialogError = '';
@@ -1512,7 +1540,6 @@
       return;
     }
     const removedId = pendingRemoveWorkspace.workspaceId;
-    const removedPath = pendingRemoveWorkspace.rootPath;
     const removedName = pendingRemoveWorkspace.name;
 
     // 立即关闭弹窗，不等 API 返回
@@ -1521,7 +1548,7 @@
 
     try {
       const next = await runActionWithFeedback(
-        () => removeAgentWorkspace(removedId, removedPath),
+        () => removeAgentWorkspace(removedId),
         {
           actionLabel: i18n.t('web.action.removeWorkspace'),
           successMessage: i18n.t('web.workspaceRemoved', { name: removedName }),
@@ -1548,10 +1575,27 @@
             ...expandedWorkspaceIds,
             [selectedWorkspaceId]: true,
           };
-          await refreshWorkspaceSessions(
-            selectedWorkspaceId,
-            workspacePathForId(selectedWorkspaceId),
-          );
+          const nextWorkspace = next.find((workspace) => workspace.workspaceId === selectedWorkspaceId);
+          if (nextWorkspace) {
+            await loadWorkspaceSessionsForSidebar(nextWorkspace);
+            const nextSession = getWorkspaceSessionList(selectedWorkspaceId)[0];
+            navigateSession(nextSession
+              ? {
+                  kind: 'session',
+                  scope: 'workspace',
+                  workspaceId: selectedWorkspaceId,
+                  workspacePath: workspaceBindingPath(nextWorkspace),
+                  sessionId: nextSession.id,
+                }
+              : {
+                  kind: 'draft',
+                  scope: 'workspace',
+                  workspaceId: selectedWorkspaceId,
+                  workspacePath: workspaceBindingPath(nextWorkspace),
+                });
+          }
+        } else {
+          navigateSession({ kind: 'draft', scope: 'personal' });
         }
       }
     } finally {
@@ -1697,7 +1741,7 @@
     workspace: AgentWorkspaceSummary,
     session: Session,
   ): Promise<void> {
-    if (renamingSessionId || pendingNavigation) {
+    if (renamingSessionId || pendingNavigation || messagesState.sessionHydrating) {
       return;
     }
     editingSession = {
@@ -1811,12 +1855,15 @@
   }
 
   function openDeleteSessionDialog(workspace: AgentWorkspaceSummary, session: Session): void {
+    if (pendingNavigation || messagesState.sessionHydrating) {
+      return;
+    }
     pendingDeleteSession = { workspace, session };
     showDeleteSessionDialog = true;
   }
 
   async function beginPersonalSessionRename(session: Session): Promise<void> {
-    if (renamingSessionId || pendingNavigation) return;
+    if (renamingSessionId || pendingNavigation || messagesState.sessionHydrating) return;
     editingSession = { workspaceId: null, sessionId: session.id };
     sessionRenameDraft = session.name || '';
     sessionRenameError = '';
@@ -1844,6 +1891,9 @@
   }
 
   function openPersonalDeleteSessionDialog(session: Session): void {
+    if (pendingNavigation || messagesState.sessionHydrating) {
+      return;
+    }
     pendingDeleteSession = { workspace: null, session };
     showDeleteSessionDialog = true;
   }
@@ -2866,7 +2916,7 @@
        browserContentBounds 与右栏 DOM 必须共享同一 x/width，否则原生
        WebContentsView 会在 overlay 模式向左错一像素并遮住工具栏。 */
     box-shadow: inset 1px 0 var(--border);
-    background: var(--magi-desktop-shell-background, var(--magi-canvas));
+    background: transparent;
   }
 
   .desktop-right-pane-column :global(.right-pane) {
@@ -2878,7 +2928,7 @@
   .web-workbench-shell--desktop .desktop-right-pane-column :global(.right-pane) {
     border: 0;
     border-radius: 0;
-    background: transparent;
+    background: var(--magi-surface-right-pane);
     box-shadow: none;
   }
 
@@ -3800,14 +3850,15 @@
   }
 
   .workbench-app-pane {
-    /* 不要再创建独立 stacking context，否则内部的 .settings-overlay 等全局 modal
-       会被困在 pane 子树（auto=0）内，被相邻的 file-preview-panel 等覆盖。
+    /* 外层只负责中栏的边界、圆角和裁切；真实主题材质由内部 App 的
+       .app-container 唯一提供，避免普通 Web 模式出现双层中栏背景。
+       不要再创建独立 stacking context，否则内部的 .settings-overlay 等全局
+       modal 会被困在 pane 子树（auto=0）内，被相邻的 file-preview-panel 等覆盖。
        外层 .web-workbench-shell 已用 isolation: isolate 做了一层隔离。 */
     min-width: 0;
     min-height: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    background: var(--magi-surface-main);
     overflow: hidden;
   }
 
@@ -3833,7 +3884,7 @@
     border: 0;
     border-right: 1px solid var(--border);
     border-radius: 0;
-    background: transparent;
+    background: var(--magi-surface-sidebar);
   }
 
   .web-workbench-shell--desktop .workbench-content,

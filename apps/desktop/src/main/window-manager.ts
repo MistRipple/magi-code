@@ -123,13 +123,17 @@ export class WindowManager {
     const browserLayer = new View();
     const overlayLayer = new View();
     const appView = this.createTrustedView("app", windowId);
-    window.contentView.addChildView(appLayer);
+    // BaseWindow 的 contentView 是原生合成树，不受 Renderer 的 z-index
+    // 控制。显式指定插入位置，建立唯一且可验证的层级契约：应用背景、主
+    // Renderer、浏览器内容、桌面弹层。浏览器 Surface 只能挂在 browserLayer，
+    // 任何弹层只能挂在 overlayLayer。
+    window.contentView.addChildView(appLayer, 0);
     // WebContents 直接挂到窗口内容树，保证 Electron 可以在同一
     // BaseWindow 内可靠切换 App Renderer 与 Browser Surface 的键盘焦点。
     // appLayer 仍保留为主界面背景层，不承载另一个 WebContents。
-    window.contentView.addChildView(appView);
-    window.contentView.addChildView(browserLayer);
-    window.contentView.addChildView(overlayLayer);
+    window.contentView.addChildView(appView, 1);
+    window.contentView.addChildView(browserLayer, 2);
+    window.contentView.addChildView(overlayLayer, 3);
     // Browser Surface 只挂在当前右栏内容槽宿主内。宿主由 Main 布局设置
     // 边界，WebContentsView 使用局部坐标，避免原生 View 的命中区域扩散
     // 到对话区，造成键盘焦点落入网页输入框。
@@ -337,11 +341,12 @@ export class WindowManager {
     // App View 的输入焦点，最后恢复浏览器的可见性。这样不会改变页面状态，
     // 但能避免 macOS 保留上一个 WebContents 的键盘焦点。
     const browserWasVisible = record.browserLayer.getVisible();
+    const browserWasFocused = this.#surfaceManager.blurWindow(windowId);
     if (browserWasVisible) record.browserLayer.setVisible(false);
     record.window.focus();
     record.appView.setVisible(true);
     record.appView.webContents.focus();
-    if (browserWasVisible) {
+    if (browserWasVisible || browserWasFocused) {
       setImmediate(() => {
         if (record.closed || record.window.isDestroyed()) return;
         record.browserLayer.setVisible(
@@ -351,9 +356,11 @@ export class WindowManager {
               Boolean(record.layout.activeSurfaceId),
             ),
         );
+        this.#surfaceManager.restoreWindow(windowId);
         // 恢复可见性不能改变最终键盘归属。macOS 在重新加入可见的
         // WebContentsView 时可能把焦点重新交给 Browser Surface，故在
         // 原生层级恢复完成后再次提交 App Renderer 焦点。
+        record.window.focus();
         if (!record.appView.webContents.isDestroyed()) {
           record.appView.webContents.focus();
         }
@@ -377,6 +384,7 @@ export class WindowManager {
 
   openOverlay(windowId: string, state: DesktopOverlayState): void {
     const record = this.requireWindow(windowId);
+    this.ensureNativeLayerOrder(record);
     const browserTabId = state.ownerId.startsWith("browser:")
       ? state.ownerId.slice("browser:".length)
       : null;
@@ -392,6 +400,10 @@ export class WindowManager {
       layout,
       currentBrowserContentBounds,
     );
+    // Overlay Manager 可能在 open() 内首次挂载 Overlay WebContentsView，
+    // Electron 会因此重排 Widget 的原生子视图。挂载完成后再次提交唯一
+    // 的父层级顺序，确保菜单不会被已存在的 Browser Surface 压到下面。
+    this.ensureNativeLayerOrder(record);
   }
 
   closeOverlay(windowId: string): void {
@@ -698,6 +710,7 @@ export class WindowManager {
   }
 
   private applyLayout(record: DesktopWindowRecord): DesktopWindowSnapshot {
+    this.ensureNativeLayerOrder(record);
     const snapshot = this.snapshot(record.windowId);
     const { layout } = snapshot;
     record.appLayer.setBounds(layout.appBounds as Rectangle);
@@ -732,8 +745,22 @@ export class WindowManager {
       );
     }
     this.#overlayManager.updateLayout(record.windowId, layout, currentBrowserContentBounds);
+    // bindContentSurface() 可能首次把 Browser WebContentsView 加入原生树，
+    // 必须在所有子视图挂载和布局操作结束后收敛一次 z-order。
+    this.ensureNativeLayerOrder(record);
     this.#onSnapshot(snapshot);
     return snapshot;
+  }
+
+  private ensureNativeLayerOrder(record: DesktopWindowRecord): void {
+    if (record.window.isDestroyed()) return;
+    // addChildView(view, index) 也负责对已挂载的子 View 重新排序。每次
+    // Main 布局事务都重申一次顺序，避免任何后续原生 View 挂载改变弹层的
+    // 合成层级；这不是坐标或 CSS 补偿，而是桌面宿主的结构性约束。
+    record.window.contentView.addChildView(record.appLayer, 0);
+    record.window.contentView.addChildView(record.appView, 1);
+    record.window.contentView.addChildView(record.browserLayer, 2);
+    record.window.contentView.addChildView(record.overlayLayer, 3);
   }
 
   private requireWindow(windowId: string): DesktopWindowRecord {

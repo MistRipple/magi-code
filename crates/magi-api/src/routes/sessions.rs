@@ -25,6 +25,7 @@ use serde_json::json;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::dispatch_flow::accepted_session_directory_entry;
 use super::session_scope::{
     SessionScope, parse_session_id, require_session_record_in_scope, require_session_request_scope,
     resolve_existing_session_scope, resolve_explicit_session_scope, resolve_session_scope,
@@ -2260,6 +2261,7 @@ async fn submit_mainline_session_turn(
         .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
     let (accepted_canonical_turn, accepted_canonical_item) =
         super::dispatch_accepted_canonical_event(&state, &accepted);
+    let session_summary = accepted_session_directory_entry(&state, &accepted);
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id: accepted.session_id,
         entry_id: accepted.entry_id,
@@ -2274,6 +2276,7 @@ async fn submit_mainline_session_turn(
         execution_chain_ref,
         user_message_item_id: accepted.user_message_item_id,
     })
+    .with_session_summary(session_summary)
     .with_canonical_event(
         "turn_started",
         accepted_canonical_turn,
@@ -3922,6 +3925,7 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NotificationsQuery {
+    scope: SessionScopeKindDto,
     session_id: Option<String>,
     #[serde(default)]
     workspace_id: Option<String>,
@@ -3947,8 +3951,9 @@ async fn get_notifications(
     State(state): State<ApiState>,
     Query(query): Query<NotificationsQuery>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
-    let scope = resolve_session_scope(
+    let scope = resolve_explicit_session_scope(
         &state,
+        query.scope,
         query.requested_workspace_id(),
         query.requested_workspace_path(),
     )?;
@@ -9938,11 +9943,26 @@ mod tests {
             "必须显式指定 workspace 和 session",
         );
 
+        let personal_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/notifications?scope=personal")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(personal_response.status(), StatusCode::OK);
+
         let response = routes()
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
-                    .uri(format!("/notifications?sessionId={}", session_id.as_str()))
+                    .uri(format!(
+                        "/notifications?scope=workspace&sessionId={}",
+                        session_id.as_str()
+                    ))
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -9969,7 +9989,7 @@ mod tests {
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
-                    .uri("/notifications?workspaceId=workspace-a")
+                    .uri("/notifications?scope=workspace&workspaceId=workspace-a")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -10044,7 +10064,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/notifications?workspaceId=workspace-owned-notifications&sessionId={}",
+                        "/notifications?scope=workspace&workspaceId=workspace-owned-notifications&sessionId={}",
                         session_id.as_str()
                     ))
                     .body(Body::empty())

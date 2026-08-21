@@ -1463,6 +1463,75 @@ export function replacePersonalSessionProjection(
   return true;
 }
 
+/**
+ * 应用首条消息 accepted 事件携带的权威会话目录增量。
+ *
+ * 会话目录的快照只负责全量 bootstrap，事件流负责提交后的增量。两者
+ * 通过同一个事件游标排序，因此旧快照可以被拒绝，或在 accepted 之后
+ * 到达时只更新游标而不删除已提交的会话。
+ */
+export function upsertAcceptedSessionDirectoryEntry(
+  session: Session,
+  cursor: WorkspaceSessionProjectionCursor,
+): boolean {
+  const sessionId = normalizeSessionId(session.id);
+  const runtimeEpoch = cursor.runtimeEpoch?.trim() || '';
+  if (!sessionId || !runtimeEpoch) {
+    return false;
+  }
+  const normalizedSession: Session = { ...session, id: sessionId };
+  const normalizedCursor = normalizeWorkspaceSessionProjectionCursor(cursor);
+  const workspaceId = normalizeWorkspaceId(normalizedSession.workspaceId);
+  const activeWorkspaceId = normalizeWorkspaceId(messagesState.currentWorkspaceId);
+
+  if (workspaceId) {
+    const current = messagesState.workspaceSessionProjection;
+    if (activeWorkspaceId && activeWorkspaceId !== workspaceId) {
+      return false;
+    }
+    if (current.workspaceId && normalizeWorkspaceId(current.workspaceId) !== workspaceId) {
+      return false;
+    }
+    if (current.runtimeEpoch && current.runtimeEpoch !== runtimeEpoch) {
+      return false;
+    }
+    const sessions = current.sessions.some((candidate) => candidate.id === sessionId)
+      ? current.sessions.map((candidate) => candidate.id === sessionId ? normalizedSession : candidate)
+      : [...current.sessions, normalizedSession];
+    const effectiveCursor: WorkspaceSessionProjectionCursor = current.runtimeEpoch === runtimeEpoch
+      ? {
+          runtimeEpoch,
+          eventStreamNextSequence: Math.max(
+            current.eventStreamNextSequence,
+            normalizedCursor.eventStreamNextSequence,
+          ),
+        }
+      : normalizedCursor;
+    return replaceWorkspaceSessionProjection(workspaceId, sessions, effectiveCursor);
+  }
+
+  if (activeWorkspaceId) {
+    return false;
+  }
+  const current = messagesState.personalSessionProjection;
+  if (current.runtimeEpoch && current.runtimeEpoch !== runtimeEpoch) {
+    return false;
+  }
+  const sessions = current.sessions.some((candidate) => candidate.id === sessionId)
+    ? current.sessions.map((candidate) => candidate.id === sessionId ? normalizedSession : candidate)
+    : [...current.sessions, normalizedSession];
+  const effectiveCursor: WorkspaceSessionProjectionCursor = current.runtimeEpoch === runtimeEpoch
+    ? {
+        runtimeEpoch,
+        eventStreamNextSequence: Math.max(
+          current.eventStreamNextSequence,
+          normalizedCursor.eventStreamNextSequence,
+        ),
+      }
+    : normalizedCursor;
+  return replacePersonalSessionProjection(sessions, effectiveCursor);
+}
+
 export function advanceWorkspaceSessionProjectionCursor(
   workspaceId: string,
   cursor: WorkspaceSessionProjectionCursor,

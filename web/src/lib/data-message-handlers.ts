@@ -8,8 +8,10 @@ import {
   getState,
   setIsProcessing,
   setCurrentSessionId,
+  adoptAcceptedSessionIdForLocalTurn,
   adoptCurrentSessionIdForLiveTurn,
   advanceWorkspaceSessionProjectionCursor,
+  upsertAcceptedSessionDirectoryEntry,
   replaceWorkspaceSessionProjection,
   replacePersonalSessionProjection,
   clearWorkspaceSessionProjection,
@@ -104,6 +106,132 @@ function currentWorkspaceIdValue(): string {
   return typeof messagesState.currentWorkspaceId === 'string'
     ? messagesState.currentWorkspaceId.trim()
     : '';
+}
+
+type AcceptedSubmissionContext = {
+  requestId: string;
+  scope: 'personal' | 'workspace';
+  workspaceId: string;
+  workspacePath: string;
+  targetSessionId: string;
+  optimisticSessionId: string;
+  acceptedSessionId: string;
+};
+
+function normalizeAcceptedSubmissionContext(value: unknown): AcceptedSubmissionContext | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const requestId = typeof raw.requestId === 'string' ? raw.requestId.trim() : '';
+  const scope = raw.scope === 'workspace' || raw.scope === 'personal' ? raw.scope : null;
+  const targetSessionId = typeof raw.targetSessionId === 'string' ? raw.targetSessionId.trim() : '';
+  const optimisticSessionId = typeof raw.optimisticSessionId === 'string'
+    ? raw.optimisticSessionId.trim()
+    : '';
+  if (!requestId || !scope || !optimisticSessionId) {
+    return null;
+  }
+  return {
+    requestId,
+    scope,
+    workspaceId: typeof raw.workspaceId === 'string' ? raw.workspaceId.trim() : '',
+    workspacePath: typeof raw.workspacePath === 'string' ? raw.workspacePath.trim() : '',
+    targetSessionId,
+    optimisticSessionId,
+    acceptedSessionId: typeof raw.acceptedSessionId === 'string'
+      ? raw.acceptedSessionId.trim()
+      : '',
+  };
+}
+
+function acceptedSubmissionMatchesCurrentBinding(
+  context: AcceptedSubmissionContext | null,
+  requestId: string,
+  sessionId: string,
+): boolean {
+  if (
+    !context
+    || context.requestId !== requestId
+    || !messagesState.pendingRequests.has(requestId)
+    || !getRequestBinding(requestId)
+  ) {
+    return false;
+  }
+  const workspaceId = currentWorkspaceIdValue();
+  const workspacePath = typeof messagesState.currentWorkspacePath === 'string'
+    ? messagesState.currentWorkspacePath.trim()
+    : '';
+  if (context.scope === 'workspace') {
+    if (!workspaceId && !workspacePath) {
+      return false;
+    }
+    if (
+      context.workspaceId
+        ? context.workspaceId !== workspaceId
+          || Boolean(context.workspacePath && context.workspacePath !== workspacePath)
+        : context.workspacePath !== workspacePath
+    ) {
+      return false;
+    }
+  } else if (workspaceId || workspacePath) {
+    return false;
+  }
+
+  const currentSessionId = messagesState.currentSessionId?.trim() || '';
+  if (context.targetSessionId) {
+    return context.targetSessionId === sessionId && currentSessionId === sessionId;
+  }
+  return (
+    currentSessionId === context.optimisticSessionId
+    || (context.acceptedSessionId === sessionId && currentSessionId === sessionId)
+  );
+}
+
+function normalizeAcceptedSessionSummary(
+  value: unknown,
+  fallbackSessionId: string,
+  fallbackWorkspaceId: string,
+): Session | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const id = (typeof raw.id === 'string' ? raw.id : typeof raw.sessionId === 'string' ? raw.sessionId : fallbackSessionId).trim();
+  const workspaceId = (typeof raw.workspaceId === 'string' ? raw.workspaceId : fallbackWorkspaceId).trim();
+  const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
+    ? Math.floor(raw.createdAt)
+    : 0;
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+    ? Math.floor(raw.updatedAt)
+    : createdAt;
+  if (!id || createdAt < 1 || updatedAt < 1) {
+    return null;
+  }
+  const nameValue = typeof raw.name === 'string'
+    ? raw.name
+    : typeof raw.title === 'string' ? raw.title : '';
+  const messageCount = typeof raw.messageCount === 'number' && Number.isFinite(raw.messageCount)
+    ? Math.max(0, Math.floor(raw.messageCount))
+    : 0;
+  const runningTaskCount = typeof raw.runningTaskCount === 'number' && Number.isFinite(raw.runningTaskCount)
+    ? Math.max(0, Math.floor(raw.runningTaskCount))
+    : 0;
+  const session: Session = {
+    id,
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(nameValue.trim() ? { name: nameValue.trim() } : {}),
+    createdAt,
+    updatedAt,
+    messageCount,
+    isRunning: raw.isRunning === true,
+    runningTaskCount,
+    hasUnreadCompletion: raw.hasUnreadCompletion === true,
+  };
+  if (typeof raw.preview === 'string' && raw.preview.trim()) {
+    session.preview = raw.preview.trim();
+  }
+  return session;
 }
 
 function clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId: string): void {
@@ -602,11 +730,49 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'sessionTurnAccepted': {
       const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
       const workspaceId = typeof payload.workspaceId === 'string' ? payload.workspaceId.trim() : '';
-      if (sessionId) {
-        adoptCurrentSessionIdForLiveTurn(sessionId);
+      const requestId = typeof payload.requestId === 'string' ? payload.requestId.trim() : '';
+      const currentSessionId = messagesState.currentSessionId?.trim() || '';
+      const submissionContext = normalizeAcceptedSubmissionContext(payload.submissionContext);
+      const matchesPendingSubmission = acceptedSubmissionMatchesCurrentBinding(
+        submissionContext,
+        requestId,
+        sessionId,
+      );
+      if (sessionId && (currentSessionId === sessionId || matchesPendingSubmission)) {
+        const adoptedOptimisticSession = Boolean(
+          matchesPendingSubmission
+          && submissionContext
+          && !submissionContext.targetSessionId
+          && adoptAcceptedSessionIdForLocalTurn(
+            submissionContext.optimisticSessionId,
+            sessionId,
+          ),
+        );
+        if (!adoptedOptimisticSession) {
+          adoptCurrentSessionIdForLiveTurn(sessionId);
+        }
       }
       const runtimeEpoch = typeof payload.runtimeEpoch === 'string' ? payload.runtimeEpoch.trim() : '';
       const eventStreamNextSequence = Number(payload.eventStreamNextSequence);
+      if (
+        sessionId
+        && payload.createdSession === true
+        && runtimeEpoch
+        && Number.isFinite(eventStreamNextSequence)
+        && eventStreamNextSequence >= 1
+      ) {
+        const sessionSummary = normalizeAcceptedSessionSummary(
+          payload.sessionSummary,
+          sessionId,
+          workspaceId,
+        );
+        if (sessionSummary) {
+          upsertAcceptedSessionDirectoryEntry(sessionSummary, {
+            runtimeEpoch,
+            eventStreamNextSequence,
+          });
+        }
+      }
       if (workspaceId && runtimeEpoch && Number.isFinite(eventStreamNextSequence) && eventStreamNextSequence >= 1) {
         advanceWorkspaceSessionProjectionCursor(workspaceId, {
           runtimeEpoch,
@@ -1147,6 +1313,22 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
     const sessions = ensureArray(snapshot.sessions) as Session[];
     const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
+    const previousSessionId = getState().currentSessionId?.trim() || '';
+    const previousWorkspaceId = getState().currentWorkspaceId?.trim() || '';
+    const previousWorkspacePath = getState().currentWorkspacePath?.trim() || '';
+    const sameWorkspaceBinding = workspaceId
+      ? previousWorkspaceId
+        ? previousWorkspaceId === workspaceId
+        : previousWorkspacePath === workspacePath
+      : !previousWorkspaceId && !previousWorkspacePath;
+    // 空会话 bootstrap 可能只是 SSE 恢复期间的旧快照。只要不是显式导航，
+    // 就不能在首条消息仍 pending 时擦掉本地乐观会话，否则 HTTP/SSE accepted
+    // 返回后失去唯一的当前页面锚点，首条消息会表现为“发送后消失”。
+    const preservePendingSession = navigationTarget === null
+      && hasPendingLocalTurn
+      && previousSessionId
+      && sameWorkspaceBinding;
+    const nextSessionId = preservePendingSession ? previousSessionId : '';
     const preserveExistingDraftConfig = navigationTarget === null
       && !getState().currentSessionId
       && getState().currentWorkspaceId?.trim() === workspaceId;
@@ -1174,7 +1356,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       } else {
         replacePersonalSessionProjection(sessions, workspaceSessionCursorFromBootstrap(message), { allowRuntimeEpochChange: true });
       }
-      setCurrentSessionId(null);
+      setCurrentSessionId(nextSessionId || null);
       messagesState.draftOrchestratorSessionConfig = navigationTarget === 'draft'
         ? { ...navigationDraftConfig }
         : preserveExistingDraftConfig ? { ...messagesState.draftOrchestratorSessionConfig } : {};
@@ -1185,7 +1367,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         ...state,
         sessions,
         currentSession: undefined,
-        currentSessionId: '',
+        currentSessionId: nextSessionId,
         currentWorkspaceId: workspaceId,
         isProcessing: false,
         processingState: null,

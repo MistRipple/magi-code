@@ -1338,14 +1338,13 @@ mod tests {
 
     #[tokio::test]
     async fn structured_api_reports_non_git_workspace_without_repository_context() {
-        let (workspace, state, workspace_id) = non_git_api_fixture();
+        let (workspace, state, _workspace_id) = non_git_api_fixture();
         let workspace_path = workspace.path().to_string_lossy().to_string();
 
         let status = post_json(
             state.clone(),
             "/workspace/vcs/status",
             serde_json::json!({
-                "workspaceId": workspace_id,
                 "workspacePath": workspace_path,
             }),
         )
@@ -1358,7 +1357,6 @@ mod tests {
             state,
             "/workspace/vcs/branches",
             serde_json::json!({
-                "workspaceId": workspace_id,
                 "workspacePath": workspace_path,
                 "includeRemote": true,
             }),

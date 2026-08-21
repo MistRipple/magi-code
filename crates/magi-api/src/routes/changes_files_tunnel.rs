@@ -194,7 +194,7 @@ fn resolve_session_change_scope_from_request(
 // ─── Changes ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ChangesQuery {
     session_id: Option<String>,
     workspace_id: Option<String>,
@@ -232,7 +232,7 @@ async fn list_changes(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DiffQuery {
     file_path: Option<String>,
     session_id: Option<String>,
@@ -363,7 +363,7 @@ async fn get_diff(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApproveChangeRequest {
     file_path: String,
     session_id: Option<String>,
@@ -399,7 +399,7 @@ async fn approve_change(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RevertChangeRequest {
     file_path: String,
     session_id: Option<String>,
@@ -435,7 +435,7 @@ async fn revert_change(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApproveAllRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
@@ -473,7 +473,7 @@ async fn approve_all_changes(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RevertAllRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
@@ -511,7 +511,7 @@ async fn revert_all_changes(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RevertExecutionGroupRequest {
     execution_group_id: String,
     session_id: Option<String>,
@@ -568,7 +568,7 @@ async fn revert_execution_group_changes(
 // ─── Files ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileContentQuery {
     file_path: Option<String>,
     session_id: Option<String>,
@@ -578,7 +578,7 @@ struct FileContentQuery {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileRevealTargetRequest {
     file_path: Option<String>,
     session_id: Option<String>,
@@ -770,7 +770,7 @@ async fn get_file_raw(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FilesystemListQuery {
     path: Option<String>,
     workspace_id: Option<String>,
@@ -873,7 +873,7 @@ async fn list_filesystem(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FilesystemBrowseQuery {
     path: Option<String>,
     path_ref: Option<String>,
@@ -906,7 +906,7 @@ async fn browse_filesystem(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResolveFilesystemPathRequest {
     input: String,
     base_path_ref: Option<String>,
@@ -923,7 +923,7 @@ async fn resolve_filesystem_path(
 // ─── Tunnel ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StartTunnelRequest {
     workspace_id: Option<String>,
     workspace_path: Option<String>,
@@ -1359,7 +1359,10 @@ fn build_prompt_suggestions_instruction(
     if let Some(workspace) = workspace {
         instruction.push_str(&format!("project_name: {}\n", workspace.name));
         if !workspace.entries.is_empty() {
-            instruction.push_str(&format!("top_level_entries: {}\n", workspace.entries.join(", ")));
+            instruction.push_str(&format!(
+                "top_level_entries: {}\n",
+                workspace.entries.join(", ")
+            ));
         }
     }
     if !exclude_prompts.is_empty() {
@@ -1460,17 +1463,21 @@ async fn prompt_suggestions(
         tracing::warn!("prompt suggestions auxiliary model returned empty content");
         ApiError::model_invocation_failed("辅助模型未返回建议内容", "content missing")
     })?;
-    let normalized =
-        normalize_prompt_suggestions(raw, requested_groups, count, &request.exclude_prompts)
-            .map_err(|error| {
-                tracing::warn!(error = %error, "prompt suggestions payload rejected by normalization");
-                ApiError::model_invocation_failed("辅助模型返回内容不合规", error)
-            })?;
+    let normalized = normalize_prompt_suggestions(
+        raw,
+        requested_groups,
+        count,
+        &request.exclude_prompts,
+    )
+    .map_err(|error| {
+        tracing::warn!(error = %error, "prompt suggestions payload rejected by normalization");
+        ApiError::model_invocation_failed("辅助模型返回内容不合规", error)
+    })?;
     Ok(Json(normalized))
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EnhancePromptRequest {
     prompt: String,
     #[serde(default)]

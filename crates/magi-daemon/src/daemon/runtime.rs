@@ -3062,7 +3062,7 @@ done
         .expect("tool catalog test workspace index should become ready");
         let catalog = get_json(
             app,
-            "/api/tools/catalog?workspaceId=test-workspace-001&sessionId=test-session-001&includeInternal=true&includeSchema=true",
+            "/api/tools/catalog?scope=workspace&workspaceId=test-workspace-001&sessionId=test-session-001&includeInternal=true&includeSchema=true",
         )
         .await;
 

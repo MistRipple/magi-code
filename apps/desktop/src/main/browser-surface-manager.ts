@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import {
   BaseWindow,
   WebContentsView,
+  webContents,
   session,
   type HandlerDetails,
   type Rectangle,
@@ -209,7 +210,6 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Emulation.setDeviceMetricsOverride",
   "Emulation.setEmulatedMedia",
   "Emulation.setGeolocationOverride",
-  "Emulation.setTouchEmulationEnabled",
   "Emulation.setUserAgentOverride",
   "HeapProfiler.addHeapSnapshotChunk",
   "HeapProfiler.disable",
@@ -345,6 +345,10 @@ export class BrowserSurfaceManager {
         contextIsolation: true,
         sandbox: true,
         webSecurity: true,
+        // 页面导航不应改变桌面当前输入归属。用户点击浏览器内容时由
+        // Chromium 原生命中测试接管焦点；主 Renderer 获得焦点后，导航中
+        // 的 did-finish-load 不能再把键盘输入抢回网页。
+        focusOnNavigation: false,
       },
     });
     view.setVisible(false);
@@ -457,6 +461,37 @@ export class BrowserSurfaceManager {
     return true;
   }
 
+  /**
+   * 在 App Renderer 接管焦点前，将当前获得焦点的浏览器 Surface 从原生
+   * 命中树移除。BaseWindow 没有提供子 WebContents 的统一失焦接口，卸载
+   * 当前 WebContentsView 是 macOS 真正释放网页键盘焦点的原生操作。
+   */
+  blurWindow(windowId: string): boolean {
+    const window = this.#windows.get(windowId);
+    const focused = webContents.getFocusedWebContents();
+    let changed = false;
+    for (const record of this.#surfaces.values()) {
+      if (
+        record.windowId !== windowId
+        || record.closed
+        || !record.mounted
+        || record.contents !== focused
+      ) continue;
+      this.unmountSurface(record, window);
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** 在不重建 WebContents 的前提下恢复 blurWindow 临时卸载的 Surface。 */
+  restoreWindow(windowId: string): void {
+    const window = this.#windows.get(windowId);
+    for (const record of this.#surfaces.values()) {
+      if (record.windowId !== windowId || record.closed || !record.slotVisible) continue;
+      this.applySlot(record, record.slotBounds, window);
+    }
+  }
+
   primaryBindingForTab(tabId: string): BrowserSurfaceBinding | null {
     const record = this.#surfaces.primaryForTab(tabId);
     return record && !record.closed ? this.binding(record) : null;
@@ -496,7 +531,10 @@ export class BrowserSurfaceManager {
     return this.viewportStateForSurface(surfaceId)?.viewport ?? null;
   }
 
-  recordForBinding(binding: BrowserSurfaceBinding): WebContents {
+  recordForBinding(
+    binding: BrowserSurfaceBinding,
+    options: { allowNavigationAdvance?: boolean } = {},
+  ): WebContents {
     const record = this.#surfaces.get(binding.surface_id);
     if (!record || record.closed) {
       throw staleSurfaceError("browser_surface_not_found");
@@ -509,7 +547,11 @@ export class BrowserSurfaceManager {
       || binding.web_contents_id !== record.contents.id
       || binding.target_id !== record.targetId
       || binding.browser_context_id !== record.partitionId
-      || binding.navigation_revision !== record.navigationRevision
+      || (
+        options.allowNavigationAdvance !== true
+          ? binding.navigation_revision !== record.navigationRevision
+          : binding.navigation_revision > record.navigationRevision
+      )
     ) {
       throw staleSurfaceError("browser_surface_stale");
     }
@@ -527,7 +569,14 @@ export class BrowserSurfaceManager {
     }
     const record = this.requireRecord(binding.surface_id);
     await this.waitForDebugger(record);
-    const contents = this.recordForBinding(binding);
+    // 输入事件属于一个完整的用户动作。Enter、点击或输入事件可能在
+    // keyDown/mousePressed 之后立即推进 navigation_revision；后续的
+    // keyUp/mouseReleased 仍然必须送到同一个 WebContents，而不是被页面
+    // 自身导航误判成 Surface 已失效。Surface/Tab/桌面代次仍由上面的
+    // 完整身份校验严格保护。
+    const contents = this.recordForBinding(binding, {
+      allowNavigationAdvance: method.startsWith("Input."),
+    });
     if (sessionId && !record.cdpSessionIds.has(sessionId)) {
       throw staleSurfaceError("browser_cdp_session_stale");
     }
@@ -544,15 +593,29 @@ export class BrowserSurfaceManager {
       // 在首帧/导航切换阶段直接让 Page.captureScreenshot 卡满超时；
       // 超时后仍继续截图，不能把慢站点变成永远不可操作。
       await this.waitForScreenshotReadiness(record);
+      // 普通可视区域截图走同一 WebContents 的原生捕获，避免
+      // Page.captureScreenshot 在 WebContentsView 尚未取得 compositor
+      // frame 时阻塞 CDP lane。full-page、元素范围和 WebP 必须保留
+      // Chromium CDP 的原生语义，不能把内容尺寸错误地裁成内容槽。
+      if (params.captureBeyondViewport === true || params.format === "webp") {
+        return this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
+          contents,
+          method,
+          params,
+          SCREENSHOT_CDP_COMMAND_TIMEOUT_MS,
+          sessionId,
+          track,
+        ));
+      }
+      return this.capturePageScreenshot(record, params);
     }
     const injectsInput = method.startsWith("Input.");
     if (injectsInput) record.automationInputDepth += 1;
     try {
-      const screenshotParams = params;
       const result = await this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
         contents,
         method,
-        screenshotParams,
+        params,
         method === "Page.captureScreenshot" ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
         sessionId,
         track,
@@ -576,6 +639,23 @@ export class BrowserSurfaceManager {
     } finally {
       if (injectsInput) record.automationInputDepth = Math.max(0, record.automationInputDepth - 1);
     }
+  }
+
+  private async capturePageScreenshot(
+    record: BrowserSurfaceRecord,
+    params: Record<string, unknown>,
+  ): Promise<{ data: string }> {
+    if (record.closed || record.contents.isDestroyed()) {
+      throw staleSurfaceError("browser_surface_not_found");
+    }
+    const format = params.format === "jpeg" ? "jpeg" : "png";
+    const rect = capturePageRect(record, params);
+    const image = await record.contents.capturePage(rect);
+    const bytes = format === "jpeg"
+      ? image.toJPEG(normalizeJpegQuality(params.quality))
+      : image.toPNG();
+    if (bytes.byteLength === 0) throw new Error("browser_screenshot_empty");
+    return { data: bytes.toString("base64") };
   }
 
   private enqueueCdp<T>(
@@ -778,7 +858,6 @@ export class BrowserSurfaceManager {
     bounds: Rectangle | null,
     window: BaseWindow | undefined,
   ): void {
-    const previousBounds = record.slotBounds;
     record.slotBounds = bounds ? { ...bounds } : null;
     record.slotVisible = bounds !== null;
     if (!window || window.isDestroyed()) {
@@ -807,18 +886,10 @@ export class BrowserSurfaceManager {
     // 导航过程由 Chromium 自己绘制。只有 Surface 生命周期失败才解绑，
     // 页面导航失败仍保留真实 WebContentsView，避免右栏黑屏或空槽。
     record.view.setVisible(true);
-    // 固定响应式视口的 CSS 尺寸属于页面仿真，显示比例则必须重新适配
-    // 当前右栏内容槽。只在槽位实际变化时重新提交 CDP，避免普通布局
-    // 事务重复触发页面重排；队列会合并连续拖动中的过期尺寸。
-    if (
-      record.viewport.mode === "fixed"
-      && (!previousBounds
-        || previousBounds.width !== bounds.width
-        || previousBounds.height !== bounds.height)
-    ) {
-      record.viewportApplied = false;
-      this.scheduleViewportApply(record);
-    }
+    // 内容槽只管理原生 View 的物理承载范围。它的尺寸变化不能重新提交
+    // 当前 Tab 的 viewport：auto 由 WebContentsView 的真实尺寸自然驱动，
+    // fixed 则保持用户选择的 CSS viewport，避免拖动右栏触发页面重排、闪烁
+    // 或把物理槽尺寸写入设备仿真状态。
   }
 
   private async loadPage(
@@ -1237,7 +1308,7 @@ export class BrowserSurfaceManager {
     }
     // 内容槽可能先于调试器握手完成。固定视口在这段竞态中不能因为
     // 首次 CDP apply 提前返回而永久失效，握手完成后补交同一 Surface
-    // 的最新 viewport 和 fit scale。
+    // 的最新 Tab 级 viewport 配置。
     if (record.slotVisible) this.scheduleViewportApply(record);
   }
 
@@ -1323,14 +1394,6 @@ export class BrowserSurfaceManager {
         undefined,
         track,
       );
-      await sendCdpCommandWithTimeout(
-        record.contents,
-        "Emulation.setTouchEmulationEnabled",
-        { enabled: false },
-        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        undefined,
-        track,
-      );
       record.viewportApplied = true;
       return;
     }
@@ -1339,16 +1402,6 @@ export class BrowserSurfaceManager {
     const width = Math.max(320, Math.round(viewport.width));
     const height = Math.max(240, Math.round(viewport.height));
     const mobile = viewport.device_type === "mobile";
-    const availableWidth = record.slotBounds?.width ?? width;
-    const availableHeight = record.slotBounds?.height ?? height;
-    // 这是 Chromium Emulation 的原生 scale 参数，只缩放仿真视口的合成
-    // 结果，不改变页面 DOM、CSS px、截图裁剪或输入坐标。这样 1280x800
-    // 等调试视口在窄右栏中仍完整可见，不会出现右侧/底部被宿主裁掉。
-    const fitScale = Math.min(
-      1,
-      Math.max(0.01, availableWidth / width),
-      Math.max(0.01, availableHeight / height),
-    );
     await sendCdpCommandWithTimeout(
       record.contents,
       "Emulation.setDeviceMetricsOverride",
@@ -1359,22 +1412,10 @@ export class BrowserSurfaceManager {
         mobile,
         screenWidth: width,
         screenHeight: height,
-        scale: fitScale,
         screenOrientation: {
           type: width > height ? "landscapePrimary" : "portraitPrimary",
           angle: width > height ? 90 : 0,
         },
-      },
-      DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-      undefined,
-      track,
-    );
-    await sendCdpCommandWithTimeout(
-      record.contents,
-      "Emulation.setTouchEmulationEnabled",
-      {
-        enabled: mobile,
-        maxTouchPoints: mobile ? 5 : 1,
       },
       DEFAULT_CDP_COMMAND_TIMEOUT_MS,
       undefined,
@@ -1644,6 +1685,39 @@ function sameBounds(left: Rectangle, right: Rectangle): boolean {
     && left.y === right.y
     && left.width === right.width
     && left.height === right.height;
+}
+
+function capturePageRect(
+  record: BrowserSurfaceRecord,
+  params: Record<string, unknown>,
+): Rectangle {
+  const viewBounds = record.view.getBounds();
+  const clip = params.clip;
+  if (!clip || typeof clip !== "object") {
+    return { x: 0, y: 0, width: Math.max(1, viewBounds.width), height: Math.max(1, viewBounds.height) };
+  }
+  const value = clip as Record<string, unknown>;
+  const x = finiteNumber(value.x, 0);
+  const y = finiteNumber(value.y, 0);
+  const width = finiteNumber(value.width, viewBounds.width);
+  const height = finiteNumber(value.height, viewBounds.height);
+  const left = Math.max(0, Math.min(viewBounds.width - 1, Math.floor(x)));
+  const top = Math.max(0, Math.min(viewBounds.height - 1, Math.floor(y)));
+  return {
+    x: left,
+    y: top,
+    width: Math.max(1, Math.min(viewBounds.width - left, Math.ceil(width))),
+    height: Math.max(1, Math.min(viewBounds.height - top, Math.ceil(height))),
+  };
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeJpegQuality(value: unknown): number {
+  const quality = finiteNumber(value, 90);
+  return Math.max(0, Math.min(100, Math.round(quality)));
 }
 
 async function sendCdpCommandWithTimeout(

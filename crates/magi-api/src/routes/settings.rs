@@ -317,7 +317,7 @@ fn parse_access_profile_query(query: &HashMap<String, String>) -> AccessProfile 
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FetchModelsRequest {
     config: Value,
     target: String,
@@ -1072,7 +1072,7 @@ async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateSettingRequest {
     key: String,
     value: serde_json::Value,

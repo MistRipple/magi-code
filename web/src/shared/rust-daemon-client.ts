@@ -151,8 +151,21 @@ export class RustDaemonClient {
     return this.getJson<VersionHandshakeDto>('/version');
   }
 
-  public async fetchBootstrap(scope: 'personal' | 'workspace'): Promise<BootstrapDto> {
-    return this.getJson<BootstrapDto>(`/bootstrap?scope=${scope}`);
+  public async fetchBootstrap(
+    scope: 'personal' | 'workspace',
+    options: { workspaceId?: string; workspacePath?: string; sessionId?: string } = {},
+  ): Promise<BootstrapDto> {
+    const query = new URLSearchParams({ scope });
+    if (scope === 'workspace' && options.workspaceId?.trim()) {
+      query.set('workspaceId', options.workspaceId.trim());
+    }
+    if (scope === 'workspace' && options.workspacePath?.trim()) {
+      query.set('workspacePath', options.workspacePath.trim());
+    }
+    if (options.sessionId?.trim()) {
+      query.set('sessionId', options.sessionId.trim());
+    }
+    return this.getJson<BootstrapDto>(`/bootstrap?${query.toString()}`);
   }
 
   public async fetchRuntimeReadModel(): Promise<RuntimeReadModelDto> {
@@ -208,17 +221,21 @@ export class RustDaemonClient {
   }
 
   public async fetchNotifications(
-    workspaceId?: string | null,
-    workspacePath?: string,
-    sessionId?: string,
+    scope: 'personal' | 'workspace',
+    options: { workspaceId?: string; workspacePath?: string; sessionId?: string } = {},
   ): Promise<NotificationsResponseDto> {
-    const params = new URLSearchParams();
-    if (workspaceId?.trim()) params.set('workspaceId', workspaceId.trim());
-    if (workspacePath) params.set('workspacePath', workspacePath);
-    if (sessionId) params.set('sessionId', sessionId);
-    const query = params.toString();
+    const query = new URLSearchParams({ scope });
+    if (scope === 'workspace' && options.workspaceId?.trim()) {
+      query.set('workspaceId', options.workspaceId.trim());
+    }
+    if (scope === 'workspace' && options.workspacePath?.trim()) {
+      query.set('workspacePath', options.workspacePath.trim());
+    }
+    if (options.sessionId?.trim()) {
+      query.set('sessionId', options.sessionId.trim());
+    }
     return this.getJson<NotificationsResponseDto>(
-      `/api/notifications${query ? `?${query}` : ''}`,
+      `/api/notifications?${query.toString()}`,
     );
   }
 
@@ -395,8 +412,11 @@ export class RustDaemonClient {
 
   // ─── Knowledge ────────────────────────────────────────────────────
 
-  public async clearKnowledge(): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/clear', {});
+  public async clearKnowledge(request: {
+    workspaceId: string;
+    workspacePath?: string;
+  }): Promise<KnowledgeMutationResponseDto> {
+    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/clear', request);
   }
 
   // ─── MCP servers ──────────────────────────────────────────────────
@@ -508,11 +528,13 @@ export class RustDaemonClient {
     filePath?: string,
     sessionId?: string,
     workspaceId?: string,
+    workspacePath?: string,
   ): Promise<DiffResponseDto> {
     const params = new URLSearchParams();
     if (filePath) params.set('filePath', filePath);
     if (sessionId) params.set('sessionId', sessionId);
     if (workspaceId) params.set('workspaceId', workspaceId);
+    if (workspacePath) params.set('workspacePath', workspacePath);
     const qs = params.toString();
     return this.getJson<DiffResponseDto>(`/api/changes/diff${qs ? `?${qs}` : ''}`);
   }
@@ -550,11 +572,13 @@ export class RustDaemonClient {
     filePath?: string,
     sessionId?: string,
     workspaceId?: string,
+    workspacePath?: string,
   ): Promise<FileContentResponseDto> {
     const params = new URLSearchParams();
     if (filePath) params.set('filePath', filePath);
     if (sessionId) params.set('sessionId', sessionId);
     if (workspaceId) params.set('workspaceId', workspaceId);
+    if (workspacePath) params.set('workspacePath', workspacePath);
     const qs = params.toString();
     return this.getJson<FileContentResponseDto>(`/api/files/content${qs ? `?${qs}` : ''}`);
   }
@@ -563,10 +587,12 @@ export class RustDaemonClient {
     path: string | undefined,
     workspaceId: string,
     showHidden = false,
+    workspacePath?: string,
   ): Promise<FilesystemListResponseDto> {
     const params = new URLSearchParams();
     if (path) params.set('path', path);
     if (workspaceId) params.set('workspaceId', workspaceId);
+    if (workspacePath) params.set('workspacePath', workspacePath);
     if (showHidden) params.set('showHidden', '1');
     const qs = params.toString();
     return this.getJson<FilesystemListResponseDto>(
@@ -599,8 +625,8 @@ export class RustDaemonClient {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     query.set('scope', scope);
-    if (workspaceId) query.set('workspaceId', workspaceId);
-    if (workspacePath) query.set('workspacePath', workspacePath);
+    if (scope === 'workspace' && workspaceId) query.set('workspaceId', workspaceId);
+    if (scope === 'workspace' && workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<CurrentGoalResponseDto>(
       `/api/goals/current?${query.toString()}`,
       signal,
@@ -648,8 +674,8 @@ export class RustDaemonClient {
     const query = new URLSearchParams();
     query.set('scope', scope);
     query.set('sessionId', sessionId);
-    if (workspaceId) query.set('workspaceId', workspaceId);
-    if (workspacePath) query.set('workspacePath', workspacePath);
+    if (scope === 'workspace' && workspaceId) query.set('workspaceId', workspaceId);
+    if (scope === 'workspace' && workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<AgentRunProjectionDto>(
       `/api/agent-runs/projection/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
       signal,

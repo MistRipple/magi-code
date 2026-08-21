@@ -237,7 +237,7 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function refreshWorkspaces\(\): Promise<void> \{[\s\S]*?workspaces = next;[\s\S]*?sessionsByWorkspace = \{\};[\s\S]*?if \(!messagesState\.bootstrapped\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?selectedWorkspaceId = resolveBackendWorkspaceSelection\(next\)/,
+  /async function refreshWorkspaces\(\): Promise<void> \{[\s\S]*?workspaces = next;[\s\S]*?sessionsByWorkspace = Object\.fromEntries[\s\S]*?if \(!messagesState\.bootstrapped\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?selectedWorkspaceId = resolveBackendWorkspaceSelection\(next\)/,
   '工作区列表先到达时必须等待无作用域 bootstrap 恢复最后会话，不能按 isActive 抢先触发工作区切换',
 );
 assert.match(

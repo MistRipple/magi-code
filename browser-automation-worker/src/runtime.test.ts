@@ -10,6 +10,7 @@ import type {
   WorkerToMainMessage,
 } from "@magi/desktop-browser-contracts";
 import { CdpClient, type ParentPort } from "./cdp-client.js";
+import { INSTALL_PAGE_RUNTIME } from "./page-script.js";
 import { BrowserAutomationRuntime } from "./runtime.js";
 
 function assertScreenshotHeader(binary: Buffer, format: "png" | "jpeg" | "webp"): void {
@@ -25,6 +26,7 @@ function assertScreenshotHeader(binary: Buffer, format: "png" | "jpeg" | "webp")
 class FakePort implements ParentPort {
   #listener: ((event: { data: MainToWorkerMessage }) => void) | null = null;
   readonly methods: string[] = [];
+  readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];
   responseBinding: BrowserSurfaceBinding | null = null;
 
   on(_event: "message", listener: (event: { data: MainToWorkerMessage }) => void): void {
@@ -34,6 +36,7 @@ class FakePort implements ParentPort {
   postMessage(message: WorkerToMainMessage): void {
     if (message.type !== "cdp_request") return;
     this.methods.push(message.method);
+    this.requests.push({ method: message.method, params: message.params ?? {} });
     queueMicrotask(() => {
       this.#listener?.({
         data: {
@@ -135,6 +138,28 @@ test("CDP 响应的完整 Surface 身份变化必须被拒绝", async () => {
     client.send(binding, "Runtime.enable"),
     /browser_surface_stale/u,
   );
+});
+
+test("浏览器按键使用 Chromium 原生 key 事件类型和键码", async () => {
+  const port = new FakePort();
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port));
+  const result = await runtime.execute("press-enter", binding, {
+    type: "press",
+    payload: {
+      tab_id: binding.tab_id,
+      control: { mode: "agent", lease_id: "lease-1", fence: 1 },
+      key: "Enter",
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  const keyEvents = port.methods.filter((method) => method === "Input.dispatchKeyEvent");
+  assert.equal(keyEvents.length, 2);
+  const inputRequests = port.requests.filter((request) => request.method === "Input.dispatchKeyEvent");
+  assert.equal(inputRequests[0]?.params.type, "rawKeyDown");
+  assert.equal(inputRequests[0]?.params.key, "Enter");
+  assert.equal(inputRequests[0]?.params.code, "Enter");
+  assert.equal(inputRequests[0]?.params.windowsVirtualKeyCode, 13);
+  assert.equal(inputRequests[1]?.params.type, "keyUp");
 });
 
 test("扩展浏览器能力已经进入 Worker 执行链", async () => {
@@ -287,7 +312,7 @@ test("浏览器截图的归一化区域必须转换为当前布局视口的真�
     format: "png",
     clip: { x: 300, y: 80, width: 600, height: 200, scale: 1 },
     captureBeyondViewport: false,
-    fromSurface: true,
+    fromSurface: false,
   });
 });
 
@@ -335,7 +360,7 @@ test("截图和滚动使用页面脚本视口坐标，不把 CDP layoutViewport 
       format: "png",
       clip: { x: 48, y: 85.4, width: 96, height: 170.8, scale: 1 },
       captureBeyondViewport: false,
-      fromSurface: true,
+      fromSurface: false,
     },
   );
 
@@ -604,7 +629,7 @@ test("浏览器截图收到快照根节点时必须捕获整页范围而不是�
   assert.equal(port.requests.some((request) => request.method === "Runtime.evaluate"), false);
   assert.deepEqual(
     port.requests.find((request) => request.method === "Page.captureScreenshot")?.params,
-    { format: "png", captureBeyondViewport: false, fromSurface: true },
+    { format: "png", captureBeyondViewport: false, fromSurface: false },
   );
 });
 
@@ -686,7 +711,7 @@ test("整页截图使用 Chromium contentSize 和 captureBeyondViewport", async 
       format: "png",
       clip: { x: 0, y: 0, width: 1400, height: 3000, scale: 1 },
       captureBeyondViewport: true,
-      fromSurface: true,
+      fromSurface: false,
     },
   );
 });
@@ -726,7 +751,7 @@ test("元素截图先滚动到元素并重新读取最终 bounds", async () => {
       format: "png",
       clip: { x: 20, y: 30, width: 400, height: 200, scale: 1 },
       captureBeyondViewport: true,
-      fromSurface: true,
+      fromSurface: false,
     },
   );
 });
@@ -801,6 +826,13 @@ test("持久化浏览器标记通过 Host 同步到当前 Chromium 文档", asyn
   assert.match(
     String(port.requests.find((request) => request.method === "Runtime.evaluate")?.params.expression),
     /setAnnotations/u,
+  );
+});
+
+test("浏览器标记层的 MutationObserver 不会观察自身 Shadow DOM 重绘", () => {
+  assert.match(
+    INSTALL_PAGE_RUNTIME,
+    /target === state\.annotationShadow[\s\S]*?state\.annotationShadow\?\.contains\(target\)/u,
   );
 });
 

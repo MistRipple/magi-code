@@ -172,7 +172,7 @@ function applyRootTheme(
   pack: ThemePack,
   scheme: ThemeScheme,
   wallpaperUrl: string,
-): { desktopShellBackground: string; nativeBackgroundColor: string } {
+): { nativeBackgroundColor: string } {
   const root = document.documentElement;
   const body = document.body;
   const desktopSurface = root.dataset.magiDesktopSurface;
@@ -203,12 +203,6 @@ function applyRootTheme(
     ? pack.material === 'clear' ? 0.98 : pack.material === 'translucent' ? 0.9 : 0.84
     : 1);
   const criticalOverlay = rgba(background, effectiveWallpaperUrl ? 0.97 : 1);
-  // Desktop App 的最外层壳只负责承接窗口边缘和面板间隙，必须与主题材质
-  // 使用同一透明度；壁纸由 body 的唯一背景层绘制，不能在壳层再次加载。
-  const desktopShellBackground = rgba(
-    background,
-    effectiveWallpaperUrl ? materialAlpha : 1,
-  );
   const primaryForeground = relativeLuminance(accent) > 0.44 ? '#111827' : '#FFFFFF';
 
   const variables: Record<string, string> = {
@@ -249,7 +243,6 @@ function applyRootTheme(
     '--magi-surface-dialog': elevated,
     '--magi-surface-popover': elevated,
     '--magi-surface-critical': critical,
-    '--magi-desktop-shell-background': desktopShellBackground,
     '--magi-window-overlay': windowOverlay,
     '--magi-popover-overlay': popoverOverlay,
     '--magi-critical-overlay': criticalOverlay,
@@ -287,7 +280,6 @@ function applyRootTheme(
   };
   for (const [name, value] of Object.entries(variables)) root.style.setProperty(name, value);
   return {
-    desktopShellBackground,
     // Electron 的原生非客户区没有办法读取 Renderer 的壁纸层；使用主题
     // 背景色作为不透明首帧和窗口框架底色，材质透明度仍由 App Renderer
     // 的 CSS 壳层消费，避免原生层透出桌面或出现黑色闪烁。

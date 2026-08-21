@@ -151,6 +151,7 @@ import {
   clearPendingRequest,
   completeTurnEditing,
   createRequestBinding,
+  getRequestBinding,
   setCurrentSessionId,
   setQueuedMessages,
   setOrchestratorRuntimeState,
@@ -171,6 +172,22 @@ let currentSessionScope: 'personal' | 'workspace' = 'personal';
 let currentInterruptTaskId = '';
 let continueRequestId = '';
 let currentRuntimeEpoch = '';
+type SessionTurnSubmissionContext = {
+  requestId: string;
+  scope: 'personal' | 'workspace';
+  workspaceId: string;
+  workspacePath: string;
+  /** 提交时已经存在的后端会话 ID；空值表示新会话草稿。 */
+  targetSessionId: string;
+  /** 仅用于把新会话首条消息固定在当前页面，绝不发送给后端。 */
+  optimisticSessionId: string;
+  /** SSE 先于 HTTP 返回时记录已确认的后端会话。 */
+  acceptedSessionId?: string;
+};
+
+// 会话首条消息的归属只能由这一份上下文决定。requestBindings 负责消息渲染，
+// 但不能单独决定哪个页面可以被 SSE 接管，否则旧请求返回时会污染 currentSessionId。
+let activeSessionTurnSubmission: SessionTurnSubmissionContext | null = null;
 const guidingQueuedMessageIds = new Set<string>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
@@ -233,6 +250,69 @@ function clearContinueRequestInFlight(): void {
   if (continueRequestId) {
     clearPendingRequest(continueRequestId);
     continueRequestId = '';
+  }
+}
+
+function submissionContextPayload(
+  context: SessionTurnSubmissionContext,
+): Record<string, unknown> {
+  return {
+    requestId: context.requestId,
+    scope: context.scope,
+    workspaceId: context.workspaceId || null,
+    workspacePath: context.workspacePath || null,
+    targetSessionId: context.targetSessionId || null,
+    optimisticSessionId: context.optimisticSessionId,
+    ...(context.acceptedSessionId ? { acceptedSessionId: context.acceptedSessionId } : {}),
+  };
+}
+
+function currentStoreSessionId(): string {
+  return messagesState.currentSessionId?.trim() || '';
+}
+
+function submissionContextMatchesCurrentScope(context: SessionTurnSubmissionContext): boolean {
+  if (context.scope !== currentSessionScope) {
+    return false;
+  }
+  if (context.scope === 'workspace') {
+    return context.workspaceId
+      ? context.workspaceId === currentWorkspaceId
+        && (!context.workspacePath || context.workspacePath === currentWorkspacePath)
+      : context.workspacePath === currentWorkspacePath;
+  }
+  return !currentWorkspaceId && !currentWorkspacePath;
+}
+
+function submissionContextCanCommit(
+  context: SessionTurnSubmissionContext,
+  resolvedSessionId: string,
+): boolean {
+  if (!activeSessionTurnSubmission || activeSessionTurnSubmission.requestId !== context.requestId) {
+    return false;
+  }
+  if (!submissionContextMatchesCurrentScope(context)) {
+    return false;
+  }
+  const storeSessionId = currentStoreSessionId();
+  if (context.targetSessionId) {
+    return context.targetSessionId === resolvedSessionId
+      && currentSessionId === context.targetSessionId
+      && storeSessionId === context.targetSessionId;
+  }
+  if (context.acceptedSessionId) {
+    return context.acceptedSessionId === resolvedSessionId
+      && currentSessionId === resolvedSessionId
+      && storeSessionId === resolvedSessionId;
+  }
+  // 草稿首条消息的本地 ID 只存在消息 Store，不能提前写入 Bridge 的
+  // 权威 currentSessionId；HTTP accepted 返回后再由下面的持久绑定收敛。
+  return !currentSessionId && storeSessionId === context.optimisticSessionId;
+}
+
+function finishSessionTurnSubmission(context: SessionTurnSubmissionContext): void {
+  if (activeSessionTurnSubmission?.requestId === context.requestId) {
+    activeSessionTurnSubmission = null;
   }
 }
 
@@ -1124,6 +1204,37 @@ function emitDataMessage(dataType: DataMessageType, payload: Record<string, unkn
   emitMessage({ type: 'unifiedMessage', message });
 }
 
+function emitSessionTurnAccepted(
+  payload: {
+    sessionId: string;
+    workspaceId?: string;
+    requestId?: string;
+    runtimeEpoch?: string;
+    eventStreamNextSequence?: number;
+    acceptedAt?: number;
+    sessionSummary?: unknown;
+    createdSession?: boolean;
+    route?: unknown;
+    submissionContext?: SessionTurnSubmissionContext | null;
+  },
+): void {
+  const submissionContext = payload.submissionContext;
+  emitDataMessage('sessionTurnAccepted', {
+    sessionId: payload.sessionId,
+    workspaceId: payload.workspaceId || '',
+    ...(payload.requestId ? { requestId: payload.requestId } : {}),
+    ...(payload.runtimeEpoch ? { runtimeEpoch: payload.runtimeEpoch } : {}),
+    ...(typeof payload.eventStreamNextSequence === 'number'
+      ? { eventStreamNextSequence: payload.eventStreamNextSequence }
+      : {}),
+    ...(typeof payload.acceptedAt === 'number' ? { acceptedAt: payload.acceptedAt } : {}),
+    ...(payload.sessionSummary === undefined ? {} : { sessionSummary: payload.sessionSummary }),
+    ...(payload.createdSession === undefined ? {} : { createdSession: payload.createdSession }),
+    ...(payload.route === undefined ? {} : { route: payload.route }),
+    ...(submissionContext ? { submissionContext: submissionContextPayload(submissionContext) } : {}),
+  });
+}
+
 function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void {
   const isTerminalEvent = canonicalEvent.kind === 'turn_completed'
     || canonicalEvent.kind === 'turn_superseded'
@@ -1454,6 +1565,30 @@ function rustEventTaskId(event: RustEventEnvelope): string {
     || rustEventPayloadString(event, 'task_id', 'taskId');
 }
 
+function rustEventRequestId(event: RustEventEnvelope): string {
+  return rustEventPayloadString(event, 'request_id', 'requestId');
+}
+
+function activeDraftSubmissionMatchesAcceptedEvent(
+  event: RustEventEnvelope,
+  eventSessionId: string,
+): boolean {
+  const requestId = rustEventRequestId(event);
+  const context = activeSessionTurnSubmission;
+  return Boolean(
+    event.event_type === 'session.turn.task.accepted'
+    && eventSessionId
+    && context
+    && !context.targetSessionId
+    && context.requestId === requestId
+    && messagesState.pendingRequests.has(requestId)
+    && getRequestBinding(requestId)
+    && submissionContextMatchesCurrentScope(context)
+    && !currentSessionId
+    && currentStoreSessionId() === context.optimisticSessionId,
+  );
+}
+
 function rustTaskEventRootTaskIds(event: RustEventEnvelope): string[] {
   const candidates = [
     rustEventPayloadString(event, 'root_task_id', 'rootTaskId'),
@@ -1473,7 +1608,19 @@ function eventMatchesCurrentWorkspace(event: RustEventEnvelope): boolean {
 
 function eventTargetsDifferentSession(event: RustEventEnvelope): boolean {
   const eventSessionId = rustEventSessionId(event);
-  return Boolean(eventSessionId && currentSessionId && eventSessionId !== currentSessionId);
+  if (event.event_type === 'session.turn.task.accepted' && !eventSessionId) {
+    return true;
+  }
+  if (!eventSessionId) {
+    return false;
+  }
+  if (currentSessionId) {
+    return eventSessionId !== currentSessionId;
+  }
+
+  // 草稿态没有已提交的会话 ID。只有当前 submission context 的 requestId
+  // 可以建立会话；requestBindings 或 pendingRequests 单独匹配都不够严格。
+  return !activeDraftSubmissionMatchesAcceptedEvent(event, eventSessionId);
 }
 
 function shouldApplyCurrentSessionRustEvent(event: RustEventEnvelope): boolean {
@@ -1758,7 +1905,39 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (!shouldApplyCurrentSessionRustEvent(event)) {
-    if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event)) {
+    const acceptedPayload = event.payload;
+    const hasAcceptedDirectoryIncrement =
+      eventType === 'session.turn.task.accepted'
+      && acceptedPayload?.created_session === true
+      && Boolean(acceptedPayload?.session_summary);
+    if (hasAcceptedDirectoryIncrement && acceptedPayload) {
+      const acceptedSessionId = trimBridgeString(acceptedPayload.session_id)
+        || trimBridgeString(acceptedPayload.sessionId)
+        || trimBridgeString(event.session_id);
+      const acceptedWorkspaceId = trimBridgeString(acceptedPayload.workspace_id)
+        || trimBridgeString(acceptedPayload.workspaceId)
+        || trimBridgeString(event.workspace_id)
+        || currentWorkspaceId;
+      if (acceptedSessionId) {
+        emitSessionTurnAccepted({
+          sessionId: acceptedSessionId,
+          workspaceId: acceptedWorkspaceId,
+          sessionSummary: acceptedPayload.session_summary,
+          createdSession: true,
+          route: acceptedPayload.route ?? 'task',
+          runtimeEpoch: currentRuntimeEpoch,
+          eventStreamNextSequence: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+            ? Math.max(1, Math.floor(event.sequence) + 1)
+            : 0,
+          acceptedAt: typeof acceptedPayload.accepted_at === 'number' && Number.isFinite(acceptedPayload.accepted_at)
+            ? Math.floor(acceptedPayload.accepted_at)
+            : typeof acceptedPayload.acceptedAt === 'number' && Number.isFinite(acceptedPayload.acceptedAt)
+              ? Math.floor(acceptedPayload.acceptedAt)
+              : undefined,
+        });
+      }
+    }
+    if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event) && !hasAcceptedDirectoryIncrement) {
       scheduleSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
     }
     return;
@@ -1894,23 +2073,50 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       || trimBridgeString(event.payload.workspaceId)
       || trimBridgeString(event.workspace_id)
       || currentWorkspaceId;
-    const acceptedCreatedSession = event.payload.created_session ?? event.payload.createdSession ?? false;
-    if (acceptedSessionId && (!currentSessionId || currentSessionId === acceptedSessionId)) {
+    const acceptedRequestId = rustEventRequestId(event);
+    const acceptedCreatedSession = event.payload.created_session === true
+      || event.payload.createdSession === true;
+    const acceptedMatchesCurrentSession = Boolean(
+      acceptedSessionId && currentSessionId === acceptedSessionId,
+    );
+    const acceptedSubmissionContext = acceptedRequestId
+      && activeSessionTurnSubmission?.requestId === acceptedRequestId
+      && messagesState.pendingRequests.has(acceptedRequestId)
+      && getRequestBinding(acceptedRequestId)
+      ? activeSessionTurnSubmission
+      : null;
+    const acceptedMatchesDraftSubmission = Boolean(
+      acceptedSubmissionContext
+      && !acceptedSubmissionContext.targetSessionId
+      && activeDraftSubmissionMatchesAcceptedEvent(event, acceptedSessionId),
+    );
+    if (acceptedSessionId && (acceptedMatchesCurrentSession || acceptedMatchesDraftSubmission)) {
+      if (acceptedMatchesDraftSubmission && acceptedSubmissionContext) {
+        acceptedSubmissionContext.acceptedSessionId = acceptedSessionId;
+      }
       persistWorkspaceBinding(
         currentSessionScope,
         acceptedWorkspaceId,
         currentWorkspacePath,
         acceptedSessionId,
       );
-      emitDataMessage('sessionTurnAccepted', {
+      emitSessionTurnAccepted({
         sessionId: acceptedSessionId,
         workspaceId: acceptedWorkspaceId,
+        requestId: acceptedRequestId || undefined,
         runtimeEpoch: currentRuntimeEpoch,
         eventStreamNextSequence: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
           ? Math.max(1, Math.floor(event.sequence) + 1)
           : 0,
+        acceptedAt: typeof event.payload.accepted_at === 'number' && Number.isFinite(event.payload.accepted_at)
+          ? Math.floor(event.payload.accepted_at)
+          : typeof event.payload.acceptedAt === 'number' && Number.isFinite(event.payload.acceptedAt)
+            ? Math.floor(event.payload.acceptedAt)
+            : undefined,
+        sessionSummary: event.payload.session_summary ?? event.payload.sessionSummary ?? null,
         createdSession: acceptedCreatedSession,
         route: event.payload.route ?? 'task',
+        submissionContext: acceptedMatchesDraftSubmission ? acceptedSubmissionContext : null,
       });
     }
     const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
@@ -1932,9 +2138,6 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       ) {
         completeTurnEditing(editingTurn.turnId);
       }
-    }
-    if (acceptedCreatedSession === true) {
-      scheduleSessionSummaryRefresh('created_session_accepted');
     }
   }
 
@@ -2312,10 +2515,10 @@ function eventStreamBindingKey(): string {
 function eventStreamQuery(): string {
   const query = new URLSearchParams();
   query.set('scope', currentSessionScope);
-  if (currentWorkspaceId) {
+  if (currentSessionScope === 'workspace' && currentWorkspaceId) {
     query.set('workspaceId', currentWorkspaceId);
   }
-  if (currentWorkspacePath) {
+  if (currentSessionScope === 'workspace' && currentWorkspacePath) {
     query.set('workspacePath', currentWorkspacePath);
   }
   if (eventStreamCursorScopeKey === eventStreamScopeKey() && eventStreamAfterSequence > 0) {
@@ -2327,10 +2530,10 @@ function eventStreamQuery(): string {
 function eventStreamScopeKey(): string {
   const query = new URLSearchParams();
   query.set('scope', currentSessionScope);
-  if (currentWorkspaceId) {
+  if (currentSessionScope === 'workspace' && currentWorkspaceId) {
     query.set('workspaceId', currentWorkspaceId);
   }
-  if (currentWorkspacePath) {
+  if (currentSessionScope === 'workspace' && currentWorkspacePath) {
     query.set('workspacePath', currentWorkspacePath);
   }
   return query.toString();
@@ -2482,8 +2685,8 @@ function persistWorkspaceBinding(
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   const previousSessionId = currentSessionId;
-  const normalizedWorkspaceId = workspaceId.trim();
-  const normalizedWorkspacePath = workspacePath.trim();
+  const normalizedWorkspaceId = scope === 'workspace' ? workspaceId.trim() : '';
+  const normalizedWorkspacePath = scope === 'workspace' ? workspacePath.trim() : '';
   const incomingSessionId = sessionId.trim();
   const incomingScope = scope;
 
@@ -2550,11 +2753,12 @@ function clearWorkspaceSessionBinding(
   workspaceId: string,
   workspacePath: string,
 ): boolean {
+  activeSessionTurnSubmission = null;
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   const previousSessionId = currentSessionId;
-  const normalizedWorkspaceId = workspaceId.trim();
-  const normalizedWorkspacePath = workspacePath.trim();
+  const normalizedWorkspaceId = scope === 'workspace' ? workspaceId.trim() : '';
+  const normalizedWorkspacePath = scope === 'workspace' ? workspacePath.trim() : '';
   const incomingScope = scope;
   const settingsBindingChanged = clearSettingsBootstrapCacheIfBindingChanged(
     previousWorkspaceId,
@@ -2603,6 +2807,7 @@ function clearWorkspaceSessionBinding(
 }
 
 function clearPersistedWorkspaceBinding(): void {
+  activeSessionTurnSubmission = null;
   clearSettingsBootstrapCache();
   currentWorkspaceId = '';
   currentWorkspacePath = '';
@@ -3262,6 +3467,8 @@ async function commitSessionNavigation(
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   invalidateBootstrapRequests();
+  // 导航事务拥有新的会话归属；旧提交即使随后收到 HTTP/SSE，也不能重新夺回当前页面。
+  activeSessionTurnSubmission = null;
   const response = await getTransport().request(agentUrl('/api/session/navigation'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3659,13 +3866,22 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0) {
     return false;
   }
-  const requestId = input.requestId || generateMessageId();
+  const requestId = trimBridgeString(input.requestId) || generateMessageId();
   const userMessageId = generateMessageId();
   const placeholderMessageId = `assistant-placeholder-${requestId}`;
   const turnOrderSeq = allocateTurnOrderSeq();
   const requestCreatedAt = Date.now();
   const optimisticSessionId = targetSessionId || localOptimisticSessionIdForRequest(requestId);
   const usesLocalOptimisticSession = !targetSessionId;
+  const submissionContext: SessionTurnSubmissionContext = {
+    requestId,
+    scope: targetScope,
+    workspaceId: targetWorkspaceId,
+    workspacePath: targetWorkspacePath,
+    targetSessionId,
+    optimisticSessionId,
+  };
+  activeSessionTurnSubmission = submissionContext;
 
   createRequestBinding({
     requestId,
@@ -3746,25 +3962,36 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
       ? turnResult.sessionId.trim()
       : targetSessionId;
+    const submissionCanCommit = Boolean(
+      resolvedSessionId && submissionContextCanCommit(submissionContext, resolvedSessionId),
+    );
     if (usesLocalOptimisticSession && resolvedSessionId) {
-      adoptAcceptedSessionIdForLocalTurn(optimisticSessionId, resolvedSessionId);
+      if (submissionCanCommit) {
+        submissionContext.acceptedSessionId = resolvedSessionId;
+        adoptAcceptedSessionIdForLocalTurn(optimisticSessionId, resolvedSessionId);
+      }
     }
     if (resolvedSessionId) {
-      emitDataMessage('sessionTurnAccepted', {
+      emitSessionTurnAccepted({
         sessionId: resolvedSessionId,
         workspaceId: targetWorkspaceId,
+        requestId,
         runtimeEpoch: turnResult.runtimeEpoch,
         eventStreamNextSequence: turnResult.eventStreamNextSequence,
+        acceptedAt: turnResult.acceptedAt,
+        sessionSummary: turnResult.sessionSummary ?? null,
         createdSession: turnResult.createdSession,
         route: turnResult.route,
+        submissionContext,
       });
     }
-    if (resolvedSessionId) {
+    if (resolvedSessionId && submissionCanCommit) {
       persistWorkspaceBinding(targetScope, targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
     if (turnResult.queued) {
       clearPendingRequest(requestId);
       clearRequestBinding(requestId);
+      finishSessionTurnSubmission(submissionContext);
       await fetchBootstrap({ forceFresh: true });
       emitBridgeSuccessToast(
         i18n.t('bridge.action.sendMessage'),
@@ -3789,16 +4016,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       placeholderMessageId,
       ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
     });
-    if (turnResult.createdSession && resolvedSessionId) {
-      void fetchBootstrap({ forceFresh: true }).catch((error) => {
-        reportExpectedRecoveryFailure(
-          i18n.t('bridge.action.syncSessions'),
-          '[web-client-bridge] 新会话 accepted 后刷新失败:',
-          error,
-        );
-        scheduleRecovery('new_session_accepted_refresh', error, true);
-      });
-    }
     const successMessage = turnResult.route === 'task'
       ? i18n.t('bridge.detail.taskSubmitted')
       : turnResult.route === 'continue'
@@ -3819,6 +4036,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     void ensureEventStream({ forceReconnect: false, waitUntilOpen: false }).catch((err) => {
       console.warn('[web-client-bridge] executeTask 后 SSE 连接确认失败:', err);
     });
+    finishSessionTurnSubmission(submissionContext);
     return true;
   } catch (error) {
     clearActiveTurnInFlight();
@@ -3839,7 +4057,12 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       failedAt: Date.now(),
       error: errorText,
     });
+    // 失败路径必须与拒绝、终态路径一样回收本地 pending request。
+    // 否则 emitForcedProcessingIdle 会把仍绑定的失败请求误判为活跃轮次，
+    // 让草稿会话一直处于处理中，并阻断后续目录/导航收敛。
+    clearPendingRequest(requestId);
     clearRequestBinding(requestId);
+    finishSessionTurnSubmission(submissionContext);
     emitBridgeErrorToast(i18n.t('bridge.action.sendMessage'), error);
     emitForcedProcessingIdle('execute_task_failed', {
       error: normalizeErrorMessage(error),

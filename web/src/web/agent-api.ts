@@ -472,6 +472,7 @@ export interface AgentSessionTurnResult {
   eventStreamNextSequence: number;
   createdSession: boolean;
   route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
+  sessionSummary?: AgentSessionSummary | null;
   /** Root task ID when the backend created an agent run for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
@@ -818,10 +819,11 @@ function terminalSessionUrl(request: TerminalSessionRequest, channel: boolean): 
     `/api/terminal/sessions/${encodeURIComponent(request.terminalTabId.trim())}${suffix}`,
   ));
   const workspaceId = request.workspaceId?.trim() || '';
-  url.searchParams.set('scope', workspaceId ? 'workspace' : 'personal');
+  const workspacePath = request.workspacePath?.trim() || '';
+  const hasWorkspaceBinding = Boolean(workspaceId || workspacePath);
+  url.searchParams.set('scope', hasWorkspaceBinding ? 'workspace' : 'personal');
   if (workspaceId) url.searchParams.set('workspaceId', workspaceId);
   url.searchParams.set('sessionId', request.sessionId.trim());
-  const workspacePath = request.workspacePath?.trim();
   if (workspacePath) url.searchParams.set('workspacePath', workspacePath);
   if (request.cols) url.searchParams.set('cols', String(request.cols));
   if (request.rows) url.searchParams.set('rows', String(request.rows));
@@ -1001,13 +1003,15 @@ export async function createBrowserSession(
   workspacePath?: string,
 ): Promise<BrowserSessionSnapshot> {
   const normalizedWorkspaceId = workspaceId?.trim() || '';
+  const normalizedWorkspacePath = workspacePath?.trim() || '';
+  const hasWorkspaceBinding = Boolean(normalizedWorkspaceId || normalizedWorkspacePath);
   const response = await getTransport().request(agentUrl('/api/browser/sessions'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      scope: normalizedWorkspaceId ? 'workspace' : 'personal',
-        workspaceId: normalizedWorkspaceId || null,
-        workspacePath: normalizedWorkspaceId ? (workspacePath?.trim() || null) : null,
+        scope: hasWorkspaceBinding ? 'workspace' : 'personal',
+        workspaceId: hasWorkspaceBinding ? (normalizedWorkspaceId || null) : null,
+        workspacePath: hasWorkspaceBinding ? (normalizedWorkspacePath || null) : null,
         sessionId,
         clientPlatform: browserClientPlatform(),
       }),
@@ -1020,13 +1024,15 @@ export async function materializeSession(
   workspacePath?: string,
 ): Promise<{ sessionId: string; workspaceId: string | null }> {
   const normalizedWorkspaceId = workspaceId?.trim() || '';
+  const normalizedWorkspacePath = workspacePath?.trim() || '';
+  const hasWorkspaceBinding = Boolean(normalizedWorkspaceId || normalizedWorkspacePath);
   const response = await getTransport().request(agentUrl('/api/session/materialize'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      scope: normalizedWorkspaceId ? 'workspace' : 'personal',
-      workspaceId: normalizedWorkspaceId || null,
-      workspacePath: normalizedWorkspaceId ? (workspacePath?.trim() || null) : null,
+      scope: hasWorkspaceBinding ? 'workspace' : 'personal',
+      workspaceId: hasWorkspaceBinding ? (normalizedWorkspaceId || null) : null,
+      workspacePath: hasWorkspaceBinding ? (normalizedWorkspacePath || null) : null,
     }),
   });
   const payload = await parseAgentJson<{ sessionId?: unknown; workspaceId?: unknown }>(
@@ -1057,11 +1063,13 @@ export async function getCurrentBrowserSession(
   workspacePath?: string,
 ): Promise<BrowserSessionSnapshot | null> {
   const normalizedWorkspaceId = workspaceId?.trim() || '';
+  const normalizedWorkspacePath = workspacePath?.trim() || '';
+  const hasWorkspaceBinding = Boolean(normalizedWorkspaceId || normalizedWorkspacePath);
   const query = new URLSearchParams({
-    scope: normalizedWorkspaceId ? 'workspace' : 'personal',
+    scope: hasWorkspaceBinding ? 'workspace' : 'personal',
     sessionId,
     ...(normalizedWorkspaceId ? { workspaceId: normalizedWorkspaceId } : {}),
-    ...(normalizedWorkspaceId && workspacePath?.trim() ? { workspacePath: workspacePath.trim() } : {}),
+    ...(normalizedWorkspacePath ? { workspacePath: normalizedWorkspacePath } : {}),
   }).toString();
   const response = await getTransport().request(
     agentUrl('/api/browser/sessions/current', query),
@@ -1274,13 +1282,9 @@ export function isWebAgentMode(): boolean {
 
 function buildBoundQuery(
   extra: Record<string, string>,
-  options: { includeSession?: boolean } = {},
+  options: { includeScope?: boolean; includeSession?: boolean } = {},
 ): string {
   return buildBoundQueryWithOverride(extra, undefined, options);
-}
-
-export function buildWorkspaceBoundQuery(extra: Record<string, string>): string {
-  return buildBoundQuery(extra, { includeSession: false });
 }
 
 export function buildFilePreviewQuery(
@@ -1296,7 +1300,10 @@ export function buildFilePreviewQuery(
   return buildBoundQueryWithOverride(
     { filePath },
     bindingOverride,
-    { includeSession: options.includeSession === true || explicitSessionId },
+    {
+      includeScope: false,
+      includeSession: options.includeSession !== false && (options.includeSession === true || explicitSessionId),
+    },
   );
 }
 
@@ -1326,11 +1333,13 @@ function resolveBindingWithOverride(
 function buildBoundQueryWithOverride(
   extra: Record<string, string>,
   bindingOverride?: AgentBindingOverride,
-  options: { includeSession?: boolean } = {},
+  options: { includeScope?: boolean; includeSession?: boolean } = {},
 ): string {
   const binding = resolveBindingWithOverride(bindingOverride);
   const query = new URLSearchParams();
-  query.set('scope', binding.scope);
+  if (options.includeScope !== false) {
+    query.set('scope', binding.scope);
+  }
   if (binding.scope === 'workspace') {
     if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
     if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
@@ -1360,12 +1369,17 @@ async function postJsonWithBinding<T>(
   bindingOverride?: AgentBindingOverride,
   includeSession = true,
   signal?: AbortSignal,
+  options: { includeWorkspaceBinding?: boolean } = {},
 ): Promise<T> {
   try {
     const binding = resolveBindingWithOverride(bindingOverride);
     const bindingPayload = {
-      ...(binding.scope === 'workspace' && binding.workspaceId ? { workspaceId: binding.workspaceId } : {}),
-      ...(binding.scope === 'workspace' && binding.workspacePath ? { workspacePath: binding.workspacePath } : {}),
+      ...(options.includeWorkspaceBinding !== false && binding.scope === 'workspace' && binding.workspaceId
+        ? { workspaceId: binding.workspaceId }
+        : {}),
+      ...(options.includeWorkspaceBinding !== false && binding.scope === 'workspace' && binding.workspacePath
+        ? { workspacePath: binding.workspacePath }
+        : {}),
       ...(includeSession && binding.sessionId ? { sessionId: binding.sessionId } : {}),
     };
     const response = await getTransport().request(agentUrl(pathname), {
@@ -1394,6 +1408,23 @@ async function postBoundJson<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, true, signal);
+}
+
+async function postWorkspacePathBoundJson<T>(
+  pathname: string,
+  payload: Record<string, unknown>,
+  action: string,
+  bindingOverride?: AgentBindingOverride,
+): Promise<T> {
+  return await postJsonWithBinding<T>(
+    pathname,
+    payload,
+    action,
+    bindingOverride,
+    true,
+    undefined,
+    { includeWorkspaceBinding: false },
+  );
 }
 
 export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
@@ -1438,14 +1469,13 @@ export async function registerAgentWorkspace(rootPath: string): Promise<AgentWor
   }
 }
 
-export async function removeAgentWorkspace(workspaceId: string, workspacePath: string): Promise<AgentWorkspaceSummary[]> {
+export async function removeAgentWorkspace(workspaceId: string): Promise<AgentWorkspaceSummary[]> {
   try {
     const response = await getTransport().request(agentUrl('/api/workspaces/remove'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         workspaceId,
-        workspacePath,
       }),
     });
     const payload = await parseAgentJson<{ workspaces?: RawAgentWorkspaceSummary[]; removed?: boolean }>(response, 'remove workspace');
@@ -1606,6 +1636,8 @@ export async function resolveAgentPath(
     'resolve filesystem path',
     undefined,
     false,
+    undefined,
+    { includeWorkspaceBinding: false },
   );
 }
 
@@ -1744,6 +1776,22 @@ async function postWorkspaceBoundJson<T>(
   bindingOverride?: AgentBindingOverride,
 ): Promise<T> {
   return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, false);
+}
+
+async function postGlobalJson<T>(
+  pathname: string,
+  payload: Record<string, unknown>,
+  action: string,
+): Promise<T> {
+  return await postJsonWithBinding<T>(
+    pathname,
+    payload,
+    action,
+    undefined,
+    false,
+    undefined,
+    { includeWorkspaceBinding: false },
+  );
 }
 
 export async function deleteAgentSession(
@@ -1949,6 +1997,7 @@ export async function submitSessionTurn(
       eventStreamNextSequence: number;
       createdSession: boolean;
       route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
+      sessionSummary?: RawAgentSessionSummary | null;
       rootTaskId?: string | null;
       actionTaskId?: string | null;
       executionChainRef?: string | null;
@@ -1979,6 +2028,7 @@ export async function submitSessionTurn(
       eventStreamNextSequence,
       createdSession: raw.createdSession,
       route: raw.route,
+      sessionSummary: raw.sessionSummary ? normalizeSessionSummary(raw.sessionSummary) : null,
       rootTaskId: typeof raw.rootTaskId === 'string' && raw.rootTaskId.trim() ? raw.rootTaskId.trim() : null,
       actionTaskId: typeof raw.actionTaskId === 'string' && raw.actionTaskId.trim()
         ? raw.actionTaskId.trim()
@@ -2295,7 +2345,7 @@ export interface WorkspaceVcsStatus {
 export async function fetchWorkspaceBranches(
   bindingOverride?: AgentBindingOverride,
 ): Promise<WorkspaceBranchesResult> {
-  return await postBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', { includeRemote: true }, 'fetch workspace branches', bindingOverride);
+  return await postWorkspacePathBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', { includeRemote: true }, 'fetch workspace branches', bindingOverride);
 }
 
 interface GitExpectedContext {
@@ -2319,7 +2369,7 @@ export async function checkoutWorkspaceBranch(
   expected?: GitExpectedContext,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/switch', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/branch/switch', {
     branch,
     ...gitExpectedPayload(expected),
   }, 'switch workspace branch', bindingOverride);
@@ -2345,7 +2395,7 @@ export async function createWorkspaceBranch(
   expected?: GitExpectedContext,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/create', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/branch/create', {
     branch,
     switch: true,
     ...gitExpectedPayload(expected),
@@ -2357,7 +2407,7 @@ export async function previewWorkspaceMerge(
   expected?: GitExpectedContext,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/merge/preview', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/merge/preview', {
     target,
     ...gitExpectedPayload(expected),
   }, 'preview workspace merge', bindingOverride);
@@ -2369,7 +2419,7 @@ export async function mergeWorkspaceBranch(
   expected?: GitExpectedContext,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/merge', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/merge', {
     target,
     ffOnly,
     confirm: true,
@@ -2383,7 +2433,7 @@ export async function deleteWorkspaceBranch(
   expected?: GitExpectedContext,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/delete', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/branch/delete', {
     branch,
     ...options,
     ...gitExpectedPayload(expected),
@@ -2393,7 +2443,7 @@ export async function deleteWorkspaceBranch(
 export async function fetchWorkspaceWorktrees(
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/list', {}, 'list workspace worktrees', bindingOverride);
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/list', {}, 'list workspace worktrees', bindingOverride);
 }
 
 export async function createWorkspaceWorktree(
@@ -2402,7 +2452,7 @@ export async function createWorkspaceWorktree(
   expected?: GitExpectedContext,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/create', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/create', {
     mode,
     ...options,
     ...gitExpectedPayload(expected),
@@ -2415,7 +2465,7 @@ export async function removeWorkspaceWorktree(
   expected?: GitExpectedContext,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/remove', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/remove', {
     path,
     ...options,
     ...gitExpectedPayload(expected),
@@ -2426,7 +2476,7 @@ export async function acceptWorkspaceGitContext(
   expectedContextRevision: number | null,
   bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
-  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/context/accept', {
+  return await postWorkspacePathBoundJson<GitOperationResult>('/api/workspace/vcs/context/accept', {
     ...(typeof expectedContextRevision === 'number'
       ? { expectedContextRevision }
       : {}),
@@ -2434,7 +2484,7 @@ export async function acceptWorkspaceGitContext(
 }
 
 export async function updateAgentRuntimeSetting(key: string, value: unknown): Promise<AgentRuntimeSettings> {
-  const payload = await postWorkspaceBoundJson<AgentRuntimeSettings>('/api/settings/update', { key, value }, 'update runtime setting');
+  const payload = await postGlobalJson<AgentRuntimeSettings>('/api/settings/update', { key, value }, 'update runtime setting');
   if (key === 'locale' && (payload?.locale === 'zh-CN' || payload?.locale === 'en-US')) {
     safeWriteLocalStorage('magi-locale', payload.locale);
     i18n.setLocale(payload.locale);
@@ -2443,15 +2493,15 @@ export async function updateAgentRuntimeSetting(key: string, value: unknown): Pr
 }
 
 export async function saveAgentWorkerConfig(worker: string, config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/worker/save', { worker, config }, 'save worker config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/worker/save', { worker, config }, 'save worker config');
 }
 
 export async function saveAgentUserRules(data: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/user-rules/save', data, 'save user rules');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/user-rules/save', data, 'save user rules');
 }
 
 export async function saveAgentOrchestratorConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/orchestrator/save', config, 'save orchestrator config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/orchestrator/save', config, 'save orchestrator config');
 }
 
 export async function saveAgentOrchestratorSessionConfig(
@@ -2474,7 +2524,7 @@ export async function saveAgentModelContextWindow(
   model: string,
   contextWindowTokens: number,
 ): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>(
+  return await postGlobalJson<Record<string, unknown>>(
     '/api/settings/model-context-window/save',
     { model, contextWindowTokens },
     'save model context window',
@@ -2482,82 +2532,82 @@ export async function saveAgentModelContextWindow(
 }
 
 export async function saveAgentAuxiliaryConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/save', config, 'save auxiliary config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/auxiliary/save', config, 'save auxiliary config');
 }
 
 export async function saveAgentVisionConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/vision/save', config, 'save vision config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/vision/save', config, 'save vision config');
 }
 
 export async function saveAgentImageGenerationConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/image-generation/save', config, 'save image generation config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/image-generation/save', config, 'save image generation config');
 }
 
 export async function removeAgentWorkerConfig(worker: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/worker/remove', { worker }, 'remove worker config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/worker/remove', { worker }, 'remove worker config');
 }
 
 export async function testAgentWorkerConnection(worker: string, config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/worker/test', { worker, config }, 'test worker connection');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/worker/test', { worker, config }, 'test worker connection');
 }
 
 export async function testAgentOrchestratorConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/orchestrator/test', config, 'test orchestrator connection');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/orchestrator/test', config, 'test orchestrator connection');
 }
 
 export async function testAgentAuxiliaryConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/test', config, 'test auxiliary connection');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/auxiliary/test', config, 'test auxiliary connection');
 }
 
 export async function testAgentVisionConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/vision/test', config, 'test vision connection');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/vision/test', config, 'test vision connection');
 }
 
 export async function testAgentImageGenerationConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/image-generation/test', config, 'test image generation connection');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/image-generation/test', config, 'test image generation connection');
 }
 
 
 export async function listAgentRoleTemplates(): Promise<RoleTemplate[]> {
-  const response = await getTransport().request(agentUrl('/api/settings/registry/role-templates', buildWorkspaceBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/registry/role-templates'));
   const payload = await parseAgentJson<{ templates?: RoleTemplate[] }>(response, 'load role templates');
   return Array.isArray(payload.templates) ? payload.templates : [];
 }
 
 export async function listAgentRegistryEngines(): Promise<ModelEngine[]> {
-  const response = await getTransport().request(agentUrl('/api/settings/registry/engines', buildWorkspaceBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/registry/engines'));
   const payload = await parseAgentJson<{ engines?: ModelEngine[] }>(response, 'load registry engines');
   return Array.isArray(payload.engines) ? payload.engines : [];
 }
 
 export async function listAgentRegistryAgents(): Promise<AgentBinding[]> {
-  const response = await getTransport().request(agentUrl('/api/settings/registry/agents', buildWorkspaceBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/registry/agents'));
   const payload = await parseAgentJson<{ agents?: AgentBinding[] }>(response, 'load registry agents');
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
 export async function upsertAgentRegistryEngine(engine: ModelEngine): Promise<ModelEngine[]> {
-  const payload = await postWorkspaceBoundJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/upsert', engine as unknown as Record<string, unknown>, 'upsert registry engine');
+  const payload = await postGlobalJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/upsert', engine as unknown as Record<string, unknown>, 'upsert registry engine');
   return Array.isArray(payload.engines) ? payload.engines : [];
 }
 
 export async function removeAgentRegistryEngine(engineId: string): Promise<ModelEngine[]> {
-  const payload = await postWorkspaceBoundJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/remove', { engineId }, 'remove registry engine');
+  const payload = await postGlobalJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/remove', { engineId }, 'remove registry engine');
   return Array.isArray(payload.engines) ? payload.engines : [];
 }
 
 export async function upsertAgentRegistryBinding(agent: AgentBinding): Promise<AgentBinding[]> {
-  const payload = await postWorkspaceBoundJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/upsert', agent as unknown as Record<string, unknown>, 'upsert registry agent');
+  const payload = await postGlobalJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/upsert', agent as unknown as Record<string, unknown>, 'upsert registry agent');
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
 export async function removeAgentRegistryBinding(templateId: string): Promise<AgentBinding[]> {
-  const payload = await postWorkspaceBoundJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/remove', { templateId }, 'remove registry agent');
+  const payload = await postGlobalJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/remove', { templateId }, 'remove registry agent');
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
 export async function fetchAgentModelList(config: Record<string, unknown>, target: string): Promise<FetchModelsResponseDto> {
-  return await postWorkspaceBoundJson<FetchModelsResponseDto>('/api/settings/models/fetch', { config, target }, 'fetch model list');
+  return await postGlobalJson<FetchModelsResponseDto>('/api/settings/models/fetch', { config, target }, 'fetch model list');
 }
 
 export async function clearAgentProjectKnowledge(
@@ -2811,16 +2861,16 @@ export async function deleteAgentKnowledgeRelation(
 }
 
 export async function loadAgentMcpServers(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/settings/mcp', buildWorkspaceBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/mcp'));
   return await parseAgentJson<Record<string, unknown>>(response, 'load mcp servers');
 }
 
 export async function addAgentMcpServer(server: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/add', normalizeMcpServerConfig(server), 'add mcp server');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/add', normalizeMcpServerConfig(server), 'add mcp server');
 }
 
 export async function updateAgentMcpServer(serverId: string, updates: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>(
+  return await postGlobalJson<Record<string, unknown>>(
     '/api/settings/mcp/update',
     normalizeMcpServerConfig({ ...updates, id: serverId, serverId }),
     'update mcp server',
@@ -2828,53 +2878,53 @@ export async function updateAgentMcpServer(serverId: string, updates: Record<str
 }
 
 export async function deleteAgentMcpServer(serverId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/delete', { serverId }, 'delete mcp server');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/delete', { serverId }, 'delete mcp server');
 }
 
 export async function getAgentMcpServerTools(serverId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/tools', { serverId }, 'get mcp server tools');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/tools', { serverId }, 'get mcp server tools');
 }
 
 export async function refreshAgentMcpTools(serverId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/tools/refresh', { serverId }, 'refresh mcp tools');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/tools/refresh', { serverId }, 'refresh mcp tools');
 }
 
 export async function connectAgentMcpServer(serverId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/connect', { serverId }, 'connect mcp server');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/connect', { serverId }, 'connect mcp server');
 }
 
 export async function disconnectAgentMcpServer(serverId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/disconnect', { serverId }, 'disconnect mcp server');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/mcp/disconnect', { serverId }, 'disconnect mcp server');
 }
 
 export async function loadAgentRepositories(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/settings/repositories', buildWorkspaceBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/repositories'));
   return await parseAgentJson<Record<string, unknown>>(response, 'load repositories');
 }
 
 export async function addAgentRepository(url: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/add', { url }, 'add repository');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/repositories/add', { url }, 'add repository');
 }
 
 export async function updateAgentRepository(repositoryId: string, updates: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/update', { repositoryId, updates }, 'update repository');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/repositories/update', { repositoryId, updates }, 'update repository');
 }
 
 export async function deleteAgentRepository(repositoryId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/delete', { repositoryId }, 'delete repository');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/repositories/delete', { repositoryId }, 'delete repository');
 }
 
 export async function refreshAgentRepository(repositoryId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/refresh', { repositoryId }, 'refresh repository');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/repositories/refresh', { repositoryId }, 'refresh repository');
 }
 
 export async function loadAgentSkillLibrary(): Promise<SkillsLibraryResponseDto> {
-  const response = await getTransport().request(agentUrl('/api/settings/skills/library', buildWorkspaceBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/skills/library'));
   return await parseAgentJson<SkillsLibraryResponseDto>(response, 'load skill library');
 }
 
 export async function installAgentSkill(skillId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/install', { skillId }, 'install skill');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/install', { skillId }, 'install skill');
 }
 
 export interface AgentLocalSkillInstallRequest {
@@ -2896,19 +2946,19 @@ export async function installAgentLocalSkill(
       payload.skillId = request.skillId;
     }
   }
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/install-local', payload, 'install local skill');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/install-local', payload, 'install local skill');
 }
 
 export async function scanAgentLocalSkillDirectory(directoryPath: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/scan-local', { directoryPath }, 'scan local skill directory');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/scan-local', { directoryPath }, 'scan local skill directory');
 }
 
 export async function saveAgentSkillsConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/config/save', config, 'save skills config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/config/save', config, 'save skills config');
 }
 
 export async function toggleAgentSkill(skillId: string, enabled: boolean): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>(
+  return await postGlobalJson<Record<string, unknown>>(
     '/api/settings/skills/toggle',
     { skillId, enabled },
     'toggle skill',
@@ -2916,33 +2966,33 @@ export async function toggleAgentSkill(skillId: string, enabled: boolean): Promi
 }
 
 export async function saveAgentSafeguardConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/safeguard/save', config, 'save safeguard config');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/safeguard/save', config, 'save safeguard config');
 }
 
 export async function addAgentCustomTool(tool: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/custom-tool/add', tool, 'add custom tool');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/custom-tool/add', tool, 'add custom tool');
 }
 
 export type AgentSkillSource = 'custom' | 'instruction';
 
 export async function removeAgentInstalledSkill(skillId: string, source: AgentSkillSource): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/remove', { skillId, source }, 'remove installed skill');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/remove', { skillId, source }, 'remove installed skill');
 }
 
 export async function updateAgentSkill(skillId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/update', { skillId }, 'update skill');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/update', { skillId }, 'update skill');
 }
 
 export async function updateAllAgentSkills(): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/update-all', {}, 'update all skills');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/update-all', {}, 'update all skills');
 }
 
 export async function checkAgentSkillUpdates(): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/check-updates', {}, 'check skill updates');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/check-updates', {}, 'check skill updates');
 }
 
 export async function rollbackAgentSkill(skillId: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/rollback', { skillId }, 'rollback skill');
+  return await postGlobalJson<Record<string, unknown>>('/api/settings/skills/rollback', { skillId }, 'rollback skill');
 }
 
 export interface AgentPendingChangesPayload {
@@ -2963,6 +3013,7 @@ export async function getAgentPendingChanges(
     const query = buildBoundQueryWithOverride(
       options.forceRefresh ? { forceRefresh: 'true' } : {},
       options,
+      { includeScope: false },
     );
     const response = await getTransport().request(agentUrl('/api/changes', query));
     return await parseAgentJson<AgentPendingChangesPayload>(response, 'load pending changes');
@@ -2979,7 +3030,7 @@ export async function getAgentChangeDiff(
   options: WorkspaceAgentBindingOverride,
 ): Promise<AgentChangeDiffPayload> {
   try {
-    const query = buildBoundQueryWithOverride({ filePath }, options);
+    const query = buildBoundQueryWithOverride({ filePath }, options, { includeScope: false });
     const response = await getTransport().request(agentUrl(`/api/changes/diff`, query));
     return await parseAgentJson<AgentChangeDiffPayload>(response, 'load change diff');
   } catch (error) {

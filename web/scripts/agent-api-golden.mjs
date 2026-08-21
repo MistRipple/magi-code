@@ -61,6 +61,11 @@ await withGoldenViteServer(async (server) => {
   assert.equal(defaultPreviewQuery.get('workspacePath'), '/tmp/workspace-query-golden');
   assert.equal(defaultPreviewQuery.get('filePath'), 'src/main.ts');
   assert.equal(
+    defaultPreviewQuery.has('scope'),
+    false,
+    'file preview query must only contain fields declared by the file preview endpoints',
+  );
+  assert.equal(
     defaultPreviewQuery.has('sessionId'),
     false,
     'file preview must default to workspace scope to avoid stale session binding failures',
@@ -229,6 +234,11 @@ await withGoldenViteServer(async (server) => {
     assert.equal(changesUrl.searchParams.get('workspaceId'), 'workspace-knowledge-override');
     assert.equal(changesUrl.searchParams.get('workspacePath'), '/tmp/workspace-knowledge-override');
     assert.equal(changesUrl.searchParams.get('sessionId'), 'session-changes-refresh');
+    assert.equal(
+      changesUrl.searchParams.has('scope'),
+      false,
+      'changes query must not send the session scope field to the changes endpoint',
+    );
   } finally {
     if (originalFetch === undefined) {
       delete globalThis.fetch;
@@ -278,6 +288,9 @@ await withGoldenViteServer(async (server) => {
       'Git UI helpers must use only the structured workspace VCS endpoints',
     );
     assert.equal(gitRequests[0].body.includeRemote, true);
+    assert.equal(gitRequests[0].body.workspaceId, undefined);
+    assert.equal(gitRequests[0].body.workspacePath, undefined);
+    assert.equal(gitRequests[0].body.sessionId, 'session-query-golden');
     assert.equal(gitRequests[2].body.confirm, true);
     assert.equal(gitRequests[3].body.confirmForce, true);
     assert.equal(gitRequests[5].body.expectedContextRevision, 7);
@@ -446,8 +459,6 @@ await withGoldenViteServer(async (server) => {
         method: 'POST',
         body: {
           ...imageConfig,
-          workspaceId: 'workspace-query-golden',
-          workspacePath: '/tmp/workspace-query-golden',
         },
       },
       {
@@ -455,8 +466,6 @@ await withGoldenViteServer(async (server) => {
         method: 'POST',
         body: {
           ...imageConfig,
-          workspaceId: 'workspace-query-golden',
-          workspacePath: '/tmp/workspace-query-golden',
         },
       },
     ]);

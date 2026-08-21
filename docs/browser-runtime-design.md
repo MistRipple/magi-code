@@ -437,7 +437,7 @@ BrowserAuthority 不再持久化：
 
 - `activeTabId`
 - WebContents id、Target id、BrowserContext id
-- viewport、scale、物理 bounds
+- viewport、物理 bounds
 - Agent Lease、用户控制模式和光标
 - Window、Desktop 或 Surface identity
 
@@ -761,9 +761,10 @@ viewport 只属于 `BrowserSurfaceInstance`：
 - 窄屏 `390 x 844`
 - 用户自定义 width/height
 
-输入短防抖动态生效，无确认按钮。Worker 使用 `Emulation.setDeviceMetricsOverride` 设置 CSS viewport、device scale factor、screen、touch、orientation、UA 和 Client Hints。
+输入短防抖动态生效，无确认按钮。Worker 使用 `Emulation.setDeviceMetricsOverride` 设置 CSS viewport、device scale factor、screen、orientation、UA 和 Client Hints。
 
-- 不对页面截图、Canvas 或 DOM 做外层缩放；宽屏/窄屏/自定义模式只通过 Chromium device metrics 改变 CSS viewport，并使用 `Emulation.setDeviceMetricsOverride.scale` 将仿真视口的合成结果等比适配当前内容槽。该 scale 是 Chromium 内部设备仿真参数，不是 Magi DOM transform，不改变 CSS px、元素坐标或页面布局。
+- 不对页面截图、Canvas、DOM 或 Chromium 仿真结果做外层缩放。宽屏/窄屏/自定义模式只通过 Chromium device metrics 改变当前 Surface 的 CSS viewport；右栏内容槽只改变原生 `WebContentsView` 的物理 bounds，不能参与 viewport 参数计算或触发 viewport 重设。
+- `auto` 下，Chromium 根据原生 `WebContentsView` 的实际内容槽自然触发页面 resize；`fixed` 下，页面 CSS 宽高保持用户选择的逻辑值，右栏拖动不会改变媒体查询、DOM 坐标或页面运行态。
 - 用户输入由 Chromium `WebContentsView` 命中测试处理，不由 Svelte 转换坐标。
 - 工具坐标保持 CSS px；CDP 截图 clip 与 ElementRef 统一使用 CSS px。
 - viewport 修改只使当前 Surface 的 snapshot revision 失效，不导航、不刷新、不创建页面。
@@ -1167,7 +1168,7 @@ CI 增加废码门禁，扫描旧模块、旧命令、CEF/Tauri 依赖、独立 
 - CDP method allowlist 和错误规范化测试。
 - 每 Surface 串行队列、取消和 fence 测试。
 - Popup 创建前阻断测试，CDP Target 数始终不增加。
-- viewport scale、输入坐标和截图坐标测试。
+- viewport 与物理内容槽解耦、输入坐标和截图坐标测试。
 - Annotation/Artifact 关闭 Tab 后访问测试。
 - daemon/Worker parent death 和孤儿清理测试。
 - 打包解包、manifest、哈希、签名和公证测试。

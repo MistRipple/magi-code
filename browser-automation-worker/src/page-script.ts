@@ -274,7 +274,13 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     addEventListener('scroll', scheduleAnnotationRender, true);
     addEventListener('resize', scheduleAnnotationRender, true);
     state.annotationObserver = new MutationObserver((records) => {
-      if (records.some((record) => !(state.annotationLayer && state.annotationLayer.contains(record.target)))) {
+      const isAnnotationMutation = (target) => (
+        target === state.annotationLayer
+        || target === state.annotationShadow
+        || Boolean(state.annotationLayer?.contains(target))
+        || Boolean(state.annotationShadow?.contains(target))
+      );
+      if (records.some((record) => !isAnnotationMutation(record.target))) {
         scheduleAnnotationRender();
       }
     });

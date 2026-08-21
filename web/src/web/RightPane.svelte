@@ -322,12 +322,10 @@
         if (!navigation) {
           throw new Error('当前已有会话导航操作正在进行');
         }
-        // 主视图导航与浏览器资源创建并行推进。后端会话已经由
-        // materializeSession 建立，右栏不应等待另一个 Renderer 的 URL
-        // 收敛，否则浏览器新增操作会被无期限阻塞。
-        void waitForSessionNavigation(navigation).catch((error) => {
-          console.warn('[RightPane] 浏览器会话导航收敛失败:', error);
-        });
+        // materialize 创建的是主会话事实，浏览器资源必须在主视图完成
+        // 导航后再创建。并行创建会让 Composer 仍处于草稿态时收到浏览器
+        // 会话事件，进而把该会话错误地接管为当前对话。
+        await waitForSessionNavigation(navigation);
       }
       const browserSession = await createBrowserSession(workspaceId, sessionId, workspaceRoot);
       const tab = await createBrowserTab(
@@ -697,6 +695,14 @@
       workspacePath: activeCodePayload?.workspacePath,
     });
   });
+  const activeSitePreviewQuery = $derived.by(() => {
+    if (!activeFilePath) return '';
+    return buildFilePreviewQuery(activeFilePath, {
+      includeSession: false,
+      workspaceId: activeCodePayload?.workspaceId,
+      workspacePath: activeCodePayload?.workspacePath,
+    });
+  });
 
   // 异步内容缓存跟随当前 Tab 集合裁剪，关闭预览后立即释放对应内容。
   $effect(() => {
@@ -1000,7 +1006,7 @@
       const browserSession = await createBrowserSession(workspaceId, sessionId, workspaceRoot);
       const tab = await createBrowserTab(
         browserSession.browserSessionId,
-        agentUrl('/api/files/site-open', activeFilePreviewQuery),
+        agentUrl('/api/files/site-open', activeSitePreviewQuery),
       );
       registerBrowserPane(
         browserSession.browserSessionId,

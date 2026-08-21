@@ -3,11 +3,54 @@ use magi_conversation_runtime::context_reference::{
 };
 use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_core::{AccessProfile, EventId, SessionId, TaskId, UtcMillis};
-use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem};
+use magi_session_store::{
+    CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem, SessionRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::SessionScopeKindDto;
+
+/// 首条消息 accepted 时随事件/响应发布的权威会话目录增量。
+///
+/// 会话目录列表只是 bootstrap 快照；新会话创建必须通过这条增量进入
+/// 客户端目录，避免旧快照在异步返回时覆盖新事实。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDirectoryEntryDto {
+    pub session_id: String,
+    pub workspace_id: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: usize,
+    pub is_running: bool,
+    pub running_task_count: usize,
+    pub has_unread_completion: bool,
+}
+
+impl SessionDirectoryEntryDto {
+    pub fn from_record(
+        session: SessionRecord,
+        is_running: bool,
+        running_task_count: usize,
+    ) -> Self {
+        let has_unread_completion = session.has_unread_completion();
+        Self {
+            session_id: session.session_id.to_string(),
+            workspace_id: session.workspace_id,
+            title: session.title,
+            status: format!("{:?}", session.status),
+            created_at: session.created_at.0,
+            updated_at: session.updated_at.0,
+            message_count: session.message_count.unwrap_or(0),
+            is_running,
+            running_task_count,
+            has_unread_completion,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -298,6 +341,8 @@ pub struct SessionTurnResponseDto {
     pub created_session: bool,
     pub route: SessionTurnRouteDto,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_summary: Option<SessionDirectoryEntryDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_task_id: Option<String>,
@@ -363,6 +408,7 @@ impl SessionTurnResponseDto {
             event_stream_next_sequence,
             created_session,
             route,
+            session_summary: None,
             root_task_id: root_task_id.map(|task_id| task_id.to_string()),
             action_task_id: action_task_id.map(|task_id| task_id.to_string()),
             execution_chain_ref,
@@ -382,6 +428,14 @@ impl SessionTurnResponseDto {
         self.queued = true;
         self.queue_id = Some(queue_id);
         self.queue_position = Some(queue_position);
+        self
+    }
+
+    pub fn with_session_summary(
+        mut self,
+        session_summary: Option<SessionDirectoryEntryDto>,
+    ) -> Self {
+        self.session_summary = session_summary;
         self
     }
 

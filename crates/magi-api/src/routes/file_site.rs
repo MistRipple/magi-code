@@ -24,7 +24,7 @@ pub fn routes() -> Router<ApiState> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SiteOpenQuery {
     workspace_id: Option<String>,
     workspace_path: Option<String>,
@@ -363,7 +363,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/files/site-open?workspaceId=workspace-site&filePath=index.html&tunnel_token=transport-secret")
+                    .uri("/files/site-open?workspaceId=workspace-site&filePath=index.html")
                     .body(Body::empty())
                     .expect("request should build"),
             )

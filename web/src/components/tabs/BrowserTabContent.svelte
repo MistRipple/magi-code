@@ -683,6 +683,7 @@
         }
       }
       if (action.id === 'auto') {
+        desktopOverlayId = null;
         void run(async () => {
           await updateLogicalViewport('auto');
           closeDesktopOverlay();
@@ -691,6 +692,7 @@
       }
       const preset = VIEWPORT_DEVICE_MODES.find((mode) => mode.id === action.id);
       if (preset) {
+        desktopOverlayId = null;
         void run(async () => {
           await updateLogicalViewport('fixed', {
             width: preset.width,
@@ -708,7 +710,13 @@
       }
     });
     const unsubscribeOverlayState = desktop?.onOverlayState((state) => {
-      if (state.ownerId !== `browser:${tabId}`) desktopOverlayId = null;
+      if (state.ownerId === `browser:${tabId}`) {
+        // 原生弹层状态是唯一事实源；Renderer 重载或外部完成关闭后，
+        // 这里也会自动修复本地残留的 overlay id。
+        desktopOverlayId = state.overlayId;
+      } else {
+        desktopOverlayId = null;
+      }
     });
     const unsubscribeOverlayClosed = desktop?.onOverlayClosed(() => {
       desktopOverlayId = null;

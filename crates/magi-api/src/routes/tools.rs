@@ -8,15 +8,16 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 use super::session_scope;
-use crate::{errors::ApiError, state::ApiState};
+use crate::{dto::SessionScopeKindDto, errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
     Router::new().route("/tools/catalog", get(get_tool_catalog))
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ToolCatalogQuery {
+    scope: SessionScopeKindDto,
     #[serde(default)]
     include_internal: Option<bool>,
     #[serde(default)]
@@ -91,8 +92,9 @@ impl ToolCatalogQuery {
         &self,
         state: &ApiState,
     ) -> Result<magi_tool_runtime::ToolExecutionContext, ApiError> {
-        let mut context = session_scope::resolve_optional_session_workspace_scope(
+        let mut context = session_scope::resolve_optional_explicit_session_scope(
             state,
+            self.scope,
             self.session_id.as_deref(),
             self.workspace_id.as_deref(),
             self.workspace_path.as_deref(),
@@ -172,12 +174,14 @@ mod tests {
     #[test]
     fn tool_catalog_query_rejects_legacy_snake_case_fields() {
         serde_json::from_value::<ToolCatalogQuery>(serde_json::json!({
+            "scope": "workspace",
             "include_internal": true,
             "workspace_id": "workspace-tools"
         }))
         .expect_err("tools catalog query 不得继续接受 snake_case 请求字段");
 
         let query = serde_json::from_value::<ToolCatalogQuery>(serde_json::json!({
+            "scope": "workspace",
             "includeInternal": true,
             "workspaceId": "workspace-tools"
         }))
@@ -201,7 +205,7 @@ mod tests {
 
         let (status, body) = get_json(
             app,
-            "/tools/catalog?workspaceId=workspace-tools&sessionId=session-tools",
+            "/tools/catalog?scope=workspace&workspaceId=workspace-tools&sessionId=session-tools",
         )
         .await;
 
@@ -233,7 +237,8 @@ mod tests {
             .merge(routes())
             .with_state(test_state_with_tool_registry());
 
-        let (status, body) = get_json(app, "/tools/catalog?refreshEnvironment=true").await;
+        let (status, body) =
+            get_json(app, "/tools/catalog?scope=personal&refreshEnvironment=true").await;
 
         assert_eq!(status, StatusCode::OK);
         assert!(
@@ -253,7 +258,11 @@ mod tests {
             .merge(routes())
             .with_state(test_state_with_tool_registry());
 
-        let (status, body) = get_json(app, "/tools/catalog?accessProfile=full_access").await;
+        let (status, body) = get_json(
+            app,
+            "/tools/catalog?scope=personal&accessProfile=full_access",
+        )
+        .await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["currentAccessProfile"], "full_access");
@@ -281,7 +290,7 @@ mod tests {
 
         let (status, body) = get_json(
             app,
-            "/tools/catalog?includeInternal=true&includeSchema=true",
+            "/tools/catalog?scope=personal&includeInternal=true&includeSchema=true",
         )
         .await;
 
@@ -322,7 +331,7 @@ mod tests {
         let (status, body) = get_json(
             app,
             &format!(
-                "/tools/catalog?workspaceId={}&sessionId={}",
+                "/tools/catalog?scope=workspace&workspaceId={}&sessionId={}",
                 workspace_a, session_b
             ),
         )
@@ -353,7 +362,7 @@ mod tests {
         let (status, body) = get_json(
             app,
             &format!(
-                "/tools/catalog?workspaceId=workspace-stale-query&workspacePath={}&sessionId={}",
+                "/tools/catalog?scope=workspace&workspaceId=workspace-stale-query&workspacePath={}&sessionId={}",
                 workspace_path,
                 session_id.as_str()
             ),
@@ -390,7 +399,7 @@ mod tests {
         let (status, body) = get_json(
             app,
             &format!(
-                "/tools/catalog?workspaceId={}&workspacePath=/tmp/magi-tools-test-workspace&sessionId={}",
+                "/tools/catalog?scope=workspace&workspaceId={}&workspacePath=/tmp/magi-tools-test-workspace&sessionId={}",
                 workspace_b,
                 session_b.as_str()
             ),

@@ -354,6 +354,14 @@
     border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
   }
 
+  /* Desktop 中栏的 app-container 提供结构性磨砂层。Header 只保留结构
+     边界和控件状态，不能再使用更不透明的 glass-bg 覆盖中栏材质。 */
+  :global([data-magi-desktop-surface='app']) .header-bar {
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
   .header-center {
     display: flex;
     flex: 1;

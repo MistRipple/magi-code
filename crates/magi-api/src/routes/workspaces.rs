@@ -123,7 +123,7 @@ async fn list_workspaces(State(state): State<ApiState>) -> Json<WorkspaceListRes
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RegisterWorkspaceRequest {
     path: String,
 }
@@ -228,7 +228,7 @@ fn workspace_root_matches(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RemoveWorkspaceRequest {
     workspace_id: String,
 }

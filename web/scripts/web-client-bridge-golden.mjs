@@ -627,7 +627,7 @@ function completedCanonicalTurn() {
   };
 }
 
-function acceptedEnvelope() {
+function acceptedEnvelope(requestId = '') {
   const canonicalItem = acceptedCanonicalUserItem();
   return {
     event_id: `event-session-turn-task-${ACCEPTED_AT}`,
@@ -642,6 +642,19 @@ function acceptedEnvelope() {
       workspace_id: WORKSPACE_ID,
       created_session: true,
       route: 'chat',
+      session_summary: {
+        sessionId: SESSION_ID,
+        workspaceId: WORKSPACE_ID,
+        title: '新建会话',
+        status: 'Running',
+        createdAt: ACCEPTED_AT,
+        updatedAt: ACCEPTED_AT,
+        messageCount: 1,
+        isRunning: true,
+        runningTaskCount: 1,
+        hasUnreadCompletion: false,
+      },
+      ...(requestId ? { request_id: requestId, requestId } : {}),
       canonical_schema_version: 'canonical-turn.v1',
       canonical_event_kind: 'turn_started',
       canonical_turn: {
@@ -915,12 +928,43 @@ await withGoldenViteServer(async (server) => {
   const recoveredStream = FakeEventSource.instances.at(-1);
   recoveredStream.onopen?.();
 
-  recoveredStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope()) });
+  const liveAcceptedRequestId = 'request-live-accepted';
+  const liveAcceptedResponse = deferred();
+  sessionTurnInterceptors.push(() => liveAcceptedResponse.promise);
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '通过真实 submission context 建立会话。',
+    requestId: liveAcceptedRequestId,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: '',
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === liveAcceptedRequestId),
+    'workspace-only page 首条提交必须建立 submission context',
+  );
+  recoveredStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope(liveAcceptedRequestId)) });
   acceptedPublished = true;
   await waitFor(
     () => messagesStore.messagesState.currentSessionId === SESSION_ID,
     'workspace-only page must adopt live accepted session',
   );
+  liveAcceptedResponse.resolve(jsonResponse({
+    sessionId: SESSION_ID,
+    entryId: 'timeline-live-accepted',
+    eventId: 'event-live-accepted',
+    acceptedAt: ACCEPTED_AT,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    createdSession: true,
+    route: 'chat',
+    userMessageItemId: USER_ITEM_ID,
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  messagesStore.clearPendingRequest(liveAcceptedRequestId);
 
   recoveredStream.onmessage?.({ data: JSON.stringify(contextUsageEnvelope()) });
   assert.deepEqual(
@@ -1002,7 +1046,7 @@ await withGoldenViteServer(async (server) => {
   );
   await waitFor(
     () => messagesStore.messagesState.workspaceSessionProjection.sessions.some((session) => session.id === SESSION_ID),
-    'created live session must refresh the workspace session summary',
+    'created live session must enter the workspace session projection from the accepted increment',
   );
 
   summaryMessageCount = 2;
@@ -1061,6 +1105,7 @@ await withGoldenViteServer(async (server) => {
     'completed',
     'a stale terminal bootstrap must not lift the runtime panel back to running',
   );
+  messagesStore.clearRequestBinding(liveAcceptedRequestId);
 
   const canonicalTurnsBeforeLaterRound = structuredClone(turnStore.turnStoreState.reducer.turns);
   const laterRoundAccepted = deferred();
@@ -1302,6 +1347,155 @@ await withGoldenViteServer(async (server) => {
     '草稿断流恢复只能刷新目录，不能把页面切回旧会话',
   );
 
+  // 草稿态不能被同一工作区其他会话的 accepted 事件接管。
+  recoveredDraftStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope()) });
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    null,
+    '草稿态收到没有 requestId 的其他会话 accepted 事件时必须保持空绑定',
+  );
+
+  // 首条消息的 accepted 事件必须与本次仍在等待的 requestId 关联，不能只
+  // 因为页面处于草稿态就接受任意 sessionId。
+  const draftTurnAccepted = deferred();
+  const draftTurnRequestId = 'request-draft-first-turn';
+  sessionTurnInterceptors.push(() => draftTurnAccepted.promise);
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '新会话首条消息必须绑定到本次提交。',
+    requestId: draftTurnRequestId,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: '',
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === draftTurnRequestId),
+    '新会话首条消息必须到达 session turn 接口',
+  );
+  const draftTurnBody = capturedTurnBodies.find((body) => body.requestId === draftTurnRequestId);
+  assert.equal(
+    draftTurnBody.sessionId,
+    null,
+    '新会话首条消息不能把本地或其他会话 ID 作为显式 sessionId 发送',
+  );
+  const staleDraftBootstrap = bootstrapPayload();
+  bootstrapInterceptors.push(() => jsonResponse({
+    ...staleDraftBootstrap,
+    currentSession: null,
+    state: {
+      ...staleDraftBootstrap.state,
+      currentSessionId: '',
+    },
+    timeline: [],
+    canonicalTurns: [],
+  }));
+  bridge.postMessage({ type: 'requestState' });
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId?.startsWith(`session-local-${draftTurnRequestId}`),
+    'pending 首条消息收到空会话 bootstrap 时必须保留本地会话锚点',
+  );
+  recoveredDraftStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope('request-draft-foreign')) });
+  assert.equal(
+    messagesStore.messagesState.currentSessionId?.startsWith(`session-local-${draftTurnRequestId}`),
+    true,
+    '草稿态收到其他 requestId 的 accepted 事件时必须保持当前本地提交上下文',
+  );
+  recoveredDraftStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope(draftTurnRequestId)) });
+  assert.notEqual(
+    messagesStore.messagesState.currentSessionId,
+    null,
+    '与当前首条消息 requestId 匹配的 accepted 事件必须建立会话绑定',
+  );
+  draftTurnAccepted.resolve(jsonResponse({
+    sessionId: SESSION_ID,
+    entryId: 'timeline-draft-first-turn',
+    eventId: 'event-draft-first-turn',
+    acceptedAt: ACCEPTED_AT + 2900,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    createdSession: true,
+    route: 'chat',
+    userMessageItemId: 'user-draft-first-turn',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId === SESSION_ID,
+    '新会话首条消息 accepted 后必须绑定服务端返回的 session',
+  );
+  // 该夹具只验证首条消息的绑定，不模拟后续 terminal event。显式结束本次
+  // 请求绑定，保证后面的导航/排队场景不会把它当作仍在运行的本地 turn。
+  messagesStore.clearPendingRequest(draftTurnRequestId);
+  messagesStore.clearRequestBinding(draftTurnRequestId);
+
+  // HTTP accepted 返回晚于用户切换草稿时，旧提交不能重新夺回 currentSessionId。
+  const staleDraftTurnAccepted = deferred();
+  const staleDraftTurnRequestId = 'request-stale-draft-after-navigation';
+  sessionTurnInterceptors.push(() => staleDraftTurnAccepted.promise);
+  bridge.postMessage({
+    type: 'navigateSession',
+    target: 'draft',
+    scope: 'workspace',
+    requestId: 'navigation-enter-stale-draft',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => !messagesStore.messagesState.currentSessionId,
+    '切换新草稿必须先清除已提交会话绑定',
+  );
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '旧草稿提交不能污染后续草稿。',
+    requestId: staleDraftTurnRequestId,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: '',
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === staleDraftTurnRequestId),
+    '旧草稿提交必须到达后端后再模拟导航竞态',
+  );
+  const staleDraftLocalSessionId = messagesStore.messagesState.currentSessionId;
+  assert.ok(staleDraftLocalSessionId?.startsWith(`session-local-${staleDraftTurnRequestId}`));
+  bridge.postMessage({
+    type: 'navigateSession',
+    target: 'draft',
+    scope: 'workspace',
+    requestId: 'navigation-replace-stale-draft',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => !messagesStore.messagesState.currentSessionId
+      && messagesStore.messagesState.currentSessionId !== staleDraftLocalSessionId,
+    '用户进入新的草稿后旧本地会话必须失效',
+  );
+  staleDraftTurnAccepted.resolve(jsonResponse({
+    sessionId: 'session-stale-draft-response',
+    entryId: 'timeline-stale-draft-response',
+    eventId: 'event-stale-draft-response',
+    acceptedAt: ACCEPTED_AT + 3001,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    createdSession: true,
+    route: 'chat',
+    userMessageItemId: 'user-stale-draft-response',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    null,
+    '旧草稿 HTTP accepted 返回后不得恢复已失效的 sessionId',
+  );
+  messagesStore.clearRequestBinding(staleDraftTurnRequestId);
+
   bridge.postMessage({
     type: 'navigateSession',
     target: 'session',
@@ -1315,6 +1509,7 @@ await withGoldenViteServer(async (server) => {
     () => messagesStore.messagesState.currentSessionId === SESSION_ID,
     'selecting an existing session after abandoning the draft must restore it normally',
   );
+
   const streamAfterDraftReturn = FakeEventSource.instances.at(-1);
   streamAfterDraftReturn.onopen?.();
 
@@ -2003,6 +2198,11 @@ await withGoldenViteServer(async (server) => {
   const continueCapturedTurnCount = capturedTurnBodies.length;
   sessionTurnInterceptors.push(() => continueTurnAccepted.promise);
   bridge.postMessage({ type: 'continueTask' });
+  assert.equal(
+    workspaceSessionsRequestCount,
+    continueWorkspaceSessionsRequestCount,
+    'continueTask must not synchronously refresh the workspace session list before submission',
+  );
   await waitFor(
     () => capturedTurnBodies.length === continueCapturedTurnCount + 1,
     'continueTask must submit through the canonical session turn endpoint',
@@ -2014,11 +2214,6 @@ await withGoldenViteServer(async (server) => {
     bootstrapRequestCount,
     continueBootstrapRequestCount,
     'continueTask must not refresh the full bootstrap before submission',
-  );
-  assert.equal(
-    workspaceSessionsRequestCount,
-    continueWorkspaceSessionsRequestCount,
-    'continueTask must not refresh the workspace session list before submission',
   );
   const continueLocalArtifact = findArtifactByRequestId(
     messagesStore.messagesState.canonicalTimelineProjection,
@@ -2051,7 +2246,6 @@ await withGoldenViteServer(async (server) => {
     'continueTask accepted response must keep the request tracked until terminal runtime output arrives',
   );
   assert.equal(bootstrapRequestCount, continueBootstrapRequestCount);
-  assert.equal(workspaceSessionsRequestCount, continueWorkspaceSessionsRequestCount);
   messagesStore.clearPendingRequest(continueTurnBody.requestId);
 
   const slowWorkspaceSessions = deferred();
@@ -2253,6 +2447,153 @@ await withGoldenViteServer(async (server) => {
     'authoritative empty-workspace bootstrap must clear stale session summaries',
   );
   workspaceListPayload = null;
+
+  const directoryRaceSessionId = 'session-directory-race-increment';
+  messagesStore.replaceWorkspaceSessionProjection(
+    RACE_WORKSPACE_ID,
+    [],
+    { runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE + 9 },
+    { allowRuntimeEpochChange: true },
+  );
+  const acceptedDirectorySession = {
+    id: directoryRaceSessionId,
+    workspaceId: RACE_WORKSPACE_ID,
+    name: 'accepted 目录会话',
+    createdAt: ACCEPTED_AT + 4000,
+    updatedAt: ACCEPTED_AT + 4000,
+    messageCount: 1,
+    isRunning: true,
+    runningTaskCount: 1,
+  };
+  assert.equal(
+    messagesStore.upsertAcceptedSessionDirectoryEntry(
+      acceptedDirectorySession,
+      { runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE + 10 },
+    ),
+    true,
+    'accepted directory increment must be applied to the active projection',
+  );
+  assert.equal(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.some((session) => session.id === directoryRaceSessionId),
+    true,
+    'accepted directory increment must make the new session visible immediately',
+  );
+  assert.equal(
+    messagesStore.replaceWorkspaceSessionProjection(
+      RACE_WORKSPACE_ID,
+      [],
+      { runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE + 9 },
+      { allowRuntimeEpochChange: true },
+    ),
+    false,
+    'an older directory snapshot must be rejected after the accepted increment',
+  );
+  assert.equal(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.some((session) => session.id === directoryRaceSessionId),
+    true,
+    'an older directory snapshot must not remove the accepted session',
+  );
+  messagesStore.replaceWorkspaceSessionProjection(
+    RACE_WORKSPACE_ID,
+    [],
+    { runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE + 11 },
+    { allowRuntimeEpochChange: true },
+  );
+  assert.equal(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.some((session) => session.id === directoryRaceSessionId),
+    false,
+    'a newer authoritative snapshot may remove a session that it does not contain',
+  );
+
+  messagesStore.upsertAcceptedSessionDirectoryEntry(
+    acceptedDirectorySession,
+    { runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE + 12 },
+  );
+  messagesStore.replaceWorkspaceSessionProjection(
+    RACE_WORKSPACE_ID,
+    [{
+      ...acceptedDirectorySession,
+      name: '权威目录会话',
+      updatedAt: ACCEPTED_AT + 4001,
+    }],
+    { runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE + 13 },
+    { allowRuntimeEpochChange: true },
+  );
+  assert.equal(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.find((session) => session.id === directoryRaceSessionId)?.name,
+    '权威目录会话',
+    'a newer authoritative snapshot must replace the accepted increment with canonical fields',
+  );
+  messagesStore.replaceWorkspaceSessionProjection(
+    RACE_WORKSPACE_ID,
+    [],
+    { runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE + 14 },
+    { allowRuntimeEpochChange: true },
+  );
+  assert.equal(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.some((session) => session.id === directoryRaceSessionId),
+    false,
+    'once an authoritative directory snapshot confirms the session, normal deletion semantics must resume',
+  );
+
+  // 已提交会话的 HTTP accepted 晚于会话切换时，也不能把 currentSessionId 切回旧会话。
+  const currentCommittedSessionId = messagesStore.messagesState.currentSessionId || SESSION_ID;
+  const staleCommittedTurnAccepted = deferred();
+  const staleCommittedTurnRequestId = 'request-stale-committed-after-navigation';
+  sessionTurnInterceptors.push(() => staleCommittedTurnAccepted.promise);
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '已提交会话的旧响应也不能污染新页面。',
+    requestId: staleCommittedTurnRequestId,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: currentCommittedSessionId,
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === staleCommittedTurnRequestId),
+    '已提交会话的竞态消息必须到达后端后再模拟导航',
+  );
+  sessionNavigationInterceptors.push(() => jsonResponse(scopedBootstrapPayload(
+    RACE_WORKSPACE_ID,
+    RACE_WORKSPACE_PATH,
+    RACE_SESSION_ID,
+    '竞态切换后的会话',
+  )));
+  bridge.postMessage({
+    type: 'navigateSession',
+    target: 'session',
+    scope: 'workspace',
+    requestId: 'navigation-replace-committed-turn',
+    sessionId: RACE_SESSION_ID,
+    workspaceId: RACE_WORKSPACE_ID,
+    workspacePath: RACE_WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId === RACE_SESSION_ID,
+    '切换会话必须先建立新的 currentSessionId',
+  );
+  staleCommittedTurnAccepted.resolve(jsonResponse({
+    sessionId: currentCommittedSessionId,
+    entryId: 'timeline-stale-committed-response',
+    eventId: 'event-stale-committed-response',
+    acceptedAt: ACCEPTED_AT + 3002,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    createdSession: false,
+    route: 'chat',
+    userMessageItemId: 'user-stale-committed-response',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    RACE_SESSION_ID,
+    '旧已提交会话 HTTP accepted 返回后不得夺回新会话的 currentSessionId',
+  );
+  messagesStore.clearRequestBinding(staleCommittedTurnRequestId);
 
   console.log('web client bridge golden replay passed');
 }, {

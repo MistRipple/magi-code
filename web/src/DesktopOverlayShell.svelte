@@ -214,7 +214,6 @@
             class="overlay-item"
             class:selected={item.selected}
             disabled={item.disabled}
-            role="menuitem"
             onclick={() => submit('select', item.id)}
           >
             {#if item.icon}

@@ -52,6 +52,16 @@ test("右栏布局和原生 Surface 使用同一 Main 事务", () => {
   assert.doesNotMatch(windowManagerSource, /updateBrowserSlot/u);
 });
 
+test("原生合成层级固定为 App < Browser < Overlay", () => {
+  assert.match(windowManagerSource, /contentView\.addChildView\(appLayer, 0\)/u);
+  assert.match(windowManagerSource, /contentView\.addChildView\(appView, 1\)/u);
+  assert.match(windowManagerSource, /contentView\.addChildView\(browserLayer, 2\)/u);
+  assert.match(windowManagerSource, /contentView\.addChildView\(overlayLayer, 3\)/u);
+  assert.match(windowManagerSource, /private ensureNativeLayerOrder\([\s\S]*?contentView\.addChildView\(record\.overlayLayer, 3\)/u);
+  assert.match(windowManagerSource, /openOverlay\([\s\S]*?this\.ensureNativeLayerOrder\(record\)/u);
+  assert.match(windowManagerSource, /bindContentSurface\([\s\S]*?this\.ensureNativeLayerOrder\(record\)/u);
+});
+
 test("Renderer 不再发布原生内容槽坐标", () => {
   assert.match(browserTabSource, /class="browser-surface-slot"/u);
   assert.match(browserTabSource, /class="browser-native-surface"/u);
@@ -92,6 +102,18 @@ test("Surface 创建不等待调试器握手，工具调用才等待", () => {
   assert.match(source, /await this\.waitForDebugger\(record\)/u);
 });
 
+test("Browser Surface 导航不自动抢占 App Renderer 焦点", () => {
+  const createSurface = section(source, "private createSurface(", "bindContentSurface(");
+  assert.match(createSurface, /focusOnNavigation:\s*false/u);
+  assert.match(source, /blurWindow\(windowId: string\): boolean/u);
+  assert.match(source, /webContents\.getFocusedWebContents\(\)/u);
+  assert.match(source, /restoreWindow\(windowId: string\): void/u);
+  assert.match(windowManagerSource, /const browserWasFocused = this\.#surfaceManager\.blurWindow\(windowId\)/u);
+  assert.match(windowManagerSource, /this\.#surfaceManager\.restoreWindow\(windowId\)/u);
+  const focusApp = section(windowManagerSource, "focusApp(windowId: string)", "async setBrowserViewport(");
+  assert.match(focusApp, /record\.window\.focus\(\)[\s\S]*?record\.appView\.webContents\.focus\(\)[\s\S]*?restoreWindow\(windowId\)[\s\S]*?record\.window\.focus\(\)[\s\S]*?record\.appView\.webContents\.focus\(\)/u);
+});
+
 test("页面导航期间保持原生页面可见，只有渲染进程崩溃才恢复 Surface", () => {
   const surfaceSlot = section(source, "private applySlot(", "private async loadPage(");
   const navigationEvents = section(source, "webContents.on(\"did-start-navigation\"", "webContents.on(\"before-input-event\"");
@@ -109,6 +131,10 @@ test("页面导航期间保持原生页面可见，只有渲染进程崩溃才�
 test("Surface 布局和加载回调不隐式抢占 App Renderer 焦点", () => {
   const applySlot = section(source, "private applySlot(", "private async loadPage(");
   assert.doesNotMatch(applySlot, /contents\.focus\(\)/u);
+  assert.match(source, /focusOnNavigation:\s*false/u);
+  assert.match(source, /blurWindow\(windowId: string\)[\s\S]*?unmountSurface\(record, window\)/u);
+  assert.match(windowManagerSource, /focusApp\([\s\S]*?this\.#surfaceManager\.blurWindow\(windowId\)/u);
+  assert.match(windowManagerSource, /focusApp\([\s\S]*?this\.#surfaceManager\.restoreWindow\(windowId\)/u);
   assert.match(windowManagerSource, /activatePanel\([\s\S]*?record\.appView\.webContents\.focus\(\)/u);
   assert.match(readFileSync(new URL("../../../../web/src/App.svelte", import.meta.url), "utf8"), /document\.addEventListener\('pointerdown', focusAppRenderer, true\)/u);
   assert.match(readFileSync(new URL("../../../../web/src/App.svelte", import.meta.url), "utf8"), /document\.addEventListener\('focusin', focusAppRenderer, true\)/u);
@@ -162,27 +188,31 @@ test("Surface 激活使用代次，过期请求不能抢占当前槽", () => {
   assert.match(source, /created[\s\S]*?closeRecord\(record, false\)/u);
 });
 
-test("viewport 只作用于当前 Surface，不改变右栏或 DOM 尺寸", () => {
+test("viewport 只作用于当前 Surface，且与右栏物理尺寸完全解耦", () => {
   assert.match(source, /Emulation\.clearDeviceMetricsOverride/u);
   assert.match(source, /Emulation\.setDeviceMetricsOverride/u);
-  assert.match(source, /scale: fitScale/u);
-  assert.match(source, /record\.viewport\.mode === "fixed"[\s\S]*?scheduleViewportApply\(record\)/u);
-  assert.match(source, /if \(record\.slotVisible\) this\.scheduleViewportApply\(record\)/u);
-  assert.match(source, /Emulation\.setTouchEmulationEnabled/u);
+  const applySlot = section(source, "private applySlot(", "private async loadPage(");
+  assert.match(applySlot, /内容槽只管理原生 View 的物理承载范围/u);
+  assert.doesNotMatch(applySlot, /scheduleViewportApply\(record\)/u);
+  assert.doesNotMatch(applySlot, /viewportApplied\s*=\s*false/u);
   const viewportMethods = section(source, "private async applyViewport(", "private scheduleViewportApply(");
+  assert.doesNotMatch(viewportMethods, /slotBounds|availableWidth|availableHeight|scale\s*:/u);
+  const captureMethods = section(source, "function capturePageRect(", "async function sendCdpCommandWithTimeout(");
+  assert.doesNotMatch(captureMethods, /captureViewportScale|slotBounds/u);
+  assert.doesNotMatch(source, /Emulation\.setTouchEmulationEnabled/u);
   assert.doesNotMatch(viewportMethods, /capturePage\(|startScreencast|drawImage\(/u);
   assert.match(browserTabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/u);
   assert.match(browserTabSource, /scheduleCustomViewportUpdate\(\)/u);
   assert.match(browserTabSource, /viewport: mode === 'auto'\s*\n?\s*\? \{ mode: 'auto' \}/u);
 });
 
-test("截图统一通过同一 WebContents 的 Chromium CDP，root 不依赖 DOM ref", () => {
+test("截图统一通过同一 WebContents 的原生 Chromium 捕获，root 不依赖 DOM ref", () => {
   assert.match(source, /method === "Page\.captureScreenshot"/u);
   assert.match(source, /sendCdpCommandWithTimeout\([\s\S]*?method/u);
-  assert.doesNotMatch(source, /record\.contents\.capturePage\(/u);
+  assert.match(source, /private async capturePageScreenshot\([\s\S]*?record\.contents\.capturePage\(/u);
   assert.doesNotMatch(source, /captureScreenshot\(/u);
   assert.match(source, /private enqueueCdp[\s\S]*?record\.cdpLane/u);
-  assert.doesNotMatch(source, /fromSurface: false/u);
+  assert.match(browserRuntimeSource, /fromSurface: false/u);
   assert.doesNotMatch(source, /startScreencast|drawImage\(/u);
   assert.match(browserRuntimeSource, /element_ref !== "root"[\s\S]*?else if \(input\.clip\)/u);
   assert.match(browserRuntimeSource, /input\.clip\.width \* viewport\.width/u);
@@ -202,17 +232,29 @@ test("WebContents 销毁时必须清理 Surface 挂载和注册索引", () => {
   assert.match(closeRecord, /if \(!wasClosed && !record\.contents\.isDestroyed\(\)\) record\.contents\.close\(\)/u);
 });
 
-test("后台截图复用同一个 WebContents 的 CDP，不创建隐藏窗口或临时挂载 Surface", () => {
-  assert.doesNotMatch(source, /capturePage\(|captureWindow/u);
-  assert.match(source, /Page\.captureScreenshot/u);
+test("后台截图复用同一个 WebContents，不创建隐藏窗口或临时挂载 Surface", () => {
+  assert.match(source, /capturePageScreenshot\([\s\S]*?record\.contents\.capturePage/u);
+  assert.doesNotMatch(source, /captureWindow/u);
 });
 
 test("所有工具截图都从真实 WebContents 读取，并通过 Surface CDP lane 串行化", () => {
   const cdpSection = section(source, "async sendCdp(", "private enqueueCdp<T>(");
-  assert.doesNotMatch(cdpSection, /capturePage\(/u);
+  assert.match(cdpSection, /method === "Page\.captureScreenshot"[\s\S]*?capturePageScreenshot\(record, params\)/u);
   assert.match(cdpSection, /method === "Page\.captureScreenshot"[\s\S]*?waitForScreenshotReadiness\(record\)/u);
   assert.match(cdpSection, /this\.enqueueCdp\(record/u);
   assert.match(source, /private async waitForScreenshotReadiness\(record: BrowserSurfaceRecord\)/u);
+});
+
+test("输入动作允许同一 WebContents 在动作内部推进导航 revision", () => {
+  assert.match(source, /recordForBinding\([\s\S]*?allowNavigationAdvance\?: boolean/u);
+  assert.match(source, /allowNavigationAdvance: method\.startsWith\("Input\."\)/u);
+  assert.match(desktopControlSource, /交互命令在 Worker 内可能由多个 CDP 输入事件组成/u);
+});
+
+test("交互命令完成后由 Main 返回当前页面状态契约", () => {
+  assert.match(desktopControlSource, /isPageStateInteraction\(command\)/u);
+  assert.match(desktopControlSource, /currentBinding\.navigation_revision/u);
+  assert.match(desktopControlSource, /type: "page_state"/u);
 });
 
 test("render-process-gone 才触发页面崩溃恢复", () => {
@@ -273,7 +315,7 @@ test("权限和安全边界不读取外部浏览器资料", () => {
 
 test("原生 View 层级固定，浏览器与 App、Overlay 同级", () => {
   assert.match(windowManagerSource, /const appLayer = new View\(\);[\s\S]*?const overlayLayer = new View\(\)/u);
-  assert.match(windowManagerSource, /window\.contentView\.addChildView\(appLayer\)[\s\S]*?window\.contentView\.addChildView\(appView\)[\s\S]*?window\.contentView\.addChildView\(browserLayer\)[\s\S]*?window\.contentView\.addChildView\(overlayLayer\)/u);
+  assert.match(windowManagerSource, /window\.contentView\.addChildView\(appLayer, 0\)[\s\S]*?window\.contentView\.addChildView\(appView, 1\)[\s\S]*?window\.contentView\.addChildView\(browserLayer, 2\)[\s\S]*?window\.contentView\.addChildView\(overlayLayer, 3\)/u);
   assert.match(source, /record\.host\.addChildView\(record\.view, 0\)/u);
   assert.match(windowManagerSource, /closeOverlay\([\s\S]*?record\.appView\.webContents\.focus\(\)/u);
   assert.match(windowManagerSource, /closeOverlay\([\s\S]*?this\.applyLayout\(record\)/u);

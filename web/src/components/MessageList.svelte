@@ -916,11 +916,12 @@
       isLoadingBefore: true,
     });
     try {
+      const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
       const response = await getAgentSessionMessages({
         sessionId,
-        scope: workspaceId ? 'workspace' : 'personal',
+        scope: workspaceId || workspacePath ? 'workspace' : 'personal',
         workspaceId,
-        workspacePath: messagesState.currentWorkspacePath,
+        workspacePath,
         beforeCursor: historyState.beforeCursor,
         canonicalBeforeCursor: historyState.canonicalBeforeCursor,
         limit: 50,

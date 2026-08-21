@@ -448,10 +448,10 @@ body.theme-dark,
   /* 页面级滚动防护：与 html/body 双重保险 */
 }
 
-/* Desktop 的唯一 App Renderer 外壳使用主题材质填充窗口边缘和面板间隙。
-   壁纸仍由 body::before 唯一绘制，避免外壳与内容各自 cover 出不同裁切。 */
+/* Desktop 的壁纸只由 body::before 绘制；左、中、右三个结构面板分别
+   消费自己的语义材质，#app 本身不再叠加第四层全窗口颜色。 */
 [data-magi-desktop-surface='app'] #app {
-  background: var(--magi-desktop-shell-background, var(--magi-canvas)) !important;
+  background: transparent !important;
   background-clip: border-box;
 }
 

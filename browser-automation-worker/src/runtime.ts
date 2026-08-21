@@ -462,11 +462,24 @@ export class BrowserAutomationRuntime {
     modifiers = 0,
     code?: string,
   ): Promise<void> {
+    const description = keyDescription(key, code, modifiers);
+    const keyDown = type === "keyDown";
     await this.#cdp.send(binding, "Input.dispatchKeyEvent", {
-      type,
-      key,
-      code: code ?? key,
+      // Chromium expects rawKeyDown for non-text keys. Sending keyDown with
+      // an empty text payload is accepted inconsistently across Electron/
+      // Chromium versions and is the reason Enter/Backspace intermittently
+      // failed in the packaged desktop runtime.
+      type: keyDown && description.text ? "keyDown" : keyDown ? "rawKeyDown" : "keyUp",
+      key: description.key,
+      code: description.code,
       modifiers,
+      windowsVirtualKeyCode: description.keyCode,
+      nativeVirtualKeyCode: description.keyCode,
+      ...(description.text && keyDown
+        ? { text: description.text, unmodifiedText: description.text }
+        : {}),
+      ...(keyDown ? { autoRepeat: false, isKeypad: false, location: 0 } : {}),
+      ...(description.commands.length > 0 ? { commands: description.commands } : {}),
     });
   }
 
@@ -546,9 +559,13 @@ export class BrowserAutomationRuntime {
       ...(input.quality !== undefined ? { quality: input.quality } : {}),
       ...(clip ? { clip } : {}),
       captureBeyondViewport: input.full_page || hasElementTarget,
-      // 截图走同一 WebContents 的 Chromium surface，显示视图和标记裁剪
-      // 使用同一套 CSS 坐标，避免非 surface 截图忽略 clip 导致标记退化成整页。
-      fromSurface: true,
+      // WebContentsView 的页面截图必须从同一 WebContents 的 view 内容读取。
+      // Electron 的 fromSurface 路径依赖宿主 compositor surface；当原生
+      // View 处于右栏内容槽、正在切换层级或尚未获得 compositor frame 时，
+      // Chromium 不会完成 Page.captureScreenshot，最终拖垮整个 CDP lane。
+      // fromSurface=false 仍是 Chromium CDP 的真实页面截图，不是 Renderer
+      // 截图、Canvas 投影或图片缩放，并且对 clip/full-page 坐标保持一致。
+      fromSurface: false,
     });
     const binary = Buffer.from(captured.data, "base64");
     const mime = screenshotMime(input.format);
@@ -1903,33 +1920,65 @@ function snapshotTarget(args: Record<string, unknown>, prefix = ""): BrowserSnap
   return { element_ref: elementRef, snapshot_revision: revision };
 }
 
-function keyDescription(value: string): { key: string; code?: string; modifiers: number } {
+function keyDescription(
+  value: string,
+  explicitCode?: string,
+  modifiers = 0,
+): { key: string; code: string; keyCode: number; modifiers: number; text?: string; commands: string[] } {
   const parts = value.split("+").map((part) => part.trim()).filter(Boolean);
   const key = parts.pop() ?? value;
-  let modifiers = 0;
+  let modifierMask = modifiers;
   for (const modifier of parts) {
     switch (modifier.toLowerCase()) {
-      case "alt": modifiers |= 1; break;
+      case "alt": modifierMask |= 1; break;
       case "control":
-      case "ctrl": modifiers |= 2; break;
+      case "ctrl": modifierMask |= 2; break;
       case "meta":
       case "command":
-      case "cmd": modifiers |= 4; break;
-      case "shift": modifiers |= 8; break;
+      case "cmd": modifierMask |= 4; break;
+      case "shift": modifierMask |= 8; break;
     }
   }
-  const aliases: Record<string, { key: string; code: string }> = {
-    enter: { key: "Enter", code: "Enter" },
-    tab: { key: "Tab", code: "Tab" },
-    escape: { key: "Escape", code: "Escape" },
-    backspace: { key: "Backspace", code: "Backspace" },
-    delete: { key: "Delete", code: "Delete" },
-    arrowup: { key: "ArrowUp", code: "ArrowUp" },
-    arrowdown: { key: "ArrowDown", code: "ArrowDown" },
-    arrowleft: { key: "ArrowLeft", code: "ArrowLeft" },
-    arrowright: { key: "ArrowRight", code: "ArrowRight" },
-    space: { key: " ", code: "Space" },
+  const aliases: Record<string, { key: string; code: string; keyCode: number }> = {
+    enter: { key: "Enter", code: "Enter", keyCode: 13 },
+    tab: { key: "Tab", code: "Tab", keyCode: 9 },
+    escape: { key: "Escape", code: "Escape", keyCode: 27 },
+    backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+    delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+    arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+    space: { key: " ", code: "Space", keyCode: 32 },
   };
   const alias = aliases[key.toLowerCase()];
-  return alias ? { ...alias, modifiers } : { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, modifiers };
+  const resolved = alias ?? {
+    key,
+    code: explicitCode ?? (key.length === 1 && /[A-Za-z]/u.test(key)
+      ? `Key${key.toUpperCase()}`
+      : key),
+    keyCode: key.length === 1
+      ? key.toUpperCase().charCodeAt(0)
+      : 0,
+  };
+  const printable = resolved.key.length === 1 && resolved.key !== "\n" && resolved.key !== "\r";
+  return {
+    ...resolved,
+    modifiers: modifierMask,
+    ...(printable && modifierMask === 0 ? { text: resolved.key } : {}),
+    commands: macEditingCommands(resolved.code, modifierMask),
+  };
+}
+
+function macEditingCommands(code: string, modifiers: number): string[] {
+  if (process.platform !== "darwin" || (modifiers & 4) === 0) return [];
+  const commandByCode: Record<string, string> = {
+    KeyA: "selectAll",
+    KeyC: "copy",
+    KeyV: "paste",
+    KeyX: "cut",
+    KeyZ: (modifiers & 8) !== 0 ? "redo" : "undo",
+  };
+  const command = commandByCode[code];
+  return command ? [command] : [];
 }

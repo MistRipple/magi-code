@@ -336,7 +336,33 @@ export class DesktopControlServer {
         const tabId = commandTabId(command);
         if (!tabId) throw new Error("browser_tab_id_missing");
         const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
-        return this.#worker.execute(binding, command);
+        const executed = await this.#worker.execute(binding, command);
+        // 交互命令在 Worker 内可能由多个 CDP 输入事件组成。动作中的
+        // keyDown/click 可能已经触发导航，因此不能把 Worker 发送前的
+        // binding 当作动作结果的页面状态。由 Main 在动作完成后读取同一
+        // WebContents 的最新地址、标题和 navigation revision，统一满足
+        // Rust 工具层的 PageState 契约。
+        if (executed.outcome.status === "succeeded" && isPageStateInteraction(command)) {
+          const currentBinding = requirePrimaryBinding(this.#surfaceManager, tabId);
+          const contents = this.#surfaceManager.recordForBinding(currentBinding);
+          return {
+            outcome: {
+              status: "succeeded",
+              payload: {
+                type: "page_state",
+                payload: {
+                  tab_id: currentBinding.tab_id,
+                  url: contents.getURL() || "about:blank",
+                  origin: safeOrigin(contents.getURL()),
+                  title: contents.getTitle() || "",
+                  navigation_revision: currentBinding.navigation_revision,
+                },
+              },
+            },
+            ...(executed.binary ? { binary: executed.binary } : {}),
+          };
+        }
+        return executed;
       }
     }
   }
@@ -371,6 +397,13 @@ function commandTabId(command: BrowserHostCommand): string | null {
   return "payload" in command && "tab_id" in command.payload
     ? String(command.payload.tab_id)
     : null;
+}
+
+function isPageStateInteraction(command: BrowserHostCommand): boolean {
+  return command.type === "click"
+    || command.type === "type"
+    || command.type === "press"
+    || command.type === "scroll";
 }
 
 function requirePrimaryBinding(manager: BrowserSurfaceManager, tabId: string) {
