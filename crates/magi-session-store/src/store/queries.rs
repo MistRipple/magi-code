@@ -317,6 +317,36 @@ impl SessionStore {
         turns
     }
 
+    /// 按协议 requestId 找回已经持久化的 canonical Turn。
+    ///
+    /// App Server 客户端可能在服务端已经接受请求、但响应尚未送达时重试同一个
+    /// requestId。这个查询是重试幂等的唯一持久事实来源，不能依赖连接内存状态。
+    pub fn canonical_turn_for_request_id(
+        &self,
+        request_id: &str,
+    ) -> Option<crate::models::CanonicalTurn> {
+        let request_id = request_id.trim();
+        if request_id.is_empty() {
+            return None;
+        }
+        let state = self.state.read().expect("session state read lock poisoned");
+        let mut turn = state
+            .canonical_turns
+            .iter()
+            .find(|turn| {
+                turn.items.iter().any(|item| {
+                    item.metadata
+                        .get("requestId")
+                        .or_else(|| item.metadata.get("request_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(request_id)
+                })
+            })?
+            .clone();
+        turn.normalize();
+        Some(turn)
+    }
+
     /// 返回当前会话 canonical turn 的倒序分页窗口。
     ///
     /// canonical turn 是主对话的权威事实，不能在每次 bootstrap 时完整复制。

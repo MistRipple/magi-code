@@ -359,4 +359,26 @@ mod tests {
             .expect_err("缺少 method 与 result/error 必须失败");
         assert!(matches!(error, ProtocolError::InvalidRequest(_)));
     }
+
+    #[test]
+    fn newer_minor_protocol_is_rejected_but_older_minor_is_compatible() {
+        assert!(
+            ProtocolVersion::CURRENT.is_compatible_with(&ProtocolVersion {
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR,
+            })
+        );
+        assert!(
+            !ProtocolVersion::CURRENT.is_compatible_with(&ProtocolVersion {
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR + 1,
+            })
+        );
+        assert!(
+            !ProtocolVersion::CURRENT.is_compatible_with(&ProtocolVersion {
+                major: PROTOCOL_MAJOR + 1,
+                minor: 0,
+            })
+        );
+    }
 }
