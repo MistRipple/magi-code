@@ -107,6 +107,15 @@ npm run release:preflight:full -- --tag vX.Y.Z
 
 其中 `--package` 会构建当前操作系统的 Electron 发行包，跨平台安装包和 GitHub Release 仍由发布工作流负责。
 
+### GitHub 新版本发布规则
+
+- 发布仓库固定为 `MistRipple/magi-code`，发布提交必须先进入 `main`，并等待同一提交的 GitHub CI 全部通过。
+- 创建或移动版本 Tag 前，必须在本地执行完整预检：`npm run release:preflight:full -- --tag vX.Y.Z`。预检通过后才提交、推送 `main`，再创建版本 Tag 触发发布工作流。
+- 正式发行边界固定为 Electron；不再发布 Tauri、CEF 或 Browser Runtime 独立发行物。
+- Electron 安装包保持无 Apple/Windows 代码签名和公证；仅为旧版 Tauri 客户端的无感迁移桥生成并保留旧更新器所需的 `.sig`。
+- 发布后必须确认 GitHub Latest Release、Electron 更新元数据、`magi-desktop-stable/latest.json`、旧版迁移包及其 8 个平台入口均已生成并可访问，确保旧版客户端可以无感迁移到 Electron。
+- 所有仓库提交使用 GitHub 账户 `MistRipple <east_xiaodong@126.com>`，不得使用 `Codex <codex@openai.com>`。
+
 涉及 daemon 托管前端时，建议额外确认：
 
 ```bash
