@@ -1203,14 +1203,13 @@ impl RuntimeStatePersistence {
                 {
                     continue;
                 }
-                if persistence.knowledge_save_dirty.load(Ordering::Acquire) {
-                    if persistence
+                if persistence.knowledge_save_dirty.load(Ordering::Acquire)
+                    && persistence
                         .knowledge_save_scheduled
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
-                    {
-                        continue;
-                    }
+                {
+                    continue;
                 }
                 break;
             }
