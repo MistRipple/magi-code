@@ -345,7 +345,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -409,7 +409,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -637,9 +637,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1119,7 +1119,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "magi-agent-role"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "dirs",
  "magi-core",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "magi-api"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "arboard",
  "axum",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "magi-appearance"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "base64",
  "image",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "magi-bridge-client"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "base64",
  "httpdate",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "magi-browser-authority"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "futures-util",
  "magi-core",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "magi-context-runtime"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "magi-knowledge-store",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "magi-conversation-runtime"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "insta",
  "magi-agent-role",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "magi-core"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "base64",
  "dunce",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "magi-daemon"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "axum",
  "magi-agent-role",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "magi-daemon-app"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "dirs",
  "magi-daemon",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "magi-event-bus"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "magi-usage-authority",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "magi-git"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-process",
  "serde",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "magi-governance"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "serde",
@@ -1380,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "magi-knowledge-store"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "flate2",
  "magi-core",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "magi-memory-store"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "serde",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "magi-mission-metrics"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "serde",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "magi-orchestrator"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-agent-role",
  "magi-bridge-client",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "magi-permissions"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "serde",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "magi-plan"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "magi-event-bus",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "magi-process"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "libc",
  "sysinfo",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "magi-project-memory"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "magi-event-bus",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "magi-runtime-state"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "serde",
  "serde_json",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "magi-safety-gate"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "serde",
  "serde_json",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "magi-session-store"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "getrandom 0.3.4",
  "magi-core",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "magi-settings-store"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "serde_json",
@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "magi-skill-runtime"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-bridge-client",
  "magi-core",
@@ -1536,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "magi-snapshot"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "ignore",
  "magi-process",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "magi-spawn-graph"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "thiserror 2.0.18",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "magi-tool-runtime"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "base64",
  "dirs",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "magi-usage-authority"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "serde",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "magi-worker-runtime"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-bridge-client",
  "magi-core",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "magi-workspace"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "magi-core",
  "serde",
@@ -1757,7 +1757,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2197,7 +2197,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2470,7 +2470,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2567,7 +2567,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3159,7 +3159,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
