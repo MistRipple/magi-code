@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod app_server;
 mod browser_tool_runtime;
 mod change_projection;
 mod dto;

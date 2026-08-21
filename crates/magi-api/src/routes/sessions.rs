@@ -377,7 +377,7 @@ async fn guide_session_turn_queue_item(
     Ok(Json(session_turn_queue_response(&state, &session_id)))
 }
 
-async fn submit_session_turn(
+pub(crate) async fn submit_session_turn(
     State(state): State<ApiState>,
     Json(mut request): Json<SessionTurnRequestDto>,
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {

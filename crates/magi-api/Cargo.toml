@@ -17,6 +17,7 @@ thiserror.workspace = true
 reqwest.workspace = true
 urlencoding = "2"
 magi-core = { path = "../magi-core" }
+magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 magi-browser-authority = { path = "../magi-browser-authority" }
 magi-appearance = { path = "../magi-appearance" }
 magi-agent-role = { path = "../magi-agent-role" }

@@ -103,6 +103,7 @@ pub fn build_router(state: ApiState) -> Router {
     let tunnel_manager = state.tunnel_manager.clone();
     let api_routes = Router::new()
         .merge(workspaces::routes())
+        .merge(crate::app_server::routes())
         .merge(workspace_vcs::routes())
         .merge(sessions::routes())
         .merge(goals::routes())
