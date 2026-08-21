@@ -20,7 +20,9 @@ assert.match(builderConfig, /maintainer:\s*Magi contributors <[^>]+>/, 'Linux de
 assert.match(releaseWorkflow, /latest\.yml[\s\S]*latest-linux\.yml[\s\S]*latest-mac\.yml/, 'Release 必须发布 Electron 原生更新元数据');
 assert.match(releaseWorkflow, /make_latest:\s*true/, 'Desktop Release 必须显式成为 GitHub latest Release');
 assert.match(releaseWorkflow, /releases\/latest[\s\S]*latest-mac\.yml[\s\S]*latest-linux\.yml/, 'Release 必须验证 GitHub latest 指向统一 Desktop 更新源');
-assert.doesNotMatch(releaseWorkflow, /latest\.json|\.AppImage\.sig|\.exe\.sig/, '不得保留旧更新清单和更新 feed');
+assert.match(releaseWorkflow, /build-legacy-desktop-bridge\.mjs/, '必须生成旧版客户端无感迁移桥');
+assert.match(releaseWorkflow, /latest\.json[\s\S]*magi-desktop-stable/, '迁移桥必须更新旧版稳定 Feed');
+assert.match(releaseWorkflow, /TAURI_SIGNING_PRIVATE_KEY/, '迁移桥必须使用原有更新签名密钥');
 assert.match(releaseWorkflow, /browser-runtime|magi-desktop-stable/, 'Release 必须拒绝旧 Browser Runtime 或 Desktop channel 成为 latest');
 
 const directory = await mkdtemp(join(tmpdir(), 'magi-electron-update-'));

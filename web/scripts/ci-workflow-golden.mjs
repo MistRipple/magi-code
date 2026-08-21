@@ -43,6 +43,7 @@ assert.match(release, /actions\/attest-build-provenance@v3/, '最终发行文件
 assert.match(release, /latest\.yml[\s\S]*latest-linux\.yml[\s\S]*latest-mac\.yml/, 'Electron 更新元数据必须覆盖三个桌面平台');
 assert.match(release, /make_latest:\s*true/, 'Desktop Release 必须显式成为 GitHub latest Release');
 assert.match(release, /GitHub Desktop 更新源[\s\S]*releases\/latest[\s\S]*latest-mac\.yml[\s\S]*latest-linux\.yml/, '发布流程必须校验统一 Desktop 更新源');
+assert.match(release, /build-legacy-desktop-bridge\.mjs[\s\S]*latest\.json/, '发布流程必须生成旧版客户端无感迁移桥');
 assert.match(release, /真实启动解包 Desktop[\s\S]*\/health[\s\S]*\/web\.html/, '发布链必须真实启动解包 Desktop');
 assert.doesNotMatch(
   `${ci}\n${security}\n${release}`,

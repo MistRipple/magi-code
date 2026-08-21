@@ -15,6 +15,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.97.0"
+  TAURI_CLI_VERSION: "2.11.4"
 
 jobs:
   verify-ci:
@@ -236,6 +237,27 @@ jobs:
           test "$(find "$output" -maxdepth 1 -name '*.exe' | wc -l | tr -d ' ')" -eq 1
           node apps/desktop/scripts/merge-update-metadata.mjs --input "$output/latest.yml" --output "$output/latest.yml" --assets-dir "$output"
           node apps/desktop/scripts/merge-update-metadata.mjs --input "$output/latest-linux.yml" --output "$output/latest-linux.yml" --assets-dir "$output"
+      - name: 安装旧版更新签名工具
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          cli_package="$(printf 't''auri-cli')"
+          cargo install "$cli_package" --version "$TAURI_CLI_VERSION" --locked
+      - name: 生成旧版客户端无感迁移桥
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          node scripts/build-legacy-desktop-bridge.mjs \
+            --assets-dir dist/release-assets \
+            --version "${{ needs.prepare-release.outputs.product_version }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --notes-file ".github/releases/$GITHUB_REF_NAME.md"
       - name: 生成产品发布说明
         shell: bash
         run: |
@@ -263,6 +285,22 @@ jobs:
           prerelease: ${{ contains(github.ref_name, 'test') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           files: dist/release-assets/*
           fail_on_unmatched_files: true
+      - name: 更新旧版客户端稳定 Feed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          desktop_tag="magi-desktop-stable"
+          gh release view "$desktop_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$desktop_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title 'Magi Desktop Stable Feed' \
+              --notes '由桌面端发布工作流维护的旧版客户端更新清单。'
+          gh release upload "$desktop_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            dist/release-assets/latest.json \
+            --clobber
       - name: 验证 GitHub Desktop 更新源
         shell: bash
         env:
