@@ -15,6 +15,8 @@ assert.match(builderConfig, /publish:[\s\S]*provider: github[\s\S]*owner: MistRi
 assert.match(builderConfig, /releaseType: release/, 'Electron updater 必须使用正式 Desktop Release');
 assert.doesNotMatch(builderConfig, /^\s*channel\s*:/m, 'Electron updater 不得声明独立 channel');
 assert.match(builderConfig, /notarize: false[\s\S]*dmg:[\s\S]*sign: false/, 'macOS 包必须明确保持未签名');
+assert.match(builderConfig, /win:[\s\S]*signExecutable: false/, 'Windows 包必须明确保持未签名');
+assert.match(builderConfig, /maintainer:\s*Magi contributors <[^>]+>/, 'Linux deb 包必须声明 maintainer 邮箱');
 assert.match(releaseWorkflow, /latest\.yml[\s\S]*latest-linux\.yml[\s\S]*latest-mac\.yml/, 'Release 必须发布 Electron 原生更新元数据');
 assert.match(releaseWorkflow, /make_latest:\s*true/, 'Desktop Release 必须显式成为 GitHub latest Release');
 assert.match(releaseWorkflow, /releases\/latest[\s\S]*latest-mac\.yml[\s\S]*latest-linux\.yml/, 'Release 必须验证 GitHub latest 指向统一 Desktop 更新源');

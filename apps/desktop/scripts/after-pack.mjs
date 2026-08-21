@@ -48,7 +48,9 @@ export async function afterPack(context) {
 }
 
 function verifyAsarComponent(asarPath, path, expected) {
-  const bytes = extractFile(asarPath, path);
+  // ASAR 元数据在 Windows 使用反斜杠分隔，读取时必须沿用当前平台的路径格式。
+  const archivePath = join(...path.split("/"));
+  const bytes = extractFile(asarPath, archivePath);
   if (bytes.byteLength !== expected.size || sha256(bytes) !== expected.sha256) {
     throw new Error(`app.asar 组件哈希不匹配: ${path}`);
   }
