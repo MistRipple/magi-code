@@ -1000,8 +1000,9 @@ mod tests {
     use magi_event_bus::EventCategory;
     use magi_governance::GovernanceService;
     use magi_session_store::{
-        CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
-        CanonicalTurnStatus, CanonicalTurnVisibility, SessionStore,
+        ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnItem,
+        CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
+        CanonicalTurnVisibility, SessionStore, TimelineEntryInput, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
     use std::collections::HashMap;
@@ -1201,6 +1202,175 @@ mod tests {
             .expect("等待任务不应失败");
     }
 
+    #[tokio::test]
+    async fn start_turn_replays_persisted_canonical_turn_without_submitting_again() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(8));
+        let session_store = Arc::new(SessionStore::default());
+        let session_id = SessionId::new("session-app-server-canonical-replay");
+        session_store
+            .create_session_for_workspace_at(
+                session_id.clone(),
+                "Canonical replay",
+                None,
+                UtcMillis(1),
+            )
+            .expect("重放测试会话应创建");
+        let request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
+            "sessionId": session_id,
+            "scope": "personal",
+            "text": "inspect browser",
+            "requestId": "request-canonical-replay"
+        }))
+        .expect("重放请求应反序列化");
+        let request_fingerprint = request.request_fingerprint().expect("重放请求指纹应生成");
+        let item = ActiveExecutionTurnItem {
+            item_id: "user-canonical-replay".to_string(),
+            item_seq: 0,
+            kind: "user_message".to_string(),
+            status: "completed".to_string(),
+            source: "user".to_string(),
+            title: None,
+            content: request.trimmed_text(),
+            task_id: None,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id: request.request_id(),
+            user_message_id: None,
+            placeholder_message_id: None,
+            metadata: HashMap::from([
+                ("route".to_string(), json!("chat")),
+                ("requestFingerprint".to_string(), json!(request_fingerprint)),
+            ]),
+            timeline_entry_id: Some("timeline-canonical-replay".to_string()),
+            source_thread_id: ThreadId::new("thread-canonical-replay"),
+        };
+        session_store
+            .accept_current_turn_with_timeline_entry(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-canonical-replay",
+                    TimelineEntryKind::UserMessage,
+                    "inspect browser",
+                    UtcMillis(2),
+                ),
+                ActiveExecutionTurn {
+                    turn_id: "turn-canonical-replay".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(2),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("inspect browser".to_string()),
+                    items: vec![item],
+                },
+            )
+            .expect("canonical Turn 应持久化");
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store,
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+
+        let response = start_turn_once(
+            &state,
+            RequestId::new("rpc-canonical-replay").expect("RPC request id 合法"),
+            request,
+        )
+        .await;
+        let response = serde_json::to_value(response).expect("重放响应应可序列化");
+        assert_eq!(response["result"]["replayed"], true);
+        assert_eq!(response["result"]["turnId"], "turn-canonical-replay");
+        assert_eq!(
+            response["result"]["userMessageItemId"],
+            "user-canonical-replay"
+        );
+        assert_eq!(
+            state
+                .session_store
+                .canonical_turns_for_session(&SessionId::new("session-app-server-canonical-replay"))
+                .len(),
+            1,
+            "重试只能读取已持久化的 canonical Turn，不能再次提交"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_turn_replays_persisted_queue_without_enqueuing_again() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(8));
+        let session_store = Arc::new(SessionStore::default());
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store,
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let session_id = SessionId::new("session-app-server-queue-replay");
+        let request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
+            "sessionId": session_id,
+            "scope": "personal",
+            "text": "queued browser check",
+            "requestId": "request-queue-replay"
+        }))
+        .expect("排队请求应反序列化");
+        let request_fingerprint = request.request_fingerprint().expect("排队请求指纹应生成");
+        let queue_id = "queue-app-server-replay".to_string();
+        state
+            .enqueue_regular_session_turn(crate::state::QueuedRegularSessionTurn {
+                request,
+                request_fingerprint: Some(request_fingerprint),
+                requested_workspace_id: None,
+                accepted_at: UtcMillis(3),
+                route: crate::dto::SessionTurnRouteDto::Chat,
+                task_title: None,
+                execution_goal: None,
+                task_tier: TaskTier::ExecutionChain,
+                tool_intent: None,
+                forced_tool_name: None,
+                goal_mode: false,
+                required_tool_chain: Vec::new(),
+                completion_contract: TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                session_id: session_id.clone(),
+                workspace_id: None,
+                queue_id: queue_id.clone(),
+                retry_count: 0,
+            })
+            .expect("排队 Turn 应持久化");
+
+        let replay_request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
+            "sessionId": session_id,
+            "scope": "personal",
+            "text": "queued browser check",
+            "requestId": "request-queue-replay"
+        }))
+        .expect("重放排队请求应反序列化");
+        let response = start_turn_once(
+            &state,
+            RequestId::new("rpc-queue-replay").expect("RPC request id 合法"),
+            replay_request,
+        )
+        .await;
+        let response = serde_json::to_value(response).expect("排队重放响应应可序列化");
+        assert_eq!(response["result"]["replayed"], true);
+        assert_eq!(response["result"]["queued"], true);
+        assert_eq!(response["result"]["queueId"], queue_id);
+        assert_eq!(
+            state.queued_regular_session_turn_count(&SessionId::new(
+                "session-app-server-queue-replay"
+            )),
+            1,
+            "排队请求重试不能再次入队"
+        );
+    }
+
     async fn next_text_message(
         socket: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -1387,6 +1557,114 @@ mod tests {
             .expect("连接应保持")
             .expect("Pong 帧应有效");
         assert_eq!(pong, ClientMessage::Pong(vec![1, 2, 3].into()));
+
+        drop(socket);
+        shutdown_tx.send(()).expect("测试服务应收到停止信号");
+        server.await.expect("测试服务任务应正常结束");
+    }
+
+    #[tokio::test]
+    async fn websocket_subscription_reports_resync_for_an_expired_cursor() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(2));
+        for sequence in 1..=4 {
+            event_bus.publish(event(
+                sequence,
+                Some("session-resync"),
+                Some("workspace-resync"),
+            ));
+        }
+        let state = ApiState::new(
+            "magi-test",
+            event_bus.clone(),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试监听器应绑定");
+        let address = listener.local_addr().expect("应读取测试端口");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::routes::build_router(state))
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("测试路由应正常退出");
+        });
+
+        let (mut socket, _) = connect_async(format!("ws://{address}/api/app-server"))
+            .await
+            .expect("应成功连接 App Server WebSocket");
+        let initialize = send_request(
+            &mut socket,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "resync-initialize",
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "resync-integration-test"},
+                    "protocol": {"major": 1, "minor": 0},
+                    "capabilities": {"streaming": true}
+                }
+            }),
+            "resync-initialize",
+        )
+        .await;
+        assert_eq!(initialize["result"]["capabilities"]["events"], true);
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("initialized 通知应发送");
+
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "resync-subscribe",
+                    "method": "events/subscribe",
+                    "params": {
+                        "workspaceId": "workspace-resync",
+                        "afterSequence": 1
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("events/subscribe 请求应发送");
+
+        let mut response = None;
+        let mut resync_notification = None;
+        for _ in 0..2 {
+            let message = next_text_message(&mut socket).await;
+            if message.get("id").and_then(Value::as_str) == Some("resync-subscribe") {
+                response = Some(message);
+            } else if message.get("method").and_then(Value::as_str) == Some("events/resyncRequired")
+                && message["params"]["reason"] == "afterSequenceExpired"
+            {
+                resync_notification = Some(message);
+            }
+            if response.is_some() && resync_notification.is_some() {
+                break;
+            }
+        }
+        let response = response.expect("events/subscribe 应返回响应");
+        assert_eq!(response["result"]["resyncRequired"], true);
+        let resync_notification = resync_notification.expect("过期游标应发送 resync 通知");
+        assert_eq!(resync_notification["params"]["requestedAfterSequence"], 1);
+        assert_eq!(
+            resync_notification["params"]["snapshot"]["recent_events"]
+                .as_array()
+                .map(Vec::len),
+            Some(2),
+            "resync 快照应包含保留窗口内的事件"
+        );
 
         drop(socket);
         shutdown_tx.send(()).expect("测试服务应收到停止信号");
