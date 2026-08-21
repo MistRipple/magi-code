@@ -348,7 +348,7 @@ async fn subscribe_events(
             active: true,
             session_id,
             workspace_id,
-            after_sequence: after_sequence,
+            after_sequence,
         };
     }
     let snapshot = initial_snapshot
@@ -476,14 +476,35 @@ async fn start_turn(
             );
         }
     };
-    match sessions::submit_session_turn(axum::extract::State(state.clone()), axum::Json(request))
-        .await
+    if request.requested_session_id().is_none()
+        && let Some(existing_turn) = request.request_id().as_deref().and_then(|request_id| {
+            state
+                .session_store
+                .canonical_turn_for_request_id(request_id)
+        })
     {
-        Ok(axum::Json(result)) => response(
+        response(
             request_id,
-            serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-        ),
-        Err(error) => error_response(request_id, api_error_to_protocol(error)),
+            json!({
+                "replayed": true,
+                "sessionId": existing_turn.session_id,
+                "turnId": existing_turn.turn_id,
+                "acceptedAt": existing_turn.accepted_at,
+                "runtimeEpoch": state.runtime_epoch(),
+                "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
+                "canonicalTurn": existing_turn,
+            }),
+        )
+    } else {
+        match sessions::submit_session_turn(axum::extract::State(state.clone()), axum::Json(request))
+            .await
+        {
+            Ok(axum::Json(result)) => response(
+                request_id,
+                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+            ),
+            Err(error) => error_response(request_id, api_error_to_protocol(error)),
+        }
     }
 }
 
@@ -496,7 +517,6 @@ async fn handle_notification(
         if guard.initialize_seen {
             guard.initialized = true;
         }
-        return;
     }
 }
 
@@ -663,4 +683,60 @@ async fn send_protocol_error(
         error_response(id, ErrorObject::new(code, message).retryable(retryable)),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{EventId, UtcMillis};
+    use magi_event_bus::EventCategory;
+
+    fn event(sequence: u64, session_id: Option<&str>, workspace_id: Option<&str>) -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId::new(format!("event-{sequence}")),
+            event_type: "session.changed".to_string(),
+            category: EventCategory::Domain,
+            occurred_at: UtcMillis(sequence),
+            sequence,
+            workspace_id: workspace_id.map(WorkspaceId::new),
+            session_id: session_id.map(SessionId::new),
+            mission_id: None,
+            assignment_id: None,
+            task_id: None,
+            payload: json!({"sequence": sequence}),
+        }
+    }
+
+    #[test]
+    fn event_subscription_requires_at_least_one_scope() {
+        let error = parse_subscription_scope(&EventSubscribeParams {
+            session_id: None,
+            workspace_id: None,
+            after_sequence: None,
+        })
+        .expect_err("未绑定会话或工作区不能订阅全局事件");
+        assert!(error.contains("至少需要"));
+    }
+
+    #[test]
+    fn event_filter_keeps_only_the_requested_scope() {
+        let subscription = EventSubscription {
+            active: true,
+            session_id: Some(SessionId::new("session-1")),
+            workspace_id: Some(WorkspaceId::new("workspace-1")),
+            after_sequence: 0,
+        };
+        assert!(event_matches(
+            &event(1, Some("session-1"), Some("workspace-1")),
+            &subscription
+        ));
+        assert!(!event_matches(
+            &event(2, Some("session-2"), Some("workspace-1")),
+            &subscription
+        ));
+        assert!(!event_matches(
+            &event(3, Some("session-1"), Some("workspace-2")),
+            &subscription
+        ));
+    }
 }
