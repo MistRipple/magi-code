@@ -133,78 +133,12 @@ jobs:
           sudo apt-get install -y libasound2 libgtk-3-0 libnss3 xauth xvfb
       - name: 校验唯一 Electron 发行边界
         run: npm run release:guard
-      - name: 配置 macOS Developer ID 与公证
-        if: matrix.os == 'macos'
-        shell: bash
-        env:
-          MACOS_CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
-          MACOS_CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
-          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: |
-          set -euo pipefail
-          for name in MACOS_CSC_LINK MACOS_CSC_KEY_PASSWORD APPLE_API_KEY_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER; do
-            test -n "${!name:-}" || { echo "缺少签名 Secret: $name" >&2; exit 1; }
-          done
-          key_path="$RUNNER_TEMP/AuthKey.p8"
-          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_path"
-          chmod 600 "$key_path"
-          echo "APPLE_API_KEY=$key_path" >> "$GITHUB_ENV"
-      - name: 校验 Windows Authenticode 证书
-        if: matrix.os == 'windows'
-        shell: bash
-        env:
-          WINDOWS_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
-          WINDOWS_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          test -n "${WINDOWS_CSC_LINK:-}" || { echo "缺少签名 Secret: WINDOWS_CSC_LINK" >&2; exit 1; }
-          test -n "${WINDOWS_CSC_KEY_PASSWORD:-}" || { echo "缺少签名 Secret: WINDOWS_CSC_KEY_PASSWORD" >&2; exit 1; }
       - name: 构建 Web、Worker、daemon、Electron 并组装安装包
         shell: bash
         env:
-          MAGI_REQUIRE_CODE_SIGNING: "${{ matrix.os == 'linux' && '0' || '1' }}"
-          CSC_LINK: ${{ matrix.os == 'macos' && secrets.MACOS_CSC_LINK || '' }}
-          CSC_KEY_PASSWORD: ${{ matrix.os == 'macos' && secrets.MACOS_CSC_KEY_PASSWORD || '' }}
-          WIN_CSC_LINK: ${{ matrix.os == 'windows' && secrets.WINDOWS_CSC_LINK || '' }}
-          WIN_CSC_KEY_PASSWORD: ${{ matrix.os == 'windows' && secrets.WINDOWS_CSC_KEY_PASSWORD || '' }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          MAGI_REQUIRE_CODE_SIGNING: "0"
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run desktop:package
-      - name: 公证并装订 macOS 磁盘映像
-        if: matrix.os == 'macos'
-        shell: bash
-        env:
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: |
-          set -euo pipefail
-          dmg="$(find target/electron-dist -maxdepth 1 -type f -name '*.dmg' -print -quit)"
-          test -s "$dmg"
-          xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
-          xcrun stapler staple "$dmg"
-          xcrun stapler validate "$dmg"
-      - name: 校验 macOS 代码签名
-        if: matrix.os == 'macos'
-        shell: bash
-        run: |
-          set -euo pipefail
-          app_path="$(find target/electron-dist -type d -name 'Magi.app' -print -quit)"
-          test -d "$app_path"
-          codesign --verify --deep --strict --verbose=2 "$app_path"
-          spctl --assess --type execute --verbose=2 "$app_path"
-          xcrun stapler validate "$app_path"
-      - name: 校验 Windows Authenticode 签名
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          $files = Get-ChildItem target/electron-dist -Recurse -File -Filter *.exe
-          if ($files.Count -lt 3) { throw "Windows 发行包缺少主程序、daemon 或安装器" }
-          foreach ($file in $files) {
-            $signature = Get-AuthenticodeSignature $file.FullName
-            if ($signature.Status -ne "Valid") { throw "签名无效: $($file.FullName) [$($signature.Status)]" }
-          }
       - name: 真实启动解包 Desktop
         if: matrix.os != 'windows'
         shell: bash
@@ -311,24 +245,11 @@ jobs:
           notes_file=".github/releases/${tag}.md"
           test -s "$notes_file"
           cp "$notes_file" dist/release-notes.md
-      - name: 生成哈希并使用发行密钥签名
+      - name: 生成发行物哈希
         shell: bash
-        env:
-          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
-          RELEASE_GPG_PRIVATE_KEY_PASSWORD: ${{ secrets.RELEASE_GPG_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          test -n "${RELEASE_GPG_PRIVATE_KEY:-}" || { echo "缺少签名 Secret: RELEASE_GPG_PRIVATE_KEY" >&2; exit 1; }
-          test -n "${RELEASE_GPG_PRIVATE_KEY_PASSWORD:-}" || { echo "缺少签名 Secret: RELEASE_GPG_PRIVATE_KEY_PASSWORD" >&2; exit 1; }
-          printf '%s' "$RELEASE_GPG_PRIVATE_KEY" | gpg --batch --import
-          key_id="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
-          test -n "$key_id"
           (cd dist/release-assets && sha256sum * > SHA256SUMS)
-          while IFS= read -r file; do
-            gpg --batch --yes --pinentry-mode loopback --passphrase "$RELEASE_GPG_PRIVATE_KEY_PASSWORD" --local-user "$key_id" --armor --detach-sign "$file"
-            gpg --batch --verify "$file.asc" "$file"
-          done < <(find dist/release-assets -maxdepth 1 -type f ! -name '*.asc' -print | sort)
-          gpg --batch --armor --export "$key_id" > dist/release-assets/Magi-release-signing-public-key.asc
       - name: 生成 GitHub 构建来源证明
         uses: actions/attest-build-provenance@v3
         with:

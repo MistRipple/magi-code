@@ -28,6 +28,8 @@ const artifacts = await build({
       // 目录包用于本地验收，不能误启用 electron-updater。
       magiDistribution: directoryOnly ? "directory" : "release",
     },
+    // 未签名发行物不应尝试读取本机证书、提交公证或给 DMG 重新签名。
+    ...(!requireCodeSigning ? { mac: { notarize: false }, dmg: { sign: false } } : {}),
     ...(requireCodeSigning ? { forceCodeSigning: true } : {}),
   },
 });
