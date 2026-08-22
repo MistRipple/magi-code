@@ -4354,7 +4354,9 @@ async function updateSetting(key: string, value: unknown): Promise<void> {
     cachedSettingsBootstrap = {
       ...cachedSettingsBootstrap,
       runtimeSettings: {
+        ...cachedSettingsBootstrap.runtimeSettings,
         locale: payload.locale,
+        conversationDisplayMode: payload.conversationDisplayMode,
       },
     };
   }
@@ -5280,7 +5282,10 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'updateSetting':
-          if (typeof message.key === 'string' && (message.key === "locale")) {
+          if (
+            typeof message.key === 'string'
+            && (message.key === 'locale' || message.key === 'conversationDisplayMode')
+          ) {
             void updateSetting(message.key, message.value).catch((error) => {
               logBridgeOperationFailure(i18n.t('bridge.action.updateSetting'), '[web-client-bridge] 更新设置失败:', error);
             });

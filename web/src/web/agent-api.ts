@@ -283,13 +283,19 @@ function normalizeSettingsBootstrapPayload(
   if (payload.scope !== 'personal' && payload.scope !== 'workspace') {
     throw new Error('settings bootstrap 缺少有效的会话作用域');
   }
-  const runtimeSettings = (
+  const runtimeSettingsRecord = (
     payload.runtimeSettings
     && typeof payload.runtimeSettings === 'object'
     && !Array.isArray(payload.runtimeSettings)
       ? payload.runtimeSettings
-      : { locale: 'zh-CN' }
-  ) as SettingsRuntimeSnapshot;
+      : { locale: 'zh-CN', conversationDisplayMode: 'original' }
+  ) as Record<string, unknown>;
+  const runtimeSettings: SettingsRuntimeSnapshot = {
+    locale: runtimeSettingsRecord.locale === 'en-US' ? 'en-US' : 'zh-CN',
+    conversationDisplayMode: runtimeSettingsRecord.conversationDisplayMode === 'summary'
+      ? 'summary'
+      : 'original',
+  };
 
   return {
     scope: payload.scope,

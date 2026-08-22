@@ -4064,8 +4064,20 @@ fn runtime_settings_from_snapshot(
         .or_else(|| snapshot.get("locale").and_then(|value| value.as_str()))
         .filter(|value| matches!(*value, "zh-CN" | "en-US"))
         .unwrap_or("zh-CN");
+    let conversation_display_mode = runtime
+        .and_then(|value| value.get("conversationDisplayMode"))
+        .and_then(|value| value.as_str())
+        .filter(|value| matches!(*value, "original" | "summary"))
+        .or_else(|| {
+            snapshot
+                .get("conversationDisplayMode")
+                .and_then(|value| value.as_str())
+                .filter(|value| matches!(*value, "original" | "summary"))
+        })
+        .unwrap_or("original");
     serde_json::json!({
         "locale": locale,
+        "conversationDisplayMode": conversation_display_mode,
     })
 }
 

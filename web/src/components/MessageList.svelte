@@ -234,14 +234,6 @@
     };
   }
 
-  function isTurnLive(items: TimelineRenderItem[]): boolean {
-    return items.some((item) => {
-      if (item.message.isStreaming) return true;
-      const status = messageMetadataString(item.message, 'turnStatus');
-      return status === 'pending' || status === 'running';
-    });
-  }
-
   function resolveMessageRenderRevision(message: Message): string {
     const metadata = (message.metadata && typeof message.metadata === 'object')
       ? (message.metadata as Record<string, unknown>)
@@ -525,8 +517,15 @@
     }
     return entries;
   });
+  const conversationDisplayMode = $derived.by(() => (
+    messagesState.settingsBootstrapSnapshot?.runtimeSettings?.conversationDisplayMode === 'summary'
+      ? 'summary'
+      : 'original'
+  ));
   const renderEntries = $derived(
-    displayContext === 'thread' ? conversationRenderEntries : timelineRenderEntries,
+    displayContext === 'thread' && conversationDisplayMode === 'summary'
+      ? conversationRenderEntries
+      : timelineRenderEntries,
   );
   const runtimeLayoutSignature = $derived(
     `${runtimeIndicatorKey}:${runtimeIndicatorInsertionIndex}`
@@ -1122,6 +1121,7 @@
     onwheel={handleWheel}
     data-panel-id={displayContext === 'thread' ? 'thread' : (taskId || 'task')}
     data-display-context={displayContext}
+    data-conversation-display-mode={displayContext === 'thread' ? conversationDisplayMode : 'original'}
     data-panel-active={isActive ? 'true' : 'false'}
   >
     {#if safeRenderItems.length > 0 && (canLoadOlderHistory || sessionHistory.isLoadingBefore)}
@@ -1218,7 +1218,7 @@
             {displayContext}
             runtimeActive={Boolean(entry.runtimeKey)}
             {elapsedSeconds}
-            initialExpanded={isTurnLive(entry.items) || Boolean(entry.runtimeKey)}
+            initialExpanded={false}
             {filePreviewScopeForItem}
             canEditMessage={(item) => canEditUserMessage(item.message)}
             editMessage={(item) => editUserMessage(item.message)}

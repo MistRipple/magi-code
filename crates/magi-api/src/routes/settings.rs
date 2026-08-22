@@ -1087,6 +1087,13 @@ async fn update_setting(
             "浏览器能力设置必须通过专用接口更新".to_string(),
         ));
     }
+    if request.key.trim() == "conversationDisplayMode"
+        && !matches!(request.value.as_str(), Some("original" | "summary"))
+    {
+        return Err(ApiError::InvalidInput(
+            "conversationDisplayMode 必须是 original 或 summary".to_string(),
+        ));
+    }
     state
         .settings_store
         .set(&request.key, request.value.clone())

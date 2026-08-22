@@ -15,6 +15,8 @@ export type SettingsWorkerStatusSnapshot = Record<string, {
 
 export type SettingsWorkerStatusMap = SettingsWorkerStatusSnapshot;
 
+export type ConversationDisplayMode = 'original' | 'summary';
+
 export interface SettingsBuiltinTool {
   name: string;
   category: string;
@@ -50,6 +52,7 @@ export interface SettingsCapabilityDependency {
 
 export interface SettingsRuntimeSnapshot {
   locale: string;
+  conversationDisplayMode: ConversationDisplayMode;
 }
 
 export interface VisionBuiltinTextModelRule {

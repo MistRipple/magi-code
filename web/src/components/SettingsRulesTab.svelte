@@ -1,6 +1,8 @@
 <script lang="ts">
+  import type { ConversationDisplayMode } from '../shared/settings-bootstrap';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
+  import ConversationDisplayPreference from './ConversationDisplayPreference.svelte';
 
   let {
     userRules = $bindable(),
@@ -15,6 +17,9 @@
     safeguardSaveStatus,
     safeguardAuditCount,
     safeguardAuditPersistenceHealthy,
+    conversationDisplayMode,
+    conversationDisplaySaveStatus,
+    saveConversationDisplayMode,
   } = $props<{
     userRules: string;
     SAFEGUARD_CATEGORIES: any[];
@@ -28,6 +33,9 @@
     safeguardSaveStatus: string;
     safeguardAuditCount: number;
     safeguardAuditPersistenceHealthy: boolean;
+    conversationDisplayMode: ConversationDisplayMode;
+    conversationDisplaySaveStatus: 'idle' | 'saving' | 'saved' | 'error';
+    saveConversationDisplayMode: (mode: ConversationDisplayMode) => void;
   }>();
 
   const SAFEGUARD_ACTIONS = [
@@ -83,6 +91,12 @@
 
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
+<ConversationDisplayPreference
+  mode={conversationDisplayMode}
+  saveStatus={conversationDisplaySaveStatus}
+  onChange={saveConversationDisplayMode}
+/>
+
 <!-- 用户自定义规则 -->
 <div class="settings-section">
   <div class="settings-section-header">

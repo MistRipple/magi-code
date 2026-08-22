@@ -7,7 +7,8 @@
   import Icon from './Icon.svelte';
   import MessageItem from './MessageItem.svelte';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
-  import ConversationStage, { type ConversationStageModel } from './ConversationStage.svelte';
+  import ConversationProcessRow from './ConversationProcessRow.svelte';
+  import ConversationToolGroup from './ConversationToolGroup.svelte';
 
   interface Props {
     turnId: string;
@@ -23,6 +24,10 @@
     continueInterruptedSession: () => void;
   }
 
+  type ConversationProcessEntry =
+    | { kind: 'event'; key: string; item: TimelineRenderItem }
+    | { kind: 'tool-group'; key: string; items: TimelineRenderItem[] };
+
   let {
     turnId,
     items,
@@ -37,7 +42,7 @@
     continueInterruptedSession,
   }: Props = $props();
 
-  // 轮次默认收起；当前正在输出的轮次由 MessageList 传入展开，避免实时输出被隐藏。
+  // 轮次状态只在首次创建时读取；用户手动展开后，流式更新不能覆盖这个选择。
   let expanded = $state(untrack(() => initialExpanded));
 
   function metadataString(message: Message, key: string): string {
@@ -45,8 +50,11 @@
     return typeof value === 'string' ? value.trim() : '';
   }
 
-  function isAssistantOutput(message: Message): boolean {
-    return message.type !== 'user_input';
+  function isToolLikeMessage(message: Message): boolean {
+    return message.type === 'tool_call'
+      || (message.blocks || []).some((block) => (
+        block.type === 'tool_call' || block.type === 'tool_result' || block.type === 'file_change'
+      ));
   }
 
   function isFinalMessage(message: Message): boolean {
@@ -57,7 +65,7 @@
   }
 
   function isUsefulFinalCandidate(message: Message): boolean {
-    if (message.type === 'tool_call' || message.type === 'thinking') return false;
+    if (isToolLikeMessage(message) || message.type === 'thinking') return false;
     if (message.type === 'error' || message.type === 'result' || message.type === 'text') return true;
     return Boolean(
       message.content?.trim()
@@ -71,7 +79,7 @@
   }
 
   const userItems = $derived(items.filter((item) => item.message.type === 'user_input'));
-  const assistantItems = $derived(items.filter((item) => isAssistantOutput(item.message)));
+  const assistantItems = $derived(items.filter((item) => item.message.type !== 'user_input'));
   const explicitFinalItems = $derived(assistantItems.filter((item) => isFinalMessage(item.message)));
   const finalItems = $derived.by(() => {
     if (explicitFinalItems.length > 0) return explicitFinalItems;
@@ -79,51 +87,45 @@
       const candidate = assistantItems[index];
       if (isUsefulFinalCandidate(candidate.message)) return [candidate];
     }
-    // 极少数没有最终正文的失败/中断轮次仍需保留一个可见锚点，不能因折叠把整轮内容隐藏。
-    return assistantItems.length > 0 ? [assistantItems[assistantItems.length - 1]] : [];
+    // 只有明确的最终输出才离开过程区；工具结果不能伪装成最终回答。
+    return [];
   });
   const finalItemKeys = $derived(new Set(finalItems.map((item) => item.key)));
   const processItems = $derived(assistantItems.filter((item) => !finalItemKeys.has(item.key)));
 
-  function modelRound(item: TimelineRenderItem): number | null {
-    const value = item.message.metadata?.modelRound;
-    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-      ? value
-      : null;
-  }
+  const processEntries = $derived.by(() => {
+    const result: ConversationProcessEntry[] = [];
+    let toolGroupItems: TimelineRenderItem[] = [];
+    let toolGroupInserted = false;
+    const hasToolItems = processItems.some((item) => isToolLikeMessage(item.message));
 
-  function isToolLike(item: TimelineRenderItem): boolean {
-    return item.message.type === 'tool_call'
-      || (item.message.blocks || []).some((block) => (
-        block.type === 'tool_call' || block.type === 'tool_result' || block.type === 'file_change'
-      ));
-  }
+    const insertToolGroup = () => {
+      if (toolGroupInserted || toolGroupItems.length === 0) return;
+      const firstKey = toolGroupItems[0].key;
+      result.push({
+        kind: 'tool-group',
+        key: `tool-group:${firstKey}`,
+        items: toolGroupItems,
+      });
+      toolGroupInserted = true;
+    };
 
-  const stages = $derived.by(() => {
-    const result: ConversationStageModel[] = [];
-    let currentGroupingKey = '';
-    let fallbackIndex = 0;
     for (const item of processItems) {
-      const round = modelRound(item);
-      const groupingKey = round !== null
-        ? `round:${round}`
-        : (isToolLike(item) && currentGroupingKey
-          ? currentGroupingKey
-          : `sequence:${fallbackIndex++}`);
-      if (groupingKey !== currentGroupingKey) {
-        result.push({
-          key: `stage:${result.length}:${groupingKey}`,
-          index: result.length + 1,
-          items: [],
-        });
-        currentGroupingKey = groupingKey;
+      if (isToolLikeMessage(item.message)) {
+        toolGroupItems.push(item);
+        continue;
       }
-      result[result.length - 1].items.push(item);
+      // 同一轮中的思考输出只是模型内部过程，不应把连续工具调用切成多个组。
+      // 有工具时省略这些重复的思考行；没有工具时仍保留思考事件供用户展开查看。
+      if (hasToolItems && item.message.type === 'thinking') continue;
+      insertToolGroup();
+      result.push({ kind: 'event', key: `event:${item.key}`, item });
     }
+    insertToolGroup();
     return result;
   });
 
-  const hasProcess = $derived(processItems.length > 0 || runtimeActive);
+  const hasProcess = $derived(processEntries.length > 0 || runtimeActive);
   const isLive = $derived(
     runtimeActive
       || items.some((item) => item.message.isStreaming)
@@ -180,23 +182,26 @@
       >
         <span class="turn-disclosure-label">{disclosureLabel}</span>
         <span class="turn-disclosure-chevron" class:rotated={expanded}>
-          <Icon name="chevron-right" size={13} />
+          <Icon name="chevron-right" size={14} />
         </span>
       </button>
 
       {#if expanded}
         <div class="turn-process" id={`turn-process-${turnId}`}>
-          {#each stages as stage (stage.key)}
-            <ConversationStage
-              {stage}
-              {readOnly}
-              {displayContext}
-              filePreviewScopeForItem={filePreviewScopeForItem}
-              canEditMessage={canEditMessage}
-              editMessage={editMessage}
-              continueInterruptedSession={continueInterruptedSession}
-              initialExpanded={isLive}
-            />
+          {#each processEntries as entry (entry.key)}
+            {#if entry.kind === 'event'}
+              <ConversationProcessRow item={entry.item} />
+            {:else}
+              <ConversationToolGroup
+                items={entry.items}
+                {readOnly}
+                {displayContext}
+                {filePreviewScopeForItem}
+                {canEditMessage}
+                {editMessage}
+                {continueInterruptedSession}
+              />
+            {/if}
           {/each}
           {#if runtimeActive}
             <TurnRuntimeIndicator {elapsedSeconds} />
@@ -233,16 +238,18 @@
   }
 
   .turn-disclosure-header {
-    display: inline-flex;
+    display: flex;
     align-items: center;
-    gap: var(--space-2);
-    min-height: 26px;
+    width: 100%;
+    min-height: 42px;
+    gap: 8px;
     padding: 0;
     border: 0;
-    border-radius: var(--radius-sm);
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
     background: transparent;
     color: var(--foreground-muted);
-    font-size: var(--text-xs);
+    text-align: left;
     cursor: pointer;
   }
 
@@ -257,11 +264,14 @@
   }
 
   .turn-disclosure-label {
+    font-size: var(--text-base);
     font-variant-numeric: tabular-nums;
+    font-weight: var(--font-medium);
   }
 
   .turn-disclosure-chevron {
     display: inline-flex;
+    flex: 0 0 auto;
     transition: transform var(--transition-fast), color var(--transition-fast);
   }
 
@@ -273,19 +283,19 @@
   .turn-process {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
-    margin-top: var(--space-1);
-    padding: var(--space-2) 0 0 var(--space-3);
-    border-left: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    gap: 2px;
+    margin-top: var(--space-3);
+    padding: 0 0 var(--space-2) 28px;
+    border-left: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
   }
 
   .turn-process :global(.turn-runtime-indicator) {
-    margin-left: var(--space-2);
+    margin-left: 0;
   }
 
   @media (max-width: 560px) {
     .turn-process {
-      padding-left: var(--space-2);
+      padding-left: 20px;
     }
   }
 </style>

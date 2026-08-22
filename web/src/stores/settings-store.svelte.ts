@@ -49,6 +49,7 @@ import {
   saveAgentSafeguardConfig,
   saveAgentWorkerConfig,
   saveAgentOrchestratorConfig,
+  updateAgentRuntimeSetting,
   removeAgentWorkerConfig,
   testAgentAuxiliaryConnection,
   testAgentVisionConnection,
@@ -64,6 +65,7 @@ import {
 } from "../web/agent-api";
 import type { RoleTemplate } from "../shared/types/role-templates";
 import type {
+  ConversationDisplayMode,
   VisionBuiltinTextModelRule,
 } from "../shared/settings-bootstrap";
 import type {
@@ -336,6 +338,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   // 全局用户规则
   let userRules = $state("");
+
+  // 对话主区域的呈现模式。默认保持原始风格，摘要风格只改变 thread 主区，
+  // 不影响右侧 task 面板的执行明细。
+  let conversationDisplayMode = $state<ConversationDisplayMode>("original");
+  let persistedConversationDisplayMode = $state<ConversationDisplayMode>("original");
+  let conversationDisplaySaveStatus = $state<"idle" | "saving" | "saved" | "error">("idle");
+  let conversationDisplaySaveVersion = 0;
+  let conversationDisplaySaveQueue: Promise<void> = Promise.resolve();
+  let conversationDisplayStatusTimer: ReturnType<typeof setTimeout> | null = null;
 
   onMount(() => {
     const handler = (e: Event) => {
@@ -1437,9 +1448,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
   ) {
     const runtimeLocale = payload.runtimeSettings?.locale;
+    const runtimeDisplayMode: ConversationDisplayMode = payload.runtimeSettings?.conversationDisplayMode === 'summary'
+      ? 'summary'
+      : 'original';
     if (options?.allowLocaleHydration !== false && (runtimeLocale === 'zh-CN' || runtimeLocale === 'en-US')) {
       i18n.setLocale(runtimeLocale);
     }
+    conversationDisplayMode = runtimeDisplayMode;
+    persistedConversationDisplayMode = runtimeDisplayMode;
+    conversationDisplaySaveStatus = "idle";
     applyUserRulesConfig(payload.userRulesConfig);
     visionBuiltinTextModelRules = payload.visionBuiltinTextModelRules.map((rule) => ({
       ...rule,
@@ -1815,6 +1832,62 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   async function reloadRoleTemplates(): Promise<void> {
     await loadRegistryData();
+  }
+
+  function clearConversationDisplaySaveStatusLater(): void {
+    if (conversationDisplayStatusTimer) {
+      clearTimeout(conversationDisplayStatusTimer);
+    }
+    conversationDisplayStatusTimer = setTimeout(() => {
+      conversationDisplaySaveStatus = "idle";
+      conversationDisplayStatusTimer = null;
+    }, 2000);
+  }
+
+  function updateConversationDisplaySnapshot(mode: ConversationDisplayMode): void {
+    const snapshot = messagesState.settingsBootstrapSnapshot as
+      | AgentSettingsBootstrapSnapshot
+      | null;
+    if (!snapshot) return;
+    messagesState.settingsBootstrapSnapshot = {
+      ...snapshot,
+      runtimeSettings: {
+        ...snapshot.runtimeSettings,
+        conversationDisplayMode: mode,
+      },
+    };
+  }
+
+  function saveConversationDisplayMode(mode: ConversationDisplayMode): void {
+    const requestedMode: ConversationDisplayMode = mode === 'summary' ? 'summary' : 'original';
+    conversationDisplayMode = requestedMode;
+    const requestVersion = ++conversationDisplaySaveVersion;
+    conversationDisplaySaveStatus = "saving";
+
+    // 顺序化写入，避免用户快速切换时后发请求先落库，最终设置与界面不一致。
+    conversationDisplaySaveQueue = conversationDisplaySaveQueue
+      .catch(() => undefined)
+      .then(async () => {
+        if (requestVersion !== conversationDisplaySaveVersion) return;
+        try {
+          const payload = await updateAgentRuntimeSetting('conversationDisplayMode', requestedMode);
+          if (requestVersion !== conversationDisplaySaveVersion) return;
+          const savedMode: ConversationDisplayMode = payload.conversationDisplayMode === 'summary'
+            ? 'summary'
+            : 'original';
+          conversationDisplayMode = savedMode;
+          persistedConversationDisplayMode = savedMode;
+          updateConversationDisplaySnapshot(savedMode);
+          conversationDisplaySaveStatus = "saved";
+        } catch (error) {
+          if (requestVersion !== conversationDisplaySaveVersion) return;
+          conversationDisplayMode = persistedConversationDisplayMode;
+          updateConversationDisplaySnapshot(persistedConversationDisplayMode);
+          conversationDisplaySaveStatus = "error";
+          notifySettingsError(i18n.t("settings.conversationDisplay.title"), error);
+        }
+        clearConversationDisplaySaveStatusLater();
+      });
   }
 
   async function saveUserRulesNow(value = userRules, saveVersion = ++userRulesSaveVersion, force = false) {
@@ -3867,6 +3940,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get userRulesSaveStatus() {
       return userRulesSaveStatus;
     },
+    get conversationDisplayMode() {
+      return conversationDisplayMode;
+    },
+    get conversationDisplaySaveStatus() {
+      return conversationDisplaySaveStatus;
+    },
+    saveConversationDisplayMode,
     get safeguardSaveStatus() {
       return safeguardSaveStatus;
     },
