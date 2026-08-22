@@ -1,0 +1,824 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magi.dev/contracts/app-server/app-server.schema.json",
+  "title": "Magi App Server protocol",
+  "x-protocol": { "name": "magi.app-server", "major": 1, "minor": 0, "jsonrpcVersion": "2.0" },
+  "x-methods": [
+    "initialize", "initialized", "ping", "session/list", "session/read", "turn/start",
+    "events/subscribe", "browser/tools/list", "browser/tool", "approval/request",
+    "$/cancelRequest"
+  ],
+  "x-method-signatures": {
+    "initialize": {
+      "kind": "request",
+      "params": "InitializeParams",
+      "result": "InitializeResult"
+    },
+    "initialized": {
+      "kind": "notification",
+      "params": "EmptyParams"
+    },
+    "ping": {
+      "kind": "request",
+      "params": "EmptyParams",
+      "result": "PingResult"
+    },
+    "session/list": {
+      "kind": "request",
+      "params": "SessionListParams",
+      "result": "SessionListResult"
+    },
+    "session/read": {
+      "kind": "request",
+      "params": "SessionReadParams",
+      "result": "SessionReadResult"
+    },
+    "turn/start": {
+      "kind": "request",
+      "params": "TurnStartParams",
+      "result": "TurnStartResult"
+    },
+    "events/subscribe": {
+      "kind": "request",
+      "params": "EventSubscribeParams",
+      "result": "EventSubscribeResult"
+    },
+    "browser/tools/list": {
+      "kind": "request",
+      "params": "BrowserToolsListParams",
+      "result": "BrowserToolsListResult"
+    },
+    "browser/tool": {
+      "kind": "request",
+      "params": "BrowserToolParams",
+      "result": "BrowserToolResult"
+    },
+    "approval/request": {
+      "kind": "request",
+      "params": "ApprovalRequestParams",
+      "result": "ApprovalDecision",
+      "serverRequest": true
+    },
+    "$/cancelRequest": {
+      "kind": "notification",
+      "params": "CancelRequestParams"
+    }
+  },
+  "$ref": "#/$defs/JsonRpcMessage",
+  "$defs": {
+    "JsonRpcVersion": {
+      "type": "string",
+      "enum": ["2.0"]
+    },
+    "JsonRpcRequestId": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "number", "x-rust-type": "serde_json::Number" }
+      ]
+    },
+    "JsonValue": {},
+    "ProtocolVersion": {
+      "type": "object",
+      "x-rust-derive-default": true,
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "minor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      }
+    },
+    "ClientInfo": {
+      "type": "object",
+      "x-rust-derive-default": true,
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "title": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] }
+      }
+    },
+    "ClientCapabilities": {
+      "type": "object",
+      "x-rust-derive-default": true,
+      "additionalProperties": false,
+      "properties": {
+        "desktopBrowserSurface": { "type": "boolean", "default": false, "x-rust-default": true },
+        "browserTools": { "type": "boolean", "default": false, "x-rust-default": true },
+        "approvals": { "type": "boolean", "default": false, "x-rust-default": true },
+        "streaming": { "type": "boolean", "default": false, "x-rust-default": true },
+        "optOutNotificationMethods": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "x-rust-default": true
+        }
+      }
+    },
+    "EmptyParams": {
+      "type": "object",
+      "x-rust-derive-default": true,
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "PingResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeEpoch"],
+      "properties": {
+        "runtimeEpoch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ServerCapabilities": {
+      "type": "object",
+      "x-rust-derive-default": true,
+      "additionalProperties": false,
+      "required": ["sessions", "turns", "events", "approvals", "browserTools"],
+      "properties": {
+        "sessions": { "type": "boolean" },
+        "turns": { "type": "boolean" },
+        "events": { "type": "boolean" },
+        "approvals": { "type": "boolean" },
+        "browserTools": { "type": "boolean" }
+      }
+    },
+    "InitializeParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clientInfo"],
+      "properties": {
+        "clientInfo": { "$ref": "#/$defs/ClientInfo" },
+        "protocol": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProtocolVersion" },
+            { "type": "null" }
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/ClientCapabilities",
+          "default": {},
+          "x-rust-default": true
+        }
+      }
+    },
+    "InitializeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["serverInfo", "protocol", "runtimeEpoch", "capabilities"],
+      "properties": {
+        "serverInfo": { "$ref": "#/$defs/ClientInfo" },
+        "protocol": { "$ref": "#/$defs/ProtocolVersion" },
+        "runtimeEpoch": { "type": "string", "minLength": 1 },
+        "capabilities": { "$ref": "#/$defs/ServerCapabilities" }
+      }
+    },
+    "BrowserToolsListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": { "type": ["string", "null"] }
+      }
+    },
+    "EventSubscribeParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": { "type": ["string", "null"] },
+        "workspaceId": { "type": ["string", "null"] },
+        "afterSequence": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" }
+      }
+    },
+    "SessionListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspaceId": { "type": ["string", "null"] }
+      }
+    },
+    "SessionReadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "includeTurns": { "type": "boolean", "default": false, "x-rust-default": true }
+      }
+    },
+    "SessionScope": {
+      "type": "string",
+      "enum": ["personal", "workspace"]
+    },
+    "SessionTurnImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "dataUrl"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "dataUrl": { "type": "string", "minLength": 1 }
+      }
+    },
+    "SessionContextReferenceKind": {
+      "type": "string",
+      "enum": ["file", "directory"]
+    },
+    "SessionContextReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "name"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/SessionContextReferenceKind" },
+        "path": { "type": "string", "minLength": 1 },
+        "pathRef": { "type": ["string", "null"] },
+        "name": { "type": "string", "minLength": 1 }
+      }
+    },
+    "AccessProfile": {
+      "type": "string",
+      "enum": ["read_only", "restricted", "full_access"]
+    },
+    "TurnStartParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope"],
+      "properties": {
+        "sessionId": { "type": ["string", "null"] },
+        "scope": { "$ref": "#/$defs/SessionScope" },
+        "workspaceId": { "type": ["string", "null"] },
+        "workspacePath": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "skillName": { "type": ["string", "null"] },
+        "locale": { "type": ["string", "null"] },
+        "goalMode": { "type": "boolean", "default": false, "x-rust-default": true },
+        "images": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SessionTurnImage" },
+          "default": [],
+          "x-rust-default": true
+        },
+        "contextReferences": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SessionContextReference" },
+          "default": [],
+          "x-rust-default": true
+        },
+        "browserAnnotationRefs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "x-rust-default": true
+        },
+        "accessProfile": {
+          "oneOf": [
+            { "$ref": "#/$defs/AccessProfile" },
+            { "type": "null" }
+          ],
+          "x-rust-default": true
+        },
+        "orchestratorSessionConfig": {
+          "oneOf": [
+            { "$ref": "#/$defs/JsonValue" },
+            { "type": "null" }
+          ],
+          "x-rust-type": "Option<Value>",
+          "x-ts-type": "JsonValue | null",
+          "x-rust-default": true
+        },
+        "requestId": { "type": ["string", "null"] },
+        "userMessageId": { "type": ["string", "null"] },
+        "placeholderMessageId": { "type": ["string", "null"] },
+        "steerCurrentTurn": { "type": "boolean", "default": false, "x-rust-default": true },
+        "expectedTurnId": { "type": ["string", "null"] },
+        "replaceTurnId": { "type": ["string", "null"] }
+      }
+    },
+    "SessionSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId", "workspaceId", "title", "status", "createdAt", "updatedAt",
+        "messageCount", "isRunning", "runningTaskCount", "hasUnreadCompletion"
+      ],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "workspaceId": { "type": ["string", "null"] },
+        "title": { "type": "string" },
+        "status": { "type": "string", "minLength": 1 },
+        "createdAt": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "updatedAt": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "messageCount": { "type": "integer", "minimum": 0, "x-rust-type": "usize" },
+        "isRunning": { "type": "boolean" },
+        "runningTaskCount": { "type": "integer", "minimum": 0, "x-rust-type": "usize" },
+        "hasUnreadCompletion": { "type": "boolean" }
+      }
+    },
+    "SessionListResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessions", "runtimeEpoch"],
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SessionSummary" }
+        },
+        "runtimeEpoch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "SessionReadResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "turns", "runtimeEpoch"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionSummary" },
+        "turns": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CanonicalTurn" }
+        },
+        "runtimeEpoch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "EventCategory": {
+      "type": "string",
+      "enum": ["Domain", "Audit", "Usage", "Projection", "System"]
+    },
+    "CanonicalTurnStatus": {
+      "type": "string",
+      "enum": ["pending", "running", "completed", "blocked", "failed", "interrupted", "cancelled", "superseded"]
+    },
+    "CanonicalTurnItemKind": {
+      "type": "string",
+      "enum": ["user_message", "assistant_text", "assistant_thinking", "tool_call", "task_status", "system_notice"]
+    },
+    "CanonicalTurnItemStatus": {
+      "type": "string",
+      "enum": ["pending", "running", "completed", "blocked", "failed", "cancelled"]
+    },
+    "CanonicalTurnEventKind": {
+      "type": "string",
+      "enum": ["turn_started", "turn_item_upsert", "turn_completed", "turn_superseded"]
+    },
+    "CanonicalTurnVisibility": {
+      "type": "object",
+      "x-rust-derive-default": true,
+      "additionalProperties": false,
+      "properties": {
+        "renderable": { "type": "boolean", "default": true, "x-rust-default": true }
+      }
+    },
+    "CanonicalToolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callId", "name"],
+      "properties": {
+        "callId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "arguments": { "type": ["object", "array", "string", "number", "boolean", "null"], "x-rust-type": "Option<Value>", "x-ts-type": "JsonValue | null" },
+        "result": { "type": ["object", "array", "string", "number", "boolean", "null"], "x-rust-type": "Option<Value>", "x-ts-type": "JsonValue | null" },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "CanonicalWorkerRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "taskId": { "type": ["string", "null"] },
+        "workerId": { "type": ["string", "null"] },
+        "roleId": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] }
+      }
+    },
+    "CanonicalTurnItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "turnId", "turnSeq", "itemId", "itemSeq", "kind", "createdAt", "status", "updatedAt", "sourceThreadId", "visibility"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "turnId": { "type": "string", "minLength": 1 },
+        "turnSeq": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "itemId": { "type": "string", "minLength": 1 },
+        "itemSeq": { "type": "integer", "minimum": 0, "x-rust-type": "usize" },
+        "kind": { "$ref": "#/$defs/CanonicalTurnItemKind" },
+        "createdAt": { "type": "integer", "x-rust-type": "i64" },
+        "status": { "$ref": "#/$defs/CanonicalTurnItemStatus" },
+        "itemVersion": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
+        "updatedAt": { "type": "integer", "x-rust-type": "i64" },
+        "title": { "type": ["string", "null"] },
+        "content": { "type": ["string", "null"] },
+        "blocks": { "type": "array", "items": {}, "default": [], "x-rust-default": true, "x-rust-type": "Vec<Value>" },
+        "tool": { "oneOf": [{ "$ref": "#/$defs/CanonicalToolCall" }, { "type": "null" }] },
+        "worker": { "oneOf": [{ "$ref": "#/$defs/CanonicalWorkerRef" }, { "type": "null" }] },
+        "sourceThreadId": { "type": "string", "minLength": 1 },
+        "visibility": { "$ref": "#/$defs/CanonicalTurnVisibility", "x-rust-default": true },
+        "metadata": { "type": "object", "default": {}, "x-rust-default": true, "x-rust-type": "std::collections::HashMap<String, Value>", "x-ts-type": "Record<string, JsonValue>" }
+      }
+    },
+    "CanonicalTurn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "turnId", "turnSeq", "acceptedAt", "status", "items"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "turnId": { "type": "string", "minLength": 1 },
+        "turnSeq": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "acceptedAt": { "type": "integer", "x-rust-type": "i64" },
+        "completedAt": { "type": ["integer", "null"], "x-rust-type": "Option<i64>" },
+        "status": { "$ref": "#/$defs/CanonicalTurnStatus" },
+        "responseDurationMs": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
+        "usage": { "type": ["object", "array", "string", "number", "boolean", "null"], "x-rust-type": "Option<Value>", "x-ts-type": "JsonValue | null" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/CanonicalTurnItem" }, "default": [], "x-rust-default": true },
+        "metadata": { "type": "object", "default": {}, "x-rust-default": true, "x-rust-type": "std::collections::HashMap<String, Value>", "x-ts-type": "Record<string, JsonValue>" }
+      }
+    },
+    "CanonicalTurnEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonicalSchemaVersion", "canonicalEventKind"],
+      "properties": {
+        "canonicalSchemaVersion": { "type": "string", "minLength": 1 },
+        "canonicalEventKind": { "$ref": "#/$defs/CanonicalTurnEventKind" },
+        "canonicalTurn": { "oneOf": [{ "$ref": "#/$defs/CanonicalTurn" }, { "type": "null" }] },
+        "canonicalItem": { "oneOf": [{ "$ref": "#/$defs/CanonicalTurnItem" }, { "type": "null" }] }
+      }
+    },
+    "TurnStartKind": {
+      "type": "string",
+      "enum": ["accepted", "queued"]
+    },
+    "TurnStartRoute": {
+      "type": "string",
+      "enum": ["chat", "execute", "task", "continue", "steer"]
+    },
+    "TurnQueueInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queueId", "queuePosition"],
+      "properties": {
+        "queueId": { "type": "string", "minLength": 1 },
+        "queuePosition": { "type": "integer", "minimum": 0, "x-rust-type": "usize" }
+      }
+    },
+    "TurnStartResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "replayed", "requestId", "sessionId", "turnId", "entryId", "eventId",
+        "acceptedAt", "runtimeEpoch", "eventStreamNextSequence", "createdSession", "route",
+        "sessionSummary", "userMessageItemId", "canonicalTurn", "canonicalItem", "queue"
+      ],
+      "properties": {
+        "kind": { "$ref": "#/$defs/TurnStartKind" },
+        "replayed": { "type": "boolean" },
+        "requestId": { "type": ["string", "null"] },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "turnId": { "type": ["string", "null"] },
+        "entryId": { "type": "string", "minLength": 1 },
+        "eventId": { "type": "string", "minLength": 1 },
+        "acceptedAt": { "type": "integer", "x-rust-type": "i64" },
+        "runtimeEpoch": { "type": "string", "minLength": 1 },
+        "eventStreamNextSequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "createdSession": { "type": "boolean" },
+        "route": {
+          "oneOf": [
+            { "$ref": "#/$defs/TurnStartRoute" },
+            { "type": "null" }
+          ]
+        },
+        "sessionSummary": {
+          "oneOf": [
+            { "$ref": "#/$defs/SessionSummary" },
+            { "type": "null" }
+          ]
+        },
+        "userMessageItemId": { "type": ["string", "null"] },
+        "canonicalTurn": {
+          "oneOf": [
+            { "$ref": "#/$defs/CanonicalTurn" },
+            { "type": "null" }
+          ]
+        },
+        "canonicalItem": {
+          "oneOf": [
+            { "$ref": "#/$defs/CanonicalTurnItem" },
+            { "type": "null" }
+          ]
+        },
+        "queue": {
+          "oneOf": [
+            { "$ref": "#/$defs/TurnQueueInfo" },
+            { "type": "null" }
+          ]
+        },
+        "rootTaskId": { "type": ["string", "null"] },
+        "actionTaskId": { "type": ["string", "null"] },
+        "executionChainRef": { "type": ["string", "null"] },
+        "steeredTurnId": { "type": ["string", "null"] },
+        "canonicalSchemaVersion": { "type": ["string", "null"] },
+        "canonicalEventKind": { "type": ["string", "null"] }
+      }
+    },
+    "EventEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "event_type", "category", "occurred_at", "sequence", "payload"],
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1 },
+        "event_type": { "type": "string", "minLength": 1 },
+        "category": { "$ref": "#/$defs/EventCategory" },
+        "occurred_at": { "type": "integer", "x-rust-type": "i64" },
+        "sequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "workspace_id": { "type": ["string", "null"] },
+        "session_id": { "type": ["string", "null"] },
+        "mission_id": { "type": ["string", "null"] },
+        "assignment_id": { "type": ["string", "null"] },
+        "task_id": { "type": ["string", "null"] },
+        "payload": { "type": "object", "x-rust-type": "Value", "x-ts-type": "Record<string, JsonValue>" }
+      }
+    },
+    "EventStreamSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["next_sequence", "recent_events"],
+      "properties": {
+        "next_sequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "recent_events": { "type": "array", "items": { "$ref": "#/$defs/EventEnvelope" } }
+      }
+    },
+    "EventNotificationParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "event"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "event": { "$ref": "#/$defs/EventEnvelope" }
+      }
+    },
+    "EventSubscribeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subscribed", "nextSequence", "resyncRequired"],
+      "properties": {
+        "subscribed": { "type": "boolean" },
+        "nextSequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "resyncRequired": { "type": "boolean" }
+      }
+    },
+    "EventSnapshotParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nextSequence", "recentEvents"],
+      "properties": {
+        "nextSequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "recentEvents": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EventEnvelope" }
+        }
+      }
+    },
+    "EventResyncReason": {
+      "type": "string",
+      "enum": ["afterSequenceExpired", "clientTooSlow"]
+    },
+    "EventResyncRequiredParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "requestedAfterSequence", "skipped", "snapshot"],
+      "properties": {
+        "reason": { "$ref": "#/$defs/EventResyncReason" },
+        "requestedAfterSequence": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
+        "skipped": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
+        "snapshot": { "$ref": "#/$defs/EventStreamSnapshot" }
+      }
+    },
+    "BrowserAccessProfile": {
+      "type": "string",
+      "enum": ["read_only", "restricted", "full_access"]
+    },
+    "BrowserToolAccess": {
+      "type": "string",
+      "enum": ["read", "write", "mixed"]
+    },
+    "BrowserToolDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "access"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "access": { "$ref": "#/$defs/BrowserToolAccess" }
+      }
+    },
+    "BrowserHostStatus": {
+      "type": "string",
+      "enum": ["stopped", "starting", "ready", "reconnecting", "failed"]
+    },
+    "BrowserCapabilitySnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision", "inAppBrowserEnabled", "browserUseEnabled", "hostStatus",
+        "hostProtocolCompatible", "accessProfile"
+      ],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "inAppBrowserEnabled": { "type": "boolean" },
+        "browserUseEnabled": { "type": "boolean" },
+        "hostStatus": { "$ref": "#/$defs/BrowserHostStatus" },
+        "hostProtocolCompatible": { "type": "boolean" },
+        "accessProfile": { "$ref": "#/$defs/BrowserAccessProfile" }
+      }
+    },
+    "BrowserToolsListResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools", "capabilities", "runtimeEpoch"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/BrowserToolDescriptor" }
+        },
+        "capabilities": { "$ref": "#/$defs/BrowserCapabilitySnapshot" },
+        "runtimeEpoch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "BrowserToolResultStatus": {
+      "type": "string",
+      "enum": ["completed", "blocked", "failed", "cancelled", "indeterminate"]
+    },
+    "BrowserToolResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "status", "payload", "itemId", "turnId", "runtimeEpoch"],
+      "properties": {
+        "tool": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/BrowserToolResultStatus" },
+        "payload": { "$ref": "#/$defs/JsonValue", "x-rust-type": "Value", "x-ts-type": "JsonValue" },
+        "itemId": { "type": "string", "minLength": 1 },
+        "turnId": { "type": "string", "minLength": 1 },
+        "runtimeEpoch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "BrowserToolParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "tool", "arguments"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "tool": { "type": "string", "minLength": 1 },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/JsonValue" },
+          "x-rust-type": "std::collections::HashMap<String, Value>",
+          "x-ts-type": "Record<string, JsonValue>"
+        },
+        "workspaceId": { "type": ["string", "null"] },
+        "callId": { "type": ["string", "null"] },
+        "accessProfile": { "$ref": "#/$defs/BrowserAccessProfile" },
+        "browserCapabilityRevision": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
+        "browserExecutionId": { "type": ["string", "null"] },
+        "taskId": { "type": ["string", "null"] },
+        "workerId": { "type": ["string", "null"] }
+      }
+    },
+    "ApprovalRequestParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "reason"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "risk": { "type": ["string", "null"] }
+      }
+    },
+    "ApprovalDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approved"],
+      "properties": {
+        "approved": { "type": "boolean" }
+      }
+    },
+    "JsonRpcError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "integer", "x-rust-type": "i32" },
+        "message": { "type": "string", "minLength": 1 },
+        "data": { "$ref": "#/$defs/JsonValue" },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "JsonRpcRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "id", "method"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
+        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
+        "method": { "type": "string", "minLength": 1 },
+        "requestTimeoutMs": { "type": ["integer", "null"], "minimum": 100, "maximum": 600000, "x-rust-type": "Option<u64>" },
+        "params": { "$ref": "#/$defs/JsonValue", "x-rust-type": "Value", "x-rust-default": true }
+      }
+    },
+    "JsonRpcNotification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "method"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
+        "method": { "type": "string", "minLength": 1 },
+        "requestTimeoutMs": { "type": ["integer", "null"], "minimum": 100, "maximum": 600000, "x-rust-type": "Option<u64>" },
+        "params": { "$ref": "#/$defs/JsonValue", "x-rust-type": "Value", "x-rust-default": true }
+      }
+    },
+    "JsonRpcResultResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "id", "result"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
+        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
+        "result": { "$ref": "#/$defs/JsonValue" }
+      }
+    },
+    "JsonRpcErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "id", "error"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
+        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
+        "error": { "$ref": "#/$defs/JsonRpcError" }
+      }
+    },
+    "JsonRpcResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "id"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
+        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
+        "result": { "$ref": "#/$defs/JsonValue" },
+        "error": { "$ref": "#/$defs/JsonRpcError" }
+      },
+      "oneOf": [
+        { "required": ["result"], "not": { "required": ["error"] } },
+        { "required": ["error"], "not": { "required": ["result"] } }
+      ]
+    },
+    "CancelMethod": {
+      "type": "string",
+      "enum": ["$/cancelRequest"]
+    },
+    "CancelRequestParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/JsonRpcRequestId" }
+      }
+    },
+    "CancelNotification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "method", "params"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion" },
+        "method": { "$ref": "#/$defs/CancelMethod" },
+        "params": { "$ref": "#/$defs/CancelRequestParams" }
+      }
+    },
+    "JsonRpcServerRequest": {
+      "$ref": "#/$defs/JsonRpcRequest"
+    },
+    "JsonRpcServerNotification": {
+      "$ref": "#/$defs/JsonRpcNotification"
+    },
+    "JsonRpcServerResponse": {
+      "$ref": "#/$defs/JsonRpcResponse"
+    },
+    "ClientRequest": {
+      "$ref": "#/$defs/JsonRpcRequest"
+    },
+    "ClientNotification": {
+      "$ref": "#/$defs/JsonRpcNotification"
+    },
+    "ClientResponse": {
+      "$ref": "#/$defs/JsonRpcResponse"
+    },
+    "ServerRequest": {
+      "$ref": "#/$defs/JsonRpcServerRequest"
+    },
+    "ServerNotification": {
+      "$ref": "#/$defs/JsonRpcServerNotification"
+    },
+    "ServerResponse": {
+      "$ref": "#/$defs/JsonRpcServerResponse"
+    },
+    "JsonRpcMessage": {
+      "oneOf": [
+        { "$ref": "#/$defs/JsonRpcRequest" },
+        { "$ref": "#/$defs/JsonRpcNotification" },
+        { "$ref": "#/$defs/JsonRpcResponse" }
+      ]
+    }
+  }
+}

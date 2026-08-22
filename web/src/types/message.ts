@@ -214,6 +214,8 @@ export type PlaceholderState =
 export interface RequestResponseBinding {
   /** 用户请求 ID（前端生成） */
   requestId: string;
+  /** 请求所属的会话。会话切换只改变视图，不得丢弃该请求的生命周期。 */
+  sessionId?: string;
   /** 用户消息 ID */
   userMessageId: string;
   /** 本地响应占位消息 ID */

@@ -18,7 +18,9 @@
     "release:preflight": "node scripts/release-preflight.mjs",
     "release:preflight:full": "node scripts/release-preflight.mjs --package --audit",
     "test:browser-core-live": "node scripts/verify-browser-core-live.mjs",
-    "release:guard": "node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs"
+    "release:guard": "node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs",
+    "protocol:generate": "node scripts/generate-app-server-protocol.mjs",
+    "protocol:check": "node scripts/generate-app-server-protocol.mjs --check"
   },
   "engines": {
     "node": ">=22"

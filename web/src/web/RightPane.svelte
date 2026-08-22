@@ -58,11 +58,18 @@
     type BrowserCapabilitiesSnapshot,
   } from './agent-api';
 
+  type HtmlBrowserOpenRequest = {
+    requestId: number;
+    filepath: string;
+  };
+
   interface Props {
     workspaceRoot: string;
     overlay?: boolean;
     desktopSurface?: boolean;
     desktopSnapshot?: MagiDesktopWindowSnapshot | null;
+    htmlBrowserOpenRequest?: HtmlBrowserOpenRequest | null;
+    onHtmlBrowserOpenHandled?: (requestId: number) => void;
   }
 
   let {
@@ -70,6 +77,8 @@
     overlay = false,
     desktopSurface = false,
     desktopSnapshot = null,
+    htmlBrowserOpenRequest = null,
+    onHtmlBrowserOpenHandled,
   }: Props = $props();
 
   // ============ Tab 状态 ============
@@ -215,6 +224,40 @@
     }
   }
 
+  async function ensureBrowserSession(
+    workspaceId: string,
+    workspacePath: string,
+    sessionHint = '',
+  ): Promise<string> {
+    let sessionId = sessionHint.trim();
+    if (!sessionId && rightPaneState.activeWorkspaceId.trim() === workspaceId.trim()) {
+      sessionId = rightPaneState.activeSessionId.trim();
+    }
+    if (sessionId) return sessionId;
+
+    const materialized = await materializeSession(
+      workspaceId || null,
+      workspaceId ? workspacePath : undefined,
+    );
+    sessionId = materialized.sessionId;
+    const navigation = navigateSession(workspaceId
+      ? {
+          kind: 'session',
+          scope: 'workspace',
+          workspaceId,
+          workspacePath,
+          sessionId,
+        }
+      : { kind: 'session', scope: 'personal', sessionId });
+    if (!navigation) {
+      throw new Error('当前已有会话导航操作正在进行');
+    }
+    // 会话事实完成主 Renderer 导航后，才创建浏览器资源，避免浏览器事件
+    // 抢在 Composer 完成绑定前切换右栏作用域。
+    await waitForSessionNavigation(navigation);
+    return sessionId;
+  }
+
   function registerBrowserPane(
     browserSessionId: string,
     tabId: string,
@@ -303,30 +346,7 @@
     const workspaceId = rightPaneState.activeWorkspaceId.trim();
     creatingBrowserPane = true;
     try {
-      let sessionId = rightPaneState.activeSessionId.trim();
-      if (!sessionId) {
-        const materialized = await materializeSession(
-          workspaceId || null,
-          workspaceId ? workspaceRoot : undefined,
-        );
-        sessionId = materialized.sessionId;
-        const navigation = navigateSession(workspaceId
-          ? {
-              kind: 'session',
-              scope: 'workspace',
-              workspaceId,
-              workspacePath: workspaceRoot,
-              sessionId,
-            }
-          : { kind: 'session', scope: 'personal', sessionId });
-        if (!navigation) {
-          throw new Error('当前已有会话导航操作正在进行');
-        }
-        // materialize 创建的是主会话事实，浏览器资源必须在主视图完成
-        // 导航后再创建。并行创建会让 Composer 仍处于草稿态时收到浏览器
-        // 会话事件，进而把该会话错误地接管为当前对话。
-        await waitForSessionNavigation(navigation);
-      }
+      const sessionId = await ensureBrowserSession(workspaceId, workspaceRoot);
       const browserSession = await createBrowserSession(workspaceId, sessionId, workspaceRoot);
       const tab = await createBrowserTab(
         browserSession.browserSessionId,
@@ -695,15 +715,6 @@
       workspacePath: activeCodePayload?.workspacePath,
     });
   });
-  const activeSitePreviewQuery = $derived.by(() => {
-    if (!activeFilePath) return '';
-    return buildFilePreviewQuery(activeFilePath, {
-      includeSession: false,
-      workspaceId: activeCodePayload?.workspaceId,
-      workspacePath: activeCodePayload?.workspacePath,
-    });
-  });
-
   // 异步内容缓存跟随当前 Tab 集合裁剪，关闭预览后立即释放对应内容。
   $effect(() => {
     const retainedKeys = new Set<string>();
@@ -998,30 +1009,64 @@
       addToast('warning', message, undefined, { forceVisible: true });
       return;
     }
+    const filePath = activeFilePath.trim();
     const workspaceId = activeCodePayload?.workspaceId?.trim() || '';
-    const sessionId = activeCodePayload?.sessionId?.trim() || '';
-    if (!htmlFile || !activeFilePreviewQuery || !workspaceId || !sessionId || openingHtmlInBrowser) return;
+    const workspacePath = activeCodePayload?.workspacePath?.trim() || workspaceRoot.trim();
+    const sessionHint = activeCodePayload?.sessionId?.trim() || '';
+    if (!htmlFile || !filePath || !workspaceId || !workspacePath || openingHtmlInBrowser || creatingBrowserPane) return;
     openingHtmlInBrowser = true;
     try {
-      const browserSession = await createBrowserSession(workspaceId, sessionId, workspaceRoot);
+      const sitePreviewQuery = buildFilePreviewQuery(filePath, {
+        includeSession: false,
+        workspaceId,
+        workspacePath,
+      });
+      const sessionId = await ensureBrowserSession(workspaceId, workspacePath, sessionHint);
+      const browserSession = await createBrowserSession(workspaceId, sessionId, workspacePath);
       const tab = await createBrowserTab(
         browserSession.browserSessionId,
-        agentUrl('/api/files/site-open', activeSitePreviewQuery),
+        agentUrl('/api/files/site-open', sitePreviewQuery),
       );
       registerBrowserPane(
         browserSession.browserSessionId,
         tab.tabId,
         workspaceId,
         sessionId,
-        activeCodePayload?.workspacePath,
+        workspacePath,
         tab.lifecycle,
         tab.url,
         tab.navigationRevision,
       );
+    } catch (error) {
+      console.warn('[RightPane] 打开 HTML 内置浏览器失败:', error);
+      addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
     } finally {
       openingHtmlInBrowser = false;
     }
   }
+
+  let handledHtmlBrowserOpenRequestId = 0;
+  $effect(() => {
+    const request = htmlBrowserOpenRequest;
+    const currentFilePath = activeFilePath.trim();
+    void htmlFile;
+    void browserCapabilities;
+    void creatingBrowserPane;
+    void openingHtmlInBrowser;
+    if (!request || request.requestId === handledHtmlBrowserOpenRequestId) return;
+    // 能力快照尚未返回时不能把一次性请求判定为失败；等快照完成后再消费。
+    if (
+      !browserCapabilities
+      || creatingBrowserPane
+      || openingHtmlInBrowser
+      || currentFilePath !== request.filepath
+      || !htmlFile
+    ) return;
+    handledHtmlBrowserOpenRequestId = request.requestId;
+    void openHtmlInMagiBrowser().finally(() => {
+      onHtmlBrowserOpenHandled?.(request.requestId);
+    });
+  });
   const rawPreviewContent = $derived(previewContent ?? '');
   const truncatedContent = $derived(
     rawPreviewContent.length > 500_000 ? rawPreviewContent.slice(0, 100_000) : rawPreviewContent,

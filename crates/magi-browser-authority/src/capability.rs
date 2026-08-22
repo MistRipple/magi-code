@@ -115,6 +115,10 @@ impl BrowserToolKind {
         }
     }
 
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.name() == name)
+    }
+
     /// 文件系统授权需要独立的 Desktop 授权管线，当前版本不会隐式读取本地文件。
     pub fn is_supported(self) -> bool {
         Self::ALL.contains(&self)

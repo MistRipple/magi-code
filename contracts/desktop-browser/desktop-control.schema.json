@@ -39,7 +39,12 @@
     },
     "logicalViewport": {
       "oneOf": [
-        { "type": "object", "additionalProperties": false, "required": ["mode"], "properties": { "mode": { "const": "auto" } } },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "auto" } }
+        },
         {
           "type": "object",
           "additionalProperties": false,
@@ -54,16 +59,314 @@
         }
       ]
     },
-    "command": {
+    "control": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "lease_id", "fence"],
+          "properties": {
+            "mode": { "const": "agent" },
+            "lease_id": { "$ref": "#/$defs/id" },
+            "fence": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "fence"],
+          "properties": {
+            "mode": { "const": "user" },
+            "fence": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "controlUpdate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "lease_id", "fence"],
+          "properties": {
+            "mode": { "const": "agent" },
+            "lease_id": { "$ref": "#/$defs/id" },
+            "fence": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "fence"],
+          "properties": {
+            "mode": { "const": "user" },
+            "fence": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "fence"],
+          "properties": {
+            "mode": { "const": "released" },
+            "fence": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "normalizedRect": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type"],
+      "required": ["x", "y", "width", "height"],
       "properties": {
-        "type": {
-          "enum": ["ping", "create_page", "restore_page", "set_logical_viewport", "get_logical_viewport", "close_page", "navigate", "snapshot", "click", "type", "press", "scroll", "devtools", "screenshot", "hit_test", "update_control", "shutdown"]
-        },
-        "payload": { "type": "object" }
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "width": { "type": "number", "minimum": 0 },
+        "height": { "type": "number", "minimum": 0 }
       }
+    },
+    "snapshotTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_revision", "element_ref"],
+      "properties": {
+        "snapshot_revision": { "type": "integer", "minimum": 0 },
+        "element_ref": { "$ref": "#/$defs/id" }
+      }
+    },
+    "navigation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "url"],
+          "properties": {
+            "action": { "const": "url" },
+            "url": { "type": "string", "minLength": 1 },
+            "handle_before_unload": { "enum": ["accept", "dismiss"] },
+            "init_script": { "type": "string" },
+            "timeout_ms": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action"],
+          "properties": {
+            "action": { "const": "back" },
+            "timeout_ms": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action"],
+          "properties": {
+            "action": { "const": "forward" },
+            "timeout_ms": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action"],
+          "properties": {
+            "action": { "const": "reload" },
+            "ignore_cache": { "type": "boolean" },
+            "handle_before_unload": { "enum": ["accept", "dismiss"] },
+            "timeout_ms": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "snapshotLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_nodes", "max_text_bytes"],
+      "properties": {
+        "max_nodes": { "type": "integer", "minimum": 0 },
+        "max_text_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "jsonValue": {},
+    "pagePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "browser_session_id", "initial_url", "logical_viewport", "navigation_revision", "snapshot_revision"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "browser_session_id": { "$ref": "#/$defs/id" },
+        "initial_url": { "type": "string", "minLength": 1 },
+        "logical_viewport": { "$ref": "#/$defs/logicalViewport" },
+        "navigation_revision": { "type": "integer", "minimum": 0 },
+        "snapshot_revision": { "type": "integer", "minimum": 0 },
+        "allow_page_eviction": { "type": "boolean" }
+      }
+    },
+    "tabPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
+    "setViewportPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "viewport"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "viewport": { "$ref": "#/$defs/logicalViewport" }
+      }
+    },
+    "annotationsPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "annotations"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "annotations": { "type": "array", "items": { "$ref": "#/$defs/jsonValue" } }
+      }
+    },
+    "navigatePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "control", "navigation"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/control" },
+        "navigation": { "$ref": "#/$defs/navigation" }
+      }
+    },
+    "snapshotPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "navigation_revision", "snapshot_revision", "limits"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "navigation_revision": { "type": "integer", "minimum": 0 },
+        "snapshot_revision": { "type": "integer", "minimum": 0 },
+        "limits": { "$ref": "#/$defs/snapshotLimits" },
+        "subtree_ref": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "clickPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "control", "target"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/control" },
+        "target": { "$ref": "#/$defs/snapshotTarget" }
+      }
+    },
+    "typePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "control", "target", "text", "replace"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/control" },
+        "target": { "$ref": "#/$defs/snapshotTarget" },
+        "text": { "type": "string" },
+        "replace": { "type": "boolean" },
+        "submit_key": { "type": ["string", "null"] }
+      }
+    },
+    "pressPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "control", "key"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/control" },
+        "key": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scrollPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "control", "delta_x", "delta_y"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/control" },
+        "target": { "oneOf": [{ "$ref": "#/$defs/snapshotTarget" }, { "type": "null" }] },
+        "delta_x": { "type": "number" },
+        "delta_y": { "type": "number" }
+      }
+    },
+    "devtoolsPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "operation", "arguments"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "oneOf": [{ "$ref": "#/$defs/control" }, { "type": "null" }] },
+        "operation": { "type": "string", "minLength": 1 },
+        "arguments": { "type": "object" }
+      }
+    },
+    "screenshotPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "full_page", "format"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "target": { "oneOf": [{ "$ref": "#/$defs/snapshotTarget" }, { "type": "null" }] },
+        "clip": { "oneOf": [{ "$ref": "#/$defs/normalizedRect" }, { "type": "null" }] },
+        "full_page": { "type": "boolean" },
+        "format": { "enum": ["png", "jpeg", "webp"] },
+        "quality": { "type": "integer", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "hitTestPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "navigation_revision", "x", "y"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "navigation_revision": { "type": "integer", "minimum": 0 },
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      }
+    },
+    "updateControlPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "surface_id", "control"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "surface_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/controlUpdate" }
+      }
+    },
+    "cancelPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id"],
+      "properties": { "request_id": { "$ref": "#/$defs/id" } }
+    },
+    "command": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "ping" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "cancel" }, "payload": { "$ref": "#/$defs/cancelPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "create_page" }, "payload": { "$ref": "#/$defs/pagePayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "restore_page" }, "payload": { "$ref": "#/$defs/pagePayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "set_logical_viewport" }, "payload": { "$ref": "#/$defs/setViewportPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "get_logical_viewport" }, "payload": { "$ref": "#/$defs/tabPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "set_annotations" }, "payload": { "$ref": "#/$defs/annotationsPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "close_page" }, "payload": { "$ref": "#/$defs/tabPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "navigate" }, "payload": { "$ref": "#/$defs/navigatePayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "snapshot" }, "payload": { "$ref": "#/$defs/snapshotPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "click" }, "payload": { "$ref": "#/$defs/clickPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "type" }, "payload": { "$ref": "#/$defs/typePayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "press" }, "payload": { "$ref": "#/$defs/pressPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "scroll" }, "payload": { "$ref": "#/$defs/scrollPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "devtools" }, "payload": { "$ref": "#/$defs/devtoolsPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "screenshot" }, "payload": { "$ref": "#/$defs/screenshotPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "hit_test" }, "payload": { "$ref": "#/$defs/hitTestPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "update_control" }, "payload": { "$ref": "#/$defs/updateControlPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "shutdown" } } }
+      ]
     }
   }
 }

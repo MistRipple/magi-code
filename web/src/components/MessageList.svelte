@@ -5,6 +5,7 @@
     TimelineRenderItem,
   } from '../types/message';
   import MessageItem from './MessageItem.svelte';
+  import ConversationTurn from './ConversationTurn.svelte';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
   import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import TurnNavigationRail from './TurnNavigationRail.svelte';
@@ -126,6 +127,12 @@
     | { kind: 'runtime'; key: string }
     | { kind: 'runtime-summary'; key: string };
 
+  type ConversationRenderEntry =
+    | { kind: 'turn'; key: string; turnId: string; items: TimelineRenderItem[]; runtimeKey?: string }
+    | { kind: 'message'; key: string; item: TimelineRenderItem }
+    | { kind: 'runtime'; key: string }
+    | { kind: 'runtime-summary'; key: string };
+
   const turnNavigationItems = $derived.by(() => {
     if (displayContext !== 'thread') return [];
     const navigationMessages: TurnNavigationMessage[] = [];
@@ -216,6 +223,22 @@
         : [],
       skillName: typeof message.metadata?.skillName === 'string' ? message.metadata.skillName : null,
       goalMode: message.metadata?.goalMode === true,
+    });
+  }
+
+  function filePreviewScopeForItem(item: TimelineRenderItem) {
+    return {
+      workspaceId: item.workspaceId,
+      workspacePath: item.workspacePath,
+      sessionId: item.sessionId,
+    };
+  }
+
+  function isTurnLive(items: TimelineRenderItem[]): boolean {
+    return items.some((item) => {
+      if (item.message.isStreaming) return true;
+      const status = messageMetadataString(item.message, 'turnStatus');
+      return status === 'pending' || status === 'running';
     });
   }
 
@@ -450,6 +473,61 @@
     });
     return entries;
   });
+  const conversationRenderEntries = $derived.by(() => {
+    if (displayContext !== 'thread') {
+      return timelineRenderEntries as ConversationRenderEntry[];
+    }
+
+    const entries: ConversationRenderEntry[] = [];
+    const findTurnEntry = (turnId: string) => {
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (entry.kind === 'turn' && entry.turnId === turnId) return entry;
+      }
+      return null;
+    };
+
+    for (const entry of timelineRenderEntries) {
+      if (entry.kind === 'message') {
+        const turnId = messageMetadataString(entry.item.message, 'turnId');
+        if (!turnId) {
+          entries.push(entry);
+          continue;
+        }
+        const previous = entries[entries.length - 1];
+        if (previous?.kind === 'turn' && previous.turnId === turnId) {
+          previous.items.push(entry.item);
+        } else {
+          entries.push({
+            kind: 'turn',
+            key: `turn:${turnId}`,
+            turnId,
+            items: [entry.item],
+          });
+        }
+        continue;
+      }
+
+      if (entry.kind === 'runtime') {
+        const runtimeTurnId = currentRuntimeRenderItem
+          ? messageMetadataString(currentRuntimeRenderItem.message, 'turnId')
+          : '';
+        const turnEntry = runtimeTurnId ? findTurnEntry(runtimeTurnId) : null;
+        if (turnEntry) {
+          turnEntry.runtimeKey = entry.key;
+        } else {
+          entries.push(entry);
+        }
+        continue;
+      }
+
+      entries.push(entry);
+    }
+    return entries;
+  });
+  const renderEntries = $derived(
+    displayContext === 'thread' ? conversationRenderEntries : timelineRenderEntries,
+  );
   const runtimeLayoutSignature = $derived(
     `${runtimeIndicatorKey}:${runtimeIndicatorInsertionIndex}`
   );
@@ -1131,17 +1209,27 @@
         {/if}
       </div>
     {:else}
-      {#each timelineRenderEntries as entry (entry.key)}
-        {#if entry.kind === 'message'}
+      {#each renderEntries as entry (entry.key)}
+        {#if entry.kind === 'turn'}
+          <ConversationTurn
+            turnId={entry.turnId}
+            items={entry.items}
+            {readOnly}
+            {displayContext}
+            runtimeActive={Boolean(entry.runtimeKey)}
+            {elapsedSeconds}
+            initialExpanded={isTurnLive(entry.items) || Boolean(entry.runtimeKey)}
+            {filePreviewScopeForItem}
+            canEditMessage={(item) => canEditUserMessage(item.message)}
+            editMessage={(item) => editUserMessage(item.message)}
+            continueInterruptedSession={continueInterruptedSession}
+          />
+        {:else if entry.kind === 'message'}
           <MessageItem
             message={entry.item.message}
             {readOnly}
             {displayContext}
-            filePreviewScope={{
-              workspaceId: entry.item.workspaceId,
-              workspacePath: entry.item.workspacePath,
-              sessionId: entry.item.sessionId,
-            }}
+            filePreviewScope={filePreviewScopeForItem(entry.item)}
             canEdit={canEditUserMessage(entry.item.message)}
             onEdit={() => editUserMessage(entry.item.message)}
             onContinueInterrupted={continueInterruptedSession}

@@ -3,7 +3,6 @@ use magi_core::{
     UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope};
-use magi_session_store::ActiveExecutionTurn;
 use serde_json::json;
 
 use super::{
@@ -23,10 +22,11 @@ use crate::{
 use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_conversation_runtime::session_writeback::{
     SessionTurnErrorInput, append_session_turn_error_item, publish_current_session_turn_item_event,
+    session_turn_item,
 };
 use magi_session_store::{
-    CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
-    SessionGoal,
+    ActiveExecutionTurn, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem,
+    CanonicalTurnItemKind, SessionGoal, TimelineEntryInput, TimelineEntryKind,
 };
 
 pub(super) fn session_turn_route_name(route: crate::dto::SessionTurnRouteDto) -> &'static str {
@@ -234,6 +234,129 @@ struct ExecuteDispatchSubmissionInput<'a> {
     user_message_metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
+fn persist_rejected_user_turn(
+    state: &ApiState,
+    session_id: &SessionId,
+    message: &str,
+    request: &SessionTurnRequestDto,
+    accepted_at: UtcMillis,
+    user_message_metadata: &std::collections::HashMap<String, serde_json::Value>,
+    error: &ApiError,
+) {
+    let (_, source_thread_id) =
+        state
+            .session_store
+            .ensure_session_mission(session_id, accepted_at, || {
+                magi_core::MissionId::new(format!("mission-session-rejected-{}", accepted_at.0))
+            });
+    let request_id = request
+        .request_id()
+        .unwrap_or_else(|| format!("request-rejected-{}", accepted_at.0));
+    let user_message_id = request
+        .user_message_id()
+        .unwrap_or_else(|| format!("user-message-rejected-{}", accepted_at.0));
+    let placeholder_message_id = request
+        .placeholder_message_id()
+        .unwrap_or_else(|| format!("assistant-placeholder-{}", request_id));
+    let turn_id = format!("turn-session-rejected-{}", request_id);
+    let entry_id = format!("timeline-session-rejected-{}", request_id);
+    let public_error = public_runtime_excerpt(error.message(), 4096);
+
+    let mut user_item = session_turn_item(
+        "user_message",
+        "completed",
+        None,
+        Some(message.to_string()),
+        Some(user_message_id.clone()),
+        source_thread_id.clone(),
+    );
+    user_item.source = "user".to_string();
+    user_item.request_id = Some(request_id.clone());
+    user_item.user_message_id = Some(user_message_id.clone());
+    user_item.placeholder_message_id = Some(placeholder_message_id.clone());
+    user_item.timeline_entry_id = Some(entry_id.clone());
+    user_item.metadata = user_message_metadata.clone();
+    user_item.metadata.insert(
+        "requestId".to_string(),
+        serde_json::Value::String(request_id.clone()),
+    );
+
+    let mut error_item = session_turn_item(
+        "assistant_error",
+        "failed",
+        Some("回复生成失败".to_string()),
+        Some(public_error),
+        Some(format!("turn-item-assistant-error-{}", request_id)),
+        source_thread_id,
+    );
+    error_item.request_id = Some(request_id.clone());
+    error_item.user_message_id = Some(user_message_id);
+    error_item.placeholder_message_id = Some(placeholder_message_id);
+    error_item.metadata.insert(
+        "failureStage".to_string(),
+        serde_json::Value::String("git_admission".to_string()),
+    );
+
+    let turn = ActiveExecutionTurn {
+        turn_id,
+        turn_seq: accepted_at.0,
+        accepted_at,
+        completed_at: Some(accepted_at),
+        status: "failed".to_string(),
+        user_message: Some(message.to_string()),
+        items: vec![user_item, error_item],
+    };
+    let timeline = TimelineEntryInput::new(
+        entry_id,
+        TimelineEntryKind::UserMessage,
+        message,
+        accepted_at,
+    );
+    match state
+        .session_store
+        .record_rejected_user_turn_with_timeline_entry(session_id.clone(), timeline, turn)
+    {
+        Ok(Some((error_item_id, _))) => {
+            let workspace_id = state
+                .session_store
+                .execution_ownership(session_id)
+                .and_then(|ownership| ownership.workspace_id);
+            publish_current_session_turn_item_event(
+                &state.event_bus,
+                &state.session_store,
+                session_id,
+                &workspace_id,
+                &error_item_id,
+                state.task_store(),
+            );
+            publish_session_user_message_event(
+                state,
+                session_id,
+                workspace_id,
+                accepted_at,
+                message,
+            );
+            if let Err(persist_error) =
+                state.persist_session_state_checkpoint("session_turn_rejected")
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    ?persist_error,
+                    "持久化被拒绝的 session Turn 检查点失败"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(persist_error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                ?persist_error,
+                "记录被拒绝的 session Turn 失败，保留原始 admission 错误"
+            );
+        }
+    }
+}
+
 fn initial_session_orchestrator_config(
     state: &ApiState,
     created_session: bool,
@@ -323,9 +446,22 @@ async fn execute_dispatch_submission(
         .await?;
     let browser_annotation_refs =
         resolve_browser_annotation_context(state, &session_id, &request.browser_annotation_refs())?;
-    state
+    if let Err(error) = state
         .ensure_session_code_context(&session_id, &workspace_id)
-        .await?;
+        .await
+    {
+        persist_rejected_user_turn(
+            state,
+            &session_id,
+            &message,
+            request,
+            accepted_at,
+            &user_message_metadata,
+            &error,
+        );
+        state.release_session_git_execution_lease(&session_id);
+        return Err(error);
+    }
     if request.goal_mode {
         state
             .session_store

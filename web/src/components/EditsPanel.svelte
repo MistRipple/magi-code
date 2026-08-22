@@ -17,6 +17,7 @@
   import ChangeFileTree from './ChangeFileTree.svelte';
   import GitRepositoryPanel from './GitRepositoryPanel.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { requestOpenHtmlFileInBrowser } from '../lib/browser-navigation';
   import {
     getAgentChangeDiff,
     isWebAgentMode,
@@ -250,6 +251,7 @@
       headSummary: detail.headSummary,
       tailSummary: detail.tailSummary,
     });
+    requestOpenHtmlFileInBrowser(detail.filePath);
   }
 
 </script>

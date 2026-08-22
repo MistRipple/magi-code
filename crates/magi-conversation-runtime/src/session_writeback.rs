@@ -449,6 +449,9 @@ fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
 }
 
 fn canonical_item_status(status: &str) -> Option<CanonicalTurnItemStatus> {
+    if status.trim().eq_ignore_ascii_case("indeterminate") {
+        return Some(CanonicalTurnItemStatus::Failed);
+    }
     match canonical_turn_status(status)? {
         CanonicalTurnStatus::Pending => Some(CanonicalTurnItemStatus::Pending),
         CanonicalTurnStatus::Running => Some(CanonicalTurnItemStatus::Running),

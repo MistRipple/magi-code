@@ -1812,6 +1812,7 @@ struct BrowserToolError {
     requires_user_action: bool,
     details: Option<Value>,
     status: ExecutionResultStatus,
+    indeterminate: bool,
 }
 
 impl BrowserToolError {
@@ -1823,10 +1824,11 @@ impl BrowserToolError {
             requires_user_action: false,
             details: None,
             status: ExecutionResultStatus::Failed,
+            indeterminate: false,
         }
     }
 
-    fn from_host(context: &str, error: BrowserHostCommandError) -> Self {
+    fn from_host(context: &str, error: BrowserHostCommandError, indeterminate: bool) -> Self {
         let sensitive_action = error.code == "browser_sensitive_action_requires_user";
         Self {
             code: error.code.clone(),
@@ -1846,6 +1848,7 @@ impl BrowserToolError {
             } else {
                 ExecutionResultStatus::Failed
             },
+            indeterminate,
         }
     }
 }
@@ -1871,7 +1874,7 @@ fn capability_unavailable(tool: &str, message: &str) -> (String, ExecutionResult
 }
 
 fn failure_with_error(tool: &str, error: &BrowserToolError) -> (String, ExecutionResultStatus) {
-    let (payload, _) = failure_payload_with_status(
+    let (mut payload, _) = failure_payload_with_status(
         tool,
         &error.code,
         &error.message,
@@ -1880,6 +1883,12 @@ fn failure_with_error(tool: &str, error: &BrowserToolError) -> (String, Executio
         error.details.as_ref(),
         error.status,
     );
+    if error.indeterminate {
+        if let Ok(mut value) = serde_json::from_str::<Value>(&payload) {
+            value["status"] = Value::String("indeterminate".to_string());
+            payload = value.to_string();
+        }
+    }
     (payload, error.status)
 }
 
@@ -2080,9 +2089,11 @@ fn succeeded_result(
 ) -> Result<BrowserHostCommandResult, BrowserToolError> {
     match outcome {
         BrowserHostCommandOutcome::Succeeded(result) => Ok(*result),
-        BrowserHostCommandOutcome::Failed(error)
-        | BrowserHostCommandOutcome::Indeterminate(error) => {
-            Err(BrowserToolError::from_host(context, error))
+        BrowserHostCommandOutcome::Failed(error) => {
+            Err(BrowserToolError::from_host(context, error, false))
+        }
+        BrowserHostCommandOutcome::Indeterminate(error) => {
+            Err(BrowserToolError::from_host(context, error, true))
         }
         BrowserHostCommandOutcome::Cancelled => {
             Err(BrowserToolError::new("browser_command_cancelled", context))
@@ -2093,6 +2104,7 @@ fn succeeded_result(
 fn browser_host_client_error(error: BrowserHostClientError) -> BrowserToolError {
     let code = match &error {
         BrowserHostClientError::RequestTimeout(_) => "browser_host_request_timeout",
+        BrowserHostClientError::RequestIndeterminate(_) => "browser_host_request_indeterminate",
         BrowserHostClientError::UnexpectedResponse(_)
         | BrowserHostClientError::UnexpectedBinaryPayload
         | BrowserHostClientError::BinarySizeMismatch { .. }

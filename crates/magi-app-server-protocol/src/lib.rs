@@ -4,13 +4,34 @@
 //! 也不依赖 HTTP、WebSocket 或桌面端实现。这样 Desktop、Web 和测试客户端可以
 //! 共享同一套序列化边界，避免为每种传输重复定义 DTO。
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
-pub const PROTOCOL_NAME: &str = "magi.app-server";
-pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
-pub const JSONRPC_VERSION: &str = "2.0";
+pub mod generated;
+pub use generated::{
+    AccessProfile, AppServerMethodKind, AppServerMethodSignature, AppServerNotificationMethod,
+    AppServerNotificationParams, AppServerRequestMethod, AppServerRequestParams, AppServerResult,
+    ApprovalDecision, ApprovalRequestParams, BrowserAccessProfile, BrowserCapabilitySnapshot,
+    BrowserHostStatus, BrowserToolAccess, BrowserToolDescriptor, BrowserToolParams,
+    BrowserToolResult, BrowserToolResultStatus, BrowserToolsListParams, BrowserToolsListResult,
+    CancelRequestParams, CanonicalToolCall, CanonicalTurn, CanonicalTurnEvent,
+    CanonicalTurnEventKind, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
+    CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef, ClientCapabilities,
+    ClientInfo, ClientNotification, ClientRequest, ClientResponse, EmptyParams, ErrorObject,
+    EventCategory, EventEnvelope, EventNotificationParams, EventResyncReason,
+    EventResyncRequiredParams, EventSnapshotParams, EventStreamSnapshot, EventSubscribeParams,
+    EventSubscribeResult, InitializeParams, InitializeResult, JsonRpcError, JsonRpcMessage,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcRequestId, JsonRpcResponse, PingResult,
+    ProtocolVersion, RequestId, ServerCapabilities, ServerNotification, ServerRequest,
+    ServerResponse, SessionContextReference, SessionContextReferenceKind, SessionListParams,
+    SessionListResult, SessionReadParams, SessionReadResult, SessionScope, SessionSummary,
+    SessionTurnImage, TurnQueueInfo, TurnStartKind, TurnStartParams, TurnStartResult,
+    TurnStartRoute,
+};
+
+pub use generated::{
+    APP_SERVER_METHODS, JSONRPC_VERSION, PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_NAME,
+};
 
 pub const ERROR_INVALID_REQUEST: i32 = -32600;
 pub const ERROR_METHOD_NOT_FOUND: i32 = -32601;
@@ -21,68 +42,8 @@ pub const ERROR_SERVER_OVERLOADED: i32 = -32001;
 pub const ERROR_ALREADY_INITIALIZED: i32 = -32002;
 pub const ERROR_REQUEST_CONFLICT: i32 = -32010;
 pub const ERROR_SESSION_NOT_FOUND: i32 = -32004;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RequestId {
-    String(String),
-    Number(String),
-}
-
-impl RequestId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
-        let value = value.into();
-        if value.trim().is_empty() {
-            return Err(ProtocolError::InvalidRequest(
-                "request id 不能为空".to_string(),
-            ));
-        }
-        Ok(Self::String(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::String(value) | Self::Number(value) => value,
-        }
-    }
-}
-
-impl Serialize for RequestId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::String(value) => serializer.serialize_str(value),
-            Self::Number(value) => {
-                let number = value
-                    .parse::<serde_json::Number>()
-                    .map_err(|_| serde::ser::Error::custom("request id 数字无法序列化"))?;
-                number.serialize(serializer)
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for RequestId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-        match value {
-            Value::String(value) => RequestId::new(value).map_err(serde::de::Error::custom),
-            Value::Number(value) => Ok(Self::Number(value.to_string())),
-            _ => Err(serde::de::Error::custom("request id 必须是字符串或数字")),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProtocolVersion {
-    pub major: u16,
-    pub minor: u16,
-}
+pub const ERROR_REQUEST_CANCELLED: i32 = -32800;
+pub const ERROR_REQUEST_TIMEOUT: i32 = -32801;
 
 impl ProtocolVersion {
     pub const CURRENT: Self = Self {
@@ -95,29 +56,22 @@ impl ProtocolVersion {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ClientInfo {
-    pub name: String,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub version: Option<String>,
+impl AppServerRequestMethod {
+    pub fn parse(method: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_str() == method)
+    }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ClientCapabilities {
-    #[serde(default)]
-    pub desktop_browser_surface: bool,
-    #[serde(default)]
-    pub browser_tools: bool,
-    #[serde(default)]
-    pub approvals: bool,
-    #[serde(default)]
-    pub streaming: bool,
-    #[serde(default)]
-    pub opt_out_notification_methods: Vec<String>,
+impl AppServerNotificationMethod {
+    pub fn parse(method: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_str() == method)
+    }
 }
 
 impl ClientCapabilities {
@@ -128,109 +82,10 @@ impl ClientCapabilities {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ServerCapabilities {
-    pub sessions: bool,
-    pub turns: bool,
-    pub events: bool,
-    pub approvals: bool,
-    pub browser_tools: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InitializeParams {
-    pub client_info: ClientInfo,
-    #[serde(default)]
-    pub protocol: Option<ProtocolVersion>,
-    #[serde(default)]
-    pub capabilities: ClientCapabilities,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InitializeResult {
-    pub server_info: ClientInfo,
-    pub protocol: ProtocolVersion,
-    pub runtime_epoch: String,
-    pub capabilities: ServerCapabilities,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ClientRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
-    pub id: RequestId,
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
-
 impl ClientRequest {
     pub fn is_initialize(&self) -> bool {
         self.method == "initialize"
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ClientNotification {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ClientResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
-    pub id: RequestId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorObject>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ServerRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
-    pub id: RequestId,
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ServerNotification {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ServerResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
-    pub id: RequestId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorObject>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ErrorObject {
-    pub code: i32,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retryable: Option<bool>,
 }
 
 impl ErrorObject {
@@ -274,6 +129,28 @@ pub fn response(id: RequestId, result: Value) -> ServerResponse {
     }
 }
 
+/// 将已通过协议 Schema 定义的结果类型编码为 JSON-RPC response。
+///
+/// 业务层不应再手写 `json!` 组装方法结果；动态 JSON 只允许存在于 Schema 明确声明的
+/// 开放字段中。序列化失败时返回协议内部错误，而不是把错误吞成空对象。
+pub fn typed_response<T: Serialize>(
+    id: RequestId,
+    result: T,
+) -> Result<ServerResponse, ErrorObject> {
+    serde_json::to_value(result)
+        .map(|value| response(id, value))
+        .map_err(|error| ErrorObject::new(ERROR_INTERNAL, format!("响应序列化失败: {error}")))
+}
+
+pub fn typed_notification<T: Serialize>(
+    method: impl Into<String>,
+    params: T,
+) -> Result<ServerNotification, ErrorObject> {
+    serde_json::to_value(params)
+        .map(|value| notification(method, value))
+        .map_err(|error| ErrorObject::new(ERROR_INTERNAL, format!("通知序列化失败: {error}")))
+}
+
 pub fn error_response(id: RequestId, error: ErrorObject) -> ServerResponse {
     ServerResponse {
         jsonrpc: Some(JSONRPC_VERSION.to_string()),
@@ -287,6 +164,7 @@ pub fn notification(method: impl Into<String>, params: Value) -> ServerNotificat
     ServerNotification {
         jsonrpc: Some(JSONRPC_VERSION.to_string()),
         method: method.into(),
+        request_timeout_ms: None,
         params,
     }
 }
@@ -313,6 +191,11 @@ pub fn classify_client_message(value: &Value) -> Result<ClientMessage, ProtocolE
     } else if object.get("id").is_some()
         && (object.get("result").is_some() || object.get("error").is_some())
     {
+        if object.get("result").is_some() == object.get("error").is_some() {
+            return Err(ProtocolError::InvalidRequest(
+                "响应必须且只能包含 result 或 error 之一".to_string(),
+            ));
+        }
         serde_json::from_value(value.clone())
             .map(ClientMessage::Response)
             .map_err(|error| ProtocolError::InvalidRequest(error.to_string()))
@@ -399,6 +282,31 @@ mod tests {
     }
 
     #[test]
+    fn response_cannot_contain_result_and_error_at_the_same_time() {
+        let error = classify_client_message(&serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "ambiguous-response",
+            "result": {},
+            "error": {"code": ERROR_INVALID_PARAMS, "message": "invalid"}
+        }))
+        .expect_err("JSON-RPC response 不能同时包含 result 和 error");
+        assert!(error.to_string().contains("result 或 error"));
+    }
+
+    #[test]
+    fn unknown_json_rpc_message_fields_are_rejected() {
+        let error = classify_client_message(&serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "unknown-field",
+            "method": "ping",
+            "params": {},
+            "unexpected": true
+        }))
+        .expect_err("协议消息不能静默接受未知字段");
+        assert!(matches!(error, ProtocolError::InvalidRequest(_)));
+    }
+
+    #[test]
     fn newer_minor_protocol_is_rejected_but_older_minor_is_compatible() {
         assert!(
             ProtocolVersion::CURRENT.is_compatible_with(&ProtocolVersion {
@@ -418,5 +326,31 @@ mod tests {
                 minor: 0,
             })
         );
+    }
+
+    #[test]
+    fn canonical_event_wire_shape_is_generated_and_matches_sse_contract() {
+        let event = EventEnvelope {
+            event_id: "event-1".to_string(),
+            event_type: "session.turn.item.upserted".to_string(),
+            category: EventCategory::Domain,
+            occurred_at: 42,
+            sequence: 7,
+            workspace_id: Some("workspace-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            mission_id: None,
+            assignment_id: None,
+            task_id: None,
+            payload: serde_json::json!({
+                "canonicalSchemaVersion": "canonical-turn.v1",
+                "canonicalEventKind": "turn_item_upsert"
+            }),
+        };
+        let value = serde_json::to_value(event).expect("canonical event must serialize");
+        assert_eq!(value["event_id"], "event-1");
+        assert_eq!(value["event_type"], "session.turn.item.upserted");
+        assert_eq!(value["workspace_id"], "workspace-1");
+        assert_eq!(value["occurred_at"], 42);
+        assert!(value.get("mission_id").is_none());
     }
 }

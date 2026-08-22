@@ -71,6 +71,9 @@ pub struct BrowserHostRequestEnvelope {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum BrowserHostCommand {
     Ping,
+    Cancel {
+        request_id: BrowserCommandId,
+    },
     CreatePage {
         tab_id: BrowserTabId,
         browser_session_id: BrowserSessionId,

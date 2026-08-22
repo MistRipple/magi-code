@@ -17,7 +17,6 @@ import {
   clearWorkspaceSessionProjection,
   setQueuedMessages,
   setAppState,
-  clearPendingInteractions,
   clearAllMessages,
   setCanonicalTimelineProjection,
   clearPendingRequest,
@@ -25,7 +24,6 @@ import {
   getRequestBinding,
   clearRequestBinding,
   listRequestBindings,
-  clearAllRequestBindings,
   clearProcessingState,
   setOrchestratorRuntimeState,
   replaceOrchestratorRuntimeState,
@@ -655,6 +653,11 @@ export function handleUnifiedData(standard: StandardMessage) {
       const isProcessing = payload.isProcessing as boolean | undefined;
       const transitionKind = payload.transitionKind as 'derived' | 'forced' | undefined;
       const reason = typeof payload.reason === 'string' ? payload.reason.trim() : '';
+      const eventSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
+      const currentSessionId = messagesState.currentSessionId?.trim() || '';
+      if (eventSessionId && currentSessionId && eventSessionId !== currentSessionId) {
+        break;
+      }
       // 当前只接受强制 idle 终态信号。
       // processing=true 统一由本地 pending request 或后端 authoritative snapshot 驱动，
       // 这里不再保留兜底抬升路径，避免处理态出现双真相源。
@@ -955,9 +958,6 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
         resetPanelState: true,
         skipAntiLiftBack: true,
       });
-      clearAllRequestBindings();
-      clearPendingInteractions();
-      clearProcessingState({ skipAntiLiftBack: true });
       clearCanonicalSessionTurns();
       messagesState.canonicalTimelineProjection = null;
       setQueuedMessages([]);
@@ -1341,9 +1341,6 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
           resetPanelState: true,
           skipAntiLiftBack: true,
         });
-        clearAllRequestBindings();
-        clearPendingInteractions();
-        clearProcessingState({ skipAntiLiftBack: true });
         clearCanonicalSessionTurns();
         messagesState.canonicalTimelineProjection = null;
         setQueuedMessages([]);
@@ -1477,10 +1474,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       resetTimelineView: false,
       resetPanelState: false,
       skipAntiLiftBack: true,
+      preserveExecutionState: true,
     });
-    clearAllRequestBindings();
-    clearPendingInteractions();
-    clearProcessingState({ skipAntiLiftBack: true });
     clearCanonicalSessionTurns(sessionId);
 
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;

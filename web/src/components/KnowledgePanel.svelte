@@ -9,6 +9,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getState, messagesState } from '../stores/messages.svelte';
   import { openCodeTab } from '../stores/right-pane.svelte';
+  import { requestOpenHtmlFileInBrowser } from '../lib/browser-navigation';
   import {
     addAgentKnowledgeItem,
     addAgentKnowledgeRelation,
@@ -202,6 +203,7 @@
       workspaceId: messagesState.currentWorkspaceId ?? undefined,
       workspacePath: messagesState.currentWorkspacePath || undefined,
     });
+    requestOpenHtmlFileInBrowser(filepath);
   }
 
   function openKnowledgeRecord(knowledgeId: string): void {

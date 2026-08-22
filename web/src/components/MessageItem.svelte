@@ -34,6 +34,8 @@
     canEdit?: boolean;
     onEdit?: () => void;
     onContinueInterrupted?: () => void;
+    /** 轮次折叠容器已在外层展示总耗时时，避免最终消息重复显示。 */
+    hideResponseDuration?: boolean;
   }
   let {
     message,
@@ -43,6 +45,7 @@
     canEdit = false,
     onEdit = undefined,
     onContinueInterrupted = undefined,
+    hideResponseDuration = false,
   }: Props = $props();
 
   let copied = $state(false);
@@ -280,6 +283,7 @@
   });
   const showResponseDuration = $derived.by(() => (
     displayContext === 'thread'
+    && !hideResponseDuration
     && !isStreaming
     && !isPlaceholder
     && !isSystemSection

@@ -1906,6 +1906,138 @@ impl SessionStore {
         Ok((entry_id, updated))
     }
 
+    /// 原子记录一个尚未进入执行队列就被拒绝的用户 Turn。
+    ///
+    /// admission 失败不能让用户消息消失。该方法和普通 Turn 接受使用同一把
+    /// session state 写锁，同时写入 timeline、current turn 与 canonical turn，
+    /// 并以 requestId 实现重试幂等。调用方仍可以把原始 admission 错误返回给
+    /// API 客户端，但历史会话恢复时一定能看到用户输入及失败原因。
+    pub fn record_rejected_user_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        mut turn: ActiveExecutionTurn,
+    ) -> DomainResult<Option<(String, SessionRuntimeSidecar)>> {
+        let TimelineEntryInput {
+            entry_id,
+            kind,
+            message,
+            occurred_at,
+        } = timeline_entry;
+        turn.status = "failed".to_string();
+        turn.completed_at.get_or_insert(occurred_at);
+        turn.normalize();
+
+        let request_id = turn.items.iter().find_map(|item| {
+            item.request_id
+                .as_deref()
+                .or_else(|| {
+                    item.metadata
+                        .get("requestId")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .filter(|value| !value.trim().is_empty())
+        });
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+
+        if let Some(request_id) = request_id {
+            if state.canonical_turns.iter().any(|existing| {
+                existing.session_id == session_id
+                    && existing.items.iter().any(|item| {
+                        item.metadata
+                            .get("requestId")
+                            .or_else(|| item.metadata.get("request_id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(request_id)
+                    })
+            }) {
+                return Ok(None);
+            }
+        }
+
+        let existing = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .cloned();
+        reject_conflicting_active_current_turn(
+            &session_id,
+            existing
+                .as_ref()
+                .and_then(|sidecar| sidecar.current_turn.as_ref()),
+            Some(turn.turn_id.as_str()),
+        )?;
+        reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+
+        state.timeline.push(TimelineEntry {
+            entry_id: entry_id.clone(),
+            session_id: session_id.clone(),
+            kind,
+            message,
+            occurred_at,
+        });
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.updated_at = occurred_at;
+        }
+
+        let (ownership, recovery_id, active_execution_chain, sidecar_status) =
+            if let Some(existing) = existing {
+                (
+                    existing.ownership,
+                    existing.recovery_id,
+                    existing.active_execution_chain,
+                    existing.status,
+                )
+            } else {
+                (
+                    ExecutionOwnership {
+                        session_id: Some(session_id.clone()),
+                        ..ExecutionOwnership::default()
+                    },
+                    None,
+                    None,
+                    SessionExecutionSidecarStatus::Detached,
+                )
+            };
+        let item_id = turn
+            .items
+            .iter()
+            .find(|item| item.kind == "assistant_error")
+            .map(|item| item.item_id.clone())
+            .unwrap_or_else(|| turn.turn_id.clone());
+        let updated = SessionRuntimeSidecar {
+            session_id: session_id.clone(),
+            ownership,
+            recovery_id,
+            current_turn: Some(turn),
+            active_execution_chain,
+            status: sidecar_status,
+            updated_at: UtcMillis::now(),
+        };
+        if let Some(turn) = updated.current_turn.as_ref() {
+            upsert_canonical_turn_in_state(&mut state, &session_id, turn)?;
+        }
+        upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
+        Ok(Some((item_id, updated)))
+    }
+
     pub fn replace_current_turn_with_timeline_entry(
         &self,
         session_id: SessionId,
@@ -2713,6 +2845,15 @@ impl SessionStore {
     pub fn upsert_current_turn_item(
         &self,
         session_id: &SessionId,
+        item: ActiveExecutionTurnItem,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        self.upsert_current_turn_item_for_turn(session_id, None, item)
+    }
+
+    pub fn upsert_current_turn_item_for_turn(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
         mut item: ActiveExecutionTurnItem,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         let updated = {
@@ -2734,6 +2875,14 @@ impl SessionStore {
                 let Some(turn) = sidecar.current_turn.as_mut() else {
                     return Ok(None);
                 };
+                if let Some(expected_turn_id) = expected_turn_id
+                    && turn.turn_id != expected_turn_id
+                {
+                    return Err(DomainError::CurrentTurnConflict {
+                        session_id: session_id.to_string(),
+                        active_turn_id: turn.turn_id.clone(),
+                    });
+                }
 
                 if let Some(existing) = turn
                     .items

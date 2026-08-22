@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Magi · 对话查看方式</title>
+  <!--
+    设计假设：
+    - 这是同一轮对话的三种查看方式，不是三个不同页面。
+    - 视觉以用户截图为基准：白底、单列、细分隔线、普通消息流；过程不再做成复杂的仪表盘。
+    - 结果模式是默认模式；阶段模式把“文字输出 + 后续工具”合成一个小折叠；详情模式才逐条展示工具使用。
+    - 本稿是静态 UX/UI 原型，不修改生产组件。顶部“查看方式”仅用于切换三种方案。
+  -->
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #fbfbfa;
+      --line: #e6e6e3;
+      --line-dark: #d7d7d2;
+      --text: #252525;
+      --muted: #898986;
+      --faint: #b3b3ae;
+      --accent: #6b7fbe;
+      --accent-soft: #eef1fb;
+      --link: #b26a4b;
+      --green: #16a34a;
+      --red: #f04438;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: "SFMono-Regular", "Cascadia Code", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      background: var(--page);
+      color: var(--text);
+      font: 15px/1.7 var(--font);
+      -webkit-font-smoothing: antialiased;
+    }
+    button { font: inherit; color: inherit; }
+    .page { width: min(100%, 1500px); min-height: 100vh; margin: 0 auto; padding: 22px 34px 54px; }
+
+    /* 原型控制区：产品里可以对应为用户的查看偏好入口。 */
+    .view-switcher { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-height: 28px; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+    .view-switcher-label { margin-right: 2px; }
+    .view-button { padding: 2px 8px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; }
+    .view-button:hover { color: var(--text); background: #f1f1ee; }
+    .view-button.active { background: var(--text); color: #fff; }
+
+    .run-header { display: flex; align-items: center; gap: 8px; min-height: 38px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 22px; line-height: 1; }
+    .run-header strong { font-weight: 500; }
+    .run-chevron { width: 15px; height: 15px; transition: transform .18s ease; }
+    .run-chevron path { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .run-header.open .run-chevron { transform: rotate(90deg); }
+
+    .conversation { max-width: 1420px; margin: 0 auto; }
+    .user-request { margin: 35px 0 22px; font-size: 22px; font-weight: 650; line-height: 1.55; letter-spacing: -.02em; text-wrap: pretty; }
+
+    .mode-view { display: none; }
+    .mode-view.active { display: block; }
+
+    /* 三种模式共享的执行条目：没有大卡片，只有行和层级。 */
+    .execution-group { margin: 0 0 23px; }
+    .group-header, .stage-header, .tool-row { display: flex; align-items: center; min-height: 31px; gap: 10px; }
+    .group-header, .stage-header { width: 100%; border: 0; background: transparent; text-align: left; cursor: pointer; }
+    .group-header:hover, .stage-header:hover { color: var(--text); }
+    .row-icon { width: 17px; height: 17px; flex: 0 0 auto; color: var(--accent); }
+    .row-icon path, .row-icon circle, .row-icon rect { fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+    .row-icon.fill path { fill: currentColor; stroke: none; }
+    .row-label { color: var(--muted); font-size: 17px; line-height: 1.45; }
+    .row-label strong { font-weight: 500; }
+    .row-label code, .stage-copy code { padding: 1px 5px; border-radius: 5px; background: #ededeb; color: #383838; font: .92em var(--mono); }
+    .row-chevron { width: 13px; height: 13px; margin-left: 1px; color: var(--muted); transition: transform .18s ease; }
+    .row-chevron path { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+    .group-header.open .row-chevron, .stage-header.open .row-chevron { transform: rotate(90deg); }
+    .group-content { display: none; margin: 2px 0 0 29px; padding: 2px 0 1px; border-left: 1px solid var(--line-dark); }
+    .group-content.open { display: block; }
+    .tool-row { padding: 3px 0 3px 15px; min-height: 30px; }
+    .tool-row .row-icon { color: #9a9a96; width: 16px; height: 16px; }
+    .tool-row .row-label { font-size: 16px; }
+    .delta { color: var(--muted); font-size: 14px; }
+    .delta.plus { color: var(--green); }
+    .delta.minus { color: var(--red); }
+
+    /* 模式 1：每个工具调用都可见。 */
+    .detail-view .execution-group { margin-bottom: 23px; }
+    .detail-view .group-header { min-height: 35px; }
+    .detail-view .group-header .row-label { font-size: 18px; }
+    .detail-view .group-content.open { display: block; }
+    .detail-view .tool-row { min-height: 32px; }
+    .detail-view .tool-row .row-label { color: var(--muted); }
+    .detail-view .tool-row .row-label strong { color: var(--muted); }
+    .detail-view .detail-note { margin: 16px 0 23px 29px; color: var(--muted); font-size: 16px; }
+
+    /* 模式 2：一个阶段是一行，阶段内的文字和工具默认收起。 */
+    .stage-view .stage-group { margin-bottom: 13px; }
+    .stage-header { min-height: 42px; padding: 2px 0; }
+    .stage-header .row-label { font-size: 17px; }
+    .stage-header .stage-count { margin-left: auto; color: var(--faint); font-size: 13px; }
+    .stage-content { display: none; margin: 0 0 6px 29px; padding: 8px 0 8px 16px; border-left: 1px solid var(--line-dark); color: var(--muted); }
+    .stage-content.open { display: block; }
+    .stage-copy { margin: 0 0 8px; font-size: 15px; }
+    .stage-copy:last-child { margin-bottom: 0; }
+    .stage-copy strong { color: var(--text); font-weight: 500; }
+    .stage-content .tool-row { padding-left: 0; }
+    .stage-content .tool-row .row-label { font-size: 14px; }
+
+    /* 模式 3：只留下最终回答和已有的文件变更证据。 */
+    .result-view .final-answer { margin-top: 29px; max-width: 1120px; font-size: 18px; }
+    .final-answer p { margin: 0 0 17px; }
+    .final-answer h3 { margin: 18px 0 6px; font-size: 18px; font-weight: 500; }
+    .final-answer ul { margin: 0 0 15px; padding-left: 31px; }
+    .final-answer li { padding-left: 4px; margin: 3px 0; }
+    .final-answer a { color: var(--link); text-decoration: none; }
+    .final-answer a:hover { text-decoration: underline; }
+    .final-answer code { padding: 1px 6px; border-radius: 6px; background: #ededeb; color: #363636; font: .9em var(--mono); }
+
+    .change-card { margin: 25px 0 0; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.45); overflow: hidden; }
+    .change-summary { display: flex; align-items: center; gap: 16px; padding: 20px 24px; }
+    .change-icon { width: 62px; height: 62px; display: grid; place-items: center; border-radius: 12px; background: #f1f1ef; color: #747471; }
+    .change-icon svg { width: 26px; height: 26px; }
+    .change-icon path, .change-icon rect { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+    .change-title { font-size: 18px; font-weight: 500; line-height: 1.35; }
+    .change-count { margin-top: 3px; font-size: 16px; }
+    .change-count .plus { color: var(--green); }
+    .change-count .minus { color: var(--red); margin-left: 9px; }
+    .change-actions { display: flex; align-items: center; gap: 17px; margin-left: auto; font-size: 17px; }
+    .undo { border: 0; background: transparent; cursor: pointer; }
+    .undo:hover { color: var(--muted); }
+    .review { padding: 7px 15px; border: 1px solid var(--line); border-radius: 11px; background: transparent; cursor: pointer; }
+    .review:hover { border-color: var(--line-dark); background: #f6f6f4; }
+    .changed-files { border-top: 1px solid var(--line); }
+    .changed-file { display: flex; align-items: center; gap: 8px; min-height: 50px; padding: 0 24px; color: var(--muted); font-size: 17px; }
+    .changed-file + .changed-file { border-top: 1px solid #eeeeec; }
+    .changed-file .path strong { color: var(--text); font-weight: 500; }
+    .changed-file .file-delta { margin-left: auto; white-space: nowrap; }
+    .file-delta .plus { color: var(--green); }
+    .file-delta .minus { color: var(--red); margin-left: 7px; }
+
+    .mode-caption { margin: 36px 0 0; padding-top: 13px; border-top: 1px solid var(--line); color: var(--faint); font-size: 12px; }
+    .mode-caption strong { color: var(--muted); font-weight: 500; }
+
+    @media (max-width: 700px) {
+      body { font-size: 14px; }
+      .page { padding: 15px 18px 35px; }
+      .view-switcher { justify-content: flex-start; overflow-x: auto; white-space: nowrap; }
+      .run-header { font-size: 19px; }
+      .user-request { margin-top: 27px; font-size: 18px; }
+      .row-label { font-size: 15px; }
+      .detail-view .group-header .row-label, .stage-header .row-label { font-size: 15px; }
+      .detail-view .tool-row .row-label, .tool-row .row-label { font-size: 14px; }
+      .result-view .final-answer { margin-top: 22px; font-size: 16px; }
+      .final-answer h3 { font-size: 16px; }
+      .change-summary { padding: 15px; }
+      .change-icon { width: 48px; height: 48px; }
+      .change-actions { gap: 8px; font-size: 15px; }
+      .changed-file { min-height: 45px; padding: 0 15px; font-size: 14px; }
+      .changed-file .path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="view-switcher" aria-label="原型查看方式">
+      <span class="view-switcher-label">查看：</span>
+      <button class="view-button" data-mode="detail" type="button">工具详情</button>
+      <button class="view-button" data-mode="stage" type="button">阶段过程</button>
+      <button class="view-button active" data-mode="result" type="button">只看结果</button>
+    </nav>
+
+    <div class="run-header" role="button" tabindex="0" aria-expanded="false">
+      <strong>已处理 28m 3s</strong>
+      <svg class="run-chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+    </div>
+
+    <section class="conversation">
+      <p class="user-request">我会按中文工程规范和设计评审规范处理这次图谱可读性问题：先定位重叠来自数据密度、布局参数还是卡片尺寸，再收敛成适合“局部聚焦 + 审阅”的布局方案，完成后做真实页面验收。</p>
+
+      <!-- 模式 1：完全展开到工具使用过程 -->
+      <section class="mode-view detail-view" data-view="detail">
+        <div class="execution-group">
+          <button class="group-header open" type="button" aria-expanded="true">
+            <svg class="row-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5.5 8h5M8 5.5v5"/></svg>
+            <span class="row-label"><strong>已使用 浏览器编辑了多个文件</strong></span>
+            <svg class="row-chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+          </button>
+          <div class="group-content open">
+            <div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg><span class="row-label">已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+2</span> <span class="delta minus">-0</span></span></div>
+            <div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg><span class="row-label">已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+24</span> <span class="delta minus">-5</span></span></div>
+            <div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg><span class="row-label">已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+1</span> <span class="delta minus">-1</span></span></div>
+            <div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg><span class="row-label">已编辑 <u>CytoscapeRenderer.svelte</u> <span class="delta plus">+50</span> <span class="delta minus">-5</span></span></div>
+            <div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg><span class="row-label">已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+10</span> <span class="delta minus">-0</span></span></div>
+          </div>
+        </div>
+        <div class="execution-group"><div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="8" height="9.5" rx="1"/><path d="m5 5 2 2-2 2M8 9h2.5M11.5 11.5l2 2"/></svg><span class="row-label">复核新的图谱布局</span></div></div>
+        <div class="execution-group"><div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 4.5v3.8l2.4 1.5"/></svg><span class="row-label">重新打开本地知识图谱</span></div></div>
+        <div class="execution-group"><div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5 8h6M8 5v6"/></svg><span class="row-label">检查布局调整后的运行日志</span></div></div>
+        <p class="detail-note">上下文已自动压缩</p>
+        <div class="execution-group"><div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 4.5v3.8l2.4 1.5"/></svg><span class="row-label">已使用 浏览器编辑了多个文件运行了命令</span></div></div>
+        <div class="mode-caption"><strong>工具详情</strong>：适合排错、复盘和需要确认每一次修改时使用。</div>
+      </section>
+
+      <!-- 模式 2：阶段对话过程，阶段内部默认收起 -->
+      <section class="mode-view stage-view" data-view="stage">
+        <div class="stage-group">
+          <button class="stage-header" type="button" aria-expanded="false">
+            <svg class="row-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5.5 8h5M8 5.5v5"/></svg><span class="row-label">已使用 浏览器编辑了多个文件</span><span class="stage-count">5 项</span><svg class="row-chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+          </button>
+          <div class="stage-content"><p class="stage-copy"><strong>先调整图谱卡片和布局参数。</strong> 这一步包含多次文件修改与一次页面复核。</p><div class="tool-row"><svg class="row-icon" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg><span class="row-label">KnowledgeGraphPanel.svelte、CytoscapeRenderer.svelte</span></div></div>
+        </div>
+        <div class="stage-group">
+          <button class="stage-header" type="button" aria-expanded="false">
+            <svg class="row-icon" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="8" height="9.5" rx="1"/><path d="m5 5 2 2-2 2M8 9h2.5M11.5 11.5l2 2"/></svg><span class="row-label">复核新的图谱布局</span><span class="stage-count">1 项</span><svg class="row-chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+          </button>
+          <div class="stage-content"><p class="stage-copy"><strong>重新打开本地知识图谱。</strong> 对焦节点、连接线层级和卡片间距。</p></div>
+        </div>
+        <div class="stage-group">
+          <button class="stage-header" type="button" aria-expanded="false">
+            <svg class="row-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 4.5v3.8l2.4 1.5"/></svg><span class="row-label">已使用 浏览器编辑了多个文件运行了命令</span><span class="stage-count">3 项</span><svg class="row-chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+          </button>
+          <div class="stage-content"><p class="stage-copy"><strong>完成局部调整并检查运行日志。</strong> 没有新增阻塞问题。</p></div>
+        </div>
+        <div class="mode-caption"><strong>阶段过程</strong>：适合想知道“做了几步、每步大致做了什么”，但不需要逐条看工具调用的用户。</div>
+      </section>
+
+      <!-- 模式 3：完全折叠过程，只留下最终结果 -->
+      <section class="mode-view result-view active" data-view="result">
+        <article class="final-answer">
+          <p>已完成图谱页面的最终视觉收口。</p>
+          <h3>根本原因：</h3>
+          <ul>
+            <li>聚焦视图传入了 <code>breadthfirst</code>，但渲染器未正确识别，实际回退到了力导向布局。</li>
+            <li>没有明确聚焦根节点，导致节点和连接线随机分布、重叠。</li>
+            <li>卡片尺寸与长文本不匹配，画布尺寸变化后也没有自动重新适配。</li>
+          </ul>
+          <h3>解决方案：</h3>
+          <ul>
+            <li>聚焦图改为以当前知识节点为中心的同心层布局。</li>
+            <li>节点固定为 <code>160×64</code>，支持中文任意字符换行，图中标题自动压缩，详情仍保留完整内容。</li>
+            <li>连接线置于卡片下方，默认隐藏关系文字，仅选中边显示。</li>
+            <li>增加画布自动 ResizeObserver，切换审阅、聚焦、全局视图时自动重新居中适配。</li>
+            <li>清理重复 CSS 覆盖规则，并将本次收口记录补充至开发计划。</li>
+          </ul>
+          <h3>主要文件：</h3>
+          <ul>
+            <li><a href="#">CytoscapeRenderer.svelte (line 107)</a></li>
+            <li><a href="#">KnowledgeGraphPanel.svelte (line 139)</a></li>
+            <li><a href="#">knowledge-graph-plan.md (line 248)</a></li>
+          </ul>
+          <h3>已验证：</h3>
+          <ul>
+            <li><code>npm --prefix web run check</code></li>
+            <li><code>npm --prefix web run build</code></li>
+            <li><code>git diff --check</code></li>
+            <li>daemon 真实页面验收：聚焦图节点不再重叠，连线层级和布局已正常。</li>
+          </ul>
+        </article>
+        <div class="change-card">
+          <div class="change-summary">
+            <div class="change-icon"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M8 8h8M8 12h5M8 16h4"/></svg></div>
+            <div><div class="change-title">已编辑 3 个文件</div><div class="change-count"><span class="plus">+240</span><span class="minus">-108</span></div></div>
+            <div class="change-actions"><button class="undo" type="button">撤销 ↶</button><button class="review" type="button">审核</button></div>
+          </div>
+          <div class="changed-files">
+            <div class="changed-file"><span class="path">web/src/components/<strong>KnowledgeGraphPanel.svelte</strong></span><span class="file-delta"><span class="plus">+43</span><span class="minus">-20</span></span></div>
+            <div class="changed-file"><span class="path">web/src/components/diagram/<strong>CytoscapeRenderer.svelte</strong></span><span class="file-delta"><span class="plus">+194</span><span class="minus">-87</span></span></div>
+            <div class="changed-file"><span class="path">docs/<strong>knowledge-graph-plan.md</strong></span><span class="file-delta"><span class="plus">+3</span><span class="minus">-1</span></span></div>
+          </div>
+        </div>
+        <div class="mode-caption"><strong>只看结果</strong>：默认模式。过程仍然存在，但不占用用户的阅读注意力；需要时可切换回阶段过程或工具详情。</div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const viewButtons = [...document.querySelectorAll('.view-button')];
+    const viewPanels = [...document.querySelectorAll('.mode-view')];
+
+    function setMode(mode, updateHash = true) {
+      const nextMode = ['detail', 'stage', 'result'].includes(mode) ? mode : 'result';
+      viewButtons.forEach((button) => button.classList.toggle('active', button.dataset.mode === nextMode));
+      viewPanels.forEach((panel) => panel.classList.toggle('active', panel.dataset.view === nextMode));
+      if (updateHash) history.replaceState(null, '', '#' + nextMode);
+    }
+
+    viewButtons.forEach((button) => button.addEventListener('click', () => setMode(button.dataset.mode)));
+
+    document.querySelectorAll('.group-header').forEach((header) => {
+      header.addEventListener('click', () => {
+        const content = header.nextElementSibling;
+        const open = content.classList.toggle('open');
+        header.classList.toggle('open', open);
+        header.setAttribute('aria-expanded', String(open));
+      });
+    });
+
+    document.querySelectorAll('.stage-header').forEach((header) => {
+      header.addEventListener('click', () => {
+        const content = header.nextElementSibling;
+        const open = content.classList.toggle('open');
+        header.classList.toggle('open', open);
+        header.setAttribute('aria-expanded', String(open));
+      });
+    });
+
+    const initialMode = location.hash.slice(1);
+    setMode(initialMode, false);
+  </script>
+</body>
+</html>

@@ -772,7 +772,14 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
   const previousPendingRequestIds = messagesState.pendingRequests;
   const previousThinkingStartAt = messagesState.thinkingStartAt;
   const localPendingRequestIds = new Set(
-    [...previousPendingRequestIds].filter((requestId) => requestBindings.has(requestId)),
+    [...previousPendingRequestIds].filter((requestId) => {
+      const binding = requestBindings.get(requestId);
+      return Boolean(
+        binding
+        && (!binding.sessionId
+          || binding.sessionId.trim() === (messagesState.currentSessionId?.trim() || '__draft__')),
+      );
+    }),
   );
   const snapshot = normalizeProcessingStateSnapshot(input);
   if (!snapshot) {
@@ -787,6 +794,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
       messagesState.thinkingStartAt = Date.now();
     }
     updateProcessingState();
+    saveCurrentExecutionProjection();
     return;
   }
   const pendingRequestIds = new Set([
@@ -830,6 +838,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     messagesState.thinkingStartAt = null;
   }
   messagesState.isProcessing = nextIsProcessing;
+  saveCurrentExecutionProjection();
 }
 
 // Wave 执行状态（提案 4.6）
@@ -837,6 +846,110 @@ let waveState = $state<WaveState | null>(null);
 
 // 请求-响应绑定状态（消息响应流设计）
 let requestBindings = $state<Map<string, RequestResponseBinding>>(new Map());
+
+type SessionExecutionProjection = {
+  backendProcessing: boolean;
+  pendingRequests: Set<string>;
+  activeMessageIds: Set<string>;
+  thinkingStartAt: number | null;
+  isProcessing: boolean;
+  lastForcedIdleAt: number | null;
+  processingActor: ProcessingActor;
+};
+
+// 执行态属于 session，而不是当前页面。切换会话只切换这里的投影，不能清掉
+// 其他会话仍在后台运行的 request binding 或 processing 状态。
+let sessionExecutionProjections = $state<Map<string, SessionExecutionProjection>>(new Map());
+
+function executionSessionKey(sessionId: string | null | undefined): string {
+  const normalized = typeof sessionId === 'string' ? sessionId.trim() : '';
+  return normalized || '__draft__';
+}
+
+function cloneExecutionProjection(
+  projection: SessionExecutionProjection,
+): SessionExecutionProjection {
+  return {
+    ...projection,
+    pendingRequests: new Set(projection.pendingRequests),
+    activeMessageIds: new Set(projection.activeMessageIds),
+    processingActor: { ...projection.processingActor },
+  };
+}
+
+function saveCurrentExecutionProjection(sessionId = messagesState.currentSessionId): void {
+  const next = new Map(sessionExecutionProjections);
+  next.set(executionSessionKey(sessionId), {
+    backendProcessing: messagesState.backendProcessing,
+    pendingRequests: new Set(messagesState.pendingRequests),
+    activeMessageIds: new Set(messagesState.activeMessageIds),
+    thinkingStartAt: messagesState.thinkingStartAt,
+    isProcessing: messagesState.isProcessing,
+    lastForcedIdleAt: messagesState.lastForcedIdleAt,
+    processingActor: { ...messagesState.processingActor },
+  });
+  sessionExecutionProjections = next;
+}
+
+function restoreExecutionProjection(sessionId: string | null): void {
+  const stored = sessionExecutionProjections.get(executionSessionKey(sessionId));
+  const projection = stored
+    ? cloneExecutionProjection(stored)
+    : {
+      backendProcessing: false,
+      pendingRequests: new Set<string>(),
+      activeMessageIds: new Set<string>(),
+      thinkingStartAt: null,
+      isProcessing: false,
+      lastForcedIdleAt: null,
+      processingActor: { source: 'orchestrator', agent: 'orchestrator' } as ProcessingActor,
+    };
+  messagesState.backendProcessing = projection.backendProcessing;
+  messagesState.pendingRequests = projection.pendingRequests;
+  messagesState.activeMessageIds = projection.activeMessageIds;
+  messagesState.thinkingStartAt = projection.thinkingStartAt;
+  messagesState.isProcessing = projection.isProcessing;
+  messagesState.lastForcedIdleAt = projection.lastForcedIdleAt;
+  messagesState.processingActor = projection.processingActor;
+}
+
+function rekeyExecutionProjection(
+  previousSessionId: string | null,
+  nextSessionId: string | null,
+): void {
+  const previousKey = executionSessionKey(previousSessionId);
+  const nextKey = executionSessionKey(nextSessionId);
+  if (previousKey === nextKey) {
+    return;
+  }
+  const previous = sessionExecutionProjections.get(previousKey);
+  if (!previous) {
+    return;
+  }
+  const next = new Map(sessionExecutionProjections);
+  next.delete(previousKey);
+  next.set(nextKey, cloneExecutionProjection(previous));
+  sessionExecutionProjections = next;
+}
+
+function updateStoredExecutionProjection(
+  sessionId: string,
+  update: (projection: SessionExecutionProjection) => SessionExecutionProjection,
+): void {
+  const key = executionSessionKey(sessionId);
+  const existing = sessionExecutionProjections.get(key) ?? {
+    backendProcessing: false,
+    pendingRequests: new Set<string>(),
+    activeMessageIds: new Set<string>(),
+    thinkingStartAt: null,
+    isProcessing: false,
+    lastForcedIdleAt: null,
+    processingActor: { source: 'orchestrator', agent: 'orchestrator' } as ProcessingActor,
+  };
+  const next = new Map(sessionExecutionProjections);
+  next.set(key, cloneExecutionProjection(update(cloneExecutionProjection(existing))));
+  sessionExecutionProjections = next;
+}
 
 // LLM 重试运行态（非持久化，仅用于当前活跃消息展示）
 export const retryRuntimeState = $state({
@@ -1092,15 +1205,10 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
   return true;
 }
 
-function resetSessionScopedExecutionState(): void {
+function resetSessionScopedExecutionState(sessionId: string | null): void {
   messagesState.edits = [];
   messagesState.orchestratorRuntimeState = null;
-  messagesState.backendProcessing = false;
-  messagesState.pendingRequests = new Set();
-  messagesState.activeMessageIds = new Set();
-  messagesState.thinkingStartAt = null;
-  messagesState.isProcessing = false;
-  messagesState.lastForcedIdleAt = null;
+  restoreExecutionProjection(sessionId);
   if (messagesState.appState) {
     messagesState.appState = {
       ...messagesState.appState,
@@ -1252,6 +1360,7 @@ export function setCurrentSessionId(id: string | null) {
   let restoredSessionView = false;
   if (hasChanged) {
     captureCurrentSessionViewState();
+    saveCurrentExecutionProjection(previousSessionId);
   }
   messagesState.currentSessionId = nextSessionId;
   if (hasChanged) {
@@ -1268,7 +1377,7 @@ export function setCurrentSessionId(id: string | null) {
     resetNotificationCenterStatus();
   }
   if (hasChanged) {
-    resetSessionScopedExecutionState();
+    resetSessionScopedExecutionState(nextSessionId);
     // 会话切换时消息内容以后端分页快照为唯一真相源。
     // 本地只恢复滚动/定位等轻量视图状态，避免旧 session 的主线或右侧面板内容短暂残留。
     clearCanonicalSessionTurns(nextSessionId ?? undefined);
@@ -1295,6 +1404,8 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
   if (currentSessionId) {
     return false;
   }
+  saveCurrentExecutionProjection(currentSessionId);
+  rekeyExecutionProjection(currentSessionId, nextSessionId);
   clearCanonicalSessionTurns(nextSessionId);
   messagesState.currentSessionId = nextSessionId;
   messagesState.sessionHistory = {
@@ -1327,6 +1438,7 @@ export function adoptAcceptedSessionIdForLocalTurn(
   if (normalizeSessionId(messagesState.currentSessionId) !== previousSessionId) {
     return false;
   }
+  rebindLocalSubmissionSession(previousSessionId, nextSessionId);
   messagesState.currentSessionId = nextSessionId;
   messagesState.sessionHistory = {
     workspaceId: messagesState.currentWorkspaceId,
@@ -1344,6 +1456,32 @@ export function adoptAcceptedSessionIdForLocalTurn(
   syncNotificationsFromContext(nextSessionId);
   saveWebviewState();
   return true;
+}
+
+/**
+ * 将尚未完成的本地提交从草稿会话绑定到后端分配的正式会话。
+ * 当前页面可能已经切到另一个会话，因此这里只重绑定后台投影，不改变当前视图。
+ */
+export function rebindLocalSubmissionSession(
+  previousSessionId: string | null | undefined,
+  nextSessionId: string | null | undefined,
+): void {
+  const previous = normalizeSessionId(previousSessionId);
+  const next = normalizeSessionId(nextSessionId);
+  if (!previous || !next || previous === next) {
+    return;
+  }
+  if (normalizeSessionId(messagesState.currentSessionId) === previous) {
+    saveCurrentExecutionProjection(previous);
+  }
+  rekeyExecutionProjection(previous, next);
+  const reboundBindings = new Map(requestBindings);
+  for (const [requestId, binding] of reboundBindings) {
+    if (binding.sessionId?.trim() === previous) {
+      reboundBindings.set(requestId, { ...binding, sessionId: next });
+    }
+  }
+  requestBindings = reboundBindings;
 }
 
 export interface WorkspaceSessionProjectionCursor {
@@ -1661,6 +1799,7 @@ export function markMessageActive(id: string) {
     const next = new Set(messagesState.activeMessageIds);
     next.add(id);
     messagesState.activeMessageIds = next;
+    saveCurrentExecutionProjection();
   }
 }
 
@@ -1670,6 +1809,7 @@ export function markMessageComplete(id: string) {
     const next = new Set(messagesState.activeMessageIds);
     next.delete(id);
     messagesState.activeMessageIds = next;
+    saveCurrentExecutionProjection();
   }
   clearRetryRuntime(id);
 }
@@ -1684,6 +1824,7 @@ export function addPendingRequest(id: string, options?: { resetAntiLiftBack?: bo
     next.add(id);
     messagesState.pendingRequests = next;
     updateProcessingState();
+    saveCurrentExecutionProjection();
   }
 }
 
@@ -1714,15 +1855,31 @@ export function beginLocalTurnSubmission(input: {
     ? input.startedAt
     : Date.now();
   messagesState.isProcessing = true;
+  saveCurrentExecutionProjection();
 }
 
 export function clearPendingRequest(id: string) {
   if (!id) return;
+  const binding = requestBindings.get(id);
+  const ownerSessionId = binding?.sessionId?.trim() || messagesState.currentSessionId?.trim() || '__draft__';
+  if (ownerSessionId !== (messagesState.currentSessionId?.trim() || '__draft__')) {
+    updateStoredExecutionProjection(ownerSessionId, (projection) => {
+      projection.pendingRequests.delete(id);
+      projection.activeMessageIds.delete(binding?.placeholderMessageId || '');
+      projection.isProcessing = projection.backendProcessing || projection.pendingRequests.size > 0;
+      if (!projection.isProcessing) {
+        projection.thinkingStartAt = null;
+      }
+      return projection;
+    });
+    return;
+  }
   if (messagesState.pendingRequests.has(id)) {
     const next = new Set(messagesState.pendingRequests);
     next.delete(id);
     messagesState.pendingRequests = next;
     updateProcessingState();
+    saveCurrentExecutionProjection();
   }
 }
 
@@ -1742,6 +1899,7 @@ export function settleAuthoritativeIdleState() {
   messagesState.activeMessageIds = new Set();
   messagesState.thinkingStartAt = null;
   updateProcessingState();
+  saveCurrentExecutionProjection();
 }
 
 export function clearProcessingState(options?: {
@@ -1767,6 +1925,7 @@ export function clearProcessingState(options?: {
     messagesState.lastForcedIdleAt = Date.now();
   }
   updateProcessingState();
+  saveCurrentExecutionProjection();
 }
 
 export function settleProcessingForManualInteraction() {
@@ -1780,13 +1939,25 @@ export function getBackendProcessing(): boolean {
 }
 
 export function clearPendingInteractions() {
-  for (const binding of requestBindings.values()) {
+  const currentSessionId = messagesState.currentSessionId?.trim() || '__draft__';
+  const nextBindings = new Map(requestBindings);
+  for (const [requestId, binding] of requestBindings) {
+    const ownerSessionId = binding.sessionId?.trim() || currentSessionId;
+    if (ownerSessionId !== currentSessionId) {
+      continue;
+    }
     if (binding.timeoutId) {
       clearTimeout(binding.timeoutId);
     }
+    nextBindings.delete(requestId);
   }
-  requestBindings = new Map();
+  requestBindings = nextBindings;
   messagesState.pendingRequests = new Set();
+  messagesState.activeMessageIds = new Set();
+  messagesState.backendProcessing = false;
+  messagesState.isProcessing = false;
+  messagesState.thinkingStartAt = null;
+  saveCurrentExecutionProjection(currentSessionId);
 }
 
 function recomputeUnreadNotificationCount() {
@@ -2092,6 +2263,8 @@ export function clearAllMessages(options: {
   persist?: boolean;
   resetTimelineView?: boolean;
   resetPanelState?: boolean;
+  /** 切换会话时保留后台请求的执行态，由 setCurrentSessionId 负责切换投影。 */
+  preserveExecutionState?: boolean;
   /** 跨 session 切换时设为 true，跳过防回抬保护 */
   skipAntiLiftBack?: boolean;
 } = {}) {
@@ -2116,8 +2289,10 @@ export function clearAllMessages(options: {
     messageId: null,
     nonce: messagesState.messageJump.nonce,
   };
-  clearPendingInteractions();
-  clearProcessingState({ skipAntiLiftBack: options.skipAntiLiftBack });
+  if (options.preserveExecutionState !== true) {
+    clearPendingInteractions();
+    clearProcessingState({ skipAntiLiftBack: options.skipAntiLiftBack });
+  }
   // 会话级运行时状态：会话切换时必须清理，避免旧数据泄漏到新会话
   waveState = null;
   if (options.resetPanelState !== false) {
@@ -2287,7 +2462,10 @@ export function clearWaveState() {
  */
 export function createRequestBinding(binding: RequestResponseBinding): void {
   const next = new Map(requestBindings);
-  next.set(binding.requestId, binding);
+  next.set(binding.requestId, {
+    ...binding,
+    sessionId: binding.sessionId?.trim() || messagesState.currentSessionId?.trim() || '__draft__',
+  });
   requestBindings = next;
 }
 
@@ -2356,9 +2534,16 @@ export function clearRequestBinding(requestId: string): void {
  * 清除所有请求绑定（会话切换时使用）
  */
 export function clearAllRequestBindings(): void {
-  requestBindings = new Map();
-  if (messagesState.pendingRequests.size > 0) {
-    messagesState.pendingRequests = new Set();
-    updateProcessingState();
+  for (const binding of requestBindings.values()) {
+    if (binding.timeoutId) {
+      clearTimeout(binding.timeoutId);
+    }
   }
+  requestBindings = new Map();
+  sessionExecutionProjections = new Map();
+  messagesState.pendingRequests = new Set();
+  messagesState.activeMessageIds = new Set();
+  messagesState.backendProcessing = false;
+  messagesState.thinkingStartAt = null;
+  updateProcessingState();
 }

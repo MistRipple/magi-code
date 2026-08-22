@@ -47,6 +47,7 @@ const DEFAULT_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // 一个可恢复的 navigation timeout 会被错误改写成 Host disconnected。
 const NAVIGATION_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LONG_RUNNING_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct BrowserHostCommandReply {
@@ -214,22 +215,51 @@ impl BrowserHostClient {
                 .remove(&request_id);
             return Err(BrowserHostClientError::Transport(error.to_string()));
         }
-        match tokio::time::timeout(request_timeout, receiver).await {
+        let mut receiver = receiver;
+        match tokio::time::timeout(request_timeout, &mut receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BrowserHostClientError::Disconnected),
             Err(_) => {
-                self.pending
-                    .lock()
-                    .expect("browser Host pending response lock poisoned")
-                    .remove(&request_id);
-                // A request timeout invalidates the WebSocket command stream. The
-                // Host may still be executing the timed-out command, so sending
-                // later commands on this connection would only queue behind an
-                // unknown operation and turn one timeout into a tab-wide stall.
-                self.close().await;
-                Err(BrowserHostClientError::RequestTimeout(request_id))
+                if self.send_cancel(&request_id).await.is_err() {
+                    self.pending
+                        .lock()
+                        .expect("browser Host pending response lock poisoned")
+                        .remove(&request_id);
+                    self.close().await;
+                    return Err(BrowserHostClientError::RequestTimeout(request_id));
+                }
+                match tokio::time::timeout(CANCEL_GRACE_TIMEOUT, &mut receiver).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) | Err(_) => {
+                        self.pending
+                            .lock()
+                            .expect("browser Host pending response lock poisoned")
+                            .remove(&request_id);
+                        self.close().await;
+                        Err(BrowserHostClientError::RequestIndeterminate(request_id))
+                    }
+                }
             }
         }
+    }
+
+    async fn send_cancel(
+        &self,
+        request_id: &BrowserCommandId,
+    ) -> Result<(), BrowserHostClientError> {
+        let payload = serde_json::to_string(&BrowserHostRequestEnvelope {
+            request_id: request_id.clone(),
+            protocol_version: BrowserHostProtocolVersion::CURRENT,
+            command: BrowserHostCommand::Cancel {
+                request_id: request_id.clone(),
+            },
+        })?;
+        self.sink
+            .lock()
+            .await
+            .send(Message::Text(payload.into()))
+            .await
+            .map_err(|error| BrowserHostClientError::Transport(error.to_string()))
     }
 
     fn tab_lock(&self, tab_id: &BrowserTabId) -> Arc<tokio::sync::Mutex<()>> {
@@ -252,7 +282,9 @@ impl BrowserHostClient {
 
 fn command_tab_id(command: &BrowserHostCommand) -> Option<&BrowserTabId> {
     match command {
-        BrowserHostCommand::Ping | BrowserHostCommand::Shutdown => None,
+        BrowserHostCommand::Ping
+        | BrowserHostCommand::Cancel { .. }
+        | BrowserHostCommand::Shutdown => None,
         BrowserHostCommand::CreatePage { tab_id, .. }
         | BrowserHostCommand::RestorePage { tab_id, .. }
         | BrowserHostCommand::SetLogicalViewport { tab_id, .. }
@@ -558,6 +590,8 @@ pub enum BrowserHostClientError {
     DesktopProcessMismatch { expected: u32, received: u32 },
     #[error("browser Host request timed out: {0}")]
     RequestTimeout(BrowserCommandId),
+    #[error("browser Host request completed with indeterminate outcome: {0}")]
+    RequestIndeterminate(BrowserCommandId),
     #[error("browser Host response does not match a pending request: {0}")]
     UnexpectedResponse(BrowserCommandId),
     #[error("browser Host sent an unexpected binary payload")]
@@ -577,6 +611,7 @@ impl From<serde_json::Error> for BrowserHostClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BrowserHostCommandError;
 
     fn handshake() -> BrowserHostHandshake {
         BrowserHostHandshake {
@@ -775,7 +810,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn request_timeout_closes_the_command_stream_and_later_requests_fail_fast() {
+    async fn request_timeout_cancels_in_flight_command_and_keeps_protocol_aligned() {
         use tokio::net::UnixListener;
         use tokio_tungstenite::accept_async;
 
@@ -800,12 +835,52 @@ mod tests {
                 ))
                 .await
                 .expect("send ready event");
-            let _request = websocket
+            let request = websocket
                 .next()
                 .await
                 .expect("receive timed out request")
                 .expect("read timed out request");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let Message::Text(request) = request else {
+                panic!("expected text request");
+            };
+            let request: BrowserHostRequestEnvelope =
+                serde_json::from_str(request.as_str()).expect("decode timed out request");
+            let cancel = websocket
+                .next()
+                .await
+                .expect("receive cancel request")
+                .expect("read cancel request");
+            let Message::Text(cancel) = cancel else {
+                panic!("expected text cancel request");
+            };
+            let cancel: BrowserHostRequestEnvelope =
+                serde_json::from_str(cancel.as_str()).expect("decode cancel request");
+            assert_eq!(cancel.request_id, request.request_id);
+            assert_eq!(
+                cancel.command,
+                BrowserHostCommand::Cancel {
+                    request_id: request.request_id.clone(),
+                }
+            );
+            let response = BrowserHostResponseEnvelope {
+                request_id: request.request_id,
+                protocol_version: BrowserHostProtocolVersion::CURRENT,
+                outcome: BrowserHostCommandOutcome::Indeterminate(BrowserHostCommandError {
+                    code: "browser_command_cancelled".to_string(),
+                    message: "cancelled".to_string(),
+                    recoverable: false,
+                    side_effect_started: true,
+                    diagnostic: None,
+                }),
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&response)
+                        .expect("serialize cancelled response")
+                        .into(),
+                ))
+                .await
+                .expect("send cancelled response");
         });
 
         let (client, _) = BrowserHostClient::connect_desktop_socket(
@@ -819,9 +894,13 @@ mod tests {
         .expect("connect Desktop client");
         let client = client.with_request_timeout(Duration::from_millis(20));
 
+        let reply = client
+            .request(BrowserHostCommand::Ping)
+            .await
+            .expect("cancelled command must keep response alignment");
         assert!(matches!(
-            client.request(BrowserHostCommand::Ping).await,
-            Err(BrowserHostClientError::RequestTimeout(_))
+            reply.response.outcome,
+            BrowserHostCommandOutcome::Indeterminate(_)
         ));
         assert!(matches!(
             client.request(BrowserHostCommand::Ping).await,

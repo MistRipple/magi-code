@@ -15,28 +15,136 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use magi_app_server_protocol::{
+    AppServerRequestMethod, ApprovalDecision, ApprovalRequestParams, BrowserAccessProfile,
+    BrowserToolParams, BrowserToolsListParams, BrowserToolsListResult, CancelRequestParams,
     ClientCapabilities, ClientInfo, ClientMessage, ClientNotification, ClientRequest,
-    ERROR_ALREADY_INITIALIZED, ERROR_INTERNAL, ERROR_INVALID_PARAMS, ERROR_INVALID_REQUEST,
-    ERROR_METHOD_NOT_FOUND, ERROR_NOT_INITIALIZED, ERROR_REQUEST_CONFLICT, ERROR_SERVER_OVERLOADED,
-    ERROR_SESSION_NOT_FOUND, ErrorObject, InitializeParams, InitializeResult, ProtocolVersion,
-    RequestId, ServerCapabilities, classify_client_message, error_response, notification, response,
+    ClientResponse, ERROR_ALREADY_INITIALIZED, ERROR_INTERNAL, ERROR_INVALID_PARAMS,
+    ERROR_INVALID_REQUEST, ERROR_METHOD_NOT_FOUND, ERROR_NOT_INITIALIZED, ERROR_REQUEST_CANCELLED,
+    ERROR_REQUEST_CONFLICT, ERROR_REQUEST_TIMEOUT, ERROR_SERVER_OVERLOADED,
+    ERROR_SESSION_NOT_FOUND, ErrorObject, EventNotificationParams, EventResyncRequiredParams,
+    EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult, PingResult,
+    ProtocolVersion, RequestId, ServerCapabilities, ServerNotification, ServerRequest,
+    ServerResponse, SessionListParams, SessionListResult, SessionReadParams, SessionReadResult,
+    SessionSummary, TurnStartParams, TurnStartResult, classify_client_message, error_response,
+    typed_notification, typed_response,
 };
-use magi_core::{SessionId, WorkspaceId};
-use magi_event_bus::{EventEnvelope, EventStreamSnapshot};
-use serde::Deserialize;
+use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
+use magi_core::{
+    AccessProfile, EventId, ExecutionResultStatus, SessionId, ThreadId, ToolCallId, UtcMillis,
+    WorkspaceId,
+};
+use magi_event_bus::{EventContext, EventEnvelope, EventStreamSnapshot};
+use magi_session_store::ActiveExecutionTurnItem;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicU8;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 
-use crate::{errors::ApiError, routes::sessions, state::ApiState};
+use crate::{dto::SessionDirectoryEntryDto, errors::ApiError, routes::sessions, state::ApiState};
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const CONTROL_QUEUE_CAPACITY: usize = MAX_IN_FLIGHT_REQUESTS + 16;
 const EVENT_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
+const MIN_REQUEST_TIMEOUT_MS: u64 = 100;
+const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
+
+fn typed_success<T: Serialize>(request_id: RequestId, result: T) -> ServerResponse {
+    match typed_response(request_id.clone(), result) {
+        Ok(response) => response,
+        Err(error) => error_response(request_id, error),
+    }
+}
+
+fn typed_success_from_json<T>(request_id: RequestId, value: Value, method: &str) -> ServerResponse
+where
+    T: DeserializeOwned + Serialize,
+{
+    match serde_json::from_value::<T>(value) {
+        Ok(result) => typed_success(request_id, result),
+        Err(error) => error_response(
+            request_id,
+            ErrorObject::new(
+                ERROR_INTERNAL,
+                format!("{method} 结果不符合协议 Schema: {error}"),
+            ),
+        ),
+    }
+}
+
+fn typed_notification_from_json<T>(
+    method: impl Into<String>,
+    value: Value,
+) -> Result<ServerNotification, ErrorObject>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let params = serde_json::from_value::<T>(value).map_err(|error| {
+        ErrorObject::new(
+            ERROR_INTERNAL,
+            format!("通知参数不符合协议 Schema: {error}"),
+        )
+    })?;
+    typed_notification(method, params)
+}
+
+#[derive(Clone)]
+struct RequestControl {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    termination: Arc<AtomicU8>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestTermination {
+    None = 0,
+    Cancelled = 1,
+    TimedOut = 2,
+}
+
+impl RequestControl {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+            termination: Arc::new(AtomicU8::new(RequestTermination::None as u8)),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::SeqCst) {
+            self.termination
+                .store(RequestTermination::Cancelled as u8, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn timeout(&self) {
+        if !self.cancelled.swap(true, Ordering::SeqCst) {
+            self.termination
+                .store(RequestTermination::TimedOut as u8, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn termination(&self) -> RequestTermination {
+        match self.termination.load(Ordering::SeqCst) {
+            value if value == RequestTermination::Cancelled as u8 => RequestTermination::Cancelled,
+            value if value == RequestTermination::TimedOut as u8 => RequestTermination::TimedOut,
+            _ => RequestTermination::None,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
 
 pub fn routes() -> Router<ApiState> {
     Router::new().route("/app-server", get(connect))
@@ -193,6 +301,12 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
     let (initial_snapshot, mut event_rx) = state.event_bus.snapshot_and_subscribe();
     let connection_state = Arc::new(Mutex::new(ConnectionState::default()));
     let request_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+    let pending_requests = Arc::new(Mutex::new(HashMap::<RequestId, RequestControl>::new()));
+    let pending_server_requests = Arc::new(Mutex::new(HashMap::<
+        RequestId,
+        oneshot::Sender<ClientResponse>,
+    >::new()));
+    let next_server_request_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut request_tasks = tokio::task::JoinSet::new();
     let mut initial_snapshot = Some(initial_snapshot);
     let mut event_subscription_active = false;
@@ -286,29 +400,125 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                 let state_for_request = state.clone();
                                 let connection_for_request = connection_state.clone();
                                 let outgoing_for_request = outgoing.clone();
+                                let pending_requests_for_task = pending_requests.clone();
+                                let pending_server_requests_for_task = pending_server_requests.clone();
+                                let next_server_request_id_for_task = next_server_request_id.clone();
+                                let request_timeout = match request_timeout(&request) {
+                                    Ok(timeout) => timeout,
+                                    Err(error) => {
+                                        let _ = try_send_json(
+                                            &outgoing,
+                                            error_response(request.id, error),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let control = RequestControl::new();
+                                pending_requests
+                                    .lock()
+                                    .await
+                                    .insert(request.id.clone(), control.clone());
+                                let request_id_for_cleanup = request.id.clone();
+                                let side_effecting = matches!(
+                                    request.method.as_str(),
+                                    "browser/tool" | "approval/request"
+                                );
+                                let browser_tool_request = request.method == "browser/tool";
+                                let browser_timeout_retryable = browser_tool_retryable(&request);
                                 request_tasks.spawn(async move {
                                     let _slot = slot;
-                                    let response = dispatch_request(
-                                        &state_for_request,
-                                        &connection_for_request,
-                                        request,
-                                    ).await;
+                                    let request_id = request.id.clone();
+                                    let control_for_dispatch = control.clone();
+                                    let outgoing_for_dispatch = outgoing_for_request.clone();
+                                    let dispatch_task = tokio::spawn(async move {
+                                        dispatch_request(
+                                            &state_for_request,
+                                            &connection_for_request,
+                                            &outgoing_for_dispatch,
+                                            &pending_server_requests_for_task,
+                                            &next_server_request_id_for_task,
+                                            request,
+                                            control_for_dispatch,
+                                            request_timeout,
+                                        )
+                                        .await
+                                    });
+                                    let mut dispatch_task = dispatch_task;
+                                    let response = if control.is_cancelled() {
+                                        if !side_effecting {
+                                            dispatch_task.abort();
+                                        }
+                                        error_response(
+                                            request_id,
+                                            ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消")
+                                                .retryable(false),
+                                        )
+                                    } else {
+                                        tokio::select! {
+                                            biased;
+                                            _ = control.notify.notified() => {
+                                                if !side_effecting {
+                                                    dispatch_task.abort();
+                                                }
+                                                error_response(
+                                                    request_id.clone(),
+                                                    ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消")
+                                                        .retryable(false),
+                                                )
+                                            }
+                                            _ = tokio::time::sleep(request_timeout) => {
+                                                control.timeout();
+                                                if !side_effecting {
+                                                    dispatch_task.abort();
+                                                }
+                                                let error = if browser_tool_request {
+                                                    browser_timeout_error(browser_timeout_retryable)
+                                                } else {
+                                                    ErrorObject::new(ERROR_REQUEST_TIMEOUT, "请求执行超时")
+                                                        .retryable(true)
+                                                };
+                                                error_response(request_id.clone(), error)
+                                            }
+                                            result = &mut dispatch_task => {
+                                                match result {
+                                                    Ok(response) => response,
+                                                    Err(error) => error_response(
+                                                        request_id,
+                                                        ErrorObject::new(
+                                                            ERROR_INTERNAL,
+                                                            format!("请求任务异常结束: {error}"),
+                                                        ),
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                    };
+                                    pending_requests_for_task
+                                        .lock()
+                                        .await
+                                        .remove(&request_id_for_cleanup);
                                     if try_send_json(&outgoing_for_request, response).is_err() {
                                         outgoing_for_request.disconnect();
                                     }
                                 });
                             }
                             ClientMessage::Notification(notification) => {
-                                handle_notification(&connection_state, notification).await;
+                                if notification.method == "$/cancelRequest" {
+                                    handle_cancel_notification(&pending_requests, notification).await;
+                                } else {
+                                    handle_notification(&connection_state, notification).await;
+                                }
                             }
-                            ClientMessage::Response(_) => {
-                                let _ = send_protocol_error(
-                                    &outgoing,
-                                    None,
-                                    ERROR_INVALID_REQUEST,
-                                    "当前连接没有待处理的服务端请求".to_string(),
-                                    false,
-                                );
+                            ClientMessage::Response(response) => {
+                                if !resolve_server_response(&pending_server_requests, response).await {
+                                    let _ = send_protocol_error(
+                                        &outgoing,
+                                        None,
+                                        ERROR_INVALID_REQUEST,
+                                        "当前连接没有待处理的服务端请求".to_string(),
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }
@@ -337,24 +547,37 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                 &format!("event/{}", event.event_type),
                             )
                             .await
-                            && try_send_event_json(
-                                &outgoing,
-                                notification(
-                                    format!("event/{}", event.event_type),
-                                    json!({"sequence": event.sequence, "event": event}),
-                                ),
-                            )
-                            .is_err()
                         {
-                            let _ = try_send_json(
-                                &outgoing,
-                                notification(
+                            let notification = match typed_notification_from_json::<EventNotificationParams>(
+                                format!("event/{}", event.event_type),
+                                json!({"sequence": event.sequence, "event": event}),
+                            ) {
+                                Ok(notification) => notification,
+                                Err(error) => {
+                                    tracing::error!(%error.message, "事件通知不符合协议 Schema");
+                                    outgoing.disconnect();
+                                    break;
+                                }
+                            };
+                            if try_send_event_json(&outgoing, notification).is_err() {
+                                let resync = typed_notification_from_json::<EventResyncRequiredParams>(
                                     "events/resyncRequired",
-                                    json!({"reason": "clientTooSlow"}),
-                                ),
-                            );
-                            outgoing.disconnect();
-                            break;
+                                    json!({
+                                        "reason": "clientTooSlow",
+                                        "requestedAfterSequence": null,
+                                        "skipped": null,
+                                        "snapshot": {
+                                            "next_sequence": state.event_bus.snapshot().next_sequence,
+                                            "recent_events": [],
+                                        },
+                                    }),
+                                );
+                                if let Ok(resync) = resync {
+                                    let _ = try_send_json(&outgoing, resync);
+                                }
+                                outgoing.disconnect();
+                                break;
+                            }
                         }
                         if should_send {
                             connection_state.lock().await.subscription.after_sequence = event.sequence;
@@ -366,15 +589,27 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                         if is_subscribed(&connection_state).await {
                             connection_state.lock().await.subscription.after_sequence =
                                 snapshot.next_sequence.saturating_sub(1);
-                            if try_send_json(&outgoing, notification(
+                            let snapshot = filtered_snapshot(&snapshot, &connection_state).await;
+                            let notification = typed_notification_from_json::<EventResyncRequiredParams>(
                                 "events/resyncRequired",
                                 json!({
+                                    "reason": "clientTooSlow",
+                                    "requestedAfterSequence": null,
                                     "skipped": skipped,
-                                    "snapshot": filtered_snapshot(&snapshot, &connection_state).await,
+                                    "snapshot": snapshot,
                                 }),
-                            )).is_err() {
-                                outgoing.disconnect();
-                                break;
+                            );
+                            match notification {
+                                Ok(notification) => {
+                                    if try_send_json(&outgoing, notification).is_err() {
+                                        outgoing.disconnect();
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    outgoing.disconnect();
+                                    break;
+                                }
                             }
                         }
                     }
@@ -390,8 +625,23 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
         }
     }
 
-    request_tasks.abort_all();
-    while request_tasks.join_next().await.is_some() {}
+    for control in pending_requests.lock().await.values() {
+        control.cancel();
+    }
+    let drain = async {
+        while let Some(result) = request_tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::debug!(?error, "App Server 请求任务结束");
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+        .await
+        .is_err()
+    {
+        request_tasks.abort_all();
+        while request_tasks.join_next().await.is_some() {}
+    }
     drop(outgoing);
     let _ = writer.await;
 }
@@ -446,9 +696,9 @@ async fn initialize_connection(
     guard.initialize_seen = true;
     guard.client_info = Some(params.client_info);
     guard.capabilities = params.capabilities;
-    response(
+    typed_success(
         request.id,
-        serde_json::to_value(InitializeResult {
+        InitializeResult {
             server_info: ClientInfo {
                 name: state.service_info.service_name.clone(),
                 title: Some("Magi App Server".to_string()),
@@ -460,13 +710,13 @@ async fn initialize_connection(
                 sessions: true,
                 turns: true,
                 events: true,
-                approvals: false,
-                // 浏览器工具仍由现有 Browser Tool Runtime 负责；App Server 尚未暴露
-                // 对应方法时不能提前宣称能力，否则客户端会把请求发到不存在的方法。
-                browser_tools: false,
+                approvals: true,
+                // App Server 已提供 browser/tools/list 与 browser/tool。实际是否可执行
+                // 由 browser capability snapshot 在请求边界再次校验，而不是通过握手
+                // 静态伪装成“没有浏览器能力”。
+                browser_tools: true,
             },
-        })
-        .expect("初始化响应必须可序列化"),
+        },
     )
 }
 
@@ -519,52 +769,106 @@ async fn subscribe_events(
     // 会先出现在 snapshot、随后又从 broadcast receiver 重复投递一次。
     connection_state.lock().await.subscription.after_sequence =
         after_sequence.max(next_sequence.saturating_sub(1));
-    let notification_method = if resync_required {
-        "events/resyncRequired"
+    let notification = if resync_required {
+        typed_notification_from_json::<EventResyncRequiredParams>(
+            "events/resyncRequired",
+            json!({
+                "reason": "afterSequenceExpired",
+                "requestedAfterSequence": after_sequence,
+                "skipped": null,
+                "snapshot": snapshot,
+            }),
+        )
     } else {
-        "events/snapshot"
+        serde_json::to_value(snapshot)
+            .map_err(|error| {
+                ErrorObject::new(ERROR_INTERNAL, format!("事件快照序列化失败: {error}"))
+            })
+            .and_then(|value| {
+                typed_notification_from_json::<magi_app_server_protocol::EventStreamSnapshot>(
+                    "events/snapshot",
+                    value,
+                )
+            })
     };
-    let mut notification_params = if resync_required {
-        json!({"snapshot": snapshot})
-    } else {
-        serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}))
-    };
-    if resync_required {
-        notification_params["reason"] = json!("afterSequenceExpired");
-        notification_params["requestedAfterSequence"] = json!(after_sequence);
+    match notification {
+        Ok(notification) => {
+            if try_send_json(outgoing, notification).is_err() {
+                outgoing.disconnect();
+            }
+        }
+        Err(_) => outgoing.disconnect(),
     }
-    if try_send_json(
-        outgoing,
-        notification(notification_method, notification_params),
-    )
-    .is_err()
-    {
-        outgoing.disconnect();
-    }
-    response(
+    typed_success(
         request.id,
-        json!({
-            "subscribed": true,
-            "nextSequence": next_sequence,
-            "resyncRequired": resync_required,
-        }),
+        EventSubscribeResult {
+            subscribed: true,
+            next_sequence,
+            resync_required,
+        },
     )
 }
 
 async fn dispatch_request(
     state: &ApiState,
     connection_state: &Arc<Mutex<ConnectionState>>,
+    outgoing: &OutgoingChannels,
+    pending_server_requests: &Arc<Mutex<HashMap<RequestId, oneshot::Sender<ClientResponse>>>>,
+    next_server_request_id: &Arc<std::sync::atomic::AtomicU64>,
     request: ClientRequest,
+    control: RequestControl,
+    request_timeout: std::time::Duration,
 ) -> magi_app_server_protocol::ServerResponse {
     if let Some(error) = require_initialized(connection_state).await {
         return error_response(request.id, error);
     }
-    match request.method.as_str() {
-        "ping" => response(request.id, json!({"runtimeEpoch": state.runtime_epoch()})),
-        "session/list" => list_sessions(state, request.id, request.params).await,
-        "session/read" => read_session(state, request.id, request.params).await,
-        "turn/start" => start_turn(state, request.id, request.params).await,
-        _ => error_response(
+    if control.is_cancelled() {
+        return error_response(
+            request.id,
+            ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消").retryable(false),
+        );
+    }
+    let method = AppServerRequestMethod::parse(&request.method);
+    match method {
+        Some(AppServerRequestMethod::Ping) => typed_success(
+            request.id,
+            PingResult {
+                runtime_epoch: state.runtime_epoch().to_string(),
+            },
+        ),
+        Some(AppServerRequestMethod::SessionList) => {
+            list_sessions(state, request.id, request.params).await
+        }
+        Some(AppServerRequestMethod::SessionRead) => {
+            read_session(state, request.id, request.params).await
+        }
+        Some(AppServerRequestMethod::TurnStart) => {
+            start_turn(state, request.id, request.params).await
+        }
+        Some(AppServerRequestMethod::BrowserToolsList) => {
+            list_browser_tools(state, request.id, request.params).await
+        }
+        Some(AppServerRequestMethod::BrowserTool) => {
+            execute_browser_tool(state, request.id, request.params, control).await
+        }
+        Some(AppServerRequestMethod::ApprovalRequest) => {
+            request_approval(
+                ApprovalRequestContext {
+                    state,
+                    connection_state,
+                    outgoing,
+                    pending_server_requests,
+                    next_server_request_id,
+                    control,
+                },
+                request.id,
+                request.params,
+                request_timeout,
+            )
+            .await
+        }
+        Some(AppServerRequestMethod::Initialize | AppServerRequestMethod::EventsSubscribe)
+        | None => error_response(
             request.id,
             ErrorObject::new(
                 ERROR_METHOD_NOT_FOUND,
@@ -572,6 +876,522 @@ async fn dispatch_request(
             ),
         ),
     }
+}
+
+async fn list_browser_tools(
+    state: &ApiState,
+    request_id: RequestId,
+    params: Value,
+) -> magi_app_server_protocol::ServerResponse {
+    let params = match serde_json::from_value::<BrowserToolsListParams>(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return error_response(
+                request_id,
+                ErrorObject::new(
+                    ERROR_INVALID_PARAMS,
+                    format!("browser/tools/list 参数无效: {error}"),
+                ),
+            );
+        }
+    };
+    let session_id = params
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(SessionId::new);
+    let capability = state.browser_capability_snapshot(session_id.as_ref());
+    let tools = capability
+        .visible_tools()
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name(),
+                "access": tool.catalog_access(),
+            })
+        })
+        .collect::<Vec<_>>();
+    typed_success_from_json::<BrowserToolsListResult>(
+        request_id,
+        json!({
+            "tools": tools,
+            "capabilities": capability,
+            "runtimeEpoch": state.runtime_epoch(),
+        }),
+        "browser/tools/list",
+    )
+}
+
+struct BrowserToolTurnContext {
+    session_id: SessionId,
+    turn_id: String,
+    source_thread_id: ThreadId,
+    item_id: String,
+}
+
+fn browser_tool_turn_context(
+    state: &ApiState,
+    session_id: &SessionId,
+    call_id: &str,
+    tool: &str,
+    arguments: &Value,
+) -> Result<BrowserToolTurnContext, ErrorObject> {
+    let sidecar = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .ok_or_else(|| ErrorObject::new(ERROR_INVALID_PARAMS, "会话尚未建立当前 Turn"))?;
+    let turn = sidecar
+        .current_turn
+        .ok_or_else(|| ErrorObject::new(ERROR_INVALID_PARAMS, "会话尚未建立当前 Turn"))?;
+    if !matches!(
+        turn.status.trim().to_ascii_lowercase().as_str(),
+        "pending" | "queued" | "accepted" | "running" | "started" | "streaming"
+    ) {
+        return Err(ErrorObject::new(
+            ERROR_REQUEST_CONFLICT,
+            format!("当前 Turn 已结束，不能执行浏览器工具: {}", turn.status),
+        )
+        .retryable(true));
+    }
+    let source_thread_id = state
+        .session_store
+        .orchestrator_thread_for_session(session_id)
+        .map(|thread| thread.thread_id)
+        .or_else(|| turn.items.first().map(|item| item.source_thread_id.clone()))
+        .ok_or_else(|| ErrorObject::new(ERROR_INVALID_PARAMS, "会话尚未建立主线 thread"))?;
+    let item_id = format!("browser-tool-{call_id}");
+    let item = ActiveExecutionTurnItem {
+        item_id: item_id.clone(),
+        item_seq: 0,
+        kind: "tool_call_started".to_string(),
+        status: "running".to_string(),
+        source: "browser".to_string(),
+        title: Some(tool.to_string()),
+        content: None,
+        task_id: None,
+        worker_id: None,
+        role_id: None,
+        tool_call_id: Some(call_id.to_string()),
+        tool_name: Some(tool.to_string()),
+        tool_status: Some("running".to_string()),
+        tool_arguments: Some(arguments.to_string()),
+        tool_result: None,
+        tool_error: None,
+        request_id: None,
+        user_message_id: None,
+        placeholder_message_id: None,
+        metadata: std::collections::HashMap::from([
+            ("source".to_string(), json!("browser")),
+            ("browserTool".to_string(), json!(tool)),
+        ]),
+        timeline_entry_id: None,
+        source_thread_id: source_thread_id.clone(),
+    };
+    let updated = state
+        .session_store
+        .upsert_current_turn_item_for_turn(session_id, Some(&turn.turn_id), item)
+        .map_err(|error| {
+            ErrorObject::new(ERROR_INTERNAL, format!("浏览器工具 Item 写入失败: {error}"))
+        })?;
+    if updated.is_none() {
+        return Err(ErrorObject::new(
+            ERROR_INVALID_PARAMS,
+            "当前会话没有可写入的 Turn",
+        ));
+    }
+    publish_browser_tool_item(state, session_id, &turn.turn_id, &item_id);
+    Ok(BrowserToolTurnContext {
+        session_id: session_id.clone(),
+        turn_id: turn.turn_id,
+        source_thread_id,
+        item_id,
+    })
+}
+
+fn browser_access_profile(profile: Option<BrowserAccessProfile>) -> AccessProfile {
+    match profile {
+        Some(BrowserAccessProfile::ReadOnly) => AccessProfile::ReadOnly,
+        Some(BrowserAccessProfile::Restricted) => AccessProfile::Restricted,
+        Some(BrowserAccessProfile::FullAccess) => AccessProfile::FullAccess,
+        None => AccessProfile::FullAccess,
+    }
+}
+
+fn publish_browser_tool_item(
+    state: &ApiState,
+    session_id: &SessionId,
+    turn_id: &str,
+    item_id: &str,
+) {
+    let canonical = state
+        .session_store
+        .canonical_turns_for_session(session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .and_then(|turn| turn.items.into_iter().find(|item| item.item_id == item_id));
+    let Some(canonical) = canonical else {
+        return;
+    };
+    let now = UtcMillis::now();
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-browser-item-{item_id}-{}", now.0)),
+            "session.turn.item.upserted",
+            json!({"source": "browser", "item": canonical}),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+}
+
+async fn execute_browser_tool(
+    state: &ApiState,
+    request_id: RequestId,
+    params: Value,
+    control: RequestControl,
+) -> magi_app_server_protocol::ServerResponse {
+    let params = match serde_json::from_value::<BrowserToolParams>(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return error_response(
+                request_id,
+                ErrorObject::new(
+                    ERROR_INVALID_PARAMS,
+                    format!("browser/tool 参数无效: {error}"),
+                ),
+            );
+        }
+    };
+    if params.arguments.is_empty() || params.tool.trim().is_empty() {
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_INVALID_PARAMS, "tool 必须非空且 arguments 必须是对象"),
+        );
+    }
+    let session_id = SessionId::new(params.session_id.trim());
+    if state.session_store.session(&session_id).is_none() {
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_SESSION_NOT_FOUND, "会话不存在"),
+        );
+    }
+    let call_id = params
+        .call_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("rpc-{}", request_id.as_str()));
+    let turn_context = match browser_tool_turn_context(
+        state,
+        &session_id,
+        &call_id,
+        params.tool.trim(),
+        &serde_json::to_value(&params.arguments).expect("浏览器工具 arguments 必须可序列化"),
+    ) {
+        Ok(context) => context,
+        Err(error) => return error_response(request_id, error),
+    };
+    let workspace_id = params
+        .workspace_id
+        .map(|value| WorkspaceId::new(value.trim()));
+    let capability_revision = params.browser_capability_revision.unwrap_or_else(|| {
+        state
+            .browser_capability_snapshot(Some(&session_id))
+            .revision
+    });
+    let context = magi_tool_runtime::ToolExecutionContext {
+        session_id: Some(session_id.clone()),
+        workspace_id,
+        task_id: params.task_id.map(magi_core::TaskId::new),
+        worker_id: params.worker_id.map(magi_core::WorkerId::new),
+        access_profile: browser_access_profile(params.access_profile),
+        browser_capability_revision: Some(capability_revision),
+        browser_execution_id: params.browser_execution_id,
+        ..magi_tool_runtime::ToolExecutionContext::default()
+    };
+    let tool = params.tool.trim().to_string();
+    let tool_for_item = tool.clone();
+    let tool_for_runtime = tool.clone();
+    let arguments =
+        serde_json::to_string(&params.arguments).expect("浏览器工具 arguments 必须可序列化");
+    let arguments_for_runtime = arguments.clone();
+    let cancelled_before_execution = control.is_cancelled();
+    let (payload, status) = if cancelled_before_execution {
+        (
+            json!({"status": "cancelled", "code": "request_cancelled", "message": "请求已取消"})
+                .to_string(),
+            ExecutionResultStatus::Cancelled,
+        )
+    } else {
+        let runtime = state.browser_tool_runtime_dependencies();
+        let call_id_for_runtime = ToolCallId::new(call_id.clone());
+        let context_for_runtime = context.clone();
+        match tokio::task::spawn_blocking(move || {
+            runtime.execute(
+                &call_id_for_runtime,
+                &tool_for_runtime,
+                &arguments_for_runtime,
+                &context_for_runtime,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => (
+                json!({"status": "failed", "code": "browser_runtime_join_failed", "message": error.to_string()}).to_string(),
+                ExecutionResultStatus::Failed,
+            ),
+        }
+    };
+    let status_value = if cancelled_before_execution {
+        "cancelled"
+    } else {
+        match status {
+            ExecutionResultStatus::Succeeded => "completed",
+            ExecutionResultStatus::NeedsApproval => "blocked",
+            ExecutionResultStatus::Cancelled => "cancelled",
+            ExecutionResultStatus::Rejected | ExecutionResultStatus::Failed => "failed",
+        }
+    };
+    let status_value = if status_value == "failed"
+        && serde_json::from_str::<Value>(&payload)
+            .ok()
+            .is_some_and(|value| {
+                value.get("status").and_then(Value::as_str) == Some("indeterminate")
+            }) {
+        "indeterminate"
+    } else {
+        status_value
+    };
+    let item = ActiveExecutionTurnItem {
+        item_id: turn_context.item_id.clone(),
+        item_seq: 0,
+        kind: "tool_call_result".to_string(),
+        status: status_value.to_string(),
+        source: "browser".to_string(),
+        title: Some(tool_for_item.clone()),
+        content: None,
+        task_id: context.task_id.clone(),
+        worker_id: context.worker_id.clone(),
+        role_id: None,
+        tool_call_id: Some(call_id),
+        tool_name: Some(tool_for_item),
+        tool_status: Some(status_value.to_string()),
+        tool_arguments: Some(arguments.clone()),
+        tool_result: (status_value == "completed").then_some(payload.clone()),
+        tool_error: (status_value != "completed").then_some(payload.clone()),
+        request_id: Some(request_id.as_str().to_string()),
+        user_message_id: None,
+        placeholder_message_id: None,
+        metadata: std::collections::HashMap::from([
+            ("source".to_string(), json!("browser")),
+            ("browserTool".to_string(), json!(tool)),
+        ]),
+        timeline_entry_id: None,
+        source_thread_id: turn_context.source_thread_id,
+    };
+    let updated = match state.session_store.upsert_current_turn_item_for_turn(
+        &turn_context.session_id,
+        Some(&turn_context.turn_id),
+        item,
+    ) {
+        Ok(updated) => updated,
+        Err(error) => {
+            let protocol_error = match error {
+                magi_core::DomainError::CurrentTurnConflict { .. } => ErrorObject::new(
+                    ERROR_REQUEST_CONFLICT,
+                    format!("浏览器工具结果归属的 Turn 已变化: {error}"),
+                )
+                .retryable(true),
+                error => ErrorObject::new(
+                    ERROR_INTERNAL,
+                    format!("浏览器工具结果 Item 写入失败: {error}"),
+                ),
+            };
+            return error_response(request_id, protocol_error);
+        }
+    };
+    if updated.is_none() {
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_REQUEST_CONFLICT, "浏览器工具结果写入时 Turn 已结束")
+                .retryable(true),
+        );
+    }
+    publish_browser_tool_item(
+        state,
+        &turn_context.session_id,
+        &turn_context.turn_id,
+        &turn_context.item_id,
+    );
+    if status_value == "cancelled" {
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消").retryable(false),
+        );
+    }
+    typed_success_from_json::<magi_app_server_protocol::BrowserToolResult>(
+        request_id,
+        json!({
+            "tool": tool,
+            "status": status_value,
+            "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::String(payload)),
+            "itemId": turn_context.item_id,
+            "turnId": turn_context.turn_id,
+            "runtimeEpoch": state.runtime_epoch(),
+        }),
+        "browser/tool",
+    )
+}
+
+struct ApprovalRequestContext<'a> {
+    state: &'a ApiState,
+    connection_state: &'a Arc<Mutex<ConnectionState>>,
+    outgoing: &'a OutgoingChannels,
+    pending_server_requests: &'a Arc<Mutex<HashMap<RequestId, oneshot::Sender<ClientResponse>>>>,
+    next_server_request_id: &'a Arc<std::sync::atomic::AtomicU64>,
+    control: RequestControl,
+}
+
+async fn request_approval(
+    context: ApprovalRequestContext<'_>,
+    request_id: RequestId,
+    params: Value,
+    request_timeout: std::time::Duration,
+) -> magi_app_server_protocol::ServerResponse {
+    let ApprovalRequestContext {
+        state,
+        connection_state,
+        outgoing,
+        pending_server_requests,
+        next_server_request_id,
+        control,
+    } = context;
+    let params = match serde_json::from_value::<ApprovalRequestParams>(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return error_response(
+                request_id,
+                ErrorObject::new(
+                    ERROR_INVALID_PARAMS,
+                    format!("approval/request 参数无效: {error}"),
+                ),
+            );
+        }
+    };
+    if params.session_id.trim().is_empty() || params.reason.trim().is_empty() {
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_INVALID_PARAMS, "sessionId 和 reason 不能为空"),
+        );
+    }
+    if !connection_state.lock().await.capabilities.approvals {
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_INVALID_PARAMS, "客户端未声明 approvals 能力"),
+        );
+    }
+    let session_id = SessionId::new(params.session_id.trim());
+    if state.session_store.session(&session_id).is_none() {
+        return error_response(
+            request_id,
+            ErrorObject::new(ERROR_SESSION_NOT_FOUND, "会话不存在"),
+        );
+    }
+    let result = match request_client_approval(
+        outgoing,
+        pending_server_requests,
+        next_server_request_id,
+        ApprovalRequestParams {
+            session_id: session_id.to_string(),
+            reason: params.reason,
+            risk: params.risk,
+        },
+        control,
+        request_timeout,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return error_response(request_id, error),
+    };
+    typed_success(request_id, result)
+}
+
+async fn request_client_approval(
+    outgoing: &OutgoingChannels,
+    pending_server_requests: &Arc<Mutex<HashMap<RequestId, oneshot::Sender<ClientResponse>>>>,
+    next_server_request_id: &Arc<std::sync::atomic::AtomicU64>,
+    params: ApprovalRequestParams,
+    control: RequestControl,
+    request_timeout: std::time::Duration,
+) -> Result<ApprovalDecision, ErrorObject> {
+    if control.is_cancelled() {
+        return Err(match control.termination() {
+            RequestTermination::TimedOut => {
+                ErrorObject::new(ERROR_REQUEST_TIMEOUT, "请求执行超时").retryable(true)
+            }
+            RequestTermination::Cancelled | RequestTermination::None => {
+                ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消").retryable(false)
+            }
+        });
+    }
+    let server_request_id = RequestId::new(format!(
+        "server-request-{}",
+        next_server_request_id.fetch_add(1, Ordering::Relaxed)
+    ))
+    .expect("服务端请求 ID 必须非空");
+    let (sender, receiver) = oneshot::channel();
+    pending_server_requests
+        .lock()
+        .await
+        .insert(server_request_id.clone(), sender);
+    let request = ServerRequest {
+        jsonrpc: Some(magi_app_server_protocol::JSONRPC_VERSION.to_string()),
+        id: server_request_id.clone(),
+        method: AppServerRequestMethod::ApprovalRequest.as_str().to_string(),
+        request_timeout_ms: Some(request_timeout.as_millis().min(u64::MAX as u128) as u64),
+        params: serde_json::to_value(params).map_err(|error| {
+            ErrorObject::new(ERROR_INTERNAL, format!("审批请求序列化失败: {error}"))
+        })?,
+    };
+    if try_send_json(outgoing, request).is_err() {
+        pending_server_requests
+            .lock()
+            .await
+            .remove(&server_request_id);
+        return Err(ErrorObject::new(ERROR_INTERNAL, "无法发送服务端请求"));
+    }
+    let response = tokio::select! {
+        _ = control.notify.notified() => {
+            pending_server_requests.lock().await.remove(&server_request_id);
+            return Err(ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消").retryable(false));
+        }
+        result = tokio::time::timeout(request_timeout, receiver) => {
+            match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
+                    pending_server_requests.lock().await.remove(&server_request_id);
+                    return Err(ErrorObject::new(ERROR_INTERNAL, "服务端请求响应通道已关闭"));
+                }
+                Err(_) => {
+                    pending_server_requests.lock().await.remove(&server_request_id);
+                    return Err(ErrorObject::new(ERROR_REQUEST_TIMEOUT, "服务端请求响应超时").retryable(true));
+                }
+            }
+        }
+    };
+    if let Some(error) = response.error {
+        return Err(error);
+    }
+    let result = response.result.unwrap_or(Value::Null);
+    serde_json::from_value(result).map_err(|error| {
+        ErrorObject::new(
+            ERROR_INTERNAL,
+            format!("审批响应不符合协议 Schema: {error}"),
+        )
+    })
 }
 
 async fn list_sessions(
@@ -597,10 +1417,45 @@ async fn list_sessions(
         Some(workspace_id) => state.session_store.sessions_for_workspace(workspace_id),
         None => state.session_store.sessions(),
     };
-    response(
+    let sessions = sessions
+        .into_iter()
+        .map(|session| session_summary(state, session))
+        .collect::<Vec<_>>();
+    typed_success(
         request_id,
-        json!({"sessions": sessions, "runtimeEpoch": state.runtime_epoch()}),
+        SessionListResult {
+            sessions,
+            runtime_epoch: state.runtime_epoch().to_string(),
+        },
     )
+}
+
+fn session_summary(state: &ApiState, session: magi_session_store::SessionRecord) -> SessionSummary {
+    let session_id = session.session_id.clone();
+    let is_running = state
+        .session_store
+        .runtime_sidecar(&session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .is_some_and(|turn| {
+            !matches!(
+                turn.status.trim().to_ascii_lowercase().as_str(),
+                "completed" | "blocked" | "failed" | "interrupted" | "cancelled" | "superseded"
+            )
+        });
+    let summary =
+        SessionDirectoryEntryDto::from_record(session, is_running, usize::from(is_running));
+    SessionSummary {
+        session_id: summary.session_id,
+        workspace_id: summary.workspace_id,
+        title: summary.title,
+        status: summary.status,
+        created_at: summary.created_at,
+        updated_at: summary.updated_at,
+        message_count: summary.message_count,
+        is_running: summary.is_running,
+        running_task_count: summary.running_task_count,
+        has_unread_completion: summary.has_unread_completion,
+    }
 }
 
 async fn read_session(
@@ -625,14 +1480,29 @@ async fn read_session(
         );
     };
     let turns = if params.include_turns {
-        serde_json::to_value(state.session_store.canonical_turns_for_session(&session_id))
-            .unwrap_or_else(|_| json!([]))
+        match serde_json::to_value(state.session_store.canonical_turns_for_session(&session_id)) {
+            Ok(turns) => turns,
+            Err(error) => {
+                return error_response(
+                    request_id,
+                    ErrorObject::new(
+                        ERROR_INTERNAL,
+                        format!("session/read Turn 序列化失败: {error}"),
+                    ),
+                );
+            }
+        }
     } else {
         json!([])
     };
-    response(
+    typed_success_from_json::<SessionReadResult>(
         request_id,
-        json!({"session": session, "turns": turns, "runtimeEpoch": state.runtime_epoch()}),
+        json!({
+            "session": session_summary(state, session),
+            "turns": turns,
+            "runtimeEpoch": state.runtime_epoch(),
+        }),
+        "session/read",
     )
 }
 
@@ -641,12 +1511,26 @@ async fn start_turn(
     request_id: RequestId,
     params: Value,
 ) -> magi_app_server_protocol::ServerResponse {
-    let request = match serde_json::from_value::<crate::dto::SessionTurnRequestDto>(params) {
-        Ok(request) => request,
+    let protocol_params = match serde_json::from_value::<TurnStartParams>(params) {
+        Ok(params) => params,
         Err(error) => {
             return error_response(
                 request_id,
                 ErrorObject::new(ERROR_INVALID_PARAMS, error.to_string()),
+            );
+        }
+    };
+    let request = match serde_json::to_value(protocol_params)
+        .map_err(|error| error.to_string())
+        .and_then(|value| {
+            serde_json::from_value::<crate::dto::SessionTurnRequestDto>(value)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                request_id,
+                ErrorObject::new(ERROR_INTERNAL, format!("turn/start 参数转换失败: {error}")),
             );
         }
     };
@@ -682,10 +1566,12 @@ async fn start_turn_once(
             .items
             .iter()
             .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage);
-        response(
+        typed_success_from_json::<TurnStartResult>(
             request_id,
             json!({
+                    "kind": "accepted",
                     "replayed": true,
+                    "requestId": request.request_id(),
                     "entryId": format!("timeline-{}-{}", existing_turn.session_id, existing_turn.accepted_at.0),
                     "eventId": format!("event-session-turn-task-{}", existing_turn.accepted_at.0),
                     "sessionId": existing_turn.session_id,
@@ -695,12 +1581,15 @@ async fn start_turn_once(
                     "route": user_message_item.and_then(|item| {
                         item.metadata.get("route").and_then(Value::as_str)
                     }),
-                    "queued": false,
                     "userMessageItemId": user_message_item.map(|item| item.item_id.clone()),
                     "runtimeEpoch": state.runtime_epoch(),
                     "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
                     "canonicalTurn": existing_turn,
+                    "canonicalItem": user_message_item,
+                    "sessionSummary": null,
+                    "queue": null,
             }),
+            "turn/start",
         )
     } else if let Some((queued_turn, queue_position)) = request
         .request_id()
@@ -719,24 +1608,31 @@ async fn start_turn_once(
         }
         let queue_id = queued_turn.queue_id.clone();
         let user_message_item_id = queued_turn.request.user_message_id();
-        response(
+        typed_success_from_json::<TurnStartResult>(
             request_id,
             json!({
+                    "kind": "queued",
                     "replayed": true,
+                    "requestId": queued_turn.request.request_id(),
                     "entryId": queue_id,
                     "eventId": format!("event-session-turn-queued-{}", queued_turn.accepted_at.0),
-                    "queued": true,
-                    "queueId": queued_turn.queue_id,
-                    "queuePosition": queue_position,
                     "sessionId": queued_turn.session_id,
-                    "workspaceId": queued_turn.workspace_id,
+                    "turnId": null,
                     "acceptedAt": queued_turn.accepted_at,
                     "route": queued_turn.route,
                     "createdSession": false,
                     "userMessageItemId": user_message_item_id,
-                "runtimeEpoch": state.runtime_epoch(),
-                "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
+                    "runtimeEpoch": state.runtime_epoch(),
+                    "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
+                    "sessionSummary": null,
+                    "canonicalTurn": null,
+                    "canonicalItem": null,
+                    "queue": {
+                        "queueId": queued_turn.queue_id,
+                        "queuePosition": queue_position,
+                    },
             }),
+            "turn/start",
         )
     } else {
         let business_request_id = request.request_id();
@@ -747,12 +1643,61 @@ async fn start_turn_once(
         .await
         {
             Ok(axum::Json(result)) => {
-                let mut result = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
-                result["replayed"] = json!(false);
-                if let Some(business_request_id) = business_request_id {
-                    result["requestId"] = json!(business_request_id);
+                let mut result = match serde_json::to_value(result) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return error_response(
+                            request_id,
+                            ErrorObject::new(
+                                ERROR_INTERNAL,
+                                format!("turn/start 结果序列化失败: {error}"),
+                            ),
+                        );
+                    }
+                };
+                let queued = result
+                    .get("queued")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let queue = if queued {
+                    json!({
+                        "queueId": result.get("queueId").cloned().unwrap_or(Value::Null),
+                        "queuePosition": result.get("queuePosition").cloned().unwrap_or(Value::Null),
+                    })
+                } else {
+                    Value::Null
+                };
+                let Some(object) = result.as_object_mut() else {
+                    return error_response(
+                        request_id,
+                        ErrorObject::new(ERROR_INTERNAL, "turn/start 结果必须是对象"),
+                    );
+                };
+                object.remove("queued");
+                object.remove("queueId");
+                object.remove("queuePosition");
+                object.insert(
+                    "kind".to_string(),
+                    json!(if queued { "queued" } else { "accepted" }),
+                );
+                object.insert("replayed".to_string(), json!(false));
+                object.insert("requestId".to_string(), json!(business_request_id));
+                let turn_id = object
+                    .get("canonicalTurn")
+                    .and_then(|turn| turn.get("turnId"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                object.insert("turnId".to_string(), turn_id);
+                for field in [
+                    "sessionSummary",
+                    "userMessageItemId",
+                    "canonicalTurn",
+                    "canonicalItem",
+                ] {
+                    object.entry(field.to_string()).or_insert(Value::Null);
                 }
-                response(request_id, result)
+                object.insert("queue".to_string(), queue);
+                typed_success_from_json::<TurnStartResult>(request_id, result, "turn/start")
             }
             Err(error) => error_response(request_id, api_error_to_protocol(error)),
         }
@@ -800,6 +1745,72 @@ async fn handle_notification(
             guard.initialized = true;
         }
     }
+}
+
+async fn handle_cancel_notification(
+    pending_requests: &Arc<Mutex<HashMap<RequestId, RequestControl>>>,
+    message: ClientNotification,
+) {
+    let Ok(params) = serde_json::from_value::<CancelRequestParams>(message.params) else {
+        return;
+    };
+    if let Some(control) = pending_requests.lock().await.get(&params.id).cloned() {
+        control.cancel();
+    }
+}
+
+async fn resolve_server_response(
+    pending_server_requests: &Arc<Mutex<HashMap<RequestId, oneshot::Sender<ClientResponse>>>>,
+    response: ClientResponse,
+) -> bool {
+    let sender = pending_server_requests.lock().await.remove(&response.id);
+    let Some(sender) = sender else {
+        return false;
+    };
+    sender.send(response).is_ok()
+}
+
+fn request_timeout(request: &ClientRequest) -> Result<std::time::Duration, ErrorObject> {
+    let requested = request
+        .request_timeout_ms
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
+    if !(MIN_REQUEST_TIMEOUT_MS..=MAX_REQUEST_TIMEOUT_MS).contains(&requested) {
+        return Err(ErrorObject::new(
+            ERROR_INVALID_PARAMS,
+            format!(
+                "requestTimeoutMs 必须在 {MIN_REQUEST_TIMEOUT_MS} 到 {MAX_REQUEST_TIMEOUT_MS} 毫秒之间"
+            ),
+        ));
+    }
+    Ok(std::time::Duration::from_millis(requested))
+}
+
+fn browser_tool_retryable(request: &ClientRequest) -> bool {
+    let Ok(params) = serde_json::from_value::<BrowserToolParams>(request.params.clone()) else {
+        return false;
+    };
+    let Some(tool) = BrowserToolKind::from_name(params.tool.trim()) else {
+        return false;
+    };
+    matches!(tool.catalog_access(), BrowserToolAccess::Read)
+}
+
+fn browser_timeout_error(retryable: bool) -> ErrorObject {
+    let mut error = ErrorObject::new(
+        ERROR_REQUEST_TIMEOUT,
+        if retryable {
+            "浏览器只读操作执行超时，可以安全重试"
+        } else {
+            "浏览器操作执行超时，副作用状态不确定，禁止自动重放"
+        },
+    )
+    .retryable(retryable);
+    error.data = Some(json!({
+        "status": "indeterminate",
+        "operation": "browser/tool",
+        "retryable": retryable,
+    }));
+    error
 }
 
 async fn require_initialized(
@@ -880,32 +1891,6 @@ fn event_matches(event: &EventEnvelope, subscription: &EventSubscription) -> boo
         return false;
     }
     true
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EventSubscribeParams {
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    workspace_id: Option<String>,
-    #[serde(default)]
-    after_sequence: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SessionListParams {
-    #[serde(default)]
-    workspace_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SessionReadParams {
-    session_id: String,
-    #[serde(default)]
-    include_turns: bool,
 }
 
 fn parse_subscription_scope(
@@ -1360,8 +2345,8 @@ mod tests {
         .await;
         let response = serde_json::to_value(response).expect("排队重放响应应可序列化");
         assert_eq!(response["result"]["replayed"], true);
-        assert_eq!(response["result"]["queued"], true);
-        assert_eq!(response["result"]["queueId"], queue_id);
+        assert_eq!(response["result"]["kind"], "queued");
+        assert_eq!(response["result"]["queue"]["queueId"], queue_id);
         assert_eq!(
             state.queued_regular_session_turn_count(&SessionId::new(
                 "session-app-server-queue-replay"
@@ -1474,7 +2459,7 @@ mod tests {
                 "params": {
                     "clientInfo": {"name": "integration-test"},
                     "protocol": {"major": 1, "minor": 0},
-                    "capabilities": {"streaming": true}
+                    "capabilities": {"streaming": true, "approvals": true}
                 }
             }),
             "1",
@@ -1483,7 +2468,7 @@ mod tests {
         assert_eq!(initialize["jsonrpc"], "2.0");
         assert_eq!(initialize["id"], 1);
         assert_eq!(initialize["result"]["capabilities"]["events"], true);
-        assert_eq!(initialize["result"]["capabilities"]["browserTools"], false);
+        assert_eq!(initialize["result"]["capabilities"]["browserTools"], true);
 
         socket
             .send(ClientMessage::Text(
@@ -1493,6 +2478,46 @@ mod tests {
             ))
             .await
             .expect("initialized 通知应发送");
+
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "approval-rpc-1",
+                    "method": "approval/request",
+                    "params": {
+                        "sessionId": session_id,
+                        "reason": "验证双向服务端请求",
+                        "risk": "high"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("approval 请求应发送");
+        let server_request = next_text_message(&mut socket).await;
+        assert_eq!(server_request["method"], "approval/request");
+        let server_request_id = server_request["id"].clone();
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": server_request_id,
+                    "result": {"approved": true}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("approval 响应应发送");
+        let approval_response = loop {
+            let response = next_text_message(&mut socket).await;
+            if response["id"] == "approval-rpc-1" {
+                break response;
+            }
+        };
+        assert_eq!(approval_response["result"]["approved"], true);
 
         let subscribe = send_request(
             &mut socket,

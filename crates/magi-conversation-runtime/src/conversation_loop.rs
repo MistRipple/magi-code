@@ -37,13 +37,15 @@ use crate::tool_surface_state::{
     refresh_live_mcp_tool_definitions,
 };
 use crate::{
-    ConversationRegistry, MailboxAuthor, MailboxItem, MailboxKind, RoundOutcome,
-    TaskSignalBoundary, TaskTurnVisibility, TurnDriver, apply_task_final_visibility,
+    ConversationRegistry, GoalModeLifecycleState, MailboxAuthor, MailboxItem, MailboxKind,
+    RoundOutcome, TaskSignalBoundary, TaskTurnVisibility, TurnDriver, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
     compact_validation_failure, deterministic_task_final_content, execute_task_tool_call_batch,
-    forced_task_tool_choice_for_round, record_completed_required_tools,
-    required_tool_chain_is_complete, required_tool_chain_recovery_prompt,
-    required_tool_definitions_for_round, task_required_tool_chain, task_turn_visibility,
+    forced_task_tool_choice_for_round, goal_mode_required_tool_chain,
+    goal_mode_requires_terminalization, goal_mode_tool_batch_violation,
+    record_completed_required_tools, required_tool_chain_is_complete,
+    required_tool_chain_recovery_prompt, required_tool_definitions_for_round,
+    strict_goal_mode_tool_definitions_for_round, task_required_tool_chain, task_turn_visibility,
     validation_result_rejects_delivery,
 };
 use crate::{
@@ -1116,7 +1118,7 @@ fn run_conversation_loop_inner(
         &current_session_file_facts(session_store, session_id),
         workspace_root_path.as_deref(),
     );
-    let required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
+    let declared_required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
     let required_evidence_tools = task_required_evidence_tools(task);
     let historical_completion_evidence = if recovery_history {
         successful_tool_evidence_from_thread_history(&thread_history_snapshot)
@@ -1129,6 +1131,25 @@ fn run_conversation_loop_inner(
             TaskCompletionEvidence::SuccessfulToolCall { tool_name, .. } => tool_name.clone(),
         })
         .collect::<Vec<_>>();
+    let mut goal_creation_required = task.is_goal_mode()
+        && session_store.current_unfinished_goal(session_id).is_none()
+        && !historical_completed_tool_names
+            .iter()
+            .any(|tool_name| tool_name == "create_goal");
+    let mut required_tool_chain = if task.is_goal_mode() {
+        goal_mode_required_tool_chain(
+            GoalModeLifecycleState {
+                goal_creation_required,
+                goal_terminalization_required: goal_mode_requires_terminalization(
+                    session_store,
+                    session_id,
+                ),
+            },
+            &declared_required_tool_chain,
+        )
+    } else {
+        declared_required_tool_chain.clone()
+    };
     let mut completion_evidence = historical_completion_evidence;
     let mut completed_required_tool_names = historical_completed_tool_names
         .iter()
@@ -1203,7 +1224,9 @@ fn run_conversation_loop_inner(
         }))
     };
 
-    if let Some(final_content) = deterministic_task_final_content(task, task_store) {
+    if !task.is_goal_mode()
+        && let Some(final_content) = deterministic_task_final_content(task, task_store)
+    {
         let outcome = match validated_task_completion(
             task,
             vec![final_content.clone()],
@@ -1274,6 +1297,45 @@ fn run_conversation_loop_inner(
                 denied_tools,
             );
         }
+        if task.is_goal_mode() {
+            if session_store.current_unfinished_goal(session_id).is_some()
+                || completed_required_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == "create_goal")
+            {
+                goal_creation_required = false;
+            }
+            required_tool_chain = goal_mode_required_tool_chain(
+                GoalModeLifecycleState {
+                    goal_creation_required,
+                    goal_terminalization_required: goal_mode_requires_terminalization(
+                        session_store,
+                        session_id,
+                    ),
+                },
+                &declared_required_tool_chain,
+            );
+            completed_required_tool_names.retain(|tool_name| {
+                required_tool_chain
+                    .iter()
+                    .any(|required| required == tool_name)
+            });
+            // Goal creation is a one-time lifecycle decision. It is exposed
+            // only for a new Goal task whose canonical chain contains the
+            // creation step and until that step succeeds. A completed or
+            // externally changed Goal must never make create_goal available
+            // again inside the same execution.
+            let creation_is_required = required_tool_chain
+                .iter()
+                .any(|tool_name| tool_name == "create_goal");
+            let creation_is_pending = creation_is_required
+                && !completed_required_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == "create_goal");
+            if !creation_is_pending {
+                active_tools.retain(|definition| definition.function.name != "create_goal");
+            }
+        }
         let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
         let stream_item_id = task_stream_item_id(task_id, round, streaming_entry_id);
         last_stream_item_id = Some(stream_item_id.clone());
@@ -1294,21 +1356,64 @@ fn run_conversation_loop_inner(
         // 无法在分析、实施、等待之间自主选择正确的协作步骤。
         let evidence_recovery_chain = evidence_recovery_tool.iter().cloned().collect::<Vec<_>>();
         let empty_completed_tools = Vec::new();
-        let (round_required_tools, round_completed_tools) = if evidence_recovery_chain.is_empty() {
-            (&required_tool_chain, &completed_required_tool_names)
+        let strict_goal_mode_round = task.is_goal_mode();
+        let goal_lifecycle_pending = strict_goal_mode_round
+            && !required_tool_chain_is_complete(
+                &required_tool_chain,
+                &completed_required_tool_names,
+            );
+        let (round_required_tools, round_completed_tools) =
+            if goal_lifecycle_pending || evidence_recovery_chain.is_empty() {
+                (&required_tool_chain, &completed_required_tool_names)
+            } else {
+                (&evidence_recovery_chain, &empty_completed_tools)
+            };
+        let constrain_to_recovery_tool = round_goal_id.is_none()
+            && !evidence_recovery_chain.is_empty()
+            && !goal_lifecycle_pending;
+        let round_tool_definitions = if strict_goal_mode_round {
+            strict_goal_mode_tool_definitions_for_round(
+                &active_tools,
+                round_required_tools,
+                round_completed_tools,
+            )
         } else {
-            (&evidence_recovery_chain, &empty_completed_tools)
+            task_round_tool_definitions(
+                &active_tools,
+                round_required_tools,
+                round_completed_tools,
+                constrain_to_recovery_tool,
+            )
         };
-        let constrain_to_recovery_tool =
-            round_goal_id.is_none() && !evidence_recovery_chain.is_empty();
-        let round_tool_definitions = task_round_tool_definitions(
-            &active_tools,
-            round_required_tools,
-            round_completed_tools,
-            constrain_to_recovery_tool,
-        );
         let mut round_tools =
             (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
+        if (constrain_to_recovery_tool || strict_goal_mode_round)
+            && let Some(next_required_tool) = round_required_tools.iter().find(|tool_name| {
+                !round_completed_tools
+                    .iter()
+                    .any(|completed| completed == *tool_name)
+            })
+            && !active_tools
+                .iter()
+                .any(|definition| definition.function.name == *next_required_tool)
+        {
+            let failure_reason = format!(
+                "严格执行契约要求调用工具 {next_required_tool}，但当前工具面没有暴露该工具；拒绝绕过生命周期继续生成文字。"
+            );
+            append_task_error_turn_item(
+                turn_writeback_context,
+                &failure_reason,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (
+                TaskOutcome::Failed {
+                    error: failure_reason,
+                },
+                context_summary,
+            );
+        }
         let discovery_wrap_up = (discovery_only_rounds >= DISCOVERY_WRAP_UP_ROUNDS
             || discovery_tool_calls >= DISCOVERY_WRAP_UP_TOOL_CALLS)
             && !non_discovery_tool_seen
@@ -1366,7 +1471,7 @@ fn run_conversation_loop_inner(
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
             tools: round_tools.clone(),
-            tool_choice: if constrain_to_recovery_tool {
+            tool_choice: if constrain_to_recovery_tool || strict_goal_mode_round {
                 forced_task_tool_choice_for_round(
                     round_required_tools,
                     round_tools.as_ref(),
@@ -2215,7 +2320,30 @@ fn run_conversation_loop_inner(
             );
             messages.push(tool_result_message);
         }
-        let valid_tool_calls = tool_validation.valid_calls;
+        // Goal 模式遇到混合批次时，invalid call 不能与 valid call 部分执行；否则模型
+        // 即使绕过了当前严格工具面，批次里的浏览器/文件副作用仍可能已经发生。
+        let valid_tool_calls = if strict_goal_mode_round && !invalid_tool_calls.is_empty() {
+            Vec::new()
+        } else {
+            tool_validation.valid_calls
+        };
+        if strict_goal_mode_round
+            && !valid_tool_calls.is_empty()
+            && let Some(failure) = goal_mode_tool_batch_violation(
+                round_required_tools,
+                round_completed_tools,
+                &valid_tool_calls,
+            )
+        {
+            append_task_error_turn_item(
+                turn_writeback_context,
+                &failure,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error: failure }, context_summary);
+        }
         for tool_call in &valid_tool_calls {
             append_task_tool_call_started_turn_item(turn_writeback_context, tool_call);
         }
@@ -2408,12 +2536,17 @@ fn run_conversation_loop_inner(
                 .as_ref()
                 .map(magi_core::TaskPolicy::effective_access_profile)
                 .unwrap_or_default();
+            let preserved_goal_tools = if task.is_goal_mode() {
+                ["get_goal", "create_goal", "update_goal", "update_plan"].as_slice()
+            } else {
+                [].as_slice()
+            };
             active_tools = activate_skill_tool_definitions(
                 active_tools,
                 runtime,
                 &skill_id,
                 access_profile,
-                &[],
+                preserved_goal_tools,
             );
             active_skill_name = Some(skill_id.clone());
             if let Err(error) = execution_registry.update_active_skill(
@@ -2439,6 +2572,30 @@ fn run_conversation_loop_inner(
             &required_tool_chain,
             &completed_tool_names_this_round,
         );
+        if task.is_goal_mode() {
+            if session_store.current_unfinished_goal(session_id).is_some()
+                || completed_required_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == "create_goal")
+            {
+                goal_creation_required = false;
+            }
+            required_tool_chain = goal_mode_required_tool_chain(
+                GoalModeLifecycleState {
+                    goal_creation_required,
+                    goal_terminalization_required: goal_mode_requires_terminalization(
+                        session_store,
+                        session_id,
+                    ),
+                },
+                &declared_required_tool_chain,
+            );
+            completed_required_tool_names.retain(|tool_name| {
+                required_tool_chain
+                    .iter()
+                    .any(|required| required == tool_name)
+            });
+        }
         record_completed_required_tools(
             &mut completed_evidence_tool_names,
             &required_evidence_tools,
@@ -5034,6 +5191,108 @@ mod tests {
         assert!(
             task_required_tool_chain(&task, None).is_empty(),
             "只读阶段即使复述用户目标，也不能强制执行写工具链"
+        );
+    }
+
+    #[test]
+    fn strict_goal_mode_tool_chain_repairs_missing_lifecycle_steps() {
+        assert_eq!(
+            goal_mode_required_tool_chain(
+                GoalModeLifecycleState {
+                    goal_creation_required: true,
+                    goal_terminalization_required: false,
+                },
+                &["shell_exec".to_string()],
+            ),
+            ["get_goal", "create_goal", "update_plan", "shell_exec"]
+        );
+        assert_eq!(
+            goal_mode_required_tool_chain(
+                GoalModeLifecycleState {
+                    goal_creation_required: false,
+                    goal_terminalization_required: false,
+                },
+                &["get_goal".to_string(), "update_plan".to_string()],
+            ),
+            ["get_goal", "update_plan"]
+        );
+        assert_eq!(
+            goal_mode_required_tool_chain(
+                GoalModeLifecycleState {
+                    goal_creation_required: false,
+                    goal_terminalization_required: true,
+                },
+                &[
+                    "create_goal".to_string(),
+                    "shell_exec".to_string(),
+                    "get_goal".to_string(),
+                    "update_plan".to_string(),
+                ],
+            ),
+            ["get_goal", "update_plan", "update_goal", "shell_exec"]
+        );
+        assert_eq!(
+            goal_mode_required_tool_chain(
+                GoalModeLifecycleState {
+                    goal_creation_required: false,
+                    goal_terminalization_required: true,
+                },
+                &[],
+            ),
+            ["get_goal", "update_plan", "update_goal"]
+        );
+    }
+
+    #[test]
+    fn goal_mode_exposes_only_the_next_required_tool_until_lifecycle_is_complete() {
+        let tools = vec![
+            exposed_test_tool("get_goal"),
+            exposed_test_tool("create_goal"),
+            exposed_test_tool("update_plan"),
+            exposed_test_tool("shell_exec"),
+        ];
+        let required = goal_mode_required_tool_chain(
+            GoalModeLifecycleState {
+                goal_creation_required: true,
+                goal_terminalization_required: false,
+            },
+            &["shell_exec".to_string()],
+        );
+
+        let first = required_tool_definitions_for_round(&tools, &required, &[]);
+        assert_eq!(
+            first
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["get_goal"]
+        );
+
+        let after_goal =
+            required_tool_definitions_for_round(&tools, &required, &["get_goal".to_string()]);
+        assert_eq!(
+            after_goal
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["create_goal"]
+        );
+
+        let after_plan = required_tool_definitions_for_round(
+            &tools,
+            &required,
+            &[
+                "get_goal".to_string(),
+                "create_goal".to_string(),
+                "update_plan".to_string(),
+            ],
+        );
+        assert_eq!(
+            after_plan
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shell_exec"]
         );
     }
 

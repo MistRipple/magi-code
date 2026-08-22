@@ -5,6 +5,7 @@
   import FileSpan from '../FileSpan.svelte';
   import type { IconName } from '../../lib/icons';
   import { i18n } from '../../stores/i18n.svelte';
+  import { requestOpenHtmlFileInBrowser } from '../../lib/browser-navigation';
   import { openCodeTab } from '../../stores/right-pane.svelte';
   import DiffCodeBlock from './DiffCodeBlock.svelte';
   import { desktopContextMenu } from '../../lib/desktop-context-menu-contract';
@@ -112,6 +113,7 @@
       headSummary: change?.headSummary,
       tailSummary: change?.tailSummary,
     });
+    requestOpenHtmlFileInBrowser(filepath);
   }
 </script>
 

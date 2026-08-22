@@ -208,7 +208,7 @@ assert.match(tabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id:
 assert.match(tabSource, /fields:[\s\S]*?id: 'width'[\s\S]*?id: 'height'/u);
 assert.match(
   browserTools,
-  /if action != "set"[\s\S]*?let mode = optional_string[\s\S]*?mode == "auto"[\s\S]*?BrowserLogicalViewport::Auto/u,
+  /if action != "set"[\s\S]*?let mode\s*=\s*optional_string[\s\S]*?mode == "auto"[\s\S]*?BrowserLogicalViewport::Auto/u,
   "LLM 必须能通过 browser_viewport 的 auto 模式恢复跟随内容槽",
 );
 assert.match(

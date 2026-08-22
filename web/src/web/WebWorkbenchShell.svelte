@@ -42,11 +42,16 @@
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
   import { resolveFilePreviewScope } from '../lib/file-preview-scope';
+  import { isHtmlFile } from '../lib/file-preview-utils';
   import {
     cycleBuiltinAppearance,
     subscribeAppearanceRuntime,
     type AppearanceRuntimeSnapshot,
   } from '../appearance/runtime';
+  import {
+    OPEN_HTML_FILE_IN_BROWSER_EVENT,
+    type OpenHtmlFileInBrowserRequest,
+  } from '../lib/browser-navigation';
   import {
     RUNTIME_CONNECTION_EVENT,
     resolveAgentPath,
@@ -201,6 +206,12 @@
     overlay?: boolean;
     desktopSurface?: boolean;
     desktopSnapshot?: MagiDesktopWindowSnapshot | null;
+    htmlBrowserOpenRequest?: HtmlBrowserOpenRequest | null;
+    onHtmlBrowserOpenHandled?: (requestId: number) => void;
+  };
+  type HtmlBrowserOpenRequest = {
+    requestId: number;
+    filepath: string;
   };
   type WebFolderPickerProps = {
     title?: string;
@@ -212,6 +223,8 @@
   let ProjectFileTreeComponent = $state<Component<ProjectFileTreeProps> | null>(null);
   let RightPaneComponent = $state<Component<RightPaneProps> | null>(null);
   let WebFolderPickerComponent = $state<Component<WebFolderPickerProps> | null>(null);
+  let htmlBrowserOpenRequest = $state<HtmlBrowserOpenRequest | null>(null);
+  let htmlBrowserOpenRequestId = 0;
   let projectFileTreeLoad: Promise<void> | null = null;
   let rightPaneLoad: Promise<void> | null = null;
   let webFolderPickerLoad: Promise<void> | null = null;
@@ -1305,6 +1318,17 @@
       tailSummary: metadata.tailSummary,
       imageDataUrl: imageDataUrl || undefined,
     });
+    if (desktopAppSurface && isHtmlFile(metadata.displayPath || normalizedFilePath)) {
+      // HTML 文件在桌面端代表可运行的网页入口。请求放在 Shell 状态中，
+      // 由右栏组件消费，避免右栏懒加载或主 Renderer 切换布局时丢事件。
+      htmlBrowserOpenRequest = {
+        requestId: ++htmlBrowserOpenRequestId,
+        filepath: normalizedFilePath,
+      };
+      requestRightPaneVisibility(true);
+    } else {
+      htmlBrowserOpenRequest = null;
+    }
     if (sidebarIsDrawer) {
       sidebarOpen = false;
     }
@@ -2230,6 +2254,17 @@
         }
       }
     };
+    const handleOpenHtmlFileInBrowser = (event: Event) => {
+      if (!desktopAppSurface) return;
+      const detail = (event as CustomEvent<OpenHtmlFileInBrowserRequest>).detail;
+      const filepath = detail?.filepath?.trim() || '';
+      if (!filepath || !isHtmlFile(filepath)) return;
+      htmlBrowserOpenRequest = {
+        requestId: ++htmlBrowserOpenRequestId,
+        filepath,
+      };
+      requestRightPaneVisibility(true);
+    };
     const handleAgentConnection = (event: Event) => {
       const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
       const previousAgentBaseUrl = agentBaseUrl;
@@ -2265,6 +2300,7 @@
     };
     window.addEventListener('resize', handleResize);
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
+    window.addEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     window.addEventListener('keydown', handlePanelEscape);
     void registerDesktopFileDropListener(handleDesktopDragDropEvent)
@@ -2286,6 +2322,7 @@
       desktopDropIndicator = null;
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
+      window.removeEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
       window.removeEventListener('keydown', handlePanelEscape);
       if (resizeRaf !== null) {
@@ -2750,6 +2787,12 @@
           workspaceRoot={selectedWorkspace?.rootPath || ''}
           overlay={previewIsOverlay}
           desktopSnapshot={desktopSnapshot}
+          htmlBrowserOpenRequest={htmlBrowserOpenRequest}
+          onHtmlBrowserOpenHandled={(requestId) => {
+            if (htmlBrowserOpenRequest?.requestId === requestId) {
+              htmlBrowserOpenRequest = null;
+            }
+          }}
         />
       {:else if desktopAppSurface && desktopRightPaneVisible && RightPaneComponent}
         {#if !desktopRightPaneOverlay}
@@ -2771,6 +2814,12 @@
             overlay={desktopRightPaneOverlay}
             desktopSurface={true}
             desktopSnapshot={desktopSnapshot}
+            htmlBrowserOpenRequest={htmlBrowserOpenRequest}
+            onHtmlBrowserOpenHandled={(requestId) => {
+              if (htmlBrowserOpenRequest?.requestId === requestId) {
+                htmlBrowserOpenRequest = null;
+              }
+            }}
           />
         </div>
       {/if}

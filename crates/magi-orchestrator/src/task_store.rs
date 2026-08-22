@@ -1168,6 +1168,7 @@ impl TaskStore {
         // Re-insert tasks (which rebuilds mission_index).
         for mut task in checkpoint.tasks {
             task.migrate_persisted_completion_contract();
+            task.migrate_persisted_goal_mode();
             store.insert_task(task);
         }
 
@@ -1465,7 +1466,8 @@ mod tests {
         task_value["executor_binding"] = json!({
             "target_role": "coordinator",
             "required_evidence_tools": ["diagram_render"],
-            "resumes_turn_id": "turn-legacy"
+            "resumes_turn_id": "turn-legacy",
+            "required_tool_chain": ["get_goal", "update_plan"]
         });
 
         let restored = TaskStore::restore(&json!({
@@ -1484,7 +1486,14 @@ mod tests {
         );
         assert_eq!(
             restored_task.executor_binding,
-            Some(TaskExecutorBinding::for_role("coordinator"))
+            Some(
+                TaskExecutorBinding::for_role("coordinator")
+                    .with_required_tool_chain(vec![
+                        "get_goal".to_string(),
+                        "update_plan".to_string()
+                    ])
+                    .with_goal_mode(true)
+            )
         );
 
         let error = match TaskStore::restore(&json!({

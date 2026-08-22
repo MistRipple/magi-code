@@ -412,12 +412,22 @@ pub(crate) async fn submit_session_turn(
         )?
     };
     let workspace_id = scope.workspace_id();
+    if request.steer_current_turn && session_turn_requests_explicit_goal_mode(&request) {
+        return Err(ApiError::InvalidInput(
+            "目标模式必须作为独立执行轮次提交，不能作为当前轮引导".to_string(),
+        ));
+    }
     if request.steer_current_turn {
         return submit_steer_current_turn(&state, &request, &scope, accepted_at)
             .await
             .map(Json);
     }
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
+    let canonical_goal_mode = decision.reason_code.as_deref() == Some("goal_mode_request");
+    // 文本明确表达“目标模式”时也必须进入同一个结构化执行契约；否则队列、
+    // 持久化 metadata 和 dispatcher 会继续把它当作普通聊天，造成目标模式只在
+    // 分类器阶段生效的旁路。
+    request.goal_mode = canonical_goal_mode;
     if request.replace_turn_id().is_some()
         && matches!(
             decision.route,
@@ -1173,10 +1183,10 @@ fn local_session_turn_intent_decision(
     let requests_explicit_plan = session_turn_requests_explicit_plan(request);
     let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
         || session_turn_requested_public_builtin_tools(request).is_some();
-    let route = if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
-        SessionTurnRouteDto::Continue
-    } else if requests_goal_mode && !requests_explicit_task_or_agent {
+    let route = if requests_goal_mode {
         SessionTurnRouteDto::Chat
+    } else if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
+        SessionTurnRouteDto::Continue
     } else if requests_explicit_task_or_agent || requests_explicit_plan {
         SessionTurnRouteDto::Task
     } else if requests_simple_execution
@@ -1250,20 +1260,14 @@ fn normalize_session_turn_decision(
         .unwrap_or_default();
     let requires_diagram_delivery =
         session_turn_requests_diagram_generation_by_local_rules(request);
-    if !matches!(decision.route, SessionTurnRouteDto::Continue)
-        && session_turn_requests_explicit_goal_mode(request)
-    {
+    if session_turn_requests_explicit_goal_mode(request) {
         decision.route = SessionTurnRouteDto::Chat;
         decision.task_title = None;
         decision.execution_goal = None;
         decision.task_tier = TaskTier::ExecutionChain;
         decision.tool_intent = Some(goal_mode_tool_intent(request));
         decision.forced_tool_name = None;
-        decision.required_tool_chain = if goal_mode_requires_update_plan(request) {
-            vec!["update_plan".to_string()]
-        } else {
-            Vec::new()
-        };
+        decision.required_tool_chain = vec!["update_plan".to_string()];
         merge_required_tool_chain(
             &mut decision.required_tool_chain,
             requested_completion_tool_chain,
@@ -2072,29 +2076,11 @@ fn explicit_builtin_tool_intent(tool_name: &str) -> String {
     )
 }
 
-fn goal_mode_tool_intent(request: &SessionTurnRequestDto) -> String {
-    let plan_required = goal_mode_requires_update_plan(request);
-    let plan_contract = if plan_required {
-        "用户显式要求任务清单或 update_plan：最终答复前必须调用 update_plan 写入与用户要求一致的任务状态；不要只创建 goal 后直接最终回复。"
-    } else {
-        "如果目标需要三步以上或跨轮推进，最终答复前必须先用 update_plan 建立简洁任务清单。"
-    };
+fn goal_mode_tool_intent(_: &SessionTurnRequestDto) -> String {
+    let plan_contract = "目标模式强制要求维护计划：必须在本轮推进前调用 update_plan 写入与当前 Goal 绑定的任务状态，并在最终答复前再次确认计划状态；如果权威计划已经完成、取消或存在阻塞步骤，必须随后调用 update_goal 完成或阻塞 Goal；禁止只创建或读取 Goal 后直接回复。";
     format!(
         "用户请求目标模式。必须按主线 Goal 工具推进：先调用 get_goal；若当前会话没有未完成目标，再调用 create_goal 创建完整目标；create_goal 的 token_budget 必须显式传值，用户原文未明确给出 token 预算时传 null，只有用户明确给出预算数值时才传对应整数，禁止自行臆造 1000、4096、16000 等预算。调用 update_plan 时，必须把本轮 get_goal 或 create_goal 返回的 goalId、controlRevision 分别写入 expectedGoalId、expectedGoalControlRevision；没有 Goal 时两者都传 null。{plan_contract} 目标模式仍是主线对话，不要升级成旧任务 Tab 或普通 Execute 路由。"
     )
-}
-
-fn goal_mode_requires_update_plan(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    normalized.contains("update_plan")
-        || normalized.contains("任务清单")
-        || normalized.contains("todo")
-        || normalized.contains("两条任务")
-        || normalized.contains("多步骤")
-        || normalized.contains("按步骤")
 }
 
 fn workspace_inspection_tool_intent(user_text: &str) -> String {
@@ -2217,6 +2203,12 @@ async fn submit_mainline_session_turn(
         .trimmed_text()
         .unwrap_or_else(|| request.timeline_message(None));
     let goal_mode = decision.reason_code.as_deref() == Some("goal_mode_request");
+    if request.goal_mode != goal_mode {
+        return Err(ApiError::internal_assembly(
+            "收紧目标模式执行契约",
+            "request.goal_mode 与服务端分类结果不一致",
+        ));
+    }
     let execution_goal = if goal_mode {
         format!(
             "{}\n\n用户原始输入：{}",
@@ -7361,6 +7353,7 @@ mod tests {
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
         assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
+        assert_eq!(decision.required_tool_chain, ["update_plan"]);
         assert!(
             decision
                 .tool_intent
@@ -7368,6 +7361,50 @@ mod tests {
                 .unwrap_or_default()
                 .contains("create_goal")
         );
+    }
+
+    #[test]
+    fn explicit_goal_mode_outranks_continue_and_task_routing() {
+        let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "scope": "personal",
+            "text": "继续按多代理任务完成当前目标",
+            "images": [],
+            "goalMode": true
+        }))
+        .expect("structured goal mode request should parse");
+
+        let decision = normalize_session_turn_decision(
+            local_session_turn_intent_decision(&request, true),
+            &request,
+        );
+
+        assert_eq!(decision.route, SessionTurnRouteDto::Chat);
+        assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
+        assert_eq!(decision.required_tool_chain, ["update_plan"]);
+    }
+
+    #[test]
+    fn every_explicit_goal_mode_request_requires_a_plan_checkpoint() {
+        for text in ["完成当前目标", "推进这个 Goal", "继续处理剩余工作"] {
+            let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+                "scope": "personal",
+                "text": text,
+                "images": [],
+                "goalMode": true
+            }))
+            .expect("goal mode request should parse");
+            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+            assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
+            assert_eq!(decision.required_tool_chain, ["update_plan"], "{text}");
+            assert!(
+                decision
+                    .tool_intent
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("强制要求维护计划")
+            );
+        }
     }
 
     #[test]
@@ -8918,6 +8955,7 @@ mod tests {
         let task = task_store
             .get_task(&action_task_id)
             .expect("goal action task should exist");
+        assert!(task.is_goal_mode());
         assert_eq!(
             task.required_tool_chain(),
             ["get_goal", "create_goal", "update_plan", "shell_exec"]
@@ -8986,6 +9024,7 @@ mod tests {
         let task = task_store
             .get_task(&action_task_id)
             .expect("goal action task should exist");
+        assert!(task.is_goal_mode());
         assert_eq!(task.required_tool_chain(), ["get_goal", "update_plan"]);
     }
 

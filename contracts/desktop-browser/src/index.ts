@@ -4,6 +4,7 @@ export type DesktopEpoch = string;
 export type WindowId = string;
 export type SurfaceId = string;
 export type BrowserTabId = string;
+export type BrowserCommandId = string;
 
 export interface ProtocolVersion {
   major: number;
@@ -84,6 +85,7 @@ export type BrowserNavigation =
 
 export type BrowserHostCommand =
   | { type: "ping" }
+  | { type: "cancel"; payload: { request_id: BrowserCommandId } }
   | {
       type: "create_page" | "restore_page";
       payload: {

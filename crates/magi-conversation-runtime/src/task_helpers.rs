@@ -4,11 +4,11 @@
 //! 本模块严格遵守"无写回依赖"原则——任何需要 session writeback
 //! 的 publish/upsert helper 都不放在本模块。
 
-use magi_bridge_client::{ChatToolChoice, ChatToolDefinition};
-use magi_core::{Task, TaskKind, ThreadId, WorkerId};
+use magi_bridge_client::{ChatToolCall, ChatToolChoice, ChatToolDefinition};
+use magi_core::{PlanItemStatus, PlanState, SessionId, Task, TaskKind, ThreadId, WorkerId};
 use magi_orchestrator::task_worker_catalog::default_task_role_for_kind;
 use magi_orchestrator::{task_store::TaskStore, task_worker_catalog::resolve_task_role};
-use magi_session_store::ActiveExecutionTurnItem;
+use magi_session_store::{ActiveExecutionTurnItem, SessionStore};
 use magi_tool_runtime::BuiltinToolName;
 
 pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
@@ -30,6 +30,70 @@ pub(crate) fn is_goal_builtin_tool(tool: BuiltinToolName) -> bool {
         tool,
         BuiltinToolName::GetGoal | BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal
     )
+}
+
+/// 目标模式的生命周期状态由执行器读取，不由模型提示词推断。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GoalModeLifecycleState {
+    /// 当前执行轮次是否仍必须创建 Goal。创建成功后即使 Goal 随后完成，也不能再次创建。
+    pub goal_creation_required: bool,
+    /// 当前权威计划或 Goal 状态是否要求本轮收口 Goal。
+    pub goal_terminalization_required: bool,
+}
+
+/// 构造目标模式唯一的生命周期工具链。
+///
+/// Goal 生命周期工具由运行时拥有顺序，用户输入和旧任务 checkpoint 只能追加业务工具，
+/// 不能插入、删除或重排 `get_goal`、`create_goal`、`update_plan`、`update_goal`。
+pub fn goal_mode_required_tool_chain(
+    state: GoalModeLifecycleState,
+    declared: &[String],
+) -> Vec<String> {
+    let mut required = vec!["get_goal".to_string()];
+    if state.goal_creation_required {
+        required.push("create_goal".to_string());
+    }
+    required.push("update_plan".to_string());
+    if state.goal_terminalization_required {
+        required.push("update_goal".to_string());
+    }
+    for tool_name in declared {
+        let tool_name = canonical_tool_call_name(tool_name);
+        if tool_name.is_empty() {
+            continue;
+        }
+        if matches!(
+            tool_name.as_str(),
+            "get_goal" | "create_goal" | "update_plan" | "update_goal"
+        ) {
+            continue;
+        }
+        if !required.iter().any(|existing| existing == &tool_name) {
+            required.push(tool_name.clone());
+        }
+    }
+    required
+}
+
+/// 读取 Goal/Plan 的权威收口条件，不改写任何持久化状态。
+pub fn goal_mode_requires_terminalization(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+) -> bool {
+    let Some(goal) = session_store.current_unfinished_goal(session_id) else {
+        return false;
+    };
+    let Some(plan) = session_store.plan(session_id) else {
+        return false;
+    };
+    if plan.goal_id.as_ref() != Some(&goal.goal_id) {
+        return false;
+    }
+    matches!(plan.state, PlanState::Completed | PlanState::Canceled)
+        || plan
+            .items
+            .iter()
+            .any(|item| item.status == PlanItemStatus::Blocked)
 }
 
 pub(crate) fn is_git_builtin_tool(tool: BuiltinToolName) -> bool {
@@ -858,6 +922,71 @@ pub fn required_tool_definitions_for_round(
     }
 }
 
+/// 目标模式的严格工具面。
+///
+/// 目标模式不能因为当前工具面缺少必经步骤而回退到完整工具面。完整工具面会
+/// 让模型绕过 Goal/Plan 生命周期，随后再由结果校验被动发现，属于 fail-open。
+/// 普通任务的恢复工具仍使用 `required_tool_definitions_for_round`，只有目标模式
+/// 走这个 fail-closed 版本。
+pub fn strict_goal_mode_tool_definitions_for_round(
+    tools: &[ChatToolDefinition],
+    required_tool_chain: &[String],
+    completed_required_tool_names: &[String],
+) -> Vec<ChatToolDefinition> {
+    let Some(required_tool_name) = required_tool_chain.iter().find(|tool_name| {
+        !completed_required_tool_names
+            .iter()
+            .any(|completed| completed == *tool_name)
+    }) else {
+        return tools.to_vec();
+    };
+
+    tools
+        .iter()
+        .filter(|tool| tool.function.name == *required_tool_name)
+        .cloned()
+        .collect()
+}
+
+/// 校验目标模式当前轮的工具调用批次。
+///
+/// 目标模式始终是严格的单步状态机：生命周期未完成时只能调用当前必经工具；
+/// 生命周期完成后虽然可以选择业务工具，但每轮仍然最多执行一个工具。校验必须
+/// 发生在任何工具执行之前，否则浏览器、文件和 Goal 写操作可能已经产生不可逆副作用。
+pub fn goal_mode_tool_batch_violation(
+    required_tool_chain: &[String],
+    completed_required_tool_names: &[String],
+    tool_calls: &[ChatToolCall],
+) -> Option<String> {
+    if tool_calls.len() > 1 {
+        return Some(format!(
+            "严格目标模式每轮最多允许调用一个工具，实际收到 {} 个工具调用；已拒绝执行，避免批量副作用或跳过生命周期。",
+            tool_calls.len()
+        ));
+    }
+
+    let Some(next_required_tool) = required_tool_chain.iter().find(|tool_name| {
+        !completed_required_tool_names
+            .iter()
+            .any(|completed| completed == *tool_name)
+    }) else {
+        return None;
+    };
+
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    let actual_tool = canonical_tool_call_name(&tool_calls[0].function.name);
+    if actual_tool != *next_required_tool {
+        return Some(format!(
+            "严格目标模式当前必须先调用 {next_required_tool}，实际收到 {actual_tool}；已拒绝执行，避免跳过 Goal/Plan 生命周期。"
+        ));
+    }
+
+    None
+}
+
 pub fn record_completed_required_tools(
     completed: &mut Vec<String>,
     required_tool_chain: &[String],
@@ -923,7 +1052,7 @@ pub fn canonical_tool_call_name(tool_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::{ChatToolFunctionDefinition, ChatToolOrigin};
+    use magi_bridge_client::{ChatToolFunction, ChatToolFunctionDefinition, ChatToolOrigin};
 
     fn tool(name: &str) -> ChatToolDefinition {
         ChatToolDefinition {
@@ -953,6 +1082,100 @@ mod tests {
 
         let restored = required_tool_definitions_for_round(&tools, &required, &required);
         assert_eq!(restored.len(), tools.len());
+    }
+
+    fn call(name: &str) -> ChatToolCall {
+        ChatToolCall {
+            id: format!("call-{name}"),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn strict_goal_tool_surface_fails_closed_when_required_tool_is_missing() {
+        let tools = vec![tool("get_goal"), tool("shell_exec")];
+        let visible = strict_goal_mode_tool_definitions_for_round(
+            &tools,
+            &["update_plan".to_string(), "shell_exec".to_string()],
+            &[],
+        );
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn strict_goal_tool_batch_rejects_duplicates_and_skips() {
+        let required = ["get_goal".to_string(), "update_plan".to_string()];
+        assert!(goal_mode_tool_batch_violation(&required, &[], &[call("get_goal")]).is_none());
+        assert!(
+            goal_mode_tool_batch_violation(&required, &[], &[call("get_goal"), call("get_goal")])
+                .is_some()
+        );
+        assert!(goal_mode_tool_batch_violation(&required, &[], &[call("update_plan")]).is_some());
+        assert!(
+            goal_mode_tool_batch_violation(
+                &required,
+                &["get_goal".to_string()],
+                &[call("update_plan")]
+            )
+            .is_none()
+        );
+        assert!(
+            goal_mode_tool_batch_violation(&required, &required, &[call("shell_exec")]).is_none()
+        );
+        assert!(
+            goal_mode_tool_batch_violation(
+                &required,
+                &required,
+                &[call("shell_exec"), call("file_read")]
+            )
+            .is_some(),
+            "Goal 生命周期完成后仍不得批量执行工具"
+        );
+    }
+
+    #[test]
+    fn goal_mode_lifecycle_owns_order_and_cannot_be_reordered_by_declared_tools() {
+        let chain = goal_mode_required_tool_chain(
+            GoalModeLifecycleState {
+                goal_creation_required: true,
+                goal_terminalization_required: true,
+            },
+            &[
+                "update_goal".to_string(),
+                "shell_exec".to_string(),
+                "create_goal".to_string(),
+                "update_plan".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            chain,
+            [
+                "get_goal",
+                "create_goal",
+                "update_plan",
+                "update_goal",
+                "shell_exec"
+            ]
+        );
+    }
+
+    #[test]
+    fn goal_mode_creation_is_not_reintroduced_after_goal_terminalization() {
+        let chain = goal_mode_required_tool_chain(
+            GoalModeLifecycleState {
+                goal_creation_required: false,
+                goal_terminalization_required: false,
+            },
+            &[],
+        );
+
+        assert_eq!(chain, ["get_goal", "update_plan"]);
+        assert!(!chain.iter().any(|tool| *tool == "create_goal"));
     }
 
     #[test]

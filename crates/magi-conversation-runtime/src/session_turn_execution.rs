@@ -14,11 +14,13 @@ use crate::model_context_window::{
     conservative_context_limit_recovery_window, resolve_model_context_window_with_override,
 };
 use crate::{
-    ConversationRegistry, SessionTurnInputBoundary, UserSignal,
+    ConversationRegistry, GoalModeLifecycleState, SessionTurnInputBoundary, UserSignal,
     conversation_loop::{
         append_thread_messages_checkpoint, chat_message_to_thread_chat_message,
         insert_interrupted_tool_result_messages, thread_chat_message_to_chat_message,
     },
+    goal_mode_required_tool_chain, goal_mode_requires_terminalization,
+    goal_mode_tool_batch_violation,
     model_config::{resolve_orchestrator_model_config, resolve_vision_execution_config},
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
@@ -42,6 +44,7 @@ use crate::{
         session_turn_stream_update, upsert_context_compaction_completed_notice,
         upsert_context_compaction_progress_notice, upsert_session_turn_item,
     },
+    strict_goal_mode_tool_definitions_for_round,
     tool_call_validation::{
         ToolCallFailureDiagnostic, ToolCallValidationIssue, ToolCallValidationTracker,
         invalid_tool_result_message, validate_tool_call_batch,
@@ -950,7 +953,16 @@ fn run_session_turn_execution_inner(
             .map(std::path::Path::new),
     );
     let mut completed_required_tool_names: Vec<String> = Vec::new();
-    let required_tool_chain = session_required_tool_chain(&request);
+    let mut goal_creation_required = request.goal_turn_mode.is_goal_driven()
+        && request.goal_turn_mode.allows_goal_creation()
+        && session_store
+            .current_unfinished_goal(&request.session_id)
+            .is_none();
+    let mut required_tool_chain = session_required_tool_chain(
+        &request,
+        goal_creation_required,
+        goal_mode_requires_terminalization(session_store, &request.session_id),
+    );
     let mut context_budget_recheck_required = false;
     let mut empty_response_recovery_attempts = 0usize;
     let mut pre_output_invocation_recovery_attempts = 0usize;
@@ -988,8 +1000,68 @@ fn run_session_turn_execution_inner(
                 &[],
             );
         }
-        let round_tools =
-            (request.use_tools && !active_tools.is_empty()).then_some(active_tools.clone());
+        let strict_goal_mode_round = request.goal_turn_mode.is_goal_driven();
+        if strict_goal_mode_round {
+            if session_store
+                .current_unfinished_goal(&request.session_id)
+                .is_some()
+                || completed_required_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == "create_goal")
+            {
+                goal_creation_required = false;
+            }
+            required_tool_chain = session_required_tool_chain(
+                &request,
+                goal_creation_required,
+                goal_mode_requires_terminalization(session_store, &request.session_id),
+            );
+            completed_required_tool_names.retain(|tool_name| {
+                required_tool_chain
+                    .iter()
+                    .any(|required| required == tool_name)
+            });
+        }
+        if strict_goal_mode_round
+            && (!request.goal_turn_mode.allows_goal_creation()
+                || !required_tool_chain
+                    .iter()
+                    .any(|tool_name| tool_name == "create_goal")
+                || completed_required_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == "create_goal"))
+        {
+            active_tools.retain(|definition| definition.function.name != "create_goal");
+        }
+        let round_tool_definitions = if strict_goal_mode_round {
+            strict_goal_mode_tool_definitions_for_round(
+                &active_tools,
+                &required_tool_chain,
+                &completed_required_tool_names,
+            )
+        } else {
+            active_tools.clone()
+        };
+        let round_tools = (request.use_tools && !round_tool_definitions.is_empty())
+            .then_some(round_tool_definitions);
+        if strict_goal_mode_round {
+            if let Some(next_required_tool) = required_tool_chain.iter().find(|tool_name| {
+                !completed_required_tool_names
+                    .iter()
+                    .any(|completed| completed == *tool_name)
+            }) && !round_tools.as_ref().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|definition| definition.function.name == *next_required_tool)
+            }) {
+                return Err(SessionTurnExecutionError::new(
+                    SessionTurnFailureReason::RuntimeInvalidState,
+                    format!(
+                        "严格目标模式要求调用工具 {next_required_tool}，但当前工具面未提供该工具；拒绝绕过 Goal/Plan 生命周期。"
+                    ),
+                ));
+            }
+        }
         if context_budget_recheck_required && !proactive_context_compaction_completed {
             let rebuild_result =
                 rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
@@ -1039,6 +1111,7 @@ fn run_session_turn_execution_inner(
                 browser_capability_revision,
                 messages: &mut messages,
                 completed_required_tool_names: &completed_required_tool_names,
+                required_tool_chain: &required_tool_chain,
                 pre_output_invocation_recovery_attempts,
                 stream_interruption_recovery_attempts,
                 round,
@@ -1269,6 +1342,27 @@ fn run_session_turn_execution_inner(
             &required_tool_chain,
             &streamed_content.tool_call_names,
         );
+        if strict_goal_mode_round {
+            if session_store
+                .current_unfinished_goal(&request.session_id)
+                .is_some()
+                || completed_required_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == "create_goal")
+            {
+                goal_creation_required = false;
+            }
+            required_tool_chain = session_required_tool_chain(
+                &request,
+                goal_creation_required,
+                goal_mode_requires_terminalization(session_store, &request.session_id),
+            );
+            completed_required_tool_names.retain(|tool_name| {
+                required_tool_chain
+                    .iter()
+                    .any(|required| required == tool_name)
+            });
+        }
 
         if let Some(skill_id) = streamed_content.activated_skill_id.as_deref()
             && active_skill_name.as_deref() != Some(skill_id)
@@ -1579,6 +1673,7 @@ struct SessionTurnRoundRuntime<'a> {
     browser_capability_revision: Option<u64>,
     messages: &'a mut Vec<ChatMessage>,
     completed_required_tool_names: &'a [String],
+    required_tool_chain: &'a [String],
     pre_output_invocation_recovery_attempts: usize,
     stream_interruption_recovery_attempts: usize,
     round: usize,
@@ -1637,8 +1732,22 @@ fn record_completed_required_tools(
     }
 }
 
-fn session_required_tool_chain(request: &SessionTurnExecutionRequest) -> Vec<String> {
-    let mut required = request.required_tool_chain.clone();
+fn session_required_tool_chain(
+    request: &SessionTurnExecutionRequest,
+    goal_creation_required: bool,
+    goal_terminalization_required: bool,
+) -> Vec<String> {
+    let mut required = if request.goal_turn_mode.is_goal_driven() {
+        goal_mode_required_tool_chain(
+            GoalModeLifecycleState {
+                goal_creation_required,
+                goal_terminalization_required,
+            },
+            &request.required_tool_chain,
+        )
+    } else {
+        request.required_tool_chain.clone()
+    };
     if let Some(forced_tool_name) = request
         .forced_tool_name
         .as_deref()
@@ -1646,7 +1755,17 @@ fn session_required_tool_chain(request: &SessionTurnExecutionRequest) -> Vec<Str
         .filter(|name| !name.is_empty())
         && !required.iter().any(|name| name == forced_tool_name)
     {
-        required.insert(0, forced_tool_name.to_string());
+        if request.goal_turn_mode.is_goal_driven() {
+            // 目标模式的生命周期顺序由运行时拥有；只允许在生命周期之后追加业务工具。
+            if !matches!(
+                forced_tool_name,
+                "get_goal" | "create_goal" | "update_plan" | "update_goal"
+            ) {
+                required.push(forced_tool_name.to_string());
+            }
+        } else {
+            required.insert(0, forced_tool_name.to_string());
+        }
     }
     required
 }
@@ -1705,6 +1824,7 @@ fn stream_session_turn_round(
         browser_capability_revision,
         messages,
         completed_required_tool_names,
+        required_tool_chain,
         pre_output_invocation_recovery_attempts,
         stream_interruption_recovery_attempts,
         round,
@@ -1869,6 +1989,7 @@ fn stream_session_turn_round(
 
     let tool_choice = forced_tool_choice_for_round(
         request,
+        required_tool_chain,
         tools.as_ref(),
         round,
         completed_required_tool_names,
@@ -2335,7 +2456,28 @@ fn stream_session_turn_round(
         for invalid in &invalid_tool_calls {
             messages.push(invalid_tool_result_message(invalid));
         }
-        let valid_tool_calls = tool_validation.valid_calls;
+        // Goal 模式遇到混合批次时，invalid call 不能与 valid call 部分执行；否则模型
+        // 即使绕过了当前严格工具面，批次里的浏览器/文件副作用仍可能已经发生。
+        let valid_tool_calls =
+            if request.goal_turn_mode.is_goal_driven() && !invalid_tool_calls.is_empty() {
+                Vec::new()
+            } else {
+                tool_validation.valid_calls
+            };
+        if request.goal_turn_mode.is_goal_driven()
+            && !valid_tool_calls.is_empty()
+            && let Some(failure) = goal_mode_tool_batch_violation(
+                required_tool_chain,
+                completed_required_tool_names,
+                &valid_tool_calls,
+            )
+        {
+            return Err(SessionTurnRoundError::Failed {
+                error: failure,
+                context_overflow: None,
+                non_stream_fallback_attempted: false,
+            });
+        }
         let snapshot_session = snapshot_manager.and_then(|mgr| {
             request
                 .workspace_root_path
@@ -2450,17 +2592,31 @@ fn stream_session_turn_round(
 
 fn forced_tool_choice_for_round(
     request: &SessionTurnExecutionRequest,
+    required_tool_chain: &[String],
     tools: Option<&Vec<ChatToolDefinition>>,
     round: usize,
-    _completed_required_tool_names: &[String],
+    completed_required_tool_names: &[String],
 ) -> Option<ChatToolChoice> {
     if !request.use_tools {
         return None;
     }
-    let forced_tool_name = (round == 0)
-        .then_some(request.forced_tool_name.as_deref())
-        .flatten()?
-        .trim();
+    let forced_tool_name = if request.goal_turn_mode.is_goal_driven() {
+        required_tool_chain
+            .iter()
+            .cloned()
+            .into_iter()
+            .find(|tool_name| {
+                !completed_required_tool_names
+                    .iter()
+                    .any(|completed| completed == tool_name)
+            })?
+    } else {
+        (round == 0)
+            .then_some(request.forced_tool_name.as_deref())
+            .flatten()?
+            .trim()
+            .to_string()
+    };
     if forced_tool_name.is_empty() {
         return None;
     }
@@ -4012,14 +4168,38 @@ mod tests {
             origin: magi_bridge_client::ChatToolOrigin::Builtin,
         }];
 
-        let choice = forced_tool_choice_for_round(&request, Some(&tools), 0, &[])
-            .expect("first round should force diagram_render");
+        let choice = forced_tool_choice_for_round(
+            &request,
+            &request.required_tool_chain,
+            Some(&tools),
+            0,
+            &[],
+        )
+        .expect("first round should force diagram_render");
         assert_eq!(choice.function.name, "diagram_render");
-        assert!(forced_tool_choice_for_round(&request, Some(&tools), 1, &[]).is_none());
+        assert!(
+            forced_tool_choice_for_round(
+                &request,
+                &request.required_tool_chain,
+                Some(&tools),
+                1,
+                &[]
+            )
+            .is_none()
+        );
 
         let mut unavailable_request = request;
         unavailable_request.forced_tool_name = Some("missing_tool".to_string());
-        assert!(forced_tool_choice_for_round(&unavailable_request, Some(&tools), 0, &[]).is_none());
+        assert!(
+            forced_tool_choice_for_round(
+                &unavailable_request,
+                &unavailable_request.required_tool_chain,
+                Some(&tools),
+                0,
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -4045,8 +4225,49 @@ mod tests {
         };
 
         assert_eq!(
-            session_required_tool_chain(&request),
+            session_required_tool_chain(&request, false, false),
             vec!["image_generate".to_string()]
+        );
+    }
+
+    #[test]
+    fn goal_turn_required_tool_chain_is_lifecycle_ordered() {
+        let request = SessionTurnExecutionRequest {
+            session_id: SessionId::new("session-goal-lifecycle-order"),
+            turn_id: "turn-goal-lifecycle-order".to_string(),
+            workspace_id: None,
+            prompt: "推进目标".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: true,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: vec![
+                "create_goal".to_string(),
+                "shell_exec".to_string(),
+                "update_plan".to_string(),
+            ],
+            goal_turn_mode: SessionGoalTurnMode::Start,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+
+        assert_eq!(
+            session_required_tool_chain(&request, true, false),
+            ["get_goal", "create_goal", "update_plan", "shell_exec"]
+        );
+
+        let continuation = SessionTurnExecutionRequest {
+            goal_turn_mode: SessionGoalTurnMode::Continuation,
+            ..request
+        };
+        assert_eq!(
+            session_required_tool_chain(&continuation, false, false),
+            ["get_goal", "update_plan", "shell_exec"]
         );
     }
 
@@ -4088,14 +4309,30 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(forced_tool_choice_for_round(&request, Some(&tools), 0, &[]).is_none());
         assert!(
-            forced_tool_choice_for_round(&request, Some(&tools), 1, &["shell_exec".to_string()])
-                .is_none()
+            forced_tool_choice_for_round(
+                &request,
+                &request.required_tool_chain,
+                Some(&tools),
+                0,
+                &[],
+            )
+            .is_none()
         );
         assert!(
             forced_tool_choice_for_round(
                 &request,
+                &request.required_tool_chain,
+                Some(&tools),
+                1,
+                &["shell_exec".to_string()],
+            )
+            .is_none()
+        );
+        assert!(
+            forced_tool_choice_for_round(
+                &request,
+                &request.required_tool_chain,
                 Some(&tools),
                 2,
                 &["shell_exec".to_string(), "file_write".to_string()],
@@ -4993,6 +5230,7 @@ mod tests {
                 browser_capability_revision: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
+                required_tool_chain: &[],
                 pre_output_invocation_recovery_attempts: 0,
                 stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,
@@ -5128,6 +5366,7 @@ mod tests {
                 browser_capability_revision: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
+                required_tool_chain: &[],
                 pre_output_invocation_recovery_attempts: 0,
                 stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,

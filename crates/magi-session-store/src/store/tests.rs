@@ -134,6 +134,96 @@ fn unique_timeline_entry_id_appends_suffix_for_duplicate_base() {
 }
 
 #[test]
+fn rejected_user_turn_is_durable_and_request_idempotent() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-rejected-user-turn");
+    store
+        .create_session(session_id.clone(), "Rejected user turn")
+        .expect("session should be creatable");
+
+    let request_id = "request-git-context-conflict".to_string();
+    let user_message_id = "user-git-context-conflict".to_string();
+    let placeholder_message_id = "assistant-placeholder-git-context-conflict".to_string();
+    let source_thread_id = ThreadId::new("thread-rejected-user-turn");
+    let mut user_item = test_turn_item(&user_message_id, "发送前 Git context 已漂移");
+    user_item.request_id = Some(request_id.clone());
+    user_item.user_message_id = Some(user_message_id.clone());
+    user_item.placeholder_message_id = Some(placeholder_message_id.clone());
+    user_item
+        .metadata
+        .insert("requestId".to_string(), json!(request_id.clone()));
+    user_item.source_thread_id = source_thread_id.clone();
+
+    let mut error_item = test_turn_item(
+        "assistant-error-git-context-conflict",
+        "Git context 发生高风险变化",
+    );
+    error_item.kind = "assistant_error".to_string();
+    error_item.status = "failed".to_string();
+    error_item.source = "orchestrator".to_string();
+    error_item.request_id = Some(request_id.clone());
+    error_item.user_message_id = Some(user_message_id.clone());
+    error_item.placeholder_message_id = Some(placeholder_message_id.clone());
+    error_item.source_thread_id = source_thread_id;
+
+    let turn = ActiveExecutionTurn {
+        turn_id: "turn-rejected-user-turn".to_string(),
+        turn_seq: 100,
+        accepted_at: UtcMillis(100),
+        completed_at: Some(UtcMillis(100)),
+        status: "failed".to_string(),
+        user_message: Some("发送前 Git context 已漂移".to_string()),
+        items: vec![user_item, error_item],
+    };
+    let timeline = TimelineEntryInput::new(
+        "timeline-rejected-user-turn",
+        TimelineEntryKind::UserMessage,
+        "发送前 Git context 已漂移",
+        UtcMillis(100),
+    );
+
+    store
+        .record_rejected_user_turn_with_timeline_entry(session_id.clone(), timeline, turn.clone())
+        .expect("rejected turn should be durable")
+        .expect("first rejected turn should be recorded");
+
+    let turns = store.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Failed);
+    assert_eq!(turns[0].items.len(), 2);
+    assert_eq!(
+        store
+            .timeline_for_session(&session_id)
+            .into_iter()
+            .filter(|entry| entry.entry_id == "timeline-rejected-user-turn")
+            .count(),
+        1
+    );
+
+    store
+        .record_rejected_user_turn_with_timeline_entry(
+            session_id.clone(),
+            TimelineEntryInput::new(
+                "timeline-rejected-user-turn-retry",
+                TimelineEntryKind::UserMessage,
+                "重复提交不应生成第二条",
+                UtcMillis(101),
+            ),
+            turn,
+        )
+        .expect("same request retry should be idempotent");
+    assert_eq!(store.canonical_turns_for_session(&session_id).len(), 1);
+    assert_eq!(
+        store
+            .timeline_for_session(&session_id)
+            .into_iter()
+            .filter(|entry| entry.entry_id.starts_with("timeline-rejected-user-turn"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-message-count");
@@ -2755,6 +2845,35 @@ fn upsert_current_turn_item_rejects_canonical_status_regression() {
         .expect("completed item should remain");
     assert_eq!(stored_item.status, "completed");
     assert_eq!(stored_item.content.as_deref(), Some("最终回复"));
+}
+
+#[test]
+fn upsert_current_turn_item_for_turn_rejects_a_stale_turn_owner() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-turn-owner-check");
+    store
+        .create_session(session_id.clone(), "Turn Owner Check")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-current", "running", 1))
+        .expect("running turn should upsert");
+
+    let result = store.upsert_current_turn_item_for_turn(
+        &session_id,
+        Some("turn-stale"),
+        test_turn_item("browser-tool-stale", "stale browser result"),
+    );
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::CurrentTurnConflict { .. })
+    ));
+    assert!(
+        store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .is_some_and(|turn| turn.items.is_empty())
+    );
 }
 
 #[test]

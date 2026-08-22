@@ -432,6 +432,7 @@ fn desktop_connection_error_code(error: &BrowserHostClientError) -> &'static str
         | BrowserHostClientError::Json(_)
         | BrowserHostClientError::Disconnected
         | BrowserHostClientError::RequestTimeout(_)
+        | BrowserHostClientError::RequestIndeterminate(_)
         | BrowserHostClientError::UnexpectedResponse(_)
         | BrowserHostClientError::UnexpectedBinaryPayload
         | BrowserHostClientError::BinarySizeMismatch { .. }

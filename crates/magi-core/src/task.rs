@@ -639,6 +639,12 @@ pub struct TaskExecutorBinding {
     /// 其余协作决策仍由 root coordinator 在完整工具面中自行决定。
     #[serde(default)]
     pub required_tool_chain: Vec<String>,
+    /// 当前任务是否由用户显式进入目标模式。
+    ///
+    /// 该字段是持久化的执行语义，不允许运行时再从模型提示词或任务文本推断。
+    /// 目标模式任务必须由执行器统一注入并验证 Goal/Plan 生命周期。
+    #[serde(default)]
+    pub goal_mode: bool,
     /// 旧版本持久化字段，仅用于一次性载入迁移，不参与新任务执行。
     #[serde(default, skip_serializing, rename = "required_evidence_tools")]
     legacy_required_evidence_tools: Vec<String>,
@@ -702,6 +708,11 @@ impl TaskExecutorBinding {
         self
     }
 
+    pub fn with_goal_mode(mut self, goal_mode: bool) -> Self {
+        self.goal_mode = goal_mode;
+        self
+    }
+
     fn target_role(&self) -> Option<&str> {
         normalized_str_ref(self.target_role.as_deref())
     }
@@ -728,6 +739,10 @@ impl TaskExecutorBinding {
 
     fn required_tool_chain(&self) -> &[String] {
         &self.required_tool_chain
+    }
+
+    fn goal_mode(&self) -> bool {
+        self.goal_mode
     }
 }
 // --- Task
@@ -830,6 +845,12 @@ impl Task {
             .unwrap_or_default()
     }
 
+    pub fn is_goal_mode(&self) -> bool {
+        self.executor_binding
+            .as_ref()
+            .is_some_and(TaskExecutorBinding::goal_mode)
+    }
+
     pub fn completion_contract(&self) -> &TaskCompletionContract {
         &self.completion_contract
     }
@@ -851,6 +872,24 @@ impl Task {
                 .map(TaskEvidenceRequirement::successful_tool_call)
                 .collect();
             binding.legacy_resumes_turn_id = None;
+        }
+    }
+
+    /// 将旧 checkpoint 中已经声明 Goal 生命周期工具链的任务迁移到显式目标模式。
+    ///
+    /// 旧版本没有持久化 `goal_mode`，但 Goal 工具链是唯一允许出现 `get_goal` 的
+    /// 主线执行契约，因此这里只做一次确定性的结构迁移，后续执行不再检查任务文本。
+    pub fn migrate_persisted_goal_mode(&mut self) {
+        if self.is_goal_mode()
+            || !self
+                .required_tool_chain()
+                .iter()
+                .any(|tool| tool == "get_goal")
+        {
+            return;
+        }
+        if let Some(binding) = self.executor_binding.as_mut() {
+            binding.goal_mode = true;
         }
     }
 
@@ -967,6 +1006,16 @@ mod tests {
             ["agent_spawn", "agent_wait"],
             "结构化工具链必须按入口声明的顺序执行，只去除重复项"
         );
+    }
+
+    #[test]
+    fn goal_mode_binding_is_explicit_and_defaults_to_false() {
+        let normal = TaskExecutorBinding::for_role("coordinator");
+        assert!(!normal.goal_mode());
+
+        let goal = normal.clone().with_goal_mode(true);
+        assert!(goal.goal_mode());
+        assert!(!normal.goal_mode());
     }
 
     #[test]

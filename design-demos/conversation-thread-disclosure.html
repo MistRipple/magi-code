@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Magi · 对话层级展开</title>
+  <!--
+    设计边界：本稿只讨论对话区域展示，不包含任何侧栏、右栏、工作区导航或独立面板。
+
+    交互模型：
+    - 第一层：点击“已处理 28m 3s”展开/收起这一轮的过程。
+    - 第二层：在轮次内部，阶段/工具组仍是小折叠，默认不展开。
+    - 第三层：用户继续点击工具组，查看具体文件修改和工具调用。
+    - 最终回答始终留在对话流里；收起过程时，它就是用户首先看到的结果。
+
+    这是设计稿，不修改生产组件。没有右上角模式切换；哈希仅用于截图验收：
+    #turn-open = 展开轮次，#tools-open = 展开轮次 + 第一组工具详情。
+  -->
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #fcfcfb;
+      --line: #e6e6e3;
+      --line-strong: #d2d2cd;
+      --text: #2b2b2a;
+      --muted: #858582;
+      --faint: #b1b1ad;
+      --accent: #7184c0;
+      --green: #16a34a;
+      --red: #f04438;
+      --link: #b26a4b;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: "SFMono-Regular", "Cascadia Code", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      background: var(--page);
+      color: var(--text);
+      font: 15px/1.7 var(--font);
+      -webkit-font-smoothing: antialiased;
+    }
+    button { color: inherit; font: inherit; }
+    .page { width: min(100%, 1538px); min-height: 100vh; margin: 0 auto; padding: 16px 34px 56px; }
+    .conversation { width: 100%; }
+
+    /* 第一层：轮次控制。它不是一个页面级筛选器，而是对话中的普通折叠行。 */
+    .round-toggle {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      min-height: 42px;
+      gap: 8px;
+      padding: 0;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      cursor: pointer;
+    }
+    .round-toggle:hover { color: var(--text); }
+    .round-toggle strong { font-size: 22px; font-weight: 500; line-height: 1; }
+    .chevron { width: 15px; height: 15px; flex: 0 0 auto; transition: transform .18s ease; }
+    .chevron path { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .round-toggle.open .chevron { transform: rotate(90deg); }
+
+    .round-process { display: none; }
+    .round-process.open { display: block; }
+    .assistant-plan {
+      margin: 34px 0 20px;
+      max-width: 1450px;
+      font-size: 22px;
+      font-weight: 650;
+      line-height: 1.55;
+      letter-spacing: -.02em;
+      text-wrap: pretty;
+    }
+
+    /* 轮次内的普通过程行。保持截图里的无卡片、低对比度事件流。 */
+    .event-row {
+      display: flex;
+      align-items: center;
+      min-height: 34px;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+    .event-row + .event-row { margin-top: 1px; }
+    .event-icon { width: 17px; height: 17px; flex: 0 0 auto; color: var(--accent); }
+    .event-icon.muted { color: #969692; }
+    .event-icon path, .event-icon circle, .event-icon rect { fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+    .event-label { min-width: 0; }
+    .event-label u { text-decoration-style: dotted; text-underline-offset: 4px; }
+    .event-label strong { font-weight: 500; }
+    .delta { font-size: 14px; }
+    .delta.plus { color: var(--green); }
+    .delta.minus { color: var(--red); margin-left: 4px; }
+    .context-compressed { margin: 15px 0 16px 29px; color: var(--muted); font-size: 16px; }
+
+    /* 第二层：阶段/工具组折叠。它只负责承接具体过程，不重复做结果卡片。 */
+    .tool-group { margin-bottom: 6px; }
+    .tool-group-toggle {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      min-height: 37px;
+      gap: 10px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      cursor: pointer;
+    }
+    .tool-group-toggle:hover { color: var(--text); }
+    .tool-group-toggle .chevron { width: 13px; height: 13px; margin-left: 1px; order: 3; }
+    .tool-group-toggle.open .chevron { transform: rotate(90deg); }
+    .tool-group-toggle .event-label { font-size: 17px; }
+    .group-count { margin-left: 2px; color: var(--faint); font-size: 13px; }
+    .tool-list {
+      display: none;
+      margin: 0 0 8px 28px;
+      padding: 2px 0 2px 15px;
+      border-left: 1px solid var(--line-strong);
+    }
+    .tool-list.open { display: block; }
+    .tool-row { display: flex; align-items: center; min-height: 31px; gap: 9px; color: var(--muted); font-size: 16px; }
+    .tool-row .event-icon { width: 16px; height: 16px; color: #999995; }
+
+    /* 最后一层：具体工具项可继续进入，不在默认视图抢占注意力。 */
+    .tool-item-toggle {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      min-height: 31px;
+      gap: 9px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      cursor: pointer;
+    }
+    .tool-item-toggle:hover { color: var(--text); }
+    .tool-item-toggle .chevron { width: 12px; height: 12px; margin-left: auto; order: 3; opacity: .7; }
+    .tool-item-toggle.open .chevron { transform: rotate(90deg); }
+    .tool-item-detail { display: none; margin: 0 0 5px 25px; padding: 5px 0 5px 11px; border-left: 1px solid var(--line); color: var(--faint); font: 12px/1.6 var(--mono); }
+    .tool-item-detail.open { display: block; }
+
+    /* 默认可见的最终结果。它不再套一张“总结大卡”，保留对话本身的阅读节奏。 */
+    .final-answer { margin-top: 28px; max-width: 1250px; font-size: 18px; }
+    .final-answer p { margin: 0 0 17px; }
+    .final-answer h3 { margin: 18px 0 6px; font-size: 18px; font-weight: 500; }
+    .final-answer ul { margin: 0 0 15px; padding-left: 31px; }
+    .final-answer li { margin: 3px 0; padding-left: 4px; }
+    .final-answer code { padding: 1px 6px; border-radius: 6px; background: #ededeb; color: #363636; font: .9em var(--mono); }
+    .final-answer a { color: var(--link); text-decoration: none; }
+    .final-answer a:hover { text-decoration: underline; }
+
+    /* 文件变更是最终结果的一部分，放在答案之后，不当成额外面板。 */
+    .change-card { margin-top: 25px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.45); overflow: hidden; }
+    .change-summary { display: flex; align-items: center; gap: 16px; padding: 20px 24px; }
+    .change-icon { width: 62px; height: 62px; display: grid; place-items: center; border-radius: 12px; background: #f1f1ef; color: #747471; }
+    .change-icon svg { width: 26px; height: 26px; }
+    .change-icon path, .change-icon rect { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+    .change-title { font-size: 18px; font-weight: 500; line-height: 1.35; }
+    .change-count { margin-top: 3px; font-size: 16px; }
+    .change-count .plus, .file-delta .plus { color: var(--green); }
+    .change-count .minus, .file-delta .minus { margin-left: 9px; color: var(--red); }
+    .change-actions { display: flex; align-items: center; gap: 17px; margin-left: auto; font-size: 17px; }
+    .undo, .review { cursor: pointer; }
+    .undo { border: 0; background: transparent; }
+    .review { padding: 7px 15px; border: 1px solid var(--line); border-radius: 11px; background: transparent; }
+    .review:hover { background: #f6f6f4; }
+    .changed-files { border-top: 1px solid var(--line); }
+    .changed-file { display: flex; align-items: center; min-height: 50px; gap: 8px; padding: 0 24px; color: var(--muted); font-size: 17px; }
+    .changed-file + .changed-file { border-top: 1px solid #eeeeec; }
+    .changed-file .path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .changed-file .path strong { color: var(--text); font-weight: 500; }
+    .file-delta { margin-left: auto; white-space: nowrap; }
+
+    @media (max-width: 700px) {
+      body { font-size: 14px; }
+      .page { padding: 14px 18px 35px; }
+      .run-status strong { font-size: 19px; }
+      .assistant-plan { margin-top: 27px; font-size: 18px; }
+      .event-row, .tool-group-toggle { font-size: 15px; }
+      .tool-row, .tool-item-toggle { font-size: 14px; }
+      .final-answer { margin-top: 22px; font-size: 16px; }
+      .final-answer h3 { font-size: 16px; }
+      .change-summary { padding: 15px; }
+      .change-icon { width: 48px; height: 48px; }
+      .change-actions { gap: 8px; font-size: 15px; }
+      .changed-file { min-height: 45px; padding: 0 15px; font-size: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="conversation" aria-label="对话区域">
+      <button class="round-toggle" type="button" aria-expanded="false" aria-controls="round-process">
+        <strong>已处理 28m 3s</strong>
+        <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+      </button>
+
+      <div class="stream">
+        <!-- 这一块是可选过程：默认收起，但最终回答在它之后始终保留。 -->
+        <div class="round-process" id="round-process">
+          <p class="assistant-plan">我会按中文工程规范和设计评审规范处理这次图谱可读性问题：先定位重叠来自数据密度、布局参数还是卡片尺寸，再收敛成适合“局部聚焦 + 审阅”的布局方案，完成后做真实页面验收。</p>
+
+          <div class="tool-group">
+            <button class="tool-group-toggle" type="button" aria-expanded="false" aria-controls="tool-group-files">
+              <svg class="event-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5.5 8h5M8 5.5v5"/></svg>
+              <span class="event-label"><strong>已使用 浏览器编辑了多个文件</strong></span>
+              <span class="group-count">5 项</span>
+              <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+            </button>
+            <div class="tool-list" id="tool-group-files">
+              <button class="tool-item-toggle" type="button" aria-expanded="false">
+                <svg class="event-icon muted" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg>
+                <span>已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+2</span> <span class="delta minus">-0</span></span>
+                <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+              </button>
+              <div class="tool-item-detail">修改了图谱视图的布局参数和聚焦状态映射。</div>
+              <button class="tool-item-toggle" type="button" aria-expanded="false">
+                <svg class="event-icon muted" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg>
+                <span>已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+24</span> <span class="delta minus">-5</span></span>
+                <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+              </button>
+              <div class="tool-item-detail">调整了画布切换时的重新居中和尺寸适配。</div>
+              <button class="tool-item-toggle" type="button" aria-expanded="false">
+                <svg class="event-icon muted" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg>
+                <span>已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+1</span> <span class="delta minus">-1</span></span>
+                <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+              </button>
+              <div class="tool-item-detail">清理了重复的 CSS 覆盖规则。</div>
+              <button class="tool-item-toggle" type="button" aria-expanded="false">
+                <svg class="event-icon muted" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg>
+                <span>已编辑 <u>CytoscapeRenderer.svelte</u> <span class="delta plus">+50</span> <span class="delta minus">-5</span></span>
+                <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+              </button>
+              <div class="tool-item-detail">固定节点尺寸，整理连接线层级和文字显示条件。</div>
+              <button class="tool-item-toggle" type="button" aria-expanded="false">
+                <svg class="event-icon muted" viewBox="0 0 16 16"><path d="m3 11 7.6-7.6a1.4 1.4 0 0 1 2 2L5 13H3Z"/><path d="m9.5 4.5 2 2"/></svg>
+                <span>已编辑 <u>KnowledgeGraphPanel.svelte</u> <span class="delta plus">+10</span> <span class="delta minus">-0</span></span>
+                <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+              </button>
+              <div class="tool-item-detail">补充了本次收口记录和视图状态同步。</div>
+            </div>
+          </div>
+
+          <div class="event-row"><svg class="event-icon muted" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="8" height="9.5" rx="1"/><path d="m5 5 2 2-2 2M8 9h2.5M11.5 11.5l2 2"/></svg><span class="event-label">复核新的图谱布局</span></div>
+          <div class="event-row"><svg class="event-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 4.5v3.8l2.4 1.5"/></svg><span class="event-label">重新打开本地知识图谱</span></div>
+          <div class="event-row"><svg class="event-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5 8h6M8 5v6"/></svg><span class="event-label">检查布局调整后的运行日志</span></div>
+
+          <div class="context-compressed">上下文已自动压缩</div>
+
+          <div class="tool-group">
+            <button class="tool-group-toggle" type="button" aria-expanded="false" aria-controls="tool-group-command">
+              <svg class="event-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 4.5v3.8l2.4 1.5"/></svg>
+              <span class="event-label"><strong>已使用 浏览器编辑了多个文件运行了命令</strong></span>
+              <span class="group-count">3 项</span>
+              <svg class="chevron" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" /></svg>
+            </button>
+            <div class="tool-list" id="tool-group-command">
+              <div class="tool-row"><svg class="event-icon muted" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5 8h6M8 5v6"/></svg><span>重新打开页面并检查布局</span></div>
+              <div class="tool-row"><svg class="event-icon muted" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 4.5v3.8l2.4 1.5"/></svg><span>检查调整后的运行日志</span></div>
+              <div class="tool-row"><svg class="event-icon muted" viewBox="0 0 16 16"><path d="M3 3.5h10v9H3z"/><path d="m5 6 2 2-2 2M8.5 10H11"/></svg><span>完成检查并回写开发记录</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 结果不属于某个外部面板；它始终留在这条对话里。 -->
+        <article class="final-answer">
+          <p>已完成图谱页面的最终视觉收口。</p>
+          <h3>根本原因：</h3>
+          <ul>
+            <li>聚焦视图传入了 <code>breadthfirst</code>，但渲染器未正确识别，实际回退到了力导向布局。</li>
+            <li>没有明确聚焦根节点，导致节点和连接线随机分布、重叠。</li>
+            <li>卡片尺寸与长文本不匹配，画布尺寸变化后也没有自动重新适配。</li>
+          </ul>
+          <h3>解决方案：</h3>
+          <ul>
+            <li>聚焦图改为以当前知识节点为中心的同心层布局。</li>
+            <li>节点固定为 <code>160×64</code>，支持中文任意字符换行，图中标题自动压缩，详情仍保留完整内容。</li>
+            <li>连接线置于卡片下方，默认隐藏关系文字，仅选中边显示。</li>
+            <li>增加画布自动 ResizeObserver，切换审阅、聚焦、全局视图时自动重新居中适配。</li>
+            <li>清理重复 CSS 覆盖规则，并将本次收口记录补充至开发计划。</li>
+          </ul>
+          <h3>主要文件：</h3>
+          <ul>
+            <li><a href="#">CytoscapeRenderer.svelte (line 107)</a></li>
+            <li><a href="#">KnowledgeGraphPanel.svelte (line 139)</a></li>
+            <li><a href="#">knowledge-graph-plan.md (line 248)</a></li>
+          </ul>
+          <h3>已验证：</h3>
+          <ul>
+            <li><code>npm --prefix web run check</code></li>
+            <li><code>npm --prefix web run build</code></li>
+            <li><code>git diff --check</code></li>
+            <li>daemon 真实页面验收：聚焦图节点不再重叠，连线层级和布局已正常。</li>
+          </ul>
+        </article>
+
+        <div class="change-card">
+          <div class="change-summary">
+            <div class="change-icon"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M8 8h8M8 12h5M8 16h4"/></svg></div>
+            <div><div class="change-title">已编辑 3 个文件</div><div class="change-count"><span class="plus">+240</span><span class="minus">-108</span></div></div>
+            <div class="change-actions"><button class="undo" type="button">撤销 ↶</button><button class="review" type="button">审核</button></div>
+          </div>
+          <div class="changed-files">
+            <div class="changed-file"><span class="path">web/src/components/<strong>KnowledgeGraphPanel.svelte</strong></span><span class="file-delta"><span class="plus">+43</span><span class="minus">-20</span></span></div>
+            <div class="changed-file"><span class="path">web/src/components/diagram/<strong>CytoscapeRenderer.svelte</strong></span><span class="file-delta"><span class="plus">+194</span><span class="minus">-87</span></span></div>
+            <div class="changed-file"><span class="path">docs/<strong>knowledge-graph-plan.md</strong></span><span class="file-delta"><span class="plus">+3</span><span class="minus">-1</span></span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const roundToggle = document.querySelector('.round-toggle');
+    const roundProcess = document.querySelector('#round-process');
+
+    function setRoundOpen(open) {
+      roundProcess.classList.toggle('open', open);
+      roundToggle.classList.toggle('open', open);
+      roundToggle.setAttribute('aria-expanded', String(open));
+    }
+
+    roundToggle.addEventListener('click', () => setRoundOpen(!roundProcess.classList.contains('open')));
+
+    document.querySelectorAll('.tool-group-toggle').forEach((toggle) => {
+      toggle.addEventListener('click', () => {
+        const list = toggle.nextElementSibling;
+        const open = list.classList.toggle('open');
+        toggle.classList.toggle('open', open);
+        toggle.setAttribute('aria-expanded', String(open));
+      });
+    });
+
+    document.querySelectorAll('.tool-item-toggle').forEach((toggle) => {
+      toggle.addEventListener('click', () => {
+        const detail = toggle.nextElementSibling;
+        const open = detail.classList.toggle('open');
+        toggle.classList.toggle('open', open);
+        toggle.setAttribute('aria-expanded', String(open));
+      });
+    });
+
+    if (location.hash === '#turn-open' || location.hash === '#tools-open') setRoundOpen(true);
+    if (location.hash === '#tools-open') document.querySelector('.tool-group-toggle').click();
+  </script>
+</body>
+</html>

@@ -30,6 +30,7 @@ export class DesktopControlServer {
   readonly #activeWindowId: () => string;
   readonly #handshake: () => DesktopBrowserHandshake;
   readonly #queues = new Map<string, Promise<void>>();
+  readonly #active = new Map<string, AbortController>();
   #server: Server | null = null;
   #websocketServer: WebSocketServer | null = null;
   #client: WebSocket | null = null;
@@ -164,6 +165,8 @@ export class DesktopControlServer {
   async close(): Promise<void> {
     if (this.#heartbeat) clearInterval(this.#heartbeat);
     this.#heartbeat = null;
+    for (const controller of this.#active.values()) controller.abort();
+    this.#active.clear();
     this.#client?.terminate();
     this.#client = null;
     this.#websocketServer?.close();
@@ -202,11 +205,20 @@ export class DesktopControlServer {
         websocket.send(JSON.stringify(failedResponse("invalid-request", normalizeError(cause))));
         return;
       }
+      if (request.command.type === "cancel") {
+        this.#active.get(request.command.payload.request_id)?.abort();
+        return;
+      }
+      const controller = new AbortController();
+      this.#active.set(request.request_id, controller);
       const run = async () => {
-        const response = await this.execute(request);
-        if (websocket.readyState !== WebSocket.OPEN) return;
-        websocket.send(JSON.stringify(response.envelope));
-        if (response.binary) websocket.send(response.binary, { binary: true });
+        try {
+          await this.executeWithCancellation(request, controller.signal, websocket);
+        } finally {
+          if (this.#active.get(request.request_id) === controller) {
+            this.#active.delete(request.request_id);
+          }
+        }
       };
       const queueKey = commandTabId(request.command);
       if (!queueKey) {
@@ -256,6 +268,38 @@ export class DesktopControlServer {
         envelope: failedResponse(request.request_id, normalizeError(cause)),
       };
     }
+  }
+
+  private async executeWithCancellation(
+    request: BrowserHostRequestEnvelope,
+    signal: AbortSignal,
+    websocket: WebSocket,
+  ): Promise<void> {
+    if (signal.aborted) {
+      if (websocket.readyState === WebSocket.OPEN) {
+        websocket.send(JSON.stringify(cancelledResponse(request.request_id)));
+      }
+      return;
+    }
+    const operation = this.execute(request);
+    const cancellation = waitForAbort(signal);
+    const result = await Promise.race([
+      operation.then((response) => ({ kind: "completed" as const, response })),
+      cancellation.then(() => ({ kind: "cancelled" as const })),
+    ]);
+    if (result.kind === "cancelled") {
+      if (websocket.readyState === WebSocket.OPEN) {
+        websocket.send(JSON.stringify(indeterminateResponse(request.request_id)));
+      }
+      // Preserve the per-tab queue until the real Chromium/Worker operation
+      // settles. The response is already indeterminate, so the next command
+      // cannot race the unknown side effect on the same page.
+      await operation;
+      return;
+    }
+    if (websocket.readyState !== WebSocket.OPEN) return;
+    websocket.send(JSON.stringify(result.response.envelope));
+    if (result.response.binary) websocket.send(result.response.binary, { binary: true });
   }
 
   private async executeCommand(command: BrowserHostCommand): Promise<{
@@ -390,6 +434,12 @@ function parseRequest(value: string): BrowserHostRequestEnvelope {
     throw new Error("browser_protocol_incompatible");
   }
   if (!request.command || typeof request.command.type !== "string") throw new Error("browser_protocol_invalid");
+  if (
+    request.command.type === "cancel"
+    && (!request.command.payload || typeof request.command.payload.request_id !== "string")
+  ) {
+    throw new Error("browser_protocol_invalid");
+  }
   return request;
 }
 
@@ -422,6 +472,38 @@ function failedResponse(requestId: string, error: BrowserCommandError): BrowserH
     protocol_version: DESKTOP_BROWSER_PROTOCOL_VERSION,
     outcome: { status: "failed", payload: error },
   };
+}
+
+function indeterminateResponse(requestId: string): BrowserHostResponseEnvelope {
+  return {
+    request_id: requestId,
+    protocol_version: DESKTOP_BROWSER_PROTOCOL_VERSION,
+    outcome: {
+      status: "indeterminate",
+      payload: {
+        code: "browser_command_cancelled",
+        message: "浏览器命令已取消，但 Chromium 操作可能已经产生副作用",
+        recoverable: false,
+        side_effect_started: true,
+        diagnostic: null,
+      },
+    },
+  };
+}
+
+function cancelledResponse(requestId: string): BrowserHostResponseEnvelope {
+  return {
+    request_id: requestId,
+    protocol_version: DESKTOP_BROWSER_PROTOCOL_VERSION,
+    outcome: { status: "cancelled" },
+  };
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }
 
 function normalizeError(cause: unknown): BrowserCommandError {

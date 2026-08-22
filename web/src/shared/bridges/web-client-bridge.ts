@@ -128,6 +128,10 @@ import {
 } from '../protocol/canonical-turn';
 import type { SseConnection } from '../transport';
 import {
+  AppServerClient,
+  type AppServerConnectionState,
+} from '../app-server-client';
+import {
   activateAgentRunSession,
   fetchAgentRunProjection,
   startAutoRefresh as startAgentRunAutoRefresh,
@@ -152,6 +156,7 @@ import {
   completeTurnEditing,
   createRequestBinding,
   getRequestBinding,
+  rebindLocalSubmissionSession,
   setCurrentSessionId,
   setQueuedMessages,
   setOrchestratorRuntimeState,
@@ -185,9 +190,9 @@ type SessionTurnSubmissionContext = {
   acceptedSessionId?: string;
 };
 
-// 会话首条消息的归属只能由这一份上下文决定。requestBindings 负责消息渲染，
-// 但不能单独决定哪个页面可以被 SSE 接管，否则旧请求返回时会污染 currentSessionId。
-let activeSessionTurnSubmission: SessionTurnSubmissionContext | null = null;
+// 每个 request 都有自己的提交上下文。旧实现只有一个全局槽位，第二个会话
+// 提交时会覆盖第一个，导致 accepted/error 返回后无法找到原请求。
+const sessionTurnSubmissions = new Map<string, SessionTurnSubmissionContext>();
 const guidingQueuedMessageIds = new Set<string>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
@@ -198,8 +203,9 @@ function localOptimisticSessionIdForRequest(requestId: string): string {
   return `session-local-${safeRequestId}`;
 }
 
-/** 传输层维护的 SSE 连接句柄（统一管理 Web EventSource 和宿主代理两种模式） */
-let activeSseConnection: SseConnection | null = null;
+/** 事件流连接句柄：Web 使用 SSE，Desktop 使用 App Server WebSocket。 */
+type EventStreamConnection = SseConnection | AppServerClient;
+let activeEventStreamConnection: EventStreamConnection | null = null;
 let activeEventStreamKey = '';
 let activeEventStreamState: 'idle' | 'connecting' | 'open' = 'idle';
 let activeEventStreamOpenPromise: Promise<void> | null = null;
@@ -288,7 +294,7 @@ function submissionContextCanCommit(
   context: SessionTurnSubmissionContext,
   resolvedSessionId: string,
 ): boolean {
-  if (!activeSessionTurnSubmission || activeSessionTurnSubmission.requestId !== context.requestId) {
+  if (sessionTurnSubmissions.get(context.requestId) !== context) {
     return false;
   }
   if (!submissionContextMatchesCurrentScope(context)) {
@@ -311,8 +317,8 @@ function submissionContextCanCommit(
 }
 
 function finishSessionTurnSubmission(context: SessionTurnSubmissionContext): void {
-  if (activeSessionTurnSubmission?.requestId === context.requestId) {
-    activeSessionTurnSubmission = null;
+  if (sessionTurnSubmissions.get(context.requestId) === context) {
+    sessionTurnSubmissions.delete(context.requestId);
   }
 }
 
@@ -1574,7 +1580,7 @@ function activeDraftSubmissionMatchesAcceptedEvent(
   eventSessionId: string,
 ): boolean {
   const requestId = rustEventRequestId(event);
-  const context = activeSessionTurnSubmission;
+  const context = sessionTurnSubmissions.get(requestId);
   return Boolean(
     event.event_type === 'session.turn.task.accepted'
     && eventSessionId
@@ -2080,10 +2086,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       acceptedSessionId && currentSessionId === acceptedSessionId,
     );
     const acceptedSubmissionContext = acceptedRequestId
-      && activeSessionTurnSubmission?.requestId === acceptedRequestId
+      && sessionTurnSubmissions.get(acceptedRequestId)
       && messagesState.pendingRequests.has(acceptedRequestId)
       && getRequestBinding(acceptedRequestId)
-      ? activeSessionTurnSubmission
+      ? sessionTurnSubmissions.get(acceptedRequestId)
       : null;
     const acceptedMatchesDraftSubmission = Boolean(
       acceptedSubmissionContext
@@ -2512,6 +2518,30 @@ function eventStreamBindingKey(): string {
   return eventStreamScopeKey();
 }
 
+function shouldUseAppServerEventStream(): boolean {
+  return typeof window !== 'undefined'
+    && window.magiDesktop?.runtime === 'electron'
+    && Boolean(currentSessionId || currentWorkspaceId);
+}
+
+function appServerEventStreamKey(): string {
+  return `${eventStreamBindingKey()}\u0000${currentSessionId}`;
+}
+
+function appServerEventSubscription(): {
+  sessionId?: string | null;
+  workspaceId?: string | null;
+  afterSequence: number;
+} {
+  return {
+    sessionId: currentSessionId || null,
+    workspaceId: currentSessionScope === 'workspace' ? currentWorkspaceId || null : null,
+    afterSequence: eventStreamCursorScopeKey === eventStreamScopeKey()
+      ? eventStreamAfterSequence
+      : 0,
+  };
+}
+
 function eventStreamQuery(): string {
   const query = new URLSearchParams();
   query.set('scope', currentSessionScope);
@@ -2753,7 +2783,6 @@ function clearWorkspaceSessionBinding(
   workspaceId: string,
   workspacePath: string,
 ): boolean {
-  activeSessionTurnSubmission = null;
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   const previousSessionId = currentSessionId;
@@ -2807,7 +2836,6 @@ function clearWorkspaceSessionBinding(
 }
 
 function clearPersistedWorkspaceBinding(): void {
-  activeSessionTurnSubmission = null;
   clearSettingsBootstrapCache();
   currentWorkspaceId = '';
   currentWorkspacePath = '';
@@ -2848,11 +2876,11 @@ function closeEventStream(): void {
   stopEventStreamIdleCheck();
   activeEventStreamOpenReject?.(new Error('事件流连接已关闭'));
   activeEventStreamToken += 1;
-  // SSE 断开后无法接收增量事件，结束活跃 turn 防护
+  // 事件流断开后无法接收增量事件，结束活跃 turn 防护
   clearActiveTurnInFlight();
-  if (activeSseConnection) {
-    activeSseConnection.close();
-    activeSseConnection = null;
+  if (activeEventStreamConnection) {
+    activeEventStreamConnection.close();
+    activeEventStreamConnection = null;
   }
   activeEventStreamKey = '';
   activeEventStreamState = 'idle';
@@ -2988,12 +3016,13 @@ async function ensureEventStream(
   if (typeof window === 'undefined') {
     return;
   }
-  const nextKey = eventStreamBindingKey();
+  const useAppServer = shouldUseAppServerEventStream();
+  const nextKey = useAppServer ? appServerEventStreamKey() : eventStreamBindingKey();
   if (!nextKey) {
     closeEventStream();
     return;
   }
-  if (!options.forceReconnect && activeSseConnection && activeEventStreamKey === nextKey) {
+  if (!options.forceReconnect && activeEventStreamConnection && activeEventStreamKey === nextKey) {
     if (options.waitUntilOpen && activeEventStreamState !== 'open' && activeEventStreamOpenPromise) {
       await activeEventStreamOpenPromise;
     }
@@ -3004,41 +3033,92 @@ async function ensureEventStream(
   activeEventStreamState = 'connecting';
   const streamToken = ++activeEventStreamToken;
   const openPromise = createEventStreamOpenPromise(streamToken);
-  activeSseConnection = getTransport().connectEventStream(
-    agentUrl('/events', eventStreamQuery()),
-    {
-      onOpen() {
-        if (streamToken !== activeEventStreamToken) {
-          return;
-        }
-        activeEventStreamState = 'open';
-        setAgentRunBridgeConnected(true);
-        startEventStreamIdleCheck();
-        resolveEventStreamOpen();
+  if (useAppServer) {
+    const client = new AppServerClient({
+      endpoint: agentUrl('/api/app-server'),
+      clientInfo: { name: 'magi-desktop-renderer', title: 'Magi Desktop', version: currentRuntimeEpoch || null },
+      capabilities: {
+        desktopBrowserSurface: true,
+        browserTools: true,
+        approvals: true,
+        streaming: true,
       },
-      onMessage(data: string) {
-        if (streamToken !== activeEventStreamToken) {
-          return;
+      subscription: appServerEventSubscription(),
+      onStateChange(state: AppServerConnectionState) {
+        if (streamToken !== activeEventStreamToken) return;
+        if (state === 'ready') {
+          activeEventStreamState = 'open';
+          setAgentRunBridgeConnected(true);
+          startEventStreamIdleCheck();
+          resolveEventStreamOpen();
+        } else if (state === 'connecting' || state === 'reconnecting') {
+          activeEventStreamState = 'connecting';
+          setAgentRunBridgeConnected(false);
         }
+      },
+      onSnapshot(snapshot) {
+        if (streamToken !== activeEventStreamToken) return;
         markEventStreamActive();
-        const event = parseRustEventEnvelope(data);
-        if (!event) {
-          handleEventStreamParseFailure(data, new Error('Rust 事件流载荷不符合 EventEnvelope 协议'));
-          return;
+        const previousSequence = eventStreamAfterSequence;
+        for (const event of snapshot.recent_events) {
+          if (typeof event.sequence === 'number' && event.sequence <= previousSequence) continue;
+          handleRustEventStreamMessage(event);
         }
+        updateEventStreamCursorFromSnapshot(snapshot.next_sequence);
+      },
+      onEvent(event) {
+        if (streamToken !== activeEventStreamToken) return;
+        markEventStreamActive();
         handleRustEventStreamMessage(event);
       },
-      onError() {
-        if (streamToken !== activeEventStreamToken) {
-          return;
-        }
-        const openFailed = activeEventStreamState !== 'open';
-        rejectEventStreamOpen(openFailed ? new Error('事件流连接失败') : undefined);
-        closeEventStream();
-        scheduleRecovery('event_stream_error');
+    });
+    activeEventStreamConnection = client;
+    const connectPromise = client.connect().catch((error: unknown) => {
+      if (streamToken !== activeEventStreamToken) return;
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      rejectEventStreamOpen(normalized);
+      closeEventStream();
+      scheduleRecovery('app_server_connect_error', normalized);
+      throw normalized;
+    });
+    connectPromise.catch(() => undefined);
+  } else {
+    activeEventStreamConnection = getTransport().connectEventStream(
+      agentUrl('/events', eventStreamQuery()),
+      {
+        onOpen() {
+          if (streamToken !== activeEventStreamToken) {
+            return;
+          }
+          activeEventStreamState = 'open';
+          setAgentRunBridgeConnected(true);
+          startEventStreamIdleCheck();
+          resolveEventStreamOpen();
+        },
+        onMessage(data: string) {
+          if (streamToken !== activeEventStreamToken) {
+            return;
+          }
+          markEventStreamActive();
+          const event = parseRustEventEnvelope(data);
+          if (!event) {
+            handleEventStreamParseFailure(data, new Error('Rust 事件流载荷不符合 EventEnvelope 协议'));
+            return;
+          }
+          handleRustEventStreamMessage(event);
+        },
+        onError() {
+          if (streamToken !== activeEventStreamToken) {
+            return;
+          }
+          const openFailed = activeEventStreamState !== 'open';
+          rejectEventStreamOpen(openFailed ? new Error('事件流连接失败') : undefined);
+          closeEventStream();
+          scheduleRecovery('event_stream_error');
+        },
       },
-    },
-  );
+    );
+  }
   if (options.waitUntilOpen) {
     await openPromise;
   }
@@ -3468,7 +3548,6 @@ async function commitSessionNavigation(
   const previousWorkspacePath = currentWorkspacePath;
   invalidateBootstrapRequests();
   // 导航事务拥有新的会话归属；旧提交即使随后收到 HTTP/SSE，也不能重新夺回当前页面。
-  activeSessionTurnSubmission = null;
   const response = await getTransport().request(agentUrl('/api/session/navigation'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3881,10 +3960,11 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     targetSessionId,
     optimisticSessionId,
   };
-  activeSessionTurnSubmission = submissionContext;
+  sessionTurnSubmissions.set(requestId, submissionContext);
 
   createRequestBinding({
     requestId,
+    sessionId: optimisticSessionId,
     userMessageId,
     placeholderMessageId,
     turnOrderSeq,
@@ -3969,6 +4049,10 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       if (submissionCanCommit) {
         submissionContext.acceptedSessionId = resolvedSessionId;
         adoptAcceptedSessionIdForLocalTurn(optimisticSessionId, resolvedSessionId);
+      } else {
+        // 请求在另一个会话提交期间完成时，当前页面不能被切回旧会话；
+        // 但后台 pending projection 和 request binding 仍必须绑定正式 session。
+        rebindLocalSubmissionSession(optimisticSessionId, resolvedSessionId);
       }
     }
     if (resolvedSessionId) {

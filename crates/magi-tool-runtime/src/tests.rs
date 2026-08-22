@@ -5692,7 +5692,16 @@ fn browser_interaction_schemas_match_worker_parameter_contracts() {
     let emulate = BuiltinToolName::BrowserEmulate.parameters_schema();
     assert_eq!(
         emulate["properties"]["action"]["enum"],
-        serde_json::json!(["set_user_agent", "set_geolocation", "clear_geolocation", "set_color_scheme", "set_cpu_throttling", "set_network_conditions", "set_headers", "clear"])
+        serde_json::json!([
+            "set_user_agent",
+            "set_geolocation",
+            "clear_geolocation",
+            "set_color_scheme",
+            "set_cpu_throttling",
+            "set_network_conditions",
+            "set_headers",
+            "clear"
+        ])
     );
 }
 

@@ -276,6 +276,7 @@ struct DispatchTaskInput<'a> {
     context_references: &'a [SessionContextReference],
     workspace_root_path: Option<&'a Path>,
     required_tool_chain: Vec<String>,
+    goal_mode: bool,
     completion_contract: TaskCompletionContract,
     recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     denied_tools: Vec<String>,
@@ -297,6 +298,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         context_references,
         workspace_root_path,
         required_tool_chain,
+        goal_mode,
         completion_contract,
         recovery_checkpoint,
         denied_tools,
@@ -306,6 +308,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string))
         .with_required_tool_chain(required_tool_chain)
+        .with_goal_mode(goal_mode)
         .with_plan_item_id(plan_item_id);
     let mut input_refs = session_context_reference_input_refs(context_references);
     input_refs.extend(browser_annotation_reference_input_refs(
@@ -393,6 +396,11 @@ pub fn run_dispatch_submission(
     // Skill 是本轮方法上下文，不是角色路由信号。聊天框进入的主线任务必须保留 coordinator
     // 权限面，具体 worker role 只能由显式 target_role 或后续 agent_spawn 决定。
     let target_role = request.target_role.as_deref().unwrap_or("coordinator");
+    if request.goal_mode && target_role != "coordinator" {
+        return Err(DispatchSubmissionRunError::InvalidInput(
+            "目标模式只能绑定主线 coordinator，不能下发到 worker 或 sidechain".to_string(),
+        ));
+    }
     if !runtime
         .agent_role_registry
         .role_supports_task_kind(target_role, TaskKind::LocalAgent)
@@ -431,6 +439,7 @@ pub fn run_dispatch_submission(
         browser_annotation_refs: &request.browser_annotation_refs,
         workspace_root_path: runtime.workspace_root_path,
         required_tool_chain: request.required_tool_chain.clone(),
+        goal_mode: request.goal_mode,
         completion_contract: request.completion_contract.clone(),
         recovery_checkpoint: request.recovery_checkpoint.clone(),
         denied_tools: request.denied_tools.clone(),
