@@ -49,6 +49,8 @@ export interface AppServerClientOptions {
   reconnectBaseDelayMs?: number;
   reconnectMaxDelayMs?: number;
   onStateChange?: (state: AppServerConnectionState) => void;
+  /** 连接收到有效响应或通知时触发，用于上层更新传输活跃时间。 */
+  onActivity?: () => void;
   onNotification?: (notification: ServerNotification) => void;
   onEvent?: (event: EventEnvelope) => void;
   onSnapshot?: (snapshot: EventStreamSnapshot) => void;
@@ -84,6 +86,8 @@ interface JsonRpcRequestLike extends JsonRpcNotificationLike {
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 250;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 10_000;
+const APP_SERVER_HEARTBEAT_INTERVAL_MS = 10_000;
+const APP_SERVER_HEARTBEAT_TIMEOUT_MS = 5_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -302,6 +306,8 @@ export class AppServerClient {
   #initializeResult: InitializeResult | null = null;
   #subscription: EventSubscribeParams | null;
   #lastSequence = 0;
+  #heartbeatTimer: number | null = null;
+  #heartbeatInFlight = false;
 
   constructor(options: AppServerClientOptions) {
     this.#options = {
@@ -342,6 +348,7 @@ export class AppServerClient {
 
   close(): void {
     this.#closedByClient = true;
+    this.stopHeartbeat();
     if (this.#reconnectTimer !== null) {
       window.clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
@@ -405,6 +412,7 @@ export class AppServerClient {
     }
     this.#reconnectAttempt = 0;
     this.setState('ready');
+    this.startHeartbeat();
     return initialize;
   }
 
@@ -416,6 +424,7 @@ export class AppServerClient {
 
   private handleClose(socket: WebSocket): void {
     if (this.#socket !== socket) return;
+    this.stopHeartbeat();
     this.#socket = null;
     this.#initializeResult = null;
     this.rejectPending(protocolError('App Server WebSocket 已断开', -32000));
@@ -438,6 +447,47 @@ export class AppServerClient {
       this.#reconnectTimer = null;
       void this.connect().catch(() => this.scheduleReconnect());
     }, delay);
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.#heartbeatTimer = window.setInterval(() => {
+      if (
+        this.#state !== 'ready'
+        || this.#heartbeatInFlight
+        || this.#socket?.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      this.#heartbeatInFlight = true;
+      void this.requestRaw(
+        this.nextRequestId(),
+        'ping',
+        {},
+        { timeoutMs: APP_SERVER_HEARTBEAT_TIMEOUT_MS },
+      )
+        .then(() => {
+          this.#options.onActivity?.();
+        })
+        .catch(() => {
+          // WebSocket 可能仍显示 OPEN，但已经无法可靠收发数据。主动关闭
+          // 交给统一 close/reconnect 链路处理，避免上层空闲检测误判为 SSE 断流。
+          if (!this.#closedByClient) {
+            this.#socket?.close();
+          }
+        })
+        .finally(() => {
+          this.#heartbeatInFlight = false;
+        });
+    }, APP_SERVER_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.#heartbeatTimer !== null) {
+      window.clearInterval(this.#heartbeatTimer);
+      this.#heartbeatTimer = null;
+    }
+    this.#heartbeatInFlight = false;
   }
 
   private async requestRaw<M extends AppServerRequestMethod>(
@@ -555,6 +605,7 @@ export class AppServerClient {
     if (!pending) return;
     this.#pending.delete(requestIdKey(value.id));
     this.clearPending(pending);
+    this.#options.onActivity?.();
     if (value.error !== undefined) {
       pending.reject(errorFromRpc(asJsonRpcError(value.error)));
       return;

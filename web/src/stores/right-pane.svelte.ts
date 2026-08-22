@@ -114,6 +114,8 @@ export interface SessionPaneState {
   openTabs: RightPaneTab[];
   activeTabId: string | null;
   collapsed: boolean;
+  /** 已经收到当前作用域的 BrowserAuthority 快照；用于区分启动竞态和确认后的空状态。 */
+  browserAuthoritySynchronized: boolean;
 }
 
 interface RightPaneRootState {
@@ -130,6 +132,7 @@ const EMPTY_SESSION_STATE: SessionPaneState = {
   openTabs: [],
   activeTabId: null,
   collapsed: true,
+  browserAuthoritySynchronized: false,
 };
 
 /** localStorage 持久化 key，带 schema 版本号方便后续演化 */
@@ -140,12 +143,18 @@ const WORKSPACE_SCOPE_PREFIX = 'workspace:';
 /** 无工作区、无会话的个人草稿也必须拥有稳定的右栏作用域。 */
 const PERSONAL_SCOPE_KEY = 'personal';
 
+interface PersistedSessionPaneState {
+  openTabs: RightPaneTab[];
+  activeTabId: string | null;
+  collapsed: boolean;
+}
+
 interface PersistedShape {
   version: 3 | 4;
   activeScopeKey: string;
   activeWorkspaceId: string;
   activeSessionId: string;
-  perSession: Record<string, SessionPaneState>;
+  perSession: Record<string, PersistedSessionPaneState>;
 }
 
 function isDesktopRenderer(): boolean {
@@ -285,6 +294,7 @@ function loadPersisted(): void {
         // 浏览器 Tab 会在连接 BrowserAuthority 后重新投影，不能因启动时
         // 尚未投影而把用户原本展开的右侧面板永久折叠。
         collapsed: Boolean(state.collapsed),
+        browserAuthoritySynchronized: false,
       };
     }
     rightPaneState.perSession = recovered;
@@ -359,6 +369,50 @@ interface PendingDesktopPanelIntent {
 // 存在异步 IPC 窗口，必须保留统一的在途意图，否则旧的 Browser 快照会把
 // 用户刚选中的文件/终端 Tab 立即写回，表现为“浏览器能看但其他 Tab 点不开”。
 let pendingDesktopPanelIntent: PendingDesktopPanelIntent | null = null;
+// 用户关闭 Browser Tab 后，HTTP 删除和下一次权威快照之间存在竞态。
+// 这些键只在确认失败或权威快照确认删除后清理，不允许旧快照把 Tab 重新投影回 UI。
+const pendingBrowserTabClosures = new Set<string>();
+
+function browserTabClosureKey(
+  scopeKey: string,
+  browserSessionId: string,
+  tabId: string,
+): string {
+  return [scopeKey, browserSessionId, tabId].join('\u0001');
+}
+
+function splitBrowserTabClosureKey(key: string): [string, string, string] | null {
+  const parts = key.split('\u0001');
+  return parts.length === 3 ? parts as [string, string, string] : null;
+}
+
+export function markBrowserTabClosePending(
+  scopeKeyOrSessionId: string | null | undefined,
+  browserSessionId: string,
+  tabId: string,
+): void {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  const normalizedBrowserSessionId = browserSessionId.trim();
+  const normalizedTabId = tabId.trim();
+  if (!scopeKey || !normalizedBrowserSessionId || !normalizedTabId) return;
+  pendingBrowserTabClosures.add(
+    browserTabClosureKey(scopeKey, normalizedBrowserSessionId, normalizedTabId),
+  );
+}
+
+export function clearBrowserTabClosePending(
+  scopeKeyOrSessionId: string | null | undefined,
+  browserSessionId: string,
+  tabId: string,
+): void {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  const normalizedBrowserSessionId = browserSessionId.trim();
+  const normalizedTabId = tabId.trim();
+  if (!scopeKey || !normalizedBrowserSessionId || !normalizedTabId) return;
+  pendingBrowserTabClosures.delete(
+    browserTabClosureKey(scopeKey, normalizedBrowserSessionId, normalizedTabId),
+  );
+}
 
 // 模块加载时立即恢复——必须放在 rightPaneState 定义之后、任何使用方读取之前
 loadPersisted();
@@ -382,6 +436,7 @@ function ensureSession(scopeKey: string): SessionPaneState {
       openTabs: [],
       activeTabId: null,
       collapsed: true,
+      browserAuthoritySynchronized: false,
     };
     rightPaneState.perSession[scopeKey] = state;
   }
@@ -775,6 +830,30 @@ export function synchronizeBrowserSessionSnapshot(
   );
 }
 
+/** 先按权威关闭事件移除本地投影，避免等待下一次 HTTP 快照期间显示已关闭 Tab。 */
+export function removeBrowserTabProjection(
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+  browserSessionId: string | null | undefined,
+  tabId: string | null | undefined,
+): void {
+  const scopeKey = sessionScopeKey(workspaceId, sessionId);
+  const normalizedBrowserSessionId = browserSessionId?.trim() || '';
+  const normalizedTabId = tabId?.trim() || '';
+  if (!scopeKey || !normalizedTabId) return;
+  if (normalizedBrowserSessionId) {
+    markBrowserTabClosePending(scopeKey, normalizedBrowserSessionId, normalizedTabId);
+  }
+  const pane = rightPaneState.perSession[scopeKey];
+  const localTab = pane?.openTabs.find((tab) => (
+    tab.kind === 'browser'
+    && (tab.payload as BrowserTabPayload).tabId === normalizedTabId
+    && (!normalizedBrowserSessionId
+      || (tab.payload as BrowserTabPayload).browserSessionId === normalizedBrowserSessionId)
+  ));
+  if (localTab) closeTab(scopeKey, localTab.id);
+}
+
 let terminalTabCounter = 0;
 
 function newTerminalTabId(): string {
@@ -837,11 +916,30 @@ export function synchronizeBrowserTabs(
   if (!scopeKey) return;
 
   const pane = ensureSession(scopeKey);
+  pane.browserAuthoritySynchronized = true;
   const previousActiveTabId = pane.activeTabId;
   const hadBrowserProjection = pane.openTabs.some((tab) => tab.kind === 'browser');
   const browserSessionId = snapshot?.browserSessionId.trim() || '';
-  const authorityTabs = (snapshot?.tabs ?? []).filter((tab) => (
-    tab.tabId.trim() && tab.lifecycle !== 'closed'
+  const rawAuthorityTabs = (snapshot?.tabs ?? []).filter((tab) => tab.tabId.trim());
+  const rawAuthorityTabsById = new Map(
+    rawAuthorityTabs.map((tab) => [tab.tabId.trim(), tab.lifecycle]),
+  );
+  for (const pendingKey of [...pendingBrowserTabClosures]) {
+    const parts = splitBrowserTabClosureKey(pendingKey);
+    if (!parts || parts[0] !== scopeKey) continue;
+    if (snapshot === null || parts[1] !== browserSessionId) {
+      if (snapshot === null) pendingBrowserTabClosures.delete(pendingKey);
+      continue;
+    }
+    if (!rawAuthorityTabsById.has(parts[2]) || rawAuthorityTabsById.get(parts[2]) === 'closed') {
+      pendingBrowserTabClosures.delete(pendingKey);
+    }
+  }
+  const authorityTabs = rawAuthorityTabs.filter((tab) => (
+    tab.lifecycle !== 'closed'
+    && !pendingBrowserTabClosures.has(
+      browserTabClosureKey(scopeKey, browserSessionId, tab.tabId.trim()),
+    )
   ));
   const authorityPaneIds = new Set(
     authorityTabs.map((tab) => `browser:${browserSessionId}:${tab.tabId.trim()}`),

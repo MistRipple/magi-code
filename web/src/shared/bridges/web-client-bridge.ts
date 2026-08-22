@@ -3056,6 +3056,10 @@ async function ensureEventStream(
           setAgentRunBridgeConnected(false);
         }
       },
+      onActivity() {
+        if (streamToken !== activeEventStreamToken) return;
+        markEventStreamActive();
+      },
       onSnapshot(snapshot) {
         if (streamToken !== activeEventStreamToken) return;
         markEventStreamActive();

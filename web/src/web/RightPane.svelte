@@ -30,6 +30,8 @@
     updateRightPaneTabLabel,
     setRightPaneCollapsed,
     clearPendingDesktopPanelIntent,
+    clearBrowserTabClosePending,
+    markBrowserTabClosePending,
     type RightPaneTab,
     type CodeTabPayload,
     type AgentTabPayload,
@@ -85,6 +87,7 @@
   const paneScopeKey = $derived(rightPaneState.activeScopeKey);
   const paneState = $derived(getRightPaneState(paneScopeKey));
   const openTabs = $derived(paneState.openTabs);
+  const browserAuthoritySynchronized = $derived(paneState.browserAuthoritySynchronized);
   let tabStripElement: HTMLDivElement | undefined;
 
   $effect(() => {
@@ -203,11 +206,31 @@
     };
   });
 
-  async function closeBrowserPanelResource(tabId: string): Promise<void> {
+  async function closeBrowserPanelResource(
+    scopeKey: string,
+    payload: BrowserTabPayload,
+  ): Promise<void> {
+    let closeError: unknown = null;
     try {
-      await closeBrowserTab(tabId);
+      await closeBrowserTab(payload.tabId);
     } catch (error) {
-      console.warn('[RightPane] 关闭浏览器面板资源失败:', error);
+      closeError = error;
+      clearBrowserTabClosePending(scopeKey, payload.browserSessionId, payload.tabId);
+    }
+    try {
+      const snapshot = await getBrowserSession(payload.browserSessionId);
+      synchronizeBrowserSessionSnapshot(snapshot, payload.workspacePath, {
+        workspaceId: payload.workspaceId,
+        sessionId: payload.sessionId,
+      });
+    } catch (error) {
+      if (closeError) {
+        console.warn('[RightPane] 关闭浏览器面板资源失败，权威状态也无法刷新:', {
+          closeError,
+          error,
+          tabId: payload.tabId,
+        });
+      }
     }
   }
 
@@ -591,6 +614,7 @@
       !current
       && desktopSnapshot?.layout.activePanelKind === 'browser'
       && desktopSnapshot.layout.activeTabId
+      && !browserAuthoritySynchronized
     ) {
       return;
     }
@@ -1180,8 +1204,13 @@
     const tab = openTabs.find((item) => item.id === tabId);
     closeTab(paneScopeKey, tabId);
     if (tab?.kind === 'browser') {
-      const browserTabId = (tab.payload as BrowserTabPayload).tabId;
-      void closeBrowserPanelResource(browserTabId);
+      const browserPayload = tab.payload as BrowserTabPayload;
+      markBrowserTabClosePending(
+        paneScopeKey,
+        browserPayload.browserSessionId,
+        browserPayload.tabId,
+      );
+      void closeBrowserPanelResource(paneScopeKey, browserPayload);
       if (desktopSurface && getRightPaneState(paneScopeKey).openTabs.length === 0) {
         activeDesktopPanelKey = 'empty';
         void window.magiDesktop?.activatePanel({ kind: null, tabId: null }).catch((error) => {

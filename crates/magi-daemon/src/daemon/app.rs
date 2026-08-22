@@ -38,6 +38,7 @@ const WEB_DEV_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_DEV_READY_INTERVAL: Duration = Duration::from_millis(250);
 const WEB_DEV_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WEB_DEV_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const STATIC_APP_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws://127.0.0.1:38123 ws://localhost:38123 ws://127.0.0.1:3000 ws://localhost:3000 ws://0.0.0.0:3000; form-action 'self'";
 
 #[derive(Clone, Debug)]
 pub struct Daemon {
@@ -451,6 +452,8 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
 fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Router {
     if let FrontendMode::Dev(dev_server) = frontend {
         let dev_html = build_web_dev_html(dev_server.origin(), dev_server.agent_origin());
+        let content_security_policy =
+            app_content_security_policy(dev_server.origin(), dev_server.agent_origin());
         info!(
             web_dev_origin = %dev_server.origin(),
             agent_origin = %dev_server.agent_origin(),
@@ -462,9 +465,19 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
                 "/web.html",
                 get({
                     let dev_html = dev_html.clone();
+                    let content_security_policy = content_security_policy.clone();
                     move || {
                         let dev_html = dev_html.clone();
-                        async move { Html(dev_html) }
+                        let content_security_policy = content_security_policy.clone();
+                        async move {
+                            let mut response = Html(dev_html).into_response();
+                            response.headers_mut().insert(
+                                header::CONTENT_SECURITY_POLICY,
+                                header::HeaderValue::from_str(&content_security_policy)
+                                    .expect("应用 CSP 必须是合法响应头"),
+                            );
+                            response
+                        }
                     }
                 }),
             )
@@ -490,12 +503,15 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
         .route("/", get(|| async { Redirect::temporary("/web.html") }))
         .route(
             "/web.html",
-            get_service(ServeFile::new(static_assets.web_html_path.clone())).layer(
-                SetResponseHeaderLayer::overriding(
+            get_service(ServeFile::new(static_assets.web_html_path.clone()))
+                .layer::<_, std::convert::Infallible>(SetResponseHeaderLayer::overriding(
                     header::CACHE_CONTROL,
                     header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
-                ),
-            ),
+                ))
+                .layer::<_, std::convert::Infallible>(SetResponseHeaderLayer::overriding(
+                    header::CONTENT_SECURITY_POLICY,
+                    header::HeaderValue::from_static(STATIC_APP_CONTENT_SECURITY_POLICY),
+                )),
         )
         .merge(api_router);
 
@@ -582,6 +598,39 @@ fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
   </body>
 </html>"#
     )
+}
+
+fn app_content_security_policy(vite_origin: &str, agent_origin: &str) -> String {
+    let mut websocket_origins = [vite_origin, agent_origin]
+        .into_iter()
+        .map(websocket_origin)
+        .collect::<Vec<_>>();
+    if let Some(port) = origin_port(vite_origin) {
+        websocket_origins.push(format!("ws://0.0.0.0:{port}"));
+    }
+    format!(
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' {}; form-action 'self'",
+        websocket_origins.join(" "),
+    )
+}
+
+fn origin_port(origin: &str) -> Option<&str> {
+    origin
+        .trim_end_matches('/')
+        .split_once("://")
+        .and_then(|(_, authority)| authority.rsplit_once(':').map(|(_, port)| port))
+        .filter(|port| !port.is_empty() && port.chars().all(|character| character.is_ascii_digit()))
+}
+
+fn websocket_origin(origin: &str) -> String {
+    let origin = origin.trim_end_matches('/');
+    if let Some(rest) = origin.strip_prefix("https://") {
+        return format!("wss://{rest}");
+    }
+    if let Some(rest) = origin.strip_prefix("http://") {
+        return format!("ws://{rest}");
+    }
+    origin.to_string()
 }
 
 async fn proxy_vite_dev_asset(dev_server: WebDevServer, uri: Uri) -> Response {
@@ -939,6 +988,12 @@ mod tests {
         assert!(html.contains(r#"src="/@vite/client""#));
         assert!(html.contains(r#"src="/src/main-web.ts""#));
         assert!(!html.contains(r#"src="http://127.0.0.1:3000"#));
+
+        let csp = app_content_security_policy("http://127.0.0.1:3000", "http://127.0.0.1:38123");
+        assert!(csp.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(csp.contains("ws://127.0.0.1:3000"));
+        assert!(csp.contains("ws://127.0.0.1:38123"));
     }
 
     #[test]
@@ -1010,6 +1065,12 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL),
             Some(&header::HeaderValue::from_static(
                 "no-store, no-cache, must-revalidate"
+            ))
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_SECURITY_POLICY),
+            Some(&header::HeaderValue::from_static(
+                STATIC_APP_CONTENT_SECURITY_POLICY
             ))
         );
     }

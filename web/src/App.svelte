@@ -14,6 +14,7 @@
   import { refreshPendingChangesProjection } from './lib/pending-changes-refresh';
   import {
     activateRightPaneSession,
+    removeBrowserTabProjection,
     synchronizeBrowserTabs,
   } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
@@ -185,6 +186,17 @@
       const createdTabId = typeof detail?.payload?.tab_id === 'string'
         ? detail.payload.tab_id.trim()
         : '';
+      if (eventType === 'browser.tab.closed') {
+        const closedTabId = typeof detail?.payload?.tab_id === 'string'
+          ? detail.payload.tab_id.trim()
+          : (typeof detail?.payload?.tabId === 'string' ? detail.payload.tabId.trim() : '');
+        const browserSessionId = typeof detail?.payload?.browser_session_id === 'string'
+          ? detail.payload.browser_session_id.trim()
+          : (typeof detail?.payload?.browserSessionId === 'string'
+            ? detail.payload.browserSessionId.trim()
+            : '');
+        removeBrowserTabProjection(workspaceId, sessionId, browserSessionId, closedTabId);
+      }
       void synchronizeCurrentBrowserAuthority(
         eventType === 'browser.tab.created' ? createdTabId : '',
       );
