@@ -809,6 +809,7 @@ async fn subscribe_events(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     state: &ApiState,
     connection_state: &Arc<Mutex<ConnectionState>>,

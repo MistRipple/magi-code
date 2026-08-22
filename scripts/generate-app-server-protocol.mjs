@@ -371,6 +371,7 @@ function rustMethodMapping(schema) {
     notificationParams,
     '}',
     '',
+    '#[allow(clippy::large_enum_variant)]',
     '#[derive(Clone, Debug, PartialEq)]',
     'pub enum AppServerResult {',
     results,

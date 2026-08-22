@@ -965,13 +965,11 @@ pub fn goal_mode_tool_batch_violation(
         ));
     }
 
-    let Some(next_required_tool) = required_tool_chain.iter().find(|tool_name| {
+    let next_required_tool = required_tool_chain.iter().find(|tool_name| {
         !completed_required_tool_names
             .iter()
             .any(|completed| completed == *tool_name)
-    }) else {
-        return None;
-    };
+    })?;
 
     if tool_calls.is_empty() {
         return None;

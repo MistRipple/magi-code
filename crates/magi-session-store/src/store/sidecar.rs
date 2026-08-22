@@ -1950,8 +1950,8 @@ impl SessionStore {
             return Err(DomainError::NotFound { entity: "session" });
         }
 
-        if let Some(request_id) = request_id {
-            if state.canonical_turns.iter().any(|existing| {
+        if let Some(request_id) = request_id
+            && state.canonical_turns.iter().any(|existing| {
                 existing.session_id == session_id
                     && existing.items.iter().any(|item| {
                         item.metadata
@@ -1960,9 +1960,9 @@ impl SessionStore {
                             .and_then(serde_json::Value::as_str)
                             == Some(request_id)
                     })
-            }) {
-                return Ok(None);
-            }
+            })
+        {
+            return Ok(None);
         }
 
         let existing = state

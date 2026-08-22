@@ -1044,23 +1044,24 @@ fn run_session_turn_execution_inner(
         };
         let round_tools = (request.use_tools && !round_tool_definitions.is_empty())
             .then_some(round_tool_definitions);
-        if strict_goal_mode_round {
-            if let Some(next_required_tool) = required_tool_chain.iter().find(|tool_name| {
+        if strict_goal_mode_round
+            && let Some(next_required_tool) = required_tool_chain.iter().find(|tool_name| {
                 !completed_required_tool_names
                     .iter()
                     .any(|completed| completed == *tool_name)
-            }) && !round_tools.as_ref().is_some_and(|tools| {
+            })
+            && !round_tools.as_ref().is_some_and(|tools| {
                 tools
                     .iter()
                     .any(|definition| definition.function.name == *next_required_tool)
-            }) {
-                return Err(SessionTurnExecutionError::new(
-                    SessionTurnFailureReason::RuntimeInvalidState,
-                    format!(
-                        "严格目标模式要求调用工具 {next_required_tool}，但当前工具面未提供该工具；拒绝绕过 Goal/Plan 生命周期。"
-                    ),
-                ));
-            }
+            })
+        {
+            return Err(SessionTurnExecutionError::new(
+                SessionTurnFailureReason::RuntimeInvalidState,
+                format!(
+                    "严格目标模式要求调用工具 {next_required_tool}，但当前工具面未提供该工具；拒绝绕过 Goal/Plan 生命周期。"
+                ),
+            ));
         }
         if context_budget_recheck_required && !proactive_context_compaction_completed {
             let rebuild_result =

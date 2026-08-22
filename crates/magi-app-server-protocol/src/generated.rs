@@ -194,6 +194,7 @@ pub enum AppServerNotificationParams {
     CancelRequest(CancelRequestParams),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppServerResult {
     Initialize(InitializeResult),

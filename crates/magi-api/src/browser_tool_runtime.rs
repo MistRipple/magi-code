@@ -1883,11 +1883,11 @@ fn failure_with_error(tool: &str, error: &BrowserToolError) -> (String, Executio
         error.details.as_ref(),
         error.status,
     );
-    if error.indeterminate {
-        if let Ok(mut value) = serde_json::from_str::<Value>(&payload) {
-            value["status"] = Value::String("indeterminate".to_string());
-            payload = value.to_string();
-        }
+    if error.indeterminate
+        && let Ok(mut value) = serde_json::from_str::<Value>(&payload)
+    {
+        value["status"] = Value::String("indeterminate".to_string());
+        payload = value.to_string();
     }
     (payload, error.status)
 }
