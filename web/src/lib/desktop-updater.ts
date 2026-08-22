@@ -87,7 +87,7 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
   return {
     currentVersion: snapshot.currentVersion,
     version: snapshot.availableVersion,
-    installability: { installable: true },
+    installability: { installable: snapshot.installable },
     download: async (onProgress) => {
       const unsubscribe = desktop.onUpdate((next) => {
         if (next.status !== 'downloading' && next.status !== 'downloaded') return;

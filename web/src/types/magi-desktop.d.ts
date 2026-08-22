@@ -120,6 +120,7 @@ interface MagiDesktopUpdateSnapshot {
   totalBytes: number | null;
   percent: number | null;
   error: string | null;
+  installable: boolean;
 }
 
 type MagiDesktopBrowserComponentStatus = 'starting' | 'ready' | 'restarting' | 'failed' | 'stopped';
