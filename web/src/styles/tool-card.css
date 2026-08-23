@@ -41,6 +41,14 @@
   background: var(--surface-hover);
 }
 
+/* 折叠态只提示“可展开”，不把整行染成选中背景；保留 cursor 与标题/箭头反馈。 */
+.tool-call.collapsed .tool-header:hover,
+.code-block.collapsed .code-header:hover,
+.thinking-block.collapsed .thinking-header:hover,
+.plan-card.collapsed .plan-header:hover {
+  background: transparent;
+}
+
 /* file-mutation-header 默认无 hover（不可展开），但需要保持等高 */
 .file-mutation-header {
   cursor: default;
