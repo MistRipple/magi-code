@@ -415,6 +415,9 @@
   const hasContent = $derived(hasInput || hasOutput || hasError);
   const canExpand = $derived(hasContent && !isCompactReadOnlyTool && !isCompactMutation);
   const shouldRenderCard = $derived(hasContent || isCompactReadOnlyTool || isCompactMutation);
+  const detailId = $derived(
+    id ? `tool-call-detail-${id.replace(/[^a-zA-Z0-9_-]/gu, '-')}` : undefined,
+  );
   const detailVisible = $derived(canExpand && !collapsed);
   const inputText = $derived(detailVisible ? formatToolInput(input) : '');
   const generatedImagePreview = $derived(
@@ -984,7 +987,12 @@
       data-tool-call-id={id || undefined}
     >
       {#if canExpand}
-        <button class="tool-header" onclick={toggle} aria-expanded={!collapsed}>
+        <button
+          class="tool-header"
+          onclick={toggle}
+          aria-expanded={!collapsed}
+          aria-controls={detailId}
+        >
           <span class="chevron">
             <Icon name="chevron-right" size={12} />
           </span>
@@ -1011,7 +1019,7 @@
       {/if}
 
       {#if canExpand && !collapsed}
-        <div class="tool-content" class:diagram-content={isDiagramTool}>
+        <div class="tool-content" class:diagram-content={isDiagramTool} id={detailId}>
           {#if hasInput && !isDiagramTool}
             <div class="tool-section">
               <div class="section-header">

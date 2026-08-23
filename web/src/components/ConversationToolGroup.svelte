@@ -4,15 +4,13 @@
   import { untrack } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
-  import ConversationToolItem from './ConversationToolItem.svelte';
+  import MessageItem from './MessageItem.svelte';
 
   interface Props {
     items: TimelineRenderItem[];
     readOnly?: boolean;
     displayContext?: 'thread' | 'task';
     filePreviewScopeForItem: (item: TimelineRenderItem) => FilePreviewScope;
-    canEditMessage: (item: TimelineRenderItem) => boolean;
-    editMessage: (item: TimelineRenderItem) => void;
     continueInterruptedSession: () => void;
   }
 
@@ -21,8 +19,6 @@
     readOnly = false,
     displayContext = 'thread',
     filePreviewScopeForItem,
-    canEditMessage,
-    editMessage,
     continueInterruptedSession,
   }: Props = $props();
 
@@ -40,6 +36,7 @@
   }
 
   const names = $derived(items.map(toolName).filter(Boolean));
+  const contentId = $derived(`conversation-tool-group-${(items[0]?.key || 'empty').replace(/[^a-zA-Z0-9_-]/gu, '-')}`);
   const groupLabel = $derived.by(() => {
     const allFileTools = names.length > 0 && names.every((name) => (
       /(?:file|patch|edit|write|remove|mkdir|move|copy)/iu.test(name)
@@ -63,27 +60,26 @@
     type="button"
     class="tool-group-header"
     aria-expanded={expanded}
+    aria-controls={contentId}
     onclick={toggle}
   >
-    <span class="tool-group-icon"><Icon name="plus" size={14} /></span>
+    <span class="tool-group-chevron" class:rotated={expanded}>
+      <Icon name="chevron-right" size={12} />
+    </span>
     <span class="tool-group-label">{groupLabel}</span>
     <span class="tool-group-count">{i18n.t('messageList.turnDisclosure.toolCount', { count: items.length })}</span>
-    <span class="tool-group-chevron" class:rotated={expanded}>
-      <Icon name="chevron-right" size={13} />
-    </span>
   </button>
 
   {#if expanded}
-    <div class="tool-group-list">
+    <div class="tool-group-list" id={contentId}>
       {#each items as item (item.key)}
-        <ConversationToolItem
-          {item}
+        <MessageItem
+          message={item.message}
           {readOnly}
           {displayContext}
-          {filePreviewScopeForItem}
-          {canEditMessage}
-          {editMessage}
-          {continueInterruptedSession}
+          filePreviewScope={filePreviewScopeForItem(item)}
+          onContinueInterrupted={continueInterruptedSession}
+          hideResponseDuration
         />
       {/each}
     </div>
@@ -100,7 +96,7 @@
     align-items: center;
     width: 100%;
     min-height: 35px;
-    gap: 9px;
+    gap: 8px;
     padding: 0;
     border: 0;
     background: transparent;
@@ -119,9 +115,12 @@
     outline-offset: 3px;
   }
 
-  .tool-group-icon {
+  .tool-group-chevron {
     display: inline-flex;
-    color: var(--primary);
+    flex: 0 0 12px;
+    color: var(--foreground-muted);
+    opacity: 0.62;
+    transition: transform var(--transition-fast), opacity var(--transition-fast);
   }
 
   .tool-group-label {
@@ -137,14 +136,15 @@
 
   .tool-group-count {
     flex: 0 0 auto;
+    margin-left: auto;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
   }
 
-  .tool-group-chevron {
-    display: inline-flex;
-    margin-left: auto;
-    transition: transform var(--transition-fast);
+  .tool-group-header:hover .tool-group-chevron,
+  .tool-group-header:focus-visible .tool-group-chevron,
+  .tool-group-chevron.rotated {
+    opacity: 1;
   }
 
   .tool-group-chevron.rotated {
@@ -152,8 +152,68 @@
   }
 
   .tool-group-list {
-    margin: 0 0 7px 22px;
-    padding: 3px 0 3px 14px;
-    border-left: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+    margin: 0 0 7px;
+    padding: 2px 0 2px 18px;
+    border-left: 0;
+  }
+
+  .conversation-tool-group .tool-group-list :global(.message-item.assistant) {
+    margin-top: 0;
+    padding-inline: 0;
+  }
+
+  .conversation-tool-group .tool-group-list :global(.tool-call) {
+    margin-top: 0;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .conversation-tool-group .tool-group-list :global(.tool-header) {
+    min-height: 34px;
+    gap: 8px;
+    padding: 4px 0;
+  }
+
+  .conversation-tool-group .tool-group-list :global(.chevron) {
+    flex: 0 0 12px;
+    color: var(--foreground-muted);
+  }
+
+  .conversation-tool-group .tool-group-list :global(.tool-icon) {
+    flex: 0 0 14px;
+    color: var(--foreground-muted);
+    opacity: 0.78;
+  }
+
+  .conversation-tool-group .tool-group-list :global(.status-dot) {
+    width: 6px;
+    height: 6px;
+  }
+
+  .conversation-tool-group .tool-group-list :global(.tool-content) {
+    margin: 0 0 8px;
+    padding: 7px 0 7px 18px;
+    border-top: 0;
+    border-left: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+    background: transparent;
+  }
+
+  .conversation-tool-group .tool-group-list :global(.tool-content.diagram-content) {
+    margin-left: 0;
+    padding: 0;
+    border-left: 0;
+    background: var(--code-bg);
+  }
+
+  @media (max-width: 560px) {
+    .tool-group-list {
+      padding-left: 14px;
+    }
+
+    .conversation-tool-group .tool-group-list :global(.tool-content) {
+      padding-left: 12px;
+    }
   }
 </style>

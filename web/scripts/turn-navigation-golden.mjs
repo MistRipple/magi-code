@@ -100,23 +100,23 @@ assert.doesNotMatch(
 );
 assert.match(
   railSource,
-  /\.turn-navigation-marker\s*\{[\s\S]*?width:\s*6px;/,
-  '静默态轨道节点长度必须缩短一半',
+  /\.turn-navigation-marker\s*\{[\s\S]*?width:\s*28px;[\s\S]*?height:\s*18px;/,
+  '轨道节点必须提供足够的真实点击区域',
 );
 assert.match(
   railSource,
-  /\.turn-navigation-marker-list\s*\{[\s\S]*?gap:\s*11px;/,
-  '轨道节点间隔必须缩短约三分之一',
+  /\.turn-navigation-marker-list\s*\{[\s\S]*?gap:\s*0;/,
+  '相邻节点点击区域必须连续且不能互相重叠',
 );
 assert.match(
   railSource,
-  /\.turn-navigation-marker\s*\{[\s\S]*?flex:\s*0 0 2px;[\s\S]*?height:\s*2px;/,
-  '轨道节点必须统一使用 2px 细线',
+  /\.turn-navigation-marker::before\s*\{[\s\S]*?width:\s*6px;[\s\S]*?height:\s*2px;/,
+  '轨道节点的视觉部分必须继续使用 2px 细线',
 );
 for (const selector of [
-  '.turn-navigation-marker.active',
-  '.turn-navigation-rail.magnetic .turn-navigation-marker.magnetic-focus',
-  '.turn-navigation-marker.selected',
+  '.turn-navigation-marker.active::before',
+  '.turn-navigation-rail.magnetic .turn-navigation-marker.magnetic-focus::before',
+  '.turn-navigation-marker.selected::before',
 ]) {
   assert.doesNotMatch(
     extractRuleBody(railSource, selector),
@@ -131,13 +131,23 @@ assert.doesNotMatch(
 );
 assert.match(
   railSource,
-  /\.turn-navigation-rail\.magnetic\s+\.turn-navigation-marker\s*\{[\s\S]*?width:\s*calc\(6px\s*\+\s*var\(--turn-wave-strength,\s*0\)\s*\*\s*14px\)/,
+  /\.turn-navigation-rail\.magnetic\s+\.turn-navigation-marker::before\s*\{[\s\S]*?width:\s*calc\(6px\s*\+\s*var\(--turn-wave-strength,\s*0\)\s*\*\s*14px\)/,
   '悬停波澜必须从 6px 静默态渐进伸展，峰值限制为 20px',
 );
 assert.match(
   railSource,
-  /\.turn-navigation-marker\.selected\s*\{[\s\S]*?width:\s*20px;/,
+  /\.turn-navigation-marker\.selected::before\s*\{[\s\S]*?width:\s*20px;/,
   '点击选中节点必须在鼠标移出后保留 20px 向右凸起',
+);
+assert.match(
+  railSource,
+  /\.turn-navigation-capsule-button\s*\{[\s\S]*?height:\s*44px;/,
+  '窄屏轮次胶囊必须满足最小触控高度',
+);
+assert.match(
+  railSource,
+  /\.turn-navigation-menu-item\s*\{[\s\S]*?min-height:\s*44px;/,
+  '窄屏轮次菜单项必须满足最小触控高度',
 );
 assert.doesNotMatch(
   railSource,

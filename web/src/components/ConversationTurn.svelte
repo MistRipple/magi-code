@@ -7,6 +7,7 @@
   import Icon from './Icon.svelte';
   import MessageItem from './MessageItem.svelte';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
+  import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import ConversationProcessRow from './ConversationProcessRow.svelte';
   import ConversationToolGroup from './ConversationToolGroup.svelte';
 
@@ -96,18 +97,17 @@
   const processEntries = $derived.by(() => {
     const result: ConversationProcessEntry[] = [];
     let toolGroupItems: TimelineRenderItem[] = [];
-    let toolGroupInserted = false;
     const hasToolItems = processItems.some((item) => isToolLikeMessage(item.message));
 
-    const insertToolGroup = () => {
-      if (toolGroupInserted || toolGroupItems.length === 0) return;
+    const flushToolGroup = () => {
+      if (toolGroupItems.length === 0) return;
       const firstKey = toolGroupItems[0].key;
       result.push({
         kind: 'tool-group',
         key: `tool-group:${firstKey}`,
         items: toolGroupItems,
       });
-      toolGroupInserted = true;
+      toolGroupItems = [];
     };
 
     for (const item of processItems) {
@@ -118,10 +118,10 @@
       // 同一轮中的思考输出只是模型内部过程，不应把连续工具调用切成多个组。
       // 有工具时省略这些重复的思考行；没有工具时仍保留思考事件供用户展开查看。
       if (hasToolItems && item.message.type === 'thinking') continue;
-      insertToolGroup();
+      flushToolGroup();
       result.push({ kind: 'event', key: `event:${item.key}`, item });
     }
-    insertToolGroup();
+    flushToolGroup();
     return result;
   });
 
@@ -141,6 +141,13 @@
     }
     return null;
   });
+  const completedAt = $derived.by(() => {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const value = items[index].message.metadata?.responseCompletedAt;
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+    }
+    return null;
+  });
   const durationLabel = $derived.by(() => {
     if (isLive) return formatElapsed(Math.max(0, elapsedSeconds));
     if (durationMs === null) return '';
@@ -150,7 +157,8 @@
     const prefix = isLive
       ? i18n.t('messageList.turnDisclosure.processing')
       : i18n.t('messageList.turnDisclosure.processed');
-    return durationLabel ? `${prefix} ${durationLabel}` : prefix;
+    const durationPart = durationLabel ? ` ${durationLabel}` : '';
+    return `${prefix}${durationPart}`;
   });
 
   function toggle(): void {
@@ -197,8 +205,6 @@
                 {readOnly}
                 {displayContext}
                 {filePreviewScopeForItem}
-                {canEditMessage}
-                {editMessage}
                 {continueInterruptedSession}
               />
             {/if}
@@ -209,6 +215,10 @@
         </div>
       {/if}
     </section>
+  {:else if durationLabel}
+    <div class="turn-status-header">
+      <span class="turn-disclosure-label">{disclosureLabel}</span>
+    </div>
   {/if}
 
   {#each finalItems as item (item.key)}
@@ -223,6 +233,10 @@
       hideResponseDuration
     />
   {/each}
+
+  {#if !isLive && durationMs !== null}
+    <TurnRuntimeSummary durationMs={durationMs} {completedAt} />
+  {/if}
 </article>
 
 <style>
@@ -237,7 +251,8 @@
     min-width: 0;
   }
 
-  .turn-disclosure-header {
+  .turn-disclosure-header,
+  .turn-status-header {
     display: flex;
     align-items: center;
     width: 100%;
@@ -250,7 +265,14 @@
     background: transparent;
     color: var(--foreground-muted);
     text-align: left;
+  }
+
+  .turn-disclosure-header {
     cursor: pointer;
+  }
+
+  .turn-status-header {
+    cursor: default;
   }
 
   .turn-disclosure-header:hover,
@@ -285,7 +307,7 @@
     flex-direction: column;
     gap: 2px;
     margin-top: var(--space-3);
-    padding: 0 0 var(--space-2) 28px;
+    padding: 0 0 var(--space-2) 12px;
     border-left: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
   }
 
@@ -295,7 +317,7 @@
 
   @media (max-width: 560px) {
     .turn-process {
-      padding-left: 20px;
+      padding-left: 10px;
     }
   }
 </style>

@@ -1,8 +1,6 @@
 <script lang="ts">
   import type { TimelineRenderItem } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
-  import type { IconName } from '../lib/icons';
-  import Icon from './Icon.svelte';
 
   interface Props {
     item: TimelineRenderItem;
@@ -49,16 +47,10 @@
     return i18n.t('messageList.turnDisclosure.processEvent');
   });
 
-  const iconName = $derived.by((): IconName => {
-    if (message.type === 'thinking') return 'clock';
-    if (message.type === 'system-notice') return 'info';
-    if (message.type === 'task_card' || message.type === 'plan') return 'list';
-    return 'terminal';
-  });
 </script>
 
 <div class="conversation-process-row" class:streaming={isStreaming} title={label}>
-  <span class="process-icon"><Icon name={iconName} size={15} /></span>
+  <span class="process-marker" aria-hidden="true"></span>
   <span class="process-label">{label}</span>
 </div>
 
@@ -67,7 +59,7 @@
     display: flex;
     align-items: flex-start;
     min-height: 32px;
-    gap: 9px;
+    gap: 7px;
     padding: 3px 0;
     color: var(--foreground-muted);
     font-size: var(--text-sm);
@@ -78,23 +70,45 @@
     color: var(--foreground);
   }
 
-  .process-icon {
-    display: inline-flex;
-    flex: 0 0 auto;
-    margin-top: 3px;
-    color: var(--primary);
+  .process-marker {
+    position: relative;
+    flex: 0 0 12px;
+    width: 12px;
+    height: 20px;
   }
 
-  .conversation-process-row:not(.streaming) .process-icon {
-    color: var(--foreground-muted);
+  .process-marker::before {
+    content: '';
+    position: absolute;
+    top: 8px;
+    left: 4px;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.52;
+  }
+
+  .conversation-process-row.streaming .process-marker::before {
+    opacity: 1;
+    animation: processMarkerPulse 1.5s ease-in-out infinite;
   }
 
   .process-label {
-    display: -webkit-box;
     min-width: 0;
-    overflow: hidden;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  @keyframes processMarkerPulse {
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conversation-process-row.streaming .process-marker::before {
+      animation: none;
+    }
   }
 </style>

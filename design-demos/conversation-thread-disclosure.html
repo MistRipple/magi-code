@@ -21,11 +21,9 @@
       color-scheme: light;
       --page: #fcfcfb;
       --line: #e6e6e3;
-      --line-strong: #d2d2cd;
       --text: #2b2b2a;
       --muted: #858582;
       --faint: #b1b1ad;
-      --accent: #7184c0;
       --green: #16a34a;
       --red: #f04438;
       --link: #b26a4b;
@@ -88,7 +86,7 @@
       font-size: 17px;
     }
     .event-row + .event-row { margin-top: 1px; }
-    .event-icon { width: 17px; height: 17px; flex: 0 0 auto; color: var(--accent); }
+    .event-icon { width: 17px; height: 17px; flex: 0 0 auto; color: #969692; }
     .event-icon.muted { color: #969692; }
     .event-icon path, .event-icon circle, .event-icon rect { fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
     .event-label { min-width: 0; }
@@ -97,7 +95,17 @@
     .delta { font-size: 14px; }
     .delta.plus { color: var(--green); }
     .delta.minus { color: var(--red); margin-left: 4px; }
-    .context-compressed { margin: 15px 0 16px 29px; color: var(--muted); font-size: 16px; }
+    .event-row > .event-icon { display: none; }
+    .event-row::before {
+      content: '';
+      width: 4px;
+      height: 4px;
+      margin: 0 6px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: .55;
+    }
+    .context-compressed { margin: 15px 0 16px 16px; color: var(--muted); font-size: 16px; }
 
     /* 第二层：阶段/工具组折叠。它只负责承接具体过程，不重复做结果卡片。 */
     .tool-group { margin-bottom: 6px; }
@@ -115,19 +123,29 @@
       cursor: pointer;
     }
     .tool-group-toggle:hover { color: var(--text); }
-    .tool-group-toggle .chevron { width: 13px; height: 13px; margin-left: 1px; order: 3; }
+    .tool-group-toggle > .event-icon { display: none; }
+    .tool-group-toggle .chevron { width: 13px; height: 13px; margin-left: 1px; order: -1; opacity: .65; }
     .tool-group-toggle.open .chevron { transform: rotate(90deg); }
     .tool-group-toggle .event-label { font-size: 17px; }
     .group-count { margin-left: 2px; color: var(--faint); font-size: 13px; }
     .tool-list {
       display: none;
-      margin: 0 0 8px 28px;
-      padding: 2px 0 2px 15px;
-      border-left: 1px solid var(--line-strong);
+      margin: 0 0 8px;
+      padding: 2px 0 2px 18px;
+      border-left: 0;
     }
     .tool-list.open { display: block; }
     .tool-row { display: flex; align-items: center; min-height: 31px; gap: 9px; color: var(--muted); font-size: 16px; }
-    .tool-row .event-icon { width: 16px; height: 16px; color: #999995; }
+    .tool-row .event-icon { display: none; }
+    .tool-row::before {
+      content: '';
+      width: 4px;
+      height: 4px;
+      margin: 0 5px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: .55;
+    }
 
     /* 最后一层：具体工具项可继续进入，不在默认视图抢占注意力。 */
     .tool-item-toggle {
@@ -144,9 +162,9 @@
       cursor: pointer;
     }
     .tool-item-toggle:hover { color: var(--text); }
-    .tool-item-toggle .chevron { width: 12px; height: 12px; margin-left: auto; order: 3; opacity: .7; }
+    .tool-item-toggle .chevron { width: 12px; height: 12px; margin-left: 0; order: -1; opacity: .65; }
     .tool-item-toggle.open .chevron { transform: rotate(90deg); }
-    .tool-item-detail { display: none; margin: 0 0 5px 25px; padding: 5px 0 5px 11px; border-left: 1px solid var(--line); color: var(--faint); font: 12px/1.6 var(--mono); }
+    .tool-item-detail { display: none; margin: 0 0 5px; padding: 5px 0 5px 20px; border-left: 0; color: var(--faint); font: 12px/1.6 var(--mono); }
     .tool-item-detail.open { display: block; }
 
     /* 默认可见的最终结果。它不再套一张“总结大卡”，保留对话本身的阅读节奏。 */
@@ -180,11 +198,19 @@
     .changed-file .path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .changed-file .path strong { color: var(--text); font-weight: 500; }
     .file-delta { margin-left: auto; white-space: nowrap; }
+    .runtime-footer {
+      min-height: 26px;
+      padding: 7px 0 3px;
+      color: var(--muted);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.4;
+    }
 
     @media (max-width: 700px) {
       body { font-size: 14px; }
       .page { padding: 14px 18px 35px; }
-      .run-status strong { font-size: 19px; }
+      .round-toggle strong { font-size: 19px; }
       .assistant-plan { margin-top: 27px; font-size: 18px; }
       .event-row, .tool-group-toggle { font-size: 15px; }
       .tool-row, .tool-item-toggle { font-size: 14px; }
@@ -316,6 +342,8 @@
             <div class="changed-file"><span class="path">docs/<strong>knowledge-graph-plan.md</strong></span><span class="file-delta"><span class="plus">+3</span><span class="minus">-1</span></span></div>
           </div>
         </div>
+
+        <div class="runtime-footer">总耗时 28m 3s · 18:42</div>
       </div>
     </section>
   </main>

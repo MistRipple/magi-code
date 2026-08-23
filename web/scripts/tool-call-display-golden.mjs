@@ -10,6 +10,18 @@ const terminalCardSource = await readFile(
   new URL('../src/components/TerminalSessionCard.svelte', import.meta.url),
   'utf8',
 );
+const conversationTurnSource = await readFile(
+  new URL('../src/components/ConversationTurn.svelte', import.meta.url),
+  'utf8',
+);
+const conversationToolGroupSource = await readFile(
+  new URL('../src/components/ConversationToolGroup.svelte', import.meta.url),
+  'utf8',
+);
+const conversationProcessRowSource = await readFile(
+  new URL('../src/components/ConversationProcessRow.svelte', import.meta.url),
+  'utf8',
+);
 const modelFailureCardSource = await readFile(
   new URL('../src/components/ModelFailureCard.svelte', import.meta.url),
   'utf8',
@@ -67,6 +79,76 @@ assert.match(
   terminalCardSource,
   /const displayOutput = \$derived\(isExpanded \? formatOutput\(rawDisplayOutput\) : ''\);/,
   '折叠 Shell 卡片不得在首屏格式化终端输出',
+);
+assert.match(
+  terminalCardSource,
+  /error:\s*terminalPayloadErrorText\(structuredErrorPayload\)/,
+  'Shell 卡片只能从已确认的错误载荷提取错误文本',
+);
+assert.match(
+  terminalCardSource,
+  /const showErrorHint = \$derived\.by\(\(\) => \{\s*if \(statusClass !== 'error'\)/,
+  'Shell 执行提示只能在错误状态下显示',
+);
+assert.doesNotMatch(
+  terminalCardSource,
+  /const publicErrorText = \$derived\([\s\S]*?publicToolPayloadMessage\(terminal\?\.output\)/,
+  'Shell 标准输出不得被当作公开错误提示',
+);
+assert.match(
+  conversationTurnSource,
+  /const flushToolGroup = \(\) => \{[\s\S]*?toolGroupItems = \[\];[\s\S]*?flushToolGroup\(\);\s*result\.push\(\{ kind: 'event'/,
+  '非工具过程事件必须提交当前连续工具组，保持真实时间顺序',
+);
+assert.match(
+  conversationTurnSource,
+  /\{:else if durationLabel\}[\s\S]*?class="turn-status-header"/,
+  '无过程的直接回复也必须显示一致的静态轮次状态行',
+);
+assert.match(
+  conversationTurnSource,
+  /import TurnRuntimeSummary from '\.\/TurnRuntimeSummary\.svelte';[\s\S]*?\{#if !isLive && durationMs !== null\}[\s\S]*?<TurnRuntimeSummary durationMs=\{durationMs\} \{completedAt\} \/>/,
+  '摘要模式必须在最终结果底部复用原始模式的耗时与完成时间组件',
+);
+assert.match(
+  conversationToolGroupSource,
+  /<MessageItem[\s\S]*?message=\{item\.message\}/,
+  '工具组必须直接复用原始工具卡片，不能再套一层工具详情组件',
+);
+assert.doesNotMatch(
+  conversationToolGroupSource,
+  /ConversationToolItem/,
+  '摘要模式不得保留重复工具详情实现',
+);
+assert.match(
+  conversationToolGroupSource,
+  /\.conversation-tool-group \.tool-group-list :global\(\.tool-call\)\s*\{[\s\S]*?border:\s*0;[\s\S]*?background:\s*transparent;/,
+  '工具组内的原始工具卡片必须压平，避免出现嵌套卡片外框',
+);
+assert.doesNotMatch(
+  conversationToolGroupSource,
+  /<Icon name="plus"/,
+  '工具组不得混入另一套彩色加号图标，折叠层统一使用 chevron',
+);
+assert.match(
+  conversationToolGroupSource,
+  /\.tool-group-list\s*\{[\s\S]*?padding:\s*2px 0 2px 18px;[\s\S]*?border-left:\s*0;/,
+  '工具组内容只允许一级紧凑缩进，不能叠加第二条装饰线',
+);
+assert.doesNotMatch(
+  conversationProcessRowSource,
+  /line-clamp/,
+  '用户展开轮次后必须能阅读完整过程文字',
+);
+assert.doesNotMatch(
+  conversationProcessRowSource,
+  /<Icon\s/,
+  '普通过程行使用统一的中性节点，不得混入多套装饰图标',
+);
+assert.match(
+  conversationTurnSource,
+  /\.turn-process\s*\{[\s\S]*?padding:\s*0 0 var\(--space-2\) 12px;/,
+  '摘要过程必须保持紧凑的单层缩进',
 );
 assert.match(
   toolCallSource,

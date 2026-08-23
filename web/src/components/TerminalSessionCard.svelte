@@ -94,6 +94,17 @@
 
   const parsedResult = $derived(parseJson(toolCall?.result));
   const parsedErrorResult = $derived(parseJson(toolCall?.error));
+  const resultPayloadIsError = $derived(Boolean(
+    parsedResult
+      && (
+        status === 'error'
+        || toolCall?.status === 'error'
+        || isStructuredToolErrorPayload(parsedResult)
+      ),
+  ));
+  const structuredErrorPayload = $derived(
+    parsedErrorResult || (resultPayloadIsError ? parsedResult : null),
+  );
   const terminalPayload = $derived(parsedResult || parsedErrorResult);
   const terminal = $derived.by((): Partial<TerminalSessionBlock> | undefined => {
     if (!terminalPayload && !toolCall) {
@@ -133,7 +144,7 @@
       accepted: readBool(terminalPayload?.accepted),
       killed: readBool(terminalPayload?.killed),
       releasedLock: readBool(terminalPayload?.released_lock),
-      error: terminalPayloadErrorText(terminalPayload) || undefined,
+      error: terminalPayloadErrorText(structuredErrorPayload) || undefined,
     };
   });
   const terminalId = $derived(terminal?.terminalId);
@@ -234,23 +245,16 @@
   const locked = $derived(terminal?.locked);
   const startupMessage = $derived(terminal?.startupMessage || '');
   const publicErrorText = $derived(
-    publicToolPayloadMessage(parsedErrorResult)
-    || publicToolPayloadMessage(parsedResult)
-    || publicToolPayloadMessage(terminal?.output)
+    publicToolPayloadMessage(structuredErrorPayload)
     || publicToolPayloadMessage(toolCall?.error)
-    || publicToolPayloadMessage(toolCall?.result)
   );
   const shouldOfferFullAccessSwitch = $derived(
-    isAccessModeApprovalErrorPayload(parsedErrorResult)
-    || isAccessModeApprovalErrorPayload(parsedResult)
-    || isAccessModeApprovalErrorPayload(terminal?.output)
+    isAccessModeApprovalErrorPayload(structuredErrorPayload)
     || isAccessModeApprovalErrorPayload(toolCall?.error)
-    || isAccessModeApprovalErrorPayload(toolCall?.result)
   );
   const errorText = $derived(
     terminal?.error
-    || publicToolPayloadMessage(terminal?.output)
-    || terminalPayloadErrorText(parsedErrorResult)
+    || terminalPayloadErrorText(structuredErrorPayload)
     || publicToolPayloadMessage(toolCall?.error)
     || toolCall?.error
     || ''
@@ -320,8 +324,16 @@
   ));
   const canToggle = $derived(isExpandable);
   const isExpanded = $derived(canToggle && !collapsed);
+  const contentId = $derived(
+    toolCall?.id
+      ? `terminal-tool-detail-${toolCall.id.replace(/[^a-zA-Z0-9_-]/gu, '-')}`
+      : undefined,
+  );
   const displayOutput = $derived(isExpanded ? formatOutput(rawDisplayOutput) : '');
   const showErrorHint = $derived.by(() => {
+    if (statusClass !== 'error') {
+      return false;
+    }
     const normalizedError = normalizeDisplayText(publicErrorText || errorText);
     if (!normalizedError) {
       return false;
@@ -370,7 +382,12 @@
     data-terminal-id={typeof terminalId === 'number' ? String(terminalId) : undefined}
   >
     {#if canToggle}
-      <button class="tool-header" onclick={toggle} aria-expanded={!collapsed}>
+      <button
+        class="tool-header"
+        onclick={toggle}
+        aria-expanded={!collapsed}
+        aria-controls={contentId}
+      >
         <span class="chevron">
           <Icon name="chevron-right" size={12} />
         </span>
@@ -405,7 +422,7 @@
     {/if}
 
     {#if canToggle && !collapsed}
-      <div class="tool-content terminal-content">
+      <div class="tool-content terminal-content" id={contentId}>
         <div class="terminal-meta-grid">
           {#if typeof terminalId === 'number'}
             <div class="terminal-meta-item">{i18n.t('terminalSession.title', { id: terminalId })}</div>

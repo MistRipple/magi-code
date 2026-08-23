@@ -376,7 +376,7 @@
     position: absolute;
     top: 50%;
     left: 2px;
-    width: 14px;
+    width: 28px;
     height: min(60vh, 560px);
     max-height: calc(100% - 32px);
     min-height: 120px;
@@ -399,7 +399,7 @@
     flex-direction: column;
     align-items: flex-start;
     justify-content: safe center;
-    gap: 11px;
+    gap: 0;
     overflow-y: auto;
     padding: 12px 0;
     scrollbar-width: none;
@@ -411,55 +411,69 @@
   }
 
   .turn-navigation-marker {
-    flex: 0 0 2px;
+    flex: 0 0 18px;
     position: relative;
+    left: 0;
+    width: 28px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .turn-navigation-marker::before {
+    content: '';
+    position: absolute;
+    top: 50%;
     left: 0;
     width: 6px;
     height: 2px;
-    padding: 0;
-    border: 0;
     border-radius: 2px;
     background: var(--border);
-    cursor: pointer;
+    transform: translateY(-50%);
     transition: width 180ms cubic-bezier(.16, 1, .3, 1), background 180ms ease, opacity 180ms ease, box-shadow 180ms ease;
   }
 
-  .turn-navigation-marker.active {
+  .turn-navigation-marker.active::before {
     background: var(--foreground);
   }
 
-  .turn-navigation-marker.running {
+  .turn-navigation-marker.running::before {
     background: var(--primary);
     animation: turnNavigationPulse 1.5s ease-in-out infinite;
   }
 
   .turn-navigation-marker:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 3px;
+    outline: none;
   }
 
-  .turn-navigation-rail.has-selection .turn-navigation-marker.active:not(.selected):not(.selected-neighbor) {
+  .turn-navigation-marker:focus-visible::before {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 70%, transparent);
+  }
+
+  .turn-navigation-rail.has-selection .turn-navigation-marker.active:not(.selected):not(.selected-neighbor)::before {
     background: var(--border);
   }
 
-  .turn-navigation-rail.magnetic .turn-navigation-marker {
+  .turn-navigation-rail.magnetic .turn-navigation-marker::before {
     width: calc(6px + var(--turn-wave-strength, 0) * 14px);
     opacity: calc(0.38 + var(--turn-wave-strength, 0) * 0.62);
   }
 
-  .turn-navigation-rail.magnetic .turn-navigation-marker.magnetic-focus {
+  .turn-navigation-rail.magnetic .turn-navigation-marker.magnetic-focus::before {
     opacity: 1;
     background: var(--foreground);
     animation: none;
   }
 
-  .turn-navigation-marker.selected-neighbor {
+  .turn-navigation-marker.selected-neighbor::before {
     opacity: 0.78;
     background: color-mix(in srgb, var(--foreground) 62%, var(--border));
     animation: none;
   }
 
-  .turn-navigation-marker.selected {
+  .turn-navigation-marker.selected::before {
     width: 20px;
     opacity: 1;
     background: var(--foreground);
@@ -531,7 +545,7 @@
     justify-content: center;
     gap: 5px;
     width: 54px;
-    height: 36px;
+    height: 44px;
     padding: 0 9px;
     border-radius: var(--radius-full);
     color: var(--foreground);
@@ -558,7 +572,7 @@
   .turn-navigation-menu {
     position: absolute;
     right: 0;
-    bottom: 44px;
+    bottom: 52px;
     width: min(340px, calc(100vw - 30px));
     max-height: 410px;
     overflow: auto;
@@ -580,12 +594,14 @@
     grid-template-columns: 20px minmax(0, 1fr);
     gap: var(--space-2);
     width: 100%;
+    min-height: 44px;
     padding: var(--space-2) var(--space-3);
     border: 0;
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--foreground);
     text-align: left;
+    align-items: center;
     cursor: pointer;
   }
 
@@ -646,13 +662,13 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .turn-navigation-marker,
+    .turn-navigation-marker::before,
     .turn-navigation-rail,
     .turn-navigation-preview {
       transition: none;
     }
 
-    .turn-navigation-marker.running,
+    .turn-navigation-marker.running::before,
     .turn-navigation-status-dot {
       animation: none;
     }
