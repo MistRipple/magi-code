@@ -3,7 +3,7 @@
   import FileSpan from './FileSpan.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
-  import AccessProfileSwitchAction from './AccessProfileSwitchAction.svelte';
+  import ToolApprovalAction from './ToolApprovalAction.svelte';
   import type { FilePreviewScope } from '../lib/file-reference';
   import { vscode } from '../lib/vscode-bridge';
   import { extractLeadingJson } from '../lib/terminal-utils';
@@ -30,8 +30,8 @@
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import {
     ACCESS_MODE_APPROVAL_ERROR_CODES,
-    isAccessModeApprovalErrorPayload,
     isStructuredToolErrorPayload,
+    parseToolApprovalPayload,
     parseToolPayloadRecord,
     publicToolPayloadMessage,
     toolPayloadErrorCode,
@@ -44,6 +44,8 @@
     resolveToolCardTarget,
     sanitizeToolDisplayPayload,
   } from '../lib/tool-call-display';
+  import type { ConversationPresentationRole } from '../lib/conversation-presentation';
+  import { untrack } from 'svelte';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -65,6 +67,7 @@
     duration?: number;
     filepath?: string;
     filePreviewScope?: FilePreviewScope;
+    presentationRole?: ConversationPresentationRole;
   }
 
   let {
@@ -77,13 +80,16 @@
     status = 'success',
     filepath,
     filePreviewScope = undefined,
+    presentationRole = 'process',
   }: Props = $props();
 
-  // 工具过程默认保持折叠；状态更新不得覆盖用户主动展开或收起的选择。
-  let collapsed = $state(true);
+  // 过程工具默认折叠；摘要投影提升出的用户产物和待处理事项默认直接可见。
+  // 首次渲染后不再跟随状态更新，避免覆盖用户主动展开或收起的选择。
+  let collapsed = $state(untrack(() => presentationRole !== 'artifact' && presentationRole !== 'attention'));
   let copySuccess = $state(false);
   let lastLoggedErrorSignature = $state('');
   let lastReportedAgentSpawnFailureSignature = $state('');
+  let lastAutoExpandedApprovalId = $state('');
 
   // 格式化内容
   function formatContent(content: unknown): string {
@@ -392,8 +398,13 @@
   const hasInput = $derived(
     hasDisplayContent(sanitizedInput) || hasInternalRedactedDisplayValue(input),
   );
-  const outputIsStructuredError = $derived(isStructuredToolErrorPayload(output));
-  const hasOutput = $derived(!outputIsStructuredError && hasDisplayContent(output));
+  const toolApproval = $derived.by(() => (
+    parseToolApprovalPayload(output)
+    || parseToolApprovalPayload(error)
+    || parseToolApprovalPayload(standardized?.message)
+  ));
+  const outputIsStructuredError = $derived(!toolApproval && isStructuredToolErrorPayload(output));
+  const hasOutput = $derived(!toolApproval && !outputIsStructuredError && hasDisplayContent(output));
   const structuredErrorText = $derived.by(() => {
     if (!outputIsStructuredError) {
       return '';
@@ -412,8 +423,12 @@
   const errorForDiagnosis = $derived((error && error.trim()) || structuredErrorText);
   const hasError = $derived(!!errorForDiagnosis);
 
-  const hasContent = $derived(hasInput || hasOutput || hasError);
-  const canExpand = $derived(hasContent && !isCompactReadOnlyTool && !isCompactMutation);
+  const hasContent = $derived(hasInput || hasOutput || hasError || Boolean(toolApproval));
+  // 待授权是用户必须处理的交互，即使它来自文件变更这类紧凑工具，也不能
+  // 被紧凑卡片规则吞掉；授权状态会自动展开到卡片内容区。
+  const canExpand = $derived(
+    hasContent && (Boolean(toolApproval) || (!isCompactReadOnlyTool && !isCompactMutation)),
+  );
   const shouldRenderCard = $derived(hasContent || isCompactReadOnlyTool || isCompactMutation);
   const detailId = $derived(
     id ? `tool-call-detail-${id.replace(/[^a-zA-Z0-9_-]/gu, '-')}` : undefined,
@@ -448,6 +463,13 @@
     detailVisible ? parseToolDiagramPayload(name, output) : null,
   );
   const isDiagramTool = $derived(!!diagramPayload);
+
+  $effect(() => {
+    const approvalId = toolApproval?.approvalId || '';
+    if (!approvalId || approvalId === lastAutoExpandedApprovalId) return;
+    lastAutoExpandedApprovalId = approvalId;
+    collapsed = false;
+  });
 
   const skillApplyPolicy = $derived.by(() => {
     if (!detailVisible || name !== 'skill_apply') return null;
@@ -599,11 +621,6 @@
     ).toLowerCase();
   }
 
-  function isAccessModeApprovalError(errorText?: string, toolResult?: StandardizedToolResult): boolean {
-    const errorCode = toolErrorCodeForDiagnosis(errorText, toolResult);
-    return ACCESS_MODE_APPROVAL_ERROR_CODES.some((pattern) => errorCode.includes(pattern));
-  }
-
   function detectErrorDiagnosis(errorText?: string, toolResult?: StandardizedToolResult): ErrorDiagnosis | null {
     const rawMessage = `${toolResult?.message || ''}\n${errorText || ''}`.trim();
     if (!rawMessage) return null;
@@ -752,12 +769,6 @@
   }
 
   const errorDiagnosis = $derived.by(() => detectErrorDiagnosis(errorForDiagnosis, standardized));
-  const shouldOfferFullAccessSwitch = $derived.by(() =>
-    isAccessModeApprovalError(errorForDiagnosis, standardized)
-    || isAccessModeApprovalErrorPayload(output)
-    || isAccessModeApprovalErrorPayload(error)
-    || isAccessModeApprovalErrorPayload(standardized?.message)
-  );
   const publicPayloadErrorMessage = $derived(
     publicToolPayloadMessage(output)
     || publicToolPayloadMessage(error)
@@ -1029,6 +1040,12 @@
             </div>
           {/if}
 
+          {#if toolApproval}
+            <div class="tool-section approval">
+              <ToolApprovalAction approval={toolApproval} />
+            </div>
+          {/if}
+
           {#if hasOutput}
             <div class="tool-section diagram-section">
               {#if diagramPayload}
@@ -1134,9 +1151,6 @@
               <div class="section-content error-content">{publicErrorMessage}</div>
               {#if errorDiagnosis}
                 <div class="error-hint">{errorDiagnosis.hint}</div>
-              {/if}
-              {#if shouldOfferFullAccessSwitch}
-                <AccessProfileSwitchAction />
               {/if}
             </div>
           {/if}

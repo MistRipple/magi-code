@@ -11,10 +11,16 @@
     resolveCurrentConversationTurnStartedAt,
   } from '../lib/conversation-runtime-records';
   import MessageList from './MessageList.svelte';
+  import ConversationApprovalTray from './ConversationApprovalTray.svelte';
   import InputArea from './InputArea.svelte';
   import RuntimeStatePanel from './RuntimeStatePanel.svelte';
   import GoalRunDrawers from './GoalRunDrawers.svelte';
   import ActiveAgentCenter from './ActiveAgentCenter.svelte';
+  import { parseToolApprovalPayload } from '../lib/tool-error-payload';
+  import {
+    syncToolApprovals,
+    toolApprovalState,
+  } from '../stores/tool-approval-store.svelte';
 
   interface Props {
     isTopActive?: boolean;
@@ -47,6 +53,40 @@
   const conversationStartedAt = $derived(
     resolveCurrentConversationTurnStartedAt(threadRenderItems),
   );
+  const anchoredApprovalIds = $derived.by(() => {
+    const ids = new Set<string>();
+    for (const item of threadRenderItems) {
+      for (const block of item.message.blocks || []) {
+        if (!block || typeof block !== 'object') continue;
+        const toolCall = block.toolCall;
+        if (!toolCall) continue;
+        const approval = parseToolApprovalPayload(toolCall.result)
+          || parseToolApprovalPayload(toolCall.error)
+          || parseToolApprovalPayload(toolCall.standardized?.message)
+          || parseToolApprovalPayload(block.content);
+        if (approval) ids.add(approval.approvalId);
+      }
+    }
+    return ids;
+  });
+  const unanchoredApprovals = $derived.by(() => (
+    toolApprovalState.pending.filter((approval) => !anchoredApprovalIds.has(approval.approvalId))
+  ));
+  let lastApprovalSyncKey = '';
+  $effect(() => {
+    if (!messagesState.bootstrapped) return;
+    const sessionId = messagesState.currentSessionId?.trim() || '';
+    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
+    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
+    const scope = workspaceId || workspacePath ? 'workspace' : 'personal';
+    const approvalIds = [...anchoredApprovalIds].sort().join('|');
+    const syncKey = `${scope}:${workspaceId}:${workspacePath}:${sessionId}:${approvalIds}`;
+    if (syncKey === lastApprovalSyncKey) return;
+    lastApprovalSyncKey = syncKey;
+    void syncToolApprovals(sessionId, scope === 'workspace'
+      ? { scope, workspaceId, workspacePath }
+      : { scope });
+  });
 </script>
 
 <div class="thread-panel" data-desktop-drop-zone="conversation">
@@ -59,6 +99,7 @@
   />
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
+    <ConversationApprovalTray approvals={unanchoredApprovals} />
     <ActiveAgentCenter />
   </div>
 

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 pub const TOOL_EXECUTION_FAILED_PUBLIC_ERROR: &str = "工具执行失败，请稍后重试";
 pub const TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
-    "安全防护已在受限访问下拦截该操作，请切换为完全访问权限后重试";
+    "安全防护要求确认该操作，授权后将继续当前调用";
 /// 模型可见的单个工具结果上限。完整结果仍由审计、UI 和恢复状态保存。
 pub const MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES: usize = 12 * 1024;
 /// 单轮模型上下文中所有历史工具结果的总预算。
@@ -122,6 +122,32 @@ pub fn tool_result_execution_status(result: &str) -> ExecutionResultStatus {
     }
 }
 
+/// 运行时只有在明确声明“尚未产生副作用、可用同一参数继续”时，才允许授权后
+/// 重新进入执行入口。缺少该契约的 NeedsApproval 必须作为运行时协议错误处理。
+pub(crate) fn approval_resume_is_safe(result: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("approval_resume_safe")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn approval_resume_contract_failure(tool_name: &str) -> (String, ExecutionResultStatus) {
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": "failed",
+            "error_code": "tool_approval_resume_contract_invalid",
+            "error": "工具未声明可安全恢复，已阻止授权后重复执行",
+        })
+        .to_string(),
+        ExecutionResultStatus::Failed,
+    )
+}
+
 pub fn safety_gate_public_error(status: ExecutionResultStatus) -> PublicToolError {
     match status {
         ExecutionResultStatus::NeedsApproval => PublicToolError {
@@ -155,7 +181,7 @@ pub fn tool_execution_failed_result(tool_name: &str) -> (String, ExecutionResult
 pub fn turn_item_status_for_tool_result(status: ExecutionResultStatus) -> &'static str {
     match status {
         ExecutionResultStatus::Succeeded => "completed",
-        ExecutionResultStatus::NeedsApproval => "failed",
+        ExecutionResultStatus::NeedsApproval => "awaiting_approval",
         ExecutionResultStatus::Failed
         | ExecutionResultStatus::Rejected
         | ExecutionResultStatus::Cancelled => "failed",
@@ -492,7 +518,7 @@ mod tests {
         );
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::NeedsApproval),
-            "failed"
+            "awaiting_approval"
         );
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::Cancelled),
@@ -568,7 +594,7 @@ mod tests {
 
     #[test]
     fn model_visible_tool_result_keeps_structured_error_for_recovery() {
-        let result = r#"{"status":"needs_approval","error_code":"tool_policy_needs_approval","error":"受限访问已拦截该操作，请切换为完全访问权限后重试","access_profile":"restricted","required_access_profile":"full_access"}"#;
+        let result = r#"{"status":"needs_approval","error_code":"tool_policy_needs_approval","error":"该操作需要你的确认，授权后将继续当前调用","access_profile":"restricted","required_access_profile":"full_access"}"#;
 
         assert_eq!(
             model_visible_tool_result(result, ExecutionResultStatus::NeedsApproval),

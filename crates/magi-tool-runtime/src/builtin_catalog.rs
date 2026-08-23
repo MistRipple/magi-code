@@ -2262,7 +2262,7 @@ pub fn builtin_permission_engine() -> magi_permissions::PermissionEngine {
 
 pub(crate) const TOOL_POLICY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前上下文中不可用";
 pub(crate) const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
-    "受限访问已拦截该操作，请切换为完全访问权限后重试";
+    "该操作需要你的确认，授权后将继续当前调用";
 
 pub(crate) fn tool_policy_decision_payload(
     tool_name: &str,
@@ -2296,6 +2296,7 @@ pub(crate) fn tool_policy_decision_payload(
         "error_code": error_code,
         "error": public_error,
         "access_profile": access_profile.as_str(),
+        "approval_resume_safe": status == ExecutionResultStatus::NeedsApproval,
     })
     .to_string()
 }

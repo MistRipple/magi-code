@@ -289,7 +289,7 @@ await withGoldenViteServer(async (server) => {
     );
     assert.equal(gitRequests[0].body.includeRemote, true);
     assert.equal(gitRequests[0].body.workspaceId, undefined);
-    assert.equal(gitRequests[0].body.workspacePath, undefined);
+    assert.equal(gitRequests[0].body.workspacePath, '/tmp/workspace-query-golden');
     assert.equal(gitRequests[0].body.sessionId, 'session-query-golden');
     assert.equal(gitRequests[2].body.confirm, true);
     assert.equal(gitRequests[3].body.confirmForce, true);

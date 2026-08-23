@@ -39,7 +39,6 @@ assert.doesNotMatch(
 );
 
 for (const [component, source] of [
-  ['ToolCall', toolCallSource],
   ['TerminalSessionCard', terminalCardSource],
 ]) {
   assert.match(source, /let collapsed = \$state\(true\);/, `${component} 必须默认折叠`);
@@ -54,6 +53,32 @@ for (const [component, source] of [
     `${component} 的展开按钮必须暴露真实可访问状态`,
   );
 }
+
+assert.match(
+  toolCallSource,
+  /let collapsed = \$state\(untrack\(\(\) => presentationRole !== 'artifact' && presentationRole !== 'attention'\)\);/,
+  '普通工具过程必须默认折叠，用户产物和待处理事项必须默认可见',
+);
+assert.match(
+  toolCallSource,
+  /presentationRole\?: ConversationPresentationRole;/,
+  '工具卡必须接收统一的对话展示角色，而不是维护摘要模式专用实现',
+);
+assert.match(
+  toolCallSource,
+  /aria-expanded=\{!collapsed\}/,
+  'ToolCall 的展开按钮必须暴露真实可访问状态',
+);
+assert.match(
+  toolCallSource,
+  /const approvalId = toolApproval\?\.approvalId \|\| '';[\s\S]*?collapsed = false;/,
+  '待授权工具必须自动展开授权动作，但不得因普通运行态自动展开',
+);
+assert.match(
+  toolCallSource,
+  /const canExpand = \$derived\([\s\S]*?Boolean\(toolApproval\) \|\| \(!isCompactReadOnlyTool && !isCompactMutation\)/,
+  '紧凑文件工具出现待授权状态时必须保留可展开的授权动作',
+);
 
 assert.match(
   toolCallSource,
@@ -132,7 +157,7 @@ assert.doesNotMatch(
 );
 assert.match(
   conversationToolGroupSource,
-  /\.tool-group-list\s*\{[\s\S]*?padding:\s*2px 0 2px 18px;[\s\S]*?border-left:\s*0;/,
+  /\.tool-group-list\s*\{[\s\S]*?padding:\s*2px 0 2px 8px;[\s\S]*?border-left:\s*0;/,
   '工具组内容只允许一级紧凑缩进，不能叠加第二条装饰线',
 );
 assert.doesNotMatch(
@@ -147,7 +172,7 @@ assert.doesNotMatch(
 );
 assert.match(
   conversationTurnSource,
-  /\.turn-process\s*\{[\s\S]*?padding:\s*0 0 var\(--space-2\) 12px;/,
+  /\.turn-process-entry\s*\{[\s\S]*?padding-left:\s*8px;/,
   '摘要过程必须保持紧凑的单层缩进',
 );
 assert.match(

@@ -57,6 +57,9 @@ import type {
   SessionDeleteRequestDto,
   SessionInterruptRequestDto,
   SessionInterruptResponseDto,
+  SessionToolApprovalRequestDto,
+  SessionToolApprovalResponseDto,
+  SessionToolApprovalsResponseDto,
   NotificationsResponseDto,
   SessionRenameRequestDto,
   ExecutionStatsResponseDto,
@@ -198,6 +201,23 @@ export class RustDaemonClient {
     request: SessionInterruptRequestDto,
   ): Promise<SessionInterruptResponseDto> {
     return this.postJson<SessionInterruptResponseDto>('/api/session/interrupt', request);
+  }
+
+  public async fetchSessionToolApprovals(
+    request: Pick<SessionToolApprovalRequestDto, 'sessionId' | 'workspaceId' | 'workspacePath'>,
+  ): Promise<SessionToolApprovalsResponseDto> {
+    const query = new URLSearchParams({ sessionId: request.sessionId });
+    if (request.workspaceId?.trim()) query.set('workspaceId', request.workspaceId.trim());
+    if (request.workspacePath?.trim()) query.set('workspacePath', request.workspacePath.trim());
+    return this.getJson<SessionToolApprovalsResponseDto>(
+      `/api/session/tool-approvals?${query.toString()}`,
+    );
+  }
+
+  public async resolveSessionToolApproval(
+    request: SessionToolApprovalRequestDto,
+  ): Promise<SessionToolApprovalResponseDto> {
+    return this.postJson<SessionToolApprovalResponseDto>('/api/session/tool-approval', request);
   }
 
   // ─── Session management ───────────────────────────────────────────

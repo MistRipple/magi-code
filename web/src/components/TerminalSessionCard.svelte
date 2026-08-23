@@ -1,6 +1,5 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import AccessProfileSwitchAction from './AccessProfileSwitchAction.svelte';
   import {
     parseLeadingJson,
     resolveTerminalArgumentId,
@@ -10,7 +9,6 @@
   import { i18n } from '../stores/i18n.svelte';
   import type { ToolCall, TerminalSessionBlock } from '../types/message';
   import {
-    isAccessModeApprovalErrorPayload,
     isStructuredToolErrorPayload,
     publicToolPayloadMessage,
     toolPayloadStatus,
@@ -248,10 +246,6 @@
     publicToolPayloadMessage(structuredErrorPayload)
     || publicToolPayloadMessage(toolCall?.error)
   );
-  const shouldOfferFullAccessSwitch = $derived(
-    isAccessModeApprovalErrorPayload(structuredErrorPayload)
-    || isAccessModeApprovalErrorPayload(toolCall?.error)
-  );
   const errorText = $derived(
     terminal?.error
     || terminalPayloadErrorText(structuredErrorPayload)
@@ -461,11 +455,6 @@
         {#if showErrorHint}
           <div class="terminal-error">{i18n.t('terminalSession.error')}: {publicErrorText || errorText || i18n.t('terminalSession.errorHint')}</div>
         {/if}
-        {#if shouldOfferFullAccessSwitch}
-          <div class="terminal-hint">{i18n.t('toolCall.errorDiagnosis.permission.hint')}</div>
-          <AccessProfileSwitchAction />
-        {/if}
-
         {#if showFooter}
           <div class="terminal-footer">
             {#if typeof outputCursor === 'number'}

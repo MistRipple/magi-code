@@ -22,6 +22,7 @@
   import { parseToolCallFailureDiagnostic } from '../lib/tool-call-failure';
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import { browserAnnotationArtifactUrl } from '../web/agent-api';
+  import type { ConversationPresentationRole } from '../lib/conversation-presentation';
 
   // Props
   interface Props {
@@ -36,6 +37,8 @@
     onContinueInterrupted?: () => void;
     /** 轮次折叠容器已在外层展示总耗时时，避免最终消息重复显示。 */
     hideResponseDuration?: boolean;
+    /** 摘要投影中的语义角色；原始模式不传入，保持现有时间线呈现。 */
+    presentationRole?: ConversationPresentationRole;
   }
   let {
     message,
@@ -46,6 +49,7 @@
     onEdit = undefined,
     onContinueInterrupted = undefined,
     hideResponseDuration = false,
+    presentationRole = 'process',
   }: Props = $props();
 
   let copied = $state(false);
@@ -562,7 +566,7 @@
             {@const blockIsStreaming = block.type === 'thinking'
               ? (isStreaming && i === presentationBlocks.length - 1)
               : isStreaming}
-            <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} {filePreviewScope} />
+            <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} {filePreviewScope} {presentationRole} />
           {/each}
         {:else if message.content}
           <MarkdownContent content={message.content} {isStreaming} {filePreviewScope} />

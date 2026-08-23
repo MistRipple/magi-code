@@ -165,6 +165,7 @@ import {
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
+import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 const pendingBridgeMessages: ClientBridgeMessage[] = [];
@@ -1684,6 +1685,23 @@ function shouldRefreshCurrentSessionSummary(eventType: string): boolean {
   return eventType === 'message.created' || eventType === 'session.viewed';
 }
 
+function refreshCurrentSessionToolApprovals(reason: string): void {
+  const sessionId = currentSessionId.trim();
+  if (!sessionId) {
+    return;
+  }
+  const binding = currentSessionScope === 'workspace'
+    ? {
+        scope: 'workspace' as const,
+        workspaceId: currentWorkspaceId,
+        workspacePath: currentWorkspacePath,
+      }
+    : { scope: 'personal' as const };
+  void syncToolApprovals(sessionId, binding).catch((error) => {
+    console.warn(`[web-client-bridge] 权限状态同步失败(${reason}):`, error);
+  });
+}
+
 const TURN_TERMINAL_EVENTS = new Set([
   'session.turn.completed',
   'session.turn.failed',
@@ -1958,6 +1976,13 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         payload: event.payload ?? {},
       },
     }));
+    return;
+  }
+
+  // 授权请求与授权结果都通过同一事件流进入前端。这里刷新会话级授权投影，
+  // 让主会话和子代理共用一个待处理托盘，不依赖轮询或“重新打开会话”才能看到按钮。
+  if (eventType === 'tool.approval.requested' || eventType === 'tool.approval.resolved') {
+    refreshCurrentSessionToolApprovals(eventType);
     return;
   }
 

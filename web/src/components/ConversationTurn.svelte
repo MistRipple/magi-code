@@ -10,6 +10,10 @@
   import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import ConversationProcessRow from './ConversationProcessRow.svelte';
   import ConversationToolGroup from './ConversationToolGroup.svelte';
+  import ConversationAgentGroup from './ConversationAgentGroup.svelte';
+  import {
+    conversationPresentationRole,
+  } from '../lib/conversation-presentation';
 
   interface Props {
     turnId: string;
@@ -25,9 +29,11 @@
     continueInterruptedSession: () => void;
   }
 
-  type ConversationProcessEntry =
+  type ConversationStreamEntry =
     | { kind: 'event'; key: string; item: TimelineRenderItem }
-    | { kind: 'tool-group'; key: string; items: TimelineRenderItem[] };
+    | { kind: 'tool-group'; key: string; items: TimelineRenderItem[] }
+    | { kind: 'item'; key: string; item: TimelineRenderItem; role: 'artifact' | 'attention' }
+    | { kind: 'agent-group'; key: string; items: TimelineRenderItem[] };
 
   let {
     turnId,
@@ -54,7 +60,9 @@
   function isToolLikeMessage(message: Message): boolean {
     return message.type === 'tool_call'
       || (message.blocks || []).some((block) => (
-        block.type === 'tool_call' || block.type === 'tool_result' || block.type === 'file_change'
+        Boolean(block)
+          && typeof block === 'object'
+          && (block.type === 'tool_call' || block.type === 'tool_result' || block.type === 'file_change')
       ));
   }
 
@@ -71,10 +79,12 @@
     return Boolean(
       message.content?.trim()
       || (message.blocks || []).some((block) => (
-        Boolean(block.content?.trim())
-          || block.type === 'file_change'
-          || block.type === 'plan'
-          || block.type === 'code'
+        Boolean(block)
+          && typeof block === 'object'
+          && (Boolean(block.content?.trim())
+            || block.type === 'file_change'
+            || block.type === 'plan'
+            || block.type === 'code')
       )),
     );
   }
@@ -92,10 +102,19 @@
     return [];
   });
   const finalItemKeys = $derived(new Set(finalItems.map((item) => item.key)));
-  const processItems = $derived(assistantItems.filter((item) => !finalItemKeys.has(item.key)));
-
-  const processEntries = $derived.by(() => {
-    const result: ConversationProcessEntry[] = [];
+  const presentationItems = $derived(assistantItems.map((item) => ({
+    item,
+    role: conversationPresentationRole(item, finalItemKeys),
+  })));
+  const processItems = $derived(
+    presentationItems.filter((entry) => entry.role === 'process').map((entry) => entry.item),
+  );
+  const delegationItems = $derived(
+    presentationItems.filter((entry) => entry.role === 'delegation').map((entry) => entry.item),
+  );
+  const streamEntries = $derived.by(() => {
+    const result: ConversationStreamEntry[] = [];
+    let agentGroupEmitted = false;
     let toolGroupItems: TimelineRenderItem[] = [];
     const hasToolItems = processItems.some((item) => isToolLikeMessage(item.message));
 
@@ -110,22 +129,48 @@
       toolGroupItems = [];
     };
 
-    for (const item of processItems) {
-      if (isToolLikeMessage(item.message)) {
-        toolGroupItems.push(item);
+    for (const entry of presentationItems) {
+      if (entry.role === 'final') continue;
+      if (entry.role === 'delegation') {
+        flushToolGroup();
+        if (!agentGroupEmitted) {
+          result.push({
+            kind: 'agent-group',
+            key: `agent-group:${entry.item.key}`,
+            items: delegationItems,
+          });
+          agentGroupEmitted = true;
+        }
+        continue;
+      }
+      if (entry.role === 'artifact' || entry.role === 'attention') {
+        flushToolGroup();
+        result.push({
+          kind: 'item',
+          key: `${entry.role}:${entry.item.key}`,
+          item: entry.item,
+          role: entry.role,
+        });
+        continue;
+      }
+      if (isToolLikeMessage(entry.item.message)) {
+        toolGroupItems.push(entry.item);
         continue;
       }
       // 同一轮中的思考输出只是模型内部过程，不应把连续工具调用切成多个组。
       // 有工具时省略这些重复的思考行；没有工具时仍保留思考事件供用户展开查看。
-      if (hasToolItems && item.message.type === 'thinking') continue;
+      if (hasToolItems && entry.item.message.type === 'thinking') continue;
       flushToolGroup();
-      result.push({ kind: 'event', key: `event:${item.key}`, item });
+      result.push({ kind: 'event', key: `event:${entry.item.key}`, item: entry.item });
     }
     flushToolGroup();
     return result;
   });
 
-  const hasProcess = $derived(processEntries.length > 0 || runtimeActive);
+  const hasProcess = $derived(
+    streamEntries.some((entry) => entry.kind === 'event' || entry.kind === 'tool-group')
+      || runtimeActive,
+  );
   const isLive = $derived(
     runtimeActive
       || items.some((item) => item.message.isStreaming)
@@ -194,32 +239,61 @@
         </span>
       </button>
 
-      {#if expanded}
-        <div class="turn-process" id={`turn-process-${turnId}`}>
-          {#each processEntries as entry (entry.key)}
-            {#if entry.kind === 'event'}
-              <ConversationProcessRow item={entry.item} />
-            {:else}
-              <ConversationToolGroup
-                items={entry.items}
-                {readOnly}
-                {displayContext}
-                {filePreviewScopeForItem}
-                {continueInterruptedSession}
-              />
-            {/if}
-          {/each}
-          {#if runtimeActive}
-            <TurnRuntimeIndicator {elapsedSeconds} />
-          {/if}
-        </div>
-      {/if}
     </section>
   {:else if durationLabel}
     <div class="turn-status-header">
       <span class="turn-disclosure-label">{disclosureLabel}</span>
     </div>
   {/if}
+
+  <div class="turn-stream" id={`turn-process-${turnId}`}>
+  {#each streamEntries as entry (entry.key)}
+    {#if entry.kind === 'event'}
+      {#if expanded}
+        <div class="turn-process-entry"><ConversationProcessRow item={entry.item} /></div>
+      {/if}
+    {:else if entry.kind === 'tool-group'}
+      {#if expanded}
+        <div class="turn-process-entry">
+          <ConversationToolGroup
+            items={entry.items}
+            {readOnly}
+            {displayContext}
+            {filePreviewScopeForItem}
+            {continueInterruptedSession}
+          />
+        </div>
+      {/if}
+    {:else if entry.kind === 'agent-group'}
+      <ConversationAgentGroup
+        items={entry.items}
+        {readOnly}
+        {displayContext}
+        {filePreviewScopeForItem}
+        {continueInterruptedSession}
+      />
+    {:else}
+      <section
+        class="turn-promoted"
+        data-turn-attention={entry.role === 'attention' ? 'true' : undefined}
+        data-turn-artifact={entry.role === 'artifact' ? 'true' : undefined}
+      >
+        <MessageItem
+          message={entry.item.message}
+          {readOnly}
+          {displayContext}
+          filePreviewScope={filePreviewScopeForItem(entry.item)}
+          onContinueInterrupted={continueInterruptedSession}
+          hideResponseDuration
+          presentationRole={entry.role}
+        />
+      </section>
+    {/if}
+  {/each}
+  {#if expanded && runtimeActive}
+    <div class="turn-process-entry turn-runtime-row"><TurnRuntimeIndicator {elapsedSeconds} /></div>
+  {/if}
+  </div>
 
   {#each finalItems as item (item.key)}
     <MessageItem
@@ -302,22 +376,35 @@
     color: var(--foreground);
   }
 
-  .turn-process {
+  .turn-stream {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    margin-top: var(--space-3);
-    padding: 0 0 var(--space-2) 12px;
+    min-width: 0;
+  }
+
+  .turn-process-entry {
+    min-width: 0;
+    padding-left: 8px;
     border-left: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
   }
 
-  .turn-process :global(.turn-runtime-indicator) {
+  .turn-runtime-row :global(.turn-runtime-indicator) {
     margin-left: 0;
   }
 
+  .turn-promoted {
+    min-width: 0;
+    padding: 2px 0;
+  }
+
+  .turn-promoted :global(.message-item.assistant) {
+    padding-inline: 0;
+  }
+
   @media (max-width: 560px) {
-    .turn-process {
-      padding-left: 10px;
+    .turn-process-entry {
+      padding-left: 6px;
     }
   }
 </style>

@@ -1168,6 +1168,27 @@ fn sanitize_git_path_component(value: &str) -> String {
     }
 }
 
+fn project_policy_paths_to_execution_root(
+    paths: &[String],
+    workspace_identity_root: &PathBuf,
+    execution_root: &PathBuf,
+) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            let source = PathBuf::from(path);
+            let Ok(relative) = source.strip_prefix(workspace_identity_root) else {
+                return path.clone();
+            };
+            if relative.as_os_str().is_empty() {
+                execution_root.to_string_lossy().into_owned()
+            } else {
+                execution_root.join(relative).to_string_lossy().into_owned()
+            }
+        })
+        .collect()
+}
+
 fn block_on_git<F>(future: F) -> F::Output
 where
     F: Future + Send,
@@ -1366,6 +1387,44 @@ impl LlmTaskDispatcher {
             }),
         );
         Ok(Some(path))
+    }
+
+    /// TaskPolicy 持久化的是逻辑 workspace 边界；子代理进入隔离 worktree 后，
+    /// 同一边界必须投影到当前执行实例的物理根目录。这里只替换 workspace 内路径，
+    /// 显式授权的外部引用路径保持不变，避免把整个 agent worktree 上级目录放入白名单。
+    fn task_for_execution_root(
+        task: &magi_core::Task,
+        workspace_identity_root: Option<&PathBuf>,
+        execution_root: Option<&PathBuf>,
+    ) -> magi_core::Task {
+        let mut projected = task.clone();
+        let (Some(identity_root), Some(execution_root), Some(policy)) = (
+            workspace_identity_root,
+            execution_root,
+            projected.policy_snapshot.as_mut(),
+        ) else {
+            return projected;
+        };
+        if identity_root == execution_root {
+            return projected;
+        }
+
+        policy.allowed_paths = project_policy_paths_to_execution_root(
+            &policy.allowed_paths,
+            identity_root,
+            execution_root,
+        );
+        policy.denied_paths = project_policy_paths_to_execution_root(
+            &policy.denied_paths,
+            identity_root,
+            execution_root,
+        );
+        policy.read_only_paths = project_policy_paths_to_execution_root(
+            &policy.read_only_paths,
+            identity_root,
+            execution_root,
+        );
+        projected
     }
 
     /// 子代理模型调用结束后立即结束 worktree 的 active 生命周期。
@@ -2096,15 +2155,23 @@ impl LlmTaskDispatcher {
                 return (TaskOutcome::Failed { error }, None);
             }
         };
+        let execution_task = Self::task_for_execution_root(
+            task,
+            workspace_identity_root_path.as_ref(),
+            workspace_root_path.as_ref(),
+        );
 
         let tools = if use_tools {
-            let access_profile = task
+            let access_profile = execution_task
                 .policy_snapshot
                 .as_ref()
                 .map(magi_core::TaskPolicy::effective_access_profile)
                 .unwrap_or_default();
-            let tool_defs =
-                self.build_tool_definitions(Some(task), skill_name.as_deref(), access_profile);
+            let tool_defs = self.build_tool_definitions(
+                Some(&execution_task),
+                skill_name.as_deref(),
+                access_profile,
+            );
             if tool_defs.is_empty() {
                 None
             } else {
@@ -2166,7 +2233,7 @@ impl LlmTaskDispatcher {
             plan_store: &plan_store,
             project_memory: project_memory.as_deref(),
             mission_metrics: mission_metrics.as_ref(),
-            task,
+            task: &execution_task,
             task_id,
             lease_id,
             session_id,
@@ -2974,6 +3041,73 @@ mod tests {
             "git {:?} failed: {}",
             args,
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sidechain_projects_workspace_policy_paths_to_agent_execution_root() {
+        let identity_root = PathBuf::from("/workspace/project");
+        let execution_root = PathBuf::from("/runtime/agent-worktree");
+        let mut task = task_with_role("explorer", TaskTier::ExecutionChain);
+        let policy = task.policy_snapshot.as_mut().expect("task policy");
+        policy.allowed_paths = vec![
+            identity_root.to_string_lossy().into_owned(),
+            "/shared/reference".to_string(),
+        ];
+        policy.denied_paths = vec![identity_root.join("private").to_string_lossy().into_owned()];
+        policy.read_only_paths = vec![identity_root.join("vendor").to_string_lossy().into_owned()];
+
+        let projected = LlmTaskDispatcher::task_for_execution_root(
+            &task,
+            Some(&identity_root),
+            Some(&execution_root),
+        );
+        let projected_policy = projected.policy_snapshot.expect("projected policy");
+
+        assert_eq!(
+            projected_policy.allowed_paths,
+            vec![
+                execution_root.to_string_lossy().into_owned(),
+                "/shared/reference".to_string(),
+            ]
+        );
+        assert_eq!(
+            projected_policy.denied_paths,
+            vec![
+                execution_root
+                    .join("private")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+        assert_eq!(
+            projected_policy.read_only_paths,
+            vec![execution_root.join("vendor").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            task.policy_snapshot
+                .as_ref()
+                .expect("source policy")
+                .allowed_paths[0],
+            identity_root.to_string_lossy()
+        );
+        let decision = crate::tool_batch::access_profile_tool_decision(
+            crate::tool_batch::AccessProfileToolDecisionInput {
+                access_profile: projected_policy.access_profile,
+                command_mode: &projected_policy.command_mode,
+                allowed_tools: &projected_policy.allowed_tools,
+                denied_tools: &projected_policy.denied_tools,
+                allowed_paths: &projected_policy.allowed_paths,
+                denied_paths: &projected_policy.denied_paths,
+                read_only_paths: &projected_policy.read_only_paths,
+                requested_tool_name: BuiltinToolName::FileRead.as_str(),
+                arguments: r#"{"path":"crates/magi-api/src/routes/sessions.rs"}"#,
+                workspace_root_path: Some(&execution_root),
+            },
+        );
+        assert!(
+            decision.is_none(),
+            "子代理相对执行根目录读取工作区文件不应被继承的逻辑路径策略拒绝"
         );
     }
 

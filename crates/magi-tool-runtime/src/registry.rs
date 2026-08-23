@@ -124,8 +124,9 @@ impl ToolRegistry {
                             "tool": model_tool_name,
                             "status": "needs_approval",
                             "error_code": "mcp_requires_full_access",
-                            "error": "受限访问已拦截该 MCP 工具，请切换为完全访问权限后重试",
+                            "error": "该 MCP 工具需要你的确认，授权后将继续当前调用",
                             "access_profile": "restricted",
+                            "approval_resume_safe": true,
                         })
                         .to_string(),
                         ExecutionResultStatus::NeedsApproval,

@@ -33,6 +33,7 @@ pub mod task_execution_registry;
 pub mod task_helpers;
 pub mod task_runner;
 pub mod task_runner_bridge;
+pub mod tool_approval;
 pub mod tool_batch;
 mod tool_call_validation;
 mod tool_declared_paths;
@@ -75,6 +76,9 @@ pub use task_helpers::{
     required_tool_definitions_for_round, strict_goal_mode_tool_definitions_for_round,
     task_required_tool_chain, task_turn_visibility, tool_reference_position,
     validation_result_rejects_delivery,
+};
+pub use tool_approval::{
+    PendingToolApproval, ToolApprovalDecision, ToolApprovalRegistry, ToolApprovalRequestOutcome,
 };
 pub(crate) use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};

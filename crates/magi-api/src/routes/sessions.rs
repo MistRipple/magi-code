@@ -5,8 +5,8 @@ use axum::{
 };
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    SessionTurnInputCommitError, SessionTurnInputError, UserSignal,
-    requested_public_builtin_tool_chain, requested_required_tool_chain,
+    PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
+    UserSignal, requested_public_builtin_tool_chain, requested_required_tool_chain,
 };
 use magi_core::{
     AccessProfile, DomainError, EventId, SessionId, TaskCompletionContract,
@@ -57,6 +57,11 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/session/queue/guide", post(guide_session_turn_queue_item))
         .route("/session/interrupt", post(interrupt_session_turn))
+        .route("/session/tool-approvals", get(get_session_tool_approvals))
+        .route(
+            "/session/tool-approval",
+            post(resolve_session_tool_approval),
+        )
         .route("/session/continue", post(continue_session))
         .route("/session/navigation", post(navigate_session))
         .route("/session/delete", post(delete_session))
@@ -72,6 +77,124 @@ pub fn routes() -> Router<ApiState> {
         .route("/notifications/clear", post(clear_notifications))
         .route("/notifications/resolve", post(resolve_notification))
         .route("/notifications/remove", post(remove_notification))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionToolApprovalScope {
+    session_id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+}
+
+impl SessionToolApprovalScope {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveSessionToolApprovalRequest {
+    #[serde(flatten)]
+    scope: SessionToolApprovalScope,
+    approval_id: String,
+    decision: ToolApprovalDecision,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionToolApprovalsResponse {
+    session_id: SessionId,
+    pending_approvals: Vec<PendingToolApproval>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveSessionToolApprovalResponse {
+    session_id: SessionId,
+    approval_id: String,
+    decision: ToolApprovalDecision,
+    status: &'static str,
+}
+
+fn require_session_tool_approval_scope(
+    state: &ApiState,
+    scope: &SessionToolApprovalScope,
+) -> Result<SessionId, ApiError> {
+    let session_id = parse_session_id(Some(&scope.session_id))?;
+    resolve_existing_session_scope(
+        state,
+        &session_id,
+        scope.requested_workspace_id(),
+        scope.requested_workspace_path(),
+    )?;
+    Ok(session_id)
+}
+
+async fn get_session_tool_approvals(
+    State(state): State<ApiState>,
+    Query(scope): Query<SessionToolApprovalScope>,
+) -> Result<Json<SessionToolApprovalsResponse>, ApiError> {
+    let session_id = require_session_tool_approval_scope(&state, &scope)?;
+    Ok(Json(SessionToolApprovalsResponse {
+        pending_approvals: state
+            .conversation_registry
+            .tool_approvals()
+            .pending_for_session(&session_id),
+        session_id,
+    }))
+}
+
+async fn resolve_session_tool_approval(
+    State(state): State<ApiState>,
+    Json(request): Json<ResolveSessionToolApprovalRequest>,
+) -> Result<Json<ResolveSessionToolApprovalResponse>, ApiError> {
+    let session_id = require_session_tool_approval_scope(&state, &request.scope)?;
+    let approval_id = request.approval_id.trim();
+    if approval_id.is_empty() {
+        return Err(ApiError::InvalidInput("approvalId 不能为空".to_string()));
+    }
+    let pending = state
+        .conversation_registry
+        .tool_approvals()
+        .resolve(&session_id, approval_id, request.decision)
+        .map_err(ApiError::Conflict)?;
+    let _ = state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-tool-approval-resolved-{}",
+                UtcMillis::now().0
+            )),
+            "tool.approval.resolved",
+            json!({
+                "session_id": session_id,
+                "task_id": pending.task_id,
+                "turn_id": pending.turn_id,
+                "tool_call_id": pending.tool_call_id,
+                "tool_name": pending.tool_name,
+                "approval_id": pending.approval_id,
+                "decision": request.decision,
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            task_id: Some(pending.task_id),
+            ..EventContext::default()
+        }),
+    );
+    Ok(Json(ResolveSessionToolApprovalResponse {
+        session_id,
+        approval_id: approval_id.to_string(),
+        decision: request.decision,
+        status: "resolved",
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4398,6 +4521,84 @@ mod tests {
             Arc::new(GovernanceService::default()),
         )
         .with_task_store(Arc::new(TaskStore::new()))
+    }
+
+    #[tokio::test]
+    async fn tool_approval_route_resolves_pending_runtime_call() {
+        let state = test_state();
+        let session_id = SessionId::new("session-tool-approval-route");
+        state
+            .session_store
+            .create_session(session_id.clone(), "tool approval route")
+            .expect("session should be creatable");
+        let pending = PendingToolApproval {
+            approval_id: "approval-route-1".to_string(),
+            session_id: session_id.clone(),
+            task_id: TaskId::new("task-tool-approval-route"),
+            turn_id: "turn-tool-approval-route".to_string(),
+            tool_call_id: "call-tool-approval-route".to_string(),
+            tool_name: "file_write".to_string(),
+            reason: "需要写入文件".to_string(),
+            requested_at: UtcMillis::now(),
+        };
+        let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = state
+            .conversation_registry
+            .tool_approvals()
+            .request(pending)
+            .expect("approval should become pending")
+        else {
+            panic!("first approval request must wait");
+        };
+        let app = routes().with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/session/tool-approval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "approvalId": "approval-route-1",
+                            "decision": "allow_once",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("approval route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            waiter
+                .decision_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("runtime should receive approval"),
+            ToolApprovalDecision::AllowOnce
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/session/tool-approvals?sessionId={}",
+                        session_id.as_str()
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("approval list route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read"),
+        )
+        .expect("response body should be json");
+        assert_eq!(payload["pendingApprovals"], serde_json::json!([]));
     }
 
     struct PendingTaskDispatcher;

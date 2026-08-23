@@ -50,7 +50,8 @@ use crate::{
     task_helpers::task_can_see_builtin_tool,
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
     tool_result_utils::{
-        safety_gate_public_error, tool_execution_failed_result, tool_execution_status_label,
+        approval_resume_contract_failure, approval_resume_is_safe, safety_gate_public_error,
+        tool_execution_failed_result, tool_execution_status_label,
     },
 };
 use crate::{
@@ -81,8 +82,7 @@ const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
 const TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前任务角色或阶段下不可用";
 const TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR: &str = "该工具受当前任务角色或策略限制";
-const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
-    "受限访问已拦截该操作，请切换为完全访问权限后重试";
+const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str = "该操作需要你的确认，授权后将继续当前调用";
 
 pub(crate) struct ToolPreflightDecision {
     pub(crate) payload: String,
@@ -2774,6 +2774,7 @@ fn execute_task_tool_call(
         );
     }
 
+    let mut approval_granted = false;
     if let Some(decision) = task_tool_preflight_decision(
         task,
         safety_gate,
@@ -2781,7 +2782,25 @@ fn execute_task_tool_call(
         &tool_call.function.arguments,
         workspace_root_path,
     ) {
-        return (decision.payload, decision.status);
+        if decision.status == ExecutionResultStatus::NeedsApproval {
+            match await_task_tool_approval(
+                event_bus,
+                conversation_registry.tool_approvals(),
+                task_store,
+                session_store,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+                &decision,
+                on_progress,
+            ) {
+                Ok(()) => approval_granted = true,
+                Err(result) => return result,
+            }
+        } else {
+            return (decision.payload, decision.status);
+        }
     }
 
     if let Some(canonical) =
@@ -2908,85 +2927,343 @@ fn execute_task_tool_call(
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
-    let access_profile = task
-        .policy_snapshot
-        .as_ref()
-        .map(magi_core::TaskPolicy::effective_access_profile)
-        .unwrap_or_default();
-    if let Some((tool_skill_name, binding_id)) =
-        parse_skill_custom_tool_name(&tool_call.function.name)
-    {
-        return execute_skill_custom_tool(
-            tool_call,
-            &tool_skill_name,
-            &binding_id,
-            skill_name,
-            task_tool_execution_policy_scope(task),
-            safety_gate,
-            skill_runtime,
-            skill_dispatch_runtime,
-            ToolExecutionContext {
-                worker_id: worker_id.cloned(),
-                task_id: Some(task.task_id.clone()),
-                session_id: Some(session_id.clone()),
-                workspace_id: workspace_id.clone(),
-                access_profile,
-                working_directory: workspace_root_path.cloned(),
-                browser_capability_revision,
-                browser_execution_id: Some(format!("task:{}", task.task_id)),
-            },
-            workspace_root_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-        );
-    }
-
-    if let Some(result) = registry.execute_external_mcp_tool(
-        &tool_call.function.name,
-        &tool_call.function.arguments,
-        access_profile,
-    ) {
-        return result;
-    }
-
-    if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
-        return (rejection, ExecutionResultStatus::Failed);
-    }
-
-    let mut tool_policy =
-        active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
-    apply_task_policy_scope(&mut tool_policy, task.policy_snapshot.as_ref());
-    let input = ToolExecutionInput::for_builtin_invocation(
-        ToolCallId::new(&tool_call.id),
-        &tool_call.function.name,
-        tool_call.function.arguments.clone(),
-    );
-    let context = ToolExecutionContext {
-        worker_id: worker_id.cloned(),
-        task_id: Some(task.task_id.clone()),
-        session_id: Some(session_id.clone()),
-        workspace_id: workspace_id.clone(),
-        access_profile: tool_policy.access_profile,
-        working_directory: workspace_root_path.cloned(),
-        browser_capability_revision,
-        browser_execution_id: Some(format!("task:{}", task.task_id)),
+    let access_profile = if approval_granted {
+        AccessProfile::FullAccess
+    } else {
+        task.policy_snapshot
+            .as_ref()
+            .map(magi_core::TaskPolicy::effective_access_profile)
+            .unwrap_or_default()
     };
-    let output = match on_progress {
-        Some(on_progress) => {
-            registry.execute_with_policy_and_progress(input, context, &tool_policy, on_progress)
+    let execute_runtime_tool = |effective_access_profile: AccessProfile| {
+        if let Some((tool_skill_name, binding_id)) =
+            parse_skill_custom_tool_name(&tool_call.function.name)
+        {
+            return execute_skill_custom_tool(
+                tool_call,
+                &tool_skill_name,
+                &binding_id,
+                skill_name,
+                task_tool_execution_policy_scope_with_access_profile(
+                    task,
+                    effective_access_profile,
+                ),
+                safety_gate,
+                skill_runtime,
+                skill_dispatch_runtime,
+                ToolExecutionContext {
+                    worker_id: worker_id.cloned(),
+                    task_id: Some(task.task_id.clone()),
+                    session_id: Some(session_id.clone()),
+                    workspace_id: workspace_id.clone(),
+                    access_profile: effective_access_profile,
+                    working_directory: workspace_root_path.cloned(),
+                    browser_capability_revision,
+                    browser_execution_id: Some(format!("task:{}", task.task_id)),
+                },
+                workspace_root_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            );
         }
-        None => registry.execute_with_policy(input, context, &tool_policy),
+
+        if let Some(result) = registry.execute_external_mcp_tool(
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+            effective_access_profile,
+        ) {
+            return result;
+        }
+
+        if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
+            return (rejection, ExecutionResultStatus::Failed);
+        }
+
+        let mut tool_policy =
+            active_skill_tool_execution_policy(effective_access_profile, skill_runtime, skill_name);
+        apply_task_policy_scope(&mut tool_policy, task.policy_snapshot.as_ref());
+        tool_policy.access_profile = effective_access_profile;
+        let input = ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new(&tool_call.id),
+            &tool_call.function.name,
+            tool_call.function.arguments.clone(),
+        );
+        let context = ToolExecutionContext {
+            worker_id: worker_id.cloned(),
+            task_id: Some(task.task_id.clone()),
+            session_id: Some(session_id.clone()),
+            workspace_id: workspace_id.clone(),
+            access_profile: tool_policy.access_profile,
+            working_directory: workspace_root_path.cloned(),
+            browser_capability_revision,
+            browser_execution_id: Some(format!("task:{}", task.task_id)),
+        };
+        let output = match on_progress {
+            Some(on_progress) => {
+                registry.execute_with_policy_and_progress(input, context, &tool_policy, on_progress)
+            }
+            None => registry.execute_with_policy(input, context, &tool_policy),
+        };
+        (output.payload, output.status)
     };
 
-    (output.payload, output.status)
+    let mut result = execute_runtime_tool(access_profile);
+    if result.1 == ExecutionResultStatus::NeedsApproval && !approval_granted {
+        if !approval_resume_is_safe(&result.0) {
+            return approval_resume_contract_failure(&tool_call.function.name);
+        }
+        let runtime_decision = ToolPreflightDecision {
+            payload: result.0,
+            status: result.1,
+        };
+        match await_task_tool_approval(
+            event_bus,
+            conversation_registry.tool_approvals(),
+            task_store,
+            session_store,
+            task,
+            session_id,
+            workspace_id,
+            tool_call,
+            &runtime_decision,
+            on_progress,
+        ) {
+            Ok(()) => result = execute_runtime_tool(AccessProfile::FullAccess),
+            Err(rejected) => return rejected,
+        }
+    }
+    if result.1 == ExecutionResultStatus::NeedsApproval {
+        return approval_resume_contract_failure(&tool_call.function.name);
+    }
+    result
 }
 
-fn task_tool_execution_policy_scope(task: &magi_core::Task) -> ToolExecutionPolicy {
+#[allow(clippy::too_many_arguments)]
+fn await_task_tool_approval(
+    event_bus: &InMemoryEventBus,
+    registry: &crate::ToolApprovalRegistry,
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+    decision: &ToolPreflightDecision,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+) -> Result<(), (String, ExecutionResultStatus)> {
+    let Some(turn_id) = session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
+        .filter(|turn_id| {
+            crate::tool_approval::session_turn_is_active(session_store, session_id, turn_id)
+        })
+    else {
+        return Err((
+            serde_json::json!({
+                "tool": tool_call.function.name,
+                "status": "cancelled",
+                "error_code": "tool_approval_cancelled",
+                "error": "当前对话轮次已经结束，待授权操作未执行",
+            })
+            .to_string(),
+            ExecutionResultStatus::Cancelled,
+        ));
+    };
+    let approval_id = format!("tool-approval-{}-{}", task.task_id, tool_call.id);
+    let reason = serde_json::from_str::<serde_json::Value>(&decision.payload)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "该操作需要用户授权".to_string());
+    let request = crate::PendingToolApproval {
+        approval_id: approval_id.clone(),
+        session_id: session_id.clone(),
+        task_id: task.task_id.clone(),
+        turn_id: turn_id.clone(),
+        tool_call_id: tool_call.id.clone(),
+        tool_name: tool_call.function.name.clone(),
+        reason: reason.clone(),
+        requested_at: UtcMillis::now(),
+    };
+    let waiter = match registry.request(request.clone()) {
+        Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
+        Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
+        Err(error) => {
+            return Err((
+                serde_json::json!({
+                    "tool": tool_call.function.name,
+                    "status": "failed",
+                    "error_code": "tool_approval_runtime_failed",
+                    "error": error,
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            ));
+        }
+    };
+
+    let progress_payload = serde_json::json!({
+        "tool": tool_call.function.name,
+        "status": "awaiting_approval",
+        "error_code": "tool_policy_needs_approval",
+        "error": reason,
+        "approval_id": approval_id,
+        "approval": request,
+    })
+    .to_string();
+    if let Some(on_progress) = on_progress {
+        on_progress(ToolExecutionProgress {
+            tool_call_id: ToolCallId::new(&tool_call.id),
+            tool_name: tool_call.function.name.clone(),
+            payload: progress_payload.clone(),
+        });
+    }
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-tool-approval-requested-{}",
+                UtcMillis::now().0
+            )),
+            "tool.approval.requested",
+            serde_json::json!({
+                "session_id": session_id,
+                "workspace_id": workspace_id,
+                "task_id": task.task_id,
+                "turn_id": turn_id,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.function.name,
+                "approval_id": waiter.request.approval_id,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+
+    loop {
+        match waiter
+            .decision_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+        {
+            Ok(
+                crate::ToolApprovalDecision::AllowOnce | crate::ToolApprovalDecision::AllowForTurn,
+            ) => {
+                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
+                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                });
+                let turn_is_active = crate::tool_approval::session_turn_is_active(
+                    session_store,
+                    session_id,
+                    &turn_id,
+                );
+                if !task_is_active || !turn_is_active {
+                    if !turn_is_active {
+                        registry.remove_turn(session_id, &turn_id);
+                    } else {
+                        registry.remove_task(session_id, &task.task_id);
+                    }
+                    return Err((
+                        serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "cancelled",
+                            "error_code": "tool_approval_cancelled",
+                            "error": "任务或对话轮次已停止，待授权操作未执行",
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Cancelled,
+                    ));
+                }
+                if let Some(on_progress) = on_progress {
+                    on_progress(ToolExecutionProgress {
+                        tool_call_id: ToolCallId::new(&tool_call.id),
+                        tool_name: tool_call.function.name.clone(),
+                        payload: serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "running",
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                    });
+                }
+                return Ok(());
+            }
+            Ok(crate::ToolApprovalDecision::Deny) => {
+                return Err((
+                    serde_json::json!({
+                        "tool": tool_call.function.name,
+                        "status": "rejected",
+                        "error_code": "tool_approval_denied",
+                        "error": "用户拒绝了本次工具操作",
+                        "approval_id": approval_id,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Rejected,
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
+                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                });
+                let turn_is_active = crate::tool_approval::session_turn_is_active(
+                    session_store,
+                    session_id,
+                    &turn_id,
+                );
+                if !task_is_active || !turn_is_active {
+                    if !turn_is_active {
+                        registry.remove_turn(session_id, &turn_id);
+                    } else {
+                        registry.remove_task(session_id, &task.task_id);
+                    }
+                    return Err((
+                        serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "cancelled",
+                            "error_code": "tool_approval_cancelled",
+                            "error": "任务已停止，待授权操作未执行",
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Cancelled,
+                    ));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                registry.cancel(&approval_id);
+                return Err((
+                    serde_json::json!({
+                        "tool": tool_call.function.name,
+                        "status": "failed",
+                        "error_code": "tool_approval_runtime_failed",
+                        "error": "工具授权等待通道已关闭",
+                        "approval_id": approval_id,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                ));
+            }
+        }
+    }
+}
+
+fn task_tool_execution_policy_scope_with_access_profile(
+    task: &magi_core::Task,
+    access_profile: AccessProfile,
+) -> ToolExecutionPolicy {
     let Some(policy) = task.policy_snapshot.as_ref() else {
-        return tool_execution_policy_scope(AccessProfile::default(), "", &[], &[]);
+        return tool_execution_policy_scope(access_profile, "", &[], &[]);
     };
     let mut tool_policy = tool_execution_policy_scope(
-        policy.access_profile,
+        access_profile,
         policy.command_mode.clone(),
         &policy.allowed_paths,
         &policy.denied_paths,
@@ -3281,7 +3558,7 @@ fn task_policy_decision_payload(
             "tool_policy_needs_approval",
             TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR,
             Some("full_access"),
-            "不要在相同访问模式下重复调用。若该操作是完成任务所必需的，请停止当前执行并等待用户切换为完全访问；若目标只需读取，请改用专用读取或搜索工具。",
+            "当前调用已暂停并等待用户授权，不要重复调用。若用户拒绝，再改用专用读取、搜索工具或缩小操作范围。",
         ),
         ExecutionResultStatus::Rejected => (
             "tool_policy_rejected",
@@ -3294,7 +3571,7 @@ fn task_policy_decision_payload(
             },
             constrained_by_access_profile.then_some("full_access"),
             if constrained_by_access_profile {
-                "不要重复相同调用。只读目的必须改写为真实只读命令或改用专用读取、搜索工具；任务确实需要写入时，等待用户切换为完全访问后再恢复。"
+                "不要重复相同调用。只读目的必须改用专用读取、搜索工具；需要写入时应等待当前授权结果。"
             } else {
                 "不要重复相同调用。该工具受当前任务角色、路径范围或显式策略限制，请使用当前任务允许的工具和路径。"
             },
@@ -4699,7 +4976,7 @@ mod tests {
         );
         assert_eq!(
             payload["error"].as_str(),
-            Some("受限访问已拦截该操作，请切换为完全访问权限后重试")
+            Some("该操作需要你的确认，授权后将继续当前调用")
         );
         assert_eq!(payload["access_profile"].as_str(), Some("restricted"));
         assert_eq!(
@@ -4713,7 +4990,7 @@ mod tests {
         assert!(
             payload["instruction"]
                 .as_str()
-                .is_some_and(|instruction| instruction.contains("不要在相同访问模式下重复调用"))
+                .is_some_and(|instruction| instruction.contains("当前调用已暂停"))
         );
     }
 
@@ -5181,7 +5458,7 @@ mod tests {
         );
         assert_eq!(
             payload["error"].as_str(),
-            Some("安全防护已在受限访问下拦截该操作，请切换为完全访问权限后重试")
+            Some("安全防护要求确认该操作，授权后将继续当前调用")
         );
         assert!(payload.get("safety_gate").is_none());
         assert!(!decision.payload.contains("deploy-prod"));
@@ -5390,7 +5667,7 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_call_requires_approval_for_file_remove_in_restricted_profile() {
+    fn task_tool_approval_resumes_original_file_remove_call() {
         let event_bus = InMemoryEventBus::new(16);
         let task_store = TaskStore::new();
         let session_store = SessionStore::new();
@@ -5408,7 +5685,25 @@ mod tests {
         let target = dir.path().join("probe.txt");
         std::fs::write(&target, "probe").expect("write probe");
         let task = test_task("task-file-remove", "task-file-remove", None);
+        task_store.insert_task(task.clone());
         let session_id = SessionId::new("session-file-remove");
+        session_store
+            .create_session(session_id.clone(), "task approval test")
+            .expect("approval test session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                magi_session_store::ActiveExecutionTurn {
+                    turn_id: "turn-file-remove".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("remove probe".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("approval test turn should be active");
         let workspace_id = Some(WorkspaceId::new("workspace-file-remove"));
         let tool_call = ChatToolCall {
             id: "call-file-remove".to_string(),
@@ -5422,44 +5717,71 @@ mod tests {
             },
         };
 
-        let result = execute_task_tool_call_batch(
-            &event_bus,
-            Some(&tool_registry),
-            &agent_role_registry,
-            None,
-            None,
-            None,
-            &task_store,
-            &session_store,
-            &execution_registry,
-            &conversation_registry,
-            &spawn_graph,
-            None,
-            &plan_store,
-            None,
-            &task,
-            &session_id,
-            &workspace_id,
-            Some(&dir.path().to_path_buf()),
-            None,
-            None,
-            &[tool_call],
-            &mut ToolExecutionLedger::default(),
-            None,
-            None,
-            None,
-        );
+        let result = thread::scope(|scope| {
+            let resolver = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    if let Some(pending) = conversation_registry
+                        .tool_approvals()
+                        .pending_for_session(&session_id)
+                        .into_iter()
+                        .next()
+                    {
+                        assert!(target.exists(), "授权前不能执行删除");
+                        conversation_registry
+                            .tool_approvals()
+                            .resolve(
+                                &session_id,
+                                &pending.approval_id,
+                                crate::ToolApprovalDecision::AllowOnce,
+                            )
+                            .expect("task approval should resolve");
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "task tool approval should become pending"
+                    );
+                    std::thread::yield_now();
+                }
+            });
+            let result = execute_task_tool_call_batch(
+                &event_bus,
+                Some(&tool_registry),
+                &agent_role_registry,
+                None,
+                None,
+                None,
+                &task_store,
+                &session_store,
+                &execution_registry,
+                &conversation_registry,
+                &spawn_graph,
+                None,
+                &plan_store,
+                None,
+                &task,
+                &session_id,
+                &workspace_id,
+                Some(&dir.path().to_path_buf()),
+                None,
+                None,
+                &[tool_call],
+                &mut ToolExecutionLedger::default(),
+                None,
+                None,
+                None,
+            );
+            resolver.join().expect("task approval resolver should join");
+            result
+        });
 
-        assert_eq!(result[0].1, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
         let payload: serde_json::Value =
-            serde_json::from_str(&result[0].0).expect("policy payload should be json");
+            serde_json::from_str(&result[0].0).expect("tool payload should be json");
         assert_eq!(payload["tool"].as_str(), Some("file_remove"));
-        assert_eq!(payload["status"].as_str(), Some("needs_approval"));
-        assert_eq!(
-            payload["error_code"].as_str(),
-            Some("tool_policy_needs_approval")
-        );
-        assert!(target.exists(), "受限访问拦截的删除不能提前执行");
+        assert_eq!(payload["status"].as_str(), Some("succeeded"));
+        assert!(!target.exists(), "授权后必须恢复并完成原始删除调用");
     }
 
     #[test]

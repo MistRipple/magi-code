@@ -388,6 +388,7 @@ fn bridge_public_payload(
         },
         "error_code": error_code,
         "error": message.into(),
+        "approval_resume_safe": status == ExecutionResultStatus::NeedsApproval,
     })
     .to_string()
 }

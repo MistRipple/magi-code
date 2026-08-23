@@ -177,6 +177,39 @@ export interface SessionInterruptResponseDto {
   removedTimelineEntryIds: string[];
 }
 
+export type ToolApprovalDecision = 'allow_once' | 'allow_for_turn' | 'deny';
+
+export interface PendingToolApprovalDto {
+  approvalId: string;
+  sessionId: string;
+  taskId: string;
+  turnId: string;
+  toolCallId: string;
+  toolName: string;
+  reason: string;
+  requestedAt: number;
+}
+
+export interface SessionToolApprovalRequestDto {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  approvalId: string;
+  decision: ToolApprovalDecision;
+}
+
+export interface SessionToolApprovalResponseDto {
+  sessionId: string;
+  approvalId: string;
+  decision: ToolApprovalDecision;
+  status: 'resolved';
+}
+
+export interface SessionToolApprovalsResponseDto {
+  sessionId: string;
+  pendingApprovals: PendingToolApprovalDto[];
+}
+
 export interface ServiceInfoDto {
   serviceName: string;
   apiVersion: string;

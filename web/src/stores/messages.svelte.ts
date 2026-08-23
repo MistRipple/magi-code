@@ -48,6 +48,8 @@ import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import { shouldUseHostProxyTransport } from '../shared/transport';
+import { parseToolApprovalPayload } from '../lib/tool-error-payload';
+import { hasPendingToolApproval, toolApprovalState } from './tool-approval-store.svelte';
 
 interface SettingsRegistrySnapshot {
   roleTemplates: RoleTemplate[];
@@ -2209,6 +2211,30 @@ export function applyNotificationsStatus(rawStatus: unknown): void {
 }
 
 export function getActiveInteractionType(): string | null {
+  const currentSessionId = messagesState.currentSessionId?.trim() || '';
+  if (
+    currentSessionId
+    && toolApprovalState.sessionId === currentSessionId
+    && toolApprovalState.hydrated
+  ) {
+    return hasPendingToolApproval(currentSessionId) ? 'tool_approval' : null;
+  }
+  const artifacts = ensureArray<TimelineProjectionArtifact>(messagesState.canonicalTimelineProjection?.artifacts);
+  for (const artifact of artifacts) {
+    for (const block of artifact.message.blocks || []) {
+      if (!block || typeof block !== 'object') continue;
+      const toolCall = block.toolCall;
+      if (!toolCall) continue;
+      if (
+        parseToolApprovalPayload(toolCall.result)
+        || parseToolApprovalPayload(toolCall.error)
+        || parseToolApprovalPayload(toolCall.standardized?.message)
+        || parseToolApprovalPayload(block.content)
+      ) {
+        return 'tool_approval';
+      }
+    }
+  }
   return null;
 }
 

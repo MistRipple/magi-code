@@ -25,6 +25,7 @@ pub struct ConversationRegistry {
     session_turn_inputs: Mutex<HashMap<SessionId, SessionTurnInputState>>,
     task_signal_channels: Mutex<HashMap<(SessionId, TaskId), VecDeque<RuntimeSignal>>>,
     task_signal_ready: Condvar,
+    tool_approvals: crate::ToolApprovalRegistry,
 }
 
 #[derive(Debug)]
@@ -136,6 +137,10 @@ impl ConversationRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn tool_approvals(&self) -> &crate::ToolApprovalRegistry {
+        &self.tool_approvals
     }
 
     /// 注册当前主会话 Turn 的引导输入通道。每个 session 同时只能有一个活跃
@@ -253,6 +258,8 @@ impl ConversationRegistry {
         }
         if active.pending.is_empty() {
             guard.remove(session_id);
+            drop(guard);
+            self.tool_approvals.remove_turn(session_id, turn_id);
             SessionTurnInputBoundary::Closed
         } else {
             SessionTurnInputBoundary::Pending(active.pending.drain(..).collect())
@@ -264,7 +271,7 @@ impl ConversationRegistry {
             .session_turn_inputs
             .lock()
             .expect("session turn input mutex poisoned");
-        if guard
+        let removed = if guard
             .get(session_id)
             .is_some_and(|active| active.turn_id == turn_id)
         {
@@ -272,7 +279,12 @@ impl ConversationRegistry {
             true
         } else {
             false
+        };
+        drop(guard);
+        if removed {
+            self.tool_approvals.remove_turn(session_id, turn_id);
         }
+        removed
     }
 
     /// 注册任务级运行时信号通道。agent_spawn 可在子任务 runner 启动前调用，因此
@@ -384,6 +396,8 @@ impl ConversationRegistry {
         };
         if channel.is_empty() {
             channels.remove(&key);
+            drop(channels);
+            self.tool_approvals.remove_task(session_id, task_id);
             TaskSignalBoundary::Closed
         } else {
             TaskSignalBoundary::Pending(channel.drain(..).collect())
@@ -391,11 +405,16 @@ impl ConversationRegistry {
     }
 
     pub fn close_task_signal_channel(&self, session_id: &SessionId, task_id: &TaskId) -> bool {
-        self.task_signal_channels
+        let removed = self
+            .task_signal_channels
             .lock()
             .expect("task signal channel mutex poisoned")
             .remove(&(session_id.clone(), task_id.clone()))
-            .is_some()
+            .is_some();
+        if removed {
+            self.tool_approvals.remove_task(session_id, task_id);
+        }
+        removed
     }
 
     /// 删除 session 主对话及其全部 task 对话。会话删除后这些内存态不能继续存活，
@@ -422,6 +441,7 @@ impl ConversationRegistry {
             .lock()
             .expect("task signal channel mutex poisoned")
             .retain(|(candidate, _), _| candidate != session_id);
+        self.tool_approvals.remove_session(session_id);
         removed
     }
 }

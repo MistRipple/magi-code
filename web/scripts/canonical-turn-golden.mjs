@@ -14,8 +14,9 @@ await withGoldenViteServer(async (server) => {
   const viewImagePreview = await server.ssrLoadModule('/src/lib/view-image-preview.ts');
   const canonicalProtocol = await server.ssrLoadModule('/src/shared/protocol/canonical-turn.ts');
   const blockRegistry = await server.ssrLoadModule('/src/lib/block-registry.ts');
+  const conversationPresentation = await server.ssrLoadModule('/src/lib/conversation-presentation.ts');
   const markdownUrl = await server.ssrLoadModule('/src/lib/markdown-url.ts');
-  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, markdownUrl);
+  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, conversationPresentation, markdownUrl);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
 
@@ -45,7 +46,7 @@ function installGoldenMemoryBridge(bridgeRuntime) {
   });
 }
 
-function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, markdownUrl) {
+function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, conversationPresentation, markdownUrl) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -114,6 +115,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertUserImageMetadataProjectsToMessage(reducer, projection, timelineRenderItems);
   assertViewImageToolResultProjectsAsPreview(reducer, projection, viewImagePreview);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
+  assertSidechainApprovalAndArtifactArePromoted(reducer, projection, timelineRenderItems);
   assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
   assertAgentTerminalOutputExtractsFinalText(agentOutput);
@@ -137,7 +139,21 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertCanonicalBlocksProjectToFirstClassCards(reducer, projection);
   assertBootstrapSeedsCanonicalEventWatermark(reducer);
   assertUnknownCanonicalBlockHasNoTextFallback(blockRegistry);
+  assertMalformedMessageBlocksDoNotBreakPresentation(conversationPresentation);
   assertMarkdownUrlSanitizerKeepsOnlyValidFileLinks(markdownUrl);
+}
+
+function assertMalformedMessageBlocksDoNotBreakPresentation(conversationPresentation) {
+  const message = {
+    type: 'text',
+    metadata: {},
+    blocks: [undefined],
+  };
+  assert.equal(
+    conversationPresentation.inferConversationPresentationRole(message),
+    'process',
+    'malformed legacy message blocks must be ignored by presentation classification',
+  );
 }
 
 function assertSingleThinkingProjectsAsGroup(reducer, projection) {
@@ -1029,6 +1045,67 @@ function assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, pr
       .map((entry) => entry.message.metadata?.turnItemId),
     ['child-final-a'],
     'child task tab should still show child task artifacts',
+  );
+}
+
+function assertSidechainApprovalAndArtifactArePromoted(reducer, projection, timelineRenderItems) {
+  const c = baseCase('agent-promoted-attention-artifact', 'session-golden-promoted', 'turn-golden-promoted', 9580);
+  const userItem = user(c, 1, '请让代理生成图表并执行一次受限操作。');
+  const spawnItem = agentSpawnTool(c, 2, 'spawn-a', 'call-spawn-a', 'executor', '执行代理', 'task-child-a', 'running');
+  spawnItem.worker = { taskId: 'task-root', title: 'agent_spawn' };
+  const childProcess = tool(c, 3, 'child-process', 'call-child-process', 'printf child', 'completed', { stdout: 'child' });
+  childProcess.worker = { taskId: 'task-child-a', workerId: 'worker-child-a', roleId: 'executor', title: 'shell_exec' };
+  const childApproval = tool(c, 4, 'child-approval', 'call-child-approval', 'file_remove', 'running', {
+    tool: 'file_remove',
+    status: 'awaiting_approval',
+    error_code: 'tool_policy_needs_approval',
+    error: '该操作需要你的确认，授权后将继续当前调用',
+    approval: {
+      approvalId: 'approval-child-a',
+      sessionId: c.sessionId,
+      taskId: 'task-child-a',
+      turnId: c.turnId,
+      toolCallId: 'call-child-approval',
+      toolName: 'file_remove',
+      reason: '需要删除文件',
+      requestedAt: 9584,
+    },
+  });
+  childApproval.tool.name = 'file_remove';
+  childApproval.worker = { taskId: 'task-child-a', workerId: 'worker-child-a', roleId: 'executor', title: 'file_remove' };
+  const childDiagram = tool(c, 5, 'child-diagram', 'call-child-diagram', 'diagram', 'completed', {
+    tool: 'diagram_render',
+    type: 'diagram_render',
+    kind: 'flow',
+    graph: { nodes: [{ id: 'a', label: 'A' }], edges: [] },
+  });
+  childDiagram.tool.name = 'diagram_render';
+  childDiagram.tool.arguments = { kind: 'flow', graph: { nodes: [], edges: [] } };
+  childDiagram.worker = { taskId: 'task-child-a', workerId: 'worker-child-a', roleId: 'executor', title: 'diagram_render' };
+  const rootFinal = assistantText(c, 6, 'root-final', '我已汇总代理结果。', 'completed');
+  rootFinal.worker = { taskId: 'task-root', title: '最终回复' };
+
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'running', [userItem, spawnItem, childProcess, childApproval, childDiagram, rootFinal], { responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.ok(projectionValue, 'promoted sidechain projection should exist');
+  assert.deepEqual(
+    projectionValue.threadRenderEntries.map((entry) => entry.artifactId),
+    [
+      `turn:${c.turnId}:user-message`,
+      `turn:${c.turnId}:spawn-a`,
+      `turn:${c.turnId}:child-approval`,
+      `turn:${c.turnId}:child-diagram`,
+      `turn:${c.turnId}:root-final`,
+    ],
+    'main conversation should promote only sidechain attention and user-visible artifacts in order',
+  );
+  assert.deepEqual(
+    timelineRenderItems.buildTimelineRenderItems(projectionValue, 'task', 'task-child-a')
+      .map((entry) => entry.message.metadata?.turnItemId),
+    ['child-process', 'child-approval', 'child-diagram'],
+    'task detail should retain the complete child transcript',
   );
 }
 

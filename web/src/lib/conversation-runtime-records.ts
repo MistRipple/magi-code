@@ -126,7 +126,11 @@ function buildMessageRuntimeRecords(message: Message): OrchestrationRuntimeTimel
   }
 
   const embeddedToolCalls = (message.blocks || [])
-    .map((block) => block.type === 'tool_call' ? block.toolCall : undefined)
+    .map((block) => (
+      block && typeof block === 'object' && block.type === 'tool_call'
+        ? block.toolCall
+        : undefined
+    ))
     .filter((toolCall): toolCall is ToolCall => Boolean(toolCall));
   if (embeddedToolCalls.length > 0) {
     return embeddedToolCalls

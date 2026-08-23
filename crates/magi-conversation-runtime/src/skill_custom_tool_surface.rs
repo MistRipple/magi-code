@@ -19,7 +19,7 @@ const SKILL_TOOL_SCOPE_PUBLIC_ERROR: &str = "该 Skill 工具不属于当前激�
 const SKILL_TOOL_DISPATCH_PUBLIC_ERROR: &str = "Skill 工具执行失败，请稍后重试";
 const SKILL_TOOL_POLICY_PUBLIC_ERROR: &str = "该 Skill 工具在当前访问模式下不可用";
 const SKILL_TOOL_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
-    "受限访问已拦截该 Skill 工具，请切换为完全访问权限后重试";
+    "该 Skill 工具需要你的确认，授权后将继续当前调用";
 const SKILL_TOOL_REMOTE_PUBLIC_ERROR: &str = "Skill 工具返回失败，请检查输入或外接工具状态";
 const SKILL_CUSTOM_TOOL_SKILL_SEGMENT_MAX_LEN: usize = 20;
 const SKILL_CUSTOM_TOOL_BINDING_SEGMENT_MAX_LEN: usize = 35;
@@ -417,6 +417,7 @@ fn custom_tool_preflight_payload(
             "skill_name": skill_name,
             "error_code": error_code,
             "error": public_error,
+            "approval_resume_safe": status == ExecutionResultStatus::NeedsApproval,
         })
         .to_string(),
         status,
@@ -465,6 +466,7 @@ fn custom_tool_dispatch_failure_payload(
             "skill_name": skill_name,
             "error_code": error_code,
             "error": public_error,
+            "approval_resume_safe": status == ExecutionResultStatus::NeedsApproval,
         })
         .to_string(),
         status,
@@ -580,6 +582,7 @@ fn custom_tool_safety_payload(
             "skill_name": skill_name,
             "error_code": public_error.error_code,
             "error": public_error.error,
+            "approval_resume_safe": status == ExecutionResultStatus::NeedsApproval,
         })
         .to_string(),
         status,

@@ -7,7 +7,7 @@ use magi_skill_runtime::{SkillDispatchObservation, SkillDispatchRoute, SkillDisp
 use serde::{Deserialize, Serialize};
 
 const SKILL_DISPATCH_NEEDS_APPROVAL_DETAIL: &str =
-    "受限访问已拦截该 Skill 工具，请切换为完全访问权限后重试";
+    "该 Skill 工具需要你的确认，授权后将继续当前调用";
 const SKILL_DISPATCH_REJECTED_DETAIL: &str = "Skill 工具调用被策略或配置阻断";
 const SKILL_DISPATCH_FAILED_DETAIL: &str = "Skill 工具调用失败，请检查工具配置或外接服务状态";
 

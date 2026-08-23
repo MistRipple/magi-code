@@ -2,8 +2,9 @@ use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecor
 use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
-    model_visible_tool_result, summarize_tool_result, tool_execution_failed_result,
-    tool_execution_status_label, turn_item_status_for_tool_result,
+    approval_resume_contract_failure, approval_resume_is_safe, model_visible_tool_result,
+    summarize_tool_result, tool_execution_failed_result, tool_execution_status_label,
+    turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::activated_skill_id_from_tool_result;
 use crate::{
@@ -1062,6 +1063,7 @@ fn append_session_tool_call_items_batch(
         persist_session_state,
     } = context;
     let plan_store = crate::test_plan_store("test-plan");
+    let tool_approval_registry = crate::ToolApprovalRegistry::default();
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     let mut tool_execution_ledger = ToolExecutionLedger::default();
     append_session_tool_call_items_batch_with_context(
@@ -1073,6 +1075,7 @@ fn append_session_tool_call_items_batch(
             skill_dispatch_runtime,
             skill_name,
             safety_gate,
+            tool_approval_registry: &tool_approval_registry,
             plan_store: &plan_store,
             mission_id: &mission_id,
             session_id,
@@ -1102,6 +1105,7 @@ pub(crate) struct SessionToolCallBatchContext<'a> {
     pub skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
     pub skill_name: Option<&'a str>,
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    pub tool_approval_registry: &'a crate::ToolApprovalRegistry,
     pub plan_store: &'a magi_plan::PlanStore,
     pub mission_id: &'a magi_core::MissionId,
     pub session_id: &'a SessionId,
@@ -1132,6 +1136,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
+        tool_approval_registry,
         plan_store,
         mission_id,
         session_id,
@@ -1177,6 +1182,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
+        tool_approval_registry,
         plan_store,
         mission_id,
         session_id,
@@ -1321,6 +1327,7 @@ struct SessionToolExecutionContext<'a> {
     skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
     skill_name: Option<&'a str>,
     safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    tool_approval_registry: &'a crate::ToolApprovalRegistry,
     plan_store: &'a magi_plan::PlanStore,
     mission_id: &'a magi_core::MissionId,
     session_id: &'a SessionId,
@@ -1489,6 +1496,7 @@ fn execute_session_turn_tool_call(
         access_profile,
     } = context;
     let plan_store = crate::test_plan_store("test-plan");
+    let tool_approval_registry = crate::ToolApprovalRegistry::default();
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     let source_thread_id = ThreadId::new(format!("thread-{session_id}"));
     execute_session_turn_tool_call_scoped(
@@ -1500,6 +1508,7 @@ fn execute_session_turn_tool_call(
             skill_dispatch_runtime,
             skill_name,
             safety_gate,
+            tool_approval_registry: &tool_approval_registry,
             plan_store: &plan_store,
             mission_id: &mission_id,
             session_id,
@@ -1515,6 +1524,367 @@ fn execute_session_turn_tool_call(
     )
 }
 
+#[cfg(test)]
+fn execute_session_turn_tool_call_with_approval(
+    context: SessionToolCallTestContext<'_>,
+    tool_call: &ChatToolCall,
+    approval_decision: crate::ToolApprovalDecision,
+) -> (String, ExecutionResultStatus) {
+    let SessionToolCallTestContext {
+        session_store,
+        event_bus,
+        tool_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        safety_gate,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        access_profile,
+    } = context;
+    if session_store.session(session_id).is_none() {
+        session_store
+            .create_session(session_id.clone(), "tool approval test")
+            .expect("approval test session should be creatable");
+    }
+    if session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .is_none()
+    {
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: format!("turn-{session_id}"),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("approval test".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("approval test turn should be creatable");
+    }
+    let plan_store = crate::test_plan_store("test-plan-approval");
+    let tool_approval_registry = crate::ToolApprovalRegistry::default();
+    let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
+    let source_thread_id = ThreadId::new(format!("thread-{session_id}"));
+    let execution_context = SessionToolExecutionContext {
+        session_store,
+        event_bus,
+        tool_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        safety_gate,
+        tool_approval_registry: &tool_approval_registry,
+        plan_store: &plan_store,
+        mission_id: &mission_id,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        context_references: &[],
+        access_profile,
+        browser_capability_revision: None,
+        browser_execution_id: None,
+        source_thread_id: &source_thread_id,
+    };
+
+    thread::scope(|scope| {
+        let handle =
+            scope.spawn(|| execute_session_turn_tool_call_scoped(execution_context, tool_call));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(pending) = tool_approval_registry
+                .pending_for_session(session_id)
+                .into_iter()
+                .next()
+            {
+                tool_approval_registry
+                    .resolve(session_id, &pending.approval_id, approval_decision)
+                    .expect("approval decision should resolve");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool approval request should become pending"
+            );
+            std::thread::yield_now();
+        }
+        handle.join().expect("approval tool execution should join")
+    })
+}
+
+#[derive(Clone, Copy)]
+struct SessionToolApprovalContext<'a> {
+    session_store: &'a SessionStore,
+    event_bus: &'a InMemoryEventBus,
+    registry: &'a crate::ToolApprovalRegistry,
+    mission_id: &'a magi_core::MissionId,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    source_thread_id: &'a ThreadId,
+}
+
+fn upsert_session_tool_progress_item(
+    session_store: &SessionStore,
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    source_thread_id: &ThreadId,
+    tool_call: &ChatToolCall,
+    tool_name: String,
+    payload: String,
+) {
+    let progress_status = serde_json::from_str::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|status| status == "awaiting_approval")
+        .unwrap_or_else(|| "running".to_string());
+    let mut item = session_turn_item(
+        "tool_call_started",
+        &progress_status,
+        Some(tool_call.function.name.clone()),
+        Some(summarize_tool_result(&payload)),
+        Some(format!("turn-item-tool-{}", tool_call.id)),
+        source_thread_id.clone(),
+    );
+    item.source = "tool".to_string();
+    item.tool_call_id = Some(tool_call.id.clone());
+    item.tool_name = Some(tool_name);
+    item.tool_status = Some(progress_status);
+    item.tool_arguments = Some(tool_call.function.arguments.clone());
+    item.tool_result = Some(payload);
+    if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
+}
+
+fn await_session_tool_approval(
+    context: SessionToolApprovalContext<'_>,
+    tool_call: &ChatToolCall,
+    decision: &crate::tool_batch::ToolPreflightDecision,
+) -> Result<(), (String, ExecutionResultStatus)> {
+    let SessionToolApprovalContext {
+        session_store,
+        event_bus,
+        registry,
+        mission_id,
+        session_id,
+        workspace_id,
+        source_thread_id,
+    } = context;
+    let Some(turn_id) = session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .filter(|turn| {
+            canonical_turn_status(&turn.status).is_some_and(|status| {
+                matches!(
+                    status,
+                    CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running
+                )
+            })
+        })
+        .map(|turn| turn.turn_id)
+    else {
+        return Err((
+            serde_json::json!({
+                "tool": tool_call.function.name,
+                "status": "cancelled",
+                "error_code": "tool_approval_cancelled",
+                "error": "当前对话轮次已经结束，待授权操作未执行",
+            })
+            .to_string(),
+            ExecutionResultStatus::Cancelled,
+        ));
+    };
+    let approval_id = format!(
+        "tool-approval-session-{}-{}-{}",
+        session_id, turn_id, tool_call.id
+    );
+    let reason = serde_json::from_str::<serde_json::Value>(&decision.payload)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "该操作需要用户授权".to_string());
+    let request = crate::PendingToolApproval {
+        approval_id: approval_id.clone(),
+        session_id: session_id.clone(),
+        task_id: TaskId::new(format!("session:{session_id}")),
+        turn_id: turn_id.clone(),
+        tool_call_id: tool_call.id.clone(),
+        tool_name: tool_call.function.name.clone(),
+        reason: reason.clone(),
+        requested_at: UtcMillis::now(),
+    };
+    let waiter = match registry.request(request.clone()) {
+        Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
+        Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
+        Err(error) => {
+            return Err((
+                serde_json::json!({
+                    "tool": tool_call.function.name,
+                    "status": "failed",
+                    "error_code": "tool_approval_runtime_failed",
+                    "error": error,
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            ));
+        }
+    };
+
+    let progress_payload = serde_json::json!({
+        "tool": tool_call.function.name,
+        "status": "awaiting_approval",
+        "error_code": "tool_policy_needs_approval",
+        "error": reason,
+        "approval_id": approval_id,
+        "approval": request,
+    })
+    .to_string();
+    upsert_session_tool_progress_item(
+        session_store,
+        event_bus,
+        session_id,
+        workspace_id,
+        source_thread_id,
+        tool_call,
+        tool_call.function.name.clone(),
+        progress_payload,
+    );
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-tool-approval-requested-{}",
+                UtcMillis::now().0
+            )),
+            "tool.approval.requested",
+            serde_json::json!({
+                "session_id": session_id,
+                "workspace_id": workspace_id,
+                "task_id": waiter.request.task_id,
+                "turn_id": turn_id,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.function.name,
+                "approval_id": waiter.request.approval_id,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(waiter.request.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+
+    loop {
+        match waiter
+            .decision_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+        {
+            Ok(
+                crate::ToolApprovalDecision::AllowOnce | crate::ToolApprovalDecision::AllowForTurn,
+            ) => {
+                if !crate::tool_approval::session_turn_is_active(
+                    session_store,
+                    session_id,
+                    &turn_id,
+                ) {
+                    registry.remove_turn(session_id, &turn_id);
+                    return Err((
+                        serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "cancelled",
+                            "error_code": "tool_approval_cancelled",
+                            "error": "对话轮次已停止，待授权操作未执行",
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Cancelled,
+                    ));
+                }
+                upsert_session_tool_progress_item(
+                    session_store,
+                    event_bus,
+                    session_id,
+                    workspace_id,
+                    source_thread_id,
+                    tool_call,
+                    tool_call.function.name.clone(),
+                    serde_json::json!({
+                        "tool": tool_call.function.name,
+                        "status": "running",
+                        "approval_id": approval_id,
+                    })
+                    .to_string(),
+                );
+                return Ok(());
+            }
+            Ok(crate::ToolApprovalDecision::Deny) => {
+                return Err((
+                    serde_json::json!({
+                        "tool": tool_call.function.name,
+                        "status": "rejected",
+                        "error_code": "tool_approval_denied",
+                        "error": "用户拒绝了本次工具操作",
+                        "approval_id": approval_id,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Rejected,
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !crate::tool_approval::session_turn_is_active(
+                    session_store,
+                    session_id,
+                    &turn_id,
+                ) {
+                    registry.remove_turn(session_id, &turn_id);
+                    return Err((
+                        serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "cancelled",
+                            "error_code": "tool_approval_cancelled",
+                            "error": "对话轮次已停止，待授权操作未执行",
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Cancelled,
+                    ));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                registry.cancel(&approval_id);
+                return Err((
+                    serde_json::json!({
+                        "tool": tool_call.function.name,
+                        "status": "failed",
+                        "error_code": "tool_approval_runtime_failed",
+                        "error": "工具授权等待通道已关闭",
+                        "approval_id": approval_id,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                ));
+            }
+        }
+    }
+}
+
 fn execute_session_turn_tool_call_scoped(
     context: SessionToolExecutionContext<'_>,
     tool_call: &ChatToolCall,
@@ -1527,6 +1897,7 @@ fn execute_session_turn_tool_call_scoped(
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
+        tool_approval_registry,
         plan_store,
         mission_id,
         session_id,
@@ -1617,6 +1988,10 @@ fn execute_session_turn_tool_call_scoped(
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
+    if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
+        return (rejection, ExecutionResultStatus::Failed);
+    }
+
     if let Some(gate) = safety_gate {
         publish_safety_evaluation_audit(
             event_bus,
@@ -1634,7 +2009,7 @@ fn execute_session_turn_tool_call_scoped(
         );
     }
 
-    let reference_policy = crate::context_reference::session_context_reference_policy(
+    let initial_reference_policy = crate::context_reference::session_context_reference_policy(
         context_references,
         workspace_root_path
             .map(|path| path.to_string_lossy())
@@ -1642,58 +2017,15 @@ fn execute_session_turn_tool_call_scoped(
         access_profile,
     );
 
-    if let Some((tool_skill_name, binding_id)) =
-        parse_skill_custom_tool_name(&tool_call.function.name)
-    {
-        let mut tool_policy =
-            tool_execution_policy_scope(access_profile, "", &reference_policy.allowed_paths, &[]);
-        tool_policy.read_only_paths = reference_policy.read_only_paths.clone();
-        return execute_skill_custom_tool(
-            tool_call,
-            &tool_skill_name,
-            &binding_id,
-            skill_name,
-            tool_policy,
-            safety_gate,
-            skill_runtime,
-            skill_dispatch_runtime,
-            ToolExecutionContext {
-                worker_id: None,
-                task_id: None,
-                session_id: Some(session_id.clone()),
-                workspace_id: workspace_id.clone(),
-                access_profile,
-                working_directory: workspace_root_path.cloned(),
-                browser_capability_revision,
-                browser_execution_id: browser_execution_id.map(str::to_string),
-            },
-            workspace_root_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-        );
-    }
-
-    if let Some(result) = registry.execute_external_mcp_tool(
-        &tool_call.function.name,
-        &tool_call.function.arguments,
-        access_profile,
-    ) {
-        return result;
-    }
-
-    if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
-        return (rejection, ExecutionResultStatus::Failed);
-    }
-
     let access_profile_decision =
         access_profile_tool_decision(crate::tool_batch::AccessProfileToolDecisionInput {
             access_profile,
             command_mode: "",
             allowed_tools: &[],
             denied_tools: &[],
-            allowed_paths: &reference_policy.allowed_paths,
+            allowed_paths: &initial_reference_policy.allowed_paths,
             denied_paths: &[],
-            read_only_paths: &reference_policy.read_only_paths,
+            read_only_paths: &initial_reference_policy.read_only_paths,
             requested_tool_name: &tool_call.function.name,
             arguments: &tool_call.function.arguments,
             workspace_root_path,
@@ -1706,57 +2038,158 @@ fn execute_session_turn_tool_call_scoped(
             &tool_call.function.arguments,
         )
     });
+    let mut approval_granted = false;
     if let Some(decision) = select_preflight_decision(access_profile_decision, safety_gate_decision)
     {
-        return (decision.payload, decision.status);
+        if decision.status == ExecutionResultStatus::NeedsApproval {
+            match await_session_tool_approval(
+                SessionToolApprovalContext {
+                    session_store,
+                    event_bus,
+                    registry: tool_approval_registry,
+                    mission_id,
+                    session_id,
+                    workspace_id,
+                    source_thread_id,
+                },
+                tool_call,
+                &decision,
+            ) {
+                Ok(()) => approval_granted = true,
+                Err(result) => return result,
+            }
+        } else {
+            return (decision.payload, decision.status);
+        }
     }
 
-    let mut tool_policy =
-        active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
-    tool_policy.allowed_paths = reference_policy.allowed_paths;
-    tool_policy.read_only_paths = reference_policy.read_only_paths;
     let progress_callback = |progress: ToolExecutionProgress| {
         if progress.tool_call_id.as_str() != tool_call.id {
             return;
         }
-        let mut item = session_turn_item(
-            "tool_call_started",
-            "running",
-            Some(tool_call.function.name.clone()),
-            Some(summarize_tool_result(&progress.payload)),
-            Some(format!("turn-item-tool-{}", tool_call.id)),
-            source_thread_id.clone(),
+        upsert_session_tool_progress_item(
+            session_store,
+            event_bus,
+            session_id,
+            workspace_id,
+            source_thread_id,
+            tool_call,
+            progress.tool_name,
+            progress.payload,
         );
-        item.source = "tool".to_string();
-        item.tool_call_id = Some(tool_call.id.clone());
-        item.tool_name = Some(progress.tool_name);
-        item.tool_status = Some("running".to_string());
-        item.tool_arguments = Some(tool_call.function.arguments.clone());
-        item.tool_result = Some(progress.payload);
-        if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
-            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
-        }
     };
-    let output = registry.execute_with_policy_and_progress(
-        ToolExecutionInput::for_builtin_invocation(
-            ToolCallId::new(&tool_call.id),
+    let execute_runtime_tool = |effective_access_profile: magi_core::AccessProfile| {
+        let reference_policy = crate::context_reference::session_context_reference_policy(
+            context_references,
+            workspace_root_path
+                .map(|path| path.to_string_lossy())
+                .as_deref(),
+            effective_access_profile,
+        );
+        if let Some((tool_skill_name, binding_id)) =
+            parse_skill_custom_tool_name(&tool_call.function.name)
+        {
+            let mut tool_policy = tool_execution_policy_scope(
+                effective_access_profile,
+                "",
+                &reference_policy.allowed_paths,
+                &[],
+            );
+            tool_policy.read_only_paths = reference_policy.read_only_paths;
+            return execute_skill_custom_tool(
+                tool_call,
+                &tool_skill_name,
+                &binding_id,
+                skill_name,
+                tool_policy,
+                safety_gate,
+                skill_runtime,
+                skill_dispatch_runtime,
+                ToolExecutionContext {
+                    worker_id: None,
+                    task_id: None,
+                    session_id: Some(session_id.clone()),
+                    workspace_id: workspace_id.clone(),
+                    access_profile: effective_access_profile,
+                    working_directory: workspace_root_path.cloned(),
+                    browser_capability_revision,
+                    browser_execution_id: browser_execution_id.map(str::to_string),
+                },
+                workspace_root_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            );
+        }
+
+        if let Some(result) = registry.execute_external_mcp_tool(
             &tool_call.function.name,
-            tool_call.function.arguments.clone(),
-        ),
-        ToolExecutionContext {
-            worker_id: None,
-            task_id: None,
-            session_id: Some(session_id.clone()),
-            workspace_id: workspace_id.clone(),
-            access_profile: tool_policy.access_profile,
-            working_directory: workspace_root_path.cloned(),
-            browser_capability_revision,
-            browser_execution_id: browser_execution_id.map(str::to_string),
-        },
-        &tool_policy,
-        &progress_callback,
-    );
-    (output.payload, output.status)
+            &tool_call.function.arguments,
+            effective_access_profile,
+        ) {
+            return result;
+        }
+
+        let mut tool_policy =
+            active_skill_tool_execution_policy(effective_access_profile, skill_runtime, skill_name);
+        tool_policy.allowed_paths = reference_policy.allowed_paths;
+        tool_policy.read_only_paths = reference_policy.read_only_paths;
+        let output = registry.execute_with_policy_and_progress(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(&tool_call.id),
+                &tool_call.function.name,
+                tool_call.function.arguments.clone(),
+            ),
+            ToolExecutionContext {
+                worker_id: None,
+                task_id: None,
+                session_id: Some(session_id.clone()),
+                workspace_id: workspace_id.clone(),
+                access_profile: tool_policy.access_profile,
+                working_directory: workspace_root_path.cloned(),
+                browser_capability_revision,
+                browser_execution_id: browser_execution_id.map(str::to_string),
+            },
+            &tool_policy,
+            &progress_callback,
+        );
+        (output.payload, output.status)
+    };
+
+    let effective_access_profile = if approval_granted {
+        magi_core::AccessProfile::FullAccess
+    } else {
+        access_profile
+    };
+    let mut result = execute_runtime_tool(effective_access_profile);
+    if result.1 == ExecutionResultStatus::NeedsApproval && !approval_granted {
+        if !approval_resume_is_safe(&result.0) {
+            return approval_resume_contract_failure(&tool_call.function.name);
+        }
+        let runtime_decision = crate::tool_batch::ToolPreflightDecision {
+            payload: result.0,
+            status: result.1,
+        };
+        match await_session_tool_approval(
+            SessionToolApprovalContext {
+                session_store,
+                event_bus,
+                registry: tool_approval_registry,
+                mission_id,
+                session_id,
+                workspace_id,
+                source_thread_id,
+            },
+            tool_call,
+            &runtime_decision,
+        ) {
+            Ok(()) => result = execute_runtime_tool(magi_core::AccessProfile::FullAccess),
+            Err(rejected) => return rejected,
+        }
+    }
+    if result.1 == ExecutionResultStatus::NeedsApproval {
+        return approval_resume_contract_failure(&tool_call.function.name);
+    }
+    result
 }
 
 fn is_session_goal_write_tool(tool_name: &str) -> bool {
@@ -2699,7 +3132,7 @@ mod tests {
             },
         };
 
-        let (payload, status) = execute_session_turn_tool_call(
+        let (payload, status) = execute_session_turn_tool_call_with_approval(
             SessionToolCallTestContext {
                 session_store: &SessionStore::new(),
                 event_bus: &event_bus,
@@ -2714,25 +3147,17 @@ mod tests {
                 access_profile: magi_core::AccessProfile::Restricted,
             },
             &call,
+            crate::ToolApprovalDecision::AllowOnce,
         );
 
-        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
-        assert_eq!(parsed["status"], "needs_approval");
-        assert_eq!(parsed["tool"], "skill__code-review__review-mcp");
-        assert_eq!(parsed["error_code"], "skill_tool_needs_approval");
-        assert_eq!(
-            parsed["error"],
-            "受限访问已拦截该 Skill 工具，请切换为完全访问权限后重试"
-        );
-        assert_eq!(parsed.get("bridge_kind"), None);
-        assert_eq!(parsed.get("bridge_target"), None);
-        assert_eq!(parsed.get("risk_level"), None);
-        assert!(mcp_calls.lock().expect("mcp calls lock").is_empty());
+        assert_eq!(parsed["tool"], "echo.describe");
+        assert_eq!(mcp_calls.lock().expect("mcp calls lock").len(), 1);
         let invocations = tool_registry.invocations();
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].tool_kind, magi_governance::ToolKind::Mcp);
-        assert_eq!(invocations[0].status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[1].tool_kind, magi_governance::ToolKind::Mcp);
+        assert_eq!(invocations[1].status, ExecutionResultStatus::Succeeded);
     }
 
     #[test]
@@ -2991,7 +3416,7 @@ mod tests {
             },
         };
 
-        let (payload, status) = execute_session_turn_tool_call(
+        let (payload, status) = execute_session_turn_tool_call_with_approval(
             SessionToolCallTestContext {
                 session_store: &SessionStore::new(),
                 event_bus: &event_bus,
@@ -3006,17 +3431,14 @@ mod tests {
                 access_profile: magi_core::AccessProfile::Restricted,
             },
             &call,
+            crate::ToolApprovalDecision::AllowOnce,
         );
 
-        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
-        assert!(
-            !target.exists(),
-            "受限模式下写类 shell 被拦截，不能提前执行"
-        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        assert!(target.exists(), "用户允许后必须恢复并完成原始 shell 调用");
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["tool"], "shell_exec");
-        assert_eq!(parsed["status"], "needs_approval");
-        assert_eq!(parsed["access_profile"], "restricted");
+        assert_eq!(parsed["status"], "succeeded");
     }
 
     #[test]
@@ -3084,7 +3506,7 @@ mod tests {
             },
         };
 
-        let (payload, status) = execute_session_turn_tool_call(
+        let (payload, status) = execute_session_turn_tool_call_with_approval(
             SessionToolCallTestContext {
                 session_store: &SessionStore::new(),
                 event_bus: &event_bus,
@@ -3099,18 +3521,14 @@ mod tests {
                 access_profile: magi_core::AccessProfile::Restricted,
             },
             &call,
+            crate::ToolApprovalDecision::Deny,
         );
 
-        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(status, ExecutionResultStatus::Rejected);
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["tool"], "shell_exec");
-        assert_eq!(parsed["status"], "needs_approval");
-        assert_eq!(parsed["error_code"], "tool_safety_needs_approval");
-        assert_eq!(
-            parsed["error"],
-            "安全防护已在受限访问下拦截该操作，请切换为完全访问权限后重试"
-        );
-        assert_eq!(parsed.get("safety_gate"), None);
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["error_code"], "tool_approval_denied");
         assert!(!payload.contains("rm -rf"));
         assert!(!payload.contains("bulk_delete"));
     }
@@ -3185,7 +3603,7 @@ mod tests {
             },
         };
 
-        let (payload, status) = execute_session_turn_tool_call(
+        let (payload, status) = execute_session_turn_tool_call_with_approval(
             SessionToolCallTestContext {
                 session_store: &SessionStore::new(),
                 event_bus: &event_bus,
@@ -3200,14 +3618,15 @@ mod tests {
                 access_profile: magi_core::AccessProfile::Restricted,
             },
             &call,
+            crate::ToolApprovalDecision::Deny,
         );
 
-        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(status, ExecutionResultStatus::Rejected);
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["tool"], "file_remove");
-        assert_eq!(parsed["status"], "needs_approval");
-        assert_eq!(parsed["error_code"], "tool_policy_needs_approval");
-        assert!(target.exists(), "受限访问拦截的删除不能提前执行");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["error_code"], "tool_approval_denied");
+        assert!(target.exists(), "用户拒绝后不能执行删除");
     }
 
     #[test]
@@ -3637,6 +4056,7 @@ mod tests {
                 skill_dispatch_runtime: None,
                 skill_name: None,
                 safety_gate: None,
+                tool_approval_registry: &crate::ToolApprovalRegistry::default(),
                 plan_store: &plan_store,
                 mission_id: &mission_id,
                 session_id: &session_id,
@@ -3695,6 +4115,7 @@ mod tests {
                 skill_dispatch_runtime: None,
                 skill_name: None,
                 safety_gate: None,
+                tool_approval_registry: &crate::ToolApprovalRegistry::default(),
                 plan_store: &plan_store,
                 mission_id: &mission_id,
                 session_id: &session_id,
@@ -3793,6 +4214,7 @@ mod tests {
                 skill_dispatch_runtime: None,
                 skill_name: None,
                 safety_gate: None,
+                tool_approval_registry: &crate::ToolApprovalRegistry::default(),
                 plan_store: &plan_store,
                 mission_id: &mission_id,
                 session_id: &session_id,
@@ -3820,7 +4242,7 @@ mod tests {
     }
 
     #[test]
-    fn session_turn_approval_required_tool_is_terminal_error_item() {
+    fn session_turn_approval_resumes_original_tool_call() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(32);
         let session_id = SessionId::new("session-turn-approval-tool");
@@ -3867,40 +4289,87 @@ mod tests {
             },
         }];
         let mut messages = Vec::new();
+        let tool_approval_registry = crate::ToolApprovalRegistry::default();
+        let plan_store = crate::test_plan_store("approval-resume-plan");
+        let mission_id = magi_core::MissionId::new("mission-turn-approval-tool");
+        let source_thread_id = ThreadId::new("thread-approval-tool");
+        let mut tool_execution_ledger = ToolExecutionLedger::default();
+        let outcome = thread::scope(|scope| {
+            let resolver = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    let pending = tool_approval_registry
+                        .pending_for_session(&session_id)
+                        .into_iter()
+                        .next();
+                    let awaiting_item = session_store
+                        .runtime_sidecar(&session_id)
+                        .and_then(|sidecar| sidecar.current_turn)
+                        .and_then(|turn| turn.items.into_iter().next())
+                        .filter(|item| item.status == "awaiting_approval");
+                    if let (Some(pending), Some(item)) = (pending, awaiting_item) {
+                        assert_eq!(item.tool_status.as_deref(), Some("awaiting_approval"));
+                        assert!(!target.exists(), "授权前不能执行原始工具调用");
+                        tool_approval_registry
+                            .resolve(
+                                &session_id,
+                                &pending.approval_id,
+                                crate::ToolApprovalDecision::AllowOnce,
+                            )
+                            .expect("approval should resolve");
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "canonical item should enter awaiting_approval"
+                    );
+                    std::thread::yield_now();
+                }
+            });
+            let outcome = append_session_tool_call_items_batch_with_context(
+                SessionToolCallBatchContext {
+                    session_store: &session_store,
+                    event_bus: &event_bus,
+                    tool_registry: Some(&tool_registry),
+                    skill_runtime: None,
+                    skill_dispatch_runtime: None,
+                    skill_name: None,
+                    safety_gate: None,
+                    tool_approval_registry: &tool_approval_registry,
+                    plan_store: &plan_store,
+                    mission_id: &mission_id,
+                    session_id: &session_id,
+                    workspace_id: &workspace_id,
+                    workspace_root_path: Some(root.clone()),
+                    context_references: &[],
+                    access_profile: magi_core::AccessProfile::Restricted,
+                    browser_capability_revision: None,
+                    browser_execution_id: None,
+                    snapshot_session: None,
+                    execution_group_id: None,
+                    source_thread_id: &source_thread_id,
+                    persist_session_state: None,
+                    tool_execution_ledger: &mut tool_execution_ledger,
+                },
+                &tool_calls,
+                &mut messages,
+                || true,
+            );
+            resolver.join().expect("approval resolver should join");
+            outcome
+        });
 
-        append_session_tool_call_items_batch(
-            SessionToolCallBatchTestContext {
-                session_store: &session_store,
-                event_bus: &event_bus,
-                tool_registry: Some(&tool_registry),
-                skill_runtime: None,
-                skill_dispatch_runtime: None,
-                skill_name: None,
-                safety_gate: None,
-                session_id: &session_id,
-                workspace_id: &workspace_id,
-                workspace_root_path: Some(root.clone()),
-                access_profile: magi_core::AccessProfile::Restricted,
-                browser_capability_revision: None,
-                snapshot_session: None,
-                execution_group_id: None,
-                source_thread_id: &ThreadId::new("thread-approval-tool"),
-                persist_session_state: None,
-            },
-            &tool_calls,
-            &mut messages,
-            || true,
-        );
-
-        assert!(!target.exists(), "受限访问拦截的工具调用不能提前执行");
+        assert!(outcome.completed);
+        assert_eq!(outcome.succeeded_tool_names, vec!["shell_exec"]);
+        assert!(target.exists(), "授权后原始工具调用必须继续执行");
         let sidecar = session_store
             .runtime_sidecar(&session_id)
             .expect("sidecar should exist");
         let turn = sidecar.current_turn.expect("turn should exist");
         let item = turn.items.first().expect("tool item should exist");
-        assert_eq!(item.status, "failed");
-        assert_eq!(item.tool_status.as_deref(), Some("needs_approval"));
-        assert!(item.tool_error.is_some(), "受限访问拦截必须作为错误槽写回");
+        assert_eq!(item.status, "completed");
+        assert_eq!(item.tool_status.as_deref(), Some("succeeded"));
+        assert!(item.tool_error.is_none());
         assert_eq!(
             messages
                 .first()
@@ -3913,28 +4382,8 @@ mod tests {
                 .and_then(|message| message.content.as_deref())
                 .expect("tool result should be visible to the model"),
         )
-        .expect("model-visible tool failure should preserve structured json");
-        assert_eq!(
-            model_visible_result["error_code"].as_str(),
-            Some("tool_policy_needs_approval")
-        );
-        assert_eq!(
-            model_visible_result["access_profile"].as_str(),
-            Some("restricted")
-        );
-        assert_eq!(
-            model_visible_result["required_access_profile"].as_str(),
-            Some("full_access")
-        );
-        assert_eq!(
-            model_visible_result["retryable_with_same_arguments"].as_bool(),
-            Some(false)
-        );
-        assert!(
-            model_visible_result["instruction"]
-                .as_str()
-                .is_some_and(|instruction| instruction.contains("不要在相同访问模式下重复调用"))
-        );
+        .expect("model-visible tool result should preserve structured json");
+        assert_eq!(model_visible_result["status"].as_str(), Some("succeeded"));
 
         let canonical_turn = session_store
             .canonical_turns_for_session(&session_id)
@@ -3945,10 +4394,10 @@ mod tests {
             .items
             .first()
             .expect("canonical tool item should exist");
-        assert_eq!(canonical_item.status, CanonicalTurnItemStatus::Failed);
+        assert_eq!(canonical_item.status, CanonicalTurnItemStatus::Completed);
         let canonical_tool = canonical_item.tool.as_ref().expect("canonical tool");
         assert!(canonical_tool.result.is_some());
-        assert!(canonical_tool.error.is_some());
+        assert!(canonical_tool.error.is_none());
     }
 
     #[test]

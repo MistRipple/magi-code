@@ -23,6 +23,7 @@
     const directContent = typeof message.content === 'string' ? plainText(message.content) : '';
     if (directContent) return directContent;
     for (const block of message.blocks || []) {
+      if (!block || typeof block !== 'object') continue;
       if (typeof block.content === 'string') {
         const content = plainText(block.content);
         if (content) return content;

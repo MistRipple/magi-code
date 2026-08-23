@@ -14,6 +14,9 @@ import type {
   NotificationCenterSnapshotDto,
   NotificationsResponseDto,
   SessionInterruptResponseDto,
+  SessionToolApprovalResponseDto,
+  SessionToolApprovalsResponseDto,
+  ToolApprovalDecision,
   SessionTurnQueueResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
@@ -1422,9 +1425,18 @@ async function postWorkspacePathBoundJson<T>(
   action: string,
   bindingOverride?: AgentBindingOverride,
 ): Promise<T> {
+  const binding = resolveBindingWithOverride(bindingOverride);
+  if (binding.scope !== 'workspace') {
+    throw new AgentApiError(400, '工作区作用域不完整', action);
+  }
+  const workspacePath = binding.workspacePath.trim()
+    || findCachedWorkspaceSummary(binding.workspaceId).rootPath.trim();
+  if (!workspacePath) {
+    throw new AgentApiError(400, 'workspacePath 不能为空', action);
+  }
   return await postJsonWithBinding<T>(
     pathname,
-    payload,
+    { ...payload, workspacePath },
     action,
     bindingOverride,
     true,
@@ -2148,6 +2160,53 @@ export async function interruptAgentSession(
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+export async function getAgentSessionToolApprovals(
+  sessionId: string,
+  bindingOverride?: AgentBindingOverride,
+): Promise<SessionToolApprovalsResponseDto> {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) {
+    throw new AgentApiError(400, 'sessionId 不能为空', 'load tool approvals');
+  }
+  const query = buildBoundQueryWithOverride(
+    {},
+    bindingOverride
+      ? { ...bindingOverride, sessionId: normalizedSessionId }
+      : { sessionId: normalizedSessionId },
+    { includeScope: false, includeSession: true },
+  );
+  const response = await getTransport().request(
+    agentUrl('/api/session/tool-approvals', query),
+    { cache: 'no-store' },
+  );
+  return parseAgentJson<SessionToolApprovalsResponseDto>(response, 'load tool approvals');
+}
+
+export async function resolveAgentToolApproval(
+  sessionId: string,
+  approvalId: string,
+  decision: ToolApprovalDecision,
+  bindingOverride?: AgentBindingOverride,
+): Promise<SessionToolApprovalResponseDto> {
+  const normalizedSessionId = sessionId.trim();
+  const normalizedApprovalId = approvalId.trim();
+  if (!normalizedSessionId || !normalizedApprovalId) {
+    throw new AgentApiError(400, 'sessionId 和 approvalId 不能为空', 'resolve tool approval');
+  }
+  return await postBoundJson<SessionToolApprovalResponseDto>(
+    '/api/session/tool-approval',
+    {
+      sessionId: normalizedSessionId,
+      approvalId: normalizedApprovalId,
+      decision,
+    },
+    'resolve tool approval',
+    bindingOverride
+      ? { ...bindingOverride, sessionId: normalizedSessionId }
+      : { sessionId: normalizedSessionId },
+  );
 }
 
 export async function getAgentSettingsBootstrap(

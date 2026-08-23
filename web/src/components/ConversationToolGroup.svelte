@@ -30,6 +30,7 @@
       : '';
     if (metadataName) return metadataName;
     for (const block of item.message.blocks || []) {
+      if (!block || typeof block !== 'object') continue;
       if (block.type === 'tool_call' && block.toolCall?.name) return block.toolCall.name;
     }
     return '';
@@ -153,7 +154,7 @@
 
   .tool-group-list {
     margin: 0 0 7px;
-    padding: 2px 0 2px 18px;
+    padding: 2px 0 2px 8px;
     border-left: 0;
   }
 
@@ -194,7 +195,7 @@
 
   .conversation-tool-group .tool-group-list :global(.tool-content) {
     margin: 0 0 8px;
-    padding: 7px 0 7px 18px;
+    padding: 7px 0 7px 8px;
     border-top: 0;
     border-left: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
     background: transparent;
@@ -209,11 +210,11 @@
 
   @media (max-width: 560px) {
     .tool-group-list {
-      padding-left: 14px;
+      padding-left: 6px;
     }
 
     .conversation-tool-group .tool-group-list :global(.tool-content) {
-      padding-left: 12px;
+      padding-left: 6px;
     }
   }
 </style>

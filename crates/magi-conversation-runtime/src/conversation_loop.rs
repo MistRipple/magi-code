@@ -3601,9 +3601,19 @@ fn upsert_task_tool_call_progress_turn_item(
     if progress.tool_call_id.as_str() != tool_call.id {
         return;
     }
+    let progress_status = serde_json::from_str::<serde_json::Value>(&progress.payload)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|status| status == "awaiting_approval")
+        .unwrap_or_else(|| "running".to_string());
     let mut item = session_turn_item(
         "tool_call_started",
-        "running",
+        &progress_status,
         Some(tool_call.function.name.clone()),
         Some(summarize_tool_result(&progress.payload)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
@@ -3612,7 +3622,7 @@ fn upsert_task_tool_call_progress_turn_item(
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
     item.tool_name = Some(progress.tool_name);
-    item.tool_status = Some("running".to_string());
+    item.tool_status = Some(progress_status);
     item.tool_arguments = Some(tool_call.function.arguments.clone());
     item.tool_result = Some(progress.payload);
     if let Some(published) = upsert_session_turn_item_with_task_store(

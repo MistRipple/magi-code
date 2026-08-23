@@ -22,6 +22,10 @@ import type { CanonicalTurnReducerState } from './turn-reducer';
 import { coerceToolArgumentsRecord } from '../lib/tool-call-display';
 import { buildCanonicalToolFileChangeBlocks } from '../lib/canonical-tool-file-change';
 import { mapStandardBlocks } from '../lib/message-utils';
+import {
+  inferConversationPresentationRole,
+  isPromotedSidechainMessage,
+} from '../lib/conversation-presentation';
 
 /**
  * 单个 turn 的「呈现层」预计算结果。
@@ -461,7 +465,7 @@ function buildMessage(
     || noticeType === 'info'
     ? noticeType
     : undefined;
-  return {
+  const message: Message = {
     id: artifactId,
     role: resolveMessageRole(item),
     source: resolveMessageSource(item),
@@ -513,6 +517,11 @@ function buildMessage(
       canonical: true,
     },
   };
+  message.metadata = {
+    ...message.metadata,
+    conversationPresentationRole: inferConversationPresentationRole(message),
+  };
+  return message;
 }
 
 function resolveArtifactId(turn: CanonicalTurn, item: CanonicalTurnItem): string {
@@ -940,6 +949,10 @@ function renderEntry(artifact: TimelineProjectionArtifact): TimelineProjectionRe
   };
 }
 
+function shouldRenderOnConversationThread(artifact: TimelineProjectionArtifact): boolean {
+  return !artifact.taskId || isPromotedSidechainMessage(artifact.message);
+}
+
 export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerState): SessionTimelineProjection | null {
   const sessionId = normalizeSessionId(state.sessionId);
   if (!sessionId) {
@@ -950,10 +963,10 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     .flatMap((turn) => buildTurnProjectionArtifacts(turn))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
-  // 主时间线只承接 root agent artifacts；
-  // 代理 artifacts 由 RightPane agent run tab 按 metadata.taskId 过滤呈现。
+  // 主时间线承接 root agent artifacts，并提升子代理中必须由用户处理的授权、
+  // 以及图表/图片等最终可见产物；其余代理过程仍留在 task 详情。
   const threadRenderEntries = artifacts
-    .filter((artifact) => !artifact.taskId)
+    .filter(shouldRenderOnConversationThread)
     .map(renderEntry);
   return {
     schemaVersion: 'session-timeline-projection.v2',
@@ -1028,7 +1041,7 @@ export function updateCanonicalTimelineProjection(
     lastAppliedEventSeq: state.lastAppliedEventSeq,
     artifacts,
     threadRenderEntries: artifacts
-      .filter((artifact) => !artifact.taskId)
+      .filter(shouldRenderOnConversationThread)
       .map(renderEntry),
   };
 }
