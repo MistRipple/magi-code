@@ -5,6 +5,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import MessageItem from './MessageItem.svelte';
+  import { resolveConversationToolGroupLabel } from '../lib/conversation-disclosure';
 
   interface Props {
     items: TimelineRenderItem[];
@@ -24,32 +25,10 @@
 
   let expanded = $state(untrack(() => false));
 
-  function toolName(item: TimelineRenderItem): string {
-    const metadataName = typeof item.message.metadata?.toolName === 'string'
-      ? item.message.metadata.toolName.trim()
-      : '';
-    if (metadataName) return metadataName;
-    for (const block of item.message.blocks || []) {
-      if (!block || typeof block !== 'object') continue;
-      if (block.type === 'tool_call' && block.toolCall?.name) return block.toolCall.name;
-    }
-    return '';
-  }
-
-  const names = $derived(items.map(toolName).filter(Boolean));
   const contentId = $derived(`conversation-tool-group-${(items[0]?.key || 'empty').replace(/[^a-zA-Z0-9_-]/gu, '-')}`);
-  const groupLabel = $derived.by(() => {
-    const allFileTools = names.length > 0 && names.every((name) => (
-      /(?:file|patch|edit|write|remove|mkdir|move|copy)/iu.test(name)
-    ));
-    const allCommandTools = names.length > 0 && names.every((name) => (
-      /(?:shell|exec|command|process)/iu.test(name)
-    ));
-    if (items.length === 1) return i18n.t('messageList.turnDisclosure.toolGroupSingle');
-    if (allFileTools) return i18n.t('messageList.turnDisclosure.toolGroupFiles');
-    if (allCommandTools) return i18n.t('messageList.turnDisclosure.toolGroupCommands');
-    return i18n.t('messageList.turnDisclosure.toolGroupMixed');
-  });
+  const groupLabel = $derived(
+    resolveConversationToolGroupLabel(items, i18n.t.bind(i18n)),
+  );
 
   function toggle(): void {
     expanded = !expanded;
@@ -68,7 +47,6 @@
       <Icon name="chevron-right" size={12} />
     </span>
     <span class="tool-group-label">{groupLabel}</span>
-    <span class="tool-group-count">{i18n.t('messageList.turnDisclosure.toolCount', { count: items.length })}</span>
   </button>
 
   {#if expanded}
@@ -89,15 +67,15 @@
 
 <style>
   .conversation-tool-group {
-    margin: 4px 0 7px;
+    margin: 0;
   }
 
   .tool-group-header {
     display: flex;
     align-items: center;
     width: 100%;
-    min-height: 35px;
-    gap: 8px;
+    min-height: 28px;
+    gap: 7px;
     padding: 0;
     border: 0;
     background: transparent;
@@ -135,13 +113,6 @@
     white-space: nowrap;
   }
 
-  .tool-group-count {
-    flex: 0 0 auto;
-    margin-left: auto;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-  }
-
   .tool-group-header:hover .tool-group-chevron,
   .tool-group-header:focus-visible .tool-group-chevron,
   .tool-group-chevron.rotated {
@@ -153,8 +124,8 @@
   }
 
   .tool-group-list {
-    margin: 0 0 7px;
-    padding: 2px 0 2px 8px;
+    margin: 0;
+    padding: 0 0 1px 8px;
     border-left: 0;
   }
 
@@ -175,6 +146,28 @@
     min-height: 34px;
     gap: 8px;
     padding: 4px 0;
+    transition: color var(--transition-fast);
+  }
+
+  /*
+   * 摘要模式中的工具行是过程信息，不是列表选中项。
+   * 这里移除通用 tool-header 的整行 hover 背景，避免无内缩的底色直接顶到两侧；
+   * 交互反馈改为颜色和指针，键盘导航仍保留可见焦点。
+   */
+  .conversation-tool-group .tool-group-list :global(.tool-header:hover) {
+    background: transparent;
+    color: var(--foreground);
+  }
+
+  .conversation-tool-group .tool-group-list :global(.tool-header:hover .tool-icon),
+  .conversation-tool-group .tool-group-list :global(.tool-header:focus-visible .tool-icon) {
+    color: var(--foreground);
+  }
+
+  .conversation-tool-group .tool-group-list :global(.tool-header:focus-visible) {
+    outline: 1px solid color-mix(in srgb, var(--primary) 72%, transparent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .conversation-tool-group .tool-group-list :global(.chevron) {
@@ -209,6 +202,10 @@
   }
 
   @media (max-width: 560px) {
+    .tool-group-header {
+      min-height: 32px;
+    }
+
     .tool-group-list {
       padding-left: 6px;
     }

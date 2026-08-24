@@ -1214,7 +1214,7 @@
             {displayContext}
             runtimeActive={Boolean(entry.runtimeKey)}
             {elapsedSeconds}
-            initialExpanded={false}
+            initialExpanded={Boolean(entry.runtimeKey)}
             {filePreviewScopeForItem}
             canEditMessage={(item) => canEditUserMessage(item.message)}
             editMessage={(item) => editUserMessage(item.message)}

@@ -8,12 +8,17 @@
   import MessageItem from './MessageItem.svelte';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
   import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
-  import ConversationProcessRow from './ConversationProcessRow.svelte';
-  import ConversationToolGroup from './ConversationToolGroup.svelte';
   import ConversationAgentGroup from './ConversationAgentGroup.svelte';
+  import ConversationToolGroup from './ConversationToolGroup.svelte';
+  import ConversationPhase from './ConversationPhase.svelte';
   import {
     conversationPresentationRole,
   } from '../lib/conversation-presentation';
+  import {
+    buildConversationDisclosureBlocks,
+    type ConversationDisclosureBlock,
+    type ConversationStreamEntry,
+  } from '../lib/conversation-disclosure';
 
   interface Props {
     turnId: string;
@@ -29,12 +34,6 @@
     continueInterruptedSession: () => void;
   }
 
-  type ConversationStreamEntry =
-    | { kind: 'event'; key: string; item: TimelineRenderItem }
-    | { kind: 'tool-group'; key: string; items: TimelineRenderItem[] }
-    | { kind: 'item'; key: string; item: TimelineRenderItem; role: 'artifact' | 'attention' }
-    | { kind: 'agent-group'; key: string; items: TimelineRenderItem[] };
-
   let {
     turnId,
     items,
@@ -49,8 +48,10 @@
     continueInterruptedSession,
   }: Props = $props();
 
-  // 轮次状态只在首次创建时读取；用户手动展开后，流式更新不能覆盖这个选择。
-  let expanded = $state(untrack(() => initialExpanded));
+  // 自动状态只负责实时轮次；用户手动展开/收起后，流式更新不能覆盖这个选择。
+  let expanded = $state(untrack(() => initialExpanded || runtimeActive));
+  let manualTurnOverride = false;
+  let previousLive = false;
 
   function metadataString(message: Message, key: string): string {
     const value = message.metadata?.[key];
@@ -179,6 +180,14 @@
         return status === 'pending' || status === 'running';
       }),
   );
+
+  $effect(() => {
+    const nextLive = isLive;
+    if (nextLive !== previousLive) {
+      if (!manualTurnOverride) expanded = nextLive;
+      previousLive = nextLive;
+    }
+  });
   const durationMs = $derived.by(() => {
     for (let index = items.length - 1; index >= 0; index -= 1) {
       const value = items[index].message.metadata?.responseDurationMs;
@@ -206,7 +215,20 @@
     return `${prefix}${durationPart}`;
   });
 
+  const disclosureBlocks = $derived<ConversationDisclosureBlock[]>(
+    buildConversationDisclosureBlocks(streamEntries),
+  );
+  const activePhaseKey = $derived.by(() => {
+    if (!isLive) return '';
+    for (let index = disclosureBlocks.length - 1; index >= 0; index -= 1) {
+      const block = disclosureBlocks[index];
+      if (block.kind === 'phase') return block.phase.key;
+    }
+    return '';
+  });
+
   function toggle(): void {
+    manualTurnOverride = true;
     expanded = !expanded;
   }
 </script>
@@ -247,52 +269,59 @@
   {/if}
 
   <div class="turn-stream" id={`turn-process-${turnId}`}>
-  {#each streamEntries as entry (entry.key)}
-    {#if entry.kind === 'event'}
-      {#if expanded}
-        <div class="turn-process-entry"><ConversationProcessRow item={entry.item} /></div>
-      {/if}
-    {:else if entry.kind === 'tool-group'}
-      {#if expanded}
-        <div class="turn-process-entry">
-          <ConversationToolGroup
-            items={entry.items}
-            {readOnly}
-            {displayContext}
-            {filePreviewScopeForItem}
-            {continueInterruptedSession}
-          />
-        </div>
-      {/if}
-    {:else if entry.kind === 'agent-group'}
-      <ConversationAgentGroup
-        items={entry.items}
-        {readOnly}
-        {displayContext}
-        {filePreviewScopeForItem}
-        {continueInterruptedSession}
-      />
-    {:else}
-      <section
-        class="turn-promoted"
-        data-turn-attention={entry.role === 'attention' ? 'true' : undefined}
-        data-turn-artifact={entry.role === 'artifact' ? 'true' : undefined}
-      >
-        <MessageItem
-          message={entry.item.message}
+    {#each disclosureBlocks as block (block.kind === 'phase' ? block.phase.key : block.key)}
+      {#if block.kind === 'phase'}
+        {#if expanded}
+        <ConversationPhase
+          phase={block.phase}
+          active={block.phase.key === activePhaseKey}
           {readOnly}
           {displayContext}
-          filePreviewScope={filePreviewScopeForItem(entry.item)}
+          {filePreviewScopeForItem}
+          {continueInterruptedSession}
+        />
+        {/if}
+      {:else if block.kind === 'agent-group'}
+        <ConversationAgentGroup
+          items={block.items}
+          {readOnly}
+          {displayContext}
+          {filePreviewScopeForItem}
+          {continueInterruptedSession}
+        />
+      {:else if block.kind === 'tool-group'}
+        {#if expanded}
+          <div class="turn-process-entry">
+            <ConversationToolGroup
+              items={block.items}
+              {readOnly}
+              {displayContext}
+              {filePreviewScopeForItem}
+              {continueInterruptedSession}
+            />
+          </div>
+        {/if}
+      {:else}
+      <section
+          class="turn-promoted"
+          data-turn-attention={block.role === 'attention' ? 'true' : undefined}
+          data-turn-artifact={block.role === 'artifact' ? 'true' : undefined}
+      >
+        <MessageItem
+          message={block.item.message}
+          {readOnly}
+          {displayContext}
+          filePreviewScope={filePreviewScopeForItem(block.item)}
           onContinueInterrupted={continueInterruptedSession}
           hideResponseDuration
-          presentationRole={entry.role}
+          presentationRole={block.role}
         />
       </section>
-    {/if}
-  {/each}
-  {#if expanded && runtimeActive}
+      {/if}
+    {/each}
+    {#if expanded && runtimeActive}
     <div class="turn-process-entry turn-runtime-row"><TurnRuntimeIndicator {elapsedSeconds} /></div>
-  {/if}
+    {/if}
   </div>
 
   {#each finalItems as item (item.key)}
@@ -317,7 +346,7 @@
   .conversation-turn {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--space-2);
     min-width: 0;
   }
 
@@ -330,7 +359,7 @@
     display: flex;
     align-items: center;
     width: 100%;
-    min-height: 42px;
+    min-height: 38px;
     gap: 8px;
     padding: 0;
     border: 0;
@@ -379,7 +408,7 @@
   .turn-stream {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 0;
     min-width: 0;
   }
 
@@ -403,6 +432,11 @@
   }
 
   @media (max-width: 560px) {
+    .turn-disclosure-header,
+    .turn-status-header {
+      min-height: 40px;
+    }
+
     .turn-process-entry {
       padding-left: 6px;
     }

@@ -157,7 +157,7 @@ assert.doesNotMatch(
 );
 assert.match(
   conversationToolGroupSource,
-  /\.tool-group-list\s*\{[\s\S]*?padding:\s*2px 0 2px 8px;[\s\S]*?border-left:\s*0;/,
+  /\.tool-group-list\s*\{[\s\S]*?padding:\s*0 0 1px 8px;[\s\S]*?border-left:\s*0;/,
   '工具组内容只允许一级紧凑缩进，不能叠加第二条装饰线',
 );
 assert.doesNotMatch(
