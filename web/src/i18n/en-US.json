@@ -1080,7 +1080,7 @@
   "settings.model.orchestratorModelLabel": "Default main: {model}",
   "settings.profile.workerAssignment": "Agent Assignment",
   "settings.conversationDisplay.title": "Conversation display",
-  "settings.conversationDisplay.description": "Choose how the main conversation presents model work. This only affects the main conversation; agent detail panels keep their original view.",
+  "settings.conversationDisplay.description": "Choose how all conversation areas present model work. The main conversation and agent detail panels use the same setting.",
   "settings.conversationDisplay.original": "Original style",
   "settings.conversationDisplay.originalDesc": "Show messages, thinking, and tool cards in full, as they are today.",
   "settings.conversationDisplay.summary": "Summary style",

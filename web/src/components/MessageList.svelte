@@ -466,10 +466,6 @@
     return entries;
   });
   const conversationRenderEntries = $derived.by(() => {
-    if (displayContext !== 'thread') {
-      return timelineRenderEntries as ConversationRenderEntry[];
-    }
-
     const entries: ConversationRenderEntry[] = [];
     const findTurnEntry = (turnId: string) => {
       for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -523,7 +519,7 @@
       : 'original'
   ));
   const renderEntries = $derived(
-    displayContext === 'thread' && conversationDisplayMode === 'summary'
+    conversationDisplayMode === 'summary'
       ? conversationRenderEntries
       : timelineRenderEntries,
   );
@@ -1121,7 +1117,7 @@
     onwheel={handleWheel}
     data-panel-id={displayContext === 'thread' ? 'thread' : (taskId || 'task')}
     data-display-context={displayContext}
-    data-conversation-display-mode={displayContext === 'thread' ? conversationDisplayMode : 'original'}
+    data-conversation-display-mode={conversationDisplayMode}
     data-panel-active={isActive ? 'true' : 'false'}
   >
     {#if safeRenderItems.length > 0 && (canLoadOlderHistory || sessionHistory.isLoadingBefore)}

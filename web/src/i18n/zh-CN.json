@@ -1080,7 +1080,7 @@
   "settings.model.orchestratorModelLabel": "默认主模型: {model}",
   "settings.profile.workerAssignment": "代理分工配置",
   "settings.conversationDisplay.title": "对话显示",
-  "settings.conversationDisplay.description": "选择主对话区如何呈现模型处理过程。设置只影响主对话区，右侧代理详情保持原始明细。",
+  "settings.conversationDisplay.description": "选择所有对话区域如何呈现模型处理过程，主对话和右侧代理详情统一生效。",
   "settings.conversationDisplay.original": "原始风格",
   "settings.conversationDisplay.originalDesc": "完整展示消息、思考和工具卡片，保持现有阅读方式。",
   "settings.conversationDisplay.summary": "摘要风格",
