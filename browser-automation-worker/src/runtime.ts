@@ -1922,7 +1922,7 @@ type LighthouseListener = (...args: unknown[]) => void;
 
 class LighthouseCdpSession {
   readonly #cdp: CdpClient;
-  readonly #binding: BrowserSurfaceBinding;
+  #binding: BrowserSurfaceBinding;
   readonly #sessionId: string | undefined;
   #targetInfo: Record<string, unknown>;
   readonly #listeners = new Map<string, Set<LighthouseListener>>();
@@ -1942,7 +1942,14 @@ class LighthouseCdpSession {
     this.#targetInfo = targetInfo ?? { targetId: binding.target_id, type: "page" };
     this.#unsubscribe = cdp.onEvent((eventBinding, method, params, eventSessionId) => {
       if (eventBinding.surface_id !== binding.surface_id || eventBinding.surface_revision !== binding.surface_revision) return;
-      if (eventBinding.navigation_revision !== binding.navigation_revision) return;
+      if (eventBinding.target_id !== binding.target_id || eventBinding.tab_id !== binding.tab_id) return;
+      // Lighthouse navigation mode deliberately drives the same WebContents
+      // through Page.navigate. Main advances navigation_revision as soon as
+      // Chromium starts the new document, so a long-lived Lighthouse CDP
+      // session must follow that revision instead of dropping every
+      // Page/Network lifecycle event as stale.
+      if (eventBinding.navigation_revision < this.#binding.navigation_revision) return;
+      this.#binding = eventBinding;
       if (eventSessionId !== this.#sessionId) return;
       this.emit(method, params);
     });

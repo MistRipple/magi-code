@@ -200,7 +200,10 @@ test("viewport 只作用于当前 Surface，且与右栏物理尺寸完全解耦
   const captureMethods = section(source, "function capturePageRect(", "async function sendCdpCommandWithTimeout(");
   assert.doesNotMatch(captureMethods, /captureViewportScale/u);
   assert.match(captureMethods, /logicalBounds|slotBounds/u);
-  assert.doesNotMatch(source, /Emulation\.setTouchEmulationEnabled/u);
+  assert.match(
+    source,
+    /const ALLOWED_WORKER_CDP_METHODS = new Set\(\[[\s\S]*?"Emulation\.setTouchEmulationEnabled"/u,
+  );
   assert.doesNotMatch(viewportMethods, /capturePage\(|startScreencast|drawImage\(/u);
   assert.match(browserTabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/u);
   assert.match(browserTabSource, /scheduleCustomViewportUpdate\(\)/u);

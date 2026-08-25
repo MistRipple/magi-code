@@ -209,6 +209,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Emulation.clearDeviceMetricsOverride",
   "Emulation.setCPUThrottlingRate",
   "Emulation.setDeviceMetricsOverride",
+  "Emulation.setTouchEmulationEnabled",
   "Emulation.setEmulatedMedia",
   "Emulation.setGeolocationOverride",
   "Emulation.setUserAgentOverride",
