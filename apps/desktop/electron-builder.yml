@@ -27,6 +27,12 @@ extraResources:
       - magi-daemon-app.exe
   - from: ../../browser-automation-worker/dist/index.cjs
     to: browser-automation-worker/index.cjs
+  - from: dist/lighthouse-runtime/node_modules
+    to: browser-automation-worker/node_modules
+    filter:
+      - "**/*"
+  - from: dist/lighthouse-runtime/runtime-manifest.json
+    to: browser-automation-worker/runtime-manifest.json
   - from: ../../web/dist
     to: web/dist
   - from: dist/resources/browser-capability-manifest.json

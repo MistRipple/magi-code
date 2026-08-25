@@ -46,7 +46,7 @@ await Promise.all([
   esbuild({ ...shared, entryPoints: [join(desktopRoot, "src", "preload", "index.ts")] }),
   esbuild({
     ...shared,
-    external: [],
+    external: ["lighthouse"],
     entryPoints: [join(repositoryRoot, "browser-automation-worker", "src", "index.ts")],
   }),
 ]);

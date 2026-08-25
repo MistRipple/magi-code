@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { arch, platform, tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { downloadArtifact } from "@electron/get";
@@ -16,9 +16,10 @@ export const desktopRoot = resolve(scriptDirectory, "..");
 export const repositoryRoot = resolve(desktopRoot, "../..");
 export const desktopDist = join(desktopRoot, "dist");
 export const workerDist = join(repositoryRoot, "browser-automation-worker", "dist");
+export const lighthouseRuntimeDist = join(desktopDist, "lighthouse-runtime");
 export const webDist = join(repositoryRoot, "web", "dist");
 
-const runtimePackages = ["electron", "electron-updater", "ws", "devtools-protocol"];
+const runtimePackages = ["electron", "electron-updater", "ws", "devtools-protocol", "lighthouse"];
 
 export async function buildDesktopJavaScript({ development = false } = {}) {
   const productVersion = await readProductVersion();
@@ -70,6 +71,7 @@ export async function buildDesktopJavaScript({ development = false } = {}) {
       define: {
         "process.env.NODE_ENV": JSON.stringify(development ? "development" : "production"),
       },
+      external: ["lighthouse"],
     }),
   ]);
 }
@@ -120,6 +122,7 @@ export async function prepareReleaseMetadata() {
   const files = [];
   await appendFileHash(files, daemonBinary("release"), daemonResourcePath());
   await appendFileHash(files, join(workerDist, "index.cjs"), "browser-automation-worker/index.cjs");
+  await appendTreeHashes(files, lighthouseRuntimeDist, "browser-automation-worker");
   await appendTreeHashes(files, webDist, "web/dist");
   await appendTreeHashes(files, join(resources, "licenses"), "licenses");
   await appendTreeHashes(files, join(resources, "sbom"), "sbom");
@@ -311,6 +314,65 @@ async function stageRuntimeLicenses(destination) {
     `${JSON.stringify(notices, null, 2)}\n`,
     "utf8",
   );
+}
+
+export async function stageLighthouseRuntime() {
+  await rm(lighthouseRuntimeDist, { recursive: true, force: true });
+  const sourceModulesRoot = join(repositoryRoot, "node_modules");
+  const targetModulesRoot = join(lighthouseRuntimeDist, "node_modules");
+  await mkdir(targetModulesRoot, { recursive: true });
+  const copied = new Set();
+
+  async function copyPackage(packageName, fromPackageRoot) {
+    const packageJson = await resolveInstalledPackageJson(packageName, fromPackageRoot);
+    if (!packageJson) return;
+    const sourcePackageRoot = dirname(packageJson);
+    const relativePackageRoot = relative(sourceModulesRoot, sourcePackageRoot);
+    if (
+      relativePackageRoot.startsWith(".." + sep)
+      || relativePackageRoot === ".."
+      || isAbsolute(relativePackageRoot)
+    ) {
+      throw new Error(`Lighthouse 运行时依赖不在工作区 node_modules 内: ${sourcePackageRoot}`);
+    }
+    if (copied.has(sourcePackageRoot)) return;
+
+    const targetPackageRoot = join(targetModulesRoot, relativePackageRoot);
+    await cp(sourcePackageRoot, targetPackageRoot, { recursive: true, dereference: true });
+    copied.add(sourcePackageRoot);
+
+    const metadata = await readJson(packageJson);
+    const dependencies = new Set([
+      ...Object.keys(metadata.dependencies ?? {}),
+      ...Object.keys(metadata.optionalDependencies ?? {}),
+    ]);
+    for (const dependency of dependencies) {
+      await copyPackage(dependency, sourcePackageRoot);
+    }
+  }
+
+  await copyPackage("lighthouse", repositoryRoot);
+  if (!copied.size) throw new Error("无法准备 Lighthouse 运行时依赖");
+  await writeFile(
+    join(lighthouseRuntimeDist, "runtime-manifest.json"),
+    `${JSON.stringify({ packageCount: copied.size, root: "lighthouse" }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function resolveInstalledPackageJson(packageName, fromPackageRoot) {
+  let directory = fromPackageRoot;
+  while (true) {
+    const candidate = join(directory, "node_modules", packageName, "package.json");
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      const parent = dirname(directory);
+      if (parent === directory) return null;
+      directory = parent;
+    }
+  }
 }
 
 async function ensureChromiumLicenses() {

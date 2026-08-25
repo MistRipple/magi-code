@@ -5,6 +5,7 @@ import {
   buildWebAssets,
   cleanDesktopOutputs,
   prepareReleaseMetadata,
+  stageLighthouseRuntime,
 } from "./build-support.mjs";
 import { pathToFileURL } from "node:url";
 
@@ -15,6 +16,7 @@ export async function buildDesktopRelease() {
     buildDaemon("release"),
     buildDesktopJavaScript(),
   ]);
+  await stageLighthouseRuntime();
   const manifest = await prepareReleaseMetadata();
   await assertReleaseInputs();
   process.stdout.write(
