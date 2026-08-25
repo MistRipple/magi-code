@@ -351,6 +351,8 @@ export interface WorkerCdpRequest {
   method: string;
   params?: Record<string, unknown>;
   session_id?: string;
+  /** Lighthouse 导航允许同一 WebContents 在当前 CDP 会话内推进 navigation revision。 */
+  allow_navigation_advance?: boolean;
 }
 
 export interface WorkerCdpResponse {

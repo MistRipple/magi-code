@@ -251,8 +251,16 @@ test("所有工具截图都从真实 WebContents 读取，并通过 Surface CDP 
 
 test("输入动作允许同一 WebContents 在动作内部推进导航 revision", () => {
   assert.match(source, /recordForBinding\([\s\S]*?allowNavigationAdvance\?: boolean/u);
-  assert.match(source, /allowNavigationAdvance: method\.startsWith\("Input\."\)/u);
+  assert.match(source, /allowNavigationAdvance: options\.allowNavigationAdvance === true \|\| method\.startsWith\("Input\."\)/u);
   assert.match(desktopControlSource, /交互命令在 Worker 内可能由多个 CDP 输入事件组成/u);
+});
+
+test("Lighthouse CDP 会话允许导航推进但不放宽 Surface 身份校验", () => {
+  assert.match(source, /options: \{ allowNavigationAdvance\?: boolean \} = \{\}/u);
+  assert.match(workerSource, /allowNavigationAdvance: message\.allow_navigation_advance === true/u);
+  assert.match(browserRuntimeSource, /allowNavigationAdvance: true/u);
+  assert.match(browserRuntimeSource, /this\.#cdp\.send\([\s\S]*?\{ allowNavigationAdvance: true \}/u);
+  assert.match(readFileSync(new URL("../../../../contracts/desktop-browser/src/index.ts", import.meta.url), "utf8"), /allow_navigation_advance\?: boolean/u);
 });
 
 test("交互命令完成后由 Main 返回当前页面状态契约", () => {

@@ -238,6 +238,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Overlay.highlightNode",
   "Runtime.evaluate",
   "Runtime.enable",
+  "Runtime.disable",
   "Runtime.getHeapUsage",
   "Network.enable",
   "Tracing.end",
@@ -624,6 +625,7 @@ export class BrowserSurfaceManager {
     method: string,
     params: Record<string, unknown> = {},
     sessionId?: string,
+    options: { allowNavigationAdvance?: boolean } = {},
   ): Promise<unknown> {
     if (!ALLOWED_WORKER_CDP_METHODS.has(method)) {
       throw new Error(`browser_cdp_method_denied:${method}`);
@@ -645,7 +647,7 @@ export class BrowserSurfaceManager {
     // 自身导航误判成 Surface 已失效。Surface/Tab/桌面代次仍由上面的
     // 完整身份校验严格保护。
     const contents = this.recordForBinding(binding, {
-      allowNavigationAdvance: method.startsWith("Input."),
+      allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
     });
     if (sessionId && !record.cdpSessionIds.has(sessionId)) {
       throw staleSurfaceError("browser_cdp_session_stale");

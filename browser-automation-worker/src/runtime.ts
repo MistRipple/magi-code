@@ -2008,7 +2008,14 @@ class LighthouseCdpSession {
     if (method === "Target.getTargetInfo") {
       return { targetInfo: { ...this.#targetInfo, url: this.#targetInfo.url ?? await this.pageUrl() } };
     }
-    return this.#cdp.send(this.#binding, method, params, options?.timeout ?? 30_000, this.#sessionId);
+    return this.#cdp.send(
+      this.#binding,
+      method,
+      params,
+      options?.timeout ?? 30_000,
+      this.#sessionId,
+      { allowNavigationAdvance: true },
+    );
   }
 
   async detach(): Promise<void> {
@@ -2065,7 +2072,7 @@ function createLighthousePage(cdp: CdpClient, binding: BrowserSurfaceBinding, pa
         expression: "location.href",
         returnByValue: true,
         awaitPromise: false,
-      }, 30_000);
+      }, 30_000, undefined, { allowNavigationAdvance: true });
       return typeof response?.result?.value === "string" ? response.result.value : "about:blank";
     },
     target() {

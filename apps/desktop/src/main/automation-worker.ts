@@ -245,6 +245,7 @@ export class AutomationWorker {
       message.method,
       message.params ?? {},
       message.session_id,
+      { allowNavigationAdvance: message.allow_navigation_advance === true },
     )
       .then((result) => {
         const response: MainToWorkerMessage = {

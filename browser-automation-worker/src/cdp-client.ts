@@ -40,6 +40,7 @@ export class CdpClient {
     params: Record<string, unknown> = {},
     timeoutMs = 30_000,
     sessionId?: string,
+    options: { allowNavigationAdvance?: boolean } = {},
   ): Promise<T> {
     const requestId = `cdp-${randomUUID()}`;
     const request: WorkerCdpRequest = {
@@ -49,6 +50,7 @@ export class CdpClient {
       method,
       params,
       ...(sessionId ? { session_id: sessionId } : {}),
+      ...(options.allowNavigationAdvance ? { allow_navigation_advance: true } : {}),
     };
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
