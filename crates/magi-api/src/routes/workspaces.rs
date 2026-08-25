@@ -10,6 +10,7 @@ use std::{
 };
 
 use super::session_scope::require_registered_workspace_binding;
+use crate::session_activity::session_running_task_count;
 use crate::{errors::ApiError, state::ApiState};
 
 static WORKSPACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -74,27 +75,33 @@ struct PersonalSessionsResponse {
     sessions: Vec<WorkspaceSessionDto>,
 }
 
+fn session_directory_entry(
+    state: &ApiState,
+    session: &magi_session_store::SessionRecord,
+    workspace_id: Option<&str>,
+) -> WorkspaceSessionDto {
+    let sidecar = state.session_store.runtime_sidecar(&session.session_id);
+    let running_task_count = session_running_task_count(sidecar.as_ref());
+    WorkspaceSessionDto {
+        session_id: session.session_id.to_string(),
+        workspace_id: workspace_id.map(str::to_string),
+        title: session.title.clone(),
+        status: format!("{:?}", session.status),
+        created_at: session.created_at.0,
+        updated_at: session.updated_at.0,
+        message_count: session.message_count.unwrap_or(0),
+        is_running: running_task_count > 0,
+        running_task_count,
+        has_unread_completion: session.has_unread_completion(),
+    }
+}
+
 async fn personal_sessions(State(state): State<ApiState>) -> Json<PersonalSessionsResponse> {
     let event_stream_next_sequence = state.event_bus.snapshot().next_sequence;
     let sessions = state
         .session_records_for_workspace(None)
         .iter()
-        .map(|session| {
-            let sidecar = state.session_store.runtime_sidecar(&session.session_id);
-            let running_task_count = workspace_session_running_task_count(sidecar.as_ref());
-            WorkspaceSessionDto {
-                session_id: session.session_id.to_string(),
-                workspace_id: None,
-                title: session.title.clone(),
-                status: format!("{:?}", session.status),
-                created_at: session.created_at.0,
-                updated_at: session.updated_at.0,
-                message_count: session.message_count.unwrap_or(0),
-                is_running: running_task_count > 0,
-                running_task_count,
-                has_unread_completion: session.has_unread_completion(),
-            }
-        })
+        .map(|session| session_directory_entry(&state, session, None))
         .collect();
     Json(PersonalSessionsResponse {
         runtime_epoch: state.runtime_epoch().to_string(),
@@ -321,22 +328,7 @@ async fn workspace_sessions(
     let scoped_sessions = state
         .session_records_for_workspace(Some(scoped_workspace_id.as_str()))
         .iter()
-        .map(|session| {
-            let sidecar = state.session_store.runtime_sidecar(&session.session_id);
-            let running_task_count = workspace_session_running_task_count(sidecar.as_ref());
-            WorkspaceSessionDto {
-                session_id: session.session_id.to_string(),
-                workspace_id: Some(scoped_workspace_id.clone()),
-                title: session.title.clone(),
-                status: format!("{:?}", session.status),
-                created_at: session.created_at.0,
-                updated_at: session.updated_at.0,
-                message_count: session.message_count.unwrap_or(0),
-                is_running: running_task_count > 0,
-                running_task_count,
-                has_unread_completion: session.has_unread_completion(),
-            }
-        })
+        .map(|session| session_directory_entry(&state, session, Some(&scoped_workspace_id)))
         .collect::<Vec<_>>();
 
     Ok(Json(WorkspaceSessionsResponse {
@@ -345,71 +337,6 @@ async fn workspace_sessions(
         workspace: workspace_dto,
         sessions: scoped_sessions,
     }))
-}
-
-fn workspace_session_running_task_count(
-    sidecar: Option<&magi_session_store::SessionRuntimeSidecar>,
-) -> usize {
-    let Some(turn) = sidecar.and_then(workspace_session_current_turn) else {
-        return 0;
-    };
-    if current_turn_status_is_terminal(&turn.status) {
-        return 0;
-    }
-    turn.items
-        .iter()
-        .filter(|item| {
-            current_turn_item_status_is_active(&item.status)
-                || item
-                    .tool_status
-                    .as_deref()
-                    .is_some_and(current_turn_item_status_is_active)
-        })
-        .count()
-        .max(1)
-}
-
-fn workspace_session_current_turn(
-    sidecar: &magi_session_store::SessionRuntimeSidecar,
-) -> Option<&magi_session_store::ActiveExecutionTurn> {
-    sidecar.current_turn.as_ref().or_else(|| {
-        sidecar
-            .active_execution_chain
-            .as_ref()
-            .and_then(|chain| chain.current_turn.as_ref())
-    })
-}
-
-fn current_turn_status_is_terminal(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "completed"
-            | "complete"
-            | "succeeded"
-            | "success"
-            | "failed"
-            | "error"
-            | "blocked"
-            | "cancelled"
-            | "canceled"
-            | "killed"
-    )
-}
-
-fn current_turn_item_status_is_active(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "pending"
-            | "queued"
-            | "running"
-            | "started"
-            | "streaming"
-            | "blocked"
-            | "awaiting_approval"
-            | "review_required"
-            | "repairing"
-            | "verifying"
-    )
 }
 
 #[cfg(test)]
@@ -898,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_sessions_marks_non_terminal_current_turn_running() {
+    async fn workspace_sessions_reports_active_and_interrupted_turn_states() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-running-session");
         state
@@ -940,7 +867,7 @@ mod tests {
             .expect("current turn should upsert");
 
         let response = routes()
-            .with_state(state)
+            .with_state(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/workspaces/sessions?workspaceId=workspace-running-session")
@@ -959,6 +886,29 @@ mod tests {
         assert_eq!(sessions[0]["sessionId"], "session-running");
         assert_eq!(sessions[0]["isRunning"], true);
         assert_eq!(sessions[0]["runningTaskCount"], 1);
+
+        state
+            .session_store
+            .update_current_turn_status(&session_id, "interrupted")
+            .expect("current turn should be interruptible");
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-running-session")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let sessions = payload["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions[0]["isRunning"], false);
+        assert_eq!(sessions[0]["runningTaskCount"], 0);
     }
 
     #[tokio::test]

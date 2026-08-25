@@ -8,7 +8,10 @@ use magi_session_store::{GoalStatus, SessionGoal, SessionPlan};
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{SessionRequestScope, require_session_request_scope};
-use crate::{dto::SessionScopeKindDto, errors::ApiError, state::ApiState};
+use crate::{
+    dto::SessionScopeKindDto, errors::ApiError, session_activity::current_turn_status_is_active,
+    state::ApiState,
+};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -262,21 +265,7 @@ fn goal_execution_to_interrupt(
 ) -> Option<(Option<magi_core::TaskId>, String)> {
     let sidecar = state.session_store.runtime_sidecar(session_id)?;
     let current_turn = sidecar.current_turn.as_ref()?;
-    if current_turn.status.is_empty()
-        || matches!(
-            current_turn.status.trim().to_ascii_lowercase().as_str(),
-            "completed"
-                | "complete"
-                | "succeeded"
-                | "success"
-                | "failed"
-                | "error"
-                | "interrupted"
-                | "cancelled"
-                | "canceled"
-                | "superseded"
-        )
-    {
+    if !current_turn_status_is_active(&current_turn.status) {
         return None;
     }
     let root_task_id = sidecar

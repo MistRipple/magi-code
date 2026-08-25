@@ -35,6 +35,7 @@
   } from '../lib/notifications';
   import {
     resolveSessionActivityIndicator,
+    resolveSessionRunningState,
     shouldMarkSessionCompletionViewed,
   } from '../lib/session-activity-indicator';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
@@ -505,41 +506,46 @@
       || '';
   }
 
-  // 列表同步 effect：只按列表自身的工作区作用域投影，不能用当前草稿工作区推断归属。
-  // 与"激活指针同步"正交——删除当前会话时 currentSessionId 会被后端清空，但列表本身的
-  // 增删（删除/新建/改名）必须独立地落到 sessionsByWorkspace 上，否则左侧列表不刷新。
+  // 列表同步 effect：按 workspaceId 分片接收目录投影，不能用当前草稿工作区
+  // 推断归属。这样后台工作区的运行态变化不会覆盖当前主投影，也不会被丢弃。
   $effect(() => {
-    const sessionsWorkspaceId = messagesState.workspaceSessionProjection.workspaceId?.trim() || '';
-    if (!sessionsWorkspaceId) {
-      return;
+    const projections = messagesState.workspaceSessionProjections;
+    const nextSessionsByWorkspace = { ...sessionsByWorkspace };
+    let changed = false;
+    for (const [workspaceId, projection] of Object.entries(projections)) {
+      const normalizedWorkspaceId = workspaceId.trim();
+      if (!normalizedWorkspaceId) {
+        continue;
+      }
+      const projectionRuntimeEpoch = projection.runtimeEpoch?.trim() || '';
+      const projectionNextSequence = projection.eventStreamNextSequence;
+      if (projectionRuntimeEpoch && projectionNextSequence >= 1) {
+        workspaceSessionCursorByWorkspace.set(normalizedWorkspaceId, {
+          runtimeEpoch: projectionRuntimeEpoch,
+          eventStreamNextSequence: projectionNextSequence,
+        });
+      }
+      const currentSessions = projection.sessions;
+      const existingSessions = nextSessionsByWorkspace[normalizedWorkspaceId] ?? [];
+      const sessionsChanged = existingSessions.length !== currentSessions.length
+        || existingSessions.some((session, index) => {
+          const next = currentSessions[index];
+          return !next
+            || session.id !== next.id
+            || session.name !== next.name
+            || session.updatedAt !== next.updatedAt
+            || session.messageCount !== next.messageCount
+            || session.isRunning !== next.isRunning
+            || session.runningTaskCount !== next.runningTaskCount
+            || session.hasUnreadCompletion !== next.hasUnreadCompletion;
+        });
+      if (sessionsChanged) {
+        nextSessionsByWorkspace[normalizedWorkspaceId] = currentSessions;
+        changed = true;
+      }
     }
-    const currentSessions = messagesState.workspaceSessionProjection.sessions;
-    const projectionRuntimeEpoch = messagesState.workspaceSessionProjection.runtimeEpoch?.trim() || '';
-    const projectionNextSequence = messagesState.workspaceSessionProjection.eventStreamNextSequence;
-    if (projectionRuntimeEpoch && projectionNextSequence >= 1) {
-      workspaceSessionCursorByWorkspace.set(sessionsWorkspaceId, {
-        runtimeEpoch: projectionRuntimeEpoch,
-        eventStreamNextSequence: projectionNextSequence,
-      });
-    }
-    const existingSessions = sessionsByWorkspace[sessionsWorkspaceId] ?? [];
-    const sessionsChanged = existingSessions.length !== currentSessions.length
-      || existingSessions.some((session, index) => {
-        const next = currentSessions[index];
-        return !next
-          || session.id !== next.id
-          || session.name !== next.name
-          || session.updatedAt !== next.updatedAt
-          || session.messageCount !== next.messageCount
-          || session.isRunning !== next.isRunning
-          || session.runningTaskCount !== next.runningTaskCount
-          || session.hasUnreadCompletion !== next.hasUnreadCompletion;
-      });
-    if (sessionsChanged) {
-      sessionsByWorkspace = {
-        ...sessionsByWorkspace,
-        [sessionsWorkspaceId]: currentSessions,
-      };
+    if (changed) {
+      sessionsByWorkspace = nextSessionsByWorkspace;
     }
   });
 
@@ -640,6 +646,27 @@
     }
   });
 
+  // 个人会话没有 workspace 指针，不能沿用上一次工作区的侧栏选择。
+  // bootstrap 完成后同步本地侧栏指针，确保最近会话的 active 状态与主对话一致。
+  $effect(() => {
+    if (!messagesState.bootstrapped || loading || workspaceActionPending) {
+      return;
+    }
+    if (currentBootstrapWorkspaceId()) {
+      return;
+    }
+    const bootstrapSessionId = typeof messagesState.currentSessionId === 'string'
+      ? messagesState.currentSessionId.trim()
+      : '';
+    if (selectedWorkspaceId) {
+      selectedWorkspaceId = '';
+    }
+    const nextSessionId = bootstrapSessionId || null;
+    if (currentSessionId !== nextSessionId) {
+      currentSessionId = nextSessionId;
+    }
+  });
+
   // 激活会话指针同步 effect：把 bootstrap 的 currentSessionId 镜像到本地 currentSessionId。
   // bootstrap 是真值——非空就切过去；空也要镜像为空（删除/关闭/新建当前会话都会让它清空），
   // 否则本地 currentSessionId 和 URL 残留指向已删除的会话。
@@ -732,20 +759,15 @@
   }
 
   function isSessionRunning(workspaceId: string, session: Session): boolean {
-    const runningTaskCount = typeof session.runningTaskCount === 'number'
-      ? session.runningTaskCount
-      : 0;
-    if (session.isRunning === true || runningTaskCount > 0) {
-      return true;
-    }
-    if (!workspaceId) {
-      return !currentBootstrapWorkspaceId()
-        && session.id === currentSessionId
-        && messagesState.isProcessing === true;
-    }
-    return workspaceId === selectedWorkspaceId
-      && session.id === currentSessionId
-      && messagesState.isProcessing === true;
+    return resolveSessionRunningState({
+      isRunning: session.isRunning,
+      runningTaskCount: session.runningTaskCount,
+      isCurrentSession: session.id === currentSessionId,
+      isCurrentWorkspace: workspaceId === selectedWorkspaceId,
+      isPersonalScope: !workspaceId,
+      hasActiveWorkspace: Boolean(currentBootstrapWorkspaceId()),
+      isProcessing: messagesState.isProcessing === true,
+    });
   }
 
   function isInternalSession(session: Session): boolean {

@@ -122,7 +122,7 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /列表同步 effect：[\s\S]*?const sessionsWorkspaceId = messagesState\.workspaceSessionProjection\.workspaceId\?\.trim\(\) \|\| ''[\s\S]*?\[sessionsWorkspaceId\]: currentSessions/,
+  /列表同步 effect：[\s\S]*?const projections = messagesState\.workspaceSessionProjections[\s\S]*?nextSessionsByWorkspace[\s\S]*?nextSessionsByWorkspace\[normalizedWorkspaceId\] = currentSessions/,
   '侧栏会话集合必须按列表自身的工作区作用域同步，不能由当前草稿指针推断归属',
 );
 assert.match(
@@ -217,8 +217,13 @@ assert.match(
 );
 assert.match(
   bridgeSource,
-  /shouldRefreshCurrentSessionSummary[\s\S]*?eventType === 'session\.viewed'/,
-  '当前会话的已查看事件也必须触发跨客户端状态同步',
+  /shouldRefreshCurrentSessionSummary[\s\S]*?eventType === 'session\.viewed'[\s\S]*?TURN_TERMINAL_EVENTS\.has\(eventType\)[\s\S]*?eventType === 'session\.turn\.superseded'/,
+  '当前会话的已查看、Turn 终止和替代事件都必须触发跨客户端状态同步',
+);
+assert.match(
+  shellSource,
+  /resolveSessionRunningState\(\{[\s\S]*?isRunning: session\.isRunning[\s\S]*?runningTaskCount: session\.runningTaskCount/,
+  '侧栏运行灯必须以目录接口返回的显式 isRunning 为权威值，不能被残留任务数抬回运行中',
 );
 assert.match(
   bridgeSource,
@@ -244,6 +249,11 @@ assert.match(
   shellSource,
   /工作区指针同步 effect[\s\S]*?const authoritativeWorkspaceId = currentBootstrapWorkspaceId\(\);[\s\S]*?selectedWorkspaceId = authoritativeWorkspaceId;[\s\S]*?currentSessionId = bootstrapSessionId \|\| null;[\s\S]*?refreshWorkspaceSessions\([\s\S]*?authoritativeWorkspaceId,[\s\S]*?bootstrapSessionId/,
   'bootstrap 返回后必须以恢复的工作区和会话作为侧栏加载作用域',
+);
+assert.match(
+  shellSource,
+  /个人会话没有 workspace 指针[\s\S]*?if \(!messagesState\.bootstrapped \|\| loading \|\| workspaceActionPending\)[\s\S]*?if \(currentBootstrapWorkspaceId\(\)\)[\s\S]*?selectedWorkspaceId = ''[\s\S]*?currentSessionId !== nextSessionId[\s\S]*?currentSessionId = nextSessionId;/,
+  '切换到最近会话后必须清除旧工作区侧栏选择，并同步当前个人会话的 active 指针',
 );
 
 console.log('workspace onboarding golden passed');

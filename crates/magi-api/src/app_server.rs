@@ -45,7 +45,10 @@ use std::sync::{
 };
 use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 
-use crate::{dto::SessionDirectoryEntryDto, errors::ApiError, routes::sessions, state::ApiState};
+use crate::{
+    dto::SessionDirectoryEntryDto, errors::ApiError, routes::sessions,
+    session_activity::session_running_task_count, state::ApiState,
+};
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const CONTROL_QUEUE_CAPACITY: usize = MAX_IN_FLIGHT_REQUESTS + 16;
@@ -1433,18 +1436,10 @@ async fn list_sessions(
 
 fn session_summary(state: &ApiState, session: magi_session_store::SessionRecord) -> SessionSummary {
     let session_id = session.session_id.clone();
-    let is_running = state
-        .session_store
-        .runtime_sidecar(&session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .is_some_and(|turn| {
-            !matches!(
-                turn.status.trim().to_ascii_lowercase().as_str(),
-                "completed" | "blocked" | "failed" | "interrupted" | "cancelled" | "superseded"
-            )
-        });
+    let sidecar = state.session_store.runtime_sidecar(&session_id);
+    let running_task_count = session_running_task_count(sidecar.as_ref());
     let summary =
-        SessionDirectoryEntryDto::from_record(session, is_running, usize::from(is_running));
+        SessionDirectoryEntryDto::from_record(session, running_task_count > 0, running_task_count);
     SessionSummary {
         session_id: summary.session_id,
         workspace_id: summary.workspace_id,

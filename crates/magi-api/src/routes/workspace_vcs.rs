@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use crate::{errors::ApiError, state::ApiState};
+use crate::{errors::ApiError, session_activity::session_running_task_count, state::ApiState};
 
 #[derive(Clone)]
 struct WorkspaceGitScope {
@@ -1057,25 +1057,9 @@ fn workspace_has_running_turn(state: &ApiState, workspace_id: &WorkspaceId) -> b
         .into_iter()
         .filter(|session| session.workspace_id.as_deref() == Some(workspace_id.as_str()))
         .any(|session| {
-            state
-                .session_store
-                .runtime_sidecar(&session.session_id)
-                .and_then(|sidecar| {
-                    sidecar.current_turn.or_else(|| {
-                        sidecar
-                            .active_execution_chain
-                            .and_then(|chain| chain.current_turn)
-                    })
-                })
-                .is_some_and(|turn| !turn_status_is_terminal(&turn.status))
+            let sidecar = state.session_store.runtime_sidecar(&session.session_id);
+            session_running_task_count(sidecar.as_ref()) > 0
         })
-}
-
-fn turn_status_is_terminal(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "completed" | "failed" | "cancelled" | "canceled" | "superseded"
-    )
 }
 
 fn publish_git_context_changed(
@@ -1284,14 +1268,6 @@ mod tests {
         assert_eq!(sanitize_allocation_key("session/a b"), "session-a-b");
         assert_eq!(sanitize_allocation_key("///"), "allocation");
         assert_eq!(sanitize_allocation_key(&"a".repeat(100)).len(), 80);
-    }
-
-    #[test]
-    fn terminal_turn_status_is_explicit() {
-        assert!(turn_status_is_terminal("completed"));
-        assert!(turn_status_is_terminal("FAILED"));
-        assert!(!turn_status_is_terminal("running"));
-        assert!(!turn_status_is_terminal("blocked"));
     }
 
     #[test]

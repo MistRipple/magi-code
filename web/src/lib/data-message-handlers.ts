@@ -914,16 +914,16 @@ function handleSessionsUpdated(message: ClientBridgeMessage) {
     }
     return;
   }
-  const currentWorkspaceId = currentWorkspaceIdValue();
-  if (currentWorkspaceId && workspaceId !== currentWorkspaceId) {
-    return;
-  }
   if (sessions) {
+    // 工作区目录是按 workspaceId 分片的共享投影。即使当前主对话已经切到
+    // 另一个工作区，也必须接收后台工作区的摘要刷新，侧栏才能保持统一状态。
+    const currentWorkspaceId = currentWorkspaceIdValue();
     replaceWorkspaceSessionProjection(workspaceId, ensureArray(sessions), {
       runtimeEpoch: typeof message.runtimeEpoch === 'string' ? message.runtimeEpoch : '',
       eventStreamNextSequence: Number(message.eventStreamNextSequence),
     }, {
       allowRuntimeEpochChange: message.allowRuntimeEpochChange === true,
+      mirrorCurrentProjection: currentWorkspaceId === workspaceId,
     });
   }
 }

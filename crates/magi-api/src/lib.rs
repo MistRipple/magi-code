@@ -13,6 +13,7 @@ mod performance;
 mod public_canonical;
 mod routes;
 mod scope_binding;
+mod session_activity;
 pub(crate) mod session_continue;
 pub mod session_title;
 pub mod skill_loader;

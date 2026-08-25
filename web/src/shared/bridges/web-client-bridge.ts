@@ -240,6 +240,10 @@ let eventStreamTunnelSyncInFlight: Promise<void> | null = null;
 let eventStreamTunnelSyncBindingKey = '';
 let initialWindowBindingHydrated = false;
 let sessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+type SessionSummaryRefreshTarget =
+  | { scope: 'personal'; key: 'personal' }
+  | { scope: 'workspace'; key: string; workspaceId: string; workspacePath: string };
+const sessionSummaryRefreshTargets = new Map<string, SessionSummaryRefreshTarget>();
 let terminalTaskRuntimeRefreshTimer: number | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
 
@@ -343,6 +347,7 @@ const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
   'session.turn.completed',
   'session.turn.failed',
   'session.turn.interrupted',
+  'session.turn.superseded',
   'session.title.updated',
   'session.deleted',
   'session.closed',
@@ -1576,6 +1581,10 @@ function rustEventWorkspaceId(event: RustEventEnvelope): string {
     || rustEventPayloadString(event, 'workspace_id', 'workspaceId');
 }
 
+function rustEventWorkspacePath(event: RustEventEnvelope): string {
+  return rustEventPayloadString(event, 'workspace_path', 'workspacePath');
+}
+
 function rustEventSessionId(event: RustEventEnvelope): string {
   return trimBridgeString(event.session_id)
     || rustEventPayloadString(event, 'session_id', 'sessionId');
@@ -1654,49 +1663,80 @@ function shouldApplyCurrentSessionRustEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
-function scheduleSessionSummaryRefresh(reason: string): void {
+function currentSessionSummaryRefreshTarget(): SessionSummaryRefreshTarget {
+  if (currentSessionScope === 'workspace' && currentWorkspaceId) {
+    return {
+      scope: 'workspace',
+      key: `workspace:${currentWorkspaceId}`,
+      workspaceId: currentWorkspaceId,
+      workspacePath: currentWorkspacePath,
+    };
+  }
+  return { scope: 'personal', key: 'personal' };
+}
+
+function sessionSummaryRefreshTargetForEvent(event: RustEventEnvelope): SessionSummaryRefreshTarget {
+  const workspaceId = rustEventWorkspaceId(event);
+  if (workspaceId) {
+    return {
+      scope: 'workspace',
+      key: `workspace:${workspaceId}`,
+      workspaceId,
+      workspacePath: rustEventWorkspacePath(event),
+    };
+  }
+  return currentSessionSummaryRefreshTarget();
+}
+
+function scheduleSessionSummaryRefresh(
+  reason: string,
+  target: SessionSummaryRefreshTarget = currentSessionSummaryRefreshTarget(),
+): void {
+  sessionSummaryRefreshTargets.set(target.key, target);
   if (sessionSummaryRefreshTimer) {
     return;
   }
   sessionSummaryRefreshTimer = setTimeout(() => {
     sessionSummaryRefreshTimer = null;
-    const binding = resolveWorkspaceQuery();
-    const request = binding.scope === 'workspace'
-      ? getWorkspaceSessions(binding.workspaceId, binding.workspacePath)
-      : getPersonalSessions();
-    void request.then((snapshot) => {
-      const currentBinding = resolveWorkspaceQuery();
-      if (
-        currentBinding.scope !== binding.scope
-        || agentBindingWorkspaceId(currentBinding) !== agentBindingWorkspaceId(binding)
-        || agentBindingWorkspacePath(currentBinding) !== agentBindingWorkspacePath(binding)
-      ) {
-        return;
-      }
-      emitDataMessage('sessionsUpdated', {
-        ...(binding.scope === 'workspace' ? { workspaceId: binding.workspaceId } : {}),
-        sessions: snapshot.sessions,
-        runtimeEpoch: snapshot.runtimeEpoch,
-        eventStreamNextSequence: snapshot.eventStreamNextSequence,
+    const targets = Array.from(sessionSummaryRefreshTargets.values());
+    sessionSummaryRefreshTargets.clear();
+    for (const refreshTarget of targets) {
+      const request = refreshTarget.scope === 'workspace'
+        ? getWorkspaceSessions(refreshTarget.workspaceId, refreshTarget.workspacePath)
+        : getPersonalSessions();
+      void request.then((snapshot) => {
+        emitDataMessage('sessionsUpdated', {
+          ...(refreshTarget.scope === 'workspace' ? { workspaceId: refreshTarget.workspaceId } : {}),
+          sessions: snapshot.sessions,
+          runtimeEpoch: snapshot.runtimeEpoch,
+          eventStreamNextSequence: snapshot.eventStreamNextSequence,
+        });
+      }).catch((error) => {
+        reportExpectedRecoveryFailure(
+          i18n.t('bridge.action.syncMessages'),
+          `[web-client-bridge] 会话事件后刷新会话列表失败(${reason}, ${refreshTarget.key}):`,
+          error,
+        );
+        scheduleRecovery(reason, error, true);
       });
-    }).catch((error) => {
-      reportExpectedRecoveryFailure(
-        i18n.t('bridge.action.syncMessages'),
-        `[web-client-bridge] 外部会话事件后刷新会话列表失败(${reason}):`,
-        error,
-      );
-      scheduleRecovery(reason, error, true);
-    });
+    }
   }, 300);
 }
 
 function shouldRefreshExternalWorkspaceSessionSummary(eventType: string, event: RustEventEnvelope): boolean {
-  return EXTERNAL_SESSION_SUMMARY_EVENTS.has(eventType)
-    && eventTargetsDifferentSession(event);
+  if (!EXTERNAL_SESSION_SUMMARY_EVENTS.has(eventType)) {
+    return false;
+  }
+  const eventWorkspaceId = rustEventWorkspaceId(event);
+  return eventTargetsDifferentSession(event)
+    || Boolean(eventWorkspaceId && eventWorkspaceId !== currentWorkspaceId);
 }
 
 function shouldRefreshCurrentSessionSummary(eventType: string): boolean {
-  return eventType === 'message.created' || eventType === 'session.viewed';
+  return eventType === 'message.created'
+    || eventType === 'session.viewed'
+    || TURN_TERMINAL_EVENTS.has(eventType)
+    || eventType === 'session.turn.superseded';
 }
 
 function refreshCurrentSessionToolApprovals(reason: string): void {
@@ -1908,10 +1948,19 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  advanceEventStreamCursorFromEvent(event);
+
+  // 事件流可能携带当前主对话之外的会话事件。它们不能进入消息时间轴，
+  // 但必须继续驱动对应的工作区目录投影，否则后台会话的状态灯会停留在旧状态。
   if (!eventMatchesCurrentWorkspace(event)) {
+    if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event)) {
+      scheduleSessionSummaryRefresh(
+        `external_${eventType.replaceAll('.', '_')}`,
+        sessionSummaryRefreshTargetForEvent(event),
+      );
+    }
     return;
   }
-  advanceEventStreamCursorFromEvent(event);
 
   if (eventType === 'event.stream.lagged') {
     console.warn('[web-client-bridge] 事件流出现 lag，切换到 bootstrap recovery', {
@@ -1976,7 +2025,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       }
     }
     if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event) && !hasAcceptedDirectoryIncrement) {
-      scheduleSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
+      scheduleSessionSummaryRefresh(
+        `external_${eventType.replaceAll('.', '_')}`,
+        sessionSummaryRefreshTargetForEvent(event),
+      );
     }
     return;
   }
@@ -2210,6 +2262,14 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     if (canonicalEvent) {
       emitSessionTurnCanonicalEvent(canonicalEvent);
       completeTurnEditing(canonicalEvent.turnId);
+    }
+    if (shouldApplyCurrentSessionRustEvent(event)) {
+      scheduleSessionSummaryRefresh('current_session_turn_superseded');
+    } else if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event)) {
+      scheduleSessionSummaryRefresh(
+        'external_session_turn_superseded',
+        sessionSummaryRefreshTargetForEvent(event),
+      );
     }
     return;
   }

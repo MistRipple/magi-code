@@ -115,6 +115,9 @@ export const messagesState = $state({
     runtimeEpoch: null as string | null,
     eventStreamNextSequence: 0,
   },
+  // 侧栏可以同时展示多个工作区。目录快照按 workspaceId 分片保存，避免
+  // 后台工作区的状态刷新覆盖当前工作区的主投影。
+  workspaceSessionProjections: {} as Record<string, WorkspaceSessionProjection>,
   personalSessionProjection: {
     sessions: [] as Session[],
     runtimeEpoch: null as string | null,
@@ -1486,6 +1489,13 @@ export function rebindLocalSubmissionSession(
   requestBindings = reboundBindings;
 }
 
+export interface WorkspaceSessionProjection {
+  workspaceId: string;
+  sessions: Session[];
+  runtimeEpoch: string | null;
+  eventStreamNextSequence: number;
+}
+
 export interface WorkspaceSessionProjectionCursor {
   runtimeEpoch: string;
   eventStreamNextSequence: number;
@@ -1510,9 +1520,15 @@ export function canApplyWorkspaceSessionProjectionCursor(
   options: { allowRuntimeEpochChange?: boolean } = {},
 ): boolean {
   const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
+  if (!currentWorkspaceId) {
+    return false;
+  }
   const normalized = normalizeWorkspaceSessionProjectionCursor(cursor);
-  const current = messagesState.workspaceSessionProjection;
-  if (normalizeWorkspaceId(current.workspaceId) !== currentWorkspaceId) {
+  const current = messagesState.workspaceSessionProjections[currentWorkspaceId]
+    ?? (normalizeWorkspaceId(messagesState.workspaceSessionProjection.workspaceId) === currentWorkspaceId
+      ? messagesState.workspaceSessionProjection
+      : null);
+  if (!current) {
     return true;
   }
   const currentRuntimeEpoch = current.runtimeEpoch?.trim() || '';
@@ -1531,7 +1547,10 @@ export function replaceWorkspaceSessionProjection(
   workspaceId: string,
   newSessions: Session[],
   cursor: WorkspaceSessionProjectionCursor,
-  options: { allowRuntimeEpochChange?: boolean } = {},
+  options: {
+    allowRuntimeEpochChange?: boolean;
+    mirrorCurrentProjection?: boolean;
+  } = {},
 ): boolean {
   const seen = new Set<string>();
   const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
@@ -1553,14 +1572,22 @@ export function replaceWorkspaceSessionProjection(
       seen.add(session.id);
       return true;
     });
-  messagesState.workspaceSessionProjection = {
+  const nextProjection: WorkspaceSessionProjection = {
     workspaceId: currentWorkspaceId,
     sessions,
     runtimeEpoch: normalizedCursor.runtimeEpoch,
     eventStreamNextSequence: normalizedCursor.eventStreamNextSequence,
   };
-  pruneSessionViewStateByKnownSessions();
-  saveWebviewState();
+  messagesState.workspaceSessionProjections = {
+    ...messagesState.workspaceSessionProjections,
+    [currentWorkspaceId]: nextProjection,
+  };
+  const shouldMirrorCurrentProjection = options.mirrorCurrentProjection !== false;
+  if (shouldMirrorCurrentProjection) {
+    messagesState.workspaceSessionProjection = nextProjection;
+    pruneSessionViewStateByKnownSessions();
+    saveWebviewState();
+  }
   return true;
 }
 
@@ -1625,10 +1652,15 @@ export function upsertAcceptedSessionDirectoryEntry(
   const activeWorkspaceId = normalizeWorkspaceId(messagesState.currentWorkspaceId);
 
   if (workspaceId) {
-    const current = messagesState.workspaceSessionProjection;
-    if (activeWorkspaceId && activeWorkspaceId !== workspaceId) {
-      return false;
-    }
+    const current = messagesState.workspaceSessionProjections[workspaceId]
+      ?? (normalizeWorkspaceId(messagesState.workspaceSessionProjection.workspaceId) === workspaceId
+        ? messagesState.workspaceSessionProjection
+        : {
+            workspaceId,
+            sessions: [],
+            runtimeEpoch: null,
+            eventStreamNextSequence: 0,
+          });
     if (current.workspaceId && normalizeWorkspaceId(current.workspaceId) !== workspaceId) {
       return false;
     }
@@ -1647,7 +1679,10 @@ export function upsertAcceptedSessionDirectoryEntry(
           ),
         }
       : normalizedCursor;
-    return replaceWorkspaceSessionProjection(workspaceId, sessions, effectiveCursor);
+    return replaceWorkspaceSessionProjection(workspaceId, sessions, effectiveCursor, {
+      mirrorCurrentProjection: activeWorkspaceId === workspaceId
+        || normalizeWorkspaceId(messagesState.workspaceSessionProjection.workspaceId) === workspaceId,
+    });
   }
 
   if (activeWorkspaceId) {
@@ -1677,7 +1712,14 @@ export function advanceWorkspaceSessionProjectionCursor(
   cursor: WorkspaceSessionProjectionCursor,
 ): boolean {
   const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
-  if (!currentWorkspaceId || normalizeWorkspaceId(messagesState.workspaceSessionProjection.workspaceId) !== currentWorkspaceId) {
+  if (!currentWorkspaceId) {
+    return false;
+  }
+  const current = messagesState.workspaceSessionProjections[currentWorkspaceId]
+    ?? (normalizeWorkspaceId(messagesState.workspaceSessionProjection.workspaceId) === currentWorkspaceId
+      ? messagesState.workspaceSessionProjection
+      : null);
+  if (!current) {
     return false;
   }
   const normalizedCursor = normalizeWorkspaceSessionProjectionCursor(cursor);
@@ -1685,16 +1727,24 @@ export function advanceWorkspaceSessionProjectionCursor(
     return false;
   }
   if (
-    messagesState.workspaceSessionProjection.runtimeEpoch === normalizedCursor.runtimeEpoch
-    && messagesState.workspaceSessionProjection.eventStreamNextSequence === normalizedCursor.eventStreamNextSequence
+    current.runtimeEpoch === normalizedCursor.runtimeEpoch
+    && current.eventStreamNextSequence === normalizedCursor.eventStreamNextSequence
   ) {
     return true;
   }
-  messagesState.workspaceSessionProjection = {
-    ...messagesState.workspaceSessionProjection,
+  const nextProjection: WorkspaceSessionProjection = {
+    ...current,
     runtimeEpoch: normalizedCursor.runtimeEpoch,
     eventStreamNextSequence: normalizedCursor.eventStreamNextSequence,
   };
+  messagesState.workspaceSessionProjections = {
+    ...messagesState.workspaceSessionProjections,
+    [currentWorkspaceId]: nextProjection,
+  };
+  if (normalizeWorkspaceId(messagesState.currentWorkspaceId) === currentWorkspaceId
+    || normalizeWorkspaceId(messagesState.workspaceSessionProjection.workspaceId) === currentWorkspaceId) {
+    messagesState.workspaceSessionProjection = nextProjection;
+  }
   saveWebviewState();
   return true;
 }
@@ -1720,6 +1770,7 @@ export function updateWorkspaceSessionProjectionSessions(
 }
 
 export function clearWorkspaceSessionProjection() {
+  messagesState.workspaceSessionProjections = {};
   messagesState.workspaceSessionProjection = {
     workspaceId: null,
     sessions: [],
