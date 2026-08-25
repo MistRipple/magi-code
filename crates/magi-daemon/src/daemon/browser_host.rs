@@ -451,12 +451,19 @@ async fn monitor_desktop_connection(
         tokio::select! {
             event = tokio::time::timeout(DESKTOP_HEARTBEAT_TIMEOUT, events.recv()) => {
                 match event {
-                    Ok(Ok(event)) => handle_host_event(state, event, generation),
+                    Ok(Ok(event)) => {
+                        tracing::debug!(generation, event = ?event.envelope.event, "收到 Electron Desktop 浏览器事件");
+                        handle_host_event(state, event, generation)
+                    }
                     Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                         tracing::warn!(skipped, "Electron Desktop 浏览器事件接收滞后");
                     }
-                    Ok(Err(broadcast::error::RecvError::Closed)) => return "event_stream_closed",
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        tracing::warn!(generation, "Electron Desktop 浏览器事件流关闭");
+                        return "event_stream_closed";
+                    }
                     Err(_) => {
+                        tracing::warn!(generation, "Electron Desktop 浏览器心跳超时");
                         client.close().await;
                         return "heartbeat_timeout";
                     }

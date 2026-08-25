@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
@@ -467,6 +467,79 @@ fn model_provider_gate() -> &'static ModelProviderGate {
     })
 }
 
+fn shared_streaming_http_client() -> Result<reqwest::Client, BridgeClientError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            // 流式请求不设置总 timeout；响应体的 idle timeout 由 streaming_http_io
+            // 按 chunk 单独控制，避免长回复被误判为超时。
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(message) => Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: format!("HTTP streaming client build failed: {message}"),
+        }),
+    }
+}
+
+fn shared_http_runtime() -> Result<&'static tokio::runtime::Runtime, BridgeClientError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(message) => Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: format!("HTTP runtime build failed: {message}"),
+        }),
+    }
+}
+
+fn shared_request_http_client() -> Result<reqwest::Client, BridgeClientError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(message) => Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: format!("HTTP client build failed: {message}"),
+        }),
+    }
+}
+
+fn shared_blocking_http_client() -> Result<reqwest::blocking::Client, BridgeClientError> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(message) => Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: format!("HTTP blocking client build failed: {message}"),
+        }),
+    }
+}
+
 fn normalize_provider_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
 }
@@ -659,15 +732,7 @@ fn execute_http_post(
 ) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
     std::thread::spawn(move || {
         let _permit = model_provider_gate().acquire(&provider_key);
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|error| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Transport,
-                code: Some(-32005),
-                message: format!("HTTP client build failed: {error}"),
-            })?;
+        let client = shared_blocking_http_client()?;
 
         let mut req_builder = client
             .post(&url)
@@ -726,17 +791,9 @@ fn execute_cancellable_http_post(
         let result = match model_provider_gate()
             .acquire_cancellable(&provider_key, worker_cancellation.as_ref())
         {
-            Some(_permit) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::Transport,
-                    code: Some(-32005),
-                    message: format!("HTTP runtime build failed: {error}"),
-                })
-                .and_then(|runtime| {
-                    runtime.block_on(async_http_post_io(url, body, headers, cancellation_rx))
-                }),
+            Some(_permit) => shared_http_runtime().and_then(|runtime| {
+                runtime.block_on(async_http_post_io(url, body, headers, cancellation_rx))
+            }),
             None => Err(model_invocation_cancelled_error()),
         };
         let _ = tx.send(result);
@@ -757,15 +814,7 @@ async fn async_http_post_io(
     headers: Vec<(String, String)>,
     mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> HttpPostResult {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Transport,
-            code: Some(-32005),
-            message: format!("HTTP client build failed: {error}"),
-        })?;
+    let client = shared_request_http_client()?;
     let mut request = client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -1027,25 +1076,18 @@ fn execute_streaming_http_post(
         let result = match model_provider_gate()
             .acquire_cancellable(&provider_key, worker_cancellation.as_ref())
         {
-            Some(_permit) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::Transport,
-                    code: Some(-32005),
-                    message: format!("streaming HTTP runtime build failed: {error}"),
-                })
-                .and_then(|runtime| {
-                    runtime.block_on(streaming_http_io(
-                        url,
-                        body,
-                        headers,
-                        provider_family,
-                        tool_name_codec,
-                        &tx,
-                        cancellation_rx,
-                    ))
-                }),
+            Some(_permit) => shared_http_runtime().and_then(|runtime| {
+                runtime.block_on(streaming_http_io(
+                    provider_key.clone(),
+                    url,
+                    body,
+                    headers,
+                    provider_family,
+                    tool_name_codec,
+                    &tx,
+                    cancellation_rx,
+                ))
+            }),
             None => Err(model_invocation_cancelled_error()),
         };
         let _ = tx.send(StreamMessage::Done(result));
@@ -1196,6 +1238,7 @@ fn execute_streaming_http_post_with_retries(
 
 /// 独立线程内执行的流式 HTTP I/O 逻辑。
 async fn streaming_http_io(
+    provider_key: String,
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
@@ -1204,16 +1247,8 @@ async fn streaming_http_io(
     tx: &mpsc::Sender<StreamMessage>,
     mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> StreamingHttpResult {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        // reqwest 默认不设置总请求 timeout，流式读取在 response.chunk()
-        // 上单独执行 idle timeout，避免把正常的长响应误判为超时。
-        .build()
-        .map_err(|error| BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Transport,
-            code: Some(-32005),
-            message: format!("HTTP client build failed: {error}"),
-        })?;
+    let started_at = Instant::now();
+    let client = shared_streaming_http_client()?;
 
     let mut req_builder = client
         .post(&url)
@@ -1243,6 +1278,13 @@ async fn streaming_http_io(
     };
 
     let status = response.status().as_u16();
+    tracing::info!(
+        target: "magi.performance",
+        provider_key = %provider_key,
+        stage = "provider_headers_received",
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "provider response timing"
+    );
     let retry_after = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -1280,6 +1322,7 @@ async fn streaming_http_io(
     let mut saw_protocol_terminal = false;
     let mut terminal_drain_deadline = None;
     let mut raw_response = String::new();
+    let mut first_delta_reported = false;
 
     'stream_read: loop {
         let chunk_result = if let Some(deadline) = terminal_drain_deadline {
@@ -1344,6 +1387,17 @@ async fn streaming_http_io(
             )? {
                 saw_protocol_terminal = true;
                 break 'stream_read;
+            }
+            if !first_delta_reported && (last_content_delta_len > 0 || last_thinking_delta_len > 0)
+            {
+                first_delta_reported = true;
+                tracing::info!(
+                    target: "magi.performance",
+                    provider_key = %provider_key,
+                    stage = "provider_first_delta",
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "provider response timing"
+                );
             }
         }
         if accumulator.saw_terminal() && terminal_drain_deadline.is_none() {

@@ -2,9 +2,9 @@ use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecor
 use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
-    approval_resume_contract_failure, approval_resume_is_safe, model_visible_tool_result,
-    summarize_tool_result, tool_execution_failed_result, tool_execution_status_label,
-    turn_item_status_for_tool_result,
+    DeterministicToolFailure, approval_resume_contract_failure, approval_resume_is_safe,
+    model_visible_tool_result, non_retryable_tool_failure, summarize_tool_result,
+    tool_execution_failed_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::activated_skill_id_from_tool_result;
 use crate::{
@@ -285,6 +285,7 @@ pub struct SessionToolCallBatchOutcome {
     pub completed: bool,
     pub succeeded_tool_names: Vec<String>,
     pub activated_skill_id: Option<String>,
+    pub terminal_failure: Option<DeterministicToolFailure>,
 }
 
 const STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS: u64 = 80;
@@ -1225,6 +1226,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
 
     let mut succeeded_tool_names = Vec::new();
     let mut activated_skill_id = None;
+    let mut terminal_failure = None;
     for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results) {
         if !write_allowed() {
             return SessionToolCallBatchOutcome::default();
@@ -1263,11 +1265,17 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         {
             activated_skill_id = Some(skill_id);
         }
+        if let Some(failure) =
+            non_retryable_tool_failure(&tool_call.function.name, &tool_result, tool_status)
+        {
+            terminal_failure.get_or_insert(failure);
+        }
     }
     SessionToolCallBatchOutcome {
         completed: true,
         succeeded_tool_names,
         activated_skill_id,
+        terminal_failure,
     }
 }
 
@@ -1729,22 +1737,30 @@ fn await_session_tool_approval(
         reason: reason.clone(),
         requested_at: UtcMillis::now(),
     };
-    let waiter = match registry.request(request.clone()) {
-        Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
-        Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
-        Err(error) => {
-            return Err((
-                serde_json::json!({
-                    "tool": tool_call.function.name,
-                    "status": "failed",
-                    "error_code": "tool_approval_runtime_failed",
-                    "error": error,
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            ));
-        }
-    };
+    let waiter =
+        match registry.request_with_arguments(request.clone(), &tool_call.function.arguments) {
+            Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
+            Ok(crate::ToolApprovalRequestOutcome::PreviouslyDenied) => {
+                return Err(crate::tool_approval::rejected_tool_approval_result(
+                    &tool_call.function.name,
+                    &approval_id,
+                    true,
+                ));
+            }
+            Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
+            Err(error) => {
+                return Err((
+                    serde_json::json!({
+                        "tool": tool_call.function.name,
+                        "status": "failed",
+                        "error_code": "tool_approval_runtime_failed",
+                        "error": error,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                ));
+            }
+        };
 
     let progress_payload = serde_json::json!({
         "tool": tool_call.function.name,
@@ -1835,16 +1851,10 @@ fn await_session_tool_approval(
                 return Ok(());
             }
             Ok(crate::ToolApprovalDecision::Deny) => {
-                return Err((
-                    serde_json::json!({
-                        "tool": tool_call.function.name,
-                        "status": "rejected",
-                        "error_code": "tool_approval_denied",
-                        "error": "用户拒绝了本次工具操作",
-                        "approval_id": approval_id,
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Rejected,
+                return Err(crate::tool_approval::rejected_tool_approval_result(
+                    &tool_call.function.name,
+                    &approval_id,
+                    false,
                 ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -3391,6 +3401,7 @@ mod tests {
         assert_eq!(parsed["tool"], "file_write");
         assert_eq!(parsed["status"], "rejected");
         assert_eq!(parsed["access_profile"], "read_only");
+        assert_eq!(parsed["restriction_kind"], "read_only");
     }
 
     #[test]

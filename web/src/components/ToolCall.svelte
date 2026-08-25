@@ -34,6 +34,7 @@
     parseToolApprovalPayload,
     parseToolPayloadRecord,
     publicToolPayloadMessage,
+    toolPayloadRestrictionKind,
     toolPayloadErrorCode,
     toolPayloadStatus,
   } from '../lib/tool-error-payload';
@@ -410,14 +411,16 @@
       return '';
     }
     const publicMessage = publicToolPayloadMessage(output);
-    if (publicMessage) {
-      return publicMessage;
-    }
     const errorCode = toolPayloadErrorCode(output);
     const payloadStatus = toolPayloadStatus(output);
+    const restrictionKind = toolPayloadRestrictionKind(output);
+    const payload = parseToolPayloadRecord(output);
     return JSON.stringify({
       error_code: errorCode,
       status: payloadStatus || 'failed',
+      error: publicMessage || undefined,
+      restriction_kind: restrictionKind || undefined,
+      required_access_profile: payload?.required_access_profile,
     });
   });
   const errorForDiagnosis = $derived((error && error.trim()) || structuredErrorText);
@@ -663,12 +666,20 @@
       'tool_safety_rejected',
       'tool_safety_failed',
     )) {
+      const restrictionKind = toolPayloadRestrictionKind(errorText) || toolPayloadRestrictionKind(toolResult?.message);
+      const detailKey = restrictionKind === 'path_scope'
+        ? 'pathScope'
+        : restrictionKind === 'read_only'
+          ? 'readOnly'
+          : restrictionKind === 'tool_scope'
+            ? 'toolScope'
+            : 'default';
       return {
         category: 'policy',
-        categoryLabel: i18n.t('toolCall.errorDiagnosis.policy.categoryLabel'),
-        ownerLabel: i18n.t('toolCall.errorDiagnosis.policy.ownerLabel'),
-        message: i18n.t('toolCall.errorDiagnosis.policy.message'),
-        hint: i18n.t('toolCall.errorDiagnosis.policy.hint'),
+        categoryLabel: i18n.t(`toolCall.errorDiagnosis.policy.${detailKey}.categoryLabel`),
+        ownerLabel: i18n.t(`toolCall.errorDiagnosis.policy.${detailKey}.ownerLabel`),
+        message: i18n.t(`toolCall.errorDiagnosis.policy.${detailKey}.message`),
+        hint: i18n.t(`toolCall.errorDiagnosis.policy.${detailKey}.hint`),
       };
     }
 

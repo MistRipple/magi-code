@@ -37,6 +37,7 @@ use crate::{
         SessionTurnResponseDto, SessionTurnResponseInput, SessionTurnRouteDto,
     },
     errors::ApiError,
+    performance::PerformanceTrace,
     session_continue::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
         continue_execution_chain_with_pre_resume, persist_resumed_branch_user_input,
@@ -2321,6 +2322,12 @@ async fn submit_mainline_session_turn(
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
 ) -> Result<SessionTurnResponseDto, ApiError> {
+    let trace = PerformanceTrace::new(request.request_id().as_deref(), accepted_at);
+    let requested_session_label = request
+        .requested_session_id()
+        .map(|session_id| session_id.to_string())
+        .unwrap_or_else(|| "new-session".to_string());
+    trace.mark("submit_received", &requested_session_label, None, None);
     let route = decision.route;
     let user_text = request
         .trimmed_text()
@@ -2395,7 +2402,12 @@ async fn submit_mainline_session_turn(
         },
     )
     .await?;
-    super::finalize_session_task_dispatch(state.clone(), accepted.clone()).await;
+    trace.mark(
+        "admission_completed",
+        accepted.session_id.as_str(),
+        None,
+        None,
+    );
     let execution_chain_ref = state
         .session_store
         .runtime_sidecar(&accepted.session_id)
@@ -2403,6 +2415,13 @@ async fn submit_mainline_session_turn(
     let (accepted_canonical_turn, accepted_canonical_item) =
         super::dispatch_accepted_canonical_event(&state, &accepted);
     let session_summary = accepted_session_directory_entry(&state, &accepted);
+    trace.mark(
+        "accepted_response_sent",
+        accepted.session_id.as_str(),
+        Some(&format!("turn-session-action-{}", accepted.accepted_at.0)),
+        None,
+    );
+    super::schedule_session_task_dispatch(state.clone(), accepted.clone());
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id: accepted.session_id,
         entry_id: accepted.entry_id,
@@ -2619,7 +2638,7 @@ async fn submit_goal_continuation_turn(
     )
     .await?;
     super::dispatch_flow::publish_goal_continuation_task_accepted_event(&state, &accepted);
-    super::finalize_session_task_dispatch(state, accepted).await;
+    super::schedule_session_task_dispatch(state, accepted);
     Ok(())
 }
 
@@ -4509,7 +4528,7 @@ mod tests {
         ToolRegistry,
     };
     use magi_workspace::WorkspaceStore;
-    use std::{fs, sync::Arc};
+    use std::{fs, sync::Arc, time::Duration};
     use tower::ServiceExt;
 
     fn test_state() -> ApiState {
@@ -8069,10 +8088,18 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(body["canonicalEventKind"], "turn_started");
-        let context = state
-            .session_code_contexts
-            .get(session_id.as_str())
-            .expect("adopted Git context");
+        let context = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(context) = state.session_code_contexts.get(session_id.as_str())
+                    && context.git.base_head.as_deref() == Some(advanced_head.as_str())
+                {
+                    break context;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accepted turn preparation should adopt Git context");
         assert_eq!(
             context.git.base_head.as_deref(),
             Some(advanced_head.as_str())

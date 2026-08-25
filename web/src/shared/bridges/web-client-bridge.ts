@@ -359,7 +359,21 @@ let webviewStatePersistenceDisabled = false;
 let webviewStatePersistenceWarningLogged = false;
 let pendingWebviewState: unknown = null;
 let cachedWebviewState: unknown = null;
+const goalRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const storageWarningSignatures = new Set<string>();
+
+function scheduleGoalRefresh(
+  sessionId: string,
+  workspaceId: string,
+  workspacePath: string,
+): void {
+  const key = `${workspaceId.trim() || 'personal'}\u0000${sessionId.trim()}`;
+  if (!sessionId.trim() || goalRefreshTimers.has(key)) return;
+  goalRefreshTimers.set(key, setTimeout(() => {
+    goalRefreshTimers.delete(key);
+    void refreshCurrentGoal(sessionId, workspaceId, workspacePath);
+  }, 120));
+}
 
 function normalizeStorageErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) {
@@ -2177,7 +2191,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       const sessionId = rustEventSessionId(event) || currentSessionId;
       const workspaceId = rustEventWorkspaceId(event) || currentWorkspaceId;
       if (sessionId) {
-        void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
+        scheduleGoalRefresh(sessionId, workspaceId, currentWorkspacePath);
       }
       return;
     }

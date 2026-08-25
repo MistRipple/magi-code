@@ -1726,6 +1726,7 @@ impl DaemonRuntime {
             );
         }
         magi_api::task_turn_finalize::schedule_restored_session_turn_queues(&state);
+        magi_api::schedule_restored_session_task_dispatches(state.clone());
         super::browser_host::start_controller(&state);
 
         Ok(state)
@@ -1826,6 +1827,16 @@ impl DaemonRuntime {
                 let chain = sidecar.active_execution_chain?;
                 let root_task = task_store.get_task(&chain.root_task_id)?;
                 if matches!(root_task.status, TaskStatus::Completed | TaskStatus::Killed) {
+                    return None;
+                }
+                // accepted/preparing 是提交控制面已经 durable 的执行准备阶段。
+                // 这类 Turn 尚未向 provider 发起不可安全重放的请求，保留 chain，
+                // 待 ApiState 装配完成后由 preparation worker 恢复。
+                let recoverable_preparation = root_task.status == TaskStatus::Pending
+                    && sidecar.current_turn.as_ref().is_some_and(|turn| {
+                        matches!(turn.status.as_str(), "accepted" | "preparing")
+                    });
+                if recoverable_preparation {
                     return None;
                 }
                 let turn_is_active = sidecar

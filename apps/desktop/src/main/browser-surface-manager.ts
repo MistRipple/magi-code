@@ -104,6 +104,7 @@ interface BrowserSurfaceRecord {
   viewportApplyPromise: Promise<void> | null;
   viewportApplyDirty: boolean;
   debuggerListenersInstalled: boolean;
+  dialogBridgeInstalled: boolean;
   cdpSessionIds: Set<string>;
   debuggerReadyPromise: Promise<void> | null;
   recoveryPromise: Promise<void> | null;
@@ -228,6 +229,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Page.getFrameTree",
   "Page.getLayoutMetrics",
   "Page.handleJavaScriptDialog",
+  "Runtime.addBinding",
   "Page.removeScriptToEvaluateOnNewDocument",
   "Performance.enable",
   "Performance.getMetrics",
@@ -247,6 +249,50 @@ const SCREENSHOT_CDP_COMMAND_TIMEOUT_MS = 10_000;
 const SCREENSHOT_READINESS_TIMEOUT_MS = 5_000;
 const CURSOR_CDP_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 120_000;
+const HIDDEN_AUTO_VIEWPORT = { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false } as const;
+const DIALOG_BRIDGE_BINDING = "__magiBrowserDialog";
+const DIALOG_BRIDGE_SCRIPT = String.raw`(() => {
+  if (globalThis.__magiBrowserDialogInstalled) return;
+  let sequence = 0;
+  let active = null;
+  const notify = (event) => {
+    try {
+      if (typeof globalThis.${DIALOG_BRIDGE_BINDING} === 'function') {
+        globalThis.${DIALOG_BRIDGE_BINDING}(JSON.stringify(event));
+      }
+    } catch {}
+  };
+  const open = (type, message, defaultPrompt) => {
+    const dialog = {
+      id: 'magi-dialog-' + (++sequence),
+      type,
+      message: String(message ?? ''),
+      defaultPrompt: defaultPrompt == null ? null : String(defaultPrompt),
+    };
+    active = dialog;
+    notify({ event: 'opening', ...dialog });
+    return dialog;
+  };
+  globalThis.__magiBrowserDialogResolve = (input) => {
+    if (!active) return { handled: false };
+    const dialog = active;
+    active = null;
+    notify({
+      event: 'closed',
+      id: dialog.id,
+      action: String(input?.action ?? 'dismiss'),
+      promptText: typeof input?.promptText === 'string' ? input.promptText : null,
+    });
+    return { handled: true };
+  };
+  globalThis.alert = (message) => { open('alert', message, null); };
+  globalThis.confirm = (message) => { open('confirm', message, null); return true; };
+  globalThis.prompt = (message, defaultPrompt = '') => {
+    const dialog = open('prompt', message, defaultPrompt);
+    return dialog.defaultPrompt ?? '';
+  };
+  globalThis.__magiBrowserDialogInstalled = true;
+})();`;
 export class BrowserSurfaceManager {
   readonly #desktopEpoch: string;
   readonly #surfaces = new BrowserSurfaceRegistry<BrowserSurfaceRecord>();
@@ -316,6 +362,10 @@ export class BrowserSurfaceManager {
     if (!this.#surfaces.primaryForTab(record.tabId)) this.promote(record.surfaceId);
     const initialUrl = normalizeNavigableUrl(input.initialUrl);
     this.assertActivationCurrent(input.windowId, input.activationGeneration);
+    // 首次文档导航前先完成调试器对话框桥接。原生 JavaScript 对话框会
+    // 阻塞 Electron Main 的事件循环，导致 Host 心跳和后续 accept/dismiss
+    // 请求一起失效；桥接必须早于 loadURL 注入才能覆盖页面首个脚本。
+    if (created && record.debuggerReadyPromise) await record.debuggerReadyPromise;
     if (
       (record.contents.getURL() || "") === ""
       || (
@@ -387,6 +437,7 @@ export class BrowserSurfaceManager {
       viewportApplyPromise: null,
       viewportApplyDirty: false,
       debuggerListenersInstalled: false,
+      dialogBridgeInstalled: false,
       cdpSessionIds: new Set(),
       debuggerReadyPromise: null,
       recoveryPromise: null,
@@ -402,7 +453,16 @@ export class BrowserSurfaceManager {
       this.closeRecord(record);
     });
     this.installSurfacePolicy(record);
-    const debuggerReady = this.enqueueCdp(record, () => this.attachDebugger(record));
+    const debuggerReady = this.enqueueCdp(record, async () => {
+      // 新建 WebContents 在第一次 loadURL 前还没有 renderer document。
+      // Chromium/Electron 在这个阶段允许 attach debugger，但 Runtime domain
+      // 可能一直不响应；先完成一次受控的 about:blank 初始文档，再安装
+      // Runtime binding 与 new-document 脚本，随后 materialize 才会导航到
+      // 用户请求的 URL。这样既保留首个业务文档的桥接时机，也避免把
+      // 首次 Runtime.enable 超时误报成浏览器不可用。
+      await primeInitialDocument(record.contents);
+      await this.attachDebugger(record);
+    });
     record.debuggerReadyPromise = debuggerReady;
     void debuggerReady.then(
       () => {
@@ -568,7 +628,16 @@ export class BrowserSurfaceManager {
       throw new Error(`browser_cdp_method_denied:${method}`);
     }
     const record = this.requireRecord(binding.surface_id);
-    await this.waitForDebugger(record);
+    // JavaScript 对话框会阻塞触发它的 Input.dispatchMouseEvent。对话框处理
+    // 命令必须能够穿过当前 Surface lane 直接送达 Chromium，否则会形成：
+    // Input 等待对话框关闭、dialog 又排在 Input 后面，最终 Rust Host 请求超时
+    // 并把本来已经成功的点击错误收敛为 browser_host_disconnected。
+    const isDialogCommand = method === "Page.handleJavaScriptDialog";
+    if (!isDialogCommand) {
+      await this.waitForDebugger(record);
+    } else if (!record.contents.debugger.isAttached()) {
+      await this.waitForDebugger(record);
+    }
     // 输入事件属于一个完整的用户动作。Enter、点击或输入事件可能在
     // keyDown/mousePressed 之后立即推进 navigation_revision；后续的
     // keyUp/mouseReleased 仍然必须送到同一个 WebContents，而不是被页面
@@ -587,21 +656,32 @@ export class BrowserSurfaceManager {
     if (!contents.debugger.isAttached()) {
       throw staleSurfaceError("browser_debugger_detached");
     }
+    if (isDialogCommand) {
+      return sendCdpCommandWithTimeout(
+        contents,
+        method,
+        params,
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        sessionId,
+      );
+    }
     if (method === "Page.captureScreenshot") {
       // 激活 Browser Tab 的导航是非阻塞的，截图可能紧跟在 Surface
       // 物化之后到达。先给 Chromium 当前文档一个有限的稳定窗口，避免
       // 在首帧/导航切换阶段直接让 Page.captureScreenshot 卡满超时；
       // 超时后仍继续截图，不能把慢站点变成永远不可操作。
       await this.waitForScreenshotReadiness(record);
-      // 普通可视区域截图走同一 WebContents 的原生捕获，避免
+      // Electron 原生捕获覆盖普通视口、元素范围和全页范围，避免
       // Page.captureScreenshot 在 WebContentsView 尚未取得 compositor
-      // frame 时阻塞 CDP lane。full-page、元素范围和 WebP 必须保留
-      // Chromium CDP 的原生语义，不能把内容尺寸错误地裁成内容槽。
-      if (params.captureBeyondViewport === true || params.format === "webp") {
+      // frame（尤其是后台 Surface）时阻塞 CDP lane。WebP 仍保留
+      // Chromium CDP 的原生编码语义。
+      if (params.format === "webp") {
         return this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
           contents,
           method,
-          params,
+          // WebP 需要 Chromium compositor 的编码路径；Electron 的
+          // nativeImage 没有 WebP 编码接口，因此明确使用 surface 捕获。
+          { ...params, fromSurface: true },
           SCREENSHOT_CDP_COMMAND_TIMEOUT_MS,
           sessionId,
           track,
@@ -650,7 +730,11 @@ export class BrowserSurfaceManager {
     }
     const format = params.format === "jpeg" ? "jpeg" : "png";
     const rect = capturePageRect(record, params);
-    const image = await record.contents.capturePage(rect);
+    // WebContentsView 在右栏切换/恢复的瞬间，view.getBounds() 可能暂时是
+    // 0×0。capturePage 仍必须使用页面的逻辑视口尺寸，否则 Electron 会
+    // 返回 1×1 空白图片；capturePageRect 会在物理尺寸不可用时使用固定
+    // viewport 或隐藏 Surface 的标准视口作为确定性边界。
+    const image = await record.contents.capturePage(rect, { stayHidden: true });
     const bytes = format === "jpeg"
       ? image.toJPEG(normalizeJpegQuality(params.quality))
       : image.toPNG();
@@ -858,8 +942,13 @@ export class BrowserSurfaceManager {
     bounds: Rectangle | null,
     window: BaseWindow | undefined,
   ): void {
+    const wasSlotVisible = record.slotVisible;
     record.slotBounds = bounds ? { ...bounds } : null;
     record.slotVisible = bounds !== null;
+    if (record.viewport.mode === "auto" && wasSlotVisible !== record.slotVisible) {
+      record.viewportApplied = false;
+      this.scheduleViewportApply(record);
+    }
     if (!window || window.isDestroyed()) {
       this.detachSurface(record, window);
       return;
@@ -928,6 +1017,7 @@ export class BrowserSurfaceManager {
         loadPromise,
         clampNavigationTimeout(timeoutMs),
       );
+      await this.installDialogBridgeInCurrentDocument(record);
     } catch (error) {
       if (record.navigationOperationId !== operationId) {
         throw staleSurfaceError("browser_navigation_superseded");
@@ -1202,6 +1292,18 @@ export class BrowserSurfaceManager {
       if (!record.closed && !record.viewportApplied) {
         this.scheduleViewportApply(record);
       }
+      // Electron 的 contextIsolation 会让 CDP 注入的 new-document 脚本与
+      // 自动化执行世界拥有不同的全局对象；在真实文档完成后，再通过
+      // executeJavaScript 在页面主世界收敛一次同一桥接脚本，确保页面内
+      // 的 window.alert/confirm/prompt 被替换，而不是落回原生阻塞对话框。
+      void this.installDialogBridgeInCurrentDocument(record).catch((error) => {
+        if (!record.closed) {
+          console.warn("[BrowserSurfaceManager] 当前文档对话框桥接安装失败", {
+            surfaceId: record.surfaceId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
       if (record.closed || !record.agentControlled) return;
       void this.setAgentCursor(record, true, record.cursor.x, record.cursor.y, record.cursor.action)
         .catch(() => undefined);
@@ -1277,6 +1379,16 @@ export class BrowserSurfaceManager {
       debuggerApi.on("message", (_event, method, params, sessionId) => {
         if (record.closed) return;
         const eventParams = (params ?? {}) as Record<string, unknown>;
+        if (method === "Page.javascriptDialogOpening" || method === "Page.javascriptDialogClosed") {
+          console.info("[BrowserSurfaceManager] JavaScript dialog event", {
+            surfaceId: record.surfaceId,
+            tabId: record.tabId,
+            method,
+            sessionId: sessionId ?? null,
+            type: eventParams.type ?? null,
+            message: eventParams.message ?? null,
+          });
+        }
         if (method === "Target.attachedToTarget" && typeof eventParams.sessionId === "string") {
           record.cdpSessionIds.add(eventParams.sessionId);
         }
@@ -1293,6 +1405,11 @@ export class BrowserSurfaceManager {
       });
       debuggerApi.on("detach", (_event, reason) => {
         if (record.closed) return;
+        console.warn("[BrowserSurfaceManager] Browser debugger detached", {
+          surfaceId: record.surfaceId,
+          tabId: record.tabId,
+          reason,
+        });
         // 调试器是自动化通道，不是页面本身。短暂 detach 不能隐藏或 reload
         // 用户正在看的 Chromium 文档；仅后台重新 attach，页面继续保持可见。
         void this.reconnectDebugger(record, `debugger-detached:${reason}`).catch((error) => {
@@ -1306,10 +1423,54 @@ export class BrowserSurfaceManager {
         });
       });
     }
+    if (!record.dialogBridgeInstalled) {
+      // Runtime.addBinding 在 Electron 中需要先显式启用 Runtime domain；
+      // 否则某些 Chromium 版本不会返回错误，而是让 sendCommand 一直挂起。
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Page.enable",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+      );
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Runtime.enable",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+      );
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Runtime.addBinding",
+        { name: DIALOG_BRIDGE_BINDING },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+      );
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Page.addScriptToEvaluateOnNewDocument",
+        { source: DIALOG_BRIDGE_SCRIPT },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+      );
+      record.dialogBridgeInstalled = true;
+      await record.contents.executeJavaScript(DIALOG_BRIDGE_SCRIPT, true);
+    }
     // 内容槽可能先于调试器握手完成。固定视口在这段竞态中不能因为
     // 首次 CDP apply 提前返回而永久失效，握手完成后补交同一 Surface
-    // 的最新 Tab 级 viewport 配置。
-    if (record.slotVisible) this.scheduleViewportApply(record);
+    // 的最新 Tab 级 viewport 配置。后台 auto Surface 也必须收敛一次，
+    // 否则 Chromium 会把未挂载 WebContentsView 的页面计算成 0×0。
+    this.scheduleViewportApply(record);
+  }
+
+  private async installDialogBridgeInCurrentDocument(record: BrowserSurfaceRecord): Promise<void> {
+    if (
+      record.closed
+      || record.contents.isDestroyed()
+      || !record.contents.debugger.isAttached()
+      || record.contents.isLoadingMainFrame()
+    ) return;
+    await this.enqueueCdp(record, async () => {
+      if (record.closed || record.contents.isDestroyed()) return;
+      await record.contents.executeJavaScript(DIALOG_BRIDGE_SCRIPT, true);
+    });
   }
 
   private reconnectDebugger(record: BrowserSurfaceRecord, reason: string): Promise<void> {
@@ -1386,10 +1547,12 @@ export class BrowserSurfaceManager {
     if (record.closed || !record.contents.debugger.isAttached()) return;
     if (record.contents.isLoadingMainFrame()) return;
     if (record.viewport.mode === "auto") {
+      const bounds = record.view.getBounds();
+      const hasVisibleSlot = record.slotVisible && bounds.width > 0 && bounds.height > 0;
       await sendCdpCommandWithTimeout(
         record.contents,
-        "Emulation.clearDeviceMetricsOverride",
-        {},
+        hasVisibleSlot ? "Emulation.clearDeviceMetricsOverride" : "Emulation.setDeviceMetricsOverride",
+        hasVisibleSlot ? {} : HIDDEN_AUTO_VIEWPORT,
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
         undefined,
         track,
@@ -1692,22 +1855,35 @@ function capturePageRect(
   params: Record<string, unknown>,
 ): Rectangle {
   const viewBounds = record.view.getBounds();
+  const logicalBounds = record.viewport.mode === "fixed"
+    ? { width: record.viewport.width, height: record.viewport.height }
+    : HIDDEN_AUTO_VIEWPORT;
+  const fallbackWidth = viewBounds.width > 0
+    ? viewBounds.width
+    : record.slotBounds && record.slotBounds.width > 0
+      ? record.slotBounds.width
+      : logicalBounds.width;
+  const fallbackHeight = viewBounds.height > 0
+    ? viewBounds.height
+    : record.slotBounds && record.slotBounds.height > 0
+      ? record.slotBounds.height
+      : logicalBounds.height;
   const clip = params.clip;
   if (!clip || typeof clip !== "object") {
-    return { x: 0, y: 0, width: Math.max(1, viewBounds.width), height: Math.max(1, viewBounds.height) };
+    return { x: 0, y: 0, width: Math.max(1, fallbackWidth), height: Math.max(1, fallbackHeight) };
   }
   const value = clip as Record<string, unknown>;
   const x = finiteNumber(value.x, 0);
   const y = finiteNumber(value.y, 0);
-  const width = finiteNumber(value.width, viewBounds.width);
-  const height = finiteNumber(value.height, viewBounds.height);
-  const left = Math.max(0, Math.min(viewBounds.width - 1, Math.floor(x)));
-  const top = Math.max(0, Math.min(viewBounds.height - 1, Math.floor(y)));
+  const width = finiteNumber(value.width, fallbackWidth);
+  const height = finiteNumber(value.height, fallbackHeight);
+  const left = Math.max(0, Math.min(fallbackWidth - 1, Math.floor(x)));
+  const top = Math.max(0, Math.min(fallbackHeight - 1, Math.floor(y)));
   return {
     x: left,
     y: top,
-    width: Math.max(1, Math.min(viewBounds.width - left, Math.ceil(width))),
-    height: Math.max(1, Math.min(viewBounds.height - top, Math.ceil(height))),
+    width: Math.max(1, Math.min(fallbackWidth - left, Math.ceil(width))),
+    height: Math.max(1, Math.min(fallbackHeight - top, Math.ceil(height))),
   };
 }
 
@@ -1728,6 +1904,7 @@ async function sendCdpCommandWithTimeout(
   sessionId?: string,
   track?: (promise: Promise<unknown>) => void,
 ): Promise<unknown> {
+  const startedAt = performance.now();
   let command: Promise<unknown>;
   try {
     command = contents.debugger.sendCommand(method, params, sessionId);
@@ -1739,7 +1916,23 @@ async function sendCdpCommandWithTimeout(
   // 如果 lane 继续等待它，单次超时就会永久阻塞后续快照、输入和标记。
   const timed = withTimeout(command, timeoutMs, method);
   track?.(timed.then(() => undefined, () => undefined));
-  return timed;
+  try {
+    const result = await timed;
+    if (method === "Page.handleJavaScriptDialog" || method === "Input.dispatchMouseEvent") {
+      console.info("[BrowserSurfaceManager] CDP command settled", {
+        method,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+    }
+    return result;
+  } catch (error) {
+    console.warn("[BrowserSurfaceManager] CDP command failed", {
+      method,
+      durationMs: Math.round(performance.now() - startedAt),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, method: string): Promise<T> {
@@ -1775,6 +1968,21 @@ async function withNavigationTimeout<T>(promise: Promise<T>, timeoutMs: number):
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function primeInitialDocument(contents: WebContents): Promise<void> {
+  if (contents.isDestroyed()) throw new Error("browser_surface_not_found");
+  await waitForNavigationEvent(
+    contents,
+    () => {
+      // 新建 WebContents 的默认 URL 可能已经显示为 about:blank，但在
+      // Chromium renderer 真正完成初始化前 Runtime domain 仍不可用。
+      // 显式完成一次空白导航，确保后续 debugger.sendCommand 有稳定的
+      // document/renderer 目标。
+      void contents.loadURL("about:blank").catch(() => undefined);
+    },
+    DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+  );
 }
 
 async function waitForNavigationEvent(

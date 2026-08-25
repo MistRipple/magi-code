@@ -52,7 +52,7 @@ class FakePort implements ParentPort {
 
 class ScriptedPort implements ParentPort {
   #listener: ((event: { data: MainToWorkerMessage }) => void) | null = null;
-  readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+  readonly requests: Array<{ method: string; params: Record<string, unknown>; sessionId?: string }> = [];
 
   constructor(
     private readonly respond: (method: string, params: Record<string, unknown>) => unknown,
@@ -64,14 +64,28 @@ class ScriptedPort implements ParentPort {
 
   postMessage(message: WorkerToMainMessage): void {
     if (message.type !== "cdp_request") return;
-    this.requests.push({ method: message.method, params: message.params ?? {} });
+    this.requests.push({
+      method: message.method,
+      params: message.params ?? {},
+      ...(message.session_id ? { sessionId: message.session_id } : {}),
+    });
     queueMicrotask(() => {
+      const result = this.respond(message.method, message.params ?? {});
       this.#listener?.({
         data: {
           type: "cdp_response",
           request_id: message.request_id,
           binding: message.binding,
-          result: this.respond(message.method, message.params ?? {}),
+          ...(result instanceof Error
+            ? {
+                error: {
+                  code: "browser_cdp_failed",
+                  message: result.message,
+                  recoverable: true,
+                  side_effect_started: false,
+                },
+              }
+            : { result }),
         },
       });
     });
@@ -379,6 +393,57 @@ test("截图和滚动使用页面脚本视口坐标，不把 CDP layoutViewport 
   );
 });
 
+test("页面脚本视口失效时兼容 CDP 仅返回 clientWidth/clientHeight 的布局视口", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") {
+      return { frameTree: { frame: { id: "frame-1" } } };
+    }
+    if (method === "Page.createIsolatedWorld") {
+      return { executionContextId: 1 };
+    }
+    if (method === "Page.getLayoutMetrics") {
+      return {
+        cssVisualViewport: { width: 0, height: 0, clientWidth: 480, clientHeight: 854 },
+      };
+    }
+    if (method === "Runtime.evaluate") {
+      return {
+        result: {
+          value: String(params.expression).trim().endsWith("globalThis.__magiBrowserAutomation.viewport()")
+            ? { width: 0, height: 0 }
+            : null,
+        },
+      };
+    }
+    if (method === "Page.captureScreenshot") {
+      return { data: PNG_BYTES.toString("base64") };
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+
+  const result = await runtime.execute("client-dimension-viewport", binding, {
+    type: "screenshot",
+    payload: {
+      tab_id: binding.tab_id,
+      clip: { x: 0, y: 0, width: 0.5, height: 0.5 },
+      full_page: false,
+      format: "png",
+    },
+  });
+
+  assert.equal(result.outcome.status, "succeeded");
+  assert.deepEqual(
+    port.requests.find((request) => request.method === "Page.captureScreenshot")?.params,
+    {
+      format: "png",
+      clip: { x: 0, y: 0, width: 240, height: 427, scale: 1 },
+      captureBeyondViewport: false,
+      fromSurface: false,
+    },
+  );
+});
+
 test("滚动目标元素时使用元素中心作为 wheel 坐标", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
@@ -425,6 +490,210 @@ test("click_at 的 double_click 产生完整双击序列", async () => {
     port.requests.filter((request) => request.method === "Input.dispatchMouseEvent").map((request) => request.params.clickCount),
     [undefined, 1, 1, 2, 2],
   );
+});
+
+test("点击触发 JavaScript 对话框时，CDP 鼠标超时不会掩盖已经生效的点击", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null } } };
+    if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+      port.emit("Page.javascriptDialogOpening", { type: "alert", message: "magi-dialog" });
+      return new Error("browser_cdp_timeout:Input.dispatchMouseEvent");
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("click-dialog", binding, {
+    type: "click",
+    payload: {
+      tab_id: binding.tab_id,
+      control: { mode: "user", fence: 1 },
+      target: { snapshot_revision: 1, element_ref: "e:1:dialog" },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  assert.ok(
+    port.requests
+      .filter((request) => request.method === "Runtime.evaluate")
+      .some((request) => String(request.params.expression).includes("scrollIntoView")),
+    "点击前应将目标滚动到当前浏览器视口",
+  );
+});
+
+test("原生鼠标事件未形成 DOM click 时异步回退到元素点击", async () => {
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null } } };
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("click-fallback", binding, {
+    type: "click",
+    payload: {
+      tab_id: binding.tab_id,
+      control: { mode: "user", fence: 1 },
+      target: { snapshot_revision: 1, element_ref: "e:1:button" },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  assert.ok(
+    port.requests.some((request) => String(request.params.expression).includes("fallbackClick")),
+    "未观察到 DOM click 时应调度异步元素点击",
+  );
+});
+
+test("点击完成后异步到达的 JavaScript 对话框事件仍可被下一次 list 读取", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null } } };
+    if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased") {
+      setTimeout(() => port.emit("Page.javascriptDialogOpening", { type: "alert", message: "magi-dialog" }), 500);
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const clicked = await runtime.execute("click-dialog-race", binding, {
+    type: "click",
+    payload: {
+      tab_id: binding.tab_id,
+      control: { mode: "user", fence: 1 },
+      target: { snapshot_revision: 1, element_ref: "e:1:dialog" },
+    },
+  });
+  assert.equal(clicked.outcome.status, "succeeded");
+
+  const listed = await runtime.execute("dialog-race-list", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "dialog", arguments: { action: "list" } },
+  });
+  assert.equal(listed.outcome.status, "succeeded");
+  const value = listed.outcome.payload.type === "json" ? listed.outcome.payload.payload.value as Record<string, any> : null;
+  assert.deepEqual(value?.dialog, { type: "alert", message: "magi-dialog" });
+});
+
+test("drag 使用完整 HTML DragEvent 生命周期，而不是只发送一次鼠标移动", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      if (expression.includes("new DragEvent") || expression.includes("dragstart")) {
+        return { result: { value: { dragged: true, drag_over_accepted: true, drop_accepted: true } } };
+      }
+      return { result: { value: null } };
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("drag-call", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "drag",
+      arguments: {
+        source: { snapshot_revision: 1, element_ref: "e:1:source" },
+        target: { snapshot_revision: 1, element_ref: "e:1:target" },
+      },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(
+    port.requests.filter((request) => request.method === "Input.dispatchMouseEvent").length,
+    0,
+    "拖拽不应退化为不完整的鼠标事件序列",
+  );
+  assert.ok(port.requests.some((request) => String(request.params.expression).includes("new DragEvent")));
+});
+
+test("对话框事件即使来自 CDP 子会话也能列出并使用同一会话处理", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  port.emit("Page.javascriptDialogOpening", { type: "alert", message: "需要确认" }, binding, "dialog-session");
+
+  const listed = await runtime.execute("dialog-list", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "dialog", arguments: { action: "list" } },
+  });
+  assert.equal(listed.outcome.status, "succeeded");
+  const listedValue = listed.outcome.payload.type === "json" ? listed.outcome.payload.payload.value as Record<string, unknown> : null;
+  assert.deepEqual(listedValue?.dialog, { type: "alert", message: "需要确认" });
+
+  const handled = await runtime.execute("dialog-accept", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "dialog", arguments: { action: "accept" } },
+  });
+  assert.equal(handled.outcome.status, "succeeded");
+  assert.equal(
+    port.requests.find((request) => request.method === "Page.handleJavaScriptDialog")?.sessionId,
+    "dialog-session",
+  );
+});
+
+test("非阻塞页面对话框桥接可列出并通过 Runtime.evaluate 收口", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  port.emit("Runtime.bindingCalled", {
+    name: "__magiBrowserDialog",
+    payload: JSON.stringify({
+      event: "opening",
+      id: "magi-dialog-1",
+      type: "alert",
+      message: "magi-dialog",
+      defaultPrompt: null,
+    }),
+  });
+
+  const listed = await runtime.execute("virtual-dialog-list", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "dialog", arguments: { action: "list" } },
+  });
+  const listedValue = listed.outcome.status === "succeeded" && listed.outcome.payload.type === "json"
+    ? listed.outcome.payload.payload.value as Record<string, unknown>
+    : null;
+  assert.deepEqual(listedValue?.dialog, {
+    event: "opening",
+    id: "magi-dialog-1",
+    type: "alert",
+    message: "magi-dialog",
+    defaultPrompt: null,
+    virtual: true,
+  });
+
+  const handled = await runtime.execute("virtual-dialog-accept", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "dialog", arguments: { action: "accept" } },
+  });
+  assert.equal(handled.outcome.status, "succeeded");
+  assert.equal(
+    port.requests.some((request) => request.method === "Runtime.evaluate"
+      && String(request.params.expression).includes("__magiBrowserDialogResolve")),
+    true,
+  );
+});
+
+test("网络响应体不可读时保留网络记录并返回结构化不可用原因", async () => {
+  const port = new ScriptedPort((method) => (
+    method === "Network.getResponseBody" ? new Error("No data found for resource with given identifier") : {}
+  ));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  port.emit("Network.responseReceived", { requestId: "response-1", type: "Fetch", response: { url: "https://example.test/data" } });
+
+  const result = await runtime.execute("network-body", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "network",
+      arguments: { action: "get", request_id: "response-1", include_body: true },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  const value = result.outcome.payload.type === "json" ? result.outcome.payload.payload.value as Record<string, any> : null;
+  assert.equal(value?.entry?.requestId, "response-1");
+  assert.equal(value?.body, null);
+  assert.equal(value?.body_unavailable?.code, "browser_network_body_unavailable");
 });
 
 test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async () => {

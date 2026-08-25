@@ -988,7 +988,37 @@ function reuseEquivalentArtifact(
   artifact: TimelineProjectionArtifact,
 ): TimelineProjectionArtifact {
   const previous = previousById.get(artifact.artifactId);
-  return previous && JSON.stringify(previous) === JSON.stringify(artifact) ? previous : artifact;
+  if (!previous) return artifact;
+  if (
+    artifact.artifactVersion !== undefined
+    && previous.artifactVersion === artifact.artifactVersion
+    && previous.displayOrder === artifact.displayOrder
+    && previous.cardStreamSeq === artifact.cardStreamSeq
+    && previous.messageIds.length === artifact.messageIds.length
+    && previous.messageIds.every((id, index) => id === artifact.messageIds[index])
+  ) {
+    return previous;
+  }
+  return projectionValuesEqual(previous, artifact) ? previous : artifact;
+}
+
+function projectionValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null || typeof left !== typeof right) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((value, index) => projectionValuesEqual(value, right[index]));
+  }
+  if (typeof left === 'object' && typeof right === 'object') {
+    const leftRecord = left as Record<string, unknown>;
+    const rightRecord = right as Record<string, unknown>;
+    const leftKeys = Object.keys(leftRecord);
+    const rightKeys = Object.keys(rightRecord);
+    return leftKeys.length === rightKeys.length
+      && leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightRecord, key)
+        && projectionValuesEqual(leftRecord[key], rightRecord[key]));
+  }
+  return false;
 }
 
 function mergeSortedArtifacts(

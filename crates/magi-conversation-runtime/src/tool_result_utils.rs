@@ -32,6 +32,56 @@ pub struct DeterministicToolFailure {
     pub detail: String,
 }
 
+/// 判断工具结果是否明确声明“相同调用不可重试”，并把它提升为当前任务的终止信号。
+///
+/// 权限/策略拒绝不是普通的模型纠错失败。若只把拒绝结果继续交回模型，模型可能
+/// 改换工具名或参数反复尝试同一个不可能成功的副作用，导致一轮任务长时间空转。
+/// 只有结果携带明确的 `retryable_with_same_arguments=false` 契约时才在这里终止，
+/// 不影响需要用户授权的 NeedsApproval 流程和可恢复的普通工具失败。
+pub fn non_retryable_tool_failure(
+    tool_name: &str,
+    result: &str,
+    status: ExecutionResultStatus,
+) -> Option<DeterministicToolFailure> {
+    if status != ExecutionResultStatus::Rejected {
+        return None;
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(result).ok()?;
+    if payload
+        .get("retryable_with_same_arguments")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return None;
+    }
+    let error_code = payload
+        .get("error_code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("tool_policy_rejected");
+    let access_profile = payload
+        .get("access_profile")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("当前任务策略");
+    let required_access_profile = payload
+        .get("required_access_profile")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let error = payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("该工具已被当前策略阻止");
+    let recovery = required_access_profile
+        .map(|profile| format!("如需继续，请将访问模式切换为 {profile} 后重新发送任务。"))
+        .unwrap_or_else(|| "请改用当前允许的工具或调整任务范围后重新发送。".to_string());
+    Some(DeterministicToolFailure {
+        summary: format!("{tool_name} 已被当前访问策略阻止，已停止继续重试。"),
+        detail: format!(
+            "工具：{tool_name}\n错误码：{error_code}\n访问模式：{access_profile}\n原因：{error}\n{recovery}"
+        ),
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DeterministicToolFailureTracker {
     observations: BTreeMap<String, usize>,
@@ -773,5 +823,54 @@ mod tests {
             .expect("任务 retry_limit=1 时第二次相同失败必须止损");
         assert!(failure.summary.contains("连续失败 2 次"));
         assert!(failure.detail.contains("browser_navigation_failed"));
+    }
+
+    #[test]
+    fn non_retryable_policy_rejection_stops_without_waiting_for_duplicate_calls() {
+        let result = r#"{
+            "status":"rejected",
+            "error_code":"tool_policy_rejected",
+            "error":"该工具在当前访问模式下不可用",
+            "access_profile":"read_only",
+            "required_access_profile":"full_access",
+            "retryable_with_same_arguments":false
+        }"#;
+
+        let failure =
+            non_retryable_tool_failure("shell_exec", result, ExecutionResultStatus::Rejected)
+                .expect("明确不可重试的权限拒绝必须立即终止任务");
+        assert!(failure.summary.contains("停止继续重试"));
+        assert!(failure.detail.contains("切换为 full_access"));
+    }
+
+    #[test]
+    fn retryable_or_approval_results_do_not_trigger_terminal_policy_failure() {
+        let needs_approval = r#"{
+            "status":"needs_approval",
+            "error_code":"tool_policy_needs_approval",
+            "retryable_with_same_arguments":false
+        }"#;
+        assert!(
+            non_retryable_tool_failure(
+                "shell_exec",
+                needs_approval,
+                ExecutionResultStatus::NeedsApproval,
+            )
+            .is_none()
+        );
+
+        let retryable_rejection = r#"{
+            "status":"rejected",
+            "error_code":"tool_approval_denied",
+            "retryable_with_same_arguments":true
+        }"#;
+        assert!(
+            non_retryable_tool_failure(
+                "shell_exec",
+                retryable_rejection,
+                ExecutionResultStatus::Rejected,
+            )
+            .is_none()
+        );
     }
 }

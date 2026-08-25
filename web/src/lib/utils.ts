@@ -55,13 +55,11 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
 
-  const pad2 = (value: number) => String(value).padStart(2, '0');
-
   if (hours > 0) {
-    return `${hours}h${pad2(minutes)}m${pad2(seconds)}s`;
+    return `${hours}h${String(minutes).padStart(2, '0')}m${seconds}s`;
   }
   if (minutes > 0) {
-    return `${minutes}m${pad2(seconds)}s`;
+    return `${minutes}m${seconds}s`;
   }
   return `${seconds}s`;
 }

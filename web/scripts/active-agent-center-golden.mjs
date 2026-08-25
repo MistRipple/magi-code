@@ -123,7 +123,7 @@ await withGoldenViteServer(async (server) => {
     '终态代理必须固定使用后端投影的完成时间与总耗时',
   );
   assert.equal(center.formatAgentDuration(8), '8s');
-  assert.equal(center.formatAgentDuration(68), '1m 08s');
+  assert.equal(center.formatAgentDuration(68), '1m 8s');
   assert.equal(center.formatAgentDuration(3_728), '1h 02m');
 
   assert.deepEqual(

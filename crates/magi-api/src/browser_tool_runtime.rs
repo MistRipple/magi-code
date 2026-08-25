@@ -539,31 +539,52 @@ impl BrowserToolRuntimeDependencies {
                     .map_err(browser_host_client_error)?;
                 let page = page_state(reply.response.outcome, "浏览器交互失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
-                let snapshot = if bool_arg(arguments, "include_snapshot", false) {
-                    let snapshot = self.capture_snapshot(&client, &tab.tab_id, None).await?;
-                    Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id))
+                let (snapshot, snapshot_error) = if bool_arg(arguments, "include_snapshot", false) {
+                    match self.capture_snapshot(&client, &tab.tab_id, None).await {
+                        Ok(snapshot) => (
+                            Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id)),
+                            None,
+                        ),
+                        Err(error) => (
+                            None,
+                            Some(json!({
+                                "code": error.code,
+                                "message": error.message,
+                                "recoverable": error.recoverable,
+                            })),
+                        ),
+                    }
                 } else {
-                    None
+                    (None, None)
                 };
                 Ok(json!({
                     "tool": tool_name,
                     "status": "succeeded",
                     "tab": updated,
                     "snapshot": snapshot,
+                    "snapshot_error": snapshot_error,
                 })
                 .to_string())
             }
             "browser_screenshot" => {
-                let has_element_scope = optional_string(arguments, "element_ref").is_some();
+                let has_element_scope = screenshot_has_element_scope(arguments);
                 let target = optional_snapshot_target(arguments)?;
-                let clip = arguments
-                    .get("clip")
-                    .map(parse_normalized_rect)
-                    .transpose()?;
                 let full_page = arguments
                     .get("full_page")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // 模型在补全可选参数时可能同时带上一个默认 clip 和
+                // full_page=true。整页是更明确的范围意图，丢弃这个无效
+                // clip，避免一次本可执行的截图被范围校验拦截并耗尽本轮
+                // 唯一的截图调用额度；具体元素与 full_page 仍保持冲突。
+                let clip = if full_page {
+                    None
+                } else {
+                    arguments
+                        .get("clip")
+                        .map(parse_normalized_rect)
+                        .transpose()?
+                };
                 validate_screenshot_scope(has_element_scope, clip.is_some(), full_page)?;
                 let format = match optional_string(arguments, "format").as_deref() {
                     None | Some("png") => magi_browser_authority::BrowserScreenshotFormat::Png,
@@ -589,14 +610,14 @@ impl BrowserToolRuntimeDependencies {
                     })
                     .transpose()?
                     .map(|value| value.min(100));
-                if format == magi_browser_authority::BrowserScreenshotFormat::Png
-                    && quality.is_some()
-                {
-                    return Err(BrowserToolError::new(
-                        "invalid_screenshot_quality",
-                        "PNG 不支持 quality，只有 jpeg 或 webp 支持质量参数",
-                    ));
-                }
+                // PNG 是无损格式，quality 对它没有定义。模型可能会复用截图
+                // 参数并携带 quality；在进入 Host 协议前将无效字段规范化掉，
+                // 避免一个不影响结果的可选参数阻断真实截图。
+                let quality = match format {
+                    magi_browser_authority::BrowserScreenshotFormat::Png => None,
+                    magi_browser_authority::BrowserScreenshotFormat::Jpeg
+                    | magi_browser_authority::BrowserScreenshotFormat::Webp => quality,
+                };
                 let reply = client
                     .request(BrowserHostCommand::Screenshot {
                         tab_id: tab.tab_id.clone(),
@@ -1955,6 +1976,10 @@ fn optional_string(arguments: &Map<String, Value>, name: &str) -> Option<String>
         .map(ToOwned::to_owned)
 }
 
+fn screenshot_has_element_scope(arguments: &Map<String, Value>) -> bool {
+    optional_string(arguments, "element_ref").is_some_and(|element_ref| element_ref != "root")
+}
+
 fn number_arg(arguments: &Map<String, Value>, name: &str) -> Option<f64> {
     arguments.get(name).and_then(Value::as_f64)
 }
@@ -2345,7 +2370,8 @@ mod tests {
     use super::{
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_requested_access,
         browser_tool_snapshot_value, optional_snapshot_target, parse_normalized_rect,
-        validate_devtools_arguments, validate_screenshot_binary, validate_screenshot_scope,
+        screenshot_has_element_scope, validate_devtools_arguments, validate_screenshot_binary,
+        validate_screenshot_scope,
     };
     use crate::state::BrowserHostStatusSnapshot;
     use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
@@ -2639,14 +2665,18 @@ mod tests {
 
     #[test]
     fn browser_screenshot_scope_is_explicitly_mutually_exclusive() {
+        let mut root_arguments = Map::new();
+        root_arguments.insert("element_ref".to_string(), json!("root"));
+        assert!(!screenshot_has_element_scope(&root_arguments));
+
+        let mut element_arguments = Map::new();
+        element_arguments.insert("element_ref".to_string(), json!("e:4:1"));
+        assert!(screenshot_has_element_scope(&element_arguments));
+
         assert!(validate_screenshot_scope(true, false, false).is_ok());
         assert!(validate_screenshot_scope(false, true, false).is_ok());
         assert!(validate_screenshot_scope(false, false, true).is_ok());
-        for (element, clip, full_page) in [
-            (true, true, false),
-            (true, false, true),
-            (false, true, true),
-        ] {
+        for (element, clip, full_page) in [(true, true, false), (true, false, true)] {
             let error = validate_screenshot_scope(element, clip, full_page)
                 .expect_err("screenshot scopes must not be combined");
             assert_eq!(error.code, "invalid_screenshot_scope");

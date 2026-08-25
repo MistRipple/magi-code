@@ -10,3 +10,4 @@ magi-core = { path = "../magi-core" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-memory-store = { path = "../magi-memory-store" }
 magi-session-store = { path = "../magi-session-store" }
+tracing.workspace = true

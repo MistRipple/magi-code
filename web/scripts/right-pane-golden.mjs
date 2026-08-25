@@ -109,7 +109,7 @@ await withGoldenViteServer(async (server) => {
   assert.match(surfaceManagerSource, /method === "Page\.captureScreenshot"/u);
   assert.match(surfaceManagerSource, /sendCdpCommandWithTimeout\([\s\S]*?Page\.captureScreenshot/u);
   assert.match(surfaceManagerSource, /private async capturePageScreenshot[\s\S]*?record\.contents\.capturePage\(/u);
-  assert.doesNotMatch(surfaceManagerSource, /stayHidden:\s*true/u);
+  assert.match(surfaceManagerSource, /record\.contents\.capturePage\([\s\S]*?stayHidden:\s*true/u);
   assert.doesNotMatch(surfaceManagerSource, /startScreencast|drawImage\(/u);
 
   // The browser remains a peer panel: terminal and future right-pane tabs

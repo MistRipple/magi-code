@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    dispatch_flow::{accept_session_task_submission, finalize_session_task_dispatch},
+    dispatch_flow::{accept_session_task_submission, schedule_session_task_dispatch},
     session_scope::{SessionRequestScope, require_session_request_scope},
 };
 use crate::{
@@ -429,7 +429,7 @@ async fn restart_task(
             return Err(error);
         }
     };
-    finalize_session_task_dispatch(state.clone(), accepted.clone()).await;
+    schedule_session_task_dispatch(state.clone(), accepted.clone());
     let execution_chain_ref = state
         .session_store
         .runtime_sidecar(&accepted.session_id)

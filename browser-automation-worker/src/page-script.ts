@@ -14,6 +14,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     annotationFrame: 0,
     annotationObserver: null,
     annotationListenersInstalled: false,
+    clickGuards: new Map(),
   };
   const roleFor = (element) => {
     const explicit = element.getAttribute?.('role');
@@ -24,6 +25,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     if (tag === 'textarea') return 'textbox';
     if (tag === 'select') return 'combobox';
     if (tag === 'img') return 'img';
+    if (element.draggable) return 'draggable';
     if (tag === 'input') {
       const type = (element.getAttribute('type') || 'text').toLowerCase();
       if (type === 'checkbox') return 'checkbox';
@@ -34,6 +36,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     return null;
   };
   const nameFor = (element) => {
+    const tag = element.tagName?.toLowerCase?.() || '';
     const aria = element.getAttribute?.('aria-label')?.trim();
     if (aria) return aria;
     const labelledBy = element.getAttribute?.('aria-labelledby');
@@ -45,6 +48,13 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     if (alt) return alt;
     const title = element.getAttribute?.('title')?.trim();
     if (title) return title;
+    const explicitLabel = element.id
+      ? document.querySelector('label[for="' + CSS.escape(element.id) + '"]')?.textContent?.replace(/\s+/g, ' ').trim()
+      : '';
+    if (explicitLabel) return explicitLabel;
+    const parentLabel = element.closest?.('label')?.textContent?.replace(/\s+/g, ' ').trim();
+    if (parentLabel) return parentLabel;
+    if (tag === 'input' && (element.getAttribute('type') || '').toLowerCase() === 'file') return 'file input';
     const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
     return text.slice(0, 240) || null;
   };
@@ -80,6 +90,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     const role = roleFor(element);
     const tag = element.tagName.toLowerCase();
     return Boolean(role)
+      || Boolean(element.id && (element.textContent || '').replace(/\s+/g, ' ').trim())
       || ['input', 'textarea', 'select', 'summary', 'details'].includes(tag)
       || element.tabIndex >= 0
       || element.hasAttribute('contenteditable')
@@ -107,8 +118,17 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     if (name) budget.textBytes += new TextEncoder().encode(name).byteLength;
     if (budget.textBytes > budget.maxTextBytes) return null;
     budget.nodes += 1;
+    const elementRef = include
+      ? refFor(element)
+      : 'group:' + state.snapshotRevision + ':' + state.nextRef++;
+    // 结构性元素（例如没有 ARIA role 的 draggable div）也可能是浏览器
+    // 交互的真实目标。快照此前只返回 group 引用但没有登记到 refs，导致
+    // 模型按可见名称选择拖拽源/目标后必然得到 browser_element_ref_stale。
+    // group 仍保持“非交互节点”的语义，但在当前快照内允许运行时解析到
+    // 它对应的 DOM 元素；动作能力仍由各工具自身校验。
+    state.refs.set(elementRef, element);
     return {
-      element_ref: include ? refFor(element) : 'group:' + state.snapshotRevision + ':' + state.nextRef++,
+      element_ref: elementRef,
       role: roleFor(element),
       name,
       value: 'value' in element && typeof element.value === 'string' ? element.value.slice(0, 240) : null,
@@ -350,6 +370,36 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
       element.focus({ preventScroll: true });
       return this.target(ref, revision);
+    },
+    prepareClick(ref, revision, token) {
+      const element = this.resolve(ref, revision);
+      const guard = { element, observed: false, listener: null };
+      guard.listener = () => { guard.observed = true; };
+      element.addEventListener('click', guard.listener, { capture: true, once: true });
+      state.clickGuards.set(String(token), guard);
+      setTimeout(() => {
+        if (state.clickGuards.get(String(token)) !== guard) return;
+        element.removeEventListener('click', guard.listener, true);
+        state.clickGuards.delete(String(token));
+      }, 60000);
+      return { prepared: true };
+    },
+    finishClick(token) {
+      const guard = state.clickGuards.get(String(token));
+      if (!guard) return { observed: false };
+      guard.element.removeEventListener('click', guard.listener, true);
+      state.clickGuards.delete(String(token));
+      return { observed: guard.observed };
+    },
+    fallbackClick(ref, revision) {
+      const element = this.resolve(ref, revision);
+      // Runtime.evaluate 必须先返回，避免 alert/confirm/prompt 在同步
+      // evaluate 内阻塞 CDP。下一轮任务会通过 Page.javascriptDialogOpening
+      // 收到对话框事件，并可由 browser_dialog 接管。
+      setTimeout(() => {
+        if (element.isConnected) element.click();
+      }, 0);
+      return { scheduled: true };
     },
     hitTest(x, y) {
       const element = document.elementFromPoint(x, y);

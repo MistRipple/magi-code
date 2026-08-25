@@ -9,6 +9,7 @@ pub mod git_tool_runtime;
 mod host_paths;
 pub mod mcp_config;
 mod model_config;
+mod performance;
 mod public_canonical;
 mod routes;
 mod scope_binding;
@@ -27,6 +28,9 @@ pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::DirectHttpModelProbeConfig;
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
+pub fn schedule_restored_session_task_dispatches(state: ApiState) {
+    routes::schedule_restored_session_task_dispatches(state);
+}
 pub use state::{
     ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot,
     ExecutionResourceCancellationReport, ExecutionResourceCoordinator, RunnerManager,

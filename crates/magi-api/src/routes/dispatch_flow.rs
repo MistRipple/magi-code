@@ -13,6 +13,7 @@ use super::{
 use crate::{
     dto::{SessionDirectoryEntryDto, SessionTurnRequestDto},
     errors::ApiError,
+    performance::PerformanceTrace,
     state::ApiState,
     task_dispatch::{
         DispatchSubmissionAccepted, DispatchSubmissionRequest, DispatchTurnOrigin,
@@ -22,11 +23,10 @@ use crate::{
 use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_conversation_runtime::session_writeback::{
     SessionTurnErrorInput, append_session_turn_error_item, publish_current_session_turn_item_event,
-    session_turn_item,
 };
 use magi_session_store::{
     ActiveExecutionTurn, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem,
-    CanonicalTurnItemKind, SessionGoal, TimelineEntryInput, TimelineEntryKind,
+    CanonicalTurnItemKind, SessionGoal,
 };
 
 pub(super) fn session_turn_route_name(route: crate::dto::SessionTurnRouteDto) -> &'static str {
@@ -104,10 +104,14 @@ pub(super) async fn accept_session_task_submission_at(
     let request_fingerprint = request
         .request_fingerprint()
         .map_err(ApiError::InvalidInput)?;
+    let trace_id = request
+        .request_id()
+        .unwrap_or_else(|| format!("trace-turn-{}", accepted_at.0));
     user_message_metadata.insert(
         "requestFingerprint".to_string(),
         serde_json::Value::String(request_fingerprint),
     );
+    user_message_metadata.insert("traceId".to_string(), serde_json::Value::String(trace_id));
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
     let mission_title = task_title
@@ -234,129 +238,6 @@ struct ExecuteDispatchSubmissionInput<'a> {
     user_message_metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
-fn persist_rejected_user_turn(
-    state: &ApiState,
-    session_id: &SessionId,
-    message: &str,
-    request: &SessionTurnRequestDto,
-    accepted_at: UtcMillis,
-    user_message_metadata: &std::collections::HashMap<String, serde_json::Value>,
-    error: &ApiError,
-) {
-    let (_, source_thread_id) =
-        state
-            .session_store
-            .ensure_session_mission(session_id, accepted_at, || {
-                magi_core::MissionId::new(format!("mission-session-rejected-{}", accepted_at.0))
-            });
-    let request_id = request
-        .request_id()
-        .unwrap_or_else(|| format!("request-rejected-{}", accepted_at.0));
-    let user_message_id = request
-        .user_message_id()
-        .unwrap_or_else(|| format!("user-message-rejected-{}", accepted_at.0));
-    let placeholder_message_id = request
-        .placeholder_message_id()
-        .unwrap_or_else(|| format!("assistant-placeholder-{}", request_id));
-    let turn_id = format!("turn-session-rejected-{}", request_id);
-    let entry_id = format!("timeline-session-rejected-{}", request_id);
-    let public_error = public_runtime_excerpt(error.message(), 4096);
-
-    let mut user_item = session_turn_item(
-        "user_message",
-        "completed",
-        None,
-        Some(message.to_string()),
-        Some(user_message_id.clone()),
-        source_thread_id.clone(),
-    );
-    user_item.source = "user".to_string();
-    user_item.request_id = Some(request_id.clone());
-    user_item.user_message_id = Some(user_message_id.clone());
-    user_item.placeholder_message_id = Some(placeholder_message_id.clone());
-    user_item.timeline_entry_id = Some(entry_id.clone());
-    user_item.metadata = user_message_metadata.clone();
-    user_item.metadata.insert(
-        "requestId".to_string(),
-        serde_json::Value::String(request_id.clone()),
-    );
-
-    let mut error_item = session_turn_item(
-        "assistant_error",
-        "failed",
-        Some("回复生成失败".to_string()),
-        Some(public_error),
-        Some(format!("turn-item-assistant-error-{}", request_id)),
-        source_thread_id,
-    );
-    error_item.request_id = Some(request_id.clone());
-    error_item.user_message_id = Some(user_message_id);
-    error_item.placeholder_message_id = Some(placeholder_message_id);
-    error_item.metadata.insert(
-        "failureStage".to_string(),
-        serde_json::Value::String("git_admission".to_string()),
-    );
-
-    let turn = ActiveExecutionTurn {
-        turn_id,
-        turn_seq: accepted_at.0,
-        accepted_at,
-        completed_at: Some(accepted_at),
-        status: "failed".to_string(),
-        user_message: Some(message.to_string()),
-        items: vec![user_item, error_item],
-    };
-    let timeline = TimelineEntryInput::new(
-        entry_id,
-        TimelineEntryKind::UserMessage,
-        message,
-        accepted_at,
-    );
-    match state
-        .session_store
-        .record_rejected_user_turn_with_timeline_entry(session_id.clone(), timeline, turn)
-    {
-        Ok(Some((error_item_id, _))) => {
-            let workspace_id = state
-                .session_store
-                .execution_ownership(session_id)
-                .and_then(|ownership| ownership.workspace_id);
-            publish_current_session_turn_item_event(
-                &state.event_bus,
-                &state.session_store,
-                session_id,
-                &workspace_id,
-                &error_item_id,
-                state.task_store(),
-            );
-            publish_session_user_message_event(
-                state,
-                session_id,
-                workspace_id,
-                accepted_at,
-                message,
-            );
-            if let Err(persist_error) =
-                state.persist_session_state_checkpoint("session_turn_rejected")
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    ?persist_error,
-                    "持久化被拒绝的 session Turn 检查点失败"
-                );
-            }
-        }
-        Ok(None) => {}
-        Err(persist_error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                ?persist_error,
-                "记录被拒绝的 session Turn 失败，保留原始 admission 错误"
-            );
-        }
-    }
-}
-
 fn initial_session_orchestrator_config(
     state: &ApiState,
     created_session: bool,
@@ -441,27 +322,8 @@ async fn execute_dispatch_submission(
         } else {
             None
         });
-    state
-        .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
-        .await?;
     let browser_annotation_refs =
         resolve_browser_annotation_context(state, &session_id, &request.browser_annotation_refs())?;
-    if let Err(error) = state
-        .ensure_session_code_context(&session_id, &workspace_id)
-        .await
-    {
-        persist_rejected_user_turn(
-            state,
-            &session_id,
-            &message,
-            request,
-            accepted_at,
-            &user_message_metadata,
-            &error,
-        );
-        state.release_session_git_execution_lease(&session_id);
-        return Err(error);
-    }
     if request.goal_mode {
         state
             .session_store
@@ -482,7 +344,6 @@ async fn execute_dispatch_submission(
                 None,
             );
         }
-        state.persist_session_state_checkpoint("goal_paused_for_diversion")?;
     }
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
@@ -664,11 +525,97 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
     event_id
 }
 
+/// 在 accepted 事件已经发出后执行所有可能访问磁盘、Git 或模型的准备工作。
+///
+/// 提交控制面不能等待这段流程：workspace snapshot、Git 观测和上下文准备都属于
+/// 可恢复的执行面。失败仍然沿原 Turn 收口，不能再创建第二条错误消息链。
+async fn prepare_session_task_dispatch(
+    state: &ApiState,
+    accepted: &DispatchSubmissionAccepted,
+) -> Result<(), ApiError> {
+    let trace_id = state
+        .session_store
+        .runtime_sidecar(&accepted.session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .and_then(|turn| {
+            turn.items.into_iter().find_map(|item| {
+                item.metadata
+                    .get("traceId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        });
+    let trace = PerformanceTrace::new(trace_id.as_deref(), accepted.accepted_at);
+    trace.mark(
+        "preparation_started",
+        accepted.session_id.as_str(),
+        Some(&format!("turn-session-action-{}", accepted.accepted_at.0)),
+        None,
+    );
+    let _ = state
+        .session_store
+        .update_current_turn_status(&accepted.session_id, "preparing");
+    if let Some(item_id) = accepted.user_message_item_id.as_deref() {
+        publish_current_session_turn_item_event(
+            &state.event_bus,
+            &state.session_store,
+            &accepted.session_id,
+            &state
+                .session_store
+                .execution_ownership(&accepted.session_id)
+                .and_then(|ownership| ownership.workspace_id),
+            item_id,
+            state.task_store(),
+        );
+    }
+
+    state
+        .ensure_snapshot_session_for_workspace_id(
+            &accepted.session_id,
+            &state
+                .session_store
+                .execution_ownership(&accepted.session_id)
+                .and_then(|ownership| ownership.workspace_id),
+        )
+        .await?;
+    state
+        .ensure_session_code_context(
+            &accepted.session_id,
+            &state
+                .session_store
+                .execution_ownership(&accepted.session_id)
+                .and_then(|ownership| ownership.workspace_id),
+        )
+        .await?;
+    state.persist_session_state_checkpoint("session_task_turn_prepared")?;
+    trace.mark(
+        "preparation_completed",
+        accepted.session_id.as_str(),
+        Some(&format!("turn-session-action-{}", accepted.accepted_at.0)),
+        None,
+    );
+    Ok(())
+}
+
 pub(super) async fn finalize_session_task_dispatch(
     state: ApiState,
     accepted: DispatchSubmissionAccepted,
 ) {
     let mut accepted = accepted;
+    if let Err(error) = prepare_session_task_dispatch(&state, &accepted).await {
+        state.release_session_git_execution_lease(&accepted.session_id);
+        tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            ?error,
+            "session turn preparation failed"
+        );
+        fail_accepted_task_submission(&state, &accepted, error.message());
+        return;
+    }
+    let _ = state
+        .session_store
+        .update_current_turn_status(&accepted.session_id, "running");
     if let Err(error) = drive_dispatch_submission(&state, &mut accepted).await {
         tracing::error!(
             session_id = %accepted.session_id,
@@ -681,6 +628,72 @@ pub(super) async fn finalize_session_task_dispatch(
         return;
     }
     append_dispatch_assistant_message(&state, &accepted);
+}
+
+/// 只把执行面投递到后台；调用方已经完成最小 durable accepted 写入。
+pub(super) fn schedule_session_task_dispatch(
+    state: ApiState,
+    accepted: DispatchSubmissionAccepted,
+) {
+    tokio::spawn(async move {
+        finalize_session_task_dispatch(state, accepted).await;
+    });
+}
+
+/// daemon 重启后恢复已经 durable accepted、但尚未开始 Runner 的主线 Turn。
+///
+/// 只恢复 `accepted/preparing + pending root task`，已经进入模型执行的轮次仍由
+/// daemon 的中断收口逻辑处理，避免重复发送上游请求。
+pub(crate) fn schedule_restored_session_task_dispatches(state: ApiState) {
+    let Some(task_store) = state.task_store() else {
+        return;
+    };
+    let restored = state
+        .session_store
+        .runtime_sidecars()
+        .into_iter()
+        .filter_map(|sidecar| {
+            let turn = sidecar.current_turn?;
+            if !matches!(turn.status.as_str(), "accepted" | "preparing") {
+                return None;
+            }
+            let chain = sidecar.active_execution_chain?;
+            let root_task = task_store.get_task(&chain.root_task_id)?;
+            if root_task.status != TaskStatus::Pending {
+                return None;
+            }
+            let action_task_id = chain
+                .branches
+                .iter()
+                .find(|branch| branch.is_primary)
+                .map(|branch| branch.task_id.clone())
+                .unwrap_or_else(|| chain.root_task_id.clone());
+            let user_message_item_id = turn
+                .items
+                .iter()
+                .find(|item| item.kind == "user_message")
+                .map(|item| item.item_id.clone());
+            Some(DispatchSubmissionAccepted {
+                session_id: sidecar.session_id,
+                entry_id: chain.dispatch_context.entry_id,
+                accepted_at: chain.dispatch_context.accepted_at,
+                created_session: false,
+                root_task_id: chain.root_task_id,
+                action_task_id,
+                user_message_item_id,
+                runner_started: false,
+                superseded_turn: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    for accepted in restored {
+        tracing::info!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            "恢复 daemon 重启前已接纳但尚未启动的 session Turn"
+        );
+        schedule_session_task_dispatch(state.clone(), accepted);
+    }
 }
 
 fn fail_accepted_task_submission(

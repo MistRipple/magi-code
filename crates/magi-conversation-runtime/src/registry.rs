@@ -159,6 +159,7 @@ impl ConversationRegistry {
                 active_turn_id: active.turn_id.clone(),
             });
         }
+        self.tool_approvals.begin_turn(&session_id);
         guard.insert(
             session_id,
             SessionTurnInputState {
@@ -258,8 +259,6 @@ impl ConversationRegistry {
         }
         if active.pending.is_empty() {
             guard.remove(session_id);
-            drop(guard);
-            self.tool_approvals.remove_turn(session_id, turn_id);
             SessionTurnInputBoundary::Closed
         } else {
             SessionTurnInputBoundary::Pending(active.pending.drain(..).collect())

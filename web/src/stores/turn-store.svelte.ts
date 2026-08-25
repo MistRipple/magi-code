@@ -5,6 +5,7 @@ import type {
 import type { SessionTimelineProjection } from '../types/message';
 import {
   createCanonicalTurnReducerState,
+  rebuildCanonicalTurnIndexes,
   reduceCanonicalTurnEvent,
   replaceCanonicalTurns,
 } from './turn-reducer';
@@ -15,6 +16,29 @@ export const turnStoreState = $state({
   projection: null as SessionTimelineProjection | null,
   lastError: null as string | null,
 });
+
+const domPaintScheduledTurnIds = new Set<string>();
+
+function browserTimingTraceId(event: CanonicalTurnEvent): string {
+  const metadata = event.turn?.metadata || event.item?.metadata;
+  const requestId = metadata?.requestId;
+  return typeof requestId === 'string' && requestId.trim()
+    ? requestId.trim()
+    : event.turnId;
+}
+
+function markBrowserTiming(stage: string, event: CanonicalTurnEvent, startedAt: number): void {
+  const viteEnv = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env;
+  if (!viteEnv?.DEV || typeof performance === 'undefined') return;
+  const elapsed = Math.max(0, performance.now() - startedAt);
+  performance.mark(`magi-${stage}-${event.turnId}-${Math.round(performance.now())}`);
+  console.debug('[magi.performance]', {
+    traceId: browserTimingTraceId(event),
+    turnId: event.turnId,
+    stage,
+    elapsedMs: Number(elapsed.toFixed(2)),
+  });
+}
 
 function normalizeSessionId(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -44,7 +68,7 @@ export function rebindCanonicalSessionTurns(
   if (turnStoreState.reducer.sessionId !== previous) {
     return turnStoreState.projection;
   }
-  turnStoreState.reducer = {
+  turnStoreState.reducer = rebuildCanonicalTurnIndexes({
     ...turnStoreState.reducer,
     sessionId: next,
     turns: turnStoreState.reducer.turns.map((turn) => ({
@@ -56,13 +80,16 @@ export function rebindCanonicalSessionTurns(
         sourceThreadId: remapSourceThreadId(item.sourceThreadId, previous, next),
       })),
     })),
-  };
+  });
   turnStoreState.lastError = null;
   return publishProjection();
 }
 
 export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimelineProjection | null {
+  const receivedAt = typeof performance === 'undefined' ? 0 : performance.now();
+  markBrowserTiming('event_received', event, receivedAt);
   const result = reduceCanonicalTurnEvent(turnStoreState.reducer, event);
+  markBrowserTiming('reducer_completed', event, receivedAt);
   if (result.error) {
     turnStoreState.lastError = result.error;
     console.error('[canonical-turn-store] 拒绝 canonical turn event:', result.error);
@@ -88,6 +115,16 @@ export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimel
     turnStoreState.reducer,
     result.changedTurnIds,
   );
+  markBrowserTiming('projection_completed', event, receivedAt);
+  if (result.changed && !domPaintScheduledTurnIds.has(event.turnId)) {
+    domPaintScheduledTurnIds.add(event.turnId);
+    const onPaint = () => {
+      domPaintScheduledTurnIds.delete(event.turnId);
+      markBrowserTiming('dom_painted', event, receivedAt);
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(onPaint);
+    else setTimeout(onPaint, 0);
+  }
   return turnStoreState.projection;
 }
 

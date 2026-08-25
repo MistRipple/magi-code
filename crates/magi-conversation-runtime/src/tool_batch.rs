@@ -3089,22 +3089,30 @@ fn await_task_tool_approval(
         reason: reason.clone(),
         requested_at: UtcMillis::now(),
     };
-    let waiter = match registry.request(request.clone()) {
-        Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
-        Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
-        Err(error) => {
-            return Err((
-                serde_json::json!({
-                    "tool": tool_call.function.name,
-                    "status": "failed",
-                    "error_code": "tool_approval_runtime_failed",
-                    "error": error,
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            ));
-        }
-    };
+    let waiter =
+        match registry.request_with_arguments(request.clone(), &tool_call.function.arguments) {
+            Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
+            Ok(crate::ToolApprovalRequestOutcome::PreviouslyDenied) => {
+                return Err(crate::tool_approval::rejected_tool_approval_result(
+                    &tool_call.function.name,
+                    &approval_id,
+                    true,
+                ));
+            }
+            Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
+            Err(error) => {
+                return Err((
+                    serde_json::json!({
+                        "tool": tool_call.function.name,
+                        "status": "failed",
+                        "error_code": "tool_approval_runtime_failed",
+                        "error": error,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                ));
+            }
+        };
 
     let progress_payload = serde_json::json!({
         "tool": tool_call.function.name,
@@ -3197,16 +3205,10 @@ fn await_task_tool_approval(
                 return Ok(());
             }
             Ok(crate::ToolApprovalDecision::Deny) => {
-                return Err((
-                    serde_json::json!({
-                        "tool": tool_call.function.name,
-                        "status": "rejected",
-                        "error_code": "tool_approval_denied",
-                        "error": "用户拒绝了本次工具操作",
-                        "approval_id": approval_id,
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Rejected,
+                return Err(crate::tool_approval::rejected_tool_approval_result(
+                    &tool_call.function.name,
+                    &approval_id,
+                    false,
                 ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -3550,6 +3552,7 @@ fn task_policy_decision_payload(
     reason: String,
     access_profile: Option<magi_core::AccessProfile>,
 ) -> ToolPreflightDecision {
+    let restriction_kind = policy_restriction_kind(status, &reason);
     let constrained_by_access_profile = reason.starts_with("只读任务")
         || reason.starts_with("受限执行")
         || reason.starts_with("只读访问");
@@ -3598,12 +3601,31 @@ fn task_policy_decision_payload(
             "error": public_error,
             "access_profile": access_profile.map(|profile| profile.as_str()),
             "required_access_profile": required_access_profile,
+            "restriction_kind": restriction_kind,
             "retryable_with_same_arguments": false,
             "instruction": instruction,
         })
         .to_string(),
         status,
     }
+}
+
+fn policy_restriction_kind(status: ExecutionResultStatus, reason: &str) -> &'static str {
+    if status == ExecutionResultStatus::NeedsApproval {
+        return "approval_required";
+    }
+    if reason.starts_with("只读任务") || reason.starts_with("只读访问") {
+        return "read_only";
+    }
+    if reason.starts_with("策略拒绝访问路径") || reason.starts_with("策略未授权访问路径")
+    {
+        return "path_scope";
+    }
+    if reason.starts_with("任务策略拒绝工具") || reason.starts_with("任务策略未授权工具")
+    {
+        return "tool_scope";
+    }
+    "policy"
 }
 
 fn task_tool_visibility_decision_payload(
@@ -3627,6 +3649,8 @@ fn task_tool_visibility_decision_payload(
             "status": tool_execution_status_label(ExecutionResultStatus::Rejected),
             "error_code": "tool_policy_rejected",
             "error": TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR,
+            "retryable_with_same_arguments": false,
+            "instruction": "不要重复相同调用，请改用当前可用工具或直接返回文本结果。",
         })
         .to_string(),
         status: ExecutionResultStatus::Rejected,
@@ -3769,6 +3793,12 @@ fn safety_gate_decision_payload(
             "status": tool_execution_status_label(status),
             "error_code": public_error.error_code,
             "error": public_error.error,
+            "retryable_with_same_arguments": status == ExecutionResultStatus::Rejected,
+            "instruction": if status == ExecutionResultStatus::Rejected {
+                "该安全策略拒绝不可重试的相同调用，请改用安全替代方案。"
+            } else {
+                "当前调用已暂停并等待用户授权，不要重复调用。"
+            },
         })
         .to_string(),
         status,
@@ -4980,6 +5010,10 @@ mod tests {
         );
         assert_eq!(payload["access_profile"].as_str(), Some("restricted"));
         assert_eq!(
+            payload["restriction_kind"].as_str(),
+            Some("approval_required")
+        );
+        assert_eq!(
             payload["required_access_profile"].as_str(),
             Some("full_access")
         );
@@ -5068,6 +5102,7 @@ mod tests {
                 .payload
                 .contains(outside_path.to_string_lossy().as_ref())
         );
+        assert_eq!(payload["restriction_kind"].as_str(), Some("path_scope"));
     }
 
     #[cfg(unix)]

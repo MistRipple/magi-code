@@ -136,7 +136,7 @@ export function formatAgentDuration(totalSeconds: number): string {
   }
   const totalMinutes = Math.floor(seconds / 60);
   if (totalMinutes < 60) {
-    return `${totalMinutes}m ${String(seconds % 60).padStart(2, '0')}s`;
+    return `${totalMinutes}m ${seconds % 60}s`;
   }
   const hours = Math.floor(totalMinutes / 60);
   return `${hours}h ${String(totalMinutes % 60).padStart(2, '0')}m`;

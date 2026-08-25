@@ -29,9 +29,10 @@ use crate::{
         model_stream_interruption_recovery_prompt, public_model_image_invocation_error_message,
     },
     prompt_utils::{
-        PromptFragmentKind, current_turn_context_priority_prompt, dynamic_skill_prompt_message,
-        normalize_model_stream_preview_content, normalize_model_visible_content,
-        skill_prompt_message, system_prompt_fragment_message, workspace_context_system_prompt,
+        PromptFragmentKind, current_access_profile_prompt, current_turn_context_priority_prompt,
+        dynamic_skill_prompt_message, normalize_model_stream_preview_content,
+        normalize_model_visible_content, skill_prompt_message, system_prompt_fragment_message,
+        workspace_context_system_prompt,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
@@ -45,14 +46,16 @@ use crate::{
         upsert_context_compaction_progress_notice, upsert_session_turn_item,
     },
     strict_goal_mode_tool_definitions_for_round,
+    task_helpers::canonical_tool_call_name,
     tool_call_validation::{
         ToolCallFailureDiagnostic, ToolCallValidationIssue, ToolCallValidationTracker,
-        invalid_tool_result_message, validate_tool_call_batch,
+        invalid_tool_result_message, non_retryable_tool_call_failure, validate_tool_call_batch,
     },
     tool_execution_ledger::ToolExecutionLedger,
+    tool_result_utils::DeterministicToolFailure,
     tool_surface_state::{
         BrowserToolSurfaceContext, activate_skill_tool_definitions,
-        refresh_live_browser_tool_definitions, refresh_live_mcp_tool_definitions,
+        refresh_live_browser_tool_definitions, refresh_live_mcp_tool_definitions_with_mode,
     },
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
@@ -72,9 +75,28 @@ use magi_settings_store::SettingsStore;
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
-use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc, time::Instant};
 
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
+
+fn mark_turn_timing(
+    stage: &'static str,
+    request: &SessionTurnExecutionRequest,
+    elapsed_ms: u128,
+    provider_call_id: Option<&str>,
+) {
+    tracing::info!(
+        target: "magi.performance",
+        trace_id = request.request_id.as_deref().unwrap_or(&request.turn_id),
+        request_id = request.request_id.as_deref().unwrap_or_default(),
+        session_id = %request.session_id,
+        turn_id = %request.turn_id,
+        provider_call_id = provider_call_id.unwrap_or_default(),
+        stage,
+        elapsed_ms = elapsed_ms as u64,
+        "conversation response timing"
+    );
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionGoalTurnMode {
@@ -144,6 +166,7 @@ pub enum SessionTurnFailureReason {
     ModelResponseInvalid,
     ModelImageInvocationFailed,
     ToolCallProtocolFailed,
+    ToolPolicyRejected,
     ContextCompactionFailed,
     RuntimeInvalidState,
 }
@@ -158,6 +181,7 @@ impl SessionTurnFailureReason {
             Self::ModelResponseInvalid => "model_response_invalid",
             Self::ModelImageInvocationFailed => "model_image_invocation_failed",
             Self::ToolCallProtocolFailed => "tool_arguments_invalid",
+            Self::ToolPolicyRejected => "tool_policy_rejected",
             Self::ContextCompactionFailed => "context_compaction_failed",
             Self::RuntimeInvalidState => "session_turn_runtime_invalid_state",
         }
@@ -205,6 +229,13 @@ impl SessionTurnExecutionError {
             model_failure: None,
             tool_call_failure: Some(Box::new(tool_call_failure)),
         }
+    }
+
+    fn from_terminal_tool_failure(failure: DeterministicToolFailure) -> Self {
+        Self::new(
+            SessionTurnFailureReason::ToolPolicyRejected,
+            failure.summary,
+        )
     }
 
     fn runtime_invalid_state() -> Self {
@@ -391,19 +422,62 @@ fn build_session_turn_messages(
     knowledge_context_prompt: Option<&str>,
     history: &[ThreadChatMessage],
 ) -> Vec<ChatMessage> {
+    build_session_turn_messages_with_runtime(
+        session_store,
+        request,
+        prompt,
+        knowledge_context_prompt,
+        history,
+        None,
+        None,
+        None,
+    )
+}
+
+fn build_session_turn_messages_with_runtime(
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+    prompt: &str,
+    knowledge_context_prompt: Option<&str>,
+    history: &[ThreadChatMessage],
+    settings_store: Option<&Arc<SettingsStore>>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+) -> Vec<ChatMessage> {
     let mut messages = if request.use_tools {
         workspace_context_messages(request)
     } else {
         Vec::new()
     };
-    if let Some(execution_state) =
-        session_execution_state_prompt(session_store, &request.session_id, &request.turn_id)
-    {
-        messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::UserPlan,
-            execution_state,
+    let user_rules = settings_store.map(|store| {
+        crate::prompt_utils::user_rules_from_settings(&store.get_section("userRules"))
+    });
+    let user_rules = user_rules.flatten();
+    let safeguard = Some(crate::prompt_utils::render_safeguard_prompt(safety_gate));
+    if let Some(developer) = crate::prompt_utils::compose_developer_instructions(
+        None,
+        user_rules.as_deref(),
+        safeguard.as_deref(),
+        None,
+    ) {
+        messages.push(crate::prompt_utils::developer_instructions_message(
+            developer,
         ));
     }
+    if let Some(skill_id) = request.skill_name.as_deref()
+        && let Some(skill_message) = skill_runtime
+            .and_then(|runtime| crate::prompt_utils::skill_prompt_message(runtime, skill_id))
+    {
+        messages.push(skill_message);
+    }
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentAccessProfile,
+        current_access_profile_prompt(request.access_profile, "full"),
+    ));
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentTurnPriority,
+        current_turn_context_priority_prompt(),
+    ));
     if request.goal_turn_mode.is_goal_driven()
         || session_store
             .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
@@ -415,6 +489,14 @@ fn build_session_turn_messages(
                 "计划语言规则：用户明确指定的语言优先，其次当前用户消息的主要语言，再次产品 locale={}，最后默认 zh-CN。调用 update_plan 时必须将最终选择写入 language，计划创建后不得切换；存在未完成 Goal 时，必须使用本轮 get_goal 或 create_goal 返回的 goalId 与 controlRevision 作为 expectedGoalId 与 expectedGoalControlRevision。",
                 request.product_locale
             ),
+        ));
+    }
+    if let Some(execution_state) =
+        session_execution_state_prompt(session_store, &request.session_id, &request.turn_id)
+    {
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::UserPlan,
+            execution_state,
         ));
     }
     if let Some(reference_prompt) =
@@ -432,10 +514,6 @@ fn build_session_turn_messages(
         ));
     }
     messages.extend(history.iter().map(thread_chat_message_to_chat_message));
-    messages.push(system_prompt_fragment_message(
-        PromptFragmentKind::CurrentTurnPriority,
-        current_turn_context_priority_prompt(),
-    ));
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
@@ -606,12 +684,15 @@ fn rebuild_messages_for_context_window(
         active_skill_name,
         persist_checkpoint,
     } = input;
-    let mut fixed_messages = build_session_turn_messages(
+    let mut fixed_messages = build_session_turn_messages_with_runtime(
         session_store,
         request,
         prompt,
         knowledge_context_prompt,
         &[],
+        settings_store,
+        None,
+        skill_runtime,
     );
     if let Some(skill_message) =
         dynamic_skill_prompt_message(skill_runtime, initial_skill_name, active_skill_name)
@@ -670,12 +751,15 @@ fn rebuild_messages_for_context_window(
     {
         history.pop();
     }
-    *messages = build_session_turn_messages(
+    *messages = build_session_turn_messages_with_runtime(
         session_store,
         request,
         prompt,
         knowledge_context_prompt,
         &history,
+        settings_store,
+        None,
+        skill_runtime,
     );
     if let Some(skill_message) =
         dynamic_skill_prompt_message(skill_runtime, initial_skill_name, active_skill_name)
@@ -782,6 +866,9 @@ fn run_session_turn_execution_inner(
         live_settings_store: _live_settings_store,
     } = runtime;
 
+    let execution_started = Instant::now();
+    mark_turn_timing("runner_started", &request, 0, None);
+
     if !request_turn_is_writable(session_store, &request) {
         return Ok(SessionTurnExecutionOutput::interrupted());
     }
@@ -863,6 +950,12 @@ fn run_session_turn_execution_inner(
         upsert_context_compaction_progress_notice(compaction_writeback, progress);
     };
     let compaction_cancelled = || !request_turn_is_writable(session_store, &request);
+    mark_turn_timing(
+        "context_prepare_started",
+        &request,
+        execution_started.elapsed().as_millis(),
+        None,
+    );
     let prepared_history = ContextAuthority::new(
         client,
         event_bus,
@@ -890,6 +983,12 @@ fn run_session_turn_execution_inner(
         )),
         force_compaction: false,
     });
+    mark_turn_timing(
+        "context_prepare_completed",
+        &request,
+        execution_started.elapsed().as_millis(),
+        None,
+    );
     if let Some(terminal) = prepared_history.terminal {
         return match terminal {
             ContextCompactionTerminal::Cancelled => Ok(SessionTurnExecutionOutput::interrupted()),
@@ -902,12 +1001,15 @@ fn run_session_turn_execution_inner(
         upsert_context_compaction_completed_notice(compaction_writeback, compaction);
     }
     let mut proactive_context_compaction_completed = prepared_history.compaction.is_some();
-    let mut messages = build_session_turn_messages(
+    let mut messages = build_session_turn_messages_with_runtime(
         session_store,
         &request,
         &prompt,
         knowledge_context_prompt.as_deref(),
         &prepared_history.messages,
+        settings_store,
+        safety_gate,
+        skill_runtime,
     );
     if let Some(identity_prompt) =
         model_identity_prompt_for_request(&request.prompt, &resolved_context_model)
@@ -940,6 +1042,7 @@ fn run_session_turn_execution_inner(
     let initial_skill_name = skill_name.clone();
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
+    let mut deferred_mcp_tools_loaded = false;
     let mut tool_execution_ledger = ToolExecutionLedger::from_thread_history(
         &request.prompt,
         &session_store.thread_message_history(&orchestrator_thread_id),
@@ -990,7 +1093,7 @@ fn run_session_turn_execution_inner(
             );
             active_tools = browser_surface.definitions;
             browser_capability_revision = browser_surface.capability_revision;
-            active_tools = refresh_live_mcp_tool_definitions(
+            active_tools = refresh_live_mcp_tool_definitions_with_mode(
                 active_tools,
                 registry,
                 skill_runtime,
@@ -998,6 +1101,7 @@ fn run_session_turn_execution_inner(
                 request.access_profile,
                 None,
                 &[],
+                deferred_mcp_tools_loaded,
             );
         }
         let strict_goal_mode_round = request.goal_turn_mode.is_goal_driven();
@@ -1137,6 +1241,32 @@ fn run_session_turn_execution_inner(
                 pre_output_invocation_recovery_attempts += 1;
                 round = round.saturating_add(1);
                 continue;
+            }
+            Err(SessionTurnRoundError::TerminalToolFailure(failure)) => {
+                if !request_turn_is_writable(session_store, &request) {
+                    return Ok(SessionTurnExecutionOutput::interrupted());
+                }
+                let execution_error =
+                    SessionTurnExecutionError::from_terminal_tool_failure(failure);
+                append_session_turn_error_item(
+                    event_bus,
+                    session_store,
+                    crate::session_writeback::SessionTurnErrorInput {
+                        session_id: &request.session_id,
+                        workspace_id: &request.workspace_id,
+                        task_id: None,
+                        request_id: request.request_id.as_deref(),
+                        user_message_id: request.user_message_id.as_deref(),
+                        placeholder_message_id: request.placeholder_message_id.as_deref(),
+                        error_text: &execution_error.public_message,
+                        model_failure: None,
+                        tool_call_failure: None,
+                        streaming_entry_id: main_timeline_entry_id.as_deref(),
+                        source_thread_id: orchestrator_thread_id.clone(),
+                        persist_session_state,
+                    },
+                );
+                return Err(execution_error);
             }
             Err(SessionTurnRoundError::InvalidResponse(model_failure)) => {
                 if !request_turn_is_writable(session_store, &request) {
@@ -1283,10 +1413,41 @@ fn run_session_turn_execution_inner(
         if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
         }
+        deferred_mcp_tools_loaded |= streamed_content.mcp_tools_loaded;
         if let Some(observation) = streamed_content.response_observation.as_ref() {
             last_response_observation = Some(observation.clone());
         }
         let response_provider_context = streamed_content.provider_context.clone();
+        if let Some(tool_call_failure) = streamed_content
+            .invalid_tool_calls
+            .iter()
+            .find_map(non_retryable_tool_call_failure)
+        {
+            let execution_error =
+                SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
+            append_session_turn_error_item(
+                event_bus,
+                session_store,
+                crate::session_writeback::SessionTurnErrorInput {
+                    session_id: &request.session_id,
+                    workspace_id: &request.workspace_id,
+                    task_id: None,
+                    request_id: request.request_id.as_deref(),
+                    user_message_id: request.user_message_id.as_deref(),
+                    placeholder_message_id: request.placeholder_message_id.as_deref(),
+                    error_text: &execution_error.public_message,
+                    model_failure: None,
+                    tool_call_failure: execution_error.tool_call_failure.as_ref().map(|failure| {
+                        serde_json::to_value(failure)
+                            .expect("tool call failure diagnostic must serialize")
+                    }),
+                    streaming_entry_id: main_timeline_entry_id.as_deref(),
+                    source_thread_id: orchestrator_thread_id.clone(),
+                    persist_session_state,
+                },
+            );
+            return Err(execution_error);
+        }
         let repeated_tool_call_failure = if streamed_content.invalid_tool_calls.is_empty() {
             None
         } else {
@@ -1698,6 +1859,7 @@ struct SessionTurnRoundOutput {
     invalid_tool_calls: Vec<ToolCallValidationIssue>,
     response_observation: Option<String>,
     provider_context: Vec<ModelProviderContext>,
+    mcp_tools_loaded: bool,
     interrupted: bool,
 }
 
@@ -1710,6 +1872,7 @@ enum SessionTurnRoundError {
         non_stream_fallback_attempted: bool,
     },
     InvalidResponse(Box<ModelFailureDiagnostic>),
+    TerminalToolFailure(DeterministicToolFailure),
     PreOutputInvocationRecovered,
     StreamInterruptedRecovered,
 }
@@ -1868,6 +2031,14 @@ fn stream_session_turn_round(
     let thinking_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
     let writeback_aborted = std::cell::Cell::new(false);
     let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
+    let provider_started_at = Instant::now();
+    let first_delta_reported = std::cell::Cell::new(false);
+    mark_turn_timing(
+        "provider_request_started",
+        request,
+        provider_started_at.elapsed().as_millis(),
+        Some(&call_id),
+    );
     let resolved_model =
         resolved_model_for_usage_binding(settings_store, usage_binding, &request.session_id)
             .unwrap_or_default();
@@ -1898,6 +2069,16 @@ fn stream_session_turn_round(
         if !request_turn_is_writable(session_store, request) {
             writeback_aborted.set(true);
             return;
+        }
+        if (!delta.content.is_empty() || !delta.thinking.is_empty())
+            && !first_delta_reported.replace(true)
+        {
+            mark_turn_timing(
+                "provider_first_delta",
+                request,
+                provider_started_at.elapsed().as_millis(),
+                Some(&call_id),
+            );
         }
         if let Some(tracker) = context_usage_tracker.as_ref() {
             tracker.observe_accumulated_output(&delta.content, &delta.thinking);
@@ -2039,6 +2220,7 @@ fn stream_session_turn_round(
                     invalid_tool_calls: Vec::new(),
                     response_observation: None,
                     provider_context: Vec::new(),
+                    mcp_tools_loaded: false,
                     interrupted: true,
                 });
             }
@@ -2294,6 +2476,7 @@ fn stream_session_turn_round(
             invalid_tool_calls: Vec::new(),
             response_observation: response_observation.clone(),
             provider_context: Vec::new(),
+            mcp_tools_loaded: false,
             interrupted: true,
         });
     }
@@ -2319,6 +2502,7 @@ fn stream_session_turn_round(
                 invalid_tool_calls: Vec::new(),
                 response_observation: response_observation.clone(),
                 provider_context: Vec::new(),
+                mcp_tools_loaded: false,
                 interrupted: true,
             });
         }
@@ -2371,6 +2555,7 @@ fn stream_session_turn_round(
                 invalid_tool_calls: Vec::new(),
                 response_observation: response_observation.clone(),
                 provider_context: Vec::new(),
+                mcp_tools_loaded: false,
                 interrupted: true,
             });
         }
@@ -2451,6 +2636,7 @@ fn stream_session_turn_round(
                 invalid_tool_calls: Vec::new(),
                 response_observation: response_observation.clone(),
                 provider_context: Vec::new(),
+                mcp_tools_loaded: false,
                 interrupted: true,
             });
         }
@@ -2460,14 +2646,13 @@ fn stream_session_turn_round(
         for invalid in &invalid_tool_calls {
             messages.push(invalid_tool_result_message(invalid));
         }
-        // Goal 模式遇到混合批次时，invalid call 不能与 valid call 部分执行；否则模型
-        // 即使绕过了当前严格工具面，批次里的浏览器/文件副作用仍可能已经发生。
-        let valid_tool_calls =
-            if request.goal_turn_mode.is_goal_driven() && !invalid_tool_calls.is_empty() {
-                Vec::new()
-            } else {
-                tool_validation.valid_calls
-            };
+        // 任意无效调用都会使整个模型批次失效，不能让同一批次的合法调用继续产生
+        // 副作用；模型修正后再由下一轮重新提交完整批次。
+        let valid_tool_calls = if invalid_tool_calls.is_empty() {
+            tool_validation.valid_calls
+        } else {
+            Vec::new()
+        };
         if request.goal_turn_mode.is_goal_driven()
             && !valid_tool_calls.is_empty()
             && let Some(failure) = goal_mode_tool_batch_violation(
@@ -2531,6 +2716,12 @@ fn stream_session_turn_round(
             persist_session_state,
             "session_turn_thread_tool_results",
         );
+        if let Some(failure) = tool_batch
+            .as_ref()
+            .and_then(|batch| batch.terminal_failure.clone())
+        {
+            return Err(SessionTurnRoundError::TerminalToolFailure(failure));
+        }
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
@@ -2543,9 +2734,16 @@ fn stream_session_turn_round(
                 invalid_tool_calls: Vec::new(),
                 response_observation: response_observation.clone(),
                 provider_context: Vec::new(),
+                mcp_tools_loaded: false,
                 interrupted: true,
             });
         }
+        let mcp_tools_loaded = tool_batch.as_ref().is_some_and(|batch| {
+            batch
+                .succeeded_tool_names
+                .iter()
+                .any(|name| canonical_tool_call_name(name) == "tool_catalog")
+        });
         return Ok(SessionTurnRoundOutput {
             final_content: None,
             final_item_id: None,
@@ -2563,6 +2761,7 @@ fn stream_session_turn_round(
                 .collect(),
             response_observation: response_observation.clone(),
             provider_context: Vec::new(),
+            mcp_tools_loaded,
             interrupted: false,
         });
     }
@@ -2591,6 +2790,7 @@ fn stream_session_turn_round(
         invalid_tool_calls: Vec::new(),
         response_observation,
         provider_context: parsed.provider_context.clone(),
+        mcp_tools_loaded: false,
         interrupted: false,
     })
 }
@@ -3062,7 +3262,7 @@ mod tests {
                 .expect("context compaction requests mutex poisoned")
                 .push(request);
             Ok(ModelResponse::completed(
-                "## 关键事实\n- file_read 已成功读取 facts.txt，内容哈希保持有效。\n## 未完成与下一步\n- 继续当前任务。",
+                "## 目标与完成标准\n- 完成当前任务。\n## 约束与权限\n- 遵守当前访问模式。\n## 工作区事实\n- facts.txt 内容哈希保持有效。\n## 工具与外部操作\n- file_read 已成功读取。\n## 代理状态\n- 无。\n## 已确认决策\n- 继续当前方案。\n## 阻塞与风险\n- 无。\n## 下一步\n- 继续当前任务。\n## 禁止重复\n- 不重复读取已确认文件。",
             ))
         }
 
@@ -5579,24 +5779,58 @@ mod tests {
                 .iter()
                 .map(|message| message.role.as_str())
                 .collect::<Vec<_>>(),
-            vec!["user", "assistant", "system", "user"]
+            vec![
+                "developer",
+                "developer",
+                "developer",
+                "user",
+                "assistant",
+                "user",
+            ]
         );
-        let contents = messages
+        let history_user_index = messages
             .iter()
-            .map(|message| message.content.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>();
-        assert_eq!(contents[0], "请用一句话回答：2+3 等于几？");
+            .position(|message| {
+                message.role == "user"
+                    && message.content.as_deref() == Some("请用一句话回答：2+3 等于几？")
+            })
+            .expect("应保留历史用户消息");
+        let history_assistant_index = messages
+            .iter()
+            .position(|message| {
+                message.role == "assistant" && message.content.as_deref() == Some("2+3 等于 5。")
+            })
+            .expect("应保留历史助手消息");
+        let current_user_index = messages
+            .iter()
+            .rposition(|message| {
+                message.role == "user"
+                    && message.content.as_deref()
+                        == Some("请基于上一轮结果，用一句话回答：再加 4 等于几？")
+            })
+            .expect("应保留当前用户消息");
+        assert!(history_user_index < history_assistant_index);
+        assert!(history_assistant_index < current_user_index);
         assert!(
-            messages[0].images.is_empty(),
-            "历史图片只能作为会话记录展示，不能重复进入后续文本 turn 的模型上下文"
+            messages[..history_user_index]
+                .iter()
+                .all(|message| message.role == "developer")
         );
-        assert_eq!(contents[1], "2+3 等于 5。");
-        assert!(contents[2].contains("本轮用户原始输入"));
-        assert!(contents[2].contains("只能作为参考证据"));
-        assert_eq!(
-            contents[3],
-            "请基于上一轮结果，用一句话回答：再加 4 等于几？"
-        );
+        assert!(messages[history_user_index].images.is_empty());
+        assert!(messages.iter().any(|message| {
+            message.role == "developer"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("当前执行权限快照"))
+        }));
+        assert!(messages.iter().any(|message| {
+            message.role == "developer"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("本轮用户原始输入"))
+        }));
     }
 
     #[test]
@@ -6024,7 +6258,7 @@ mod tests {
         let messages =
             build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
-        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].role, "developer");
         let context = messages[0].content.as_deref().unwrap_or_default();
         assert!(context.contains("/tmp/current-project"));
         assert!(context.contains("不要要求用户手动粘贴项目结构"));
@@ -6093,7 +6327,7 @@ mod tests {
     }
 
     #[test]
-    fn build_session_turn_messages_injects_current_turn_knowledge_as_system_fragment() {
+    fn build_session_turn_messages_injects_current_turn_knowledge_as_reference_fragment() {
         let session_id = SessionId::new("session-knowledge-context");
         let store = SessionStore::new();
         store
@@ -6130,13 +6364,13 @@ mod tests {
         let knowledge = messages
             .iter()
             .find(|message| {
-                message.role == "system"
+                message.role == "user"
                     && message
                         .content
                         .as_deref()
-                        .is_some_and(|content| content.contains("kind=\"knowledge_context\""))
+                        .is_some_and(|content| content.contains("id=\"knowledge_context\""))
             })
-            .expect("knowledge context should be injected as a system fragment");
+            .expect("knowledge context should be injected as a user reference fragment");
         assert!(
             knowledge
                 .content
@@ -6257,14 +6491,15 @@ mod tests {
                 .iter()
                 .map(|message| message.role.as_str())
                 .collect::<Vec<_>>(),
-            vec!["system", "user"]
+            vec!["developer", "developer", "developer", "user"]
         );
-        assert!(
-            messages[0]
-                .content
-                .as_deref()
-                .is_some_and(|content| content.contains("上下文优先级"))
-        );
+        assert!(messages.iter().any(|message| {
+            message.role == "developer"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("上下文优先级"))
+        }));
         assert!(
             !messages[0]
                 .content
@@ -6272,7 +6507,7 @@ mod tests {
                 .unwrap_or_default()
                 .contains("/tmp/current-project")
         );
-        assert_eq!(messages[1].content.as_deref(), Some("解释一下当前状态"));
+        assert_eq!(messages[3].content.as_deref(), Some("解释一下当前状态"));
 
         let goal_request = SessionTurnExecutionRequest {
             goal_turn_mode: SessionGoalTurnMode::Start,
@@ -6287,8 +6522,11 @@ mod tests {
             &goal_history,
         );
         assert!(
-            goal_messages[0].content.as_deref().is_some_and(|content| {
-                content.contains("计划语言规则") && content.contains("locale=zh-CN")
+            goal_messages.iter().any(|message| {
+                message.role == "developer"
+                    && message.content.as_deref().is_some_and(|content| {
+                        content.contains("计划语言规则") && content.contains("locale=zh-CN")
+                    })
             }),
             "目标模式才应注入计划语言规则"
         );
@@ -6712,7 +6950,7 @@ mod tests {
             message
                 .content
                 .as_deref()
-                .is_some_and(|content| content.contains("file_read 已成功读取 facts.txt"))
+                .is_some_and(|content| content.contains("file_read 已成功读取"))
         }));
         assert!(store.thread_context_checkpoint(&thread_id).is_some());
     }

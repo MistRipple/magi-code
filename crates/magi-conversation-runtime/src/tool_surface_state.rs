@@ -162,7 +162,7 @@ pub(crate) fn activate_skill_tool_definitions(
     definitions
 }
 
-pub(crate) fn refresh_live_mcp_tool_definitions(
+pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
     mut definitions: Vec<ChatToolDefinition>,
     tool_registry: &ToolRegistry,
     skill_runtime: Option<&SkillRuntime>,
@@ -170,8 +170,12 @@ pub(crate) fn refresh_live_mcp_tool_definitions(
     access_profile: AccessProfile,
     allowed_tools: Option<&[String]>,
     denied_tools: &[String],
+    include_external: bool,
 ) -> Vec<ChatToolDefinition> {
     definitions.retain(|definition| !definition.function.name.starts_with("mcp__"));
+    if !include_external {
+        return definitions;
+    }
     let skill_allowed_tools = active_skill_id.and_then(|skill_id| {
         skill_runtime.and_then(|runtime| {
             let policy = runtime
@@ -505,7 +509,7 @@ mod tests {
             }
         }));
 
-        let definitions = refresh_live_mcp_tool_definitions(
+        let definitions = refresh_live_mcp_tool_definitions_with_mode(
             Vec::new(),
             &registry,
             None,
@@ -513,6 +517,7 @@ mod tests {
             AccessProfile::ReadOnly,
             None,
             &[],
+            true,
         );
         let names = definitions
             .iter()
@@ -520,5 +525,57 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["mcp__repo__inspect"]);
+    }
+
+    #[test]
+    fn deferred_mcp_surface_omits_external_schema_until_requested() {
+        let registry = ToolRegistry::new(
+            std::sync::Arc::new(magi_governance::GovernanceService::default()),
+            std::sync::Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+        )
+        .with_external_tool_catalog_provider(std::sync::Arc::new(|| {
+            magi_tool_runtime::ExternalToolCatalogSnapshot {
+                mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                    server_id: "repo".to_string(),
+                    server_name: "Repository".to_string(),
+                    model_tool_name: "mcp__repo__inspect".to_string(),
+                    tool_name: "inspect".to_string(),
+                    description: "Inspect repository".to_string(),
+                    read_only: true,
+                    input_schema: serde_json::json!({ "type": "object" }),
+                }],
+                ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()
+            }
+        }));
+
+        let first_round = refresh_live_mcp_tool_definitions_with_mode(
+            Vec::new(),
+            &registry,
+            None,
+            None,
+            AccessProfile::Restricted,
+            None,
+            &[],
+            false,
+        );
+        assert!(first_round.is_empty(), "首轮不应注入完整 MCP schema");
+
+        let after_catalog = refresh_live_mcp_tool_definitions_with_mode(
+            first_round,
+            &registry,
+            None,
+            None,
+            AccessProfile::Restricted,
+            None,
+            &[],
+            true,
+        );
+        assert_eq!(
+            after_catalog
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp__repo__inspect"]
+        );
     }
 }

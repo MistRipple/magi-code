@@ -13,8 +13,8 @@ use magi_memory_store::{MemoryQuery, MemoryRecord, MemoryStore};
 use magi_session_store::SessionStore;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex, RwLock},
 };
 
 pub use execution_context::{ExecutionContextAssemblyRequest, ExecutionContextClues};
@@ -224,7 +224,21 @@ pub struct ContextRuntime {
     shared_context_pool: SharedContextPool,
     file_summary_store: FileSummaryStore,
     project_recent_turn_store: ProjectRecentTurnStore,
+    knowledge_selection_cache: KnowledgeSelectionCache,
 }
+
+#[derive(Clone, Debug, Default)]
+struct KnowledgeSelectionCache {
+    state: Arc<Mutex<KnowledgeSelectionCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct KnowledgeSelectionCacheState {
+    entries: HashMap<String, KnowledgeContextSelection>,
+    order: VecDeque<String>,
+}
+
+const KNOWLEDGE_SELECTION_CACHE_LIMIT: usize = 256;
 
 impl ContextRuntime {
     pub fn new(knowledge_store: KnowledgeStore, memory_store: MemoryStore) -> Self {
@@ -235,6 +249,7 @@ impl ContextRuntime {
             shared_context_pool: SharedContextPool::default(),
             file_summary_store: FileSummaryStore::default(),
             project_recent_turn_store: ProjectRecentTurnStore::default(),
+            knowledge_selection_cache: KnowledgeSelectionCache::default(),
         }
     }
 
@@ -253,6 +268,7 @@ impl ContextRuntime {
             shared_context_pool,
             file_summary_store,
             project_recent_turn_store,
+            knowledge_selection_cache: KnowledgeSelectionCache::default(),
         }
     }
 
@@ -320,6 +336,34 @@ impl ContextRuntime {
     ) -> ContextAssemblyResult {
         let selection = budgeting::assemble_budgeted_selection(self, budget, input);
         structured_output::build_context_assembly_result(selection)
+    }
+}
+
+impl KnowledgeSelectionCache {
+    fn get(&self, key: &str) -> Option<KnowledgeContextSelection> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("knowledge selection cache poisoned");
+        let value = state.entries.get(key).cloned()?;
+        state.order.retain(|item| item != key);
+        state.order.push_back(key.to_string());
+        Some(value)
+    }
+
+    fn insert(&self, key: String, value: KnowledgeContextSelection) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("knowledge selection cache poisoned");
+        state.entries.insert(key.clone(), value);
+        state.order.retain(|item| item != &key);
+        state.order.push_back(key);
+        while state.order.len() > KNOWLEDGE_SELECTION_CACHE_LIMIT {
+            if let Some(oldest) = state.order.pop_front() {
+                state.entries.remove(&oldest);
+            }
+        }
     }
 }
 

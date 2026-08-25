@@ -456,6 +456,31 @@ mod tests {
     }
 
     #[test]
+    fn developer_message_is_preserved_as_responses_input_instruction() {
+        let adapted = OpenAiResponsesAdapter
+            .build_request(
+                &params(vec![
+                    LlmMessage {
+                        role: "developer".to_string(),
+                        content: LlmMessageContent::Text("当前权限快照".to_string()),
+                    },
+                    LlmMessage {
+                        role: "user".to_string(),
+                        content: LlmMessageContent::Text("继续执行".to_string()),
+                    },
+                ]),
+                "gpt-5",
+            )
+            .expect("build");
+        let input = adapted.body["input"].as_array().expect("input");
+
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], "当前权限快照");
+        assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
     fn builds_responses_message_and_function_output_items() {
         let mut request_params = params(vec![
             LlmMessage {

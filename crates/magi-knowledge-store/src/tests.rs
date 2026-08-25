@@ -8,6 +8,62 @@ use crate::{
 use magi_core::{UtcMillis, WorkspaceId};
 
 #[test]
+fn knowledge_revision_changes_when_knowledge_and_relations_change() {
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("revision-workspace");
+    assert_eq!(store.revision(), 0);
+
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "revision-knowledge".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Revision fact".into(),
+        content: "Revision content".into(),
+        tags: Vec::new(),
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+    let after_knowledge = store.revision();
+    assert!(after_knowledge > 0);
+
+    let relation = KnowledgeRelation {
+        relation_id: "revision-relation".into(),
+        workspace_id: workspace_id.clone(),
+        source: GraphNodeRef::Knowledge {
+            knowledge_id: "revision-knowledge".into(),
+        },
+        kind: GraphEdgeKind::References,
+        target: GraphNodeRef::File {
+            path: "src/revision.rs".into(),
+        },
+        origin: GraphEdgeOrigin::ExplicitUser,
+        confidence: Some(0.9),
+        status: GraphEdgeStatus::Active,
+        evidence: Vec::new(),
+        discovery_key: None,
+        discovery_evidence: None,
+        reviewed_at: None,
+        created_at: UtcMillis(2),
+        updated_at: UtcMillis(2),
+    };
+    store
+        .upsert_relation(relation)
+        .expect("relation should be accepted");
+    let after_relation = store.revision();
+    assert!(after_relation > after_knowledge);
+
+    store
+        .delete_relation_in_workspace("revision-relation", &workspace_id)
+        .expect("relation should be deleted");
+    assert!(store.revision() > after_relation);
+    store
+        .delete_in_workspace("revision-knowledge", &workspace_id)
+        .expect("knowledge should be deleted");
+    assert!(store.revision() > after_relation);
+}
+
+#[test]
 fn knowledge_relations_are_workspace_scoped_persisted_and_cascaded() {
     let store = KnowledgeStore::new();
     let workspace_id = WorkspaceId::new("relation-workspace");

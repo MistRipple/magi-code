@@ -47,6 +47,7 @@ const DEFAULT_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // 一个可恢复的 navigation timeout 会被错误改写成 Host disconnected。
 const NAVIGATION_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LONG_RUNNING_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const WAIT_FOR_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(62);
 const CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
@@ -355,6 +356,22 @@ fn request_timeout_for(command: &BrowserHostCommand, default: Duration) -> Durat
     ) {
         return default.max(LONG_RUNNING_BROWSER_HOST_REQUEST_TIMEOUT);
     }
+    if let BrowserHostCommand::Devtools {
+        operation,
+        arguments,
+        ..
+    } = command
+        && operation == "wait_for"
+    {
+        let requested_timeout = arguments
+            .get("timeout_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| Duration::from_millis(value.saturating_add(2_000)))
+            .unwrap_or_default();
+        return default
+            .max(WAIT_FOR_BROWSER_HOST_REQUEST_TIMEOUT)
+            .max(requested_timeout);
+    }
     default
 }
 
@@ -651,6 +668,22 @@ mod tests {
         assert_eq!(
             request_timeout_for(&devtools("lighthouse"), Duration::from_secs(180)),
             Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn wait_for_timeout_follows_requested_wait_window() {
+        let mut command = devtools("wait_for");
+        if let BrowserHostCommand::Devtools { arguments, .. } = &mut command {
+            *arguments = serde_json::json!({ "timeout_ms": 60_000 });
+        }
+        assert_eq!(
+            request_timeout_for(&command, Duration::from_secs(30)),
+            Duration::from_secs(62)
+        );
+        assert_eq!(
+            request_timeout_for(&devtools("wait_for"), Duration::from_secs(120)),
+            Duration::from_secs(120)
         );
     }
 

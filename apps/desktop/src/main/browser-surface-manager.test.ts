@@ -92,10 +92,9 @@ test("物化只创建一次 Surface，导航默认脱离激活关键路径", () 
   assert.doesNotMatch(windowManagerSource, /async activateBrowser\([\s\S]*?registerDesktopBrowserConnection/u);
 });
 
-test("Surface 创建不等待调试器握手，工具调用才等待", () => {
+test("Surface 创建异步准备首个文档，工具调用才等待调试器握手", () => {
   const createSurface = section(source, "private createSurface(", "bindContentSurface(");
-  assert.doesNotMatch(createSurface, /await this\.attachDebugger\(/u);
-  assert.match(createSurface, /const debuggerReady = this\.enqueueCdp\(record, \(\) => this\.attachDebugger\(record\)\)/u);
+  assert.match(createSurface, /const debuggerReady = this\.enqueueCdp\(record, async \(\) => \{[\s\S]*?await primeInitialDocument\(record\.contents\);[\s\S]*?await this\.attachDebugger\(record\);/u);
   assert.match(createSurface, /debuggerReady\.then\([\s\S]*?debuggerReadyPromise === debuggerReady[\s\S]*?= null/u);
   assert.match(source, /private async waitForDebugger\(record: BrowserSurfaceRecord\)/u);
   assert.match(source, /const debuggerReady = record\.debuggerReadyPromise[\s\S]*?debuggerReadyPromise === debuggerReady[\s\S]*?= null/u);
@@ -193,12 +192,14 @@ test("viewport 只作用于当前 Surface，且与右栏物理尺寸完全解耦
   assert.match(source, /Emulation\.setDeviceMetricsOverride/u);
   const applySlot = section(source, "private applySlot(", "private async loadPage(");
   assert.match(applySlot, /内容槽只管理原生 View 的物理承载范围/u);
-  assert.doesNotMatch(applySlot, /scheduleViewportApply\(record\)/u);
-  assert.doesNotMatch(applySlot, /viewportApplied\s*=\s*false/u);
+  assert.match(applySlot, /scheduleViewportApply\(record\)/u);
+  assert.match(applySlot, /viewportApplied\s*=\s*false/u);
   const viewportMethods = section(source, "private async applyViewport(", "private scheduleViewportApply(");
   assert.doesNotMatch(viewportMethods, /slotBounds|availableWidth|availableHeight|scale\s*:/u);
+  assert.match(viewportMethods, /HIDDEN_AUTO_VIEWPORT/u);
   const captureMethods = section(source, "function capturePageRect(", "async function sendCdpCommandWithTimeout(");
-  assert.doesNotMatch(captureMethods, /captureViewportScale|slotBounds/u);
+  assert.doesNotMatch(captureMethods, /captureViewportScale/u);
+  assert.match(captureMethods, /logicalBounds|slotBounds/u);
   assert.doesNotMatch(source, /Emulation\.setTouchEmulationEnabled/u);
   assert.doesNotMatch(viewportMethods, /capturePage\(|startScreencast|drawImage\(/u);
   assert.match(browserTabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/u);
@@ -302,6 +303,19 @@ test("浏览器动作沿现有统一工具和单 Tab 队列执行", () => {
   assert.match(desktopControlSource, /this\.#queues\.set\(queueKey, tail\)/u);
   assert.match(indexSource, /registerDesktopBrowserConnection\(\)/u);
   assert.match(rightPaneSource, /getBrowserSession\(/u);
+});
+
+test("JavaScript 对话框处理命令绕过输入事件队列，避免点击与授权互相等待", () => {
+  const cdpSection = section(source, "async sendCdp(", "private enqueueCdp<T>(");
+  assert.match(cdpSection, /const isDialogCommand = method === "Page\.handleJavaScriptDialog"/u);
+  assert.match(cdpSection, /if \(!isDialogCommand\) \{[\s\S]*?await this\.waitForDebugger\(record\)/u);
+  assert.match(cdpSection, /if \(isDialogCommand\) \{[\s\S]*?sendCdpCommandWithTimeout\(/u);
+  assert.match(cdpSection, /JavaScript 对话框会阻塞触发它的 Input\.dispatchMouseEvent/u);
+  assert.match(source, /Runtime\.addBinding/u);
+  assert.match(source, /Page\.addScriptToEvaluateOnNewDocument/u);
+  assert.match(source, /executeJavaScript\(DIALOG_BRIDGE_SCRIPT, true\)/u);
+  assert.match(source, /private async installDialogBridgeInCurrentDocument/u);
+  assert.match(source, /__magiBrowserDialogResolve/u);
 });
 
 test("权限和安全边界不读取外部浏览器资料", () => {

@@ -918,7 +918,7 @@ impl BuiltinToolName {
                 - 构建成功、curl 成功或静态阅读都不能替代真实浏览器验收"
             }
             Self::BrowserSnapshot => {
-                "读取当前浏览器页面的 DOM 交互快照和 Chromium Accessibility Tree，优先用于读取文本、标题、计数、控件和状态。返回的元素 ref 只在同一 snapshot_revision 内有效。不要用截图替代文本快照。"
+                "读取当前浏览器页面的 DOM 交互快照和 Chromium Accessibility Tree，优先用于读取文本、标题、计数、控件和状态。返回的 element_ref（包括结构性节点的 group 引用）只在本次 snapshot_revision 内有效；后续交互必须使用最近一次工具结果里的引用和 revision，页面发生交互或结构变化后不要复用旧快照。不要用截图替代文本快照。"
             }
             Self::BrowserClick => {
                 "点击当前浏览器快照中的元素。必须传入 browser_snapshot 返回的 element_ref 和 snapshot_revision。"
@@ -929,7 +929,7 @@ impl BuiltinToolName {
             Self::BrowserPress => "向当前浏览器页面发送一个按键或组合键。",
             Self::BrowserScroll => "滚动当前浏览器页面或快照中的指定元素。",
             Self::BrowserScreenshot => {
-                "截取当前浏览器页面或指定元素并返回图片 artifact。仅用于布局、样式、图像等视觉问题或用户明确要求截图的场景；读取文本、标题、计数、控件和状态必须使用 browser_snapshot。"
+                "截取当前浏览器页面或指定元素并返回图片 artifact。仅用于布局、样式、图像等视觉问题或用户明确要求截图的场景；读取文本、标题、计数、控件和状态必须使用 browser_snapshot。截图范围三选一：省略 element_ref、clip、full_page 时截取当前视口；指定 clip 时不能同时传 full_page；指定 element_ref 时不能同时传 clip 或 full_page。quality 只对 jpeg/webp 有效，png 不要传 quality。"
             }
             Self::BrowserTabs => {
                 "列出、激活或新建当前 Magi 会话的内置浏览器标签页；任务完成时必须保留标签及其当前页面，不得把 close 当作清理动作。只有用户明确要求关闭指定标签时才允许使用 close。"
@@ -942,7 +942,7 @@ impl BuiltinToolName {
             }
             Self::BrowserHover => "将鼠标悬停到当前浏览器快照中的元素。",
             Self::BrowserDrag => {
-                "把当前浏览器快照中的 source 元素拖到 target 元素。两个引用必须来自同一个 snapshot_revision。"
+                "把当前浏览器快照中的 source 元素拖到 target 元素。两个引用必须来自最近一次 browser_snapshot 或交互工具结果中的同一个 snapshot_revision；可使用快照里的 e 引用或结构性 draggable div 等节点的 group 引用。页面发生变化后先重新获取快照，不要复用旧 revision。"
             }
             Self::BrowserFillForm => {
                 "按 fields 中的统一快照引用一次性填写多个控件；文本框使用文本值，select 使用选项值或值数组，checkbox/radio 使用布尔值。"
@@ -1437,11 +1437,11 @@ impl BuiltinToolName {
                 "properties": {
                     "tab_id": { "type": "string" },
                     "snapshot_revision": { "type": "integer", "minimum": 1 },
-                    "element_ref": { "type": "string", "description": "可选；省略时截取页面" },
-                    "clip": { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 }, "y": { "type": "number", "minimum": 0, "maximum": 1 }, "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }, "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 } }, "required": ["x", "y", "width", "height"], "description": "按当前视口归一化坐标截取区域，不能与 element_ref 或 full_page 同时使用" },
+                    "element_ref": { "type": "string", "description": "可选；省略时截取页面；与 clip、full_page 互斥" },
+                    "clip": { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 }, "y": { "type": "number", "minimum": 0, "maximum": 1 }, "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }, "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 } }, "required": ["x", "y", "width", "height"], "description": "按当前视口归一化坐标截取区域；与 element_ref、full_page 互斥，只能三选一" },
                     "format": { "type": "string", "enum": ["png", "jpeg", "webp"], "description": "图片格式，默认 png" },
-                    "quality": { "type": "integer", "minimum": 0, "maximum": 100, "description": "jpeg/webp 压缩质量" },
-                    "full_page": { "type": "boolean", "description": "默认 false" }
+                    "quality": { "type": "integer", "minimum": 0, "maximum": 100, "description": "jpeg/webp 压缩质量；format=png 时不要传此字段" },
+                    "full_page": { "type": "boolean", "description": "设为 true 截取整页；不能同时传 element_ref 或 clip，默认 false" }
                 },
                 "required": []
             }),

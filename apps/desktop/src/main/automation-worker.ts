@@ -105,10 +105,20 @@ export class AutomationWorker {
       this.#process = null;
       this.clearStabilityTimer();
       const error = new Error(`browser_worker_exited:${code ?? "unknown"}`);
+      console.error("[browser-worker] UtilityProcess exited", {
+        code,
+        workerEpoch: this.#workerEpoch,
+      });
       this.failPending(error);
       this.failReadyWaiters(error);
       void this.handleFailure(error);
       if (!this.#stopping) this.scheduleRecovery(error);
+    });
+    child.on("error", (cause) => {
+      console.error("[browser-worker] UtilityProcess error", {
+        workerEpoch: this.#workerEpoch,
+        error: String(cause),
+      });
     });
     child.stdout?.on("data", (chunk) => process.stdout.write(`[browser-worker] ${chunk}`));
     child.stderr?.on("data", (chunk) => process.stderr.write(`[browser-worker] ${chunk}`));
@@ -368,9 +378,16 @@ function sameBinding(left: BrowserSurfaceBinding, right: BrowserSurfaceBinding):
 }
 
 function workerTimeout(command: BrowserHostCommand): number {
-  return command.type === "devtools" && ["lighthouse", "heap"].includes(command.payload.operation)
-    ? 120_000
-    : 30_000;
+  if (command.type !== "devtools") return 30_000;
+  if (["lighthouse", "heap"].includes(command.payload.operation)) return 120_000;
+  if (command.payload.operation === "wait_for") {
+    const requested = typeof command.payload.arguments.timeout_ms === "number"
+      && Number.isFinite(command.payload.arguments.timeout_ms)
+      ? Math.max(0, Math.min(60_000, command.payload.arguments.timeout_ms))
+      : 5_000;
+    return requested + 2_000;
+  }
+  return 30_000;
 }
 
 function errorCode(cause: unknown): string {

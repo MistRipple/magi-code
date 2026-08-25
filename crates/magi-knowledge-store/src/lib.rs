@@ -26,6 +26,7 @@ use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -170,6 +171,8 @@ pub struct KnowledgeStore {
     index_builds: Arc<Mutex<HashMap<WorkspaceId, bool>>>,
     index_outcomes: Arc<RwLock<HashMap<WorkspaceId, code_scanner::CodeIndexScanOutcome>>>,
     index_persist_callback: Arc<RwLock<Option<IndexPersistenceCallback>>>,
+    /// 知识、关系和代码索引投影的统一代际；上下文检索缓存必须绑定它。
+    revision: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for KnowledgeStore {
@@ -241,6 +244,7 @@ impl KnowledgeStore {
             index_builds: Arc::default(),
             index_outcomes: Arc::default(),
             index_persist_callback: Arc::default(),
+            revision: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -249,6 +253,15 @@ impl KnowledgeStore {
             .read()
             .expect("knowledge store read lock poisoned")
             .clone()
+    }
+
+    /// 返回知识库事实源的单调代际，用于失效对话上下文检索缓存。
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn index_persistence_callback_configured(&self) -> bool {
@@ -849,6 +862,9 @@ impl KnowledgeStore {
             refreshed += 1;
         }
         drop(state);
+        if refreshed > 0 {
+            self.bump_revision();
+        }
         refreshed
     }
 
@@ -916,6 +932,7 @@ impl KnowledgeStore {
             .write()
             .expect("knowledge store write lock poisoned")
             .upsert(normalized, indexed_terms, None, None, None);
+        self.bump_revision();
         if let Some(workspace_id) = workspace_id {
             self.refresh_inferred_relations_for_workspace_inner(&workspace_id);
         }
@@ -939,6 +956,8 @@ impl KnowledgeStore {
             .expect("knowledge store write lock poisoned");
         validate_relation(&state, &relation)?;
         state.upsert_relation(relation);
+        drop(state);
+        self.bump_revision();
         Ok(())
     }
 
@@ -996,6 +1015,8 @@ impl KnowledgeStore {
         if !state.delete_relation(relation_id) {
             return Err(DomainError::NotFound { entity: "relation" });
         }
+        drop(state);
+        self.bump_revision();
         Ok(())
     }
 
@@ -1049,6 +1070,7 @@ impl KnowledgeStore {
                 normalized.audit,
                 normalized.governance,
             );
+        self.bump_revision();
     }
 
     pub fn get(&self, knowledge_id: &str) -> Option<KnowledgeRecord> {
@@ -1195,6 +1217,8 @@ impl KnowledgeStore {
                 entity: "knowledge",
             });
         }
+        drop(state);
+        self.bump_revision();
         Ok(())
     }
 
@@ -1269,6 +1293,7 @@ impl KnowledgeStore {
             .write()
             .expect("knowledge store index outcomes write lock poisoned")
             .clear();
+        self.bump_revision();
     }
 
     pub fn clear_workspace(&self, workspace_id: &WorkspaceId) {

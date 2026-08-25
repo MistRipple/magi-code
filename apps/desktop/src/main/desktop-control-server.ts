@@ -182,6 +182,9 @@ export class DesktopControlServer {
 
   private acceptClient(websocket: WebSocket): void {
     this.#client = websocket;
+    console.info("[DesktopControlServer] Browser Host connected", {
+      readyState: websocket.readyState,
+    });
     this.emit({ type: "ready", payload: this.#handshake() });
     // daemon 可能在 Electron 已经创建并提升 Browser Surface 之后才建立
     // 控制连接。连接握手只发送 ready 会丢失既有 Primary，导致 daemon
@@ -202,9 +205,17 @@ export class DesktopControlServer {
       try {
         request = parseRequest(data.toString());
       } catch (cause) {
+        console.error("[DesktopControlServer] Invalid Browser Host request", {
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
         websocket.send(JSON.stringify(failedResponse("invalid-request", normalizeError(cause))));
         return;
       }
+      console.info("[DesktopControlServer] Browser command received", {
+        requestId: request.request_id,
+        command: request.command.type,
+        tabId: commandTabId(request.command),
+      });
       if (request.command.type === "cancel") {
         this.#active.get(request.command.payload.request_id)?.abort();
         return;
@@ -212,8 +223,14 @@ export class DesktopControlServer {
       const controller = new AbortController();
       this.#active.set(request.request_id, controller);
       const run = async () => {
+        const startedAt = performance.now();
         try {
           await this.executeWithCancellation(request, controller.signal, websocket);
+          console.info("[DesktopControlServer] Browser command settled", {
+            requestId: request.request_id,
+            command: request.command.type,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
         } finally {
           if (this.#active.get(request.request_id) === controller) {
             this.#active.delete(request.request_id);
@@ -244,7 +261,16 @@ export class DesktopControlServer {
         if (this.#queues.get(queueKey) === tail) this.#queues.delete(queueKey);
       });
     });
-    websocket.on("close", () => {
+    websocket.on("error", (error) => {
+      console.error("[DesktopControlServer] Browser Host websocket error", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+    websocket.on("close", (code, reason) => {
+      console.warn("[DesktopControlServer] Browser Host websocket closed", {
+        code,
+        reason: reason.toString(),
+      });
       if (this.#client === websocket) this.#client = null;
     });
   }

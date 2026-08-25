@@ -8,7 +8,15 @@ export const ACCESS_MODE_APPROVAL_ERROR_CODES = [
   'skill_tool_needs_approval',
   'external_tool_needs_approval',
   'tool_safety_needs_approval',
+  'tool_approval_denied',
 ];
+
+export type ToolPolicyRestrictionKind =
+  | 'approval_required'
+  | 'read_only'
+  | 'path_scope'
+  | 'tool_scope'
+  | 'policy';
 
 export interface ToolApprovalPayload {
   approvalId: string;
@@ -56,6 +64,15 @@ export function toolPayloadStatus(content: unknown): string {
   const payload = parseToolPayloadRecord(content);
   if (!payload) return '';
   return readString(payload.status).toLowerCase();
+}
+
+export function toolPayloadRestrictionKind(content: unknown): ToolPolicyRestrictionKind | '' {
+  const payload = parseToolPayloadRecord(content);
+  if (!payload) return '';
+  const kind = readString(payload.restriction_kind) || readString(payload.restrictionKind);
+  return ['approval_required', 'read_only', 'path_scope', 'tool_scope', 'policy'].includes(kind)
+    ? kind as ToolPolicyRestrictionKind
+    : '';
 }
 
 export function isAccessModeApprovalErrorPayload(content: unknown): boolean {

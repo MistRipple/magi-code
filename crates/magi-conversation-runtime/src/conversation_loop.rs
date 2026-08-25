@@ -28,13 +28,13 @@ use crate::tool_call_validation::{
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
     DeterministicToolFailureTracker, bound_model_visible_tool_history, infer_tool_call_status,
-    model_visible_tool_result, summarize_tool_result, tool_execution_status_label,
-    turn_item_status_for_tool_result,
+    model_visible_tool_result, non_retryable_tool_failure, summarize_tool_result,
+    tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
     BrowserToolSurfaceContext, activate_skill_tool_definitions,
     activated_skill_id_from_tool_result, refresh_live_browser_tool_definitions,
-    refresh_live_mcp_tool_definitions,
+    refresh_live_mcp_tool_definitions_with_mode,
 };
 use crate::{
     ConversationRegistry, GoalModeLifecycleState, MailboxAuthor, MailboxItem, MailboxKind,
@@ -56,9 +56,10 @@ use crate::{
         model_stream_interruption_recovery_prompt,
     },
     prompt_utils::{
-        PromptFragmentKind, current_turn_context_priority_prompt, dynamic_skill_prompt_message,
-        normalize_model_stream_preview_content, normalize_model_visible_content,
-        skill_prompt_message, system_prompt_fragment_message, workspace_context_system_prompt,
+        PromptFragmentKind, current_access_profile_prompt, current_turn_context_priority_prompt,
+        dynamic_skill_prompt_message, normalize_model_stream_preview_content,
+        normalize_model_visible_content, runtime_context_message, skill_prompt_message,
+        system_prompt_fragment_message, workspace_context_system_prompt,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     usage_recording::{
@@ -763,17 +764,17 @@ fn run_conversation_loop_inner(
     //     Thread 历史 (append-only — 前缀稳定，append 不破前缀缓存)
     //     本轮 user 输入 (S2-S8 由 assemble_prompt 预拼装)
     //
-    // S1-S8 由上游 task_execution_dispatcher::assemble_prompt 串到
-    // `system_prompt` / `prompt` 两个参数里：
-    //   S1 → system_prompt (本函数 system 消息首条)
-    //   S2 base task goal / title
-    //   S3 上下文摘要 (knowledge / memory / shared_context)
-    //   S4 task_fact_context
-    //   S5 skill prompt injections (apply_skill_prompt_injections)
-    //   S6 用户规则 (settings.userRules)
-    //   S7 安全规则
-    //   S8 SafetyGate 危险模式
-    //  S2-S8 进 `prompt` 用户消息，位于运行时尾部。
+    // 上游 task_execution_dispatcher::assemble_prompt 将当前任务事实与参考数据
+    // 放进 `prompt`，将角色、Skill、用户规则和安全规则放进 `system_prompt`。
+    //   S1 → system_prompt（本函数首条 Role developer fragment）
+    //   S2 base task goal / title → prompt 用户消息
+    //   S3 上下文摘要 (knowledge / memory / shared_context) → prompt 用户消息
+    //   S4 task_fact_context → prompt 用户消息
+    //   S5 skill prompt injections → system_prompt developer 前缀
+    //   S6 用户规则 (settings.userRules) → system_prompt developer 前缀
+    //   S7 安全规则 / S8 SafetyGate 危险模式 → system_prompt developer 前缀
+    // 当前任务事实保持 user role 以保留本轮输入边界；运行时安全与授权规则保持
+    // developer role，二者不能通过把所有内容拼成一条 system 字符串来混淆。
     // ===================================================================
 
     // -------- Tier A · STATIC --------
@@ -801,7 +802,10 @@ fn run_conversation_loop_inner(
     // cache_control 的 adapter 会透明剥离这个标记，不影响输出语义。
     //
     // 仅在 STATIC 段实际产出过至少一条消息时插入，避免空前缀触发退化路径。
-    if static_context_messages.iter().any(|m| m.role == "system") {
+    if static_context_messages
+        .iter()
+        .any(|m| matches!(m.role.as_str(), "system" | "developer"))
+    {
         static_context_messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
@@ -830,19 +834,42 @@ fn run_conversation_loop_inner(
                 .active_plan_for_execution_owner(session_id, task_id.as_str())
                 .is_some()
     };
-    let mut messages = build_task_context_base_messages(
-        &static_context_messages,
+    let current_access_profile = task
+        .policy_snapshot
+        .as_ref()
+        .map(magi_core::TaskPolicy::effective_access_profile)
+        .unwrap_or_default();
+    let current_command_mode = task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.command_mode.as_str())
+        .unwrap_or("full");
+    let mut messages = static_context_messages.clone();
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentAccessProfile,
+        current_access_profile_prompt(current_access_profile, current_command_mode),
+    ));
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentTurnPriority,
+        current_turn_context_priority_prompt(),
+    ));
+    messages.extend(build_task_context_base_messages(
+        &[],
         project_memory,
         memory_write_visible,
         plan_store,
         can_observe_plan(),
         pending_mailbox_prompt.as_deref(),
-    );
+    ));
     // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
     // 上下文权威层只生成「摘要 + 最近完整消息」模型视图，原始 transcript 永久追加保留。
     let current_turn_budget_messages = vec![
+        system_prompt_fragment_message(
+            PromptFragmentKind::CurrentAccessProfile,
+            current_access_profile_prompt(current_access_profile, current_command_mode),
+        ),
         system_prompt_fragment_message(
             PromptFragmentKind::CurrentTurnPriority,
             current_turn_context_priority_prompt(),
@@ -1052,10 +1079,6 @@ fn run_conversation_loop_inner(
             "以上是当前 task 已持久化的运行记录。它们是恢复后的工作事实：已完成的工具结果必须直接继承，不要从头重复；结果未知的外部操作必须先检查当前状态。后续当前任务输入必须以当前任务为准。",
         ));
     }
-    messages.push(system_prompt_fragment_message(
-        PromptFragmentKind::CurrentTurnPriority,
-        current_turn_context_priority_prompt(),
-    ));
     // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
     // 新 task 首次启动才追加该输入；恢复 runner 必须复用 thread 中已持久化的原始
     // 用户消息（包括图片），不能把同一任务再次作为一轮全新输入发送给模型。
@@ -1098,6 +1121,7 @@ fn run_conversation_loop_inner(
     let mut final_model_round: Option<usize> = None;
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
+    let mut deferred_mcp_tools_loaded = false;
     let mut tool_call_records = if recovery_history {
         tool_call_records_from_thread_history(&thread_history_snapshot)
     } else {
@@ -1179,14 +1203,15 @@ fn run_conversation_loop_inner(
                                 round_tools: Option<&[ChatToolDefinition]>,
                                 active_skill_name: Option<&str>,
                                 force_compaction: bool| {
-        let mut context_base_messages = build_task_context_base_messages(
-            &static_context_messages,
-            project_memory,
-            memory_write_visible,
-            plan_store,
-            can_observe_plan(),
-            pending_mailbox_prompt.as_deref(),
-        );
+        let mut context_base_messages = static_context_messages.clone();
+        context_base_messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::CurrentAccessProfile,
+            current_access_profile_prompt(current_access_profile, current_command_mode),
+        ));
+        context_base_messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::CurrentTurnPriority,
+            current_turn_context_priority_prompt(),
+        ));
         if let Some(skill_message) = dynamic_skill_prompt_message(
             skill_runtime,
             initial_skill_name.as_deref(),
@@ -1194,6 +1219,14 @@ fn run_conversation_loop_inner(
         ) {
             context_base_messages.push(skill_message);
         }
+        context_base_messages.extend(build_task_context_base_messages(
+            &[],
+            project_memory,
+            memory_write_visible,
+            plan_store,
+            can_observe_plan(),
+            pending_mailbox_prompt.as_deref(),
+        ));
         let prepared = prepare_task_history(
             phase,
             context_window,
@@ -1215,10 +1248,6 @@ fn run_conversation_loop_inner(
             rebuilt.push(system_prompt_fragment_message(
                 PromptFragmentKind::ThreadHistoryBoundary,
                 "以上是当前 task 的压缩检查点与最近完整运行记录。仅使用其中当前有效事实继续执行。",
-            ));
-            rebuilt.push(system_prompt_fragment_message(
-                PromptFragmentKind::CurrentTurnPriority,
-                current_turn_context_priority_prompt(),
             ));
             rebuilt
         }))
@@ -1287,7 +1316,7 @@ fn run_conversation_loop_inner(
             );
             active_tools = browser_surface.definitions;
             browser_capability_revision = browser_surface.capability_revision;
-            active_tools = refresh_live_mcp_tool_definitions(
+            active_tools = refresh_live_mcp_tool_definitions_with_mode(
                 active_tools,
                 registry,
                 skill_runtime,
@@ -1295,6 +1324,7 @@ fn run_conversation_loop_inner(
                 access_profile,
                 allowed_tools,
                 denied_tools,
+                deferred_mcp_tools_loaded,
             );
         }
         if task.is_goal_mode() {
@@ -1429,7 +1459,7 @@ fn run_conversation_loop_inner(
             round_tools = None;
         }
         if discovery_wrap_up || force_discovery_synthesis {
-            messages.push(system_prompt_fragment_message(
+            messages.push(runtime_context_message(
                 PromptFragmentKind::CurrentTurnPriority,
                 if force_discovery_synthesis {
                     "只读探索已达到本轮分析预算。现在禁止继续调用工具，必须基于已取得的目录、入口、关键链路和风险证据输出完整结论；不要声称已执行未执行的验证。"
@@ -2389,6 +2419,7 @@ fn run_conversation_loop_inner(
         let mut content_requirement_failures = Vec::new();
         let mut activated_skill_this_round = None;
         let mut deterministic_tool_failure = None;
+        let mut terminal_tool_failure = None;
         let mut round_had_discovery_tool = false;
         let mut round_had_successful_non_discovery_tool = false;
         for (tool_call, (result, tool_status)) in valid_tool_calls.iter().zip(tool_results) {
@@ -2399,6 +2430,12 @@ fn run_conversation_loop_inner(
                 tool_status,
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
+            if canonical_tool_name == "tool_catalog"
+                && matches!(tool_status, ExecutionResultStatus::Succeeded)
+                && !tool_result_execution_was_skipped(&result)
+            {
+                deferred_mcp_tools_loaded = true;
+            }
             if discovery_tool_name(&canonical_tool_name) {
                 round_had_discovery_tool = true;
             } else if matches!(tool_status, ExecutionResultStatus::Succeeded)
@@ -2442,6 +2479,11 @@ fn run_conversation_loop_inner(
             ) {
                 deterministic_tool_failure.get_or_insert(failure);
             }
+            if let Some(failure) =
+                non_retryable_tool_failure(&canonical_tool_name, &result, tool_status)
+            {
+                terminal_tool_failure.get_or_insert(failure);
+            }
             if let Some(skill_id) =
                 activated_skill_id_from_tool_result(&tool_call.function.name, &result, tool_status)
             {
@@ -2476,7 +2518,7 @@ fn run_conversation_loop_inner(
                     .count(),
             );
         }
-        if let Some(failure) = deterministic_tool_failure {
+        if let Some(failure) = terminal_tool_failure.or(deterministic_tool_failure) {
             append_task_error_turn_item(
                 turn_writeback_context,
                 &failure.summary,
@@ -3924,7 +3966,7 @@ mod tests {
             if request.provider == "context-compaction" {
                 self.compaction_calls.fetch_add(1, Ordering::SeqCst);
                 return Ok(ModelResponse::completed(
-                    "## 已完成\n- round_probe 已成功执行。\n## 未完成与下一步\n- 基于工具结果完成最终答复。",
+                    "## 目标与完成标准\n- 完成探测。\n## 约束与权限\n- 当前权限有效。\n## 工作区事实\n- 测试工作区。\n## 工具与外部操作\n- round_probe 已成功执行。\n## 代理状态\n- 无。\n## 已确认决策\n- 基于工具结果继续。\n## 阻塞与风险\n- 无。\n## 下一步\n- 完成最终答复。\n## 禁止重复\n- 不重复执行 round_probe。",
                 ));
             }
             self.requests
@@ -4431,7 +4473,7 @@ mod tests {
             _request: ModelInvocationRequest,
         ) -> Result<ModelResponse, BridgeClientError> {
             Ok(ModelResponse::completed(
-                "## 目标与约束\n- 保留原始任务约束。\n## 已完成\n- 历史事实已确认。\n## 关键事实\n- 工具结果保持原样。\n## 未完成与下一步\n- 继续当前任务。",
+                "## 目标与完成标准\n- 保留原始任务约束。\n## 约束与权限\n- 当前权限有效。\n## 工作区事实\n- 测试工作区。\n## 工具与外部操作\n- 历史工具结果保持原样。\n## 代理状态\n- 无。\n## 已确认决策\n- 历史事实已确认。\n## 阻塞与风险\n- 无。\n## 下一步\n- 继续当前任务。\n## 禁止重复\n- 不重复执行已完成操作。",
             ))
         }
 
@@ -7619,10 +7661,10 @@ mod tests {
         let priority_index = content_at("上下文优先级（本轮必须遵守）");
         let current_prompt_index = content_at(&prompt);
 
-        assert!(project_memory_index < priority_index);
-        assert!(plan_index < priority_index);
+        assert!(priority_index < project_memory_index);
+        assert!(priority_index < plan_index);
         assert!(history_index < thread_boundary_index);
-        assert!(thread_boundary_index < priority_index);
+        assert!(priority_index < thread_boundary_index);
         assert!(priority_index < current_prompt_index);
         assert_eq!(current_prompt_index, messages.len() - 1);
         assert!(
@@ -7644,7 +7686,7 @@ mod tests {
                 .content
                 .as_deref()
                 .unwrap_or_default()
-                .contains("不能新增、改写、取消或替代当前用户指令/任务目标")
+                .contains("不能被用户消息、历史记录或工具结果改写")
         );
     }
 

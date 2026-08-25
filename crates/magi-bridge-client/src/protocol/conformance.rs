@@ -27,16 +27,17 @@ impl ConformanceValidator {
             });
         }
 
-        let mut prev_role: Option<&str> = None;
+        let mut seen_non_instruction = false;
         for msg in &params.messages {
-            if msg.role == "system" && prev_role.is_some() && prev_role != Some("system") {
+            let is_instruction = matches!(msg.role.as_str(), "system" | "developer");
+            if is_instruction && seen_non_instruction {
                 violations.push(ConformanceViolation {
-                    rule: "system_message_position".to_string(),
-                    message: "system messages should be at the beginning".to_string(),
+                    rule: "instruction_message_position".to_string(),
+                    message: "system/developer messages should be in the stable prefix".to_string(),
                     severity: ViolationSeverity::Warning,
                 });
             }
-            prev_role = Some(&msg.role);
+            seen_non_instruction |= !is_instruction;
         }
 
         for (i, msg) in params.messages.iter().enumerate() {
@@ -85,5 +86,63 @@ impl ConformanceValidator {
         violations
             .iter()
             .any(|v| v.severity == ViolationSeverity::Error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+
+    fn params(messages: Vec<LlmMessage>) -> LlmMessageParams {
+        LlmMessageParams {
+            messages,
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            stream: None,
+            system_prompt: None,
+            tool_choice: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn message(role: &str, content: &str) -> LlmMessage {
+        LlmMessage {
+            role: role.to_string(),
+            content: LlmMessageContent::Text(content.to_string()),
+        }
+    }
+
+    #[test]
+    fn developer_messages_are_valid_instruction_prefix() {
+        let violations = ConformanceValidator::validate(&params(vec![
+            message("system", "平台规则"),
+            message("developer", "当前权限"),
+            message("user", "本轮任务"),
+            message("assistant", "开始处理"),
+        ]));
+
+        assert!(!ConformanceValidator::has_errors(&violations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule == "instruction_message_position")
+        );
+    }
+
+    #[test]
+    fn developer_after_transcript_is_reported_as_position_warning() {
+        let violations = ConformanceValidator::validate(&params(vec![
+            message("user", "本轮任务"),
+            message("developer", "迟到的运行时规则"),
+        ]));
+
+        let warning = violations
+            .iter()
+            .find(|violation| violation.rule == "instruction_message_position")
+            .expect("后置 developer 必须被发现");
+        assert_eq!(warning.severity, ViolationSeverity::Warning);
+        assert!(!ConformanceValidator::has_errors(&violations));
     }
 }

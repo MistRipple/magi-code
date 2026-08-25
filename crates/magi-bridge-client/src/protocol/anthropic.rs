@@ -43,21 +43,30 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         params: &LlmMessageParams,
         model: &str,
     ) -> Result<AdaptedRequest, String> {
-        let (system_messages, non_system): (Vec<_>, Vec<_>) =
-            params.messages.iter().partition(|m| m.role == "system");
+        // Anthropic 没有独立的 developer role。Magi 的 developer 前缀在这里
+        // 收敛到 Anthropic system 字段，避免把受信任的运行时约束降级成普通 user。
+        let (system_messages, non_system): (Vec<_>, Vec<_>) = params
+            .messages
+            .iter()
+            .partition(|m| matches!(m.role.as_str(), "system" | "developer"));
 
-        let system_text = if let Some(ref sp) = params.system_prompt {
-            sp.clone()
-        } else {
+        let mut system_parts = Vec::new();
+        if let Some(system_prompt) = params
+            .system_prompt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            system_parts.push(system_prompt);
+        }
+        system_parts.extend(
             system_messages
                 .iter()
-                .filter_map(|m| match &m.content {
-                    crate::llm_types::LlmMessageContent::Text(t) => Some(t.as_str()),
+                .filter_map(|message| match &message.content {
+                    crate::llm_types::LlmMessageContent::Text(text) => Some(text.as_str()),
                     _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+                }),
+        );
+        let system_text = system_parts.join("\n");
 
         let non_system_owned: Vec<_> = non_system.into_iter().cloned().collect();
         let messages = convert_messages_to_anthropic(&non_system_owned);
@@ -398,6 +407,32 @@ mod tests {
         let text = format!("STATIC ONLY{}", PROMPT_CACHE_BOUNDARY);
         let value = build_system_field(&text);
         assert_eq!(value, json!("STATIC ONLY"));
+    }
+
+    #[test]
+    fn developer_and_explicit_system_prompt_are_combined_in_anthropic_system_field() {
+        let mut params = base_params(vec![
+            LlmMessage {
+                role: "developer".to_string(),
+                content: LlmMessageContent::Text("当前权限快照".to_string()),
+            },
+            LlmMessage {
+                role: "user".to_string(),
+                content: LlmMessageContent::Text("继续执行".to_string()),
+            },
+        ]);
+        params.system_prompt = Some("平台安全规则".to_string());
+
+        let adapted = AnthropicMessagesAdapter
+            .build_request(&params, "claude-test")
+            .expect("build");
+        let system = adapted.body["system"].as_str().expect("system");
+        let messages = adapted.body["messages"].as_array().expect("messages");
+
+        assert!(system.contains("平台安全规则"));
+        assert!(system.contains("当前权限快照"));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
     }
 
     #[test]

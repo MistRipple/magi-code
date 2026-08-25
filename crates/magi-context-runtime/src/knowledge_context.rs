@@ -184,6 +184,31 @@ impl ContextRuntime {
         &self,
         request: KnowledgeContextRequest,
     ) -> KnowledgeContextSelection {
+        let cache_key = format!(
+            "{:?}\u{001f}{}\u{001f}{}\u{001f}{}",
+            request.consumer,
+            request
+                .workspace_id
+                .as_ref()
+                .map(WorkspaceId::as_str)
+                .unwrap_or_default(),
+            self.knowledge_store.revision(),
+            normalize_knowledge_query(&request.query),
+        );
+        if let Some(selection) = self.knowledge_selection_cache.get(&cache_key) {
+            tracing::debug!(target: "magi.performance", stage = "knowledge_context_cache_hit", "复用知识上下文选择");
+            return selection;
+        }
+        let selection = self.select_knowledge_on_demand_uncached(request);
+        self.knowledge_selection_cache
+            .insert(cache_key, selection.clone());
+        selection
+    }
+
+    fn select_knowledge_on_demand_uncached(
+        &self,
+        request: KnowledgeContextRequest,
+    ) -> KnowledgeContextSelection {
         let intent = detect_knowledge_intent(&request.query);
         if !intent.needed() {
             return KnowledgeContextSelection::empty(
@@ -482,6 +507,14 @@ fn detect_knowledge_intent(query: &str) -> KnowledgeIntent {
             ],
         ),
     }
+}
+
+fn normalize_knowledge_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn contains_any(value: &str, terms: &[&str]) -> bool {

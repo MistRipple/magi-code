@@ -1,7 +1,8 @@
-use magi_core::{SessionId, TaskId, UtcMillis};
+use magi_core::{ExecutionResultStatus, SessionId, TaskId, UtcMillis};
 use magi_session_store::SessionStore;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +33,13 @@ struct TurnToolGrant {
     tool_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionToolCallFingerprint {
+    session_id: SessionId,
+    tool_name: String,
+    normalized_arguments: String,
+}
+
 fn grant_for(request: &PendingToolApproval) -> TurnToolGrant {
     TurnToolGrant {
         session_id: request.session_id.clone(),
@@ -41,9 +49,41 @@ fn grant_for(request: &PendingToolApproval) -> TurnToolGrant {
     }
 }
 
+fn fingerprint_for(request: &PendingToolApproval, arguments: &str) -> SessionToolCallFingerprint {
+    SessionToolCallFingerprint {
+        session_id: request.session_id.clone(),
+        tool_name: magi_tool_runtime::canonical_builtin_tool_name(&request.tool_name)
+            .unwrap_or_else(|| request.tool_name.trim().to_ascii_lowercase()),
+        normalized_arguments: normalize_arguments(arguments),
+    }
+}
+
+fn normalize_arguments(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.trim().to_string();
+    };
+    serde_json::to_string(&canonicalize_json(&value))
+        .unwrap_or_else(|_| arguments.trim().to_string())
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 #[derive(Debug)]
 struct PendingApprovalEntry {
     request: PendingToolApproval,
+    fingerprint: SessionToolCallFingerprint,
     decision_tx: mpsc::Sender<ToolApprovalDecision>,
 }
 
@@ -51,6 +91,7 @@ struct PendingApprovalEntry {
 struct ToolApprovalState {
     pending: HashMap<String, PendingApprovalEntry>,
     turn_tool_grants: HashSet<TurnToolGrant>,
+    denied_session_tool_calls: HashSet<SessionToolCallFingerprint>,
 }
 
 pub struct ToolApprovalWaiter {
@@ -60,6 +101,7 @@ pub struct ToolApprovalWaiter {
 
 pub enum ToolApprovalRequestOutcome {
     AlreadyAllowed,
+    PreviouslyDenied,
     Pending(ToolApprovalWaiter),
 }
 
@@ -99,7 +141,16 @@ impl ToolApprovalRegistry {
         &self,
         request: PendingToolApproval,
     ) -> Result<ToolApprovalRequestOutcome, String> {
+        self.request_with_arguments(request, "")
+    }
+
+    pub fn request_with_arguments(
+        &self,
+        request: PendingToolApproval,
+        arguments: &str,
+    ) -> Result<ToolApprovalRequestOutcome, String> {
         let grant = grant_for(&request);
+        let fingerprint = fingerprint_for(&request, arguments);
         let mut state = self
             .state
             .lock()
@@ -110,6 +161,9 @@ impl ToolApprovalRegistry {
         if state.turn_tool_grants.contains(&grant) {
             return Ok(ToolApprovalRequestOutcome::AlreadyAllowed);
         }
+        if state.denied_session_tool_calls.contains(&fingerprint) {
+            return Ok(ToolApprovalRequestOutcome::PreviouslyDenied);
+        }
         if state.pending.contains_key(&request.approval_id) {
             return Err(format!("工具授权请求已存在: {}", request.approval_id));
         }
@@ -118,6 +172,7 @@ impl ToolApprovalRegistry {
             request.approval_id.clone(),
             PendingApprovalEntry {
                 request: request.clone(),
+                fingerprint,
                 decision_tx,
             },
         );
@@ -148,7 +203,9 @@ impl ToolApprovalRegistry {
             .decision_tx
             .send(decision)
             .map_err(|_| "工具授权等待任务已经结束".to_string())?;
-        if decision == ToolApprovalDecision::AllowForTurn {
+        if decision == ToolApprovalDecision::Deny {
+            state.denied_session_tool_calls.insert(entry.fingerprint);
+        } else if decision == ToolApprovalDecision::AllowForTurn {
             let grant = grant_for(&entry.request);
             state.turn_tool_grants.insert(grant.clone());
             let matching_approval_ids = state
@@ -197,6 +254,28 @@ impl ToolApprovalRegistry {
             state
                 .turn_tool_grants
                 .retain(|grant| grant.session_id != *session_id || grant.turn_id != turn_id);
+            let _ = turn_id;
+            state
+                .denied_session_tool_calls
+                .retain(|fingerprint| fingerprint.session_id != *session_id);
+        }
+    }
+
+    /// 开始一次新的用户请求，清理上一次请求留下的授权决定。
+    ///
+    /// 模型在同一次用户请求内可能经历多个内部执行子轮，不能在子轮边界清理拒绝记忆；
+    /// 只有新的用户请求开始时，才允许相同调用再次进入授权流程。
+    pub fn begin_turn(&self, session_id: &SessionId) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .pending
+                .retain(|_, entry| entry.request.session_id != *session_id);
+            state
+                .turn_tool_grants
+                .retain(|grant| grant.session_id != *session_id);
+            state
+                .denied_session_tool_calls
+                .retain(|fingerprint| fingerprint.session_id != *session_id);
         }
     }
 
@@ -216,8 +295,35 @@ impl ToolApprovalRegistry {
             state
                 .turn_tool_grants
                 .retain(|grant| grant.session_id != *session_id);
+            state
+                .denied_session_tool_calls
+                .retain(|fingerprint| fingerprint.session_id != *session_id);
         }
     }
+}
+
+pub(crate) fn rejected_tool_approval_result(
+    tool_name: &str,
+    approval_id: &str,
+    repeated: bool,
+) -> (String, ExecutionResultStatus) {
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": "rejected",
+            "error_code": "tool_approval_denied",
+            "error": if repeated {
+                "用户已拒绝相同的工具操作，本轮不会再次请求授权"
+            } else {
+                "用户拒绝了本次工具操作"
+            },
+            "approval_id": approval_id,
+            "retryable_with_same_arguments": false,
+            "instruction": "不要重复相同调用；如需继续，请修改操作范围或参数后再尝试。",
+        })
+        .to_string(),
+        ExecutionResultStatus::Rejected,
+    )
 }
 
 #[cfg(test)]
@@ -359,5 +465,76 @@ mod tests {
                 .pending_for_session(&SessionId::new("session-approval"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn deny_remembers_only_the_same_call_within_the_turn() {
+        let registry = ToolApprovalRegistry::default();
+        let first = request("approval-deny-first");
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request_with_arguments(first, r#"{"path":"src/a.txt","content":"a"}"#)
+            .expect("first approval")
+        else {
+            panic!("first request must wait");
+        };
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-deny-first",
+                ToolApprovalDecision::Deny,
+            )
+            .expect("deny approval");
+        assert_eq!(
+            waiter.decision_rx.recv().expect("receive denial"),
+            ToolApprovalDecision::Deny
+        );
+
+        let mut same_call = request("approval-deny-repeat");
+        same_call.tool_call_id = "call-repeat".to_string();
+        assert!(matches!(
+            registry
+                .request_with_arguments(same_call, r#"{ "content": "a", "path": "src/a.txt" }"#,)
+                .expect("same call should be remembered"),
+            ToolApprovalRequestOutcome::PreviouslyDenied
+        ));
+
+        let mut changed_call = request("approval-deny-changed");
+        changed_call.tool_call_id = "call-changed".to_string();
+        assert!(matches!(
+            registry
+                .request_with_arguments(changed_call, r#"{"path":"src/b.txt","content":"a"}"#)
+                .expect("changed call can ask again"),
+            ToolApprovalRequestOutcome::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn deny_memory_is_removed_with_the_turn() {
+        let registry = ToolApprovalRegistry::default();
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request_with_arguments(request("approval-deny-cleanup"), r#"{"path":"a"}"#)
+            .expect("approval")
+        else {
+            panic!("request must wait");
+        };
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-deny-cleanup",
+                ToolApprovalDecision::Deny,
+            )
+            .expect("deny approval");
+        assert_eq!(
+            waiter.decision_rx.recv().expect("receive denial"),
+            ToolApprovalDecision::Deny
+        );
+
+        registry.remove_turn(&SessionId::new("session-approval"), "turn-approval");
+        assert!(matches!(
+            registry
+                .request_with_arguments(request("approval-after-cleanup"), r#"{"path":"a"}"#)
+                .expect("request after turn cleanup"),
+            ToolApprovalRequestOutcome::Pending(_)
+        ));
     }
 }

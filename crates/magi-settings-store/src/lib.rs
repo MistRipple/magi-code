@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 const SESSION_SECTION_PREFIX: &str = "__session__:";
 pub const ORCHESTRATOR_SESSION_DEFAULTS_SECTION: &str = "orchestratorSessionDefaults";
@@ -25,6 +26,8 @@ pub struct SettingsStore {
     sections: RwLock<HashMap<String, Value>>,
     /// 持久化文件路径，为 None 时仅内存模式。
     persistence_path: Option<PathBuf>,
+    /// 配置事实源代际。执行期缓存只允许绑定这个代际，设置变化后自然失效。
+    revision: Arc<AtomicU64>,
 }
 
 impl Default for SettingsStore {
@@ -39,6 +42,7 @@ impl Clone for SettingsStore {
         Self {
             sections: RwLock::new(sections),
             persistence_path: self.persistence_path.clone(),
+            revision: Arc::new(AtomicU64::new(self.revision())),
         }
     }
 }
@@ -48,6 +52,7 @@ impl SettingsStore {
         Self {
             sections: RwLock::new(HashMap::new()),
             persistence_path: None,
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -56,6 +61,7 @@ impl SettingsStore {
         Self {
             sections: RwLock::new(HashMap::new()),
             persistence_path: Some(path),
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -68,6 +74,7 @@ impl SettingsStore {
         Self {
             sections: RwLock::new(sections),
             persistence_path: None,
+            revision: Arc::new(AtomicU64::new(self.revision())),
         }
     }
 
@@ -88,6 +95,7 @@ impl SettingsStore {
                     Self::save_sections(path, &data)?;
                 }
                 *self.sections.write().unwrap() = data;
+                self.revision.fetch_add(1, Ordering::AcqRel);
             }
             Err(error) => {
                 return Err(std::io::Error::new(
@@ -135,7 +143,13 @@ impl SettingsStore {
             }
             return Err(error);
         }
+        self.revision.fetch_add(1, Ordering::AcqRel);
         Ok(result)
+    }
+
+    /// 返回设置事实源的单调代际，用于失效执行期模型、工具和安全策略缓存。
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     pub fn get(&self, key: &str) -> Option<Value> {
@@ -683,6 +697,23 @@ mod tests {
                 "apiProtocol": "openai_chat",
             })
         );
+    }
+
+    #[test]
+    fn revision_invalidates_execution_caches_without_mutating_old_snapshot() {
+        let store = SettingsStore::new();
+        assert_eq!(store.revision(), 0);
+
+        store.set("cacheFlag", json!("a")).unwrap();
+        assert_eq!(store.revision(), 1);
+
+        let snapshot = store.execution_snapshot();
+        assert_eq!(snapshot.revision(), 1);
+
+        store.set("cacheFlag", json!("b")).unwrap();
+        assert_eq!(store.revision(), 2);
+        assert_eq!(snapshot.revision(), 1);
+        assert_eq!(snapshot.get("cacheFlag"), Some(json!("a")));
     }
 
     #[test]

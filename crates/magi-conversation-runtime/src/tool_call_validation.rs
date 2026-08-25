@@ -80,6 +80,27 @@ pub(crate) struct ToolCallFailureDiagnostic {
 }
 
 impl ToolCallFailureDiagnostic {
+    pub(crate) fn non_retryable(issue: &ToolCallValidationIssue) -> Self {
+        Self {
+            schema_version: TOOL_CALL_FAILURE_SCHEMA_VERSION,
+            code: issue.code.clone(),
+            summary: format!(
+                "模型调用了本轮不可用的 {} 工具；工具未执行，已停止继续重试。",
+                issue.tool_name
+            ),
+            detail: format!(
+                "工具：{}\n失败阶段：tool_call_validation\n直接原因：{}\n本轮工具面未提供该工具，继续调用不会改变结果。",
+                issue.tool_name, issue.message
+            ),
+            stage: "tool_call_validation",
+            tool_name: issue.tool_name.clone(),
+            reason_code: issue.reason_code.clone(),
+            missing_fields: issue.missing_fields.clone(),
+            arguments_preview: issue.arguments_preview.clone(),
+            retry_attempts: 0,
+        }
+    }
+
     pub(crate) fn repeated(issue: &ToolCallValidationIssue, retry_attempts: usize) -> Self {
         let missing_fields = if issue.missing_fields.is_empty() {
             "无".to_string()
@@ -113,6 +134,13 @@ impl ToolCallFailureDiagnostic {
             retry_attempts,
         }
     }
+}
+
+pub(crate) fn non_retryable_tool_call_failure(
+    issue: &ToolCallValidationIssue,
+) -> Option<ToolCallFailureDiagnostic> {
+    (issue.reason_code == "tool_not_available")
+        .then(|| ToolCallFailureDiagnostic::non_retryable(issue))
 }
 
 pub(crate) fn validate_tool_call_batch(

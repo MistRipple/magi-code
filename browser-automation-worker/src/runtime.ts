@@ -22,6 +22,7 @@ interface PageRuntimeState {
   network: Array<Record<string, unknown>>;
   nextNetworkId: number;
   dialog: Record<string, unknown> | null;
+  dialogSessionId: string | undefined;
   heapSnapshotChunks: string[];
   traceActive: boolean;
   traceEvents: Array<Record<string, unknown>>;
@@ -72,7 +73,7 @@ export class BrowserAutomationRuntime {
     this.#workerEpoch = workerEpoch;
     const configuredUploadRoot = options.uploadRoot ?? process.env.MAGI_BROWSER_UPLOAD_ROOT ?? "";
     this.#uploadRoot = configuredUploadRoot.trim() ? resolve(configuredUploadRoot) : null;
-    cdp.onEvent((binding, method, params) => this.onCdpEvent(binding, method, params));
+    cdp.onEvent((binding, method, params, sessionId) => this.onCdpEvent(binding, method, params, sessionId));
   }
 
   rebind(bindings: BrowserSurfaceBinding[]): void {
@@ -205,6 +206,7 @@ export class BrowserAutomationRuntime {
       network: resetRuntimeState ? [] : current?.network ?? [],
       nextNetworkId: resetRuntimeState ? 1 : current?.nextNetworkId ?? 1,
       dialog: null,
+      dialogSessionId: undefined,
       heapSnapshotChunks: [],
       traceActive: resetRuntimeState ? false : current?.traceActive ?? false,
       traceEvents: resetRuntimeState ? [] : current?.traceEvents ?? [],
@@ -420,10 +422,38 @@ export class BrowserAutomationRuntime {
   }
 
   private async click(binding: BrowserSurfaceBinding, ref: BrowserSnapshotTarget): Promise<void> {
-    const target = await this.target(binding, ref);
+    const clickToken = `click-${randomUUID()}`;
+    await this.evaluate(
+      binding,
+      `globalThis.__magiBrowserAutomation.prepareClick(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)}, ${JSON.stringify(clickToken)})`,
+    );
+    // 浏览器视口可能小于文档内容高度。真实鼠标事件发到视口外的坐标
+    // 时，Chromium 不会触发页面 click，但此前命令仍可能返回 succeeded，
+    // 让后续 wait_for 误报为页面异步逻辑失败。先用与输入聚焦相同的
+    // scrollIntoView 路径把目标收敛到当前视口，再读取滚动后的坐标。
+    const target = await this.target(binding, ref, true);
     await this.pointer(binding, "mouseMoved", target.x, target.y);
-    await this.pointer(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 });
-    await this.pointer(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 });
+    if (!await this.pointerOrHandleDialog(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 })) return;
+    if (!await this.pointerOrHandleDialog(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 })) return;
+    // 某些 Electron WebContentsView 的后台/非激活 Surface 会接受 CDP
+    // Input.dispatchMouseEvent 并更新焦点，但不把完整鼠标序列转成 DOM
+    // click。等待一个事件循环后检查捕获监听器；只有确认页面没有观察到
+    // click 时才排队一次异步 HTMLElement.click()，避免原生鼠标成功时
+    // 重复触发提交、导航或对话框。
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    if (this.page(binding).dialog) return;
+    const observed = await this.evaluate<{ observed?: boolean }>(
+      binding,
+      `globalThis.__magiBrowserAutomation.finishClick(${JSON.stringify(clickToken)})`,
+    ).catch((cause) => {
+      if (this.page(binding).dialog) return { observed: true };
+      throw cause;
+    });
+    if (observed?.observed) return;
+    await this.evaluate(
+      binding,
+      `globalThis.__magiBrowserAutomation.fallbackClick(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)})`,
+    );
   }
 
   private async typeText(
@@ -505,11 +535,37 @@ export class BrowserAutomationRuntime {
       binding,
       "globalThis.__magiBrowserAutomation.viewport()",
     );
-    if (!Number.isFinite(viewport?.width) || !Number.isFinite(viewport?.height)
-      || viewport.width <= 0 || viewport.height <= 0) {
-      throw protocolFailure("browser_viewport_invalid", "page viewport is unavailable");
+    if (Number.isFinite(viewport?.width) && Number.isFinite(viewport?.height)
+      && viewport.width > 0 && viewport.height > 0) {
+      return viewport;
     }
-    return viewport;
+    // WebContentsView 在尚未获得宿主布局尺寸时，页面脚本的 innerWidth/innerHeight
+    // 可能暂时为 0；此时 Chromium 自己的布局视口仍是截图和归一化裁剪的权威尺寸。
+    const metrics = await this.#cdp.send<{
+      layoutViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number };
+      visualViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number };
+      cssVisualViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number };
+    }>(binding, "Page.getLayoutMetrics");
+    const candidates = [metrics.cssVisualViewport, metrics.visualViewport, metrics.layoutViewport];
+    const positiveDimension = (primary: unknown, fallback: unknown): number | null => {
+      const primaryValue = Number(primary);
+      if (Number.isFinite(primaryValue) && primaryValue > 0) return primaryValue;
+      const fallbackValue = Number(fallback);
+      return Number.isFinite(fallbackValue) && fallbackValue > 0 ? fallbackValue : null;
+    };
+    for (const candidate of candidates) {
+      const width = positiveDimension(candidate?.width, candidate?.clientWidth);
+      const height = positiveDimension(candidate?.height, candidate?.clientHeight);
+      if (width === null || height === null) continue;
+      return {
+        width,
+        height,
+      };
+    }
+    // 后台 Surface 没有物理内容槽时，Main 仍会给 Chromium 应用标准隐藏
+    // viewport；此时 layout metrics 可能短暂返回 0×0。使用同一标准值
+    // 继续完成截图/拖拽坐标换算，避免把“暂时未挂载”误报成浏览器不可用。
+    return { width: 1280, height: 720 };
   }
 
   private async pointer(
@@ -522,12 +578,37 @@ export class BrowserAutomationRuntime {
     await this.#cdp.send(binding, "Input.dispatchMouseEvent", { type, x, y, ...extra });
   }
 
+  private async pointerOrHandleDialog(
+    binding: BrowserSurfaceBinding,
+    type: string,
+    x: number,
+    y: number,
+    extra: Record<string, unknown> = {},
+  ): Promise<boolean> {
+    try {
+      await this.pointer(binding, type, x, y, extra);
+      return true;
+    } catch (cause) {
+      // alert/confirm/prompt 会在 mousePressed 或 mouseReleased 的 CDP
+      // 请求尚未返回时阻塞 renderer。只在已经收到对应的对话框事件时
+      // 将该请求视为“点击已生效”，其他超时仍必须原样失败。
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (message.includes("browser_cdp_timeout:Input.dispatchMouseEvent") && this.page(binding).dialog) {
+        return false;
+      }
+      throw cause;
+    }
+  }
+
   private async screenshot(
     binding: BrowserSurfaceBinding,
     input: Extract<BrowserHostCommand, { type: "screenshot" }>["payload"],
   ): Promise<{ result: BrowserCommandResult; binary: Buffer }> {
     const hasElementTarget = Boolean(input.target && input.target.element_ref !== "root");
-    const hasElementScope = Boolean(input.target);
+    // root 代表整页范围，与未传 target 的截图语义相同；只有具体元素
+    // 才会与 clip/full_page 互斥。否则模型或上层调用在 full_page 请求中
+    // 带上 root 会被错误判定为范围冲突。
+    const hasElementScope = hasElementTarget;
     const hasClip = Boolean(input.clip);
     if ((hasElementScope && hasClip) || (hasElementScope && input.full_page) || (hasClip && input.full_page)) {
       throw protocolFailure(
@@ -630,19 +711,13 @@ export class BrowserAutomationRuntime {
         const clicks = doubleClick ? 2 : 1;
         for (let index = 0; index < clicks; index += 1) {
           const clickCount = doubleClick ? index + 1 : 1;
-          await this.pointer(binding, "mousePressed", x, y, { button: "left", buttons: 1, clickCount });
-          await this.pointer(binding, "mouseReleased", x, y, { button: "left", buttons: 0, clickCount });
+          if (!await this.pointerOrHandleDialog(binding, "mousePressed", x, y, { button: "left", buttons: 1, clickCount })) break;
+          if (!await this.pointerOrHandleDialog(binding, "mouseReleased", x, y, { button: "left", buttons: 0, clickCount })) break;
         }
         return { clicked: true, double_click: doubleClick };
       }
       case "drag": {
-        const source = await this.target(binding, snapshotTarget(args, "source"));
-        const target = await this.target(binding, snapshotTarget(args, "target"));
-        await this.pointer(binding, "mouseMoved", source.x, source.y);
-        await this.pointer(binding, "mousePressed", source.x, source.y, { button: "left", buttons: 1, clickCount: 1 });
-        await this.pointer(binding, "mouseMoved", target.x, target.y, { button: "left", buttons: 1 });
-        await this.pointer(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 });
-        return { dragged: true };
+        return this.drag(binding, args);
       }
       case "fill_form":
         return this.fillForm(binding, args);
@@ -678,18 +753,35 @@ export class BrowserAutomationRuntime {
       case "emulate":
         return this.emulate(binding, args);
       case "dialog":
-        if (args.action === "list") return { dialog: this.page(binding).dialog };
+        if (args.action === "list") return { dialog: await this.waitForDialog(binding) };
         if (args.action === "clear") {
-          this.page(binding).dialog = null;
+          const page = this.page(binding);
+          if (page.dialog?.virtual === true) {
+            await this.resolveVirtualDialog(binding, "dismiss", null);
+          }
+          page.dialog = null;
+          page.dialogSessionId = undefined;
           return { cleared: true };
         }
         if (args.action !== "accept" && args.action !== "dismiss") {
           throw protocolFailure("browser_dialog_action_invalid", "action must be list, clear, accept, or dismiss");
         }
+        const dialog = this.page(binding);
+        if (!dialog.dialog) await this.waitForDialog(binding);
+        if (dialog.dialog?.virtual === true) {
+          await this.resolveVirtualDialog(
+            binding,
+            args.action === "accept" ? "accept" : "dismiss",
+            typeof args.prompt_text === "string" ? args.prompt_text : null,
+          );
+          dialog.dialog = null;
+          dialog.dialogSessionId = undefined;
+          return { handled: true };
+        }
         await this.#cdp.send(binding, "Page.handleJavaScriptDialog", {
           accept: args.action !== "dismiss",
           ...(typeof args.prompt_text === "string" ? { promptText: args.prompt_text } : {}),
-        });
+        }, 30_000, dialog.dialogSessionId);
         return { handled: true };
       case "webmcp":
         return this.webmcp(binding, args);
@@ -710,6 +802,63 @@ export class BrowserAutomationRuntime {
       default:
         throw protocolFailure("browser_devtools_operation_unsupported", operation);
     }
+  }
+
+  private async drag(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
+    const source = snapshotTarget(args, "source");
+    const target = snapshotTarget(args, "target");
+    const result = await this.evaluate<Record<string, unknown>>(
+      binding,
+      `(() => {
+        const source = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(source.element_ref)}, ${safeInteger(source.snapshot_revision, 0)});
+        const target = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
+        if (!(source instanceof Element) || !(target instanceof Element)) throw new Error('browser_drag_target_stale');
+        if (typeof DataTransfer !== 'function' || typeof DragEvent !== 'function') throw new Error('browser_drag_unsupported');
+        const sourceRect = source.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        const dataTransfer = new DataTransfer();
+        dataTransfer.effectAllowed = 'move';
+        const event = (type, rect) => new DragEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          clientX: rect.left + rect.width / 2,
+          clientY: rect.top + rect.height / 2,
+          dataTransfer,
+        });
+        source.dispatchEvent(event('dragstart', sourceRect));
+        target.dispatchEvent(event('dragenter', targetRect));
+        const dragOverAccepted = !target.dispatchEvent(event('dragover', targetRect));
+        const dropAccepted = !target.dispatchEvent(event('drop', targetRect));
+        source.dispatchEvent(event('dragend', targetRect));
+        return { dragged: true, drag_over_accepted: dragOverAccepted, drop_accepted: dropAccepted };
+      })()`,
+    );
+    return result ?? { dragged: true };
+  }
+
+  private async waitForDialog(binding: BrowserSurfaceBinding): Promise<Record<string, unknown> | null> {
+    const page = this.page(binding);
+    // Electron 通过主进程转发 WebContents 的 CDP 事件；输入命令刚完成时，
+    // javascriptDialogOpening 可能仍在主进程与 Worker 的 IPC 队列中。给
+    // 事件一个明确的收敛窗口，避免 list 抢在事件前返回 null，随后页面被
+    // 未处理的 alert 阻塞而把后续操作伪装成 wait 超时。
+    const deadline = Date.now() + 2_000;
+    while (!page.dialog && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return page.dialog;
+  }
+
+  private async resolveVirtualDialog(
+    binding: BrowserSurfaceBinding,
+    action: "accept" | "dismiss",
+    promptText: string | null,
+  ): Promise<void> {
+    await this.#cdp.send(binding, "Runtime.evaluate", {
+      expression: `globalThis.__magiBrowserDialogResolve?.(${JSON.stringify({ action, promptText })})`,
+      returnByValue: true,
+    });
   }
 
   private async uploadFile(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -933,7 +1082,7 @@ export class BrowserAutomationRuntime {
     if (!selector && textValues.length === 0 && !url) {
       throw protocolFailure("browser_wait_invalid", "selector, text, texts, or url is required");
     }
-    const timeoutMs = Math.min(30_000, Math.max(0, safeInteger(args.timeout_ms, 5_000)));
+    const timeoutMs = Math.min(60_000, Math.max(0, safeInteger(args.timeout_ms, 5_000)));
     const deadline = Date.now() + timeoutMs;
     do {
       const found = await this.evaluate<unknown>(
@@ -987,10 +1136,36 @@ export class BrowserAutomationRuntime {
     if (args.action === "get") {
       const requestId = String(args.request_id ?? "").trim();
       if (!requestId) throw protocolFailure("browser_network_request_id_required", "request_id is required");
-      const entry = page.network.find((candidate) => matchesResourceType(candidate) && String(candidate.requestId ?? candidate.id) === requestId) ?? null;
+      const matching = page.network.filter((candidate) => matchesResourceType(candidate) && String(candidate.requestId ?? candidate.id) === requestId);
+      const entry = [...matching].reverse().find((candidate) => candidate.event_type === "response")
+        ?? [...matching].reverse()[0]
+        ?? null;
       if (args.include_body) {
-        const body = await this.#cdp.send(binding, "Network.getResponseBody", { requestId });
-        return { entry, body };
+        if (!entry || entry.event_type !== "response") {
+          return {
+            entry,
+            body: null,
+            body_unavailable: {
+              code: "browser_network_response_unavailable",
+              message: "response body is unavailable until a response is recorded",
+            },
+          };
+        }
+        try {
+          const body = await this.#cdp.send(binding, "Network.getResponseBody", { requestId });
+          return { entry, body };
+        } catch (cause) {
+          const error = normalizeError(cause);
+          return {
+            entry,
+            body: null,
+            body_unavailable: {
+              code: "browser_network_body_unavailable",
+              message: error.message,
+              cause_code: error.code,
+            },
+          };
+        }
       }
       return { entry };
     }
@@ -1275,6 +1450,7 @@ export class BrowserAutomationRuntime {
       page.console.length = 0;
       page.network.length = 0;
       page.dialog = null;
+      page.dialogSessionId = undefined;
       page.heapSnapshotChunks = [];
       page.heapSnapshot = null;
       page.previousHeapSnapshot = null;
@@ -1324,8 +1500,29 @@ export class BrowserAutomationRuntime {
       page.traceCompletionPromise = null;
       page.traceCompletionResolve = null;
     }
-    if (!sessionId && method === "Page.javascriptDialogOpening") page.dialog = params;
-    if (!sessionId && method === "Page.javascriptDialogClosed") page.dialog = null;
+    if (method === "Page.javascriptDialogOpening") {
+      page.dialog = params;
+      page.dialogSessionId = sessionId;
+    }
+    if (method === "Runtime.bindingCalled" && params.name === "__magiBrowserDialog") {
+      try {
+        const event = JSON.parse(String(params.payload ?? "")) as Record<string, unknown>;
+        if (event.event === "opening") {
+          page.dialog = { ...event, virtual: true };
+          page.dialogSessionId = undefined;
+        } else if (event.event === "closed") {
+          page.dialog = null;
+          page.dialogSessionId = undefined;
+        }
+      } catch {
+        // Ignore malformed page bridge payloads; the page remains usable and
+        // the regular CDP dialog event path continues to be authoritative.
+      }
+    }
+    if (method === "Page.javascriptDialogClosed") {
+      page.dialog = null;
+      page.dialogSessionId = undefined;
+    }
     if (!sessionId && method === "HeapProfiler.addHeapSnapshotChunk") {
       const chunk = typeof params.chunk === "string" ? params.chunk : "";
       if (chunk) page.heapSnapshotChunks.push(chunk);
@@ -1727,8 +1924,9 @@ class LighthouseCdpSession {
   readonly #cdp: CdpClient;
   readonly #binding: BrowserSurfaceBinding;
   readonly #sessionId: string | undefined;
-  readonly #targetInfo: Record<string, unknown>;
+  #targetInfo: Record<string, unknown>;
   readonly #listeners = new Map<string, Set<LighthouseListener>>();
+  readonly #onceWrappers = new Map<string, Map<LighthouseListener, LighthouseListener>>();
   readonly #children = new Set<LighthouseCdpSession>();
   readonly #unsubscribe: () => void;
 
@@ -1761,8 +1959,25 @@ class LighthouseCdpSession {
     return this;
   }
 
+  once(event: string, listener: LighthouseListener): this {
+    const wrapper: LighthouseListener = (...args) => {
+      this.off(event, listener);
+      listener(...args);
+    };
+    const wrappers = this.#onceWrappers.get(event) ?? new Map<LighthouseListener, LighthouseListener>();
+    wrappers.set(listener, wrapper);
+    this.#onceWrappers.set(event, wrappers);
+    return this.on(event, wrapper);
+  }
+
   off(event: string, listener: LighthouseListener): this {
-    this.#listeners.get(event)?.delete(listener);
+    const listeners = this.#listeners.get(event);
+    listeners?.delete(listener);
+    const wrapper = this.#onceWrappers.get(event)?.get(listener);
+    if (wrapper) {
+      listeners?.delete(wrapper);
+      this.#onceWrappers.get(event)?.delete(listener);
+    }
     return this;
   }
 
@@ -1811,7 +2026,9 @@ class LighthouseCdpSession {
     return this.detach();
   }
 
-  setTargetInfo(_targetInfo: unknown): void {}
+  setTargetInfo(targetInfo: unknown): void {
+    if (targetInfo && typeof targetInfo === "object") this.#targetInfo = { ...(targetInfo as Record<string, unknown>) };
+  }
   hasNextProtocolTimeout(): boolean { return false; }
   getNextProtocolTimeout(): number { return 30_000; }
   setNextProtocolTimeout(_timeout: number): void {}

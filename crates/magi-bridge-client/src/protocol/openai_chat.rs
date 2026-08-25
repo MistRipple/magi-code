@@ -271,6 +271,28 @@ mod tests {
     }
 
     #[test]
+    fn developer_message_role_is_preserved_for_chat_completions() {
+        let params = base_params(vec![
+            LlmMessage {
+                role: "developer".to_string(),
+                content: LlmMessageContent::Text("当前权限快照".to_string()),
+            },
+            LlmMessage {
+                role: "user".to_string(),
+                content: LlmMessageContent::Text("继续执行".to_string()),
+            },
+        ]);
+        let adapted = OpenAiChatCompletionsAdapter
+            .build_request(&params, "gpt-4o")
+            .expect("build");
+        let messages = adapted.body["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["role"], "developer");
+        assert_eq!(messages[0]["content"], "当前权限快照");
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
     fn cache_boundary_marker_message_is_stripped() {
         let params = base_params(vec![
             LlmMessage {

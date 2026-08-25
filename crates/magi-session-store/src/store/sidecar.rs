@@ -420,6 +420,36 @@ fn upsert_canonical_turn_in_state(
     Ok(())
 }
 
+/// 流式正文已经存在于 canonical turn 时，只替换当前 item。
+///
+/// 普通 item 更新仍走完整投影以保持校验和元数据收口；只有同一个流式 item 的
+/// 连续快照允许走这里，从而避免每个 delta 都把整轮所有 item 重新转换一遍。
+fn upsert_canonical_stream_item_in_state(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+    item: &ActiveExecutionTurnItem,
+) -> DomainResult<bool> {
+    let Some(canonical_turn) = state
+        .canonical_turns
+        .iter_mut()
+        .find(|existing| existing.session_id == *session_id && existing.turn_id == turn.turn_id)
+    else {
+        return Ok(false);
+    };
+    let incoming = current_turn_item_to_canonical_item(session_id, turn, item)?;
+    let Some(existing_item) = canonical_turn
+        .items
+        .iter_mut()
+        .find(|existing| existing.item_id == incoming.item_id)
+    else {
+        return Ok(false);
+    };
+    incoming.validate_update_from(existing_item)?;
+    *existing_item = incoming;
+    Ok(true)
+}
+
 fn turn_matches_owner_id(turn: &CanonicalTurn, owner_id: &str) -> bool {
     turn.turn_id == owner_id
         || turn.items.iter().any(|item| {
@@ -2856,6 +2886,8 @@ impl SessionStore {
         expected_turn_id: Option<&str>,
         mut item: ActiveExecutionTurnItem,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let stream_item_id = item.item_id.clone();
+        let use_stream_item_projection: Option<bool>;
         let updated = {
             let mut state = self
                 .state
@@ -2883,6 +2915,16 @@ impl SessionStore {
                         active_turn_id: turn.turn_id.clone(),
                     });
                 }
+
+                use_stream_item_projection = Some(
+                    matches!(
+                        item.kind.as_str(),
+                        "assistant_stream" | "assistant_thinking"
+                    ) && turn
+                        .items
+                        .iter()
+                        .any(|existing| existing.item_id == stream_item_id),
+                );
 
                 if let Some(existing) = turn
                     .items
@@ -2929,7 +2971,23 @@ impl SessionStore {
             if let Some(updated) = updated.as_ref()
                 && let Some(turn) = updated.current_turn.as_ref()
             {
-                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+                let stream_item_updated = if use_stream_item_projection.unwrap_or(false) {
+                    turn.items
+                        .iter()
+                        .find(|item| item.item_id == stream_item_id)
+                        .map(|item| {
+                            upsert_canonical_stream_item_in_state(
+                                &mut state, session_id, turn, item,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !stream_item_updated {
+                    upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+                }
             }
             updated
         };
