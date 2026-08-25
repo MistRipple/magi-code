@@ -134,10 +134,21 @@ assert.match(
   /Emulation\.setDeviceMetricsOverride[\s\S]*?deviceScaleFactor: viewport\.device_scale_factor_millis \/ 1_000[\s\S]*?screenWidth: width[\s\S]*?screenHeight: height/u,
   "固定响应式视口必须使用 Chromium 原生设备指标和设备像素比",
 );
-assert.doesNotMatch(
+assert.match(
   surfaceManager,
+  /const ALLOWED_WORKER_CDP_METHODS = new Set\(\[[\s\S]*?"Emulation\.setTouchEmulationEnabled"/u,
+  "Lighthouse 触控仿真命令必须经过 Worker CDP 白名单",
+);
+const viewportMethods = section(
+  surfaceManager,
+  "private async applyViewport(",
+  "private scheduleViewportApply(",
+  "BrowserSurfaceManager.applyViewport",
+);
+assert.doesNotMatch(
+  viewportMethods,
   /Emulation\.setTouchEmulationEnabled/u,
-  "桌面 WebContentsView 不应调用会阻塞 CDP lane 的触控仿真命令",
+  "桌面 viewport 应用不能直接调用触控仿真命令",
 );
 assert.match(
   surfaceManager,
@@ -165,10 +176,10 @@ assert.match(
   /内容槽只管理原生 View 的物理承载范围[\s\S]*?不能重新提交[\s\S]*?fixed/u,
   "右栏尺寸变化只能更新原生内容槽，不得改写 Tab 级 CSS viewport",
 );
-assert.doesNotMatch(
+assert.match(
   applySlotSection,
-  /scheduleViewportApply\(record\)/u,
-  "右栏尺寸变化不得重新提交 viewport",
+  /record\.viewport\.mode === "auto" && wasSlotVisible !== record\.slotVisible[\s\S]*?scheduleViewportApply\(record\)/u,
+  "仅在 Surface 可见性切换时恢复 auto viewport，右栏尺寸变化不触发 viewport 重算",
 );
 assert.match(
   surfaceManager,
