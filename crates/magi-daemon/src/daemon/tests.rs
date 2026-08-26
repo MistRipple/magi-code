@@ -2478,22 +2478,12 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
         .expect("session id should serialize as string")
         .to_string();
 
-    let workspace_sessions_path = state_root
-        .join("test-workspace")
-        .join(".magi")
-        .join("sessions.json");
-    let durable_payload = fs::read_to_string(&workspace_sessions_path)
-        .expect("workspace sessions durable state should be written immediately");
+    let accepted_journal_path = state_root.join("accepted-submissions.json");
+    let durable_payload = fs::read_to_string(&accepted_journal_path)
+        .expect("accepted journal should be written before the HTTP response");
     assert!(
         durable_payload.contains("request-no-subscriber-recovery"),
-        "durable state should contain accepted turn before any SSE subscriber is present"
-    );
-
-    let sidecar_payload = fs::read_to_string(state_root.join("session-sidecars.json"))
-        .expect("session sidecar state should be written immediately");
-    assert!(
-        sidecar_payload.contains("request-no-subscriber-recovery"),
-        "sidecar state should contain accepted current turn before periodic maintenance"
+        "accepted journal should contain the turn before any SSE subscriber is present"
     );
 
     drop(app);
@@ -2633,10 +2623,9 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
         "workspace two bootstrap should include its own message"
     );
 
-    let workspace_two_durable =
-        fs::read_to_string(second_workspace_root.join(".magi").join("sessions.json"))
-            .expect("workspace two sessions state should persist");
-    assert!(workspace_two_durable.contains("request-workspace-two-isolated"));
+    let accepted_journal = fs::read_to_string(state_root.join("accepted-submissions.json"))
+        .expect("accepted journal should persist workspace two submission");
+    assert!(accepted_journal.contains("request-workspace-two-isolated"));
 }
 
 #[tokio::test]

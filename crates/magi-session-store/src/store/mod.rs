@@ -7,9 +7,9 @@ mod tests;
 
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
-    NotificationContext, NotificationRecord, NotificationScope, SessionDurableState,
-    SessionExecutionSidecarStoreState, SessionPlan, SessionRecord, SessionSidecarFlushReason,
-    SessionStoreState, TimelineEntry, TimelineEntryKind,
+    NotificationContext, NotificationRecord, NotificationScope, SessionAcceptanceRecord,
+    SessionDurableState, SessionExecutionSidecarStoreState, SessionPlan, SessionRecord,
+    SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis};
 use std::sync::{Arc, Mutex, RwLock};
@@ -204,6 +204,119 @@ impl SessionStore {
         sidecar::reconcile_terminal_goal_continuations(&mut state);
         sidecar::reconcile_goal_response_duration_scopes(&mut state);
         Self::from_state(state)
+    }
+
+    /// 将 accepted journal 合并回内存状态。
+    ///
+    /// journal 只在完整 snapshot 成功后删除，因此这里必须允许它与旧 snapshot
+    /// 重复出现；已有终态事实优先，不能被一条过期的 accepted 记录覆盖。
+    pub fn restore_session_acceptance_records(
+        &self,
+        records: impl IntoIterator<Item = SessionAcceptanceRecord>,
+    ) -> usize {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let mut restored = 0;
+        for record in records {
+            let SessionAcceptanceRecord {
+                session,
+                timeline_entry,
+                canonical_turn,
+                sidecar,
+            } = record;
+            let session_id = session.session_id.clone();
+            let turn_id = canonical_turn.turn_id.clone();
+            let mut changed = false;
+
+            if !state
+                .sessions
+                .iter()
+                .any(|existing| existing.session_id == session_id)
+            {
+                state.sessions.push(session);
+                changed = true;
+            }
+            if !state
+                .timeline
+                .iter()
+                .any(|existing| existing.entry_id == timeline_entry.entry_id)
+            {
+                state.timeline.push(timeline_entry);
+                changed = true;
+            }
+
+            let canonical_index = state.canonical_turns.iter().position(|existing| {
+                existing.session_id == session_id && existing.turn_id == turn_id
+            });
+            if canonical_index.is_none() {
+                state.canonical_turns.push(canonical_turn.clone());
+                changed = true;
+            }
+
+            let sidecar_index = state
+                .execution_sidecar_store
+                .runtime_sidecars
+                .iter()
+                .position(|existing| existing.session_id == session_id);
+            match sidecar_index {
+                Some(index) => {
+                    let should_replace = state.execution_sidecar_store.runtime_sidecars[index]
+                        .current_turn
+                        .as_ref()
+                        .is_none_or(|current| {
+                            current.turn_id != turn_id
+                                && Self::acceptance_turn_is_newer(&canonical_turn, current)
+                        });
+                    if should_replace {
+                        state.execution_sidecar_store.runtime_sidecars[index] = sidecar;
+                        changed = true;
+                    }
+                }
+                None => {
+                    state.execution_sidecar_store.runtime_sidecars.push(sidecar);
+                    changed = true;
+                }
+            }
+            if state.current_session_id.is_none() {
+                state.current_session_id = Some(session_id);
+                changed = true;
+            }
+            if changed {
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            state
+                .execution_sidecar_store
+                .runtime_sidecars
+                .sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
+            state.canonical_turns.sort_by(|left, right| {
+                left.turn_seq
+                    .cmp(&right.turn_seq)
+                    .then_with(|| left.turn_id.cmp(&right.turn_id))
+            });
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
+        }
+        restored
+    }
+
+    /// 比较 accepted journal 中的 Turn 与当前 sidecar Turn，保证旧 journal
+    /// 不能覆盖更新的活动轮次。`turn_id` 是同一时间戳下的最终稳定排序键。
+    fn acceptance_turn_is_newer(
+        candidate: &crate::models::CanonicalTurn,
+        current: &crate::models::ActiveExecutionTurn,
+    ) -> bool {
+        (
+            candidate.accepted_at.0,
+            candidate.turn_seq,
+            candidate.turn_id.as_str(),
+        ) > (
+            current.accepted_at.0,
+            current.turn_seq,
+            current.turn_id.as_str(),
+        )
     }
 
     /// 串行化完整 durable snapshot 持久化事务。快照必须在锁内生成，避免较早请求

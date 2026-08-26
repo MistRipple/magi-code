@@ -567,6 +567,18 @@ pub struct SessionRuntimeSidecarExport {
     pub active_execution_chain: Option<ActiveExecutionChain>,
 }
 
+/// accepted journal 用于在完整 session snapshot 尚未异步落盘前保留一条可恢复的提交事实。
+///
+/// 该记录只包含本次提交新增的 session、timeline、canonical turn 与运行 sidecar，
+/// 不复制整个历史会话；维护线程完成完整 snapshot 后会删除对应 journal。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionAcceptanceRecord {
+    pub session: SessionRecord,
+    pub timeline_entry: TimelineEntry,
+    pub canonical_turn: CanonicalTurn,
+    pub sidecar: SessionRuntimeSidecar,
+}
+
 impl SessionRuntimeSidecar {
     pub fn export_view(&self) -> SessionRuntimeSidecarExport {
         SessionRuntimeSidecarExport {

@@ -446,7 +446,7 @@ pub fn run_dispatch_submission(
         denied_tools: request.denied_tools.clone(),
         plan_item_id: plan_item_id.clone(),
     });
-    runtime.task_store.insert_task(task);
+    runtime.task_store.insert_task_without_checkpoint(task);
     if let Some(plan_item_id) = plan_item_id {
         match plan_store.bind_task(act_task_id.clone(), plan_item_id) {
             Ok(_) => {}

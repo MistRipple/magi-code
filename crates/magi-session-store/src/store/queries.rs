@@ -1,7 +1,7 @@
 use super::{SessionStore, cmp_sessions_newest_first, with_session_message_count};
 use crate::models::{
-    ActiveExecutionChain, NotificationContext, NotificationRecord, SessionDurableState,
-    SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
+    ActiveExecutionChain, NotificationContext, NotificationRecord, SessionAcceptanceRecord,
+    SessionDurableState, SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
     SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, TimelineEntry,
 };
 use magi_core::{ExecutionOwnership, SessionId};
@@ -454,6 +454,59 @@ impl SessionStore {
             .expect("session state read lock poisoned")
             .execution_sidecar_store
             .runtime_sidecar(session_id)
+    }
+
+    /// 构造一条仅覆盖当前 accepted Turn 的最小恢复记录。
+    pub fn session_acceptance_record(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Option<SessionAcceptanceRecord> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| &session.session_id == session_id)?
+            .clone();
+        let sidecar = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| {
+                &sidecar.session_id == session_id
+                    && sidecar
+                        .current_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.turn_id == turn_id)
+            })?
+            .clone();
+        let canonical_turn = state
+            .canonical_turns
+            .iter()
+            .find(|turn| &turn.session_id == session_id && turn.turn_id == turn_id)?
+            .clone();
+        let entry_id = sidecar
+            .active_execution_chain
+            .as_ref()
+            .map(|chain| chain.dispatch_context.entry_id.as_str())
+            .or_else(|| {
+                sidecar.current_turn.as_ref().and_then(|turn| {
+                    turn.items
+                        .iter()
+                        .find_map(|item| item.timeline_entry_id.as_deref())
+                })
+            })?;
+        let timeline_entry = state
+            .timeline
+            .iter()
+            .find(|entry| &entry.session_id == session_id && entry.entry_id == entry_id)?
+            .clone();
+        Some(SessionAcceptanceRecord {
+            session,
+            timeline_entry,
+            canonical_turn,
+            sidecar,
+        })
     }
 
     pub fn active_execution_sidecars(&self) -> Vec<SessionRuntimeSidecar> {

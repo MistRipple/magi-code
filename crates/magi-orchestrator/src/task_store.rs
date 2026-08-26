@@ -211,6 +211,18 @@ impl TaskStore {
 
     /// 插入一个任务并更新索引。
     pub fn insert_task(&self, task: Task) {
+        self.insert_task_inner(task, true);
+    }
+
+    /// 插入一个任务并更新索引，但把 checkpoint 交给后续状态迁移或 accepted journal。
+    ///
+    /// 派发提交阶段不能因为已有 task-store 全量快照而阻塞 HTTP accepted；调用方必须
+    /// 在返回 accepted 前写入自己的小型恢复记录，随后由后台状态迁移完成完整 checkpoint。
+    pub fn insert_task_without_checkpoint(&self, task: Task) {
+        self.insert_task_inner(task, false);
+    }
+
+    fn insert_task_inner(&self, task: Task, checkpoint: bool) {
         let task_id = task.task_id.clone();
         let mission_id = task.mission_id.clone();
         self.tasks
@@ -224,7 +236,9 @@ impl TaskStore {
             .entry(mission_id)
             .or_default()
             .push(task_id.clone());
-        self.fire_checkpoint();
+        if checkpoint {
+            self.fire_checkpoint();
+        }
     }
 
     /// 通过 ID 获取任务。

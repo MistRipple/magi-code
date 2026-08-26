@@ -130,6 +130,8 @@ pub struct RunnerHandle {
 type RunnerTerminalObserver =
     Arc<dyn Fn(TaskId, Option<SessionId>, String, Option<String>) + Send + Sync>;
 pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<(), ApiError> + Send + Sync>;
+pub type SessionTaskAcceptancePersist =
+    Arc<dyn Fn(&SessionId, &str, &TaskId) -> Result<(), ApiError> + Send + Sync>;
 
 fn snapshot_baseline_patch(
     entries: Vec<magi_git::GitTreeBaselineEntry>,
@@ -1111,6 +1113,7 @@ pub struct ApiState {
     pub appearance_library: Arc<magi_appearance::AppearanceLibrary>,
     runtime_persistence: Option<Arc<RuntimeStatePersistence>>,
     session_state_checkpoint_persist: Option<SessionStateCheckpointPersist>,
+    session_task_acceptance_persist: Option<SessionTaskAcceptancePersist>,
     bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider,
     bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider,
     bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider,
@@ -1504,6 +1507,7 @@ impl ApiState {
             appearance_library: Arc::new(magi_appearance::AppearanceLibrary::in_memory()),
             runtime_persistence: None,
             session_state_checkpoint_persist: None,
+            session_task_acceptance_persist: None,
             bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider::default(),
             bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider::default(),
             bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider::default(),
@@ -2919,6 +2923,27 @@ impl ApiState {
     ) -> Self {
         self.session_state_checkpoint_persist = Some(persist);
         self
+    }
+
+    pub fn with_session_task_acceptance_persist(
+        mut self,
+        persist: SessionTaskAcceptancePersist,
+    ) -> Self {
+        self.session_task_acceptance_persist = Some(persist);
+        self
+    }
+
+    /// 在 HTTP accepted 返回前写入最小提交恢复记录；完整 session/task snapshot 由后台维护线程处理。
+    pub fn persist_session_task_acceptance(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        root_task_id: &TaskId,
+    ) -> Result<(), ApiError> {
+        if let Some(persist) = &self.session_task_acceptance_persist {
+            persist(session_id, turn_id, root_task_id)?;
+        }
+        Ok(())
     }
 
     pub fn persist_session_state_checkpoint(&self, checkpoint: &str) -> Result<(), ApiError> {

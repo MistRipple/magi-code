@@ -211,7 +211,11 @@ pub(super) async fn accept_goal_continuation_task_submission(
         turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
-    if let Err(error) = state.persist_session_state_checkpoint("goal_continuation_accepted") {
+    if let Err(error) = state.persist_session_task_acceptance(
+        &accepted.session_id,
+        &accepted.turn_id,
+        &accepted.root_task_id,
+    ) {
         fail_accepted_task_submission(state, &accepted, error.message());
         return Err(error);
     }
@@ -385,7 +389,11 @@ async fn execute_dispatch_submission(
             return Err(error);
         }
     };
-    if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_accepted") {
+    if let Err(error) = state.persist_session_task_acceptance(
+        &accepted.session_id,
+        &accepted.turn_id,
+        &accepted.root_task_id,
+    ) {
         fail_accepted_task_submission(state, &accepted, error.message());
         return Err(error);
     }

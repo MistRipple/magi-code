@@ -890,6 +890,7 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
 #[derive(Clone)]
 pub(crate) struct DaemonRuntime {
     state_root: PathBuf,
+    state_repository: StateRepository,
     local_port: u16,
     event_bus: Arc<InMemoryEventBus>,
     session_store: Arc<SessionStore>,
@@ -919,10 +920,16 @@ impl DaemonRuntime {
 
         // 从全局未绑定会话和各工作区 .magi/sessions.json 加载会话。
         let session_durable = state_repository.load_sessions_from_workspaces(&workspace_roots)?;
+        let accepted_submissions = state_repository.load_accepted_submissions()?;
         let session_store = Arc::new(SessionStore::from_persisted_parts(
             session_durable,
             state_repository.load_session_sidecars()?,
         ));
+        session_store.restore_session_acceptance_records(
+            accepted_submissions
+                .into_iter()
+                .map(|record| record.session),
+        );
         let knowledge_store = Arc::new(KnowledgeStore::from_state(
             state_repository.load_knowledge_state()?,
         ));
@@ -954,6 +961,7 @@ impl DaemonRuntime {
 
         Ok(Self {
             state_root: config.state_root.clone(),
+            state_repository,
             local_port: config.port,
             event_bus,
             session_store,
@@ -1029,7 +1037,7 @@ impl DaemonRuntime {
             .attach_recovery_ref(&session_id, Some(recovery.recovery_id))
             .map_err(|error| DaemonError::internal(format!("绑定测试恢复入口失败: {error}")))?;
 
-        let state_repository = StateRepository::new(config.state_root.clone());
+        let state_repository = runtime.state_repository.clone();
         let runtime_persistence = RuntimeSidecarPersistence::new(
             state_repository.clone(),
             runtime.session_store.clone(),
@@ -1397,7 +1405,7 @@ impl DaemonRuntime {
         let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
         let worker_runtime = self.worker_runtime.clone();
         let tool_registry_for_dispatcher = tool_registry.clone();
-        let task_store_checkpoint_path = self.state_root.join("task-store.json");
+        let task_store_checkpoint_path = self.state_repository.task_store_checkpoint_path();
         let event_bus_for_task_store = self.event_bus.clone();
         let session_store_for_task_status = self.session_store.clone();
         let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
@@ -1472,6 +1480,18 @@ impl DaemonRuntime {
                 )))
             }
         };
+        let accepted_submissions = self.state_repository.load_accepted_submissions()?;
+        let restored_accepted_task_count = accepted_submissions
+            .iter()
+            .filter(|record| {
+                if task_store.get_task(&record.task.task_id).is_some() {
+                    false
+                } else {
+                    task_store.insert_task_without_checkpoint(record.task.clone());
+                    true
+                }
+            })
+            .count();
         let reconciled_threads = reconcile_terminal_task_execution_threads(
             self.session_store.as_ref(),
             task_store.as_ref(),
@@ -1505,11 +1525,33 @@ impl DaemonRuntime {
         }
         let spawn_graph = Arc::new(std::sync::Mutex::new(rebuilt_spawn_graph));
         let task_store_checkpoint_path_for_callback = task_store_checkpoint_path.clone();
+        let accepted_submission_repository = self.state_repository.clone();
+        let accepted_submission_repository_for_callback = accepted_submission_repository.clone();
         task_store.set_checkpoint_callback(Box::new(move |store| {
             if let Err(error) = store.checkpoint_to_file(&task_store_checkpoint_path_for_callback) {
                 warn!(?error, "任务状态 checkpoint 持久化失败");
+                return;
+            }
+            if let Err(error) =
+                accepted_submission_repository_for_callback.mark_task_acceptances_durable(store)
+            {
+                warn!(?error, "清理已完成 accepted journal 失败");
             }
         }));
+        if restored_accepted_task_count > 0 {
+            task_store
+                .checkpoint_to_file(&task_store_checkpoint_path)
+                .map_err(|error| {
+                    DaemonError::internal(format!("恢复 accepted task 失败: {error}"))
+                })?;
+            if let Err(error) =
+                accepted_submission_repository.mark_task_acceptances_durable(task_store.as_ref())
+            {
+                warn!(?error, "恢复 accepted task 后清理 journal 失败");
+            }
+        } else if let Err(error) = accepted_submission_repository.prune_accepted_submissions() {
+            warn!(?error, "启动时清理 accepted journal 失败");
+        }
         // 单一事实源：dispatch summary（execution_runtime）与 prompt 注入（LlmTaskDispatcher）
         // 使用同一份 ContextBudget。max_memory ≥ 一批 session-memory 的 slice 数（=5），
         // 否则辅助模型提取的 5 条 slice 会被预算切断、只投放前两条进 prompt。
@@ -1532,7 +1574,7 @@ impl DaemonRuntime {
             );
 
         let session_checkpoint_persistence = RuntimeSidecarPersistence::new(
-            StateRepository::new(self.state_root.clone()),
+            self.state_repository.clone(),
             self.session_store.clone(),
             self.workspace_store.clone(),
             self.worker_runtime.clone(),
@@ -1574,6 +1616,27 @@ impl DaemonRuntime {
         .with_tunnel_port(self.local_port)
         .with_runtime_persistence(runtime_persistence)
         .with_session_state_checkpoint_persist(session_state_checkpoint_persist)
+        .with_session_task_acceptance_persist({
+            let repository = self.state_repository.clone();
+            let session_store = self.session_store.clone();
+            let task_store = task_store.clone();
+            Arc::new(move |session_id, turn_id, root_task_id| {
+                repository
+                    .save_accepted_submission(
+                        &session_store,
+                        session_id,
+                        turn_id,
+                        &task_store,
+                        root_task_id,
+                    )
+                    .map_err(|error| {
+                        ApiError::internal_assembly(
+                            "session/task accepted journal 持久化失败",
+                            error,
+                        )
+                    })
+            })
+        })
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
@@ -1890,7 +1953,7 @@ impl DaemonRuntime {
     }
 
     fn flush_reconciled_runtime_sidecars(&self, warning: &'static str) {
-        let repository = StateRepository::new(self.state_root.clone());
+        let repository = self.state_repository.clone();
         let persistence = RuntimeSidecarPersistence::new(
             repository,
             self.session_store.clone(),

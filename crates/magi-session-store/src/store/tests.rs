@@ -3,11 +3,11 @@ use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
     ExecutionThreadStatus, GoalContinuationPhase, GoalContinuationState, GoalRevisionExpectation,
-    GoalStatus, NotificationContext, NotificationRecord, NotificationScope, SessionDurableState,
-    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
-    SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
-    ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
-    ThreadModelProviderContext,
+    GoalStatus, NotificationContext, NotificationRecord, NotificationScope,
+    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStatus,
+    SessionExecutionSidecarStoreState, SessionPlan, SessionSidecarFlushReason, SessionStoreState,
+    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint,
+    ThreadFileFactVersion, ThreadModelProviderContext,
 };
 use magi_core::{
     AccessProfile, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
@@ -74,6 +74,91 @@ fn test_active_chain(
         },
         current_turn: turn,
     }
+}
+
+fn acceptance_record(
+    session_id: &SessionId,
+    turn_id: &str,
+    accepted_at: u64,
+    chain_ref: &str,
+) -> (SessionStore, SessionAcceptanceRecord) {
+    let store = SessionStore::new();
+    store
+        .create_session(session_id.clone(), "accepted restore test")
+        .expect("session should be creatable");
+    let turn = test_turn(turn_id, "accepted", accepted_at);
+    let mut chain = test_active_chain(session_id, chain_ref, Some(turn));
+    chain.dispatch_context.accepted_at = UtcMillis(accepted_at);
+    store
+        .accept_active_execution_chain_with_timeline_entry(
+            session_id.clone(),
+            TimelineEntryInput::new(
+                chain.dispatch_context.entry_id.clone(),
+                TimelineEntryKind::UserMessage,
+                format!("message for {turn_id}"),
+                UtcMillis(accepted_at),
+            ),
+            chain,
+        )
+        .expect("accepted turn should be stored");
+    let record = store
+        .session_acceptance_record(session_id, turn_id)
+        .expect("accepted record should be reconstructable");
+    (store, record)
+}
+
+#[test]
+fn restore_acceptance_records_prefers_newest_turn_and_preserves_terminal_state() {
+    let session_id = SessionId::new("session-accepted-restore-order");
+    let (_old_source, old_record) =
+        acceptance_record(&session_id, "turn-old", 10, "chain-accepted-restore-old");
+    let (_new_source, new_record) =
+        acceptance_record(&session_id, "turn-new", 20, "chain-accepted-restore-new");
+
+    let restored = SessionStore::new();
+    let restored_count =
+        restored.restore_session_acceptance_records([new_record.clone(), old_record.clone()]);
+    assert_eq!(restored_count, 2);
+    assert_eq!(
+        restored
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .map(|turn| turn.turn_id),
+        Some("turn-new".to_string())
+    );
+    assert_eq!(
+        restored.canonical_turns_for_session(&session_id).len(),
+        2,
+        "多个 accepted journal 不能因 session 只有一个 current turn 而丢失历史 canonical turn"
+    );
+
+    let (terminal_source, accepted_record) = acceptance_record(
+        &SessionId::new("session-accepted-restore-terminal"),
+        "turn-terminal",
+        30,
+        "chain-accepted-restore-terminal",
+    );
+    let terminal_session_id = SessionId::new("session-accepted-restore-terminal");
+    terminal_source
+        .update_current_turn_status_for_turn(
+            &terminal_session_id,
+            Some("turn-terminal"),
+            "completed",
+        )
+        .expect("source turn should become terminal");
+    let terminal_target = SessionStore::from_persisted_parts(
+        terminal_source.durable_state(),
+        terminal_source.execution_sidecar_store_state(),
+    );
+    terminal_target.restore_session_acceptance_records([accepted_record]);
+    assert_eq!(
+        terminal_target
+            .runtime_sidecar(&terminal_session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .map(|turn| turn.status),
+        Some("completed".to_string()),
+        "旧 accepted journal 不能覆盖已经持久化的终态 Turn"
+    );
 }
 
 fn test_turn_item(item_id: &str, content: &str) -> ActiveExecutionTurnItem {

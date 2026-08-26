@@ -1,25 +1,49 @@
 use super::config::DaemonError;
+use magi_core::{Task, TaskId};
 use magi_event_bus::AuditUsageLedgerSnapshot;
 use magi_knowledge_store::KnowledgeState;
-use magi_session_store::{SessionDurableState, SessionExecutionSidecarStoreState, SessionStore};
+use magi_orchestrator::task_store::TaskStore;
+use magi_session_store::{
+    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionStore,
+};
 use magi_worker_runtime::{WorkerRuntime, WorkerRuntimeDurableSnapshot};
 use magi_workspace::{WorkspaceDurableState, WorkspaceRecoverySidecarStoreState, WorkspaceStore};
 use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StateRepository {
     state_root: PathBuf,
+    write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AcceptedSubmissionRecord {
+    pub session: SessionAcceptanceRecord,
+    pub task: Task,
+    #[serde(default)]
+    pub session_checkpointed: bool,
+    #[serde(default)]
+    pub task_checkpointed: bool,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct AcceptedSubmissionJournal {
+    #[serde(default)]
+    records: Vec<AcceptedSubmissionRecord>,
 }
 
 impl StateRepository {
     pub(crate) fn new(state_root: PathBuf) -> Self {
-        Self { state_root }
+        Self {
+            state_root,
+            write_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub(crate) fn session_durable_state_path(&self) -> PathBuf {
@@ -101,6 +125,140 @@ impl StateRepository {
         state: &SessionDurableState,
     ) -> Result<(), DaemonError> {
         self.write_json_atomically(self.session_durable_state_path(), state)
+    }
+
+    pub(crate) fn accepted_submissions_path(&self) -> PathBuf {
+        self.state_root.join("accepted-submissions.json")
+    }
+
+    pub(crate) fn task_store_checkpoint_path(&self) -> PathBuf {
+        self.state_root.join("task-store.json")
+    }
+
+    pub(crate) fn load_accepted_submissions(
+        &self,
+    ) -> Result<Vec<AcceptedSubmissionRecord>, DaemonError> {
+        Ok(self
+            .read_json_or_default::<AcceptedSubmissionJournal>(self.accepted_submissions_path())?
+            .records)
+    }
+
+    pub(crate) fn save_accepted_submission(
+        &self,
+        session_store: &SessionStore,
+        session_id: &magi_core::SessionId,
+        turn_id: &str,
+        task_store: &TaskStore,
+        root_task_id: &TaskId,
+    ) -> Result<(), DaemonError> {
+        let session = session_store
+            .session_acceptance_record(session_id, turn_id)
+            .ok_or_else(|| DaemonError::internal("构造 accepted session journal 失败"))?;
+        let task = task_store
+            .get_task(root_task_id)
+            .ok_or_else(|| DaemonError::internal("构造 accepted task journal 失败"))?;
+        let path = self.accepted_submissions_path();
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        let mut journal = self.read_json_or_default::<AcceptedSubmissionJournal>(path.clone())?;
+        journal.records.retain(|record| {
+            !(record.session.session.session_id == *session_id
+                && record.session.canonical_turn.turn_id == turn_id)
+        });
+        journal.records.push(AcceptedSubmissionRecord {
+            session,
+            task,
+            session_checkpointed: false,
+            task_checkpointed: false,
+        });
+        journal.records.sort_by(|left, right| {
+            left.session
+                .canonical_turn
+                .accepted_at
+                .0
+                .cmp(&right.session.canonical_turn.accepted_at.0)
+                .then_with(|| {
+                    left.session
+                        .canonical_turn
+                        .turn_id
+                        .cmp(&right.session.canonical_turn.turn_id)
+                })
+        });
+        self.write_json_atomically_locked(path, &journal)
+    }
+
+    pub(crate) fn mark_session_acceptances_durable(
+        &self,
+        persisted_turns: &[(magi_core::SessionId, String)],
+    ) -> Result<(), DaemonError> {
+        if persisted_turns.is_empty() {
+            return Ok(());
+        }
+        let path = self.accepted_submissions_path();
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        let mut journal = self.read_json_or_default::<AcceptedSubmissionJournal>(path.clone())?;
+        for record in &mut journal.records {
+            if persisted_turns.iter().any(|(session_id, turn_id)| {
+                record.session.session.session_id == *session_id
+                    && record.session.canonical_turn.turn_id == *turn_id
+            }) {
+                record.session_checkpointed = true;
+            }
+        }
+        self.finish_accepted_submission_journal_locked(path, journal)
+    }
+
+    pub(crate) fn mark_task_acceptances_durable(
+        &self,
+        task_store: &TaskStore,
+    ) -> Result<(), DaemonError> {
+        let path = self.accepted_submissions_path();
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        let mut journal = self.read_json_or_default::<AcceptedSubmissionJournal>(path.clone())?;
+        for record in &mut journal.records {
+            if task_store.get_task(&record.task.task_id).is_some() {
+                record.task_checkpointed = true;
+            }
+        }
+        self.finish_accepted_submission_journal_locked(path, journal)
+    }
+
+    pub(crate) fn prune_accepted_submissions(&self) -> Result<(), DaemonError> {
+        let path = self.accepted_submissions_path();
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        let journal = self.read_json_or_default::<AcceptedSubmissionJournal>(path.clone())?;
+        self.finish_accepted_submission_journal_locked(path, journal)
+    }
+
+    fn finish_accepted_submission_journal_locked(
+        &self,
+        path: PathBuf,
+        mut journal: AcceptedSubmissionJournal,
+    ) -> Result<(), DaemonError> {
+        journal
+            .records
+            .retain(|record| !(record.session_checkpointed && record.task_checkpointed));
+        if journal.records.is_empty() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            self.write_json_atomically_locked(path, &journal)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn session_sidecars_path(&self) -> PathBuf {
@@ -246,6 +404,17 @@ impl StateRepository {
     where
         T: serde::Serialize,
     {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        self.write_json_atomically_locked(path, value)
+    }
+
+    fn write_json_atomically_locked<T>(&self, path: PathBuf, value: &T) -> Result<(), DaemonError>
+    where
+        T: serde::Serialize,
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -386,8 +555,9 @@ impl RuntimeSidecarPersistence {
     }
 
     fn save_session_durable_state(&self) -> Result<(), DaemonError> {
-        self.session_store.persist_durable_state_with(|durable| {
+        let persisted_turns = self.session_store.persist_durable_state_with(|durable| {
             let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
+            let mut persisted_turns = Vec::new();
             for workspace in self.workspace_store.workspaces() {
                 let workspace_id = workspace.workspace_id.to_string();
                 let workspace_state = workspace_states.remove(&workspace_id).unwrap_or_default();
@@ -395,6 +565,12 @@ impl RuntimeSidecarPersistence {
                     workspace.native_root_path().as_path(),
                     &workspace_state,
                 )?;
+                persisted_turns.extend(
+                    workspace_state
+                        .canonical_turns
+                        .iter()
+                        .map(|turn| (turn.session_id.clone(), turn.turn_id.clone())),
+                );
             }
 
             let orphan_session_count: usize = workspace_states
@@ -414,14 +590,31 @@ impl RuntimeSidecarPersistence {
                 match fs::remove_file(&global_path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(DaemonError::from(error)),
                 }
             } else {
+                persisted_turns.extend(
+                    global_state
+                        .canonical_turns
+                        .iter()
+                        .map(|turn| (turn.session_id.clone(), turn.turn_id.clone())),
+                );
                 self.state_repository
                     .save_session_durable_state(&global_state)?;
             }
-            Ok(())
-        })
+            Ok(persisted_turns)
+        })?;
+
+        if let Err(error) = self
+            .state_repository
+            .mark_session_acceptances_durable(&persisted_turns)
+        {
+            warn!(
+                ?error,
+                "标记 accepted session snapshot 已持久化失败；journal 将保留待下次维护重试"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn flush_runtime_sidecars(&self) -> Result<RuntimeSidecarFlushReport, DaemonError> {
@@ -435,6 +628,9 @@ impl RuntimeSidecarPersistence {
                 self.state_repository.save_session_sidecars(state)?;
                 self.save_session_durable_state()
             })?;
+        if let Err(error) = self.state_repository.prune_accepted_submissions() {
+            warn!(?error, "刷新运行时 sidecar 后清理 accepted journal 失败");
+        }
         let workspace_recovery_sidecars_flushed =
             self.workspace_store.flush_recovery_sidecars_with(|state| {
                 self.state_repository
@@ -467,15 +663,249 @@ fn stale_backup_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use magi_core::{
-        MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus, PlanState, SessionId,
-        SessionLifecycleStatus, TaskId, ThreadId, UtcMillis, WorkerId,
+        AbsolutePath, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus, PlanState,
+        SessionId, SessionLifecycleStatus, TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis,
+        WorkerId, WorkspaceId,
     };
     use magi_session_store::{
-        ExecutionThread, ExecutionThreadStatus, NotificationRecord, NotificationScope,
-        SessionDurableState, SessionPlan, SessionRecord, ThreadChatMessage,
-        ThreadContextCheckpoint, TimelineEntry, TimelineEntryKind,
+        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn, ExecutionThread,
+        ExecutionThreadStatus, NotificationRecord, NotificationScope, SessionDurableState,
+        SessionPlan, SessionRecord, ThreadChatMessage, ThreadContextCheckpoint, TimelineEntry,
+        TimelineEntryKind,
     };
-    use std::collections::HashMap;
+    use std::{collections::HashMap, thread};
+
+    fn accepted_session_store(
+        session_id: &str,
+        workspace_id: Option<&str>,
+        accepted_at: u64,
+    ) -> (SessionStore, String, TaskId) {
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new(session_id);
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "accepted journal test",
+                workspace_id.map(str::to_string),
+            )
+            .expect("accepted journal test session should be created");
+        let turn_id = format!("turn-{session_id}-{accepted_at}");
+        let entry_id = format!("timeline-{session_id}-{accepted_at}");
+        let task_id = TaskId::new(format!("task-{session_id}-{accepted_at}"));
+        let chain = ActiveExecutionChain {
+            session_id: session_id.clone(),
+            mission_id: MissionId::new(format!("mission-{session_id}")),
+            root_task_id: task_id.clone(),
+            execution_chain_ref: format!("chain-{session_id}-{accepted_at}"),
+            workspace_id: workspace_id.map(WorkspaceId::new),
+            active_branch_task_ids: vec![task_id.clone()],
+            active_worker_bindings: vec![WorkerId::new(format!("worker-{session_id}"))],
+            branches: Vec::new(),
+            recovery_ref: None,
+            dispatch_context: ActiveExecutionDispatchContext {
+                accepted_at: UtcMillis(accepted_at),
+                entry_id: entry_id.clone(),
+                trimmed_text: Some("test accepted journal".to_string()),
+                skill_name: None,
+            },
+            current_turn: Some(ActiveExecutionTurn {
+                turn_id: turn_id.clone(),
+                turn_seq: accepted_at,
+                accepted_at: UtcMillis(accepted_at),
+                completed_at: None,
+                status: "accepted".to_string(),
+                user_message: Some("test accepted journal".to_string()),
+                items: Vec::new(),
+            }),
+        };
+        session_store
+            .accept_active_execution_chain_with_timeline_entry(
+                session_id,
+                magi_session_store::TimelineEntryInput::new(
+                    entry_id,
+                    TimelineEntryKind::UserMessage,
+                    "test accepted journal",
+                    UtcMillis(accepted_at),
+                ),
+                chain,
+            )
+            .expect("accepted journal test turn should be accepted");
+        (session_store, turn_id, task_id)
+    }
+
+    fn accepted_task(task_id: TaskId, accepted_at: u64) -> Task {
+        let mission_id = MissionId::new(format!("mission-{task_id}"));
+        Task {
+            task_id: task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: task_id,
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "accepted journal task".to_string(),
+            goal: "accepted journal task".to_string(),
+            status: TaskStatus::Pending,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
+            created_at: UtcMillis(accepted_at),
+            updated_at: UtcMillis(accepted_at),
+        }
+    }
+
+    #[test]
+    fn accepted_journal_is_retained_until_all_recovery_facts_are_durable() {
+        let state_root = unique_temp_dir("magi-accepted-journal-retention");
+        let repository = StateRepository::new(state_root.clone());
+        let (session_store, turn_id, task_id) =
+            accepted_session_store("accepted-journal-retention", None, 10);
+        let task_store = TaskStore::new();
+        task_store.insert_task_without_checkpoint(accepted_task(task_id.clone(), 10));
+
+        repository
+            .save_accepted_submission(
+                &session_store,
+                &SessionId::new("accepted-journal-retention"),
+                &turn_id,
+                &task_store,
+                &task_id,
+            )
+            .expect("accepted journal should save");
+        repository
+            .prune_accepted_submissions()
+            .expect("retention check should succeed before checkpoints");
+        assert!(repository.accepted_submissions_path().exists());
+
+        repository
+            .save_session_durable_state(&session_store.durable_state())
+            .expect("session durable state should save");
+        repository
+            .save_session_sidecars(&session_store.execution_sidecar_store_state())
+            .expect("session sidecars should save");
+        repository
+            .mark_session_acceptances_durable(&[(
+                SessionId::new("accepted-journal-retention"),
+                turn_id.clone(),
+            )])
+            .expect("session acceptance should be marked durable");
+        task_store
+            .checkpoint_to_file(&repository.task_store_checkpoint_path())
+            .expect("task checkpoint should save");
+        repository
+            .mark_task_acceptances_durable(&task_store)
+            .expect("journal should prune after all checkpoints");
+        assert!(!repository.accepted_submissions_path().exists());
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn workspace_accepted_journal_uses_workspace_session_checkpoint() {
+        let state_root = unique_temp_dir("magi-accepted-journal-workspace");
+        let workspace_root = unique_temp_dir("magi-accepted-journal-workspace-root");
+        let repository = StateRepository::new(state_root.clone());
+        let workspace_store = WorkspaceStore::new();
+        let workspace_id = WorkspaceId::new("workspace-accepted-journal");
+        workspace_store
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should register");
+        let (session_store, turn_id, task_id) = accepted_session_store(
+            "accepted-journal-workspace",
+            Some(workspace_id.as_str()),
+            20,
+        );
+        let session_id = SessionId::new("accepted-journal-workspace");
+        let task_store = TaskStore::new();
+        task_store.insert_task_without_checkpoint(accepted_task(task_id.clone(), 20));
+
+        repository
+            .save_accepted_submission(&session_store, &session_id, &turn_id, &task_store, &task_id)
+            .expect("workspace accepted journal should save");
+        repository
+            .save_workspace_session_state(&workspace_root, &session_store.durable_state())
+            .expect("workspace session durable state should save");
+        repository
+            .save_session_sidecars(&session_store.execution_sidecar_store_state())
+            .expect("workspace session sidecars should save");
+        repository
+            .mark_session_acceptances_durable(&[(session_id.clone(), turn_id.clone())])
+            .expect("workspace session acceptance should be marked durable");
+        task_store
+            .checkpoint_to_file(&repository.task_store_checkpoint_path())
+            .expect("workspace task checkpoint should save");
+        repository
+            .mark_task_acceptances_durable(&task_store)
+            .expect("workspace journal should prune after all checkpoints");
+        assert!(!repository.accepted_submissions_path().exists());
+
+        let _ = fs::remove_dir_all(state_root);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn concurrent_accepted_journal_writes_keep_both_records() {
+        let state_root = unique_temp_dir("magi-accepted-journal-concurrent");
+        let repository = StateRepository::new(state_root.clone());
+        let (session_store_a, turn_id_a, task_id_a) =
+            accepted_session_store("accepted-journal-concurrent-a", None, 30);
+        let (session_store_b, turn_id_b, task_id_b) =
+            accepted_session_store("accepted-journal-concurrent-b", None, 31);
+        let task_store_a = TaskStore::new();
+        task_store_a.insert_task_without_checkpoint(accepted_task(task_id_a.clone(), 30));
+        let task_store_b = TaskStore::new();
+        task_store_b.insert_task_without_checkpoint(accepted_task(task_id_b.clone(), 31));
+        let repository_a = repository.clone();
+        let repository_b = repository.clone();
+
+        thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                repository_a.save_accepted_submission(
+                    &session_store_a,
+                    &SessionId::new("accepted-journal-concurrent-a"),
+                    &turn_id_a,
+                    &task_store_a,
+                    &task_id_a,
+                )
+            });
+            let second = scope.spawn(move || {
+                repository_b.save_accepted_submission(
+                    &session_store_b,
+                    &SessionId::new("accepted-journal-concurrent-b"),
+                    &turn_id_b,
+                    &task_store_b,
+                    &task_id_b,
+                )
+            });
+            first
+                .join()
+                .expect("first journal write should not panic")
+                .expect("first journal write should succeed");
+            second
+                .join()
+                .expect("second journal write should not panic")
+                .expect("second journal write should succeed");
+        });
+
+        let records = repository
+            .load_accepted_submissions()
+            .expect("accepted journal should load");
+        assert_eq!(records.len(), 2, "并发 accepted 写入不能丢失任一恢复记录");
+
+        let _ = fs::remove_dir_all(state_root);
+    }
 
     #[test]
     fn legacy_cleared_goal_migrates_to_empty_current_slot() {
