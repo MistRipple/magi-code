@@ -1077,16 +1077,16 @@ fn execute_streaming_http_post(
             .acquire_cancellable(&provider_key, worker_cancellation.as_ref())
         {
             Some(_permit) => shared_http_runtime().and_then(|runtime| {
-                runtime.block_on(streaming_http_io(
-                    provider_key.clone(),
+                runtime.block_on(streaming_http_io(StreamingHttpIoRequest {
+                    provider_key: provider_key.clone(),
                     url,
                     body,
                     headers,
                     provider_family,
                     tool_name_codec,
-                    &tx,
+                    tx: tx.clone(),
                     cancellation_rx,
-                ))
+                }))
             }),
             None => Err(model_invocation_cancelled_error()),
         };
@@ -1237,16 +1237,28 @@ fn execute_streaming_http_post_with_retries(
 }
 
 /// 独立线程内执行的流式 HTTP I/O 逻辑。
-async fn streaming_http_io(
+struct StreamingHttpIoRequest {
     provider_key: String,
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
     tool_name_codec: ProviderToolNameCodec,
-    tx: &mpsc::Sender<StreamMessage>,
-    mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
-) -> StreamingHttpResult {
+    tx: mpsc::Sender<StreamMessage>,
+    cancellation_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResult {
+    let StreamingHttpIoRequest {
+        provider_key,
+        url,
+        body,
+        headers,
+        provider_family,
+        tool_name_codec,
+        tx,
+        mut cancellation_rx,
+    } = request;
     let started_at = Instant::now();
     let client = shared_streaming_http_client()?;
 
@@ -1383,7 +1395,7 @@ async fn streaming_http_io(
                 &mut accumulator,
                 &mut last_content_delta_len,
                 &mut last_thinking_delta_len,
-                tx,
+                &tx,
             )? {
                 saw_protocol_terminal = true;
                 break 'stream_read;
@@ -1415,7 +1427,7 @@ async fn streaming_http_io(
                 &mut accumulator,
                 &mut last_content_delta_len,
                 &mut last_thinking_delta_len,
-                tx,
+                &tx,
             )? {
                 saw_protocol_terminal = true;
                 break;

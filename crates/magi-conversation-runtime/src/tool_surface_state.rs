@@ -162,16 +162,30 @@ pub(crate) fn activate_skill_tool_definitions(
     definitions
 }
 
+pub(crate) struct RefreshLiveMcpToolDefinitionsInput<'a> {
+    pub definitions: Vec<ChatToolDefinition>,
+    pub tool_registry: &'a ToolRegistry,
+    pub skill_runtime: Option<&'a SkillRuntime>,
+    pub active_skill_id: Option<&'a str>,
+    pub access_profile: AccessProfile,
+    pub allowed_tools: Option<&'a [String]>,
+    pub denied_tools: &'a [String],
+    pub include_external: bool,
+}
+
 pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
-    mut definitions: Vec<ChatToolDefinition>,
-    tool_registry: &ToolRegistry,
-    skill_runtime: Option<&SkillRuntime>,
-    active_skill_id: Option<&str>,
-    access_profile: AccessProfile,
-    allowed_tools: Option<&[String]>,
-    denied_tools: &[String],
-    include_external: bool,
+    input: RefreshLiveMcpToolDefinitionsInput<'_>,
 ) -> Vec<ChatToolDefinition> {
+    let RefreshLiveMcpToolDefinitionsInput {
+        mut definitions,
+        tool_registry,
+        skill_runtime,
+        active_skill_id,
+        access_profile,
+        allowed_tools,
+        denied_tools,
+        include_external,
+    } = input;
     definitions.retain(|definition| !definition.function.name.starts_with("mcp__"));
     if !include_external {
         return definitions;
@@ -509,16 +523,17 @@ mod tests {
             }
         }));
 
-        let definitions = refresh_live_mcp_tool_definitions_with_mode(
-            Vec::new(),
-            &registry,
-            None,
-            None,
-            AccessProfile::ReadOnly,
-            None,
-            &[],
-            true,
-        );
+        let definitions =
+            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+                definitions: Vec::new(),
+                tool_registry: &registry,
+                skill_runtime: None,
+                active_skill_id: None,
+                access_profile: AccessProfile::ReadOnly,
+                allowed_tools: None,
+                denied_tools: &[],
+                include_external: true,
+            });
         let names = definitions
             .iter()
             .map(|definition| definition.function.name.as_str())
@@ -548,28 +563,30 @@ mod tests {
             }
         }));
 
-        let first_round = refresh_live_mcp_tool_definitions_with_mode(
-            Vec::new(),
-            &registry,
-            None,
-            None,
-            AccessProfile::Restricted,
-            None,
-            &[],
-            false,
-        );
+        let first_round =
+            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+                definitions: Vec::new(),
+                tool_registry: &registry,
+                skill_runtime: None,
+                active_skill_id: None,
+                access_profile: AccessProfile::Restricted,
+                allowed_tools: None,
+                denied_tools: &[],
+                include_external: false,
+            });
         assert!(first_round.is_empty(), "首轮不应注入完整 MCP schema");
 
-        let after_catalog = refresh_live_mcp_tool_definitions_with_mode(
-            first_round,
-            &registry,
-            None,
-            None,
-            AccessProfile::Restricted,
-            None,
-            &[],
-            true,
-        );
+        let after_catalog =
+            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+                definitions: first_round,
+                tool_registry: &registry,
+                skill_runtime: None,
+                active_skill_id: None,
+                access_profile: AccessProfile::Restricted,
+                allowed_tools: None,
+                denied_tools: &[],
+                include_external: true,
+            });
         assert_eq!(
             after_catalog
                 .iter()

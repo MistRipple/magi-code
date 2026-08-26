@@ -32,7 +32,7 @@ use crate::tool_result_utils::{
     tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
-    BrowserToolSurfaceContext, activate_skill_tool_definitions,
+    BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput, activate_skill_tool_definitions,
     activated_skill_id_from_tool_result, refresh_live_browser_tool_definitions,
     refresh_live_mcp_tool_definitions_with_mode,
 };
@@ -1316,16 +1316,17 @@ fn run_conversation_loop_inner(
             );
             active_tools = browser_surface.definitions;
             browser_capability_revision = browser_surface.capability_revision;
-            active_tools = refresh_live_mcp_tool_definitions_with_mode(
-                active_tools,
-                registry,
-                skill_runtime,
-                active_skill_name.as_deref(),
-                access_profile,
-                allowed_tools,
-                denied_tools,
-                deferred_mcp_tools_loaded,
-            );
+            active_tools =
+                refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+                    definitions: active_tools,
+                    tool_registry: registry,
+                    skill_runtime,
+                    active_skill_id: active_skill_name.as_deref(),
+                    access_profile,
+                    allowed_tools,
+                    denied_tools,
+                    include_external: deferred_mcp_tools_loaded,
+                });
         }
         if task.is_goal_mode() {
             if session_store.current_unfinished_goal(session_id).is_some()

@@ -1637,16 +1637,28 @@ struct SessionToolApprovalContext<'a> {
     source_thread_id: &'a ThreadId,
 }
 
+#[derive(Clone, Copy)]
+struct SessionToolProgressContext<'a> {
+    session_store: &'a SessionStore,
+    event_bus: &'a InMemoryEventBus,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    source_thread_id: &'a ThreadId,
+}
+
 fn upsert_session_tool_progress_item(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    source_thread_id: &ThreadId,
+    context: SessionToolProgressContext<'_>,
     tool_call: &ChatToolCall,
     tool_name: String,
     payload: String,
 ) {
+    let SessionToolProgressContext {
+        session_store,
+        event_bus,
+        session_id,
+        workspace_id,
+        source_thread_id,
+    } = context;
     let progress_status = serde_json::from_str::<serde_json::Value>(&payload)
         .ok()
         .and_then(|value| {
@@ -1772,11 +1784,13 @@ fn await_session_tool_approval(
     })
     .to_string();
     upsert_session_tool_progress_item(
-        session_store,
-        event_bus,
-        session_id,
-        workspace_id,
-        source_thread_id,
+        SessionToolProgressContext {
+            session_store,
+            event_bus,
+            session_id,
+            workspace_id,
+            source_thread_id,
+        },
         tool_call,
         tool_call.function.name.clone(),
         progress_payload,
@@ -1834,11 +1848,13 @@ fn await_session_tool_approval(
                     ));
                 }
                 upsert_session_tool_progress_item(
-                    session_store,
-                    event_bus,
-                    session_id,
-                    workspace_id,
-                    source_thread_id,
+                    SessionToolProgressContext {
+                        session_store,
+                        event_bus,
+                        session_id,
+                        workspace_id,
+                        source_thread_id,
+                    },
                     tool_call,
                     tool_call.function.name.clone(),
                     serde_json::json!({
@@ -2078,11 +2094,13 @@ fn execute_session_turn_tool_call_scoped(
             return;
         }
         upsert_session_tool_progress_item(
-            session_store,
-            event_bus,
-            session_id,
-            workspace_id,
-            source_thread_id,
+            SessionToolProgressContext {
+                session_store,
+                event_bus,
+                session_id,
+                workspace_id,
+                source_thread_id,
+            },
             tool_call,
             progress.tool_name,
             progress.payload,

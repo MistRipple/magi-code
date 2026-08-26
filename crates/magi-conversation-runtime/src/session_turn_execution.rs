@@ -54,8 +54,9 @@ use crate::{
     tool_execution_ledger::ToolExecutionLedger,
     tool_result_utils::DeterministicToolFailure,
     tool_surface_state::{
-        BrowserToolSurfaceContext, activate_skill_tool_definitions,
-        refresh_live_browser_tool_definitions, refresh_live_mcp_tool_definitions_with_mode,
+        BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput,
+        activate_skill_tool_definitions, refresh_live_browser_tool_definitions,
+        refresh_live_mcp_tool_definitions_with_mode,
     },
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
@@ -422,28 +423,42 @@ fn build_session_turn_messages(
     knowledge_context_prompt: Option<&str>,
     history: &[ThreadChatMessage],
 ) -> Vec<ChatMessage> {
-    build_session_turn_messages_with_runtime(
+    build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
         session_store,
         request,
         prompt,
         knowledge_context_prompt,
         history,
-        None,
-        None,
-        None,
-    )
+        settings_store: None,
+        safety_gate: None,
+        skill_runtime: None,
+    })
+}
+
+struct BuildSessionTurnMessagesWithRuntimeInput<'a> {
+    session_store: &'a SessionStore,
+    request: &'a SessionTurnExecutionRequest,
+    prompt: &'a str,
+    knowledge_context_prompt: Option<&'a str>,
+    history: &'a [ThreadChatMessage],
+    settings_store: Option<&'a Arc<SettingsStore>>,
+    safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
 }
 
 fn build_session_turn_messages_with_runtime(
-    session_store: &SessionStore,
-    request: &SessionTurnExecutionRequest,
-    prompt: &str,
-    knowledge_context_prompt: Option<&str>,
-    history: &[ThreadChatMessage],
-    settings_store: Option<&Arc<SettingsStore>>,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    input: BuildSessionTurnMessagesWithRuntimeInput<'_>,
 ) -> Vec<ChatMessage> {
+    let BuildSessionTurnMessagesWithRuntimeInput {
+        session_store,
+        request,
+        prompt,
+        knowledge_context_prompt,
+        history,
+        settings_store,
+        safety_gate,
+        skill_runtime,
+    } = input;
     let mut messages = if request.use_tools {
         workspace_context_messages(request)
     } else {
@@ -684,16 +699,17 @@ fn rebuild_messages_for_context_window(
         active_skill_name,
         persist_checkpoint,
     } = input;
-    let mut fixed_messages = build_session_turn_messages_with_runtime(
-        session_store,
-        request,
-        prompt,
-        knowledge_context_prompt,
-        &[],
-        settings_store,
-        None,
-        skill_runtime,
-    );
+    let mut fixed_messages =
+        build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
+            session_store,
+            request,
+            prompt,
+            knowledge_context_prompt,
+            history: &[],
+            settings_store,
+            safety_gate: None,
+            skill_runtime,
+        });
     if let Some(skill_message) =
         dynamic_skill_prompt_message(skill_runtime, initial_skill_name, active_skill_name)
     {
@@ -751,16 +767,17 @@ fn rebuild_messages_for_context_window(
     {
         history.pop();
     }
-    *messages = build_session_turn_messages_with_runtime(
-        session_store,
-        request,
-        prompt,
-        knowledge_context_prompt,
-        &history,
-        settings_store,
-        None,
-        skill_runtime,
-    );
+    *messages =
+        build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
+            session_store,
+            request,
+            prompt,
+            knowledge_context_prompt,
+            history: &history,
+            settings_store,
+            safety_gate: None,
+            skill_runtime,
+        });
     if let Some(skill_message) =
         dynamic_skill_prompt_message(skill_runtime, initial_skill_name, active_skill_name)
     {
@@ -1001,16 +1018,17 @@ fn run_session_turn_execution_inner(
         upsert_context_compaction_completed_notice(compaction_writeback, compaction);
     }
     let mut proactive_context_compaction_completed = prepared_history.compaction.is_some();
-    let mut messages = build_session_turn_messages_with_runtime(
-        session_store,
-        &request,
-        &prompt,
-        knowledge_context_prompt.as_deref(),
-        &prepared_history.messages,
-        settings_store,
-        safety_gate,
-        skill_runtime,
-    );
+    let mut messages =
+        build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
+            session_store,
+            request: &request,
+            prompt: &prompt,
+            knowledge_context_prompt: knowledge_context_prompt.as_deref(),
+            history: &prepared_history.messages,
+            settings_store,
+            safety_gate,
+            skill_runtime,
+        });
     if let Some(identity_prompt) =
         model_identity_prompt_for_request(&request.prompt, &resolved_context_model)
     {
@@ -1093,16 +1111,17 @@ fn run_session_turn_execution_inner(
             );
             active_tools = browser_surface.definitions;
             browser_capability_revision = browser_surface.capability_revision;
-            active_tools = refresh_live_mcp_tool_definitions_with_mode(
-                active_tools,
-                registry,
-                skill_runtime,
-                active_skill_name.as_deref(),
-                request.access_profile,
-                None,
-                &[],
-                deferred_mcp_tools_loaded,
-            );
+            active_tools =
+                refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+                    definitions: active_tools,
+                    tool_registry: registry,
+                    skill_runtime,
+                    active_skill_id: active_skill_name.as_deref(),
+                    access_profile: request.access_profile,
+                    allowed_tools: None,
+                    denied_tools: &[],
+                    include_external: deferred_mcp_tools_loaded,
+                });
         }
         let strict_goal_mode_round = request.goal_turn_mode.is_goal_driven();
         if strict_goal_mode_round {

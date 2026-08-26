@@ -29,7 +29,9 @@ use crate::{
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_role_id},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
-    tool_surface_state::refresh_live_mcp_tool_definitions_with_mode,
+    tool_surface_state::{
+        RefreshLiveMcpToolDefinitionsInput, refresh_live_mcp_tool_definitions_with_mode,
+    },
     usage_recording::{
         AuxiliaryModelUsageContext, ModelUsageBinding, invoke_auxiliary_model_with_usage,
         model_usage_binding_for_worker_with_settings,
@@ -61,7 +63,7 @@ use magi_workspace::WorkspaceStore;
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -1036,20 +1038,20 @@ impl LlmTaskDispatcher {
         let Some(registry) = self.tool_registry.as_ref() else {
             return definitions;
         };
-        refresh_live_mcp_tool_definitions_with_mode(
+        refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
             definitions,
-            registry,
-            self.skill_runtime.as_deref(),
-            skill_name,
-            tool_surface_access_profile(task, access_profile),
-            task_policy
+            tool_registry: registry,
+            skill_runtime: self.skill_runtime.as_deref(),
+            active_skill_id: skill_name,
+            access_profile: tool_surface_access_profile(task, access_profile),
+            allowed_tools: task_policy
                 .filter(|policy| !policy.allowed_tools.is_empty())
                 .map(|policy| policy.allowed_tools.as_slice()),
-            task_policy
+            denied_tools: task_policy
                 .map(|policy| policy.denied_tools.as_slice())
                 .unwrap_or_default(),
-            false,
-        )
+            include_external: false,
+        })
     }
 
     fn build_base_tool_definitions(
@@ -1256,8 +1258,8 @@ fn sanitize_git_path_component(value: &str) -> String {
 
 fn project_policy_paths_to_execution_root(
     paths: &[String],
-    workspace_identity_root: &PathBuf,
-    execution_root: &PathBuf,
+    workspace_identity_root: &Path,
+    execution_root: &Path,
 ) -> Vec<String> {
     paths
         .iter()
@@ -1984,12 +1986,8 @@ impl LlmTaskDispatcher {
     }
 
     fn skill_prompt_instructions(&self, skill_name: Option<&str>) -> Option<String> {
-        let Some(skill_id) = skill_name else {
-            return None;
-        };
-        let Some(ref skill_rt) = self.skill_runtime else {
-            return None;
-        };
+        let skill_id = skill_name?;
+        let skill_rt = self.skill_runtime.as_ref()?;
         let plan = skill_rt.build_tool_runtime_plan(magi_skill_runtime::SkillSelection {
             skill_ids: vec![skill_id.to_string()],
             requested_tools: vec![],

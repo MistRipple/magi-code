@@ -118,9 +118,10 @@ interface SurfaceLaneContext {
 const ALLOWED_NAVIGATION_PROTOCOLS = new Set(["http:", "https:", "about:"]);
 const BLOCKED_HOSTS = new Set(["169.254.169.254", "metadata.google.internal"]);
 // 固定资产只用于隔离世界中的可视化指针，不读取或修改页面的光标样式。
-// 采用深色填充和浅色描边，和 Codex 的浏览器操作指针保持同一视觉语义；
-// 使用内联矢量资源避免依赖页面外部网络和站点 CSS。
-const AGENT_CURSOR_ASSET = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'%3E%3Cpath d='M3 1.8 17.2 11l-6.1 1.1 3.7 5.1-2.2 1.6-3.7-5.1-3.4 5.2Z' fill='%23333743' stroke='%23f8fafc' stroke-width='1.35' stroke-linejoin='round'/%3E%3C/svg%3E";
+// 指针沿用 Codex 的低存在感视觉：灰紫色主体、柔和浅色描边和圆润转角，
+// 让它在浅色页面上清晰可见，但不会像黑色系统光标一样抢占内容注意力。
+const AGENT_CURSOR_SVG = "<svg xmlns='http://www.w3.org/2000/svg' width='26' height='26' viewBox='0 0 26 26'><path d='M5.05 3.55c-.77-.28-1.53.36-1.33 1.18l4.19 16.55c.28 1.1 1.74 1.34 2.28.32l3.7-6.95c.11-.21.28-.39.48-.51l6.35-3.61c1.16-.66.98-2.38-.3-2.79L5.05 3.55Z' fill='#4e4d66' stroke='#d5d5d9' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/></svg>";
+const AGENT_CURSOR_ASSET = `data:image/svg+xml,${encodeURIComponent(AGENT_CURSOR_SVG)}`;
 const ALLOWED_WORKER_CDP_METHODS = new Set([
   "DOM.getDocument",
   "DOM.querySelector",
@@ -902,6 +903,33 @@ export class BrowserSurfaceManager {
     });
   }
 
+  private initialAgentCursorPosition(record: BrowserSurfaceRecord): { x: number; y: number } {
+    const viewBounds = record.view.getBounds();
+    const width = viewBounds.width > 0
+      ? viewBounds.width
+      : record.slotBounds && record.slotBounds.width > 0
+        ? record.slotBounds.width
+        : record.viewport.mode === "fixed"
+          ? record.viewport.width
+          : 640;
+    const height = viewBounds.height > 0
+      ? viewBounds.height
+      : record.slotBounds && record.slotBounds.height > 0
+        ? record.slotBounds.height
+        : record.viewport.mode === "fixed"
+          ? record.viewport.height
+          : 480;
+    const inset = 18;
+    const clamp = (value: number, limit: number): number => Math.max(
+      0,
+      Math.min(Math.max(0, limit - inset), value),
+    );
+    return {
+      x: clamp(Math.round(width / 2), width),
+      y: clamp(Math.round(height / 2), height),
+    };
+  }
+
   async closeTab(tabId: string): Promise<void> {
     const records = [...this.#surfaces.values()].filter((record) => record.tabId === tabId);
     for (const record of records) this.closeRecord(record, false);
@@ -1634,7 +1662,10 @@ export class BrowserSurfaceManager {
     action: string | null,
   ): Promise<void> {
     if (record.closed || record.contents.isDestroyed()) return;
-    record.cursor = { visible, x, y, action };
+    const position = visible && (x === null || y === null)
+      ? this.initialAgentCursorPosition(record)
+      : { x, y };
+    record.cursor = { visible, ...position, action };
     this.#onEvent({
       type: "agent_cursor",
       binding: this.binding(record),
@@ -1676,23 +1707,28 @@ export class BrowserSurfaceManager {
           contextId: record.cursorExecutionContextId,
           returnByValue: true,
           expression: `(() => {
-            const state = ${JSON.stringify({ visible, x, y, action })};
+            const state = ${JSON.stringify({ visible, ...position, action })};
             const cursorAsset = ${JSON.stringify(AGENT_CURSOR_ASSET)};
+            const hostStyle = 'position:fixed;z-index:2147483647;pointer-events:none;width:26px;height:26px;overflow:visible;transform:translate(-3px,-3px);transition:left 60ms linear,top 60ms linear;display:none;will-change:left,top;';
             let host = document.querySelector('[data-magi-agent-cursor="true"]');
             if (!(host instanceof HTMLElement) || !host.isConnected) {
               host = document.createElement('div');
               host.dataset.magiAgentCursor = 'true';
               host.setAttribute('aria-hidden', 'true');
-              host.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;width:20px;height:20px;overflow:visible;transform:translate(-2px,-2px);transition:left 60ms linear,top 60ms linear;display:none;will-change:left,top;';
-              const image = document.createElement('img');
-              image.alt = '';
-              image.draggable = false;
-              image.style.cssText = 'position:absolute;left:0;top:0;width:20px;height:20px;display:block;pointer-events:none;filter:drop-shadow(0 1px 1px rgba(0,0,0,.55));';
-              image.src = cursorAsset;
-              host.append(image);
               (document.documentElement || document.body)?.append(host);
             }
             if (!(host instanceof HTMLElement)) return true;
+            host.style.cssText = hostStyle;
+            let image = host.querySelector('[data-magi-agent-cursor-image="true"], img');
+            if (!(image instanceof HTMLImageElement)) {
+              image = document.createElement('img');
+              image.dataset.magiAgentCursorImage = 'true';
+              image.alt = '';
+              image.draggable = false;
+              image.style.cssText = 'position:absolute;left:0;top:0;width:26px;height:26px;display:block;pointer-events:none;filter:drop-shadow(0 1px 1.5px rgba(11,13,28,.42));';
+              host.append(image);
+            }
+            image.src = cursorAsset;
             const hasPosition = Number.isFinite(state.x) && Number.isFinite(state.y);
             const shouldShow = state.visible && hasPosition;
             host.style.display = shouldShow ? 'block' : 'none';
@@ -1707,13 +1743,13 @@ export class BrowserSurfaceManager {
               pulse?.remove();
               const clickPulse = document.createElement('span');
               clickPulse.dataset.magiAgentCursorPulse = 'true';
-              clickPulse.style.cssText = 'position:absolute;left:-5px;top:-5px;width:28px;height:28px;box-sizing:border-box;border:1px solid rgba(248,250,252,.82);border-radius:50%;pointer-events:none;opacity:.72;transform:scale(.32);transition:opacity 420ms cubic-bezier(.2,.7,.3,1),transform 420ms cubic-bezier(.2,.7,.3,1);';
-              host.append(clickPulse);
+              clickPulse.style.cssText = 'position:absolute;left:-10px;top:-10px;width:28px;height:28px;box-sizing:border-box;border:1px solid rgba(213,213,217,.72);background:rgba(213,213,217,.10);border-radius:50%;pointer-events:none;opacity:.7;transform:scale(.42);transition:opacity 360ms cubic-bezier(.2,.7,.3,1),transform 360ms cubic-bezier(.2,.7,.3,1);';
+              host.insertBefore(clickPulse, image);
               requestAnimationFrame(() => {
                 clickPulse.style.opacity = '0';
-                clickPulse.style.transform = 'scale(1.4)';
+                clickPulse.style.transform = 'scale(1.08)';
               });
-              window.setTimeout(() => clickPulse.remove(), 460);
+              window.setTimeout(() => clickPulse.remove(), 400);
             }
             return true;
           })()`,

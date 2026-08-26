@@ -333,17 +333,16 @@ async fn execute_dispatch_submission(
         .session_store
         .pause_active_goal_for_diversion(&session_id)
         .map_err(|error| ApiError::internal_assembly("切换任务时暂停当前 Goal 失败", error))?
+        && let Some(plan) = plan.as_ref()
     {
-        if let Some(plan) = plan.as_ref() {
-            magi_plan::publish_plan_event(
-                &state.event_bus,
-                magi_plan::plan_event_type(plan),
-                plan,
-                workspace_id.as_ref(),
-                None,
-                None,
-            );
-        }
+        magi_plan::publish_plan_event(
+            &state.event_bus,
+            magi_plan::plan_event_type(plan),
+            plan,
+            workspace_id.as_ref(),
+            None,
+            None,
+        );
     }
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);

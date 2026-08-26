@@ -211,9 +211,8 @@ impl ToolApprovalRegistry {
             let matching_approval_ids = state
                 .pending
                 .iter()
-                .filter_map(|(candidate_id, candidate)| {
-                    (grant_for(&candidate.request) == grant).then(|| candidate_id.clone())
-                })
+                .filter(|(_, candidate)| grant_for(&candidate.request) == grant)
+                .map(|(candidate_id, _)| candidate_id.clone())
                 .collect::<Vec<_>>();
             for candidate_id in matching_approval_ids {
                 if let Some(candidate) = state.pending.remove(&candidate_id) {
