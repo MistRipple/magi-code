@@ -43,6 +43,7 @@
   } from '../stores/right-pane.svelte';
   import {
     activateBrowserTab,
+    AgentApiError,
     closeBrowserTab,
     closeTerminalSession,
     createBrowserSession,
@@ -353,6 +354,30 @@
       });
   }
 
+  function browserOpenFailureFeedback(error: unknown): {
+    type: 'warning' | 'error';
+    message: string;
+  } {
+    if (error instanceof AgentApiError) {
+      if (error.errorCode === 'BROWSER_GLOBAL_TAB_LIMIT_REACHED') {
+        return {
+          type: 'warning',
+          message: i18n.t('browser.error.globalTabLimitReached'),
+        };
+      }
+      if (error.errorCode === 'BROWSER_SESSION_TAB_LIMIT_REACHED') {
+        return {
+          type: 'warning',
+          message: i18n.t('browser.error.sessionTabLimitReached'),
+        };
+      }
+    }
+    return {
+      type: 'error',
+      message: i18n.t('browser.error.openInternal'),
+    };
+  }
+
   async function createBrowserPane(initialUrl = 'about:blank'): Promise<void> {
     if (creatingBrowserPane) return;
     if (!canCreateBrowserPane) {
@@ -387,7 +412,8 @@
       );
     } catch (error) {
       console.warn('[RightPane] 新建浏览器面板失败:', error);
-      addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+      const feedback = browserOpenFailureFeedback(error);
+      addToast(feedback.type, feedback.message, undefined, { forceVisible: true });
     } finally {
       creatingBrowserPane = false;
     }
@@ -596,7 +622,8 @@
         clearPendingDesktopPanelIntent(paneScopeKey, 'browser', payload.tabId);
         activeBrowserActivationKey = '';
         console.warn('[RightPane] 激活浏览器面板失败:', error);
-        addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+        const feedback = browserOpenFailureFeedback(error);
+        addToast(feedback.type, feedback.message, undefined, { forceVisible: true });
       });
   });
 
@@ -1063,7 +1090,8 @@
       );
     } catch (error) {
       console.warn('[RightPane] 打开 HTML 内置浏览器失败:', error);
-      addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+      const feedback = browserOpenFailureFeedback(error);
+      addToast(feedback.type, feedback.message, undefined, { forceVisible: true });
     } finally {
       openingHtmlInBrowser = false;
     }

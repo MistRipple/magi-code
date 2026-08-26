@@ -12,12 +12,12 @@ use crate::model_context_window::{
 };
 use crate::session_writeback::{
     ContextCompactionWritebackContext, SessionStatePersistCallback, SessionTurnStreamPublishGate,
-    SessionTurnStreamUpdate, append_session_turn_item_with_task_store, apply_model_response_round,
+    SessionTurnStreamUpdate, append_session_turn_item_for_turn, apply_model_response_round,
     new_context_compaction_item_id, persist_session_state_checkpoint,
     publish_current_session_turn_item_event, publish_model_retry_runtime_event,
     publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
     session_turn_stream_update, upsert_context_compaction_completed_notice,
-    upsert_context_compaction_progress_notice, upsert_session_turn_item_with_task_store,
+    upsert_context_compaction_progress_notice, upsert_session_turn_item_for_turn,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
@@ -64,8 +64,8 @@ use crate::{
     session_images::{SessionTurnImage, session_turn_image_sources},
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
-        account_active_goal_usage, current_turn_id, publish_model_usage_record,
-        record_mission_turn, resolved_model_for_usage_binding, resolved_provider_for_usage_binding,
+        account_active_goal_usage, publish_model_usage_record_for_turn, record_mission_turn,
+        resolved_model_for_usage_binding, resolved_provider_for_usage_binding,
         vision_model_usage_binding,
     },
 };
@@ -741,6 +741,7 @@ fn run_conversation_loop_inner(
         execution_group_id,
         persist_session_state,
     } = request;
+    let expected_turn_id = execution_registry.turn_id(task_id);
 
     let mut static_context_messages = Vec::new();
     // ===================================================================
@@ -943,6 +944,7 @@ fn run_conversation_loop_inner(
         workspace_id,
         turn_visibility: &turn_visibility,
         persist_session_state,
+        expected_turn_id: expected_turn_id.as_deref(),
     };
     let prepare_task_history = |phase: &'static str,
                                 context_window: u64,
@@ -960,6 +962,7 @@ fn run_conversation_loop_inner(
             persist_session_state,
             task: Some(task),
             turn_visibility: Some(&turn_visibility),
+            expected_turn_id: expected_turn_id.as_deref(),
         };
         let compaction_observer = |progress| {
             upsert_context_compaction_progress_notice(compaction_writeback, progress);
@@ -974,6 +977,7 @@ fn run_conversation_loop_inner(
             thread_id,
             settings_store,
         )
+        .with_expected_turn_id(expected_turn_id.as_deref())
         .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
         .prepare(ContextPrepareRequest {
             fallback_history: Vec::new(),
@@ -1513,7 +1517,6 @@ fn run_conversation_loop_inner(
             },
         };
         let round_call_id = format!("task-{}-{}-{round}", task_id, lease_id);
-        let current_turn_id = current_turn_id(session_store, session_id);
         let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
             let resolved_provider =
                 resolved_provider_for_usage_binding(settings_store, usage_binding, session_id);
@@ -1522,7 +1525,7 @@ fn run_conversation_loop_inner(
                 settings_store: settings_store.map(Arc::as_ref),
                 session_id,
                 workspace_id,
-                turn_id: current_turn_id.as_deref(),
+                turn_id: expected_turn_id.as_deref(),
                 call_id: &round_call_id,
                 resolved_model: &resolved_context_model,
                 prefill_tokens: estimate_chat_messages_tokens(&messages)
@@ -1604,10 +1607,11 @@ fn run_conversation_loop_inner(
                         let classification = classify_model_invocation_error(&raw_error_message);
                         let error_message = classification.public_message.to_string();
                         let error_detail = direct_runtime_error(&error, &error_message);
-                        publish_model_usage_record(
+                        publish_model_usage_record_for_turn(
                             event_bus,
                             session_store,
                             settings_store,
+                            expected_turn_id.as_deref(),
                             crate::usage_recording::ModelUsageRecordInput {
                                 session_id,
                                 workspace_id,
@@ -1790,10 +1794,11 @@ fn run_conversation_loop_inner(
                                         fallback_classification.public_message.to_string();
                                     let fallback_detail =
                                         direct_runtime_error(&fallback_error, &fallback_message);
-                                    publish_model_usage_record(
+                                    publish_model_usage_record_for_turn(
                                         event_bus,
                                         session_store,
                                         settings_store,
+                                        expected_turn_id.as_deref(),
                                         crate::usage_recording::ModelUsageRecordInput {
                                             session_id,
                                             workspace_id,
@@ -1904,10 +1909,11 @@ fn run_conversation_loop_inner(
                     let classification = classify_model_invocation_error(&raw_error_message);
                     let error_message = classification.public_message.to_string();
                     let error_detail = direct_runtime_error(&error, &error_message);
-                    publish_model_usage_record(
+                    publish_model_usage_record_for_turn(
                         event_bus,
                         session_store,
                         settings_store,
+                        expected_turn_id.as_deref(),
                         crate::usage_recording::ModelUsageRecordInput {
                             session_id,
                             workspace_id,
@@ -2116,10 +2122,11 @@ fn run_conversation_loop_inner(
             ),
             ModelResponseStatus::Completed | ModelResponseStatus::RequiresToolExecution => None,
         };
-        publish_model_usage_record(
+        publish_model_usage_record_for_turn(
             event_bus,
             session_store,
             settings_store,
+            expected_turn_id.as_deref(),
             crate::usage_recording::ModelUsageRecordInput {
                 session_id,
                 workspace_id,
@@ -2535,6 +2542,7 @@ fn run_conversation_loop_inner(
             );
         }
         let repeated_tool_call_failure = if invalid_tool_calls.is_empty() {
+            tool_call_validation_tracker.record_valid_round();
             None
         } else {
             let attempts = tool_call_validation_tracker.record_round();
@@ -3322,6 +3330,7 @@ struct TaskTurnWritebackContext<'a> {
     workspace_id: &'a Option<WorkspaceId>,
     turn_visibility: &'a TaskTurnVisibility,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
+    expected_turn_id: Option<&'a str>,
 }
 
 fn task_context_compaction_terminal_outcome(
@@ -3431,9 +3440,10 @@ fn upsert_task_thinking_turn_item(
     );
     apply_model_response_round(&mut item, model_round);
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
-    if let Some(published) = upsert_session_turn_item_with_task_store(
+    if let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
+        context.expected_turn_id,
         item,
         Some(context.task_store),
     ) {
@@ -3537,9 +3547,10 @@ fn upsert_task_stream_turn_item(
     );
     apply_model_response_round(&mut item, model_round);
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
-    if let Some(published) = upsert_session_turn_item_with_task_store(
+    if let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
+        context.expected_turn_id,
         item,
         Some(context.task_store),
     ) {
@@ -3580,9 +3591,10 @@ fn append_task_tool_call_started_turn_item(
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_status = Some("running".to_string());
     item.tool_arguments = Some(tool_call.function.arguments.clone());
-    if let Some(published) = upsert_session_turn_item_with_task_store(
+    if let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
+        context.expected_turn_id,
         item,
         Some(context.task_store),
     ) {
@@ -3617,12 +3629,18 @@ fn upsert_task_tool_call_result_turn_item(
     item.tool_status = Some(status_label.to_string());
     item.tool_arguments = Some(tool_call.function.arguments.clone());
     item.tool_result = Some(tool_result.to_string());
-    if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
+    if matches!(
+        tool_status,
+        ExecutionResultStatus::Failed
+            | ExecutionResultStatus::Rejected
+            | ExecutionResultStatus::NeedsApproval
+    ) {
         item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) = upsert_session_turn_item_with_task_store(
+    if let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
+        context.expected_turn_id,
         item,
         Some(context.task_store),
     ) {
@@ -3668,9 +3686,10 @@ fn upsert_task_tool_call_progress_turn_item(
     item.tool_status = Some(progress_status);
     item.tool_arguments = Some(tool_call.function.arguments.clone());
     item.tool_result = Some(progress.payload);
-    if let Some(published) = upsert_session_turn_item_with_task_store(
+    if let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
+        context.expected_turn_id,
         item,
         Some(context.task_store),
     ) {
@@ -3729,9 +3748,10 @@ fn append_task_final_turn_item(
     }
     let final_item_id = final_item.item_id.clone();
     if has_requested_final_item_id {
-        if let Some(published) = upsert_session_turn_item_with_task_store(
+        if let Some(published) = upsert_session_turn_item_for_turn(
             context.session_store,
             context.session_id,
+            context.expected_turn_id,
             final_item,
             Some(context.task_store),
         ) {
@@ -3743,9 +3763,10 @@ fn append_task_final_turn_item(
                 &published,
             );
         }
-    } else if let Some(published) = append_session_turn_item_with_task_store(
+    } else if let Some(published) = append_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
+        context.expected_turn_id,
         final_item,
         Some(context.task_store),
     ) {
@@ -3762,9 +3783,11 @@ fn append_task_final_turn_item(
         .get_task(&context.task.root_task_id)
         .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
     if context.turn_visibility.is_mainline() && root_task_completed {
-        let _ = context
-            .session_store
-            .update_current_turn_status(context.session_id, "completed");
+        let _ = context.session_store.update_current_turn_status_for_turn(
+            context.session_id,
+            context.expected_turn_id,
+            "completed",
+        );
         persist_session_state_checkpoint(context.persist_session_state, "task_turn_completed");
         publish_current_session_turn_item_event(
             context.event_bus,
@@ -3807,9 +3830,10 @@ fn append_task_error_turn_item(
         );
     }
     let error_item_id = error_item.item_id.clone();
-    if let Some(published) = append_session_turn_item_with_task_store(
+    if let Some(published) = append_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
+        context.expected_turn_id,
         error_item,
         Some(context.task_store),
     ) {
@@ -3821,9 +3845,11 @@ fn append_task_error_turn_item(
         );
     }
     if context.turn_visibility.is_mainline() {
-        let _ = context
-            .session_store
-            .update_current_turn_status(context.session_id, "failed");
+        let _ = context.session_store.update_current_turn_status_for_turn(
+            context.session_id,
+            context.expected_turn_id,
+            "failed",
+        );
         persist_session_state_checkpoint(context.persist_session_state, "task_turn_failed");
         publish_current_session_turn_item_event(
             context.event_bus,
@@ -7829,6 +7855,7 @@ mod tests {
                 workspace_id: &None,
                 turn_visibility: &visibility,
                 persist_session_state: None,
+                expected_turn_id: None,
             },
             "primary action 已完成",
             Some("timeline-streaming-task-action-final-root-running"),

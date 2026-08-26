@@ -13,8 +13,10 @@ use crate::{
     BrowserTabLifecycle, GoalControlBinding, normalize_browser_page_state,
 };
 
-const MAX_BROWSER_TABS_PER_SESSION: usize = 32;
-const MAX_BROWSER_TABS_TOTAL: usize = 64;
+/// 单个 Magi 会话允许保留的逻辑 Browser Tab 数量。
+pub const MAX_BROWSER_TABS_PER_SESSION: usize = 32;
+/// 所有 Magi 会话共享的逻辑 Browser Tab 总容量。
+pub const MAX_BROWSER_TABS_TOTAL: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct CreateBrowserSession {
@@ -345,6 +347,33 @@ impl BrowserAuthority {
         self.active_surface_leases
             .get(&(tab_id.clone(), surface_id.to_string()))
             .and_then(|lease_id| self.leases.get(lease_id))
+    }
+
+    pub fn active_lease_for_tab(
+        &self,
+        tab_id: &BrowserTabId,
+        now: UtcMillis,
+    ) -> Option<&BrowserControlLease> {
+        self.leases.values().find(|lease| {
+            lease.tab_id == *tab_id
+                && lease.lifecycle == BrowserLeaseLifecycle::Held
+                && lease.expires_at > now
+        })
+    }
+
+    /// 返回 Tab 是否处于可以被用户显式回收的非活动状态。
+    ///
+    /// `Suspended` 表示逻辑页面仍可恢复但当前没有物理 Chromium Page，
+    /// `Crashed` 表示物化失败或运行时异常。Ready/Creating 不能通过资源
+    /// 回收入口关闭，避免误伤当前正在使用的页面或创建中的页面。
+    pub fn is_reclaimable_tab(&self, tab_id: &BrowserTabId, now: UtcMillis) -> bool {
+        let Some(tab) = self.tabs.get(tab_id) else {
+            return false;
+        };
+        matches!(
+            tab.lifecycle,
+            BrowserTabLifecycle::Suspended | BrowserTabLifecycle::Crashed
+        ) && self.active_lease_for_tab(tab_id, now).is_none()
     }
 
     pub fn primary_surface(&self, tab_id: &BrowserTabId) -> Option<&BrowserPrimarySurface> {
@@ -1719,7 +1748,11 @@ impl BrowserAuthority {
             .count()
     }
 
-    fn live_tab_count(&self) -> usize {
+    /// 返回参与全局容量计算的逻辑 Tab 数量。
+    ///
+    /// Crashed 不占用可创建容量，但仍会出现在资源管理列表中，供用户
+    /// 一并收口历史失败记录。
+    pub fn live_tab_count(&self) -> usize {
         self.sessions
             .values()
             .map(|session| self.live_tab_count_for_session(session))

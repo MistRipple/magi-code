@@ -32,6 +32,10 @@ pub enum ApiError {
     InternalAssemblyError(String),
     /// 资源状态冲突（如 runner 已启动）
     Conflict(String),
+    /// 当前浏览器会话已达到页面容量上限。
+    BrowserSessionTabLimitReached,
+    /// Browser Authority 已达到全局页面容量上限。
+    BrowserGlobalTabLimitReached,
     /// 当前客户端平台不具备所请求的能力。
     CapabilityUnavailable {
         capability: String,
@@ -116,6 +120,8 @@ impl ApiError {
             ApiError::ModelInvocationFailed(_) => "MODEL_INVOCATION_FAILED",
             ApiError::InternalAssemblyError(_) => "INTERNAL_ASSEMBLY_ERROR",
             ApiError::Conflict(_) => "CONFLICT",
+            ApiError::BrowserSessionTabLimitReached => "BROWSER_SESSION_TAB_LIMIT_REACHED",
+            ApiError::BrowserGlobalTabLimitReached => "BROWSER_GLOBAL_TAB_LIMIT_REACHED",
             ApiError::CapabilityUnavailable { .. } => "CAPABILITY_UNAVAILABLE",
             ApiError::TurnConflict { .. } => "TURN_CONFLICT",
         }
@@ -131,6 +137,9 @@ impl ApiError {
             ApiError::ModelInvocationFailed(_) => StatusCode::BAD_GATEWAY,
             ApiError::InternalAssemblyError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::BrowserSessionTabLimitReached | ApiError::BrowserGlobalTabLimitReached => {
+                StatusCode::CONFLICT
+            }
             ApiError::CapabilityUnavailable { .. } => StatusCode::NOT_IMPLEMENTED,
             ApiError::TurnConflict { .. } => StatusCode::CONFLICT,
         }
@@ -146,6 +155,12 @@ impl ApiError {
             ApiError::ModelInvocationFailed(message) => message,
             ApiError::InternalAssemblyError(message) => message,
             ApiError::Conflict(message) => message,
+            ApiError::BrowserSessionTabLimitReached => {
+                "当前浏览器会话已达到页面上限，请关闭不再使用的页面后重试"
+            }
+            ApiError::BrowserGlobalTabLimitReached => {
+                "内置浏览器已达到页面上限，请关闭不再使用的页面后重试"
+            }
             ApiError::CapabilityUnavailable { message, .. } => message,
             ApiError::TurnConflict { message, .. } => message,
         }
@@ -322,6 +337,14 @@ mod tests {
             "INTERNAL_ASSEMBLY_ERROR"
         );
         assert_eq!(
+            ApiError::BrowserSessionTabLimitReached.error_code(),
+            "BROWSER_SESSION_TAB_LIMIT_REACHED"
+        );
+        assert_eq!(
+            ApiError::BrowserGlobalTabLimitReached.error_code(),
+            "BROWSER_GLOBAL_TAB_LIMIT_REACHED"
+        );
+        assert_eq!(
             ApiError::turn_conflict(
                 "expected_turn_mismatch",
                 Some("turn-current".to_string()),
@@ -360,6 +383,10 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
+            ApiError::BrowserGlobalTabLimitReached.status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
             ApiError::ModelInvocationFailed("fail".into()).status_code(),
             StatusCode::BAD_GATEWAY
         );
@@ -377,6 +404,7 @@ mod tests {
         assert!(ApiError::Conflict("busy".into()).queued_submission_is_retryable());
         assert!(!ApiError::InvalidInput("invalid".into()).queued_submission_is_retryable());
         assert!(!ApiError::SessionNotFound("missing".into()).queued_submission_is_retryable());
+        assert!(!ApiError::BrowserGlobalTabLimitReached.queued_submission_is_retryable());
     }
 
     #[test]

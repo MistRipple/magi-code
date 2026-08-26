@@ -23,8 +23,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
-const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
+// Shell 命令可能包含构建、测试或用户明确要求的等待。默认超时必须覆盖常见
+// 的长命令，不能把没有输出但仍在正常运行的命令误判成失败。
+const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
+const MIN_SHELL_TIMEOUT_MS: u64 = 1_000;
+const MAX_SHELL_TIMEOUT_MS: u64 = 1_800_000;
 const SHELL_TIMEOUT_POLL_MS: u64 = 20;
 const DEFAULT_FILE_READ_MAX_BYTES: usize = 64 * 1024;
 const FILE_READ_MAX_BYTES: usize = 1024 * 1024;
@@ -761,7 +764,7 @@ fn execute_shell_exec(
         .and_then(|object| field_usize(object, &["timeout_ms", "timeoutMs", "timeout"]))
         .map(|value| value as u64)
         .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
-        .clamp(SHELL_TIMEOUT_POLL_MS, MAX_SHELL_TIMEOUT_MS);
+        .clamp(MIN_SHELL_TIMEOUT_MS, MAX_SHELL_TIMEOUT_MS);
     if let Some(payload) = non_git_read_only_probe_payload(&command, &cwd, access_mode, timeout_ms)
     {
         return payload;
@@ -4750,5 +4753,12 @@ mod tests {
         assert!(!output.contains("/private/workspace/secret.txt"));
         assert!(!output.contains("No such file"));
         assert!(!output.contains("os error"));
+    }
+
+    #[test]
+    fn shell_timeout_defaults_cover_silent_long_commands() {
+        assert_eq!(DEFAULT_SHELL_TIMEOUT_MS, 300_000);
+        assert_eq!(MIN_SHELL_TIMEOUT_MS, 1_000);
+        assert_eq!(MAX_SHELL_TIMEOUT_MS, 1_800_000);
     }
 }

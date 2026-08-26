@@ -390,19 +390,24 @@ function adaptFlatToolCallBlock(block: Record<string, unknown>): import('../type
     case 'running': resolvedStatus = 'running'; break;
     case 'success': case 'completed': resolvedStatus = 'success'; break;
     case 'error': case 'failed': resolvedStatus = 'error'; break;
+    case 'cancelled': case 'canceled': resolvedStatus = 'cancelled'; break;
     default:
       if (standardizedStatus === 'success') resolvedStatus = 'success';
-      else if (['error', 'timeout', 'killed', 'blocked', 'rejected', 'aborted'].includes(standardizedStatus)) resolvedStatus = 'error';
+      else if (standardizedStatus === 'cancelled' || standardizedStatus === 'canceled') resolvedStatus = 'cancelled';
+      else if (['killed', 'aborted'].includes(standardizedStatus)) resolvedStatus = 'cancelled';
+      else if (['error', 'timeout', 'blocked', 'rejected'].includes(standardizedStatus)) resolvedStatus = 'error';
       else if (error) resolvedStatus = 'error';
       else if (output) resolvedStatus = 'success';
       else resolvedStatus = 'running';
   }
 
-  const standardizedHardError = ['error', 'timeout', 'killed', 'blocked', 'rejected', 'aborted'].includes(standardizedStatus);
+  const standardizedHardError = ['error', 'timeout', 'blocked', 'rejected'].includes(standardizedStatus);
   const standardizedError = standardized && standardizedHardError
     ? (typeof standardized.message === 'string' ? standardized.message : undefined)
     : undefined;
-  const resolvedError = error || standardizedError || (resolvedStatus === 'error' ? output : undefined);
+  const resolvedError = resolvedStatus === 'error'
+    ? (error || standardizedError || output)
+    : undefined;
 
   return {
     id: typeof block.toolId === 'string' ? block.toolId : '',
@@ -426,8 +431,11 @@ function adaptFlatToolResultBlock(block: Record<string, unknown>): import('../ty
   const rawContent = typeof block.content === 'string' ? block.content.trim() : '';
   const fallbackMessage = typeof standardized?.message === 'string' ? standardized.message.trim() : '';
   const resolvedContent = rawContent || fallbackMessage;
-  const isError = block.isError === true
-    || ['error', 'timeout', 'killed', 'blocked', 'rejected', 'aborted'].includes(standardizedStatus);
+  const isCancelled = ['cancelled', 'canceled', 'killed', 'aborted'].includes(standardizedStatus);
+  const isError = !isCancelled && (
+    block.isError === true
+    || ['error', 'timeout', 'blocked', 'rejected'].includes(standardizedStatus)
+  );
 
   return {
     id: typeof block.toolCallId === 'string' ? block.toolCallId : '',
@@ -435,7 +443,7 @@ function adaptFlatToolResultBlock(block: Record<string, unknown>): import('../ty
       ? standardized.toolName
       : 'tool_result',
     arguments: parseToolInput(block.input),
-    status: isError ? 'error' : 'success',
+    status: isCancelled ? 'cancelled' : (isError ? 'error' : 'success'),
     result: isError ? undefined : (resolvedContent || undefined),
     error: isError ? (resolvedContent || undefined) : undefined,
     standardized: standardized as import('../types/message').StandardizedToolResult | undefined,

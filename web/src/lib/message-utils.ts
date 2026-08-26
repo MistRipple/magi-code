@@ -155,17 +155,19 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           block.error
         );
         const standardizedStatus = (block.standardized?.status || '').toLowerCase();
-        const standardizedHardError = standardizedStatus === 'error'
+        const standardizedCancellation = ['cancelled', 'canceled', 'killed', 'aborted'].includes(standardizedStatus);
+        const standardizedHardError = !standardizedCancellation && (standardizedStatus === 'error'
           || standardizedStatus === 'timeout'
-          || standardizedStatus === 'killed'
           || standardizedStatus === 'blocked'
           || standardizedStatus === 'rejected'
-          || standardizedStatus === 'aborted';
+          );
         const standardizedError = block.standardized
           && standardizedHardError
           ? (block.standardized.message || undefined)
           : undefined;
-        const resolvedError = block.error || standardizedError || (toolStatus === 'error' ? block.output : undefined);
+        const resolvedError = toolStatus === 'error'
+          ? (block.error || standardizedError || block.output)
+          : undefined;
         const toolCall: ToolCall = {
           id: toolId,
           name: block.toolName,
@@ -322,6 +324,11 @@ function mapToolStatus(
       return 'error';
     case 'completed':
       return 'success';
+    case 'cancelled':
+    case 'canceled':
+    case 'killed':
+    case 'aborted':
+      return 'cancelled';
     case 'failed':
       return 'error';
   }
@@ -332,12 +339,18 @@ function mapToolStatus(
         return 'success';
       case 'error':
       case 'timeout':
-      case 'killed':
         return 'error';
+      case 'killed':
+      case 'aborted':
       case 'blocked':
       case 'rejected':
-      case 'aborted':
-        return 'error';
+        return standardizedStatus.toLowerCase() === 'killed'
+          || standardizedStatus.toLowerCase() === 'aborted'
+          ? 'cancelled'
+          : 'error';
+      case 'cancelled':
+      case 'canceled':
+        return 'cancelled';
       default:
         break;
     }
@@ -352,17 +365,25 @@ function mapToolResultStatus(
   isError: boolean | undefined,
   standardizedStatus?: string,
 ): ToolCall['status'] {
+  const normalizedStatus = (standardizedStatus || '').toLowerCase();
+  if (normalizedStatus === 'cancelled' || normalizedStatus === 'canceled') {
+    return 'cancelled';
+  }
   if (isError === true) {
     return 'error';
   }
-  switch ((standardizedStatus || '').toLowerCase()) {
+  switch (normalizedStatus) {
     case 'error':
     case 'timeout':
-    case 'killed':
     case 'blocked':
     case 'rejected':
-    case 'aborted':
       return 'error';
+    case 'killed':
+    case 'aborted':
+      return 'cancelled';
+    case 'cancelled':
+    case 'canceled':
+      return 'cancelled';
     default:
       return 'success';
   }

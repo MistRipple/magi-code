@@ -16,7 +16,7 @@
 
   interface Props {
     toolCall?: ToolCall;
-    status?: 'pending' | 'running' | 'success' | 'error';
+    status?: 'pending' | 'running' | 'success' | 'error' | 'cancelled';
   }
 
   let { toolCall, status = 'running' }: Props = $props();
@@ -60,7 +60,7 @@
   }
 
   function terminalStatusFromCanonical(
-    canonicalStatus?: 'pending' | 'running' | 'success' | 'error',
+    canonicalStatus?: 'pending' | 'running' | 'success' | 'error' | 'cancelled',
     payloadStatus?: string,
   ): string {
     if (canonicalStatus === 'error') {
@@ -77,7 +77,11 @@
       }
       return 'error';
     }
-    if (canonicalStatus === 'running' || canonicalStatus === 'pending') {
+    if (
+      canonicalStatus === 'running'
+      || canonicalStatus === 'pending'
+      || canonicalStatus === 'cancelled'
+    ) {
       return canonicalStatus;
     }
     return payloadStatus || canonicalStatus || 'running';
@@ -192,12 +196,17 @@
       return i18n.t('terminalSession.status.success');
     }
     if (
-      ['failed', 'error', 'timeout', 'cancelled', 'canceled', 'aborted', 'rejected'].includes(normalized)
+      ['cancelled', 'canceled', 'killed', 'aborted'].includes(normalized)
+      || normalized.includes('cancel')
+      || normalized.includes('abort')
+    ) {
+      return i18n.t('terminalSession.status.cancelled');
+    }
+    if (
+      ['failed', 'error', 'timeout', 'rejected'].includes(normalized)
       || normalized.includes('fail')
       || normalized.includes('error')
       || normalized.includes('timeout')
-      || normalized.includes('cancel')
-      || normalized.includes('abort')
       || normalized.includes('reject')
     ) {
       return i18n.t('terminalSession.status.error');
@@ -227,11 +236,13 @@
     if (normalized.includes('finish') || normalized.includes('complete') || normalized.includes('success')) {
       return i18n.t('terminalSession.phase.completed');
     }
+    if (normalized.includes('cancel') || normalized.includes('abort')) {
+      return i18n.t('terminalSession.phase.cancelled');
+    }
     if (
       normalized.includes('fail')
       || normalized.includes('error')
       || normalized.includes('timeout')
-      || normalized.includes('cancel')
     ) {
       return i18n.t('terminalSession.phase.interrupted');
     }
@@ -262,6 +273,7 @@
   const normalizedStatus = $derived(String(displayStatus || '').toLowerCase());
 
   const statusClass = $derived.by(() => {
+    if (normalizedStatus.includes('cancel')) return 'cancelled';
     if (
       normalizedStatus.includes('fail')
       || normalizedStatus.includes('error')
@@ -585,6 +597,10 @@
 
   .status-error {
     color: var(--error);
+  }
+
+  .status-cancelled {
+    color: var(--foreground-muted);
   }
 
   @keyframes pulse {

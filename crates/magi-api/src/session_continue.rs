@@ -170,9 +170,51 @@ pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
     finalize_terminal_worker_branches, task_status_is_terminal,
 };
 
+/// 新 Turn 已经写入后，如果 runner 启动失败，必须把它收口为失败态。
+///
+/// Continue 入口会先持久化用户可见的 running Turn，再启动后台 runner；启动阶段的
+/// 任何失败都不能把这个 Turn 留在 running，否则下一次发送会继续看到一个永远不会
+/// 收口的“活动会话”，并再次触发旧执行链的恢复逻辑。
+fn fail_prepared_continue_turn(state: &ApiState, session_id: &SessionId, turn_id: &str) {
+    match state.session_store.update_current_turn_status_for_turn(
+        session_id,
+        Some(turn_id),
+        "failed",
+    ) {
+        Ok(Some(_)) => {
+            if let Err(error) =
+                state.persist_session_state_checkpoint("session_continue_start_failed")
+            {
+                tracing::error!(
+                    ?error,
+                    %session_id,
+                    turn_id,
+                    "Continue runner 启动失败后的 Turn 终态持久化失败"
+                );
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                %session_id,
+                turn_id,
+                "Continue runner 启动失败时未找到可收口的 current Turn"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                %session_id,
+                turn_id,
+                "Continue runner 启动失败后的 Turn 收口失败"
+            );
+        }
+    }
+}
+
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
+    turn_id: &str,
     execution_root: Option<std::path::PathBuf>,
     execution_settings_snapshot: Option<Arc<SettingsStore>>,
 ) -> TaskExecutionPlan {
@@ -212,6 +254,7 @@ fn rebuild_dispatch_plan_for_branch(
         thread_id: branch.thread_id.clone(),
         is_primary: branch.is_primary,
         session_id: chain.session_id.clone(),
+        turn_id: turn_id.to_string(),
         workspace_id: chain.workspace_id.clone(),
         execution_root,
         ownership,
@@ -458,16 +501,18 @@ pub(crate) fn persist_resumed_branch_user_input(
 ///
 /// 这使“用户输入接管中断任务”和“启动恢复 runner”属于同一个串行临界区，避免双击
 /// 恢复链接或多个窗口同时提交时把第二条输入遗留到错误执行链中。
-pub(crate) async fn continue_execution_chain_with_pre_resume<T, F>(
+pub(crate) async fn continue_execution_chain_with_pre_resume<T, U, F, G>(
     state: &ApiState,
     session_id: &SessionId,
     requested_agent_ids: &[WorkerId],
     resumed_turn_id: &str,
     resumed_at: UtcMillis,
     prepare_input: F,
-) -> Result<(SessionContinueAccepted, T), ApiError>
+    prepare_turn: G,
+) -> Result<(SessionContinueAccepted, T, U), ApiError>
 where
     F: FnOnce(&[ActiveExecutionBranch]) -> Result<T, ApiError>,
+    G: FnOnce(&ActiveExecutionChain, &ActiveExecutionBranch, &T) -> Result<U, ApiError>,
 {
     if state.session_store.session(session_id).is_none() {
         return Err(ApiError::session_not_found(session_id.as_str()));
@@ -700,6 +745,21 @@ where
         }
     })?;
 
+    // 恢复链可能已经因为任务失败或 daemon 停止而失去执行能力，但旧 current Turn
+    // 的异步终态写回尚未到达。先按 execution chain 携带的 Turn ID 原子收口旧轮次，
+    // 再写入 Continue 的新 Turn，避免新旧 Turn 竞争同一个 current_turn 指针。
+    if let Some(previous_turn_id) = chain
+        .current_turn
+        .as_ref()
+        .map(|turn| turn.turn_id.as_str())
+    {
+        state
+            .session_store
+            .finalize_current_turn_for_continue(session_id, previous_turn_id)
+            .map_err(|error| ApiError::internal_assembly("收口 Continue 前置 Turn 失败", error))?;
+        state.persist_session_state_checkpoint("session_continue_finalize_previous_turn")?;
+    }
+
     let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
     restore_missing_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)?;
     let prepared_input = prepare_input(&branches_to_resume)?;
@@ -740,6 +800,7 @@ where
             rebuild_dispatch_plan_for_branch(
                 &chain,
                 branch,
+                resumed_turn_id,
                 execution_root.clone(),
                 execution_settings_snapshot.clone(),
             ),
@@ -785,19 +846,26 @@ where
             .map_err(|msg| ApiError::internal_assembly("继续会话失败", msg))?;
     }
 
+    // 必须在启动 runner 前切换 current turn。旧 interrupted turn 仍保留在历史中，
+    // 新 runner 的所有流式/工具写回都绑定到这个新 turn，避免首个事件落到旧轮次。
+    let prepared_turn = prepare_turn(&chain, primary_branch, &prepared_input)?;
+
     // 旧 runner 已在恢复状态前完成退出；这里只允许启动一个全新的执行轮。
     match manager.start_after_quiesce(chain.root_task_id.as_str(), Some(session_id.clone())) {
         Ok(_) => {}
         Err(RunnerStartError::AlreadyRunning) => {
+            fail_prepared_continue_turn(state, session_id, resumed_turn_id);
             return Err(ApiError::internal_assembly(
                 "继续会话失败",
                 "恢复锁内仍存在活动 runner",
             ));
         }
         Err(RunnerStartError::NotFound) => {
+            fail_prepared_continue_turn(state, session_id, resumed_turn_id);
             return Err(ApiError::internal_assembly("继续会话失败", "根任务不存在"));
         }
         Err(RunnerStartError::SessionUnavailable) => {
+            fail_prepared_continue_turn(state, session_id, resumed_turn_id);
             return Err(ApiError::InvalidInput(
                 "当前会话已关闭，不能继续执行".to_string(),
             ));
@@ -810,11 +878,12 @@ where
         mission_id: chain.mission_id,
         root_task_id: chain.root_task_id,
         action_task_id: primary_branch.task_id.clone(),
+        turn_id: resumed_turn_id.to_string(),
         execution_chain_ref: chain.execution_chain_ref,
         resumed_branch_count: branches_to_resume.len(),
         runner_started: true,
     };
     recovery_claim.commit();
     git_execution_lease.commit();
-    Ok((accepted, prepared_input))
+    Ok((accepted, prepared_input, prepared_turn))
 }

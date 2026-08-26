@@ -201,14 +201,29 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     session_id: &SessionId,
     root_task_id: &TaskId,
 ) -> bool {
+    finalize_background_session_task_turn_if_root_completed_for_turn(
+        state,
+        session_id,
+        root_task_id,
+        None,
+    )
+}
+
+pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
+    state: &ApiState,
+    session_id: &SessionId,
+    root_task_id: &TaskId,
+    expected_turn_id: Option<&str>,
+) -> bool {
     release_terminal_browser_resources(state, session_id, root_task_id);
     let persist_session_state = session_state_persist_callback(state);
-    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed(
+    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
         state.session_store.as_ref(),
         &state.event_bus,
         state.task_store(),
         session_id,
         root_task_id,
+        expected_turn_id,
         Some(persist_session_state.as_ref()),
     );
     if finalized {
@@ -223,23 +238,28 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     finalized
 }
 
-pub fn finalize_background_session_task_turn_if_root_terminal(
+pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
     state: &ApiState,
     session_id: &SessionId,
     root_task_id: &TaskId,
     runner_status: &str,
+    expected_turn_id: Option<&str>,
 ) -> bool {
     release_terminal_browser_resources(state, session_id, root_task_id);
     let persist_session_state = session_state_persist_callback(state);
-    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
-        state.session_store.as_ref(),
-        &state.event_bus,
-        state.task_store(),
-        session_id,
-        root_task_id,
-        runner_status,
-        Some(persist_session_state.as_ref()),
-    );
+    let finalized =
+        magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
+            magi_conversation_runtime::session_turn_finalize::FinalizeBackgroundSessionTaskTurnContext {
+                session_store: state.session_store.as_ref(),
+                event_bus: &state.event_bus,
+                task_store: state.task_store(),
+                session_id,
+                root_task_id,
+                runner_status,
+                expected_turn_id,
+                persist_session_state: Some(persist_session_state.as_ref()),
+            },
+        );
     if finalized {
         let owns_active_plan = state
             .session_store
@@ -559,12 +579,15 @@ mod tests {
         )
         .with_task_store(task_store);
 
-        assert!(finalize_background_session_task_turn_if_root_terminal(
-            &state,
-            &session_id,
-            &root_task_id,
-            "error",
-        ));
+        assert!(
+            finalize_background_session_task_turn_if_root_terminal_for_turn(
+                &state,
+                &session_id,
+                &root_task_id,
+                "error",
+                None,
+            )
+        );
         let plan = plan_store.snapshot().expect("plan should remain visible");
         assert_eq!(plan.state, magi_core::PlanState::Paused);
         assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);

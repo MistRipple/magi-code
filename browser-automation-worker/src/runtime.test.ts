@@ -229,6 +229,29 @@ test("PWA 工具只接受 state action", async () => {
   assert.equal(result.outcome.payload.code, "browser_pwa_action_unsupported");
 });
 
+test("wait_for 超时会返回可恢复的具体等待条件", async () => {
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: false } };
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("wait-timeout", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "wait_for",
+      arguments: { text: "敌人 5", timeout_ms: 0 },
+    },
+  });
+
+  assert.equal(result.outcome.status, "failed");
+  assert.equal(result.outcome.payload.code, "browser_wait_timeout");
+  assert.match(result.outcome.payload.message, /敌人 5/u);
+  assert.match(result.outcome.payload.message, /browser_snapshot/u);
+});
+
 test("WebMCP 执行工具时传递结构化输入而不是 JSON 字符串", async () => {
   let executeExpression = "";
   const port = new ScriptedPort((method, params) => {

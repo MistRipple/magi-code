@@ -168,6 +168,8 @@ function buildToolRuntimeRecord(
   const status = toolCall.status;
   const type = status === 'error'
     ? 'session.tool.failed'
+    : status === 'cancelled'
+      ? 'session.tool.cancelled'
     : status === 'success'
       ? 'session.tool.succeeded'
       : 'session.tool.running';
@@ -176,7 +178,7 @@ function buildToolRuntimeRecord(
     suffix: `tool-${toolCall.id}`,
     type,
     summary: resolveToolRuntimeSummary(toolCall) || toolCall.name,
-    kind: status === 'error' ? 'error' : status === 'success' ? 'success' : 'progress',
+    kind: status === 'error' ? 'error' : status === 'cancelled' ? 'warning' : status === 'success' ? 'success' : 'progress',
     source: toolCall.name,
     detail: detail || undefined,
   });

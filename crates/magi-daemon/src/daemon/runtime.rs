@@ -1650,7 +1650,7 @@ impl DaemonRuntime {
         )
         .with_agent_role_registry(state.agent_role_registry.clone())
         .with_checkpoint_path(task_store_checkpoint_path)
-        .with_terminal_observer(move |root_task_id, session_id, status| {
+        .with_terminal_observer(move |root_task_id, session_id, status, turn_id| {
             let Some(session_id) = session_id else {
                 return;
             };
@@ -1684,11 +1684,12 @@ impl DaemonRuntime {
             let callback_state = state_for_runner_terminal
                 .clone()
                 .with_shared_runner_manager(runner_manager);
-            if magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
+            if magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
                 &callback_state,
                 &session_id,
                 &root_task_id,
                 &status,
+                turn_id.as_deref(),
             ) {
                 let _ = callback_state.persist_session_durable_state();
             }

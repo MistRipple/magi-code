@@ -232,9 +232,8 @@ pub fn turn_item_status_for_tool_result(status: ExecutionResultStatus) -> &'stat
     match status {
         ExecutionResultStatus::Succeeded => "completed",
         ExecutionResultStatus::NeedsApproval => "awaiting_approval",
-        ExecutionResultStatus::Failed
-        | ExecutionResultStatus::Rejected
-        | ExecutionResultStatus::Cancelled => "failed",
+        ExecutionResultStatus::Cancelled => "cancelled",
+        ExecutionResultStatus::Failed | ExecutionResultStatus::Rejected => "failed",
     }
 }
 
@@ -248,9 +247,9 @@ pub fn infer_tool_call_status(result: &str) -> &'static str {
         .and_then(|v| v.as_str())
     {
         match status.to_ascii_lowercase().as_str() {
-            "error" | "failed" | "blocked" | "rejected" | "cancelled" | "canceled"
-            | "needs_approval" | "needsapproval" | "timeout" | "timed_out" | "killed"
-            | "aborted" => return "error",
+            "error" | "failed" | "blocked" | "rejected" | "needs_approval" | "needsapproval"
+            | "timeout" | "timed_out" => return "error",
+            "cancelled" | "canceled" | "killed" | "aborted" => return "cancelled",
             "succeeded" | "success" | "ok" | "completed" => explicit_success = true,
             "degraded" => {
                 explicit_success = true;
@@ -572,7 +571,7 @@ mod tests {
         );
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::Cancelled),
-            "failed"
+            "cancelled"
         );
     }
 
@@ -596,6 +595,10 @@ mod tests {
     fn infer_tool_call_status_prefers_status_field() {
         assert_eq!(infer_tool_call_status(r#"{"status":"failed"}"#), "error");
         assert_eq!(infer_tool_call_status(r#"{"status":"blocked"}"#), "error");
+        assert_eq!(
+            infer_tool_call_status(r#"{"status":"cancelled"}"#),
+            "cancelled"
+        );
         assert_eq!(
             infer_tool_call_status(r#"{"status":"needs_approval"}"#),
             "error"

@@ -88,6 +88,7 @@ struct DispatchPlanExecutionInput<'a> {
     task: &'a magi_core::Task,
     lease_id: &'a LeaseId,
     session_id: SessionId,
+    turn_id: String,
     workspace_id: Option<WorkspaceId>,
     execution_root: Option<PathBuf>,
     ownership: ExecutionOwnership,
@@ -552,6 +553,7 @@ impl LlmTaskDispatcher {
             task,
             lease_id,
             session_id,
+            turn_id,
             workspace_id,
             execution_root,
             ownership,
@@ -598,6 +600,7 @@ impl LlmTaskDispatcher {
             if should_enrich_session {
                 self.schedule_post_completion_enrichment(
                     session_id,
+                    turn_id,
                     workspace_id,
                     outcome,
                     execution_settings_snapshot,
@@ -612,6 +615,7 @@ impl LlmTaskDispatcher {
     fn schedule_post_completion_enrichment(
         &self,
         session_id: SessionId,
+        turn_id: String,
         workspace_id: Option<WorkspaceId>,
         outcome: TaskOutcome,
         execution_settings_snapshot: Option<Arc<SettingsStore>>,
@@ -625,12 +629,14 @@ impl LlmTaskDispatcher {
                 dispatcher.extract_and_persist_knowledge(
                     execution_settings,
                     &session_id,
+                    Some(&turn_id),
                     &workspace_id,
                     &outcome,
                 );
                 dispatcher.extract_and_persist_session_memory(
                     execution_settings,
                     &session_id,
+                    Some(&turn_id),
                     &workspace_id,
                 );
             })
@@ -643,6 +649,7 @@ impl LlmTaskDispatcher {
         &self,
         settings_store: Option<&Arc<SettingsStore>>,
         session_id: &SessionId,
+        expected_turn_id: Option<&str>,
         workspace_id: &Option<WorkspaceId>,
         outcome: &TaskOutcome,
     ) {
@@ -704,12 +711,15 @@ impl LlmTaskDispatcher {
             return;
         };
         let learnings = match extract_learnings_via_auxiliary(
-            client,
-            self.event_bus.as_ref(),
-            self.session_store.as_ref(),
-            settings_store,
-            session_id,
-            workspace_id,
+            AuxiliaryModelExtractionContext {
+                client,
+                event_bus: self.event_bus.as_ref(),
+                session_store: self.session_store.as_ref(),
+                settings_store,
+                session_id,
+                workspace_id,
+                expected_turn_id,
+            },
             &extraction_text,
         ) {
             Ok(Some(learnings)) => learnings,
@@ -796,6 +806,7 @@ impl LlmTaskDispatcher {
         &self,
         settings_store: Option<&Arc<SettingsStore>>,
         session_id: &SessionId,
+        expected_turn_id: Option<&str>,
         workspace_id: &Option<WorkspaceId>,
     ) {
         let Some(client) = self
@@ -857,12 +868,15 @@ impl LlmTaskDispatcher {
         }
 
         let Some(slices) = extract_session_memory_via_auxiliary(
-            client,
-            self.event_bus.as_ref(),
-            self.session_store.as_ref(),
-            settings_store,
-            session_id,
-            workspace_id,
+            AuxiliaryModelExtractionContext {
+                client,
+                event_bus: self.event_bus.as_ref(),
+                session_store: self.session_store.as_ref(),
+                settings_store,
+                session_id,
+                workspace_id,
+                expected_turn_id,
+            },
             &excerpt_text,
         ) else {
             return;
@@ -2340,6 +2354,7 @@ impl LlmTaskDispatcher {
                 thread_id,
                 is_primary,
                 session_id,
+                turn_id,
                 workspace_id,
                 execution_root,
                 ownership,
@@ -2348,6 +2363,7 @@ impl LlmTaskDispatcher {
                 skill_name,
                 images,
                 execution_settings_snapshot,
+                ..
             } => {
                 self.publish_task_dispatched_event(TaskDispatchedEventInput {
                     task_id: &task.task_id,
@@ -2362,6 +2378,7 @@ impl LlmTaskDispatcher {
                     task,
                     lease_id: &lease.lease_id,
                     session_id,
+                    turn_id,
                     workspace_id,
                     execution_root,
                     ownership,
@@ -2478,6 +2495,16 @@ struct SessionMemorySlice {
     content: String,
 }
 
+struct AuxiliaryModelExtractionContext<'a> {
+    client: Arc<dyn ModelBridgeClient>,
+    event_bus: &'a InMemoryEventBus,
+    session_store: &'a SessionStore,
+    settings_store: Option<&'a Arc<SettingsStore>>,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    expected_turn_id: Option<&'a str>,
+}
+
 /// 利用辅助模型从会话片段中识别"经验/结论/教训"。
 ///
 /// 与 `session_title::refine_new_session_title` 保持同一套约定：
@@ -2485,14 +2512,18 @@ struct SessionMemorySlice {
 /// - 模型返回失败、`ok=false` 等异常一律 `tracing::debug!` 并返回明确失败原因，
 ///   由上层发布诊断事件；不做任何降级到 marker 路径的回退。
 fn extract_learnings_via_auxiliary(
-    client: Arc<dyn ModelBridgeClient>,
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    settings_store: Option<&Arc<SettingsStore>>,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: AuxiliaryModelExtractionContext<'_>,
     text: &str,
 ) -> Result<Option<Vec<LearningCandidate>>, LearningExtractionFailure> {
+    let AuxiliaryModelExtractionContext {
+        client,
+        event_bus,
+        session_store,
+        settings_store,
+        session_id,
+        workspace_id,
+        expected_turn_id,
+    } = context;
     let prompt = build_knowledge_extraction_prompt(text);
     let request = ModelInvocationRequest {
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
@@ -2517,6 +2548,7 @@ fn extract_learnings_via_auxiliary(
             workspace_id,
             call_id,
             phase: UsagePhase::Integration,
+            expected_turn_id,
         },
     ) {
         Ok(resp) => resp,
@@ -2610,14 +2642,18 @@ fn is_pure_tool_sequence(content: &str) -> bool {
 /// JSON 解析异常一律 `tracing::debug!` 后返回 `None`。调用方需先确保辅助模型
 /// 已配置（外层使用 `resolve_target_for_role(.., RoleTarget::Auxiliary)` 短路）。
 fn extract_session_memory_via_auxiliary(
-    client: Arc<dyn ModelBridgeClient>,
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    settings_store: Option<&Arc<SettingsStore>>,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: AuxiliaryModelExtractionContext<'_>,
     text: &str,
 ) -> Option<Vec<SessionMemorySlice>> {
+    let AuxiliaryModelExtractionContext {
+        client,
+        event_bus,
+        session_store,
+        settings_store,
+        session_id,
+        workspace_id,
+        expected_turn_id,
+    } = context;
     let prompt = build_session_memory_prompt(text);
     let request = ModelInvocationRequest {
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
@@ -2642,6 +2678,7 @@ fn extract_session_memory_via_auxiliary(
             workspace_id,
             call_id,
             phase: UsagePhase::Integration,
+            expected_turn_id,
         },
     ) {
         Ok(resp) => resp,
@@ -3005,6 +3042,7 @@ mod tests {
         let schedule_call = std::thread::spawn(move || {
             dispatcher.schedule_post_completion_enrichment(
                 SessionId::new("session-nonblocking-enrichment"),
+                "turn-nonblocking-enrichment".to_string(),
                 Some(WorkspaceId::new("workspace-nonblocking-enrichment")),
                 TaskOutcome::Completed {
                     attempt: TaskCompletionAttempt {
@@ -4524,12 +4562,15 @@ mod tests {
         let session_id = SessionId::new("session-learning-extraction-failure");
         let workspace_id = Some(WorkspaceId::new("workspace-learning-extraction-failure"));
         let result = extract_learnings_via_auxiliary(
-            Arc::new(FailingAuxiliaryClient),
-            &event_bus,
-            &session_store,
-            Some(&settings_store),
-            &session_id,
-            &workspace_id,
+            AuxiliaryModelExtractionContext {
+                client: Arc::new(FailingAuxiliaryClient),
+                event_bus: &event_bus,
+                session_store: &session_store,
+                settings_store: Some(&settings_store),
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                expected_turn_id: None,
+            },
             "这是一段用于验证辅助模型失败诊断的会话内容",
         );
 

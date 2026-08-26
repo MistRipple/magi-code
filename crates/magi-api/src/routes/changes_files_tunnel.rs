@@ -1442,6 +1442,7 @@ async fn prompt_suggestions(
                 UtcMillis::now().0
             ),
             phase: magi_usage_authority::UsagePhase::Integration,
+            expected_turn_id: None,
         },
     )
     .map_err(|error| {
@@ -1676,6 +1677,7 @@ async fn enhance_prompt(
             workspace_id: &workspace_binding,
             call_id,
             phase: magi_usage_authority::UsagePhase::Integration,
+            expected_turn_id: None,
         },
     ) {
         Ok(resp) => resp,

@@ -17,7 +17,8 @@ use magi_browser_authority::{
     BrowserHostControlUpdate, BrowserHostHitTest, BrowserHostRect, BrowserHostStatus,
     BrowserNavigation, BrowserNormalizedRect, BrowserRegionAnnotationAnchor, BrowserSession,
     BrowserSessionLifecycle, BrowserSurfaceControlSnapshot, BrowserTab, BrowserTabLifecycle,
-    BrowserViewport, CreateBrowserSession, CreateBrowserTab, validate_browser_navigation_url,
+    BrowserViewport, CreateBrowserSession, CreateBrowserTab, MAX_BROWSER_TABS_TOTAL,
+    validate_browser_navigation_url,
 };
 use magi_core::{
     BrowserAnnotationId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, SessionId,
@@ -30,6 +31,7 @@ use serde_json::Value;
 use crate::{
     errors::ApiError,
     routes::session_scope::{self, SessionScope},
+    session_activity::session_running_task_count,
     state::{ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot},
 };
 
@@ -43,6 +45,11 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/browser/capabilities", get(capabilities))
         .route("/browser/settings", post(update_browser_settings))
+        .route("/browser/resources", get(browser_resources))
+        .route(
+            "/browser/resources/reclaim",
+            post(reclaim_browser_resources),
+        )
         .route(
             "/browser/desktop/connection",
             get(get_desktop_connection)
@@ -499,6 +506,241 @@ async fn update_browser_settings(
     Ok(Json(response))
 }
 
+/// 返回 daemon 全局共享的逻辑 Browser Tab 资源，而不是当前右侧面板中的页面。
+///
+/// 页面在 daemon 重启后可能处于 Suspended：没有物理 Chromium Page，但仍然
+/// 代表可恢复的历史页面并占用逻辑容量。资源管理入口正是为了让用户看见并
+/// 显式回收这类资源，避免“当前没有 Tab 但页面已达上限”的不可解释状态。
+async fn browser_resources(
+    State(state): State<ApiState>,
+) -> Result<Json<BrowserResourcesResponse>, ApiError> {
+    let reconciled = state.reconcile_browser_sessions_with_session_store()?;
+    if reconciled > 0 {
+        state.persist_browser_durable_state_for_api()?;
+    }
+    Ok(Json(browser_resources_response(&state)))
+}
+
+async fn reclaim_browser_resources(
+    State(state): State<ApiState>,
+    Json(request): Json<ReclaimBrowserResourcesRequest>,
+) -> Result<Json<ReclaimBrowserResourcesResponse>, ApiError> {
+    let requested_ids = request
+        .tab_ids
+        .into_iter()
+        .map(|tab_id| tab_id.trim().to_string())
+        .filter(|tab_id| !tab_id.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if requested_ids.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "至少选择一个要回收的浏览器页面".to_string(),
+        ));
+    }
+    if requested_ids.len() > MAX_BROWSER_TABS_TOTAL {
+        return Err(ApiError::InvalidInput(format!(
+            "单次最多回收 {MAX_BROWSER_TABS_TOTAL} 个浏览器页面"
+        )));
+    }
+
+    // 回收属于跨 Host/Authority 的资源操作。先串行化它与页面关闭、激活、
+    // 导航等物理控制，避免用户在确认后又把同一 Page 重新物化。
+    let _control_guard = state.browser_control_lock.lock().await;
+    let current_resources = browser_resources_response(&state);
+    let requested_ids = requested_ids.into_iter().collect::<Vec<_>>();
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for tab_id in &requested_ids {
+        let Some(resource) = current_resources
+            .tabs
+            .iter()
+            .find(|resource| resource.tab_id.as_str() == tab_id)
+        else {
+            skipped.push(BrowserResourceReclaimSkip {
+                tab_id: tab_id.clone(),
+                reason: "not_found".to_string(),
+            });
+            continue;
+        };
+        if !resource.can_reclaim {
+            skipped.push(BrowserResourceReclaimSkip {
+                tab_id: tab_id.clone(),
+                reason: resource
+                    .reclaim_reason
+                    .clone()
+                    .unwrap_or_else(|| "not_reclaimable".to_string()),
+            });
+            continue;
+        }
+        targets.push(BrowserReclaimTarget {
+            tab_id: resource.tab_id.clone(),
+            browser_session_id: resource.browser_session_id.clone(),
+            session_id: resource.session_id.clone(),
+            workspace_id: resource.workspace_id.clone(),
+        });
+    }
+
+    // ClosePage 对 Suspended 是幂等清理，对 Crashed 则尽量释放仍被 Host
+    // 持有的物理页。即使 Host 已断开，也继续收口逻辑状态，确保容量真正
+    // 释放，而不是把用户再次留在 64/64 的死循环里。
+    if let Some(client) = state.browser_host_client() {
+        for target in &targets {
+            match client
+                .request(BrowserHostCommand::ClosePage {
+                    tab_id: target.tab_id.clone(),
+                })
+                .await
+            {
+                Ok(reply) if host_command_succeeded(&reply.response.outcome) => {}
+                Ok(reply) => tracing::warn!(
+                    tab_id = %target.tab_id,
+                    outcome = ?reply.response.outcome,
+                    "回收浏览器资源时 Host 未能关闭物理 Page，继续收口逻辑状态"
+                ),
+                Err(error) => tracing::warn!(
+                    tab_id = %target.tab_id,
+                    ?error,
+                    "回收浏览器资源时 Browser Host 不可用，继续收口逻辑状态"
+                ),
+            }
+        }
+    }
+
+    let now = UtcMillis::now();
+    let mut reclaimed = Vec::new();
+    let mut state_changed = Vec::new();
+    state.mutate_browser_authority(|authority| {
+        for target in &targets {
+            if !authority.is_reclaimable_tab(&target.tab_id, now) {
+                state_changed.push(target.tab_id.clone());
+                continue;
+            }
+            authority.transition_tab(&target.tab_id, BrowserTabLifecycle::Closed, now)?;
+            reclaimed.push(target.clone());
+        }
+        Ok(())
+    })?;
+    for tab_id in state_changed {
+        skipped.push(BrowserResourceReclaimSkip {
+            tab_id: tab_id.to_string(),
+            reason: "state_changed".to_string(),
+        });
+    }
+
+    for target in &reclaimed {
+        publish_browser_event(
+            &state,
+            "browser.tab.closed",
+            target.workspace_id.as_ref(),
+            &target.session_id,
+            serde_json::json!({
+                "browser_session_id": target.browser_session_id,
+                "tab_id": target.tab_id,
+                "reason": "user_reclaimed_inactive_resource",
+            }),
+        );
+    }
+
+    Ok(Json(ReclaimBrowserResourcesResponse {
+        reclaimed_count: reclaimed.len(),
+        reclaimed_tab_ids: reclaimed.into_iter().map(|target| target.tab_id).collect(),
+        skipped,
+        resources: browser_resources_response(&state),
+    }))
+}
+
+fn browser_resources_response(state: &ApiState) -> BrowserResourcesResponse {
+    let now = UtcMillis::now();
+    let current_session_id = state
+        .session_store
+        .current_session()
+        .map(|session| session.session_id);
+    let session_records = state
+        .session_store
+        .sessions()
+        .into_iter()
+        .map(|session| (session.session_id.clone(), session))
+        .collect::<std::collections::HashMap<_, _>>();
+    let authority = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned");
+    let live_tabs = authority.live_tab_count();
+    let mut tabs = Vec::new();
+
+    for session in authority.snapshot().sessions {
+        let session_running = session_records
+            .get(&session.session_id)
+            .and_then(|record| state.session_store.runtime_sidecar(&record.session_id))
+            .as_ref()
+            .map(|sidecar| session_running_task_count(Some(sidecar)))
+            .unwrap_or_default()
+            > 0;
+        let is_current_session = current_session_id.as_ref() == Some(&session.session_id);
+        let active_tab_id = authority.active_tab(&session.browser_session_id);
+        for tab_id in session.tab_ids {
+            let Some(tab) = authority.tab(&tab_id) else {
+                continue;
+            };
+            let is_current_tab = active_tab_id == Some(&tab.tab_id) && is_current_session;
+            let lifecycle_reclaimable = matches!(
+                tab.lifecycle,
+                BrowserTabLifecycle::Suspended | BrowserTabLifecycle::Crashed
+            );
+            let active_lease = authority.active_lease_for_tab(&tab.tab_id, now).is_some();
+            let can_reclaim =
+                lifecycle_reclaimable && !active_lease && !session_running && !is_current_tab;
+            let reclaim_reason = if can_reclaim {
+                None
+            } else if !lifecycle_reclaimable {
+                Some("active".to_string())
+            } else if active_lease {
+                Some("agent_occupied".to_string())
+            } else if session_running {
+                Some("session_running".to_string())
+            } else if is_current_tab {
+                Some("current_tab".to_string())
+            } else {
+                Some("not_reclaimable".to_string())
+            };
+            let session_title = session_records
+                .get(&session.session_id)
+                .map(|record| record.title.clone());
+            tabs.push(BrowserResourceTabResponse {
+                tab_id: tab.tab_id.clone(),
+                browser_session_id: tab.browser_session_id.clone(),
+                session_id: session.session_id.clone(),
+                workspace_id: session.workspace_id.clone(),
+                session_title,
+                lifecycle: tab.lifecycle,
+                url: tab.url.clone(),
+                title: tab.title.clone(),
+                created_at: tab.created_at,
+                updated_at: tab.updated_at,
+                is_current_session,
+                is_current_tab,
+                session_running,
+                can_reclaim,
+                reclaim_reason,
+            });
+        }
+    }
+    tabs.sort_by(|left, right| {
+        right
+            .can_reclaim
+            .cmp(&left.can_reclaim)
+            .then_with(|| left.updated_at.cmp(&right.updated_at))
+            .then_with(|| left.tab_id.as_str().cmp(right.tab_id.as_str()))
+    });
+
+    BrowserResourcesResponse {
+        max_tabs: MAX_BROWSER_TABS_TOTAL,
+        live_tabs,
+        available_tabs: MAX_BROWSER_TABS_TOTAL.saturating_sub(live_tabs),
+        reclaimable_tabs: tabs.iter().filter(|tab| tab.can_reclaim).count(),
+        tabs,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateBrowserSessionRequest {
@@ -552,6 +794,66 @@ struct BrowserSessionResponse {
     agent_occupied: bool,
     created_at: UtcMillis,
     updated_at: UtcMillis,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserResourceTabResponse {
+    tab_id: BrowserTabId,
+    browser_session_id: BrowserSessionId,
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
+    session_title: Option<String>,
+    lifecycle: BrowserTabLifecycle,
+    url: String,
+    title: String,
+    created_at: UtcMillis,
+    updated_at: UtcMillis,
+    is_current_session: bool,
+    is_current_tab: bool,
+    session_running: bool,
+    can_reclaim: bool,
+    reclaim_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserResourcesResponse {
+    max_tabs: usize,
+    live_tabs: usize,
+    available_tabs: usize,
+    reclaimable_tabs: usize,
+    tabs: Vec<BrowserResourceTabResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReclaimBrowserResourcesRequest {
+    tab_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserResourceReclaimSkip {
+    tab_id: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReclaimBrowserResourcesResponse {
+    reclaimed_count: usize,
+    reclaimed_tab_ids: Vec<BrowserTabId>,
+    skipped: Vec<BrowserResourceReclaimSkip>,
+    resources: BrowserResourcesResponse,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserReclaimTarget {
+    tab_id: BrowserTabId,
+    browser_session_id: BrowserSessionId,
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -776,6 +1078,18 @@ async fn create_session(
     )?;
     let workspace_id = scope.workspace_id();
     ensure_browser_ui_ready(&state, &session_id)?;
+
+    // Browser Session 与 Magi Session 同生命周期。桌面端长期运行时，旧版本或
+    // 异常退出可能留下不再属于 SessionStore 的逻辑 Tab；在新建浏览器会话前
+    // 先执行一次权威收口，避免这些孤儿资源继续占用全局页面容量。
+    let reconciled_browser_sessions = state.reconcile_browser_sessions_with_session_store()?;
+    if reconciled_browser_sessions > 0 {
+        state.persist_browser_durable_state_for_api()?;
+        tracing::info!(
+            count = reconciled_browser_sessions,
+            "新建浏览器会话前已清理孤儿 Browser Session"
+        );
+    }
     let existing = wait_for_magi_browser_session(&state, &session_id).await?;
     if let Some(existing) = existing {
         if existing.lifecycle != BrowserSessionLifecycle::Failed {
@@ -2362,8 +2676,9 @@ mod tests {
     use super::{
         BrowserAnnotationAnchorResponse, BrowserClientPlatform,
         BrowserElementAnnotationAnchorResponse, BrowserRegionAnnotationAnchorResponse,
-        DesktopConnectionClearRequest, DesktopConnectionRequest, browser_platform_capabilities,
-        browser_session_response, clear_desktop_connection, finish_browser_tab_creation,
+        DesktopConnectionClearRequest, DesktopConnectionRequest, ReclaimBrowserResourcesRequest,
+        browser_platform_capabilities, browser_resources_response, browser_session_response,
+        clear_desktop_connection, finish_browser_tab_creation, reclaim_browser_resources,
         register_desktop_connection, require_desktop_browser_capability,
         resolve_browser_annotation_context,
     };
@@ -2899,5 +3214,98 @@ mod tests {
             .cloned()
             .expect("failed tab should remain in authority");
         assert_eq!(tab.lifecycle, BrowserTabLifecycle::Crashed);
+    }
+
+    #[tokio::test]
+    async fn reclaim_resources_closes_inactive_tab_even_without_browser_host() {
+        let state = ApiState::new(
+            "browser-resource-reclaim-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let session_id = SessionId::new("session-browser-resource-reclaim");
+        let browser_session_id = BrowserSessionId::new("browser-session-resource-reclaim");
+        let tab_id = BrowserTabId::new("browser-tab-resource-reclaim");
+        let profile_id = BrowserProfileId::new("browser-profile-resource-reclaim");
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: tempfile::tempdir()
+                        .expect("resource profile should create")
+                        .keep(),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })?;
+                authority.create_session(CreateBrowserSession {
+                    browser_session_id: browser_session_id.clone(),
+                    workspace_id: None,
+                    session_id: session_id.clone(),
+                    profile_id,
+                    now: UtcMillis(1),
+                })?;
+                authority.transition_session(
+                    &browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(2),
+                )?;
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    url: "https://example.com/old".to_string(),
+                    now: UtcMillis(2),
+                })?;
+                authority.transition_tab(&tab_id, BrowserTabLifecycle::Suspended, UtcMillis(3))?;
+                Ok(())
+            })
+            .expect("resource fixture should create");
+
+        let before = browser_resources_response(&state);
+        assert_eq!(before.live_tabs, 1);
+        assert_eq!(before.reclaimable_tabs, 1);
+        assert!(before.tabs[0].can_reclaim);
+
+        let response = reclaim_browser_resources(
+            axum::extract::State(state.clone()),
+            axum::Json(ReclaimBrowserResourcesRequest {
+                tab_ids: vec![tab_id.to_string()],
+            }),
+        )
+        .await
+        .expect("resource reclamation should not require a live Host");
+        assert_eq!(response.0.reclaimed_count, 1);
+        assert_eq!(response.0.reclaimed_tab_ids, vec![tab_id.clone()]);
+        assert_eq!(response.0.resources.live_tabs, 0);
+        assert_eq!(response.0.resources.reclaimable_tabs, 0);
+
+        let authority = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold");
+        assert_eq!(
+            authority
+                .session(&browser_session_id)
+                .expect("browser session should be retained")
+                .lifecycle,
+            BrowserSessionLifecycle::Ready
+        );
+        assert!(
+            authority
+                .session(&browser_session_id)
+                .expect("browser session should be retained")
+                .tab_ids
+                .is_empty()
+        );
+        assert_eq!(
+            authority
+                .tab(&tab_id)
+                .expect("closed tab should remain in audit history")
+                .lifecycle,
+            BrowserTabLifecycle::Closed
+        );
     }
 }

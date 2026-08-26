@@ -286,11 +286,7 @@ fn serialize_response_tools(tools: &[ToolDefinition]) -> Vec<Value> {
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": {
-                    "type": tool.input_schema.kind,
-                    "properties": tool.input_schema.properties,
-                    "required": tool.input_schema.required,
-                },
+                "parameters": tool.input_schema.to_json_schema(),
             })
         })
         .collect()
@@ -512,6 +508,7 @@ mod tests {
                 kind: "object".to_string(),
                 properties: json!({"command": {"type": "string"}}),
                 required: Some(vec!["command".to_string()]),
+                additional_keywords: serde_json::Map::new(),
             },
             origin: crate::types::ChatToolOrigin::Builtin,
         }]);

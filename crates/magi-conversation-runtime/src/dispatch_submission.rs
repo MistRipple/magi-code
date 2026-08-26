@@ -118,6 +118,7 @@ pub struct DispatchSubmissionAccepted {
     pub created_session: bool,
     pub root_task_id: TaskId,
     pub action_task_id: TaskId,
+    pub turn_id: String,
     pub user_message_item_id: Option<String>,
     pub runner_started: bool,
     pub superseded_turn: Option<CanonicalTurn>,
@@ -468,6 +469,12 @@ pub fn run_dispatch_submission(
 
     let workspace_id = request.workspace_id.clone();
     let execution_chain_ref = format!("session-action-chain-{}", accepted_at.0);
+    let turn_id = match &request.turn_origin {
+        DispatchTurnOrigin::User => format!("turn-session-action-{}", accepted_at.0),
+        DispatchTurnOrigin::GoalContinuation(_) => {
+            format!("turn-goal-continuation-{}-{}", session_id, accepted_at.0)
+        }
+    };
     // coordinator 是 session 主线的唯一执行角色，必须复用 session 的
     // orchestrator thread。否则每个普通回合都会生成一个空 worker thread，
     // 上下文权威层只能看到空历史，连续对话和自动压缩都会被架空。
@@ -525,6 +532,7 @@ pub fn run_dispatch_submission(
             thread_id: worker_thread_id.clone(),
             is_primary: true,
             session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
             workspace_id: workspace_id.clone(),
             execution_root: request.execution_root.clone(),
             ownership: ownership.clone(),
@@ -570,12 +578,7 @@ pub fn run_dispatch_submission(
             .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0))
     });
     let mut current_turn = ActiveExecutionTurn {
-        turn_id: match &request.turn_origin {
-            DispatchTurnOrigin::User => format!("turn-session-action-{}", accepted_at.0),
-            DispatchTurnOrigin::GoalContinuation(_) => {
-                format!("turn-goal-continuation-{}-{}", session_id, accepted_at.0)
-            }
-        },
+        turn_id,
         turn_seq: accepted_at.0,
         accepted_at,
         status: "accepted".to_string(),
@@ -773,6 +776,20 @@ pub fn accept_dispatch_submission(
     request: DispatchSubmissionRequest,
     graph: DispatchSubmissionGraph,
 ) -> Result<DispatchSubmissionAccepted, DispatchSubmissionAcceptError> {
+    let turn_id = graph
+        .active_execution_chain
+        .as_ref()
+        .and_then(|chain| chain.current_turn.as_ref())
+        .map(|turn| turn.turn_id.clone())
+        .or_else(|| {
+            session_store
+                .runtime_sidecar(&request.session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .map(|turn| turn.turn_id)
+        })
+        .ok_or_else(|| DispatchSubmissionAcceptError::Internal {
+            message: "接纳任务派发后缺少当前 Turn".to_string(),
+        })?;
     if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
         let accept_result = if let Some(goal_id) = request.turn_origin.continuation_goal_id() {
             session_store
@@ -847,6 +864,7 @@ pub fn accept_dispatch_submission(
             created_session: request.created_session,
             root_task_id: graph.root_task_id,
             action_task_id: graph.action_task_id,
+            turn_id: turn_id.clone(),
             user_message_item_id,
             runner_started: false,
             superseded_turn,
@@ -867,6 +885,7 @@ pub fn accept_dispatch_submission(
         created_session: request.created_session,
         root_task_id: graph.root_task_id,
         action_task_id: graph.action_task_id,
+        turn_id,
         user_message_item_id,
         runner_started: false,
         superseded_turn: None,

@@ -455,6 +455,65 @@ fn shell_exec_runs_and_reports_failure_semantics() {
 
 #[cfg(unix)]
 #[test]
+fn shell_exec_silent_command_completes_without_being_treated_as_timeout() {
+    let registry = make_registry();
+    let started = Instant::now();
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-shell-silent-success"),
+            BuiltinToolName::ShellExec.as_str(),
+            serde_json::json!({ "command": "sleep 1" }).to_string(),
+        ),
+        ToolExecutionContext::default(),
+        &full_access_policy(),
+    );
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "sleep 1 should actually wait instead of being replaced by a fast-path"
+    );
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload should parse");
+    assert_eq!(payload["status"], "succeeded");
+    assert_eq!(payload["timed_out"], false);
+    assert_eq!(payload["cancelled"], false);
+    assert_eq!(payload["exit_code"], 0);
+    assert_eq!(payload["stdout"], "");
+    assert_eq!(payload["stderr"], "");
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_exec_explicit_timeout_is_reported_as_timeout_not_cancellation() {
+    let registry = make_registry();
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-shell-explicit-timeout"),
+            BuiltinToolName::ShellExec.as_str(),
+            serde_json::json!({
+                "command": "sleep 2",
+                "timeout_ms": 1_000,
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext::default(),
+        &full_access_policy(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload should parse");
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["timed_out"], true);
+    assert_eq!(payload["cancelled"], false);
+    assert!(
+        payload["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("超时"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn shell_exec_publishes_output_before_process_completion() {
     let registry = make_registry();
     let progress = Arc::new(Mutex::new(Vec::<ToolExecutionProgress>::new()));

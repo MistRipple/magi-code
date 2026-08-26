@@ -35,6 +35,9 @@ pub enum TaskExecutionPlan {
         thread_id: ThreadId,
         is_primary: bool,
         session_id: SessionId,
+        /// 该任务所属的会话 Turn。所有异步写回都必须使用它做来源校验，不能
+        /// 在写回时重新读取 session 当前指针。
+        turn_id: String,
         workspace_id: Option<WorkspaceId>,
         /// 此任务实际执行的根目录。个人会话使用 Magi 管理的目录，项目会话使用项目根目录。
         /// 它与 `workspace_id` 分离，避免把“是否属于项目”和“工具 cwd”混为同一概念。
@@ -131,6 +134,16 @@ impl TaskExecutionRegistry {
             .expect("task execution registry read lock poisoned")
             .get(task_id)
             .cloned()
+    }
+
+    pub fn turn_id(&self, task_id: &TaskId) -> Option<String> {
+        self.plans
+            .read()
+            .expect("task execution registry read lock poisoned")
+            .get(task_id)
+            .map(|plan| match plan {
+                TaskExecutionPlan::Dispatch { turn_id, .. } => turn_id.clone(),
+            })
     }
 
     /// 删除一个 session 拥有的全部执行计划，并返回被删除的 TaskId，供上层同步
@@ -279,6 +292,17 @@ impl TaskExecutionRegistry {
             now,
         );
         let parent_plan = self.get(&parent_task_id);
+        let inherited_turn_id = parent_plan
+            .as_ref()
+            .map(|plan| match plan {
+                TaskExecutionPlan::Dispatch { turn_id, .. } => turn_id.clone(),
+            })
+            .or_else(|| chain.current_turn.as_ref().map(|turn| turn.turn_id.clone()))
+            .ok_or_else(|| {
+                SpawnedChildExecutionError::InvalidState(
+                    "agent_spawn 父任务缺少所属 Turn，无法注册子任务".to_string(),
+                )
+            })?;
         let inherited_skill_name = parent_plan.as_ref().and_then(|plan| match plan {
             TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
         });
@@ -344,6 +368,7 @@ impl TaskExecutionRegistry {
                 thread_id: thread_id.clone(),
                 is_primary: false,
                 session_id: session_id.clone(),
+                turn_id: inherited_turn_id,
                 workspace_id: workspace_id.clone(),
                 execution_root: inherited_execution_root,
                 ownership: ExecutionOwnership {
@@ -519,6 +544,7 @@ mod tests {
                 thread_id: ThreadId::new("thread-atomic-spawn-parent"),
                 is_primary: true,
                 session_id: session_id.clone(),
+                turn_id: "turn-atomic-spawn".to_string(),
                 workspace_id: workspace_id.clone(),
                 execution_root: None,
                 ownership: ExecutionOwnership::default(),
@@ -636,6 +662,7 @@ mod tests {
                     thread_id: ThreadId::new("thread-registry-cleanup"),
                     is_primary: true,
                     session_id,
+                    turn_id: "turn-registry-cleanup".to_string(),
                     workspace_id: None,
                     execution_root: None,
                     ownership: ExecutionOwnership::default(),

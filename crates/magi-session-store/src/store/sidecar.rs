@@ -102,6 +102,46 @@ fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
     }
 }
 
+fn normalize_terminal_current_turn_item_metadata(
+    item: &mut ActiveExecutionTurnItem,
+    terminal_status: &str,
+) {
+    if item.metadata.get("noticeKind").and_then(Value::as_str) != Some("context_compaction")
+        || item.metadata.get("compactionState").and_then(Value::as_str) != Some("running")
+    {
+        return;
+    }
+    let Some(compaction_state) = (match terminal_status.trim().to_ascii_lowercase().as_str() {
+        "completed" | "complete" | "succeeded" | "success" => Some("completed"),
+        "failed" | "error" => Some("failed"),
+        "blocked" => Some("blocked"),
+        "cancelled" | "canceled" | "killed" | "interrupted" => Some("cancelled"),
+        _ => None,
+    }) else {
+        return;
+    };
+    item.metadata.insert(
+        "compactionState".to_string(),
+        Value::String(compaction_state.to_string()),
+    );
+}
+
+fn settle_active_current_turn_items(items: &mut [ActiveExecutionTurnItem], terminal_status: &str) {
+    for item in items {
+        if current_turn_item_status_is_active(&item.status) {
+            item.status = terminal_status.to_string();
+        }
+        if item
+            .tool_status
+            .as_deref()
+            .is_some_and(current_turn_item_status_is_active)
+        {
+            item.tool_status = Some(terminal_status.to_string());
+        }
+        normalize_terminal_current_turn_item_metadata(item, terminal_status);
+    }
+}
+
 fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStatus> {
     match status.trim().to_ascii_lowercase().as_str() {
         "preparing" | "pending" | "queued" | "accepted" => Ok(CanonicalTurnStatus::Pending),
@@ -1096,6 +1136,41 @@ fn reject_conflicting_active_current_turn(
     })
 }
 
+/// 校验执行面写回仍然属于发起它的 Turn。
+///
+/// `current_turn` 是 session 级别的可变指针。旧 runner 在用户停止后仍可能有
+/// 延迟到达的流式 delta、工具结果或终态回调；如果只按 session 查找，就会把这些
+/// 事件写进后续新 Turn，甚至把已取消的 Turn 重新改成 completed。所有生产执行面
+/// 写回都必须带 expected_turn_id，并在同一把 state 锁内完成这项校验。
+fn validate_expected_current_turn(
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+    expected_turn_id: Option<&str>,
+) -> DomainResult<()> {
+    validate_expected_current_turn_owner(session_id, turn, expected_turn_id)?;
+    if expected_turn_id.is_some_and(|_| current_turn_status_is_terminal(&turn.status)) {
+        return Err(DomainError::CurrentTurnConflict {
+            session_id: session_id.to_string(),
+            active_turn_id: turn.turn_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_expected_current_turn_owner(
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+    expected_turn_id: Option<&str>,
+) -> DomainResult<()> {
+    if expected_turn_id.is_some_and(|expected| turn.turn_id != expected) {
+        return Err(DomainError::CurrentTurnConflict {
+            session_id: session_id.to_string(),
+            active_turn_id: turn.turn_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn reject_duplicate_timeline_entry(timeline: &[TimelineEntry], entry_id: &str) -> DomainResult<()> {
     if timeline.iter().any(|entry| entry.entry_id == entry_id) {
         return Err(DomainError::InvalidState {
@@ -1235,8 +1310,8 @@ impl SessionStore {
         // 本函数只写 sidecar 元数据（ownership / chain / recovery / status）。
         // sidecar.current_turn 字段对调用方而言是只读快照——调用方在写锁之外
         // 读取它，再传进来仅用于持久化镜像。canonical turn 由显式的 turn 变更
-        // 函数（upsert_current_turn_item / update_current_turn_status /
-        // complete_current_turn_from_completed_root_task / cancel_current_turn）
+        // 函数（upsert_current_turn_item_for_turn / update_current_turn_status_for_turn /
+        // complete_current_turn_from_completed_root_task_for_turn / cancel_current_turn）
         // 在各自的写锁内原子投影；这里若再次投影，会用过期快照对最新 canonical
         // 触发非法状态转换（例如 Failed→Completed），导致 panic 并毒化整个
         // session state RwLock。因此本函数绝不能从 sidecar.current_turn 反向
@@ -1900,7 +1975,7 @@ impl SessionStore {
             session.updated_at = occurred_at;
         }
 
-        let (ownership, recovery_id, active_execution_chain, status) =
+        let (ownership, recovery_id, mut active_execution_chain, status) =
             if let Some(existing) = existing {
                 (
                     existing.ownership,
@@ -1919,6 +1994,13 @@ impl SessionStore {
                     SessionExecutionSidecarStatus::Detached,
                 )
             };
+        if let Some(chain) = active_execution_chain.as_mut() {
+            // current_turn 是 execution chain 和 session sidecar 共同消费的活动指针。
+            // Continue 创建新 Turn 时必须在同一原子写入里同步它，否则旧 runner 的
+            // chain 快照仍会指向上一轮，并可能把后续写回投递到错误的 Turn。
+            chain.current_turn = Some(turn.clone());
+            chain.normalize();
+        }
         let updated = SessionRuntimeSidecar {
             session_id: session_id.clone(),
             ownership,
@@ -1935,6 +2017,74 @@ impl SessionStore {
         drop(state);
         self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
         Ok((entry_id, updated))
+    }
+
+    /// 在 Continue 创建新 Turn 前，将仍处于活动态的旧 current Turn 收口为失败。
+    ///
+    /// 某些恢复场景中根任务已经失败或 daemon 已经停止，但异步终态回调尚未把
+    /// session Turn 更新为终态。Continue 不能把用户输入写进一个仍被视为活动的旧
+    /// Turn，也不能无条件覆盖另一个并发产生的新 Turn，因此必须带上调用方观察到的
+    /// Turn ID 做原子归属校验。
+    pub fn finalize_current_turn_for_continue(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &str,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                let Some(turn) = sidecar.current_turn.as_mut() else {
+                    return Ok(None);
+                };
+                if turn.turn_id != expected_turn_id {
+                    return Err(DomainError::CurrentTurnConflict {
+                        session_id: session_id.to_string(),
+                        active_turn_id: turn.turn_id.clone(),
+                    });
+                }
+                if current_turn_status_is_terminal(&turn.status) {
+                    return Ok(Some(sidecar.clone()));
+                }
+
+                turn.status = "failed".to_string();
+                turn.completed_at.get_or_insert_with(UtcMillis::now);
+                settle_active_current_turn_items(&mut turn.items, "failed");
+                turn.normalize();
+                if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                    chain.current_turn = sidecar.current_turn.clone();
+                    chain.normalize();
+                }
+                sidecar.updated_at = UtcMillis::now();
+                Some(sidecar.clone())
+            };
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+            }
+            updated
+        };
+        if updated
+            .as_ref()
+            .and_then(|sidecar| sidecar.current_turn.as_ref())
+            .is_some_and(|turn| turn.status == "failed")
+        {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+        }
+        Ok(updated)
     }
 
     /// 原子记录一个尚未进入执行队列就被拒绝的用户 Turn。
@@ -2765,9 +2915,10 @@ impl SessionStore {
         Ok(updated)
     }
 
-    pub fn append_current_turn_item(
+    pub fn append_current_turn_item_for_turn(
         &self,
         session_id: &SessionId,
+        expected_turn_id: Option<&str>,
         item: ActiveExecutionTurnItem,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         let updated = {
@@ -2786,6 +2937,10 @@ impl SessionStore {
                         entity: "session_runtime_sidecar",
                     });
                 };
+                let Some(turn) = sidecar.current_turn.as_ref() else {
+                    return Ok(None);
+                };
+                validate_expected_current_turn(session_id, turn, expected_turn_id)?;
                 append_item_to_current_turn(sidecar, item)?
             };
             if let Some(updated) = updated.as_ref()
@@ -2801,9 +2956,10 @@ impl SessionStore {
         Ok(updated)
     }
 
-    pub fn append_current_turn_item_with_timeline_entry(
+    pub fn append_current_turn_item_with_timeline_entry_for_turn(
         &self,
         session_id: &SessionId,
+        expected_turn_id: Option<&str>,
         timeline_entry: TimelineEntryInput,
         item: ActiveExecutionTurnItem,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
@@ -2834,6 +2990,7 @@ impl SessionStore {
             else {
                 return Ok(None);
             };
+            validate_expected_current_turn(session_id, turn, expected_turn_id)?;
             if let Some(existing) = turn
                 .items
                 .iter()
@@ -2873,14 +3030,6 @@ impl SessionStore {
         Ok(updated)
     }
 
-    pub fn upsert_current_turn_item(
-        &self,
-        session_id: &SessionId,
-        item: ActiveExecutionTurnItem,
-    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
-        self.upsert_current_turn_item_for_turn(session_id, None, item)
-    }
-
     pub fn upsert_current_turn_item_for_turn(
         &self,
         session_id: &SessionId,
@@ -2908,14 +3057,7 @@ impl SessionStore {
                 let Some(turn) = sidecar.current_turn.as_mut() else {
                     return Ok(None);
                 };
-                if let Some(expected_turn_id) = expected_turn_id
-                    && turn.turn_id != expected_turn_id
-                {
-                    return Err(DomainError::CurrentTurnConflict {
-                        session_id: session_id.to_string(),
-                        active_turn_id: turn.turn_id.clone(),
-                    });
-                }
+                validate_expected_current_turn(session_id, turn, expected_turn_id)?;
 
                 use_stream_item_projection = Some(
                     matches!(
@@ -2998,9 +3140,10 @@ impl SessionStore {
         Ok(updated)
     }
 
-    pub fn update_current_turn_status(
+    pub fn update_current_turn_status_for_turn(
         &self,
         session_id: &SessionId,
+        expected_turn_id: Option<&str>,
         status: impl Into<String>,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         let updated = {
@@ -3022,20 +3165,20 @@ impl SessionStore {
                 let Some(turn) = sidecar.current_turn.as_mut() else {
                     return Ok(None);
                 };
-                turn.status = normalize_stored_current_turn_status(status.into());
-                if let Some(item_status) = terminal_item_status_for_turn_status(&turn.status) {
-                    for item in &mut turn.items {
-                        if current_turn_item_status_is_active(&item.status) {
-                            item.status = item_status.to_string();
-                        }
-                        if item
-                            .tool_status
-                            .as_deref()
-                            .is_some_and(current_turn_item_status_is_active)
-                        {
-                            item.tool_status = Some(item_status.to_string());
-                        }
+                let next_status = normalize_stored_current_turn_status(status.into());
+                validate_expected_current_turn_owner(session_id, turn, expected_turn_id)?;
+                if expected_turn_id.is_some() && current_turn_status_is_terminal(&turn.status) {
+                    if turn.status != next_status {
+                        return Err(DomainError::CurrentTurnConflict {
+                            session_id: session_id.to_string(),
+                            active_turn_id: turn.turn_id.clone(),
+                        });
                     }
+                    return Ok(Some(sidecar.clone()));
+                }
+                turn.status = next_status;
+                if let Some(item_status) = terminal_item_status_for_turn_status(&turn.status) {
+                    settle_active_current_turn_items(&mut turn.items, item_status);
                 }
                 if turn.completed_at.is_none() && current_turn_status_is_terminal(&turn.status) {
                     turn.completed_at = Some(UtcMillis::now());
@@ -3069,9 +3212,10 @@ impl SessionStore {
         Ok(updated)
     }
 
-    pub fn complete_current_turn_from_completed_root_task(
+    pub fn complete_current_turn_from_completed_root_task_for_turn(
         &self,
         session_id: &SessionId,
+        expected_turn_id: Option<&str>,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         let updated = {
             let mut state = self
@@ -3092,6 +3236,7 @@ impl SessionStore {
                 let Some(turn) = sidecar.current_turn.as_mut() else {
                     return Ok(None);
                 };
+                validate_expected_current_turn(session_id, turn, expected_turn_id)?;
                 turn.status = "completed".to_string();
                 if turn.completed_at.is_none() {
                     turn.completed_at = Some(UtcMillis::now());
@@ -3114,6 +3259,7 @@ impl SessionStore {
                             item.tool_status = Some("completed".to_string());
                         }
                     }
+                    normalize_terminal_current_turn_item_metadata(item, "completed");
                 }
                 turn.normalize();
                 if let Some(chain) = sidecar.active_execution_chain.as_mut() {
@@ -3196,18 +3342,7 @@ impl SessionStore {
                 let now = UtcMillis::now();
                 let interrupted_at =
                     UtcMillis(sidecar.updated_at.0.max(turn.accepted_at.0).min(now.0));
-                for item in &mut turn.items {
-                    if current_turn_item_status_is_active(&item.status) {
-                        item.status = "cancelled".to_string();
-                    }
-                    if item
-                        .tool_status
-                        .as_deref()
-                        .is_some_and(current_turn_item_status_is_active)
-                    {
-                        item.tool_status = Some("cancelled".to_string());
-                    }
-                }
+                settle_active_current_turn_items(&mut turn.items, "cancelled");
 
                 let notice_item_id = format!("turn-item-interruption-{}", turn.turn_id);
                 let source_thread_id = turn
@@ -3641,18 +3776,7 @@ impl SessionStore {
                             Value::from(now.0),
                         );
                     }
-                    for item in &mut turn.items {
-                        if current_turn_item_status_is_active(&item.status) {
-                            item.status = "cancelled".to_string();
-                        }
-                        if item
-                            .tool_status
-                            .as_deref()
-                            .is_some_and(current_turn_item_status_is_active)
-                        {
-                            item.tool_status = Some("cancelled".to_string());
-                        }
-                    }
+                    settle_active_current_turn_items(&mut turn.items, "cancelled");
                     turn.status = "cancelled".to_string();
                     if turn.completed_at.is_none() {
                         turn.completed_at = Some(now);

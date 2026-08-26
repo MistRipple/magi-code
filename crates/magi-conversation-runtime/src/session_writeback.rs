@@ -67,6 +67,7 @@ pub(crate) struct ContextCompactionWritebackContext<'a> {
     pub(crate) persist_session_state: Option<&'a SessionStatePersistCallback>,
     pub(crate) task: Option<&'a magi_core::Task>,
     pub(crate) turn_visibility: Option<&'a TaskTurnVisibility>,
+    pub(crate) expected_turn_id: Option<&'a str>,
 }
 
 pub(crate) fn new_context_compaction_item_id(
@@ -158,9 +159,13 @@ pub(crate) fn upsert_context_compaction_progress_notice(
         item.metadata
             .insert("totalChunks".to_string(), serde_json::json!(total_chunks));
     }
-    if let Some(published) =
-        upsert_session_turn_item(context.session_store, context.session_id, item)
-    {
+    if let Some(published) = upsert_session_turn_item_for_turn(
+        context.session_store,
+        context.session_id,
+        context.expected_turn_id,
+        item,
+        None,
+    ) {
         publish_session_turn_item_event(
             context.event_bus,
             context.session_id,
@@ -225,9 +230,13 @@ pub(crate) fn upsert_context_compaction_completed_notice(
         "compactedAt".to_string(),
         serde_json::json!(record.compacted_at.0),
     );
-    if let Some(published) =
-        upsert_session_turn_item(context.session_store, context.session_id, item)
-    {
+    if let Some(published) = upsert_session_turn_item_for_turn(
+        context.session_store,
+        context.session_id,
+        context.expected_turn_id,
+        item,
+        None,
+    ) {
         persist_session_state_checkpoint(
             context.persist_session_state,
             "context_compaction_notice",
@@ -712,45 +721,31 @@ pub fn session_turn_item(
     }
 }
 
-pub fn append_session_turn_item(
+pub fn append_session_turn_item_for_turn(
     session_store: &SessionStore,
     session_id: &SessionId,
-    item: ActiveExecutionTurnItem,
-) -> Option<PublishedSessionTurnItem> {
-    append_session_turn_item_with_task_store(session_store, session_id, item, None)
-}
-
-pub fn append_session_turn_item_with_task_store(
-    session_store: &SessionStore,
-    session_id: &SessionId,
+    expected_turn_id: Option<&str>,
     item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
 ) -> Option<PublishedSessionTurnItem> {
     let item_id = item.item_id.clone();
     let sidecar = session_store
-        .append_current_turn_item(session_id, item)
+        .append_current_turn_item_for_turn(session_id, expected_turn_id, item)
         .ok()
         .flatten()?;
     published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
 }
 
-pub fn upsert_session_turn_item(
+pub fn upsert_session_turn_item_for_turn(
     session_store: &SessionStore,
     session_id: &SessionId,
-    item: ActiveExecutionTurnItem,
-) -> Option<PublishedSessionTurnItem> {
-    upsert_session_turn_item_with_task_store(session_store, session_id, item, None)
-}
-
-pub fn upsert_session_turn_item_with_task_store(
-    session_store: &SessionStore,
-    session_id: &SessionId,
+    expected_turn_id: Option<&str>,
     item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
 ) -> Option<PublishedSessionTurnItem> {
     let item_id = item.item_id.clone();
     let sidecar = session_store
-        .upsert_current_turn_item(session_id, item)
+        .upsert_current_turn_item_for_turn(session_id, expected_turn_id, item)
         .ok()
         .flatten()?;
     published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
@@ -918,6 +913,7 @@ pub struct SessionTurnErrorInput<'a> {
     pub streaming_entry_id: Option<&'a str>,
     pub source_thread_id: ThreadId,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+    pub expected_turn_id: Option<&'a str>,
 }
 
 pub fn append_session_turn_error_item(
@@ -938,6 +934,7 @@ pub fn append_session_turn_error_item(
         streaming_entry_id: _,
         source_thread_id,
         persist_session_state,
+        expected_turn_id,
     } = input;
     let mut error_item = session_turn_item(
         "assistant_error",
@@ -965,8 +962,15 @@ pub fn append_session_turn_error_item(
             .metadata
             .insert("toolCallFailure".to_string(), tool_call_failure);
     }
-    let _ = append_session_turn_item(session_store, session_id, error_item);
-    let _ = session_store.update_current_turn_status(session_id, "failed");
+    let _ = append_session_turn_item_for_turn(
+        session_store,
+        session_id,
+        expected_turn_id,
+        error_item,
+        None,
+    );
+    let _ =
+        session_store.update_current_turn_status_for_turn(session_id, expected_turn_id, "failed");
     persist_session_state_checkpoint(persist_session_state, "session_turn_failed");
     publish_current_session_turn_item_event(
         event_bus,
@@ -1090,6 +1094,7 @@ fn append_session_tool_call_items_batch(
             execution_group_id,
             source_thread_id,
             persist_session_state,
+            expected_turn_id: None,
             tool_execution_ledger: &mut tool_execution_ledger,
         },
         tool_calls,
@@ -1120,6 +1125,7 @@ pub(crate) struct SessionToolCallBatchContext<'a> {
     pub execution_group_id: Option<String>,
     pub source_thread_id: &'a ThreadId,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+    pub expected_turn_id: Option<&'a str>,
     pub tool_execution_ledger: &'a mut ToolExecutionLedger,
 }
 
@@ -1151,6 +1157,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         execution_group_id,
         source_thread_id,
         persist_session_state,
+        expected_turn_id,
         tool_execution_ledger,
     } = context;
     for tool_call in tool_calls {
@@ -1170,7 +1177,13 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         started_item.tool_name = Some(tool_call.function.name.clone());
         started_item.tool_status = Some("running".to_string());
         started_item.tool_arguments = Some(tool_call.function.arguments.clone());
-        if let Some(published) = upsert_session_turn_item(session_store, session_id, started_item) {
+        if let Some(published) = upsert_session_turn_item_for_turn(
+            session_store,
+            session_id,
+            expected_turn_id,
+            started_item,
+            None,
+        ) {
             publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
         }
     }
@@ -1194,6 +1207,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         browser_capability_revision,
         browser_execution_id,
         source_thread_id,
+        expected_turn_id,
     };
     let tool_results =
         tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
@@ -1244,6 +1258,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
                 workspace_id,
                 source_thread_id,
                 persist_session_state,
+                expected_turn_id,
             },
             tool_call,
             &tool_result,
@@ -1287,6 +1302,7 @@ struct SessionToolResultWritebackContext<'a> {
     workspace_id: &'a Option<WorkspaceId>,
     source_thread_id: &'a ThreadId,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
+    expected_turn_id: Option<&'a str>,
 }
 
 fn upsert_session_tool_call_result_item(
@@ -1310,12 +1326,21 @@ fn upsert_session_tool_call_result_item(
     result_item.tool_status = Some(status_label.to_string());
     result_item.tool_arguments = Some(tool_call.function.arguments.clone());
     result_item.tool_result = Some(tool_result.to_string());
-    if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
+    if matches!(
+        tool_status,
+        ExecutionResultStatus::Failed
+            | ExecutionResultStatus::Rejected
+            | ExecutionResultStatus::NeedsApproval
+    ) {
         result_item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) =
-        upsert_session_turn_item(context.session_store, context.session_id, result_item)
-    {
+    if let Some(published) = upsert_session_turn_item_for_turn(
+        context.session_store,
+        context.session_id,
+        context.expected_turn_id,
+        result_item,
+        None,
+    ) {
         persist_session_state_checkpoint(context.persist_session_state, "session_turn_tool_result");
         publish_session_turn_item_event(
             context.event_bus,
@@ -1346,6 +1371,7 @@ struct SessionToolExecutionContext<'a> {
     browser_capability_revision: Option<u64>,
     browser_execution_id: Option<&'a str>,
     source_thread_id: &'a ThreadId,
+    expected_turn_id: Option<&'a str>,
 }
 
 fn execute_session_turn_tool_call_batch(
@@ -1527,6 +1553,7 @@ fn execute_session_turn_tool_call(
             browser_capability_revision: None,
             browser_execution_id: None,
             source_thread_id: &source_thread_id,
+            expected_turn_id: None,
         },
         tool_call,
     )
@@ -1599,6 +1626,7 @@ fn execute_session_turn_tool_call_with_approval(
         browser_capability_revision: None,
         browser_execution_id: None,
         source_thread_id: &source_thread_id,
+        expected_turn_id: None,
     };
 
     thread::scope(|scope| {
@@ -1635,6 +1663,7 @@ struct SessionToolApprovalContext<'a> {
     session_id: &'a SessionId,
     workspace_id: &'a Option<WorkspaceId>,
     source_thread_id: &'a ThreadId,
+    expected_turn_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -1644,6 +1673,7 @@ struct SessionToolProgressContext<'a> {
     session_id: &'a SessionId,
     workspace_id: &'a Option<WorkspaceId>,
     source_thread_id: &'a ThreadId,
+    expected_turn_id: Option<&'a str>,
 }
 
 fn upsert_session_tool_progress_item(
@@ -1658,6 +1688,7 @@ fn upsert_session_tool_progress_item(
         session_id,
         workspace_id,
         source_thread_id,
+        expected_turn_id,
     } = context;
     let progress_status = serde_json::from_str::<serde_json::Value>(&payload)
         .ok()
@@ -1683,7 +1714,9 @@ fn upsert_session_tool_progress_item(
     item.tool_status = Some(progress_status);
     item.tool_arguments = Some(tool_call.function.arguments.clone());
     item.tool_result = Some(payload);
-    if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
+    if let Some(published) =
+        upsert_session_turn_item_for_turn(session_store, session_id, expected_turn_id, item, None)
+    {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
@@ -1701,17 +1734,19 @@ fn await_session_tool_approval(
         session_id,
         workspace_id,
         source_thread_id,
+        expected_turn_id,
     } = context;
     let Some(turn_id) = session_store
         .runtime_sidecar(session_id)
         .and_then(|sidecar| sidecar.current_turn)
         .filter(|turn| {
-            canonical_turn_status(&turn.status).is_some_and(|status| {
-                matches!(
-                    status,
-                    CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running
-                )
-            })
+            expected_turn_id.is_none_or(|expected| expected == turn.turn_id)
+                && canonical_turn_status(&turn.status).is_some_and(|status| {
+                    matches!(
+                        status,
+                        CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running
+                    )
+                })
         })
         .map(|turn| turn.turn_id)
     else {
@@ -1790,6 +1825,7 @@ fn await_session_tool_approval(
             session_id,
             workspace_id,
             source_thread_id,
+            expected_turn_id,
         },
         tool_call,
         tool_call.function.name.clone(),
@@ -1854,6 +1890,7 @@ fn await_session_tool_approval(
                         session_id,
                         workspace_id,
                         source_thread_id,
+                        expected_turn_id,
                     },
                     tool_call,
                     tool_call.function.name.clone(),
@@ -1934,6 +1971,7 @@ fn execute_session_turn_tool_call_scoped(
         browser_capability_revision,
         browser_execution_id,
         source_thread_id,
+        expected_turn_id,
     } = context;
     if let Some(canonical) = BuiltinToolName::from_name(tool_call.function.name.as_str())
         && matches!(
@@ -2077,6 +2115,7 @@ fn execute_session_turn_tool_call_scoped(
                     session_id,
                     workspace_id,
                     source_thread_id,
+                    expected_turn_id,
                 },
                 tool_call,
                 &decision,
@@ -2100,6 +2139,7 @@ fn execute_session_turn_tool_call_scoped(
                 session_id,
                 workspace_id,
                 source_thread_id,
+                expected_turn_id,
             },
             tool_call,
             progress.tool_name,
@@ -2206,6 +2246,7 @@ fn execute_session_turn_tool_call_scoped(
                 session_id,
                 workspace_id,
                 source_thread_id,
+                expected_turn_id,
             },
             tool_call,
             &runtime_decision,
@@ -2425,8 +2466,14 @@ mod tests {
             Some(item_id.to_string()),
             source_thread_id.clone(),
         );
-        let first_published = upsert_session_turn_item(&session_store, &session_id, first_item)
-            .expect("first stream item should be published");
+        let first_published = upsert_session_turn_item_for_turn(
+            &session_store,
+            &session_id,
+            Some("turn-stream-delta-payload"),
+            first_item,
+            None,
+        )
+        .expect("first stream item should be published");
         let first_update = session_turn_stream_update("", first_content)
             .expect("first stream update should exist");
         publish_session_turn_item_stream_event(
@@ -2447,9 +2494,14 @@ mod tests {
             Some(item_id.to_string()),
             source_thread_id.clone(),
         );
-        let suppressed_published =
-            upsert_session_turn_item(&session_store, &session_id, suppressed_item)
-                .expect("suppressed stream item should be stored");
+        let suppressed_published = upsert_session_turn_item_for_turn(
+            &session_store,
+            &session_id,
+            Some("turn-stream-delta-payload"),
+            suppressed_item,
+            None,
+        )
+        .expect("suppressed stream item should be stored");
         let suppressed_update = session_turn_stream_update(first_content, suppressed_content)
             .expect("suppressed stream update should exist");
         publish_session_turn_item_stream_event(
@@ -2470,8 +2522,14 @@ mod tests {
             Some(item_id.to_string()),
             source_thread_id,
         );
-        let second_published = upsert_session_turn_item(&session_store, &session_id, second_item)
-            .expect("second stream item should be published");
+        let second_published = upsert_session_turn_item_for_turn(
+            &session_store,
+            &session_id,
+            Some("turn-stream-delta-payload"),
+            second_item,
+            None,
+        )
+        .expect("second stream item should be published");
         let second_update = session_turn_stream_update(suppressed_content, &second_content)
             .expect("second stream update should exist");
         publish_session_turn_item_stream_event(
@@ -4099,6 +4157,7 @@ mod tests {
                 execution_group_id: None,
                 source_thread_id: &thread_id,
                 persist_session_state: None,
+                expected_turn_id: None,
                 tool_execution_ledger: &mut tool_execution_ledger,
             },
             &[valid_call],
@@ -4158,6 +4217,7 @@ mod tests {
                 execution_group_id: None,
                 source_thread_id: &thread_id,
                 persist_session_state: None,
+                expected_turn_id: None,
                 tool_execution_ledger: &mut tool_execution_ledger,
             },
             &[invalid_call],
@@ -4257,6 +4317,7 @@ mod tests {
                 execution_group_id: None,
                 source_thread_id: &thread_id,
                 persist_session_state: None,
+                expected_turn_id: None,
                 tool_execution_ledger: &mut tool_execution_ledger,
             },
             &[call],
@@ -4378,6 +4439,7 @@ mod tests {
                     execution_group_id: None,
                     source_thread_id: &source_thread_id,
                     persist_session_state: None,
+                    expected_turn_id: None,
                     tool_execution_ledger: &mut tool_execution_ledger,
                 },
                 &tool_calls,
@@ -4732,7 +4794,11 @@ mod tests {
             )
             .expect("plain turn should be stored");
         session_store
-            .update_current_turn_status(&session_id, "completed")
+            .update_current_turn_status_for_turn(
+                &session_id,
+                Some("turn-session-plain"),
+                "completed",
+            )
             .expect("plain turn should complete");
 
         let sidecar = session_store

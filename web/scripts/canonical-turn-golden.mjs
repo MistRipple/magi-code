@@ -3425,7 +3425,7 @@ function cancelledToolCase() {
   // ordered=[user, phase, cancelled] → 1/2/3 → ×1000
   c.expected = [
     signatureMessage('message', 'user_message', 1000, userItem.content),
-    signatureTool(3000, 'shell_exec', 'error', false),
+    signatureTool(3000, 'shell_exec', 'cancelled', false, true),
   ];
   return c;
 }

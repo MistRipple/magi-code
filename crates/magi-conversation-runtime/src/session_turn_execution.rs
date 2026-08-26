@@ -38,12 +38,13 @@ use crate::{
     session_writeback::{
         ContextCompactionWritebackContext, SessionStatePersistCallback,
         SessionTurnStreamPublishGate, append_session_tool_call_items_batch_with_context,
-        append_session_turn_error_item, append_session_turn_item, apply_model_response_round,
-        new_context_compaction_item_id, persist_session_state_checkpoint,
-        publish_current_session_turn_item_event, publish_model_retry_runtime_event,
-        publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
-        session_turn_stream_update, upsert_context_compaction_completed_notice,
-        upsert_context_compaction_progress_notice, upsert_session_turn_item,
+        append_session_turn_error_item, append_session_turn_item_for_turn,
+        apply_model_response_round, new_context_compaction_item_id,
+        persist_session_state_checkpoint, publish_current_session_turn_item_event,
+        publish_model_retry_runtime_event, publish_session_turn_item_event,
+        publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
+        upsert_context_compaction_completed_notice, upsert_context_compaction_progress_notice,
+        upsert_session_turn_item_for_turn,
     },
     strict_goal_mode_tool_definitions_for_round,
     task_helpers::canonical_tool_call_name,
@@ -60,9 +61,9 @@ use crate::{
     },
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
-        account_active_goal_usage, publish_model_usage_record, resolved_model_for_usage_binding,
-        resolved_provider_for_usage_binding, session_turn_model_usage_binding,
-        vision_model_usage_binding,
+        account_active_goal_usage, publish_model_usage_record_for_turn,
+        resolved_model_for_usage_binding, resolved_provider_for_usage_binding,
+        session_turn_model_usage_binding, vision_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -728,6 +729,7 @@ fn rebuild_messages_for_context_window(
         persist_session_state,
         task: None,
         turn_visibility: None,
+        expected_turn_id: Some(&request.turn_id),
     };
     let compaction_observer = |progress| {
         upsert_context_compaction_progress_notice(compaction_writeback, progress);
@@ -742,6 +744,7 @@ fn rebuild_messages_for_context_window(
         thread_id,
         settings_store,
     )
+    .with_expected_turn_id(Some(&request.turn_id))
     .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
         fallback_history: Vec::new(),
@@ -962,6 +965,7 @@ fn run_session_turn_execution_inner(
         persist_session_state,
         task: None,
         turn_visibility: None,
+        expected_turn_id: Some(&request.turn_id),
     };
     let compaction_observer = |progress| {
         upsert_context_compaction_progress_notice(compaction_writeback, progress);
@@ -982,6 +986,7 @@ fn run_session_turn_execution_inner(
         &orchestrator_thread_id,
         settings_store,
     )
+    .with_expected_turn_id(Some(&request.turn_id))
     .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
         fallback_history,
@@ -1283,6 +1288,7 @@ fn run_session_turn_execution_inner(
                         streaming_entry_id: main_timeline_entry_id.as_deref(),
                         source_thread_id: orchestrator_thread_id.clone(),
                         persist_session_state,
+                        expected_turn_id: Some(&request.turn_id),
                     },
                 );
                 return Err(execution_error);
@@ -1311,6 +1317,7 @@ fn run_session_turn_execution_inner(
                         streaming_entry_id: main_timeline_entry_id.as_deref(),
                         source_thread_id: orchestrator_thread_id.clone(),
                         persist_session_state,
+                        expected_turn_id: Some(&request.turn_id),
                     },
                 );
                 return Err(execution_error);
@@ -1424,6 +1431,7 @@ fn run_session_turn_execution_inner(
                         streaming_entry_id: main_timeline_entry_id.as_deref(),
                         source_thread_id: orchestrator_thread_id.clone(),
                         persist_session_state,
+                        expected_turn_id: Some(&request.turn_id),
                     },
                 );
                 return Err(execution_error);
@@ -1463,11 +1471,13 @@ fn run_session_turn_execution_inner(
                     streaming_entry_id: main_timeline_entry_id.as_deref(),
                     source_thread_id: orchestrator_thread_id.clone(),
                     persist_session_state,
+                    expected_turn_id: Some(&request.turn_id),
                 },
             );
             return Err(execution_error);
         }
         let repeated_tool_call_failure = if streamed_content.invalid_tool_calls.is_empty() {
+            tool_call_validation_tracker.record_valid_round();
             None
         } else {
             let attempts = tool_call_validation_tracker.record_round();
@@ -1510,6 +1520,7 @@ fn run_session_turn_execution_inner(
                     streaming_entry_id: main_timeline_entry_id.as_deref(),
                     source_thread_id: orchestrator_thread_id.clone(),
                     persist_session_state,
+                    expected_turn_id: Some(&request.turn_id),
                 },
             );
             return Err(execution_error);
@@ -1728,6 +1739,7 @@ fn run_session_turn_execution_inner(
                 streaming_entry_id: main_timeline_entry_id.as_deref(),
                 source_thread_id: orchestrator_thread_id.clone(),
                 persist_session_state,
+                expected_turn_id: Some(&request.turn_id),
             },
         );
         return Err(failure);
@@ -2124,9 +2136,13 @@ fn stream_session_turn_round(
             );
             apply_request_aliases(&mut item, request);
             apply_model_response_round(&mut item, round);
-            if let Some(published) =
-                upsert_session_turn_item(session_store, &request.session_id, item)
-                && let Some(stream_update) = stream_update.as_ref()
+            if let Some(published) = upsert_session_turn_item_for_turn(
+                session_store,
+                &request.session_id,
+                Some(&request.turn_id),
+                item,
+                None,
+            ) && let Some(stream_update) = stream_update.as_ref()
             {
                 publish_session_turn_item_stream_event(
                     event_bus,
@@ -2177,8 +2193,13 @@ fn stream_session_turn_round(
         );
         apply_request_aliases(&mut item, request);
         apply_model_response_round(&mut item, round);
-        if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item)
-            && let Some(stream_update) = stream_update.as_ref()
+        if let Some(published) = upsert_session_turn_item_for_turn(
+            session_store,
+            &request.session_id,
+            Some(&request.turn_id),
+            item,
+            None,
+        ) && let Some(stream_update) = stream_update.as_ref()
         {
             publish_session_turn_item_stream_event(
                 event_bus,
@@ -2245,10 +2266,11 @@ fn stream_session_turn_round(
             }
             let raw_error = error.to_string();
             let classification = classify_model_invocation_error(&raw_error);
-            publish_model_usage_record(
+            publish_model_usage_record_for_turn(
                 event_bus,
                 session_store,
                 settings_store,
+                Some(&request.turn_id),
                 crate::usage_recording::ModelUsageRecordInput {
                     session_id: &request.session_id,
                     workspace_id: &request.workspace_id,
@@ -2297,9 +2319,13 @@ fn stream_session_turn_round(
                 apply_request_aliases(&mut thinking_item, request);
                 apply_model_response_round(&mut thinking_item, round);
                 apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
-                if let Some(published) =
-                    upsert_session_turn_item(session_store, &request.session_id, thinking_item)
-                {
+                if let Some(published) = upsert_session_turn_item_for_turn(
+                    session_store,
+                    &request.session_id,
+                    Some(&request.turn_id),
+                    thinking_item,
+                    None,
+                ) {
                     persist_session_state_checkpoint(
                         persist_session_state,
                         "session_turn_stream_interrupted_thinking",
@@ -2324,9 +2350,13 @@ fn stream_session_turn_round(
                 apply_request_aliases(&mut stream_item, request);
                 apply_model_response_round(&mut stream_item, round);
                 apply_goal_turn_intermediate_visibility(&mut stream_item, request);
-                if let Some(published) =
-                    upsert_session_turn_item(session_store, &request.session_id, stream_item)
-                {
+                if let Some(published) = upsert_session_turn_item_for_turn(
+                    session_store,
+                    &request.session_id,
+                    Some(&request.turn_id),
+                    stream_item,
+                    None,
+                ) {
                     persist_session_state_checkpoint(
                         persist_session_state,
                         "session_turn_stream_interrupted_content",
@@ -2389,10 +2419,11 @@ fn stream_session_turn_round(
                     let fallback_raw_error = fallback_error.to_string();
                     let fallback_classification =
                         classify_model_invocation_error(&fallback_raw_error);
-                    publish_model_usage_record(
+                    publish_model_usage_record_for_turn(
                         event_bus,
                         session_store,
                         settings_store,
+                        Some(&request.turn_id),
                         crate::usage_recording::ModelUsageRecordInput {
                             session_id: &request.session_id,
                             workspace_id: &request.workspace_id,
@@ -2446,10 +2477,11 @@ fn stream_session_turn_round(
         ),
         ModelResponseStatus::Completed | ModelResponseStatus::RequiresToolExecution => None,
     };
-    publish_model_usage_record(
+    publish_model_usage_record_for_turn(
         event_bus,
         session_store,
         settings_store,
+        Some(&request.turn_id),
         crate::usage_recording::ModelUsageRecordInput {
             session_id: &request.session_id,
             workspace_id: &request.workspace_id,
@@ -2536,9 +2568,13 @@ fn stream_session_turn_round(
         apply_request_aliases(&mut thinking_item, request);
         apply_model_response_round(&mut thinking_item, round);
         apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
-        if let Some(published) =
-            upsert_session_turn_item(session_store, &request.session_id, thinking_item)
-        {
+        if let Some(published) = upsert_session_turn_item_for_turn(
+            session_store,
+            &request.session_id,
+            Some(&request.turn_id),
+            thinking_item,
+            None,
+        ) {
             persist_session_state_checkpoint(
                 persist_session_state,
                 "session_turn_thinking_completed",
@@ -2589,9 +2625,13 @@ fn stream_session_turn_round(
         apply_request_aliases(&mut stream_item, request);
         apply_model_response_round(&mut stream_item, round);
         apply_goal_turn_intermediate_visibility(&mut stream_item, request);
-        if let Some(published) =
-            upsert_session_turn_item(session_store, &request.session_id, stream_item)
-        {
+        if let Some(published) = upsert_session_turn_item_for_turn(
+            session_store,
+            &request.session_id,
+            Some(&request.turn_id),
+            stream_item,
+            None,
+        ) {
             persist_session_state_checkpoint(
                 persist_session_state,
                 "session_turn_stream_completed",
@@ -2718,6 +2758,7 @@ fn stream_session_turn_round(
                     execution_group_id: Some(execution_group_id),
                     source_thread_id: orchestrator_thread_id,
                     persist_session_state,
+                    expected_turn_id: Some(&request.turn_id),
                     tool_execution_ledger,
                 },
                 &valid_tool_calls,
@@ -2900,9 +2941,13 @@ fn append_final_item(
     }
     let final_item_id = final_item.item_id.clone();
     if has_requested_final_item_id {
-        if let Some(published) =
-            upsert_session_turn_item(session_store, &request.session_id, final_item)
-        {
+        if let Some(published) = upsert_session_turn_item_for_turn(
+            session_store,
+            &request.session_id,
+            Some(&request.turn_id),
+            final_item,
+            None,
+        ) {
             persist_session_state_checkpoint(persist_session_state, "session_turn_final_item");
             publish_session_turn_item_event(
                 event_bus,
@@ -2911,9 +2956,13 @@ fn append_final_item(
                 &published,
             );
         }
-    } else if let Some(published) =
-        append_session_turn_item(session_store, &request.session_id, final_item)
-    {
+    } else if let Some(published) = append_session_turn_item_for_turn(
+        session_store,
+        &request.session_id,
+        Some(&request.turn_id),
+        final_item,
+        None,
+    ) {
         persist_session_state_checkpoint(persist_session_state, "session_turn_final_item");
         publish_session_turn_item_event(
             event_bus,
@@ -2922,7 +2971,11 @@ fn append_final_item(
             &published,
         );
     }
-    let _ = session_store.update_current_turn_status(&request.session_id, "completed");
+    let _ = session_store.update_current_turn_status_for_turn(
+        &request.session_id,
+        Some(&request.turn_id),
+        "completed",
+    );
     persist_session_state_checkpoint(persist_session_state, "session_turn_completed");
     publish_current_session_turn_item_event(
         event_bus,
@@ -2937,6 +2990,7 @@ fn append_final_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_writeback::append_session_turn_item_for_turn;
     use magi_bridge_client::{
         BridgeClientError, BridgeErrorLayer, ModelResponse, ModelRetryRuntimeEvent,
         ModelRetryRuntimePhase,
@@ -6606,8 +6660,14 @@ mod tests {
             orchestrator_thread_id.clone(),
         );
         pre_tool_stream.timeline_entry_id = Some("turn-item-assistant-stream-main".to_string());
-        append_session_turn_item(&store, &session_id, pre_tool_stream)
-            .expect("pre-tool stream item should be stored");
+        append_session_turn_item_for_turn(
+            &store,
+            &session_id,
+            Some(&request.turn_id),
+            pre_tool_stream,
+            None,
+        )
+        .expect("pre-tool stream item should be stored");
         let post_tool_stream = session_turn_item(
             "assistant_stream",
             "completed",
@@ -6616,8 +6676,14 @@ mod tests {
             Some("turn-item-assistant-stream-post-tool".to_string()),
             orchestrator_thread_id.clone(),
         );
-        append_session_turn_item(&store, &session_id, post_tool_stream)
-            .expect("post-tool stream item should be stored");
+        append_session_turn_item_for_turn(
+            &store,
+            &session_id,
+            Some(&request.turn_id),
+            post_tool_stream,
+            None,
+        )
+        .expect("post-tool stream item should be stored");
 
         append_final_item(
             &event_bus,
@@ -6762,6 +6828,7 @@ mod tests {
             persist_session_state: None,
             task: None,
             turn_visibility: None,
+            expected_turn_id: None,
         };
         upsert_context_compaction_progress_notice(
             writeback,

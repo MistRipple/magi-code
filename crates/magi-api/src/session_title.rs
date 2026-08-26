@@ -207,6 +207,7 @@ fn refine_new_session_title_inner(
                     workspace_id: &workspace_binding,
                     call_id,
                     phase: UsagePhase::Integration,
+                    expected_turn_id: None,
                 },
             )
         }

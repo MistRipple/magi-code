@@ -353,6 +353,7 @@ mod tests {
                 kind: "object".to_string(),
                 properties: json!({}),
                 required: None,
+                additional_keywords: serde_json::Map::new(),
             },
             origin: crate::types::ChatToolOrigin::Builtin,
         }]);

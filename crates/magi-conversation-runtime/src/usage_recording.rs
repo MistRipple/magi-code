@@ -154,6 +154,8 @@ pub struct AuxiliaryModelUsageContext<'a> {
     pub workspace_id: &'a Option<WorkspaceId>,
     pub call_id: String,
     pub phase: UsagePhase,
+    /// 若辅助调用由某个执行 Turn 派生，固定其用量归属，避免异步回写落到后续 Turn。
+    pub expected_turn_id: Option<&'a str>,
 }
 
 pub fn auxiliary_model_usage_binding(phase: UsagePhase) -> ModelUsageBinding {
@@ -196,10 +198,11 @@ pub fn invoke_auxiliary_model_with_usage(
     match client.invoke(request) {
         Ok(response) => {
             if let Some(session_id) = context.session_id {
-                publish_model_usage_record(
+                publish_model_usage_record_for_turn(
                     context.event_bus,
                     context.session_store,
                     context.settings_store,
+                    context.expected_turn_id,
                     ModelUsageRecordInput {
                         session_id,
                         workspace_id: context.workspace_id,
@@ -216,10 +219,11 @@ pub fn invoke_auxiliary_model_with_usage(
         }
         Err(error) => {
             if let Some(session_id) = context.session_id {
-                publish_model_usage_record(
+                publish_model_usage_record_for_turn(
                     context.event_bus,
                     context.session_store,
                     context.settings_store,
+                    context.expected_turn_id,
                     ModelUsageRecordInput {
                         session_id,
                         workspace_id: context.workspace_id,
@@ -294,7 +298,35 @@ pub fn publish_model_usage_record(
     settings_store: Option<&Arc<SettingsStore>>,
     input: ModelUsageRecordInput<'_>,
 ) {
-    publish_model_usage_record_internal(event_bus, session_store, settings_store, input, None);
+    publish_model_usage_record_internal(
+        event_bus,
+        session_store,
+        settings_store,
+        input,
+        None,
+        None,
+    );
+}
+
+/// 为执行中的固定 Turn 记录模型用量。
+///
+/// 调用可能在当前 session 已切换到下一 Turn 后才返回，因此不能在写入时再读取
+/// `current_turn` 推断归属；显式 Turn ID 只用于账本归属，不会把旧 Turn 写回当前状态。
+pub fn publish_model_usage_record_for_turn(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    settings_store: Option<&Arc<SettingsStore>>,
+    expected_turn_id: Option<&str>,
+    input: ModelUsageRecordInput<'_>,
+) {
+    publish_model_usage_record_internal(
+        event_bus,
+        session_store,
+        settings_store,
+        input,
+        None,
+        expected_turn_id,
+    );
 }
 
 pub fn publish_model_usage_record_with_config(
@@ -310,6 +342,7 @@ pub fn publish_model_usage_record_with_config(
         settings_store,
         input,
         Some(model_config),
+        None,
     );
 }
 
@@ -436,6 +469,7 @@ fn publish_model_usage_record_internal(
     settings_store: Option<&Arc<SettingsStore>>,
     input: ModelUsageRecordInput<'_>,
     explicit_model_config: Option<LlmConfig>,
+    expected_turn_id: Option<&str>,
 ) {
     let ModelUsageRecordInput {
         session_id,
@@ -481,7 +515,9 @@ fn publish_model_usage_record_internal(
     let input = UsageCallRecordInput {
         workspace_id: workspace_id_value,
         session_id: session_id.to_string(),
-        turn_id: current_turn_id(session_store, session_id),
+        turn_id: expected_turn_id
+            .map(str::to_string)
+            .or_else(|| current_turn_id(session_store, session_id)),
         dispatch_wave_id: None,
         assignment_id,
         event_id: Some(format!(
@@ -1146,6 +1182,7 @@ mod tests {
                 workspace_id: &workspace_id,
                 call_id: "auxiliary-success-call".to_string(),
                 phase: UsagePhase::Integration,
+                expected_turn_id: None,
             },
         )
         .expect("辅助模型成功调用不应失败");

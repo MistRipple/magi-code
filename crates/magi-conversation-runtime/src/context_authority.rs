@@ -3,7 +3,7 @@ use crate::{
     prompt_utils::{PromptFragmentKind, render_prompt_fragment},
     tool_result_utils::{bound_model_visible_tool_history, infer_tool_call_status},
     usage_recording::{
-        ModelUsageRecordInput, auxiliary_model_usage_binding, publish_model_usage_record,
+        ModelUsageRecordInput, auxiliary_model_usage_binding, publish_model_usage_record_for_turn,
     },
 };
 use magi_bridge_client::{
@@ -110,6 +110,10 @@ pub(crate) struct ContextAuthority<'a> {
     workspace_id: &'a Option<WorkspaceId>,
     thread_id: &'a ThreadId,
     settings_store: Option<&'a Arc<SettingsStore>>,
+    /// 将上下文压缩产生的辅助模型用量固定归属到发起压缩的 Turn。
+    ///
+    /// 生产执行路径必须传入固定 Turn，避免异步返回时把旧 Turn 的用量归到新 Turn。
+    expected_turn_id: Option<&'a str>,
     compaction_observer: Option<&'a (dyn Fn(ContextCompactionProgress) + Sync)>,
     is_cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
     compaction_progress_gate: Mutex<ContextCompactionProgressGate>,
@@ -206,6 +210,7 @@ impl<'a> ContextAuthority<'a> {
             workspace_id,
             thread_id,
             settings_store,
+            expected_turn_id: None,
             compaction_observer: None,
             is_cancelled: None,
             compaction_progress_gate: Mutex::new(ContextCompactionProgressGate::default()),
@@ -219,6 +224,11 @@ impl<'a> ContextAuthority<'a> {
     ) -> Self {
         self.compaction_observer = Some(observer);
         self.is_cancelled = Some(is_cancelled);
+        self
+    }
+
+    pub(crate) fn with_expected_turn_id(mut self, expected_turn_id: Option<&'a str>) -> Self {
+        self.expected_turn_id = expected_turn_id;
         self
     }
 
@@ -724,10 +734,11 @@ impl<'a> ContextAuthority<'a> {
             .unwrap_or(&never_cancelled);
         let response = client.invoke_with_cancellation(request, is_cancelled);
         let binding = auxiliary_model_usage_binding(UsagePhase::Integration);
-        publish_model_usage_record(
+        publish_model_usage_record_for_turn(
             self.event_bus,
             self.session_store,
             self.settings_store,
+            self.expected_turn_id,
             ModelUsageRecordInput {
                 session_id: self.session_id,
                 workspace_id: self.workspace_id,

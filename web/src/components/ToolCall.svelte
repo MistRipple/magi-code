@@ -64,7 +64,7 @@
     output?: unknown;
     error?: string;
     standardized?: StandardizedToolResult;
-    status?: 'pending' | 'running' | 'success' | 'error';
+    status?: 'pending' | 'running' | 'success' | 'error' | 'cancelled';
     duration?: number;
     filepath?: string;
     filePreviewScope?: FilePreviewScope;
@@ -216,7 +216,7 @@
     return 'tool';
   }
 
-  type VisualToolStatus = 'pending' | 'running' | 'success' | 'error';
+  type VisualToolStatus = 'pending' | 'running' | 'success' | 'error' | 'cancelled';
 
   function visualStatusInfo(value: VisualToolStatus): { class: string } {
     const map: Record<string, { class: string }> = {
@@ -224,6 +224,7 @@
       running: { class: 'running' },
       success: { class: 'success' },
       error: { class: 'error' },
+      cancelled: { class: 'cancelled' },
     };
     return map[value] || { class: 'success' };
   }
@@ -799,6 +800,7 @@
   });
 
   function toolStatusLabel(value: VisualToolStatus): string {
+    if (value === 'cancelled') return i18n.t('terminalSession.status.cancelled');
     return i18n.t(`terminalSession.status.${value}`);
   }
 
@@ -1312,6 +1314,7 @@
   .status-running { color: var(--info); }
   .status-success { color: var(--success); }
   .status-error { color: var(--error); }
+  .status-cancelled { color: var(--foreground-muted); }
 
   @keyframes pulse {
     0%, 100% { opacity: 1; }

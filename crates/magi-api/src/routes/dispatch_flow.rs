@@ -422,18 +422,12 @@ pub(super) fn dispatch_accepted_canonical_event(
     state: &ApiState,
     accepted: &DispatchSubmissionAccepted,
 ) -> (Option<CanonicalTurn>, Option<CanonicalTurnItem>) {
-    let current_turn_id = state
-        .session_store
-        .runtime_sidecar(&accepted.session_id)
-        .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id));
     let canonical_turn = state
         .session_store
         .canonical_turns_for_session(&accepted.session_id)
         .into_iter()
         .find(|turn| {
-            current_turn_id
-                .as_ref()
-                .is_some_and(|turn_id| &turn.turn_id == turn_id)
+            turn.turn_id == accepted.turn_id
                 || (turn.accepted_at == accepted.accepted_at
                     && turn.items.iter().any(|item| {
                         item.worker
@@ -548,12 +542,14 @@ async fn prepare_session_task_dispatch(
     trace.mark(
         "preparation_started",
         accepted.session_id.as_str(),
-        Some(&format!("turn-session-action-{}", accepted.accepted_at.0)),
+        Some(&accepted.turn_id),
         None,
     );
-    let _ = state
-        .session_store
-        .update_current_turn_status(&accepted.session_id, "preparing");
+    let _ = state.session_store.update_current_turn_status_for_turn(
+        &accepted.session_id,
+        Some(&accepted.turn_id),
+        "preparing",
+    );
     if let Some(item_id) = accepted.user_message_item_id.as_deref() {
         publish_current_session_turn_item_event(
             &state.event_bus,
@@ -590,7 +586,7 @@ async fn prepare_session_task_dispatch(
     trace.mark(
         "preparation_completed",
         accepted.session_id.as_str(),
-        Some(&format!("turn-session-action-{}", accepted.accepted_at.0)),
+        Some(&accepted.turn_id),
         None,
     );
     Ok(())
@@ -612,9 +608,11 @@ pub(super) async fn finalize_session_task_dispatch(
         fail_accepted_task_submission(&state, &accepted, error.message());
         return;
     }
-    let _ = state
-        .session_store
-        .update_current_turn_status(&accepted.session_id, "running");
+    let _ = state.session_store.update_current_turn_status_for_turn(
+        &accepted.session_id,
+        Some(&accepted.turn_id),
+        "running",
+    );
     if let Err(error) = drive_dispatch_submission(&state, &mut accepted).await {
         tracing::error!(
             session_id = %accepted.session_id,
@@ -679,6 +677,7 @@ pub(crate) fn schedule_restored_session_task_dispatches(state: ApiState) {
                 created_session: false,
                 root_task_id: chain.root_task_id,
                 action_task_id,
+                turn_id: turn.turn_id,
                 user_message_item_id,
                 runner_started: false,
                 superseded_turn: None,
@@ -707,11 +706,12 @@ fn fail_accepted_task_submission(
     {
         task_store.set_output_refs(&accepted.root_task_id, vec![direct_error]);
         let _ = task_store.update_status(&accepted.root_task_id, TaskStatus::Failed);
-        if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
+        if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
             state,
             &accepted.session_id,
             &accepted.root_task_id,
             "error",
+            Some(&accepted.turn_id),
         ) {
             let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
             return;
@@ -742,12 +742,15 @@ fn fail_accepted_task_submission(
                 streaming_entry_id: None,
                 source_thread_id: thread.thread_id,
                 persist_session_state: None,
+                expected_turn_id: Some(&accepted.turn_id),
             },
         );
     } else {
-        let _ = state
-            .session_store
-            .update_current_turn_status(&accepted.session_id, "failed");
+        let _ = state.session_store.update_current_turn_status_for_turn(
+            &accepted.session_id,
+            Some(&accepted.turn_id),
+            "failed",
+        );
     }
     let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
 }
@@ -872,10 +875,11 @@ pub(super) fn append_dispatch_assistant_message(
     state: &ApiState,
     accepted: &DispatchSubmissionAccepted,
 ) {
-    if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_completed(
+    if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
         state,
         &accepted.session_id,
         &accepted.root_task_id,
+        Some(&accepted.turn_id),
     ) {
         return;
     }
@@ -918,9 +922,11 @@ pub(super) fn append_dispatch_assistant_message(
     let Some((response_text, final_item_id)) = response else {
         return;
     };
-    let _ = state
-        .session_store
-        .update_current_turn_status(&accepted.session_id, "completed");
+    let _ = state.session_store.update_current_turn_status_for_turn(
+        &accepted.session_id,
+        Some(&accepted.turn_id),
+        "completed",
+    );
     if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_completed") {
         tracing::error!(
             session_id = %accepted.session_id,
@@ -1123,6 +1129,7 @@ mod tests {
             created_session: false,
             root_task_id: root_task_id.clone(),
             action_task_id: root_task_id.clone(),
+            turn_id: "turn-dispatch-direct-error".to_string(),
             user_message_item_id: None,
             runner_started: false,
             superseded_turn: None,

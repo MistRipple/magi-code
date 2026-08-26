@@ -1,6 +1,6 @@
 use magi_usage_authority::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -19,6 +19,64 @@ pub struct ToolInputSchema {
     pub properties: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<Vec<String>>,
+    /// 保留标准 JSON Schema 中除 type、properties、required 外的约束。
+    ///
+    /// 运行时工具定义可能包含 oneOf、anyOf、not、minItems 等条件。只保留
+    /// 三个基础字段会让模型和调用前校验都看不到真实契约，最终把非法参数
+    /// 推迟到执行层才失败。
+    #[serde(flatten)]
+    pub additional_keywords: Map<String, Value>,
+}
+
+impl ToolInputSchema {
+    pub fn from_json_schema(schema: &Value) -> Self {
+        let object = schema.as_object();
+        let kind = object
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("object")
+            .to_string();
+        let properties = object
+            .and_then(|object| object.get("properties"))
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let required = object
+            .and_then(|object| object.get("required"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            });
+        let additional_keywords = object
+            .into_iter()
+            .flat_map(|object| object.iter())
+            .filter(|(key, _)| !matches!(key.as_str(), "type" | "properties" | "required"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        Self {
+            kind,
+            properties,
+            required,
+            additional_keywords,
+        }
+    }
+
+    pub fn to_json_schema(&self) -> Value {
+        let mut schema = self.additional_keywords.clone();
+        schema.insert("type".to_string(), Value::String(self.kind.clone()));
+        schema.insert("properties".to_string(), self.properties.clone());
+        if let Some(required) = &self.required {
+            schema.insert(
+                "required".to_string(),
+                Value::Array(required.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        Value::Object(schema)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

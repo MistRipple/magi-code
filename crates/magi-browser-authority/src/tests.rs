@@ -10,7 +10,8 @@ use crate::{
     BrowserAnnotationKind, BrowserAuthority, BrowserDeviceType, BrowserDurableState,
     BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserProfile, BrowserProfileKind,
     BrowserSessionLifecycle, BrowserSurfaceBinding, BrowserTabLifecycle, BrowserViewport,
-    CreateBrowserSession, CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite,
+    CreateBrowserSession, CreateBrowserTab, GoalControlBinding, MAX_BROWSER_TABS_TOTAL,
+    ValidateBrowserWrite,
 };
 
 fn at(value: u64) -> UtcMillis {
@@ -34,12 +35,20 @@ fn register_profile(authority: &mut BrowserAuthority) {
 }
 
 fn ready_session(authority: &mut BrowserAuthority) -> BrowserSessionId {
-    let browser_session_id = BrowserSessionId::new("browser-session-1");
+    ready_session_with_ids(authority, "browser-session-1", "session-1")
+}
+
+fn ready_session_with_ids(
+    authority: &mut BrowserAuthority,
+    browser_session_id: &str,
+    session_id: &str,
+) -> BrowserSessionId {
+    let browser_session_id = BrowserSessionId::new(browser_session_id);
     authority
         .create_session(CreateBrowserSession {
             browser_session_id: browser_session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-1")),
-            session_id: SessionId::new("session-1"),
+            session_id: SessionId::new(session_id),
             profile_id: profile_id(),
             now: at(2),
         })
@@ -646,6 +655,103 @@ fn closing_tab_revokes_surface_lease_and_removes_membership() {
             .tab_ids
             .contains(&tab_id)
     );
+}
+
+#[test]
+fn inactive_tabs_are_reclaimable_and_closed_tabs_release_capacity() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+
+    assert!(!authority.is_reclaimable_tab(&tab_id, at(6)));
+    authority
+        .transition_tab(&tab_id, BrowserTabLifecycle::Suspended, at(7))
+        .expect("ready tab should become suspended");
+    assert!(authority.is_reclaimable_tab(&tab_id, at(8)));
+    assert_eq!(authority.live_tab_count(), 1);
+
+    authority
+        .transition_tab(&tab_id, BrowserTabLifecycle::Closed, at(9))
+        .expect("suspended tab should close");
+    assert!(!authority.is_reclaimable_tab(&tab_id, at(10)));
+    assert_eq!(authority.live_tab_count(), 0);
+}
+
+#[test]
+fn reclaiming_a_suspended_tab_makes_global_capacity_available() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let first_session_id = ready_session_with_ids(
+        &mut authority,
+        "browser-session-capacity-first",
+        "session-capacity-first",
+    );
+    let second_session_id = ready_session_with_ids(
+        &mut authority,
+        "browser-session-capacity-second",
+        "session-capacity-second",
+    );
+
+    for index in 0..(MAX_BROWSER_TABS_TOTAL / 2) {
+        authority
+            .create_tab(CreateBrowserTab {
+                tab_id: BrowserTabId::new(format!("browser-tab-capacity-first-{index}")),
+                browser_session_id: first_session_id.clone(),
+                url: "about:blank".to_string(),
+                now: at(10 + index as u64),
+            })
+            .expect("first session should accept tabs up to its limit");
+    }
+    let mut suspended_tab_id = None;
+    for index in 0..(MAX_BROWSER_TABS_TOTAL / 2) {
+        let tab_id = BrowserTabId::new(format!("browser-tab-capacity-second-{index}"));
+        authority
+            .create_tab(CreateBrowserTab {
+                tab_id: tab_id.clone(),
+                browser_session_id: second_session_id.clone(),
+                url: "about:blank".to_string(),
+                now: at(50 + index as u64),
+            })
+            .expect("second session should fill the remaining global capacity");
+        if index == 0 {
+            suspended_tab_id = Some(tab_id);
+        }
+    }
+    let suspended_tab_id = suspended_tab_id.expect("one tab should be selected for reclamation");
+    authority
+        .transition_tab(&suspended_tab_id, BrowserTabLifecycle::Suspended, at(90))
+        .expect("a tab should become suspended without leaving global capacity");
+    assert_eq!(authority.live_tab_count(), MAX_BROWSER_TABS_TOTAL);
+
+    let third_session_id = ready_session_with_ids(
+        &mut authority,
+        "browser-session-capacity-third",
+        "session-capacity-third",
+    );
+    let rejected = authority.create_tab(CreateBrowserTab {
+        tab_id: BrowserTabId::new("browser-tab-capacity-rejected"),
+        browser_session_id: third_session_id.clone(),
+        url: "about:blank".to_string(),
+        now: at(91),
+    });
+    assert!(matches!(
+        rejected,
+        Err(crate::BrowserAuthorityError::GlobalTabLimitReached { .. })
+    ));
+
+    authority
+        .transition_tab(&suspended_tab_id, BrowserTabLifecycle::Closed, at(92))
+        .expect("reclaimed tab should close");
+    assert_eq!(authority.live_tab_count(), MAX_BROWSER_TABS_TOTAL - 1);
+    authority
+        .create_tab(CreateBrowserTab {
+            tab_id: BrowserTabId::new("browser-tab-capacity-reclaimed"),
+            browser_session_id: third_session_id,
+            url: "about:blank".to_string(),
+            now: at(93),
+        })
+        .expect("closing a suspended tab should release global capacity");
 }
 
 #[test]

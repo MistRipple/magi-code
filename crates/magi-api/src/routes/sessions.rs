@@ -44,7 +44,6 @@ use crate::{
     },
     state::{ApiState, QueuedRegularSessionTurn},
     task_dispatch::DispatchSubmissionAccepted,
-    task_turn_finalize::finalize_background_session_task_turn_if_root_terminal,
 };
 
 pub fn routes() -> Router<ApiState> {
@@ -564,7 +563,10 @@ pub(crate) async fn submit_session_turn(
     }
     let session_turn_guard = if matches!(
         decision.route,
-        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task
+        SessionTurnRouteDto::Chat
+            | SessionTurnRouteDto::Execute
+            | SessionTurnRouteDto::Task
+            | SessionTurnRouteDto::Continue
     ) {
         match request.requested_session_id() {
             Some(session_id) => Some(state.lock_session_turn(&session_id).await),
@@ -665,7 +667,7 @@ pub(crate) async fn submit_session_turn(
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
             require_session_record_in_scope(&state, &session_id, &scope)?;
             let resumed_turn_id = format!("turn-session-continue-{}", accepted_at.0);
-            let (accepted, signal) = continue_execution_chain_with_pre_resume(
+            let (accepted, _signal, user_message) = continue_execution_chain_with_pre_resume(
                 &state,
                 &session_id,
                 &[],
@@ -690,27 +692,37 @@ pub(crate) async fn submit_session_turn(
                     )?;
                     Ok(signal)
                 },
+                |chain, primary_branch, signal| {
+                    let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
+                        &session_id,
+                        accepted_at,
+                        || chain.mission_id.clone(),
+                    );
+                    let accepted_for_turn = SessionContinueAccepted {
+                        session_id: session_id.clone(),
+                        mission_id: chain.mission_id.clone(),
+                        root_task_id: chain.root_task_id.clone(),
+                        action_task_id: primary_branch.task_id.clone(),
+                        turn_id: resumed_turn_id.clone(),
+                        execution_chain_ref: chain.execution_chain_ref.clone(),
+                        resumed_branch_count: 0,
+                        runner_started: false,
+                    };
+                    write_continue_user_message(ContinueUserMessageInput {
+                        state: &state,
+                        accepted: &accepted_for_turn,
+                        prompt_text: signal.text.as_deref(),
+                        continued_at: accepted_at,
+                        request_id: signal.request_id.clone(),
+                        user_message_id: signal.user_message_id.clone(),
+                        placeholder_message_id: signal.placeholder_message_id.clone(),
+                        request_fingerprint: Some(request_fingerprint.clone()),
+                        orchestrator_thread_id,
+                    })
+                },
             )
             .await?;
-            let prompt_text = signal.text.clone();
-            let (_, orchestrator_thread_id) =
-                state
-                    .session_store
-                    .ensure_session_mission(&session_id, accepted_at, || {
-                        accepted.mission_id.clone()
-                    });
-            let (entry_id, user_message_item_id) =
-                write_continue_user_message(ContinueUserMessageInput {
-                    state: &state,
-                    accepted: &accepted,
-                    prompt_text: prompt_text.as_deref(),
-                    continued_at: accepted_at,
-                    request_id: signal.request_id,
-                    user_message_id: signal.user_message_id,
-                    placeholder_message_id: signal.placeholder_message_id,
-                    request_fingerprint: Some(request_fingerprint),
-                    orchestrator_thread_id,
-                })?;
+            let (entry_id, user_message_item_id) = user_message;
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state_for_api()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
@@ -902,7 +914,11 @@ async fn submit_steer_current_turn(
         .try_steer_session_turn_with(&session_id, &expected_turn_id, signal, || {
             state
                 .session_store
-                .append_current_turn_item(&session_id, user_message_item)
+                .append_current_turn_item_for_turn(
+                    &session_id,
+                    Some(&expected_turn_id),
+                    user_message_item,
+                )
                 .and_then(|sidecar| {
                     sidecar.ok_or(magi_core::DomainError::InvalidState {
                         message: "当前会话没有可写入的活跃 Turn".to_string(),
@@ -1027,11 +1043,6 @@ fn decide_session_turn_with_task_planner(
         .as_ref()
         .map(|session_id| session_has_recoverable_chain(state, session_id))
         .unwrap_or(false);
-    let has_recovery_ready_interruption = requested_session_id.as_ref().is_some_and(|session_id| {
-        state
-            .session_store
-            .has_recovery_ready_interruption(session_id)
-    });
     let has_claimed_interrupted_recovery =
         requested_session_id.as_ref().is_some_and(|session_id| {
             state
@@ -1067,29 +1078,9 @@ fn decide_session_turn_with_task_planner(
             task_evidence: Vec::new(),
         });
     }
-    if has_recovery_ready_interruption && request.replace_turn_id().is_none() {
-        if !has_recoverable_chain {
-            return Err(ApiError::internal_assembly(
-                "恢复异常中断会话失败",
-                "恢复提示存在，但执行链没有可继续的 branch",
-            ));
-        }
-        return Ok(SessionTurnIntentDecision {
-            route: SessionTurnRouteDto::Continue,
-            task_title: None,
-            execution_goal: None,
-            task_tier: TaskTier::ExecutionChain,
-            tool_intent: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            completion_contract: TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            confidence: 1.0,
-            reason_code: Some("interrupted_recovery_ready".to_string()),
-            route_reason: Some("当前会话存在待接管的异常中断执行链。".to_string()),
-            task_evidence: Vec::new(),
-        });
-    }
+    // recovery-ready 只表示界面可以提供“继续”操作，不能改变普通消息的语义。
+    // 只有用户明确表达继续意图时才复用旧执行链；否则必须创建新的独立 Turn，
+    // 避免新消息被异常恢复流程吞掉并重新激活已停止的会话。
     if has_recoverable_chain
         && requests_continuation
         && !session_turn_requests_image_generation_by_local_rules(request)
@@ -3230,92 +3221,79 @@ fn write_continue_user_message(
         orchestrator_thread_id,
     } = input;
     let entry_id = format!("timeline-{}-{}", accepted.session_id, continued_at.0);
-    let Some(prompt_text) = prompt_text else {
-        return Ok((entry_id, None));
-    };
-    let (user_message_item_id, user_message_item) =
-        build_user_message_turn_item(UserMessageTurnItemInput {
-            accepted_at: continued_at,
-            message: prompt_text,
-            entry_id: &entry_id,
-            request_id,
-            user_message_id,
-            placeholder_message_id,
-            metadata: {
-                let mut metadata = std::collections::HashMap::from([(
-                    "route".to_string(),
-                    serde_json::Value::String("continue".to_string()),
-                )]);
-                if let Some(request_fingerprint) = request_fingerprint {
-                    metadata.insert(
-                        "requestFingerprint".to_string(),
-                        serde_json::Value::String(request_fingerprint),
-                    );
-                }
-                metadata
-            },
-            task_id: Some(accepted.action_task_id.clone()),
-            source_thread_id: orchestrator_thread_id,
-        });
-    let append_to_current_turn = state
-        .session_store
-        .runtime_sidecar(&accepted.session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .is_some_and(|turn| turn_status_is_interruptible(&turn.status));
-    if append_to_current_turn {
-        let updated = state
-            .session_store
-            .append_current_turn_item_with_timeline_entry(
-                &accepted.session_id,
-                TimelineEntryInput::new(
-                    entry_id.clone(),
-                    TimelineEntryKind::UserMessage,
-                    prompt_text,
-                    continued_at,
-                ),
-                user_message_item,
-            )
-            .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
-        if updated.is_none() {
-            return Err(ApiError::internal_assembly(
-                "写入 continue 用户消息失败",
-                "current_turn 不存在",
-            ));
-        }
+    let (user_message_item_id, items, user_message) = if let Some(prompt_text) = prompt_text {
+        let (user_message_item_id, user_message_item) =
+            build_user_message_turn_item(UserMessageTurnItemInput {
+                accepted_at: continued_at,
+                message: prompt_text,
+                entry_id: &entry_id,
+                request_id,
+                user_message_id,
+                placeholder_message_id,
+                metadata: {
+                    let mut metadata = std::collections::HashMap::from([(
+                        "route".to_string(),
+                        serde_json::Value::String("continue".to_string()),
+                    )]);
+                    if let Some(request_fingerprint) = request_fingerprint {
+                        metadata.insert(
+                            "requestFingerprint".to_string(),
+                            serde_json::Value::String(request_fingerprint),
+                        );
+                    }
+                    metadata
+                },
+                task_id: Some(accepted.action_task_id.clone()),
+                source_thread_id: orchestrator_thread_id,
+            });
+        (
+            Some(user_message_item_id),
+            vec![user_message_item],
+            Some(prompt_text.to_string()),
+        )
     } else {
-        let mut turn = ActiveExecutionTurn {
-            turn_id: format!("turn-session-continue-{}", continued_at.0),
-            turn_seq: continued_at.0,
-            accepted_at: continued_at,
-            status: "running".to_string(),
-            completed_at: None,
-            user_message: Some(prompt_text.to_string()),
-            items: vec![user_message_item],
-        };
-        turn.normalize();
-        state
-            .session_store
-            .accept_current_turn_with_timeline_entry(
-                accepted.session_id.clone(),
-                TimelineEntryInput::new(
-                    entry_id.clone(),
-                    TimelineEntryKind::UserMessage,
-                    prompt_text,
-                    continued_at,
-                ),
-                turn,
-            )
-            .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
-    }
+        (None, Vec::new(), None)
+    };
+    let timeline_kind = if user_message.is_some() {
+        TimelineEntryKind::UserMessage
+    } else {
+        TimelineEntryKind::NotificationPublished
+    };
+    let timeline_message = user_message.as_deref().unwrap_or("继续执行中断的任务");
+    let mut turn = ActiveExecutionTurn {
+        turn_id: accepted.turn_id.clone(),
+        turn_seq: continued_at.0,
+        accepted_at: continued_at,
+        status: "running".to_string(),
+        completed_at: None,
+        user_message: user_message.clone(),
+        items,
+    };
+    turn.normalize();
+    state
+        .session_store
+        .accept_current_turn_with_timeline_entry(
+            accepted.session_id.clone(),
+            TimelineEntryInput::new(
+                entry_id.clone(),
+                timeline_kind,
+                timeline_message,
+                continued_at,
+            ),
+            turn,
+        )
+        .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
     state.persist_session_state_checkpoint("session_continue_user_message")?;
-    publish_session_user_message_created_event(
-        state,
-        &accepted.session_id,
-        session_workspace_for_event(state, &accepted.session_id),
-        continued_at,
-        prompt_text,
-    );
-    Ok((entry_id, Some(user_message_item_id)))
+    if let Some(user_message) = user_message {
+        publish_session_user_message_created_event(
+            state,
+            &accepted.session_id,
+            session_workspace_for_event(state, &accepted.session_id),
+            continued_at,
+            &user_message,
+        );
+    }
+    Ok((entry_id, user_message_item_id))
 }
 
 fn current_turn_streaming_timeline_entry_ids(
@@ -3562,11 +3540,12 @@ fn finalize_terminal_root_current_turn(
         TaskStatus::Killed => "killed",
         _ => return false,
     };
-    finalize_background_session_task_turn_if_root_terminal(
+    crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
         state,
         session_id,
         &chain.root_task_id,
         runner_status,
+        current_turn.map(|turn| turn.turn_id.as_str()),
     )
 }
 
@@ -3675,6 +3654,9 @@ async fn execute_session_continue(
     workspace_id: &Option<WorkspaceId>,
     request: SessionContinueExecutionRequest,
 ) -> Result<ContinueSessionResponseDto, ApiError> {
+    // /session/continue 和 agent-run Continue 都绕过普通 turn 分类器，必须在这里
+    // 取得同一把 session 锁，才能与新消息、队列 drain 和另一个 Continue 请求串行。
+    let _session_turn_guard = state.lock_session_turn(session_id).await;
     let requested_prompt_text = request
         .prompt_text
         .as_deref()
@@ -3699,7 +3681,7 @@ async fn execute_session_continue(
         .collect::<Vec<_>>();
     let continued_at = UtcMillis::now();
     let resumed_turn_id = format!("turn-session-continue-{}", continued_at.0);
-    let (accepted, ()) = continue_execution_chain_with_pre_resume(
+    let (accepted, (), _) = continue_execution_chain_with_pre_resume(
         state,
         session_id,
         &requested_agent_ids,
@@ -3715,23 +3697,35 @@ async fn execute_session_continue(
                 continued_at,
             )
         },
+        |chain, primary_branch, _| {
+            let (_, orchestrator_thread_id) =
+                state
+                    .session_store
+                    .ensure_session_mission(session_id, continued_at, || chain.mission_id.clone());
+            let accepted_for_turn = SessionContinueAccepted {
+                session_id: session_id.clone(),
+                mission_id: chain.mission_id.clone(),
+                root_task_id: chain.root_task_id.clone(),
+                action_task_id: primary_branch.task_id.clone(),
+                turn_id: resumed_turn_id.clone(),
+                execution_chain_ref: chain.execution_chain_ref.clone(),
+                resumed_branch_count: 0,
+                runner_started: false,
+            };
+            write_continue_user_message(ContinueUserMessageInput {
+                state,
+                accepted: &accepted_for_turn,
+                prompt_text: prompt_text.as_deref(),
+                continued_at,
+                request_id: request_id.clone(),
+                user_message_id: user_message_id.clone(),
+                placeholder_message_id: placeholder_message_id.clone(),
+                request_fingerprint: None,
+                orchestrator_thread_id,
+            })
+        },
     )
     .await?;
-    let (_, orchestrator_thread_id) =
-        state
-            .session_store
-            .ensure_session_mission(session_id, continued_at, || accepted.mission_id.clone());
-    let _ = write_continue_user_message(ContinueUserMessageInput {
-        state,
-        accepted: &accepted,
-        prompt_text: prompt_text.as_deref(),
-        continued_at,
-        request_id,
-        user_message_id,
-        placeholder_message_id,
-        request_fingerprint: None,
-        orchestrator_thread_id,
-    })?;
     finalize_continue_session(state.clone(), accepted.clone(), continued_at);
     state.persist_runtime_durable_state_for_api()?;
     let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
@@ -3793,6 +3787,7 @@ fn finalize_continue_session(
             created_session: false,
             root_task_id: accepted.root_task_id.clone(),
             action_task_id: accepted.action_task_id.clone(),
+            turn_id: accepted.turn_id.clone(),
             user_message_item_id: Some(format!("turn-item-user-{}", continued_at.0)),
             runner_started: accepted.runner_started,
             superseded_turn: None,
@@ -5014,7 +5009,11 @@ mod tests {
             .expect("current turn should upsert");
         state
             .session_store
-            .update_current_turn_status(&session_id, "completed")
+            .update_current_turn_status_for_turn(
+                &session_id,
+                Some("turn-viewed-personal"),
+                "completed",
+            )
             .expect("turn should complete");
 
         let (status, body) = post_json(
@@ -5364,7 +5363,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_recovery_routes_any_next_input_to_continue_without_keyword_matching() {
+    fn interrupted_recovery_does_not_hijack_an_unrelated_next_input() {
         let state = test_state();
         let session_id = SessionId::new("session-interrupted-recovery-route");
         let mission_id = MissionId::new("mission-interrupted-recovery-route");
@@ -5450,14 +5449,26 @@ mod tests {
             .interrupt_current_turn_by_daemon_restart(&session_id)
             .expect("daemon restart interruption should persist");
 
-        let mut request = session_turn_request("先补充一个新的约束，再继续处理");
-        request.session_id = Some(session_id.to_string());
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("recovery-ready session should route without keyword matching");
-        assert!(matches!(decision.route, SessionTurnRouteDto::Continue));
+        for text in ["补充一个新的约束", "看看以上内容"] {
+            let mut request = session_turn_request(text);
+            request.session_id = Some(session_id.to_string());
+            let decision = decide_session_turn_with_task_planner(&state, &request)
+                .expect("recovery-ready session should accept an unrelated new turn");
+            assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+            assert_eq!(decision.reason_code.as_deref(), Some("plain_chat"));
+        }
+
+        let mut continue_request = session_turn_request("继续");
+        continue_request.session_id = Some(session_id.to_string());
+        let continue_decision = decide_session_turn_with_task_planner(&state, &continue_request)
+            .expect("explicit continuation should still resume the recovery-ready chain");
+        assert!(matches!(
+            continue_decision.route,
+            SessionTurnRouteDto::Continue
+        ));
         assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("interrupted_recovery_ready")
+            continue_decision.reason_code.as_deref(),
+            Some("continue_requested")
         );
     }
 
@@ -6922,6 +6933,7 @@ mod tests {
             mission_id,
             root_task_id,
             action_task_id: action_task_id.clone(),
+            turn_id: "turn-session-continue-2".to_string(),
             execution_chain_ref: "chain-continue-new-turn".to_string(),
             resumed_branch_count: 1,
             runner_started: true,
@@ -8601,7 +8613,11 @@ mod tests {
             .expect("canonical turn should persist");
         state
             .session_store
-            .update_current_turn_status(&session_id, "completed")
+            .update_current_turn_status_for_turn(
+                &session_id,
+                Some("turn-canonical-match"),
+                "completed",
+            )
             .expect("canonical turn should complete");
         let canonical = state
             .session_store
@@ -8729,7 +8745,11 @@ mod tests {
         );
         state
             .session_store
-            .update_current_turn_status(&session_id, "completed")
+            .update_current_turn_status_for_turn(
+                &session_id,
+                Some("turn-active-before-queue"),
+                "completed",
+            )
             .expect("current turn should complete");
         assert_eq!(
             drain_next_queued_regular_session_turn(
@@ -8818,7 +8838,11 @@ mod tests {
 
         state
             .session_store
-            .update_current_turn_status(&session_id, "completed")
+            .update_current_turn_status_for_turn(
+                &session_id,
+                Some("turn-before-queued-goal"),
+                "completed",
+            )
             .expect("current turn should complete");
         assert_eq!(
             drain_next_queued_regular_session_turn(state, session_id, Some(workspace_id),).await,
@@ -9432,6 +9456,7 @@ mod tests {
                 thread_id: orchestrator_thread_id,
                 is_primary: true,
                 session_id: session_id.clone(),
+                turn_id: "turn-delete-runtime-resources".to_string(),
                 workspace_id: Some(workspace_id.clone()),
                 execution_root: None,
                 ownership: ExecutionOwnership::default(),

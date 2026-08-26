@@ -1103,7 +1103,17 @@ export class BrowserAutomationRuntime {
       if (found) return { matched: true, value: found };
       await new Promise((resolve) => setTimeout(resolve, 100));
     } while (Date.now() < deadline);
-    throw protocolFailure("browser_wait_timeout", "wait condition timed out");
+    const condition = [
+      selector ? `selector=${selector}` : "",
+      textValues.length > 0 ? `text=${textValues.join(" | ")}` : "",
+      url ? `url=${url}` : "",
+    ]
+      .filter(Boolean)
+      .join(", ");
+    throw protocolFailure(
+      "browser_wait_timeout",
+      `wait condition timed out (${condition}); call browser_snapshot to verify the current page state before retrying`,
+    );
   }
 
   private async pwaAudit(binding: BrowserSurfaceBinding): Promise<unknown> {

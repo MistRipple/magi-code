@@ -117,12 +117,15 @@ function resolveMessageSource(item: CanonicalTurnItem): Message['source'] {
   return 'orchestrator';
 }
 
-function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'running' | 'success' | 'error' {
+function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'running' | 'success' | 'error' | 'cancelled' {
   if (status === 'completed') {
     return 'success';
   }
-  if (status === 'blocked' || status === 'failed' || status === 'cancelled') {
+  if (status === 'blocked' || status === 'failed') {
     return 'error';
+  }
+  if (status === 'cancelled') {
+    return 'cancelled';
   }
   if (status === 'running') {
     return 'running';

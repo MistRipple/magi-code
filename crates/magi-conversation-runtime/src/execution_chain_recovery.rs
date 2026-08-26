@@ -24,6 +24,7 @@ pub struct SessionContinueAccepted {
     pub mission_id: magi_core::MissionId,
     pub root_task_id: magi_core::TaskId,
     pub action_task_id: magi_core::TaskId,
+    pub turn_id: String,
     pub execution_chain_ref: String,
     pub resumed_branch_count: usize,
     pub runner_started: bool,

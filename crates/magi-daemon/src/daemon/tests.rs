@@ -235,6 +235,36 @@ async fn wait_for_agent_run_projection_completed(
     }
 }
 
+async fn wait_for_agent_run_projection_settled(
+    app: axum::Router,
+    root_task_id: &str,
+    session_id: &str,
+    workspace_id: &str,
+) -> Value {
+    let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+    loop {
+        let projection =
+            get_agent_run_projection(app.clone(), root_task_id, session_id, workspace_id).await;
+        let total_tasks = projection["progress_summary"]["total_tasks"]
+            .as_u64()
+            .unwrap_or(0);
+        let running_tasks = projection["progress_summary"]["running_tasks"]
+            .as_u64()
+            .unwrap_or(0);
+        let root_is_terminal = matches!(
+            projection["root_task"]["status"].as_str(),
+            Some("completed" | "failed" | "killed" | "cancelled")
+        );
+        if total_tasks >= 1 && running_tasks == 0 && root_is_terminal {
+            return projection;
+        }
+        if Instant::now() >= deadline {
+            return projection;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_execution_group(
     app: axum::Router,
     mission_id: &str,
@@ -944,6 +974,21 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         TaskId::new("task-root-router-recovery").to_string()
     );
     assert_eq!(recovery_body["status"], "continued");
+
+    // Continue 会启动同一执行链的新 runner；普通 followup 在 runner 仍运行时应进入
+    // session 队列，而不是与恢复 runner 并发创建第二个 root task。等待恢复完成后，
+    // 才验证 followup 的正常派发与恢复写回消费。
+    let recovery_projection = wait_for_agent_run_projection_settled(
+        app.clone(),
+        "task-root-router-recovery",
+        session_id.as_str(),
+        workspace_id.as_str(),
+    )
+    .await;
+    assert_eq!(
+        recovery_projection["root_task"]["status"], "failed",
+        "recovery preflight fixture should settle the unavailable executor as a terminal failure"
+    );
 
     let verification = pipeline
         .memory_store

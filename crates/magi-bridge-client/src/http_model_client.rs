@@ -1867,27 +1867,7 @@ fn tool_definition_from_chat_tool(tool: &crate::types::ChatToolDefinition) -> To
     ToolDefinition {
         name: tool.function.name.clone(),
         description: tool.function.description.clone(),
-        input_schema: ToolInputSchema {
-            kind: parameters
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("object")
-                .to_string(),
-            properties: parameters
-                .get("properties")
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-            required: parameters
-                .get("required")
-                .and_then(serde_json::Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>()
-                }),
-        },
+        input_schema: ToolInputSchema::from_json_schema(parameters),
         origin: tool.origin,
     }
 }

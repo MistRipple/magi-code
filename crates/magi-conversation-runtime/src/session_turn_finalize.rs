@@ -12,7 +12,7 @@ use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{ActiveExecutionTurn, SessionStore};
 
 use crate::session_writeback::{
-    SessionStatePersistCallback, append_session_turn_item_with_task_store,
+    SessionStatePersistCallback, append_session_turn_item_for_turn,
     persist_session_state_checkpoint, publish_current_session_turn_item_event,
     publish_session_turn_item_event, session_turn_item,
 };
@@ -21,6 +21,17 @@ const TASK_CONTEXT_MAX_CHARS: usize = 4000;
 const TASK_CONTEXT_MAX_REFS: usize = 8;
 const ROOT_COMPLETION_SUMMARY_MAX_CHARS: usize = 2400;
 const TASK_FAILURE_DETAIL_MAX_CHARS: usize = 4096;
+
+pub struct FinalizeBackgroundSessionTaskTurnContext<'a> {
+    pub session_store: &'a SessionStore,
+    pub event_bus: &'a InMemoryEventBus,
+    pub task_store: Option<&'a TaskStore>,
+    pub session_id: &'a SessionId,
+    pub root_task_id: &'a TaskId,
+    pub runner_status: &'a str,
+    pub expected_turn_id: Option<&'a str>,
+    pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
 
 pub fn turn_item_status_for_task_status(status: TaskStatus) -> &'static str {
     match status {
@@ -119,9 +130,10 @@ pub fn publish_task_status_turn_item_for_active_sessions(
         if let Some(branch) = branch {
             item.worker_id = Some(branch.worker_id.clone());
         }
-        if let Some(published) = append_session_turn_item_with_task_store(
+        if let Some(published) = append_session_turn_item_for_turn(
             session_store,
             &sidecar.session_id,
+            Some(&turn.turn_id),
             item,
             task_store,
         ) {
@@ -444,9 +456,13 @@ fn ensure_root_completion_final_item(
     workspace_id: &Option<WorkspaceId>,
     root_task: &Task,
     task_store: &TaskStore,
+    expected_turn_id: Option<&str>,
 ) -> Option<(String, String)> {
     let sidecar = session_store.runtime_sidecar(session_id)?;
     let turn = sidecar.current_turn.as_ref()?;
+    if expected_turn_id.is_some_and(|expected| expected != turn.turn_id) {
+        return None;
+    }
     let orchestrator_thread = session_store.orchestrator_thread_for_session(session_id)?;
     if let Some(response) = latest_root_task_assistant_final(turn, &root_task.task_id)
         .or_else(|| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
@@ -466,9 +482,10 @@ fn ensure_root_completion_final_item(
     final_item.source = "orchestrator".to_string();
     final_item.task_id = Some(root_task.task_id.clone());
 
-    if let Some(published) = append_session_turn_item_with_task_store(
+    if let Some(published) = append_session_turn_item_for_turn(
         session_store,
         session_id,
+        expected_turn_id,
         final_item,
         Some(task_store),
     ) {
@@ -494,6 +511,26 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     root_task_id: &TaskId,
     persist_session_state: Option<&SessionStatePersistCallback>,
 ) -> bool {
+    finalize_background_session_task_turn_if_root_completed_for_turn(
+        session_store,
+        event_bus,
+        task_store,
+        session_id,
+        root_task_id,
+        None,
+        persist_session_state,
+    )
+}
+
+pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
+    session_store: &SessionStore,
+    event_bus: &InMemoryEventBus,
+    task_store: Option<&TaskStore>,
+    session_id: &SessionId,
+    root_task_id: &TaskId,
+    expected_turn_id: Option<&str>,
+    persist_session_state: Option<&SessionStatePersistCallback>,
+) -> bool {
     let Some(task_store) = task_store else {
         return false;
     };
@@ -517,6 +554,9 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     let Some(turn) = sidecar.current_turn.as_ref() else {
         return false;
     };
+    if expected_turn_id.is_some_and(|expected| expected != turn.turn_id) {
+        return false;
+    }
     if current_turn_status_is_terminal(&turn.status) {
         let archived =
             archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
@@ -539,6 +579,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
                 &workspace_id,
                 &root_task,
                 task_store,
+                expected_turn_id,
             )
         });
     let event_item_id = response
@@ -549,7 +590,8 @@ pub fn finalize_background_session_task_turn_if_root_completed(
         return false;
     };
 
-    if update_current_turn_completed_from_root(session_store, session_id).is_err() {
+    if update_current_turn_completed_from_root(session_store, session_id, expected_turn_id).is_err()
+    {
         return false;
     }
     persist_session_state_checkpoint(persist_session_state, "session_task_turn_completed");
@@ -652,9 +694,10 @@ fn task_failure_message(task_store: &TaskStore, root_task: &Task) -> String {
 fn update_current_turn_completed_from_root(
     session_store: &SessionStore,
     session_id: &SessionId,
+    expected_turn_id: Option<&str>,
 ) -> Result<(), ()> {
     match session_store
-        .complete_current_turn_from_completed_root_task(session_id)
+        .complete_current_turn_from_completed_root_task_for_turn(session_id, expected_turn_id)
         .map_err(|_| ())?
     {
         Some(_) => Ok(()),
@@ -675,20 +718,25 @@ pub fn terminal_turn_event_anchor_item_id(
 }
 
 pub fn finalize_background_session_task_turn_if_root_terminal(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    task_store: Option<&TaskStore>,
-    session_id: &SessionId,
-    root_task_id: &TaskId,
-    runner_status: &str,
-    persist_session_state: Option<&SessionStatePersistCallback>,
+    context: FinalizeBackgroundSessionTaskTurnContext<'_>,
 ) -> bool {
-    if finalize_background_session_task_turn_if_root_completed(
+    let FinalizeBackgroundSessionTaskTurnContext {
         session_store,
         event_bus,
         task_store,
         session_id,
         root_task_id,
+        runner_status,
+        expected_turn_id,
+        persist_session_state,
+    } = context;
+    if finalize_background_session_task_turn_if_root_completed_for_turn(
+        session_store,
+        event_bus,
+        task_store,
+        session_id,
+        root_task_id,
+        expected_turn_id,
         persist_session_state,
     ) {
         return true;
@@ -733,6 +781,14 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     if active_chain.root_task_id != *root_task_id {
         return false;
     }
+    if expected_turn_id.is_some_and(|expected| {
+        sidecar
+            .current_turn
+            .as_ref()
+            .is_none_or(|turn| turn.turn_id != expected)
+    }) {
+        return false;
+    }
     let workspace_id = active_chain.workspace_id.clone();
     if let Some(turn) = sidecar.current_turn.as_ref()
         && current_turn_status_is_terminal(&turn.status)
@@ -764,7 +820,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     }
 
     if session_store
-        .update_current_turn_status(session_id, turn_status)
+        .update_current_turn_status_for_turn(session_id, expected_turn_id, turn_status)
         .is_err()
     {
         return false;
@@ -780,9 +836,10 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         orchestrator_thread.thread_id.clone(),
     );
     error_item.task_id = Some(root_task_id.clone());
-    if let Some(published) = append_session_turn_item_with_task_store(
+    if let Some(published) = append_session_turn_item_for_turn(
         session_store,
         session_id,
+        expected_turn_id,
         error_item,
         Some(task_store),
     ) {
@@ -829,21 +886,25 @@ pub fn reconcile_terminal_session_task_turns(
                 sidecar.session_id.clone(),
                 chain.root_task_id.clone(),
                 runner_status,
+                turn.turn_id.clone(),
             ))
         })
         .collect::<Vec<_>>();
 
     candidates
         .into_iter()
-        .filter(|(session_id, root_task_id, runner_status)| {
+        .filter(|(session_id, root_task_id, runner_status, turn_id)| {
             finalize_background_session_task_turn_if_root_terminal(
-                session_store,
-                event_bus,
-                Some(task_store),
-                session_id,
-                root_task_id,
-                runner_status,
-                None,
+                FinalizeBackgroundSessionTaskTurnContext {
+                    session_store,
+                    event_bus,
+                    task_store: Some(task_store),
+                    session_id,
+                    root_task_id,
+                    runner_status,
+                    expected_turn_id: Some(turn_id),
+                    persist_session_state: None,
+                },
             )
         })
         .count()

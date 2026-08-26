@@ -571,8 +571,9 @@ mod tests {
             )
             .expect("turn should upsert");
         store
-            .upsert_current_turn_item(
+            .upsert_current_turn_item_for_turn(
                 &session_id,
+                Some("turn-messages-tool-redaction"),
                 magi_session_store::ActiveExecutionTurnItem {
                     item_id: "turn-item-tool-redaction".to_string(),
                     item_seq: 1,

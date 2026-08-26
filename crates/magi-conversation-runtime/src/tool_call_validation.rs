@@ -62,6 +62,10 @@ impl ToolCallValidationTracker {
         self.invalid_rounds = self.invalid_rounds.saturating_add(1);
         self.invalid_rounds
     }
+
+    pub(crate) fn record_valid_round(&mut self) {
+        self.invalid_rounds = 0;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -236,6 +240,18 @@ fn validate_tool_call(
         )));
     }
 
+    if let Some(schema) = expected_input_schema.as_ref()
+        && let Err(message) = validate_json_schema_value(&arguments, schema)
+    {
+        return Err(Box::new(validation_issue(
+            call,
+            "tool_arguments_schema_mismatch",
+            message,
+            Vec::new(),
+            expected_input_schema,
+        )));
+    }
+
     Ok(())
 }
 
@@ -317,6 +333,170 @@ fn schema_allows_null(schema: &Value) -> bool {
             .filter_map(|keyword| schema.get(keyword).and_then(Value::as_array))
             .flatten()
             .any(schema_allows_null)
+}
+
+fn validate_json_schema_value(value: &Value, schema: &Value) -> Result<(), String> {
+    validate_json_schema_value_at(value, schema, "$".to_string())
+}
+
+/// 执行层之前只需要一组稳定、无外部依赖的 JSON Schema 子集校验。
+///
+/// 这里覆盖工具目录实际使用的类型、枚举、必填字段、数组/字符串长度以及
+/// anyOf/oneOf/not 条件。Schema 仍然是协议边界的唯一来源，不能为某个工具
+/// 另写一份参数判断，否则模型看到的契约和执行前契约会再次分叉。
+fn validate_json_schema_value_at(
+    value: &Value,
+    schema: &Value,
+    path: String,
+) -> Result<(), String> {
+    if let Some(type_value) = schema.get("type") {
+        let type_matches = match type_value {
+            Value::String(expected) => json_type_matches(value, expected),
+            Value::Array(expected_types) => expected_types
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|expected| json_type_matches(value, expected)),
+            _ => true,
+        };
+        if !type_matches {
+            return Err(format!("{path} 的类型不符合 schema 要求：{}", type_value));
+        }
+    }
+
+    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array)
+        && !enum_values.iter().any(|candidate| candidate == value)
+    {
+        return Err(format!("{path} 的值不在允许的枚举范围内"));
+    }
+    if let Some(expected) = schema.get("const")
+        && expected != value
+    {
+        return Err(format!("{path} 的值不符合固定参数约束"));
+    }
+
+    if let Some(min_length) = schema.get("minLength").and_then(Value::as_u64)
+        && value
+            .as_str()
+            .is_some_and(|text| text.chars().count() < min_length as usize)
+    {
+        return Err(format!("{path} 的文本不能为空或长度不足 {min_length}"));
+    }
+    if let Some(max_length) = schema.get("maxLength").and_then(Value::as_u64)
+        && value
+            .as_str()
+            .is_some_and(|text| text.chars().count() > max_length as usize)
+    {
+        return Err(format!("{path} 的文本长度不能超过 {max_length}"));
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
+            && number < minimum
+        {
+            return Err(format!("{path} 必须大于或等于 {minimum}"));
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
+            && number > maximum
+        {
+            return Err(format!("{path} 必须小于或等于 {maximum}"));
+        }
+        if let Some(exclusive_minimum) = schema.get("exclusiveMinimum").and_then(Value::as_f64)
+            && number <= exclusive_minimum
+        {
+            return Err(format!("{path} 必须大于 {exclusive_minimum}"));
+        }
+        if let Some(exclusive_maximum) = schema.get("exclusiveMaximum").and_then(Value::as_f64)
+            && number >= exclusive_maximum
+        {
+            return Err(format!("{path} 必须小于 {exclusive_maximum}"));
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64)
+            && array.len() < min_items as usize
+        {
+            return Err(format!("{path} 至少需要 {min_items} 项"));
+        }
+        if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64)
+            && array.len() > max_items as usize
+        {
+            return Err(format!("{path} 最多允许 {max_items} 项"));
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in array.iter().enumerate() {
+                validate_json_schema_value_at(item, item_schema, format!("{path}[{index}]"))?;
+            }
+        }
+    }
+
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(format!("{path} 缺少必填参数 {field}"));
+                }
+            }
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (field, field_schema) in properties {
+                if let Some(field_value) = object.get(field) {
+                    validate_json_schema_value_at(
+                        field_value,
+                        field_schema,
+                        format!("{path}.{field}"),
+                    )?;
+                }
+            }
+        }
+    }
+
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array)
+        && !any_of
+            .iter()
+            .any(|candidate| validate_json_schema_value_at(value, candidate, path.clone()).is_ok())
+    {
+        return Err(format!("{path} 不符合 anyOf 中的任何参数分支"));
+    }
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        let matches = one_of
+            .iter()
+            .filter(|candidate| {
+                validate_json_schema_value_at(value, candidate, path.clone()).is_ok()
+            })
+            .count();
+        if matches != 1 {
+            return Err(format!(
+                "{path} 必须且只能符合 oneOf 中的一个参数分支（当前符合 {matches} 个）"
+            ));
+        }
+    }
+    if let Some(not_schema) = schema.get("not")
+        && validate_json_schema_value_at(value, not_schema, path.clone()).is_ok()
+    {
+        return Err(format!("{path} 命中了 schema 禁止的参数组合"));
+    }
+
+    Ok(())
+}
+
+fn json_type_matches(value: &Value, expected: &str) -> bool {
+    match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        "number" => value.is_number(),
+        "integer" => {
+            value.as_i64().is_some()
+                || value.as_u64().is_some()
+                || value
+                    .as_f64()
+                    .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+        }
+        _ => true,
+    }
 }
 
 fn validation_issue(
@@ -470,6 +650,100 @@ mod tests {
 
         assert_eq!(tracker.record_round(), 1);
         assert_eq!(tracker.record_round(), 2);
+        tracker.record_valid_round();
+        assert_eq!(tracker.record_round(), 1);
+        assert_eq!(tracker.record_round(), 2);
+    }
+
+    #[test]
+    fn conditional_schema_rejects_file_patch_mixed_input_before_execution() {
+        let definition = definition(
+            "file_patch",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "old_string": {"type": "string", "minLength": 1},
+                    "new_string": {"type": "string"},
+                    "patches": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "object", "required": ["old_string", "new_string"]}
+                    }
+                },
+                "required": ["path"],
+                "oneOf": [
+                    {"required": ["old_string", "new_string"], "not": {"required": ["patches"]}},
+                    {"required": ["patches"], "not": {"anyOf": [{"required": ["old_string"]}, {"required": ["new_string"]}]}}
+                ]
+            }),
+        );
+        let batch = validate_tool_call_batch(
+            &[call(
+                "file_patch",
+                r#"{"path":"src/lib.rs","old_string":"a","new_string":"b","patches":[{"old_string":"x","new_string":"y"}]}"#,
+            )],
+            &[definition],
+        );
+
+        assert!(batch.valid_calls.is_empty());
+        assert_eq!(batch.invalid_calls.len(), 1);
+        assert_eq!(
+            batch.invalid_calls[0].issue.reason_code,
+            "tool_arguments_schema_mismatch"
+        );
+    }
+
+    #[test]
+    fn conditional_schema_accepts_file_patch_single_and_batch_forms() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "old_string": {"type": "string", "minLength": 1},
+                "new_string": {"type": "string"},
+                "patches": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["old_string", "new_string"]}}
+            },
+            "required": ["path"],
+            "oneOf": [
+                {"required": ["old_string", "new_string"], "not": {"required": ["patches"]}},
+                {"required": ["patches"], "not": {"anyOf": [{"required": ["old_string"]}, {"required": ["new_string"]}]}}
+            ]
+        });
+        let definitions = [definition("file_patch", schema)];
+        for arguments in [
+            r#"{"path":"src/lib.rs","old_string":"a","new_string":""}"#,
+            r#"{"path":"src/lib.rs","patches":[{"old_string":"a","new_string":"b"}]}"#,
+        ] {
+            let batch = validate_tool_call_batch(&[call("file_patch", arguments)], &definitions);
+            assert!(batch.invalid_calls.is_empty(), "{arguments}");
+        }
+    }
+
+    #[test]
+    fn conditional_schema_rejects_navigation_cache_flag_on_url_action() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["url", "back", "forward", "reload"]},
+                "url": {"type": "string", "minLength": 1},
+                "ignore_cache": {"type": "boolean"}
+            },
+            "oneOf": [
+                {"required": ["url"], "properties": {"action": {"enum": ["url"]}}, "not": {"required": ["ignore_cache"]}},
+                {"required": ["action"], "properties": {"action": {"enum": ["reload"]}}}
+            ]
+        });
+        let batch = validate_tool_call_batch(
+            &[call(
+                "browser_navigate",
+                r#"{"url":"http://localhost:4173","ignore_cache":true}"#,
+            )],
+            &[definition("browser_navigate", schema)],
+        );
+
+        assert!(batch.valid_calls.is_empty());
+        assert_eq!(batch.invalid_calls.len(), 1);
     }
 
     #[test]

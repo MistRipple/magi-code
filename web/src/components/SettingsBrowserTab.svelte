@@ -5,8 +5,12 @@
   import { i18n } from '../stores/i18n.svelte';
   import {
     getBrowserCapabilities,
+    getBrowserResources,
+    reclaimBrowserResources,
     updateBrowserSettings,
     type BrowserCapabilitiesSnapshot,
+    type BrowserResourceTabSnapshot,
+    type BrowserResourcesSnapshot,
   } from '../web/agent-api';
   import {
     checkForDesktopUpdate,
@@ -22,9 +26,15 @@
   let desktopLoading = $state(false);
   let capabilityError = $state('');
   let desktopError = $state('');
+  let resourceError = $state('');
   let actionNotice = $state('');
   let activeAction = $state<DesktopAction | ''>('');
   let savingSetting = $state<'inAppBrowserEnabled' | 'browserUseEnabled' | ''>('');
+  let browserResources = $state<BrowserResourcesSnapshot | null>(null);
+  let resourceManagerOpen = $state(false);
+  let resourceLoading = $state(false);
+  let resourceReclaiming = $state(false);
+  let selectedResourceTabIds = $state<string[]>([]);
   let actionNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
   function clearActionFeedback(): void {
@@ -66,6 +76,91 @@
     } finally {
       capabilityLoading = false;
     }
+  }
+
+  function defaultResourceSelection(snapshot: BrowserResourcesSnapshot): string[] {
+    return snapshot.tabs
+      .filter((tab) => tab.canReclaim && !tab.isCurrentSession)
+      .map((tab) => tab.tabId);
+  }
+
+  async function loadBrowserResources(options: { selectDefaults?: boolean } = {}): Promise<void> {
+    if (resourceLoading) return;
+    resourceLoading = true;
+    resourceError = '';
+    try {
+      const snapshot = await getBrowserResources();
+      browserResources = snapshot;
+      const availableIds = new Set(snapshot.tabs.filter((tab) => tab.canReclaim).map((tab) => tab.tabId));
+      selectedResourceTabIds = options.selectDefaults === true
+        ? defaultResourceSelection(snapshot)
+        : selectedResourceTabIds.filter((tabId) => availableIds.has(tabId));
+    } catch (error) {
+      console.warn('[SettingsBrowserTab] 获取浏览器页面资源失败:', error);
+      resourceError = i18n.t('settings.browser.resourcesLoadFailed');
+    } finally {
+      resourceLoading = false;
+    }
+  }
+
+  function openResourceManager(): void {
+    resourceManagerOpen = !resourceManagerOpen;
+    if (resourceManagerOpen) {
+      void loadBrowserResources({ selectDefaults: true });
+    }
+  }
+
+  function toggleResourceTab(tabId: string, selected: boolean): void {
+    if (selected) {
+      if (!selectedResourceTabIds.includes(tabId)) {
+        selectedResourceTabIds = [...selectedResourceTabIds, tabId];
+      }
+      return;
+    }
+    selectedResourceTabIds = selectedResourceTabIds.filter((candidate) => candidate !== tabId);
+  }
+
+  function selectAllReclaimableResources(): void {
+    selectedResourceTabIds = browserResources?.tabs
+      .filter((tab) => tab.canReclaim)
+      .map((tab) => tab.tabId) ?? [];
+  }
+
+  async function reclaimSelectedResources(): Promise<void> {
+    const selected = selectedResourceTabIds;
+    if (resourceReclaiming || selected.length === 0) return;
+    if (!window.confirm(i18n.t('settings.browser.resourcesReclaimConfirm', { count: selected.length }))) return;
+    resourceReclaiming = true;
+    resourceError = '';
+    try {
+      const result = await reclaimBrowserResources(selected);
+      browserResources = result.resources;
+      selectedResourceTabIds = defaultResourceSelection(result.resources);
+      const message = result.skipped.length > 0
+        ? i18n.t('settings.browser.resourcesReclaimedWithSkipped', {
+            count: result.reclaimedCount,
+            skipped: result.skipped.length,
+          })
+        : i18n.t('settings.browser.resourcesReclaimed', { count: result.reclaimedCount });
+      showActionNotice(message);
+    } catch (error) {
+      console.warn('[SettingsBrowserTab] 回收浏览器页面资源失败:', error);
+      resourceError = errorMessage(error);
+    } finally {
+      resourceReclaiming = false;
+    }
+  }
+
+  function resourcePageLabel(tab: BrowserResourceTabSnapshot): string {
+    return tab.title.trim() || tab.url.trim() || i18n.t('settings.browser.resourcesUntitled');
+  }
+
+  function resourceStatusLabel(tab: BrowserResourceTabSnapshot): string {
+    if (tab.isCurrentTab) return i18n.t('settings.browser.resourcesCurrentTab');
+    if (tab.sessionRunning) return i18n.t('settings.browser.resourcesSessionRunning');
+    if (tab.lifecycle === 'suspended') return i18n.t('settings.browser.resourcesSuspended');
+    if (tab.lifecycle === 'crashed') return i18n.t('settings.browser.resourcesCrashed');
+    return i18n.t('settings.browser.resourcesActive');
   }
 
   async function fetchDesktopInfo(): Promise<MagiDesktopBrowserComponentSnapshot> {
@@ -265,6 +360,7 @@
     const desktop = window.magiDesktop;
     isDesktop = desktop?.runtime === 'electron';
     void loadCapabilities();
+    void loadBrowserResources({ selectDefaults: true });
 
     let unsubscribeComponent: (() => void) | null = null;
     if (isDesktop && desktop) {
@@ -320,6 +416,116 @@
         <div class="status-message status-message--error" role="status">
           <Icon name="alert-circle" size={14} />
           <span>{capabilityError}</span>
+        </div>
+      {/if}
+    </section>
+
+    <section class="settings-section browser-resource-section" aria-labelledby="browser-resources-title">
+      <div class="section-heading">
+        <div class="section-icon" aria-hidden="true"><Icon name="database" size={17} /></div>
+        <div>
+          <h3 id="browser-resources-title">{i18n.t('settings.browser.resourcesTitle')}</h3>
+          <p>{i18n.t('settings.browser.resourcesDescription')}</p>
+        </div>
+      </div>
+
+      <div class="resource-summary" aria-live="polite">
+        <div class="resource-summary-copy">
+          <strong>
+            {browserResources
+              ? i18n.t('settings.browser.resourcesUsage', {
+                  used: browserResources.liveTabs,
+                  max: browserResources.maxTabs,
+                })
+              : i18n.t('settings.browser.resourcesReading')}
+          </strong>
+          <span>
+            {browserResources
+              ? i18n.t('settings.browser.resourcesReclaimable', { count: browserResources.reclaimableTabs })
+              : i18n.t('settings.browser.resourcesReadingDescription')}
+          </span>
+        </div>
+        <button
+          type="button"
+          class="resource-manage-button"
+          onclick={openResourceManager}
+          disabled={resourceLoading && !browserResources}
+        >
+          <Icon name={resourceManagerOpen ? 'chevron-up' : 'chevron-down'} size={12} />
+          {i18n.t(resourceManagerOpen ? 'settings.browser.resourcesCollapse' : 'settings.browser.resourcesManage')}
+        </button>
+      </div>
+
+      {#if resourceManagerOpen}
+        <div class="resource-manager" aria-busy={resourceLoading || resourceReclaiming}>
+          <div class="resource-manager-toolbar">
+            <span>
+              {i18n.t('settings.browser.resourcesSelected', { count: selectedResourceTabIds.length })}
+            </span>
+            <div>
+              <button
+                type="button"
+                class="resource-text-button"
+                onclick={selectAllReclaimableResources}
+                disabled={resourceLoading || resourceReclaiming || !browserResources?.reclaimableTabs}
+              >{i18n.t('settings.browser.resourcesSelectAll')}</button>
+              <button
+                type="button"
+                class="resource-text-button"
+                onclick={() => { selectedResourceTabIds = []; }}
+                disabled={resourceLoading || resourceReclaiming || selectedResourceTabIds.length === 0}
+              >{i18n.t('settings.browser.resourcesClearSelection')}</button>
+            </div>
+          </div>
+
+          {#if resourceLoading && !browserResources}
+            <div class="resource-empty" role="status"><Icon name="loader" size={14} />{i18n.t('settings.browser.resourcesReading')}</div>
+          {:else if browserResources?.tabs.length === 0}
+            <div class="resource-empty">{i18n.t('settings.browser.resourcesEmpty')}</div>
+          {:else if browserResources}
+            <div class="resource-list">
+              {#each browserResources.tabs as tab (tab.tabId)}
+                <label class="resource-row" class:resource-row--blocked={!tab.canReclaim}>
+                  <input
+                    type="checkbox"
+                    checked={selectedResourceTabIds.includes(tab.tabId)}
+                    disabled={!tab.canReclaim || resourceLoading || resourceReclaiming}
+                    onchange={(event) => toggleResourceTab(tab.tabId, (event.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span class="resource-row-copy">
+                    <strong>{tab.sessionTitle || tab.sessionId}</strong>
+                    <span class="resource-page">{resourcePageLabel(tab)}</span>
+                    <small>{tab.url}</small>
+                  </span>
+                  <span class="resource-row-status" class:resource-row-status--ready={tab.canReclaim}>
+                    {resourceStatusLabel(tab)}
+                  </span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+
+          {#if resourceError}
+            <div class="status-message status-message--error" role="alert">
+              <Icon name="alert-circle" size={14} /><span>{resourceError}</span>
+            </div>
+          {/if}
+
+          <div class="resource-manager-footer">
+            <span>{i18n.t('settings.browser.resourcesWarning')}</span>
+            <button
+              type="button"
+              class="danger resource-reclaim-button"
+              onclick={() => void reclaimSelectedResources()}
+              disabled={resourceLoading || resourceReclaiming || selectedResourceTabIds.length === 0}
+              aria-busy={resourceReclaiming}
+            >
+              <Icon name="trash" size={13} />
+              {resourceReclaiming
+                ? i18n.t('settings.browser.resourcesReclaiming')
+                : i18n.t('settings.browser.resourcesReclaim')}
+            </button>
+          </div>
         </div>
       {/if}
     </section>
@@ -579,6 +785,209 @@
     background: var(--ind-bg-control);
   }
 
+  .resource-summary {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 0;
+    border-top: 1px solid var(--ind-border-separator);
+    border-bottom: 1px solid var(--ind-border-separator);
+  }
+
+  .resource-summary-copy {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .resource-summary-copy strong,
+  .resource-summary-copy span {
+    display: block;
+  }
+
+  .resource-summary-copy strong {
+    color: var(--ind-foreground);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .resource-summary-copy span {
+    margin-top: 4px;
+    color: var(--ind-foreground-secondary);
+    font-size: 11px;
+    line-height: 1.45;
+  }
+
+  .resource-manage-button,
+  .resource-text-button,
+  .resource-reclaim-button {
+    cursor: pointer;
+  }
+
+  .resource-manage-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    min-height: 29px;
+    padding: 0 10px;
+    border: 1px solid var(--ind-border-control);
+    border-radius: 6px;
+    color: var(--ind-foreground);
+    background: var(--ind-bg-control);
+    font-size: 12px;
+  }
+
+  .resource-manager {
+    padding-top: 12px;
+  }
+
+  .resource-manager-toolbar,
+  .resource-manager-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .resource-manager-toolbar {
+    color: var(--ind-foreground-muted);
+    font-size: 11px;
+  }
+
+  .resource-manager-toolbar > div {
+    display: inline-flex;
+    gap: 10px;
+  }
+
+  .resource-text-button {
+    padding: 0;
+    border: 0;
+    color: var(--ind-tab-accent);
+    background: transparent;
+    font-size: 11px;
+  }
+
+  .resource-text-button:disabled {
+    cursor: default;
+    opacity: 0.42;
+  }
+
+  .resource-list {
+    max-height: 280px;
+    margin-top: 8px;
+    overflow: auto;
+    border-top: 1px solid var(--ind-border-separator);
+    border-bottom: 1px solid var(--ind-border-separator);
+  }
+
+  .resource-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 52px;
+    padding: 7px 2px;
+    border-bottom: 1px solid var(--ind-border-separator);
+  }
+
+  .resource-row:last-child { border-bottom: 0; }
+
+  .resource-row input {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+    accent-color: var(--ind-tab-accent);
+  }
+
+  .resource-row-copy {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .resource-row-copy strong,
+  .resource-row-copy span,
+  .resource-row-copy small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .resource-row-copy strong {
+    color: var(--ind-foreground);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .resource-row-copy .resource-page {
+    margin-top: 2px;
+    color: var(--ind-foreground-secondary);
+    font-size: 11px;
+  }
+
+  .resource-row-copy small {
+    margin-top: 2px;
+    color: var(--ind-foreground-muted);
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 10px;
+  }
+
+  .resource-row-status {
+    flex: 0 0 auto;
+    max-width: 104px;
+    color: var(--ind-foreground-muted);
+    font-size: 10px;
+    text-align: right;
+  }
+
+  .resource-row-status--ready {
+    color: var(--ind-tab-accent);
+  }
+
+  .resource-manager-footer {
+    align-items: flex-start;
+    padding-top: 10px;
+  }
+
+  .resource-manager-footer > span {
+    max-width: 64%;
+    color: var(--ind-foreground-muted);
+    font-size: 10px;
+    line-height: 1.45;
+  }
+
+  .resource-reclaim-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    min-height: 29px;
+    padding: 0 10px;
+    border: 1px solid color-mix(in srgb, var(--danger, #c53f4f) 42%, var(--ind-border-control));
+    border-radius: 6px;
+    color: var(--danger, #c53f4f);
+    background: transparent;
+    font-size: 11px;
+  }
+
+  .resource-reclaim-button:disabled {
+    cursor: default;
+    opacity: 0.42;
+  }
+
+  .resource-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 74px;
+    color: var(--ind-foreground-muted);
+    font-size: 11px;
+  }
+
+  .resource-empty :global(svg) {
+    animation: browser-components-refresh-spin 0.9s linear infinite;
+  }
+
   .icon-action,
   .action-row button {
     border: 1px solid var(--ind-border-control);
@@ -645,5 +1054,10 @@
     .section-heading { align-items: flex-start; }
     .component-row code { max-width: 42%; }
     .action-row { align-items: flex-start; padding: 12px 0; }
+    .resource-summary { align-items: flex-start; }
+    .resource-summary { flex-direction: column; }
+    .resource-manage-button { align-self: flex-start; }
+    .resource-manager-footer { flex-direction: column; }
+    .resource-manager-footer > span { max-width: none; }
   }
 </style>

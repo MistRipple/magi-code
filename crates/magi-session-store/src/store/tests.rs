@@ -1087,6 +1087,109 @@ fn accept_current_turn_with_timeline_entry_rejects_running_turn_without_timeline
 }
 
 #[test]
+fn finalize_current_turn_for_continue_closes_active_turn_and_chain_atomically() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-finalize-continue");
+    store
+        .create_session(session_id.clone(), "Finalize Continue")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-before-continue", "running", 1),
+        )
+        .expect("running turn should upsert");
+
+    let mut tool_item = test_turn_item("tool-before-continue", "执行中的工具");
+    tool_item.kind = "tool_call_started".to_string();
+    tool_item.status = "running".to_string();
+    tool_item.tool_call_id = Some("tool-call-before-continue".to_string());
+    tool_item.tool_name = Some("shell_exec".to_string());
+    tool_item.tool_arguments = Some("{}".to_string());
+    store
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-before-continue"), tool_item)
+        .expect("active tool item should upsert");
+    let mut chain_turn = test_turn("turn-before-continue", "running", 1);
+    chain_turn.items.push(
+        store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .and_then(|turn| turn.items.into_iter().next())
+            .expect("active tool item should be visible in the current turn"),
+    );
+    store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            test_active_chain(&session_id, "chain-before-continue", Some(chain_turn)),
+        )
+        .expect("active chain should upsert");
+
+    let finalized = store
+        .finalize_current_turn_for_continue(&session_id, "turn-before-continue")
+        .expect("continue should finalize the observed turn")
+        .expect("current turn should exist");
+    let turn = finalized.current_turn.expect("finalized turn should exist");
+    assert_eq!(turn.status, "failed");
+    assert!(turn.completed_at.is_some());
+    assert_eq!(turn.items[0].status, "failed");
+    assert_eq!(
+        finalized
+            .active_execution_chain
+            .and_then(|chain| chain.current_turn)
+            .map(|turn| turn.status),
+        Some("failed".to_string())
+    );
+    assert_eq!(
+        store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-before-continue")
+            .map(|turn| turn.status),
+        Some(CanonicalTurnStatus::Failed)
+    );
+
+    let repeated = store
+        .finalize_current_turn_for_continue(&session_id, "turn-before-continue")
+        .expect("finalizing an already terminal turn should be idempotent")
+        .expect("terminal current turn should remain visible");
+    assert_eq!(
+        repeated
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.completed_at),
+        turn.completed_at
+    );
+}
+
+#[test]
+fn finalize_current_turn_for_continue_rejects_a_stale_turn_owner() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-finalize-continue-stale");
+    store
+        .create_session(session_id.clone(), "Finalize Continue Stale")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-current", "running", 1))
+        .expect("running turn should upsert");
+
+    let result = store.finalize_current_turn_for_continue(&session_id, "turn-stale");
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::CurrentTurnConflict {
+            ref active_turn_id,
+            ..
+        }) if active_turn_id == "turn-current"
+    ));
+    assert_eq!(
+        store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .map(|turn| (turn.turn_id, turn.status)),
+        Some(("turn-current".to_string(), "running".to_string()))
+    );
+}
+
+#[test]
 fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-replace-user-interrupted-turn");
@@ -1767,8 +1870,9 @@ fn append_current_turn_item_with_timeline_entry_writes_item_and_timeline_atomica
         .expect("running turn should upsert");
 
     let updated = store
-        .append_current_turn_item_with_timeline_entry(
+        .append_current_turn_item_with_timeline_entry_for_turn(
             &session_id,
+            Some("turn-running"),
             TimelineEntryInput::new(
                 "timeline-append-item",
                 TimelineEntryKind::UserMessage,
@@ -1813,14 +1917,14 @@ fn upsert_current_turn_item_allows_assistant_stream_to_final_canonical_update() 
     stream_item.kind = "assistant_stream".to_string();
     stream_item.status = "running".to_string();
     store
-        .upsert_current_turn_item(&session_id, stream_item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-running"), stream_item)
         .expect("stream item should upsert");
 
     let mut final_item = test_turn_item("turn-item-assistant", "最终回复");
     final_item.kind = "assistant_final".to_string();
     final_item.status = "completed".to_string();
     let updated = store
-        .upsert_current_turn_item(&session_id, final_item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-running"), final_item)
         .expect("assistant_text canonical update should be accepted")
         .expect("current turn should exist");
 
@@ -1851,7 +1955,7 @@ fn upsert_current_turn_item_allows_assistant_stream_to_final_canonical_update() 
     );
 
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(&session_id, Some("turn-running"), "completed")
         .expect("turn should become terminal before restore");
     let mut durable = store.durable_state();
     durable
@@ -1897,7 +2001,7 @@ fn active_goal_terminal_turn_is_not_a_user_response_duration_boundary() {
         .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
         .expect("goal turn should start");
     store
-        .update_current_turn_status(&session_id, "failed")
+        .update_current_turn_status_for_turn(&session_id, Some(turn_id), "failed")
         .expect("goal progress turn should become terminal");
 
     let canonical = store
@@ -2139,7 +2243,7 @@ fn completed_goal_terminal_turn_is_the_user_response_duration_boundary() {
         )
         .expect("goal should complete");
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(&session_id, Some(turn_id), "completed")
         .expect("completed goal turn should become terminal");
 
     let canonical = store
@@ -2165,11 +2269,11 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
     assistant_item.kind = "assistant_stream".to_string();
     assistant_item.status = "running".to_string();
     store
-        .upsert_current_turn_item(&session_id, assistant_item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-durable"), assistant_item)
         .expect("assistant item should upsert");
 
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(&session_id, Some("turn-durable"), "completed")
         .expect("turn status should update");
 
     let durable = store.durable_state();
@@ -2206,7 +2310,7 @@ fn canonical_turn_request_id_lookup_survives_normalization_and_restore() {
     item.request_id = Some("request-id-1".to_string());
     item.item_seq = 2;
     store
-        .upsert_current_turn_item(&session_id, item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-request-id"), item)
         .expect("request item should be persisted");
 
     let found = store
@@ -2247,7 +2351,11 @@ fn completed_current_turn_marks_session_completion_unread() {
         .expect("running turn should upsert");
 
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(
+            &session_id,
+            Some("turn-unread-completion"),
+            "completed",
+        )
         .expect("turn should complete");
 
     let session = store.session(&session_id).expect("session should exist");
@@ -2270,7 +2378,10 @@ fn completed_root_task_marks_session_completion_unread() {
         .expect("running turn should upsert");
 
     store
-        .complete_current_turn_from_completed_root_task(&session_id)
+        .complete_current_turn_from_completed_root_task_for_turn(
+            &session_id,
+            Some("turn-root-task-unread-completion"),
+        )
         .expect("root task should complete current turn");
 
     let session = store.session(&session_id).expect("session should exist");
@@ -2292,7 +2403,11 @@ fn marking_session_viewed_clears_unread_completion_and_survives_restore() {
         )
         .expect("running turn should upsert");
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(
+            &session_id,
+            Some("turn-viewed-completion"),
+            "completed",
+        )
         .expect("turn should complete");
     let completed_at = store
         .session(&session_id)
@@ -2337,7 +2452,11 @@ fn failed_current_turn_does_not_mark_successful_completion_unread() {
         .expect("running turn should upsert");
 
     store
-        .update_current_turn_status(&session_id, "failed")
+        .update_current_turn_status_for_turn(
+            &session_id,
+            Some("turn-failed-no-unread-completion"),
+            "failed",
+        )
         .expect("turn should fail");
 
     let session = store.session(&session_id).expect("session should exist");
@@ -2359,7 +2478,11 @@ fn replaying_completed_current_turn_keeps_original_completion_read_state() {
         )
         .expect("running turn should upsert");
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(
+            &session_id,
+            Some("turn-completed-replay"),
+            "completed",
+        )
         .expect("turn should complete");
     let completed_at = store
         .session(&session_id)
@@ -2370,7 +2493,11 @@ fn replaying_completed_current_turn_keeps_original_completion_read_state() {
         .expect("session should be marked viewed");
 
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(
+            &session_id,
+            Some("turn-completed-replay"),
+            "completed",
+        )
         .expect("completed replay should remain valid");
 
     let session = store.session(&session_id).expect("session should exist");
@@ -2401,7 +2528,7 @@ fn current_turn_hides_runtime_internal_tool_calls_in_durable_canonical_log() {
     wait_item.tool_arguments = Some("{\"task_ids\":[\"task-1\"]}".to_string());
     wait_item.tool_result = Some("{\"status\":\"succeeded\"}".to_string());
     store
-        .upsert_current_turn_item(&session_id, wait_item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-internal-tool"), wait_item)
         .expect("agent_wait item should upsert");
 
     let mut spawn_item = test_turn_item("turn-item-agent-spawn", "{\"status\":\"started\"}");
@@ -2420,7 +2547,7 @@ fn current_turn_hides_runtime_internal_tool_calls_in_durable_canonical_log() {
     );
     spawn_item.tool_result = Some("{\"status\":\"started\"}".to_string());
     store
-        .upsert_current_turn_item(&session_id, spawn_item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-internal-tool"), spawn_item)
         .expect("agent_spawn item should upsert");
 
     let turn = store
@@ -2496,11 +2623,15 @@ fn blocked_current_turn_is_terminal_in_canonical_log() {
     assistant_item.kind = "assistant_error".to_string();
     assistant_item.status = "running".to_string();
     store
-        .upsert_current_turn_item(&session_id, assistant_item)
+        .upsert_current_turn_item_for_turn(
+            &session_id,
+            Some("turn-blocked-terminal"),
+            assistant_item,
+        )
         .expect("assistant item should upsert");
 
     store
-        .update_current_turn_status(&session_id, "blocked")
+        .update_current_turn_status_for_turn(&session_id, Some("turn-blocked-terminal"), "blocked")
         .expect("blocked turn status should update");
 
     let turns = store.canonical_turns_for_session(&session_id);
@@ -2534,11 +2665,15 @@ fn killed_current_turn_status_is_stored_as_cancelled_terminal_turn() {
     assistant_item.kind = "assistant_error".to_string();
     assistant_item.status = "running".to_string();
     store
-        .upsert_current_turn_item(&session_id, assistant_item)
+        .upsert_current_turn_item_for_turn(
+            &session_id,
+            Some("turn-killed-terminal"),
+            assistant_item,
+        )
         .expect("assistant item should upsert");
 
     let updated = store
-        .update_current_turn_status(&session_id, "killed")
+        .update_current_turn_status_for_turn(&session_id, Some("turn-killed-terminal"), "killed")
         .expect("killed turn status should update")
         .expect("current turn should exist");
     let updated_turn = updated.current_turn.expect("turn should remain");
@@ -2682,7 +2817,11 @@ fn killed_task_status_item_is_written_as_cancelled_canonical_item() {
     task_item.status = "killed".to_string();
     task_item.source = "task".to_string();
     store
-        .upsert_current_turn_item(&session_id, task_item)
+        .upsert_current_turn_item_for_turn(
+            &session_id,
+            Some("turn-killed-task-status-item"),
+            task_item,
+        )
         .expect("killed task status item should upsert");
 
     let turns = store.canonical_turns_for_session(&session_id);
@@ -2708,7 +2847,7 @@ fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() 
         )
         .expect("turn should upsert");
     store
-        .update_current_turn_status(&session_id, "completed")
+        .update_current_turn_status_for_turn(&session_id, Some("turn-terminal-wins"), "completed")
         .expect("turn should complete");
 
     let durable_state = store.durable_state();
@@ -2744,10 +2883,18 @@ fn persisted_parts_repairs_terminal_turn_with_stale_active_items() {
     assistant_item.kind = "assistant_error".to_string();
     assistant_item.status = "running".to_string();
     store
-        .upsert_current_turn_item(&session_id, assistant_item)
+        .upsert_current_turn_item_for_turn(
+            &session_id,
+            Some("turn-terminal-active-item-repair"),
+            assistant_item,
+        )
         .expect("assistant item should upsert");
     store
-        .update_current_turn_status(&session_id, "blocked")
+        .update_current_turn_status_for_turn(
+            &session_id,
+            Some("turn-terminal-active-item-repair"),
+            "blocked",
+        )
         .expect("turn should become blocked");
 
     let mut durable_state = store.durable_state();
@@ -2780,7 +2927,7 @@ fn upsert_current_turn_item_rejects_canonical_immutable_field_conflict() {
     stream_item.kind = "assistant_stream".to_string();
     stream_item.status = "running".to_string();
     store
-        .upsert_current_turn_item(&session_id, stream_item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-running"), stream_item)
         .expect("stream item should upsert");
 
     let mut conflicting_item = test_turn_item("turn-item-conflict", "工具调用");
@@ -2788,7 +2935,11 @@ fn upsert_current_turn_item_rejects_canonical_immutable_field_conflict() {
     conflicting_item.status = "running".to_string();
     conflicting_item.tool_call_id = Some("tool-conflict".to_string());
     conflicting_item.tool_name = Some("shell_exec".to_string());
-    let result = store.upsert_current_turn_item(&session_id, conflicting_item);
+    let result = store.upsert_current_turn_item_for_turn(
+        &session_id,
+        Some("turn-running"),
+        conflicting_item,
+    );
 
     assert!(matches!(
         result,
@@ -2822,13 +2973,14 @@ fn upsert_current_turn_item_rejects_canonical_status_regression() {
     final_item.kind = "assistant_final".to_string();
     final_item.status = "completed".to_string();
     store
-        .upsert_current_turn_item(&session_id, final_item)
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-running"), final_item)
         .expect("final item should upsert");
 
     let mut failed_item = test_turn_item("turn-item-status", "失败回复");
     failed_item.kind = "assistant_error".to_string();
     failed_item.status = "failed".to_string();
-    let result = store.upsert_current_turn_item(&session_id, failed_item);
+    let result =
+        store.upsert_current_turn_item_for_turn(&session_id, Some("turn-running"), failed_item);
 
     assert!(matches!(
         result,
@@ -2877,6 +3029,48 @@ fn upsert_current_turn_item_for_turn_rejects_a_stale_turn_owner() {
 }
 
 #[test]
+fn stale_turn_writeback_cannot_mutate_a_replacement_turn_or_resurrect_cancelled_turn() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-stale-writeback-replacement");
+    store
+        .create_session(session_id.clone(), "Stale Writeback Replacement")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-old", "running", 1))
+        .expect("old turn should upsert");
+    store
+        .interrupt_current_turn_by_user(&session_id)
+        .expect("old turn should be interruptible");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-new", "running", 2))
+        .expect("replacement turn should upsert");
+
+    let stale_item = store.append_current_turn_item_for_turn(
+        &session_id,
+        Some("turn-old"),
+        test_turn_item("turn-item-stale", "迟到的旧轮次写回"),
+    );
+    let stale_status =
+        store.update_current_turn_status_for_turn(&session_id, Some("turn-old"), "failed");
+
+    assert!(matches!(
+        stale_item,
+        Err(magi_core::DomainError::CurrentTurnConflict { .. })
+    ));
+    assert!(matches!(
+        stale_status,
+        Err(magi_core::DomainError::CurrentTurnConflict { .. })
+    ));
+    let current_turn = store
+        .runtime_sidecar(&session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .expect("replacement turn should remain");
+    assert_eq!(current_turn.turn_id, "turn-new");
+    assert_eq!(current_turn.status, "running");
+    assert!(current_turn.items.is_empty());
+}
+
+#[test]
 fn append_current_turn_item_with_timeline_entry_does_not_write_timeline_without_turn() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-append-item-no-turn");
@@ -2892,8 +3086,9 @@ fn append_current_turn_item_with_timeline_entry_does_not_write_timeline_without_
     );
 
     let updated = store
-        .append_current_turn_item_with_timeline_entry(
+        .append_current_turn_item_with_timeline_entry_for_turn(
             &session_id,
+            Some("turn-no-current"),
             TimelineEntryInput::new(
                 "timeline-no-turn",
                 TimelineEntryKind::UserMessage,

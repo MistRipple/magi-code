@@ -666,7 +666,11 @@ mod tests {
             .expect("current turn should upsert");
         state
             .session_store
-            .update_current_turn_status(&session_id, "completed")
+            .update_current_turn_status_for_turn(
+                &session_id,
+                Some("turn-unread-completion"),
+                "completed",
+            )
             .expect("turn should complete");
 
         for _ in 0..2 {
@@ -731,7 +735,7 @@ mod tests {
             .expect("current turn should upsert");
         state
             .session_store
-            .update_current_turn_status(&session_id, "completed")
+            .update_current_turn_status_for_turn(&session_id, Some("turn-mark-viewed"), "completed")
             .expect("turn should complete");
 
         let response = crate::routes::build_router(state.clone())
@@ -889,7 +893,7 @@ mod tests {
 
         state
             .session_store
-            .update_current_turn_status(&session_id, "interrupted")
+            .update_current_turn_status_for_turn(&session_id, Some("turn-running"), "interrupted")
             .expect("current turn should be interruptible");
         let response = routes()
             .with_state(state)

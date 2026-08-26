@@ -116,7 +116,7 @@ export function isStructuredToolErrorPayload(content: unknown): boolean {
     return false;
   }
   const status = toolPayloadStatus(content);
-  return !status || !['succeeded', 'success', 'ok'].includes(status);
+  return !status || !['succeeded', 'success', 'ok', 'cancelled', 'canceled', 'killed', 'aborted'].includes(status);
 }
 
 export function publicToolPayloadMessage(content: unknown): string {

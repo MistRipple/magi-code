@@ -263,7 +263,7 @@ export type MessageType =
 export type NoticeType = 'info' | 'success' | 'warning' | 'error';
 
 // 工具调用状态
-export type ToolCallStatus = 'pending' | 'running' | 'success' | 'error';
+export type ToolCallStatus = 'pending' | 'running' | 'success' | 'error' | 'cancelled';
 
 // 工具结果标准化状态（与协议层保持一致）
 export type StandardizedToolStatus =
@@ -273,7 +273,8 @@ export type StandardizedToolStatus =
   | 'killed'
   | 'blocked'
   | 'rejected'
-  | 'aborted';
+  | 'aborted'
+  | 'cancelled';
 
 // 工具结果标准化结构（机器可读）
 export interface StandardizedToolResult {

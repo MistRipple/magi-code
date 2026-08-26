@@ -577,6 +577,7 @@ impl BrowserToolRuntimeDependencies {
                 // full_page=true。整页是更明确的范围意图，丢弃这个无效
                 // clip，避免一次本可执行的截图被范围校验拦截并耗尽本轮
                 // 唯一的截图调用额度；具体元素与 full_page 仍保持冲突。
+                let requested_clip = arguments.contains_key("clip");
                 let clip = if full_page {
                     None
                 } else {
@@ -584,8 +585,13 @@ impl BrowserToolRuntimeDependencies {
                         .get("clip")
                         .map(parse_normalized_rect)
                         .transpose()?
+                        .and_then(normalize_screenshot_clip)
                 };
-                validate_screenshot_scope(has_element_scope, clip.is_some(), full_page)?;
+                validate_screenshot_scope(
+                    has_element_scope,
+                    requested_clip && !full_page,
+                    full_page,
+                )?;
                 let format = match optional_string(arguments, "format").as_deref() {
                     None | Some("png") => magi_browser_authority::BrowserScreenshotFormat::Png,
                     Some("jpeg") => magi_browser_authority::BrowserScreenshotFormat::Jpeg,
@@ -805,9 +811,9 @@ impl BrowserToolRuntimeDependencies {
                 .lock()
                 .expect("browser authority lock poisoned");
             if let Some(id) = requested_tab_id.as_ref() {
-                let tab = authority.tab(id).ok_or_else(|| {
-                    BrowserToolError::new("browser_tab_not_found", "指定的浏览器 Tab 不存在")
-                })?;
+                let tab = authority
+                    .tab(id)
+                    .ok_or_else(|| browser_tab_not_found_error(&authority, session, id))?;
                 if tab.browser_session_id != session.browser_session_id {
                     return Err(BrowserToolError::new(
                         "browser_tab_scope_mismatch",
@@ -1727,7 +1733,7 @@ fn tab_in_session(
         .expect("browser authority lock poisoned");
     let tab = authority
         .tab(tab_id)
-        .ok_or_else(|| BrowserToolError::new("browser_tab_not_found", "指定的浏览器 Tab 不存在"))?;
+        .ok_or_else(|| browser_tab_not_found_error(&authority, session, tab_id))?;
     if tab.browser_session_id != session.browser_session_id {
         return Err(BrowserToolError::new(
             "browser_tab_scope_mismatch",
@@ -1735,6 +1741,43 @@ fn tab_in_session(
         ));
     }
     Ok(tab.clone())
+}
+
+fn browser_tab_not_found_error(
+    authority: &magi_browser_authority::BrowserAuthority,
+    session: &magi_browser_authority::BrowserSession,
+    requested_tab_id: &BrowserTabId,
+) -> BrowserToolError {
+    let available_tabs = session
+        .tab_ids
+        .iter()
+        .filter_map(|tab_id| authority.tab(tab_id))
+        .map(|tab| {
+            json!({
+                "tab_id": tab.tab_id,
+                "url": tab.url,
+                "title": tab.title,
+                "lifecycle": tab.lifecycle,
+            })
+        })
+        .collect::<Vec<_>>();
+    let active_tab_id = authority
+        .active_tab(&session.browser_session_id)
+        .map(|tab_id| tab_id.as_str());
+    let mut error = BrowserToolError::new(
+        "browser_tab_not_found",
+        format!(
+            "指定的浏览器 Tab 不存在：{}。请使用 browser_tabs 的 list 获取当前有效 tab_id，不要重复使用旧 Tab ID。",
+            requested_tab_id
+        ),
+    );
+    error.recoverable = true;
+    error.details = Some(json!({
+        "requested_tab_id": requested_tab_id,
+        "active_tab_id": active_tab_id,
+        "available_tabs": available_tabs,
+    }));
+    error
 }
 
 fn browser_tool_requested_access(
@@ -2057,6 +2100,16 @@ fn parse_normalized_rect(
     Ok(rect)
 }
 
+fn normalize_screenshot_clip(
+    clip: magi_browser_authority::BrowserNormalizedRect,
+) -> Option<magi_browser_authority::BrowserNormalizedRect> {
+    if clip.x == 0.0 && clip.y == 0.0 && clip.width == 1.0 && clip.height == 1.0 {
+        None
+    } else {
+        Some(clip)
+    }
+}
+
 fn validate_screenshot_scope(
     has_element_ref: bool,
     has_clip: bool,
@@ -2369,9 +2422,9 @@ mod tests {
 
     use super::{
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_requested_access,
-        browser_tool_snapshot_value, optional_snapshot_target, parse_normalized_rect,
-        screenshot_has_element_scope, validate_devtools_arguments, validate_screenshot_binary,
-        validate_screenshot_scope,
+        browser_tool_snapshot_value, normalize_screenshot_clip, optional_snapshot_target,
+        parse_normalized_rect, screenshot_has_element_scope, validate_devtools_arguments,
+        validate_screenshot_binary, validate_screenshot_scope,
     };
     use crate::state::BrowserHostStatusSnapshot;
     use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
@@ -2661,6 +2714,19 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn browser_screenshot_full_viewport_clip_is_sent_as_page_scope() {
+        let clip = parse_normalized_rect(&json!({
+            "x": 0.0,
+            "y": 0.0,
+            "width": 1.0,
+            "height": 1.0
+        }))
+        .expect("full viewport clip should be valid");
+
+        assert_eq!(normalize_screenshot_clip(clip), None);
     }
 
     #[test]

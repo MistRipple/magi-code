@@ -1183,8 +1183,8 @@ async fn execute_browser_tool(
         tool_name: Some(tool_for_item),
         tool_status: Some(status_value.to_string()),
         tool_arguments: Some(arguments.clone()),
-        tool_result: (status_value == "completed").then_some(payload.clone()),
-        tool_error: (status_value != "completed").then_some(payload.clone()),
+        tool_result: matches!(status_value, "completed" | "cancelled").then_some(payload.clone()),
+        tool_error: (!matches!(status_value, "completed" | "cancelled")).then_some(payload.clone()),
         request_id: Some(request_id.as_str().to_string()),
         user_message_id: None,
         placeholder_message_id: None,
@@ -1920,6 +1920,9 @@ fn api_error_to_protocol(error: ApiError) -> ErrorObject {
         ApiError::RecoveryNotFound(message) => ErrorObject::new(ERROR_SESSION_NOT_FOUND, message),
         ApiError::Conflict(message) | ApiError::TurnConflict { message, .. } => {
             ErrorObject::new(ERROR_REQUEST_CONFLICT, message).retryable(true)
+        }
+        ApiError::BrowserSessionTabLimitReached | ApiError::BrowserGlobalTabLimitReached => {
+            ErrorObject::new(ERROR_REQUEST_CONFLICT, error.message()).retryable(false)
         }
         ApiError::CapabilityUnavailable { message, .. } => {
             ErrorObject::new(-32011, message).retryable(false)

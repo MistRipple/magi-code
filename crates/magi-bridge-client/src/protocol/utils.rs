@@ -86,11 +86,7 @@ pub fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Vec<Value> {
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": {
-                        "type": tool.input_schema.kind,
-                        "properties": tool.input_schema.properties,
-                        "required": tool.input_schema.required,
-                    },
+                    "parameters": tool.input_schema.to_json_schema(),
                 }
             })
         })
@@ -104,11 +100,7 @@ pub fn serialize_anthropic_tool_definitions(tools: &[ToolDefinition]) -> Vec<Val
             json!({
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": {
-                    "type": tool.input_schema.kind,
-                    "properties": tool.input_schema.properties,
-                    "required": tool.input_schema.required,
-                }
+                "input_schema": tool.input_schema.to_json_schema()
             })
         })
         .collect()
@@ -445,6 +437,7 @@ mod tests {
                     }
                 }),
                 required: Some(vec!["command".to_string()]),
+                additional_keywords: serde_json::Map::new(),
             },
             origin: crate::types::ChatToolOrigin::Builtin,
         }];
@@ -455,6 +448,25 @@ mod tests {
         assert_eq!(parameters["type"], "object");
         assert_eq!(parameters["properties"]["command"]["type"], "string");
         assert_eq!(parameters["required"][0], "command");
+    }
+
+    #[test]
+    fn serialize_tool_definitions_preserves_conditional_schema_keywords() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "oneOf": [{"required": ["value"]}],
+            "additionalProperties": false
+        });
+        let tool = ToolDefinition {
+            name: "conditional".to_string(),
+            description: "test".to_string(),
+            input_schema: ToolInputSchema::from_json_schema(&schema),
+            origin: crate::types::ChatToolOrigin::Builtin,
+        };
+
+        let serialized = serialize_tool_definitions(&[tool]);
+        assert_eq!(serialized[0]["function"]["parameters"], schema);
     }
 
     #[test]

@@ -11,7 +11,7 @@ interface FileChangeProjectionInput {
   toolName: string;
   arguments: unknown;
   result?: unknown;
-  status: 'pending' | 'running' | 'success' | 'error';
+  status: 'pending' | 'running' | 'success' | 'error' | 'cancelled';
 }
 
 interface TextPatch {

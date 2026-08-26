@@ -967,6 +967,41 @@ export interface BrowserCapabilitiesSnapshot {
   };
 }
 
+export type BrowserResourceTabLifecycle = 'creating' | 'ready' | 'suspended' | 'crashed';
+
+export interface BrowserResourceTabSnapshot {
+  tabId: string;
+  browserSessionId: string;
+  sessionId: string;
+  workspaceId: string | null;
+  sessionTitle: string | null;
+  lifecycle: BrowserResourceTabLifecycle;
+  url: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  isCurrentSession: boolean;
+  isCurrentTab: boolean;
+  sessionRunning: boolean;
+  canReclaim: boolean;
+  reclaimReason: string | null;
+}
+
+export interface BrowserResourcesSnapshot {
+  maxTabs: number;
+  liveTabs: number;
+  availableTabs: number;
+  reclaimableTabs: number;
+  tabs: BrowserResourceTabSnapshot[];
+}
+
+export interface ReclaimBrowserResourcesSnapshot {
+  reclaimedCount: number;
+  reclaimedTabIds: string[];
+  skipped: Array<{ tabId: string; reason: string }>;
+  resources: BrowserResourcesSnapshot;
+}
+
 export type BrowserClientPlatform = 'desktop' | 'web' | 'mobile-web';
 
 export function browserClientPlatform(): BrowserClientPlatform {
@@ -1004,6 +1039,29 @@ export async function updateBrowserSettings(settings: {
     body: JSON.stringify({ ...settings, clientPlatform: browserClientPlatform() }),
   });
   return parseAgentJson<BrowserCapabilitiesSnapshot>(response, 'update browser settings');
+}
+
+export async function getBrowserResources(): Promise<BrowserResourcesSnapshot> {
+  const response = await getTransport().request(
+    agentUrl('/api/browser/resources'),
+    { cache: 'no-store' },
+  );
+  return parseAgentJson<BrowserResourcesSnapshot>(response, 'load browser resources');
+}
+
+export async function reclaimBrowserResources(tabIds: string[]): Promise<ReclaimBrowserResourcesSnapshot> {
+  const normalizedTabIds = Array.from(new Set(
+    tabIds
+      .filter((tabId): tabId is string => typeof tabId === 'string')
+      .map((tabId) => tabId.trim())
+      .filter(Boolean),
+  ));
+  const response = await getTransport().request(agentUrl('/api/browser/resources/reclaim'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tabIds: normalizedTabIds }),
+  });
+  return parseAgentJson<ReclaimBrowserResourcesSnapshot>(response, 'reclaim browser resources');
 }
 
 export async function createBrowserSession(

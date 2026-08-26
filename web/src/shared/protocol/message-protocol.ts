@@ -173,7 +173,8 @@ export type StandardizedToolStatus =
   | 'killed'
   | 'blocked'
   | 'rejected'
-  | 'aborted';
+  | 'aborted'
+  | 'cancelled';
 
 export interface StandardizedToolResultPayload {
   schemaVersion: 'tool-result.v1';

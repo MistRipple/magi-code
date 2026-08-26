@@ -127,7 +127,8 @@ pub struct RunnerHandle {
     join_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
+type RunnerTerminalObserver =
+    Arc<dyn Fn(TaskId, Option<SessionId>, String, Option<String>) + Send + Sync>;
 pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<(), ApiError> + Send + Sync>;
 
 fn snapshot_baseline_patch(
@@ -306,7 +307,7 @@ impl RunnerManager {
 
     pub fn with_terminal_observer(
         mut self,
-        observer: impl Fn(TaskId, Option<SessionId>, String) + Send + Sync + 'static,
+        observer: impl Fn(TaskId, Option<SessionId>, String, Option<String>) + Send + Sync + 'static,
     ) -> Self {
         self.terminal_observer = Some(Arc::new(observer));
         self
@@ -354,6 +355,15 @@ impl RunnerManager {
                 return Err(RunnerStartError::SessionUnavailable);
             }
         }
+
+        // runner 的终态回调可能在用户停止并提交下一轮后才到达；回调必须携带
+        // 启动时绑定的 Turn，而不能在回调时重新读取 session 的 current_turn。
+        let observer_turn_id = session_id.as_ref().and_then(|session_id| {
+            self.session_store
+                .runtime_sidecar(session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .map(|turn| turn.turn_id)
+        });
 
         let mut runners = self.runners.lock().expect("runners lock should hold");
         if let Some(existing) = runners.get(root_task_id)
@@ -484,6 +494,7 @@ impl RunnerManager {
                                 root_id.clone(),
                                 observer_session_id.clone(),
                                 "completed".to_string(),
+                                observer_turn_id.clone(),
                             );
                         }
                         break;
@@ -517,6 +528,7 @@ impl RunnerManager {
                                 root_id.clone(),
                                 observer_session_id.clone(),
                                 runner_status.to_string(),
+                                observer_turn_id.clone(),
                             );
                         }
                         break;
@@ -554,6 +566,7 @@ impl RunnerManager {
                                 root_id.clone(),
                                 observer_session_id.clone(),
                                 "error".to_string(),
+                                observer_turn_id.clone(),
                             );
                         }
                         break;
@@ -1404,6 +1417,12 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
         | BrowserAuthorityError::NavigationRevisionMismatch { .. }
         | BrowserAuthorityError::NavigationRevisionRegression { .. } => {
             ApiError::Conflict(error.to_string())
+        }
+        BrowserAuthorityError::SessionTabLimitReached { .. } => {
+            ApiError::BrowserSessionTabLimitReached
+        }
+        BrowserAuthorityError::GlobalTabLimitReached { .. } => {
+            ApiError::BrowserGlobalTabLimitReached
         }
         BrowserAuthorityError::InvalidSnapshot(_) => {
             ApiError::InternalAssemblyError(error.to_string())
@@ -4940,7 +4959,7 @@ mod tests {
             Arc::new(PanickingDispatcher),
             Arc::new(EventBasedResultReceiver::new()),
         )
-        .with_terminal_observer(move |_task_id, _session_id, status| {
+        .with_terminal_observer(move |_task_id, _session_id, status, _turn_id| {
             *observed_status_for_observer
                 .lock()
                 .expect("observer status lock should not poison") = Some(status);

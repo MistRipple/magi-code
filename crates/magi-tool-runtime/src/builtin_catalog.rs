@@ -938,7 +938,7 @@ impl BuiltinToolName {
                 "读取或设置当前内置浏览器页面的设备视口。使用 action=set、mode=auto 恢复跟随右侧内容槽的自适应布局；使用 mode=fixed 并传入 width/height 验证电脑/平板宽屏或手机窄屏响应式布局。可选 device_scale_factor_millis 调整设备像素比（500-4000，默认 1000）。该工具只通过 Chromium 原生 device metrics、设备类型和触控语义改变页面 CSS 视口，不修改页面 DOM，也不使用 Magi 外层缩放。"
             }
             Self::BrowserWaitFor => {
-                "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。"
+                "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。"
             }
             Self::BrowserHover => "将鼠标悬停到当前浏览器快照中的元素。",
             Self::BrowserDrag => {
@@ -1182,7 +1182,7 @@ impl BuiltinToolName {
             Self::FilePatch => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要修改文件的工作区相对路径（推荐）或当前平台原生绝对路径" },
+                    "path": { "type": "string", "minLength": 1, "description": "要修改文件的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "old_string": { "type": "string", "minLength": 1, "description": "要查找的原文本（必须在文件中精确匹配一次）" },
                     "new_string": { "type": "string", "description": "替换后的文本" },
                     "patches": {
@@ -1199,7 +1199,24 @@ impl BuiltinToolName {
                         }
                     }
                 },
-                "required": ["path"]
+                "required": ["path"],
+                "oneOf": [
+                    {
+                        "description": "单次精确替换",
+                        "required": ["old_string", "new_string"],
+                        "not": { "required": ["patches"] }
+                    },
+                    {
+                        "description": "批量精确替换",
+                        "required": ["patches"],
+                        "not": {
+                            "anyOf": [
+                                { "required": ["old_string"] },
+                                { "required": ["new_string"] }
+                            ]
+                        }
+                    }
+                ]
             }),
             Self::ApplyPatch => serde_json::json!({
                 "type": "object",
@@ -1277,7 +1294,7 @@ impl BuiltinToolName {
                     "command": { "type": "string", "description": "要执行的当前平台原生 Shell 命令：Windows 使用 PowerShell 语法（如 Get-ChildItem、Get-Content），macOS 默认使用 zsh/POSIX 语法（如 ls -la、cat file），Linux 默认使用当前用户 Shell/POSIX 语法（如 find . -type f）；必须遵循工作区上下文声明的 Shell 方言，不得混用平台语法" },
                     "cwd": { "type": "string", "description": "工作区相对路径或当前平台原生绝对路径；默认当前工作区" },
                     "shell": { "type": "string", "description": "可选 Shell 程序或程序加启动参数；默认 Windows 使用 PowerShell -NoLogo -NoProfile -NonInteractive -Command，macOS 使用 zsh -c，Linux 使用当前用户 Shell -c，并继承 Magi 统一初始化的用户执行环境；Windows 仅支持 PowerShell" },
-                    "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
+                    "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 1800000, "description": "执行超时（毫秒），默认 300000；正常长命令请保留较大的超时时间，命令被用户停止时会返回 cancelled，而不是 failed" },
                     "action": {
                         "type": "string",
                         "description": "后台进程控制动作：run/read/write/kill/list。省略时默认 run；background=true 启动后台命令后，使用 read/write/kill/list 搭配 terminal_id 继续管理。",
@@ -1371,7 +1388,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["url", "back", "forward", "reload"], "description": "可选；提供 url 时默认执行 URL 导航，后退、前进或刷新时再显式填写" },
-                    "url": { "type": "string", "description": "要打开的 URL；提供该字段时 action 默认是 url" },
+                    "url": { "type": "string", "minLength": 1, "description": "要打开的 URL；提供该字段时 action 默认是 url" },
                     "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" },
                     "ignore_cache": { "type": "boolean", "description": "action=reload 时忽略缓存；默认 false" },
                     "handle_before_unload": { "type": "string", "enum": ["accept", "dismiss"], "description": "导航触发 beforeunload 时自动接受或取消" },
@@ -1379,7 +1396,38 @@ impl BuiltinToolName {
                     "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "description": "导航超时，默认 15000 毫秒" },
                     "include_snapshot": { "type": "boolean", "description": "导航后还要继续交互时设为 true，在同一次工具结果中附带最新可访问性快照；默认 false" }
                 },
-                "required": []
+                "required": [],
+                "oneOf": [
+                    {
+                        "description": "URL 导航；action 可省略或必须为 url",
+                        "required": ["url"],
+                        "properties": { "action": { "enum": ["url"] } },
+                        "not": { "required": ["ignore_cache"] }
+                    },
+                    {
+                        "description": "后退或前进",
+                        "required": ["action"],
+                        "properties": { "action": { "enum": ["back", "forward"] } },
+                        "not": {
+                            "anyOf": [
+                                { "required": ["url"] },
+                                { "required": ["ignore_cache"] },
+                                { "required": ["init_script"] }
+                            ]
+                        }
+                    },
+                    {
+                        "description": "刷新",
+                        "required": ["action"],
+                        "properties": { "action": { "enum": ["reload"] } },
+                        "not": {
+                            "anyOf": [
+                                { "required": ["url"] },
+                                { "required": ["init_script"] }
+                            ]
+                        }
+                    }
+                ]
             }),
             Self::BrowserSnapshot => serde_json::json!({
                 "type": "object",
@@ -1471,13 +1519,19 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "text": { "type": ["string", "array"], "items": { "type": "string" }, "minItems": 1 },
-                    "texts": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-                    "selector": { "type": "string" },
-                    "url": { "type": "string" },
+                    "text": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 }] },
+                    "texts": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+                    "selector": { "type": "string", "minLength": 1 },
+                    "url": { "type": "string", "minLength": 1 },
                     "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
                 },
-                "required": []
+                "required": [],
+                "anyOf": [
+                    { "required": ["selector"] },
+                    { "required": ["text"] },
+                    { "required": ["texts"] },
+                    { "required": ["url"] }
+                ]
             }),
             Self::BrowserHover => serde_json::json!({
                 "type": "object",
@@ -2436,6 +2490,7 @@ mod tests {
     #[test]
     fn file_patch_schema_requires_non_empty_match_inputs() {
         let schema = BuiltinToolName::FilePatch.parameters_schema();
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(2));
         assert_eq!(schema["properties"]["old_string"]["minLength"], 1);
         assert_eq!(schema["properties"]["patches"]["minItems"], 1);
         assert_eq!(
@@ -2466,6 +2521,16 @@ mod tests {
         assert!(required.is_empty());
         assert_eq!(schema["properties"]["url"]["type"], "string");
         assert_eq!(schema["properties"]["include_snapshot"]["type"], "boolean");
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn browser_wait_for_schema_requires_a_real_wait_condition() {
+        let schema = BuiltinToolName::BrowserWaitFor.parameters_schema();
+
+        assert_eq!(schema["anyOf"].as_array().map(Vec::len), Some(4));
+        assert_eq!(schema["properties"]["selector"]["minLength"], 1);
+        assert_eq!(schema["properties"]["texts"]["minItems"], 1);
     }
 
     #[test]
