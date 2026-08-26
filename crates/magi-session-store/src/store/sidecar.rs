@@ -77,7 +77,8 @@ fn current_turn_status_is_terminal(status: &str) -> bool {
 fn current_turn_item_status_is_active(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),
-        "pending"
+        "preparing"
+            | "pending"
             | "queued"
             | "running"
             | "started"
@@ -103,7 +104,7 @@ fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
 
 fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStatus> {
     match status.trim().to_ascii_lowercase().as_str() {
-        "pending" | "queued" | "accepted" => Ok(CanonicalTurnStatus::Pending),
+        "preparing" | "pending" | "queued" | "accepted" => Ok(CanonicalTurnStatus::Pending),
         "running" | "started" | "streaming" | "awaiting_approval" | "review_required"
         | "repairing" | "verifying" => Ok(CanonicalTurnStatus::Running),
         "completed" | "complete" | "succeeded" | "success" => Ok(CanonicalTurnStatus::Completed),

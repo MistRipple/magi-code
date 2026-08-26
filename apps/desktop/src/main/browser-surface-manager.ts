@@ -118,8 +118,9 @@ interface SurfaceLaneContext {
 const ALLOWED_NAVIGATION_PROTOCOLS = new Set(["http:", "https:", "about:"]);
 const BLOCKED_HOSTS = new Set(["169.254.169.254", "metadata.google.internal"]);
 // 固定资产只用于隔离世界中的可视化指针，不读取或修改页面的光标样式。
-// 使用内联矢量资源避免依赖页面外部网络和站点 CSS，且在 Shadow DOM 内保持封装。
-const AGENT_CURSOR_ASSET = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'%3E%3Cpath d='M3 1.8 17.2 11l-6.1 1.1 3.7 5.1-2.2 1.6-3.7-5.1-3.4 5.2Z' fill='%232563eb' stroke='white' stroke-width='1.2' stroke-linejoin='round'/%3E%3C/svg%3E";
+// 采用深色填充和浅色描边，和 Codex 的浏览器操作指针保持同一视觉语义；
+// 使用内联矢量资源避免依赖页面外部网络和站点 CSS。
+const AGENT_CURSOR_ASSET = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'%3E%3Cpath d='M3 1.8 17.2 11l-6.1 1.1 3.7 5.1-2.2 1.6-3.7-5.1-3.4 5.2Z' fill='%23333743' stroke='%23f8fafc' stroke-width='1.35' stroke-linejoin='round'/%3E%3C/svg%3E";
 const ALLOWED_WORKER_CDP_METHODS = new Set([
   "DOM.getDocument",
   "DOM.querySelector",
@@ -705,12 +706,17 @@ export class BrowserSurfaceManager {
       ));
       if (injectsInput && record.agentControlled) {
         const input = params as { type?: string; x?: number; y?: number };
+        // 一个完整点击包含 pressed/released 两个事件，但视觉反馈只在
+        // pressed 时触发一次；released 仍更新指针位置，避免一次点击出现
+        // 两个连续波纹。
         const action = method === "Input.insertText"
           ? "type"
-          : input.type === "mousePressed" || input.type === "mouseReleased"
+          : input.type === "mousePressed"
             ? "click"
             : input.type === "mouseWheel" ? "scroll" : "move";
-        void this.setAgentCursor(
+        // 等待代理指针完成注入再返回输入命令，保证调用方紧接着截图时
+        // 能看到与刚刚执行的动作一致的指针位置和点击反馈。
+        await this.setAgentCursor(
           record,
           true,
           typeof input.x === "number" ? input.x : record.cursor.x,
@@ -1325,7 +1331,7 @@ export class BrowserSurfaceManager {
       if (
         record.closed
         || record.automationInputDepth > 0
-        || !["mouseDown", "contextMenu", "mouseWheel"].includes(input.type)
+        || !["mouseMove", "mouseDown", "contextMenu", "mouseWheel"].includes(input.type)
       ) return;
       this.promote(record.surfaceId);
       void this.setAgentCursor(record, false, null, null, null).catch(() => undefined);
@@ -1672,27 +1678,50 @@ export class BrowserSurfaceManager {
           expression: `(() => {
             const state = ${JSON.stringify({ visible, x, y, action })};
             const cursorAsset = ${JSON.stringify(AGENT_CURSOR_ASSET)};
-            let host = document.getElementById('magi-agent-cursor');
-            if (!host) {
+            let host = document.querySelector('[data-magi-agent-cursor="true"]');
+            if (!(host instanceof HTMLElement) || !host.isConnected) {
               host = document.createElement('div');
-              host.id = 'magi-agent-cursor';
+              host.dataset.magiAgentCursor = 'true';
               host.setAttribute('aria-hidden', 'true');
-              host.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;width:20px;height:20px;transform:translate(-2px,-2px);transition:left 60ms linear,top 60ms linear;display:none;';
-              const shadow = host.attachShadow({ mode: 'closed' });
-              const image = document.createElement('div');
-              image.style.cssText = 'width:20px;height:20px;background: center / contain no-repeat;';
-              image.style.backgroundImage = 'url(' + cursorAsset + ')';
-              shadow.append(image);
+              host.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;width:20px;height:20px;overflow:visible;transform:translate(-2px,-2px);transition:left 60ms linear,top 60ms linear;display:none;will-change:left,top;';
+              const image = document.createElement('img');
+              image.alt = '';
+              image.draggable = false;
+              image.style.cssText = 'position:absolute;left:0;top:0;width:20px;height:20px;display:block;pointer-events:none;filter:drop-shadow(0 1px 1px rgba(0,0,0,.55));';
+              image.src = cursorAsset;
+              host.append(image);
               (document.documentElement || document.body)?.append(host);
             }
-            host.style.display = state.visible ? 'block' : 'none';
-            if (state.visible && state.x !== null && state.y !== null) {
+            if (!(host instanceof HTMLElement)) return true;
+            const hasPosition = Number.isFinite(state.x) && Number.isFinite(state.y);
+            const shouldShow = state.visible && hasPosition;
+            host.style.display = shouldShow ? 'block' : 'none';
+            if (shouldShow && state.x !== null && state.y !== null) {
               host.style.left = state.x + 'px';
               host.style.top = state.y + 'px';
+            }
+            const pulse = host.querySelector('[data-magi-agent-cursor-pulse]');
+            if (!shouldShow) {
+              pulse?.remove();
+            } else if (state.action === 'click') {
+              pulse?.remove();
+              const clickPulse = document.createElement('span');
+              clickPulse.dataset.magiAgentCursorPulse = 'true';
+              clickPulse.style.cssText = 'position:absolute;left:-5px;top:-5px;width:28px;height:28px;box-sizing:border-box;border:1px solid rgba(248,250,252,.82);border-radius:50%;pointer-events:none;opacity:.72;transform:scale(.32);transition:opacity 420ms cubic-bezier(.2,.7,.3,1),transform 420ms cubic-bezier(.2,.7,.3,1);';
+              host.append(clickPulse);
+              requestAnimationFrame(() => {
+                clickPulse.style.opacity = '0';
+                clickPulse.style.transform = 'scale(1.4)';
+              });
+              window.setTimeout(() => clickPulse.remove(), 460);
             }
             return true;
           })()`,
         }, CURSOR_CDP_COMMAND_TIMEOUT_MS, undefined, track);
+        // Runtime.evaluate 返回只代表 DOM 已更新，不代表 Chromium 已经
+        // 完成下一帧合成。等待一个渲染帧，保证紧跟在输入动作后的截图
+        // 能看到代理指针和点击反馈，而不是捕获到更新前的 compositor frame。
+        await new Promise<void>((resolve) => setTimeout(resolve, 16));
       } catch {
         // 导航会清理 isolated world；did-finish-load 会按最新状态重建它。
         record.cursorExecutionContextId = null;

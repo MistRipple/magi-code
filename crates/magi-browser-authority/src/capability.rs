@@ -169,6 +169,7 @@ pub enum BrowserCapabilityUnavailableReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserCapabilitySnapshot {
     pub revision: u64,
     pub in_app_browser_enabled: bool,

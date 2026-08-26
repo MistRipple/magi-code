@@ -950,7 +950,7 @@ fn browser_tool_turn_context(
         .ok_or_else(|| ErrorObject::new(ERROR_INVALID_PARAMS, "会话尚未建立当前 Turn"))?;
     if !matches!(
         turn.status.trim().to_ascii_lowercase().as_str(),
-        "pending" | "queued" | "accepted" | "running" | "started" | "streaming"
+        "preparing" | "pending" | "queued" | "accepted" | "running" | "started" | "streaming"
     ) {
         return Err(ErrorObject::new(
             ERROR_REQUEST_CONFLICT,
