@@ -37,6 +37,45 @@
         "navigation_revision": { "type": "integer", "minimum": 0 }
       }
     },
+    "surfaceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "surface_id", "navigation_revision"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "surface_id": { "$ref": "#/$defs/id" },
+        "navigation_revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "nodeSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tab_id", "surface_id", "navigation_revision", "url", "title", "frame_id",
+        "backend_dom_node_id", "dom_node_id", "node_name", "attributes", "text_excerpt",
+        "outer_html", "aria_role", "aria_name", "bounds"
+      ],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "surface_id": { "$ref": "#/$defs/id" },
+        "navigation_revision": { "type": "integer", "minimum": 0 },
+        "url": { "type": "string" },
+        "title": { "type": "string" },
+        "frame_id": { "type": "string" },
+        "backend_dom_node_id": { "type": "integer", "minimum": 0 },
+        "dom_node_id": { "type": "integer", "minimum": 0 },
+        "node_name": { "type": "string" },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "text_excerpt": { "type": "string" },
+        "outer_html": { "type": "string" },
+        "aria_role": { "type": ["string", "null"] },
+        "aria_name": { "type": ["string", "null"] },
+        "bounds": { "$ref": "#/$defs/normalizedRect" }
+      }
+    },
     "logicalViewport": {
       "oneOf": [
         {
@@ -354,6 +393,8 @@
         { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "set_logical_viewport" }, "payload": { "$ref": "#/$defs/setViewportPayload" } } },
         { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "get_logical_viewport" }, "payload": { "$ref": "#/$defs/tabPayload" } } },
         { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "set_annotations" }, "payload": { "$ref": "#/$defs/annotationsPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "inspect_start" }, "payload": { "$ref": "#/$defs/surfaceIdentity" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "inspect_stop" }, "payload": { "$ref": "#/$defs/surfaceIdentity" } } },
         { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "close_page" }, "payload": { "$ref": "#/$defs/tabPayload" } } },
         { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "navigate" }, "payload": { "$ref": "#/$defs/navigatePayload" } } },
         { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "snapshot" }, "payload": { "$ref": "#/$defs/snapshotPayload" } } },

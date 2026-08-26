@@ -353,3 +353,78 @@ test("清理浏览数据等待每个活动页面完成刷新", () => {
   assert.match(clearData, /await Promise\.all\(\[\.\.\.this\.#surfaces\.values\(\)\]/u);
   assert.match(clearData, /reloadAndWait\(record\.contents, true\)/u);
 });
+
+test("节点检查使用 Chromium Overlay Inspect Mode 和真实 DOM 后端节点", () => {
+  assert.match(source, /export interface BrowserInspectedNodeContext/u);
+  assert.match(source, /async startInspect\(binding: BrowserSurfaceBinding\)/u);
+  assert.match(source, /async stopInspect\(binding: BrowserSurfaceBinding\)/u);
+  assert.match(source, /Overlay\.enable/u);
+  assert.match(source, /Overlay\.setInspectMode/u);
+  assert.match(source, /mode: "searchForNode"/u);
+  assert.match(source, /mode: "none", highlightConfig: INSPECT_HIGHLIGHT_CONFIG/u);
+  assert.match(source, /Overlay\.inspectNodeRequested/u);
+  assert.match(source, /DOM\.describeNode/u);
+  assert.match(source, /DOM\.getAttributes/u);
+  assert.match(source, /DOM\.getOuterHTML/u);
+  assert.match(source, /DOM\.getBoxModel/u);
+  assert.match(source, /Page\.getFrameTree/u);
+  assert.match(source, /DOM\.resolveNode/u);
+  assert.match(source, /Runtime\.callFunctionOn/u);
+  assert.match(source, /Runtime\.releaseObjectGroup/u);
+  assert.match(source, /private async resolveInspectFrameId\(/u);
+  assert.match(source, /frameId = await this\.resolveInspectFrameId/u);
+  assert.match(source, /backendNodeId/u);
+  assert.doesNotMatch(
+    section(source, "async startInspect(", "private initialAgentCursorPosition("),
+    /Input\.dispatchMouseEvent|DOM\.getNodeForLocation|capturePage\(/u,
+  );
+});
+
+test("节点检查命令通过 Desktop Control Server 进入同一 Surface 生命周期", () => {
+  const executeCommand = section(desktopControlSource, "private async executeCommand(", "private emit(");
+  assert.match(executeCommand, /case "inspect_start":\n\s*case "inspect_stop":/u);
+  assert.match(executeCommand, /requirePrimaryBindingForIdentity\(this\.#surfaceManager, command\.payload\)/u);
+  assert.match(executeCommand, /await this\.#surfaceManager\.startInspect\(binding\)/u);
+  assert.match(executeCommand, /await this\.#surfaceManager\.stopInspect\(binding\)/u);
+  assert.match(desktopControlSource, /function requirePrimaryBindingForIdentity\(/u);
+  assert.match(desktopControlSource, /binding\.surface_id !== identity\.surface_id/u);
+  assert.match(desktopControlSource, /binding\.navigation_revision !== identity\.navigation_revision/u);
+});
+
+test("节点选择只向 Host 发送当前 Primary 的完整结构化上下文", () => {
+  const surfaceEvents = section(desktopControlSource, "handleSurfaceEvent(event: BrowserSurfaceEvent)", "async close(): Promise<void>");
+  assert.match(surfaceEvents, /case "node_inspected":/u);
+  assert.match(surfaceEvents, /this\.#surfaceManager\.isPrimary\(event\.binding\)/u);
+  assert.match(surfaceEvents, /nodeSelectionFromEvent\(event\)/u);
+  assert.match(surfaceEvents, /type: "node_selection"/u);
+  const conversion = section(desktopControlSource, "function nodeSelectionFromEvent(", "function succeeded(");
+  assert.match(conversion, /node\.node_id === null/u);
+  assert.match(conversion, /!node\.frame_id/u);
+  assert.match(conversion, /!node\.bounds/u);
+  assert.match(conversion, /backend_dom_node_id: node\.backend_node_id/u);
+  assert.match(conversion, /outer_html: node\.outer_html/u);
+  assert.match(conversion, /aria_role:/u);
+  assert.match(conversion, /aria_name:/u);
+  assert.doesNotMatch(conversion, /surface_revision/u);
+});
+
+test("节点检查在导航、卸载、detach、Primary 切换和销毁时失效", () => {
+  const navigation = section(source, 'webContents.on("did-start-navigation"', 'const publishPage =');
+  assert.match(navigation, /this\.stopInspectForLifecycle\(record, "navigation"\)/u);
+  const detach = section(source, 'debuggerApi.on("detach"', "private reconnectDebugger(");
+  assert.match(detach, /this\.stopInspectForLifecycle\(record, "debugger-detached"\)/u);
+  const unmount = section(source, "private detachSurface(", "private isRenderable(");
+  assert.match(unmount, /this\.stopInspectForLifecycle\(record, "surface-unmounted"\)/u);
+  const close = section(source, "private closeRecord(", "private removeRecordIndexes(");
+  assert.match(close, /this\.stopInspectForLifecycle\(record, "surface-closed"\)/u);
+  const promotion = section(source, "private promote(surfaceId: string)", "private promoteFallback(");
+  assert.match(promotion, /this\.stopInspectForLifecycle\(previous, "surface-not-primary"\)/u);
+  const generation = section(source, "private isInspectGenerationActive(", "private stopInspectForLifecycle(");
+  assert.match(generation, /record\.inspectGeneration === generation/u);
+  assert.match(source, /const generation = \+\+record\.inspectGeneration/u);
+  assert.match(source, /const generation = \+\+record\.inspectGeneration;\n\s*record\.inspectActive = false/u);
+  assert.match(
+    section(source, "record.inspectStartPromise = start;", "private isInspectGenerationActive("),
+    /this\.recordForBinding\(binding\)[\s\S]*?record\.inspectActive/u,
+  );
+});

@@ -437,6 +437,46 @@ pub struct SessionContextReference {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserNodeSelectionBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserNodeSelection {
+    #[serde(rename = "tabId")]
+    pub tab_id: String,
+    #[serde(rename = "surfaceId")]
+    pub surface_id: String,
+    #[serde(rename = "navigationRevision")]
+    pub navigation_revision: u64,
+    pub url: String,
+    pub title: String,
+    #[serde(rename = "frameId")]
+    pub frame_id: String,
+    #[serde(rename = "backendDomNodeId")]
+    pub backend_dom_node_id: u64,
+    #[serde(rename = "domNodeId")]
+    pub dom_node_id: u64,
+    #[serde(rename = "nodeName")]
+    pub node_name: String,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "textExcerpt")]
+    pub text_excerpt: String,
+    #[serde(rename = "outerHtml")]
+    pub outer_html: String,
+    #[serde(rename = "ariaRole")]
+    pub aria_role: Option<String>,
+    #[serde(rename = "ariaName")]
+    pub aria_name: Option<String>,
+    pub bounds: BrowserNodeSelectionBounds,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AccessProfile {
     #[serde(rename = "read_only")]
@@ -484,6 +524,9 @@ pub struct TurnStartParams {
     #[serde(default)]
     #[serde(rename = "browserAnnotationRefs")]
     pub browser_annotation_refs: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "browserNodeSelections")]
+    pub browser_node_selections: Vec<BrowserNodeSelection>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "accessProfile")]

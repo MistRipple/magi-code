@@ -340,6 +340,7 @@ struct QueuedSessionTurnDto {
     images: Vec<crate::dto::SessionTurnImageDto>,
     context_references: Vec<crate::dto::SessionContextReferenceDto>,
     browser_annotation_refs: Vec<String>,
+    browser_node_selections: Vec<crate::dto::BrowserNodeSelectionDto>,
     can_guide: bool,
     retry_count: u8,
 }
@@ -391,6 +392,7 @@ fn session_turn_queue_response(
                 images: queued.request.images,
                 context_references: queued.request.context_references,
                 browser_annotation_refs: queued.request.browser_annotation_refs,
+                browser_node_selections: queued.request.browser_node_selections,
                 can_guide,
                 retry_count: queued.retry_count,
             }
@@ -507,6 +509,9 @@ pub(crate) async fn submit_session_turn(
     validate_session_turn_input(&request)?;
     request
         .validate_context_references()
+        .map_err(ApiError::InvalidInput)?;
+    request
+        .validate_browser_node_selections()
         .map_err(ApiError::InvalidInput)?;
     let images = request
         .parsed_images()
@@ -987,6 +992,7 @@ fn session_turn_request_is_plain_text(request: &SessionTurnRequestDto) -> bool {
         && request.images.is_empty()
         && request.context_references.is_empty()
         && request.browser_annotation_refs.is_empty()
+        && request.browser_node_selections.is_empty()
 }
 
 fn steer_input_error(error: SessionTurnInputError) -> ApiError {
@@ -1018,6 +1024,7 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
         && request.images.is_empty()
         && request.context_references.is_empty()
         && request.browser_annotation_refs.is_empty()
+        && request.browser_node_selections.is_empty()
     {
         return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
     }
@@ -5057,6 +5064,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,

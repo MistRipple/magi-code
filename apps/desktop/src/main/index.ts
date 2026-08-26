@@ -268,6 +268,14 @@ function registerIpc(): void {
       parseViewport(request.viewport),
     );
   });
+  ipcMain.handle("magi-desktop:start-browser-inspect", async (event, value: unknown) => {
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    return manager.startBrowserInspect(windowId, parseBrowserInspectRequest(value));
+  });
+  ipcMain.handle("magi-desktop:stop-browser-inspect", async (event, value: unknown) => {
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    return manager.stopBrowserInspect(windowId, parseBrowserInspectRequest(value));
+  });
   ipcMain.handle("magi-desktop:focus-app", (event) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.focusApp(windowId);
@@ -907,6 +915,23 @@ function parseBrowserActivation(value: unknown): {
   const navigationRevision = finite(input.navigationRevision, "navigationRevision");
   const viewport = parseViewport(input.viewport);
   return { tabId, browserSessionId, url, navigationRevision, viewport };
+}
+
+function parseBrowserInspectRequest(value: unknown): {
+  tabId: string;
+  surfaceId: string;
+  navigationRevision: number;
+} {
+  const input = rejectUnknownFields(
+    object(value),
+    ["tabId", "surfaceId", "navigationRevision"],
+    "browserInspect",
+  );
+  return {
+    tabId: text(input.tabId, "tabId"),
+    surfaceId: text(input.surfaceId, "surfaceId"),
+    navigationRevision: nonNegativeInteger(input.navigationRevision, "navigationRevision"),
+  };
 }
 
 function parseViewport(value: unknown): BrowserLogicalViewport {

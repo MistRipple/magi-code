@@ -395,6 +395,7 @@ async fn restart_task(
         images: Vec::new(),
         context_references: Vec::new(),
         browser_annotation_refs: Vec::new(),
+        browser_node_selections: Vec::new(),
         access_profile: root_task
             .policy_snapshot
             .as_ref()

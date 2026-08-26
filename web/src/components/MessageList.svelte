@@ -221,6 +221,9 @@
       browserAnnotationRefs: Array.isArray(message.browserAnnotationRefs)
         ? message.browserAnnotationRefs
         : [],
+      browserNodeSelections: Array.isArray(message.browserNodeSelections)
+        ? message.browserNodeSelections
+        : [],
       skillName: typeof message.metadata?.skillName === 'string' ? message.metadata.skillName : null,
       goalMode: message.metadata?.goalMode === true,
     });

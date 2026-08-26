@@ -790,6 +790,24 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 serde_json::json!({ "tab_id": binding.tab_id, "binding": binding, "url": url }),
             );
         }
+        BrowserHostEvent::NodeSelection(selection) => {
+            if !is_current_node_selection(state, &selection) {
+                tracing::debug!(
+                    tab_id = %selection.tab_id,
+                    surface_id = %selection.surface_id,
+                    navigation_revision = selection.navigation_revision,
+                    "忽略已失效 Browser Surface 的节点选择事件"
+                );
+                return;
+            }
+            publish_tab_event(
+                state,
+                "browser.node.selected",
+                browser_tab_context(state, &selection.tab_id),
+                serde_json::to_value(selection)
+                    .expect("BrowserNodeSelection must serialize as a structured event"),
+            );
+        }
         BrowserHostEvent::Ready(_)
         | BrowserHostEvent::Console { .. }
         | BrowserHostEvent::AgentCursor(_)
@@ -865,6 +883,22 @@ fn is_current_primary_binding(
         .lock()
         .expect("browser authority lock poisoned");
     authority.is_current_surface_binding(binding)
+}
+
+fn is_current_node_selection(
+    state: &ApiState,
+    selection: &magi_browser_authority::BrowserNodeSelection,
+) -> bool {
+    let authority = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned");
+    authority
+        .primary_surface(&selection.tab_id)
+        .is_some_and(|binding| {
+            binding.surface_id == selection.surface_id
+                && binding.navigation_revision == selection.navigation_revision
+        })
 }
 
 fn schedule_browser_annotation_sync(state: &ApiState, tab_id: &BrowserTabId) {
@@ -1078,7 +1112,7 @@ fn publish_host_status(state: &ApiState) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use magi_api::ApiState;
     use magi_browser_authority::{
@@ -1105,6 +1139,145 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    fn node_selection_fixture() -> (ApiState, BrowserTabId) {
+        let state = test_state();
+        let profile_id = BrowserProfileId::new("browser-profile-node-selection");
+        let browser_session_id = BrowserSessionId::new("browser-session-node-selection");
+        let tab_id = BrowserTabId::new("browser-tab-node-selection");
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: std::env::temp_dir().join("magi-browser-node-selection-test"),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })?;
+                authority.create_session(CreateBrowserSession {
+                    browser_session_id: browser_session_id.clone(),
+                    workspace_id: None,
+                    session_id: SessionId::new("session-node-selection"),
+                    profile_id,
+                    now: UtcMillis(1),
+                })?;
+                authority.transition_session(
+                    &browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(2),
+                )?;
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id,
+                    url: "https://example.com".to_string(),
+                    now: UtcMillis(2),
+                })?;
+                authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis(2))?;
+                authority.set_primary_surface(
+                    magi_browser_authority::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop-node-selection".to_string(),
+                        window_id: "window-node-selection".to_string(),
+                        surface_id: "surface-node-selection".to_string(),
+                        surface_revision: 1,
+                        tab_id: tab_id.clone(),
+                        web_contents_id: 23,
+                        target_id: "target-node-selection".to_string(),
+                        browser_context_id: "context-node-selection".to_string(),
+                        navigation_revision: 4,
+                    },
+                    UtcMillis(3),
+                )?;
+                Ok(())
+            })
+            .expect("node selection fixture should create");
+        (state, tab_id)
+    }
+
+    fn node_selection_event(
+        tab_id: BrowserTabId,
+        surface_id: &str,
+        navigation_revision: u64,
+    ) -> BrowserHostEvent {
+        BrowserHostEvent::NodeSelection(magi_browser_authority::BrowserNodeSelection {
+            tab_id,
+            surface_id: surface_id.to_string(),
+            navigation_revision,
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            frame_id: "frame-1".to_string(),
+            backend_dom_node_id: 101,
+            dom_node_id: 202,
+            node_name: "BUTTON".to_string(),
+            attributes: BTreeMap::from([("data-testid".to_string(), "submit".to_string())]),
+            text_excerpt: "Submit".to_string(),
+            outer_html: "<button>Submit</button>".to_string(),
+            aria_role: Some("button".to_string()),
+            aria_name: Some("Submit".to_string()),
+            bounds: magi_browser_authority::BrowserHostRect {
+                x: 10.0,
+                y: 20.0,
+                width: 120.0,
+                height: 40.0,
+            },
+        })
+    }
+
+    #[test]
+    fn current_node_selection_is_published_as_a_structured_browser_event() {
+        let (state, tab_id) = node_selection_fixture();
+        let mut events = state.event_bus.subscribe();
+
+        handle_host_event(
+            &state,
+            BrowserHostIncomingEvent {
+                envelope: BrowserHostEventEnvelope {
+                    protocol_version: BrowserHostProtocolVersion::CURRENT,
+                    sequence: 1,
+                    event: node_selection_event(tab_id, "surface-node-selection", 4),
+                },
+                binary: None,
+            },
+            0,
+        );
+
+        let event = events
+            .try_recv()
+            .expect("current node selection should be published");
+        assert_eq!(event.event_type, "browser.node.selected");
+        assert_eq!(event.payload["tab_id"], "browser-tab-node-selection");
+        assert_eq!(event.payload["surface_id"], "surface-node-selection");
+        assert_eq!(event.payload["navigation_revision"], 4);
+        assert_eq!(event.payload["node_name"], "BUTTON");
+    }
+
+    #[test]
+    fn stale_node_selection_is_dropped_before_it_reaches_the_event_bus() {
+        let (state, tab_id) = node_selection_fixture();
+        let mut events = state.event_bus.subscribe();
+
+        for (surface_id, navigation_revision) in
+            [("surface-node-selection", 3), ("replaced-surface", 4)]
+        {
+            handle_host_event(
+                &state,
+                BrowserHostIncomingEvent {
+                    envelope: BrowserHostEventEnvelope {
+                        protocol_version: BrowserHostProtocolVersion::CURRENT,
+                        sequence: 1,
+                        event: node_selection_event(
+                            tab_id.clone(),
+                            surface_id,
+                            navigation_revision,
+                        ),
+                    },
+                    binary: None,
+                },
+                0,
+            );
+
+            assert!(events.try_recv().is_err());
+        }
     }
 
     #[test]

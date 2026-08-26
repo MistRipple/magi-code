@@ -1,4 +1,4 @@
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 2 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 3 } as const;
 
 export type DesktopEpoch = string;
 export type WindowId = string;
@@ -21,6 +21,31 @@ export interface BrowserSurfaceBinding {
   target_id: string;
   browser_context_id: string;
   navigation_revision: number;
+}
+
+/**
+ * 产生 inspect 请求或节点选择的真实 Browser Surface 身份。字段必须完整提供，
+ * 不能从逻辑 Tab 推断，因为同一 Tab 可能重新绑定或发生导航。
+ */
+export interface BrowserSurfaceIdentity {
+  tab_id: BrowserTabId;
+  surface_id: SurfaceId;
+  navigation_revision: number;
+}
+
+export interface BrowserNodeSelection extends BrowserSurfaceIdentity {
+  url: string;
+  title: string;
+  frame_id: string;
+  backend_dom_node_id: number;
+  dom_node_id: number;
+  node_name: string;
+  attributes: Record<string, string>;
+  text_excerpt: string;
+  outer_html: string;
+  aria_role: string | null;
+  aria_name: string | null;
+  bounds: BrowserNormalizedRect;
 }
 
 export interface DesktopBrowserHandshake {
@@ -110,6 +135,8 @@ export type BrowserHostCommand =
       type: "set_annotations";
       payload: { tab_id: BrowserTabId; annotations: unknown[] };
     }
+  | { type: "inspect_start"; payload: BrowserSurfaceIdentity }
+  | { type: "inspect_stop"; payload: BrowserSurfaceIdentity }
   | { type: "close_page"; payload: { tab_id: BrowserTabId } }
   | {
       type: "navigate";
@@ -319,6 +346,7 @@ export type BrowserHostEvent =
   | { type: "dialog"; payload: { tab_id: BrowserTabId; dialog_id: number; dialog_type: string; message: string } }
   | { type: "download"; payload: { tab_id: BrowserTabId; suggested_filename: string; state: string; byte_length?: number; error?: string } }
   | { type: "popup_blocked"; payload: { binding: BrowserSurfaceBinding; url: string } }
+  | { type: "node_selection"; payload: BrowserNodeSelection }
   | { type: "agent_cursor"; payload: { tab_id: BrowserTabId; visible: boolean; x: number | null; y: number | null; action: string | null } }
   | { type: "binary_payload_ready"; payload: BrowserBinaryPayload }
   | { type: "heartbeat"; payload: { monotonic_millis: number } };

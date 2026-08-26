@@ -163,7 +163,7 @@ import {
   updateRequestBinding,
 } from '../../stores/messages.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
-import type { OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
+import type { MessageBrowserNodeSelection, OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
 
@@ -1300,6 +1300,7 @@ function emitLocalPendingCanonicalTurn(input: {
     comment: string;
     screenshotArtifactId?: string | null;
   }>;
+  browserNodeSelections: MessageBrowserNodeSelection[];
   turnSeq: number;
   createdAt: number;
 }): boolean {
@@ -1319,6 +1320,9 @@ function emitLocalPendingCanonicalTurn(input: {
       : {}),
     ...(input.browserAnnotationSnapshots.length > 0
       ? { browserAnnotationRefs: input.browserAnnotationSnapshots }
+      : {}),
+    ...(input.browserNodeSelections.length > 0
+      ? { browserNodeSelections: input.browserNodeSelections }
       : {}),
     localOptimistic: true,
   };
@@ -1399,6 +1403,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     comment: string;
     screenshotArtifactId?: string | null;
   }>;
+  browserNodeSelections: MessageBrowserNodeSelection[];
   turnSeq: number;
   createdAt: number;
   failedAt: number;
@@ -1420,6 +1425,9 @@ function emitLocalPendingCanonicalTurnFailed(input: {
       : {}),
     ...(input.browserAnnotationSnapshots.length > 0
       ? { browserAnnotationRefs: input.browserAnnotationSnapshots }
+      : {}),
+    ...(input.browserNodeSelections.length > 0
+      ? { browserNodeSelections: input.browserNodeSelections }
       : {}),
     localTerminal: true,
   };
@@ -3862,6 +3870,7 @@ interface ExecuteTaskInput {
     name: string;
   }>;
   browserAnnotationRefs?: string[];
+  browserNodeSelections?: MessageBrowserNodeSelection[];
   browserAnnotationSnapshots?: Array<{
     annotationId: string;
     browserSessionId: string;
@@ -3900,6 +3909,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     images: turn.images,
     contextReferences: turn.contextReferences,
     browserAnnotationRefs: turn.browserAnnotationRefs,
+    browserNodeSelections: turn.browserNodeSelections,
     canGuide: turn.canGuide,
   };
 }
@@ -4045,7 +4055,26 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       }))
       .filter((annotation) => annotation.annotationId && annotation.browserSessionId && annotation.tabId && annotation.comment)
     : [];
-  if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0) {
+  const browserNodeSelections = Array.isArray(input.browserNodeSelections)
+    ? input.browserNodeSelections
+      .filter((selection): selection is MessageBrowserNodeSelection => (
+        Boolean(selection)
+        && typeof selection.browserSessionId === 'string'
+        && typeof selection.tabId === 'string'
+        && typeof selection.surfaceId === 'string'
+        && typeof selection.backendDomNodeId === 'number'
+      ))
+      .map((selection) => ({
+        ...selection,
+        browserSessionId: selection.browserSessionId.trim(),
+        tabId: selection.tabId.trim(),
+        surfaceId: selection.surfaceId.trim(),
+        attributes: { ...selection.attributes },
+        bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
+      }))
+      .filter((selection) => selection.browserSessionId && selection.tabId && selection.surfaceId)
+    : [];
+  if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
@@ -4097,6 +4126,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     images,
     contextReferences,
     browserAnnotationSnapshots,
+    browserNodeSelections,
     turnSeq: turnOrderSeq,
     createdAt: requestCreatedAt,
   });
@@ -4126,6 +4156,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       images,
       contextReferences,
       browserAnnotationRefs,
+      browserNodeSelections,
       accessProfile: input.accessProfile ?? null,
       orchestratorSessionConfig: input.orchestratorSessionConfig ?? null,
       requestId,
@@ -4239,6 +4270,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       images,
       contextReferences,
       browserAnnotationSnapshots,
+      browserNodeSelections,
       turnSeq: turnOrderSeq,
       createdAt: requestCreatedAt,
       failedAt: Date.now(),
@@ -5295,6 +5327,7 @@ export function createWebClientBridge(): ClientBridge {
             || (Array.isArray(message.images) && message.images.length > 0)
             || (Array.isArray(message.contextReferences) && message.contextReferences.length > 0)
             || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
+            || (Array.isArray(message.browserNodeSelections) && message.browserNodeSelections.length > 0)
           ) {
             void executeTask({
               text: typeof message.text === 'string' ? message.text : null,
@@ -5340,6 +5373,9 @@ export function createWebClientBridge(): ClientBridge {
                     comment: string;
                     screenshotArtifactId?: string | null;
                   }>
+                : [],
+              browserNodeSelections: Array.isArray(message.browserNodeSelections)
+                ? message.browserNodeSelections as MessageBrowserNodeSelection[]
                 : [],
             });
           }

@@ -583,6 +583,8 @@ export interface Message {
   contextReferences?: MessageContextReference[];
   /** 用户在内置浏览器中创建并随本轮提交的权威标记引用。 */
   browserAnnotationRefs?: MessageBrowserAnnotationReference[];
+  /** 用户在真实 Chromium 中选中的 DOM 节点，只读地随本轮提交。 */
+  browserNodeSelections?: MessageBrowserNodeSelection[];
   metadata?: {
     model?: string;
     tokens?: number;
@@ -617,6 +619,39 @@ export interface MessageBrowserAnnotationReference {
   kind: 'element' | 'region';
   comment: string;
   screenshotArtifactId?: string | null;
+}
+
+/**
+ * 真实 Chromium DOM 节点选择的消息快照。
+ *
+ * 这是一次性的只读上下文，不是可执行的坐标或浏览器操作指令。
+ * surface/navigation 身份由后端再次校验；可选字段允许 Chromium 在文本节点、
+ * 导航竞态或不可布局节点场景下返回不完整但仍有价值的节点信息。
+ */
+export interface MessageBrowserNodeSelection {
+  browserSessionId: string;
+  tabId: string;
+  surfaceId: string;
+  navigationRevision: number;
+  url: string;
+  title: string;
+  frameId?: string | null;
+  backendDomNodeId: number;
+  domNodeId?: number | null;
+  nodeName: string;
+  attributes: Record<string, string>;
+  textExcerpt: string;
+  outerHtml: string;
+  ariaRole?: string | null;
+  ariaName?: string | null;
+  bounds?: BrowserNodeSelectionRect | null;
+}
+
+export interface BrowserNodeSelectionRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export type { AgentId, AnyAgentId };
@@ -714,6 +749,8 @@ export interface QueuedMessageBrowserAnnotationReference {
   screenshotArtifactId?: string | null;
 }
 
+export type QueuedMessageBrowserNodeSelection = MessageBrowserNodeSelection;
+
 export interface QueuedMessage {
   id: string;
   requestId?: string;
@@ -732,6 +769,7 @@ export interface QueuedMessage {
   images?: QueuedMessageImage[];
   contextReferences?: QueuedMessageContextReference[];
   browserAnnotationRefs?: string[];
+  browserNodeSelections?: QueuedMessageBrowserNodeSelection[];
   canGuide: boolean;
 }
 

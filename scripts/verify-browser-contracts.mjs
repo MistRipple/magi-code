@@ -34,7 +34,7 @@ function enumBody(source, enumName, label) {
 
 function rustEnumVariants(source, enumName, label) {
   return sorted(
-    [...enumBody(source, enumName, label).matchAll(/^    ([A-Z][A-Za-z0-9]*)\s*(?:\{|,)/gmu)].map((match) =>
+    [...enumBody(source, enumName, label).matchAll(/^    ([A-Z][A-Za-z0-9]*)\s*(?:\{|\(|,)/gmu)].map((match) =>
       match[1].replace(/([a-z0-9])([A-Z])/gu, "$1_$2").toLowerCase(),
     ),
   );
@@ -84,15 +84,14 @@ const tsCommandSection = section(
   "TypeScript BrowserHostCommand",
 );
 const tsCommands = sorted(
-  tsCommandSection
-    .split("\n")
-    .filter((line) => /(?:^|\{)\s*type:\s*/u.test(line))
-    .flatMap((line) => [...line.matchAll(/"([a-z_]+)"/gu)].map((match) => match[1])),
+  [...tsCommandSection.matchAll(/\btype:\s*((?:"[a-z_]+"(?:\s*\|\s*)?)+)/gu)].flatMap((match) =>
+    [...match[1].matchAll(/"([a-z_]+)"/gu)].map((item) => item[1]),
+  ),
 );
 const rustCommands = rustEnumVariants(rustHostProtocol, "BrowserHostCommand", "Rust BrowserHostCommand");
 assert.deepEqual(schemaCommands, tsCommands, "Schema/TypeScript 命令集合不一致");
 assert.deepEqual(schemaCommands, rustCommands, "Schema/Rust 命令集合不一致");
-assert.equal(schemaCommands.length, 19, "Desktop Browser 命令集合数量发生漂移");
+assert.equal(schemaCommands.length, 21, "Desktop Browser 命令集合数量发生漂移");
 
 for (const branch of controlSchema.$defs.command.oneOf) {
   const command = branch.properties.type.const;
@@ -116,6 +115,14 @@ const annotations = controlSchema.$defs.annotationsPayload;
 assert.deepEqual(annotations.required, ["tab_id", "annotations"], "set_annotations payload required 不完整");
 assert.equal(annotations.properties.annotations.type, "array", "set_annotations.annotations 必须是数组");
 assert.deepEqual(annotations.properties.annotations.items, { $ref: "#/$defs/jsonValue" }, "set_annotations.annotations 必须保持 JSON value 数组语义");
+
+const surfaceIdentity = controlSchema.$defs.surfaceIdentity;
+assert.deepEqual(
+  surfaceIdentity.required,
+  ["tab_id", "surface_id", "navigation_revision"],
+  "inspect payload 必须携带完整 Surface 身份",
+);
+assert.equal(surfaceIdentity.additionalProperties, false, "inspect payload 不得接受未知身份字段");
 
 const deviceTypes = sorted(controlSchema.$defs.logicalViewport.oneOf[1].properties.device_type.enum);
 assert.deepEqual(deviceTypes, tsStringUnion(typescript, "BrowserDeviceType", "TypeScript BrowserDeviceType"), "Schema/TypeScript device_type 枚举不一致");

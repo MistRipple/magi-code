@@ -414,6 +414,8 @@ pub enum TaskRuntimePayload {
     BrowserAnnotations {
         #[serde(default)]
         references: Vec<serde_json::Value>,
+        #[serde(default)]
+        node_selections: Vec<serde_json::Value>,
     },
 }
 
@@ -796,7 +798,16 @@ impl Task {
 
     pub fn browser_annotation_references(&self) -> &[serde_json::Value] {
         match &self.runtime_payload {
-            TaskRuntimePayload::BrowserAnnotations { references } => references,
+            TaskRuntimePayload::BrowserAnnotations { references, .. } => references,
+            TaskRuntimePayload::None | TaskRuntimePayload::AgentContext { .. } => &[],
+        }
+    }
+
+    pub fn browser_node_selections(&self) -> &[serde_json::Value] {
+        match &self.runtime_payload {
+            TaskRuntimePayload::BrowserAnnotations {
+                node_selections, ..
+            } => node_selections,
             TaskRuntimePayload::None | TaskRuntimePayload::AgentContext { .. } => &[],
         }
     }

@@ -189,6 +189,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         images: Vec::new(),
         context_references: Vec::new(),
         browser_annotation_refs: Vec::new(),
+        browser_node_selections: Vec::new(),
         created_session: false,
         mission_title: "目标自动推进".to_string(),
         task_title: "执行: 目标自动推进".to_string(),
@@ -328,6 +329,9 @@ async fn execute_dispatch_submission(
         });
     let browser_annotation_refs =
         resolve_browser_annotation_context(state, &session_id, &request.browser_annotation_refs())?;
+    let browser_node_selections = request
+        .validate_browser_node_selections()
+        .map_err(ApiError::InvalidInput)?;
     if request.goal_mode {
         state
             .session_store
@@ -361,6 +365,7 @@ async fn execute_dispatch_submission(
         images,
         context_references: request.context_references(),
         browser_annotation_refs,
+        browser_node_selections,
         created_session,
         mission_title,
         task_title: action_task_title,

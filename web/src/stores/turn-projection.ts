@@ -3,6 +3,7 @@ import type {
   ContentBlock,
   Message,
   MessageBrowserAnnotationReference,
+  MessageBrowserNodeSelection,
   MessageImage,
   SessionTimelineProjection,
   ThinkingSegment,
@@ -367,6 +368,72 @@ function normalizeMessageBrowserAnnotationRefsFromMetadata(
   return normalized.length > 0 ? normalized : undefined;
 }
 
+function normalizeMessageBrowserNodeSelectionsFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): MessageBrowserNodeSelection[] | undefined {
+  const selections = metadata?.browserNodeSelections;
+  if (!Array.isArray(selections)) return undefined;
+  const normalized = selections
+    .filter((selection): selection is Record<string, unknown> => (
+      Boolean(selection) && typeof selection === 'object' && !Array.isArray(selection)
+    ))
+    .map((selection): MessageBrowserNodeSelection | null => {
+      const browserSessionId = typeof selection.browserSessionId === 'string' ? selection.browserSessionId.trim() : '';
+      const tabId = typeof selection.tabId === 'string' ? selection.tabId.trim() : '';
+      const surfaceId = typeof selection.surfaceId === 'string' ? selection.surfaceId.trim() : '';
+      const navigationRevision = Number.isSafeInteger(selection.navigationRevision)
+        && Number(selection.navigationRevision) >= 0
+        ? Number(selection.navigationRevision)
+        : -1;
+      const backendDomNodeId = Number.isSafeInteger(selection.backendDomNodeId)
+        && Number(selection.backendDomNodeId) > 0
+        ? Number(selection.backendDomNodeId)
+        : -1;
+      const nodeName = typeof selection.nodeName === 'string' ? selection.nodeName.trim() : '';
+      if (!browserSessionId || !tabId || !surfaceId || navigationRevision < 0 || backendDomNodeId < 1 || !nodeName) {
+        return null;
+      }
+      const attributes = selection.attributes && typeof selection.attributes === 'object' && !Array.isArray(selection.attributes)
+        ? Object.fromEntries(Object.entries(selection.attributes as Record<string, unknown>)
+          .filter(([, value]) => typeof value === 'string')) as Record<string, string>
+        : {};
+      const bounds = selection.bounds && typeof selection.bounds === 'object' && !Array.isArray(selection.bounds)
+        ? selection.bounds as Record<string, unknown>
+        : null;
+      const normalizedBounds = bounds
+        && ['x', 'y', 'width', 'height'].every((key) => typeof bounds[key] === 'number' && Number.isFinite(bounds[key]))
+        ? {
+            x: Number(bounds.x),
+            y: Number(bounds.y),
+            width: Math.max(0, Number(bounds.width)),
+            height: Math.max(0, Number(bounds.height)),
+          }
+        : null;
+      return {
+        browserSessionId,
+        tabId,
+        surfaceId,
+        navigationRevision,
+        url: typeof selection.url === 'string' ? selection.url.trim() : '',
+        title: typeof selection.title === 'string' ? selection.title.trim() : '',
+        frameId: typeof selection.frameId === 'string' ? selection.frameId.trim() || null : null,
+        backendDomNodeId,
+        domNodeId: Number.isSafeInteger(selection.domNodeId) && Number(selection.domNodeId) > 0
+          ? Number(selection.domNodeId)
+          : null,
+        nodeName,
+        attributes,
+        textExcerpt: typeof selection.textExcerpt === 'string' ? selection.textExcerpt : '',
+        outerHtml: typeof selection.outerHtml === 'string' ? selection.outerHtml : '',
+        ariaRole: typeof selection.ariaRole === 'string' ? selection.ariaRole.trim() || null : null,
+        ariaName: typeof selection.ariaName === 'string' ? selection.ariaName.trim() || null : null,
+        bounds: normalizedBounds,
+      };
+    })
+    .filter((selection): selection is MessageBrowserNodeSelection => selection !== null);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 function messageMetadataWithoutTransportAttachments(
   metadata: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
@@ -377,6 +444,7 @@ function messageMetadataWithoutTransportAttachments(
   delete messageMetadata.images;
   delete messageMetadata.contextReferences;
   delete messageMetadata.browserAnnotationRefs;
+  delete messageMetadata.browserNodeSelections;
   return messageMetadata;
 }
 
@@ -461,6 +529,9 @@ function buildMessage(
   const browserAnnotationRefs = item.kind === 'user_message'
     ? normalizeMessageBrowserAnnotationRefsFromMetadata(item.metadata)
     : undefined;
+  const browserNodeSelections = item.kind === 'user_message'
+    ? normalizeMessageBrowserNodeSelectionsFromMetadata(item.metadata)
+    : undefined;
   const noticeType = item.metadata?.noticeType;
   const normalizedNoticeType = noticeType === 'success'
     || noticeType === 'error'
@@ -477,6 +548,7 @@ function buildMessage(
     ...(images ? { images } : {}),
     ...(contextReferences ? { contextReferences } : {}),
     ...(browserAnnotationRefs ? { browserAnnotationRefs } : {}),
+    ...(browserNodeSelections ? { browserNodeSelections } : {}),
     timestamp: resolveItemTimestamp(item),
     updatedAt: item.updatedAt,
     isStreaming,

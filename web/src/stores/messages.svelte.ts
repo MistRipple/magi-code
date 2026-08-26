@@ -80,6 +80,7 @@ export interface TurnEditingDraft {
   images: NonNullable<Message['images']>;
   contextReferences: NonNullable<Message['contextReferences']>;
   browserAnnotationRefs: NonNullable<Message['browserAnnotationRefs']>;
+  browserNodeSelections: NonNullable<Message['browserNodeSelections']>;
   skillName: string | null;
   goalMode: boolean;
 }
@@ -289,6 +290,7 @@ function normalizePersistedAutoScrollConfig(value: unknown): AutoScrollConfig {
 
 type QueuedMessageImageItem = NonNullable<QueuedMessage['images']>[number];
 type QueuedMessageContextReferenceItem = NonNullable<QueuedMessage['contextReferences']>[number];
+type QueuedMessageBrowserNodeSelectionItem = NonNullable<QueuedMessage['browserNodeSelections']>[number];
 
 function normalizeQueuedMessageImage(image: unknown): QueuedMessageImageItem | null {
   if (!image || typeof image !== 'object') {
@@ -321,6 +323,58 @@ function normalizeQueuedMessageContextReference(
     name: typeof item.name === 'string' && item.name.trim()
       ? item.name.trim()
       : path.split(/[\\/]/u).filter(Boolean).pop() || path,
+  };
+}
+
+function normalizeQueuedMessageBrowserNodeSelection(
+  selection: unknown,
+): QueuedMessageBrowserNodeSelectionItem | null {
+  if (!selection || typeof selection !== 'object' || Array.isArray(selection)) return null;
+  const item = selection as Record<string, unknown>;
+  const browserSessionId = typeof item.browserSessionId === 'string' ? item.browserSessionId.trim() : '';
+  const tabId = typeof item.tabId === 'string' ? item.tabId.trim() : '';
+  const surfaceId = typeof item.surfaceId === 'string' ? item.surfaceId.trim() : '';
+  const navigationRevision = Number.isSafeInteger(item.navigationRevision) && Number(item.navigationRevision) >= 0
+    ? Number(item.navigationRevision)
+    : -1;
+  const backendDomNodeId = Number.isSafeInteger(item.backendDomNodeId) && Number(item.backendDomNodeId) > 0
+    ? Number(item.backendDomNodeId)
+    : -1;
+  const nodeName = typeof item.nodeName === 'string' ? item.nodeName.trim() : '';
+  if (!browserSessionId || !tabId || !surfaceId || navigationRevision < 0 || backendDomNodeId < 1 || !nodeName) return null;
+  const attributes = item.attributes && typeof item.attributes === 'object' && !Array.isArray(item.attributes)
+    ? Object.fromEntries(Object.entries(item.attributes as Record<string, unknown>)
+      .filter(([, value]) => typeof value === 'string')) as Record<string, string>
+    : {};
+  const bounds = item.bounds && typeof item.bounds === 'object' && !Array.isArray(item.bounds)
+    ? item.bounds as Record<string, unknown>
+    : null;
+  const normalizedBounds = bounds
+    && ['x', 'y', 'width', 'height'].every((key) => typeof bounds[key] === 'number' && Number.isFinite(bounds[key]))
+    ? {
+        x: Number(bounds.x),
+        y: Number(bounds.y),
+        width: Math.max(0, Number(bounds.width)),
+        height: Math.max(0, Number(bounds.height)),
+      }
+    : null;
+  return {
+    browserSessionId,
+    tabId,
+    surfaceId,
+    navigationRevision,
+    url: typeof item.url === 'string' ? item.url.trim() : '',
+    title: typeof item.title === 'string' ? item.title.trim() : '',
+    frameId: typeof item.frameId === 'string' ? item.frameId.trim() || null : null,
+    backendDomNodeId,
+    domNodeId: Number.isSafeInteger(item.domNodeId) && Number(item.domNodeId) > 0 ? Number(item.domNodeId) : null,
+    nodeName,
+    attributes,
+    textExcerpt: typeof item.textExcerpt === 'string' ? item.textExcerpt : '',
+    outerHtml: typeof item.outerHtml === 'string' ? item.outerHtml : '',
+    ariaRole: typeof item.ariaRole === 'string' ? item.ariaRole.trim() || null : null,
+    ariaName: typeof item.ariaName === 'string' ? item.ariaName.trim() || null : null,
+    bounds: normalizedBounds,
   };
 }
 
@@ -387,6 +441,9 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
         .filter((annotationId): annotationId is string => typeof annotationId === 'string')
         .map((annotationId) => annotationId.trim())
         .filter(Boolean),
+      browserNodeSelections: ensureArray(item.browserNodeSelections)
+        .map(normalizeQueuedMessageBrowserNodeSelection)
+        .filter((selection): selection is QueuedMessageBrowserNodeSelectionItem => selection !== null),
       canGuide: item.canGuide === true,
     }));
 }
@@ -2318,6 +2375,11 @@ export function beginTurnEditing(draft: TurnEditingDraft): void {
     images: draft.images.map((image) => ({ ...image })),
     contextReferences: draft.contextReferences.map((reference) => ({ ...reference })),
     browserAnnotationRefs: draft.browserAnnotationRefs.map((reference) => ({ ...reference })),
+    browserNodeSelections: draft.browserNodeSelections.map((selection) => ({
+      ...selection,
+      attributes: { ...selection.attributes },
+      bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
+    })),
     skillName: draft.skillName?.trim() || null,
     goalMode: draft.goalMode === true,
   };

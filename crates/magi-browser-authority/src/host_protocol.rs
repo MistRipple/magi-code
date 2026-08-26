@@ -3,7 +3,7 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 2;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 3;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
 
@@ -60,6 +60,38 @@ pub struct BrowserSurfaceBinding {
     pub navigation_revision: u64,
 }
 
+/// 产生 inspect 请求或节点选择的真实 Browser Surface 身份。
+///
+/// 不能只依赖 tab_id：同一逻辑 Tab 在重建、切换窗口或导航后可能绑定
+/// 到不同的物理 Surface。缺少任一字段都必须被视为无效协议消息。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserSurfaceIdentity {
+    pub tab_id: BrowserTabId,
+    pub surface_id: String,
+    pub navigation_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserNodeSelection {
+    pub tab_id: BrowserTabId,
+    pub surface_id: String,
+    pub navigation_revision: u64,
+    pub url: String,
+    pub title: String,
+    pub frame_id: String,
+    pub backend_dom_node_id: u64,
+    pub dom_node_id: u64,
+    pub node_name: String,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    pub text_excerpt: String,
+    pub outer_html: String,
+    pub aria_role: Option<String>,
+    pub aria_name: Option<String>,
+    pub bounds: BrowserHostRect,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrowserHostRequestEnvelope {
     pub request_id: BrowserCommandId,
@@ -111,6 +143,8 @@ pub enum BrowserHostCommand {
         tab_id: BrowserTabId,
         annotations: Vec<serde_json::Value>,
     },
+    InspectStart(BrowserSurfaceIdentity),
+    InspectStop(BrowserSurfaceIdentity),
     ClosePage {
         tab_id: BrowserTabId,
     },
@@ -471,6 +505,7 @@ pub enum BrowserHostEvent {
         binding: BrowserSurfaceBinding,
         url: String,
     },
+    NodeSelection(BrowserNodeSelection),
     AgentCursor(BrowserAgentCursor),
     BinaryPayloadReady(BrowserHostBinaryPayload),
     Heartbeat {
@@ -516,7 +551,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(handshake).expect("serialize desktop handshake"),
             serde_json::json!({
-                "protocol_version": { "major": 3, "minor": 2 },
+                "protocol_version": { "major": 3, "minor": 3 },
                 "desktop_version": "desktop-test",
                 "electron_version": "electron-test",
                 "chromium_version": "chromium-test",
@@ -573,6 +608,183 @@ mod tests {
                 "type": "get_logical_viewport",
                 "payload": { "tab_id": "tab-1" }
             })
+        );
+    }
+
+    fn surface_identity() -> BrowserSurfaceIdentity {
+        BrowserSurfaceIdentity {
+            tab_id: BrowserTabId::new("tab-1"),
+            surface_id: "surface-1".to_string(),
+            navigation_revision: 11,
+        }
+    }
+
+    fn node_selection() -> BrowserNodeSelection {
+        BrowserNodeSelection {
+            tab_id: BrowserTabId::new("tab-1"),
+            surface_id: "surface-1".to_string(),
+            navigation_revision: 11,
+            url: "https://example.com/page".to_string(),
+            title: "Example page".to_string(),
+            frame_id: "frame-1".to_string(),
+            backend_dom_node_id: 101,
+            dom_node_id: 202,
+            node_name: "BUTTON".to_string(),
+            attributes: std::collections::BTreeMap::from([
+                ("class".to_string(), "primary".to_string()),
+                ("data-testid".to_string(), "submit".to_string()),
+            ]),
+            text_excerpt: "Submit".to_string(),
+            outer_html: "<button class=\"primary\">Submit</button>".to_string(),
+            aria_role: Some("button".to_string()),
+            aria_name: Some("Submit".to_string()),
+            bounds: BrowserHostRect {
+                x: 10.0,
+                y: 20.0,
+                width: 120.0,
+                height: 40.0,
+            },
+        }
+    }
+
+    #[test]
+    fn inspect_commands_match_typescript_contract_and_round_trip() {
+        for (command, command_type) in [
+            (
+                BrowserHostCommand::InspectStart(surface_identity()),
+                "inspect_start",
+            ),
+            (
+                BrowserHostCommand::InspectStop(surface_identity()),
+                "inspect_stop",
+            ),
+        ] {
+            let value = serde_json::to_value(&command).expect("serialize inspect command");
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "type": command_type,
+                    "payload": {
+                        "tab_id": "tab-1",
+                        "surface_id": "surface-1",
+                        "navigation_revision": 11
+                    }
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<BrowserHostCommand>(value)
+                    .expect("deserialize inspect command"),
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn node_selection_event_matches_typescript_contract_and_round_trip() {
+        let selection = node_selection();
+        let value = serde_json::to_value(BrowserHostEvent::NodeSelection(selection.clone()))
+            .expect("serialize node selection event");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "node_selection",
+                "payload": {
+                    "tab_id": "tab-1",
+                    "surface_id": "surface-1",
+                    "navigation_revision": 11,
+                    "url": "https://example.com/page",
+                    "title": "Example page",
+                    "frame_id": "frame-1",
+                    "backend_dom_node_id": 101,
+                    "dom_node_id": 202,
+                    "node_name": "BUTTON",
+                    "attributes": {
+                        "class": "primary",
+                        "data-testid": "submit"
+                    },
+                    "text_excerpt": "Submit",
+                    "outer_html": "<button class=\"primary\">Submit</button>",
+                    "aria_role": "button",
+                    "aria_name": "Submit",
+                    "bounds": {
+                        "x": 10.0,
+                        "y": 20.0,
+                        "width": 120.0,
+                        "height": 40.0
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<BrowserHostEvent>(value)
+                .expect("deserialize node selection event"),
+            BrowserHostEvent::NodeSelection(selection)
+        );
+    }
+
+    #[test]
+    fn inspect_and_node_selection_identities_are_strict() {
+        for field in ["tab_id", "surface_id", "navigation_revision"] {
+            let mut command = serde_json::json!({
+                "type": "inspect_start",
+                "payload": {
+                    "tab_id": "tab-1",
+                    "surface_id": "surface-1",
+                    "navigation_revision": 11
+                }
+            });
+            command["payload"]
+                .as_object_mut()
+                .expect("payload object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<BrowserHostCommand>(command).is_err(),
+                "missing inspect identity field {field} must be rejected"
+            );
+
+            let mut event = serde_json::to_value(BrowserHostEvent::NodeSelection(node_selection()))
+                .expect("serialize node selection event");
+            event["payload"]
+                .as_object_mut()
+                .expect("payload object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<BrowserHostEvent>(event).is_err(),
+                "missing node selection identity field {field} must be rejected"
+            );
+        }
+
+        let mut stale_shape =
+            serde_json::to_value(BrowserHostEvent::NodeSelection(node_selection()))
+                .expect("serialize node selection event");
+        stale_shape["payload"]["surface_revision"] = serde_json::json!(7);
+        assert!(
+            serde_json::from_value::<BrowserHostEvent>(stale_shape).is_err(),
+            "legacy surface_revision must not be accepted as node selection identity"
+        );
+
+        let mut inspect_with_unknown_identity = serde_json::json!({
+            "type": "inspect_start",
+            "payload": {
+                "tab_id": "tab-1",
+                "surface_id": "surface-1",
+                "navigation_revision": 11,
+                "surface_revision": 7
+            }
+        });
+        assert!(
+            serde_json::from_value::<BrowserHostCommand>(inspect_with_unknown_identity.take())
+                .is_err(),
+            "inspect identity must reject legacy or unknown fields"
+        );
+
+        let mut node_with_unknown_identity =
+            serde_json::to_value(BrowserHostEvent::NodeSelection(node_selection()))
+                .expect("serialize node selection event");
+        node_with_unknown_identity["payload"]["surface_revision"] = serde_json::json!(7);
+        assert!(
+            serde_json::from_value::<BrowserHostEvent>(node_with_unknown_identity).is_err(),
+            "node selection identity must reject legacy or unknown fields"
         );
     }
 

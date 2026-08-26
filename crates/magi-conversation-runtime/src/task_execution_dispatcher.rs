@@ -1672,6 +1672,11 @@ impl LlmTaskDispatcher {
         ) {
             parts.push(prompt);
         }
+        if let Some(prompt) =
+            crate::context_reference::browser_node_selections_prompt(task.browser_node_selections())
+        {
+            parts.push(prompt);
+        }
 
         let task_store = self.pipeline.execution_runtime.task_store();
         for dependency_id in &task.dependency_ids {

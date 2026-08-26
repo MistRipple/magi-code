@@ -4293,6 +4293,7 @@ mod tests {
                 images: Vec::new(),
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
+                browser_node_selections: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some(format!("request-{queue_id}")),

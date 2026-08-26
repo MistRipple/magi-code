@@ -112,6 +112,12 @@ interface MagiDesktopBrowserActivationRequest {
   viewport: MagiDesktopViewportIntent;
 }
 
+interface MagiDesktopBrowserInspectRequest {
+  tabId: string;
+  surfaceId: string;
+  navigationRevision: number;
+}
+
 interface MagiDesktopUpdateSnapshot {
   status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'failed' | 'unsupported';
   currentVersion: string;
@@ -193,6 +199,8 @@ interface MagiDesktopBridge {
     tabId: string;
     viewport: MagiDesktopViewportIntent;
   }): Promise<MagiDesktopWindowSnapshot>;
+  startBrowserInspect(request: MagiDesktopBrowserInspectRequest): Promise<MagiDesktopWindowSnapshot>;
+  stopBrowserInspect(request: MagiDesktopBrowserInspectRequest): Promise<MagiDesktopWindowSnapshot>;
   focusApp(): Promise<void>;
   readyRightPane(): Promise<void>;
   openOverlay(state: Omit<MagiDesktopOverlayState, 'overlayId' | 'phase'> & { overlayId?: string; phase?: MagiDesktopOverlayState['phase'] }): Promise<void>;

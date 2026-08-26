@@ -21,6 +21,25 @@ export interface SessionTurnImageDto {
   dataUrl: string;
 }
 
+export interface SessionBrowserNodeSelectionDto {
+  browserSessionId: string;
+  tabId: string;
+  surfaceId: string;
+  navigationRevision: number;
+  url: string;
+  title: string;
+  frameId?: string | null;
+  backendDomNodeId: number;
+  domNodeId?: number | null;
+  nodeName: string;
+  attributes: Record<string, string>;
+  textExcerpt: string;
+  outerHtml: string;
+  ariaRole?: string | null;
+  ariaName?: string | null;
+  bounds?: { x: number; y: number; width: number; height: number } | null;
+}
+
 export type SessionTurnRouteDto =
   | 'chat'
   | 'execute'
@@ -44,6 +63,7 @@ export interface SessionTurnRequestDto {
     name: string;
   }>;
   browserAnnotationRefs?: string[];
+  browserNodeSelections?: SessionBrowserNodeSelectionDto[];
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   requestId?: string | null;
@@ -115,6 +135,7 @@ export interface QueuedSessionTurnDto {
     name: string;
   }>;
   browserAnnotationRefs: string[];
+  browserNodeSelections: SessionBrowserNodeSelectionDto[];
   canGuide: boolean;
   retryCount: number;
 }

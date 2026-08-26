@@ -9,6 +9,7 @@ use magi_session_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use super::SessionScopeKindDto;
 
@@ -77,6 +78,88 @@ pub struct SessionContextReferenceDto {
     pub name: String,
 }
 
+/// 从真实 Chromium/CDP inspect 事件产生的节点观察结果。
+///
+/// 这些字段不是执行指令，也不是可跨导航复用的选择器；它们只描述用户提交时
+/// 当前 Browser Surface 上的 DOM 节点。进入 dispatch 前必须完成身份和数值校验。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserNodeSelectionDto {
+    pub tab_id: String,
+    pub surface_id: String,
+    pub navigation_revision: u64,
+    pub url: String,
+    pub title: String,
+    pub frame_id: String,
+    pub backend_dom_node_id: u64,
+    pub dom_node_id: u64,
+    pub node_name: String,
+    pub attributes: BTreeMap<String, String>,
+    pub text_excerpt: String,
+    pub outer_html: String,
+    pub aria_role: Option<String>,
+    pub aria_name: Option<String>,
+    pub bounds: BrowserNodeSelectionBoundsDto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserNodeSelectionBoundsDto {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl BrowserNodeSelectionDto {
+    fn validate(&self, index: usize) -> Result<(), String> {
+        let required_strings = [
+            ("tabId", self.tab_id.as_str()),
+            ("surfaceId", self.surface_id.as_str()),
+            ("url", self.url.as_str()),
+            ("frameId", self.frame_id.as_str()),
+            ("nodeName", self.node_name.as_str()),
+        ];
+        for (field, value) in required_strings {
+            if value.trim().is_empty() {
+                return Err(format!("浏览器节点选择[{index}] 的 {field} 不能为空"));
+            }
+        }
+        if self.backend_dom_node_id == 0 {
+            return Err(format!(
+                "浏览器节点选择[{index}] 的 backendDomNodeId 必须是正整数"
+            ));
+        }
+        if self.dom_node_id == 0 {
+            return Err(format!("浏览器节点选择[{index}] 的 domNodeId 必须是正整数"));
+        }
+        for (name, value) in &self.attributes {
+            if name.trim().is_empty() {
+                return Err(format!("浏览器节点选择[{index}] 的属性名不能为空"));
+            }
+            if value.len() > 16 * 1024 {
+                return Err(format!(
+                    "浏览器节点选择[{index}] 的属性值过长: {}",
+                    name.trim()
+                ));
+            }
+        }
+        let bounds = self.bounds;
+        if !bounds.x.is_finite()
+            || !bounds.y.is_finite()
+            || !bounds.width.is_finite()
+            || !bounds.height.is_finite()
+            || bounds.width < 0.0
+            || bounds.height < 0.0
+        {
+            return Err(format!(
+                "浏览器节点选择[{index}] 的 bounds 必须是有限的非负尺寸"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTurnRequestDto {
@@ -99,6 +182,9 @@ pub struct SessionTurnRequestDto {
     /// 前端不能直接提交可执行的坐标或伪造的页面快照。
     #[serde(default)]
     pub browser_annotation_refs: Vec<String>,
+    /// 已由真实 Browser Surface 产生并随本轮提交的 DOM 节点观察结果。
+    #[serde(default)]
+    pub browser_node_selections: Vec<BrowserNodeSelectionDto>,
     #[serde(default)]
     pub access_profile: Option<AccessProfile>,
     #[serde(default)]
@@ -239,6 +325,32 @@ impl SessionTurnRequestDto {
             .collect()
     }
 
+    pub fn validate_browser_node_selections(&self) -> Result<Vec<Value>, String> {
+        const MAX_BROWSER_NODE_SELECTIONS: usize = 20;
+        if self.browser_node_selections.len() > MAX_BROWSER_NODE_SELECTIONS {
+            return Err(format!(
+                "单轮最多添加 {MAX_BROWSER_NODE_SELECTIONS} 个浏览器节点选择"
+            ));
+        }
+        for (index, selection) in self.browser_node_selections.iter().enumerate() {
+            selection.validate(index)?;
+        }
+        self.browser_node_selections
+            .iter()
+            .map(|selection| {
+                serde_json::to_value(selection)
+                    .map_err(|error| format!("序列化浏览器节点选择失败: {error}"))
+            })
+            .collect()
+    }
+
+    pub fn browser_node_selections(&self) -> Vec<Value> {
+        self.browser_node_selections
+            .iter()
+            .filter_map(|selection| serde_json::to_value(selection).ok())
+            .collect()
+    }
+
     pub fn mission_title(&self, trimmed_text: Option<&str>) -> String {
         trimmed_text
             .map(normalize_task_title)
@@ -301,6 +413,12 @@ impl SessionTurnRequestDto {
                 self.browser_annotation_refs.len()
             ));
         }
+        if trimmed_text.is_none() && !self.browser_node_selections.is_empty() {
+            message_lines.push(format!(
+                "[浏览器节点选择 {} 项]",
+                self.browser_node_selections.len()
+            ));
+        }
         if message_lines.is_empty() && !self.images.is_empty() {
             String::new()
         } else if message_lines.is_empty() {
@@ -327,6 +445,7 @@ impl SessionTurnRequestDto {
     pub fn request_fingerprint(&self) -> Result<String, String> {
         let mut normalized = self.clone();
         normalized.validate_context_references()?;
+        normalized.validate_browser_node_selections()?;
         let context_references = normalized
             .context_references()
             .into_iter()
@@ -353,6 +472,7 @@ impl SessionTurnRequestDto {
             "images": normalized.images,
             "contextReferences": context_references,
             "browserAnnotationRefs": normalized.browser_annotation_refs(),
+            "browserNodeSelections": normalized.browser_node_selections(),
             "accessProfile": normalized.requested_access_profile(),
             "orchestratorSessionConfig": normalized.orchestrator_session_config,
             "requestId": normalized.request_id(),
@@ -544,6 +664,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,

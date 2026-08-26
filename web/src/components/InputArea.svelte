@@ -9,7 +9,7 @@
     isPersistedSessionId,
     messagesState,
   } from '../stores/messages.svelte';
-  import type { QueuedMessage } from '../types/message';
+  import type { MessageBrowserNodeSelection, QueuedMessage } from '../types/message';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import {
     enhanceAgentPrompt,
@@ -142,6 +142,7 @@
   let selectedSkill = $state<SkillOption | null>(null);
   let selectedContextReferences = $state<ComposerContextReference[]>([]);
   let selectedBrowserAnnotations = $state<SelectedBrowserAnnotation[]>([]);
+  let selectedBrowserNodeSelections = $state<MessageBrowserNodeSelection[]>([]);
   let editingBrowserAnnotation = $state<SelectedBrowserAnnotation | null>(null);
   let editingBrowserAnnotationComment = $state('');
   let browserAnnotationSaving = $state(false);
@@ -295,6 +296,7 @@
     selectedSkill = null;
     selectedContextReferences = [];
     selectedBrowserAnnotations = [];
+    selectedBrowserNodeSelections = [];
     addMenuOpen = false;
     contextPickerOpen = false;
     closeSlashMenu();
@@ -432,6 +434,7 @@
       || pendingImageReadCount > 0
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
+      || selectedBrowserNodeSelections.length > 0
       || selectedGoalMode
       || selectedSkill !== null
       || editingTurn !== null,
@@ -466,6 +469,11 @@
       sequence: reference.sequence ?? index + 1,
       screenshotArtifactId: reference.screenshotArtifactId ?? null,
       status: 'active',
+    }));
+    selectedBrowserNodeSelections = draft.browserNodeSelections.map((selection) => ({
+      ...selection,
+      attributes: { ...selection.attributes },
+      bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
     }));
     selectedGoalMode = draft.goalMode;
     selectedSkill = draft.skillName
@@ -1059,6 +1067,22 @@
         item.annotationId === annotation.annotationId ? annotation : item
       ));
     }
+    function handleBrowserNodeSelected(event: Event) {
+      const selection = (event as CustomEvent<MessageBrowserNodeSelection>).detail;
+      if (!selection?.browserSessionId || !selection.tabId || !selection.surfaceId) return;
+      if (selectedBrowserNodeSelections.some((item) => (
+        item.browserSessionId === selection.browserSessionId
+        && item.tabId === selection.tabId
+        && item.surfaceId === selection.surfaceId
+        && item.backendDomNodeId === selection.backendDomNodeId
+      ))) return;
+      if (selectedBrowserNodeSelections.length >= 20) {
+        addToast('warning', i18n.t('browser.nodeSelection.limit'));
+        return;
+      }
+      selectedBrowserNodeSelections = [...selectedBrowserNodeSelections, selection];
+      queueMicrotask(focusEditor);
+    }
     function handleBrowserScreenshotCaptured(event: Event) {
       const detail = (event as CustomEvent<{
         dataUrl?: unknown;
@@ -1115,6 +1139,7 @@
     window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
     window.addEventListener('magi:browserAnnotationCreated', handleBrowserAnnotationCreated as EventListener);
     window.addEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
+    window.addEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
     window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     window.addEventListener('storage', handleStoredAccessProfileChange);
@@ -1125,6 +1150,7 @@
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
       window.removeEventListener('magi:browserAnnotationCreated', handleBrowserAnnotationCreated as EventListener);
       window.removeEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
+      window.removeEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
       window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);
@@ -1199,7 +1225,7 @@
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (
-        (!normalizedContent && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0)
+        (!normalizedContent && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
         || sessionInputLocked
         || isInteractionBlocking
       ) return;
@@ -1215,6 +1241,8 @@
             ? i18n.t('input.analyzeReferences')
             : selectedBrowserAnnotations.length > 0
               ? i18n.t('browser.annotation.context')
+            : selectedBrowserNodeSelections.length > 0
+              ? i18n.t('browser.nodeSelection.context')
             : null;
       const submissionLength = submissionText?.length ?? 0;
 
@@ -1262,6 +1290,7 @@
           comment: annotation.comment,
           screenshotArtifactId: annotation.screenshotArtifactId,
         })),
+        browserNodeSelections: selectedBrowserNodeSelections,
       });
       if (!replaceTurnId) {
         clearComposerState();
@@ -1956,7 +1985,7 @@
     {/if}
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
-    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedGoalMode || selectedSkill}
+    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedGoalMode || selectedSkill}
       <div class="ia-reference-chip-row">
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
@@ -1992,6 +2021,21 @@
               onclick={() => { selectedBrowserAnnotations = selectedBrowserAnnotations.filter((item) => item.annotationId !== annotation.annotationId); }}
               title={i18n.t('browser.annotation.remove')}
               aria-label={i18n.t('browser.annotation.remove')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/each}
+        {#each selectedBrowserNodeSelections as selection, selectionIndex (`${selection.tabId}-${selection.surfaceId}-${selection.backendDomNodeId}`)}
+          <span class="ia-reference-chip ia-browser-node-selection-chip" title={selection.url}>
+            <span class="ia-browser-annotation-number">{selectionIndex + 1}</span>
+            <span class="ia-reference-chip-label">{selection.ariaRole || selection.nodeName}{selection.ariaName ? `: ${selection.ariaName}` : ''}</span>
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => { selectedBrowserNodeSelections = selectedBrowserNodeSelections.filter((_, index) => index !== selectionIndex); }}
+              title={i18n.t('browser.nodeSelection.remove')}
+              aria-label={i18n.t('browser.nodeSelection.remove')}
             >
               <Icon name="close" size={10} />
             </button>

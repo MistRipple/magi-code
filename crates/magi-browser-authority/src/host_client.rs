@@ -30,6 +30,7 @@ use crate::{
     BrowserHostBinaryPayload, BrowserHostCommand, BrowserHostCommandOutcome,
     BrowserHostCommandResult, BrowserHostEvent, BrowserHostEventEnvelope, BrowserHostHandshake,
     BrowserHostProtocolVersion, BrowserHostRequestEnvelope, BrowserHostResponseEnvelope,
+    BrowserSurfaceIdentity,
 };
 
 trait DesktopControlStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -291,6 +292,8 @@ fn command_tab_id(command: &BrowserHostCommand) -> Option<&BrowserTabId> {
         | BrowserHostCommand::SetLogicalViewport { tab_id, .. }
         | BrowserHostCommand::GetLogicalViewport { tab_id }
         | BrowserHostCommand::SetAnnotations { tab_id, .. }
+        | BrowserHostCommand::InspectStart(BrowserSurfaceIdentity { tab_id, .. })
+        | BrowserHostCommand::InspectStop(BrowserSurfaceIdentity { tab_id, .. })
         | BrowserHostCommand::ClosePage { tab_id }
         | BrowserHostCommand::Navigate { tab_id, .. }
         | BrowserHostCommand::Snapshot { tab_id, .. }

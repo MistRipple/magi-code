@@ -193,6 +193,31 @@ export interface SessionContextReference {
   name: string;
 }
 
+export interface BrowserNodeSelectionBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserNodeSelection {
+  tabId: string;
+  surfaceId: string;
+  navigationRevision: number;
+  url: string;
+  title: string;
+  frameId: string;
+  backendDomNodeId: number;
+  domNodeId: number;
+  nodeName: string;
+  attributes: Record<string, string>;
+  textExcerpt: string;
+  outerHtml: string;
+  ariaRole: string | null;
+  ariaName: string | null;
+  bounds: BrowserNodeSelectionBounds;
+}
+
 export type AccessProfile = "read_only" | "restricted" | "full_access";
 
 export interface TurnStartParams {
@@ -207,6 +232,7 @@ export interface TurnStartParams {
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
   browserAnnotationRefs?: Array<string>;
+  browserNodeSelections?: Array<BrowserNodeSelection>;
   accessProfile?: AccessProfile | null;
   orchestratorSessionConfig?: JsonValue | null;
   requestId?: string | null;

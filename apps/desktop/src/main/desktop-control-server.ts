@@ -13,6 +13,8 @@ import {
   type BrowserHostEventEnvelope,
   type BrowserHostRequestEnvelope,
   type BrowserHostResponseEnvelope,
+  type BrowserNodeSelection,
+  type BrowserSurfaceIdentity,
   type DesktopBrowserHandshake,
 } from "@magi/desktop-browser-contracts";
 import { WebSocket, WebSocketServer } from "ws";
@@ -159,6 +161,15 @@ export class DesktopControlServer {
         break;
       case "cdp_event":
         break;
+      case "node_inspected": {
+        // 节点选择必须和 page/surface 的 Primary 身份一起校验。即使
+        // Main 已经在异步采集期间切换了 Primary，也不能把旧 Surface 的
+        // DOM 上下文发送给 Host，避免 LLM 收到另一页的节点。
+        if (!this.#surfaceManager.isPrimary(event.binding)) break;
+        const selection = nodeSelectionFromEvent(event);
+        if (selection) this.emit({ type: "node_selection", payload: selection });
+        break;
+      }
     }
   }
 
@@ -393,6 +404,16 @@ export class DesktopControlServer {
           },
         });
       }
+      case "inspect_start":
+      case "inspect_stop": {
+        const binding = requirePrimaryBindingForIdentity(this.#surfaceManager, command.payload);
+        if (command.type === "inspect_start") {
+          await this.#surfaceManager.startInspect(binding);
+        } else {
+          await this.#surfaceManager.stopInspect(binding);
+        }
+        return succeeded({ type: "empty" });
+      }
       case "update_control":
         await this.#surfaceManager.updateControl(
           command.payload.tab_id,
@@ -486,6 +507,60 @@ function requirePrimaryBinding(manager: BrowserSurfaceManager, tabId: string) {
   const binding = manager.primaryBindingForTab(tabId);
   if (!binding) throw new Error("browser_surface_not_found");
   return binding;
+}
+
+function requirePrimaryBindingForIdentity(
+  manager: BrowserSurfaceManager,
+  identity: BrowserSurfaceIdentity,
+) {
+  const binding = requirePrimaryBinding(manager, identity.tab_id);
+  if (
+    binding.surface_id !== identity.surface_id
+    || binding.navigation_revision !== identity.navigation_revision
+  ) {
+    throw new Error("browser_surface_stale");
+  }
+  return binding;
+}
+
+function nodeSelectionFromEvent(
+  event: Extract<BrowserSurfaceEvent, { type: "node_inspected" }>,
+): BrowserNodeSelection | null {
+  const { node } = event;
+  // Chromium normally returns all three fields for an Overlay selection. A
+  // text node or a navigation race can lack a DOM node id or box model;
+  // keeping the raw Main event is useful for the UI, but the Host contract
+  // must never receive fabricated identity or geometry.
+  if (node.node_id === null || !node.frame_id || !node.bounds) {
+    console.warn("[DesktopControlServer] 忽略不完整的 Chromium 节点选择", {
+      surfaceId: event.binding.surface_id,
+      hasNodeId: node.node_id !== null,
+      hasFrameId: Boolean(node.frame_id),
+      hasBounds: node.bounds !== null,
+    });
+    return null;
+  }
+  const textExcerpt = node.node_value.trim()
+    || node.attributes["aria-label"]?.trim()
+    || node.attributes.title?.trim()
+    || "";
+  return {
+    tab_id: event.binding.tab_id,
+    surface_id: event.binding.surface_id,
+    navigation_revision: event.binding.navigation_revision,
+    url: node.page_url,
+    title: node.page_title,
+    frame_id: node.frame_id,
+    backend_dom_node_id: node.backend_node_id,
+    dom_node_id: node.node_id,
+    node_name: node.node_name,
+    attributes: node.attributes,
+    text_excerpt: textExcerpt,
+    outer_html: node.outer_html,
+    aria_role: node.attributes.role?.trim() || null,
+    aria_name: node.attributes["aria-label"]?.trim() || null,
+    bounds: node.bounds,
+  };
 }
 
 function succeeded(result: BrowserCommandResult): { outcome: BrowserCommandOutcome } {

@@ -31,6 +31,7 @@ use crate::session_thread;
 use crate::context_reference::{
     SessionContextReference, browser_annotation_artifact_paths,
     browser_annotation_reference_input_refs, browser_annotation_references_metadata,
+    browser_node_selection_input_refs, browser_node_selections_metadata,
     session_context_reference_input_refs, session_context_reference_policy,
     session_context_references_metadata,
 };
@@ -87,6 +88,8 @@ pub struct DispatchSubmissionRequest {
     pub context_references: Vec<SessionContextReference>,
     /// 已由 Magi API 的 BrowserAuthority 解析并校验的页面标记引用。
     pub browser_annotation_refs: Vec<serde_json::Value>,
+    /// 已由 Magi API 严格校验的当前 Browser Surface DOM 节点观察结果。
+    pub browser_node_selections: Vec<serde_json::Value>,
     pub created_session: bool,
     pub mission_title: String,
     pub task_title: String,
@@ -283,6 +286,7 @@ struct DispatchTaskInput<'a> {
     denied_tools: Vec<String>,
     plan_item_id: Option<PlanItemId>,
     browser_annotation_refs: &'a [serde_json::Value],
+    browser_node_selections: &'a [serde_json::Value],
 }
 
 fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
@@ -305,6 +309,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         denied_tools,
         plan_item_id,
         browser_annotation_refs,
+        browser_node_selections,
     } = input;
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string))
@@ -315,6 +320,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
     input_refs.extend(browser_annotation_reference_input_refs(
         browser_annotation_refs,
     ));
+    input_refs.extend(browser_node_selection_input_refs(browser_node_selections));
 
     magi_core::Task {
         task_id: task_id.clone(),
@@ -345,11 +351,13 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        runtime_payload: if browser_annotation_refs.is_empty() {
+        runtime_payload: if browser_annotation_refs.is_empty() && browser_node_selections.is_empty()
+        {
             magi_core::TaskRuntimePayload::None
         } else {
             magi_core::TaskRuntimePayload::BrowserAnnotations {
                 references: browser_annotation_refs.to_vec(),
+                node_selections: browser_node_selections.to_vec(),
             }
         },
         created_at: now,
@@ -438,6 +446,7 @@ pub fn run_dispatch_submission(
         access_profile: request.access_profile,
         context_references: &request.context_references,
         browser_annotation_refs: &request.browser_annotation_refs,
+        browser_node_selections: &request.browser_node_selections,
         workspace_root_path: runtime.workspace_root_path,
         required_tool_chain: request.required_tool_chain.clone(),
         goal_mode: request.goal_mode,
@@ -618,6 +627,9 @@ pub fn run_dispatch_submission(
                     ));
                     metadata.extend(browser_annotation_references_metadata(
                         &request.browser_annotation_refs,
+                    ));
+                    metadata.extend(browser_node_selections_metadata(
+                        &request.browser_node_selections,
                     ));
                     if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
                         metadata.insert(
@@ -949,6 +961,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "当前任务推进".to_string(),
             task_title: "当前任务推进".to_string(),
@@ -1038,6 +1051,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "连续上下文".to_string(),
             task_title: "连续上下文".to_string(),
@@ -1130,6 +1144,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: vec![annotation.clone()],
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "浏览器标记检查".to_string(),
             task_title: "浏览器标记检查".to_string(),
@@ -1340,6 +1355,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "继续中断任务".to_string(),
             task_title: "继续: 画当前项目流程图".to_string(),
@@ -1494,6 +1510,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "继续中断任务".to_string(),
             task_title: "继续: 验证恢复原子性".to_string(),
@@ -1596,6 +1613,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "修复 bug + 验证".to_string(),
             task_title: "修复 bug + 验证".to_string(),
@@ -1705,6 +1723,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "继续计划".to_string(),
             task_title: "继续计划".to_string(),
@@ -1774,6 +1793,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "Skill 子代理继承".to_string(),
             task_title: "Skill 子代理继承".to_string(),
@@ -1849,6 +1869,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "代码审查".to_string(),
             task_title: "代码审查".to_string(),
@@ -1930,6 +1951,7 @@ mod tests {
                 name: "reference.md".to_string(),
             }],
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "检查引用文件".to_string(),
             task_title: "检查引用文件".to_string(),
@@ -2034,6 +2056,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "目标自动推进".to_string(),
             task_title: "执行: 目标自动推进".to_string(),
@@ -2150,6 +2173,7 @@ mod tests {
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
             created_session: false,
             mission_title: "目标自动推进".to_string(),
             task_title: "执行: 目标自动推进".to_string(),

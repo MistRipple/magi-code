@@ -369,6 +369,7 @@
   const hasUserText = $derived(Boolean(message.content?.trim()));
   const messageContextReferences = $derived(message.contextReferences || []);
   const messageBrowserAnnotationRefs = $derived(message.browserAnnotationRefs || []);
+  const messageBrowserNodeSelections = $derived(message.browserNodeSelections || []);
 
   // 图片预览弹窗状态
   let showImagePreview = $state(false);
@@ -467,6 +468,21 @@
             <span class="user-browser-annotation-number">{annotation.sequence ?? annotationIndex + 1}</span>
             <span>{annotation.comment}</span>
           </button>
+        {/each}
+      </div>
+    {/if}
+    {#if messageBrowserNodeSelections.length > 0}
+      <div class="user-browser-node-selections" aria-label={i18n.t('messageItem.browserNodeSelections')}>
+        {#each messageBrowserNodeSelections as selection, selectionIndex (`${message.id}-${selection.tabId}-${selection.backendDomNodeId}-${selectionIndex}`)}
+          <div class="user-browser-node-selection">
+            <span class="user-browser-annotation-number">{selectionIndex + 1}</span>
+            <div class="user-browser-node-selection-content">
+              <strong>{selection.ariaRole || selection.nodeName}</strong>
+              {#if selection.ariaName}<span>{selection.ariaName}</span>{/if}
+              {#if selection.textExcerpt}<span>{selection.textExcerpt}</span>{/if}
+              {#if selection.url}<a href={selection.url} target="_blank" rel="noreferrer">{selection.url}</a>{/if}
+            </div>
+          </div>
         {/each}
       </div>
     {/if}
@@ -992,6 +1008,49 @@
     flex-wrap: wrap;
     gap: 6px;
     margin-bottom: 8px;
+  }
+
+  .user-browser-node-selections {
+    display: grid;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .user-browser-node-selection {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    max-width: min(480px, 100%);
+    padding: 7px 9px;
+    border: 1px solid color-mix(in srgb, var(--info) 34%, var(--border));
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--info) 7%, var(--background));
+    color: var(--foreground-secondary);
+    font-size: 12px;
+  }
+
+  .user-browser-node-selection-content {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .user-browser-node-selection-content strong,
+  .user-browser-node-selection-content span,
+  .user-browser-node-selection-content a {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .user-browser-node-selection-content strong {
+    color: var(--foreground);
+    font-weight: 600;
+  }
+
+  .user-browser-node-selection-content a {
+    color: var(--info);
+    text-decoration: none;
   }
 
   .user-browser-annotation {

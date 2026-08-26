@@ -20,6 +20,24 @@ import type {
 } from "@magi/desktop-browser-contracts";
 import { BrowserSurfaceRegistry } from "./browser-surface-registry.js";
 
+export interface BrowserInspectedNodeContext {
+  backend_node_id: number;
+  node_id: number | null;
+  frame_id: string | null;
+  node_type: number;
+  node_name: string;
+  local_name: string;
+  node_value: string;
+  child_node_count: number | null;
+  document_url: string | null;
+  attributes: Record<string, string>;
+  outer_html: string;
+  outer_html_truncated: boolean;
+  bounds: { x: number; y: number; width: number; height: number } | null;
+  page_url: string;
+  page_title: string;
+}
+
 export type BrowserSurfaceEvent =
   | { type: "primary_changed"; binding: BrowserSurfaceBinding }
   | { type: "page_updated"; binding: BrowserSurfaceBinding; page: BrowserPageState }
@@ -50,6 +68,11 @@ export type BrowserSurfaceEvent =
       method: string;
       params: Record<string, unknown>;
       sessionId?: string;
+    }
+  | {
+      type: "node_inspected";
+      binding: BrowserSurfaceBinding;
+      node: BrowserInspectedNodeContext;
     };
 
 export interface MaterializeSurfaceInput {
@@ -109,6 +132,10 @@ interface BrowserSurfaceRecord {
   debuggerReadyPromise: Promise<void> | null;
   recoveryPromise: Promise<void> | null;
   loadPromise: Promise<void> | null;
+  inspectGeneration: number;
+  inspectActive: boolean;
+  inspectStartPromise: Promise<void> | null;
+  inspectResourcesEnabled: boolean;
 }
 
 interface SurfaceLaneContext {
@@ -238,6 +265,9 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Performance.getMetrics",
   "Overlay.hideHighlight",
   "Overlay.highlightNode",
+  "Overlay.enable",
+  "Overlay.disable",
+  "Overlay.setInspectMode",
   "Runtime.evaluate",
   "Runtime.enable",
   "Runtime.disable",
@@ -253,7 +283,15 @@ const SCREENSHOT_CDP_COMMAND_TIMEOUT_MS = 10_000;
 const SCREENSHOT_READINESS_TIMEOUT_MS = 5_000;
 const CURSOR_CDP_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 120_000;
+const MAX_INSPECTED_OUTER_HTML_LENGTH = 64 * 1024;
 const HIDDEN_AUTO_VIEWPORT = { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false } as const;
+const INSPECT_HIGHLIGHT_CONFIG = {
+  showInfo: false,
+  contentColor: { r: 66, g: 133, b: 244, a: 0.18 },
+  paddingColor: { r: 66, g: 133, b: 244, a: 0.12 },
+  borderColor: { r: 66, g: 133, b: 244, a: 0.9 },
+  marginColor: { r: 66, g: 133, b: 244, a: 0.08 },
+};
 const DIALOG_BRIDGE_BINDING = "__magiBrowserDialog";
 const DIALOG_BRIDGE_SCRIPT = String.raw`(() => {
   if (globalThis.__magiBrowserDialogInstalled) return;
@@ -446,6 +484,10 @@ export class BrowserSurfaceManager {
       debuggerReadyPromise: null,
       recoveryPromise: null,
       loadPromise: null,
+      inspectGeneration: 0,
+      inspectActive: false,
+      inspectStartPromise: null,
+      inspectResourcesEnabled: false,
     };
     this.#surfaces.add(record);
     // WebContents 的生命周期独立于原生 View 的挂载生命周期。没有当前
@@ -903,6 +945,184 @@ export class BrowserSurfaceManager {
     });
   }
 
+  async startInspect(binding: BrowserSurfaceBinding): Promise<void> {
+    const record = this.requireRecord(binding.surface_id);
+    this.recordForBinding(binding);
+    if (!this.isPrimary(binding) || !this.isRenderable(record)) {
+      throw staleSurfaceError("browser_inspect_surface_inactive");
+    }
+    await this.waitForDebugger(record);
+    this.recordForBinding(binding);
+    if (!this.isPrimary(binding) || !this.isRenderable(record)) {
+      throw staleSurfaceError("browser_inspect_surface_inactive");
+    }
+    if (record.inspectActive) {
+      const pendingStart = record.inspectStartPromise;
+      if (pendingStart) {
+        await pendingStart;
+        // stopInspect() or a lifecycle transition may have invalidated the
+        // first start while this caller was waiting. Revalidate before
+        // starting a new generation instead of reporting a false success.
+        if (!record.inspectActive) {
+          this.recordForBinding(binding);
+          if (!this.isPrimary(binding) || !this.isRenderable(record)) {
+            throw staleSurfaceError("browser_inspect_surface_inactive");
+          }
+        }
+      }
+      if (record.inspectActive) return;
+    }
+
+    const generation = ++record.inspectGeneration;
+    record.inspectActive = true;
+    const start = this.enqueueCdp(record, async ({ track }) => {
+      if (!this.isInspectGenerationActive(record, generation)) return;
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Overlay.enable",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        undefined,
+        track,
+      );
+      if (!this.isInspectGenerationActive(record, generation)) return;
+      record.inspectResourcesEnabled = true;
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "DOM.enable",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        undefined,
+        track,
+      );
+      if (!this.isInspectGenerationActive(record, generation)) return;
+      // Chromium 的 Overlay API 将“search for node”定义为 inspect mode，
+      // 不是一个坐标命中或截图模拟。用户在真实 WebContents 中选中元素后，
+      // 由 Overlay.inspectNodeRequested 返回该节点的 backendNodeId。
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Overlay.setInspectMode",
+        {
+          mode: "searchForNode",
+          highlightConfig: INSPECT_HIGHLIGHT_CONFIG,
+        },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        undefined,
+        track,
+      );
+    });
+    record.inspectStartPromise = start;
+    try {
+      await start;
+      // 导航、Primary 切换或卸载可能在 CDP lane 等待期间取消了本次
+      // inspect。不能把被取消的操作报告成成功，否则 Renderer/Host 会
+      // 认为后续点击一定会产生 node_inspected 事件。
+      this.recordForBinding(binding);
+      if (!this.isPrimary(binding) || !this.isRenderable(record) || !record.inspectActive) {
+        throw staleSurfaceError("browser_inspect_surface_inactive");
+      }
+    } catch (error) {
+      if (record.inspectStartPromise === start) record.inspectStartPromise = null;
+      if (record.inspectGeneration === generation) record.inspectActive = false;
+      // Overlay.enable 可能已成功而后续命令失败。清理已建立的 CDP 资源，
+      // 避免下一次检查继承半激活的 Overlay 状态。
+      try {
+        await this.stopInspectRecord(record);
+      } catch (cleanupError) {
+        if (!record.closed) {
+          console.warn("[BrowserSurfaceManager] 节点检查失败后的 CDP 清理失败", {
+            surfaceId: record.surfaceId,
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          });
+        }
+      }
+      throw error;
+    } finally {
+      if (record.inspectStartPromise === start) record.inspectStartPromise = null;
+    }
+  }
+
+  async stopInspect(binding: BrowserSurfaceBinding): Promise<void> {
+    const record = this.requireRecord(binding.surface_id);
+    this.recordForBinding(binding);
+    await this.stopInspectRecord(record);
+  }
+
+  private isInspectGenerationActive(record: BrowserSurfaceRecord, generation: number): boolean {
+    return !record.closed
+      && !record.contents.isDestroyed()
+      && record.primary
+      && this.#surfaces.isPrimary(record)
+      && record.inspectActive
+      && record.inspectGeneration === generation
+      && record.contents.debugger.isAttached();
+  }
+
+  private stopInspectForLifecycle(record: BrowserSurfaceRecord, reason: string): void {
+    void this.stopInspectRecord(record).catch((error) => {
+      if (!record.closed) {
+        console.warn("[BrowserSurfaceManager] 节点检查清理失败", {
+          surfaceId: record.surfaceId,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  private stopInspectRecord(record: BrowserSurfaceRecord): Promise<void> {
+    const hasInspectWork = record.inspectActive
+      || record.inspectStartPromise !== null
+      || record.inspectResourcesEnabled;
+    if (!hasInspectWork) return Promise.resolve();
+
+    const generation = ++record.inspectGeneration;
+    record.inspectActive = false;
+    const pendingStart = record.inspectStartPromise;
+    return (async () => {
+      if (pendingStart) await pendingStart.catch(() => undefined);
+      if (record.inspectGeneration !== generation || record.inspectActive) return;
+      if (record.closed || record.contents.isDestroyed() || !record.contents.debugger.isAttached()) {
+        record.inspectResourcesEnabled = false;
+        return;
+      }
+      // stopInspect() can race with a start that was cancelled before
+      // Overlay.enable completed. In that case there is no CDP domain to
+      // tear down; sending disable commands would turn an idempotent stop
+      // into a spurious "domain not enabled" failure.
+      if (!record.inspectResourcesEnabled) return;
+      await this.enqueueCdp(record, async ({ track }) => {
+        if (record.closed || record.contents.isDestroyed() || record.inspectGeneration !== generation || record.inspectActive) {
+          return;
+        }
+        if (!record.inspectResourcesEnabled) return;
+        let firstError: unknown = null;
+        for (const [method, params] of [
+          // 当前 Chromium 版本即使 mode=none 也要求传入 highlightConfig；
+          // 保持完整参数才能让 stop、导航和 Surface 销毁清理真正幂等。
+          ["Overlay.setInspectMode", { mode: "none", highlightConfig: INSPECT_HIGHLIGHT_CONFIG }],
+          ["Overlay.hideHighlight", {}],
+          ["Overlay.disable", {}],
+        ] as const) {
+          try {
+            await sendCdpCommandWithTimeout(
+              record.contents,
+              method,
+              params,
+              DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+              undefined,
+              track,
+            );
+          } catch (error) {
+            firstError ??= error;
+          }
+        }
+        if (firstError) throw firstError;
+        record.inspectResourcesEnabled = false;
+      });
+    })();
+  }
+
   private initialAgentCursorPosition(record: BrowserSurfaceRecord): { x: number; y: number } {
     const viewBounds = record.view.getBounds();
     const width = viewBounds.width > 0
@@ -1130,6 +1350,7 @@ export class BrowserSurfaceManager {
   }
 
   private detachSurface(record: BrowserSurfaceRecord, window: BaseWindow | undefined): void {
+    this.stopInspectForLifecycle(record, "surface-unmounted");
     if (!record.mounted) return;
     try {
       record.view.setVisible(false);
@@ -1235,6 +1456,225 @@ export class BrowserSurfaceManager {
     return null;
   }
 
+  private handleInspectNodeRequested(
+    record: BrowserSurfaceRecord,
+    params: Record<string, unknown>,
+    sessionId: string,
+  ): void {
+    if (
+      record.closed
+      || !record.primary
+      || !this.#surfaces.isPrimary(record)
+      || !record.inspectActive
+      || record.contents.isDestroyed()
+      || !record.contents.debugger.isAttached()
+    ) return;
+    const backendNodeId = integerOrNull(params.backendNodeId);
+    if (backendNodeId === null) return;
+    const generation = record.inspectGeneration;
+    const commandSessionId = sessionId || undefined;
+    void this.enqueueCdp(record, async ({ track }) => {
+      if (!this.isInspectGenerationActive(record, generation)) return;
+      const description = await sendCdpCommandWithTimeout(
+        record.contents,
+        "DOM.describeNode",
+        { backendNodeId, depth: 0, pierce: true },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        commandSessionId,
+        track,
+      ) as { node?: CdpNodeDescription };
+      const node = description.node;
+      if (!node || !this.isInspectGenerationActive(record, generation)) return;
+
+      // DOM.Node.frameId 只在 FrameOwner 节点上返回。普通页面节点需要
+      // 从同一 CDP target 的真实 frame tree 解析根 frame，不能因为该字段
+      // 在 Chromium 中按协议省略，就把合法的按钮、链接等节点全部丢弃。
+      const frameId = await this.resolveInspectFrameId(
+        record,
+        node.frameId,
+        backendNodeId,
+        commandSessionId,
+        generation,
+        track,
+      );
+      if (!frameId || !this.isInspectGenerationActive(record, generation)) return;
+
+      let attributeList = Array.isArray(node.attributes) ? node.attributes : [];
+      const nodeId = integerOrNull(node.nodeId);
+      if (nodeId !== null && this.isInspectGenerationActive(record, generation)) {
+        try {
+          const attributes = await sendCdpCommandWithTimeout(
+            record.contents,
+            "DOM.getAttributes",
+            { nodeId },
+            DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            commandSessionId,
+            track,
+          ) as { attributes?: unknown };
+          if (Array.isArray(attributes.attributes)) attributeList = attributes.attributes;
+        } catch {
+          // describeNode 已经携带属性时，单独的 getAttributes 失败不应丢弃
+          // 本次真实节点选择。页面导航竞态由 generation 校验负责收口。
+        }
+      }
+
+      let outerHtml = "";
+      if (this.isInspectGenerationActive(record, generation)) {
+        try {
+          const outer = await sendCdpCommandWithTimeout(
+            record.contents,
+            "DOM.getOuterHTML",
+            { backendNodeId },
+            DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            commandSessionId,
+            track,
+          ) as { outerHTML?: unknown };
+          if (typeof outer.outerHTML === "string") outerHtml = outer.outerHTML;
+        } catch {
+          // 节点仍然有效时，允许调用方使用结构化描述和属性继续处理。
+        }
+      }
+
+      let bounds: { x: number; y: number; width: number; height: number } | null = null;
+      if (this.isInspectGenerationActive(record, generation)) {
+        try {
+          const box = await sendCdpCommandWithTimeout(
+            record.contents,
+            "DOM.getBoxModel",
+            { backendNodeId },
+            DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            commandSessionId,
+            track,
+          ) as CdpBoxModelResponse;
+          bounds = quadBounds(box.model?.border);
+        } catch {
+          // 文本节点、不可布局节点和导航中的节点可能没有 box model。
+        }
+      }
+
+      if (!this.isInspectGenerationActive(record, generation)) return;
+      const pageUrl = record.contents.getURL() || "about:blank";
+      this.#onEvent({
+        type: "node_inspected",
+        binding: this.binding(record),
+        node: {
+          backend_node_id: backendNodeId,
+          node_id: nodeId,
+          frame_id: frameId,
+          node_type: finiteInteger(node.nodeType, 0),
+          node_name: typeof node.nodeName === "string" ? node.nodeName : "",
+          local_name: typeof node.localName === "string" ? node.localName : "",
+          node_value: typeof node.nodeValue === "string" ? node.nodeValue : "",
+          child_node_count: integerOrNull(node.childNodeCount),
+          document_url: typeof node.documentURL === "string" ? node.documentURL : null,
+          attributes: parseNodeAttributes(attributeList),
+          ...truncateOuterHtml(outerHtml),
+          bounds,
+          page_url: pageUrl,
+          page_title: record.contents.getTitle() || "",
+        },
+      });
+    }).catch((error) => {
+      if (!record.closed && record.inspectActive && record.inspectGeneration === generation) {
+        console.warn("[BrowserSurfaceManager] 真实 DOM 节点采集失败", {
+          surfaceId: record.surfaceId,
+          backendNodeId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  private async resolveInspectFrameId(
+    record: BrowserSurfaceRecord,
+    nodeFrameId: unknown,
+    backendNodeId: number,
+    sessionId: string | undefined,
+    generation: number,
+    track: (promise: Promise<unknown>) => void,
+  ): Promise<string | null> {
+    if (typeof nodeFrameId === "string" && nodeFrameId.length > 0) return nodeFrameId;
+    if (!this.isInspectGenerationActive(record, generation)) return null;
+    const objectGroup = "magi-inspect-frame";
+    try {
+      // 普通 DOM.Node 不带 frameId；通过真实 DOM 后端节点解析出页面对象，
+      // 再读取它的 ownerDocument.defaultView.frameElement，可以得到同一
+      // 文档所属的 iframe。整个过程仍在 Chromium CDP 内完成，只读取 DOM
+      // 关联的 frameElement，不执行页面业务代码、不依赖坐标，也不会把
+      // 主 frame 猜作子 frame。
+      const resolved = await sendCdpCommandWithTimeout(
+        record.contents,
+        "DOM.resolveNode",
+        { backendNodeId, objectGroup },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        sessionId,
+        track,
+      ) as { object?: { objectId?: unknown } };
+      const objectId = resolved.object?.objectId;
+      if (typeof objectId === "string" && objectId.length > 0 && this.isInspectGenerationActive(record, generation)) {
+        const frameElement = await sendCdpCommandWithTimeout(
+          record.contents,
+          "Runtime.callFunctionOn",
+          {
+            objectId,
+            objectGroup,
+            functionDeclaration: "function () { return this.ownerDocument?.defaultView?.frameElement || null; }",
+            returnByValue: false,
+            awaitPromise: false,
+          },
+          DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+          sessionId,
+          track,
+        ) as { result?: { objectId?: unknown; subtype?: unknown; } };
+        const frameElementObjectId = frameElement.result?.objectId;
+        if (typeof frameElementObjectId === "string" && frameElementObjectId.length > 0) {
+          const describedFrameElement = await sendCdpCommandWithTimeout(
+            record.contents,
+            "DOM.describeNode",
+            { objectId: frameElementObjectId, depth: 0, pierce: false },
+            DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            sessionId,
+            track,
+          ) as { node?: CdpNodeDescription };
+          const frameId = describedFrameElement.node?.frameId;
+          if (typeof frameId === "string" && frameId.length > 0) return frameId;
+        }
+      }
+
+      if (!this.isInspectGenerationActive(record, generation)) return null;
+      const response = await sendCdpCommandWithTimeout(
+        record.contents,
+        "Page.getFrameTree",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        sessionId,
+        track,
+      ) as {
+        frameTree?: { frame?: { id?: unknown } };
+      };
+      const frameId = response.frameTree?.frame?.id;
+      return typeof frameId === "string" && frameId.length > 0 ? frameId : null;
+    } catch {
+      // Frame tree 读取失败通常意味着导航或 target detach 已经开始；
+      // generation 校验会丢弃这次选择，下一次真实选择会重新采集。
+      return null;
+    } finally {
+      // DOM.resolveNode/Runtime.callFunctionOn 会创建临时远程对象。无论
+      // frame 解析成功、失败还是导航竞态，都必须释放对象组，避免每次
+      // 选中节点都把远程对象留在 Chromium heap 中。
+      if (!record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
+        await sendCdpCommandWithTimeout(
+          record.contents,
+          "Runtime.releaseObjectGroup",
+          { objectGroup },
+          DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+          sessionId,
+          track,
+        ).catch(() => undefined);
+      }
+    }
+  }
+
   private installSurfacePolicy(record: BrowserSurfaceRecord): void {
     const { contents: webContents } = record;
     webContents.setWindowOpenHandler((details) => {
@@ -1269,6 +1709,7 @@ export class BrowserSurfaceManager {
     });
     webContents.on("did-start-navigation", (_event, _url, _isInPlace, isMainFrame) => {
       if (!isMainFrame) return;
+      this.stopInspectForLifecycle(record, "navigation");
       record.navigationRevision += 1;
       record.navigationFailureReportedRevision = null;
       record.priming = true;
@@ -1432,6 +1873,9 @@ export class BrowserSurfaceManager {
         if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
           record.cdpSessionIds.delete(eventParams.sessionId);
         }
+        if (method === "Overlay.inspectNodeRequested") {
+          this.handleInspectNodeRequested(record, eventParams, sessionId);
+        }
         this.#onEvent({
           type: "cdp_event",
           binding: this.binding(record),
@@ -1442,6 +1886,7 @@ export class BrowserSurfaceManager {
       });
       debuggerApi.on("detach", (_event, reason) => {
         if (record.closed) return;
+        this.stopInspectForLifecycle(record, "debugger-detached");
         console.warn("[BrowserSurfaceManager] Browser debugger detached", {
           surfaceId: record.surfaceId,
           tabId: record.tabId,
@@ -1775,6 +2220,11 @@ export class BrowserSurfaceManager {
     const previous = promotion.previous;
     if (previous && !previous.closed) {
       previous.surfaceRevision = this.#surfaces.nextRevision(previous.tabId);
+      // Inspect mode belongs to the current physical Primary Surface. A
+      // promotion makes the previous surface stale even when it remains
+      // mounted in another window, so terminate its Overlay/DOM domains
+      // before allowing the new surface to receive inspect events.
+      this.stopInspectForLifecycle(previous, "surface-not-primary");
     }
     record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);
     this.#onEvent({ type: "primary_changed", binding: this.binding(record) });
@@ -1821,6 +2271,7 @@ export class BrowserSurfaceManager {
   private closeRecord(record: BrowserSurfaceRecord, promoteFallback = true): void {
     const wasClosed = record.closed;
     record.closed = true;
+    this.stopInspectForLifecycle(record, "surface-closed");
     if (!wasClosed && !record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
       try {
         record.contents.debugger.detach();
@@ -1846,6 +2297,22 @@ export class BrowserSurfaceManager {
       throw staleSurfaceError("browser_surface_activation_stale");
     }
   }
+}
+
+interface CdpNodeDescription {
+  nodeId?: unknown;
+  nodeType?: unknown;
+  nodeName?: unknown;
+  localName?: unknown;
+  nodeValue?: unknown;
+  childNodeCount?: unknown;
+  frameId?: unknown;
+  documentURL?: unknown;
+  attributes?: unknown;
+}
+
+interface CdpBoxModelResponse {
+  model?: { border?: unknown };
 }
 
 function normalizeNavigableUrl(value: string): string {
@@ -1957,6 +2424,52 @@ function capturePageRect(
 
 function finiteNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function finiteInteger(value: unknown, fallback: number): number {
+  return Number.isSafeInteger(value) ? value as number : fallback;
+}
+
+function integerOrNull(value: unknown): number | null {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : null;
+}
+
+function parseNodeAttributes(values: unknown[]): Record<string, string> {
+  const attributes: Record<string, string> = {};
+  for (let index = 0; index + 1 < values.length; index += 2) {
+    const name = values[index];
+    const value = values[index + 1];
+    if (typeof name === "string" && typeof value === "string") attributes[name] = value;
+  }
+  return attributes;
+}
+
+function truncateOuterHtml(value: string): { outer_html: string; outer_html_truncated: boolean } {
+  if (value.length <= MAX_INSPECTED_OUTER_HTML_LENGTH) {
+    return { outer_html: value, outer_html_truncated: false };
+  }
+  return {
+    outer_html: value.slice(0, MAX_INSPECTED_OUTER_HTML_LENGTH),
+    outer_html_truncated: true,
+  };
+}
+
+function quadBounds(value: unknown): { x: number; y: number; width: number; height: number } | null {
+  if (!Array.isArray(value) || value.length < 8) return null;
+  const coordinates = value.slice(0, 8);
+  if (!coordinates.every((coordinate) => typeof coordinate === "number" && Number.isFinite(coordinate))) {
+    return null;
+  }
+  const xValues = [coordinates[0], coordinates[2], coordinates[4], coordinates[6]] as number[];
+  const yValues = [coordinates[1], coordinates[3], coordinates[5], coordinates[7]] as number[];
+  const left = Math.min(...xValues);
+  const top = Math.min(...yValues);
+  return {
+    x: left,
+    y: top,
+    width: Math.max(0, Math.max(...xValues) - left),
+    height: Math.max(0, Math.max(...yValues) - top),
+  };
 }
 
 function normalizeJpegQuality(value: unknown): number {

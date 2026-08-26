@@ -2,6 +2,8 @@ import type {
   ContentBlock,
   Message,
   MessageContextReference,
+  MessageBrowserNodeSelection,
+  BrowserNodeSelectionRect,
   MessageImage,
   MessageRole,
   MessageSource,
@@ -239,6 +241,108 @@ function sanitizeMessageBrowserAnnotationRefs(
         : null,
     };
   });
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+const SENSITIVE_BROWSER_ATTRIBUTE_PATTERN = /(pass(word)?|secret|token|auth|cookie|session|csrf|credential|private[-_ ]?key)/iu;
+const MAX_BROWSER_NODE_SELECTIONS = 20;
+const MAX_BROWSER_NODE_TEXT_LENGTH = 4000;
+const MAX_BROWSER_NODE_HTML_LENGTH = 12000;
+
+function sanitizeBrowserNodeRect(value: unknown, errorPrefix: string): BrowserNodeSelectionRect | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!isPlainRecord(value)) throw new Error(`${errorPrefix} browserNodeSelections.bounds 无效`);
+  const values = ['x', 'y', 'width', 'height'].map((key) => value[key]);
+  if (!values.every((item) => typeof item === 'number' && Number.isFinite(item))) {
+    throw new Error(`${errorPrefix} browserNodeSelections.bounds 字段无效`);
+  }
+  return {
+    x: Number(values[0]),
+    y: Number(values[1]),
+    width: Math.max(0, Number(values[2])),
+    height: Math.max(0, Number(values[3])),
+  };
+}
+
+function sanitizeBrowserNodeAttributes(value: unknown, errorPrefix: string): Record<string, string> {
+  if (!isPlainRecord(value)) throw new Error(`${errorPrefix} browserNodeSelections.attributes 无效`);
+  const attributes: Record<string, string> = {};
+  for (const [key, rawValue] of Object.entries(value).slice(0, 64)) {
+    const normalizedKey = key.trim().slice(0, 200);
+    if (!normalizedKey || SENSITIVE_BROWSER_ATTRIBUTE_PATTERN.test(normalizedKey)) continue;
+    if (typeof rawValue !== 'string') continue;
+    attributes[normalizedKey] = rawValue.slice(0, 1000);
+  }
+  return attributes;
+}
+
+function sanitizeBrowserNodeSelection(
+  selection: unknown,
+  errorPrefix: string,
+): MessageBrowserNodeSelection {
+  if (!isPlainRecord(selection)) {
+    throw new Error(`${errorPrefix} browserNodeSelections 条目无效`);
+  }
+  const browserSessionId = typeof selection.browserSessionId === 'string' ? selection.browserSessionId.trim() : '';
+  const tabId = typeof selection.tabId === 'string' ? selection.tabId.trim() : '';
+  const surfaceId = typeof selection.surfaceId === 'string' ? selection.surfaceId.trim() : '';
+  const navigationRevision = Number.isSafeInteger(selection.navigationRevision)
+    && Number(selection.navigationRevision) >= 0
+    ? Number(selection.navigationRevision)
+    : -1;
+  const url = typeof selection.url === 'string' ? selection.url.trim().slice(0, 4000) : '';
+  const title = typeof selection.title === 'string' ? selection.title.trim().slice(0, 1000) : '';
+  const backendDomNodeId = Number.isSafeInteger(selection.backendDomNodeId)
+    && Number(selection.backendDomNodeId) > 0
+    ? Number(selection.backendDomNodeId)
+    : -1;
+  const nodeName = typeof selection.nodeName === 'string' ? selection.nodeName.trim().slice(0, 200) : '';
+  if (!browserSessionId || !tabId || !surfaceId || navigationRevision < 0 || !nodeName || backendDomNodeId < 1) {
+    throw new Error(`${errorPrefix} browserNodeSelections 字段无效`);
+  }
+  const textExcerpt = typeof selection.textExcerpt === 'string'
+    ? selection.textExcerpt.trim().slice(0, MAX_BROWSER_NODE_TEXT_LENGTH)
+    : '';
+  const outerHtml = typeof selection.outerHtml === 'string'
+    ? selection.outerHtml.slice(0, MAX_BROWSER_NODE_HTML_LENGTH)
+    : '';
+  const sensitiveNode = nodeName.toLowerCase() === 'input'
+    && /type\s*=\s*["']password["']/iu.test(outerHtml);
+  return {
+    browserSessionId,
+    tabId,
+    surfaceId,
+    navigationRevision,
+    url,
+    title,
+    frameId: typeof selection.frameId === 'string' ? selection.frameId.trim().slice(0, 500) || null : null,
+    backendDomNodeId,
+    domNodeId: Number.isSafeInteger(selection.domNodeId) && Number(selection.domNodeId) > 0
+      ? Number(selection.domNodeId)
+      : null,
+    nodeName,
+    attributes: sanitizeBrowserNodeAttributes(selection.attributes, errorPrefix),
+    textExcerpt: sensitiveNode ? '' : textExcerpt,
+    outerHtml: sensitiveNode
+      ? outerHtml.replace(/(value\s*=\s*["'])[^"']*(["'])/giu, '$1[REDACTED]$2')
+      : outerHtml,
+    ariaRole: typeof selection.ariaRole === 'string' ? selection.ariaRole.trim().slice(0, 200) || null : null,
+    ariaName: typeof selection.ariaName === 'string' ? selection.ariaName.trim().slice(0, 500) || null : null,
+    bounds: sanitizeBrowserNodeRect(selection.bounds, errorPrefix) ?? null,
+  };
+}
+
+function sanitizeMessageBrowserNodeSelections(
+  selections: unknown,
+  errorPrefix: string,
+): MessageBrowserNodeSelection[] | undefined {
+  if (selections === undefined) return undefined;
+  if (!Array.isArray(selections)) throw new Error(`${errorPrefix} browserNodeSelections 无效`);
+  if (selections.length > MAX_BROWSER_NODE_SELECTIONS) {
+    throw new Error(`${errorPrefix} browserNodeSelections 数量超过 ${MAX_BROWSER_NODE_SELECTIONS}`);
+  }
+  const normalized = selections.map((selection) => sanitizeBrowserNodeSelection(selection, errorPrefix));
   return normalized.length > 0 ? normalized : undefined;
 }
 
@@ -491,6 +595,10 @@ export function normalizeMessagePayload(message: Message, errorPrefix = '[Messag
     message.browserAnnotationRefs,
     errorPrefix,
   );
+  const browserNodeSelections = sanitizeMessageBrowserNodeSelections(
+    message.browserNodeSelections,
+    errorPrefix,
+  );
   const type = resolveMessageType({ role, type: message.type }, errorPrefix);
   const noticeType = typeof message.noticeType === 'string' && NOTICE_TYPE_SET.has(message.noticeType as NoticeType)
     ? message.noticeType as NoticeType
@@ -511,6 +619,7 @@ export function normalizeMessagePayload(message: Message, errorPrefix = '[Messag
     ...(images ? { images } : {}),
     ...(contextReferences ? { contextReferences } : {}),
     ...(browserAnnotationRefs ? { browserAnnotationRefs } : {}),
+    ...(browserNodeSelections ? { browserNodeSelections } : {}),
     ...(metadata ? { metadata } : {}),
   };
 }
@@ -640,6 +749,11 @@ export function sanitizeMessagePatch(
     normalized.browserAnnotationRefs = updates.browserAnnotationRefs === undefined
       ? undefined
       : sanitizeMessageBrowserAnnotationRefs(updates.browserAnnotationRefs, errorPrefix);
+  }
+  if ('browserNodeSelections' in updates) {
+    normalized.browserNodeSelections = updates.browserNodeSelections === undefined
+      ? undefined
+      : sanitizeMessageBrowserNodeSelections(updates.browserNodeSelections, errorPrefix);
   }
 
   if ('metadata' in updates) {

@@ -32,12 +32,59 @@
     desktopSurface?: boolean;
   }
 
+  // 这是 Renderer 发给消息输入层的唯一节点上下文形状。字段名称保持
+  // camelCase，便于后续直接并入 message types、bridge 和 agent-api。
+  export interface BrowserNodeSelectionContext {
+    tabId: string;
+    surfaceId: string;
+    navigationRevision: number;
+    url: string;
+    title: string;
+    frameId: string | null;
+    backendDomNodeId: number;
+    domNodeId: number | null;
+    nodeName: string;
+    attributes: Record<string, string>;
+    textExcerpt: string;
+    outerHtml: string;
+    outerHtmlTruncated: boolean;
+    ariaRole: string | null;
+    ariaName: string | null;
+    bounds: BrowserNormalizedRect | null;
+  }
+
+  interface BrowserInspectIdentity {
+    tabId: string;
+    surfaceId: string;
+    navigationRevision: number;
+  }
+
   interface DesktopBrowserEvent {
     type?: string;
-    binding?: { tab_id?: string; surface_id?: string };
+    binding?: {
+      tab_id?: string;
+      surface_id?: string;
+      navigation_revision?: number;
+    };
     page?: { url?: string; title?: string };
     loading?: boolean;
     reason?: string;
+    node?: DesktopInspectedNode;
+    payload?: Record<string, unknown>;
+  }
+
+  interface DesktopInspectedNode {
+    backend_node_id?: number;
+    node_id?: number | null;
+    frame_id?: string | null;
+    node_name?: string;
+    attributes?: Record<string, string>;
+    node_value?: string;
+    outer_html?: string;
+    outer_html_truncated?: boolean;
+    bounds?: { x: number; y: number; width: number; height: number } | null;
+    page_url?: string;
+    page_title?: string;
   }
 
   const VIEWPORT_DEVICE_MODES = [
@@ -85,6 +132,11 @@
   let annotationSelection = $state<BrowserAnnotationSelection | null>(null);
   let annotationComment = $state('');
   let pageError = $state('');
+  let nodeInspectActive = $state(false);
+  let nodeInspectBusy = $state(false);
+  let nodeSelection = $state<BrowserNodeSelectionContext | null>(null);
+  let nodeInspectIdentity = $state<BrowserInspectIdentity | null>(null);
+  let nodeInspectGeneration = 0;
   let refreshGeneration = 0;
   let desktopSurfaceSyncGeneration = 0;
   let activeBrowserIdentityKey = '';
@@ -104,6 +156,23 @@
   // activeSurfaceId 由 Main 在完成物理挂载和 bounds 更新后发布。它不是
   // Authority/Worker 握手状态，也不会因页面刷新或右栏拖动而重置。
   const browserReady = $derived(browserSurfaceAvailable);
+  const activeBrowserIdentity = $derived.by<BrowserInspectIdentity | null>(() => {
+    const tab = activeTab;
+    const surfaceId = desktopSnapshot?.layout.activeSurfaceId;
+    if (
+      !desktopRuntime
+      || !tab
+      || !surfaceId
+      || desktopSnapshot?.layout.rightPaneVisible !== true
+      || desktopSnapshot.layout.activePanelKind !== 'browser'
+      || desktopSnapshot.layout.activeTabId !== tabId
+    ) return null;
+    return {
+      tabId,
+      surfaceId,
+      navigationRevision: tab.navigationRevision,
+    };
+  });
   const error = $derived(actionError || pageError || sessionError);
   const lifecycleFailure = $derived(lifecycle === 'crashed' || activeTab?.lifecycle === 'crashed');
   const connectionState = $derived.by<'ready' | 'connecting' | 'error'>(() => {
@@ -168,6 +237,174 @@
         }
       }
     }
+  }
+
+  function sameBrowserIdentity(
+    left: BrowserInspectIdentity | null,
+    right: BrowserInspectIdentity | null,
+  ): boolean {
+    return Boolean(
+      left
+      && right
+      && left.tabId === right.tabId
+      && left.surfaceId === right.surfaceId
+      && left.navigationRevision === right.navigationRevision,
+    );
+  }
+
+  function clearNodeInspection(preserveSelection = false): void {
+    const identity = nodeInspectIdentity;
+    const generation = ++nodeInspectGeneration;
+    nodeInspectIdentity = null;
+    nodeInspectActive = false;
+    if (!preserveSelection) nodeSelection = null;
+
+    const desktop = window.magiDesktop;
+    if (!identity || !desktop) {
+      if (nodeInspectGeneration === generation) nodeInspectBusy = false;
+      return;
+    }
+    nodeInspectBusy = true;
+    void desktop.stopBrowserInspect(identity)
+      .catch(() => undefined)
+      .finally(() => {
+        if (nodeInspectGeneration === generation) nodeInspectBusy = false;
+      });
+  }
+
+  function toggleNodeInspection(): void {
+    if (nodeInspectBusy || busy || !browserReady || nodeInspectActive) {
+      if (nodeInspectActive && !nodeInspectBusy && !busy) clearNodeInspection();
+      return;
+    }
+    const desktop = window.magiDesktop;
+    const identity = activeBrowserIdentity;
+    if (!desktop || !identity) return;
+
+    const generation = ++nodeInspectGeneration;
+    nodeInspectIdentity = identity;
+    nodeInspectActive = false;
+    nodeSelection = null;
+    nodeInspectBusy = true;
+    actionError = '';
+    void desktop.startBrowserInspect(identity)
+      .then((next) => {
+        if (
+          generation !== nodeInspectGeneration
+          || !sameBrowserIdentity(nodeInspectIdentity, identity)
+          || !sameBrowserIdentity(activeBrowserIdentity, identity)
+        ) {
+          // 生命周期清理已经处理了旧身份；仅在本次启动仍未被清理时
+          // 追加一次同身份停止，避免异步 IPC 返回后重新留下检查模式。
+          if (generation === nodeInspectGeneration && sameBrowserIdentity(nodeInspectIdentity, identity)) {
+            clearNodeInspection();
+          }
+          return;
+        }
+        applyDesktopViewport(next);
+        nodeInspectActive = true;
+      })
+      .catch((cause) => {
+        if (generation !== nodeInspectGeneration) return;
+        nodeInspectIdentity = null;
+        nodeInspectActive = false;
+        nodeSelection = null;
+        actionError = errorMessage(cause);
+      })
+      .finally(() => {
+        if (generation === nodeInspectGeneration) nodeInspectBusy = false;
+      });
+  }
+
+  function finiteRectangle(value: unknown): BrowserNormalizedRect | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const rect = value as Record<string, unknown>;
+    if (![rect.x, rect.y, rect.width, rect.height].every((item) => typeof item === 'number' && Number.isFinite(item))) {
+      return null;
+    }
+    return {
+      x: rect.x as number,
+      y: rect.y as number,
+      width: rect.width as number,
+      height: rect.height as number,
+    };
+  }
+
+  function stringAttributes(value: unknown): Record<string, string> | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const attributes: Record<string, string> = {};
+    for (const [key, attribute] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof attribute !== 'string') return null;
+      attributes[key] = attribute;
+    }
+    return attributes;
+  }
+
+  function nodeSelectionFromEvent(
+    event: DesktopBrowserEvent,
+    binding: { tabId: string; surfaceId: string; navigationRevision: number },
+  ): BrowserNodeSelectionContext | null {
+    const source = event.type === 'node_inspected'
+      ? event.node as unknown
+      : event.payload;
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+    const value = source as Record<string, unknown>;
+    const attributes = stringAttributes(value.attributes);
+    const backendDomNodeId = value.backend_node_id ?? value.backend_dom_node_id;
+    const domNodeId = value.node_id ?? value.dom_node_id;
+    const frameId = value.frame_id ?? value.frameId;
+    const nodeName = value.node_name ?? value.nodeName;
+    const url = value.page_url ?? value.url;
+    const title = value.page_title ?? value.title;
+    const outerHtml = value.outer_html ?? value.outerHtml;
+    const outerHtmlTruncated = value.outer_html_truncated ?? value.outerHtmlTruncated;
+    const boundsValue = value.bounds;
+    if (
+      typeof backendDomNodeId !== 'number'
+      || !Number.isSafeInteger(backendDomNodeId)
+      || (domNodeId !== null && domNodeId !== undefined && (!Number.isSafeInteger(domNodeId) || typeof domNodeId !== 'number'))
+      || (frameId !== null && frameId !== undefined && typeof frameId !== 'string')
+      || typeof nodeName !== 'string'
+      || !nodeName.trim()
+      || !attributes
+      || typeof url !== 'string'
+      || typeof title !== 'string'
+      || typeof outerHtml !== 'string'
+      || typeof outerHtmlTruncated !== 'boolean'
+      || !('bounds' in value)
+    ) return null;
+    const bounds = boundsValue === null ? null : finiteRectangle(boundsValue);
+    if (boundsValue !== null && !bounds) return null;
+    const nodeValue = typeof value.node_value === 'string'
+      ? value.node_value.trim()
+      : typeof value.text_excerpt === 'string'
+        ? value.text_excerpt.trim()
+        : '';
+    const ariaRole = typeof value.aria_role === 'string'
+      ? value.aria_role.trim() || null
+      : attributes.role?.trim() || null;
+    const ariaName = typeof value.aria_name === 'string'
+      ? value.aria_name.trim() || null
+      : attributes['aria-label']?.trim() || null;
+    const textExcerpt = nodeValue || ariaName || attributes.title?.trim() || '';
+    return {
+      tabId: binding.tabId,
+      surfaceId: binding.surfaceId,
+      navigationRevision: binding.navigationRevision,
+      url,
+      title,
+      frameId: frameId === undefined ? null : frameId,
+      backendDomNodeId,
+      domNodeId: domNodeId === undefined ? null : domNodeId,
+      nodeName,
+      attributes,
+      textExcerpt,
+      outerHtml,
+      outerHtmlTruncated,
+      ariaRole,
+      ariaName,
+      bounds,
+    };
   }
 
   function fixedPresetSelected(mode: (typeof VIEWPORT_DEVICE_MODES)[number]): boolean {
@@ -511,6 +748,7 @@
     const tab = activeTab;
     if (!tab || !browserReady) return;
     addressEditing = false;
+    clearNodeInspection();
     void run(async () => {
       const updated = await navigateBrowserTab(tab.tabId, action, action === 'url' ? address : undefined);
       address = updated.url;
@@ -567,18 +805,80 @@
     window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: annotation }));
   }
 
+  function browserEventBinding(event: DesktopBrowserEvent): BrowserInspectIdentity | null {
+    const nestedBinding = event.payload?.binding;
+    const candidate = event.binding
+      ?? (nestedBinding && typeof nestedBinding === 'object' && !Array.isArray(nestedBinding)
+        ? nestedBinding as DesktopBrowserEvent['binding']
+        : undefined);
+    if (!candidate) return null;
+    if (
+      typeof candidate.tab_id !== 'string'
+      || !candidate.tab_id
+      || typeof candidate.surface_id !== 'string'
+      || !candidate.surface_id
+      || typeof candidate.navigation_revision !== 'number'
+      || !Number.isSafeInteger(candidate.navigation_revision)
+      || candidate.navigation_revision < 0
+    ) return null;
+    return {
+      tabId: candidate.tab_id,
+      surfaceId: candidate.surface_id,
+      navigationRevision: candidate.navigation_revision,
+    };
+  }
+
   function handleDesktopBrowserEvent(value: unknown): void {
-    if (!value || typeof value !== 'object') return;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
     const event = value as DesktopBrowserEvent;
-    if (event.binding?.tab_id !== tabId) return;
-    const activeSurfaceId = desktopSnapshot?.layout.activeSurfaceId;
-    if (event.binding?.surface_id && activeSurfaceId && event.binding.surface_id !== activeSurfaceId) return;
+    const binding = browserEventBinding(event);
+    const currentIdentity = activeBrowserIdentity;
+    const tab = activeTab;
+    if (
+      !binding
+      || !currentIdentity
+      || !tab
+      || binding.tabId !== tabId
+      || binding.surfaceId !== currentIdentity.surfaceId
+    ) return;
+
+    if (event.type === 'node_inspected' || event.type === 'node_selection') {
+      // 节点上下文必须精确匹配启动检查时的三元身份。页面事件允许
+      // 使用更高 revision 穿过导航竞态，但节点绝不能跨代次复用。
+      if (
+        !nodeInspectActive
+        || !sameBrowserIdentity(nodeInspectIdentity, currentIdentity)
+        || binding.navigationRevision !== currentIdentity.navigationRevision
+      ) return;
+      const selection = nodeSelectionFromEvent(event, binding);
+      if (!selection) {
+        actionError = i18n.t('browser.nodeSelection.failed');
+        clearNodeInspection();
+        return;
+      }
+      nodeSelection = selection;
+      actionError = '';
+      window.dispatchEvent(new CustomEvent<BrowserNodeSelectionContext>(
+        'magi:browserNodeSelected',
+        { detail: selection },
+      ));
+      // Chromium 的 inspect mode 是一次选择动作。选中后立即退出，避免
+      // 后续普通网页点击继续被 Overlay 拦截；已选上下文仍保留给消息层。
+      clearNodeInspection(true);
+      return;
+    }
+
+    if (binding.navigationRevision < tab.navigationRevision) return;
     if (event.type === 'loading_changed') {
       browserLoading = event.loading === true;
-      if (browserLoading) pageError = '';
+      if (browserLoading) {
+        pageError = '';
+        clearNodeInspection();
+      }
       return;
     }
     if (event.type === 'page_failed') {
+      clearNodeInspection();
       pageError = event.reason?.trim() || i18n.t('browser.error.pageLoadFailed');
       browserLoading = false;
       return;
@@ -597,12 +897,23 @@
   });
 
   $effect(() => {
+    const currentIdentity = activeBrowserIdentity;
+    const inspectedIdentity = nodeInspectIdentity;
+    if (inspectedIdentity && !sameBrowserIdentity(inspectedIdentity, currentIdentity)) {
+      // Tab、Surface、导航代次或右栏面板任一项变化，都必须让旧检查请求
+      // 失效。停止调用使用旧身份，绝不能把清理动作发给新页面。
+      untrack(() => clearNodeInspection());
+    }
+  });
+
+  $effect(() => {
     const expectedSessionId = browserSessionId.trim();
     const expectedTabId = tabId.trim();
     const identityKey = `${expectedSessionId}\u0000${expectedTabId}`;
     if (identityKey === activeBrowserIdentityKey) return;
     activeBrowserIdentityKey = identityKey;
     untrack(() => {
+      clearNodeInspection();
       snapshot = null;
       address = '';
       addressEditing = false;
@@ -738,6 +1049,7 @@
       unsubscribeDesktopSnapshot?.();
       window.removeEventListener('pointerdown', pointerDown);
       window.removeEventListener('keydown', keyboard);
+      clearNodeInspection();
       if (desktop) {
         if (desktopOverlayId) void desktop.closeOverlay().catch(() => undefined);
       }
@@ -803,6 +1115,16 @@
           </div>
         {/if}
       </div>
+      <button
+        type="button"
+        class="icon-button"
+        class:active={nodeInspectActive || Boolean(nodeSelection)}
+        onclick={toggleNodeInspection}
+        disabled={!browserReady || busy || nodeInspectBusy || (!nodeInspectActive && !activeBrowserIdentity)}
+        data-tooltip={i18n.t(nodeInspectActive ? 'browser.action.stopInspectNode' : 'browser.action.inspectNode')}
+        aria-label={i18n.t(nodeInspectActive ? 'browser.action.stopInspectNode' : 'browser.action.inspectNode')}
+        aria-pressed={nodeInspectActive}
+      ><Icon name="code" size={13} /></button>
     {:else}
       <div class="record-address" title={activeTab?.url || i18n.t('browser.status.noTab')}>
         <Icon name="globe" size={13} />

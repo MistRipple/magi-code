@@ -8,6 +8,8 @@ import {
 } from "electron";
 import type {
   BrowserLogicalViewport,
+  BrowserSurfaceBinding,
+  BrowserSurfaceIdentity,
 } from "@magi/desktop-browser-contracts";
 import type { BrowserSurfaceManager } from "./browser-surface-manager.js";
 import {
@@ -380,6 +382,58 @@ export class WindowManager {
     }
     await this.#surfaceManager.setViewport(binding, viewport);
     return this.snapshot(record.windowId);
+  }
+
+  async startBrowserInspect(
+    windowId: string,
+    request: { tabId: string; surfaceId: string; navigationRevision: number },
+  ): Promise<DesktopWindowSnapshot> {
+    const { record, binding } = this.requireActiveBrowserBinding(windowId, {
+      tab_id: request.tabId,
+      surface_id: request.surfaceId,
+      navigation_revision: request.navigationRevision,
+    });
+    await this.#surfaceManager.startInspect(binding);
+    return this.snapshot(record.windowId);
+  }
+
+  async stopBrowserInspect(
+    windowId: string,
+    request: { tabId: string; surfaceId: string; navigationRevision: number },
+  ): Promise<DesktopWindowSnapshot> {
+    const { record, binding } = this.requireActiveBrowserBinding(windowId, {
+      tab_id: request.tabId,
+      surface_id: request.surfaceId,
+      navigation_revision: request.navigationRevision,
+    });
+    await this.#surfaceManager.stopInspect(binding);
+    return this.snapshot(record.windowId);
+  }
+
+  private requireActiveBrowserBinding(
+    windowId: string,
+    request: BrowserSurfaceIdentity,
+  ): { record: DesktopWindowRecord; binding: BrowserSurfaceBinding } {
+    const record = this.requireWindow(windowId);
+    const layout = record.layout;
+    if (
+      !layout.rightPaneVisible
+      || layout.activePanelKind !== "browser"
+      || layout.activeTabId !== request.tab_id
+      || layout.activeSurfaceId !== request.surface_id
+    ) {
+      throw new Error("browser_inspect_surface_stale");
+    }
+    const binding = this.#surfaceManager.bindingForTabInWindow(request.tab_id, windowId);
+    if (
+      !binding
+      || binding.tab_id !== request.tab_id
+      || binding.surface_id !== request.surface_id
+      || binding.navigation_revision !== request.navigation_revision
+    ) {
+      throw new Error("browser_inspect_surface_stale");
+    }
+    return { record, binding };
   }
 
   openOverlay(windowId: string, state: DesktopOverlayState): void {

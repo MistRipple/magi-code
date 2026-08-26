@@ -232,6 +232,48 @@
         "name": { "type": "string", "minLength": 1 }
       }
     },
+    "BrowserNodeSelectionBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" },
+        "y": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" },
+        "width": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" },
+        "height": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" }
+      }
+    },
+    "BrowserNodeSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tabId", "surfaceId", "navigationRevision", "url", "title", "frameId",
+        "backendDomNodeId", "domNodeId", "nodeName", "attributes", "textExcerpt",
+        "outerHtml", "ariaRole", "ariaName", "bounds"
+      ],
+      "properties": {
+        "tabId": { "type": "string", "minLength": 1 },
+        "surfaceId": { "type": "string", "minLength": 1 },
+        "navigationRevision": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "url": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "frameId": { "type": "string", "minLength": 1 },
+        "backendDomNodeId": { "type": "integer", "minimum": 1, "x-rust-type": "u64" },
+        "domNodeId": { "type": "integer", "minimum": 1, "x-rust-type": "u64" },
+        "nodeName": { "type": "string", "minLength": 1 },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "x-rust-type": "std::collections::BTreeMap<String, String>",
+          "x-ts-type": "Record<string, string>"
+        },
+        "textExcerpt": { "type": "string" },
+        "outerHtml": { "type": "string" },
+        "ariaRole": { "type": ["string", "null"] },
+        "ariaName": { "type": ["string", "null"] },
+        "bounds": { "$ref": "#/$defs/BrowserNodeSelectionBounds" }
+      }
+    },
     "AccessProfile": {
       "type": "string",
       "enum": ["read_only", "restricted", "full_access"]
@@ -264,6 +306,12 @@
         "browserAnnotationRefs": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "x-rust-default": true
+        },
+        "browserNodeSelections": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/BrowserNodeSelection" },
           "default": [],
           "x-rust-default": true
         },

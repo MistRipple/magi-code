@@ -27,6 +27,7 @@ import type {
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
+import type { MessageBrowserNodeSelection } from '../types/message';
 import {
   resolveAgentBindingContext,
   type AgentBindingContext,
@@ -2016,6 +2017,7 @@ export async function submitSessionTurn(
       name: string;
     }>;
     browserAnnotationRefs?: string[];
+    browserNodeSelections?: MessageBrowserNodeSelection[];
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
     orchestratorSessionConfig?: Record<string, unknown> | null;
     requestId?: string | null;
@@ -2061,6 +2063,11 @@ export async function submitSessionTurn(
         browserAnnotationRefs: (payload.browserAnnotationRefs ?? [])
           .map((annotationId) => annotationId.trim())
           .filter(Boolean),
+        browserNodeSelections: (payload.browserNodeSelections ?? []).map((selection) => ({
+          ...selection,
+          attributes: { ...selection.attributes },
+          bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
+        })),
         orchestratorSessionConfig: payload.orchestratorSessionConfig ?? null,
       }),
     });
