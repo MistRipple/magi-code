@@ -73,7 +73,7 @@ export class BrowserSurfaceRegistry<T extends BrowserSurfaceRegistryRecord> {
     return { previous, current };
   }
 
-  promoteFallback(tabId: string): T | null {
+  promoteReplacement(tabId: string): T | null {
     if (this.#primaryByTab.has(tabId)) return null;
     const fallback = [...this.#records.values()].find((record) => (
       !record.closed && record.tabId === tabId

@@ -1,6 +1,14 @@
+import { createRequire } from "node:module";
 import type { BaseWindow, Rectangle, View, WebContentsView } from "electron";
-import { WebContentsView as ElectronWebContentsView } from "electron";
 import type { WindowLayoutSnapshot } from "./window-layout.js";
+import {
+  createDesktopOverlayClosedIdentityEvent,
+  sameDesktopOverlayIdentity,
+  type DesktopOverlayClosedIdentityEvent,
+  type DesktopOverlayIdentity,
+} from "./desktop-overlay-lifecycle.js";
+
+export type { DesktopOverlayIdentity } from "./desktop-overlay-lifecycle.js";
 
 export type DesktopOverlayPlacement =
   | "right-pane-add"
@@ -15,6 +23,9 @@ export interface DesktopOverlayItem {
   disabled: boolean;
 }
 
+export type DesktopOverlayKind = "menu" | "annotation";
+export type DesktopOverlayPhase = "menu" | "select" | "comment";
+
 export interface DesktopOverlayField {
   id: string;
   label: string;
@@ -26,11 +37,12 @@ export interface DesktopOverlayField {
 
 export interface DesktopOverlayState {
   overlayId: string;
-  kind: "menu" | "annotation";
-  phase: "menu" | "select" | "comment";
+  kind: DesktopOverlayKind;
+  phase: DesktopOverlayPhase;
   ownerId: string;
   placement: DesktopOverlayPlacement;
-  anchorBounds: Rectangle | null;
+  // 菜单由 App Renderer 读取真实 DOM 锚点后提交的最终矩形。标记流程不使用。
+  popupBounds: Rectangle | null;
   title: string;
   items: DesktopOverlayItem[];
   fields: DesktopOverlayField[];
@@ -38,61 +50,85 @@ export interface DesktopOverlayState {
 
 export interface DesktopOverlayAction {
   overlayId: string;
-  kind: "menu" | "annotation";
+  kind: DesktopOverlayKind;
   ownerId: string;
   interaction: "select" | "input";
   id: string;
   value: string | null;
 }
 
+export interface DesktopOverlayClosedEvent extends DesktopOverlayClosedIdentityEvent {
+  kind: DesktopOverlayKind;
+}
+
+export type DesktopOverlayCloseRequest = DesktopOverlayIdentity;
+
 interface OverlayRecord {
   windowId: string;
   window: BaseWindow;
   view: WebContentsView;
-  layer: View;
+  contentRoot: View;
   state: DesktopOverlayState | null;
   visible: boolean;
   loaded: boolean;
   loadFailed: boolean;
   ready: boolean;
+  // 当前 bounds 是否来自最近一次完整 Renderer 几何帧。
+  geometryAvailable: boolean;
   mounted: boolean;
   layout: WindowLayoutSnapshot | null;
-  browserContentBounds: Rectangle | null;
   loadPromise: Promise<void> | null;
+  viewportAppliedBounds: Rectangle | null;
+  viewportApplyPromise: Promise<void> | null;
+  viewportApplyDirty: boolean;
 }
 
-const OVERLAY_WIDTH: Record<DesktopOverlayPlacement, number> = {
-  "right-pane-add": 208,
-  "browser-viewport": 224,
-  "browser-annotations": 320,
-};
 const TRANSPARENT_VIEW_BACKGROUND = "rgba(0, 0, 0, 0)";
+const requireElectron = createRequire(import.meta.url);
+
+export type DesktopOverlayViewFactory = (options: {
+  webPreferences: {
+    preload: string;
+    additionalArguments: string[];
+    partition: string;
+    nodeIntegration: false;
+    contextIsolation: true;
+    sandbox: true;
+    webSecurity: true;
+  };
+}) => WebContentsView;
 
 export class DesktopOverlayManager {
   readonly #preloadPath: string;
   readonly #agentOrigin: string;
   readonly #desktopEpoch: string;
+  readonly #createView: DesktopOverlayViewFactory;
   readonly #records = new Map<string, OverlayRecord>();
   readonly #onAction: (windowId: string, action: DesktopOverlayAction) => void;
-  readonly #onClosed: (windowId: string) => void;
+  readonly #onClosed: (windowId: string, event: DesktopOverlayClosedEvent) => void;
 
   constructor(input: {
     preloadPath: string;
     agentOrigin: string;
     desktopEpoch: string;
+    createView?: DesktopOverlayViewFactory;
     onAction: (windowId: string, action: DesktopOverlayAction) => void;
-    onClosed: (windowId: string) => void;
+    onClosed: (windowId: string, event: DesktopOverlayClosedEvent) => void;
   }) {
     this.#preloadPath = input.preloadPath;
     this.#agentOrigin = input.agentOrigin;
     this.#desktopEpoch = input.desktopEpoch;
+    this.#createView = input.createView ?? ((options) => {
+      const electron = requireElectron("electron") as typeof import("electron");
+      return new electron.WebContentsView(options);
+    });
     this.#onAction = input.onAction;
     this.#onClosed = input.onClosed;
   }
 
-  create(windowId: string, window: BaseWindow, layer: View): void {
+  create(windowId: string, window: BaseWindow, contentRoot: View): void {
     if (this.#records.has(windowId)) return;
-    const view = new ElectronWebContentsView({
+    const view = this.#createView({
       webPreferences: {
         preload: this.#preloadPath,
         additionalArguments: [
@@ -110,25 +146,28 @@ export class DesktopOverlayManager {
       windowId,
       window,
       view,
-      layer,
+      contentRoot,
       state: null,
       visible: false,
       loaded: false,
       loadFailed: false,
       ready: false,
+      geometryAvailable: false,
       mounted: false,
       layout: null,
-      browserContentBounds: null,
       loadPromise: null,
+      viewportAppliedBounds: null,
+      viewportApplyPromise: null,
+      viewportApplyDirty: false,
     };
     this.#records.set(windowId, record);
     // Overlay 是浏览器内容槽上的透明交互层。Electron 的原生 View 默认
     // 会绘制不透明背景；仅依赖 DOM 的 background: transparent 不足以让
     // 下方 WebContentsView 可见，最终表现为打开标记后整个页面黑屏。
-    layer.setBackgroundColor(TRANSPARENT_VIEW_BACKGROUND);
     view.setBackgroundColor(TRANSPARENT_VIEW_BACKGROUND);
-    // OverlayLayer 固定存在于窗口层级中，但空闲时必须隐藏整个层，不能
-    // 让一个没有子内容的原生 View 覆盖 App Renderer 的交互区域。
+    this.clearOverlayBounds(record);
+    // 空闲 Overlay 不挂载到 contentView，不能让一个空原生 View 覆盖
+    // App Renderer 的交互区域。
     this.syncVisibility(record);
     view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     view.webContents.on("will-navigate", (event, url) => {
@@ -138,8 +177,9 @@ export class DesktopOverlayManager {
       if (record.loadFailed) return;
       record.loaded = true;
       if (record.state && record.visible) {
-        this.setOverlayBounds(record, overlayBoundsForRecord(record));
+        this.reconcileGeometry(record);
       }
+      this.scheduleViewportApply(record);
       this.syncVisibility(record);
       if (record.state && record.visible && record.ready) this.publishState(record);
     });
@@ -173,15 +213,34 @@ export class DesktopOverlayManager {
     windowId: string,
     state: DesktopOverlayState,
     layout: WindowLayoutSnapshot,
-    browserContentBounds: Rectangle | null = null,
   ): void {
     const record = this.requireRecord(windowId);
+    const previous = record.state;
+    // 打开和后续重排都必须消费同一份 Renderer geometry frame，避免
+    // 发起方的旧坐标把浮层放到浏览器内容或工具栏之上。
+    const geometry = resolveCurrentOverlayGeometry(state, layout);
+    if (!geometry) {
+      throw new Error("desktop_overlay_browser_content_unavailable");
+    }
+    // 一个窗口只有一个原生 Overlay WebContents。替换必须先完成新状态的
+    // 边界校验，再以单个 ownership 事务通知旧 owner。这样新 Overlay 打开
+    // 失败时旧 Overlay 仍然有效，且替换不会移除/重挂 WebContents 造成闪烁。
+    if (record.visible && previous && !sameDesktopOverlayIdentity(previous, state)) {
+      this.notifyClosed(record, {
+        kind: previous.kind,
+        ...createDesktopOverlayClosedIdentityEvent(
+          previous,
+          "replaced",
+          { overlayId: state.overlayId, ownerId: state.ownerId },
+        ),
+      });
+    }
     record.state = state;
     record.visible = true;
     record.layout = layout;
-    record.browserContentBounds = browserContentBounds ? { ...browserContentBounds } : null;
+    record.geometryAvailable = true;
     this.mountOnLayer(record);
-    this.setOverlayBounds(record, overlayBounds(layout, state, record.browserContentBounds));
+    this.setOverlayBounds(record, geometry.bounds);
     this.syncVisibility(record);
     if (record.loadFailed && !record.view.webContents.isDestroyed()) {
       // Overlay Renderer 可能在 daemon/Vite 刚重启的瞬间加载失败。下一次
@@ -200,76 +259,141 @@ export class DesktopOverlayManager {
     if (!record || record.loadFailed || record.view.webContents.isDestroyed()) return;
     record.ready = true;
     if (record.state && record.visible) {
-      this.setOverlayBounds(record, overlayBoundsForRecord(record));
+      this.reconcileGeometry(record);
     }
+    this.scheduleViewportApply(record);
     this.syncVisibility(record);
     if (record.visible && record.state) this.publishState(record);
   }
 
-  close(windowId: string): void {
+  close(
+    windowId: string,
+    expected: DesktopOverlayCloseRequest | null = null,
+  ): DesktopOverlayClosedEvent | null {
     const record = this.#records.get(windowId);
-    if (!record) return;
+    if (!record) return null;
+    const current = record.state;
+    if (!record.visible || !current) return null;
+    if (expected && (
+      current.overlayId !== expected.overlayId || current.ownerId !== expected.ownerId
+    )) return null;
+    return this.closeRecord(record, "closed");
+  }
+
+  private closeRecord(
+    record: OverlayRecord,
+    reason: DesktopOverlayClosedEvent["reason"],
+  ): DesktopOverlayClosedEvent {
+    const current = record.state;
+    if (!current) {
+      throw new Error("desktop_overlay_not_open");
+    }
+    const closed = {
+      kind: current.kind,
+      ...createDesktopOverlayClosedIdentityEvent(current, reason),
+    } satisfies DesktopOverlayClosedEvent;
     record.visible = false;
     record.state = null;
     record.layout = null;
-    record.browserContentBounds = null;
-    if (!record.view.webContents.isDestroyed()) {
-      record.view.webContents.send("magi-desktop:overlay-closed", null);
-    }
+    record.geometryAvailable = false;
+    this.notifyClosed(record, closed);
     this.syncVisibility(record);
     // 仅隐藏会让原生 Accessibility 树继续保留已关闭菜单并让焦点停在
     // Overlay Renderer。移除视图但保留 WebContents，下一次打开仍复用同一
     // Renderer，不会重建页面或引入闪烁。
     if (record.mounted) {
-      record.layer.removeChildView(record.view);
+      try {
+        record.contentRoot.removeChildView(record.view);
+      } catch {
+        // 窗口销毁与关闭动作可能交错到达，移除必须幂等。
+      }
       record.mounted = false;
     }
-    this.#onClosed(windowId);
+    return closed;
+  }
+
+  private notifyClosed(record: OverlayRecord, event: DesktopOverlayClosedEvent): void {
+    if (!record.view.webContents.isDestroyed()) {
+      record.view.webContents.send("magi-desktop:overlay-closed", event);
+    }
+    this.#onClosed(record.windowId, event);
+  }
+
+  private reconcileGeometry(record: OverlayRecord): void {
+    const state = record.state;
+    const layout = record.layout;
+    if (!state || !layout || !record.visible) {
+      record.geometryAvailable = false;
+      this.clearOverlayBounds(record);
+      return;
+    }
+    const geometry = resolveCurrentOverlayGeometry(state, layout);
+    if (geometry) {
+      record.geometryAvailable = true;
+      this.mountOnLayer(record);
+      this.setOverlayBounds(record, geometry.bounds);
+      return;
+    }
+    // 正常布局变化不会走到这里：WindowLayout 会保留最后一份完整几何帧，
+    // 直到 Renderer 提交下一份完整帧。这里仅处理首次加载或真实失效，
+    // 隐藏当前 View 但保留 WebContents，避免重新加载造成闪烁。
+    record.geometryAvailable = false;
+    this.clearOverlayBounds(record);
   }
 
   closeBrowserOverlay(windowId: string, tabId: string): boolean {
     const record = this.#records.get(windowId);
     if (!record?.visible || record.state?.ownerId !== `browser:${tabId}`) return false;
-    this.close(windowId);
-    return true;
+    return this.close(windowId, {
+      overlayId: record.state.overlayId,
+      ownerId: record.state.ownerId,
+    }) !== null;
   }
 
   updateLayout(
     windowId: string,
     layout: WindowLayoutSnapshot,
-    browserContentBounds: Rectangle | null = null,
   ): void {
     const record = this.#records.get(windowId);
     if (!record || !record.visible || !record.state) return;
-    record.layout = layout;
-    record.browserContentBounds = browserContentBounds ? { ...browserContentBounds } : null;
     // rightPaneBounds 是几何轨道，即使右栏当前折叠也会存在；可见性必须
     // 由 rightPaneVisible 判断。切换到其他面板时，浏览器弹出层也必须
     // 立即关闭，避免旧菜单留在主 Renderer 之外继续拦截输入。
     const browserOverlay = record.state.ownerId.startsWith("browser:");
-    if (
+    const geometry = resolveCurrentOverlayGeometry(record.state, layout);
+    const shouldClose = (
       !layout.rightPaneVisible
       || (browserOverlay && layout.activePanelKind !== "browser")
       || (browserOverlay && layout.activeTabId !== record.state.ownerId.slice("browser:".length))
-      || (record.state.kind === "annotation" && !record.browserContentBounds)
-    ) {
+    );
+    if (shouldClose) {
       this.close(windowId);
       return;
     }
+    record.layout = layout;
+    if (!geometry) {
+      record.geometryAvailable = false;
+      this.clearOverlayBounds(record);
+      this.syncVisibility(record);
+      return;
+    }
+    record.geometryAvailable = true;
     this.mountOnLayer(record);
-    this.setOverlayBounds(record, overlayBounds(layout, record.state, record.browserContentBounds));
+    this.setOverlayBounds(record, geometry.bounds);
     this.syncVisibility(record);
+    // 几何帧可能晚于 Overlay Renderer 的 ready 握手到达。此时仅切换
+    // 可见性会留下一个已加载但没有状态的空 View，后续也不会再触发
+    // did-finish-load/ready。几何确认和状态发布必须属于同一个提交点。
+    if (record.loaded && record.ready) this.publishState(record);
   }
 
   handleAction(windowId: string, action: DesktopOverlayAction): void {
     const record = this.#records.get(windowId);
     const state = record?.state;
     if (!record || !record.visible || !state) return;
-    const knownAction = (
-      state.items.some((item) => item.id === action.id && !item.disabled)
-      || state.fields.some((field) => field.id === action.id)
-      || (state.kind === "annotation" && ["selection", "save", "cancel"].includes(action.id))
-    );
+    const knownAction = state.fields.some((field) => field.id === action.id)
+      || state.items.some((item) => item.id === action.id)
+      || ["selection", "save", "cancel"].includes(action.id);
     if (
       action.overlayId !== state.overlayId
       || action.kind !== state.kind
@@ -301,10 +425,15 @@ export class DesktopOverlayManager {
     if (!record) return;
     record.visible = false;
     record.state = null;
-    record.browserContentBounds = null;
+    record.geometryAvailable = false;
+    record.layout = null;
     this.syncVisibility(record);
     if (!record.window.isDestroyed() && record.mounted) {
-      record.layer.removeChildView(record.view);
+      try {
+        record.contentRoot.removeChildView(record.view);
+      } catch {
+        // 窗口销毁与关闭动作可能交错到达，移除必须幂等。
+      }
       record.mounted = false;
     }
     if (!record.view.webContents.isDestroyed()) record.view.webContents.close();
@@ -322,9 +451,75 @@ export class DesktopOverlayManager {
       || !record.loaded
       || !record.ready
       || record.loadFailed
+      || !record.geometryAvailable
       || record.view.webContents.isDestroyed()
     ) return;
     record.view.webContents.send("magi-desktop:overlay-state", record.state);
+  }
+
+  private scheduleViewportApply(record: OverlayRecord): void {
+    record.viewportApplyDirty = true;
+    if (
+      record.window.isDestroyed()
+      || record.view.webContents.isDestroyed()
+      || !record.loaded
+      || record.loadFailed
+    ) return;
+    if (record.viewportApplyPromise) return;
+    const apply = this.flushViewportApply(record);
+    const settled = apply.finally(() => {
+      if (record.viewportApplyPromise === settled) record.viewportApplyPromise = null;
+      if (!record.window.isDestroyed() && record.loaded && !record.loadFailed && record.viewportApplyDirty) {
+        this.scheduleViewportApply(record);
+      }
+    });
+    record.viewportApplyPromise = settled;
+    void settled.catch((error) => {
+      if (!record.window.isDestroyed()) {
+        console.warn("[DesktopOverlayManager] Overlay viewport 同步失败", {
+          windowId: record.windowId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  private async flushViewportApply(record: OverlayRecord): Promise<void> {
+    while (record.viewportApplyDirty) {
+      record.viewportApplyDirty = false;
+      if (
+        record.window.isDestroyed()
+        || record.view.webContents.isDestroyed()
+        || !record.loaded
+        || record.loadFailed
+        || !record.geometryAvailable
+      ) return;
+      const bounds = record.view.getBounds();
+      if (bounds.width <= 0 || bounds.height <= 0) return;
+      if (record.viewportAppliedBounds && sameBounds(record.viewportAppliedBounds, bounds)) return;
+      // 单独的 Overlay WebContents 与 App Renderer、网页 WebContents 隔离。
+      // 这里同步它自身的真实弹层 viewport，避免菜单按整窗默认 800x600
+      // 布局后再被原生 bounds 裁切，从而看起来没有吸附到触发按钮。
+      const debuggerApi = record.view.webContents.debugger;
+      if (!debuggerApi) return;
+      if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
+      const width = Math.round(bounds.width);
+      const height = Math.round(bounds.height);
+      await debuggerApi.sendCommand("Emulation.setDeviceMetricsOverride", {
+        width,
+        height,
+        deviceScaleFactor: 1,
+        mobile: false,
+        scale: 1,
+        screenWidth: width,
+        screenHeight: height,
+        screenOrientation: {
+          type: width > height ? "landscapePrimary" : "portraitPrimary",
+          angle: width > height ? 90 : 0,
+        },
+      });
+      record.viewportAppliedBounds = { ...bounds };
+    }
   }
 
   private async loadRenderer(record: OverlayRecord): Promise<void> {
@@ -333,6 +528,8 @@ export class DesktopOverlayManager {
     record.loaded = false;
     record.ready = false;
     record.loadFailed = false;
+    record.geometryAvailable = false;
+    record.viewportAppliedBounds = null;
     const load = (async () => {
       try {
         await record.view.webContents.loadURL(this.rendererUrl(record.windowId));
@@ -340,6 +537,7 @@ export class DesktopOverlayManager {
         record.loaded = true;
         record.loadFailed = false;
         this.syncVisibility(record);
+        this.scheduleViewportApply(record);
         if (record.state && record.visible && record.ready) this.publishState(record);
       } catch {
         if (record.window.isDestroyed() || record.view.webContents.isDestroyed()) return;
@@ -363,36 +561,43 @@ export class DesktopOverlayManager {
       && record.loaded
       && record.ready
       && !record.loadFailed
+      && record.geometryAvailable
     );
     // Electron 的原生 View 即使设为不可见，也可能继续参与父窗口的命中测试。
-    // OverlayLayer 是 App Renderer 的最后一层，隐藏时必须同时收敛为零尺寸，
-    // 确保启动阶段、关闭弹层和 Renderer 恢复期间不会挡住整窗 DOM。
+    // 隐藏时必须收敛为零尺寸；真正关闭时 closeRecord 还会将它从 contentView
+    // 移除，确保不会挡住 App Renderer。
     if (!visible) {
-      record.layer.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+      record.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+      record.viewportAppliedBounds = null;
     }
-    record.layer.setVisible(visible);
     record.view.setVisible(visible);
-    if (visible && !record.view.webContents.isFocused()) record.view.webContents.focus();
+    // 布局事务只负责合成层的可见性和 bounds，不能隐式改变焦点归属。
+    // 这里抢焦点会在右栏拖动、菜单重排或页面加载时把键盘输入从对话框
+    // 或浏览器地址栏转移到 Overlay WebContents，造成“点击后输入跑错位置”。
   }
 
   private setOverlayBounds(record: OverlayRecord, bounds: Rectangle): void {
-    // OverlayLayer 只覆盖真实弹层区域，避免一个可见的整窗父层拦截
-    // App Renderer 在弹层之外的鼠标事件。子视图使用父层内坐标。
-    record.layer.setBounds(bounds);
-    record.view.setBounds({ x: 0, y: 0, width: bounds.width, height: bounds.height });
+    // Overlay 直接挂在 contentView 的第 2 层，因此必须使用 Renderer 提交的
+    // 窗口坐标。不能再把菜单坐标转换成中间 Layer 的局部坐标，否则菜单会从
+    // 按钮下方漂移，且其 Chromium viewport 会退回默认窗口尺寸。
+    if (!sameBounds(record.view.getBounds(), bounds)) record.view.setBounds(bounds);
+    this.scheduleViewportApply(record);
+  }
+
+  private clearOverlayBounds(record: OverlayRecord): void {
+    record.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    record.viewportAppliedBounds = null;
   }
 
   private mountOnLayer(record: OverlayRecord): void {
     if (record.window.isDestroyed()) return;
     if (!record.mounted) {
-      // Overlay WebContentsView 只允许作为 OverlayLayer 的子视图存在，
-      // 这样它不会绕过主 Renderer 的右栏框架。
-      record.layer.addChildView(record.view);
+      // Overlay WebContentsView 与 Browser Surface 同为 contentView 的直接
+      // 子视图。第 2 层保证菜单和标记覆盖网页，第 0 层仍由 App Renderer
+      // 管理右栏 Tab 栏、工具栏与其他功能面板。
+      record.contentRoot.addChildView(record.view, 2);
       record.mounted = true;
     }
-    // OverlayLayer 在 WindowManager 创建窗口时就以固定的最后层级挂在
-    // contentView 上。这里只挂载 Overlay WebContentsView，不重新插入
-    // OverlayLayer，避免原生层级在窗口拖动/重排时被重复重建。
   }
 
   private rendererUrl(windowId: string): string {
@@ -424,67 +629,59 @@ export class DesktopOverlayManager {
   }
 }
 
-function overlayBoundsForRecord(record: OverlayRecord): Rectangle {
-  if (!record.layout || !record.state) {
-    return { x: 0, y: 0, width: 0, height: 0 };
-  }
-  return overlayBounds(record.layout, record.state, record.browserContentBounds);
-}
-
-function overlayBounds(
-  layout: WindowLayoutSnapshot,
+export function resolveCurrentOverlayGeometry(
   state: DesktopOverlayState,
-  browserContentBounds: Rectangle | null,
-): Rectangle {
-  // 标记选择和备注编辑都属于当前页面内容，不是顶部菜单。二者使用同一
-  // Browser 内容槽，选择框与最终截图才会保持相同坐标系。
-  if (state.kind === "annotation") {
-    if (!browserContentBounds) throw new Error("desktop_overlay_browser_content_unavailable");
-    return { ...browserContentBounds };
+  layout: WindowLayoutSnapshot,
+): { bounds: Rectangle } | null {
+  const frame = layout.rendererGeometry;
+  // Renderer 是右栏结构的唯一事实来源。Overlay 只绑定它声明的容器矩形，
+  // Main 不推导菜单宽度、高度或 anchor 偏移。
+  const parent = frame?.rightPaneBounds;
+  if (!layout.rightPaneVisible || !parent) return null;
+  if (state.kind === "menu") {
+    const bounds = state.popupBounds;
+    if (!bounds) return null;
+    if (!isContainedByLayout(layout, bounds)) return null;
+    return { bounds: { ...bounds } };
   }
-  const pane = layout.rightPaneBounds;
-  if (!pane) throw new Error("desktop_overlay_right_pane_unavailable");
-  const anchor = state.anchorBounds;
-  if (!anchor) throw new Error("desktop_overlay_anchor_unavailable");
-  // Overlay 必须完全落在右栏几何区域内。固定最小宽度在极窄窗口下会
-  // 让菜单越过右栏边界，遮住中间面板；宽度不足时由菜单自身滚动和换行。
-  const width = Math.min(
-    OVERLAY_WIDTH[state.placement],
-    Math.max(1, pane.width - 8),
-  );
-  const itemHeight = 36;
-  const fieldHeight = 60;
-  // 字段在 Renderer 中是两列网格；按字段数量直接累加会把同一行的
-  // 宽度/高度输入重复计算，导致弹层底部出现一整块无意义留白。
-  const fieldRows = Math.ceil(state.fields.length / 2);
-  const contentHeight = state.items.length * itemHeight
-    + fieldRows * fieldHeight
-    + (state.items.length > 0 && state.fields.length > 0 ? 7 : 0)
-    + 12;
-  // 菜单按真实内容计算高度，视口菜单不会出现多余标题和滚动条；
-  // 内容超过右栏高度时，其他菜单仍可无滚动条访问其内容。
-  const height = Math.min(
-    380,
-    Math.max(1, pane.height - 16),
-    Math.max(80, contentHeight),
-  );
-  const paneRight = pane.x + pane.width;
-  const paneBottom = pane.y + pane.height;
-  const horizontalInset = Math.min(4, Math.max(0, (pane.width - width) / 2));
-  const verticalInset = Math.min(4, Math.max(0, (pane.height - height) / 2));
-  const x = clamp(
-    anchor.x + anchor.width - width,
-    pane.x + horizontalInset,
-    paneRight - width - horizontalInset,
-  );
-  const below = anchor.y + anchor.height + 4;
-  const above = anchor.y - height - 4;
-  const y = below + height <= paneBottom - verticalInset
-    ? below
-    : clamp(above, pane.y + verticalInset, paneBottom - height - verticalInset);
-  return { x, y, width, height };
+  if (!state.ownerId.startsWith("browser:")) return null;
+  const browserTabId = state.ownerId.slice("browser:".length);
+  if (
+    layout.activePanelKind !== "browser"
+    || layout.activeTabId !== browserTabId
+    || !layout.activeSurfaceId
+  ) return null;
+
+  // 原生 Overlay 只承担需要覆盖真实网页像素的标记流程，几何完全等于
+  // Renderer 已提交的当前 Tab 内容槽，不再由 Main 推导任何浮层尺寸。
+  const slot = frame?.browserContentSlot;
+  if (!slot || slot.tabId !== browserTabId) return null;
+  const bounds: Rectangle = { ...slot.bounds };
+  if (!isContainedByLayout(layout, bounds)) return null;
+  return { bounds };
 }
 
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(Math.max(minimum, maximum), Math.max(minimum, value));
+function isContainedByLayout(
+  layout: WindowLayoutSnapshot,
+  bounds: Rectangle,
+): boolean {
+  return Boolean(layout.rightPaneBounds)
+    && containsRectangle(layout.appBounds, bounds)
+    && containsRectangle(layout.rightPaneBounds!, bounds);
+}
+
+function containsRectangle(outer: Rectangle, inner: Rectangle): boolean {
+  return inner.x >= outer.x
+    && inner.y >= outer.y
+    && inner.width > 0
+    && inner.height > 0
+    && inner.x + inner.width <= outer.x + outer.width
+    && inner.y + inner.height <= outer.y + outer.height;
+}
+
+function sameBounds(left: Rectangle, right: Rectangle): boolean {
+  return left.x === right.x
+    && left.y === right.y
+    && left.width === right.width
+    && left.height === right.height;
 }

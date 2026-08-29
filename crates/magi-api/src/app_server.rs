@@ -56,6 +56,8 @@ const EVENT_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
 const MIN_REQUEST_TIMEOUT_MS: u64 = 100;
 const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
+const BROWSER_CANCELLATION_SETTLEMENT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 fn typed_success<T: Serialize>(request_id: RequestId, result: T) -> ServerResponse {
     match typed_response(request_id.clone(), result) {
@@ -101,6 +103,9 @@ struct RequestControl {
     cancelled: Arc<AtomicBool>,
     notify: Arc<Notify>,
     termination: Arc<AtomicU8>,
+    browser_execution_phase: Arc<AtomicU8>,
+    browser_commit_state: Arc<std::sync::Mutex<BrowserToolCommitState>>,
+    browser_settlement: Arc<std::sync::Mutex<Option<Arc<BrowserToolItemWriter>>>>,
 }
 
 #[repr(u8)]
@@ -111,27 +116,66 @@ enum RequestTermination {
     TimedOut = 2,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserExecutionPhase {
+    NotStarted = 0,
+    Started = 1,
+    CancelledBeforeStart = 2,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BrowserToolCommitState {
+    Open,
+    Committed,
+}
+
 impl RequestControl {
     fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             termination: Arc::new(AtomicU8::new(RequestTermination::None as u8)),
+            browser_execution_phase: Arc::new(AtomicU8::new(
+                BrowserExecutionPhase::NotStarted as u8,
+            )),
+            browser_commit_state: Arc::new(std::sync::Mutex::new(BrowserToolCommitState::Open)),
+            browser_settlement: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     fn cancel(&self) {
+        let _commit_guard = self
+            .browser_commit_state
+            .lock()
+            .expect("浏览器工具提交锁不能中毒");
         if !self.cancelled.swap(true, Ordering::SeqCst) {
             self.termination
                 .store(RequestTermination::Cancelled as u8, Ordering::SeqCst);
+            let _ = self.browser_execution_phase.compare_exchange(
+                BrowserExecutionPhase::NotStarted as u8,
+                BrowserExecutionPhase::CancelledBeforeStart as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             self.notify.notify_waiters();
         }
     }
 
     fn timeout(&self) {
+        let _commit_guard = self
+            .browser_commit_state
+            .lock()
+            .expect("浏览器工具提交锁不能中毒");
         if !self.cancelled.swap(true, Ordering::SeqCst) {
             self.termination
                 .store(RequestTermination::TimedOut as u8, Ordering::SeqCst);
+            let _ = self.browser_execution_phase.compare_exchange(
+                BrowserExecutionPhase::NotStarted as u8,
+                BrowserExecutionPhase::CancelledBeforeStart as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             self.notify.notify_waiters();
         }
     }
@@ -146,6 +190,37 @@ impl RequestControl {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn try_start_browser_execution(&self) -> bool {
+        self.browser_execution_phase
+            .compare_exchange(
+                BrowserExecutionPhase::NotStarted as u8,
+                BrowserExecutionPhase::Started as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn browser_execution_started(&self) -> bool {
+        self.browser_execution_phase.load(Ordering::SeqCst) == BrowserExecutionPhase::Started as u8
+    }
+
+    fn register_browser_settlement(&self, settlement: Arc<BrowserToolItemWriter>) {
+        *self
+            .browser_settlement
+            .lock()
+            .expect("浏览器工具结算锁不能中毒") = Some(settlement);
+    }
+
+    fn settle_browser_tool(&self) -> Option<BrowserToolSettlement> {
+        let settlement = self
+            .browser_settlement
+            .lock()
+            .expect("浏览器工具结算锁不能中毒")
+            .clone()?;
+        Some(settlement.settle())
     }
 }
 
@@ -422,10 +497,7 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                     .await
                                     .insert(request.id.clone(), control.clone());
                                 let request_id_for_cleanup = request.id.clone();
-                                let side_effecting = matches!(
-                                    request.method.as_str(),
-                                    "browser/tool" | "approval/request"
-                                );
+                                let approval_request = request.method == "approval/request";
                                 let browser_tool_request = request.method == "browser/tool";
                                 let browser_timeout_retryable = browser_tool_retryable(&request);
                                 request_tasks.spawn(async move {
@@ -448,39 +520,74 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
                                     });
                                     let mut dispatch_task = dispatch_task;
                                     let response = if control.is_cancelled() {
-                                        if !side_effecting {
+                                        if browser_tool_request {
+                                            finish_browser_request_after_termination(
+                                                &mut dispatch_task,
+                                                &control,
+                                                request_id,
+                                                browser_timeout_retryable,
+                                            )
+                                            .await
+                                        } else {
+                                            if !approval_request {
                                             dispatch_task.abort();
-                                        }
-                                        error_response(
-                                            request_id,
-                                            ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消")
+                                            }
+                                            error_response(
+                                                request_id,
+                                                ErrorObject::new(
+                                                    ERROR_REQUEST_CANCELLED,
+                                                    "请求已取消",
+                                                )
                                                 .retryable(false),
-                                        )
+                                            )
+                                        }
                                     } else {
                                         tokio::select! {
                                             biased;
                                             _ = control.notify.notified() => {
-                                                if !side_effecting {
+                                                if browser_tool_request {
+                                                    finish_browser_request_after_termination(
+                                                        &mut dispatch_task,
+                                                        &control,
+                                                        request_id.clone(),
+                                                        browser_timeout_retryable,
+                                                    )
+                                                    .await
+                                                } else {
+                                                    if !approval_request {
                                                     dispatch_task.abort();
-                                                }
-                                                error_response(
-                                                    request_id.clone(),
-                                                    ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消")
+                                                    }
+                                                    error_response(
+                                                        request_id.clone(),
+                                                        ErrorObject::new(
+                                                            ERROR_REQUEST_CANCELLED,
+                                                            "请求已取消",
+                                                        )
                                                         .retryable(false),
-                                                )
+                                                    )
+                                                }
                                             }
                                             _ = tokio::time::sleep(request_timeout) => {
                                                 control.timeout();
-                                                if !side_effecting {
-                                                    dispatch_task.abort();
-                                                }
-                                                let error = if browser_tool_request {
-                                                    browser_timeout_error(browser_timeout_retryable)
+                                                if browser_tool_request {
+                                                    finish_browser_request_after_termination(
+                                                        &mut dispatch_task,
+                                                        &control,
+                                                        request_id.clone(),
+                                                        browser_timeout_retryable,
+                                                    )
+                                                    .await
                                                 } else {
-                                                    ErrorObject::new(ERROR_REQUEST_TIMEOUT, "请求执行超时")
-                                                        .retryable(true)
-                                                };
-                                                error_response(request_id.clone(), error)
+                                                    if !approval_request {
+                                                    dispatch_task.abort();
+                                                    }
+                                                    let error = ErrorObject::new(
+                                                        ERROR_REQUEST_TIMEOUT,
+                                                        "请求执行超时",
+                                                    )
+                                                    .retryable(true);
+                                                    error_response(request_id.clone(), error)
+                                                }
                                             }
                                             result = &mut dispatch_task => {
                                                 match result {
@@ -882,6 +989,35 @@ async fn dispatch_request(
     }
 }
 
+async fn finish_browser_request_after_termination(
+    dispatch_task: &mut tokio::task::JoinHandle<magi_app_server_protocol::ServerResponse>,
+    control: &RequestControl,
+    request_id: RequestId,
+    retryable: bool,
+) -> magi_app_server_protocol::ServerResponse {
+    match tokio::time::timeout(BROWSER_CANCELLATION_SETTLEMENT_TIMEOUT, &mut *dispatch_task).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let settlement = control.settle_browser_tool();
+            if settlement.is_some() {
+                browser_termination_response(request_id, control, settlement, retryable)
+            } else {
+                error_response(
+                    request_id,
+                    ErrorObject::new(ERROR_INTERNAL, format!("请求任务异常结束: {error}")),
+                )
+            }
+        }
+        Err(_) => {
+            // 取消边界到期后，dispatch 不再拥有写回权。browser/tool 的
+            // 一次性提交器会先结算 indeterminate，再丢弃迟到的运行结果。
+            dispatch_task.abort();
+            let settlement = control.settle_browser_tool();
+            browser_termination_response(request_id, control, settlement, retryable)
+        }
+    }
+}
+
 async fn list_browser_tools(
     state: &ApiState,
     request_id: RequestId,
@@ -913,6 +1049,8 @@ async fn list_browser_tools(
             json!({
                 "name": tool.name(),
                 "access": tool.catalog_access(),
+                "description": tool.description(),
+                "inputSchema": tool.input_schema(),
             })
         })
         .collect::<Vec<_>>();
@@ -927,11 +1065,177 @@ async fn list_browser_tools(
     )
 }
 
+#[derive(Clone)]
 struct BrowserToolTurnContext {
     session_id: SessionId,
     turn_id: String,
     source_thread_id: ThreadId,
     item_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrowserToolSettlement {
+    status: &'static str,
+}
+
+#[derive(Clone)]
+struct BrowserToolItemWriter {
+    state: ApiState,
+    turn_context: BrowserToolTurnContext,
+    cancelled: Arc<AtomicBool>,
+    termination: Arc<AtomicU8>,
+    browser_execution_phase: Arc<AtomicU8>,
+    browser_commit_state: Arc<std::sync::Mutex<BrowserToolCommitState>>,
+    request_id: RequestId,
+    call_id: String,
+    tool: String,
+    arguments: String,
+    execution_context: magi_tool_runtime::ToolExecutionContext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserToolCommit {
+    Committed { status: &'static str },
+    AlreadyCommitted,
+}
+
+impl BrowserToolItemWriter {
+    fn cancellation_result(&self) -> (&'static str, String) {
+        let status = if self.browser_execution_phase.load(Ordering::SeqCst)
+            == BrowserExecutionPhase::Started as u8
+        {
+            "indeterminate"
+        } else {
+            "cancelled"
+        };
+        let termination = match self.termination.load(Ordering::SeqCst) {
+            value if value == RequestTermination::TimedOut as u8 => RequestTermination::TimedOut,
+            value if value == RequestTermination::Cancelled as u8 => RequestTermination::Cancelled,
+            _ => RequestTermination::None,
+        };
+        let (code, message) = match (status, termination) {
+            ("indeterminate", RequestTermination::TimedOut) => (
+                "request_timeout",
+                "浏览器副作用执行超时，状态不确定，禁止自动重放",
+            ),
+            ("indeterminate", _) => (
+                "request_cancelled",
+                "浏览器副作用执行已取消，状态不确定，禁止自动重放",
+            ),
+            (_, RequestTermination::TimedOut) => ("request_timeout", "浏览器操作尚未开始即超时"),
+            (_, _) => ("request_cancelled", "浏览器操作尚未开始即取消"),
+        };
+        (
+            status,
+            json!({
+                "status": status,
+                "code": code,
+                "message": message,
+            })
+            .to_string(),
+        )
+    }
+
+    fn settle(&self) -> BrowserToolSettlement {
+        let (status, payload) = self.cancellation_result();
+        match self.commit(&payload, status) {
+            Ok(BrowserToolCommit::Committed { status }) => BrowserToolSettlement { status },
+            Ok(BrowserToolCommit::AlreadyCommitted) => BrowserToolSettlement { status },
+            Err(error) => {
+                tracing::error!(
+                    request_id = ?self.request_id,
+                    %error.message,
+                    "浏览器工具取消结算写入失败"
+                );
+                BrowserToolSettlement { status }
+            }
+        }
+    }
+
+    fn commit(
+        &self,
+        payload: &str,
+        status_value: &'static str,
+    ) -> Result<BrowserToolCommit, ErrorObject> {
+        let mut commit_state = self
+            .browser_commit_state
+            .lock()
+            .expect("浏览器工具提交锁不能中毒");
+        if *commit_state == BrowserToolCommitState::Committed {
+            return Ok(BrowserToolCommit::AlreadyCommitted);
+        }
+
+        let (status_value, payload) = if self.cancelled.load(Ordering::SeqCst) {
+            self.cancellation_result()
+        } else {
+            (status_value, payload.to_string())
+        };
+        let item = ActiveExecutionTurnItem {
+            item_id: self.turn_context.item_id.clone(),
+            item_seq: 0,
+            kind: "tool_call_result".to_string(),
+            status: status_value.to_string(),
+            source: "browser".to_string(),
+            title: Some(self.tool.clone()),
+            content: None,
+            task_id: self.execution_context.task_id.clone(),
+            worker_id: self.execution_context.worker_id.clone(),
+            role_id: None,
+            tool_call_id: Some(self.call_id.clone()),
+            tool_name: Some(self.tool.clone()),
+            tool_status: Some(status_value.to_string()),
+            tool_arguments: Some(self.arguments.clone()),
+            tool_result: matches!(status_value, "completed" | "cancelled")
+                .then_some(payload.clone()),
+            tool_error: (!matches!(status_value, "completed" | "cancelled")).then_some(payload),
+            request_id: Some(self.request_id.as_str().to_string()),
+            user_message_id: None,
+            placeholder_message_id: None,
+            metadata: std::collections::HashMap::from([
+                ("source".to_string(), json!("browser")),
+                ("browserTool".to_string(), json!(self.tool)),
+            ]),
+            timeline_entry_id: None,
+            source_thread_id: self.turn_context.source_thread_id.clone(),
+        };
+        let updated = match self.state.session_store.upsert_current_turn_item_for_turn(
+            &self.turn_context.session_id,
+            Some(&self.turn_context.turn_id),
+            item,
+        ) {
+            Ok(updated) => updated,
+            Err(error) => {
+                return Err(match error {
+                    magi_core::DomainError::CurrentTurnConflict { .. } => ErrorObject::new(
+                        ERROR_REQUEST_CONFLICT,
+                        format!("浏览器工具结果归属的 Turn 已变化: {error}"),
+                    )
+                    .retryable(true),
+                    error => ErrorObject::new(
+                        ERROR_INTERNAL,
+                        format!("浏览器工具结果 Item 写入失败: {error}"),
+                    ),
+                });
+            }
+        };
+        if updated.is_none() {
+            return Err(ErrorObject::new(
+                ERROR_REQUEST_CONFLICT,
+                "浏览器工具结果写入时 Turn 已结束",
+            )
+            .retryable(true));
+        }
+        *commit_state = BrowserToolCommitState::Committed;
+        publish_browser_tool_item(
+            &self.state,
+            &self.turn_context.session_id,
+            &self.turn_context.turn_id,
+            &self.turn_context.item_id,
+        );
+        Ok(BrowserToolCommit::Committed {
+            status: status_value,
+        })
+    }
 }
 
 fn browser_tool_turn_context(
@@ -1115,48 +1419,74 @@ async fn execute_browser_tool(
         ..magi_tool_runtime::ToolExecutionContext::default()
     };
     let tool = params.tool.trim().to_string();
-    let tool_for_item = tool.clone();
-    let tool_for_runtime = tool.clone();
+    let retryable = browser_tool_name_retryable(&tool);
     let arguments =
         serde_json::to_string(&params.arguments).expect("浏览器工具 arguments 必须可序列化");
-    let arguments_for_runtime = arguments.clone();
-    let cancelled_before_execution = control.is_cancelled();
-    let (payload, status) = if cancelled_before_execution {
-        (
-            json!({"status": "cancelled", "code": "request_cancelled", "message": "请求已取消"})
-                .to_string(),
-            ExecutionResultStatus::Cancelled,
+    let writer = Arc::new(BrowserToolItemWriter {
+        state: state.clone(),
+        turn_context,
+        cancelled: control.cancelled.clone(),
+        termination: control.termination.clone(),
+        browser_execution_phase: control.browser_execution_phase.clone(),
+        browser_commit_state: control.browser_commit_state.clone(),
+        request_id: request_id.clone(),
+        call_id: call_id.clone(),
+        tool: tool.clone(),
+        arguments: arguments.clone(),
+        execution_context: context.clone(),
+    });
+    control.register_browser_settlement(writer.clone());
+
+    if !control.try_start_browser_execution() {
+        let settlement = control.settle_browser_tool();
+        return browser_termination_response(request_id, &control, settlement, retryable);
+    }
+
+    let runtime = state.browser_tool_runtime_dependencies();
+    let call_id_for_runtime = ToolCallId::new(call_id);
+    let context_for_runtime = context;
+    let tool_for_runtime = tool.clone();
+    let arguments_for_runtime = arguments;
+    let mut blocking_task = tokio::task::spawn_blocking(move || {
+        runtime.execute(
+            &call_id_for_runtime,
+            &tool_for_runtime,
+            &arguments_for_runtime,
+            &context_for_runtime,
         )
-    } else {
-        let runtime = state.browser_tool_runtime_dependencies();
-        let call_id_for_runtime = ToolCallId::new(call_id.clone());
-        let context_for_runtime = context.clone();
-        match tokio::task::spawn_blocking(move || {
-            runtime.execute(
-                &call_id_for_runtime,
-                &tool_for_runtime,
-                &arguments_for_runtime,
-                &context_for_runtime,
-            )
-        })
-        .await
-        {
+    });
+
+    if control.is_cancelled() {
+        blocking_task.abort();
+        let settlement = control.settle_browser_tool();
+        return browser_termination_response(request_id, &control, settlement, retryable);
+    }
+
+    let (payload, status) = tokio::select! {
+        biased;
+        _ = control.notify.notified() => {
+            blocking_task.abort();
+            let settlement = control.settle_browser_tool();
+            return browser_termination_response(request_id, &control, settlement, retryable);
+        }
+        result = &mut blocking_task => match result {
             Ok(result) => result,
             Err(error) => (
-                json!({"status": "failed", "code": "browser_runtime_join_failed", "message": error.to_string()}).to_string(),
+                json!({
+                    "status": "failed",
+                    "code": "browser_runtime_join_failed",
+                    "message": error.to_string()
+                })
+                .to_string(),
                 ExecutionResultStatus::Failed,
             ),
         }
     };
-    let status_value = if cancelled_before_execution {
-        "cancelled"
-    } else {
-        match status {
-            ExecutionResultStatus::Succeeded => "completed",
-            ExecutionResultStatus::NeedsApproval => "blocked",
-            ExecutionResultStatus::Cancelled => "cancelled",
-            ExecutionResultStatus::Rejected | ExecutionResultStatus::Failed => "failed",
-        }
+    let status_value = match status {
+        ExecutionResultStatus::Succeeded => "completed",
+        ExecutionResultStatus::NeedsApproval => "blocked",
+        ExecutionResultStatus::Cancelled => "cancelled",
+        ExecutionResultStatus::Rejected | ExecutionResultStatus::Failed => "failed",
     };
     let status_value = if status_value == "failed"
         && serde_json::from_str::<Value>(&payload)
@@ -1168,72 +1498,18 @@ async fn execute_browser_tool(
     } else {
         status_value
     };
-    let item = ActiveExecutionTurnItem {
-        item_id: turn_context.item_id.clone(),
-        item_seq: 0,
-        kind: "tool_call_result".to_string(),
-        status: status_value.to_string(),
-        source: "browser".to_string(),
-        title: Some(tool_for_item.clone()),
-        content: None,
-        task_id: context.task_id.clone(),
-        worker_id: context.worker_id.clone(),
-        role_id: None,
-        tool_call_id: Some(call_id),
-        tool_name: Some(tool_for_item),
-        tool_status: Some(status_value.to_string()),
-        tool_arguments: Some(arguments.clone()),
-        tool_result: matches!(status_value, "completed" | "cancelled").then_some(payload.clone()),
-        tool_error: (!matches!(status_value, "completed" | "cancelled")).then_some(payload.clone()),
-        request_id: Some(request_id.as_str().to_string()),
-        user_message_id: None,
-        placeholder_message_id: None,
-        metadata: std::collections::HashMap::from([
-            ("source".to_string(), json!("browser")),
-            ("browserTool".to_string(), json!(tool)),
-        ]),
-        timeline_entry_id: None,
-        source_thread_id: turn_context.source_thread_id,
+    let commit = match writer.commit(&payload, status_value) {
+        Ok(commit) => commit,
+        Err(error) => return error_response(request_id, error),
     };
-    let updated = match state.session_store.upsert_current_turn_item_for_turn(
-        &turn_context.session_id,
-        Some(&turn_context.turn_id),
-        item,
-    ) {
-        Ok(updated) => updated,
-        Err(error) => {
-            let protocol_error = match error {
-                magi_core::DomainError::CurrentTurnConflict { .. } => ErrorObject::new(
-                    ERROR_REQUEST_CONFLICT,
-                    format!("浏览器工具结果归属的 Turn 已变化: {error}"),
-                )
-                .retryable(true),
-                error => ErrorObject::new(
-                    ERROR_INTERNAL,
-                    format!("浏览器工具结果 Item 写入失败: {error}"),
-                ),
-            };
-            return error_response(request_id, protocol_error);
-        }
+    let BrowserToolCommit::Committed {
+        status: status_value,
+    } = commit
+    else {
+        return browser_termination_response(request_id, &control, None, retryable);
     };
-    if updated.is_none() {
-        return error_response(
-            request_id,
-            ErrorObject::new(ERROR_REQUEST_CONFLICT, "浏览器工具结果写入时 Turn 已结束")
-                .retryable(true),
-        );
-    }
-    publish_browser_tool_item(
-        state,
-        &turn_context.session_id,
-        &turn_context.turn_id,
-        &turn_context.item_id,
-    );
-    if status_value == "cancelled" {
-        return error_response(
-            request_id,
-            ErrorObject::new(ERROR_REQUEST_CANCELLED, "请求已取消").retryable(false),
-        );
+    if status_value == "cancelled" || status_value == "indeterminate" {
+        return browser_termination_response(request_id, &control, None, retryable);
     }
     typed_success_from_json::<magi_app_server_protocol::BrowserToolResult>(
         request_id,
@@ -1241,8 +1517,8 @@ async fn execute_browser_tool(
             "tool": tool,
             "status": status_value,
             "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::String(payload)),
-            "itemId": turn_context.item_id,
-            "turnId": turn_context.turn_id,
+            "itemId": writer.turn_context.item_id,
+            "turnId": writer.turn_context.turn_id,
             "runtimeEpoch": state.runtime_epoch(),
         }),
         "browser/tool",
@@ -1785,16 +2061,50 @@ fn browser_tool_retryable(request: &ClientRequest) -> bool {
     let Ok(params) = serde_json::from_value::<BrowserToolParams>(request.params.clone()) else {
         return false;
     };
-    let Some(tool) = BrowserToolKind::from_name(params.tool.trim()) else {
-        return false;
-    };
-    matches!(tool.catalog_access(), BrowserToolAccess::Read)
+    browser_tool_name_retryable(params.tool.trim())
 }
 
-fn browser_timeout_error(retryable: bool) -> ErrorObject {
+fn browser_tool_name_retryable(tool_name: &str) -> bool {
+    BrowserToolKind::from_name(tool_name)
+        .is_some_and(|tool| matches!(tool.catalog_access(), BrowserToolAccess::Read))
+}
+
+fn browser_termination_response(
+    request_id: RequestId,
+    control: &RequestControl,
+    settlement: Option<BrowserToolSettlement>,
+    retryable: bool,
+) -> magi_app_server_protocol::ServerResponse {
+    match control.termination() {
+        RequestTermination::TimedOut => {
+            let status = settlement.as_ref().map_or_else(
+                || {
+                    if control.browser_execution_started() {
+                        "indeterminate"
+                    } else {
+                        "cancelled"
+                    }
+                },
+                |settlement| settlement.status,
+            );
+            error_response(request_id, browser_timeout_error(retryable, status))
+        }
+        RequestTermination::Cancelled | RequestTermination::None => {
+            let indeterminate = settlement
+                .as_ref()
+                .is_some_and(|settlement| settlement.status == "indeterminate")
+                || (settlement.is_none() && control.browser_execution_started());
+            error_response(request_id, browser_cancel_error(indeterminate))
+        }
+    }
+}
+
+fn browser_timeout_error(retryable: bool, status: &str) -> ErrorObject {
     let mut error = ErrorObject::new(
         ERROR_REQUEST_TIMEOUT,
-        if retryable {
+        if status == "cancelled" {
+            "浏览器操作尚未开始即超时"
+        } else if retryable {
             "浏览器只读操作执行超时，可以安全重试"
         } else {
             "浏览器操作执行超时，副作用状态不确定，禁止自动重放"
@@ -1802,10 +2112,30 @@ fn browser_timeout_error(retryable: bool) -> ErrorObject {
     )
     .retryable(retryable);
     error.data = Some(json!({
-        "status": "indeterminate",
+        "status": status,
         "operation": "browser/tool",
         "retryable": retryable,
     }));
+    error
+}
+
+fn browser_cancel_error(indeterminate: bool) -> ErrorObject {
+    let mut error = ErrorObject::new(
+        ERROR_REQUEST_CANCELLED,
+        if indeterminate {
+            "请求已取消，浏览器副作用状态不确定，禁止自动重放"
+        } else {
+            "请求已取消"
+        },
+    )
+    .retryable(false);
+    if indeterminate {
+        error.data = Some(json!({
+            "status": "indeterminate",
+            "operation": "browser/tool",
+            "retryable": false,
+        }));
+    }
     error
 }
 

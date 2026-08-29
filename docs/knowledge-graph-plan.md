@@ -249,7 +249,7 @@ GET /api/knowledge/graph
 - 聚焦图不再依赖未指定根节点的力导向布局：以当前知识/焦点节点为中心使用同心层布局，节点按关系距离分层，连接线置于卡片下方并默认隐藏关系文字，仅选中边显示文字；切换审阅队列与独立聚焦视图时通过 `ResizeObserver` 重新适配画布，避免图形偏移或挤在一角。
 - 图谱卡片只显示压缩后的可读标题，完整内容仍保留在节点详情和关系证据中；全局图继续作为缩略总览，聚焦图作为主要阅读入口，避免将 120 个节点强行以同一缩放比例展示。
 - 本次收口已通过 `git diff --check`、`npm --prefix web run check`、`npm --prefix web run build`、知识库与 API 相关 Rust 测试，以及 daemon 主入口的真实图谱局部查询和浏览器验收。
-- 完整 Web golden 测试仍有一个既有基线阻断：`web/scripts/right-pane-golden.mjs` 仍期待旧的 `record.host.addChildView(record.view, 1)` 调用，而当前桌面 Surface 改动已采用新的挂载顺序；该失败与知识图谱改动无关，未回退其他 agent 的桌面改动。
+- 右栏 golden 测试已按当前 Electron 原生 Surface 挂载顺序校验，浏览器内容槽、面板层级和非浏览器面板共存均由同一布局契约覆盖。
 
 ## 5. 首批实现文件
 

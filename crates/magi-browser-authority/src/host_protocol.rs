@@ -3,11 +3,12 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 3;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 4;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostProtocolVersion {
     pub major: u16,
     pub minor: u16,
@@ -21,6 +22,7 @@ impl BrowserHostProtocolVersion {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostProtocolRange {
     pub minimum: BrowserHostProtocolVersion,
     pub maximum: BrowserHostProtocolVersion,
@@ -37,6 +39,7 @@ impl BrowserHostProtocolRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostHandshake {
     pub protocol_version: BrowserHostProtocolVersion,
     pub desktop_version: String,
@@ -48,6 +51,7 @@ pub struct BrowserHostHandshake {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserSurfaceBinding {
     pub desktop_epoch: String,
     pub window_id: String,
@@ -78,21 +82,24 @@ pub struct BrowserNodeSelection {
     pub tab_id: BrowserTabId,
     pub surface_id: String,
     pub navigation_revision: u64,
+    pub browser_session_id: BrowserSessionId,
     pub url: String,
     pub title: String,
-    pub frame_id: String,
+    pub frame_id: Option<String>,
     pub backend_dom_node_id: u64,
-    pub dom_node_id: u64,
+    pub dom_node_id: Option<u64>,
     pub node_name: String,
     pub attributes: std::collections::BTreeMap<String, String>,
     pub text_excerpt: String,
     pub outer_html: String,
+    pub outer_html_truncated: bool,
     pub aria_role: Option<String>,
     pub aria_name: Option<String>,
-    pub bounds: BrowserHostRect,
+    pub bounds: Option<BrowserHostRect>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostRequestEnvelope {
     pub request_id: BrowserCommandId,
     pub protocol_version: BrowserHostProtocolVersion,
@@ -100,7 +107,12 @@ pub struct BrowserHostRequestEnvelope {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum BrowserHostCommand {
     Ping,
     Cancel {
@@ -217,7 +229,7 @@ pub enum BrowserHostCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserHostControl {
     Agent {
         lease_id: BrowserLeaseId,
@@ -237,7 +249,7 @@ impl BrowserHostControl {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserHostControlUpdate {
     Agent {
         lease_id: BrowserLeaseId,
@@ -252,7 +264,7 @@ pub enum BrowserHostControlUpdate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserLogicalViewport {
     Auto,
     Fixed {
@@ -264,12 +276,12 @@ pub enum BrowserLogicalViewport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserNavigation {
     Url {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        handle_before_unload: Option<String>,
+        handle_before_unload: Option<BeforeUnloadAction>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         init_script: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,13 +299,21 @@ pub enum BrowserNavigation {
         #[serde(default)]
         ignore_cache: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        handle_before_unload: Option<String>,
+        handle_before_unload: Option<BeforeUnloadAction>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u32>,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum BeforeUnloadAction {
+    Accept,
+    Dismiss,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserSnapshotLimits {
     pub max_nodes: u32,
     pub max_text_bytes: u32,
@@ -309,13 +329,14 @@ impl Default for BrowserSnapshotLimits {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserSnapshotTarget {
     pub snapshot_revision: u64,
     pub element_ref: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserScreenshotFormat {
     Png,
     Jpeg,
@@ -323,6 +344,7 @@ pub enum BrowserScreenshotFormat {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostResponseEnvelope {
     pub request_id: BrowserCommandId,
     pub protocol_version: BrowserHostProtocolVersion,
@@ -330,7 +352,12 @@ pub struct BrowserHostResponseEnvelope {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum BrowserHostCommandOutcome {
     Succeeded(Box<BrowserHostCommandResult>),
     Failed(BrowserHostCommandError),
@@ -339,7 +366,12 @@ pub enum BrowserHostCommandOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum BrowserHostCommandResult {
     Empty,
     Pong { monotonic_millis: u64 },
@@ -351,6 +383,7 @@ pub enum BrowserHostCommandResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostPageState {
     pub tab_id: BrowserTabId,
     pub url: String,
@@ -360,6 +393,7 @@ pub struct BrowserHostPageState {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostSnapshot {
     pub tab_id: BrowserTabId,
     pub navigation_revision: u64,
@@ -375,6 +409,7 @@ pub struct BrowserHostSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserSnapshotNode {
     pub element_ref: String,
     pub role: Option<String>,
@@ -392,7 +427,7 @@ pub struct BrowserSnapshotNode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserSensitiveInputKind {
     Password,
     OneTimeCode,
@@ -400,6 +435,7 @@ pub enum BrowserSensitiveInputKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostRect {
     pub x: f64,
     pub y: f64,
@@ -408,6 +444,7 @@ pub struct BrowserHostRect {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostBinaryPayload {
     pub payload_id: String,
     pub mime_type: String,
@@ -416,6 +453,7 @@ pub struct BrowserHostBinaryPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostHitTest {
     pub navigation_revision: u64,
     pub viewport_width: u32,
@@ -436,6 +474,7 @@ pub struct BrowserHostHitTest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostCommandError {
     pub code: String,
     pub message: String,
@@ -445,6 +484,7 @@ pub struct BrowserHostCommandError {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserHostEventEnvelope {
     pub protocol_version: BrowserHostProtocolVersion,
     pub sequence: u64,
@@ -452,7 +492,12 @@ pub struct BrowserHostEventEnvelope {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum BrowserHostEvent {
     Ready(BrowserHostHandshake),
     PrimarySurfaceChanged {
@@ -514,6 +559,7 @@ pub enum BrowserHostEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserAgentCursor {
     pub tab_id: BrowserTabId,
     pub visible: bool,
@@ -523,7 +569,7 @@ pub struct BrowserAgentCursor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserAgentCursorAction {
     Move,
     Click,
@@ -551,7 +597,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(handshake).expect("serialize desktop handshake"),
             serde_json::json!({
-                "protocol_version": { "major": 3, "minor": 3 },
+                "protocol_version": { "major": 3, "minor": 4 },
                 "desktop_version": "desktop-test",
                 "electron_version": "electron-test",
                 "chromium_version": "chromium-test",
@@ -624,11 +670,12 @@ mod tests {
             tab_id: BrowserTabId::new("tab-1"),
             surface_id: "surface-1".to_string(),
             navigation_revision: 11,
+            browser_session_id: BrowserSessionId::new("browser-session-1"),
             url: "https://example.com/page".to_string(),
             title: "Example page".to_string(),
-            frame_id: "frame-1".to_string(),
+            frame_id: Some("frame-1".to_string()),
             backend_dom_node_id: 101,
-            dom_node_id: 202,
+            dom_node_id: Some(202),
             node_name: "BUTTON".to_string(),
             attributes: std::collections::BTreeMap::from([
                 ("class".to_string(), "primary".to_string()),
@@ -636,14 +683,15 @@ mod tests {
             ]),
             text_excerpt: "Submit".to_string(),
             outer_html: "<button class=\"primary\">Submit</button>".to_string(),
+            outer_html_truncated: false,
             aria_role: Some("button".to_string()),
             aria_name: Some("Submit".to_string()),
-            bounds: BrowserHostRect {
+            bounds: Some(BrowserHostRect {
                 x: 10.0,
                 y: 20.0,
                 width: 120.0,
                 height: 40.0,
-            },
+            }),
         }
     }
 
@@ -692,6 +740,7 @@ mod tests {
                     "tab_id": "tab-1",
                     "surface_id": "surface-1",
                     "navigation_revision": 11,
+                    "browser_session_id": "browser-session-1",
                     "url": "https://example.com/page",
                     "title": "Example page",
                     "frame_id": "frame-1",
@@ -704,6 +753,7 @@ mod tests {
                     },
                     "text_excerpt": "Submit",
                     "outer_html": "<button class=\"primary\">Submit</button>",
+                    "outer_html_truncated": false,
                     "aria_role": "button",
                     "aria_name": "Submit",
                     "bounds": {
@@ -786,6 +836,111 @@ mod tests {
             serde_json::from_value::<BrowserHostEvent>(node_with_unknown_identity).is_err(),
             "node selection identity must reject legacy or unknown fields"
         );
+    }
+
+    #[test]
+    fn protocol_envelopes_and_named_payloads_reject_unknown_fields() {
+        let mut request = serde_json::to_value(BrowserHostRequestEnvelope {
+            request_id: BrowserCommandId::new("request-1"),
+            protocol_version: BrowserHostProtocolVersion::CURRENT,
+            command: BrowserHostCommand::Ping,
+        })
+        .expect("serialize request");
+        request["extra"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<BrowserHostRequestEnvelope>(request).is_err(),
+            "request envelope must reject unknown fields"
+        );
+
+        let mut response = serde_json::to_value(BrowserHostResponseEnvelope {
+            request_id: BrowserCommandId::new("request-1"),
+            protocol_version: BrowserHostProtocolVersion::CURRENT,
+            outcome: BrowserHostCommandOutcome::Succeeded(Box::new(
+                BrowserHostCommandResult::Empty,
+            )),
+        })
+        .expect("serialize response");
+        response["outcome"]["extra"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<BrowserHostResponseEnvelope>(response).is_err(),
+            "response envelope must reject unknown fields"
+        );
+
+        let mut event = serde_json::to_value(BrowserHostEventEnvelope {
+            protocol_version: BrowserHostProtocolVersion::CURRENT,
+            sequence: 1,
+            event: BrowserHostEvent::Heartbeat {
+                monotonic_millis: 10,
+            },
+        })
+        .expect("serialize event");
+        event["event"]["extra"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<BrowserHostEventEnvelope>(event).is_err(),
+            "event envelope must reject unknown fields"
+        );
+
+        let command = serde_json::json!({
+            "type": "navigate",
+            "payload": {
+                "tab_id": "tab-1",
+                "control": { "mode": "user", "fence": 1 },
+                "navigation": {
+                    "action": "url",
+                    "url": "https://example.com/",
+                    "handle_before_unload": "ask"
+                }
+            }
+        });
+        assert!(
+            serde_json::from_value::<BrowserHostCommand>(command).is_err(),
+            "navigation must reject an unknown beforeunload action"
+        );
+
+        let mut payload = serde_json::json!({
+            "type": "get_logical_viewport",
+            "payload": { "tab_id": "tab-1", "extra": true }
+        });
+        assert!(
+            serde_json::from_value::<BrowserHostCommand>(payload.take()).is_err(),
+            "named command payload must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn beforeunload_action_uses_the_wire_enum_values() {
+        assert_eq!(
+            serde_json::to_value(BeforeUnloadAction::Accept).expect("serialize accept"),
+            serde_json::json!("accept")
+        );
+        assert_eq!(
+            serde_json::from_value::<BeforeUnloadAction>(serde_json::json!("dismiss"))
+                .expect("deserialize dismiss"),
+            BeforeUnloadAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn node_selection_allows_text_nodes_without_frame_dom_id_or_bounds() {
+        let mut value = serde_json::to_value(BrowserHostEvent::NodeSelection(node_selection()))
+            .expect("serialize node selection event");
+        let payload = value["payload"].as_object_mut().expect("payload object");
+        payload.insert("frame_id".to_string(), serde_json::Value::Null);
+        payload.insert("dom_node_id".to_string(), serde_json::Value::Null);
+        payload.insert("bounds".to_string(), serde_json::Value::Null);
+
+        let parsed = serde_json::from_value::<BrowserHostEvent>(value)
+            .expect("nullable node selection fields should deserialize");
+        let BrowserHostEvent::NodeSelection(selection) = parsed else {
+            panic!("expected node selection event");
+        };
+        assert_eq!(
+            selection.browser_session_id,
+            BrowserSessionId::new("browser-session-1")
+        );
+        assert_eq!(selection.frame_id, None);
+        assert_eq!(selection.dom_node_id, None);
+        assert_eq!(selection.bounds, None);
     }
 
     #[test]

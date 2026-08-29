@@ -38,17 +38,12 @@ import {
   buildTimelinePanelMessages,
 } from '../lib/timeline-render-items';
 import {
-  resolveTimelineTurnOrderSeqFromMetadata,
-} from '../shared/timeline-ordering';
-import {
   clearCanonicalSessionTurns,
-  rebindCanonicalSessionTurns,
 } from './turn-store.svelte';
 import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import { shouldUseHostProxyTransport } from '../shared/transport';
-import { parseToolApprovalPayload } from '../lib/tool-error-payload';
 import { hasPendingToolApproval, toolApprovalState } from './tool-approval-store.svelte';
 
 interface SettingsRegistrySnapshot {
@@ -182,9 +177,6 @@ const IS_HOSTED_WEBVIEW = shouldUseHostProxyTransport();
 
 const MAX_PERSISTED_ARRAY_LENGTH = 10000;
 const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
-/** 本地 turnOrderSeq 计数器：发送意图创建时分配，作为 live 渲染轮次事实 */
-let localTimelineTurnOrderSeqCounter = 0;
-
 type ScrollPanelKey = keyof ScrollPositions;
 
 const DEFAULT_SCROLL_ANCHOR: ScrollAnchor = { messageId: null, offsetTop: 0 };
@@ -214,7 +206,7 @@ function normalizeSessionId(value: string | null | undefined): string | null {
 
 export function isPersistedSessionId(value: string | null | undefined): boolean {
   const sessionId = normalizeSessionId(value);
-  return Boolean(sessionId && !sessionId.startsWith('session-local-'));
+  return Boolean(sessionId);
 }
 
 function normalizeWorkspaceId(value: string | null | undefined): string | null {
@@ -341,7 +333,15 @@ function normalizeQueuedMessageBrowserNodeSelection(
     ? Number(item.backendDomNodeId)
     : -1;
   const nodeName = typeof item.nodeName === 'string' ? item.nodeName.trim() : '';
-  if (!browserSessionId || !tabId || !surfaceId || navigationRevision < 0 || backendDomNodeId < 1 || !nodeName) return null;
+  if (
+    !browserSessionId
+    || !tabId
+    || !surfaceId
+    || navigationRevision < 0
+    || backendDomNodeId < 1
+    || !nodeName
+    || typeof item.outerHtmlTruncated !== 'boolean'
+  ) return null;
   const attributes = item.attributes && typeof item.attributes === 'object' && !Array.isArray(item.attributes)
     ? Object.fromEntries(Object.entries(item.attributes as Record<string, unknown>)
       .filter(([, value]) => typeof value === 'string')) as Record<string, string>
@@ -372,6 +372,7 @@ function normalizeQueuedMessageBrowserNodeSelection(
     attributes,
     textExcerpt: typeof item.textExcerpt === 'string' ? item.textExcerpt : '',
     outerHtml: typeof item.outerHtml === 'string' ? item.outerHtml : '',
+    outerHtmlTruncated: item.outerHtmlTruncated,
     ariaRole: typeof item.ariaRole === 'string' ? item.ariaRole.trim() || null : null,
     ariaName: typeof item.ariaName === 'string' ? item.ariaName.trim() || null : null,
     bounds: normalizedBounds,
@@ -642,31 +643,6 @@ export interface EnabledAgent {
 }
 
 let enabledAgents = $state<EnabledAgent[]>([]);
-
-function resolveMessageMetadataRecord(message: Pick<Message, 'metadata'> | undefined): Record<string, unknown> | undefined {
-  return message?.metadata && typeof message.metadata === 'object'
-    ? message.metadata as Record<string, unknown>
-    : undefined;
-}
-
-function normalizePositiveSequence(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return 0;
-  }
-  const normalized = Math.floor(value);
-  return normalized > 0 ? normalized : 0;
-}
-
-function maxTimelineTurnOrderSeqFromMessage(message: Pick<Message, 'metadata'> | undefined): number {
-  return resolveTimelineTurnOrderSeqFromMetadata(resolveMessageMetadataRecord(message));
-}
-
-function maxTimelineTurnOrderSeqFromArtifacts(artifacts: TimelineProjectionArtifact[] | undefined): number {
-  return ensureArray<TimelineProjectionArtifact>(artifacts).reduce(
-    (maxSeq, artifact) => Math.max(maxSeq, maxTimelineTurnOrderSeqFromMessage(artifact.message)),
-    0,
-  );
-}
 
 function normalizeOrchestratorRuntimeState(
   input: OrchestratorRuntimeState | null | undefined,
@@ -1168,15 +1144,6 @@ export function getState() {
   };
 }
 
-export function allocateTurnOrderSeq(): number {
-  localTimelineTurnOrderSeqCounter = Math.max(
-    normalizePositiveSequence(localTimelineTurnOrderSeqCounter),
-    maxTimelineTurnOrderSeqFromArtifacts(messagesState.canonicalTimelineProjection?.artifacts),
-  );
-  localTimelineTurnOrderSeqCounter += 1;
-  return localTimelineTurnOrderSeqCounter;
-}
-
 // ============ 状态更新函数 ============
 
 function createSessionViewStateSnapshot(sessionId: string | null | undefined): PersistedSessionViewState | null {
@@ -1483,67 +1450,6 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
   syncNotificationsFromContext(nextSessionId);
   saveWebviewState();
   return true;
-}
-
-export function adoptAcceptedSessionIdForLocalTurn(
-  localSessionId: string | null | undefined,
-  acceptedSessionId: string | null | undefined,
-): boolean {
-  const previousSessionId = normalizeSessionId(localSessionId);
-  const nextSessionId = normalizeSessionId(acceptedSessionId);
-  if (!previousSessionId || !nextSessionId) {
-    return false;
-  }
-  if (previousSessionId === nextSessionId) {
-    return true;
-  }
-  if (normalizeSessionId(messagesState.currentSessionId) !== previousSessionId) {
-    return false;
-  }
-  rebindLocalSubmissionSession(previousSessionId, nextSessionId);
-  messagesState.currentSessionId = nextSessionId;
-  messagesState.sessionHistory = {
-    workspaceId: messagesState.currentWorkspaceId,
-    sessionId: nextSessionId,
-    hasMoreBefore: false,
-    beforeCursor: null,
-    canonicalHasMoreBefore: false,
-    canonicalBeforeCursor: null,
-    isLoadingBefore: false,
-  };
-  const reboundProjection = rebindCanonicalSessionTurns(previousSessionId, nextSessionId);
-  if (reboundProjection) {
-    messagesState.canonicalTimelineProjection = reboundProjection;
-  }
-  syncNotificationsFromContext(nextSessionId);
-  saveWebviewState();
-  return true;
-}
-
-/**
- * 将尚未完成的本地提交从草稿会话绑定到后端分配的正式会话。
- * 当前页面可能已经切到另一个会话，因此这里只重绑定后台投影，不改变当前视图。
- */
-export function rebindLocalSubmissionSession(
-  previousSessionId: string | null | undefined,
-  nextSessionId: string | null | undefined,
-): void {
-  const previous = normalizeSessionId(previousSessionId);
-  const next = normalizeSessionId(nextSessionId);
-  if (!previous || !next || previous === next) {
-    return;
-  }
-  if (normalizeSessionId(messagesState.currentSessionId) === previous) {
-    saveCurrentExecutionProjection(previous);
-  }
-  rekeyExecutionProjection(previous, next);
-  const reboundBindings = new Map(requestBindings);
-  for (const [requestId, binding] of reboundBindings) {
-    if (binding.sessionId?.trim() === previous) {
-      reboundBindings.set(requestId, { ...binding, sessionId: next });
-    }
-  }
-  requestBindings = reboundBindings;
 }
 
 export interface WorkspaceSessionProjection {
@@ -2327,22 +2233,6 @@ export function getActiveInteractionType(): string | null {
   ) {
     return hasPendingToolApproval(currentSessionId) ? 'tool_approval' : null;
   }
-  const artifacts = ensureArray<TimelineProjectionArtifact>(messagesState.canonicalTimelineProjection?.artifacts);
-  for (const artifact of artifacts) {
-    for (const block of artifact.message.blocks || []) {
-      if (!block || typeof block !== 'object') continue;
-      const toolCall = block.toolCall;
-      if (!toolCall) continue;
-      if (
-        parseToolApprovalPayload(toolCall.result)
-        || parseToolApprovalPayload(toolCall.error)
-        || parseToolApprovalPayload(toolCall.standardized?.message)
-        || parseToolApprovalPayload(block.content)
-      ) {
-        return 'tool_approval';
-      }
-    }
-  }
   return null;
 }
 
@@ -2410,7 +2300,6 @@ export function clearAllMessages(options: {
   captureCurrentSessionViewState();
   if (options.resetTimelineView !== false) {
     messagesState.canonicalTimelineProjection = null;
-    localTimelineTurnOrderSeqCounter = 0;
   }
   messagesState.orchestratorRuntimeState = null;
   messagesState.sessionHistory = {
@@ -2533,10 +2422,6 @@ export function setCanonicalTimelineProjection(projection: SessionTimelineProjec
     });
     return false;
   }
-  localTimelineTurnOrderSeqCounter = Math.max(
-    localTimelineTurnOrderSeqCounter,
-    maxTimelineTurnOrderSeqFromArtifacts(projection.artifacts),
-  );
   messagesState.canonicalTimelineProjection = projection;
   upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(projection.sessionId));
   return true;

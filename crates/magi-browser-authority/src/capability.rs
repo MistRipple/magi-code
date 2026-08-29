@@ -1,6 +1,8 @@
 use magi_core::AccessProfile;
 use serde::{Deserialize, Serialize};
 
+use crate::{BrowserToolAccess, BrowserToolKind};
+
 /// Electron Main 托管的真实浏览器控制通道状态。
 ///
 /// Chromium、Electron 和 Automation Worker 都属于同一个桌面发行包，
@@ -21,143 +23,6 @@ impl BrowserHostStatus {
     pub fn is_usable(self) -> bool {
         matches!(self, Self::Ready)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrowserToolKind {
-    Navigate,
-    Snapshot,
-    Click,
-    Type,
-    Press,
-    Scroll,
-    Screenshot,
-    Tabs,
-    Viewport,
-    WaitFor,
-    Hover,
-    Drag,
-    FillForm,
-    Dialog,
-    UploadFile,
-    ClickAt,
-    Evaluate,
-    Console,
-    Network,
-    Emulate,
-    Performance,
-    Lighthouse,
-    Heap,
-    ThirdParty,
-    WebMcp,
-    Pwa,
-}
-
-impl BrowserToolKind {
-    pub const ALL: [Self; 26] = [
-        Self::Navigate,
-        Self::Snapshot,
-        Self::Click,
-        Self::Type,
-        Self::Press,
-        Self::Scroll,
-        Self::Screenshot,
-        Self::Tabs,
-        Self::Viewport,
-        Self::WaitFor,
-        Self::Hover,
-        Self::Drag,
-        Self::FillForm,
-        Self::Dialog,
-        Self::UploadFile,
-        Self::ClickAt,
-        Self::Evaluate,
-        Self::Console,
-        Self::Network,
-        Self::Emulate,
-        Self::Performance,
-        Self::Lighthouse,
-        Self::Heap,
-        Self::ThirdParty,
-        Self::WebMcp,
-        Self::Pwa,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Navigate => "browser_navigate",
-            Self::Snapshot => "browser_snapshot",
-            Self::Click => "browser_click",
-            Self::Type => "browser_type",
-            Self::Press => "browser_press",
-            Self::Scroll => "browser_scroll",
-            Self::Screenshot => "browser_screenshot",
-            Self::Tabs => "browser_tabs",
-            Self::Viewport => "browser_viewport",
-            Self::WaitFor => "browser_wait_for",
-            Self::Hover => "browser_hover",
-            Self::Drag => "browser_drag",
-            Self::FillForm => "browser_fill_form",
-            Self::Dialog => "browser_dialog",
-            Self::UploadFile => "browser_upload_file",
-            Self::ClickAt => "browser_click_at",
-            Self::Evaluate => "browser_evaluate",
-            Self::Console => "browser_console",
-            Self::Network => "browser_network",
-            Self::Emulate => "browser_emulate",
-            Self::Performance => "browser_performance",
-            Self::Lighthouse => "browser_lighthouse",
-            Self::Heap => "browser_heap",
-            Self::ThirdParty => "browser_third_party",
-            Self::WebMcp => "browser_webmcp",
-            Self::Pwa => "browser_pwa",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|tool| tool.name() == name)
-    }
-
-    /// 文件系统授权需要独立的 Desktop 授权管线，当前版本不会隐式读取本地文件。
-    pub fn is_supported(self) -> bool {
-        Self::ALL.contains(&self)
-    }
-
-    pub fn catalog_access(self) -> BrowserToolAccess {
-        match self {
-            Self::Snapshot | Self::Screenshot | Self::WaitFor => BrowserToolAccess::Read,
-            Self::Console
-            | Self::Network
-            | Self::Performance
-            | Self::Lighthouse
-            | Self::Heap
-            | Self::Dialog => BrowserToolAccess::Mixed,
-            Self::Tabs | Self::Viewport | Self::Emulate | Self::ThirdParty | Self::WebMcp => {
-                BrowserToolAccess::Mixed
-            }
-            Self::Pwa => BrowserToolAccess::Read,
-            Self::Navigate
-            | Self::Click
-            | Self::Type
-            | Self::Press
-            | Self::Scroll
-            | Self::Hover
-            | Self::Drag
-            | Self::FillForm
-            | Self::UploadFile
-            | Self::ClickAt
-            | Self::Evaluate => BrowserToolAccess::Write,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrowserToolAccess {
-    Read,
-    Write,
-    Mixed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

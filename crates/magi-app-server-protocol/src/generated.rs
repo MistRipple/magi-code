@@ -454,14 +454,16 @@ pub struct BrowserNodeSelection {
     pub surface_id: String,
     #[serde(rename = "navigationRevision")]
     pub navigation_revision: u64,
+    #[serde(rename = "browserSessionId")]
+    pub browser_session_id: String,
     pub url: String,
     pub title: String,
     #[serde(rename = "frameId")]
-    pub frame_id: String,
+    pub frame_id: Option<String>,
     #[serde(rename = "backendDomNodeId")]
     pub backend_dom_node_id: u64,
     #[serde(rename = "domNodeId")]
-    pub dom_node_id: u64,
+    pub dom_node_id: Option<u64>,
     #[serde(rename = "nodeName")]
     pub node_name: String,
     pub attributes: std::collections::BTreeMap<String, String>,
@@ -469,11 +471,13 @@ pub struct BrowserNodeSelection {
     pub text_excerpt: String,
     #[serde(rename = "outerHtml")]
     pub outer_html: String,
+    #[serde(rename = "outerHtmlTruncated")]
+    pub outer_html_truncated: bool,
     #[serde(rename = "ariaRole")]
     pub aria_role: Option<String>,
     #[serde(rename = "ariaName")]
     pub aria_name: Option<String>,
-    pub bounds: BrowserNodeSelectionBounds,
+    pub bounds: Option<BrowserNodeSelectionBounds>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1025,6 +1029,9 @@ pub enum BrowserToolAccess {
 pub struct BrowserToolDescriptor {
     pub name: String,
     pub access: BrowserToolAccess,
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1,5 +1,10 @@
 <script lang="ts">
-  import type { ContentBlock, Message, PlaceholderState } from '../types/message';
+  import type {
+    ContentBlock,
+    Message,
+    MessageBrowserAnnotationReference,
+    PlaceholderState,
+  } from '../types/message';
   import { dispatchFilePreviewEvent, type FilePreviewScope } from '../lib/file-reference';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
@@ -21,7 +26,7 @@
   import { parseModelFailureDiagnostic } from '../lib/model-failure';
   import { parseToolCallFailureDiagnostic } from '../lib/tool-call-failure';
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
-  import { browserAnnotationArtifactUrl } from '../web/agent-api';
+  import { resolveBrowserAnnotationArtifactUrl } from '../web/agent-api';
   import type { ConversationPresentationRole } from '../lib/conversation-presentation';
 
   // Props
@@ -55,6 +60,8 @@
   let copied = $state(false);
   let interruptedRecoverySubmitting = $state(false);
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let browserAnnotationPreviewRequest = 0;
+  let browserAnnotationPreviewError = $state('');
 
   function handleInterruptedRecoveryStatus(event: Event): void {
     const status = (event as CustomEvent<{ status?: unknown }>).detail?.status;
@@ -74,6 +81,7 @@
     if (typeof window !== 'undefined') {
       window.removeEventListener('magi:interruptedRecoveryContinueStatus', handleInterruptedRecoveryStatus);
     }
+    browserAnnotationPreviewRequest += 1;
   });
 
   // 派生状态
@@ -377,18 +385,34 @@
 
   // 点击图片放大预览
   function openImagePreview(imageUrl: string) {
+    browserAnnotationPreviewRequest += 1;
+    browserAnnotationPreviewError = '';
     previewImageUrl = imageUrl;
     showImagePreview = true;
   }
 
-  function openBrowserAnnotationPreview(annotationId: string): void {
-    const sessionId = filePreviewScope?.sessionId?.trim();
-    if (!sessionId) return;
-    openImagePreview(browserAnnotationArtifactUrl(annotationId, sessionId));
+  async function openBrowserAnnotationPreview(annotation: MessageBrowserAnnotationReference): Promise<void> {
+    const annotationId = annotation.annotationId.trim();
+    const sessionId = filePreviewScope?.sessionId?.trim() || '';
+    if (!annotationId || !annotation.browserSessionId.trim() || !sessionId || !annotation.screenshotArtifactId?.trim()) return;
+    const requestId = ++browserAnnotationPreviewRequest;
+    browserAnnotationPreviewError = '';
+    try {
+      const imageUrl = resolveBrowserAnnotationArtifactUrl(annotationId, sessionId);
+      if (requestId !== browserAnnotationPreviewRequest) return;
+      openImagePreview(imageUrl);
+    } catch (error) {
+      if (requestId === browserAnnotationPreviewRequest) {
+        browserAnnotationPreviewError = i18n.t('browser.annotation.previewFailed');
+        console.warn('[MessageItem] 加载浏览器标记截图失败:', error);
+      }
+    }
   }
 
   // 关闭图片预览
   function closeImagePreview() {
+    browserAnnotationPreviewRequest += 1;
+    browserAnnotationPreviewError = '';
     showImagePreview = false;
     previewImageUrl = '';
   }
@@ -463,13 +487,18 @@
             class="user-browser-annotation"
             title={annotation.comment}
             disabled={!annotation.screenshotArtifactId}
-            onclick={() => openBrowserAnnotationPreview(annotation.annotationId)}
+            onclick={() => void openBrowserAnnotationPreview(annotation)}
           >
             <span class="user-browser-annotation-number">{annotation.sequence ?? annotationIndex + 1}</span>
             <span>{annotation.comment}</span>
           </button>
         {/each}
       </div>
+      {#if browserAnnotationPreviewError}
+        <div class="user-browser-annotation-error" role="status">
+          {browserAnnotationPreviewError}
+        </div>
+      {/if}
     {/if}
     {#if messageBrowserNodeSelections.length > 0}
       <div class="user-browser-node-selections" aria-label={i18n.t('messageItem.browserNodeSelections')}>
@@ -1205,6 +1234,12 @@
     border-radius: 4px;
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
     pointer-events: auto;
+  }
+
+  .user-browser-annotation-error {
+    color: var(--error);
+    font-size: 12px;
+    margin-top: 6px;
   }
 
 </style>

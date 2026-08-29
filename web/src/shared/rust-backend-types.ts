@@ -8,12 +8,20 @@ export interface HealthDto {
   status: string;
   serviceName: string;
   apiVersion: string;
+  runtimeEpoch: string;
+  productVersion: string;
+  buildIdentity: string;
+  startupNonce: string;
 }
 
 export interface VersionHandshakeDto {
+  serviceName: string;
   apiVersion: string;
   minSupportedUiVersion: string;
   hostScope: string[];
+  productVersion: string;
+  buildIdentity: string;
+  startupNonce: string;
 }
 
 export interface SessionTurnImageDto {
@@ -35,6 +43,7 @@ export interface SessionBrowserNodeSelectionDto {
   attributes: Record<string, string>;
   textExcerpt: string;
   outerHtml: string;
+  outerHtmlTruncated: boolean;
   ariaRole?: string | null;
   ariaName?: string | null;
   bounds?: { x: number; y: number; width: number; height: number } | null;

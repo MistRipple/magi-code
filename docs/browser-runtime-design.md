@@ -2,7 +2,7 @@
 
 > 状态：后续开发唯一产品架构
 >
-> 更新日期：2026-08-15
+> 更新日期：2026-08-27
 >
 > 适用范围：Magi Desktop、Web UI、Rust daemon、Browser Automation、右侧面板、浏览器工具、发布、更新与旧实现清理
 
@@ -14,8 +14,8 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 
 - Electron `BaseWindow` 作为跨平台 Chromium Desktop Host。
 - 现有 Svelte 应用在一个全窗口可信 `MagiAppView` 中统一渲染左侧导航、中间会话和右侧多功能面板；右栏菜单和工具状态也属于这个 Renderer 的 DOM。
-- 每个桌面窗口中的每个 Browser Tab 都由 Main Process 持有一个独立的 Electron `WebContentsView`。它是真实 Chromium 页面视图，不是截图投影，也不是覆盖右栏的独立窗口；它只在当前 Browser Tab 的内容槽矩形内可见。
-- Electron Main Process 负责 Browser `WebContentsView` 的安全策略、CDP、输入接管、生命周期和物理几何；右栏外框、Tab 栏、工具栏、代码/图片/终端内容以及 Browser 内容槽仍全部由主 Renderer 的 DOM/CSS 所有。Main 根据同一份 `WindowLayoutSnapshot` 计算内容槽并绑定对应 Surface，Renderer 只提交右栏宽度等布局意图，不能创建第二套右栏布局或上报浏览器绝对坐标。
+- 每个桌面窗口中的每个 Browser Tab 都由 Main Process 持有一个独立的 Electron `WebContentsView`。它是真实 Chromium 页面视图，不是截图投影，也不是覆盖右栏的独立窗口；当前 Browser Tab 激活时，Main 将它作为 `BaseWindow.contentView` 的第 1 层直接绑定到 Renderer 上报的内容槽矩形。
+- Electron Main Process 负责 Browser `WebContentsView` 的安全策略、CDP、输入接管、生命周期和物理几何；右栏外框、Tab 栏、工具栏、代码/图片/终端内容以及 Browser 内容槽仍全部由主 Renderer 的 DOM/CSS 所有。由于 Electron 原生 View 不是 DOM 子节点，Renderer 在 DOM 完成布局后通过带 revision 的 `renderer_geometry` 报告右栏和当前 Browser 内容槽的真实窗口坐标；Main 只校验并绑定对应 Surface，不建立第二个原生承载容器或第二套页面尺寸计算。
 - Rust daemon 继续拥有 BrowserAuthority、会话、工具治理、Lease、Annotation 和 Artifact。
 - 浏览器自动化通过 Electron `webContents.debugger` 的受控 CDP Gateway 执行，不开放 Chromium remote debugging port。
 - 生产运行时不再依赖 Playwright 连接已运行 Electron；Playwright 只保留为外部端到端测试工具。
@@ -38,10 +38,10 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 - Agent 任务完成、暂停、失败或取消后只释放控制权，不关闭 Tab，不改变最终页面。
 - `target="_blank"`、`window.open()` 和新窗口链接在当前 Browser Tab 中打开，不创建额外窗口或隐藏 Target。
 - 右侧面板可以从最小宽度拖到窗口约三分之二，浏览器始终严格位于内容区。
-- 右栏宽度和拖拽手柄由统一 `WindowLayout` 约束，主 Renderer 的 DOM/CSS 只呈现这份状态；当前 Browser Tab 的 `WebContentsView` 只消费 Main 在同一布局事务中计算出的内容槽。禁止 `ResizeObserver -> IPC -> setBounds` 坐标反馈链、额外窗口、悬浮层、全右栏覆盖或浏览器专用几何计算改变面板几何。
+- 右栏宽度和拖拽手柄由统一 `WindowLayout` 约束，主 Renderer 的 DOM/CSS 只呈现这份状态；当前 Browser Tab 的 `WebContentsView` 只消费 Renderer 在真实 DOM 排版后报告、经 Main 校验的内容槽。`ResizeObserver -> 合并后的 renderer_geometry -> Main setBounds` 仅用于同步原生 View 到既有 DOM 槽位，不得反向修改 Renderer 布局、触发导航/刷新或形成第二套尺寸计算；禁止额外窗口、悬浮层、全右栏覆盖或浏览器专用几何计算改变面板几何。
 - 页面刷新、跳转、慢请求和工具执行期间不黑屏、不闪烁、不重建页面、不显示截图投影。
 - auto、宽屏、窄屏和自定义 viewport 均由 Chromium 页面真实重排，不裁切旧桌面布局。
-- 固定 viewport 只设置 Chromium 的 CSS viewport、设备类型和触控能力，禁止使用 `pageScaleFactor`、截图缩放或按右栏大小拟合模拟设备；页面在原生 1:1 Surface 中重排，超出部分由页面自身滚动，不得被桌面壳裁切或拉伸。
+- 固定 viewport 由 Chromium 设备仿真设置 CSS viewport、设备类型和设备像素比；当逻辑 viewport 大于右栏内容槽时，使用同一 CDP `Emulation.setDeviceMetricsOverride` 的原生 `scale` 仅缩放 compositor 的完整结果视图，使整个逻辑视口在内容槽内可见。禁止 CSS transform、截图投影、Canvas 合成或宿主坐标换算；页面仍按固定 CSS viewport 响应式布局，右栏尺寸变化只更新原生 compositor scale，不改变页面逻辑尺寸、不导航、不刷新。
 - 页面标记、截图和消息引用在刷新、重启、关闭 Browser Tab 和升级后仍可查看。
 
 多功能右栏的硬约束：
@@ -122,7 +122,7 @@ Magi Electron Desktop Host
   |     BaseWindow 1..N
   |       |-- MagiAppView（全窗口单一可信 Renderer）
   |       |     左侧导航、中间会话、右栏顶级 Tab 与代码/图片/终端/Agent 内容
-  |       |     `-- Browser Tab 内容槽 -> Electron WebContentsView 0..N（Main WindowLayout 绑定）
+  |       |     `-- 当前 Browser Tab -> Electron WebContentsView 0..N（直接挂 contentView 第 1 层，一次只挂载一个）
   |       `-- DesktopOverlayView 0..N
   |             弹窗、菜单、标记选择等可信覆盖层
   |
@@ -231,7 +231,7 @@ Electron app ready 前应用隐私启动参数
 
 ## 5. Desktop View 树
 
-桌面业务 UI 只有一个全窗口 `MagiAppView`，不是额外 `BrowserWindow`、无边框子窗口或悬浮窗。浏览器页面由 Main 进程的 `WebContentsView` 承载；它只绑定到当前 Browser Tab 的内容槽矩形，Tab 栏、工具栏和非浏览器面板仍由 `MagiAppView` 管理。`BaseWindow.contentView` 下的 App View 与 Browser Surface 是同一窗口中的兄弟原生视图，Browser Surface 不参与右栏外框布局。
+桌面业务 UI 只有一个全窗口 `MagiAppView`，不是额外 `BrowserWindow`、无边框子窗口或悬浮窗。浏览器页面由 Main 进程的 `WebContentsView` 承载，并在当前 Browser Tab 激活时直接作为 `BaseWindow.contentView` 的第 1 层绑定到 Renderer 上报的 Browser 内容槽矩形；Tab 栏、工具栏和非浏览器面板仍由 `MagiAppView` 管理。原生 Browser View 不参与右栏外框布局，也不建立第二套裁剪或尺寸计算。
 
 稳态层级只有：
 
@@ -239,8 +239,7 @@ Electron app ready 前应用隐私启动参数
 DesktopOverlayView        仅用于不属于右栏的可信临时覆盖层
 MagiAppView               左侧、中间和右栏多功能面板
   RightPane DOM
-    Browser Tab 内容槽（普通 DOM flex/grid 槽位）
-      Electron WebContentsView  当前 Browser Tab 的真实页面
+  Electron WebContentsView  当前 Browser Tab 的真实页面（contentView 第 1 层，仅覆盖内容槽）
 ```
 
 不允许在此树之外再建立“浏览器承载窗口”、“透明定位窗口”或“视频/截图层”。
@@ -276,7 +275,7 @@ MagiAppView               左侧、中间和右栏多功能面板
 当当前 Tab 是 Browser：
 
 - 右栏 DOM 只绘制 Tab、工具栏和内容背景。
-- 当前 Browser Tab 的内容槽是普通 DOM 元素，使用 `width: 100%`、`height: 100%` 和 flex/grid 正常布局；Main 使用同一份右栏 Tab 栏高度、浏览器工具栏高度和窗口内容 bounds 计算等价的原生内容槽，不从 Renderer 读取绝对坐标。
+- 当前 Browser Tab 的内容槽是普通 DOM 元素，使用 `width: 100%`、`height: 100%` 和 flex/grid 正常布局；Renderer 从该真实 DOM 元素读取 `getBoundingClientRect()`，通过 `renderer_geometry` 报告其相对于 App View 的窗口坐标，Main 只把对应原生 Surface 绑定到这个槽位，不按 Tab 栏或工具栏固定高度重新计算。
 - 每个 Browser Tab 有自己的 Electron `WebContentsView`；切换 Tab 只更新 Main 侧的可见 Surface 和自动化 Primary，不创建覆盖窗口，也不改变右栏外框。
 
 当当前 Tab 不是 Browser：
@@ -349,14 +348,15 @@ WindowLayoutState
   rightPaneVisible
   rightPaneMode          side-by-side | overlay
   rightPaneWidth
-  rightPaneTabBarHeight
-  browserToolbarHeight
   activePanelKind
   activeTabId
   activeSurfaceId
+  rendererGeometryRevision
+  rendererRightPaneBounds?
+  browserContentSlot?
 ```
 
-窗口可见性、模式、面板身份和右栏宽度由 Electron Main 维护；主 Renderer 只把用户的右栏宽度意图提交给 Main，并按返回的 `LayoutSnapshot` 渲染 DOM，不提交浏览器绝对坐标。
+窗口可见性、模式、面板身份和右栏宽度由 Electron Main 维护；主 Renderer 只把用户的右栏宽度意图提交给 Main，并在 CSS 排版完成后提交带 revision 的真实 DOM 几何。几何只用于把原生 Surface 对齐到内容槽，不反向参与 DOM 布局。
 
 ### 6.2 布局事务
 
@@ -370,15 +370,15 @@ WindowLayoutState
   -> WindowLayoutState 校验可见性、模式和宽度意图
   -> 广播 LayoutSnapshot 给 App Renderer
   -> App Renderer 更新 RightPane DOM 的 grid/flex 宽度
-  -> Main 用同一 LayoutSnapshot 计算 Browser 内容槽
-  -> Main 将对应 WebContentsView 绑定到内容槽，并维护 CDP/Worker
+  -> Renderer 下一帧读取真实 Browser 内容槽并提交 renderer_geometry
+  -> Main 校验 geometry revision 并将对应 WebContentsView 绑定到内容槽
 ```
 
 约束：
 
 - 只接受当前 `desktopEpoch/windowId` 的请求。
 - 只应用单调增加的 `layoutRevision`。
-- 同一事务更新 AppLayer、BrowserLayer 和 OverlayLayer，不存在独立异步 resize 队列。
+- App、BrowserHost 和 Overlay 根层级由同一 Main 布局状态驱动；原生 Browser Surface 只接受当前 Renderer 已确认且完整包含于右栏的 DOM 内容槽。geometry 暂不可用或旧槽越界时，Surface 解绑但保留同一个 WebContents，待完整新槽到达后再挂回，不使用裁剪、负坐标或超尺寸租约，也不创建独立的导航/刷新队列。
 - resize 不得触发 focus、导航、页面刷新、设备仿真或 WebContents 重建。
 
 ### 6.3 Desktop 三栏容器边界
@@ -393,7 +393,7 @@ Desktop 的左侧工作区、中间工作区和右侧多功能面板在视觉上
 - 原生窗口外壳也必须接收同一份外观快照：明暗模式同步 Electron `nativeTheme`，背景色作为不透明首帧底色，主题强调色同步 Windows 原生 accent，通透/沉浸材质分别映射到 Windows Acrylic/Mica 与 macOS Vibrancy；平台不支持时保留 Renderer 主题，不得阻塞启动。
 - 右栏宽度由 `WindowLayout` 的单一状态约束；主 Renderer 只提交用户拖拽产生的宽度意图，Main 返回布局快照并同时更新右栏 DOM 与原生层几何。
 - 窗口缩放、全屏、DPI、显示器切换和安全区变化经过同一 reducer。
-- Desktop Renderer 只通过布局意图 IPC 告知 Main 右栏状态；不存在内容槽矩形 IPC。Web 和手机 Web 不创建 Browser Surface，也不具备 Desktop 布局 IPC。
+- Desktop Renderer 通过布局意图 IPC 告知 Main 右栏状态，并通过带 revision 的 `renderer_geometry` IPC 报告真实 DOM 的右栏/Browser 内容槽几何；该几何只属于当前 Desktop 窗口运行态，不写入会话或 BrowserTabRecord。Web 和手机 Web 不创建 Browser Surface，也不具备 Desktop 布局 IPC。
 - Web 客户端没有 Desktop layout capability，不得写入该状态。
 
 ### 6.3 尺寸规则
@@ -661,8 +661,10 @@ Worker 启动或重启：
 
 ```text
 worker_ready
-  -> Main 通过 MessagePort 发送 worker_rebind(current ready bindings)
+  -> Main 通过 MessagePort 发送 worker_rebind(workerEpoch, rebindId, current ready bindings)
   -> Worker 为每个 Surface 建立 PageRuntime
+  -> Worker 返回 worker_rebind_ack(workerEpoch, rebindId, bindingCount)
+  -> Main 校验 ack 后才标记 Worker ready、注册 Desktop Host 和放行命令
   -> 不创建新页面、不重新导航
   -> 下一条命令直接复用原 Target，并按需重建 execution context
 ```
@@ -763,7 +765,7 @@ viewport 只属于 `BrowserSurfaceInstance`：
 
 输入短防抖动态生效，无确认按钮。Worker 使用 `Emulation.setDeviceMetricsOverride` 设置 CSS viewport、device scale factor、screen、orientation、UA 和 Client Hints。
 
-- 不对页面截图、Canvas、DOM 或 Chromium 仿真结果做外层缩放。宽屏/窄屏/自定义模式只通过 Chromium device metrics 改变当前 Surface 的 CSS viewport；右栏内容槽只改变原生 `WebContentsView` 的物理 bounds，不能参与 viewport 参数计算或触发 viewport 重设。
+- 不对页面截图、Canvas 或 DOM 做外层缩放。宽屏/窄屏/自定义模式只通过 Chromium device metrics 改变当前 Surface 的 CSS viewport；当逻辑尺寸超出物理内容槽时，右栏内容槽尺寸只参与 Chromium 原生 compositor `scale` 的 fit 计算，不参与 CSS viewport 参数计算。内容槽尺寸变化不导航、不刷新、不重建 Surface。
 - `auto` 下，Chromium 根据原生 `WebContentsView` 的实际内容槽自然触发页面 resize；`fixed` 下，页面 CSS 宽高保持用户选择的逻辑值，右栏拖动不会改变媒体查询、DOM 坐标或页面运行态。
 - 用户输入由 Chromium `WebContentsView` 命中测试处理，不由 Svelte 转换坐标。
 - 工具坐标保持 CSS px；CDP 截图 clip 与 ElementRef 统一使用 CSS px。
@@ -796,7 +798,7 @@ Agent 的 CDP 输入不得改变 MagiAppView 中非浏览器区域的焦点。
 元素标记：
 
 1. DesktopOverlayView 进入标记模式。
-2. 指针移动通过 Surface 本地坐标提交 hit test。
+2. 指针移动使用窗口内容坐标（DIP）提交 hit test；CSS 页面坐标只在 Chromium 命中与截图裁剪时显式换算。
 3. Worker 使用 CDP 获取元素、frame、AX 和 bounding box。
 4. CDP Overlay domain 高亮当前元素。
 5. 用户确认并输入备注。
@@ -1070,7 +1072,7 @@ POC 只验证架构，不进入正式发布；失败即修正目标架构，不�
 - `web/src/lib/native-browser.ts`
 - `native_browser_create/resize/focus/navigate/close` bridge。
 - 旧 Browser guest 注册、独立 native bridge 和 `1 x 1` 定位兼容层。
-- 没有跨模块的 viewport/截图缩放队列；浏览器尺寸完全由 RightPane DOM 的正常布局传播。
+- 没有跨模块的 viewport/截图缩放队列；浏览器逻辑尺寸完全由 Tab 级配置传播，物理内容槽只驱动同一 Chromium Surface 的 bounds 和 compositor scale。
 - `1 x 1` 隐藏和旧 frame key/generation 逻辑。
 - CEF 页面状态、原生光标和原生 Annotation 事件兼容层。
 - Browser Runtime 安装状态驱动的 UI 分支。

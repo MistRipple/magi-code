@@ -9,7 +9,7 @@
   import DesktopUpdateStatus from './DesktopUpdateStatus.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getWebSidebarContext } from '../web/sidebar-context';
-  import { navigateSession, sessionNavigationState } from '../shared/session-navigation.svelte';
+  import { navigateSession } from '../shared/session-navigation.svelte';
   import {
     rightPaneState,
     getRightPaneState,
@@ -126,14 +126,13 @@
     ensureArray(appState.threadMessages).length === 0
   );
   const newSessionDisabled = $derived(
-    sessionNavigationState.pending !== null
-      || messagesState.sessionHydrating
+    messagesState.sessionHydrating
       || (hasCurrentSession && isCurrentSessionEmpty)
   );
   const newSessionTitle = $derived(
-    sessionNavigationState.pending !== null
-      ? '正在打开新会话面板'
-      : (hasCurrentSession && isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'))
+    hasCurrentSession && isCurrentSessionEmpty
+      ? i18n.t('header.currentSessionEmpty')
+      : i18n.t('header.newSession')
   );
 
   // 新建会话

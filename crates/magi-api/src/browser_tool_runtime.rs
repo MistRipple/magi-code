@@ -9,12 +9,13 @@ use std::{
 };
 
 use magi_browser_authority::{
-    AcquireBrowserLease, BrowserCapabilitySnapshot, BrowserDeviceType, BrowserHostClient,
-    BrowserHostClientError, BrowserHostCommand, BrowserHostCommandError, BrowserHostCommandOutcome,
-    BrowserHostCommandResult, BrowserHostControl, BrowserHostControlUpdate, BrowserHostSnapshot,
-    BrowserLeaseEndReason, BrowserNavigation, BrowserSnapshotNode, BrowserSnapshotTarget,
-    BrowserToolAccess, BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession,
-    CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
+    AcquireBrowserLease, BeforeUnloadAction, BrowserCapabilitySnapshot, BrowserDeviceType,
+    BrowserHostClient, BrowserHostClientError, BrowserHostCommand, BrowserHostCommandError,
+    BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
+    BrowserHostControlUpdate, BrowserHostSnapshot, BrowserLeaseEndReason, BrowserNavigation,
+    BrowserSnapshotNode, BrowserSnapshotTarget, BrowserToolAccess, BrowserToolKind,
+    BrowserViewport, BrowserViewportMode, CreateBrowserSession, CreateBrowserTab,
+    GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
 };
 use magi_core::{
     BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, ExecutionOwnership,
@@ -161,10 +162,7 @@ impl BrowserToolRuntimeDependencies {
                 "浏览器工具参数必须是 JSON 对象",
             );
         };
-        let Some(kind) = BrowserToolKind::ALL
-            .into_iter()
-            .find(|kind| kind.name() == tool_name)
-        else {
+        let Some(kind) = BrowserToolKind::from_name(tool_name) else {
             return failure(tool_name, "unknown_browser_tool", "未知的浏览器工具");
         };
         let mut capability = self.capabilities(Some(&session_id));
@@ -309,8 +307,12 @@ impl BrowserToolRuntimeDependencies {
                         "browser_viewport action 不合法",
                     ));
                 }
-                let mode =
-                    optional_string(arguments, "mode").unwrap_or_else(|| "fixed".to_string());
+                let Some(mode) = optional_string(arguments, "mode") else {
+                    return Err(BrowserToolError::new(
+                        "browser_viewport_mode_required",
+                        "browser_viewport action=set 时必须明确指定 mode",
+                    ));
+                };
                 if mode == "auto" {
                     let _control_guard = self.control_lock.lock().await;
                     let tab = tab_in_session(self, &browser_session, &tab.tab_id)?;
@@ -414,16 +416,20 @@ impl BrowserToolRuntimeDependencies {
                     })
                     .transpose()?
                     .map(|value| value.clamp(1, 60_000));
-                let handle_before_unload = optional_string(arguments, "handle_before_unload");
-                if handle_before_unload
-                    .as_deref()
-                    .is_some_and(|value| value != "accept" && value != "dismiss")
+                let handle_before_unload = match optional_string(arguments, "handle_before_unload")
                 {
-                    return Err(BrowserToolError::new(
-                        "invalid_navigation",
-                        "handle_before_unload 必须是 accept 或 dismiss",
-                    ));
-                }
+                    None => None,
+                    Some(value) => Some(match value.as_str() {
+                        "accept" => BeforeUnloadAction::Accept,
+                        "dismiss" => BeforeUnloadAction::Dismiss,
+                        _ => {
+                            return Err(BrowserToolError::new(
+                                "invalid_navigation",
+                                "handle_before_unload 必须是 accept 或 dismiss",
+                            ));
+                        }
+                    }),
+                };
                 let init_script = optional_string(arguments, "init_script");
                 let navigation = match action.as_str() {
                     "url" => {

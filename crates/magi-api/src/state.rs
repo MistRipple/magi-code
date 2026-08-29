@@ -2,9 +2,9 @@ use crate::dto::{
     AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeProvider, BridgeCutoverSmokeSnapshotDto,
     BridgeCutoverSmokeSnapshotProvider, BridgePreflightProvider, BridgePreflightSnapshotDto,
     BridgePreflightSnapshotProvider, BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto,
-    BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, RuntimeReadModelDto,
-    ServiceInfo, SessionTurnRequestDto, SessionTurnRouteDto, VersionHandshakeDto,
-    runtime_read_model_dto_with_usage,
+    BridgeSnapshotProvider, DaemonIdentity, DirectHttpModelProbeConfig, HealthDto,
+    RuntimeReadModelDto, ServiceInfo, SessionTurnRequestDto, SessionTurnRouteDto,
+    VersionHandshakeDto, runtime_read_model_dto_with_usage,
 };
 use crate::errors::ApiError;
 use crate::mcp_config::{
@@ -1097,6 +1097,7 @@ fn spawn_browser_control_sync(client: BrowserHostClient, control: BrowserSurface
 #[derive(Clone)]
 pub struct ApiState {
     pub service_info: ServiceInfo,
+    daemon_identity: DaemonIdentity,
     runtime_epoch: String,
     pub event_bus: Arc<InMemoryEventBus>,
     pub session_store: Arc<SessionStore>,
@@ -1416,6 +1417,10 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
         | BrowserAuthorityError::GoalBindingMismatch
         | BrowserAuthorityError::LeaseOwnerMismatch
         | BrowserAuthorityError::LeaseTurnMismatch
+        | BrowserAuthorityError::SessionMagiSessionMismatch { .. }
+        | BrowserAuthorityError::PrimarySurfaceUnavailable(_)
+        | BrowserAuthorityError::SurfaceNotPrimary { .. }
+        | BrowserAuthorityError::NodeSelectionPageMismatch { .. }
         | BrowserAuthorityError::SnapshotRevisionMismatch { .. }
         | BrowserAuthorityError::NavigationRevisionMismatch { .. }
         | BrowserAuthorityError::NavigationRevisionRegression { .. } => {
@@ -1484,11 +1489,13 @@ impl ApiState {
             Arc::clone(&browser_host_client),
             Arc::clone(&event_bus),
         );
+        let service_name = service_name.into();
         Self {
             service_info: ServiceInfo {
-                service_name: service_name.into(),
+                service_name,
                 api_version: "v0".to_string(),
             },
+            daemon_identity: DaemonIdentity::unknown(),
             runtime_epoch: format!(
                 "runtime-{}-{}-{}",
                 UtcMillis::now().0,
@@ -2270,7 +2277,11 @@ impl ApiState {
     }
 
     pub fn health_dto(&self) -> HealthDto {
-        HealthDto::from_service_info(&self.service_info, &self.runtime_epoch)
+        HealthDto::from_service_info(
+            &self.service_info,
+            &self.runtime_epoch,
+            &self.daemon_identity,
+        )
     }
 
     pub fn runtime_epoch(&self) -> &str {
@@ -2472,7 +2483,12 @@ impl ApiState {
     }
 
     pub fn version_handshake_dto(&self) -> VersionHandshakeDto {
-        VersionHandshakeDto::from_service_info(&self.service_info)
+        VersionHandshakeDto::from_service_info(&self.service_info, &self.daemon_identity)
+    }
+
+    pub fn with_daemon_identity(mut self, identity: DaemonIdentity) -> Self {
+        self.daemon_identity = identity;
+        self
     }
 
     pub fn execution_pipeline(&self) -> Option<&ExecutionPipeline> {

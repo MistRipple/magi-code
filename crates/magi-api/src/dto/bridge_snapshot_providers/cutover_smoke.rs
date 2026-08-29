@@ -7,6 +7,7 @@ use magi_bridge_client::{
 };
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::super::bridge_contracts::{BridgeMcpDefaultRouteContractDto, evaluate_model_contract};
 use super::super::bridge_reason_codes::{
@@ -120,8 +121,36 @@ impl BridgeCutoverSmokeProvider for BridgeCutoverSmokeSnapshotProvider {
 fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<BridgeCutoverCheckDto> {
     let probe = JsonRpcBridgeServerProbeClient::new(transport.clone());
     let client = JsonRpcModelBridgeClient::new(transport);
-    let catalog = probe.describe_services().ok();
     let mut checks = Vec::new();
+
+    // 本地 bridge 是一次性 stdio 进程。并发诊断启动时，首个进程可能在宿主刚完成
+    // 编译/唤醒的窗口内退出；重试一次只针对 transport/protocol 层，并且失败时把
+    // 目录探测本身作为阻塞检查暴露出来，不能静默退化成“只检查 loopback”。
+    let catalog = match probe.describe_services() {
+        Ok(catalog) => Some(catalog),
+        Err(error)
+            if matches!(
+                error.layer(),
+                Some(
+                    magi_bridge_client::BridgeErrorLayer::Transport
+                        | magi_bridge_client::BridgeErrorLayer::Protocol
+                )
+            ) =>
+        {
+            std::thread::sleep(Duration::from_millis(25));
+            match probe.describe_services() {
+                Ok(catalog) => Some(catalog),
+                Err(retry_error) => {
+                    checks.push(model_catalog_failure_check(retry_error));
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            checks.push(model_catalog_failure_check(error));
+            None
+        }
+    };
 
     let loopback_profile = model_capability_profile(catalog.as_ref(), LOOPBACK_MODEL_PROVIDER)
         .unwrap_or_else(|| "model-response-v1".to_string());
@@ -161,6 +190,19 @@ fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Brid
     }
 
     checks
+}
+
+fn model_catalog_failure_check(error: BridgeClientError) -> BridgeCutoverCheckDto {
+    BridgeCutoverCheckDto {
+        check_name: "service_catalog".to_string(),
+        target: "model-bridge".to_string(),
+        ok: false,
+        blocking_reason: Some("model bridge service catalog unavailable".to_string()),
+        response_excerpt: None,
+        error: Some(BridgeProbeErrorDto::from_client_error(error)),
+        model_contract: None,
+        mcp_contract: None,
+    }
 }
 
 fn capture_direct_http_model_cutover_check(

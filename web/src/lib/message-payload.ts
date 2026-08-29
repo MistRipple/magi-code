@@ -307,6 +307,9 @@ function sanitizeBrowserNodeSelection(
   const outerHtml = typeof selection.outerHtml === 'string'
     ? selection.outerHtml.slice(0, MAX_BROWSER_NODE_HTML_LENGTH)
     : '';
+  if (typeof selection.outerHtmlTruncated !== 'boolean') {
+    throw new Error(`${errorPrefix} browserNodeSelections.outerHtmlTruncated 字段无效`);
+  }
   const sensitiveNode = nodeName.toLowerCase() === 'input'
     && /type\s*=\s*["']password["']/iu.test(outerHtml);
   return {
@@ -327,6 +330,7 @@ function sanitizeBrowserNodeSelection(
     outerHtml: sensitiveNode
       ? outerHtml.replace(/(value\s*=\s*["'])[^"']*(["'])/giu, '$1[REDACTED]$2')
       : outerHtml,
+    outerHtmlTruncated: selection.outerHtmlTruncated,
     ariaRole: typeof selection.ariaRole === 'string' ? selection.ariaRole.trim().slice(0, 200) || null : null,
     ariaName: typeof selection.ariaName === 'string' ? selection.ariaName.trim().slice(0, 500) || null : null,
     bounds: sanitizeBrowserNodeRect(selection.bounds, errorPrefix) ?? null,

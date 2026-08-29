@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { build as esbuild } from "esbuild";
+import { bridgeBinaryNames } from "./bridge-preflight.mjs";
 import { desktopRoot, readProductVersion, repositoryRoot } from "./build-support.mjs";
 
 const config = await readFile(join(desktopRoot, "electron-builder.yml"), "utf8");
@@ -13,11 +14,22 @@ const requiredConfig = [
   "releaseType: release",
   "browser-automation-worker",
   "magi-daemon-app",
+  ...bridgeBinaryNames,
   "browser-capability-manifest.json",
   "magi-desktop.cdx.json",
 ];
 for (const requirement of requiredConfig) {
   if (!config.includes(requirement)) throw new Error(`Electron Builder 配置缺少: ${requirement}`);
+}
+for (const binaryName of bridgeBinaryNames) {
+  for (const fileName of [binaryName, `${binaryName}.exe`]) {
+    if (!config.includes(fileName)) {
+      throw new Error(`Electron Builder 配置缺少 bridge resource: ${fileName}`);
+    }
+  }
+  if (!config.includes(`Contents/Resources/daemon/${binaryName}`)) {
+    throw new Error(`macOS Electron Builder binaries 缺少: ${binaryName}`);
+  }
 }
 if (/tauri|cef|playwright|native-browser|browser-runtime/i.test(config)) {
   throw new Error("Electron Builder 配置不得包含 Tauri、CEF、Playwright 或独立 Browser Runtime");

@@ -8,6 +8,12 @@ import { promisify } from "node:util";
 import { downloadArtifact } from "@electron/get";
 import { extract as extractZip } from "@electron-internal/extract-zip";
 import { build as esbuild } from "esbuild";
+import {
+  assertBridgeBinaries,
+  bridgeBinaryNames,
+  bridgeBinaryPath,
+  runBridgePreflight,
+} from "./bridge-preflight.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -22,7 +28,8 @@ export const webDist = join(repositoryRoot, "web", "dist");
 const runtimePackages = ["electron", "electron-updater", "ws", "devtools-protocol", "lighthouse"];
 
 export async function buildDesktopJavaScript({ development = false } = {}) {
-  const productVersion = await readProductVersion();
+  const [productVersion, git] = await Promise.all([readProductVersion(), readGitIdentity()]);
+  const buildIdentity = git.commit;
   await Promise.all([
     mkdir(join(desktopDist, "main"), { recursive: true }),
     mkdir(join(desktopDist, "preload"), { recursive: true }),
@@ -50,6 +57,7 @@ export async function buildDesktopJavaScript({ development = false } = {}) {
         "import.meta.url": "__magiImportMetaUrl",
         "process.env.NODE_ENV": JSON.stringify(development ? "development" : "production"),
         "process.env.MAGI_PRODUCT_VERSION": JSON.stringify(productVersion),
+        "process.env.MAGI_BUILD_ID": JSON.stringify(buildIdentity),
       },
       banner: {
         js: "const __magiImportMetaUrl = require('node:url').pathToFileURL(__filename).href;",
@@ -87,10 +95,24 @@ export async function buildWebAssets() {
 }
 
 export async function buildDaemon(profile) {
-  const args = ["build", "--locked", "-p", "magi-daemon-app"];
+  if (profile !== "debug" && profile !== "release") {
+    throw new Error(`不支持的 Rust 构建 profile: ${profile}`);
+  }
+  const args = [
+    "build",
+    "--locked",
+    "-p",
+    "magi-daemon-app",
+    "-p",
+    "magi-bridge-client",
+    "--bins",
+  ];
   if (profile === "release") args.push("--release");
   await run("cargo", args, repositoryRoot);
-  await assertFile(daemonBinary(profile), "Rust daemon sidecar");
+  await Promise.all([
+    assertFile(daemonBinary(profile), "Rust daemon sidecar"),
+    assertBridgeBinaries(bridgeBinariesRoot(profile), `Rust ${profile} bridge`),
+  ]);
 }
 
 export function daemonBinary(profile) {
@@ -121,6 +143,13 @@ export async function prepareReleaseMetadata() {
 
   const files = [];
   await appendFileHash(files, daemonBinary("release"), daemonResourcePath());
+  for (const binaryName of bridgeBinaryNames) {
+    await appendFileHash(
+      files,
+      bridgeBinary("release", binaryName),
+      bridgeResourcePath(binaryName),
+    );
+  }
   await appendFileHash(files, join(workerDist, "index.cjs"), "browser-automation-worker/index.cjs");
   await appendTreeHashes(files, lighthouseRuntimeDist, "browser-automation-worker");
   await appendTreeHashes(files, webDist, "web/dist");
@@ -135,12 +164,22 @@ export async function prepareReleaseMetadata() {
       "browser-automation-worker/index.cjs",
     ),
     daemon: await componentHash(daemonBinary("release"), daemonResourcePath()),
+    bridgeBinaries: Object.fromEntries(
+      await Promise.all(bridgeBinaryNames.map(async (binaryName) => [
+        binaryName,
+        await componentHash(
+          bridgeBinary("release", binaryName),
+          bridgeResourcePath(binaryName),
+        ),
+      ])),
+    ),
   };
 
   const manifest = {
     schemaVersion: 1,
     productVersion,
     gitCommit: git.commit,
+    buildIdentity: git.commit,
     gitDirty: git.dirty,
     electronVersion: electronVersions.electron,
     chromiumVersion: electronVersions.chrome,
@@ -193,7 +232,9 @@ export async function assertReleaseInputs() {
     assertFile(join(webDist, "web.html"), "Web Renderer"),
     assertFile(daemonBinary("release"), "Rust daemon sidecar"),
     assertFile(join(desktopDist, "resources", "browser-capability-manifest.json"), "能力清单"),
+    assertBridgeBinaries(bridgeBinariesRoot("release"), "Rust release bridge"),
   ]);
+  await runBridgePreflight(bridgeBinariesRoot("release"), "Rust release bridge");
 }
 
 export async function run(command, args, cwd = repositoryRoot, options = {}) {
@@ -224,38 +265,49 @@ export async function assertFile(path, label) {
   }
 }
 
+export function bridgeBinariesRoot(profile) {
+  return join(repositoryRoot, "target", profile);
+}
+
+export function bridgeBinary(profile, binaryName) {
+  return bridgeBinaryPath(bridgeBinariesRoot(profile), binaryName);
+}
+
 async function readElectronVersions() {
   const electronPackage = await readJson(join(repositoryRoot, "node_modules", "electron", "package.json"));
   const electronExecutable = await resolveElectronExecutable();
-  const probeDirectory = join(desktopDist, ".electron-version-probe");
+  await mkdir(desktopDist, { recursive: true });
+  const probeDirectory = await mkdtemp(join(desktopDist, ".electron-version-probe-"));
   const probePath = join(probeDirectory, "probe.cjs");
-  await mkdir(probeDirectory, { recursive: true });
-  await writeFile(
-    probePath,
-    "console.log(JSON.stringify(process.versions)); require('electron').app.exit(0);\n",
-    "utf8",
-  );
-  const args = [
-    "--headless",
-    "--disable-gpu",
-    "--use-mock-keychain",
-    "--no-first-run",
-    ...(process.platform === "linux" ? ["--no-sandbox"] : []),
-    probePath,
-  ];
-  const { stdout } = await execFileAsync(electronExecutable, args, {
-    cwd: repositoryRoot,
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024,
-  });
-  const line = stdout.trim().split(/\r?\n/).find((value) => value.trim().startsWith("{"));
-  if (!line) throw new Error("无法读取 Electron/Chromium 版本");
-  const versions = JSON.parse(line);
-  if (versions.electron !== electronPackage.version || typeof versions.chrome !== "string") {
-    throw new Error("Electron/Chromium 版本探测结果与 lockfile 不一致");
+  try {
+    await writeFile(
+      probePath,
+      "console.log(JSON.stringify(process.versions)); require('electron').app.exit(0);\n",
+      "utf8",
+    );
+    const args = [
+      "--headless",
+      "--disable-gpu",
+      "--use-mock-keychain",
+      "--no-first-run",
+      ...(process.platform === "linux" ? ["--no-sandbox"] : []),
+      probePath,
+    ];
+    const { stdout } = await execFileAsync(electronExecutable, args, {
+      cwd: repositoryRoot,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    const line = stdout.trim().split(/\r?\n/).find((value) => value.trim().startsWith("{"));
+    if (!line) throw new Error("无法读取 Electron/Chromium 版本");
+    const versions = JSON.parse(line);
+    if (versions.electron !== electronPackage.version || typeof versions.chrome !== "string") {
+      throw new Error("Electron/Chromium 版本探测结果与 lockfile 不一致");
+    }
+    return { electron: versions.electron, chrome: versions.chrome };
+  } finally {
+    await rm(probeDirectory, { recursive: true, force: true });
   }
-  await rm(probeDirectory, { recursive: true, force: true });
-  return { electron: versions.electron, chrome: versions.chrome };
 }
 
 async function resolveElectronExecutable() {
@@ -510,6 +562,10 @@ async function walkFiles(root) {
 
 function daemonResourcePath() {
   return `daemon/${process.platform === "win32" ? "magi-daemon-app.exe" : "magi-daemon-app"}`;
+}
+
+function bridgeResourcePath(binaryName) {
+  return `daemon/${binaryName}${process.platform === "win32" ? ".exe" : ""}`;
 }
 
 function toPosix(path) {

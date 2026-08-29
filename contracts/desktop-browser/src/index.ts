@@ -1,4 +1,14 @@
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 3 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 4 } as const;
+
+/**
+ * 规范化 Chromium 返回的可选 DOM.nodeId。
+ *
+ * Chromium 的 nodeId=0 表示没有可复用的 DOM 节点身份，必须在协议边界
+ * 归一化为 null；只有正的安全整数才可以继续沿着节点选择链路传递。
+ */
+export function normalizeOptionalDomNodeId(value: unknown): number | null {
+  return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : null;
+}
 
 export type DesktopEpoch = string;
 export type WindowId = string;
@@ -34,18 +44,21 @@ export interface BrowserSurfaceIdentity {
 }
 
 export interface BrowserNodeSelection extends BrowserSurfaceIdentity {
+  browser_session_id: string;
   url: string;
   title: string;
-  frame_id: string;
+  frame_id: string | null;
   backend_dom_node_id: number;
-  dom_node_id: number;
+  dom_node_id: number | null;
   node_name: string;
   attributes: Record<string, string>;
   text_excerpt: string;
   outer_html: string;
+  /** outer_html 是否已在 Chromium 侧截断，供模型正确判断上下文完整性。 */
+  outer_html_truncated: boolean;
   aria_role: string | null;
   aria_name: string | null;
-  bounds: BrowserNormalizedRect;
+  bounds: BrowserNormalizedRect | null;
 }
 
 export interface DesktopBrowserHandshake {
@@ -253,23 +266,23 @@ export interface BrowserHostResponseEnvelope {
 export interface BrowserPageState {
   tab_id: BrowserTabId;
   url: string;
-  origin?: string | null;
+  origin: string | null;
   title: string;
   navigation_revision: number;
 }
 
 export interface BrowserSnapshotNode {
   element_ref: string;
-  role?: string | null;
-  name?: string | null;
-  value?: string | null;
-  description?: string | null;
+  role: string | null;
+  name: string | null;
+  value: string | null;
+  description: string | null;
   disabled: boolean;
   focused: boolean;
   editable: boolean;
   sensitive_input_kind?: "password" | "one_time_code" | "payment_card" | null;
   visible: boolean;
-  bounds?: BrowserNormalizedRect | null;
+  bounds: BrowserNormalizedRect | null;
   children: BrowserSnapshotNode[];
 }
 
@@ -347,7 +360,7 @@ export type BrowserHostEvent =
   | { type: "download"; payload: { tab_id: BrowserTabId; suggested_filename: string; state: string; byte_length?: number; error?: string } }
   | { type: "popup_blocked"; payload: { binding: BrowserSurfaceBinding; url: string } }
   | { type: "node_selection"; payload: BrowserNodeSelection }
-  | { type: "agent_cursor"; payload: { tab_id: BrowserTabId; visible: boolean; x: number | null; y: number | null; action: string | null } }
+  | { type: "agent_cursor"; payload: { tab_id: BrowserTabId; visible: boolean; x: number | null; y: number | null; action: BrowserAgentCursorAction | null } }
   | { type: "binary_payload_ready"; payload: BrowserBinaryPayload }
   | { type: "heartbeat"; payload: { monotonic_millis: number } };
 
@@ -356,6 +369,8 @@ export interface BrowserHostEventEnvelope {
   sequence: number;
   event: BrowserHostEvent;
 }
+
+export type BrowserAgentCursorAction = "move" | "click" | "drag" | "type" | "scroll";
 
 export interface WorkerCommandRequest {
   type: "worker_command";
@@ -372,8 +387,14 @@ export interface WorkerCommandResponse {
   binary_base64?: string;
 }
 
+export interface WorkerCancelRequest {
+  type: "worker_cancel";
+  call_id: string;
+}
+
 export interface WorkerCdpRequest {
   type: "cdp_request";
+  call_id: string;
   request_id: string;
   binding: BrowserSurfaceBinding;
   method: string;
@@ -383,13 +404,23 @@ export interface WorkerCdpRequest {
   allow_navigation_advance?: boolean;
 }
 
-export interface WorkerCdpResponse {
-  type: "cdp_response";
-  request_id: string;
-  binding: BrowserSurfaceBinding;
-  result?: unknown;
-  error?: BrowserCommandError;
-}
+export type WorkerCdpResponse =
+  | {
+      type: "cdp_response";
+      call_id: string;
+      request_id: string;
+      binding: BrowserSurfaceBinding;
+      result: unknown;
+      error?: never;
+    }
+  | {
+      type: "cdp_response";
+      call_id: string;
+      request_id: string;
+      binding: BrowserSurfaceBinding;
+      error: BrowserCommandError;
+      result?: never;
+    };
 
 export interface WorkerCdpEvent {
   type: "cdp_event";
@@ -401,7 +432,16 @@ export interface WorkerCdpEvent {
 
 export interface WorkerRebindRequest {
   type: "worker_rebind";
+  worker_epoch: string;
+  rebind_id: string;
   bindings: BrowserSurfaceBinding[];
+}
+
+export interface WorkerRebindAck {
+  type: "worker_rebind_ack";
+  worker_epoch: string;
+  rebind_id: string;
+  binding_count: number;
 }
 
 export interface WorkerReadyMessage {
@@ -410,5 +450,5 @@ export interface WorkerReadyMessage {
   protocol_version: ProtocolVersion;
 }
 
-export type MainToWorkerMessage = WorkerCommandRequest | WorkerCdpResponse | WorkerCdpEvent | WorkerRebindRequest;
-export type WorkerToMainMessage = WorkerCommandResponse | WorkerCdpRequest | WorkerReadyMessage;
+export type MainToWorkerMessage = WorkerCommandRequest | WorkerCancelRequest | WorkerCdpResponse | WorkerCdpEvent | WorkerRebindRequest;
+export type WorkerToMainMessage = WorkerCommandResponse | WorkerCdpRequest | WorkerReadyMessage | WorkerRebindAck;

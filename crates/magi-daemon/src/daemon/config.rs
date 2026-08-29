@@ -1,12 +1,48 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    env,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use thiserror::Error;
+
+static STARTUP_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn new_startup_nonce() -> String {
+    let mut entropy = [0_u8; 16];
+    if getrandom::fill(&mut entropy).is_ok() {
+        return entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "fallback-{timestamp}-{}-{}",
+        std::process::id(),
+        STARTUP_NONCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn env_or_default(name: &str, default: impl FnOnce() -> String) -> String {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default)
+}
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
     pub host: String,
     pub port: u16,
     pub service_name: String,
+    pub product_version: String,
+    pub build_identity: String,
+    pub startup_nonce: String,
     pub state_root: PathBuf,
     pub web_dist_root: Option<PathBuf>,
     pub open_browser: bool,
@@ -24,6 +60,11 @@ impl DaemonConfig {
             host: host.into(),
             port,
             service_name: service_name.into(),
+            product_version: env_or_default("MAGI_PRODUCT_VERSION", || {
+                env!("CARGO_PKG_VERSION").to_string()
+            }),
+            build_identity: env_or_default("MAGI_BUILD_ID", || "source".to_string()),
+            startup_nonce: env_or_default("MAGI_DAEMON_START_NONCE", || new_startup_nonce()),
             state_root,
             web_dist_root: None,
             open_browser: false,
@@ -38,6 +79,26 @@ impl DaemonConfig {
     pub fn with_web_dist_root(mut self, web_dist_root: impl Into<PathBuf>) -> Self {
         self.web_dist_root = Some(web_dist_root.into());
         self
+    }
+
+    pub fn with_identity(
+        mut self,
+        product_version: impl Into<String>,
+        build_identity: impl Into<String>,
+        startup_nonce: impl Into<String>,
+    ) -> Self {
+        self.product_version = product_version.into();
+        self.build_identity = build_identity.into();
+        self.startup_nonce = startup_nonce.into();
+        self
+    }
+
+    pub fn identity(&self) -> magi_api::DaemonIdentity {
+        magi_api::DaemonIdentity {
+            product_version: self.product_version.clone(),
+            build_identity: self.build_identity.clone(),
+            startup_nonce: self.startup_nonce.clone(),
+        }
     }
 
     pub fn socket_addr(&self) -> Result<SocketAddr, DaemonError> {

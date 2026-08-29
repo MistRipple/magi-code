@@ -137,8 +137,8 @@ assert.doesNotMatch(
 );
 assert.match(
   shellSource,
-  /class="workspace-new-session-btn"[\s\S]*?disabled=\{workspaceActionPending \|\| messagesState\.sessionHydrating \|\| Boolean\(pendingNavigation\)\}[\s\S]*?event\.stopPropagation\(\)[\s\S]*?openWorkspaceDraft\(workspace\)[\s\S]*?<Icon name="plus"/,
-  '工作空间行必须提供不会触发展开的加号按钮，并在状态切换期间禁用',
+  /class="workspace-new-session-btn"[\s\S]*?disabled=\{workspaceActionPending \|\| messagesState\.sessionHydrating\}[\s\S]*?event\.stopPropagation\(\)[\s\S]*?openWorkspaceDraft\(workspace\)[\s\S]*?<Icon name="plus"/,
+  '工作空间行必须提供不会触发展开的加号按钮，并在工作区操作或会话加载期间禁用',
 );
 assert.match(
   shellSource,

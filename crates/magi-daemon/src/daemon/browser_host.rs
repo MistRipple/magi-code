@@ -552,6 +552,11 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             });
             match result {
                 Ok((revoked, true)) => {
+                    // Host 重连时 Control Server 只会重放当前 Primary Surface；
+                    // 之前已经完成加载的页面不会再次发送 page_updated。标记
+                    // 投影必须在 Primary 确认后立即由 Authority 重新下发，
+                    // 否则服务或 Electron 重启后持久化标记会永久消失。
+                    schedule_browser_annotation_sync(state, &binding.tab_id);
                     publish_tab_event(
                         state,
                         "browser.surface.primary_changed",
@@ -669,6 +674,15 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             }
         }
         BrowserHostEvent::PageFailed { binding, reason } => {
+            if !is_current_or_advanced_primary_binding(state, &binding) {
+                tracing::debug!(
+                    tab_id = %binding.tab_id,
+                    surface_id = %binding.surface_id,
+                    navigation_revision = binding.navigation_revision,
+                    "忽略已失效 Browser Surface 的页面失败事件"
+                );
+                return;
+            }
             publish_tab_event(
                 state,
                 "browser.automation.page_failed",
@@ -681,6 +695,15 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             );
         }
         BrowserHostEvent::LoadingChanged { binding, loading } => {
+            if !is_current_or_advanced_primary_binding(state, &binding) {
+                tracing::debug!(
+                    tab_id = %binding.tab_id,
+                    surface_id = %binding.surface_id,
+                    navigation_revision = binding.navigation_revision,
+                    "忽略已失效 Browser Surface 的加载事件"
+                );
+                return;
+            }
             publish_tab_event(
                 state,
                 "browser.tab.loading_changed",
@@ -783,6 +806,15 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             );
         }
         BrowserHostEvent::PopupBlocked { binding, url } => {
+            if !is_current_or_advanced_primary_binding(state, &binding) {
+                tracing::debug!(
+                    tab_id = %binding.tab_id,
+                    surface_id = %binding.surface_id,
+                    navigation_revision = binding.navigation_revision,
+                    "忽略已失效 Browser Surface 的弹窗事件"
+                );
+                return;
+            }
             publish_tab_event(
                 state,
                 "browser.popup.blocked",
@@ -800,12 +832,15 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 );
                 return;
             }
+            let payload = serde_json::to_value(&selection)
+                .expect("BrowserNodeSelection must serialize as a structured event");
             publish_tab_event(
                 state,
                 "browser.node.selected",
                 browser_tab_context(state, &selection.tab_id),
-                serde_json::to_value(selection)
-                    .expect("BrowserNodeSelection must serialize as a structured event"),
+                magi_conversation_runtime::context_reference::sanitize_browser_node_selection(
+                    &payload,
+                ),
             );
         }
         BrowserHostEvent::Ready(_)
@@ -885,6 +920,29 @@ fn is_current_primary_binding(
     authority.is_current_surface_binding(binding)
 }
 
+fn is_current_or_advanced_primary_binding(
+    state: &ApiState,
+    binding: &magi_browser_authority::BrowserSurfaceBinding,
+) -> bool {
+    let authority = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned");
+    authority
+        .primary_surface(&binding.tab_id)
+        .is_some_and(|current| {
+            current.desktop_epoch == binding.desktop_epoch
+                && current.window_id == binding.window_id
+                && current.surface_id == binding.surface_id
+                && current.surface_revision == binding.surface_revision
+                && current.tab_id == binding.tab_id
+                && current.web_contents_id == binding.web_contents_id
+                && current.target_id == binding.target_id
+                && current.browser_context_id == binding.browser_context_id
+                && binding.navigation_revision >= current.navigation_revision
+        })
+}
+
 fn is_current_node_selection(
     state: &ApiState,
     selection: &magi_browser_authority::BrowserNodeSelection,
@@ -897,6 +955,9 @@ fn is_current_node_selection(
         .primary_surface(&selection.tab_id)
         .is_some_and(|binding| {
             binding.surface_id == selection.surface_id
+                && authority
+                    .tab(&selection.tab_id)
+                    .is_some_and(|tab| tab.browser_session_id == selection.browser_session_id)
                 && binding.navigation_revision == selection.navigation_revision
         })
 }
@@ -1203,23 +1264,25 @@ mod tests {
             tab_id,
             surface_id: surface_id.to_string(),
             navigation_revision,
+            browser_session_id: BrowserSessionId::new("browser-session-node-selection"),
             url: "https://example.com".to_string(),
             title: "Example".to_string(),
-            frame_id: "frame-1".to_string(),
+            frame_id: Some("frame-1".to_string()),
             backend_dom_node_id: 101,
-            dom_node_id: 202,
+            dom_node_id: Some(202),
             node_name: "BUTTON".to_string(),
             attributes: BTreeMap::from([("data-testid".to_string(), "submit".to_string())]),
             text_excerpt: "Submit".to_string(),
             outer_html: "<button>Submit</button>".to_string(),
+            outer_html_truncated: false,
             aria_role: Some("button".to_string()),
             aria_name: Some("Submit".to_string()),
-            bounds: magi_browser_authority::BrowserHostRect {
+            bounds: Some(magi_browser_authority::BrowserHostRect {
                 x: 10.0,
                 y: 20.0,
                 width: 120.0,
                 height: 40.0,
-            },
+            }),
         })
     }
 

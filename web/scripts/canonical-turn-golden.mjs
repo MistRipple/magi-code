@@ -762,6 +762,7 @@ function assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore) {
     data: {
       dataType: 'sessionBootstrapLoaded',
       payload: {
+        scope: 'workspace',
         agent: { runtimeEpoch: 'runtime-golden-draft-preserve' },
         eventStreamNextSequence: 1,
         sessionId: '',
@@ -1820,6 +1821,7 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
     data: {
       dataType: 'sessionBootstrapLoaded',
       payload: {
+        scope: 'workspace',
         agent: { runtimeEpoch: 'runtime-golden-bootstrap-empty-projection' },
         eventStreamNextSequence: 1,
         sessionId: c.sessionId,
@@ -1991,6 +1993,7 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     data: {
       dataType: 'sessionBootstrapLoaded',
       payload: {
+        scope: 'workspace',
         agent: { runtimeEpoch: 'runtime-golden-stale-idle-bootstrap' },
         eventStreamNextSequence: 1,
         sessionId,
@@ -2077,6 +2080,7 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     data: {
       dataType: 'sessionBootstrapLoaded',
       payload: {
+        scope: 'workspace',
         agent: { runtimeEpoch: 'runtime-golden-authoritative-bootstrap' },
         eventStreamNextSequence: 1,
         sessionId,

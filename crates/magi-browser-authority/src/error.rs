@@ -72,6 +72,11 @@ pub enum BrowserAuthorityError {
         tab_id: BrowserTabId,
         browser_session_id: BrowserSessionId,
     },
+    #[error("browser session {browser_session_id} does not belong to Magi session {session_id}")]
+    SessionMagiSessionMismatch {
+        browser_session_id: BrowserSessionId,
+        session_id: magi_core::SessionId,
+    },
     #[error("browser tab is not ready: {tab_id} ({lifecycle:?})")]
     TabNotReady {
         tab_id: BrowserTabId,
@@ -104,6 +109,10 @@ pub enum BrowserAuthorityError {
         tab_id: BrowserTabId,
         surface_id: String,
     },
+    #[error(
+        "browser node selection page does not match the current page: expected={expected}, provided={provided}"
+    )]
+    NodeSelectionPageMismatch { expected: String, provided: String },
     #[error("browser surface binding is invalid")]
     InvalidSurfaceBinding,
     #[error("browser lease goal binding does not match the current execution")]

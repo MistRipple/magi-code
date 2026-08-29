@@ -3882,12 +3882,13 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
 #[tokio::test]
 async fn daemon_handle_starts_serves_and_shuts_down_idempotently() {
     let state_root = temp_state_root("daemon-handle-lifecycle");
-    let daemon = Daemon::new(DaemonConfig::new(
-        "127.0.0.1",
-        0,
-        "daemon-handle-test",
-        state_root,
-    ));
+    let daemon = Daemon::new(
+        DaemonConfig::new("127.0.0.1", 0, "daemon-handle-test", state_root).with_identity(
+            "3.0.51",
+            "build-test-1",
+            "nonce-test-1",
+        ),
+    );
 
     let handle = daemon.start().await.expect("daemon should start");
     assert_ne!(handle.bound_addr().port(), 0);
@@ -3896,6 +3897,26 @@ async fn daemon_handle_starts_serves_and_shuts_down_idempotently() {
         .await
         .expect("health endpoint should be reachable");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let health: serde_json::Value = response
+        .json()
+        .await
+        .expect("health response should be json");
+    assert_eq!(health["serviceName"], "daemon-handle-test");
+    assert_eq!(health["productVersion"], "3.0.51");
+    assert_eq!(health["buildIdentity"], "build-test-1");
+    assert_eq!(health["startupNonce"], "nonce-test-1");
+
+    let version_url = handle.web_url().replace("/web.html", "/version");
+    let version: serde_json::Value = reqwest::get(version_url)
+        .await
+        .expect("version endpoint should be reachable")
+        .json()
+        .await
+        .expect("version response should be json");
+    assert_eq!(version["serviceName"], "daemon-handle-test");
+    assert_eq!(version["productVersion"], "3.0.51");
+    assert_eq!(version["buildIdentity"], "build-test-1");
+    assert_eq!(version["startupNonce"], "nonce-test-1");
 
     handle
         .shutdown("desktop exit")

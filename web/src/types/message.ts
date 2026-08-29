@@ -642,6 +642,8 @@ export interface MessageBrowserNodeSelection {
   attributes: Record<string, string>;
   textExcerpt: string;
   outerHtml: string;
+  /** outerHtml 是否已由 Chromium 按协议上限截断。 */
+  outerHtmlTruncated: boolean;
   ariaRole?: string | null;
   ariaName?: string | null;
   bounds?: BrowserNodeSelectionRect | null;

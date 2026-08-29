@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { access, readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
+import { runBridgePreflight } from "./bridge-preflight.mjs";
 
 export async function afterPack(context) {
   const resources = context.electronPlatformName === "darwin"
@@ -30,6 +31,7 @@ export async function afterPack(context) {
       throw new Error(`发行资源哈希不匹配: ${file.path}`);
     }
   }
+  await runBridgePreflight(join(resources, "daemon"), "Electron resources bridge");
 
   const packagedPaths = [
     ...listPackage(asarPath).map((path) => `app.asar/${path}`),

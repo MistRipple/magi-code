@@ -13,14 +13,17 @@
     "test": "npm run test --workspace @magi/desktop && npm run test --workspace @magi/browser-automation-worker && npm run test --workspace magi-web",
     "build": "npm run build --workspace @magi/desktop",
     "test:browser-core": "node scripts/verify-browser-core-acceptance.mjs",
+    "test:browser-download-lifecycle": "node scripts/verify-browser-download-lifecycle.mjs",
     "desktop:dev": "npm run dev --workspace @magi/desktop",
     "desktop:package": "npm run package --workspace @magi/desktop --",
     "release:preflight": "node scripts/release-preflight.mjs",
     "release:preflight:full": "node scripts/release-preflight.mjs --package --audit",
     "test:browser-core-live": "node scripts/verify-browser-core-live.mjs",
-    "release:guard": "node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs",
+    "release:guard": "npm run browser-tool-catalog:check && npm run protocol:check && node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs",
     "protocol:generate": "node scripts/generate-app-server-protocol.mjs",
-    "protocol:check": "node scripts/generate-app-server-protocol.mjs --check"
+    "protocol:check": "node scripts/generate-app-server-protocol.mjs --check",
+    "browser-tool-catalog:generate": "node scripts/generate-browser-tool-catalog.mjs",
+    "browser-tool-catalog:check": "node scripts/generate-browser-tool-catalog.mjs --check"
   },
   "engines": {
     "node": ">=22"

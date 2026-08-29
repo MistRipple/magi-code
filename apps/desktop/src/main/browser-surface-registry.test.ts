@@ -39,9 +39,9 @@ test("Primary Surface 关闭后只提升同一逻辑 Tab 的剩余 Surface", () 
   registry.promote(first.surfaceId);
 
   registry.remove(first);
-  const fallback = registry.promoteFallback("tab-1");
+  const replacement = registry.promoteReplacement("tab-1");
 
-  assert.equal(fallback, second);
+  assert.equal(replacement, second);
   assert.equal(registry.primaryForTab("tab-1"), second);
   assert.equal(registry.primaryForTab("tab-2"), undefined);
 });

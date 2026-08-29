@@ -21,4 +21,7 @@ export interface SessionBootstrapSnapshot {
   beforeCursor?: string | null;
   canonicalHasMoreBefore?: boolean;
   canonicalBeforeCursor?: string | null;
+  navigationRequestId?: string;
+  navigationTarget?: 'draft' | 'session';
+  navigationOrchestratorSessionConfig?: Record<string, unknown>;
 }

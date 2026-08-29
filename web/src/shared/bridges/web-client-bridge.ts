@@ -144,24 +144,24 @@ import {
   refreshCurrentGoal,
 } from '../../stores/goal-store.svelte';
 import type { QueuedSessionTurnDto, SessionPlanDto } from '../rust-backend-types';
-import { turnStoreState } from '../../stores/turn-store.svelte';
 import { sanitizeSvgContent } from '../svg-sanitizer';
 import {
   messagesState,
-  allocateTurnOrderSeq,
-  adoptAcceptedSessionIdForLocalTurn,
   beginLocalTurnSubmission,
   clearRequestBinding,
   clearPendingRequest,
   completeTurnEditing,
   createRequestBinding,
   getRequestBinding,
-  rebindLocalSubmissionSession,
-  setCurrentSessionId,
+  adoptCurrentSessionIdForLiveTurn,
   setQueuedMessages,
   setOrchestratorRuntimeState,
   updateRequestBinding,
 } from '../../stores/messages.svelte';
+import {
+  SESSION_NAVIGATION_TIMEOUT_MS,
+  sessionNavigationState,
+} from '../session-navigation.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { MessageBrowserNodeSelection, OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
@@ -176,6 +176,7 @@ let currentWorkspacePath = '';
 let currentSessionId = '';
 let currentSessionScope: 'personal' | 'workspace' = 'personal';
 let currentInterruptTaskId = '';
+let currentBindingGeneration = 0;
 let continueRequestId = '';
 let currentRuntimeEpoch = '';
 type SessionTurnSubmissionContext = {
@@ -185,8 +186,8 @@ type SessionTurnSubmissionContext = {
   workspacePath: string;
   /** 提交时已经存在的后端会话 ID；空值表示新会话草稿。 */
   targetSessionId: string;
-  /** 仅用于把新会话首条消息固定在当前页面，绝不发送给后端。 */
-  optimisticSessionId: string;
+  /** 草稿提交开始时的绑定代际；旧请求不能夺回后来新建的草稿。 */
+  bindingGeneration: number;
   /** SSE 先于 HTTP 返回时记录已确认的后端会话。 */
   acceptedSessionId?: string;
 };
@@ -198,11 +199,6 @@ const guidingQueuedMessageIds = new Set<string>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
 let cachedSettingsBootstrapBindingKey = '';
-
-function localOptimisticSessionIdForRequest(requestId: string): string {
-  const safeRequestId = requestId.replace(/[^A-Za-z0-9_-]/g, '-');
-  return `session-local-${safeRequestId}`;
-}
 
 /** 事件流连接句柄：Web 使用 SSE，Desktop 使用 App Server WebSocket。 */
 type EventStreamConnection = SseConnection | AppServerClient;
@@ -273,7 +269,7 @@ function submissionContextPayload(
     workspaceId: context.workspaceId || null,
     workspacePath: context.workspacePath || null,
     targetSessionId: context.targetSessionId || null,
-    optimisticSessionId: context.optimisticSessionId,
+    bindingGeneration: context.bindingGeneration,
     ...(context.acceptedSessionId ? { acceptedSessionId: context.acceptedSessionId } : {}),
   };
 }
@@ -316,15 +312,24 @@ function submissionContextCanCommit(
       && currentSessionId === resolvedSessionId
       && storeSessionId === resolvedSessionId;
   }
-  // 草稿首条消息的本地 ID 只存在消息 Store，不能提前写入 Bridge 的
-  // 权威 currentSessionId；HTTP accepted 返回后再由下面的持久绑定收敛。
-  return !currentSessionId && storeSessionId === context.optimisticSessionId;
+  // 草稿没有 sessionId。只有同一绑定代际仍处于空会话时，HTTP accepted
+  // 才能把真实会话提交到当前页面；新建草稿后旧请求只能在后台完成。
+  return context.bindingGeneration === currentBindingGeneration
+    && !currentSessionId
+    && !storeSessionId;
 }
 
 function finishSessionTurnSubmission(context: SessionTurnSubmissionContext): void {
   if (sessionTurnSubmissions.get(context.requestId) === context) {
     sessionTurnSubmissions.delete(context.requestId);
   }
+}
+
+function invalidateSessionTurnSubmissionsForNavigation(): void {
+  // 导航是用户对当前页面归属的即时变更。先切断旧 submission context，
+  // 再等待导航 bootstrap，避免旧草稿的迟到 accepted 响应夺回新页面。
+  currentBindingGeneration += 1;
+  clearContinueRequestInFlight();
 }
 
 const RECOVERY_BASE_DELAY_MS = 1000;
@@ -1088,8 +1093,11 @@ function ensureWindowListener(): void {
       || message.type === 'agentSseStatus') {
       return;
     }
-    syncBindingFromBridgeMessage(message);
     emitMessage(message);
+    // sessionBootstrapLoaded 的导航响应由 data-message-handlers 在严格校验
+    // requestId/target 后提交。这里不能在处理器之前写入 binding，也不能让
+    // 迟到快照在仍有导航事务时污染当前会话。
+    syncBindingFromBridgeMessage(message);
   });
   window.addEventListener('storage', (event) => {
     if (event.key !== RUNTIME_BASE_URL_STORAGE_KEY) {
@@ -1153,6 +1161,9 @@ function extractSessionBootstrapBinding(
 }
 
 function syncBindingFromBridgeMessage(message: ClientBridgeMessage): void {
+  if (sessionNavigationState.pending) {
+    return;
+  }
   const binding = extractSessionBootstrapBinding(message);
   if (!binding) return;
   const nextSessionId = binding.sessionId;
@@ -1261,6 +1272,17 @@ function emitSessionTurnAccepted(
   });
 }
 
+function emitSessionTurnSubmissionSettled(
+  requestId: string,
+  status: 'accepted' | 'failed',
+): void {
+  const normalizedRequestId = requestId.trim();
+  if (!normalizedRequestId) return;
+  window.dispatchEvent(new CustomEvent('magi:sessionTurnSubmissionSettled', {
+    detail: { requestId: normalizedRequestId, status },
+  }));
+}
+
 function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void {
   const isTerminalEvent = canonicalEvent.kind === 'turn_completed'
     || canonicalEvent.kind === 'turn_superseded'
@@ -1281,214 +1303,6 @@ function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void
     sessionId: canonicalEvent.sessionId,
     canonicalEvent,
   });
-}
-
-function emitLocalPendingCanonicalTurn(input: {
-  sessionId: string;
-  requestId: string;
-  userMessageId: string;
-  placeholderMessageId: string;
-  text: string;
-  images: Array<{ name: string; dataUrl: string }>;
-  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; pathRef?: string; name: string }>;
-  browserAnnotationSnapshots: Array<{
-    annotationId: string;
-    browserSessionId: string;
-    tabId: string;
-    sequence?: number;
-    kind: 'element' | 'region';
-    comment: string;
-    screenshotArtifactId?: string | null;
-  }>;
-  browserNodeSelections: MessageBrowserNodeSelection[];
-  turnSeq: number;
-  createdAt: number;
-}): boolean {
-  const sessionId = input.sessionId.trim();
-  if (!sessionId || !input.requestId || input.turnSeq <= 0) {
-    return false;
-  }
-  const turnId = `turn-local-${input.requestId}`;
-  const sourceThreadId = `thread-orchestrator-${sessionId}`;
-  const sharedMetadata = {
-    requestId: input.requestId,
-    userMessageId: input.userMessageId,
-    placeholderMessageId: input.placeholderMessageId,
-    ...(input.images.length > 0 ? { images: input.images } : {}),
-    ...(input.contextReferences.length > 0
-      ? { contextReferences: input.contextReferences }
-      : {}),
-    ...(input.browserAnnotationSnapshots.length > 0
-      ? { browserAnnotationRefs: input.browserAnnotationSnapshots }
-      : {}),
-    ...(input.browserNodeSelections.length > 0
-      ? { browserNodeSelections: input.browserNodeSelections }
-      : {}),
-    localOptimistic: true,
-  };
-  const assistantItem = {
-    sessionId,
-    turnId,
-    turnSeq: input.turnSeq,
-    itemId: input.placeholderMessageId,
-    itemSeq: 2,
-    kind: 'assistant_text' as const,
-    createdAt: input.createdAt,
-    status: 'running' as const,
-    updatedAt: input.createdAt,
-    title: i18n.t('bridge.detail.generatingReply'),
-    content: '',
-    sourceThreadId,
-    visibility: {
-      renderable: true,
-    },
-    metadata: sharedMetadata,
-  };
-  emitSessionTurnCanonicalEvent({
-    schemaVersion: CANONICAL_TURN_SCHEMA_VERSION,
-    eventId: `event-local-turn-started-${input.requestId}`,
-    eventSeq: 0,
-    kind: 'turn_started',
-    sessionId,
-    turnId,
-    turnSeq: input.turnSeq,
-    occurredAt: input.createdAt,
-    turn: {
-      sessionId,
-      turnId,
-      turnSeq: input.turnSeq,
-      acceptedAt: input.createdAt,
-      status: 'running',
-      metadata: sharedMetadata,
-      items: [
-        {
-          sessionId,
-          turnId,
-          turnSeq: input.turnSeq,
-          itemId: input.userMessageId,
-          itemSeq: 1,
-          kind: 'user_message',
-          createdAt: input.createdAt,
-          status: 'completed',
-          updatedAt: input.createdAt,
-          content: input.text,
-          sourceThreadId,
-          visibility: {
-            renderable: true,
-          },
-          metadata: sharedMetadata,
-        },
-        assistantItem,
-      ],
-    },
-    item: assistantItem,
-  });
-  return true;
-}
-
-function emitLocalPendingCanonicalTurnFailed(input: {
-  sessionId: string;
-  requestId: string;
-  userMessageId: string;
-  placeholderMessageId: string;
-  text: string;
-  images: Array<{ name: string; dataUrl: string }>;
-  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; pathRef?: string; name: string }>;
-  browserAnnotationSnapshots: Array<{
-    annotationId: string;
-    browserSessionId: string;
-    tabId: string;
-    sequence?: number;
-    kind: 'element' | 'region';
-    comment: string;
-    screenshotArtifactId?: string | null;
-  }>;
-  browserNodeSelections: MessageBrowserNodeSelection[];
-  turnSeq: number;
-  createdAt: number;
-  failedAt: number;
-  error: string;
-}): boolean {
-  const sessionId = input.sessionId.trim();
-  if (!sessionId || !input.requestId || input.turnSeq <= 0) {
-    return false;
-  }
-  const turnId = `turn-local-${input.requestId}`;
-  const sourceThreadId = `thread-orchestrator-${sessionId}`;
-  const sharedMetadata = {
-    requestId: input.requestId,
-    userMessageId: input.userMessageId,
-    placeholderMessageId: input.placeholderMessageId,
-    ...(input.images.length > 0 ? { images: input.images } : {}),
-    ...(input.contextReferences.length > 0
-      ? { contextReferences: input.contextReferences }
-      : {}),
-    ...(input.browserAnnotationSnapshots.length > 0
-      ? { browserAnnotationRefs: input.browserAnnotationSnapshots }
-      : {}),
-    ...(input.browserNodeSelections.length > 0
-      ? { browserNodeSelections: input.browserNodeSelections }
-      : {}),
-    localTerminal: true,
-  };
-  const userItem = {
-    sessionId,
-    turnId,
-    turnSeq: input.turnSeq,
-    itemId: input.userMessageId,
-    itemSeq: 1,
-    kind: 'user_message' as const,
-    createdAt: input.createdAt,
-    status: 'completed' as const,
-    updatedAt: input.createdAt,
-    content: input.text,
-    sourceThreadId,
-    visibility: {
-      renderable: true,
-    },
-    metadata: sharedMetadata,
-  };
-  const assistantItem = {
-    sessionId,
-    turnId,
-    turnSeq: input.turnSeq,
-    itemId: input.placeholderMessageId,
-    itemSeq: 2,
-    kind: 'assistant_text' as const,
-    createdAt: input.createdAt,
-    status: 'failed' as const,
-    updatedAt: input.failedAt,
-    title: i18n.t('bridge.detail.sendFailedTitle'),
-    content: input.error,
-    sourceThreadId,
-    visibility: {
-      renderable: true,
-    },
-    metadata: sharedMetadata,
-  };
-  emitSessionTurnCanonicalEvent({
-    schemaVersion: CANONICAL_TURN_SCHEMA_VERSION,
-    eventId: `event-local-turn-failed-${input.requestId}`,
-    eventSeq: 0,
-    kind: 'turn_completed',
-    sessionId,
-    turnId,
-    turnSeq: input.turnSeq,
-    occurredAt: input.failedAt,
-    turn: {
-      sessionId,
-      turnId,
-      turnSeq: input.turnSeq,
-      acceptedAt: input.createdAt,
-      completedAt: input.failedAt,
-      status: 'failed',
-      responseDurationMs: Math.max(0, input.failedAt - input.createdAt),
-      metadata: sharedMetadata,
-      items: [userItem, assistantItem],
-    },
-    item: assistantItem,
-  });
-  return true;
 }
 
 function emitAcceptedCanonicalTurnFromResult(result: {
@@ -1517,31 +1331,24 @@ function emitAcceptedCanonicalTurnFromResult(result: {
   }
 }
 
-function emitLocalSupersededCanonicalTurn(turnId: string, occurredAt: number): void {
-  const normalizedTurnId = trimBridgeString(turnId);
-  const existing = turnStoreState.reducer.turns.find((turn) => turn.turnId === normalizedTurnId);
-  if (!existing || existing.status === 'superseded') {
-    return;
-  }
-  emitSessionTurnCanonicalEvent({
-    schemaVersion: CANONICAL_TURN_SCHEMA_VERSION,
-    eventId: `local-turn-superseded-${normalizedTurnId}-${occurredAt}`,
-    eventSeq: 0,
-    kind: 'turn_superseded',
-    sessionId: existing.sessionId,
-    turnId: existing.turnId,
-    turnSeq: existing.turnSeq,
-    occurredAt,
-    turn: {
-      ...existing,
-      status: 'superseded',
-      metadata: {
-        ...(existing.metadata || {}),
-        supersededReason: 'user_edit',
-        supersededAt: occurredAt,
-      },
-    },
-  });
+function canonicalTurnSeqFromResult(result: {
+  canonicalTurn?: unknown;
+  canonicalItem?: unknown;
+}): number | undefined {
+  const turnSeqCandidates = [
+    result.canonicalTurn && typeof result.canonicalTurn === 'object'
+      ? (result.canonicalTurn as Record<string, unknown>).turnSeq
+      : undefined,
+    result.canonicalItem && typeof result.canonicalItem === 'object'
+      ? (result.canonicalItem as Record<string, unknown>).turnSeq
+      : undefined,
+  ];
+  const canonicalTurnSeq = turnSeqCandidates.find((value) => (
+    typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value > 0
+  ));
+  return typeof canonicalTurnSeq === 'number' ? canonicalTurnSeq : undefined;
 }
 
 function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
@@ -1619,11 +1426,12 @@ function activeDraftSubmissionMatchesAcceptedEvent(
     && context
     && !context.targetSessionId
     && context.requestId === requestId
+    && context.bindingGeneration === currentBindingGeneration
     && messagesState.pendingRequests.has(requestId)
     && getRequestBinding(requestId)
     && submissionContextMatchesCurrentScope(context)
     && !currentSessionId
-    && currentStoreSessionId() === context.optimisticSessionId,
+    && !currentStoreSessionId(),
   );
 }
 
@@ -2635,6 +2443,12 @@ function appServerEventStreamKey(): string {
   return `${eventStreamBindingKey()}\u0000${currentSessionId}`;
 }
 
+function currentEventStreamKey(): string {
+  return shouldUseAppServerEventStream()
+    ? appServerEventStreamKey()
+    : eventStreamBindingKey();
+}
+
 function appServerEventSubscription(): {
   sessionId?: string | null;
   workspaceId?: string | null;
@@ -2844,6 +2658,7 @@ function persistWorkspaceBinding(
     || previousWorkspacePath !== normalizedWorkspacePath
     || previousSessionId !== incomingSessionId
   ) {
+    currentBindingGeneration += 1;
     clearContinueRequestInFlight();
   }
   setAgentBindingContext(incomingScope === 'workspace' ? {
@@ -2908,6 +2723,13 @@ function clearWorkspaceSessionBinding(
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
+  if (
+    previousWorkspaceId !== normalizedWorkspaceId
+    || previousWorkspacePath !== normalizedWorkspacePath
+    || previousSessionId !== ''
+  ) {
+    currentBindingGeneration += 1;
+  }
   clearContinueRequestInFlight();
   setAgentBindingContext(incomingScope === 'workspace' ? {
     scope: 'workspace',
@@ -2948,6 +2770,7 @@ function clearPersistedWorkspaceBinding(): void {
   currentWorkspacePath = '';
   currentSessionId = '';
   currentSessionScope = 'personal';
+  currentBindingGeneration += 1;
   clearContinueRequestInFlight();
   clearAgentBindingContext({ authoritative: true });
   clearCurrentInterruptTaskId();
@@ -3124,7 +2947,7 @@ async function ensureEventStream(
     return;
   }
   const useAppServer = shouldUseAppServerEventStream();
-  const nextKey = useAppServer ? appServerEventStreamKey() : eventStreamBindingKey();
+  const nextKey = currentEventStreamKey();
   if (!nextKey) {
     closeEventStream();
     return;
@@ -3658,27 +3481,52 @@ async function commitSessionNavigation(
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   invalidateBootstrapRequests();
+  invalidateSessionTurnSubmissionsForNavigation();
+  const navigationRequestSeq = bootstrapRequestSeq;
+  const navigationAbortController = new AbortController();
+  let navigationTimedOut = false;
+  const navigationTimeoutId = window.setTimeout(() => {
+    navigationTimedOut = true;
+    navigationAbortController.abort();
+  }, SESSION_NAVIGATION_TIMEOUT_MS);
   // 导航事务拥有新的会话归属；旧提交即使随后收到 HTTP/SSE，也不能重新夺回当前页面。
-  const response = await getTransport().request(agentUrl('/api/session/navigation'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      target,
-      scope: binding.scope,
-      ...(binding.scope === 'workspace' ? { workspaceId, workspacePath } : {}),
-      ...(target === 'session' ? { sessionId } : {}),
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`session navigation failed: ${response.status}`);
+  let response: Response;
+  let rawPayload: unknown;
+  try {
+    response = await getTransport().request(agentUrl('/api/session/navigation'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target,
+        scope: binding.scope,
+        ...(binding.scope === 'workspace' ? { workspaceId, workspacePath } : {}),
+        ...(target === 'session' ? { sessionId } : {}),
+      }),
+      signal: navigationAbortController.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`session navigation failed: ${response.status}`);
+    }
+    rawPayload = await response.json();
+  } catch (error) {
+    if (navigationTimedOut) {
+      throw new Error('会话导航请求超时');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(navigationTimeoutId);
   }
-  const rawPayload = await response.json();
+  if (bootstrapRequestSeq !== navigationRequestSeq) {
+    throw new Error('会话导航响应已失效');
+  }
   const payload = normalizeBootstrapResponse(rawPayload, {
     workspaceId,
     workspacePath,
     sessionId,
   });
-  const navigationRequestSeq = bootstrapRequestSeq;
+  if (!payload.state || typeof payload.state !== 'object' || Array.isArray(payload.state)) {
+    throw new Error('会话导航响应缺少有效的 state');
+  }
   const navigationBindingKey = bootstrapBindingKey({
     scope: payload.scope,
     workspaceId: payload.workspace.workspaceId,
@@ -3704,9 +3552,14 @@ async function commitSessionNavigation(
 
 async function navigateSession(message: ClientBridgeMessage): Promise<void> {
   const requestId = trimBridgeString(message.requestId);
-  const target = message.target === 'session' ? 'session' : 'draft';
+  const target = message.target === 'session'
+    ? 'session'
+    : message.target === 'draft' ? 'draft' : null;
   if (!requestId) {
     throw new Error('会话导航缺少 requestId');
+  }
+  if (!target) {
+    throw new Error('会话导航缺少有效的 target');
   }
   if (message.scope !== 'personal' && message.scope !== 'workspace') {
     throw new Error('会话导航缺少有效的 scope');
@@ -3781,7 +3634,7 @@ async function warmLiveBridgeForSubmission(reason: string): Promise<void> {
     await restoreBridgeState(reason, true);
     return;
   }
-  const expectedKey = eventStreamBindingKey();
+  const expectedKey = currentEventStreamKey();
   await ensureEventStream({
     forceReconnect: activeEventStreamKey !== expectedKey,
     waitUntilOpen: false,
@@ -3871,15 +3724,6 @@ interface ExecuteTaskInput {
   }>;
   browserAnnotationRefs?: string[];
   browserNodeSelections?: MessageBrowserNodeSelection[];
-  browserAnnotationSnapshots?: Array<{
-    annotationId: string;
-    browserSessionId: string;
-    tabId: string;
-    sequence?: number;
-    kind: 'element' | 'region';
-    comment: string;
-    screenshotArtifactId?: string | null;
-  }>;
 }
 
 function bridgeRuntimeIsBusy(): boolean {
@@ -4033,28 +3877,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       .map((annotationId) => annotationId.trim())
       .filter(Boolean)
     : [];
-  const browserAnnotationSnapshots = Array.isArray(input.browserAnnotationSnapshots)
-    ? input.browserAnnotationSnapshots
-      .filter((annotation) => (
-        typeof annotation?.annotationId === 'string'
-        && typeof annotation?.browserSessionId === 'string'
-        && typeof annotation?.tabId === 'string'
-        && (annotation?.kind === 'element' || annotation?.kind === 'region')
-        && typeof annotation?.comment === 'string'
-      ))
-      .map((annotation) => ({
-        annotationId: annotation.annotationId.trim(),
-        browserSessionId: annotation.browserSessionId.trim(),
-        tabId: annotation.tabId.trim(),
-        sequence: Number.isSafeInteger(annotation.sequence) && Number(annotation.sequence) > 0
-          ? Number(annotation.sequence)
-          : undefined,
-        kind: annotation.kind,
-        comment: annotation.comment.trim(),
-        screenshotArtifactId: annotation.screenshotArtifactId?.trim() || null,
-      }))
-      .filter((annotation) => annotation.annotationId && annotation.browserSessionId && annotation.tabId && annotation.comment)
-    : [];
   const browserNodeSelections = Array.isArray(input.browserNodeSelections)
     ? input.browserNodeSelections
       .filter((selection): selection is MessageBrowserNodeSelection => (
@@ -4063,6 +3885,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         && typeof selection.tabId === 'string'
         && typeof selection.surfaceId === 'string'
         && typeof selection.backendDomNodeId === 'number'
+        && typeof selection.outerHtmlTruncated === 'boolean'
       ))
       .map((selection) => ({
         ...selection,
@@ -4080,34 +3903,33 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
   const userMessageId = generateMessageId();
   const placeholderMessageId = `assistant-placeholder-${requestId}`;
-  const turnOrderSeq = allocateTurnOrderSeq();
   const requestCreatedAt = Date.now();
-  const optimisticSessionId = targetSessionId || localOptimisticSessionIdForRequest(requestId);
-  const usesLocalOptimisticSession = !targetSessionId;
+  if (
+    targetScope !== currentSessionScope
+    || targetWorkspaceId !== currentWorkspaceId
+    || targetWorkspacePath !== currentWorkspacePath
+    || targetSessionId !== currentSessionId
+  ) {
+    persistWorkspaceBinding(targetScope, targetWorkspaceId, targetWorkspacePath, targetSessionId);
+  }
   const submissionContext: SessionTurnSubmissionContext = {
     requestId,
     scope: targetScope,
     workspaceId: targetWorkspaceId,
     workspacePath: targetWorkspacePath,
     targetSessionId,
-    optimisticSessionId,
+    bindingGeneration: currentBindingGeneration,
   };
   sessionTurnSubmissions.set(requestId, submissionContext);
 
   createRequestBinding({
     requestId,
-    sessionId: optimisticSessionId,
+    sessionId: targetSessionId,
     userMessageId,
     placeholderMessageId,
-    turnOrderSeq,
     createdAt: requestCreatedAt,
   });
 
-  // 新会话绑定会重置 session 级执行态，因此必须先完成本地会话切换，
-  // 再写入本次请求的乐观 processing；反过来会把刚写入的 pending 清掉。
-  if (usesLocalOptimisticSession) {
-    setCurrentSessionId(optimisticSessionId);
-  }
   beginLocalTurnSubmission({
     requestId,
     placeholderMessageId,
@@ -4115,31 +3937,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     source: 'orchestrator',
     agent: 'orchestrator',
   });
-  // processing 与用户消息必须在同一次提交事务中进入当前会话，禁止出现
-  // “已经计时但消息区为空”的中间状态。后端 accepted 事件仍按 requestId 原位接管该轮次。
-  emitLocalPendingCanonicalTurn({
-    sessionId: optimisticSessionId,
-    requestId,
-    userMessageId,
-    placeholderMessageId,
-    text: normalizedText,
-    images,
-    contextReferences,
-    browserAnnotationSnapshots,
-    browserNodeSelections,
-    turnSeq: turnOrderSeq,
-    createdAt: requestCreatedAt,
-  });
 
   try {
-    if (
-      targetScope !== currentSessionScope
-      || targetWorkspaceId !== currentWorkspaceId
-      || targetWorkspacePath !== currentWorkspacePath
-      || targetSessionId !== currentSessionId
-    ) {
-      persistWorkspaceBinding(targetScope, targetWorkspaceId, targetWorkspacePath, targetSessionId);
-    }
     try {
       await warmLiveBridgeForSubmission('execute_task_preflight');
     } catch (preflightError) {
@@ -4179,15 +3978,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     const submissionCanCommit = Boolean(
       resolvedSessionId && submissionContextCanCommit(submissionContext, resolvedSessionId),
     );
-    if (usesLocalOptimisticSession && resolvedSessionId) {
-      if (submissionCanCommit) {
-        submissionContext.acceptedSessionId = resolvedSessionId;
-        adoptAcceptedSessionIdForLocalTurn(optimisticSessionId, resolvedSessionId);
-      } else {
-        // 请求在另一个会话提交期间完成时，当前页面不能被切回旧会话；
-        // 但后台 pending projection 和 request binding 仍必须绑定正式 session。
-        rebindLocalSubmissionSession(optimisticSessionId, resolvedSessionId);
-      }
+    if (submissionCanCommit && !submissionContext.targetSessionId) {
+      submissionContext.acceptedSessionId = resolvedSessionId;
     }
     if (resolvedSessionId) {
       emitSessionTurnAccepted({
@@ -4200,11 +3992,13 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         sessionSummary: turnResult.sessionSummary ?? null,
         createdSession: turnResult.createdSession,
         route: turnResult.route,
-        submissionContext,
+        submissionContext: submissionCanCommit ? submissionContext : null,
       });
     }
+    emitSessionTurnSubmissionSettled(requestId, 'accepted');
     if (resolvedSessionId && submissionCanCommit) {
       persistWorkspaceBinding(targetScope, targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
+      adoptCurrentSessionIdForLiveTurn(resolvedSessionId);
     }
     if (turnResult.queued) {
       clearPendingRequest(requestId);
@@ -4217,18 +4011,19 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       );
       return true;
     }
-    if (replaceTurnId) {
-      emitLocalSupersededCanonicalTurn(replaceTurnId, turnResult.acceptedAt);
+    // 只有仍属于当前提交代际的响应才可进入当前会话时间轴。旧草稿请求
+    // 即使服务端稍后返回，也不能把 canonical event 注入新草稿或其他会话。
+    if (submissionCanCommit || (targetSessionId && targetSessionId === currentSessionId)) {
+      emitAcceptedCanonicalTurnFromResult(turnResult);
     }
-    emitAcceptedCanonicalTurnFromResult(turnResult);
     if (replaceTurnId) {
       completeTurnEditing(replaceTurnId);
     }
 
     const canonicalUserMessageId = turnResult.userMessageItemId || userMessageId;
-    const canonicalTurnSeq = typeof turnResult.acceptedAt === 'number' && Number.isFinite(turnResult.acceptedAt)
-      ? Math.max(1, Math.floor(turnResult.acceptedAt))
-      : undefined;
+    // acceptedAt 是 wall-clock 时间戳，不是 turn 序号。服务端提供 canonical
+    // turn/item 时只采用其权威序号；缺失时保留创建 binding 时的本地顺序号。
+    const canonicalTurnSeq = canonicalTurnSeqFromResult(turnResult);
     updateRequestBinding(requestId, {
       userMessageId: canonicalUserMessageId,
       placeholderMessageId,
@@ -4260,22 +4055,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
-    const errorText = normalizeErrorMessage(error) || i18n.t('bridge.detail.messageSendFailed');
-    emitLocalPendingCanonicalTurnFailed({
-      sessionId: optimisticSessionId,
-      requestId,
-      userMessageId,
-      placeholderMessageId,
-      text: normalizedText,
-      images,
-      contextReferences,
-      browserAnnotationSnapshots,
-      browserNodeSelections,
-      turnSeq: turnOrderSeq,
-      createdAt: requestCreatedAt,
-      failedAt: Date.now(),
-      error: errorText,
-    });
+    emitSessionTurnSubmissionSettled(requestId, 'failed');
     // 失败路径必须与拒绝、终态路径一样回收本地 pending request。
     // 否则 emitForcedProcessingIdle 会把仍绑定的失败请求误判为活跃轮次，
     // 让草稿会话一直处于处理中，并阻断后续目录/导航收敛。
@@ -5362,17 +5142,6 @@ export function createWebClientBridge(): ClientBridge {
                 : [],
               browserAnnotationRefs: Array.isArray(message.browserAnnotationRefs)
                 ? message.browserAnnotationRefs.filter((value): value is string => typeof value === 'string')
-                : [],
-              browserAnnotationSnapshots: Array.isArray(message.browserAnnotationSnapshots)
-                ? message.browserAnnotationSnapshots as Array<{
-                    annotationId: string;
-                    browserSessionId: string;
-                    tabId: string;
-                    sequence?: number;
-                    kind: 'element' | 'region';
-                    comment: string;
-                    screenshotArtifactId?: string | null;
-                  }>
                 : [],
               browserNodeSelections: Array.isArray(message.browserNodeSelections)
                 ? message.browserNodeSelections as MessageBrowserNodeSelection[]

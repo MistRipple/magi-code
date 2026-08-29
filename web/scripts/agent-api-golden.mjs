@@ -92,6 +92,29 @@ await withGoldenViteServer(async (server) => {
   );
   assert.equal(sessionPreviewQuery.get('sessionId'), 'session-query-golden');
 
+  // 历史浏览器标记预览直接使用消息所属 Magi session 构造 URL；浏览器
+  // runtime 即使关闭或重启，也不能阻断已经持久化的消息 artifact。
+  for (const currentBinding of [
+    { scope: 'personal', sessionId: 'session-current-personal-golden' },
+    { scope: 'workspace', workspaceId: 'workspace-current-golden', workspacePath: '/tmp/current', sessionId: 'session-current-golden' },
+    { scope: 'workspace', workspaceId: 'workspace-after-restart-golden', workspacePath: '/tmp/after-restart', sessionId: 'session-after-restart-golden' },
+  ]) {
+    binding.setAgentBindingContext(currentBinding);
+    const previewUrl = agentApi.resolveBrowserAnnotationArtifactUrl(
+      'annotation-history-golden',
+      'session-owning-history-golden',
+    );
+    const parsedPreviewUrl = new URL(previewUrl);
+    assert.equal(parsedPreviewUrl.pathname, '/api/browser/annotations/annotation-history-golden/artifact');
+    assert.equal(parsedPreviewUrl.searchParams.get('sessionId'), 'session-owning-history-golden');
+  }
+  binding.setAgentBindingContext({
+    scope: 'workspace',
+    workspaceId: 'workspace-query-golden',
+    workspacePath: '/tmp/workspace-query-golden',
+    sessionId: 'session-query-golden',
+  });
+
   const overridePreviewQuery = new URLSearchParams(
     agentApi.buildFilePreviewQuery('README.md', {
       workspaceId: 'workspace-override',

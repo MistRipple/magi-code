@@ -18,9 +18,12 @@ validateVersion(options.tag);
 const commonSteps = [
   ["TypeScript 与 Svelte 检查", npm, ["run", "check"]],
   ["Desktop、Worker 与 Web 测试", npm, ["run", "test"]],
+  ["Browser 下载生命周期验证", npm, ["run", "test:browser-download-lifecycle"]],
   ["Web 生产构建", npm, ["run", "build", "--workspace", "magi-web"]],
   ["Browser Automation Worker 生产构建", npm, ["run", "build", "--workspace", "@magi/browser-automation-worker"]],
   ["单一 Electron 发行边界", npm, ["run", "release:guard"]],
+  ["本地 daemon 与 bridge loopback 可执行文件构建", "cargo", [rustPrefix(), "build", "-p", "magi-daemon-app", "-p", "magi-bridge-client", "--bins", "--locked"]],
+  ["本地 bridge loopback 实际 preflight", npm, ["run", "bridge:preflight", "--workspace", "@magi/desktop", "--", "--profile", "debug"]],
   ["Rust Clippy", "cargo", [rustPrefix(), "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]],
   ["Rust 全量测试", "cargo", [rustPrefix(), "test", "--workspace", "--locked"]],
 ];

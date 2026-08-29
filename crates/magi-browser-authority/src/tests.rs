@@ -11,7 +11,7 @@ use crate::{
     BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserProfile, BrowserProfileKind,
     BrowserSessionLifecycle, BrowserSurfaceBinding, BrowserTabLifecycle, BrowserViewport,
     CreateBrowserSession, CreateBrowserTab, GoalControlBinding, MAX_BROWSER_TABS_TOTAL,
-    ValidateBrowserWrite,
+    ValidateBrowserNodeSelection, ValidateBrowserWrite,
 };
 
 fn at(value: u64) -> UtcMillis {
@@ -63,7 +63,15 @@ fn ready_tab(
     authority: &mut BrowserAuthority,
     browser_session_id: &BrowserSessionId,
 ) -> BrowserTabId {
-    let tab_id = BrowserTabId::new("browser-tab-1");
+    ready_tab_with_id(authority, browser_session_id, "browser-tab-1")
+}
+
+fn ready_tab_with_id(
+    authority: &mut BrowserAuthority,
+    browser_session_id: &BrowserSessionId,
+    tab_id: &str,
+) -> BrowserTabId {
+    let tab_id = BrowserTabId::new(tab_id);
     authority
         .create_tab(CreateBrowserTab {
             tab_id: tab_id.clone(),
@@ -106,6 +114,132 @@ fn owner() -> ExecutionOwnership {
         workspace_id: Some(WorkspaceId::new("workspace-1")),
         ..ExecutionOwnership::default()
     }
+}
+
+#[test]
+fn node_selection_requires_current_magi_session_and_page() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+    let session_id = SessionId::new("session-1");
+    let good = ValidateBrowserNodeSelection {
+        session_id: &session_id,
+        browser_session_id: &browser_session_id,
+        tab_id: &tab_id,
+        surface_id: &surface_id(),
+        navigation_revision: 0,
+        page_url: "about:blank",
+    };
+    authority
+        .validate_browser_node_selection(good)
+        .expect("current node selection should be accepted");
+
+    let other_session_id = SessionId::new("session-other");
+    let error = authority
+        .validate_browser_node_selection(ValidateBrowserNodeSelection {
+            session_id: &other_session_id,
+            ..good
+        })
+        .expect_err("node selection from another Magi session must be rejected");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::SessionMagiSessionMismatch { .. }
+    ));
+
+    let error = authority
+        .validate_browser_node_selection(ValidateBrowserNodeSelection {
+            page_url: "https://stale.example/",
+            ..good
+        })
+        .expect_err("node selection from another page must be rejected");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::NodeSelectionPageMismatch { .. }
+    ));
+}
+
+#[test]
+fn node_selection_requires_current_primary_surface_and_navigation() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+    let session_id = SessionId::new("session-1");
+    let good = ValidateBrowserNodeSelection {
+        session_id: &session_id,
+        browser_session_id: &browser_session_id,
+        tab_id: &tab_id,
+        surface_id: &surface_id(),
+        navigation_revision: 0,
+        page_url: "about:blank",
+    };
+
+    let error = authority
+        .validate_browser_node_selection(ValidateBrowserNodeSelection {
+            surface_id: "surface-old",
+            ..good
+        })
+        .expect_err("node selection from another surface must be rejected");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::SurfaceNotPrimary { .. }
+    ));
+
+    let error = authority
+        .validate_browser_node_selection(ValidateBrowserNodeSelection {
+            navigation_revision: 1,
+            ..good
+        })
+        .expect_err("node selection from another navigation revision must be rejected");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::NavigationRevisionMismatch { .. }
+    ));
+}
+
+#[test]
+fn node_selection_rejects_cross_browser_session_tab() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let first_browser_session_id =
+        ready_session_with_ids(&mut authority, "browser-session-first", "session-first");
+    let first_tab_id = ready_tab_with_id(
+        &mut authority,
+        &first_browser_session_id,
+        "browser-tab-first",
+    );
+    authority
+        .set_primary_surface(binding(&first_tab_id, &surface_id(), 1), at(6))
+        .expect("first surface should bind");
+    let second_browser_session_id =
+        ready_session_with_ids(&mut authority, "browser-session-second", "session-second");
+    let second_tab_id = ready_tab_with_id(
+        &mut authority,
+        &second_browser_session_id,
+        "browser-tab-second",
+    );
+    let first_magi_session_id = SessionId::new("session-first");
+    let error = authority
+        .validate_browser_node_selection(ValidateBrowserNodeSelection {
+            session_id: &first_magi_session_id,
+            browser_session_id: &first_browser_session_id,
+            tab_id: &second_tab_id,
+            surface_id: &surface_id(),
+            navigation_revision: 0,
+            page_url: "about:blank",
+        })
+        .expect_err("a tab from another browser session must be rejected");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::TabSessionMismatch { .. }
+    ));
 }
 
 #[test]

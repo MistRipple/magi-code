@@ -390,7 +390,15 @@ function normalizeMessageBrowserNodeSelectionsFromMetadata(
         ? Number(selection.backendDomNodeId)
         : -1;
       const nodeName = typeof selection.nodeName === 'string' ? selection.nodeName.trim() : '';
-      if (!browserSessionId || !tabId || !surfaceId || navigationRevision < 0 || backendDomNodeId < 1 || !nodeName) {
+      if (
+        !browserSessionId
+        || !tabId
+        || !surfaceId
+        || navigationRevision < 0
+        || backendDomNodeId < 1
+        || !nodeName
+        || typeof selection.outerHtmlTruncated !== 'boolean'
+      ) {
         return null;
       }
       const attributes = selection.attributes && typeof selection.attributes === 'object' && !Array.isArray(selection.attributes)
@@ -425,6 +433,7 @@ function normalizeMessageBrowserNodeSelectionsFromMetadata(
         attributes,
         textExcerpt: typeof selection.textExcerpt === 'string' ? selection.textExcerpt : '',
         outerHtml: typeof selection.outerHtml === 'string' ? selection.outerHtml : '',
+        outerHtmlTruncated: selection.outerHtmlTruncated,
         ariaRole: typeof selection.ariaRole === 'string' ? selection.ariaRole.trim() || null : null,
         ariaName: typeof selection.ariaName === 'string' ? selection.ariaName.trim() || null : null,
         bounds: normalizedBounds,

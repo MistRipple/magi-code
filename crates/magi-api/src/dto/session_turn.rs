@@ -1,5 +1,5 @@
 use magi_conversation_runtime::context_reference::{
-    SessionContextReference, SessionContextReferenceKind,
+    SessionContextReference, SessionContextReferenceKind, sanitize_browser_node_selection,
 };
 use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_core::{AccessProfile, EventId, SessionId, TaskId, UtcMillis};
@@ -88,18 +88,20 @@ pub struct BrowserNodeSelectionDto {
     pub tab_id: String,
     pub surface_id: String,
     pub navigation_revision: u64,
+    pub browser_session_id: String,
     pub url: String,
     pub title: String,
-    pub frame_id: String,
+    pub frame_id: Option<String>,
     pub backend_dom_node_id: u64,
-    pub dom_node_id: u64,
+    pub dom_node_id: Option<u64>,
     pub node_name: String,
     pub attributes: BTreeMap<String, String>,
     pub text_excerpt: String,
     pub outer_html: String,
+    pub outer_html_truncated: bool,
     pub aria_role: Option<String>,
     pub aria_name: Option<String>,
-    pub bounds: BrowserNodeSelectionBoundsDto,
+    pub bounds: Option<BrowserNodeSelectionBoundsDto>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,8 +118,8 @@ impl BrowserNodeSelectionDto {
         let required_strings = [
             ("tabId", self.tab_id.as_str()),
             ("surfaceId", self.surface_id.as_str()),
+            ("browserSessionId", self.browser_session_id.as_str()),
             ("url", self.url.as_str()),
-            ("frameId", self.frame_id.as_str()),
             ("nodeName", self.node_name.as_str()),
         ];
         for (field, value) in required_strings {
@@ -130,7 +132,14 @@ impl BrowserNodeSelectionDto {
                 "浏览器节点选择[{index}] 的 backendDomNodeId 必须是正整数"
             ));
         }
-        if self.dom_node_id == 0 {
+        if self
+            .frame_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(format!("浏览器节点选择[{index}] 的 frameId 不能是空字符串"));
+        }
+        if self.dom_node_id.is_some_and(|value| value == 0) {
             return Err(format!("浏览器节点选择[{index}] 的 domNodeId 必须是正整数"));
         }
         for (name, value) in &self.attributes {
@@ -144,19 +153,24 @@ impl BrowserNodeSelectionDto {
                 ));
             }
         }
-        let bounds = self.bounds;
-        if !bounds.x.is_finite()
-            || !bounds.y.is_finite()
-            || !bounds.width.is_finite()
-            || !bounds.height.is_finite()
-            || bounds.width < 0.0
-            || bounds.height < 0.0
+        if let Some(bounds) = self.bounds
+            && (!bounds.x.is_finite()
+                || !bounds.y.is_finite()
+                || !bounds.width.is_finite()
+                || !bounds.height.is_finite()
+                || bounds.width < 0.0
+                || bounds.height < 0.0)
         {
             return Err(format!(
                 "浏览器节点选择[{index}] 的 bounds 必须是有限的非负尺寸"
             ));
         }
         Ok(())
+    }
+
+    fn sanitized_value(&self) -> Value {
+        let value = serde_json::to_value(self).expect("BrowserNodeSelectionDto must serialize");
+        sanitize_browser_node_selection(&value)
     }
 }
 
@@ -326,6 +340,20 @@ impl SessionTurnRequestDto {
     }
 
     pub fn validate_browser_node_selections(&self) -> Result<Vec<Value>, String> {
+        self.validate_browser_node_selections_with(|_, _| Ok(()))
+    }
+
+    /// 完成 DTO 结构校验后执行调用方提供的权威身份校验。
+    ///
+    /// dispatch 使用该入口把结构校验和 BrowserAuthority 校验保持在同一条
+    /// canonical 提交链路中，避免不同入口各自复制一套节点安全规则。
+    pub fn validate_browser_node_selections_with<F>(
+        &self,
+        mut validate_binding: F,
+    ) -> Result<Vec<Value>, String>
+    where
+        F: FnMut(usize, &BrowserNodeSelectionDto) -> Result<(), String>,
+    {
         const MAX_BROWSER_NODE_SELECTIONS: usize = 20;
         if self.browser_node_selections.len() > MAX_BROWSER_NODE_SELECTIONS {
             return Err(format!(
@@ -334,20 +362,18 @@ impl SessionTurnRequestDto {
         }
         for (index, selection) in self.browser_node_selections.iter().enumerate() {
             selection.validate(index)?;
+            validate_binding(index, selection)?;
         }
         self.browser_node_selections
             .iter()
-            .map(|selection| {
-                serde_json::to_value(selection)
-                    .map_err(|error| format!("序列化浏览器节点选择失败: {error}"))
-            })
+            .map(|selection| Ok(selection.sanitized_value()))
             .collect()
     }
 
     pub fn browser_node_selections(&self) -> Vec<Value> {
         self.browser_node_selections
             .iter()
-            .filter_map(|selection| serde_json::to_value(selection).ok())
+            .map(BrowserNodeSelectionDto::sanitized_value)
             .collect()
     }
 
@@ -901,6 +927,74 @@ mod tests {
                 .request_fingerprint()
                 .expect("changed request should hash"),
             fingerprint
+        );
+    }
+
+    #[test]
+    fn browser_node_selection_round_trip_preserves_html_truncation_state() {
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
+            "text": "分析所选节点",
+            "browserNodeSelections": [{
+                "tabId": "browser-tab-1",
+                "surfaceId": "surface-1",
+                "navigationRevision": 7,
+                "browserSessionId": "browser-session-1",
+                "url": "https://example.com/form",
+                "title": "Example form",
+                "frameId": null,
+                "backendDomNodeId": 42,
+                "domNodeId": 9,
+                "nodeName": "BUTTON",
+                "attributes": { "type": "submit" },
+                "textExcerpt": "Submit",
+                "outerHtml": "<button type=\"submit\">Submit</button>",
+                "outerHtmlTruncated": true,
+                "ariaRole": "button",
+                "ariaName": "Submit",
+                "bounds": { "x": 10.0, "y": 20.0, "width": 100.0, "height": 40.0 }
+            }]
+        }))
+        .expect("完整节点选择必须可解析");
+
+        let selections = request
+            .validate_browser_node_selections()
+            .expect("完整节点选择必须通过结构校验");
+        assert_eq!(selections.len(), 1);
+        assert_eq!(
+            selections[0].get("outerHtmlTruncated"),
+            Some(&serde_json::Value::Bool(true)),
+            "截断状态必须保留到 canonical payload，不能在 DTO 清洗时丢失"
+        );
+    }
+
+    #[test]
+    fn browser_node_selection_rejects_missing_html_truncation_state() {
+        let parsed = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "scope": "personal",
+            "browserNodeSelections": [{
+                "tabId": "browser-tab-1",
+                "surfaceId": "surface-1",
+                "navigationRevision": 7,
+                "browserSessionId": "browser-session-1",
+                "url": "https://example.com/form",
+                "title": "Example form",
+                "frameId": null,
+                "backendDomNodeId": 42,
+                "domNodeId": null,
+                "nodeName": "BUTTON",
+                "attributes": {},
+                "textExcerpt": "Submit",
+                "outerHtml": "<button>Submit</button>",
+                "ariaRole": null,
+                "ariaName": null,
+                "bounds": null
+            }]
+        }));
+
+        assert!(
+            parsed.is_err(),
+            "缺失 outerHtmlTruncated 的跨端事件不得被默认为完整 HTML"
         );
     }
 }

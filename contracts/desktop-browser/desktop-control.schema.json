@@ -51,19 +51,20 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "tab_id", "surface_id", "navigation_revision", "url", "title", "frame_id",
+        "tab_id", "surface_id", "navigation_revision", "browser_session_id", "url", "title", "frame_id",
         "backend_dom_node_id", "dom_node_id", "node_name", "attributes", "text_excerpt",
-        "outer_html", "aria_role", "aria_name", "bounds"
+        "outer_html", "outer_html_truncated", "aria_role", "aria_name", "bounds"
       ],
       "properties": {
         "tab_id": { "$ref": "#/$defs/id" },
         "surface_id": { "$ref": "#/$defs/id" },
         "navigation_revision": { "type": "integer", "minimum": 0 },
+        "browser_session_id": { "$ref": "#/$defs/id" },
         "url": { "type": "string" },
         "title": { "type": "string" },
-        "frame_id": { "type": "string" },
-        "backend_dom_node_id": { "type": "integer", "minimum": 0 },
-        "dom_node_id": { "type": "integer", "minimum": 0 },
+        "frame_id": { "type": ["string", "null"] },
+        "backend_dom_node_id": { "type": "integer", "minimum": 1 },
+        "dom_node_id": { "type": ["integer", "null"], "minimum": 1 },
         "node_name": { "type": "string" },
         "attributes": {
           "type": "object",
@@ -71,9 +72,15 @@
         },
         "text_excerpt": { "type": "string" },
         "outer_html": { "type": "string" },
+        "outer_html_truncated": { "type": "boolean" },
         "aria_role": { "type": ["string", "null"] },
         "aria_name": { "type": ["string", "null"] },
-        "bounds": { "$ref": "#/$defs/normalizedRect" }
+        "bounds": {
+          "oneOf": [
+            { "$ref": "#/$defs/normalizedRect" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "logicalViewport": {
@@ -383,6 +390,242 @@
       "additionalProperties": false,
       "required": ["request_id"],
       "properties": { "request_id": { "$ref": "#/$defs/id" } }
+    },
+    "handshake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "desktop_version", "electron_version", "chromium_version", "process_id", "desktop_epoch", "worker_epoch"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "desktop_version": { "type": "string" },
+        "electron_version": { "type": "string" },
+        "chromium_version": { "type": "string" },
+        "process_id": { "type": "integer", "minimum": 0 },
+        "desktop_epoch": { "$ref": "#/$defs/id" },
+        "worker_epoch": { "$ref": "#/$defs/id" }
+      }
+    },
+    "pageState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "url", "origin", "title", "navigation_revision"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "url": { "type": "string" },
+        "origin": { "type": ["string", "null"] },
+        "title": { "type": "string" },
+        "navigation_revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "snapshotNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["element_ref", "role", "name", "value", "description", "disabled", "focused", "editable", "visible", "bounds", "children"],
+      "properties": {
+        "element_ref": { "$ref": "#/$defs/id" },
+        "role": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] },
+        "value": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"] },
+        "disabled": { "type": "boolean" },
+        "focused": { "type": "boolean" },
+        "editable": { "type": "boolean" },
+        "sensitive_input_kind": { "enum": ["password", "one_time_code", "payment_card", null] },
+        "visible": { "type": "boolean" },
+        "bounds": { "oneOf": [{ "$ref": "#/$defs/normalizedRect" }, { "type": "null" }] },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/snapshotNode" } }
+      }
+    },
+    "accessibilityNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "element_ref", "parent_id", "child_ids", "role", "name", "value", "description", "ignored", "properties", "actions", "backend_dom_node_id"],
+      "properties": {
+        "node_id": { "type": "string" },
+        "element_ref": { "type": ["string", "null"] },
+        "parent_id": { "type": ["string", "null"] },
+        "child_ids": { "type": "array", "items": { "type": "string" } },
+        "role": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] },
+        "value": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"] },
+        "ignored": { "type": "boolean" },
+        "properties": { "type": "object" },
+        "actions": { "type": "array", "items": { "type": "string" } },
+        "backend_dom_node_id": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "navigation_revision", "snapshot_revision", "root", "returned_nodes", "total_nodes", "text_bytes", "truncated", "continuation_refs"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "navigation_revision": { "type": "integer", "minimum": 0 },
+        "snapshot_revision": { "type": "integer", "minimum": 0 },
+        "root": { "$ref": "#/$defs/snapshotNode" },
+        "returned_nodes": { "type": "integer", "minimum": 0 },
+        "total_nodes": { "type": "integer", "minimum": 0 },
+        "text_bytes": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "continuation_refs": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "accessibility_tree": { "type": "array", "items": { "$ref": "#/$defs/accessibilityNode" } }
+      }
+    },
+    "binaryPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_id", "mime_type", "byte_length", "sha256"],
+      "properties": {
+        "payload_id": { "$ref": "#/$defs/id" },
+        "mime_type": { "type": "string" },
+        "byte_length": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string" }
+      }
+    },
+    "hitTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["navigation_revision", "viewport_width", "viewport_height", "scroll_x", "scroll_y", "element_ref", "tag_name", "test_id", "stable_id", "aria_role", "aria_name", "text_excerpt", "css_path", "ancestor_fingerprint", "dom_fingerprint", "bounds"],
+      "properties": {
+        "navigation_revision": { "type": "integer", "minimum": 0 },
+        "viewport_width": { "type": "integer", "minimum": 0 },
+        "viewport_height": { "type": "integer", "minimum": 0 },
+        "scroll_x": { "type": "number" },
+        "scroll_y": { "type": "number" },
+        "element_ref": { "$ref": "#/$defs/id" },
+        "tag_name": { "type": "string" },
+        "test_id": { "type": ["string", "null"] },
+        "stable_id": { "type": ["string", "null"] },
+        "aria_role": { "type": ["string", "null"] },
+        "aria_name": { "type": ["string", "null"] },
+        "text_excerpt": { "type": ["string", "null"] },
+        "css_path": { "type": "string" },
+        "ancestor_fingerprint": { "type": "string" },
+        "dom_fingerprint": { "type": "string" },
+        "bounds": { "$ref": "#/$defs/normalizedRect" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "recoverable", "side_effect_started", "diagnostic"],
+      "properties": {
+        "code": { "$ref": "#/$defs/id" },
+        "message": { "type": "string" },
+        "recoverable": { "type": "boolean" },
+        "side_effect_started": { "type": "boolean" },
+        "diagnostic": { "type": ["string", "null"] }
+      }
+    },
+    "result": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "const": "empty" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": { "type": { "const": "pong" }, "payload": {
+            "type": "object", "additionalProperties": false, "required": ["monotonic_millis"],
+            "properties": { "monotonic_millis": { "type": "integer", "minimum": 0 } }
+          } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": { "type": { "const": "page_state" }, "payload": { "$ref": "#/$defs/pageState" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": { "type": { "const": "snapshot" }, "payload": { "$ref": "#/$defs/snapshot" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": { "type": { "const": "binary_payload" }, "payload": { "$ref": "#/$defs/binaryPayload" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": { "type": { "const": "hit_test" }, "payload": { "$ref": "#/$defs/hitTest" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": { "type": { "const": "json" }, "payload": {
+            "type": "object", "additionalProperties": false, "required": ["value"],
+            "properties": { "value": { "$ref": "#/$defs/jsonValue" } }
+          } }
+        }
+      ]
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "payload"],
+          "properties": { "status": { "const": "succeeded" }, "payload": { "$ref": "#/$defs/result" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "payload"],
+          "properties": { "status": { "const": "failed" }, "payload": { "$ref": "#/$defs/error" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status"],
+          "properties": { "status": { "const": "cancelled" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "payload"],
+          "properties": { "status": { "const": "indeterminate" }, "payload": { "$ref": "#/$defs/error" } }
+        }
+      ]
+    },
+    "responseEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "protocol_version", "outcome"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/id" },
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "outcome": { "$ref": "#/$defs/outcome" }
+      }
+    },
+    "event": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "ready" }, "payload": { "$ref": "#/$defs/handshake" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "primary_surface_changed" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "user_takeover" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "control_revoked" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding", "reason"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" }, "reason": { "type": "string" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "page_updated" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding", "page_state"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" }, "page_state": { "$ref": "#/$defs/pageState" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "page_failed" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding", "reason"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" }, "reason": { "type": "string" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "loading_changed" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding", "loading"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" }, "loading": { "type": "boolean" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "page_crashed" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding", "diagnostic"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" }, "diagnostic": { "type": ["string", "null"] } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "console" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tab_id", "level", "text"], "properties": { "tab_id": { "$ref": "#/$defs/id" }, "level": { "type": "string" }, "text": { "type": "string" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "dialog" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tab_id", "dialog_id", "dialog_type", "message"], "properties": { "tab_id": { "$ref": "#/$defs/id" }, "dialog_id": { "type": "integer", "minimum": 0 }, "dialog_type": { "type": "string" }, "message": { "type": "string" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "download" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tab_id", "suggested_filename", "state"], "properties": { "tab_id": { "$ref": "#/$defs/id" }, "suggested_filename": { "type": "string" }, "state": { "type": "string" }, "byte_length": { "type": "integer", "minimum": 0 }, "error": { "type": "string" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "popup_blocked" }, "payload": { "type": "object", "additionalProperties": false, "required": ["binding", "url"], "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" }, "url": { "type": "string" } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "node_selection" }, "payload": { "$ref": "#/$defs/nodeSelection" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "agent_cursor" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tab_id", "visible", "x", "y", "action"], "properties": { "tab_id": { "$ref": "#/$defs/id" }, "visible": { "type": "boolean" }, "x": { "type": ["number", "null"] }, "y": { "type": ["number", "null"] }, "action": { "enum": ["move", "click", "drag", "type", "scroll", null] } } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "binary_payload_ready" }, "payload": { "$ref": "#/$defs/binaryPayload" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "payload"], "properties": { "type": { "const": "heartbeat" }, "payload": { "type": "object", "additionalProperties": false, "required": ["monotonic_millis"], "properties": { "monotonic_millis": { "type": "integer", "minimum": 0 } } } } }
+      ]
+    },
+    "eventEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "sequence", "event"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "event": { "$ref": "#/$defs/event" }
+      }
     },
     "command": {
       "oneOf": [

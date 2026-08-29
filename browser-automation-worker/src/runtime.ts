@@ -60,6 +60,7 @@ interface HeapEdgeRecord {
 export class BrowserAutomationRuntime {
   readonly #cdp: CdpClient;
   readonly #pages = new Map<string, PageRuntimeState>();
+  readonly #calls = new Map<string, AbortController>();
   readonly #uploadRoot: string | null;
 
   readonly #workerEpoch: string;
@@ -77,7 +78,23 @@ export class BrowserAutomationRuntime {
   }
 
   rebind(bindings: BrowserSurfaceBinding[]): void {
-    for (const binding of bindings) this.page(binding);
+    for (const binding of bindings) {
+      const current = this.currentPage(binding.surface_id);
+      if (current && !samePhysicalBinding(current.binding, binding)) {
+        this.#pages.delete(binding.surface_id);
+      }
+      if (
+        current && samePhysicalBinding(current.binding, binding)
+        && current.binding.navigation_revision > binding.navigation_revision
+      ) {
+        continue;
+      }
+      this.page(binding);
+    }
+  }
+
+  cancel(callId: string): void {
+    this.#calls.get(callId)?.abort();
   }
 
   async execute(
@@ -85,22 +102,32 @@ export class BrowserAutomationRuntime {
     binding: BrowserSurfaceBinding,
     command: BrowserHostCommand,
   ): Promise<WorkerCommandResponse> {
+    const controller = new AbortController();
+    this.#calls.set(callId, controller);
     try {
-      if (command.type !== "ping") await this.ensureCdpDomains(binding);
-      const executed = await this.executeCommand(binding, command);
-      return {
-        type: "worker_result",
-        call_id: callId,
-        binding,
-        outcome: { status: "succeeded", payload: executed.result },
-        ...(executed.binary ? { binary_base64: executed.binary.toString("base64") } : {}),
-      };
-    } catch (cause) {
-      const error = normalizeError(cause);
-      const outcome: BrowserCommandOutcome = error.side_effect_started
-        ? { status: "indeterminate", payload: error }
-        : { status: "failed", payload: error };
-      return { type: "worker_result", call_id: callId, binding, outcome };
+      return await this.#cdp.run({ callId, signal: controller.signal }, async () => {
+        try {
+          if (command.type !== "ping") await this.ensureCdpDomains(binding);
+          const executed = await this.executeCommand(binding, command);
+          if (controller.signal.aborted) return cancelledWorkerResult(callId, binding);
+          return {
+            type: "worker_result",
+            call_id: callId,
+            binding,
+            outcome: { status: "succeeded", payload: executed.result },
+            ...(executed.binary ? { binary_base64: executed.binary.toString("base64") } : {}),
+          };
+        } catch (cause) {
+          if (controller.signal.aborted) return cancelledWorkerResult(callId, binding);
+          const error = normalizeError(cause);
+          const outcome: BrowserCommandOutcome = error.side_effect_started
+            ? { status: "indeterminate", payload: error }
+            : { status: "failed", payload: error };
+          return { type: "worker_result", call_id: callId, binding, outcome };
+        }
+      });
+    } finally {
+      if (this.#calls.get(callId) === controller) this.#calls.delete(callId);
     }
   }
 
@@ -180,16 +207,20 @@ export class BrowserAutomationRuntime {
     const current = this.#pages.get(binding.surface_id);
     if (
       current
-      && current.binding.surface_revision === binding.surface_revision
-      && current.binding.target_id === binding.target_id
+      && samePhysicalBinding(current.binding, binding)
       && current.binding.navigation_revision === binding.navigation_revision
     ) {
       return current;
     }
+    if (current && !samePhysicalBinding(current.binding, binding)) {
+      throw protocolFailure("browser_surface_stale", "binding does not match the current physical Surface");
+    }
+    if (current && current.binding.navigation_revision > binding.navigation_revision) {
+      throw protocolFailure("browser_surface_stale", "binding is older than the current navigation");
+    }
     const sameSurface = Boolean(
       current
-      && current.binding.surface_revision === binding.surface_revision
-      && current.binding.target_id === binding.target_id,
+      && samePhysicalBinding(current.binding, binding),
     );
     const navigationChanged = Boolean(
       current
@@ -227,6 +258,19 @@ export class BrowserAutomationRuntime {
     };
     this.#pages.set(binding.surface_id, next);
     return next;
+  }
+
+  private currentPage(surfaceId: string): PageRuntimeState | undefined {
+    return this.#pages.get(surfaceId);
+  }
+
+  private navigationAdvanced(binding: BrowserSurfaceBinding): boolean {
+    const current = this.currentPage(binding.surface_id);
+    return Boolean(
+      current
+      && samePhysicalBinding(current.binding, binding)
+      && current.binding.navigation_revision !== binding.navigation_revision,
+    );
   }
 
   private async ensureCdpDomains(binding: BrowserSurfaceBinding): Promise<void> {
@@ -434,26 +478,35 @@ export class BrowserAutomationRuntime {
     const target = await this.target(binding, ref, true);
     await this.pointer(binding, "mouseMoved", target.x, target.y);
     if (!await this.pointerOrHandleDialog(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 })) return;
+    // mousePressed 可能已经触发了主文档导航。此时点击副作用已经发生，
+    // 不能再用旧文档的 token 做 finish/fallback，也不能把 mouseReleased
+    // 之外的旧 DOM 操作投递到新页面。
     if (!await this.pointerOrHandleDialog(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 })) return;
+    if (this.navigationAdvanced(binding)) return;
     // 某些 Electron WebContentsView 的后台/非激活 Surface 会接受 CDP
     // Input.dispatchMouseEvent 并更新焦点，但不把完整鼠标序列转成 DOM
     // click。等待一个事件循环后检查捕获监听器；只有确认页面没有观察到
     // click 时才排队一次异步 HTMLElement.click()，避免原生鼠标成功时
     // 重复触发提交、导航或对话框。
     await new Promise((resolve) => setTimeout(resolve, 25));
-    if (this.page(binding).dialog) return;
+    if (this.currentPage(binding.surface_id)?.dialog) return;
     const observed = await this.evaluate<{ observed?: boolean }>(
       binding,
       `globalThis.__magiBrowserAutomation.finishClick(${JSON.stringify(clickToken)})`,
     ).catch((cause) => {
-      if (this.page(binding).dialog) return { observed: true };
+      if (this.currentPage(binding.surface_id)?.dialog || isNavigationStaleError(cause)) {
+        return { observed: true };
+      }
       throw cause;
     });
     if (observed?.observed) return;
     await this.evaluate(
       binding,
       `globalThis.__magiBrowserAutomation.fallbackClick(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)})`,
-    );
+    ).catch((cause) => {
+      if (isNavigationStaleError(cause)) return;
+      throw cause;
+    });
   }
 
   private async typeText(
@@ -562,10 +615,13 @@ export class BrowserAutomationRuntime {
         height,
       };
     }
-    // 后台 Surface 没有物理内容槽时，Main 仍会给 Chromium 应用标准隐藏
-    // viewport；此时 layout metrics 可能短暂返回 0×0。使用同一标准值
-    // 继续完成截图/拖拽坐标换算，避免把“暂时未挂载”误报成浏览器不可用。
-    return { width: 1280, height: 720 };
+    // 页面尚未拥有有效的 Chromium 布局视口时，不能伪造一个固定尺寸继续
+    // 计算坐标。伪造尺寸会把输入和截图映射到错误位置，并掩盖内容槽尚未
+    // 就绪的真实生命周期问题；调用方应收到可重试的明确错误。
+    throw protocolFailure(
+      "browser_viewport_unavailable",
+      "Browser WebContents 尚未提供有效布局视口",
+    );
   }
 
   private async pointer(
@@ -593,7 +649,7 @@ export class BrowserAutomationRuntime {
       // 请求尚未返回时阻塞 renderer。只在已经收到对应的对话框事件时
       // 将该请求视为“点击已生效”，其他超时仍必须原样失败。
       const message = cause instanceof Error ? cause.message : String(cause);
-      if (message.includes("browser_cdp_timeout:Input.dispatchMouseEvent") && this.page(binding).dialog) {
+      if (message.includes("browser_cdp_timeout:Input.dispatchMouseEvent") && this.currentPage(binding.surface_id)?.dialog) {
         return false;
       }
       throw cause;
@@ -1101,7 +1157,7 @@ export class BrowserAutomationRuntime {
         })()`,
       );
       if (found) return { matched: true, value: found };
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitWithSignal(100, this.#cdp.currentSignal());
     } while (Date.now() < deadline);
     const condition = [
       selector ? `selector=${selector}` : "",
@@ -1450,7 +1506,12 @@ export class BrowserAutomationRuntime {
     params: Record<string, unknown>,
     sessionId?: string,
   ): void {
-    const page = this.page(binding);
+    const current = this.currentPage(binding.surface_id);
+    if (!current || !samePhysicalBinding(current.binding, binding)) return;
+    if (binding.navigation_revision < current.binding.navigation_revision) return;
+    const page = binding.navigation_revision === current.binding.navigation_revision
+      ? current
+      : this.page(binding);
     if (method === "Runtime.executionContextsCleared") {
       // Renderer 进程重启或页面导航会清掉 Chromium 中的所有 CDP 运行态。
       // Worker 自己保存的活动标志必须同步清零，否则下一次调用会误以为
@@ -1545,6 +1606,64 @@ export class BrowserAutomationRuntime {
 
 function empty(): { result: BrowserCommandResult } {
   return { result: { type: "empty" } };
+}
+
+function cancelledWorkerResult(callId: string, binding: BrowserSurfaceBinding): WorkerCommandResponse {
+  return {
+    type: "worker_result",
+    call_id: callId,
+    binding,
+    outcome: {
+      status: "indeterminate",
+      payload: {
+        code: "browser_command_cancelled",
+        message: "浏览器命令已取消，但底层操作可能已经产生副作用",
+        recoverable: false,
+        side_effect_started: true,
+        diagnostic: null,
+      },
+    },
+  };
+}
+
+function samePhysicalBinding(left: BrowserSurfaceBinding, right: BrowserSurfaceBinding): boolean {
+  return left.desktop_epoch === right.desktop_epoch
+    && left.window_id === right.window_id
+    && left.surface_id === right.surface_id
+    && left.surface_revision === right.surface_revision
+    && left.tab_id === right.tab_id
+    && left.web_contents_id === right.web_contents_id
+    && left.target_id === right.target_id
+    && left.browser_context_id === right.browser_context_id;
+}
+
+async function waitWithSignal(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error("browser_command_cancelled");
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: NodeJS.Timeout;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("browser_command_cancelled"));
+    };
+    timer = setTimeout(finish, milliseconds);
+    timer.unref();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+  signal?.throwIfAborted();
 }
 
 function normalizeError(cause: unknown) {
@@ -2159,6 +2278,14 @@ function snapshotTarget(args: Record<string, unknown>, prefix = ""): BrowserSnap
     throw protocolFailure("browser_snapshot_target_invalid", "element_ref and snapshot_revision are required");
   }
   return { element_ref: elementRef, snapshot_revision: revision };
+}
+
+function isNavigationStaleError(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return message.includes("browser_surface_stale")
+    || message.includes("browser_cdp_session_stale")
+    || message.includes("browser_debugger_detached")
+    || message.includes("browser_navigation_superseded");
 }
 
 function keyDescription(

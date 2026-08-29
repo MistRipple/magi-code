@@ -247,19 +247,20 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "tabId", "surfaceId", "navigationRevision", "url", "title", "frameId",
+        "tabId", "surfaceId", "navigationRevision", "browserSessionId", "url", "title", "frameId",
         "backendDomNodeId", "domNodeId", "nodeName", "attributes", "textExcerpt",
-        "outerHtml", "ariaRole", "ariaName", "bounds"
+        "outerHtml", "outerHtmlTruncated", "ariaRole", "ariaName", "bounds"
       ],
       "properties": {
         "tabId": { "type": "string", "minLength": 1 },
         "surfaceId": { "type": "string", "minLength": 1 },
         "navigationRevision": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "browserSessionId": { "type": "string", "minLength": 1 },
         "url": { "type": "string", "minLength": 1 },
         "title": { "type": "string" },
-        "frameId": { "type": "string", "minLength": 1 },
+        "frameId": { "type": ["string", "null"] },
         "backendDomNodeId": { "type": "integer", "minimum": 1, "x-rust-type": "u64" },
-        "domNodeId": { "type": "integer", "minimum": 1, "x-rust-type": "u64" },
+        "domNodeId": { "type": ["integer", "null"], "minimum": 1, "x-rust-type": "Option<u64>" },
         "nodeName": { "type": "string", "minLength": 1 },
         "attributes": {
           "type": "object",
@@ -269,9 +270,15 @@
         },
         "textExcerpt": { "type": "string" },
         "outerHtml": { "type": "string" },
+        "outerHtmlTruncated": { "type": "boolean" },
         "ariaRole": { "type": ["string", "null"] },
         "ariaName": { "type": ["string", "null"] },
-        "bounds": { "$ref": "#/$defs/BrowserNodeSelectionBounds" }
+        "bounds": {
+          "oneOf": [
+            { "$ref": "#/$defs/BrowserNodeSelectionBounds" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "AccessProfile": {
@@ -647,10 +654,16 @@
     "BrowserToolDescriptor": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "access"],
+      "required": ["name", "access", "description", "inputSchema"],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
-        "access": { "$ref": "#/$defs/BrowserToolAccess" }
+        "access": { "$ref": "#/$defs/BrowserToolAccess" },
+        "description": { "type": "string", "minLength": 1 },
+        "inputSchema": {
+          "type": "object",
+          "x-rust-type": "Value",
+          "x-ts-type": "Record<string, JsonValue>"
+        }
       }
     },
     "BrowserHostStatus": {

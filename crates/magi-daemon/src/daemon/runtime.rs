@@ -5,8 +5,8 @@ use super::{
     persistence::{RuntimeSidecarPersistence, StateRepository},
 };
 use magi_api::{
-    ApiError, ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence,
-    build_router, build_runtime_capability_dependency_provider,
+    ApiError, ApiState, DaemonIdentity, DirectHttpModelProbeConfig, RunnerManager,
+    RuntimeStatePersistence, build_router, build_runtime_capability_dependency_provider,
     mcp_config::{build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id},
 };
 use magi_bridge_client::{
@@ -892,6 +892,7 @@ pub(crate) struct DaemonRuntime {
     state_root: PathBuf,
     state_repository: StateRepository,
     local_port: u16,
+    daemon_identity: DaemonIdentity,
     event_bus: Arc<InMemoryEventBus>,
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
@@ -963,6 +964,7 @@ impl DaemonRuntime {
             state_root: config.state_root.clone(),
             state_repository,
             local_port: config.port,
+            daemon_identity: config.identity(),
             event_bus,
             session_store,
             workspace_store,
@@ -1598,6 +1600,7 @@ impl DaemonRuntime {
             self.workspace_store.clone(),
             self.governance.clone(),
         )
+        .with_daemon_identity(self.daemon_identity.clone())
         .with_knowledge_store(self.knowledge_store.clone())
         .with_settings_store(settings_store.clone())
         .with_appearance_library(appearance_library)
@@ -5326,7 +5329,10 @@ done
             snapshot["overall_ok"], false,
             "unreachable provider should block cutover: {snapshot:?}"
         );
-        assert_eq!(snapshot["blocking_check_count"], 2);
+        assert_eq!(
+            snapshot["blocking_check_count"], 2,
+            "transport failure cutover snapshot should include bridge and provider checks: {snapshot:?}"
+        );
         assert_eq!(
             snapshot["blocking_issue_counts_by_reason_code"]["model_provider_transport_failed"],
             2

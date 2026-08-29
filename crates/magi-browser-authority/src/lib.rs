@@ -1,4 +1,6 @@
 mod authority;
+#[path = "browser_tool_catalog.generated.rs"]
+mod browser_tool_catalog;
 mod capability;
 mod domain;
 mod error;
@@ -10,12 +12,15 @@ pub use authority::{
     AcquireBrowserLease, BROWSER_DURABLE_STATE_SCHEMA_VERSION, BrowserAuthority,
     BrowserAuthoritySnapshot, BrowserDurableState, BrowserDurableTab, BrowserPrimarySurface,
     BrowserSurfaceControlSnapshot, CreateBrowserSession, CreateBrowserTab,
-    MAX_BROWSER_TABS_PER_SESSION, MAX_BROWSER_TABS_TOTAL, ValidateBrowserWrite,
-    ValidatedBrowserWrite,
+    MAX_BROWSER_TABS_PER_SESSION, MAX_BROWSER_TABS_TOTAL, ValidateBrowserNodeSelection,
+    ValidateBrowserWrite, ValidatedBrowserWrite,
+};
+pub use browser_tool_catalog::{
+    BROWSER_TOOL_CATALOG_SCHEMA_ID, BROWSER_TOOL_CATALOG_SIZE, BrowserToolAccess, BrowserToolKind,
 };
 pub use capability::{
     BrowserCapabilityRejection, BrowserCapabilitySnapshot, BrowserCapabilityUnavailableReason,
-    BrowserHostStatus, BrowserToolAccess, BrowserToolKind,
+    BrowserHostStatus,
 };
 pub use domain::{
     BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor, BrowserAnnotationKind,

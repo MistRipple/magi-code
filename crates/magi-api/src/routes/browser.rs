@@ -1966,14 +1966,14 @@ async fn annotation_artifact(
             .annotation(&annotation_id)
             .ok_or_else(|| ApiError::not_found("浏览器标记不存在", annotation_id.as_str()))?;
         let browser_session = authority
-            .session_for_magi_session(&session_id)
-            .ok_or_else(|| ApiError::not_found("浏览器会话不存在", session_id.as_str()))?;
-        if annotation.browser_session_id != browser_session.browser_session_id
-            || !browser_session
-                .tab_ids
-                .iter()
-                .any(|tab_id| tab_id == &annotation.tab_id)
-        {
+            .session(&annotation.browser_session_id)
+            .ok_or_else(|| {
+                ApiError::not_found(
+                    "浏览器会话不存在",
+                    annotation.browser_session_id.as_str(),
+                )
+            })?;
+        if browser_session.session_id != session_id {
             return Err(ApiError::NotFound("浏览器标记不存在".to_string()));
         }
         annotation
@@ -2657,7 +2657,11 @@ fn publish_browser_event(
 mod tests {
     use std::sync::Arc;
 
-    use axum::http::{HeaderMap, header::USER_AGENT};
+    use axum::{
+        body::to_bytes,
+        extract::{Path, Query, State},
+        http::{HeaderMap, StatusCode, header::USER_AGENT},
+    };
     use magi_browser_authority::{
         BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor, BrowserAnnotationKind,
         BrowserAnnotationStatus, BrowserProfile, BrowserProfileKind, BrowserRegionAnnotationAnchor,
@@ -2674,17 +2678,17 @@ mod tests {
     use magi_workspace::WorkspaceStore;
 
     use super::{
-        BrowserAnnotationAnchorResponse, BrowserClientPlatform,
+        AnnotationArtifactQuery, BrowserAnnotationAnchorResponse, BrowserClientPlatform,
         BrowserElementAnnotationAnchorResponse, BrowserRegionAnnotationAnchorResponse,
         DesktopConnectionClearRequest, DesktopConnectionRequest, ReclaimBrowserResourcesRequest,
-        browser_platform_capabilities, browser_resources_response, browser_session_response,
-        clear_desktop_connection, finish_browser_tab_creation, reclaim_browser_resources,
-        register_desktop_connection, require_desktop_browser_capability,
+        annotation_artifact, browser_platform_capabilities, browser_resources_response,
+        browser_session_response, clear_desktop_connection, finish_browser_tab_creation,
+        reclaim_browser_resources, register_desktop_connection, require_desktop_browser_capability,
         resolve_browser_annotation_context,
     };
     use crate::{
         errors::ApiError,
-        state::{ApiState, BrowserHostConnectionConfig},
+        state::{ApiState, BrowserHostConnectionConfig, RuntimeStatePersistence},
     };
 
     fn annotation_fixture() -> (ApiState, SessionId, SessionId, BrowserAnnotationId) {
@@ -2954,6 +2958,172 @@ mod tests {
             resolve_browser_annotation_context(&state, &session_id, &[annotation_id.to_string()]),
             Err(ApiError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn annotation_artifact_is_session_scoped_and_survives_persistence_boundary() {
+        let (state, session_id, other_session_id, annotation_id) = annotation_fixture();
+        let durable = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold")
+            .durable_state();
+        let state_root = tempfile::tempdir()
+            .expect("artifact state root should create")
+            .keep();
+        std::fs::create_dir_all(
+            state_root.join("browser/artifacts/session-browser-annotation-current"),
+        )
+        .expect("artifact directory should create");
+        std::fs::write(
+            state_root.join("browser/state.json"),
+            serde_json::to_vec(&durable).expect("browser durable state should serialize"),
+        )
+        .expect("browser durable state should write");
+        let artifact_bytes = vec![137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3];
+        std::fs::write(
+            state_root.join("browser/artifacts/session-browser-annotation-current/annotation.png"),
+            &artifact_bytes,
+        )
+        .expect("annotation artifact should write");
+        let state = state.with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+            state_root.join("sessions.json"),
+            state_root.join("workspaces.json"),
+            state_root.join("knowledge.json"),
+        )));
+        state
+            .mutate_browser_authority(|authority| {
+                authority.transition_session(
+                    &BrowserSessionId::new("browser-session-annotation-current"),
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(8),
+                )?;
+                authority.transition_tab(
+                    &BrowserTabId::new("browser-tab-annotation-current"),
+                    BrowserTabLifecycle::Ready,
+                    UtcMillis(8),
+                )?;
+                Ok(())
+            })
+            .expect("restored browser annotation state should become ready");
+
+        let response = annotation_artifact(
+            State(state.clone()),
+            Path(annotation_id.to_string()),
+            Query(AnnotationArtifactQuery {
+                session_id: session_id.to_string(),
+            }),
+        )
+        .await
+        .expect("current session should read its annotation artifact");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("artifact response body should read")
+                .as_ref(),
+            artifact_bytes.as_slice()
+        );
+
+        assert!(matches!(
+            annotation_artifact(
+                State(state.clone()),
+                Path(annotation_id.to_string()),
+                Query(AnnotationArtifactQuery {
+                    session_id: other_session_id.to_string(),
+                }),
+            )
+            .await,
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(matches!(
+            super::browser_annotation_artifact_path(&state, "../outside.png"),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            super::browser_annotation_artifact_path(&state, "missing.png"),
+            Err(ApiError::NotFound(_))
+        ));
+
+        let (annotation_without_artifact, restored_snapshot_revision) = {
+            let authority = state
+                .browser_authority
+                .lock()
+                .expect("browser authority lock should hold");
+            let annotation = authority
+                .annotation(&annotation_id)
+                .expect("fixture annotation should exist")
+                .clone();
+            let snapshot_revision = authority
+                .tab(&BrowserTabId::new("browser-tab-annotation-current"))
+                .expect("fixture tab should exist")
+                .snapshot_revision;
+            (annotation, snapshot_revision)
+        };
+        state
+            .mutate_browser_authority(|authority| {
+                let mut annotation = annotation_without_artifact.clone();
+                annotation.annotation_id =
+                    BrowserAnnotationId::new("browser-annotation-without-artifact");
+                annotation.screenshot_artifact_id = None;
+                annotation.sequence = 0;
+                match &mut annotation.anchor {
+                    BrowserAnnotationAnchor::Region(anchor) => {
+                        anchor.snapshot_revision = restored_snapshot_revision;
+                    }
+                    BrowserAnnotationAnchor::Element(anchor) => {
+                        anchor.snapshot_revision = restored_snapshot_revision;
+                    }
+                }
+                authority.create_annotation(annotation)
+            })
+            .expect("annotation without artifact should create");
+        assert!(matches!(
+            annotation_artifact(
+                State(state.clone()),
+                Path("browser-annotation-without-artifact".to_string()),
+                Query(AnnotationArtifactQuery {
+                    session_id: session_id.to_string(),
+                }),
+            )
+            .await,
+            Err(ApiError::NotFound(_))
+        ));
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.transition_session(
+                    &BrowserSessionId::new("browser-session-annotation-current"),
+                    BrowserSessionLifecycle::Closed,
+                    UtcMillis(9),
+                )?;
+                Ok(())
+            })
+            .expect("closing the browser session should succeed");
+        let response_after_browser_close = annotation_artifact(
+            State(state),
+            Path(annotation_id.to_string()),
+            Query(AnnotationArtifactQuery {
+                session_id: session_id.to_string(),
+            }),
+        )
+        .await
+        .expect("historical annotation artifact should survive browser session close");
+        assert_eq!(response_after_browser_close.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response_after_browser_close.into_body(), usize::MAX)
+                .await
+                .expect("closed-session artifact response body should read")
+                .as_ref(),
+            artifact_bytes.as_slice()
+        );
     }
 
     #[test]

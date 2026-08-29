@@ -41,6 +41,7 @@ class FakePort implements ParentPort {
       this.#listener?.({
         data: {
           type: "cdp_response",
+          call_id: message.call_id,
           request_id: message.request_id,
           binding: this.responseBinding ?? message.binding,
           result: {},
@@ -52,7 +53,12 @@ class FakePort implements ParentPort {
 
 class ScriptedPort implements ParentPort {
   #listener: ((event: { data: MainToWorkerMessage }) => void) | null = null;
-  readonly requests: Array<{ method: string; params: Record<string, unknown>; sessionId?: string }> = [];
+  readonly requests: Array<{
+    method: string;
+    params: Record<string, unknown>;
+    binding: BrowserSurfaceBinding;
+    sessionId?: string;
+  }> = [];
 
   constructor(
     private readonly respond: (method: string, params: Record<string, unknown>) => unknown,
@@ -67,6 +73,7 @@ class ScriptedPort implements ParentPort {
     this.requests.push({
       method: message.method,
       params: message.params ?? {},
+      binding: message.binding,
       ...(message.session_id ? { sessionId: message.session_id } : {}),
     });
     queueMicrotask(() => {
@@ -74,6 +81,7 @@ class ScriptedPort implements ParentPort {
       this.#listener?.({
         data: {
           type: "cdp_response",
+          call_id: message.call_id,
           request_id: message.request_id,
           binding: message.binding,
           ...(result instanceof Error
@@ -141,6 +149,55 @@ test("Worker 为每个 CDP Surface 显式启用页面、运行时和网络事件
 
   await runtime.execute("call-2", binding, consoleCommand());
   assert.equal(port.methods.length, 3, "同一 Surface 不应为每次工具调用重复启用 CDP 域");
+});
+
+test("不同 Browser Surface 使用独立的页面运行态和 CDP binding，不串用 Tab 数据", async () => {
+  const tabA = { ...binding, surface_id: "surface-a", tab_id: "tab-a", target_id: "target-a" };
+  const tabB = { ...binding, surface_id: "surface-b", tab_id: "tab-b", target_id: "target-b" };
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+
+  const consoleCommandFor = (target: BrowserSurfaceBinding): BrowserHostCommand => ({
+    type: "devtools",
+    payload: {
+      tab_id: target.tab_id,
+      operation: "console",
+      arguments: { action: "list" },
+    },
+  });
+
+  assert.equal((await runtime.execute("init-a", tabA, consoleCommandFor(tabA))).outcome.status, "succeeded");
+  assert.equal((await runtime.execute("init-b", tabB, consoleCommandFor(tabB))).outcome.status, "succeeded");
+
+  port.emit("Runtime.consoleAPICalled", { type: "log", args: [{ value: "only-a" }] }, tabA);
+  port.emit("Runtime.consoleAPICalled", { type: "error", args: [{ value: "only-b" }] }, tabB);
+
+  const resultA = await runtime.execute("read-a", tabA, consoleCommandFor(tabA));
+  const resultB = await runtime.execute("read-b", tabB, consoleCommandFor(tabB));
+  assert.equal(resultA.outcome.status, "succeeded");
+  assert.equal(resultB.outcome.status, "succeeded");
+
+  const valueA = resultA.outcome.payload.type === "json"
+    ? resultA.outcome.payload.payload.value as { entries?: Array<Record<string, unknown>> }
+    : null;
+  const valueB = resultB.outcome.payload.type === "json"
+    ? resultB.outcome.payload.payload.value as { entries?: Array<Record<string, unknown>> }
+    : null;
+  assert.deepEqual(valueA?.entries?.map((entry) => entry.type), ["log"]);
+  assert.deepEqual(valueA?.entries?.map((entry) => (entry.args as Array<{ value?: string }>)?.[0]?.value), ["only-a"]);
+  assert.deepEqual(valueB?.entries?.map((entry) => entry.type), ["error"]);
+  assert.deepEqual(valueB?.entries?.map((entry) => (entry.args as Array<{ value?: string }>)?.[0]?.value), ["only-b"]);
+
+  const domainRequests = port.requests.filter((request) => ["Page.enable", "Runtime.enable", "Network.enable"].includes(request.method));
+  assert.deepEqual(
+    new Set(domainRequests.filter((request) => request.binding.surface_id === tabA.surface_id).map((request) => request.method)),
+    new Set(["Page.enable", "Runtime.enable", "Network.enable"]),
+  );
+  assert.deepEqual(
+    new Set(domainRequests.filter((request) => request.binding.surface_id === tabB.surface_id).map((request) => request.method)),
+    new Set(["Page.enable", "Runtime.enable", "Network.enable"]),
+  );
+  assert.ok(domainRequests.every((request) => request.binding.tab_id === (request.binding.surface_id === tabA.surface_id ? tabA.tab_id : tabB.tab_id)));
 });
 
 test("CDP 响应的完整 Surface 身份变化必须被拒绝", async () => {
@@ -634,6 +691,7 @@ test("drag 使用完整 HTML DragEvent 生命周期，而不是只发送一次�
 test("对话框事件即使来自 CDP 子会话也能列出并使用同一会话处理", async () => {
   const port = new ScriptedPort(() => ({}));
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  runtime.rebind([binding]);
   port.emit("Page.javascriptDialogOpening", { type: "alert", message: "需要确认" }, binding, "dialog-session");
 
   const listed = await runtime.execute("dialog-list", binding, {
@@ -658,6 +716,7 @@ test("对话框事件即使来自 CDP 子会话也能列出并使用同一会话
 test("非阻塞页面对话框桥接可列出并通过 Runtime.evaluate 收口", async () => {
   const port = new ScriptedPort(() => ({}));
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  runtime.rebind([binding]);
   port.emit("Runtime.bindingCalled", {
     name: "__magiBrowserDialog",
     payload: JSON.stringify({
@@ -702,6 +761,7 @@ test("网络响应体不可读时保留网络记录并返回结构化不可用�
     method === "Network.getResponseBody" ? new Error("No data found for resource with given identifier") : {}
   ));
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  runtime.rebind([binding]);
   port.emit("Network.responseReceived", { requestId: "response-1", type: "Fetch", response: { url: "https://example.test/data" } });
 
   const result = await runtime.execute("network-body", binding, {
@@ -1322,6 +1382,7 @@ test("第三方分析只统计 response，并使用 loadingFinished 的编码字
     return {};
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  runtime.rebind([binding]);
   port.emit("Network.requestWillBeSent", { requestId: "r1", type: "Script", request: { url: "https://cdn.test/app.js" } });
   port.emit("Network.responseReceived", { requestId: "r1", type: "Script", response: { url: "https://cdn.test/app.js" } });
   port.emit("Network.loadingFinished", { requestId: "r1", encodedDataLength: 321 });

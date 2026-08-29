@@ -204,18 +204,20 @@ export interface BrowserNodeSelection {
   tabId: string;
   surfaceId: string;
   navigationRevision: number;
+  browserSessionId: string;
   url: string;
   title: string;
-  frameId: string;
+  frameId: string | null;
   backendDomNodeId: number;
-  domNodeId: number;
+  domNodeId: number | null;
   nodeName: string;
   attributes: Record<string, string>;
   textExcerpt: string;
   outerHtml: string;
+  outerHtmlTruncated: boolean;
   ariaRole: string | null;
   ariaName: string | null;
-  bounds: BrowserNodeSelectionBounds;
+  bounds: BrowserNodeSelectionBounds | null;
 }
 
 export type AccessProfile = "read_only" | "restricted" | "full_access";
@@ -423,6 +425,8 @@ export type BrowserToolAccess = "read" | "write" | "mixed";
 export interface BrowserToolDescriptor {
   name: string;
   access: BrowserToolAccess;
+  description: string;
+  inputSchema: Record<string, JsonValue>;
 }
 
 export type BrowserHostStatus = "stopped" | "starting" | "ready" | "reconnecting" | "failed";

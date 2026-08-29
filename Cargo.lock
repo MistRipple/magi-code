@@ -1309,6 +1309,7 @@ name = "magi-daemon"
 version = "3.0.51"
 dependencies = [
  "axum",
+ "getrandom 0.3.4",
  "magi-agent-role",
  "magi-api",
  "magi-appearance",

@@ -94,6 +94,58 @@ class FakeEventSource {
   }
 }
 
+class FakeWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  static instances = [];
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = FakeWebSocket.CONNECTING;
+    this.sent = [];
+    this.listeners = new Map();
+    this.closed = false;
+    FakeWebSocket.instances.push(this);
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  emit(type, event = {}) {
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener({ type, target: this, ...event });
+    }
+  }
+
+  open() {
+    this.readyState = FakeWebSocket.OPEN;
+    this.emit('open');
+  }
+
+  send(value) {
+    if (this.readyState !== FakeWebSocket.OPEN) {
+      throw new Error('fake socket is not open');
+    }
+    this.sent.push(JSON.parse(value));
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.readyState = FakeWebSocket.CLOSED;
+    this.emit('close');
+  }
+
+  message(value) {
+    this.emit('message', { data: JSON.stringify(value) });
+  }
+}
+
 class FakeCustomEvent extends Event {
   constructor(type, options = {}) {
     super(type);
@@ -164,7 +216,34 @@ function installBrowserGlobals() {
   globalThis.window = windowObject;
   globalThis.localStorage = storage;
   globalThis.EventSource = FakeEventSource;
+  globalThis.WebSocket = FakeWebSocket;
   globalThis.CustomEvent = FakeCustomEvent;
+}
+
+function lastWebSocketRequest(socket, method) {
+  return [...socket.sent].reverse().find((message) => message.method === method);
+}
+
+function replyWebSocket(socket, request, result) {
+  socket.message({ jsonrpc: '2.0', id: request.id, result });
+}
+
+function appServerInitializeResult() {
+  return {
+    runtimeEpoch: RUNTIME_EPOCH,
+    serverInfo: { name: 'magi-app-server', version: 'golden' },
+    protocol: { major: 1, minor: 0 },
+    capabilities: { streaming: true },
+  };
+}
+
+function appServerSubscribeResult() {
+  return {
+    runtimeEpoch: RUNTIME_EPOCH,
+    subscribed: true,
+    nextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    resyncRequired: false,
+  };
 }
 
 function jsonResponse(payload) {
@@ -192,6 +271,7 @@ function bootstrapPayload() {
   const canonicalTurns = terminalPublished ? [completedCanonicalTurn()] : [];
   const currentSession = acceptedPublished ? sessions[0] : null;
   return {
+    scope: 'workspace',
     workspace: {
       workspaceId: WORKSPACE_ID,
       rootPath: WORKSPACE_PATH,
@@ -232,6 +312,7 @@ function scopedBootstrapPayload(workspaceId, workspacePath, sessionId, title) {
     workspaceId,
   };
   return {
+    scope: 'workspace',
     workspace: {
       workspaceId,
       rootPath: workspacePath,
@@ -413,6 +494,10 @@ function installFetchStub() {
       return jsonResponse({
         ...payload,
         currentSession: null,
+        state: {
+          ...payload.state,
+          currentSessionId: '',
+        },
         timeline: [],
         canonicalTurns: [],
       });
@@ -847,15 +932,112 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+async function verifyBrowserNodeSelectionTurn(bridge, messagesStore) {
+  const requestId = 'request-browser-node-selection-forwarding';
+  const targetSessionId = messagesStore.messagesState.currentSessionId?.trim() || SESSION_ID;
+  const expectedSelection = {
+    browserSessionId: 'browser-session-normalized',
+    tabId: 'browser-tab-normalized',
+    surfaceId: 'surface-normalized',
+    navigationRevision: 3,
+    url: 'https://example.com/form',
+    title: 'Example form',
+    frameId: null,
+    backendDomNodeId: 42,
+    domNodeId: 43,
+    nodeName: 'BUTTON',
+    attributes: {
+      type: 'submit',
+      'aria-label': 'Submit',
+    },
+    textExcerpt: 'Submit',
+    outerHtml: '<button type="submit">Submit</button>',
+    outerHtmlTruncated: false,
+    ariaRole: 'button',
+    ariaName: 'Submit',
+    bounds: {
+      x: 10,
+      y: 20,
+      width: 100,
+      height: 40,
+    },
+  };
+  const inputSelection = {
+    ...expectedSelection,
+    browserSessionId: `  ${expectedSelection.browserSessionId}  `,
+    tabId: ` ${expectedSelection.tabId} `,
+    surfaceId: ` ${expectedSelection.surfaceId} `,
+  };
+  const invalidSelection = {
+    ...expectedSelection,
+    backendDomNodeId: '42',
+  };
+  const selectionWithoutTruncationState = { ...expectedSelection };
+  delete selectionWithoutTruncationState.outerHtmlTruncated;
+  const acceptedResponse = deferred();
+  sessionTurnInterceptors.push(() => acceptedResponse.promise);
+  const acceptedPayload = {
+    sessionId: targetSessionId,
+    entryId: 'timeline-browser-node-selection-forwarding',
+    eventId: 'event-browser-node-selection-forwarding',
+    acceptedAt: ACCEPTED_AT + capturedTurnBodies.length,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    createdSession: false,
+    route: 'chat',
+    userMessageItemId: 'user-browser-node-selection-forwarding',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  };
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '请分析选中的按钮。',
+    requestId,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: targetSessionId,
+    browserNodeSelections: [inputSelection, invalidSelection, selectionWithoutTruncationState],
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === requestId),
+    'browser node selection submit must reach the canonical session turn endpoint',
+  );
+  const turnBody = capturedTurnBodies.find((body) => body.requestId === requestId);
+  assert.deepEqual(
+    turnBody.browserNodeSelections,
+    [expectedSelection],
+    'browser node selections must trim identity fields and reject malformed selections before submit',
+  );
+  assert.equal(
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      requestId,
+    ),
+    undefined,
+    'browser node selections must not create a local canonical message before the server accepts the turn',
+  );
+  // accepted 返回后再清理 request binding，确保节点选择已经随 canonical turn 接受。
+  acceptedResponse.resolve(jsonResponse(acceptedPayload));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  messagesStore.clearRequestBinding(requestId);
+}
+
 installBrowserGlobals();
 installFetchStub();
 
 await withGoldenViteServer(async (server) => {
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
   const bridgeModule = await server.ssrLoadModule('/src/shared/bridges/web-client-bridge.ts');
+  const sessionNavigation = await server.ssrLoadModule('/src/shared/session-navigation.svelte.ts');
   const messageHandler = await server.ssrLoadModule('/src/lib/message-handler.ts');
   const messagesStore = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
   const turnStore = await server.ssrLoadModule('/src/stores/turn-store.svelte.ts');
+  const submissionLifecycleEvents = [];
+  window.addEventListener('magi:sessionTurnSubmissionSettled', (event) => {
+    submissionLifecycleEvents.push(event.detail);
+  });
 
   const resumedRootHints = bridgeModule.extractBootstrapAgentRunTrackingHints(
     { sessionId: 'session-resumed-root' },
@@ -898,6 +1080,34 @@ await withGoldenViteServer(async (server) => {
 
   const bridge = bridgeModule.createWebClientBridge();
   bridgeRuntime.setClientBridge(bridge);
+  // 这些用例直接测试 Web Client Bridge，本身不经过 Header/Sidebar 的
+  // navigateSession 协调器。先登记与真实 UI 相同的 pending 事务，才能
+  // 验证 bridge 返回的 bootstrap 是否提交给了正确的导航请求。
+  const originalBridgePostMessage = bridge.postMessage.bind(bridge);
+  bridge.postMessage = (message) => {
+    if (message.type === 'navigateSession') {
+      const target = message.scope === 'workspace'
+        ? {
+            kind: message.target,
+            scope: 'workspace',
+            workspaceId: message.workspaceId,
+            workspacePath: message.workspacePath,
+            ...(message.target === 'session' ? { sessionId: message.sessionId } : {}),
+          }
+        : {
+            kind: message.target,
+            scope: 'personal',
+            ...(message.target === 'session' ? { sessionId: message.sessionId } : {}),
+          };
+      sessionNavigation.sessionNavigationState.pending = {
+        requestId: message.requestId,
+        target,
+        startedAt: Date.now(),
+        completion: Promise.resolve(),
+      };
+    }
+    originalBridgePostMessage(message);
+  };
   messagesStore.initializeState();
   messageHandler.primeEventSeqTracking(messagesStore.messagesState.currentSessionId, messagesStore.messagesState.currentWorkspaceId);
   messageHandler.initMessageHandler(bridge);
@@ -1123,16 +1333,14 @@ await withGoldenViteServer(async (server) => {
     true,
     '已有会话的后续轮次必须在提交事件返回前进入 processing 状态',
   );
-  const laterRoundLocalArtifact = findArtifactByRequestId(
-    messagesStore.messagesState.canonicalTimelineProjection,
-    'request-later-round-immediate-feedback',
-  );
   assert.equal(
-    laterRoundLocalArtifact?.message?.type,
-    'user_input',
-    '后续轮次必须在提交事件返回前同步投影本地 pending turn，不能只显示等待动画',
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-later-round-immediate-feedback',
+    ),
+    undefined,
+    '后续轮次在服务端 accepted 前只能显示 processing，不能伪造 canonical turn',
   );
-  assert.equal(laterRoundLocalArtifact?.message?.content, '后续轮次也必须立刻出现发送反馈。');
   laterRoundAccepted.resolve(jsonResponse({
     sessionId: SESSION_ID,
     entryId: 'timeline-later-round-immediate-feedback',
@@ -1391,14 +1599,19 @@ await withGoldenViteServer(async (server) => {
   }));
   bridge.postMessage({ type: 'requestState' });
   await waitFor(
-    () => messagesStore.messagesState.currentSessionId?.startsWith(`session-local-${draftTurnRequestId}`),
-    'pending 首条消息收到空会话 bootstrap 时必须保留本地会话锚点',
+    () => messagesStore.messagesState.pendingRequests.has(draftTurnRequestId),
+    'pending 首条消息收到空会话 bootstrap 时必须保留待确认请求状态',
+  );
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    null,
+    '首条消息 accepted 前不得创建本地 sessionId',
   );
   recoveredDraftStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope('request-draft-foreign')) });
   assert.equal(
-    messagesStore.messagesState.currentSessionId?.startsWith(`session-local-${draftTurnRequestId}`),
-    true,
-    '草稿态收到其他 requestId 的 accepted 事件时必须保持当前本地提交上下文',
+    messagesStore.messagesState.currentSessionId,
+    null,
+    '草稿态收到其他 requestId 的 accepted 事件时必须保持空 session 绑定',
   );
   recoveredDraftStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope(draftTurnRequestId)) });
   assert.notEqual(
@@ -1458,8 +1671,11 @@ await withGoldenViteServer(async (server) => {
     () => capturedTurnBodies.some((body) => body.requestId === staleDraftTurnRequestId),
     '旧草稿提交必须到达后端后再模拟导航竞态',
   );
-  const staleDraftLocalSessionId = messagesStore.messagesState.currentSessionId;
-  assert.ok(staleDraftLocalSessionId?.startsWith(`session-local-${staleDraftTurnRequestId}`));
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    null,
+    '旧草稿 accepted 前不得创建本地 session 作为竞态锚点',
+  );
   bridge.postMessage({
     type: 'navigateSession',
     target: 'draft',
@@ -1469,9 +1685,8 @@ await withGoldenViteServer(async (server) => {
     workspacePath: WORKSPACE_PATH,
   });
   await waitFor(
-    () => !messagesStore.messagesState.currentSessionId
-      && messagesStore.messagesState.currentSessionId !== staleDraftLocalSessionId,
-    '用户进入新的草稿后旧本地会话必须失效',
+    () => !messagesStore.messagesState.currentSessionId,
+    '用户进入新的草稿后必须保持空 session 绑定',
   );
   staleDraftTurnAccepted.resolve(jsonResponse({
     sessionId: 'session-stale-draft-response',
@@ -1552,17 +1767,18 @@ await withGoldenViteServer(async (server) => {
     }],
     'queued follow-up must preserve authoritative pathRef context references in the POST body',
   );
-  assert.ok(
+  assert.equal(
     findArtifactByRequestId(
       messagesStore.messagesState.canonicalTimelineProjection,
       'request-queued-immediate-feedback',
     ),
-    'queued follow-up must become a local pending turn before /api/session/turn resolves',
+    undefined,
+    'queued follow-up must be tracked as pending without creating a local canonical turn',
   );
   assert.equal(
     messagesStore.messagesState.isProcessing,
     true,
-    'queued follow-up may show a local pending turn only while the daemon response is unresolved',
+    'queued follow-up must keep processing visible while the daemon response is unresolved',
   );
   queuedTurnPayloads = [
     {
@@ -2106,12 +2322,21 @@ await withGoldenViteServer(async (server) => {
   window.location.href = `http://127.0.0.1:38123/web.html?workspaceId=${encodeURIComponent(WORKSPACE_ID)}&workspacePath=${encodeURIComponent(WORKSPACE_PATH)}&sessionId=session-stale-url`;
   bootstrapInterceptors.push((parsed) => {
     staleUrlBootstrapRequests.push(parsed);
-    return jsonResponse(scopedBootstrapPayload(
+    const payload = scopedBootstrapPayload(
       WORKSPACE_ID,
       WORKSPACE_PATH,
       SESSION_ID,
       'stale URL guard bootstrap',
-    ));
+    );
+    return jsonResponse({
+      ...payload,
+      sessionId: '',
+      currentSession: null,
+      state: {
+        ...payload.state,
+        currentSessionId: '',
+      },
+    });
   });
   bridge.postMessage({ type: 'requestState' });
   await waitFor(
@@ -2139,16 +2364,19 @@ await withGoldenViteServer(async (server) => {
     true,
     '提交事件返回前必须先进入本地 processing 状态，让按钮与等待动画立即响应',
   );
-  const firstTurnLocalArtifact = findArtifactByRequestId(
-    messagesStore.messagesState.canonicalTimelineProjection,
-    'request-first-turn-immediate-feedback',
+  assert.equal(
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-first-turn-immediate-feedback',
+    ),
+    undefined,
+    '首条消息 accepted 前只能进入 processing，不能产生本地伪 canonical turn',
   );
   assert.equal(
-    firstTurnLocalArtifact?.message?.type,
-    'user_input',
-    '首条消息必须与 processing 同步进入 canonical 投影，不能产生空白对话首帧',
+    messagesStore.messagesState.currentSessionId,
+    null,
+    '首条消息 accepted 前必须保持空 session 绑定',
   );
-  assert.equal(firstTurnLocalArtifact?.message?.content, '首条消息必须立刻进入主线。');
   await waitFor(
     () => capturedTurnBodies.some((body) => body.requestId === 'request-first-turn-immediate-feedback'),
     'first turn submit must reach backend',
@@ -2158,17 +2386,6 @@ await withGoldenViteServer(async (server) => {
     firstTurnBody.sessionId,
     null,
     'first turn optimistic session must not be sent as a real backend sessionId',
-  );
-  assert.ok(
-    messagesStore.messagesState.currentSessionId?.startsWith('session-local-request-first-turn-immediate-feedback'),
-    'first turn must create a local-only session binding before backend accepted response',
-  );
-  assert.ok(
-    findArtifactByRequestId(
-      messagesStore.messagesState.canonicalTimelineProjection,
-      'request-first-turn-immediate-feedback',
-    ),
-    'first turn must become a local pending turn before /api/session/turn resolves',
   );
   firstTurnAccepted.resolve(jsonResponse({
     sessionId: SESSION_ID,
@@ -2220,9 +2437,9 @@ await withGoldenViteServer(async (server) => {
     continueTurnBody.requestId,
   );
   assert.equal(
-    continueLocalArtifact?.message?.content,
-    '继续',
-    'continueTask must render the user input immediately while the backend resumes the runner',
+    continueLocalArtifact,
+    undefined,
+    'continueTask must keep the request pending without fabricating a canonical turn before acceptance',
   );
   continueTurnAccepted.resolve(jsonResponse({
     sessionId: SESSION_ID,
@@ -2594,6 +2811,121 @@ await withGoldenViteServer(async (server) => {
     '旧已提交会话 HTTP accepted 返回后不得夺回新会话的 currentSessionId',
   );
   messagesStore.clearRequestBinding(staleCommittedTurnRequestId);
+
+  await verifyBrowserNodeSelectionTurn(bridge, messagesStore);
+
+  const failedSubmissionRequestId = 'request-submission-lifecycle-failed';
+  sessionTurnInterceptors.push(() => new Response(JSON.stringify({
+    error: 'simulated transport rejection',
+  }), {
+    status: 503,
+    headers: { 'content-type': 'application/json' },
+  }));
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '失败提交必须通知编辑器恢复草稿。',
+    requestId: failedSubmissionRequestId,
+    workspaceId: RACE_WORKSPACE_ID,
+    workspacePath: RACE_WORKSPACE_PATH,
+    sessionId: RACE_SESSION_ID,
+  });
+  await waitFor(
+    () => submissionLifecycleEvents.some((event) => (
+      event?.requestId === failedSubmissionRequestId && event?.status === 'failed'
+    )),
+    'session turn submit failure must notify the composer through the request lifecycle event',
+  );
+  assert.deepEqual(
+    submissionLifecycleEvents.find((event) => event?.requestId === failedSubmissionRequestId),
+    { requestId: failedSubmissionRequestId, status: 'failed' },
+    'submission lifecycle event must preserve the request identity and terminal status',
+  );
+
+  // Electron 使用 App Server WebSocket 时，发送前预热必须复用同一条
+  // 当前会话连接。旧实现把 App Server 键误和 SSE 键比较，导致每次发送
+  // 都关闭并重建 WebSocket，进而制造消息事件竞态。
+  const appServerSocketCountBefore = FakeWebSocket.instances.length;
+  window.magiDesktop = { runtime: 'electron' };
+  const electronTurnResponse = (index) => jsonResponse({
+    sessionId: RACE_SESSION_ID,
+    entryId: `timeline-electron-reuse-${index}`,
+    eventId: `event-electron-reuse-${index}`,
+    acceptedAt: ACCEPTED_AT + 4000 + index,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    createdSession: false,
+    route: 'chat',
+    userMessageItemId: `user-electron-reuse-${index}`,
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  });
+  sessionTurnInterceptors.push(() => electronTurnResponse(1));
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '初始化 Electron App Server 连接。',
+    requestId: 'request-electron-reuse-1',
+    workspaceId: RACE_WORKSPACE_ID,
+    workspacePath: RACE_WORKSPACE_PATH,
+    sessionId: RACE_SESSION_ID,
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-electron-reuse-1'),
+    'Electron 首次提交必须进入 canonical session turn endpoint',
+  );
+  await waitFor(
+    () => FakeWebSocket.instances.length === appServerSocketCountBefore + 1,
+    'Electron 首次提交必须创建一条 App Server WebSocket',
+  );
+  const electronSocket = FakeWebSocket.instances.at(-1);
+  electronSocket.open();
+  await waitFor(
+    () => lastWebSocketRequest(electronSocket, 'initialize'),
+    'Electron App Server WebSocket 必须完成 initialize',
+  );
+  replyWebSocket(electronSocket, lastWebSocketRequest(electronSocket, 'initialize'), appServerInitializeResult());
+  await waitFor(
+    () => lastWebSocketRequest(electronSocket, 'events/subscribe'),
+    'Electron App Server initialize 后必须完成 events/subscribe',
+  );
+  replyWebSocket(electronSocket, lastWebSocketRequest(electronSocket, 'events/subscribe'), appServerSubscribeResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const appServerSocketCountAfterFirst = FakeWebSocket.instances.length;
+  const initializeCountAfterFirst = electronSocket.sent.filter((message) => message.method === 'initialize').length;
+  const subscribeCountAfterFirst = electronSocket.sent.filter((message) => message.method === 'events/subscribe').length;
+
+  sessionTurnInterceptors.push(() => electronTurnResponse(2));
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '复用已有 Electron App Server 连接继续发送。',
+    requestId: 'request-electron-reuse-2',
+    workspaceId: RACE_WORKSPACE_ID,
+    workspacePath: RACE_WORKSPACE_PATH,
+    sessionId: RACE_SESSION_ID,
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-electron-reuse-2'),
+    'Electron 第二次提交必须进入 canonical session turn endpoint',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(
+    FakeWebSocket.instances.length,
+    appServerSocketCountAfterFirst,
+    'Electron 第二次提交不得因错误连接键关闭并重建 App Server WebSocket',
+  );
+  assert.equal(
+    electronSocket.sent.filter((message) => message.method === 'initialize').length,
+    initializeCountAfterFirst,
+    '复用连接时不得重复 initialize',
+  );
+  assert.equal(
+    electronSocket.sent.filter((message) => message.method === 'events/subscribe').length,
+    subscribeCountAfterFirst,
+    '复用连接时不得重复 events/subscribe',
+  );
+  messagesStore.clearRequestBinding('request-electron-reuse-1');
+  messagesStore.clearRequestBinding('request-electron-reuse-2');
 
   console.log('web client bridge golden replay passed');
 }, {

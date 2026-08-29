@@ -70,10 +70,14 @@ assert.match(windowManager, /awaitPageLoad: false/u);
 const startLoadSection = section(
   surfaceManager,
   "private startLoad(",
-  "private async waitForNavigation(",
+  "private waitForNavigationOperation(",
   "BrowserSurfaceManager.startLoad",
 );
-assert.match(startLoadSection, /if \(record\.loadPromise\) return record\.loadPromise;/u);
+assert.match(
+  startLoadSection,
+  /record\.loadPromise[\s\S]*?sameNavigationUrl\(record\.navigationOperation\.targetUrl \?\? "about:blank", url\)[\s\S]*?return record\.loadPromise;/u,
+  "同一 URL 的并发初始导航必须复用，目标 URL 变化才启动新导航",
+);
 
 const activationSection = section(
   windowManager,
@@ -97,12 +101,33 @@ assert.match(
 
 const surfaceSlotUpdate = section(
   surfaceManager,
-  "bindContentSurface(windowId: string, tabId: string, bounds: Rectangle | null)",
-  "bindingForTabInWindow(",
+  "  bindContentSurface(",
+  "\n  bindingForTabInWindow(",
   "BrowserSurfaceManager.bindContentSurface",
 );
-assert.match(surfaceSlotUpdate, /if \(record\.tabId === tabId\) \{\s*this\.applySlot\(record, bounds, window\);/u);
+assert.match(
+  surfaceSlotUpdate,
+  /bindContentSurface\([\s\S]*?bounds: Rectangle \| null,[\s\S]*?\): void \{/u,
+  "Browser Surface 绑定接口只接收当前内容槽",
+);
+assert.doesNotMatch(surfaceSlotUpdate, /clipBounds|intersectRect|leaseBounds/u);
+assert.match(
+  surfaceSlotUpdate,
+  /const target = records\.find\(\(record\) => record\.tabId === tabId\) \?\? null[\s\S]*?this\.applySlot\(target, bounds, window\);[\s\S]*?if \(record !== target\) this\.unmountSurface\(record, window\);/u,
+  "Browser Tab 切换必须先挂载目标 Surface，再卸载旧 Surface，不能制造空槽",
+);
 assert.doesNotMatch(surfaceSlotUpdate, /createSurface\(|startLoad\(|loadPage\(|loadURL\(|attachDebugger\(|setViewport\(/u);
+
+assert.match(
+  windowManager,
+  /bindContentSurface\(\s*record\.windowId,\s*layout\.activeTabId,\s*currentBrowserContentBounds,\s*currentBrowserParentBounds,\s*\)/u,
+  "Main 必须把 Renderer 上报的完整窗口坐标内容槽传给原生 Surface",
+);
+assert.doesNotMatch(
+  windowManager,
+  /x:\s*0,\s*y:\s*0,\s*width:\s*currentBrowserContentBounds\.width/u,
+  "Main 不得将窗口坐标内容槽重置为根坐标",
+);
 
 const windowSlotStart = windowManager.indexOf(
   "  private applyLayout(record: DesktopWindowRecord): DesktopWindowSnapshot",
@@ -114,25 +139,30 @@ const windowSlotEnd = windowManager.indexOf(
 assert.notEqual(windowSlotStart, -1, "WindowManager.applyLayout 缺少起点");
 assert.notEqual(windowSlotEnd, -1, "WindowManager.applyLayout 缺少终点");
 const windowSlotUpdate = windowManager.slice(windowSlotStart, windowSlotEnd);
-assert.match(windowSlotUpdate, /browserContentBounds\(layout\)/u);
+assert.match(windowSlotUpdate, /const currentBrowserContentBounds = browserSurfaceActive \? browserContentBounds\(layout\) : null/u);
 assert.match(windowSlotUpdate, /this\.#surfaceManager\.bindContentSurface\(/u);
 assert.doesNotMatch(windowSlotUpdate, /materialize\(|activateBrowser\(|loadURL\(|setBrowserViewport\(/u);
-assert.doesNotMatch(tabSource, /ResizeObserver|browserSurfaceSlot/u);
 assert.doesNotMatch(tabSource, /updateBrowserSlot|bindContentSurface/u);
 assert.doesNotMatch(tabSource, /transform:\s*scale\(|object-fit:\s*(fill|cover)|surfaceWidth|surfaceHeight/u);
 assert.match(windowManager, /browserContentBounds\(layout\)[\s\S]*?bindContentSurface\(/u);
-assert.match(windowManager, /record\.appLayer\.setBounds\(layout\.appBounds[\s\S]*?record\.appView\.setBounds\(layout\.appBounds/u);
+assert.match(workbenchShell, /ResizeObserver/u);
+assert.match(workbenchShell, /type:\s*['"]renderer_geometry['"]/u);
+assert.match(
+  windowManager,
+  /setViewBounds\(record\.appView, layout\.appBounds(?: as Rectangle)?\)/u,
+  "主 Renderer 必须通过统一的原生边界事务设置范围",
+);
 assert.match(workbenchShell, /desktop-right-pane-column--overlay[\s\S]*?box-shadow:\s*inset 1px 0 var\(--border\)/u);
 assert.doesNotMatch(workbenchShell, /desktop-right-pane-column--overlay[\s\S]*?border-left:/u);
 assert.match(
   surfaceManager,
-  /record\.host\.addChildView\(record\.view, 0\)[\s\S]*?const localBounds = \{ x: 0, y: 0, width: bounds\.width, height: bounds\.height \}[\s\S]*?record\.view\.setBounds\(localBounds\)/u,
-  "Browser Surface 必须挂载到当前内容槽宿主并使用局部内容槽坐标",
+  /const contentRoot = this\.#contentRoots\.get\(input\.windowId\)[\s\S]*?contentRoot\.addChildView\(record\.view, 1\)[\s\S]*?record\.view\.setBounds\(effectiveBounds\)/u,
+  "Browser Surface 必须直接挂载到窗口根 contentView 并使用窗口内容槽坐标",
 );
 assert.match(
   surfaceManager,
-  /Emulation\.setDeviceMetricsOverride[\s\S]*?deviceScaleFactor: viewport\.device_scale_factor_millis \/ 1_000[\s\S]*?screenWidth: width[\s\S]*?screenHeight: height/u,
-  "固定响应式视口必须使用 Chromium 原生设备指标和设备像素比",
+  /Emulation\.setDeviceMetricsOverride[\s\S]*?deviceScaleFactor: viewport\.device_scale_factor_millis \/ 1_000[\s\S]*?scale,[\s\S]*?screenWidth: width[\s\S]*?screenHeight: height/u,
+  "固定响应式视口必须使用 Chromium 原生设备指标和内容槽内 compositor scale",
 );
 assert.match(
   surfaceManager,
@@ -173,17 +203,22 @@ const applySlotSection = section(
 );
 assert.match(
   applySlotSection,
-  /内容槽只管理原生 View 的物理承载范围[\s\S]*?不能重新提交[\s\S]*?fixed/u,
-  "右栏尺寸变化只能更新原生内容槽，不得改写 Tab 级 CSS viewport",
+  /内容槽只管理原生 View 的物理承载范围[\s\S]*?applyViewport[\s\S]*?禁止 CSS transform、截图/u,
+  "右栏尺寸变化只能更新原生内容槽，viewport 由 Chromium 的唯一视口状态管理",
 );
 assert.match(
   applySlotSection,
-  /record\.viewport\.mode === "auto" && wasSlotVisible !== record\.slotVisible[\s\S]*?scheduleViewportApply\(record\)/u,
-  "仅在 Surface 可见性切换时恢复 auto viewport，右栏尺寸变化不触发 viewport 重算",
+  /if \(sizeChanged && record\.viewport\.mode === "fixed"\)[\s\S]*?scheduleViewportApply\(record\)/u,
+  "内容槽变化只重算 fixed 视口，auto 由原生 WebContentsView 自然响应",
+);
+assert.match(
+  applySlotSection,
+  /sizeChanged[\s\S]*?record\.viewport\.mode === "fixed"[\s\S]*?scheduleViewportApply\(record\)/u,
+  "固定视口只在内容槽尺寸变化时更新原生 compositor scale",
 );
 assert.match(
   surfaceManager,
-  /record\.host\.removeChildView\(record\.view\)/u,
+  /this\.#contentRoots\.get\(record\.windowId\)\?\.removeChildView\(record\.view\)/u,
   "非当前 Browser Surface 必须从原生命中树解绑但保留 WebContents",
 );
 
@@ -216,10 +251,23 @@ assert.match(
 assert.match(tabSource, /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS = 180/u);
 assert.match(tabSource, /useAutomaticViewport\(\)[\s\S]*?updateLogicalViewport\('auto'\)/u);
 assert.match(tabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/u);
-assert.match(tabSource, /fields:[\s\S]*?id: 'width'[\s\S]*?id: 'height'/u);
+assert.match(tabSource, /class="viewport-menu"[\s\S]*?type="number"[\s\S]*?type="number"/u);
+assert.match(tabSource, /class="annotation-menu"[\s\S]*?annotation-menu-number/u);
+// Desktop 的浮层统一走原生 Overlay，Web 模式由同一组件的 DOM 浮层承载；
+// 菜单展开期间不能撤下网页，否则会重新出现“页面像被切换”的体验。
+assert.match(tabSource, /\{#if viewportMenuOpen && !desktopRuntime\}[\s\S]*?class="viewport-popover"/u);
+assert.match(tabSource, /\{#if annotationMenuOpen && !desktopRuntime\}[\s\S]*?class="annotation-history-popover"/u);
+assert.match(tabSource, /openDesktopViewportMenu\(\)/u);
+assert.match(tabSource, /openDesktopAnnotationHistory\(\)/u);
+assert.doesNotMatch(tabSource, /setDesktopBlockingOverlay\(key, open\)/u);
+assert.match(rightPaneSource, /openDesktopAddPaneMenu\(\)/u);
+assert.doesNotMatch(rightPaneSource, /setDesktopBlockingOverlay\(key, addPaneMenuOpen\)/u);
+assert.match(overlayManager, /export type DesktopOverlayKind = "menu" \| "annotation";/u);
+assert.match(overlayManager, /"right-pane-add"[\s\S]*?"browser-viewport"[\s\S]*?"browser-annotations"/u);
+assert.doesNotMatch(overlayManager, /overlayAnchors|widthLimit|itemHeight/u);
 assert.match(
   browserTools,
-  /if action != "set"[\s\S]*?let mode\s*=\s*optional_string[\s\S]*?mode == "auto"[\s\S]*?BrowserLogicalViewport::Auto/u,
+  /if action != "set"[\s\S]*?let Some\(mode\) = optional_string[\s\S]*?mode == "auto"[\s\S]*?BrowserLogicalViewport::Auto/u,
   "LLM 必须能通过 browser_viewport 的 auto 模式恢复跟随内容槽",
 );
 assert.match(
@@ -249,7 +297,7 @@ assert.match(
 );
 assert.match(
   overlayManager,
-  /state\.kind === "annotation" && \["selection", "save", "cancel"\]/u,
+  /const knownAction = state\.fields\.some\([\s\S]*?\["selection", "save", "cancel"\]/u,
   "Main Overlay 必须允许标记选择事件进入主 Renderer，而不是把它当成未知动作丢弃",
 );
 assert.match(
@@ -258,9 +306,14 @@ assert.match(
   "标记选择成功后必须切换到备注编辑层",
 );
 assert.match(
-  rightPaneSource,
+  workbenchShell,
   /function isClosedBrowserTabError[\s\S]*?resyncAfterClosedBrowserTab/u,
-  "已关闭 Browser Tab 必须通过权威快照收敛，不能进入激活重试循环",
+  "已关闭 Browser Tab 必须由唯一 Shell 控制器通过权威快照收敛，不能进入激活重试循环",
+);
+assert.doesNotMatch(
+  rightPaneSource,
+  /function isClosedBrowserTabError|resyncAfterClosedBrowserTab/u,
+  "RightPane 不得重新成为 Browser Surface 激活或关闭态收敛的旁路写入者",
 );
 
 assert.match(
@@ -283,13 +336,18 @@ assert.match(controlSchema, /"get_logical_viewport"/u);
 
 assert.match(
   inputSource,
-  /browserAnnotationRefs:[\s\S]*?browserAnnotationSnapshots:/u,
-  "标记必须同时以稳定 ID 和快照进入消息发送载荷",
+  /browserAnnotationRefs:[\s\S]*?browserNodeSelections:/u,
+  "标记必须以稳定 ID 进入标准 Turn 发送载荷，并与节点选择共用同一上下文入口",
 );
 assert.match(
   messageSource,
   /messageBrowserAnnotationRefs\.length > 0[\s\S]*?annotation\.sequence \?\? annotationIndex \+ 1/u,
   "对话区域必须展示标记序号和备注，并按 artifact 可用性决定是否可预览",
+);
+assert.match(
+  messageSource,
+  /browserAnnotationPreviewError = \$state\(''\)[\s\S]*?browser\.annotation\.previewFailed[\s\S]*?role="status"/u,
+  "标记截图 artifact 加载失败必须在对话区域显示可见状态",
 );
 
 process.stdout.write("浏览器核心验收契约通过：Surface 非阻塞物化、Tab Surface 复用、单一 Host 连接、右栏 bounds-only 更新、截图裁剪、root 截图、CDP 仿真、标记消息链路、artifact、响应式视口均已覆盖。\n");

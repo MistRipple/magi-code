@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magi.dev/contracts/worker-ipc.schema.json",
+  "title": "Magi Desktop Browser Worker IPC protocol",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/mainToWorkerMessage" },
+    { "$ref": "#/$defs/workerToMainMessage" }
+  ],
+  "$defs": {
+    "id": { "type": "string", "minLength": 1 },
+    "optionalId": { "type": ["string", "null"], "minLength": 1 },
+    "protocolVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": { "type": "integer", "minimum": 0 },
+        "minor": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "recoverable", "side_effect_started", "diagnostic"],
+      "properties": {
+        "code": { "$ref": "#/$defs/id" },
+        "message": { "type": "string" },
+        "recoverable": { "type": "boolean" },
+        "side_effect_started": { "type": "boolean" },
+        "diagnostic": { "type": ["string", "null"] }
+      }
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "payload"],
+          "properties": {
+            "status": { "const": "succeeded" },
+            "payload": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/result" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "payload"],
+          "properties": { "status": { "const": "failed" }, "payload": { "$ref": "#/$defs/error" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status"],
+          "properties": { "status": { "const": "cancelled" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "payload"],
+          "properties": { "status": { "const": "indeterminate" }, "payload": { "$ref": "#/$defs/error" } }
+        }
+      ]
+    },
+    "workerCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "call_id", "binding", "command"],
+      "properties": {
+        "type": { "const": "worker_command" },
+        "call_id": { "$ref": "#/$defs/id" },
+        "binding": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" },
+        "command": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/command" }
+      }
+    },
+    "workerCancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "call_id"],
+      "properties": {
+        "type": { "const": "worker_cancel" },
+        "call_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "cdpResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "call_id", "request_id", "binding", "result"],
+          "properties": {
+            "type": { "const": "cdp_response" },
+            "call_id": { "$ref": "#/$defs/id" },
+            "request_id": { "$ref": "#/$defs/id" },
+            "binding": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" },
+            "result": {},
+            "error": { "not": {} }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "call_id", "request_id", "binding", "error"],
+          "properties": {
+            "type": { "const": "cdp_response" },
+            "call_id": { "$ref": "#/$defs/id" },
+            "request_id": { "$ref": "#/$defs/id" },
+            "binding": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" },
+            "result": { "not": {} },
+            "error": { "$ref": "#/$defs/error" }
+          }
+        }
+      ]
+    },
+    "cdpEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "binding", "method", "params"],
+      "properties": {
+        "type": { "const": "cdp_event" },
+        "binding": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" },
+        "method": { "$ref": "#/$defs/id" },
+        "params": { "type": "object" },
+        "session_id": { "$ref": "#/$defs/optionalId" }
+      }
+    },
+    "workerRebind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "worker_epoch", "rebind_id", "bindings"],
+      "properties": {
+        "type": { "const": "worker_rebind" },
+        "worker_epoch": { "$ref": "#/$defs/id" },
+        "rebind_id": { "$ref": "#/$defs/id" },
+        "bindings": {
+          "type": "array",
+          "items": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" }
+        }
+      }
+    },
+    "workerRebindAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "worker_epoch", "rebind_id", "binding_count"],
+      "properties": {
+        "type": { "const": "worker_rebind_ack" },
+        "worker_epoch": { "$ref": "#/$defs/id" },
+        "rebind_id": { "$ref": "#/$defs/id" },
+        "binding_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "workerResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "call_id", "binding", "outcome"],
+      "properties": {
+        "type": { "const": "worker_result" },
+        "call_id": { "$ref": "#/$defs/id" },
+        "binding": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" },
+        "outcome": { "$ref": "#/$defs/outcome" },
+        "binary_base64": { "type": "string" }
+      }
+    },
+    "cdpRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "call_id", "request_id", "binding", "method"],
+      "properties": {
+        "type": { "const": "cdp_request" },
+        "call_id": { "$ref": "#/$defs/id" },
+        "request_id": { "$ref": "#/$defs/id" },
+        "binding": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" },
+        "method": { "$ref": "#/$defs/id" },
+        "params": { "type": "object" },
+        "session_id": { "$ref": "#/$defs/optionalId" },
+        "allow_navigation_advance": { "type": "boolean" }
+      }
+    },
+    "workerReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "worker_epoch", "protocol_version"],
+      "properties": {
+        "type": { "const": "worker_ready" },
+        "worker_epoch": { "$ref": "#/$defs/id" },
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" }
+      }
+    },
+    "mainToWorkerMessage": {
+      "oneOf": [
+        { "$ref": "#/$defs/workerCommand" },
+        { "$ref": "#/$defs/workerCancel" },
+        { "$ref": "#/$defs/cdpResponse" },
+        { "$ref": "#/$defs/cdpEvent" },
+        { "$ref": "#/$defs/workerRebind" }
+      ]
+    },
+    "workerToMainMessage": {
+      "oneOf": [
+        { "$ref": "#/$defs/workerResult" },
+        { "$ref": "#/$defs/cdpRequest" },
+        { "$ref": "#/$defs/workerReady" },
+        { "$ref": "#/$defs/workerRebindAck" }
+      ]
+    }
+  }
+}

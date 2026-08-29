@@ -25,6 +25,10 @@ extraResources:
     filter:
       - magi-daemon-app
       - magi-daemon-app.exe
+      - model_bridge_loopback
+      - model_bridge_loopback.exe
+      - mcp_bridge_loopback
+      - mcp_bridge_loopback.exe
   - from: ../../browser-automation-worker/dist/index.cjs
     to: browser-automation-worker/index.cjs
   - from: dist/lighthouse-runtime/node_modules
@@ -60,6 +64,8 @@ mac:
   gatekeeperAssess: false
   binaries:
     - Contents/Resources/daemon/magi-daemon-app
+    - Contents/Resources/daemon/model_bridge_loopback
+    - Contents/Resources/daemon/mcp_bridge_loopback
   target:
     - dmg
     - zip

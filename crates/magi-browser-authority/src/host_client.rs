@@ -464,7 +464,10 @@ fn handle_text_message(
         let _ = sender.send(Ok(handshake.clone()));
     }
     if let Some(metadata) = event_binary_metadata(&envelope) {
-        binary_queue.push_back(PendingBinary::Event { envelope, metadata });
+        binary_queue.push_back(PendingBinary::Event {
+            envelope: Box::new(envelope),
+            metadata,
+        });
     } else {
         let _ = events.send(BrowserHostIncomingEvent {
             envelope,
@@ -495,7 +498,7 @@ fn handle_binary_message(
         }
         PendingBinary::Event { envelope, .. } => {
             let _ = events.send(BrowserHostIncomingEvent {
-                envelope,
+                envelope: *envelope,
                 binary: Some(bytes),
             });
         }
@@ -510,7 +513,7 @@ enum PendingBinary {
         metadata: BrowserHostBinaryPayload,
     },
     Event {
-        envelope: BrowserHostEventEnvelope,
+        envelope: Box<BrowserHostEventEnvelope>,
         metadata: BrowserHostBinaryPayload,
     },
 }

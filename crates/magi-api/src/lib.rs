@@ -26,7 +26,7 @@ mod terminal_runtime;
 pub mod tunnel;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
-pub use dto::DirectHttpModelProbeConfig;
+pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
 pub fn schedule_restored_session_task_dispatches(state: ApiState) {

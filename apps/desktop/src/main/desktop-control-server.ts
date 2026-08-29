@@ -4,6 +4,8 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { Socket } from "node:net";
 import {
   DESKTOP_BROWSER_PROTOCOL_VERSION,
+  normalizeOptionalDomNodeId,
+  type BrowserAgentCursorAction,
   type BrowserCommandError,
   type BrowserCommandOutcome,
   type BrowserCommandResult,
@@ -17,12 +19,43 @@ import {
   type BrowserSurfaceIdentity,
   type DesktopBrowserHandshake,
 } from "@magi/desktop-browser-contracts";
+import {
+  parseBrowserHostEventEnvelope,
+  parseBrowserHostRequest,
+  parseBrowserHostResponse,
+} from "@magi/desktop-browser-contracts/validation";
 import { WebSocket, WebSocketServer } from "ws";
 import type { AutomationWorker } from "./automation-worker.js";
 import type { BrowserSurfaceEvent, BrowserSurfaceManager } from "./browser-surface-manager.js";
 
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+
+interface DesktopControlConnection {
+  websocket: WebSocket;
+  active: Set<DesktopControlCommand>;
+  closed: boolean;
+  isAlive: boolean;
+}
+
+interface DesktopControlCommand {
+  request: BrowserHostRequestEnvelope;
+  controller: AbortController;
+  connection: DesktopControlConnection;
+  resourceKey: string | null;
+  state: "pending" | "running" | "settled";
+  cancellationRequested: boolean;
+}
+
+interface ResourceQueue {
+  pending: DesktopControlCommand[];
+  running: DesktopControlCommand | null;
+}
+
+interface AnnotationProjection {
+  revision: number;
+  annotations: unknown[];
+}
 
 export class DesktopControlServer {
   readonly #socketPath: string;
@@ -31,13 +64,19 @@ export class DesktopControlServer {
   readonly #worker: AutomationWorker;
   readonly #activeWindowId: () => string;
   readonly #handshake: () => DesktopBrowserHandshake;
-  readonly #queues = new Map<string, Promise<void>>();
-  readonly #active = new Map<string, AbortController>();
+  readonly #queues = new Map<string, ResourceQueue>();
+  readonly #active = new Map<string, DesktopControlCommand>();
+  readonly #connections = new Set<DesktopControlConnection>();
+  // Authority 中的标记是唯一持久化事实；这里仅缓存其最后一次已接收投影，
+  // 用于 Chromium 文档导航或 Worker 重启后重放，不把标记状态写回 Desktop。
+  readonly #annotationProjections = new Map<string, AnnotationProjection>();
+  readonly #annotationProjectionLanes = new Map<string, Promise<void>>();
   #server: Server | null = null;
   #websocketServer: WebSocketServer | null = null;
   #client: WebSocket | null = null;
   #eventSequence = 0;
   #heartbeat: NodeJS.Timeout | null = null;
+  #lifecycle: Promise<void> = Promise.resolve();
 
   constructor(input: {
     socketPath: string;
@@ -56,6 +95,10 @@ export class DesktopControlServer {
   }
 
   async start(): Promise<void> {
+    return this.enqueueLifecycle(() => this.startInternal());
+  }
+
+  private async startInternal(): Promise<void> {
     if (this.#server) return;
     if (process.platform !== "win32" && existsSync(this.#socketPath)) unlinkSync(this.#socketPath);
     const server = createServer((request, response) => {
@@ -80,35 +123,60 @@ export class DesktopControlServer {
         return;
       }
       if (this.#client && this.#client.readyState !== WebSocket.CLOSED) {
-        socket.write("HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n");
-        socket.destroy();
-        return;
+        // terminate() changes the old socket to CLOSING before its asynchronous
+        // close event arrives. Treat that state as already released so a daemon
+        // reconnect during Electron restart is not rejected by a stale client.
+        if (this.#client.readyState === WebSocket.CLOSING) {
+          const connection = this.connectionFor(this.#client);
+          if (connection) this.releaseConnection(connection);
+          this.#client = null;
+        } else {
+          socket.write("HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n");
+          socket.destroy();
+          return;
+        }
       }
       websocketServer.handleUpgrade(request, socket, head, (websocket) => {
         websocketServer.emit("connection", websocket, request);
       });
     });
     websocketServer.on("connection", (websocket) => this.acceptClient(websocket));
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(this.#socketPath, () => {
-        server.off("error", reject);
-        resolve();
-      });
-    });
     this.#server = server;
     this.#websocketServer = websocketServer;
-    this.#heartbeat = setInterval(() => {
-      this.emit({ type: "heartbeat", payload: { monotonic_millis: Math.floor(performance.now()) } });
-    }, HEARTBEAT_INTERVAL_MS);
-    this.#heartbeat.unref();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(this.#socketPath, () => {
+          server.off("error", reject);
+          resolve();
+        });
+      });
+      this.#heartbeat = setInterval(() => this.heartbeat(), HEARTBEAT_INTERVAL_MS);
+      this.#heartbeat.unref();
+    } catch (cause) {
+      this.#server = null;
+      this.#websocketServer = null;
+      await this.closeWebSocketServer(websocketServer);
+      await closeHttpServer(server);
+      if (process.platform !== "win32" && existsSync(this.#socketPath)) unlinkSync(this.#socketPath);
+      throw cause;
+    }
   }
 
   handleSurfaceEvent(event: BrowserSurfaceEvent): void {
     this.#worker.forwardSurfaceEvent(event);
+    // 一个逻辑 Tab 可以在多个窗口拥有 WebContents，但 Host 只接受其
+    // 当前 Primary 的页面事实。否则后台窗口的旧导航、加载和弹窗事件
+    // 会覆盖当前 Surface，表现为地址、状态和工具结果来回跳变。
+    if (event.type !== "primary_changed"
+      && event.type !== "cdp_event"
+      && !this.#surfaceManager.isPrimary(event.binding)) {
+      return;
+    }
     switch (event.type) {
       case "primary_changed":
         this.emit({ type: "primary_surface_changed", payload: { binding: event.binding } });
+        this.scheduleAnnotationProjection(event.binding.tab_id);
         break;
       case "page_updated":
         if (this.#surfaceManager.isPrimary(event.binding)) {
@@ -116,6 +184,7 @@ export class DesktopControlServer {
             type: "page_updated",
             payload: { binding: event.binding, page_state: event.page },
           });
+          this.scheduleAnnotationProjection(event.binding.tab_id);
         }
         break;
       case "page_crashed":
@@ -137,7 +206,7 @@ export class DesktopControlServer {
             visible: event.visible,
             x: event.x,
             y: event.y,
-            action: event.action,
+            action: agentCursorAction(event.action),
           },
         });
         break;
@@ -174,25 +243,78 @@ export class DesktopControlServer {
   }
 
   async close(): Promise<void> {
+    return this.enqueueLifecycle(() => this.closeInternal());
+  }
+
+  private async closeInternal(): Promise<void> {
     if (this.#heartbeat) clearInterval(this.#heartbeat);
     this.#heartbeat = null;
-    for (const controller of this.#active.values()) controller.abort();
-    this.#active.clear();
-    this.#client?.terminate();
+    for (const connection of [...this.#connections]) {
+      this.releaseConnection(connection);
+      connection.websocket.terminate();
+    }
     this.#client = null;
-    this.#websocketServer?.close();
+    const websocketServer = this.#websocketServer;
     this.#websocketServer = null;
+    if (websocketServer) await this.closeWebSocketServer(websocketServer);
     const server = this.#server;
     this.#server = null;
-    if (server) {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+    if (server) await closeHttpServer(server);
     if (process.platform !== "win32" && existsSync(this.#socketPath)) unlinkSync(this.#socketPath);
   }
 
+  private enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.#lifecycle.then(operation, operation);
+    this.#lifecycle = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  private heartbeat(): void {
+    for (const connection of [...this.#connections]) {
+      if (connection.closed) continue;
+      if (!connection.isAlive) {
+        this.releaseConnection(connection);
+        connection.websocket.terminate();
+        continue;
+      }
+      connection.isAlive = false;
+      if (connection.websocket.readyState === WebSocket.OPEN) {
+        try {
+          connection.websocket.ping();
+        } catch {
+          this.releaseConnection(connection);
+          connection.websocket.terminate();
+        }
+      }
+    }
+    this.emit({ type: "heartbeat", payload: { monotonic_millis: Math.floor(performance.now()) } });
+  }
+
+  private closeWebSocketServer(websocketServer: WebSocketServer): Promise<void> {
+    return new Promise((resolve) => {
+      websocketServer.close(() => resolve());
+    });
+  }
+
+  /** Worker 恢复后重放所有仍在当前 Primary Surface 上的标记投影。 */
+  async replayCachedAnnotations(): Promise<void> {
+    await Promise.allSettled(
+      [...this.#annotationProjections.keys()].map((tabId) => this.enqueueAnnotationProjection(tabId)),
+    );
+  }
+
   private acceptClient(websocket: WebSocket): void {
+    const connection: DesktopControlConnection = {
+      websocket,
+      active: new Set(),
+      closed: false,
+      isAlive: true,
+    };
+    this.#connections.add(connection);
     this.#client = websocket;
+    websocket.on("pong", () => {
+      if (!connection.closed) connection.isAlive = true;
+    });
     console.info("[DesktopControlServer] Browser Host connected", {
       readyState: websocket.readyState,
     });
@@ -205,6 +327,7 @@ export class DesktopControlServer {
     for (const binding of this.#surfaceManager.bindings()) {
       if (this.#surfaceManager.isPrimary(binding)) {
         this.emit({ type: "primary_surface_changed", payload: { binding } });
+        this.scheduleAnnotationProjection(binding.tab_id);
       }
     }
     websocket.on("message", (data, binary) => {
@@ -212,6 +335,7 @@ export class DesktopControlServer {
         websocket.close(1003, "binary requests are not supported");
         return;
       }
+      if (connection.closed) return;
       let request: BrowserHostRequestEnvelope;
       try {
         request = parseRequest(data.toString());
@@ -219,7 +343,7 @@ export class DesktopControlServer {
         console.error("[DesktopControlServer] Invalid Browser Host request", {
           error: cause instanceof Error ? cause.message : String(cause),
         });
-        websocket.send(JSON.stringify(failedResponse("invalid-request", normalizeError(cause))));
+        this.sendEnvelope(connection, failedResponse("invalid-request", normalizeError(cause)));
         return;
       }
       console.info("[DesktopControlServer] Browser command received", {
@@ -228,70 +352,202 @@ export class DesktopControlServer {
         tabId: commandTabId(request.command),
       });
       if (request.command.type === "cancel") {
-        this.#active.get(request.command.payload.request_id)?.abort();
+        const active = this.#active.get(request.command.payload.request_id);
+        if (active?.connection === connection) this.cancelCommand(active);
+        return;
+      }
+      if (this.#active.has(request.request_id)) {
+        this.sendEnvelope(
+          connection,
+          failedResponse(request.request_id, {
+            code: "browser_request_id_in_use",
+            message: "浏览器请求 ID 已在使用中",
+            recoverable: true,
+            side_effect_started: false,
+            diagnostic: null,
+          }),
+        );
         return;
       }
       const controller = new AbortController();
-      this.#active.set(request.request_id, controller);
-      const run = async () => {
-        const startedAt = performance.now();
-        try {
-          await this.executeWithCancellation(request, controller.signal, websocket);
-          console.info("[DesktopControlServer] Browser command settled", {
-            requestId: request.request_id,
-            command: request.command.type,
-            durationMs: Math.round(performance.now() - startedAt),
-          });
-        } finally {
-          if (this.#active.get(request.request_id) === controller) {
-            this.#active.delete(request.request_id);
-          }
-        }
+      const command: DesktopControlCommand = {
+        request,
+        controller,
+        connection,
+        resourceKey: commandTabId(request.command),
+        state: "pending",
+        cancellationRequested: false,
       };
-      const queueKey = commandTabId(request.command);
-      if (!queueKey) {
-        void run();
-        return;
-      }
-      const previous = this.#queues.get(queueKey) ?? Promise.resolve();
-      const next = previous.then(run, run);
-      // Queue 的尾部必须始终是 fulfilled Promise。这样某条命令因窗口销毁
-      // 或发送失败而 reject 时，后续同 Tab 命令仍能按顺序执行，不会把错误
-      // Promise 永久留在队列里；这里不做重试，只收敛队列生命周期。
-      const tail = next.then(
-        () => undefined,
-        (error) => {
-          console.error("[DesktopControlServer] Browser command queue failed", {
-            tabId: queueKey,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        },
-      );
-      this.#queues.set(queueKey, tail);
-      void tail.then(() => {
-        if (this.#queues.get(queueKey) === tail) this.#queues.delete(queueKey);
-      });
+      this.#active.set(request.request_id, command);
+      connection.active.add(command);
+      this.enqueueCommand(command);
     });
     websocket.on("error", (error) => {
       console.error("[DesktopControlServer] Browser Host websocket error", {
         error: error instanceof Error ? error.message : String(error),
       });
+      // error 不保证后续 close 事件及时到达。连接失效必须在这里完成
+      // 同一套释放流程，避免旧连接继续占用资源队列。
+      this.releaseConnection(connection);
     });
     websocket.on("close", (code, reason) => {
       console.warn("[DesktopControlServer] Browser Host websocket closed", {
         code,
         reason: reason.toString(),
       });
-      if (this.#client === websocket) this.#client = null;
+      this.releaseConnection(connection);
     });
   }
 
-  private async execute(request: BrowserHostRequestEnvelope): Promise<{
+  private enqueueCommand(command: DesktopControlCommand): void {
+    if (!command.resourceKey) {
+      void this.runCommand(command);
+      return;
+    }
+    const queue = this.#queues.get(command.resourceKey) ?? { pending: [], running: null };
+    queue.pending.push(command);
+    this.#queues.set(command.resourceKey, queue);
+    this.pumpQueue(command.resourceKey, queue);
+  }
+
+  private pumpQueue(resourceKey: string, queue: ResourceQueue): void {
+    if (queue.running) return;
+    while (queue.pending.length > 0) {
+      const command = queue.pending.shift();
+      if (!command) return;
+      if (command.connection.closed || command.cancellationRequested) {
+        this.finishCommand(command);
+        continue;
+      }
+      queue.running = command;
+      void this.runCommand(command).finally(() => {
+        if (queue.running === command) queue.running = null;
+        if (this.#queues.get(resourceKey) === queue) this.pumpQueue(resourceKey, queue);
+      });
+      return;
+    }
+    if (!queue.running && this.#queues.get(resourceKey) === queue) this.#queues.delete(resourceKey);
+  }
+
+  private async runCommand(command: DesktopControlCommand): Promise<void> {
+    if (command.state === "settled") return;
+    if (command.connection.closed || command.cancellationRequested) {
+      this.finishCommand(command);
+      return;
+    }
+    command.state = "running";
+    const startedAt = performance.now();
+    try {
+      await this.executeWithCancellation(command);
+      console.info("[DesktopControlServer] Browser command settled", {
+        requestId: command.request.request_id,
+        command: command.request.command.type,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+    } catch (cause) {
+      if (!command.connection.closed && !command.cancellationRequested) {
+        this.sendEnvelope(command.connection, failedResponse(command.request.request_id, normalizeError(cause)));
+      }
+    } finally {
+      this.finishCommand(command);
+    }
+  }
+
+  private cancelCommand(command: DesktopControlCommand): void {
+    if (command.state === "settled") return;
+    command.cancellationRequested = true;
+    command.controller.abort();
+    if (command.state !== "pending") return;
+    this.removePendingCommand(command);
+    this.sendEnvelope(command.connection, cancelledResponse(command.request.request_id));
+    this.finishCommand(command);
+  }
+
+  private removePendingCommand(command: DesktopControlCommand): void {
+    const resourceKey = command.resourceKey;
+    if (!resourceKey) return;
+    const queue = this.#queues.get(resourceKey);
+    if (!queue) return;
+    const index = queue.pending.indexOf(command);
+    if (index >= 0) queue.pending.splice(index, 1);
+    if (!queue.running) this.pumpQueue(resourceKey, queue);
+  }
+
+  private finishCommand(command: DesktopControlCommand): void {
+    if (command.state === "settled") return;
+    command.state = "settled";
+    if (this.#active.get(command.request.request_id) === command) {
+      this.#active.delete(command.request.request_id);
+    }
+    command.connection.active.delete(command);
+  }
+
+  private releaseConnection(connection: DesktopControlConnection): void {
+    if (connection.closed) return;
+    connection.closed = true;
+    for (const command of [...connection.active]) {
+      command.cancellationRequested = true;
+      command.controller.abort();
+      // A pending command has not touched Chromium and can leave the queue
+      // immediately. A running command remains the queue owner until its
+      // underlying operation settles, even though this connection is gone.
+      if (command.state === "pending") this.finishCommand(command);
+    }
+    this.#connections.delete(connection);
+    if (this.#client === connection.websocket) this.#client = null;
+    for (const [resourceKey, queue] of this.#queues) {
+      queue.pending = queue.pending.filter((command) => {
+        if (command.connection !== connection) return true;
+        this.finishCommand(command);
+        return false;
+      });
+      if (!queue.running && queue.pending.length === 0) {
+        this.#queues.delete(resourceKey);
+      } else if (!queue.running) {
+        this.pumpQueue(resourceKey, queue);
+      }
+    }
+  }
+
+  private connectionFor(websocket: WebSocket): DesktopControlConnection | null {
+    for (const connection of this.#connections) {
+      if (connection.websocket === websocket) return connection;
+    }
+    return null;
+  }
+
+  private sendEnvelope(connection: DesktopControlConnection, envelope: BrowserHostResponseEnvelope): void {
+    if (connection.closed || connection.websocket.readyState !== WebSocket.OPEN) return;
+    try {
+      const validated = parseBrowserHostResponse(envelope);
+      assertProtocolVersion(validated.protocol_version);
+      connection.websocket.send(JSON.stringify(validated));
+    } catch (cause) {
+      console.error("[DesktopControlServer] Browser response validation/send failed", {
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+      this.releaseConnection(connection);
+    }
+  }
+
+  private sendBinary(connection: DesktopControlConnection, payload: Buffer): void {
+    if (connection.closed || connection.websocket.readyState !== WebSocket.OPEN) return;
+    try {
+      connection.websocket.send(payload, { binary: true });
+    } catch (cause) {
+      console.error("[DesktopControlServer] Browser binary response send failed", {
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+      this.releaseConnection(connection);
+    }
+  }
+
+  private async execute(request: BrowserHostRequestEnvelope, signal?: AbortSignal): Promise<{
     envelope: BrowserHostResponseEnvelope;
     binary?: Buffer;
   }> {
     try {
-      const executed = await this.executeCommand(request.command);
+      const executed = await this.executeCommand(request.command, signal);
       return {
         envelope: {
           request_id: request.request_id,
@@ -308,38 +564,41 @@ export class DesktopControlServer {
   }
 
   private async executeWithCancellation(
-    request: BrowserHostRequestEnvelope,
-    signal: AbortSignal,
-    websocket: WebSocket,
+    command: DesktopControlCommand,
   ): Promise<void> {
+    const { request, controller, connection } = command;
+    const { signal } = controller;
     if (signal.aborted) {
-      if (websocket.readyState === WebSocket.OPEN) {
-        websocket.send(JSON.stringify(cancelledResponse(request.request_id)));
-      }
       return;
     }
-    const operation = this.execute(request);
+    const operation = this.execute(request, signal);
     const cancellation = waitForAbort(signal);
     const result = await Promise.race([
       operation.then((response) => ({ kind: "completed" as const, response })),
       cancellation.then(() => ({ kind: "cancelled" as const })),
     ]);
     if (result.kind === "cancelled") {
-      if (websocket.readyState === WebSocket.OPEN) {
-        websocket.send(JSON.stringify(indeterminateResponse(request.request_id)));
-      }
-      // Preserve the per-tab queue until the real Chromium/Worker operation
-      // settles. The response is already indeterminate, so the next command
-      // cannot race the unknown side effect on the same page.
-      await operation;
+      this.sendEnvelope(connection, indeterminateResponse(request.request_id));
+      // The cancellation response is immediate, but the resource remains
+      // occupied until the underlying Worker/Main operation has settled.
+      await operation.catch(() => undefined);
       return;
     }
-    if (websocket.readyState !== WebSocket.OPEN) return;
-    websocket.send(JSON.stringify(result.response.envelope));
-    if (result.response.binary) websocket.send(result.response.binary, { binary: true });
+    // Cancellation may win immediately after the operation promise resolves.
+    // Re-check both the signal and the command ownership before writing; this
+    // is the response fence that prevents a late success from an old request.
+    if (signal.aborted || command.cancellationRequested || connection.closed) {
+      if (command.cancellationRequested) {
+        this.sendEnvelope(connection, indeterminateResponse(request.request_id));
+      }
+      await operation.catch(() => undefined);
+      return;
+    }
+    this.sendEnvelope(connection, result.response.envelope);
+    if (result.response.binary) this.sendBinary(connection, result.response.binary);
   }
 
-  private async executeCommand(command: BrowserHostCommand): Promise<{
+  private async executeCommand(command: BrowserHostCommand, signal?: AbortSignal): Promise<{
     outcome: BrowserCommandOutcome;
     binary?: Buffer;
   }> {
@@ -404,6 +663,10 @@ export class DesktopControlServer {
           },
         });
       }
+      case "set_annotations": {
+        this.recordAnnotationProjection(command.payload.tab_id, command.payload.annotations);
+        return this.enqueueAnnotationProjection(command.payload.tab_id);
+      }
       case "inspect_start":
       case "inspect_stop": {
         const binding = requirePrimaryBindingForIdentity(this.#surfaceManager, command.payload);
@@ -427,7 +690,7 @@ export class DesktopControlServer {
         const tabId = commandTabId(command);
         if (!tabId) throw new Error("browser_tab_id_missing");
         const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
-        const executed = await this.#worker.execute(binding, command);
+        const executed = await this.#worker.execute(binding, command, signal);
         // 交互命令在 Worker 内可能由多个 CDP 输入事件组成。动作中的
         // keyDown/click 可能已经触发导航，因此不能把 Worker 发送前的
         // binding 当作动作结果的页面状态。由 Main 在动作完成后读取同一
@@ -458,6 +721,65 @@ export class DesktopControlServer {
     }
   }
 
+  private recordAnnotationProjection(tabId: string, annotations: unknown[]): void {
+    const previous = this.#annotationProjections.get(tabId);
+    this.#annotationProjections.set(tabId, {
+      revision: (previous?.revision ?? 0) + 1,
+      // 控制协议已完成结构化校验。复制数组防止调用方在异步重放期间改变
+      // 这一轮权威快照的成员顺序；对象会由 Worker 再次 JSON 序列化。
+      annotations: [...annotations],
+    });
+  }
+
+  private scheduleAnnotationProjection(tabId: string): void {
+    if (!this.#annotationProjections.has(tabId)) return;
+    void this.enqueueAnnotationProjection(tabId).then((result) => {
+      if (result.outcome.status !== "succeeded") {
+        console.warn("[DesktopControlServer] 浏览器标记投影未能重放", {
+          tabId,
+          code: result.outcome.status === "failed" || result.outcome.status === "indeterminate"
+            ? result.outcome.payload.code
+            : result.outcome.status,
+        });
+      }
+    }).catch((cause) => {
+      // 导航与窗口切换会让旧 Surface 失效。下一次 Primary/page_updated
+      // 事件会以同一 Authority 快照重放，无需把暂态失败写回持久化状态。
+      console.debug("[DesktopControlServer] 浏览器标记投影等待下一轮 Surface 事件", {
+        tabId,
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+    });
+  }
+
+  private enqueueAnnotationProjection(tabId: string): Promise<{ outcome: BrowserCommandOutcome; binary?: Buffer }> {
+    const previous = this.#annotationProjectionLanes.get(tabId) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined)
+      .then(async () => {
+        const projection = this.#annotationProjections.get(tabId);
+        if (!projection) throw new Error("browser_annotation_projection_missing");
+        // 每次真正执行前重新读取 Primary，不能把导航前的 binding 用于
+        // 新文档，否则旧 CDP 执行上下文会把标记错误写入下一页或直接超时。
+        const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
+        return this.#worker.execute(binding, {
+          type: "set_annotations",
+          payload: {
+            tab_id: tabId,
+            annotations: projection.annotations,
+          },
+        });
+      });
+    const settled = run.then(() => undefined, () => undefined);
+    this.#annotationProjectionLanes.set(tabId, settled);
+    void settled.finally(() => {
+      if (this.#annotationProjectionLanes.get(tabId) === settled) {
+        this.#annotationProjectionLanes.delete(tabId);
+      }
+    });
+    return run;
+  }
+
   private emit(event: BrowserHostEvent): void {
     const client = this.#client;
     if (!client || client.readyState !== WebSocket.OPEN) return;
@@ -466,28 +788,49 @@ export class DesktopControlServer {
       sequence: ++this.#eventSequence,
       event,
     };
-    client.send(JSON.stringify(envelope));
+    try {
+      const validated = parseBrowserHostEventEnvelope(envelope);
+      assertProtocolVersion(validated.protocol_version);
+      if (validated.event.type === "ready") {
+        assertProtocolVersion(validated.event.payload.protocol_version);
+      }
+      client.send(JSON.stringify(validated));
+    } catch (cause) {
+      const connection = this.connectionFor(client);
+      // 事件协议失败后不能只在 Host 侧丢弃连接。否则 daemon 仍保有一个
+      // 已打开但再也不会收到心跳的 socket，最终表现为延迟的 heartbeat_timeout。
+      try {
+        client.close(1011, "browser host event protocol failure");
+      } finally {
+        if (connection) this.releaseConnection(connection);
+      }
+      console.error("[DesktopControlServer] Browser event send failed", {
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+    }
   }
 }
 
 function parseRequest(value: string): BrowserHostRequestEnvelope {
   if (Buffer.byteLength(value, "utf8") > MAX_MESSAGE_BYTES) throw new Error("browser_command_too_large");
-  const request = JSON.parse(value) as BrowserHostRequestEnvelope;
-  if (!request.request_id || typeof request.request_id !== "string") throw new Error("browser_protocol_invalid");
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    throw new Error("browser_protocol_invalid:invalid_json");
+  }
+  const request = parseBrowserHostRequest(decoded);
+  assertProtocolVersion(request.protocol_version);
+  return request;
+}
+
+function assertProtocolVersion(version: { major: number; minor: number }): void {
   if (
-    request.protocol_version?.major !== DESKTOP_BROWSER_PROTOCOL_VERSION.major
-    || request.protocol_version?.minor !== DESKTOP_BROWSER_PROTOCOL_VERSION.minor
+    version.major !== DESKTOP_BROWSER_PROTOCOL_VERSION.major
+    || version.minor !== DESKTOP_BROWSER_PROTOCOL_VERSION.minor
   ) {
     throw new Error("browser_protocol_incompatible");
   }
-  if (!request.command || typeof request.command.type !== "string") throw new Error("browser_protocol_invalid");
-  if (
-    request.command.type === "cancel"
-    && (!request.command.payload || typeof request.command.payload.request_id !== "string")
-  ) {
-    throw new Error("browser_protocol_invalid");
-  }
-  return request;
 }
 
 function commandTabId(command: BrowserHostCommand): string | null {
@@ -527,16 +870,20 @@ function nodeSelectionFromEvent(
   event: Extract<BrowserSurfaceEvent, { type: "node_inspected" }>,
 ): BrowserNodeSelection | null {
   const { node } = event;
-  // Chromium normally returns all three fields for an Overlay selection. A
-  // text node or a navigation race can lack a DOM node id or box model;
-  // keeping the raw Main event is useful for the UI, but the Host contract
-  // must never receive fabricated identity or geometry.
-  if (node.node_id === null || !node.frame_id || !node.bounds) {
-    console.warn("[DesktopControlServer] 忽略不完整的 Chromium 节点选择", {
+  const backendDomNodeId = normalizeOptionalDomNodeId(node.backend_node_id);
+  const domNodeId = normalizeOptionalDomNodeId(node.node_id);
+  const domNodeIdIsValid = node.node_id === null
+    || node.node_id === undefined
+    || node.node_id === 0
+    || domNodeId !== null;
+  // Chromium 节点可能没有可解析的 DOM id、frame 或 box model（例如文本
+  // 节点、Shadow DOM 边界或导航竞态）。这些字段在协议中明确可空，不能
+  // 因为缺少展示信息而丢弃合法的节点选择；只有身份和节点名称必须完整。
+  if (!node.browser_session_id.trim() || backendDomNodeId === null || !domNodeIdIsValid) {
+    console.warn("[DesktopControlServer] 忽略无效的 Chromium 节点选择身份", {
       surfaceId: event.binding.surface_id,
-      hasNodeId: node.node_id !== null,
-      hasFrameId: Boolean(node.frame_id),
-      hasBounds: node.bounds !== null,
+      hasBrowserSessionId: Boolean(node.browser_session_id.trim()),
+      backendNodeId: node.backend_node_id,
     });
     return null;
   }
@@ -548,15 +895,17 @@ function nodeSelectionFromEvent(
     tab_id: event.binding.tab_id,
     surface_id: event.binding.surface_id,
     navigation_revision: event.binding.navigation_revision,
+    browser_session_id: node.browser_session_id,
     url: node.page_url,
     title: node.page_title,
     frame_id: node.frame_id,
-    backend_dom_node_id: node.backend_node_id,
-    dom_node_id: node.node_id,
+    backend_dom_node_id: backendDomNodeId,
+    dom_node_id: domNodeId,
     node_name: node.node_name,
     attributes: node.attributes,
     text_excerpt: textExcerpt,
     outer_html: node.outer_html,
+    outer_html_truncated: node.outer_html_truncated,
     aria_role: node.attributes.role?.trim() || null,
     aria_name: node.attributes["aria-label"]?.trim() || null,
     bounds: node.bounds,
@@ -603,7 +952,19 @@ function cancelledResponse(requestId: string): BrowserHostResponseEnvelope {
 function waitForAbort(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    signal.addEventListener("abort", () => resolve(), { once: true });
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function closeHttpServer(server: Server): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  server.closeAllConnections();
+  return new Promise((resolve) => {
+    server.close(() => resolve());
   });
 }
 
@@ -633,5 +994,18 @@ function safeOrigin(value: string): string | null {
     return origin === "null" ? null : origin;
   } catch {
     return null;
+  }
+}
+
+function agentCursorAction(value: string | null): BrowserAgentCursorAction | null {
+  switch (value) {
+    case "move":
+    case "click":
+    case "drag":
+    case "type":
+    case "scroll":
+      return value;
+    default:
+      return null;
   }
 }

@@ -69,7 +69,7 @@ for (const [name, source] of [
   );
 }
 assert.match(preloadSource, /readyRightPane:\s*\(\) => ipcRenderer\.invoke\("magi-desktop:right-pane-ready"\)/, 'preload 必须保留首次窗口显示握手');
-assert.match(mainSource, /ipcMain\.handle\("magi-desktop:right-pane-ready"[\s\S]*?manager\.handleRightPaneReady\(windowId\)/, 'Main 必须保留 readyRightPane 首次窗口显示握手');
+assert.match(mainSource, /handleIpc\("magi-desktop:right-pane-ready"[\s\S]*?manager\.handleRightPaneReady\(windowId\)/, 'Main 必须保留 readyRightPane 首次窗口显示握手');
 assert.match(windowManagerSource, /handleRightPaneReady\(windowId: string\): void[\s\S]*?record\.window\.show\(\)/, 'WindowManager 的 ready 握手必须负责首次显示窗口');
 assert.match(desktopTypesSource, /readyRightPane\(\): Promise<void>/, '桌面桥类型必须保留 readyRightPane 握手');
 assert.match(schemaSource, /"magi-desktop:right-pane-ready"/, 'IPC schema 必须保留 readyRightPane 空载荷通道');

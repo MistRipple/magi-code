@@ -10,171 +10,219 @@
       "type": "string",
       "enum": [
         "magi-desktop:get-snapshot", "magi-desktop:set-context", "magi-desktop:layout-intent",
-        "magi-desktop:activate-browser",
-        "magi-desktop:activate-panel", "magi-desktop:set-browser-viewport",
-        "magi-desktop:right-pane-ready",
+        "magi-desktop:activate-browser", "magi-desktop:activate-panel", "magi-desktop:set-browser-viewport",
+        "magi-desktop:start-browser-inspect", "magi-desktop:stop-browser-inspect", "magi-desktop:right-pane-ready",
         "magi-desktop:open-overlay", "magi-desktop:close-overlay", "magi-desktop:overlay-ready",
-        "magi-desktop:overlay-action", "magi-desktop:focus-browser", "magi-desktop:open-external",
-        "magi-desktop:show-context-menu", "magi-desktop:open-workspace-folder",
-        "magi-desktop:reveal-workspace-file", "magi-desktop:set-appearance",
-        "magi-desktop:get-app-version", "magi-desktop:get-browser-component-info",
-        "magi-desktop:restart-browser-automation", "magi-desktop:clear-browser-data",
-        "magi-desktop:check-for-updates", "magi-desktop:download-update", "magi-desktop:install-update"
+        "magi-desktop:overlay-action", "magi-desktop:focus-app", "magi-desktop:set-blocking-overlay",
+        "magi-desktop:open-external", "magi-desktop:show-context-menu", "magi-desktop:open-workspace-folder",
+        "magi-desktop:reveal-workspace-file", "magi-desktop:set-appearance", "magi-desktop:get-app-version",
+        "magi-desktop:get-browser-component-info", "magi-desktop:restart-browser-automation",
+        "magi-desktop:clear-browser-data", "magi-desktop:check-for-updates", "magi-desktop:download-update",
+        "magi-desktop:install-update"
       ]
     },
-    "payload": { "$ref": "#/$defs/anyPayload" }
+    "payload": {}
   },
-  "allOf": [
-    { "$ref": "#/$defs/emptyChannels" },
-    { "$ref": "#/$defs/objectChannel" },
-    { "$ref": "#/$defs/stringChannels" }
+  "oneOf": [
+    { "$ref": "#/$defs/getSnapshot" },
+    { "$ref": "#/$defs/setContext" },
+    { "$ref": "#/$defs/layoutIntentChannel" },
+    { "$ref": "#/$defs/activateBrowser" },
+    { "$ref": "#/$defs/activatePanel" },
+    { "$ref": "#/$defs/setBrowserViewport" },
+    { "$ref": "#/$defs/startBrowserInspect" },
+    { "$ref": "#/$defs/stopBrowserInspect" },
+    { "$ref": "#/$defs/rightPaneReady" },
+    { "$ref": "#/$defs/openOverlay" },
+    { "$ref": "#/$defs/closeOverlay" },
+    { "$ref": "#/$defs/overlayReady" },
+    { "$ref": "#/$defs/overlayActionChannel" },
+    { "$ref": "#/$defs/focusApp" },
+    { "$ref": "#/$defs/setBlockingOverlay" },
+    { "$ref": "#/$defs/openExternal" },
+    { "$ref": "#/$defs/showContextMenu" },
+    { "$ref": "#/$defs/openWorkspaceFolder" },
+    { "$ref": "#/$defs/revealWorkspaceFile" },
+    { "$ref": "#/$defs/setAppearance" },
+    { "$ref": "#/$defs/getAppVersion" },
+    { "$ref": "#/$defs/getBrowserComponentInfo" },
+    { "$ref": "#/$defs/restartBrowserAutomation" },
+    { "$ref": "#/$defs/clearBrowserData" },
+    { "$ref": "#/$defs/checkForUpdates" },
+    { "$ref": "#/$defs/downloadUpdate" },
+    { "$ref": "#/$defs/installUpdate" }
   ],
   "$defs": {
-    "anyPayload": {
-      "oneOf": [
-        { "type": "object" }, { "type": "array" }, { "type": "string" },
-        { "type": "number" }, { "type": "boolean" }, { "type": "null" }
-      ]
-    },
     "id": { "type": "string", "minLength": 1 },
     "optionalText": { "type": ["string", "null"] },
     "empty": { "type": "null" },
-    "emptyChannels": {
-      "if": {
-        "properties": {
-          "channel": {
-            "enum": [
-              "magi-desktop:get-snapshot", "magi-desktop:right-pane-ready",
-              "magi-desktop:close-overlay", "magi-desktop:overlay-ready",
-              "magi-desktop:get-app-version", "magi-desktop:get-browser-component-info",
-              "magi-desktop:restart-browser-automation", "magi-desktop:clear-browser-data",
-              "magi-desktop:check-for-updates", "magi-desktop:download-update",
-              "magi-desktop:install-update"
-            ]
-          }
-        },
-        "required": ["channel"]
-      },
-      "then": { "properties": { "payload": { "$ref": "#/$defs/empty" } } }
-    },
-    "objectChannel": {
-      "allOf": [
-        { "$ref": "#/$defs/contextChannel" }, { "$ref": "#/$defs/layoutChannel" },
-        { "$ref": "#/$defs/browserActivationChannel" },
-        { "$ref": "#/$defs/panelChannel" }, { "$ref": "#/$defs/viewportChannel" },
-        { "$ref": "#/$defs/overlayChannel" },
-        { "$ref": "#/$defs/contextMenuChannel" }, { "$ref": "#/$defs/revealFileChannel" },
-        { "$ref": "#/$defs/appearanceChannel" }
-      ]
-    },
-    "stringChannels": {
-      "if": {
-        "properties": {
-          "channel": {
-            "enum": ["magi-desktop:focus-browser", "magi-desktop:open-external", "magi-desktop:open-workspace-folder"]
-          }
-        },
-        "required": ["channel"]
-      },
-      "then": { "properties": { "payload": { "$ref": "#/$defs/id" } } }
-    },
-    "contextChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:set-context" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": {
-        "type": "object", "additionalProperties": false,
-        "properties": { "workspaceId": { "$ref": "#/$defs/optionalText" }, "workspacePath": { "$ref": "#/$defs/optionalText" }, "sessionId": { "$ref": "#/$defs/optionalText" } }
-      } } }
-    },
-    "layoutChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:layout-intent" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": { "$ref": "#/$defs/layoutIntent" } } }
-    },
-    "browserActivationChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:activate-browser" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": { "$ref": "#/$defs/browserActivation" } } }
-    },
-    "panelChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:activate-panel" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": {
-        "type": "object", "additionalProperties": false, "required": ["kind", "tabId"],
-        "properties": { "kind": { "enum": ["agent", "browser", "code", "terminal", null] }, "tabId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] } }
-      } } }
-    },
-    "viewportChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:set-browser-viewport" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": {
-        "type": "object", "additionalProperties": false, "required": ["tabId", "viewport"],
-        "properties": { "tabId": { "$ref": "#/$defs/id" }, "viewport": { "$ref": "#/$defs/viewport" } }
-      } } }
-    },
-    "overlayChannel": {
-      "allOf": [
-        {
-          "if": { "properties": { "channel": { "const": "magi-desktop:open-overlay" } }, "required": ["channel"] },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/overlayState" } } }
-        },
-        {
-          "if": { "properties": { "channel": { "const": "magi-desktop:overlay-action" } }, "required": ["channel"] },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/overlayAction" } } }
-        }
-      ]
-    },
-    "contextMenuChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:show-context-menu" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": {
-        "type": "object", "additionalProperties": false, "required": ["items"],
-        "properties": { "items": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "object" } } }
-      } } }
-    },
-    "revealFileChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:reveal-workspace-file" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": {
-        "type": "object", "additionalProperties": false, "required": ["targetPathRef", "workspaceRootPathRef"],
-        "properties": { "targetPathRef": { "$ref": "#/$defs/id" }, "workspaceRootPathRef": { "$ref": "#/$defs/id" } }
-      } } }
-    },
-    "appearanceChannel": {
-      "if": { "properties": { "channel": { "const": "magi-desktop:set-appearance" } }, "required": ["channel"] },
-      "then": { "properties": { "payload": {
-        "type": "object", "additionalProperties": false, "required": ["mode", "backgroundColor"],
-        "properties": { "mode": { "enum": ["light", "dark"] }, "backgroundColor": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" } }
-      } } }
-    },
-    "layoutIntent": {
-      "oneOf": [
-        { "type": "object", "additionalProperties": false, "required": ["type", "width"], "properties": { "type": { "const": "right_pane_width" }, "width": { "type": "number" } } },
-        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "right_pane_reset_width" } } },
-        { "type": "object", "additionalProperties": false, "required": ["type", "visible"], "properties": { "type": { "const": "right_pane_visibility" }, "visible": { "type": "boolean" } } }
-      ]
+    "rectangle": {
+      "type": "object", "additionalProperties": false, "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "number" }, "y": { "type": "number" },
+        "width": { "type": "number", "exclusiveMinimum": 0 },
+        "height": { "type": "number", "exclusiveMinimum": 0 }
+      }
     },
     "viewport": {
       "oneOf": [
         { "type": "object", "additionalProperties": false, "required": ["mode"], "properties": { "mode": { "const": "auto" } } },
         {
-          "type": "object", "additionalProperties": false, "required": ["mode", "width", "height"],
+          "type": "object", "additionalProperties": false,
+          "required": ["mode", "width", "height", "deviceScaleFactorMillis", "deviceType"],
           "properties": {
-            "mode": { "const": "fixed" }, "width": { "type": "number", "minimum": 320 }, "height": { "type": "number", "minimum": 240 },
-            "deviceScaleFactorMillis": { "type": "number", "minimum": 1 }, "device_scale_factor_millis": { "type": "number", "minimum": 1 },
-            "deviceType": { "enum": ["desktop", "mobile"] }, "device_type": { "enum": ["desktop", "mobile"] }
+            "mode": { "const": "fixed" },
+            "width": { "type": "integer", "minimum": 320, "maximum": 7680 },
+            "height": { "type": "integer", "minimum": 240, "maximum": 4320 },
+            "deviceScaleFactorMillis": { "type": "integer", "minimum": 1, "maximum": 8000 },
+            "deviceType": { "enum": ["desktop", "mobile"] }
           }
         }
       ]
     },
-    "browserActivation": {
-      "type": "object", "additionalProperties": false, "required": ["tabId", "browserSessionId", "url", "navigationRevision", "viewport"],
-      "properties": { "tabId": { "$ref": "#/$defs/id" }, "browserSessionId": { "$ref": "#/$defs/id" }, "url": { "$ref": "#/$defs/id" }, "navigationRevision": { "type": "number", "minimum": 0 }, "viewport": { "$ref": "#/$defs/viewport" } }
+    "layoutIntent": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "width"], "properties": { "type": { "const": "right_pane_width" }, "width": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "right_pane_reset_width" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "visible"], "properties": { "type": { "const": "right_pane_visibility" }, "visible": { "type": "boolean" } } },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "frame"],
+          "properties": {
+            "type": { "const": "renderer_geometry" },
+            "frame": { "$ref": "#/$defs/rendererGeometryFrame" }
+          }
+        }
+      ]
+    },
+    "rendererGeometryFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["revision", "layoutRevision", "coordinateSpace", "rightPaneBounds", "browserContentSlot"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "layoutRevision": { "type": "integer", "minimum": 0 },
+        "coordinateSpace": { "const": "window-content-css-px" },
+        "rightPaneBounds": { "oneOf": [{ "$ref": "#/$defs/rectangle" }, { "type": "null" }] },
+        "browserContentSlot": { "oneOf": [{ "$ref": "#/$defs/browserContentSlot" }, { "type": "null" }] }
+      }
+    },
+    "browserContentSlot": {
+      "type": "object", "additionalProperties": false, "required": ["tabId", "bounds"],
+      "properties": { "tabId": { "$ref": "#/$defs/id" }, "bounds": { "$ref": "#/$defs/rectangle" } }
+    },
+    "browserActivationPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tabId", "browserSessionId", "url", "navigationRevision", "viewport"],
+      "properties": {
+        "tabId": { "$ref": "#/$defs/id" }, "browserSessionId": { "$ref": "#/$defs/id" },
+        "url": { "type": "string", "minLength": 1 }, "navigationRevision": { "type": "number", "minimum": 0 },
+        "viewport": { "$ref": "#/$defs/viewport" }
+      }
+    },
+    "browserInspectPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tabId", "surfaceId", "navigationRevision"],
+      "properties": { "tabId": { "$ref": "#/$defs/id" }, "surfaceId": { "$ref": "#/$defs/id" }, "navigationRevision": { "type": "integer", "minimum": 0 } }
+    },
+    "panelPayload": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "tabId"],
+      "properties": { "kind": { "enum": ["agent", "browser", "code", "terminal", null] }, "tabId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] } }
+    },
+    "overlayField": {
+      "type": "object", "additionalProperties": false, "required": ["id", "label", "type", "value", "min", "max"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "label": { "$ref": "#/$defs/id" },
+        "type": { "enum": ["number", "text"] }, "value": { "type": "string" },
+        "min": { "type": ["number", "null"] }, "max": { "type": ["number", "null"] }
+      }
+    },
+    "overlayItem": {
+      "type": "object", "additionalProperties": false, "required": ["id", "label", "icon", "selected", "disabled"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "label": { "$ref": "#/$defs/id" }, "icon": { "type": ["string", "null"] },
+        "selected": { "type": "boolean" }, "disabled": { "type": "boolean" }
+      }
     },
     "overlayState": {
-      "type": "object", "additionalProperties": false, "required": ["kind", "ownerId", "placement", "title"],
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "phase", "ownerId", "placement", "popupBounds", "title"],
       "properties": {
-        "overlayId": { "$ref": "#/$defs/optionalText" }, "kind": { "enum": ["annotation", "menu"] }, "phase": { "enum": ["menu", "select", "comment"] },
-        "ownerId": { "$ref": "#/$defs/id" }, "placement": { "enum": ["right-pane-add", "browser-viewport", "browser-annotations"] }, "title": { "$ref": "#/$defs/id" },
-        "items": { "type": "array", "items": { "type": "object" } }, "fields": { "type": "array", "items": { "type": "object" } }
+        "overlayId": { "$ref": "#/$defs/optionalText" }, "kind": { "enum": ["menu", "annotation"] },
+        "phase": { "enum": ["menu", "select", "comment"] }, "ownerId": { "$ref": "#/$defs/id" },
+        "placement": { "enum": ["right-pane-add", "browser-viewport", "browser-annotations"] }, "title": { "$ref": "#/$defs/id" },
+        "popupBounds": { "oneOf": [{ "$ref": "#/$defs/rectangle" }, { "type": "null" }] },
+        "items": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/overlayItem" } },
+        "fields": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/overlayField" } }
       }
     },
     "overlayAction": {
-      "type": "object", "additionalProperties": false, "required": ["overlayId", "kind", "ownerId", "interaction", "id"],
-      "properties": { "overlayId": { "$ref": "#/$defs/id" }, "kind": { "enum": ["annotation", "menu"] }, "ownerId": { "$ref": "#/$defs/id" }, "interaction": { "enum": ["select", "input"] }, "id": { "$ref": "#/$defs/id" }, "value": { "type": ["string", "null"] } }
-    }
+      "type": "object", "additionalProperties": false, "required": ["overlayId", "kind", "ownerId", "interaction", "id", "value"],
+      "properties": {
+        "overlayId": { "$ref": "#/$defs/id" }, "kind": { "enum": ["menu", "annotation"] }, "ownerId": { "$ref": "#/$defs/id" },
+        "interaction": { "enum": ["select", "input"] }, "id": { "$ref": "#/$defs/id" }, "value": { "type": ["string", "null"] }
+      }
+    },
+    "contextMenuItem": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "role"], "properties": { "type": { "const": "role" }, "role": { "enum": ["undo", "redo", "cut", "copy", "paste", "selectAll"] } } },
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "separator" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "id", "label"], "properties": { "type": { "const": "action" }, "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" }, "label": { "type": "string", "minLength": 1, "maxLength": 160 }, "enabled": { "type": "boolean" } } }
+      ]
+    },
+    "overlayCloseRequest": {
+      "type": "object", "additionalProperties": false, "required": ["overlayId", "ownerId"],
+      "properties": { "overlayId": { "$ref": "#/$defs/id" }, "ownerId": { "$ref": "#/$defs/id" } }
+    },
+    "appearance": {
+      "type": "object", "additionalProperties": false, "required": ["mode", "backgroundColor", "accentColor", "material"],
+      "properties": {
+        "mode": { "enum": ["light", "dark"] },
+        "backgroundColor": { "type": "string", "pattern": "^(#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?|rgba?\\(\\s*\\d{1,3}\\s*,\\s*\\d{1,3}\\s*,\\s*\\d{1,3}(?:\\s*,\\s*(?:0(?:\\.\\d+)?|1(?:\\.0+)?|0?\\.\\d+))?\\s*\\))$" },
+        "accentColor": { "type": "string", "pattern": "^(#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?|rgba?\\(\\s*\\d{1,3}\\s*,\\s*\\d{1,3}\\s*,\\s*\\d{1,3}(?:\\s*,\\s*(?:0(?:\\.\\d+)?|1(?:\\.0+)?|0?\\.\\d+))?\\s*\\))$" },
+        "material": { "enum": ["clear", "translucent", "immersive"] }
+      }
+    },
+    "revealFilePayload": {
+      "type": "object", "additionalProperties": false, "required": ["targetPathRef", "workspaceRootPathRef"],
+      "properties": { "targetPathRef": { "$ref": "#/$defs/id" }, "workspaceRootPathRef": { "$ref": "#/$defs/id" } }
+    },
+    "contextMenuPayload": {
+      "type": "object", "additionalProperties": false, "required": ["items"],
+      "properties": { "items": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/contextMenuItem" } } }
+    },
+    "contextPayload": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "workspaceId": { "$ref": "#/$defs/optionalText" }, "workspacePath": { "$ref": "#/$defs/optionalText" }, "sessionId": { "$ref": "#/$defs/optionalText" } }
+    },
+    "blockingOverlayPayload": {
+      "type": "object", "additionalProperties": false, "required": ["active"], "properties": { "active": { "type": "boolean" } }
+    },
+    "getSnapshot": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:get-snapshot" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "setContext": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:set-context" }, "payload": { "$ref": "#/$defs/contextPayload" } } },
+    "layoutIntentChannel": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:layout-intent" }, "payload": { "$ref": "#/$defs/layoutIntent" } } },
+    "activateBrowser": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:activate-browser" }, "payload": { "$ref": "#/$defs/browserActivationPayload" } } },
+    "activatePanel": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:activate-panel" }, "payload": { "$ref": "#/$defs/panelPayload" } } },
+    "setBrowserViewport": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:set-browser-viewport" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tabId", "viewport"], "properties": { "tabId": { "$ref": "#/$defs/id" }, "viewport": { "$ref": "#/$defs/viewport" } } } } },
+    "startBrowserInspect": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:start-browser-inspect" }, "payload": { "$ref": "#/$defs/browserInspectPayload" } } },
+    "stopBrowserInspect": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:stop-browser-inspect" }, "payload": { "$ref": "#/$defs/browserInspectPayload" } } },
+    "rightPaneReady": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:right-pane-ready" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "openOverlay": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:open-overlay" }, "payload": { "$ref": "#/$defs/overlayState" } } },
+    "closeOverlay": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:close-overlay" }, "payload": { "$ref": "#/$defs/overlayCloseRequest" } } },
+    "overlayReady": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:overlay-ready" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "overlayActionChannel": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:overlay-action" }, "payload": { "$ref": "#/$defs/overlayAction" } } },
+    "focusApp": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:focus-app" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "setBlockingOverlay": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:set-blocking-overlay" }, "payload": { "$ref": "#/$defs/blockingOverlayPayload" } } },
+    "openExternal": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:open-external" }, "payload": { "type": "string", "minLength": 1 } } },
+    "showContextMenu": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:show-context-menu" }, "payload": { "$ref": "#/$defs/contextMenuPayload" } } },
+    "openWorkspaceFolder": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:open-workspace-folder" }, "payload": { "type": "string", "minLength": 1 } } },
+    "revealWorkspaceFile": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:reveal-workspace-file" }, "payload": { "$ref": "#/$defs/revealFilePayload" } } },
+    "setAppearance": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:set-appearance" }, "payload": { "$ref": "#/$defs/appearance" } } },
+    "getAppVersion": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:get-app-version" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "getBrowserComponentInfo": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:get-browser-component-info" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "restartBrowserAutomation": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:restart-browser-automation" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "clearBrowserData": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:clear-browser-data" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "checkForUpdates": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:check-for-updates" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "downloadUpdate": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:download-update" }, "payload": { "$ref": "#/$defs/empty" } } },
+    "installUpdate": { "type": "object", "additionalProperties": false, "required": ["channel", "payload"], "properties": { "channel": { "const": "magi-desktop:install-update" }, "payload": { "$ref": "#/$defs/empty" } } }
   }
 }

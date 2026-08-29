@@ -58,12 +58,25 @@ export interface AppServerClientOptions {
 }
 
 interface PendingRequest {
+  id: JsonRpcRequestId;
   method: AppServerRequestMethod;
+  connection: ConnectionRef;
   resolve: (value: JsonValue) => void;
   reject: (error: AppServerError) => void;
   timeoutId: number | null;
   signal?: AbortSignal;
   abortListener?: () => void;
+}
+
+interface ConnectionRef {
+  socket: WebSocket;
+  generation: number;
+}
+
+interface OpenWait {
+  connection: ConnectionRef;
+  resolve: () => void;
+  reject: (error: AppServerError) => void;
 }
 
 interface JsonRpcResponseLike {
@@ -295,10 +308,11 @@ export class AppServerClient {
   >> & AppServerClientOptions;
   readonly #pending = new Map<string, PendingRequest>();
   #socket: WebSocket | null = null;
+  #socketGeneration = 0;
+  #nextSocketGeneration = 0;
   #state: AppServerConnectionState = 'idle';
   #connectPromise: Promise<InitializeResult> | null = null;
-  #openResolve: (() => void) | null = null;
-  #openReject: ((error: AppServerError) => void) | null = null;
+  #openWait: OpenWait | null = null;
   #nextRequestId = 0;
   #reconnectAttempt = 0;
   #reconnectTimer: number | null = null;
@@ -340,10 +354,18 @@ export class AppServerClient {
     if (this.#state === 'ready' && this.#initializeResult) return this.#initializeResult;
     if (this.#connectPromise) return this.#connectPromise;
     this.#closedByClient = false;
-    this.#connectPromise = this.connectOnce().finally(() => {
-      this.#connectPromise = null;
+    if (this.#reconnectTimer !== null) {
+      window.clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
+    const connectPromise = this.connectOnce();
+    const trackedPromise = connectPromise.finally(() => {
+      if (this.#connectPromise === trackedPromise) {
+        this.#connectPromise = null;
+      }
     });
-    return this.#connectPromise;
+    this.#connectPromise = trackedPromise;
+    return trackedPromise;
   }
 
   close(): void {
@@ -353,10 +375,21 @@ export class AppServerClient {
       window.clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
     }
-    this.rejectOpen(protocolError('App Server 连接已关闭', -32000));
-    this.rejectPending(protocolError('App Server 连接已关闭', -32000));
-    this.#socket?.close();
-    this.#socket = null;
+    this.#reconnectAttempt = 0;
+    const error = protocolError('App Server 连接已关闭', -32000);
+    const connection = this.currentConnection();
+    if (connection) {
+      this.invalidateConnection(connection, error);
+      try {
+        connection.socket.close();
+      } catch {
+        // close 失败不影响本地状态已经收敛。
+      }
+    } else {
+      this.rejectOpen(error);
+      this.rejectPending(error);
+      this.#initializeResult = null;
+    }
     this.setState('closed');
   }
 
@@ -367,73 +400,146 @@ export class AppServerClient {
   ): Promise<AppServerRequestResult<M>> {
     await this.connect();
     const id = this.nextRequestId();
-    const result = await this.requestRaw(id, method, params, options);
+    const connection = this.currentConnection();
+    if (!connection) {
+      throw protocolError('App Server 尚未连接', -32000);
+    }
+    const result = await this.requestRaw(id, method, params, options, connection);
     return result;
   }
 
   private async connectOnce(): Promise<InitializeResult> {
-    this.setState(this.#reconnectAttempt > 0 ? 'reconnecting' : 'connecting');
+    const generation = ++this.#nextSocketGeneration;
     const socket = new WebSocket(endpointForWebSocket(this.#options.endpoint));
+    const connection: ConnectionRef = { socket, generation };
     this.#socket = socket;
-    const open = new Promise<void>((resolve, reject) => {
-      this.#openResolve = resolve;
-      this.#openReject = reject;
-    });
-    socket.addEventListener('open', () => this.handleOpen());
-    socket.addEventListener('message', (event) => this.handleMessage(event.data));
-    socket.addEventListener('error', () => {
-      this.#openReject?.(protocolError('App Server WebSocket 连接失败'));
-    });
-    socket.addEventListener('close', () => this.handleClose(socket));
-    await open;
-    const initialize = await this.requestRaw(
-      this.nextRequestId(),
-      'initialize',
-      {
-        clientInfo: this.#options.clientInfo,
-        protocol: { major: 1, minor: 0 },
-        capabilities: this.#options.capabilities ?? {},
-      },
-      { timeoutMs: this.#options.requestTimeoutMs },
-    );
-    this.#initializeResult = initialize;
-    this.sendNotification('initialized', {});
-    if (this.#subscription) {
-      const subscription = {
-        ...this.#subscription,
-        afterSequence: Math.max(this.#subscription.afterSequence ?? 0, this.#lastSequence),
-      };
-      await this.requestRaw(
-        this.nextRequestId(),
-        'events/subscribe',
-        subscription,
-        { timeoutMs: this.#options.requestTimeoutMs },
-      );
-    }
-    this.#reconnectAttempt = 0;
-    this.setState('ready');
-    this.startHeartbeat();
-    return initialize;
-  }
-
-  private handleOpen(): void {
-    this.#openResolve?.();
-    this.#openResolve = null;
-    this.#openReject = null;
-  }
-
-  private handleClose(socket: WebSocket): void {
-    if (this.#socket !== socket) return;
-    this.stopHeartbeat();
-    this.#socket = null;
+    this.#socketGeneration = generation;
     this.#initializeResult = null;
-    this.rejectPending(protocolError('App Server WebSocket 已断开', -32000));
+    this.setState(this.#reconnectAttempt > 0 ? 'reconnecting' : 'connecting');
+    const open = this.waitForOpen(connection);
+    socket.addEventListener('open', () => this.handleOpen(connection));
+    socket.addEventListener('message', (event) => this.handleMessage(connection, event.data));
+    socket.addEventListener('error', () => this.handleError(connection));
+    socket.addEventListener('close', () => this.handleClose(connection));
+
+    try {
+      await open;
+      this.assertCurrentConnection(connection);
+      const initialize = await this.requestRaw(
+        this.nextRequestId(),
+        'initialize',
+        {
+          clientInfo: this.#options.clientInfo,
+          protocol: { major: 1, minor: 0 },
+          capabilities: this.#options.capabilities ?? {},
+        },
+        { timeoutMs: this.#options.requestTimeoutMs },
+        connection,
+      );
+      this.assertCurrentConnection(connection);
+      this.#initializeResult = initialize;
+      this.sendNotification('initialized', {}, connection);
+      if (this.#subscription) {
+        const subscription = {
+          ...this.#subscription,
+          afterSequence: Math.max(this.#subscription.afterSequence ?? 0, this.#lastSequence),
+        };
+        await this.requestRaw(
+          this.nextRequestId(),
+          'events/subscribe',
+          subscription,
+          { timeoutMs: this.#options.requestTimeoutMs },
+          connection,
+        );
+      }
+      this.assertCurrentConnection(connection);
+      this.#reconnectAttempt = 0;
+      this.setState('ready');
+      this.startHeartbeat();
+      return initialize;
+    } catch (error) {
+      const normalized = error instanceof Error && 'code' in error
+        ? error as AppServerError
+        : protocolError(error instanceof Error ? error.message : String(error));
+      if (this.isCurrentConnection(connection)) {
+        this.failConnection(connection, normalized);
+      }
+      throw normalized;
+    }
+  }
+
+  private currentConnection(): ConnectionRef | null {
+    return this.#socket
+      ? { socket: this.#socket, generation: this.#socketGeneration }
+      : null;
+  }
+
+  private isCurrentConnection(connection: ConnectionRef): boolean {
+    return this.#socket === connection.socket && this.#socketGeneration === connection.generation;
+  }
+
+  private assertCurrentConnection(connection: ConnectionRef): void {
+    if (!this.isCurrentConnection(connection) || connection.socket.readyState !== WebSocket.OPEN) {
+      throw protocolError('App Server WebSocket 连接已失效', -32000);
+    }
+  }
+
+  private waitForOpen(connection: ConnectionRef): Promise<void> {
+    const open = new Promise<void>((resolve, reject) => {
+      this.#openWait = { connection, resolve, reject };
+    });
+    open.catch(() => undefined);
+    return open;
+  }
+
+  private handleOpen(connection: ConnectionRef): void {
+    if (!this.isCurrentConnection(connection)) return;
+    const wait = this.#openWait;
+    if (!wait || !this.sameConnection(wait.connection, connection)) return;
+    this.#openWait = null;
+    wait.resolve();
+  }
+
+  private handleError(connection: ConnectionRef): void {
+    if (!this.isCurrentConnection(connection)) return;
+    this.failConnection(connection, protocolError('App Server WebSocket 连接失败', -32000));
+  }
+
+  private handleClose(connection: ConnectionRef): void {
+    if (!this.isCurrentConnection(connection)) return;
+    this.failConnection(connection, protocolError('App Server WebSocket 已断开', -32000));
+  }
+
+  private sameConnection(left: ConnectionRef, right: ConnectionRef): boolean {
+    return left.socket === right.socket && left.generation === right.generation;
+  }
+
+  private failConnection(connection: ConnectionRef, error: AppServerError): void {
+    if (!this.isCurrentConnection(connection)) return;
+    this.stopHeartbeat();
+    this.invalidateConnection(connection, error);
     if (this.#closedByClient) {
       this.setState('closed');
-      return;
+    } else if (this.#options.reconnect) {
+      this.setState('reconnecting');
+      this.scheduleReconnect();
+    } else {
+      this.setState('closed');
     }
-    this.setState('reconnecting');
-    if (this.#options.reconnect) this.scheduleReconnect();
+    try {
+      connection.socket.close();
+    } catch {
+      // 连接已经从客户端状态移除，底层 close 失败无需再次改变状态。
+    }
+  }
+
+  private invalidateConnection(connection: ConnectionRef, error: AppServerError): void {
+    if (!this.isCurrentConnection(connection)) return;
+    this.#socket = null;
+    this.#socketGeneration = 0;
+    this.#initializeResult = null;
+    this.rejectOpen(error, connection);
+    this.rejectPending(error, connection);
   }
 
   private scheduleReconnect(): void {
@@ -445,26 +551,30 @@ export class AppServerClient {
     this.#reconnectAttempt += 1;
     this.#reconnectTimer = window.setTimeout(() => {
       this.#reconnectTimer = null;
-      void this.connect().catch(() => this.scheduleReconnect());
+      void this.connect().catch(() => undefined);
     }, delay);
   }
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.#heartbeatTimer = window.setInterval(() => {
+      const connection = this.currentConnection();
       if (
         this.#state !== 'ready'
         || this.#heartbeatInFlight
-        || this.#socket?.readyState !== WebSocket.OPEN
+        || !connection
+        || connection.socket.readyState !== WebSocket.OPEN
       ) {
         return;
       }
       this.#heartbeatInFlight = true;
+      const generation = connection.generation;
       void this.requestRaw(
         this.nextRequestId(),
         'ping',
         {},
         { timeoutMs: APP_SERVER_HEARTBEAT_TIMEOUT_MS },
+        connection,
       )
         .then(() => {
           this.#options.onActivity?.();
@@ -472,12 +582,14 @@ export class AppServerClient {
         .catch(() => {
           // WebSocket 可能仍显示 OPEN，但已经无法可靠收发数据。主动关闭
           // 交给统一 close/reconnect 链路处理，避免上层空闲检测误判为 SSE 断流。
-          if (!this.#closedByClient) {
-            this.#socket?.close();
+          if (this.isCurrentConnection(connection) && !this.#closedByClient) {
+            this.failConnection(connection, protocolError('App Server 心跳失败', -32000));
           }
         })
         .finally(() => {
-          this.#heartbeatInFlight = false;
+          if (this.#socketGeneration === generation) {
+            this.#heartbeatInFlight = false;
+          }
         });
     }, APP_SERVER_HEARTBEAT_INTERVAL_MS);
   }
@@ -490,16 +602,16 @@ export class AppServerClient {
     this.#heartbeatInFlight = false;
   }
 
-  private async requestRaw<M extends AppServerRequestMethod>(
+  private requestRaw<M extends AppServerRequestMethod>(
     id: JsonRpcRequestId,
     method: M,
     params: AppServerRequestParams<M>,
     options: { timeoutMs?: number; signal?: AbortSignal },
+    connection: ConnectionRef,
   ): Promise<AppServerRequestResult<M>> {
     if (!knownRequestMethod(method)) throw protocolError(`未知 App Server 请求方法: ${method}`);
     assertRequestParams(method, params);
-    const socket = this.#socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!this.isCurrentConnection(connection) || connection.socket.readyState !== WebSocket.OPEN) {
       throw protocolError('App Server 尚未连接', -32000);
     }
     const timeoutMs = options.timeoutMs ?? this.#options.requestTimeoutMs;
@@ -507,45 +619,70 @@ export class AppServerClient {
       throw invalidParams('requestTimeoutMs 必须在 100 到 600000 毫秒之间');
     }
     const key = requestIdKey(id);
+    if (this.#pending.has(key)) {
+      throw protocolError(`App Server 请求 ID 重复: ${String(id)}`);
+    }
     return new Promise<JsonValue>((resolve, reject) => {
-      const abortListener = options.signal
-        ? () => {
-          this.#pending.delete(key);
-          this.sendCancel(id);
-          reject(protocolError('App Server 请求已取消', -32800));
-        }
-        : undefined;
-      const timeoutId = window.setTimeout(() => {
-        this.#pending.delete(key);
-        this.sendCancel(id);
-        reject(protocolError('App Server 请求超时', -32801));
-      }, timeoutMs);
-      this.#pending.set(key, {
+      const pending: PendingRequest = {
+        id,
         method,
+        connection,
         resolve,
         reject,
-        timeoutId,
+        timeoutId: null,
         signal: options.signal,
-        abortListener,
-      });
+      };
+      const abortListener = options.signal
+        ? () => {
+          if (!this.removePending(key, pending)) return;
+          this.sendCancel(pending);
+          pending.reject(protocolError('App Server 请求已取消', -32800));
+        }
+        : undefined;
+      pending.abortListener = abortListener;
+      this.#pending.set(key, pending);
+      pending.timeoutId = window.setTimeout(() => {
+        if (!this.removePending(key, pending)) return;
+        this.sendCancel(pending);
+        pending.reject(protocolError('App Server 请求超时', -32801));
+      }, timeoutMs);
       if (options.signal?.aborted) {
         abortListener?.();
         return;
       }
       options.signal?.addEventListener('abort', abortListener!, { once: true });
-      socket.send(JSON.stringify({
-        jsonrpc: JSONRPC_VERSION,
-        id,
-        method,
-        requestTimeoutMs: timeoutMs,
-        ...(params !== undefined ? { params } : {}),
-      }));
+      try {
+        connection.socket.send(JSON.stringify({
+          jsonrpc: JSONRPC_VERSION,
+          id,
+          method,
+          requestTimeoutMs: timeoutMs,
+          ...(params !== undefined ? { params } : {}),
+        }));
+      } catch (error) {
+        if (this.removePending(key, pending)) {
+          const sendError = protocolError(
+            error instanceof Error ? error.message : 'App Server 请求发送失败',
+            -32000,
+          );
+          pending.reject(sendError);
+          this.failConnection(connection, sendError);
+        }
+      }
     }) as Promise<AppServerRequestResult<M>>;
+  }
+
+  private removePending(key: string, pending: PendingRequest): boolean {
+    if (this.#pending.get(key) !== pending) return false;
+    this.#pending.delete(key);
+    this.clearPending(pending);
+    return true;
   }
 
   private sendNotification<M extends AppServerNotificationMethod>(
     method: M,
     params: AppServerNotificationParams<M>,
+    connection: ConnectionRef | null = this.currentConnection(),
   ): void {
     if (!knownNotificationMethod(method)) {
       this.#options.onNotification?.({
@@ -560,12 +697,16 @@ export class AppServerClient {
         throw invalidParams('$/cancelRequest.id 必须是有效请求 ID');
       }
     }
-    if (this.#socket?.readyState !== WebSocket.OPEN) return;
-    this.#socket.send(JSON.stringify({ jsonrpc: JSONRPC_VERSION, method, params }));
+    if (!connection || !this.isCurrentConnection(connection) || connection.socket.readyState !== WebSocket.OPEN) return;
+    connection.socket.send(JSON.stringify({ jsonrpc: JSONRPC_VERSION, method, params }));
   }
 
-  private sendCancel(id: JsonRpcRequestId): void {
-    this.sendNotification('$/cancelRequest', { id });
+  private sendCancel(pending: PendingRequest): void {
+    try {
+      this.sendNotification('$/cancelRequest', { id: pending.id }, pending.connection);
+    } catch {
+      // 请求已经结束；取消通知发送失败不能再次改变调用方结果。
+    }
   }
 
   private nextRequestId(): string {
@@ -573,7 +714,8 @@ export class AppServerClient {
     return `app-server-${Date.now()}-${this.#nextRequestId}`;
   }
 
-  private handleMessage(raw: unknown): void {
+  private handleMessage(connection: ConnectionRef, raw: unknown): void {
+    if (!this.isCurrentConnection(connection)) return;
     let value: unknown;
     try {
       value = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -587,24 +729,23 @@ export class AppServerClient {
     }
     if (!isRecord(value) || value.jsonrpc !== JSONRPC_VERSION) return;
     if (isResponse(value)) {
-      this.handleResponse(value as JsonRpcResponseLike);
+      this.handleResponse(connection, value as JsonRpcResponseLike);
       return;
     }
     if (isServerRequest(value)) {
-      this.handleServerRequest(value as JsonRpcRequestLike);
+      this.handleServerRequest(connection, value as JsonRpcRequestLike);
       return;
     }
     if (isNotification(value)) {
-      this.handleNotification(value as JsonRpcNotificationLike);
+      this.handleNotification(connection, value as JsonRpcNotificationLike);
     }
   }
 
-  private handleResponse(value: JsonRpcResponseLike): void {
+  private handleResponse(connection: ConnectionRef, value: JsonRpcResponseLike): void {
     if (typeof value.id !== 'string' && typeof value.id !== 'number') return;
     const pending = this.#pending.get(requestIdKey(value.id));
-    if (!pending) return;
-    this.#pending.delete(requestIdKey(value.id));
-    this.clearPending(pending);
+    if (!pending || !this.sameConnection(pending.connection, connection)) return;
+    if (!this.removePending(requestIdKey(value.id), pending)) return;
     this.#options.onActivity?.();
     if (value.error !== undefined) {
       pending.reject(errorFromRpc(asJsonRpcError(value.error)));
@@ -618,9 +759,11 @@ export class AppServerClient {
     }
   }
 
-  private handleNotification(value: JsonRpcNotificationLike): void {
+  private handleNotification(connection: ConnectionRef, value: JsonRpcNotificationLike): void {
+    if (!this.isCurrentConnection(connection)) return;
     const method = typeof value.method === 'string' ? value.method : '';
     const params = value.params;
+    this.#options.onActivity?.();
     if (method === 'events/snapshot' && isEventStreamSnapshot(params)) {
       const snapshot = params;
       this.#lastSequence = Math.max(this.#lastSequence, Math.max(0, snapshot.next_sequence - 1));
@@ -642,7 +785,8 @@ export class AppServerClient {
     });
   }
 
-  private handleServerRequest(value: JsonRpcRequestLike): void {
+  private handleServerRequest(connection: ConnectionRef, value: JsonRpcRequestLike): void {
+    if (!this.isCurrentConnection(connection)) return;
     if (typeof value.id !== 'string' && typeof value.id !== 'number' || typeof value.method !== 'string') {
       return;
     }
@@ -655,7 +799,7 @@ export class AppServerClient {
     try {
       assertServerRequest(request.method, request.params);
     } catch (error) {
-      this.sendResponse(request.id, undefined, errorFromThrown(error));
+      this.sendResponse(connection, request.id, undefined, errorFromThrown(error));
       return;
     }
     let settled = false;
@@ -663,7 +807,7 @@ export class AppServerClient {
       if (settled) return;
       if (!isRecord(result) || typeof result.approved !== 'boolean') {
         settled = true;
-        this.sendResponse(request.id, undefined, {
+        this.sendResponse(connection, request.id, undefined, {
           code: -32602,
           message: 'approval/request 响应必须包含 approved 布尔值',
           retryable: false,
@@ -671,12 +815,12 @@ export class AppServerClient {
         return;
       }
       settled = true;
-      this.sendResponse(request.id, result, undefined);
+      this.sendResponse(connection, request.id, result, undefined);
     };
     const reject = (error: JsonRpcError) => {
       if (settled) return;
       settled = true;
-      this.sendResponse(request.id, undefined, error);
+      this.sendResponse(connection, request.id, undefined, error);
     };
     const context = { request, respond, reject } satisfies AppServerServerRequestContext;
     const callback = this.#options.onServerRequest;
@@ -693,13 +837,25 @@ export class AppServerClient {
     });
   }
 
-  private sendResponse(id: JsonRpcRequestId, result: JsonValue | undefined, error: JsonRpcError | undefined): void {
-    if (this.#socket?.readyState !== WebSocket.OPEN) return;
-    this.#socket.send(JSON.stringify({
-      jsonrpc: JSONRPC_VERSION,
-      id,
-      ...(error ? { error } : { result: result ?? null }),
-    }));
+  private sendResponse(
+    connection: ConnectionRef,
+    id: JsonRpcRequestId,
+    result: JsonValue | undefined,
+    error: JsonRpcError | undefined,
+  ): void {
+    if (!this.isCurrentConnection(connection) || connection.socket.readyState !== WebSocket.OPEN) return;
+    try {
+      connection.socket.send(JSON.stringify({
+        jsonrpc: JSONRPC_VERSION,
+        id,
+        ...(error ? { error } : { result: result ?? null }),
+      }));
+    } catch (sendError) {
+      this.failConnection(connection, protocolError(
+        sendError instanceof Error ? sendError.message : 'App Server 响应发送失败',
+        -32000,
+      ));
+    }
   }
 
   private clearPending(pending: PendingRequest): void {
@@ -709,18 +865,20 @@ export class AppServerClient {
     }
   }
 
-  private rejectPending(error: AppServerError): void {
+  private rejectPending(error: AppServerError, connection?: ConnectionRef): void {
     for (const [key, pending] of this.#pending) {
-      this.#pending.delete(key);
-      this.clearPending(pending);
-      pending.reject(error);
+      if (connection && !this.sameConnection(pending.connection, connection)) continue;
+      if (this.removePending(key, pending)) {
+        pending.reject(error);
+      }
     }
   }
 
-  private rejectOpen(error: AppServerError): void {
-    this.#openReject?.(error);
-    this.#openResolve = null;
-    this.#openReject = null;
+  private rejectOpen(error: AppServerError, connection?: ConnectionRef): void {
+    const wait = this.#openWait;
+    if (!wait || (connection && !this.sameConnection(wait.connection, connection))) return;
+    this.#openWait = null;
+    wait.reject(error);
   }
 
   private setState(state: AppServerConnectionState): void {

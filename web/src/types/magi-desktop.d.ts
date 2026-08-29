@@ -7,14 +7,6 @@ interface MagiDesktopRectangle {
 
 type MagiDesktopPanelKind = 'agent' | 'browser' | 'code' | 'terminal' | null;
 
-interface MagiDesktopOverlayItem {
-  id: string;
-  label: string;
-  icon: string | null;
-  selected: boolean;
-  disabled: boolean;
-}
-
 interface MagiDesktopOverlayField {
   id: string;
   label: string;
@@ -24,13 +16,21 @@ interface MagiDesktopOverlayField {
   max: number | null;
 }
 
+interface MagiDesktopOverlayItem {
+  id: string;
+  label: string;
+  icon: string | null;
+  selected: boolean;
+  disabled: boolean;
+}
+
 interface MagiDesktopOverlayState {
   overlayId: string;
   kind: 'menu' | 'annotation';
   phase: 'menu' | 'select' | 'comment';
   ownerId: string;
   placement: 'right-pane-add' | 'browser-viewport' | 'browser-annotations';
-  anchorBounds: MagiDesktopRectangle | null;
+  popupBounds: MagiDesktopRectangle | null;
   title: string;
   items: MagiDesktopOverlayItem[];
   fields: MagiDesktopOverlayField[];
@@ -43,6 +43,17 @@ interface MagiDesktopOverlayAction {
   interaction: 'select' | 'input';
   id: string;
   value: string | null;
+}
+
+interface MagiDesktopOverlayClosedEvent {
+  overlayId: string;
+  kind: MagiDesktopOverlayState['kind'];
+  ownerId: string;
+  reason: 'closed' | 'replaced';
+  replacement: {
+    overlayId: string;
+    ownerId: string;
+  } | null;
 }
 
 interface MagiDesktopWindowLayoutSnapshot {
@@ -58,9 +69,21 @@ interface MagiDesktopWindowLayoutSnapshot {
   activePanelKind: MagiDesktopPanelKind;
   activeTabId: string | null;
   activeSurfaceId: string | null;
+  rendererGeometry: MagiDesktopRendererGeometryFrame | null;
   appBounds: MagiDesktopRectangle;
   dividerBounds: MagiDesktopRectangle | null;
   rightPaneBounds: MagiDesktopRectangle | null;
+}
+
+interface MagiDesktopRendererGeometryFrame {
+  revision: number;
+  layoutRevision: number;
+  coordinateSpace: 'window-content-css-px';
+  rightPaneBounds: MagiDesktopRectangle | null;
+  browserContentSlot: {
+    tabId: string;
+    bounds: MagiDesktopRectangle;
+  } | null;
 }
 
 interface MagiDesktopWindowSnapshot {
@@ -82,7 +105,11 @@ interface MagiDesktopContextSnapshot {
 type MagiDesktopLayoutIntent =
   | { type: 'right_pane_width'; width: number }
   | { type: 'right_pane_reset_width' }
-  | { type: 'right_pane_visibility'; visible: boolean };
+  | { type: 'right_pane_visibility'; visible: boolean }
+  | {
+      type: 'renderer_geometry';
+      frame: MagiDesktopRendererGeometryFrame;
+    };
 
 type MagiDesktopLogicalViewport =
   | { mode: 'auto' }
@@ -204,7 +231,7 @@ interface MagiDesktopBridge {
   focusApp(): Promise<void>;
   readyRightPane(): Promise<void>;
   openOverlay(state: Omit<MagiDesktopOverlayState, 'overlayId' | 'phase'> & { overlayId?: string; phase?: MagiDesktopOverlayState['phase'] }): Promise<void>;
-  closeOverlay(): Promise<void>;
+  closeOverlay(request: { overlayId: string; ownerId: string }): Promise<MagiDesktopOverlayClosedEvent | null>;
   setBlockingOverlay(request: { active: boolean }): Promise<MagiDesktopWindowSnapshot>;
   readyOverlay(): Promise<void>;
   submitOverlayAction(action: MagiDesktopOverlayAction): Promise<void>;
@@ -233,7 +260,7 @@ interface MagiDesktopBridge {
   onBrowserEvent(listener: (event: unknown) => void): () => void;
   onBrowserComponent(listener: (snapshot: MagiDesktopBrowserComponentSnapshot) => void): () => void;
   onOverlayState(listener: (state: MagiDesktopOverlayState) => void): () => void;
-  onOverlayClosed(listener: () => void): () => void;
+  onOverlayClosed(listener: (event: MagiDesktopOverlayClosedEvent) => void): () => void;
   onOverlayAction(listener: (action: MagiDesktopOverlayAction) => void): () => void;
   onUpdate(listener: (snapshot: MagiDesktopUpdateSnapshot) => void): () => void;
   onFileDrop(listener: (event: MagiDesktopFileDropEvent) => void): () => void;

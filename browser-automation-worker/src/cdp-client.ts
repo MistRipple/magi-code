@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   BrowserCommandError,
   BrowserSurfaceBinding,
@@ -6,22 +7,33 @@ import type {
   WorkerCdpRequest,
   WorkerToMainMessage,
 } from "@magi/desktop-browser-contracts";
+import {
+  parseMainToWorkerMessage,
+  parseWorkerToMainMessage,
+} from "@magi/desktop-browser-contracts/validation";
 
 export interface ParentPort {
-  on(event: "message", listener: (event: { data: MainToWorkerMessage }) => void): void;
+  on(event: "message", listener: (event: { data: unknown }) => void): void;
   postMessage(message: WorkerToMainMessage): void;
 }
 
 interface PendingRequest {
+  callId: string;
   binding: BrowserSurfaceBinding;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 }
 
+export interface CdpCallContext {
+  callId: string;
+  signal: AbortSignal;
+}
+
 export class CdpClient {
   readonly #port: ParentPort;
   readonly #pending = new Map<string, PendingRequest>();
+  readonly #callContext = new AsyncLocalStorage<CdpCallContext>();
   readonly #listeners = new Set<(
     binding: BrowserSurfaceBinding,
     method: string,
@@ -31,7 +43,24 @@ export class CdpClient {
 
   constructor(port: ParentPort) {
     this.#port = port;
-    port.on("message", (event) => this.accept(event.data));
+    port.on("message", (event) => {
+      try {
+        this.accept(event.data);
+      } catch (cause) {
+        console.error(
+          "[browser-worker] invalid inbound CDP message",
+          cause instanceof Error ? cause.message : String(cause),
+        );
+      }
+    });
+  }
+
+  run<T>(context: CdpCallContext, operation: () => Promise<T>): Promise<T> {
+    return this.#callContext.run(context, operation);
+  }
+
+  currentSignal(): AbortSignal | undefined {
+    return this.#callContext.getStore()?.signal;
   }
 
   send<T = unknown>(
@@ -42,9 +71,15 @@ export class CdpClient {
     sessionId?: string,
     options: { allowNavigationAdvance?: boolean } = {},
   ): Promise<T> {
+    const context = this.#callContext.getStore();
+    if (context?.signal.aborted) {
+      return Promise.reject(new Error("browser_command_cancelled"));
+    }
     const requestId = `cdp-${randomUUID()}`;
+    const callId = context?.callId ?? `worker-internal-${randomUUID()}`;
     const request: WorkerCdpRequest = {
       type: "cdp_request",
+      call_id: callId,
       request_id: requestId,
       binding,
       method,
@@ -59,12 +94,19 @@ export class CdpClient {
       }, timeoutMs);
       timer.unref();
       this.#pending.set(requestId, {
+        callId,
         binding,
         resolve: (value) => resolve(value as T),
         reject,
         timer,
       });
-      this.#port.postMessage(request);
+      try {
+        this.#port.postMessage(parseWorkerToMainMessage(request));
+      } catch (cause) {
+        this.#pending.delete(requestId);
+        clearTimeout(timer);
+        reject(cause instanceof Error ? cause : new Error(String(cause)));
+      }
     });
   }
 
@@ -87,10 +129,12 @@ export class CdpClient {
     this.#listeners.clear();
   }
 
-  private accept(message: MainToWorkerMessage): void {
+  private accept(value: unknown): void {
+    const message: MainToWorkerMessage = parseMainToWorkerMessage(value);
     if (message.type === "cdp_response") {
       const pending = this.#pending.get(message.request_id);
       if (!pending) return;
+      if (pending.callId !== message.call_id) return;
       this.#pending.delete(message.request_id);
       clearTimeout(pending.timer);
       if (!sameBinding(pending.binding, message.binding)) {

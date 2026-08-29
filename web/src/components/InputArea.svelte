@@ -73,6 +73,7 @@
     normalizeDesktopDropPaths,
     resolveDesktopDroppedPath,
   } from '../lib/desktop-file-drop';
+  import { rightPaneState, type BrowserTabPayload } from '../stores/right-pane.svelte';
 
   interface SelectedImage {
     id: string;
@@ -91,6 +92,16 @@
     | 'status'
     | 'screenshotArtifactId'
   >;
+
+  interface ComposerSubmissionDraft {
+    text: string;
+    images: SelectedImage[];
+    contextReferences: ComposerContextReference[];
+    browserAnnotations: SelectedBrowserAnnotation[];
+    browserNodeSelections: MessageBrowserNodeSelection[];
+    goalMode: boolean;
+    skill: SkillOption | null;
+  }
 
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
   // 这一组才是 `/` 唤起的指令型技能，与 customTools（已注册到工具表）的语义不同。
@@ -190,6 +201,9 @@
   let selectedImages = $state<SelectedImage[]>([]);
   let pendingImageReadCount = $state(0);
   let sendPreparing = $state(false);
+  // 提交与 Bridge 结果通过 requestId 成对收口。输入区只拥有草稿，Bridge 只拥有
+  // 网络生命周期，不能由任一侧猜测另一个状态，避免失败时永久丢失用户上下文。
+  const submittedComposerDrafts = new Map<string, ComposerSubmissionDraft>();
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
   const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
@@ -344,7 +358,8 @@
     if (isSending) return false;
     return selectedImages.length > 0
       || pendingImageReadCount > 0
-      || selectedContextReferences.length > 0;
+      || selectedContextReferences.length > 0
+      || selectedBrowserNodeSelections.length > 0;
   });
 
   // bootstrap 是全局缓存，新会话/设置变更都会同步更新这里，所以输入框可以直接派生。
@@ -416,12 +431,181 @@
     selectedImages = [];
     selectedContextReferences = [];
     selectedBrowserAnnotations = [];
+    selectedBrowserNodeSelections = [];
     selectedGoalMode = false;
     selectedSkill = null;
     addMenuOpen = false;
     contextPickerOpen = false;
     invalidateEnhanceState();
     closeSlashMenu();
+  }
+
+  function currentBrowserTabIdentity(): { browserSessionId: string; tabId: string } | null {
+    const pane = rightPaneState.perSession[rightPaneState.activeScopeKey];
+    const activeTabId = pane?.activeTabId;
+    if (!activeTabId) return null;
+    const activeTab = pane.openTabs.find((tab) => tab.id === activeTabId);
+    if (!activeTab || activeTab.kind !== 'browser') return null;
+    const payload = activeTab.payload as BrowserTabPayload;
+    const browserSessionId = typeof payload.browserSessionId === 'string'
+      ? payload.browserSessionId.trim()
+      : '';
+    const tabId = typeof payload.tabId === 'string' ? payload.tabId.trim() : '';
+    return browserSessionId && tabId ? { browserSessionId, tabId } : null;
+  }
+
+  function browserNodeSelectionKey(selection: MessageBrowserNodeSelection): string {
+    return JSON.stringify([
+      selection.browserSessionId,
+      selection.tabId,
+      selection.surfaceId,
+      selection.navigationRevision,
+      selection.frameId ?? null,
+      selection.backendDomNodeId,
+      selection.domNodeId ?? null,
+    ]);
+  }
+
+  function normalizeBrowserNodeSelection(value: unknown): MessageBrowserNodeSelection | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const source = value as Record<string, unknown>;
+    const browserSessionId = typeof source.browserSessionId === 'string'
+      ? source.browserSessionId.trim()
+      : '';
+    const tabId = typeof source.tabId === 'string' ? source.tabId.trim() : '';
+    const surfaceId = typeof source.surfaceId === 'string' ? source.surfaceId.trim() : '';
+    const navigationRevision = Number.isSafeInteger(source.navigationRevision)
+      && Number(source.navigationRevision) >= 0
+      ? Number(source.navigationRevision)
+      : null;
+    const backendDomNodeId = Number.isSafeInteger(source.backendDomNodeId)
+      && Number(source.backendDomNodeId) > 0
+      ? Number(source.backendDomNodeId)
+      : null;
+    const domNodeId = source.domNodeId === undefined || source.domNodeId === null
+      ? null
+      : Number.isSafeInteger(source.domNodeId) && Number(source.domNodeId) > 0
+        ? Number(source.domNodeId)
+        : null;
+    const domNodeIdIsValid = source.domNodeId === undefined
+      || source.domNodeId === null
+      || domNodeId !== null;
+    const frameId = source.frameId === undefined || source.frameId === null
+      ? null
+      : typeof source.frameId === 'string'
+        ? source.frameId.trim() || null
+        : undefined;
+    const nodeName = typeof source.nodeName === 'string' ? source.nodeName.trim() : '';
+    const url = typeof source.url === 'string' ? source.url.trim() : '';
+    const title = typeof source.title === 'string' ? source.title.trim() : '';
+    const textExcerpt = typeof source.textExcerpt === 'string' ? source.textExcerpt.trim() : '';
+    const outerHtml = typeof source.outerHtml === 'string' ? source.outerHtml : '';
+    if (
+      !browserSessionId
+      || !tabId
+      || !surfaceId
+      || navigationRevision === null
+      || backendDomNodeId === null
+      || !domNodeIdIsValid
+      || frameId === undefined
+      || !nodeName
+      || typeof source.url !== 'string'
+      || typeof source.title !== 'string'
+      || typeof source.textExcerpt !== 'string'
+      || typeof source.outerHtml !== 'string'
+      || typeof source.outerHtmlTruncated !== 'boolean'
+    ) return null;
+    if (!source.attributes || typeof source.attributes !== 'object' || Array.isArray(source.attributes)) return null;
+    const attributes: Record<string, string> = {};
+    for (const [key, attribute] of Object.entries(source.attributes as Record<string, unknown>)) {
+      if (typeof attribute !== 'string') return null;
+      attributes[key] = attribute;
+    }
+    let bounds: MessageBrowserNodeSelection['bounds'] = null;
+    if (source.bounds !== undefined && source.bounds !== null) {
+      if (typeof source.bounds !== 'object' || Array.isArray(source.bounds)) return null;
+      const candidate = source.bounds as Record<string, unknown>;
+      if (![candidate.x, candidate.y, candidate.width, candidate.height]
+        .every((item) => typeof item === 'number' && Number.isFinite(item))) return null;
+      bounds = {
+        x: Number(candidate.x),
+        y: Number(candidate.y),
+        width: Math.max(0, Number(candidate.width)),
+        height: Math.max(0, Number(candidate.height)),
+      };
+    }
+    const optionalString = (field: string): string | null => {
+      const candidate = source[field];
+      if (candidate === undefined || candidate === null) return null;
+      return typeof candidate === 'string' ? candidate.trim() || null : null;
+    };
+    if (
+      (source.ariaRole !== undefined && source.ariaRole !== null && typeof source.ariaRole !== 'string')
+      || (source.ariaName !== undefined && source.ariaName !== null && typeof source.ariaName !== 'string')
+    ) return null;
+    return {
+      browserSessionId,
+      tabId,
+      surfaceId,
+      navigationRevision,
+      url,
+      title,
+      frameId,
+      backendDomNodeId,
+      domNodeId,
+      nodeName,
+      attributes,
+      textExcerpt,
+      outerHtml,
+      outerHtmlTruncated: source.outerHtmlTruncated,
+      ariaRole: optionalString('ariaRole'),
+      ariaName: optionalString('ariaName'),
+      bounds,
+    };
+  }
+
+  function cloneBrowserNodeSelection(selection: MessageBrowserNodeSelection): MessageBrowserNodeSelection {
+    return {
+      ...selection,
+      attributes: { ...selection.attributes },
+      bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
+    };
+  }
+
+  function captureComposerSubmissionDraft(text: string): ComposerSubmissionDraft {
+    return {
+      text,
+      images: selectedImages.map((image) => ({ ...image })),
+      contextReferences: selectedContextReferences.map((reference) => ({ ...reference })),
+      browserAnnotations: selectedBrowserAnnotations.map((annotation) => ({ ...annotation })),
+      browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
+      goalMode: selectedGoalMode,
+      skill: selectedSkill ? { ...selectedSkill } : null,
+    };
+  }
+
+  function composerIsPristineForSubmissionRecovery(): boolean {
+    return !editingTurn
+      && !resolveComposerRawContent().trim()
+      && selectedImages.length === 0
+      && selectedContextReferences.length === 0
+      && selectedBrowserAnnotations.length === 0
+      && selectedBrowserNodeSelections.length === 0
+      && !selectedGoalMode
+      && selectedSkill === null;
+  }
+
+  function restoreComposerSubmissionDraft(draft: ComposerSubmissionDraft): void {
+    invalidateEnhanceState();
+    inputValue = draft.text;
+    pendingCaretOffset = draft.text.length;
+    selectedImages = draft.images.map((image) => ({ ...image }));
+    selectedContextReferences = draft.contextReferences.map((reference) => ({ ...reference }));
+    selectedBrowserAnnotations = draft.browserAnnotations.map((annotation) => ({ ...annotation }));
+    selectedBrowserNodeSelections = draft.browserNodeSelections.map(cloneBrowserNodeSelection);
+    selectedGoalMode = draft.goalMode;
+    selectedSkill = draft.skill ? { ...draft.skill } : null;
+    queueMicrotask(focusEditor);
   }
 
   let loadedEditingTurnId = '';
@@ -1068,20 +1252,34 @@
       ));
     }
     function handleBrowserNodeSelected(event: Event) {
-      const selection = (event as CustomEvent<MessageBrowserNodeSelection>).detail;
-      if (!selection?.browserSessionId || !selection.tabId || !selection.surfaceId) return;
-      if (selectedBrowserNodeSelections.some((item) => (
-        item.browserSessionId === selection.browserSessionId
-        && item.tabId === selection.tabId
-        && item.surfaceId === selection.surfaceId
-        && item.backendDomNodeId === selection.backendDomNodeId
-      ))) return;
+      const selection = normalizeBrowserNodeSelection((event as CustomEvent).detail);
+      const currentBrowserTab = currentBrowserTabIdentity();
+      if (
+        !selection
+        || !currentBrowserTab
+        || selection.browserSessionId !== currentBrowserTab.browserSessionId
+        || selection.tabId !== currentBrowserTab.tabId
+      ) return;
+      const selectionKey = browserNodeSelectionKey(selection);
+      if (selectedBrowserNodeSelections.some((item) => browserNodeSelectionKey(item) === selectionKey)) return;
       if (selectedBrowserNodeSelections.length >= 20) {
         addToast('warning', i18n.t('browser.nodeSelection.limit'));
         return;
       }
-      selectedBrowserNodeSelections = [...selectedBrowserNodeSelections, selection];
+      selectedBrowserNodeSelections = [...selectedBrowserNodeSelections, cloneBrowserNodeSelection(selection)];
       queueMicrotask(focusEditor);
+    }
+    function handleBrowserNodeSelectionInvalidated(event: Event) {
+      const detail = (event as CustomEvent<{
+        browserSessionId?: unknown;
+        tabId?: unknown;
+      }>).detail;
+      const browserSessionId = typeof detail?.browserSessionId === 'string' ? detail.browserSessionId.trim() : '';
+      const tabId = typeof detail?.tabId === 'string' ? detail.tabId.trim() : '';
+      if (!browserSessionId || !tabId) return;
+      selectedBrowserNodeSelections = selectedBrowserNodeSelections.filter((selection) => (
+        selection.browserSessionId !== browserSessionId || selection.tabId !== tabId
+      ));
     }
     function handleBrowserScreenshotCaptured(event: Event) {
       const detail = (event as CustomEvent<{
@@ -1101,6 +1299,15 @@
       if (addImageToComposer({ dataUrl: detail.dataUrl, name: detail.name, size: detail.size })) {
         queueMicrotask(focusEditor);
       }
+    }
+    function handleSessionTurnSubmissionSettled(event: Event) {
+      const detail = (event as CustomEvent<{ requestId?: unknown; status?: unknown }>).detail;
+      const requestId = typeof detail?.requestId === 'string' ? detail.requestId.trim() : '';
+      if (!requestId) return;
+      const draft = submittedComposerDrafts.get(requestId);
+      submittedComposerDrafts.delete(requestId);
+      if (detail.status !== 'failed' || !draft || !composerIsPristineForSubmissionRecovery()) return;
+      restoreComposerSubmissionDraft(draft);
     }
     function handlePickerOutsidePointerDown(event: PointerEvent) {
       const target = event.target;
@@ -1140,7 +1347,9 @@
     window.addEventListener('magi:browserAnnotationCreated', handleBrowserAnnotationCreated as EventListener);
     window.addEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
     window.addEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
+    window.addEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
     window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
+    window.addEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     window.addEventListener('storage', handleStoredAccessProfileChange);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -1151,7 +1360,9 @@
       window.removeEventListener('magi:browserAnnotationCreated', handleBrowserAnnotationCreated as EventListener);
       window.removeEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
       window.removeEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
+      window.removeEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
       window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
+      window.removeEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -1262,6 +1473,9 @@
       const replaceTurnId = editingTurn?.sessionId === messagesState.currentSessionId
         ? editingTurn.turnId
         : null;
+      if (!replaceTurnId) {
+        submittedComposerDrafts.set(requestId, captureComposerSubmissionDraft(rawContent));
+      }
       vscode.postMessage({
         type: 'executeTask',
         text: submissionText,
@@ -1281,16 +1495,7 @@
         })),
         contextReferences: toSessionContextReferencePayload(selectedContextReferences),
         browserAnnotationRefs: selectedBrowserAnnotations.map((annotation) => annotation.annotationId),
-        browserAnnotationSnapshots: selectedBrowserAnnotations.map((annotation) => ({
-          annotationId: annotation.annotationId,
-          browserSessionId: annotation.browserSessionId,
-          tabId: annotation.tabId,
-          sequence: annotation.sequence,
-          kind: annotation.kind,
-          comment: annotation.comment,
-          screenshotArtifactId: annotation.screenshotArtifactId,
-        })),
-        browserNodeSelections: selectedBrowserNodeSelections,
+        browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
       });
       if (!replaceTurnId) {
         clearComposerState();
@@ -2026,7 +2231,7 @@
             </button>
           </span>
         {/each}
-        {#each selectedBrowserNodeSelections as selection, selectionIndex (`${selection.tabId}-${selection.surfaceId}-${selection.backendDomNodeId}`)}
+        {#each selectedBrowserNodeSelections as selection, selectionIndex (browserNodeSelectionKey(selection))}
           <span class="ia-reference-chip ia-browser-node-selection-chip" title={selection.url}>
             <span class="ia-browser-annotation-number">{selectionIndex + 1}</span>
             <span class="ia-reference-chip-label">{selection.ariaRole || selection.nodeName}{selection.ariaName ? `: ${selection.ariaName}` : ''}</span>

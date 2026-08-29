@@ -58,12 +58,15 @@
     resolveAgentPath,
     getWorkspaceSessions,
     getPersonalSessions,
+    getBrowserSession,
     listAgentWorkspaces,
     markAgentSessionViewed,
     registerAgentWorkspace,
     removeAgentWorkspace,
     renameAgentSession,
     resolveAgentBaseUrl,
+    activateBrowserTab,
+    setActiveBrowserTab,
     type AgentConnectionEventDetail,
     type AgentWorkspaceSummary,
   } from './agent-api';
@@ -82,6 +85,7 @@
     pendingDesktopPanelIntentFor,
     clearPendingDesktopPanelIntent,
     setRightPaneCollapsed,
+    synchronizeBrowserSessionSnapshot,
     type BrowserTabPayload,
     type CodeTabPayload,
   } from '../stores/right-pane.svelte';
@@ -99,6 +103,12 @@
     resolvePreviewPanelWidthBounds,
     resolvePanelVisibility,
   } from './panel-layout';
+  import {
+    decideDesktopPanelActivation,
+    desktopPanelTargetAcknowledged,
+    desktopPanelTargetKey,
+    sameDesktopPanelTarget,
+  } from './desktop-panel-activation';
 
   interface Props {
     desktopAppSurface?: boolean;
@@ -158,8 +168,20 @@
   let isPreviewPanelResizing = $state(false);
   let desktopRightPaneVisible = $state(false);
   let desktopSnapshot = $state<MagiDesktopWindowSnapshot | null>(null);
+  let workbenchElement = $state<HTMLElement | null>(null);
   let pendingDesktopRightPaneWidth: number | null = null;
   let desktopRightPaneResizeFrame: number | null = null;
+  let desktopGeometryMounted = false;
+  let desktopGeometrySchedulePending = false;
+  let desktopGeometryRevision = 0;
+  let desktopGeometryLastKey = '';
+  type DesktopGeometryReport = {
+    key: string;
+    desktopEpoch: string;
+    frame: MagiDesktopRendererGeometryFrame;
+  };
+  let desktopGeometryInFlight: DesktopGeometryReport | null = null;
+  let desktopGeometryPending: DesktopGeometryReport | null = null;
   let desktopSnapshotEpoch = '';
   let desktopSnapshotRevision = -1;
   type DesktopVisibilityTarget = {
@@ -173,6 +195,17 @@
     desktopEpoch: string;
     snapshotRevision: number;
   };
+  type DesktopPanelTarget = {
+    scopeKey: string;
+    kind: 'agent' | 'browser' | 'code' | 'terminal' | null;
+    tabId: string | null;
+    browserSessionId: string | null;
+    browser: BrowserTabPayload | null;
+  };
+  type DesktopPanelActivationRequest = DesktopPanelTarget & {
+    key: string;
+    requestId: number;
+  };
   // 右栏可见性只允许一条 IPC 请求在途。这个状态不是 UI 状态：
   // - target 来自当前 Renderer 的 rightPaneState；
   // - acknowledged 来自 Main 返回/推送的 desktopSnapshot；
@@ -181,6 +214,15 @@
   let desktopVisibilitySyncFailure: DesktopVisibilitySyncFailure | null = null;
   let desktopVisibilityRequestId = 0;
   let desktopVisibilitySyncEpoch = $state(0);
+  // 非浏览器右栏面板的 Main 激活必须由这里唯一串行化。RightPane 只更新
+  // 用户意图；只有 Main 快照确认后，才能认为原生 Browser Surface 已撤下。
+  // 这避免 Renderer 已渲染终端/代码、而旧 WebContentsView 仍保留在命中树。
+  let desktopPanelActivationRequest: DesktopPanelActivationRequest | null = null;
+  let desktopPanelActivationRequestId = 0;
+  let desktopPanelActivationRetryAttempt = 0;
+  let desktopPanelActivationRetryKey = '';
+  let desktopPanelActivationRetryTimer: number | null = null;
+  let desktopPanelActivationEpoch = $state(0);
   let sidebarElement = $state<HTMLElement | null>(null);
   let desktopDropIndicator = $state<{
     zone: DesktopDropZone;
@@ -206,7 +248,6 @@
     workspaceRoot: string;
     overlay?: boolean;
     desktopSurface?: boolean;
-    desktopSnapshot?: MagiDesktopWindowSnapshot | null;
     htmlBrowserOpenRequest?: HtmlBrowserOpenRequest | null;
     onHtmlBrowserOpenHandled?: (requestId: number) => void;
   };
@@ -337,6 +378,7 @@
     viewportWidth,
     sidebarWidth: effectiveSidebarWidth,
     previewPanelWidth: effectivePreviewPanelWidth,
+    desktopSurface: desktopAppSurface,
   }));
   const sidebarIsDrawer = $derived(panelLayout.sidebarDrawer);
 
@@ -409,6 +451,161 @@
     return true;
   }
 
+  function readDesktopRect(element: Element | null): MagiDesktopRectangle | null {
+    if (!(element instanceof HTMLElement)) return null;
+    const rect = element.getBoundingClientRect();
+    if (
+      !Number.isFinite(rect.left)
+      || !Number.isFinite(rect.top)
+      || !Number.isFinite(rect.width)
+      || !Number.isFinite(rect.height)
+      || rect.width <= 0
+      || rect.height <= 0
+    ) return null;
+    return {
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+  }
+
+  function rectangleKey(rectangle: MagiDesktopRectangle | null): string {
+    return rectangle
+      ? `${rectangle.x}:${rectangle.y}:${rectangle.width}:${rectangle.height}`
+      : '';
+  }
+
+  function pumpDesktopGeometryReport(): void {
+    if (desktopGeometryInFlight || !desktopGeometryPending || !window.magiDesktop) return;
+    const pending = desktopGeometryPending;
+    desktopGeometryPending = null;
+    desktopGeometryInFlight = pending;
+    let retryAfterNonAck = false;
+    void window.magiDesktop.submitLayoutIntent({
+      type: 'renderer_geometry',
+      frame: pending.frame,
+    }).then((snapshot) => {
+      if (!desktopGeometryMounted) return;
+      const snapshotApplied = applyDesktopSnapshot(snapshot);
+      const rendererGeometry = snapshot.layout.rendererGeometry;
+      const acknowledged = snapshotApplied
+        && snapshot.desktopEpoch === pending.desktopEpoch
+        && snapshot.layout.layoutRevision === pending.frame.layoutRevision
+        && rendererGeometry?.revision === pending.frame.revision
+        && rendererGeometry.layoutRevision === pending.frame.layoutRevision
+        && rendererGeometry.coordinateSpace === pending.frame.coordinateSpace
+        && rendererGeometry.browserContentSlot?.tabId === pending.frame.browserContentSlot?.tabId;
+      if (acknowledged) {
+        // 只有 Main 返回同一 layoutRevision 且实际接受了 renderer revision，
+        // 才能把这次 DOM 读取记为完成。否则必须重新读取当前 DOM。
+        desktopGeometryLastKey = pending.key;
+        if (desktopGeometryPending?.key === pending.key) {
+          desktopGeometryPending = null;
+        }
+        return;
+      }
+      // Main 会用当前快照响应 stale layoutRevision，而不是 reject Promise。
+      // 该响应不是本次几何的 ack；丢弃同一旧 generation 的排队项，下一次
+      // tick 按最新 snapshot 重新读取，避免旧请求把队列锁死。
+      if (desktopGeometryPending?.frame.layoutRevision === pending.frame.layoutRevision) {
+        desktopGeometryPending = null;
+      }
+      // 在途标记清除后再调度。否则 tick 可能先执行并因仍在途而返回，
+      // 这次 stale 响应就会丢失下一次有效读取。
+      retryAfterNonAck = true;
+    }).catch((error) => {
+      console.warn('[WebWorkbenchShell] 上报桌面 DOM 布局失败:', error);
+    }).finally(() => {
+      desktopGeometryInFlight = null;
+      if (desktopGeometryMounted) {
+        if (retryAfterNonAck) scheduleDesktopGeometryReport();
+        pumpDesktopGeometryReport();
+      }
+    });
+  }
+
+  function reportDesktopGeometry(): void {
+    if (!desktopGeometryMounted || !desktopAppSurface || !desktopSnapshot || !workbenchElement) return;
+
+    const layout = desktopSnapshot.layout;
+    const browserPanelActive = layout.rightPaneVisible
+      && layout.activePanelKind === 'browser'
+      && Boolean(layout.activeTabId);
+    const rightPaneElement = workbenchElement.querySelector('.desktop-right-pane-column');
+    const rightPaneBounds = layout.rightPaneVisible ? readDesktopRect(rightPaneElement) : null;
+    // 右栏可见时，父容器是完整 geometry frame 的必要部分。DOM 重排的中间
+    // 状态不得提交给 Main，否则原生 View 会被解绑到一个不存在的槽位。
+    if (layout.rightPaneVisible && !rightPaneBounds) return;
+    let browserContentSlot: MagiDesktopRendererGeometryFrame['browserContentSlot'] = null;
+    if (browserPanelActive) {
+      const browserSlotElement = rightPaneElement?.querySelector('.browser-surface-slot') ?? null;
+      // 槽位身份必须来自实际参与排版的 BrowserTabContent DOM。Store 的 activeTab
+      // 是逻辑状态，和 Svelte 的组件切换存在一个异步提交窗口；如果从 Store
+      // 读取身份、从 DOM 读取矩形，两者可能来自不同一帧，Main 就会丢弃本次
+      // 绑定。data-browser-tab-id 与槽位矩形由同一个 DOM 节点产生，形成唯一
+      // 的“当前浏览器内容槽位”事实来源。
+      const browserTabId = browserSlotElement instanceof HTMLElement
+        ? browserSlotElement.dataset.browserTabId?.trim() ?? ''
+        : '';
+      const browserSlotBounds = browserTabId ? readDesktopRect(browserSlotElement) : null;
+      // 浏览器面板的内容槽也是完整 frame 的必要部分。槽位暂时不存在、
+      // 没有身份或尚未完成排版时，等待 Resize/MutationObserver 的下一帧。
+      if (
+        !browserSlotBounds
+        || !layout.activeTabId
+        || browserTabId !== layout.activeTabId
+      ) return;
+      browserContentSlot = {
+        tabId: browserTabId,
+        bounds: browserSlotBounds,
+      };
+    }
+    const revision = Math.max(
+      desktopGeometryRevision + 1,
+      (layout.rendererGeometry?.revision ?? -1) + 1,
+    );
+    const frame: MagiDesktopRendererGeometryFrame = {
+      revision,
+      layoutRevision: layout.layoutRevision,
+      coordinateSpace: 'window-content-css-px',
+      rightPaneBounds,
+      browserContentSlot,
+    };
+    const key = [
+      desktopSnapshotEpoch,
+      frame.layoutRevision,
+      frame.rightPaneBounds ? 'visible' : 'hidden',
+      frame.browserContentSlot?.tabId ?? '',
+      rectangleKey(frame.rightPaneBounds),
+      rectangleKey(frame.browserContentSlot?.bounds ?? null),
+    ].join('|');
+    if (
+      key === desktopGeometryLastKey
+      || desktopGeometryPending?.key === key
+      || desktopGeometryInFlight?.key === key
+    ) return;
+
+    desktopGeometryRevision = revision;
+    desktopGeometryPending = {
+      key,
+      desktopEpoch: desktopSnapshotEpoch,
+      frame,
+    };
+    pumpDesktopGeometryReport();
+  }
+
+  function scheduleDesktopGeometryReport(): void {
+    if (!desktopGeometryMounted || desktopGeometrySchedulePending) return;
+    // tick 只等待当前 Svelte 提交完成，不创建时间轮询；ResizeObserver/
+    // MutationObserver 负责触发，单飞队列负责合并连续尺寸变化。
+    desktopGeometrySchedulePending = true;
+    void tick().then(() => {
+      desktopGeometrySchedulePending = false;
+      if (desktopGeometryMounted) reportDesktopGeometry();
+    });
+  }
+
   function sameDesktopVisibilityTarget(
     left: DesktopVisibilityTarget | null,
     right: DesktopVisibilityTarget,
@@ -416,6 +613,150 @@
     return Boolean(left)
       && left?.scopeKey === right.scopeKey
       && left.visible === right.visible;
+  }
+
+  function currentDesktopPanelTarget(): DesktopPanelTarget {
+    const scopeKey = rightPaneState.activeScopeKey;
+    const pane = getRightPaneState(scopeKey);
+    const activeTab = pane.activeTabId
+      ? pane.openTabs.find((tab) => tab.id === pane.activeTabId) ?? null
+      : null;
+    if (pane.collapsed || !activeTab) {
+      return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
+    }
+    if (activeTab.kind === 'browser') {
+      const browser = activeTab.payload as BrowserTabPayload;
+      return {
+        scopeKey,
+        kind: 'browser',
+        tabId: browser.tabId,
+        browserSessionId: browser.browserSessionId,
+        browser,
+      };
+    }
+    return {
+      scopeKey,
+      kind: activeTab.kind,
+      tabId: activeTab.id,
+      browserSessionId: null,
+      browser: null,
+    };
+  }
+
+  function clearDesktopPanelActivationRetry(): void {
+    if (desktopPanelActivationRetryTimer !== null) {
+      window.clearTimeout(desktopPanelActivationRetryTimer);
+      desktopPanelActivationRetryTimer = null;
+    }
+    desktopPanelActivationRetryAttempt = 0;
+    desktopPanelActivationRetryKey = '';
+  }
+
+  function scheduleDesktopPanelActivationRetry(target: DesktopPanelTarget): void {
+    const key = desktopPanelTargetKey(target);
+    if (desktopPanelActivationRetryKey !== key) {
+      clearDesktopPanelActivationRetry();
+      desktopPanelActivationRetryKey = key;
+    }
+    if (desktopPanelActivationRetryTimer !== null || desktopPanelActivationRetryAttempt >= 3) {
+      return;
+    }
+    const delay = 80 * (2 ** desktopPanelActivationRetryAttempt);
+    desktopPanelActivationRetryAttempt += 1;
+    desktopPanelActivationRetryTimer = window.setTimeout(() => {
+      desktopPanelActivationRetryTimer = null;
+      if (desktopPanelActivationRetryKey === key) {
+        desktopPanelActivationEpoch += 1;
+      }
+    }, delay);
+  }
+
+  function isClosedBrowserTabError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /browser tab is not ready:[\s\S]*\(Closed\)/u.test(message);
+  }
+
+  function resyncAfterClosedBrowserTab(target: DesktopPanelTarget): void {
+    const browser = target.browser;
+    if (!browser) return;
+    // “已关闭”是权威状态，不是可重试的 Surface 激活失败。必须立即拉取
+    // BrowserAuthority 快照收敛本地 Tab，避免旧 Tab 一直占据右栏内容槽。
+    void getBrowserSession(browser.browserSessionId)
+      .then((snapshot) => {
+        synchronizeBrowserSessionSnapshot(snapshot, browser.workspacePath, {
+          workspaceId: browser.workspaceId,
+          sessionId: browser.sessionId,
+        });
+      })
+      .catch((error) => {
+        console.warn('[WebWorkbenchShell] 收敛已关闭浏览器 Tab 失败:', error);
+      });
+  }
+
+  function synchronizeDesktopBrowserAuthority(target: DesktopPanelTarget): void {
+    const browser = target.browser;
+    if (target.kind !== 'browser' || !browser) return;
+    // 浏览器 Surface 已经通过 Main 的单一 Panel 事务进入右栏；Authority 的
+    // 默认工具目标和 suspended 恢复属于后台状态同步，不能阻塞可见页面。
+    void setActiveBrowserTab(browser.browserSessionId, browser.tabId)
+      .catch((error) => {
+        if (isClosedBrowserTabError(error)) {
+          resyncAfterClosedBrowserTab(target);
+          return;
+        }
+        console.warn('[WebWorkbenchShell] 同步浏览器工具默认 Tab 失败:', error);
+      });
+    if (browser.lifecycle === 'suspended' || browser.lifecycle === 'crashed') {
+      void activateBrowserTab(browser.tabId).catch((error) => {
+        console.warn('[WebWorkbenchShell] 恢复浏览器逻辑 Tab 失败:', error);
+      });
+    }
+  }
+
+  function activateDesktopPanelTarget(request: DesktopPanelActivationRequest): void {
+    const desktop = window.magiDesktop;
+    if (!desktop) return;
+    const run = request.kind === 'browser' && request.browser
+      ? desktop.activateBrowser({
+          tabId: request.browser.tabId,
+          browserSessionId: request.browser.browserSessionId,
+          url: request.browser.url || 'about:blank',
+          navigationRevision: request.browser.navigationRevision,
+          viewport: { mode: 'auto' },
+        })
+      : desktop.activatePanel({ kind: request.kind, tabId: request.tabId });
+    void run.then((snapshot) => {
+      applyDesktopSnapshot(snapshot);
+      if (desktopPanelActivationRequest?.requestId !== request.requestId) return;
+      desktopPanelActivationRequest = null;
+      const target = currentDesktopPanelTarget();
+      if (sameDesktopPanelTarget(target, request)) {
+        if (desktopPanelTargetAcknowledged(snapshot, target)) {
+          clearDesktopPanelActivationRetry();
+          if (target.kind) {
+            clearPendingDesktopPanelIntent(target.scopeKey, target.kind, target.tabId ?? '');
+          }
+          synchronizeDesktopBrowserAuthority(target);
+        } else {
+          scheduleDesktopPanelActivationRetry(target);
+        }
+      }
+      desktopPanelActivationEpoch += 1;
+    }).catch((error) => {
+      if (desktopPanelActivationRequest?.requestId !== request.requestId) return;
+      desktopPanelActivationRequest = null;
+      const target = currentDesktopPanelTarget();
+      if (sameDesktopPanelTarget(target, request)) {
+        if (isClosedBrowserTabError(error)) {
+          clearDesktopPanelActivationRetry();
+          resyncAfterClosedBrowserTab(target);
+        } else {
+          scheduleDesktopPanelActivationRetry(target);
+        }
+      }
+      desktopPanelActivationEpoch += 1;
+      console.warn('[WebWorkbenchShell] 激活桌面右栏面板失败:', error);
+    });
   }
   /** 项目文件树高亮：active code tab 的 filepath */
   const activeCodeTabFilePath = $derived.by<string>(() => {
@@ -747,13 +1088,13 @@
   }
 
   function openPersonalDraft(): void {
-    if (workspaceActionPending || messagesState.sessionHydrating || pendingNavigation) return;
+    if (workspaceActionPending || messagesState.sessionHydrating) return;
     navigateSession({ kind: 'draft', scope: 'personal' });
     if (sidebarIsDrawer) sidebarOpen = false;
   }
 
   function switchPersonalSession(sessionId: string): void {
-    if (!sessionId || pendingNavigation) return;
+    if (!sessionId) return;
     navigateSession({ kind: 'session', scope: 'personal', sessionId });
     if (sidebarIsDrawer) sidebarOpen = false;
   }
@@ -1139,13 +1480,15 @@
     if (sidebarIsDrawer) {
       return;
     }
+    const sidebarRect = sidebarElement?.getBoundingClientRect();
+    if (!sidebarRect || sidebarRect.width <= 0) return;
     event.preventDefault();
     isSidebarResizing = true;
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
-      sidebarWidth = clampSidebarWidth(moveEvent.clientX - PANEL_LAYOUT.shellPadding);
+      sidebarWidth = clampSidebarWidth(moveEvent.clientX - sidebarRect.left);
     };
     const handlePointerUp = () => {
       isSidebarResizing = false;
@@ -1171,6 +1514,8 @@
     if (previewIsOverlay) {
       return;
     }
+    const shellRect = workbenchElement?.getBoundingClientRect();
+    if (!shellRect || shellRect.width <= 0) return;
     event.preventDefault();
     isPreviewPanelResizing = true;
     document.body.style.cursor = 'col-resize';
@@ -1178,7 +1523,7 @@
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
       previewPanelWidth = clampPreviewPanelWidth(
-        window.innerWidth - moveEvent.clientX - PANEL_LAYOUT.shellPadding,
+        shellRect.right - moveEvent.clientX,
       );
     };
     const handlePointerUp = () => {
@@ -1217,24 +1562,28 @@
     if (desktopSnapshot?.layout.rightPaneMode === 'overlay') return;
     const handle = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
     if (!handle) return;
+    const rightPaneElement = workbenchElement?.querySelector('.desktop-right-pane-column');
+    const rightPaneRect = rightPaneElement?.getBoundingClientRect();
+    if (!rightPaneRect || rightPaneRect.width <= 0) return;
     // Main 与 Renderer 使用同一个定义：这里的宽度只代表右栏内容轨道，
     // 分隔条和 shell 外边距不再混入拖动值。
     const widthBounds = resolvePreviewPanelWidthBounds({
-      viewportWidth,
+      viewportWidth: workbenchElement?.getBoundingClientRect().width ?? viewportWidth,
       sidebarWidth: effectiveSidebarWidth,
       sidebarVisible: panelVisibility.sidebarVisible,
       rightPaneOpen: true,
       previewOverlay: false,
+      desktopSurface: true,
     });
     const minWidth = widthBounds.minWidth;
     const maxWidth = widthBounds.maxWidth;
     const initialWidth = Math.round(
-      desktopSnapshot?.layout.rightPaneWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH,
+      rightPaneRect.width,
     );
     if (!initialWidth) return;
     event.preventDefault();
     isPreviewPanelResizing = true;
-    const startClientX = event.clientX;
+    const initialRight = rightPaneRect.right;
     const pointerId = event.pointerId;
     let stopped = false;
     try {
@@ -1248,7 +1597,7 @@
       if (moveEvent.pointerId !== pointerId) return;
       pendingDesktopRightPaneWidth = Math.min(
         maxWidth,
-        Math.max(minWidth, initialWidth - (moveEvent.clientX - startClientX)),
+        Math.max(minWidth, initialRight - moveEvent.clientX),
       );
       if (desktopRightPaneResizeFrame === null) {
         desktopRightPaneResizeFrame = requestAnimationFrame(submitPendingDesktopRightPaneWidth);
@@ -1650,7 +1999,7 @@
   }
 
   async function selectWorkspace(workspace: AgentWorkspaceSummary): Promise<void> {
-    if (workspaceActionPending || messagesState.sessionHydrating || pendingNavigation || workspaceSelectionPending) {
+    if (workspaceActionPending || messagesState.sessionHydrating || workspaceSelectionPending) {
       return;
     }
     const workspaceId = workspace.workspaceId.trim();
@@ -1664,7 +2013,7 @@
       const hasLoadedSessions = Object.prototype.hasOwnProperty.call(sessionsByWorkspace, workspaceId);
       if (!hasLoadedSessions) {
         const loaded = await loadWorkspaceSessionsForSidebar(workspace);
-        if (!loaded || pendingNavigation) {
+        if (!loaded) {
           return;
         }
       }
@@ -1693,7 +2042,7 @@
   }
 
   function handleWorkspaceClick(workspace: AgentWorkspaceSummary): void {
-    if (workspaceSelectionPending || workspaceActionPending || messagesState.sessionHydrating || pendingNavigation) {
+    if (workspaceSelectionPending || workspaceActionPending || messagesState.sessionHydrating) {
       return;
     }
     if (workspace.workspaceId === selectedWorkspaceId) {
@@ -1719,7 +2068,7 @@
   }
 
   async function openWorkspaceDraft(workspace: AgentWorkspaceSummary): Promise<void> {
-    if (workspaceActionPending || messagesState.sessionHydrating || pendingNavigation) {
+    if (workspaceActionPending || messagesState.sessionHydrating) {
       return;
     }
     const workspaceId = workspace.workspaceId.trim();
@@ -1753,7 +2102,7 @@
 
   function switchSession(workspace: AgentWorkspaceSummary, sessionId: string): void {
     const isCurrentSelection = workspace.workspaceId === selectedWorkspaceId && sessionId === currentSessionId;
-    if (!sessionId || isCurrentSelection || pendingNavigation) {
+    if (!sessionId || isCurrentSelection) {
       return;
     }
     const nextSession = (sessionsByWorkspace[workspace.workspaceId] ?? []).find((session) => session.id === sessionId);
@@ -2199,6 +2548,70 @@
     });
   });
 
+  $effect(() => {
+    if (!desktopAppSurface || !desktopSnapshot || !window.magiDesktop) return;
+    void desktopPanelActivationEpoch;
+    const target = currentDesktopPanelTarget();
+    const targetKey = desktopPanelTargetKey(target);
+    const snapshot = desktopSnapshot;
+
+    // 新打开的右栏必须先完成 Renderer 的可见性事务，随后才物化浏览器。
+    // 不把 BrowserSurface 放到不可见右栏中，避免 Main 先挂载再撤下造成黑屏。
+    if (target.kind === 'browser' && !desktopRightPaneVisible) return;
+
+    const activationDecision = decideDesktopPanelActivation(
+      snapshot,
+      target,
+      desktopPanelActivationRequest !== null,
+    );
+    if (activationDecision === 'acknowledged') {
+      clearDesktopPanelActivationRetry();
+      if (target.kind) {
+        clearPendingDesktopPanelIntent(target.scopeKey, target.kind, target.tabId ?? '');
+      }
+      return;
+    }
+
+    if (activationDecision === 'wait_for_in_flight') {
+      // Main 侧操作严格串行。当前 Renderer 意图只保留在 rightPaneState，
+      // 在途请求结束后由 epoch 再读取最新目标，绝不并发覆盖。
+      return;
+    }
+
+    if (desktopPanelActivationRetryKey && desktopPanelActivationRetryKey !== targetKey) {
+      clearDesktopPanelActivationRetry();
+    }
+    if (desktopPanelActivationRetryTimer !== null) return;
+
+    const request: DesktopPanelActivationRequest = {
+      ...target,
+      key: targetKey,
+      requestId: ++desktopPanelActivationRequestId,
+    };
+    desktopPanelActivationRequest = request;
+    activateDesktopPanelTarget(request);
+  });
+
+  $effect(() => {
+    if (!desktopAppSurface || !desktopSnapshot || !workbenchElement) return;
+    // 这些依赖覆盖面板切换、右栏显隐、窗口尺寸和主进程确认的布局变化。
+    // 实际坐标统一延迟到当前 Svelte 提交完成后从 DOM 读取，避免在排版中间帧
+    // 把旧槽位提交给 Main。
+    void desktopSnapshot.layout.activePanelKind;
+    void desktopSnapshot.layout.activeTabId;
+    void desktopSnapshot.layout.rightPaneVisible;
+    void desktopSnapshot.layout.rightPaneMode;
+    void desktopSnapshot.layout.rightPaneWidth;
+    void desktopSnapshot.layout.rendererGeometry?.revision;
+    // 内容槽是 Surface 是否真正可见的确认状态。恢复时 activePanelKind/
+    // activeTabId 可能与上一份快照相同，只有 browserContentSlot 的变化能
+    // 触发再次读取并完成原生 View 的绑定。
+    void desktopSnapshot.layout.rendererGeometry?.browserContentSlot?.tabId;
+    void activeRightPaneState.activeTabId;
+    void activeRightPaneState.openTabs.length;
+    scheduleDesktopGeometryReport();
+  });
+
   onMount(() => {
     if (!desktopAppSurface) return;
     const desktop = window.magiDesktop;
@@ -2212,6 +2625,44 @@
       if (!disposed) console.error('[WebWorkbenchShell] 获取桌面窗口快照失败:', error);
     });
     const stopSnapshot = desktop.onSnapshot(applyDesktopSnapshot);
+    desktopGeometryMounted = true;
+    const geometryResizeObserver = new ResizeObserver(() => {
+      scheduleDesktopGeometryReport();
+    });
+    const geometryMutationObserver = new MutationObserver(() => {
+      // Svelte 可能先替换内容槽或锚点，再在同一轮提交中更新身份与显示状态。
+      // 先重新收集目标，确保新节点从这一帧开始就由 ResizeObserver 负责跟踪。
+      observeGeometryTargets();
+      scheduleDesktopGeometryReport();
+    });
+    const observeGeometryTargets = () => {
+      geometryResizeObserver.disconnect();
+      geometryMutationObserver.disconnect();
+      if (!workbenchElement) return;
+
+      // 原生 View 的坐标事实来源必须覆盖所有会参与右栏排版的 DOM 节点。
+      // 只观察父节点无法捕获槽位自身的尺寸变化（例如 class/style 切换），
+      // 只观察当前槽位也无法捕获 Tab 切换后新槽位的第一帧尺寸。
+      geometryResizeObserver.observe(workbenchElement);
+      const rightPaneElement = workbenchElement.querySelector('.desktop-right-pane-column');
+      if (rightPaneElement) {
+        geometryResizeObserver.observe(rightPaneElement);
+        const browserSlotElement = rightPaneElement.querySelector('.browser-surface-slot');
+        if (browserSlotElement) geometryResizeObserver.observe(browserSlotElement);
+      }
+
+      // 一个统一的根观察器覆盖右栏和浏览器槽位的结构、身份、
+      // 显示及层级变化。这里不使用 attributeFilter：CSS class、inline style、
+      // hidden、ARIA 和 data-* 都可能改变可见性或参与定位，过滤其中任何一种
+      // 都会重新引入“原生视图仍在旧坐标”的漏报路径。
+      geometryMutationObserver.observe(workbenchElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+      });
+    };
+    if (workbenchElement) observeGeometryTargets();
+    scheduleDesktopGeometryReport();
     // 这只是 App Renderer 的首次绘制/窗口显示握手，不携带任何右栏 Tab
     // 或面板意图；右栏状态仍由本地 rightPaneState 唯一管理。
     void desktop.readyRightPane().catch((error) => {
@@ -2219,7 +2670,11 @@
     });
     return () => {
       disposed = true;
+      desktopGeometryMounted = false;
       stopSnapshot();
+      geometryResizeObserver.disconnect();
+      geometryMutationObserver.disconnect();
+      desktopGeometryPending = null;
       if (desktopRightPaneResizeFrame !== null) {
         cancelAnimationFrame(desktopRightPaneResizeFrame);
         desktopRightPaneResizeFrame = null;
@@ -2361,6 +2816,7 @@
 </script>
 
 <div
+  bind:this={workbenchElement}
   class="web-workbench-shell"
   class:web-workbench-shell--sidebar-drawer={sidebarIsDrawer}
   class:web-workbench-shell--sidebar-open={sidebarIsDrawer && sidebarOpen}
@@ -2521,7 +2977,7 @@
                     class="workspace-new-session-btn"
                     title={i18n.t('web.newWorkspaceSessionTitle')}
                     aria-label={i18n.t('web.newWorkspaceSessionAria', { name: workspace.name })}
-                    disabled={workspaceActionPending || messagesState.sessionHydrating || Boolean(pendingNavigation)}
+                    disabled={workspaceActionPending || messagesState.sessionHydrating}
                     onclick={(event) => {
                       event.stopPropagation();
                       void openWorkspaceDraft(workspace);
@@ -2613,7 +3069,6 @@
                                 class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}
                                 class:pending={session.id === pendingSessionSwitchId && workspace.workspaceId === pendingSessionSwitchWorkspaceId}
                                 data-session-id={session.id}
-                                disabled={pendingNavigation !== null}
                                 title={session.name || i18n.t('header.unnamedSession')}
                                 onclick={() => switchSession(workspace, session.id)}
                               >
@@ -2725,7 +3180,7 @@
             data-tooltip={i18n.t('web.newPersonalSessionTitle')}
             title={i18n.t('web.newPersonalSessionTitle')}
             aria-label={i18n.t('web.newPersonalSessionTitle')}
-            disabled={workspaceActionPending || messagesState.sessionHydrating || Boolean(pendingNavigation)}
+            disabled={workspaceActionPending || messagesState.sessionHydrating}
             onclick={openPersonalDraft}
           >
             <Icon name="plus" size={13} />
@@ -2751,7 +3206,7 @@
                       {#if sessionRenameError}<span class="session-rename-error">{sessionRenameError}</span>{/if}
                     </div>
                   {:else}
-                    <button type="button" class="session-item" class:active={session.id === currentSessionId && !currentBootstrapWorkspaceId()} class:pending={session.id === pendingSessionSwitchId && pendingSessionSwitchWorkspaceId === null} data-session-id={session.id} disabled={pendingNavigation !== null} title={session.name || i18n.t('header.unnamedSession')} onclick={() => switchPersonalSession(session.id)}>
+                    <button type="button" class="session-item" class:active={session.id === currentSessionId && !currentBootstrapWorkspaceId()} class:pending={session.id === pendingSessionSwitchId && pendingSessionSwitchWorkspaceId === null} data-session-id={session.id} title={session.name || i18n.t('header.unnamedSession')} onclick={() => switchPersonalSession(session.id)}>
                       <span class="session-running-dot" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} aria-hidden="true"></span>
                       <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
                       <span class="session-meta"><span class="session-msg-count">{session.messageCount ?? 0}</span><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt)}</span></span>
@@ -2808,7 +3263,6 @@
         <RightPaneComponent
           workspaceRoot={selectedWorkspace?.rootPath || ''}
           overlay={previewIsOverlay}
-          desktopSnapshot={desktopSnapshot}
           htmlBrowserOpenRequest={htmlBrowserOpenRequest}
           onHtmlBrowserOpenHandled={(requestId) => {
             if (htmlBrowserOpenRequest?.requestId === requestId) {
@@ -2835,7 +3289,6 @@
             workspaceRoot={selectedWorkspace?.rootPath || ''}
             overlay={desktopRightPaneOverlay}
             desktopSurface={true}
-            desktopSnapshot={desktopSnapshot}
             htmlBrowserOpenRequest={htmlBrowserOpenRequest}
             onHtmlBrowserOpenHandled={(requestId) => {
               if (htmlBrowserOpenRequest?.requestId === requestId) {

@@ -8,7 +8,6 @@ import {
   getState,
   setIsProcessing,
   setCurrentSessionId,
-  adoptAcceptedSessionIdForLocalTurn,
   adoptCurrentSessionIdForLiveTurn,
   advanceWorkspaceSessionProjectionCursor,
   upsertAcceptedSessionDirectoryEntry,
@@ -59,7 +58,12 @@ import {
   handleRetryRuntimePayload,
 } from './message-utils';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
-import { failSessionNavigation, settleSessionNavigation } from '../shared/session-navigation.svelte';
+import {
+  failSessionNavigation,
+  matchesSessionNavigationTarget,
+  sessionNavigationState,
+  settleSessionNavigation,
+} from '../shared/session-navigation.svelte';
 import { selectComposerDraftWorkspace } from '../stores/composer-workspace.svelte';
 import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
 import {
@@ -112,7 +116,7 @@ type AcceptedSubmissionContext = {
   workspaceId: string;
   workspacePath: string;
   targetSessionId: string;
-  optimisticSessionId: string;
+  bindingGeneration: number;
   acceptedSessionId: string;
 };
 
@@ -124,10 +128,12 @@ function normalizeAcceptedSubmissionContext(value: unknown): AcceptedSubmissionC
   const requestId = typeof raw.requestId === 'string' ? raw.requestId.trim() : '';
   const scope = raw.scope === 'workspace' || raw.scope === 'personal' ? raw.scope : null;
   const targetSessionId = typeof raw.targetSessionId === 'string' ? raw.targetSessionId.trim() : '';
-  const optimisticSessionId = typeof raw.optimisticSessionId === 'string'
-    ? raw.optimisticSessionId.trim()
-    : '';
-  if (!requestId || !scope || !optimisticSessionId) {
+  const bindingGeneration = typeof raw.bindingGeneration === 'number'
+    && Number.isSafeInteger(raw.bindingGeneration)
+    && raw.bindingGeneration >= 0
+    ? raw.bindingGeneration
+    : null;
+  if (!requestId || !scope || bindingGeneration === null) {
     return null;
   }
   return {
@@ -136,7 +142,7 @@ function normalizeAcceptedSubmissionContext(value: unknown): AcceptedSubmissionC
     workspaceId: typeof raw.workspaceId === 'string' ? raw.workspaceId.trim() : '',
     workspacePath: typeof raw.workspacePath === 'string' ? raw.workspacePath.trim() : '',
     targetSessionId,
-    optimisticSessionId,
+    bindingGeneration,
     acceptedSessionId: typeof raw.acceptedSessionId === 'string'
       ? raw.acceptedSessionId.trim()
       : '',
@@ -181,8 +187,8 @@ function acceptedSubmissionMatchesCurrentBinding(
     return context.targetSessionId === sessionId && currentSessionId === sessionId;
   }
   return (
-    currentSessionId === context.optimisticSessionId
-    || (context.acceptedSessionId === sessionId && currentSessionId === sessionId)
+    context.acceptedSessionId === sessionId
+    && (!currentSessionId || currentSessionId === sessionId)
   );
 }
 
@@ -742,18 +748,7 @@ export function handleUnifiedData(standard: StandardMessage) {
         sessionId,
       );
       if (sessionId && (currentSessionId === sessionId || matchesPendingSubmission)) {
-        const adoptedOptimisticSession = Boolean(
-          matchesPendingSubmission
-          && submissionContext
-          && !submissionContext.targetSessionId
-          && adoptAcceptedSessionIdForLocalTurn(
-            submissionContext.optimisticSessionId,
-            sessionId,
-          ),
-        );
-        if (!adoptedOptimisticSession) {
-          adoptCurrentSessionIdForLiveTurn(sessionId);
-        }
+        adoptCurrentSessionIdForLiveTurn(sessionId);
       }
       const runtimeEpoch = typeof payload.runtimeEpoch === 'string' ? payload.runtimeEpoch.trim() : '';
       const eventStreamNextSequence = Number(payload.eventStreamNextSequence);
@@ -1201,6 +1196,7 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
     clearPendingRequest(binding.requestId);
     updateRequestBinding(binding.requestId, {
       ...(matchedAssistant ? { realMessageId: matchedAssistant.id } : {}),
+      turnSeq: matchedTurn.turnSeq,
       timeoutId: undefined,
     });
     if (binding.timeoutId) {
@@ -1265,9 +1261,11 @@ function clearStaleSettingsBootstrapSnapshot(): void {
   }
 }
 
-function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
+function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
-  const sessionScope = message.scope === 'workspace' ? 'workspace' : 'personal';
+  const sessionScope = message.scope === 'workspace'
+    ? 'workspace'
+    : message.scope === 'personal' ? 'personal' : null;
   const state = message.state as AppState | undefined;
   const workspaceRecord = (message as Record<string, unknown>).workspace;
   const workspace = workspaceRecord && typeof workspaceRecord === 'object'
@@ -1296,18 +1294,75 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     ? message.navigationOrchestratorSessionConfig as Record<string, unknown>
     : {};
 
+  const hasNavigationEnvelope = Boolean(navigationRequestId)
+    || message.navigationTarget !== undefined;
+  const failNavigation = (error: unknown): void => {
+    if (!navigationRequestId || !failSessionNavigation(navigationRequestId, error)) {
+      return;
+    }
+    const detail = error instanceof Error && error.message.trim()
+      ? error.message.trim()
+      : i18n.t('web.workbenchActionFailed', {
+        action: i18n.t('bridge.action.switchSession'),
+      });
+    showFeedback('error', detail, {
+      source: 'session-management',
+      presentation: 'toast',
+    });
+  };
+
+  if (!sessionScope) {
+    const error = new Error('会话 bootstrap 缺少有效的 scope');
+    if (navigationRequestId) {
+      failNavigation(error);
+      return;
+    }
+    throw error;
+  }
+
+  // 只有带当前 requestId 的 bootstrap 才能提交导航。迟到响应、缺少导航
+  // 元数据的后台快照都不得改写正在进行的导航事务。
+  if (hasNavigationEnvelope) {
+    if (!navigationRequestId || !navigationTarget) {
+      failNavigation(new Error('会话 bootstrap 缺少有效的导航 requestId/target'));
+      return;
+    }
+    if (sessionNavigationState.pending?.requestId !== navigationRequestId) {
+      return;
+    }
+    const targetMatches = matchesSessionNavigationTarget(navigationRequestId, {
+      kind: navigationTarget,
+      scope: sessionScope,
+      workspaceId,
+      workspacePath,
+      sessionId,
+    });
+    if (targetMatches !== true) {
+      failNavigation(new Error('会话 bootstrap 与导航请求目标不一致'));
+      return;
+    }
+  } else if (sessionNavigationState.pending) {
+    return;
+  }
+
   const settleCommittedNavigation = (): boolean => {
     if (!navigationRequestId || !navigationTarget) return false;
     return settleSessionNavigation(navigationRequestId, {
       kind: navigationTarget,
       scope: sessionScope,
       workspaceId,
+      workspacePath,
       sessionId,
     });
   };
 
-  if (!state) {
-    return;
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    const error = new Error('会话 bootstrap 缺少有效的 state');
+    if (navigationRequestId) {
+      failNavigation(error);
+      return;
+    }
+    throw error;
   }
   if (!sessionId) {
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
@@ -1521,6 +1576,29 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   });
   settleCommittedNavigation();
+}
+
+function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
+  const navigationRequestId = typeof message.navigationRequestId === 'string'
+    ? message.navigationRequestId.trim()
+    : '';
+  try {
+    applySessionBootstrapLoaded(message);
+  } catch (error) {
+    if (navigationRequestId && failSessionNavigation(navigationRequestId, error)) {
+      const detail = error instanceof Error && error.message.trim()
+        ? error.message.trim()
+        : i18n.t('web.workbenchActionFailed', {
+          action: i18n.t('bridge.action.switchSession'),
+        });
+      showFeedback('error', detail, {
+        source: 'session-management',
+        presentation: 'toast',
+      });
+      return;
+    }
+    throw error;
+  }
 }
 
 function handleNotificationsLoaded(message: ClientBridgeMessage) {

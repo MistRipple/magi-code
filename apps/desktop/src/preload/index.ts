@@ -93,7 +93,7 @@ contextBridge.exposeInMainWorld("magiDesktop", {
   focusApp: () => ipcRenderer.invoke("magi-desktop:focus-app"),
   readyRightPane: () => ipcRenderer.invoke("magi-desktop:right-pane-ready"),
   openOverlay: (state: unknown) => ipcRenderer.invoke("magi-desktop:open-overlay", state),
-  closeOverlay: () => ipcRenderer.invoke("magi-desktop:close-overlay"),
+  closeOverlay: (request: unknown) => ipcRenderer.invoke("magi-desktop:close-overlay", request),
   setBlockingOverlay: (request: unknown) => ipcRenderer.invoke("magi-desktop:set-blocking-overlay", request),
   readyOverlay: () => ipcRenderer.invoke("magi-desktop:overlay-ready"),
   submitOverlayAction: (action: unknown) => ipcRenderer.invoke("magi-desktop:overlay-action", action),
@@ -120,7 +120,7 @@ contextBridge.exposeInMainWorld("magiDesktop", {
   onBrowserEvent: (listener: (event: unknown) => void) => subscribe(BROWSER_EVENT, listener),
   onBrowserComponent: (listener: (snapshot: unknown) => void) => subscribe(BROWSER_COMPONENT_EVENT, listener),
   onOverlayState: (listener: (state: unknown) => void) => subscribe(OVERLAY_STATE_EVENT, listener),
-  onOverlayClosed: (listener: () => void) => subscribe(OVERLAY_CLOSED_EVENT, listener),
+  onOverlayClosed: (listener: (event: unknown) => void) => subscribe(OVERLAY_CLOSED_EVENT, listener),
   onOverlayAction: (listener: (action: unknown) => void) => subscribe(OVERLAY_ACTION_EVENT, listener),
   onUpdate: (listener: (snapshot: unknown) => void) => subscribe(UPDATE_EVENT, listener),
   onFileDrop: (listener: (event: DesktopFileDropEvent) => void) => {

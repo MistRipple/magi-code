@@ -1,6 +1,6 @@
 use magi_core::{
-    EventId, SessionId, TaskCompletionContract, TaskRecoveryCheckpoint, TaskStatus, TaskTier,
-    UtcMillis, WorkspaceId, public_runtime_excerpt,
+    BrowserSessionId, BrowserTabId, EventId, SessionId, TaskCompletionContract,
+    TaskRecoveryCheckpoint, TaskStatus, TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope};
 use serde_json::json;
@@ -20,6 +20,7 @@ use crate::{
         drive_dispatch_submission, submit_dispatch_submission,
     },
 };
+use magi_browser_authority::ValidateBrowserNodeSelection;
 use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_conversation_runtime::session_writeback::{
     SessionTurnErrorInput, append_session_turn_error_item, publish_current_session_turn_item_event,
@@ -329,9 +330,27 @@ async fn execute_dispatch_submission(
         });
     let browser_annotation_refs =
         resolve_browser_annotation_context(state, &session_id, &request.browser_annotation_refs())?;
+    let browser_authority = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned");
     let browser_node_selections = request
-        .validate_browser_node_selections()
+        .validate_browser_node_selections_with(|index, selection| {
+            let browser_session_id = BrowserSessionId::new(selection.browser_session_id.clone());
+            let tab_id = BrowserTabId::new(selection.tab_id.clone());
+            browser_authority
+                .validate_browser_node_selection(ValidateBrowserNodeSelection {
+                    session_id: &session_id,
+                    browser_session_id: &browser_session_id,
+                    tab_id: &tab_id,
+                    surface_id: selection.surface_id.trim(),
+                    navigation_revision: selection.navigation_revision,
+                    page_url: selection.url.trim(),
+                })
+                .map_err(|error| format!("浏览器节点选择[{index}] 无效: {error}"))
+        })
         .map_err(ApiError::InvalidInput)?;
+    drop(browser_authority);
     if request.goal_mode {
         state
             .session_store

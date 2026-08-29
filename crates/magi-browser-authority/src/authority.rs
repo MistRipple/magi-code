@@ -59,6 +59,21 @@ pub struct ValidateBrowserWrite<'a> {
     pub now: UtcMillis,
 }
 
+/// 需要由 BrowserAuthority 校验的节点选择身份。
+///
+/// 节点观察结果来自 Chromium 的异步事件，不能仅凭 DTO 的字段格式进入
+/// canonical turn。这里集中校验 Magi session、Browser session、Tab、Primary
+/// Surface、导航代次和页面地址，保证节点上下文只能来自当前真实页面。
+#[derive(Clone, Copy, Debug)]
+pub struct ValidateBrowserNodeSelection<'a> {
+    pub session_id: &'a SessionId,
+    pub browser_session_id: &'a BrowserSessionId,
+    pub tab_id: &'a BrowserTabId,
+    pub surface_id: &'a str,
+    pub navigation_revision: u64,
+    pub page_url: &'a str,
+}
+
 #[derive(Clone, Debug)]
 pub struct ValidatedBrowserWrite {
     pub owner: ExecutionOwnership,
@@ -1022,6 +1037,59 @@ impl BrowserAuthority {
             return Err(BrowserAuthorityError::NavigationRevisionMismatch {
                 expected: tab.navigation_revision,
                 provided: navigation_revision,
+            });
+        }
+        Ok(())
+    }
+
+    /// 校验一次节点选择是否仍然属于当前 Magi 会话的真实 Primary Surface。
+    ///
+    /// 该校验必须发生在 dispatch 接受前，而不是只在 Renderer 侧完成。导航、
+    /// Surface 重建和跨会话提交都通过同一入口拒绝，避免旧 DOM 观察结果进入模型。
+    pub fn validate_browser_node_selection(
+        &self,
+        input: ValidateBrowserNodeSelection<'_>,
+    ) -> Result<(), BrowserAuthorityError> {
+        let browser_session = self.require_ready_session(input.browser_session_id)?;
+        if &browser_session.session_id != input.session_id {
+            return Err(BrowserAuthorityError::SessionMagiSessionMismatch {
+                browser_session_id: input.browser_session_id.clone(),
+                session_id: input.session_id.clone(),
+            });
+        }
+        let tab = self.require_ready_tab(input.tab_id)?;
+        if &tab.browser_session_id != input.browser_session_id {
+            return Err(BrowserAuthorityError::TabSessionMismatch {
+                tab_id: input.tab_id.clone(),
+                browser_session_id: input.browser_session_id.clone(),
+            });
+        }
+        if tab.navigation_revision != input.navigation_revision {
+            return Err(BrowserAuthorityError::NavigationRevisionMismatch {
+                expected: tab.navigation_revision,
+                provided: input.navigation_revision,
+            });
+        }
+        let surface = self.primary_surfaces.get(input.tab_id).ok_or_else(|| {
+            BrowserAuthorityError::PrimarySurfaceUnavailable(input.tab_id.clone())
+        })?;
+        if surface.surface_id != input.surface_id {
+            return Err(BrowserAuthorityError::SurfaceNotPrimary {
+                tab_id: input.tab_id.clone(),
+                surface_id: input.surface_id.to_string(),
+            });
+        }
+        if surface.navigation_revision != input.navigation_revision {
+            return Err(BrowserAuthorityError::NavigationRevisionMismatch {
+                expected: surface.navigation_revision,
+                provided: input.navigation_revision,
+            });
+        }
+        let page_url = input.page_url.trim();
+        if page_url != tab.url {
+            return Err(BrowserAuthorityError::NodeSelectionPageMismatch {
+                expected: tab.url.clone(),
+                provided: page_url.to_string(),
             });
         }
         Ok(())

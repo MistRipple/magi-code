@@ -4,23 +4,26 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import {
   BaseWindow,
   WebContentsView,
-  webContents,
   session,
   type HandlerDetails,
   type Rectangle,
   type View,
   type WebContents,
 } from "electron";
-import type {
-  BrowserControlUpdate,
-  BrowserLogicalViewport,
-  BrowserPageState,
-  BrowserNavigation,
-  BrowserSurfaceBinding,
+import { browserDownloadRoot, clearBrowserDownloads } from "./browser-download-storage.js";
+import { mapBrowserCaptureClipToNativeRect } from "./browser-capture-geometry.js";
+import {
+  normalizeOptionalDomNodeId,
+  type BrowserControlUpdate,
+  type BrowserLogicalViewport,
+  type BrowserPageState,
+  type BrowserNavigation,
+  type BrowserSurfaceBinding,
 } from "@magi/desktop-browser-contracts";
 import { BrowserSurfaceRegistry } from "./browser-surface-registry.js";
 
 export interface BrowserInspectedNodeContext {
+  browser_session_id: string;
   backend_node_id: number;
   node_id: number | null;
   frame_id: string | null;
@@ -100,7 +103,6 @@ interface BrowserSurfaceRecord {
   partitionId: string;
   view: WebContentsView;
   contents: WebContents;
-  host: View;
   /**
    * 每个 Browser Tab 保留独立 WebContents；非当前 Surface 从窗口内容视图
    * 解绑但不销毁 WebContents，重新激活时再挂回，不丢失页面状态。
@@ -113,8 +115,10 @@ interface BrowserSurfaceRecord {
   targetId: string;
   navigationRevision: number;
   navigationOperationId: number;
-  navigationFailureReportedRevision: number | null;
-  navigationTargetUrl: string | null;
+  navigationGeneration: number;
+  navigationEventSequence: number;
+  navigationOperation: NavigationOperation | null;
+  navigationFailureReportedGeneration: number | null;
   viewport: BrowserLogicalViewport;
   primary: boolean;
   closed: boolean;
@@ -124,22 +128,108 @@ interface BrowserSurfaceRecord {
   cursorExecutionContextId: number | null;
   cdpLane: Promise<void>;
   viewportApplied: boolean;
+  viewportAppliedScale: number | null;
   viewportApplyPromise: Promise<void> | null;
   viewportApplyDirty: boolean;
   debuggerListenersInstalled: boolean;
+  debuggerMessageListener: DebuggerMessageListener | null;
+  debuggerDetachListener: DebuggerDetachListener | null;
+  debuggerSessionGeneration: number;
+  debuggerSessionInitialized: boolean;
   dialogBridgeInstalled: boolean;
   cdpSessionIds: Set<string>;
   debuggerReadyPromise: Promise<void> | null;
+  debuggerReconnectTimer: NodeJS.Timeout | null;
+  debuggerReconnectAttempt: number;
   recoveryPromise: Promise<void> | null;
   loadPromise: Promise<void> | null;
   inspectGeneration: number;
   inspectActive: boolean;
+  /**
+   * Inspect Mode 关闭后，Chromium 仍可能为同一次真实点击发送 mouseUp。
+   * 这个状态只覆盖当前完整手势，不会把后续普通鼠标输入误认为 Inspect。
+   */
+  inspectGestureActive: boolean;
   inspectStartPromise: Promise<void> | null;
   inspectResourcesEnabled: boolean;
+  lifecycleEpoch: number;
+  lifecycleAbort: AbortController;
 }
+
+interface NavigationFrameIdentity {
+  processId: number;
+  routingId: number;
+}
+
+type NavigationKind = "document" | "history" | "reload" | "in-page";
+
+interface NavigationWaiter {
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+interface NavigationOperation {
+  id: number;
+  generation: number;
+  kind: NavigationKind;
+  targetUrl: string | null;
+  frame: NavigationFrameIdentity | null;
+  createdEventSequence: number;
+  startEventSequence: number | null;
+  commitEventSequence: number | null;
+  frameFinishEventSequence: number | null;
+  finishEventSequence: number | null;
+  stopEventSequence: number | null;
+  committedUrl: string | null;
+  awaitingStart: boolean;
+  started: boolean;
+  loadingStarted: boolean;
+  frameNavigated: boolean;
+  committed: boolean;
+  frameFinished: boolean;
+  documentFinished: boolean;
+  completed: boolean;
+  failed: boolean;
+  settled: boolean;
+  loadingEmitted: boolean;
+  pagePublished: boolean;
+  waiters: Set<NavigationWaiter>;
+}
+
+type NavigationEventPhase =
+  | "start-loading"
+  | "commit"
+  | "frame-finish"
+  | "finish"
+  | "stop"
+  | "fail"
+  | "title";
+
+interface NavigationEventExpectation {
+  generation: number;
+  phase: NavigationEventPhase;
+  url?: string;
+  frame?: NavigationFrameIdentity;
+  allowSettled?: boolean;
+}
+
+interface NavigationEventClaim {
+  operation: NavigationOperation;
+  sequence: number;
+}
+
+type DebuggerMessageListener = (
+  event: Electron.Event,
+  method: string,
+  params: unknown,
+  sessionId?: string,
+) => void;
+
+type DebuggerDetachListener = (event: Electron.Event, reason: string) => void;
 
 interface SurfaceLaneContext {
   track(promise: Promise<unknown>): void;
+  assertCurrent(): void;
 }
 
 const ALLOWED_NAVIGATION_PROTOCOLS = new Set(["http:", "https:", "about:"]);
@@ -283,8 +373,12 @@ const SCREENSHOT_CDP_COMMAND_TIMEOUT_MS = 10_000;
 const SCREENSHOT_READINESS_TIMEOUT_MS = 5_000;
 const CURSOR_CDP_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 120_000;
+const MIN_NATIVE_VIEWPORT_SCALE = 0.05;
+const VIEWPORT_SCALE_EPSILON = 0.001;
+const DEBUGGER_RECONNECT_INITIAL_DELAY_MS = 100;
+const DEBUGGER_RECONNECT_MAX_DELAY_MS = 2_000;
+const MAX_INSPECTED_TEXT_LENGTH = 4 * 1024;
 const MAX_INSPECTED_OUTER_HTML_LENGTH = 64 * 1024;
-const HIDDEN_AUTO_VIEWPORT = { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false } as const;
 const INSPECT_HIGHLIGHT_CONFIG = {
   showInfo: false,
   contentColor: { r: 66, g: 133, b: 244, a: 0.18 },
@@ -341,11 +435,18 @@ export class BrowserSurfaceManager {
   readonly #configuredPartitions = new Set<string>();
   readonly #knownPartitions = new Set<string>();
   readonly #partitionRegistryPath: string | null;
+  readonly #downloadUserDataPath: string | null;
   readonly #downloadRoot: string | null;
+  readonly #activeDownloads = new Set<Electron.DownloadItem>();
   readonly #windows = new Map<string, BaseWindow>();
-  readonly #browserHosts = new Map<string, View>();
+  // Browser Surface 直接挂在 BaseWindow.contentView。这里保存的是窗口的
+  // 原生根节点，不是额外的 BrowserHost 容器；否则子 WebContentsView 的
+  // CSS viewport 会继承中间容器的默认尺寸而非右栏真实内容槽。
+  readonly #contentRoots = new Map<string, View>();
   readonly #activationGenerations = new Map<string, number>();
   readonly #onEvent: (event: BrowserSurfaceEvent) => void;
+  #downloadCleanupPromise: Promise<void> | null = null;
+  #downloadCleanupInProgress = false;
 
   constructor(input: {
     desktopEpoch: string;
@@ -355,17 +456,20 @@ export class BrowserSurfaceManager {
     this.#desktopEpoch = input.desktopEpoch;
     this.#onEvent = input.onEvent;
     this.#partitionRegistryPath = input.partitionRegistryPath?.trim() || null;
-    this.#downloadRoot = this.#partitionRegistryPath
-      ? join(dirname(this.#partitionRegistryPath), "browser-downloads")
+    this.#downloadUserDataPath = this.#partitionRegistryPath
+      ? dirname(this.#partitionRegistryPath)
+      : null;
+    this.#downloadRoot = this.#downloadUserDataPath
+      ? browserDownloadRoot(this.#downloadUserDataPath)
       : null;
     for (const partitionId of readPartitionRegistry(this.#partitionRegistryPath)) {
       this.#knownPartitions.add(partitionId);
     }
   }
 
-  attachWindow(windowId: string, window: BaseWindow, browserHost: View): void {
+  attachWindow(windowId: string, window: BaseWindow, contentRoot: View): void {
     this.#windows.set(windowId, window);
-    this.#browserHosts.set(windowId, browserHost);
+    this.#contentRoots.set(windowId, contentRoot);
     this.#activationGenerations.set(windowId, 0);
   }
 
@@ -381,6 +485,13 @@ export class BrowserSurfaceManager {
   async materialize(input: MaterializeSurfaceInput): Promise<BrowserSurfaceBinding> {
     this.assertActivationCurrent(input.windowId, input.activationGeneration);
     let record = this.surfaceForTab(input.tabId, input.windowId);
+    if (record && record.browserSessionId !== input.browserSessionId) {
+      // tab_id 在一个浏览器会话内稳定，但不能把另一个会话的 WebContents
+      // 或 partition 复用给它。旧 Surface 仍可能有迟到的导航/debugger
+      // 事件，先按完整生命周期关闭，再创建新的物理 Surface。
+      this.closeRecord(record, false);
+      record = null;
+    }
     const created = !record;
     if (!record) record = this.createSurface(input);
     if (input.activationGeneration !== undefined) {
@@ -404,12 +515,9 @@ export class BrowserSurfaceManager {
     if (!this.#surfaces.primaryForTab(record.tabId)) this.promote(record.surfaceId);
     const initialUrl = normalizeNavigableUrl(input.initialUrl);
     this.assertActivationCurrent(input.windowId, input.activationGeneration);
-    // 首次文档导航前先完成调试器对话框桥接。原生 JavaScript 对话框会
-    // 阻塞 Electron Main 的事件循环，导致 Host 心跳和后续 accept/dismiss
-    // 请求一起失效；桥接必须早于 loadURL 注入才能覆盖页面首个脚本。
-    if (created && record.debuggerReadyPromise) await record.debuggerReadyPromise;
     if (
-      (record.contents.getURL() || "") === ""
+      created
+      || (record.contents.getURL() || "") === ""
       || (
         initialUrl !== "about:blank"
         && (record.contents.getURL() || "about:blank") === "about:blank"
@@ -421,13 +529,17 @@ export class BrowserSurfaceManager {
     } else if (!record.contents.isLoadingMainFrame()) {
       this.scheduleViewportApply(record);
     }
+    // 真实导航和调试器初始化是两个独立生命周期。页面必须先由
+    // WebContents 自己开始加载；CDP 只在工具调用时等待，不能成为首帧
+    // 或导航的前置条件。
+    this.startDebuggerInitialization(record);
     return this.binding(record);
   }
   private createSurface(input: MaterializeSurfaceInput): BrowserSurfaceRecord {
     const window = this.#windows.get(input.windowId);
     if (!window || window.isDestroyed()) throw new Error("desktop_window_not_found");
-    const host = this.#browserHosts.get(input.windowId);
-    if (!host) throw new Error("browser_surface_host_not_found");
+    const contentRoot = this.#contentRoots.get(input.windowId);
+    if (!contentRoot) throw new Error("browser_surface_root_not_found");
     const partitionId = browserPartitionId(input.browserSessionId);
     this.configurePartition(partitionId);
     const view = new WebContentsView({
@@ -454,7 +566,6 @@ export class BrowserSurfaceManager {
       partitionId,
       view,
       contents,
-      host,
       mounted: false,
       slotVisible: false,
       slotBounds: null,
@@ -465,8 +576,10 @@ export class BrowserSurfaceManager {
       targetId: `webcontents-${contents.id}`,
       navigationRevision: input.navigationRevision,
       navigationOperationId: 0,
-      navigationFailureReportedRevision: null,
-      navigationTargetUrl: null,
+      navigationGeneration: 0,
+      navigationEventSequence: 0,
+      navigationOperation: null,
+      navigationFailureReportedGeneration: null,
       viewport: input.viewport,
       primary: false,
       closed: false,
@@ -476,18 +589,28 @@ export class BrowserSurfaceManager {
       cursorExecutionContextId: null,
       cdpLane: Promise.resolve(),
       viewportApplied: false,
+      viewportAppliedScale: null,
       viewportApplyPromise: null,
       viewportApplyDirty: false,
       debuggerListenersInstalled: false,
+      debuggerMessageListener: null,
+      debuggerDetachListener: null,
+      debuggerSessionGeneration: 0,
+      debuggerSessionInitialized: false,
       dialogBridgeInstalled: false,
       cdpSessionIds: new Set(),
       debuggerReadyPromise: null,
+      debuggerReconnectTimer: null,
+      debuggerReconnectAttempt: 0,
       recoveryPromise: null,
       loadPromise: null,
       inspectGeneration: 0,
       inspectActive: false,
+      inspectGestureActive: false,
       inspectStartPromise: null,
       inspectResourcesEnabled: false,
+      lifecycleEpoch: 0,
+      lifecycleAbort: new AbortController(),
     };
     this.#surfaces.add(record);
     // WebContents 的生命周期独立于原生 View 的挂载生命周期。没有当前
@@ -499,52 +622,53 @@ export class BrowserSurfaceManager {
       this.closeRecord(record);
     });
     this.installSurfacePolicy(record);
-    const debuggerReady = this.enqueueCdp(record, async () => {
-      // 新建 WebContents 在第一次 loadURL 前还没有 renderer document。
-      // Chromium/Electron 在这个阶段允许 attach debugger，但 Runtime domain
-      // 可能一直不响应；先完成一次受控的 about:blank 初始文档，再安装
-      // Runtime binding 与 new-document 脚本，随后 materialize 才会导航到
-      // 用户请求的 URL。这样既保留首个业务文档的桥接时机，也避免把
-      // 首次 Runtime.enable 超时误报成浏览器不可用。
-      await primeInitialDocument(record.contents);
-      await this.attachDebugger(record);
-    });
-    record.debuggerReadyPromise = debuggerReady;
-    void debuggerReady.then(
-      () => {
-        if (record.debuggerReadyPromise === debuggerReady) record.debuggerReadyPromise = null;
-      },
-      (error) => {
-        if (record.debuggerReadyPromise === debuggerReady) record.debuggerReadyPromise = null;
-        if (!record.closed) {
-          console.error("[BrowserSurfaceManager] Browser Surface 调试器初始化失败", {
-            surfaceId: record.surfaceId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      },
-    );
     return record;
   }
 
-  bindContentSurface(windowId: string, tabId: string, bounds: Rectangle | null): void {
+  bindContentSurface(
+    windowId: string,
+    tabId: string,
+    bounds: Rectangle | null,
+    parentBounds: Rectangle | null = null,
+  ): void {
     const window = this.#windows.get(windowId);
-    for (const record of this.#surfaces.values()) {
-      if (record.windowId !== windowId || record.closed) continue;
-      if (!tabId) {
-        this.applySlot(record, null, window);
-        continue;
-      }
-      if (record.tabId === tabId) {
-        this.applySlot(record, bounds, window);
-      } else if (bounds) {
-        // 一个窗口只能有一个当前 Browser Surface；切换到新的内容槽时，
-        // 其他 WebContents 保留状态，但从窗口内容视图解绑以彻底退出
-        // 原生命中树。
-        record.slotBounds = null;
-        record.slotVisible = false;
-        this.unmountSurface(record, window);
-      }
+    const records = [...this.#surfaces.values()].filter((record) => (
+      record.windowId === windowId && !record.closed
+    ));
+    if (!tabId) {
+      for (const record of records) this.unmountSurface(record, window);
+      return;
+    }
+
+    const target = records.find((record) => record.tabId === tabId) ?? null;
+    if (!target) {
+      for (const record of records) this.unmountSurface(record, window);
+      return;
+    }
+
+    if (!bounds) {
+      // 没有 Renderer 已确认的内容槽时，原生 View 必须退出命中树。
+      // WebContents 保留在 Surface 记录中，下一份有效几何到达时复用同一
+      // 页面；绝不能把旧 bounds 当作当前右栏位置，否则拖动或重排期间会
+      // 覆盖工具栏、其他面板或中栏。
+      for (const record of records) this.unmountSurface(record, window);
+      return;
+    }
+
+    // ParentBounds 是 Renderer 已确认的右栏安全边界。即使上游误把一份
+    // 过期或跨坐标系的内容槽传进来，也不能让 WebContentsView 越出右栏，
+    // 否则它会覆盖右栏工具栏、其他面板甚至中栏内容。
+    if (!parentBounds || !containsBounds(parentBounds, bounds)) {
+      for (const record of records) this.unmountSurface(record, window);
+      return;
+    }
+
+    // 先将新的 WebContentsView 挂入已经租约化的物理内容槽，再撤掉旧页面。
+    // 不能按 Surface 创建顺序先卸载旧 View，否则 Browser Tab 切换会产生
+    // 一帧空槽，用户会看到黑屏或闪断。
+    this.applySlot(target, bounds, window);
+    for (const record of records) {
+      if (record !== target) this.unmountSurface(record, window);
     }
   }
 
@@ -565,37 +689,6 @@ export class BrowserSurfaceManager {
     this.promote(record.surfaceId);
     record.contents.focus();
     return true;
-  }
-
-  /**
-   * 在 App Renderer 接管焦点前，将当前获得焦点的浏览器 Surface 从原生
-   * 命中树移除。BaseWindow 没有提供子 WebContents 的统一失焦接口，卸载
-   * 当前 WebContentsView 是 macOS 真正释放网页键盘焦点的原生操作。
-   */
-  blurWindow(windowId: string): boolean {
-    const window = this.#windows.get(windowId);
-    const focused = webContents.getFocusedWebContents();
-    let changed = false;
-    for (const record of this.#surfaces.values()) {
-      if (
-        record.windowId !== windowId
-        || record.closed
-        || !record.mounted
-        || record.contents !== focused
-      ) continue;
-      this.unmountSurface(record, window);
-      changed = true;
-    }
-    return changed;
-  }
-
-  /** 在不重建 WebContents 的前提下恢复 blurWindow 临时卸载的 Surface。 */
-  restoreWindow(windowId: string): void {
-    const window = this.#windows.get(windowId);
-    for (const record of this.#surfaces.values()) {
-      if (record.windowId !== windowId || record.closed || !record.slotVisible) continue;
-      this.applySlot(record, record.slotBounds, window);
-    }
   }
 
   primaryBindingForTab(tabId: string): BrowserSurfaceBinding | null {
@@ -704,13 +797,18 @@ export class BrowserSurfaceManager {
       throw staleSurfaceError("browser_debugger_detached");
     }
     if (isDialogCommand) {
-      return sendCdpCommandWithTimeout(
-        contents,
-        method,
-        params,
-        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        sessionId,
-      );
+      try {
+        return await sendCdpCommandWithTimeout(
+          contents,
+          method,
+          params,
+          DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+          sessionId,
+        );
+      } catch (error) {
+        if (isCdpTimeoutError(error)) this.invalidateDebuggerSession(record, "cdp-timeout");
+        throw error;
+      }
     }
     if (method === "Page.captureScreenshot") {
       // 激活 Browser Tab 的导航是非阻塞的，截图可能紧跟在 Surface
@@ -718,29 +816,40 @@ export class BrowserSurfaceManager {
       // 在首帧/导航切换阶段直接让 Page.captureScreenshot 卡满超时；
       // 超时后仍继续截图，不能把慢站点变成永远不可操作。
       await this.waitForScreenshotReadiness(record);
+      await this.waitForViewportApply(record);
       // Electron 原生捕获覆盖普通视口、元素范围和全页范围，避免
       // Page.captureScreenshot 在 WebContentsView 尚未取得 compositor
       // frame（尤其是后台 Surface）时阻塞 CDP lane。WebP 仍保留
       // Chromium CDP 的原生编码语义。
       if (params.format === "webp") {
         return this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
-          contents,
+          this.recordForBinding(binding, {
+            allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
+          }),
           method,
-          // WebP 需要 Chromium compositor 的编码路径；Electron 的
-          // nativeImage 没有 WebP 编码接口，因此明确使用 surface 捕获。
+      // WebP 需要 Chromium compositor 的编码路径；Electron 的
+      // nativeImage 没有 WebP 编码接口，因此明确使用 surface 捕获。
           { ...params, fromSurface: true },
           SCREENSHOT_CDP_COMMAND_TIMEOUT_MS,
           sessionId,
           track,
         ));
       }
+      // readiness 等待期间可能已经完成了另一轮导航。截图必须对应调用
+      // 方提供的原始文档，否则会把新页面误当成旧快照返回给 LLM。
+      this.recordForBinding(binding);
       return this.capturePageScreenshot(record, params);
     }
     const injectsInput = method.startsWith("Input.");
     if (injectsInput) record.automationInputDepth += 1;
     try {
       const result = await this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
-        contents,
+        // CDP 请求在 lane 中等待期间页面可能已发生导航。重新校验把
+        // 普通 DOM/调试命令限制在原文档；只有输入事件允许完成同一动作的
+        // keyUp/mouseUp 收尾，避免旧命令迟到后作用于新页面。
+        this.recordForBinding(binding, {
+          allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
+        }),
         method,
         params,
         method === "Page.captureScreenshot" ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
@@ -783,9 +892,8 @@ export class BrowserSurfaceManager {
     const format = params.format === "jpeg" ? "jpeg" : "png";
     const rect = capturePageRect(record, params);
     // WebContentsView 在右栏切换/恢复的瞬间，view.getBounds() 可能暂时是
-    // 0×0。capturePage 仍必须使用页面的逻辑视口尺寸，否则 Electron 会
-    // 返回 1×1 空白图片；capturePageRect 会在物理尺寸不可用时使用固定
-    // viewport 或隐藏 Surface 的标准视口作为确定性边界。
+    // 0×0。capturePage 仍必须使用当前原生 View 或最近一次内容槽的尺寸，
+    // 不能使用与真实视图无关的固定 viewport。
     const image = await record.contents.capturePage(rect, { stayHidden: true });
     const bytes = format === "jpeg"
       ? image.toJPEG(normalizeJpegQuality(params.quality))
@@ -794,15 +902,38 @@ export class BrowserSurfaceManager {
     return { data: bytes.toString("base64") };
   }
 
+  private async waitForViewportApply(record: BrowserSurfaceRecord): Promise<void> {
+    // 截图的 CSS clip 来自 Worker。fixed 视口通过 Chromium compositor
+    // scale 呈现到原生内容槽，所以必须等同一轮应用完成后再换算坐标。
+    const pending = record.viewportApplyPromise;
+    if (!pending) return;
+    await pending;
+  }
+
   private enqueueCdp<T>(
     record: BrowserSurfaceRecord,
     operation: (context: SurfaceLaneContext) => Promise<T>,
   ): Promise<T> {
     const previous = record.cdpLane;
+    const lifecycleEpoch = record.lifecycleEpoch;
     const tracked: Promise<unknown>[] = [];
-    const run = previous.catch(() => undefined).then(() => operation({
-      track: (promise) => tracked.push(promise),
-    }));
+    const run = previous.catch(() => undefined).then(async () => {
+      this.assertSurfaceLifecycleCurrent(record, lifecycleEpoch);
+      try {
+        return await operation({
+          track: (promise) => tracked.push(promise),
+          assertCurrent: () => this.assertSurfaceLifecycleCurrent(record, lifecycleEpoch),
+        });
+      } catch (error) {
+        if (isCdpTimeoutError(error)) {
+          // Electron 的 debugger.sendCommand 没有可取消句柄。超时后必须
+          // 废弃整个 debugger session 并让 Chromium 结束旧请求，否则迟到
+          // 的响应会继续污染同一 Surface 的后续命令队列。
+          this.invalidateDebuggerSession(record, "cdp-timeout");
+        }
+        throw error;
+      }
+    });
     const settled = run.then(
       async () => { await Promise.allSettled(tracked); },
       async () => { await Promise.allSettled(tracked); },
@@ -827,13 +958,22 @@ export class BrowserSurfaceManager {
       record.contents.once("did-stop-loading", finish);
       record.contents.once("did-fail-load", finish);
     });
-    await Promise.race([
+    await this.withSurfaceLifecycle(record, Promise.race([
       loading.then(() => undefined, () => undefined),
       new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, SCREENSHOT_READINESS_TIMEOUT_MS);
         timer.unref();
       }),
-    ]);
+    ]));
+  }
+
+  private withSurfaceLifecycle<T>(record: BrowserSurfaceRecord, promise: Promise<T>): Promise<T> {
+    this.assertSurfaceLifecycleCurrent(record, record.lifecycleEpoch);
+    return withAbortSignal(
+      promise,
+      record.lifecycleAbort.signal,
+      staleSurfaceError("browser_surface_lifecycle_stale"),
+    );
   }
 
   async navigate(
@@ -876,8 +1016,12 @@ export class BrowserSurfaceManager {
       }
       case "back":
         if (contents.navigationHistory.canGoBack()) {
-          await this.waitForNavigation(
-            contents,
+          const index = contents.navigationHistory.getActiveIndex();
+          const entry = contents.navigationHistory.getEntryAtIndex(index - 1);
+          await this.runNavigationAction(
+            record,
+            "history",
+            entry?.url ?? null,
             () => contents.navigationHistory.goBack(),
             navigation.timeout_ms,
           );
@@ -885,17 +1029,26 @@ export class BrowserSurfaceManager {
         break;
       case "forward":
         if (contents.navigationHistory.canGoForward()) {
-          await this.waitForNavigation(
-            contents,
+          const index = contents.navigationHistory.getActiveIndex();
+          const entry = contents.navigationHistory.getEntryAtIndex(index + 1);
+          await this.runNavigationAction(
+            record,
+            "history",
+            entry?.url ?? null,
             () => contents.navigationHistory.goForward(),
             navigation.timeout_ms,
           );
         }
         break;
       case "reload":
-        await reloadAndWait(
-          contents,
-          navigation.ignore_cache === true,
+        await this.runNavigationAction(
+          record,
+          "reload",
+          contents.getURL() || "about:blank",
+          () => {
+            if (navigation.ignore_cache === true) contents.reloadIgnoringCache();
+            else contents.reload();
+          },
           navigation.timeout_ms,
           navigation.handle_before_unload,
         );
@@ -975,7 +1128,20 @@ export class BrowserSurfaceManager {
 
     const generation = ++record.inspectGeneration;
     record.inspectActive = true;
+    record.inspectGestureActive = false;
     const start = this.enqueueCdp(record, async ({ track }) => {
+      if (!this.isInspectGenerationActive(record, generation)) return;
+      // Chromium 的 Overlay Agent 依赖已启用的 DOM Agent。先启用 DOM，
+      // 再启用 Overlay，才能在所有 Electron/Chromium 版本中建立真正的
+      // Inspect Mode；反过来会直接返回 “DOM should be enabled first”。
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "DOM.enable",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        undefined,
+        track,
+      );
       if (!this.isInspectGenerationActive(record, generation)) return;
       await sendCdpCommandWithTimeout(
         record.contents,
@@ -987,15 +1153,6 @@ export class BrowserSurfaceManager {
       );
       if (!this.isInspectGenerationActive(record, generation)) return;
       record.inspectResourcesEnabled = true;
-      await sendCdpCommandWithTimeout(
-        record.contents,
-        "DOM.enable",
-        {},
-        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        undefined,
-        track,
-      );
-      if (!this.isInspectGenerationActive(record, generation)) return;
       // Chromium 的 Overlay API 将“search for node”定义为 inspect mode，
       // 不是一个坐标命中或截图模拟。用户在真实 WebContents 中选中元素后，
       // 由 Overlay.inspectNodeRequested 返回该节点的 backendNodeId。
@@ -1059,7 +1216,10 @@ export class BrowserSurfaceManager {
   }
 
   private stopInspectForLifecycle(record: BrowserSurfaceRecord, reason: string): void {
-    void this.stopInspectRecord(record).catch((error) => {
+    // node-selected 只关闭 Chromium Overlay 资源；当前真实点击的 mouseUp
+    // 仍属于 Inspect 手势，必须继续被输入策略识别，不能在清理 CDP 时把
+    // 它提前降级为 user_takeover。
+    void this.stopInspectRecord(record, reason === "node-selected").catch((error) => {
       if (!record.closed) {
         console.warn("[BrowserSurfaceManager] 节点检查清理失败", {
           surfaceId: record.surfaceId,
@@ -1070,14 +1230,19 @@ export class BrowserSurfaceManager {
     });
   }
 
-  private stopInspectRecord(record: BrowserSurfaceRecord): Promise<void> {
+  private stopInspectRecord(record: BrowserSurfaceRecord, preserveGesture = false): Promise<void> {
+    // 捕获请求发生时的资源状态。Debugger session reset 会在同一个同步
+    // 生命周期事务中清零 record.inspectResourcesEnabled，但这不能让已经
+    // 排队的 Overlay 清理失去依据。
+    const resourcesEnabledAtRequest = record.inspectResourcesEnabled;
     const hasInspectWork = record.inspectActive
       || record.inspectStartPromise !== null
-      || record.inspectResourcesEnabled;
+      || resourcesEnabledAtRequest;
     if (!hasInspectWork) return Promise.resolve();
 
     const generation = ++record.inspectGeneration;
     record.inspectActive = false;
+    if (!preserveGesture) record.inspectGestureActive = false;
     const pendingStart = record.inspectStartPromise;
     return (async () => {
       if (pendingStart) await pendingStart.catch(() => undefined);
@@ -1090,12 +1255,13 @@ export class BrowserSurfaceManager {
       // Overlay.enable completed. In that case there is no CDP domain to
       // tear down; sending disable commands would turn an idempotent stop
       // into a spurious "domain not enabled" failure.
-      if (!record.inspectResourcesEnabled) return;
+      const resourcesEnabled = resourcesEnabledAtRequest || record.inspectResourcesEnabled;
+      if (!resourcesEnabled) return;
       await this.enqueueCdp(record, async ({ track }) => {
         if (record.closed || record.contents.isDestroyed() || record.inspectGeneration !== generation || record.inspectActive) {
           return;
         }
-        if (!record.inspectResourcesEnabled) return;
+        if (!resourcesEnabledAtRequest && !record.inspectResourcesEnabled) return;
         let firstError: unknown = null;
         for (const [method, params] of [
           // 当前 Chromium 版本即使 mode=none 也要求传入 highlightConfig；
@@ -1123,22 +1289,18 @@ export class BrowserSurfaceManager {
     })();
   }
 
-  private initialAgentCursorPosition(record: BrowserSurfaceRecord): { x: number; y: number } {
+  private initialAgentCursorPosition(record: BrowserSurfaceRecord): { x: number; y: number } | null {
     const viewBounds = record.view.getBounds();
-    const width = viewBounds.width > 0
-      ? viewBounds.width
-      : record.slotBounds && record.slotBounds.width > 0
-        ? record.slotBounds.width
-        : record.viewport.mode === "fixed"
-          ? record.viewport.width
-          : 640;
-    const height = viewBounds.height > 0
-      ? viewBounds.height
-      : record.slotBounds && record.slotBounds.height > 0
-        ? record.slotBounds.height
-        : record.viewport.mode === "fixed"
-          ? record.viewport.height
-          : 480;
+    const bounds = viewBounds.width > 0 && viewBounds.height > 0
+      ? viewBounds
+      : record.slotVisible
+        && record.slotBounds
+        && record.slotBounds.width > 0
+        && record.slotBounds.height > 0
+        ? record.slotBounds
+        : null;
+    if (!bounds) return null;
+    const { width, height } = bounds;
     const inset = 18;
     const clamp = (value: number, limit: number): number => Math.max(
       0,
@@ -1160,19 +1322,34 @@ export class BrowserSurfaceManager {
       if (record.windowId === windowId) this.closeRecord(record);
     }
     this.#windows.delete(windowId);
-    this.#browserHosts.delete(windowId);
+    this.#contentRoots.delete(windowId);
     this.#activationGenerations.delete(windowId);
   }
 
   closeAll(): void {
+    this.cancelActiveDownloads();
     for (const record of [...this.#surfaces.values()]) this.closeRecord(record, false);
     this.#surfaces.clear();
     this.#windows.clear();
-    this.#browserHosts.clear();
+    this.#contentRoots.clear();
     this.#activationGenerations.clear();
   }
 
+  async clearDownloads(): Promise<void> {
+    if (!this.#downloadUserDataPath) return;
+    if (this.#downloadCleanupPromise) return this.#downloadCleanupPromise;
+
+    const cleanup = this.performDownloadCleanup();
+    this.#downloadCleanupPromise = cleanup;
+    try {
+      await cleanup;
+    } finally {
+      if (this.#downloadCleanupPromise === cleanup) this.#downloadCleanupPromise = null;
+    }
+  }
+
   async clearBrowsingData(): Promise<void> {
+    await this.clearDownloads();
     // 不能只依赖当前进程已经创建过 WebContentsView 的 partition。浏览器
     // 会话由 daemon 持久化，应用重启后未激活的 Tab 仍然拥有同一磁盘上下文，
     // 清理数据必须覆盖这些会话，否则“清理成功”会变成空操作。
@@ -1186,7 +1363,13 @@ export class BrowserSurfaceManager {
     }));
     await Promise.all([...this.#surfaces.values()]
       .filter((record) => !record.closed && !record.contents.isDestroyed())
-      .map((record) => reloadAndWait(record.contents, true)));
+      .map((record) => this.runNavigationAction(
+        record,
+        "reload",
+        record.contents.getURL() || "about:blank",
+        () => record.contents.reloadIgnoringCache(),
+        DEFAULT_NAVIGATION_TIMEOUT_MS,
+      )));
   }
 
   private surfaceForTab(tabId: string, windowId: string): BrowserSurfaceRecord | null {
@@ -1199,43 +1382,56 @@ export class BrowserSurfaceManager {
     bounds: Rectangle | null,
     window: BaseWindow | undefined,
   ): void {
-    const wasSlotVisible = record.slotVisible;
-    record.slotBounds = bounds ? { ...bounds } : null;
-    record.slotVisible = bounds !== null;
-    if (record.viewport.mode === "auto" && wasSlotVisible !== record.slotVisible) {
-      record.viewportApplied = false;
-      this.scheduleViewportApply(record);
-    }
-    if (!window || window.isDestroyed()) {
-      this.detachSurface(record, window);
+    const previousBounds = record.slotBounds;
+    if (bounds) record.slotBounds = { ...bounds };
+    // 原生 View 的 bounds 必须始终等于本次 Renderer 已确认的内容槽。
+    // null 表示当前几何不可用，不能继续显示上一次的 bounds。
+    const effectiveBounds = bounds ? { ...bounds } : null;
+    record.slotVisible = effectiveBounds !== null;
+    const contentRoot = this.#contentRoots.get(record.windowId);
+    if (!window || window.isDestroyed() || !contentRoot) {
+      this.detachSurface(record);
       return;
     }
-    if (!bounds) {
-      this.detachSurface(record, window);
+    if (!effectiveBounds) {
+      // 页面状态仍保留在 WebContents 中，但不可验证的中间帧必须隐藏
+      // 并退出命中树。重新得到内容槽时只复用该 WebContents，不重新导航。
+      record.slotVisible = false;
+      try {
+        record.view.setVisible(false);
+      } catch {
+        // 窗口销毁与布局提交可能交错到达。
+      }
       return;
     }
     if (!record.mounted) {
-      // Browser Host 是 WindowManager 按当前右栏内容槽设置边界的独立
-      // 原生容器。WebContentsView 只在 Host 的局部坐标中占满内容槽，
-      // 不再把窗口坐标直接交给 WebContentsView。
-      record.host.addChildView(record.view, 0);
+      // WebContentsView 必须直接以 contentView 的第 1 层挂载。它的 bounds
+      // 就是 Renderer 已确认的内容槽，因此 Chromium 获得的真实 viewport
+      // 与右栏一致；第 0 层仍是 App Renderer，第 2 层保留给 Overlay。
+      contentRoot.addChildView(record.view, 1);
       record.mounted = true;
     }
-    // Browser Host 是 WindowManager 按当前右栏内容槽设置边界的独立
-    // 原生容器。WebContentsView 只在 Host 的局部坐标中占满内容槽，
-    // 不再把窗口坐标直接交给 WebContentsView。
-    const localBounds = { x: 0, y: 0, width: bounds.width, height: bounds.height };
-    if (!sameBounds(record.view.getBounds(), localBounds)) record.view.setBounds(localBounds);
+    const boundsChanged = !sameBounds(record.view.getBounds(), effectiveBounds);
+    if (boundsChanged) record.view.setBounds(effectiveBounds);
+    const sizeChanged = !previousBounds
+      || previousBounds.width !== effectiveBounds.width
+      || previousBounds.height !== effectiveBounds.height;
+    if (sizeChanged && record.viewport.mode === "fixed") {
+      // 位置变化不影响页面 viewport；只有真实内容槽尺寸变化才会重放
+      // Chromium 的固定设备指标。auto 模式完全由原生 View bounds 驱动，
+      // 不能因为右栏拖动再次发出 CDP 视口命令。
+      record.viewportApplied = false;
+      this.scheduleViewportApply(record);
+    }
     // 页面加载和调试器初始化是 Surface 内部状态，不能阻塞真实浏览器
     // 视图进入内容槽。Chromium 自行展示当前文档及加载过程；只有失败页
     // 才隐藏，避免激活流程变成“正在连接浏览器”的空白等待层。
     // 导航过程由 Chromium 自己绘制。只有 Surface 生命周期失败才解绑，
     // 页面导航失败仍保留真实 WebContentsView，避免右栏黑屏或空槽。
     record.view.setVisible(true);
-    // 内容槽只管理原生 View 的物理承载范围。它的尺寸变化不能重新提交
-    // 当前 Tab 的 viewport：auto 由 WebContentsView 的真实尺寸自然驱动，
-    // fixed 则保持用户选择的 CSS viewport，避免拖动右栏触发页面重排、闪烁
-    // 或把物理槽尺寸写入设备仿真状态。
+    // 内容槽只管理原生 View 的物理承载范围；只有 fixed 模式才由
+    // applyViewport 设置 Chromium 设备指标，禁止 CSS transform、截图映射
+    // 或宿主坐标缩放。
   }
 
   private async loadPage(
@@ -1244,76 +1440,65 @@ export class BrowserSurfaceManager {
     timeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS,
     handleBeforeUnload?: "accept" | "dismiss",
     track?: (promise: Promise<unknown>) => void,
+    request?: () => Promise<void>,
   ): Promise<void> {
     if (record.closed || record.contents.isDestroyed()) {
       throw staleSurfaceError("browser_surface_not_found");
     }
-    const operationId = ++record.navigationOperationId;
-    record.navigationTargetUrl = url;
-    record.navigationFailureReportedRevision = null;
-    record.priming = true;
-    // 新导航必须先终止旧导航。旧 loadURL 的 Promise 和迟到事件仍可能
-    // 返回，但下面所有收敛动作都会校验 operationId，不能再把当前页面
-    // 隐藏成失败态或重新显示旧 Surface。
-    if (record.contents.isLoadingMainFrame()) {
-      try {
-        record.contents.stop();
-      } catch {
-        // WebContents 销毁竞态下 stop() 可能同步失败；新的 loadURL 仍会
-        // 通过 operationId 成为唯一有效导航。
-      }
-    }
+    const operation = this.beginNavigationOperation(record, "document", url);
     const allowBeforeUnload = handleBeforeUnload === "accept"
       ? (event: Electron.Event) => event.preventDefault()
       : null;
     if (allowBeforeUnload) record.contents.on("will-prevent-unload", allowBeforeUnload);
     try {
-      const loadPromise = record.contents.loadURL(url);
+      const loadPromise = request ? request() : record.contents.loadURL(url);
       track?.(loadPromise);
-      await withNavigationTimeout(
-        loadPromise,
-        clampNavigationTimeout(timeoutMs),
-      );
-      await this.installDialogBridgeInCurrentDocument(record);
-    } catch (error) {
-      if (record.navigationOperationId !== operationId) {
+      const navigationWait = this.waitForNavigationOperation(record, operation, timeoutMs);
+      await this.withSurfaceLifecycle(record, withNavigationTimeout(Promise.all([
+        loadPromise.then(() => {
+          // Electron 的 loadURL Promise 在部分版本会先于 did-start/
+          // did-finish 事件完成，about:blank 还可能省略 start 事件。它是
+          // 当前 request 的唯一完成信号时，用当前 URL 收敛操作，避免
+          // debugger 永久等待一个永远不会再来的 renderer 事件。
+          if (this.isCurrentNavigationOperation(record, operation) && !operation.settled) {
+            this.completeNavigationFromSettledEvent(
+              record,
+              operation,
+              record.contents.getURL() || url,
+              this.nextNavigationEventSequence(record),
+            );
+          }
+        }),
+        navigationWait,
+      ]), clampNavigationTimeout(timeoutMs)));
+      if (!this.isCurrentNavigationOperation(record, operation) || !operation.completed) {
         throw staleSurfaceError("browser_navigation_superseded");
       }
-      if (!record.closed) {
-        // 导航失败不代表原生 Surface 失效。保留 WebContentsView 在内容槽中，
-        // 让 Chromium 自己展示当前文档或错误页，避免右栏收敛成黑屏。
-        record.priming = false;
-        record.navigationTargetUrl = null;
-        this.applySlot(
-          record,
-          record.slotVisible ? record.slotBounds : null,
-          this.#windows.get(record.windowId),
-        );
-        this.publishNavigationFailure(record, error instanceof Error ? error.message : String(error));
+    } catch (error) {
+      if (!this.isCurrentNavigationOperation(record, operation) || operation.settled && !operation.failed) {
+        throw staleSurfaceError("browser_navigation_superseded");
       }
+      if (!operation.failed) this.failNavigationOperation(record, operation, toError(error));
       throw error;
     } finally {
       if (allowBeforeUnload) record.contents.off("will-prevent-unload", allowBeforeUnload);
     }
-    if (record.closed) throw staleSurfaceError("browser_surface_not_found");
-    if (record.navigationOperationId !== operationId) {
+    if (!this.isCurrentNavigationOperation(record, operation) || !operation.completed) {
       throw staleSurfaceError("browser_navigation_superseded");
     }
-    record.navigationTargetUrl = null;
-    record.priming = false;
-    this.applySlot(
-      record,
-      record.slotVisible ? record.slotBounds : null,
-      this.#windows.get(record.windowId),
-    );
-    this.scheduleViewportApply(record);
+    await this.installDialogBridgeInCurrentDocument(record);
   }
 
   private startLoad(record: BrowserSurfaceRecord, url: string): Promise<void> {
-    if (record.loadPromise) return record.loadPromise;
+    if (
+      record.loadPromise
+      && record.navigationOperation
+      && !record.navigationOperation.settled
+      && sameNavigationUrl(record.navigationOperation.targetUrl ?? "about:blank", url)
+    ) return record.loadPromise;
     // 初始导航是 Chromium 的原生加载过程，不得占用 CDP 命令队列。
-    // 页面可以继续加载，同时截图、快照和输入仍然必须立即进入同一个
-    // WebContents；否则慢页面会把整个 Browser Tab 锁在“正在连接”状态。
+    // 页面先立即进入真实 WebContentsView；调试器初始化在
+    // startDebuggerInitialization() 中独立运行，不会成为导航前置条件。
     const load = this.loadPage(record, url);
     record.loadPromise = load;
     void load.then(() => {
@@ -1324,9 +1509,26 @@ export class BrowserSurfaceManager {
     return load;
   }
 
+  private startDebuggerInitialization(record: BrowserSurfaceRecord): void {
+    if (
+      record.closed
+      || record.debuggerReadyPromise
+      || record.debuggerSessionInitialized && record.contents.debugger.isAttached()
+    ) return;
+    void this.reconnectDebugger(record, "initialization").catch((error) => {
+      if (!record.closed) {
+        console.error("[BrowserSurfaceManager] Browser Surface 调试器初始化失败", {
+          surfaceId: record.surfaceId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
   private publishNavigationFailure(record: BrowserSurfaceRecord, reason: string): void {
-    if (record.closed || record.navigationFailureReportedRevision === record.navigationRevision) return;
-    record.navigationFailureReportedRevision = record.navigationRevision;
+    const operation = record.navigationOperation;
+    if (record.closed || !operation || record.navigationFailureReportedGeneration === operation.generation) return;
+    record.navigationFailureReportedGeneration = operation.generation;
     this.#onEvent({
       type: "page_failed",
       binding: this.binding(record),
@@ -1334,12 +1536,354 @@ export class BrowserSurfaceManager {
     });
   }
 
-  private async waitForNavigation(
-    contents: WebContents,
+  private async runNavigationAction(
+    record: BrowserSurfaceRecord,
+    kind: Exclude<NavigationKind, "document" | "in-page">,
+    targetUrl: string | null,
     start: () => void,
     timeoutMs?: number,
+    handleBeforeUnload?: "accept" | "dismiss",
   ): Promise<void> {
-    return waitForNavigationEvent(contents, start, clampNavigationTimeout(timeoutMs));
+    const operation = this.beginNavigationOperation(record, kind, targetUrl);
+    const allowBeforeUnload = handleBeforeUnload === "accept"
+      ? (event: Electron.Event) => event.preventDefault()
+      : null;
+    if (allowBeforeUnload) record.contents.on("will-prevent-unload", allowBeforeUnload);
+    try {
+      start();
+      await this.waitForNavigationOperation(record, operation, timeoutMs);
+    } catch (error) {
+      if (!this.isCurrentNavigationOperation(record, operation) || operation.settled && !operation.failed) {
+        throw staleSurfaceError("browser_navigation_superseded");
+      }
+      if (!operation.failed) this.failNavigationOperation(record, operation, toError(error));
+      throw error;
+    } finally {
+      if (allowBeforeUnload) record.contents.off("will-prevent-unload", allowBeforeUnload);
+    }
+  }
+
+  private beginNavigationOperation(
+    record: BrowserSurfaceRecord,
+    kind: NavigationKind,
+    targetUrl: string | null,
+    createdEventSequence = this.nextNavigationEventSequence(record),
+  ): NavigationOperation {
+    if (record.closed || record.contents.isDestroyed()) {
+      throw staleSurfaceError("browser_surface_not_found");
+    }
+    const previous = record.navigationOperation;
+    if (previous && !previous.settled) {
+      this.supersedeNavigationOperation(previous);
+    }
+    const id = ++record.navigationOperationId;
+    const operation: NavigationOperation = {
+      id,
+      generation: ++record.navigationGeneration,
+      kind,
+      targetUrl,
+      frame: null,
+      createdEventSequence,
+      startEventSequence: null,
+      commitEventSequence: null,
+      frameFinishEventSequence: null,
+      finishEventSequence: null,
+      stopEventSequence: null,
+      committedUrl: null,
+      awaitingStart: true,
+      started: false,
+      loadingStarted: false,
+      frameNavigated: false,
+      committed: false,
+      frameFinished: false,
+      documentFinished: false,
+      completed: false,
+      failed: false,
+      settled: false,
+      loadingEmitted: kind !== "in-page",
+      pagePublished: false,
+      waiters: new Set(),
+    };
+    record.navigationOperation = operation;
+    record.navigationFailureReportedGeneration = null;
+    record.priming = kind !== "in-page";
+    record.cursorExecutionContextId = null;
+    this.stopInspectForLifecycle(record, "navigation");
+    if (operation.loadingEmitted) {
+      this.#onEvent({
+        type: "loading_changed",
+        binding: this.binding(record),
+        loading: true,
+      });
+    }
+    return operation;
+  }
+
+  private nextNavigationEventSequence(record: BrowserSurfaceRecord): number {
+    record.navigationEventSequence += 1;
+    return record.navigationEventSequence;
+  }
+
+  private claimNavigationEvent(
+    record: BrowserSurfaceRecord,
+    expectation: NavigationEventExpectation,
+  ): NavigationEventClaim | null {
+    const operation = record.navigationOperation;
+    const sequence = this.nextNavigationEventSequence(record);
+    if (
+      record.closed
+      || !operation
+      || !this.isCurrentNavigationOperation(record, operation, expectation.generation)
+      || operation.failed
+      || !expectation.allowSettled && operation.settled
+      || expectation.phase !== "title" && !operation.started
+      || expectation.phase !== "start-loading" && expectation.phase !== "title" && operation.startEventSequence === null
+    ) return null;
+    if (expectation.frame && operation.frame && !sameFrame(operation.frame, expectation.frame)) return null;
+    if (expectation.url) {
+      const expectedUrl = expectation.phase === "commit" && !operation.committedUrl
+        ? null
+        : operation.committedUrl ?? operation.targetUrl;
+      if (expectedUrl && !sameNavigationUrl(expectedUrl, expectation.url)) return null;
+    }
+    if (
+      expectation.phase === "frame-finish" && operation.frameFinishEventSequence !== null
+      || expectation.phase === "finish" && operation.finishEventSequence !== null
+      || expectation.phase === "stop" && operation.stopEventSequence !== null
+    ) return null;
+    const lastOperationEvent = Math.max(
+      operation.createdEventSequence,
+      operation.startEventSequence ?? 0,
+      operation.commitEventSequence ?? 0,
+      operation.frameFinishEventSequence ?? 0,
+      operation.finishEventSequence ?? 0,
+      operation.stopEventSequence ?? 0,
+    );
+    if (sequence <= lastOperationEvent) return null;
+    return { operation, sequence };
+  }
+
+  private supersedeNavigationOperation(operation: NavigationOperation): void {
+    if (operation.settled) return;
+    operation.settled = true;
+    const error = staleSurfaceError("browser_navigation_superseded");
+    for (const waiter of operation.waiters) waiter.reject(error);
+    operation.waiters.clear();
+  }
+
+  private isCurrentNavigationOperation(
+    record: BrowserSurfaceRecord,
+    operation: NavigationOperation,
+    generation = operation.generation,
+  ): boolean {
+    return record.navigationOperation === operation
+      && record.navigationGeneration === operation.generation
+      && generation === operation.generation;
+  }
+
+  private waitForNavigationOperation(
+    record: BrowserSurfaceRecord,
+    operation: NavigationOperation,
+    timeoutMs?: number,
+  ): Promise<void> {
+    if (operation.completed) return Promise.resolve();
+    if (operation.failed) return Promise.reject(staleSurfaceError("browser_navigation_failed"));
+    if (operation.settled) return Promise.reject(staleSurfaceError("browser_navigation_superseded"));
+    const waiter = new Promise<void>((resolve, reject) => {
+      operation.waiters.add({ resolve, reject });
+    });
+    return withNavigationTimeout(waiter, clampNavigationTimeout(timeoutMs)).catch((error) => {
+      if (this.isCurrentNavigationOperation(record, operation) && !operation.settled) {
+        this.failNavigationOperation(record, operation, toError(error));
+      }
+      throw error;
+    });
+  }
+
+  private completeNavigationOperation(record: BrowserSurfaceRecord, operation: NavigationOperation): void {
+    if (!this.isCurrentNavigationOperation(record, operation) || operation.settled || operation.failed) return;
+    operation.completed = true;
+    operation.settled = true;
+    record.priming = false;
+    this.applySlot(
+      record,
+      record.slotVisible ? record.slotBounds : null,
+      this.#windows.get(record.windowId),
+    );
+    this.scheduleViewportApply(record);
+    if (operation.loadingEmitted) {
+      this.#onEvent({
+        type: "loading_changed",
+        binding: this.binding(record),
+        loading: false,
+      });
+    }
+    for (const waiter of operation.waiters) waiter.resolve();
+    operation.waiters.clear();
+    this.startDebuggerInitialization(record);
+  }
+
+  private completeWhenMainFrameSettled(record: BrowserSurfaceRecord, operation: NavigationOperation): void {
+    if (
+      !this.isCurrentNavigationOperation(record, operation)
+      || operation.failed
+      || operation.completed
+      || !operation.committed
+      || !operation.committedUrl
+      || !operation.loadingStarted
+      || !sameNavigationUrl(operation.committedUrl, record.contents.getURL() || "")
+      || !(
+        operation.frameFinished
+        || operation.documentFinished
+        || operation.stopEventSequence !== null
+      )
+    ) return;
+    // Electron 的 did-finish-load、did-frame-finish-load 和 did-stop-loading
+    // 都可能先后到达，且不同 Chromium 页面对三者的顺序并不完全一致。
+    // 主文档已经 commit 且任一主帧完成事件到达时，导航就已具备可操作性；
+    // 再等待另一个事件会把正常页面误判为超时，永久锁住 Renderer 工具栏。
+    this.completeNavigationOperation(record, operation);
+  }
+
+  private failNavigationOperation(
+    record: BrowserSurfaceRecord,
+    operation: NavigationOperation,
+    error: Error,
+  ): void {
+    if (!this.isCurrentNavigationOperation(record, operation) || operation.settled || operation.completed) return;
+    operation.failed = true;
+    operation.settled = true;
+    record.priming = false;
+    // 导航失败不是 Surface 失效。保留真实 WebContentsView，让 Chromium
+    // 自己展示当前文档或错误页，避免错误状态把右栏收敛成黑屏。
+    this.applySlot(
+      record,
+      record.slotVisible ? record.slotBounds : null,
+      this.#windows.get(record.windowId),
+    );
+    this.publishNavigationFailure(record, error.message);
+    this.scheduleViewportApply(record);
+    if (operation.loadingEmitted) {
+      this.#onEvent({
+        type: "loading_changed",
+        binding: this.binding(record),
+        loading: false,
+      });
+    }
+    for (const waiter of operation.waiters) waiter.reject(error);
+    operation.waiters.clear();
+    this.startDebuggerInitialization(record);
+  }
+
+  private completeNavigationFromSettledEvent(
+    record: BrowserSurfaceRecord,
+    operation: NavigationOperation,
+    url: string,
+    eventSequence: number,
+  ): void {
+    if (!this.isCurrentNavigationOperation(record, operation) || operation.settled || operation.failed) return;
+    const committedUrl = url || operation.targetUrl;
+    if (!committedUrl) return;
+    operation.started = true;
+    operation.awaitingStart = false;
+    operation.loadingStarted = operation.kind !== "in-page";
+    operation.committed = true;
+    operation.frameNavigated = true;
+    operation.committedUrl = committedUrl;
+    operation.commitEventSequence ??= eventSequence;
+    operation.documentFinished = true;
+    operation.finishEventSequence ??= eventSequence;
+    this.completeNavigationOperation(record, operation);
+    this.publishPageForNavigation(record, operation);
+  }
+
+  private waitForCurrentNavigation(record: BrowserSurfaceRecord): Promise<void> {
+    return (async () => {
+      // 一个旧导航可能在等待期间被新导航替换。debugger 初始化不能在旧
+      // operation 被 supersede 后直接继续，否则 CDP 会附着到尚未完成的新
+      // 文档并把两轮生命周期混在一起；必须重新读取当前 generation。
+      while (!record.closed && !record.contents.isDestroyed()) {
+        const operation = record.navigationOperation;
+        if (!operation || operation.settled) return;
+        const generation = operation.generation;
+        try {
+          await this.waitForNavigationOperation(record, operation);
+        } catch {
+          // 导航失败仍保留真实 WebContents，debugger 可以附着当前错误页；
+          // supersede 则转到最新 operation，不能让旧 waiter 提前放行。
+        }
+        if (record.navigationOperation !== operation || record.navigationGeneration !== generation) continue;
+        return;
+      }
+    })();
+  }
+
+  private claimNavigationOperation(
+    record: BrowserSurfaceRecord,
+    kind: NavigationKind,
+    url: string,
+    frame: NavigationFrameIdentity,
+    eventSequence = this.nextNavigationEventSequence(record),
+  ): NavigationOperation | null {
+    const operation = record.navigationOperation;
+    // did-frame-navigate 只能确认由当前 did-start-navigation 建立的操作。
+    // 已结束操作收到迟到事件时绝不能重新创建 generation，否则旧导航会
+    // 被误认成新导航并覆盖当前页面状态。
+    if (!operation || operation.settled || !this.isCurrentNavigationOperation(record, operation)) return null;
+    if (operation.kind !== kind && !(kind === "document" && operation.kind !== "in-page")) return null;
+    if (operation.frame && !sameFrame(operation.frame, frame)) return null;
+    if (operation.awaitingStart) {
+      if (operation.targetUrl && !sameNavigationUrl(operation.targetUrl, url)) return null;
+      operation.startEventSequence ??= eventSequence;
+      operation.awaitingStart = false;
+      operation.started = true;
+      operation.loadingStarted = true;
+    }
+    operation.frame ??= frame;
+    return operation;
+  }
+
+  private publishPageForNavigation(
+    record: BrowserSurfaceRecord,
+    operation: NavigationOperation,
+    allowRepeat = false,
+  ): void {
+    if (
+      record.closed
+      || !this.isCurrentNavigationOperation(record, operation)
+      || operation.failed
+      || !operation.committed
+      || operation.pagePublished && !allowRepeat
+    ) return;
+    operation.pagePublished = true;
+    this.#onEvent({
+      type: "page_updated",
+      binding: this.binding(record),
+      page: this.pageState(record),
+    });
+  }
+
+  private async loadPopupInCurrentPage(
+    record: BrowserSurfaceRecord,
+    url: string,
+    details: HandlerDetails,
+  ): Promise<void> {
+    const postBody = details.postBody;
+    const contentType = postBody?.boundary
+      ? `${postBody.contentType}; boundary=${postBody.boundary}`
+      : postBody?.contentType;
+    await this.loadPage(
+      record,
+      url,
+      DEFAULT_NAVIGATION_TIMEOUT_MS,
+      undefined,
+      undefined,
+      () => record.contents.loadURL(url, {
+        httpReferrer: details.referrer,
+        ...(postBody ? { postData: postBody.data } : {}),
+        ...(contentType ? { extraHeaders: `Content-Type: ${contentType}` } : {}),
+      }),
+    );
   }
 
   private unmountSurface(record: BrowserSurfaceRecord, window: BaseWindow | undefined): void {
@@ -1349,7 +1893,7 @@ export class BrowserSurfaceManager {
     this.detachSurface(record, window);
   }
 
-  private detachSurface(record: BrowserSurfaceRecord, window: BaseWindow | undefined): void {
+  private detachSurface(record: BrowserSurfaceRecord, _window?: BaseWindow): void {
     this.stopInspectForLifecycle(record, "surface-unmounted");
     if (!record.mounted) return;
     try {
@@ -1358,7 +1902,7 @@ export class BrowserSurfaceManager {
       // WebContentsView 可能已随宿主窗口销毁。
     }
     try {
-      if (window || record.host) record.host.removeChildView(record.view);
+      this.#contentRoots.get(record.windowId)?.removeChildView(record.view);
     } catch {
       // destroyed 与 closeRecord 可能交错到达，解绑必须幂等。
     }
@@ -1396,13 +1940,20 @@ export class BrowserSurfaceManager {
     webContents: WebContents,
   ): void {
     const record = this.surfaceForContents(webContents);
-    if (!record || record.closed || !this.#downloadRoot) {
+    if (this.#downloadCleanupInProgress || !record || record.closed || !this.#downloadRoot) {
       // Downloads never fall back to the user's Downloads directory. A
       // browser download is either stored in Magi's private data directory or
       // explicitly rejected, so the host cannot write outside its boundary.
       event.preventDefault();
       if (record && !record.closed) {
-        this.emitDownload(record, "download", "interrupted", "browser_download_storage_unavailable");
+        this.emitDownload(
+          record,
+          "download",
+          "interrupted",
+          this.#downloadCleanupInProgress
+            ? "browser_download_cleanup_in_progress"
+            : "browser_download_storage_unavailable",
+        );
       }
       return;
     }
@@ -1421,15 +1972,36 @@ export class BrowserSurfaceManager {
       );
       return;
     }
-    this.emitDownload(record, filename, "started", undefined, item.getTotalBytes());
+    this.#activeDownloads.add(item);
     item.on("updated", (_event, state) => {
       if (!record.closed) {
         this.emitDownload(record, filename, state === "progressing" ? "progressing" : "interrupted", undefined, downloadBytes(item));
       }
     });
     item.once("done", (_event, state) => {
+      this.#activeDownloads.delete(item);
       if (!record.closed) this.emitDownload(record, filename, state, undefined, downloadBytes(item));
     });
+  }
+
+  private async performDownloadCleanup(): Promise<void> {
+    this.#downloadCleanupInProgress = true;
+    this.cancelActiveDownloads();
+    try {
+      await clearBrowserDownloads(this.#downloadUserDataPath!);
+    } finally {
+      this.#downloadCleanupInProgress = false;
+    }
+  }
+
+  private cancelActiveDownloads(): void {
+    for (const item of this.#activeDownloads) {
+      try {
+        item.cancel();
+      } catch (error) {
+        console.warn("[BrowserSurfaceManager] 取消浏览器下载失败", error);
+      }
+    }
   }
 
   private emitDownload(
@@ -1459,7 +2031,7 @@ export class BrowserSurfaceManager {
   private handleInspectNodeRequested(
     record: BrowserSurfaceRecord,
     params: Record<string, unknown>,
-    sessionId: string,
+    sessionId?: string,
   ): void {
     if (
       record.closed
@@ -1469,10 +2041,10 @@ export class BrowserSurfaceManager {
       || record.contents.isDestroyed()
       || !record.contents.debugger.isAttached()
     ) return;
-    const backendNodeId = integerOrNull(params.backendNodeId);
+    const backendNodeId = normalizeOptionalDomNodeId(params.backendNodeId);
     if (backendNodeId === null) return;
     const generation = record.inspectGeneration;
-    const commandSessionId = sessionId || undefined;
+    const commandSessionId = sessionId?.trim() || undefined;
     void this.enqueueCdp(record, async ({ track }) => {
       if (!this.isInspectGenerationActive(record, generation)) return;
       const description = await sendCdpCommandWithTimeout(
@@ -1500,7 +2072,7 @@ export class BrowserSurfaceManager {
       if (!frameId || !this.isInspectGenerationActive(record, generation)) return;
 
       let attributeList = Array.isArray(node.attributes) ? node.attributes : [];
-      const nodeId = integerOrNull(node.nodeId);
+      const nodeId = normalizeOptionalDomNodeId(node.nodeId);
       if (nodeId !== null && this.isInspectGenerationActive(record, generation)) {
         try {
           const attributes = await sendCdpCommandWithTimeout(
@@ -1535,6 +2107,17 @@ export class BrowserSurfaceManager {
         }
       }
 
+      let textExcerpt = "";
+      if (this.isInspectGenerationActive(record, generation)) {
+        textExcerpt = await this.readInspectNodeText(
+          record,
+          backendNodeId,
+          commandSessionId,
+          generation,
+          track,
+        );
+      }
+
       let bounds: { x: number; y: number; width: number; height: number } | null = null;
       if (this.isInspectGenerationActive(record, generation)) {
         try {
@@ -1554,25 +2137,44 @@ export class BrowserSurfaceManager {
 
       if (!this.isInspectGenerationActive(record, generation)) return;
       const pageUrl = record.contents.getURL() || "about:blank";
+      const inspectedNode: BrowserInspectedNodeContext = {
+        browser_session_id: record.browserSessionId,
+        backend_node_id: backendNodeId,
+        node_id: nodeId,
+        frame_id: frameId,
+        node_type: finiteInteger(node.nodeType, 0),
+        node_name: typeof node.nodeName === "string" ? node.nodeName : "",
+        local_name: typeof node.localName === "string" ? node.localName : "",
+        // DOM.Node.nodeValue 对 Element 节点按协议就是 null。这里通过
+        // Chromium Runtime 在真实节点上读取 textContent，保留元素按钮、
+        // 标题和容器的可见语义；读取失败时仍保留原始 nodeValue。
+        node_value: textExcerpt || (typeof node.nodeValue === "string" ? node.nodeValue : ""),
+        child_node_count: integerOrNull(node.childNodeCount),
+        document_url: typeof node.documentURL === "string" ? node.documentURL : null,
+        attributes: parseNodeAttributes(attributeList),
+        ...truncateOuterHtml(outerHtml),
+        bounds,
+        page_url: pageUrl,
+        page_title: record.contents.getTitle() || "",
+      };
+      // Inspect 是一次性选择事务。先使本次代次失效，再把结果发给
+      // Renderer；清理命令放到当前 CDP lane 完成后执行，避免在节点采集
+      // 事务内部再次入队形成自等待。这样 Renderer 不需要等待停止命令，
+      // 选择结果可以立即再次触发下一次 Inspect。
+      const selectionGeneration = ++record.inspectGeneration;
+      record.inspectActive = false;
       this.#onEvent({
         type: "node_inspected",
         binding: this.binding(record),
-        node: {
-          backend_node_id: backendNodeId,
-          node_id: nodeId,
-          frame_id: frameId,
-          node_type: finiteInteger(node.nodeType, 0),
-          node_name: typeof node.nodeName === "string" ? node.nodeName : "",
-          local_name: typeof node.localName === "string" ? node.localName : "",
-          node_value: typeof node.nodeValue === "string" ? node.nodeValue : "",
-          child_node_count: integerOrNull(node.childNodeCount),
-          document_url: typeof node.documentURL === "string" ? node.documentURL : null,
-          attributes: parseNodeAttributes(attributeList),
-          ...truncateOuterHtml(outerHtml),
-          bounds,
-          page_url: pageUrl,
-          page_title: record.contents.getTitle() || "",
-        },
+        node: inspectedNode,
+      });
+      setImmediate(() => {
+        if (
+          record.closed
+          || record.inspectActive
+          || record.inspectGeneration !== selectionGeneration
+        ) return;
+        this.stopInspectForLifecycle(record, "node-selected");
       });
     }).catch((error) => {
       if (!record.closed && record.inspectActive && record.inspectGeneration === generation) {
@@ -1583,6 +2185,64 @@ export class BrowserSurfaceManager {
         });
       }
     });
+  }
+
+  private async readInspectNodeText(
+    record: BrowserSurfaceRecord,
+    backendNodeId: number,
+    sessionId: string | undefined,
+    generation: number,
+    track: (promise: Promise<unknown>) => void,
+  ): Promise<string> {
+    if (!this.isInspectGenerationActive(record, generation)) return "";
+    const objectGroup = "magi-inspect-text";
+    try {
+      const resolved = await sendCdpCommandWithTimeout(
+        record.contents,
+        "DOM.resolveNode",
+        { backendNodeId, objectGroup },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        sessionId,
+        track,
+      ) as { object?: { objectId?: unknown } };
+      const objectId = resolved.object?.objectId;
+      if (typeof objectId !== "string" || objectId.length === 0 || !this.isInspectGenerationActive(record, generation)) {
+        return "";
+      }
+      const response = await sendCdpCommandWithTimeout(
+        record.contents,
+        "Runtime.callFunctionOn",
+        {
+          objectId,
+          objectGroup,
+          functionDeclaration: "function () { const value = typeof this.textContent === 'string' ? this.textContent : ''; return value.replace(/\\s+/g, ' ').trim().slice(0, 4096); }",
+          returnByValue: true,
+          awaitPromise: false,
+        },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        sessionId,
+        track,
+      ) as { result?: { value?: unknown } };
+      const value = response.result?.value;
+      return typeof value === "string"
+        ? value.replace(/\s+/gu, " ").trim().slice(0, MAX_INSPECTED_TEXT_LENGTH)
+        : "";
+    } catch {
+      // Element 文本是增强上下文；页面导航或节点失效时不丢弃本次
+      // 结构化选择，调用方仍可使用属性和 outerHTML。
+      return "";
+    } finally {
+      if (!record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
+        await sendCdpCommandWithTimeout(
+          record.contents,
+          "Runtime.releaseObjectGroup",
+          { objectGroup },
+          DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+          sessionId,
+          track,
+        ).catch(() => undefined);
+      }
+    }
   }
 
   private async resolveInspectFrameId(
@@ -1680,7 +2340,7 @@ export class BrowserSurfaceManager {
     webContents.setWindowOpenHandler((details) => {
       try {
         const url = normalizeNavigableUrl(details.url);
-        void this.enqueueCdp(record, () => loadPopupInCurrentPage(webContents, url, details)).catch(() => {
+        void this.loadPopupInCurrentPage(record, url, details).catch(() => {
           if (!record.closed) {
             this.#onEvent({
               type: "popup_blocked",
@@ -1707,69 +2367,142 @@ export class BrowserSurfaceManager {
         event.preventDefault();
       }
     });
-    webContents.on("did-start-navigation", (_event, _url, _isInPlace, isMainFrame) => {
-      if (!isMainFrame) return;
-      this.stopInspectForLifecycle(record, "navigation");
-      record.navigationRevision += 1;
-      record.navigationFailureReportedRevision = null;
-      record.priming = true;
-      record.cursorExecutionContextId = null;
-      this.#onEvent({
-        type: "loading_changed",
-        binding: this.binding(record),
-        loading: true,
-      });
-    });
-    const publishPage = () => {
-      if (
-        record.closed
-        || (record.navigationTargetUrl && webContents.isLoadingMainFrame())
-      ) return;
-      this.#onEvent({
-        type: "page_updated",
-        binding: this.binding(record),
-        page: this.pageState(record),
-      });
-    };
-    webContents.on("did-navigate", publishPage);
-    webContents.on("did-navigate-in-page", publishPage);
-    webContents.on("page-title-updated", publishPage);
-    webContents.on("did-stop-loading", () => {
-      if (record.closed || record.navigationTargetUrl && webContents.isLoadingMainFrame()) return;
-      this.#onEvent({
-        type: "loading_changed",
-        binding: this.binding(record),
-        loading: false,
-      });
-      publishPage();
-    });
-    webContents.on("did-fail-load", (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
-      if (record.closed || !isMainFrame || errorCode === -3) return;
-      if (record.navigationTargetUrl && webContents.isLoadingMainFrame()) return;
-      // did-fail-load 是页面导航结果，不是原生 Surface 崩溃。保持 View
-      // 挂载和可见，避免失败页期间出现黑屏或重新计算内容槽。
-      record.priming = false;
-      record.navigationTargetUrl = null;
-      this.applySlot(
-        record,
-        record.slotVisible ? record.slotBounds : null,
-        this.#windows.get(record.windowId),
+    webContents.on("did-start-navigation", (details) => {
+      if (!details.isMainFrame) return;
+      const eventSequence = this.nextNavigationEventSequence(record);
+      const frame = frameIdentity(details.frame);
+      let operation = record.navigationOperation;
+      const belongsToPendingOperation = Boolean(
+        operation
+        && !operation.settled
+        && operation.awaitingStart
+        && (!operation.targetUrl || sameNavigationUrl(operation.targetUrl, details.url))
+        && (!operation.frame || !frame || sameFrame(operation.frame, frame)),
       );
-      this.publishNavigationFailure(record, errorDescription || `net_error_${errorCode}`);
-      this.scheduleViewportApply(record);
+      if (!belongsToPendingOperation) {
+        // Every new start event establishes a new operation. In particular,
+        // same-URL reloads must not be mistaken for a duplicate of the prior
+        // operation; all later events are fenced by this generation.
+        operation = this.beginNavigationOperation(
+          record,
+          details.isSameDocument ? "in-page" : "document",
+          details.url,
+          eventSequence,
+        );
+      }
+      if (!operation || !this.isCurrentNavigationOperation(record, operation)) return;
+      operation.startEventSequence ??= eventSequence;
+      operation.awaitingStart = false;
+      operation.started = true;
+      operation.loadingStarted = !details.isSameDocument;
+      operation.frame ??= frame;
+      if (details.isSameDocument) {
+        operation.kind = "in-page";
+        record.priming = false;
+      }
+    });
+    webContents.on("did-start-loading", () => {
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "start-loading",
+      });
+      if (!claim) return;
+      claim.operation.loadingStarted = true;
+    });
+    webContents.on("did-frame-navigate", (_event, url, _httpResponseCode, _httpStatusText, isMainFrame, frameProcessId, frameRoutingId) => {
+      if (!isMainFrame) return;
+      const eventSequence = this.nextNavigationEventSequence(record);
+      const operation = this.claimNavigationOperation(
+        record,
+        "document",
+        url,
+        { processId: frameProcessId, routingId: frameRoutingId },
+        eventSequence,
+      );
+      if (!operation) return;
+      operation.frameNavigated = true;
+      operation.committed = true;
+      operation.committedUrl = url;
+      operation.commitEventSequence ??= eventSequence;
+      this.publishPageForNavigation(record, operation);
+    });
+    webContents.on("did-navigate", (_event, url) => {
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "commit",
+        url,
+      });
+      if (!claim) return;
+      const { operation, sequence } = claim;
+      if (!operation.committed) {
+        operation.committed = true;
+        operation.committedUrl = url;
+        operation.commitEventSequence = sequence;
+      }
+      operation.frameNavigated = true;
+      this.publishPageForNavigation(record, operation);
+    });
+    webContents.on("did-navigate-in-page", (_event, url, isMainFrame, frameProcessId, frameRoutingId) => {
+      if (!isMainFrame) return;
+      const frame = { processId: frameProcessId, routingId: frameRoutingId };
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "commit",
+        url,
+        frame,
+      });
+      if (!claim || claim.operation.kind !== "in-page") return;
+      const { operation, sequence } = claim;
+      operation.frame ??= frame;
+      operation.frameNavigated = true;
+      operation.committed = true;
+      operation.committedUrl = url;
+      operation.commitEventSequence ??= sequence;
+      this.completeNavigationOperation(record, operation);
+      this.publishPageForNavigation(record, operation);
+    });
+    webContents.on("did-frame-finish-load", (_event, isMainFrame, frameProcessId, frameRoutingId) => {
+      if (!isMainFrame) return;
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "frame-finish",
+        frame: { processId: frameProcessId, routingId: frameRoutingId },
+      });
+      if (!claim) return;
+      const { operation, sequence } = claim;
+      if (!operation.committed) {
+        this.completeNavigationFromSettledEvent(
+          record,
+          operation,
+          webContents.getURL() || operation.targetUrl || "",
+          sequence,
+        );
+        return;
+      }
+      operation.frameFinished = true;
+      operation.frameFinishEventSequence = sequence;
+      this.completeWhenMainFrameSettled(record, operation);
     });
     webContents.on("did-finish-load", () => {
-      if (record.navigationTargetUrl && webContents.isLoadingMainFrame()) return;
-      record.navigationTargetUrl = null;
-      record.priming = false;
-      this.applySlot(
-        record,
-        record.slotVisible ? record.slotBounds : null,
-        this.#windows.get(record.windowId),
-      );
-      if (!record.closed && !record.viewportApplied) {
-        this.scheduleViewportApply(record);
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "finish",
+      });
+      if (!claim) return;
+      const { operation, sequence } = claim;
+      if (!operation.loadingStarted) return;
+      if (!operation.committed) {
+        this.completeNavigationFromSettledEvent(
+          record,
+          operation,
+          webContents.getURL() || operation.targetUrl || "",
+          sequence,
+        );
+        return;
       }
+      operation.finishEventSequence = sequence;
+      operation.documentFinished = true;
+      this.completeWhenMainFrameSettled(record, operation);
       // Electron 的 contextIsolation 会让 CDP 注入的 new-document 脚本与
       // 自动化执行世界拥有不同的全局对象；在真实文档完成后，再通过
       // executeJavaScript 在页面主世界收敛一次同一桥接脚本，确保页面内
@@ -1786,6 +2519,74 @@ export class BrowserSurfaceManager {
       void this.setAgentCursor(record, true, record.cursor.x, record.cursor.y, record.cursor.action)
         .catch(() => undefined);
     });
+    webContents.on("page-title-updated", (_event, _title) => {
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "title",
+        url: webContents.getURL() || "",
+        allowSettled: true,
+      });
+      if (!claim) return;
+      const { operation } = claim;
+      if (!operation.committed || !operation.committedUrl || record.priming) return;
+      if (!sameNavigationUrl(operation.committedUrl, webContents.getURL() || "")) return;
+      this.publishPageForNavigation(record, operation, true);
+    });
+    webContents.on("did-stop-loading", () => {
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "stop",
+      });
+      if (!claim) return;
+      const { operation, sequence } = claim;
+      if (record.contents.isLoadingMainFrame()) return;
+      if (!operation.committed) {
+        this.completeNavigationFromSettledEvent(
+          record,
+          operation,
+          webContents.getURL() || operation.targetUrl || "",
+          sequence,
+        );
+        return;
+      }
+      if (
+        !operation.committedUrl
+        || !operation.loadingStarted
+        || !sameNavigationUrl(operation.committedUrl, webContents.getURL() || "")
+      ) return;
+      operation.stopEventSequence = sequence;
+      this.completeWhenMainFrameSettled(record, operation);
+    });
+    webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame, frameProcessId, frameRoutingId) => {
+      if (record.closed || !isMainFrame) return;
+      const claim = this.claimNavigationEvent(record, {
+        generation: record.navigationGeneration,
+        phase: "fail",
+        frame: { processId: frameProcessId, routingId: frameRoutingId },
+      });
+      if (!claim) return;
+      const { operation } = claim;
+      // ERR_ABORTED 是旧导航被新导航替换时的正常结果，不能结束当前
+      // operation。其余失败必须与当前 operation 的目标或已提交地址对应。
+      if (errorCode === -3) return;
+      if (
+        validatedURL
+        && operation.committedUrl
+        && !sameNavigationUrl(operation.committedUrl, validatedURL)
+      ) return;
+      if (
+        validatedURL
+        && !operation.committedUrl
+        && operation.targetUrl
+        && !sameNavigationUrl(operation.targetUrl, validatedURL)
+      ) return;
+      operation.frame ??= { processId: frameProcessId, routingId: frameRoutingId };
+      this.failNavigationOperation(
+        record,
+        operation,
+        new Error(errorDescription || `net_error_${errorCode}`),
+      );
+    });
     webContents.on("before-input-event", (_event, input) => {
       if (
         record.closed
@@ -1797,10 +2598,26 @@ export class BrowserSurfaceManager {
       this.#onEvent({ type: "user_takeover", binding: this.binding(record) });
     });
     webContents.on("before-mouse-event", (_event, input) => {
+      if (record.closed || record.automationInputDepth > 0) return;
+
+      // Inspect Mode 使用 Chromium 的真实输入管线。Overlay 在 mouseDown
+      // 后异步发出 inspectNodeRequested，而 stopInspect 会很快关闭 Overlay；
+      // 因此必须以 mouseDown/mouseUp 组成一次完整手势，而不能只看
+      // inspectActive。否则同一次点击的迟到事件会被误报成 user_takeover。
+      if (record.inspectActive || record.inspectGestureActive) {
+        if (record.inspectActive && input.type === "mouseDown") {
+          record.inspectGestureActive = true;
+        } else if (record.inspectGestureActive && input.type === "mouseUp") {
+          record.inspectGestureActive = false;
+        }
+        return;
+      }
+
       if (
-        record.closed
-        || record.automationInputDepth > 0
-        || !["mouseMove", "mouseDown", "contextMenu", "mouseWheel"].includes(input.type)
+        // Chromium Inspect Mode 的真实鼠标事件是选择节点的输入，不是
+        // 用户接管。若在 mouseMove 上先关闭检查模式，
+        // Overlay.inspectNodeRequested 永远不会产生。
+        !["mouseMove", "mouseDown", "contextMenu", "mouseWheel"].includes(input.type)
       ) return;
       this.promote(record.surfaceId);
       void this.setAgentCursor(record, false, null, null, null).catch(() => undefined);
@@ -1822,124 +2639,214 @@ export class BrowserSurfaceManager {
   private async waitForDebugger(record: BrowserSurfaceRecord): Promise<void> {
     if (record.recoveryPromise) {
       try {
-        await record.recoveryPromise;
+        await this.withSurfaceLifecycle(record, record.recoveryPromise);
       } catch {
         // Recovery owns its terminal error state. The command below performs
         // the final lifecycle validation and returns a stable surface error.
       }
     }
+    if (record.closed || record.contents.isDestroyed()) {
+      throw staleSurfaceError("browser_surface_not_found");
+    }
     const debuggerReady = record.debuggerReadyPromise;
     if (debuggerReady) {
       try {
-        await debuggerReady;
+        await this.withSurfaceLifecycle(record, debuggerReady);
       } catch {
         // A transient attach failure must not poison the Surface forever.
       } finally {
         if (record.debuggerReadyPromise === debuggerReady) record.debuggerReadyPromise = null;
       }
     }
-    if (!record.contents.debugger.isAttached()) {
+    if (
+      !record.contents.debugger.isAttached()
+      || !record.debuggerSessionInitialized
+      || !record.debuggerListenersInstalled
+    ) {
       await this.reconnectDebugger(record, "on-demand");
     }
     if (record.closed || record.contents.isDestroyed()) {
       throw staleSurfaceError("browser_surface_not_found");
     }
-    if (!record.contents.debugger.isAttached()) {
+    if (
+      !record.contents.debugger.isAttached()
+      || !record.debuggerSessionInitialized
+      || !record.debuggerListenersInstalled
+    ) {
       throw staleSurfaceError("browser_debugger_detached");
     }
   }
 
   private async attachDebugger(record: BrowserSurfaceRecord): Promise<void> {
     const debuggerApi = record.contents.debugger;
-    if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
-    if (!record.debuggerListenersInstalled) {
-      record.debuggerListenersInstalled = true;
-      debuggerApi.on("message", (_event, method, params, sessionId) => {
-        if (record.closed) return;
-        const eventParams = (params ?? {}) as Record<string, unknown>;
-        if (method === "Page.javascriptDialogOpening" || method === "Page.javascriptDialogClosed") {
-          console.info("[BrowserSurfaceManager] JavaScript dialog event", {
-            surfaceId: record.surfaceId,
-            tabId: record.tabId,
-            method,
-            sessionId: sessionId ?? null,
-            type: eventParams.type ?? null,
-            message: eventParams.message ?? null,
-          });
-        }
-        if (method === "Target.attachedToTarget" && typeof eventParams.sessionId === "string") {
-          record.cdpSessionIds.add(eventParams.sessionId);
-        }
-        if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
-          record.cdpSessionIds.delete(eventParams.sessionId);
-        }
-        if (method === "Overlay.inspectNodeRequested") {
-          this.handleInspectNodeRequested(record, eventParams, sessionId);
-        }
-        this.#onEvent({
-          type: "cdp_event",
-          binding: this.binding(record),
-          method,
-          params: eventParams,
-          ...(sessionId ? { sessionId } : {}),
-        });
-      });
-      debuggerApi.on("detach", (_event, reason) => {
-        if (record.closed) return;
-        this.stopInspectForLifecycle(record, "debugger-detached");
-        console.warn("[BrowserSurfaceManager] Browser debugger detached", {
-          surfaceId: record.surfaceId,
-          tabId: record.tabId,
-          reason,
-        });
-        // 调试器是自动化通道，不是页面本身。短暂 detach 不能隐藏或 reload
-        // 用户正在看的 Chromium 文档；仅后台重新 attach，页面继续保持可见。
-        void this.reconnectDebugger(record, `debugger-detached:${reason}`).catch((error) => {
-          if (!record.closed) {
-            console.error("[BrowserSurfaceManager] Browser Surface 调试器重连失败", {
-              surfaceId: record.surfaceId,
-              reason,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        });
-      });
-    }
-    if (!record.dialogBridgeInstalled) {
+    if (
+      debuggerApi.isAttached()
+      && record.debuggerSessionInitialized
+      && record.debuggerListenersInstalled
+    ) return;
+    try {
+      if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
+      if (!record.debuggerListenersInstalled) this.installDebuggerListeners(record);
+      const sessionGeneration = record.debuggerSessionGeneration;
+      record.debuggerSessionInitialized = false;
       // Runtime.addBinding 在 Electron 中需要先显式启用 Runtime domain；
-      // 否则某些 Chromium 版本不会返回错误，而是让 sendCommand 一直挂起。
-      await sendCdpCommandWithTimeout(
-        record.contents,
-        "Page.enable",
-        {},
-        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-      );
-      await sendCdpCommandWithTimeout(
-        record.contents,
-        "Runtime.enable",
-        {},
-        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-      );
+      // 每次新的 debugger session 都完整执行一遍初始化，不复用 detach
+      // 前的 domain、binding、isolated world 或 Target session 状态。
+      await sendCdpCommandWithTimeout(record.contents, "Page.enable", {}, DEFAULT_CDP_COMMAND_TIMEOUT_MS);
+      this.assertDebuggerSessionCurrent(record, sessionGeneration);
+      await sendCdpCommandWithTimeout(record.contents, "Runtime.enable", {}, DEFAULT_CDP_COMMAND_TIMEOUT_MS);
+      this.assertDebuggerSessionCurrent(record, sessionGeneration);
       await sendCdpCommandWithTimeout(
         record.contents,
         "Runtime.addBinding",
         { name: DIALOG_BRIDGE_BINDING },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
       );
+      this.assertDebuggerSessionCurrent(record, sessionGeneration);
       await sendCdpCommandWithTimeout(
         record.contents,
         "Page.addScriptToEvaluateOnNewDocument",
         { source: DIALOG_BRIDGE_SCRIPT },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
       );
+      this.assertDebuggerSessionCurrent(record, sessionGeneration);
       record.dialogBridgeInstalled = true;
-      await record.contents.executeJavaScript(DIALOG_BRIDGE_SCRIPT, true);
+      if (!record.contents.isLoadingMainFrame()) {
+        await record.contents.executeJavaScript(DIALOG_BRIDGE_SCRIPT, true);
+        this.assertDebuggerSessionCurrent(record, sessionGeneration);
+      }
+      record.viewportApplyDirty = false;
+      await this.applyViewport(record);
+      this.assertDebuggerSessionCurrent(record, sessionGeneration);
+      record.debuggerSessionInitialized = true;
+    } catch (error) {
+      // Page/Runtime domain 初始化只要有一步失败，当前 session 就不能继续
+      // 复用。先解绑监听器再 detach，避免清理动作触发第二条重连链；外层
+      // reconnectDebugger 会保留单飞 Promise 并安排退避重试。
+      this.resetDebuggerSession(record);
+      if (!record.contents.isDestroyed() && debuggerApi.isAttached()) {
+        try {
+          debuggerApi.detach();
+        } catch {
+          // renderer 销毁竞态下 detach 可能同步失败，重连仍会重新 attach。
+        }
+      }
+      throw error;
     }
-    // 内容槽可能先于调试器握手完成。固定视口在这段竞态中不能因为
-    // 首次 CDP apply 提前返回而永久失效，握手完成后补交同一 Surface
-    // 的最新 Tab 级 viewport 配置。后台 auto Surface 也必须收敛一次，
-    // 否则 Chromium 会把未挂载 WebContentsView 的页面计算成 0×0。
-    this.scheduleViewportApply(record);
+  }
+
+  private assertDebuggerSessionCurrent(record: BrowserSurfaceRecord, generation: number): void {
+    if (
+      record.closed
+      || record.contents.isDestroyed()
+      || record.debuggerSessionGeneration !== generation
+      || !record.contents.debugger.isAttached()
+    ) {
+      throw staleSurfaceError("browser_debugger_session_stale");
+    }
+  }
+
+  private installDebuggerListeners(record: BrowserSurfaceRecord): void {
+    const debuggerApi = record.contents.debugger;
+    const generation = ++record.debuggerSessionGeneration;
+    const messageListener: DebuggerMessageListener = (_event, method, params, sessionId) => {
+      if (record.closed || record.debuggerSessionGeneration !== generation) return;
+      const eventParams = (params ?? {}) as Record<string, unknown>;
+      if (method === "Page.javascriptDialogOpening" || method === "Page.javascriptDialogClosed") {
+        console.info("[BrowserSurfaceManager] JavaScript dialog event", {
+          surfaceId: record.surfaceId,
+          tabId: record.tabId,
+          method,
+          sessionId: sessionId ?? null,
+          type: eventParams.type ?? null,
+          message: eventParams.message ?? null,
+        });
+      }
+      if (method === "Target.attachedToTarget" && typeof eventParams.sessionId === "string") {
+        record.cdpSessionIds.add(eventParams.sessionId);
+      }
+      if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
+        record.cdpSessionIds.delete(eventParams.sessionId);
+      }
+      if (method === "Overlay.inspectNodeRequested") {
+        this.handleInspectNodeRequested(record, eventParams, sessionId);
+      }
+      this.#onEvent({
+        type: "cdp_event",
+        binding: this.binding(record),
+        method,
+        params: eventParams,
+        ...(sessionId ? { sessionId } : {}),
+      });
+    };
+    const detachListener: DebuggerDetachListener = (_event, reason) => {
+      if (record.closed || record.debuggerSessionGeneration !== generation) return;
+      this.resetDebuggerSession(record);
+      console.warn("[BrowserSurfaceManager] Browser debugger detached", {
+        surfaceId: record.surfaceId,
+        tabId: record.tabId,
+        reason,
+      });
+      // detach 只影响自动化通道，不隐藏或 reload 用户正在看的文档；
+      // 重连会等待当前导航 operation，再完整重建 CDP session。
+      void this.reconnectDebugger(record, `debugger-detached:${reason}`).catch((error) => {
+        if (!record.closed) {
+          console.error("[BrowserSurfaceManager] Browser Surface 调试器重连失败", {
+            surfaceId: record.surfaceId,
+            reason,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    };
+    debuggerApi.on("message", messageListener);
+    debuggerApi.on("detach", detachListener);
+    record.debuggerMessageListener = messageListener;
+    record.debuggerDetachListener = detachListener;
+    record.debuggerListenersInstalled = true;
+  }
+
+  private removeDebuggerListeners(record: BrowserSurfaceRecord): void {
+    const debuggerApi = record.contents.debugger;
+    if (record.debuggerMessageListener) debuggerApi.off("message", record.debuggerMessageListener);
+    if (record.debuggerDetachListener) debuggerApi.off("detach", record.debuggerDetachListener);
+    record.debuggerMessageListener = null;
+    record.debuggerDetachListener = null;
+    record.debuggerListenersInstalled = false;
+  }
+
+  private resetDebuggerSession(record: BrowserSurfaceRecord): void {
+    // stopInspectForLifecycle 必须先读取并排队清理 Overlay 资源；下面的
+    // 状态清零只负责阻止新请求，不能覆盖这次清理已经捕获的事实。
+    this.stopInspectForLifecycle(record, "debugger-detached");
+    this.removeDebuggerListeners(record);
+    record.debuggerSessionGeneration += 1;
+    record.debuggerSessionInitialized = false;
+    this.clearDebuggerReconnectTimer(record);
+    // 任何 session reset 都必须让旧的 ready promise 失效。新的 attach
+    // 由 reconnectDebugger 单独建立，不能让旧 Promise 继续代表已失效的
+    // debugger session。
+    record.debuggerReadyPromise = null;
+    record.dialogBridgeInstalled = false;
+    record.inspectResourcesEnabled = false;
+    record.cdpSessionIds.clear();
+    record.cursorExecutionContextId = null;
+    record.viewportApplied = false;
+    record.viewportApplyDirty = true;
+  }
+
+  private invalidateDebuggerSession(record: BrowserSurfaceRecord, reason: string): void {
+    if (record.closed || record.contents.isDestroyed()) return;
+    this.resetDebuggerSession(record);
+    if (record.contents.debugger.isAttached()) {
+      try {
+        record.contents.debugger.detach();
+      } catch {
+        // Chromium renderer 销毁竞态下 detach 可能同步失败；下一次命令
+        // 仍会重新建立完整 debugger session。
+      }
+    }
+    this.scheduleDebuggerReconnect(record, reason, "browser_cdp_timeout");
   }
 
   private async installDialogBridgeInCurrentDocument(record: BrowserSurfaceRecord): Promise<void> {
@@ -1956,35 +2863,116 @@ export class BrowserSurfaceManager {
   }
 
   private reconnectDebugger(record: BrowserSurfaceRecord, reason: string): Promise<void> {
+    if (record.closed || record.contents.isDestroyed()) {
+      return Promise.reject(staleSurfaceError("browser_surface_not_found"));
+    }
+    if (record.recoveryPromise) return record.recoveryPromise;
+    if (
+      record.debuggerSessionInitialized
+      && record.contents.debugger.isAttached()
+      && record.debuggerListenersInstalled
+    ) return Promise.resolve();
     if (record.debuggerReadyPromise) return record.debuggerReadyPromise;
+    this.clearDebuggerReconnectTimer(record);
     const reconnect = this.enqueueCdp(record, async () => {
       if (record.closed || record.contents.isDestroyed()) return;
+      await this.waitForCurrentNavigation(record);
+      if (record.closed || record.contents.isDestroyed()) return;
       await this.attachDebugger(record);
-      record.cdpSessionIds.clear();
-      record.cursorExecutionContextId = null;
+      if (
+        !record.debuggerSessionInitialized
+        || !record.contents.debugger.isAttached()
+        || !record.debuggerListenersInstalled
+      ) throw staleSurfaceError("browser_debugger_detached");
       if (record.primary) this.#onEvent({ type: "primary_changed", binding: this.binding(record) });
-      void reason;
     });
     record.debuggerReadyPromise = reconnect;
     void reconnect.then(
       () => {
         if (record.debuggerReadyPromise === reconnect) record.debuggerReadyPromise = null;
+        record.debuggerReconnectAttempt = 0;
+        this.clearDebuggerReconnectTimer(record);
       },
-      () => {
+      (error) => {
         if (record.debuggerReadyPromise === reconnect) record.debuggerReadyPromise = null;
+        if (!record.closed && !record.contents.isDestroyed()) {
+          this.scheduleDebuggerReconnect(
+            record,
+            reason,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
       },
     );
     return reconnect;
+  }
+
+  private scheduleDebuggerReconnect(
+    record: BrowserSurfaceRecord,
+    reason: string,
+    error: string,
+  ): void {
+    if (
+      record.closed
+      || record.contents.isDestroyed()
+      || record.recoveryPromise
+      || record.debuggerReadyPromise
+      || record.debuggerSessionInitialized && record.contents.debugger.isAttached()
+      || record.debuggerReconnectTimer
+    ) return;
+    const attempt = record.debuggerReconnectAttempt;
+    const delay = Math.min(
+      DEBUGGER_RECONNECT_MAX_DELAY_MS,
+      DEBUGGER_RECONNECT_INITIAL_DELAY_MS * 2 ** Math.min(attempt, 5),
+    );
+    record.debuggerReconnectAttempt = Math.min(attempt + 1, 31);
+    const timer = setTimeout(() => {
+      if (record.debuggerReconnectTimer === timer) record.debuggerReconnectTimer = null;
+      if (record.closed || record.contents.isDestroyed() || record.recoveryPromise) return;
+      void this.reconnectDebugger(record, `retry:${reason}`).catch((retryError) => {
+        if (!record.closed) {
+          console.warn("[BrowserSurfaceManager] Browser Surface 调试器重连等待下一次重试", {
+            surfaceId: record.surfaceId,
+            reason,
+            error: retryError instanceof Error ? retryError.message : String(retryError),
+          });
+        }
+      });
+    }, delay);
+    timer.unref();
+    record.debuggerReconnectTimer = timer;
+    console.warn("[BrowserSurfaceManager] Browser Surface 调试器重连已调度", {
+      surfaceId: record.surfaceId,
+      reason,
+      error,
+      delayMs: delay,
+    });
+  }
+
+  private clearDebuggerReconnectTimer(record: BrowserSurfaceRecord): void {
+    if (!record.debuggerReconnectTimer) return;
+    clearTimeout(record.debuggerReconnectTimer);
+    record.debuggerReconnectTimer = null;
   }
 
   private invalidateAndRecover(record: BrowserSurfaceRecord, reason: string): void {
     if (record.recoveryPromise || record.closed || record.contents.isDestroyed()) return;
     record.priming = true;
     this.unmountSurface(record, this.#windows.get(record.windowId));
+    // render-process-gone 不保证 Electron 先发 debugger.detach。无论事件
+    // 顺序如何，恢复都必须从全新的 session 开始，不能把旧 domain/session
+    // 状态带进 reload。
+    this.resetDebuggerSession(record);
+    if (!record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
+      try {
+        record.contents.debugger.detach();
+      } catch {
+        // renderer 销毁竞态下 detach 可能同步失败，恢复流程仍会继续。
+      }
+    }
     record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);
     const recovery = this.enqueueCdp(record, () => this.recover(record, reason));
     record.recoveryPromise = recovery;
-    record.debuggerReadyPromise = recovery;
     void recovery.then(
       () => {
         if (record.recoveryPromise === recovery) record.recoveryPromise = null;
@@ -1997,10 +2985,17 @@ export class BrowserSurfaceManager {
 
   private async recover(record: BrowserSurfaceRecord, reason: string): Promise<void> {
     try {
-      await reloadAndWait(record.contents, true);
+      await this.runNavigationAction(
+        record,
+        "reload",
+        record.contents.getURL() || "about:blank",
+        () => record.contents.reloadIgnoringCache(),
+        DEFAULT_NAVIGATION_TIMEOUT_MS,
+      );
       if (record.closed) return;
       await this.attachDebugger(record);
       record.priming = false;
+      record.debuggerReconnectAttempt = 0;
       record.viewportApplied = false;
       this.scheduleViewportApply(record);
       this.applySlot(
@@ -2029,17 +3024,26 @@ export class BrowserSurfaceManager {
     if (record.closed || !record.contents.debugger.isAttached()) return;
     if (record.contents.isLoadingMainFrame()) return;
     if (record.viewport.mode === "auto") {
-      const bounds = record.view.getBounds();
-      const hasVisibleSlot = record.slotVisible && bounds.width > 0 && bounds.height > 0;
+      // auto 不写入任何设备指标。WebContentsView 的真实 bounds 就是页面
+      // viewport，Chromium 会自行触发 resize、media query 和 flex/grid 重排。
+      // 这条路径不能把右栏尺寸再次转成 CDP override，否则每次拖动都会
+      // 让页面经历第二套 viewport 变更，产生闪烁、跳动或状态不同步。
+      // 只有从 fixed 切换回来时才需要清理旧的 CDP override；清理动作也
+      // 必须允许在 Surface 暂时隐藏时执行，避免隐藏期间残留固定视口。
+      if (record.viewportAppliedScale === null) {
+        record.viewportApplied = true;
+        return;
+      }
       await sendCdpCommandWithTimeout(
         record.contents,
-        hasVisibleSlot ? "Emulation.clearDeviceMetricsOverride" : "Emulation.setDeviceMetricsOverride",
-        hasVisibleSlot ? {} : HIDDEN_AUTO_VIEWPORT,
+        "Emulation.clearDeviceMetricsOverride",
+        {},
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
         undefined,
         track,
       );
       record.viewportApplied = true;
+      record.viewportAppliedScale = null;
       return;
     }
     const viewport = record.viewport;
@@ -2047,6 +3051,15 @@ export class BrowserSurfaceManager {
     const width = Math.max(320, Math.round(viewport.width));
     const height = Math.max(240, Math.round(viewport.height));
     const mobile = viewport.device_type === "mobile";
+    const slot = record.view.getBounds();
+    const availableWidth = slot.width > 0 ? slot.width : record.slotBounds?.width ?? 0;
+    const availableHeight = slot.height > 0 ? slot.height : record.slotBounds?.height ?? 0;
+    const scale = nativeViewportScale(width, height, availableWidth, availableHeight);
+    if (
+      record.viewportApplied
+      && record.viewportAppliedScale !== null
+      && Math.abs(record.viewportAppliedScale - scale) < VIEWPORT_SCALE_EPSILON
+    ) return;
     await sendCdpCommandWithTimeout(
       record.contents,
       "Emulation.setDeviceMetricsOverride",
@@ -2055,6 +3068,10 @@ export class BrowserSurfaceManager {
         height,
         deviceScaleFactor: viewport.device_scale_factor_millis / 1_000,
         mobile,
+        // 这是 Chromium Emulation 的 compositor scale，不是 CSS transform、
+        // 截图缩放或宿主坐标换算。页面仍按 width/height 进行响应式布局，
+        // 只是把完整的结果视图缩放到当前原生内容槽，避免大逻辑视口被裁切。
+        scale,
         screenWidth: width,
         screenHeight: height,
         screenOrientation: {
@@ -2067,6 +3084,7 @@ export class BrowserSurfaceManager {
       track,
     );
     record.viewportApplied = true;
+    record.viewportAppliedScale = scale;
   }
 
   private scheduleViewportApply(record: BrowserSurfaceRecord): void {
@@ -2108,7 +3126,7 @@ export class BrowserSurfaceManager {
   ): Promise<void> {
     if (record.closed || record.contents.isDestroyed()) return;
     const position = visible && (x === null || y === null)
-      ? this.initialAgentCursorPosition(record)
+      ? this.initialAgentCursorPosition(record) ?? { x: null, y: null }
       : { x, y };
     record.cursor = { visible, ...position, action };
     this.#onEvent({
@@ -2230,11 +3248,11 @@ export class BrowserSurfaceManager {
     this.#onEvent({ type: "primary_changed", binding: this.binding(record) });
   }
 
-  private promoteFallback(tabId: string): void {
-    const fallback = this.#surfaces.promoteFallback(tabId);
-    if (!fallback) return;
-    fallback.surfaceRevision = this.#surfaces.nextRevision(fallback.tabId);
-    this.#onEvent({ type: "primary_changed", binding: this.binding(fallback) });
+  private promoteReplacement(tabId: string): void {
+    const replacement = this.#surfaces.promoteReplacement(tabId);
+    if (!replacement) return;
+    replacement.surfaceRevision = this.#surfaces.nextRevision(replacement.tabId);
+    this.#onEvent({ type: "primary_changed", binding: this.binding(replacement) });
   }
 
   private pageState(record: BrowserSurfaceRecord): BrowserPageState {
@@ -2268,11 +3286,31 @@ export class BrowserSurfaceManager {
     return record;
   }
 
-  private closeRecord(record: BrowserSurfaceRecord, promoteFallback = true): void {
-    const wasClosed = record.closed;
+  private assertSurfaceLifecycleCurrent(record: BrowserSurfaceRecord, epoch: number): void {
+    if (
+      record.closed
+      || record.lifecycleEpoch !== epoch
+      || record.contents.isDestroyed()
+    ) throw staleSurfaceError("browser_surface_lifecycle_stale");
+  }
+
+  private rejectNavigationWaiters(record: BrowserSurfaceRecord, error: Error): void {
+    const operation = record.navigationOperation;
+    if (!operation) return;
+    operation.settled = true;
+    operation.failed = true;
+    for (const waiter of operation.waiters) waiter.reject(error);
+    operation.waiters.clear();
+  }
+
+  private closeRecord(record: BrowserSurfaceRecord, promoteReplacement = true): void {
+    if (record.closed) return;
     record.closed = true;
-    this.stopInspectForLifecycle(record, "surface-closed");
-    if (!wasClosed && !record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
+    record.lifecycleEpoch += 1;
+    record.lifecycleAbort.abort();
+    this.rejectNavigationWaiters(record, staleSurfaceError("browser_surface_not_found"));
+    this.resetDebuggerSession(record);
+    if (!record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
       try {
         record.contents.debugger.detach();
       } catch {
@@ -2281,9 +3319,9 @@ export class BrowserSurfaceManager {
     }
     const window = this.#windows.get(record.windowId);
     this.detachSurface(record, window);
-    if (!wasClosed && !record.contents.isDestroyed()) record.contents.close();
+    if (!record.contents.isDestroyed()) record.contents.close();
     this.removeRecordIndexes(record);
-    if (!wasClosed && promoteFallback) this.promoteFallback(record.tabId);
+    if (promoteReplacement) this.promoteReplacement(record.tabId);
   }
 
   private removeRecordIndexes(record: BrowserSurfaceRecord): void {
@@ -2297,6 +3335,27 @@ export class BrowserSurfaceManager {
       throw staleSurfaceError("browser_surface_activation_stale");
     }
   }
+}
+
+export function nativeViewportScale(
+  logicalWidth: number,
+  logicalHeight: number,
+  availableWidth: number,
+  availableHeight: number,
+): number {
+  if (
+    !Number.isFinite(logicalWidth)
+    || !Number.isFinite(logicalHeight)
+    || logicalWidth <= 0
+    || logicalHeight <= 0
+    || !Number.isFinite(availableWidth)
+    || !Number.isFinite(availableHeight)
+    || availableWidth <= 0
+    || availableHeight <= 0
+  ) return 1;
+  const fit = Math.min(1, availableWidth / logicalWidth, availableHeight / logicalHeight);
+  const normalized = Math.max(MIN_NATIVE_VIEWPORT_SCALE, fit);
+  return Math.abs(normalized - 1) < VIEWPORT_SCALE_EPSILON ? 1 : normalized;
 }
 
 interface CdpNodeDescription {
@@ -2378,6 +3437,32 @@ function staleSurfaceError(code: string): Error {
   return error;
 }
 
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(typeof value === "string" ? value : String(value));
+}
+
+function sameNavigationUrl(left: string, right: string): boolean {
+  try {
+    return normalizeNavigableUrl(left) === normalizeNavigableUrl(right);
+  } catch {
+    return left === right;
+  }
+}
+
+function sameFrame(left: NavigationFrameIdentity, right: NavigationFrameIdentity): boolean {
+  return left.processId === right.processId && left.routingId === right.routingId;
+}
+
+function frameIdentity(value: unknown): NavigationFrameIdentity | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const frame = value as { processId?: unknown; routingId?: unknown };
+  if (!Number.isSafeInteger(frame.processId) || !Number.isSafeInteger(frame.routingId)) return null;
+  return {
+    processId: frame.processId as number,
+    routingId: frame.routingId as number,
+  };
+}
+
 function sameBounds(left: Rectangle, right: Rectangle): boolean {
   return left.x === right.x
     && left.y === right.y
@@ -2385,45 +3470,66 @@ function sameBounds(left: Rectangle, right: Rectangle): boolean {
     && left.height === right.height;
 }
 
+function containsBounds(parent: Rectangle, child: Rectangle): boolean {
+  return parent.width > 0
+    && parent.height > 0
+    && child.width > 0
+    && child.height > 0
+    && child.x >= parent.x
+    && child.y >= parent.y
+    && child.x + child.width <= parent.x + parent.width
+    && child.y + child.height <= parent.y + parent.height;
+}
+
 function capturePageRect(
   record: BrowserSurfaceRecord,
   params: Record<string, unknown>,
 ): Rectangle {
-  const viewBounds = record.view.getBounds();
-  const logicalBounds = record.viewport.mode === "fixed"
-    ? { width: record.viewport.width, height: record.viewport.height }
-    : HIDDEN_AUTO_VIEWPORT;
-  const fallbackWidth = viewBounds.width > 0
-    ? viewBounds.width
-    : record.slotBounds && record.slotBounds.width > 0
-      ? record.slotBounds.width
-      : logicalBounds.width;
-  const fallbackHeight = viewBounds.height > 0
-    ? viewBounds.height
-    : record.slotBounds && record.slotBounds.height > 0
-      ? record.slotBounds.height
-      : logicalBounds.height;
+  const nativeSize = captureNativeSize(record);
   const clip = params.clip;
-  if (!clip || typeof clip !== "object") {
-    return { x: 0, y: 0, width: Math.max(1, fallbackWidth), height: Math.max(1, fallbackHeight) };
+  const value = clip && typeof clip === "object" ? clip as Record<string, unknown> : null;
+  const logicalClip = value ? {
+    x: screenshotClipNumber(value.x, "x"),
+    y: screenshotClipNumber(value.y, "y"),
+    width: screenshotClipNumber(value.width, "width"),
+    height: screenshotClipNumber(value.height, "height"),
+  } : null;
+  let compositorScale = 1;
+  if (record.viewport.mode === "fixed") {
+    if (!record.viewportApplied || record.viewportAppliedScale === null) {
+      throw staleSurfaceError("browser_viewport_unavailable");
+    }
+    compositorScale = record.viewportAppliedScale;
   }
-  const value = clip as Record<string, unknown>;
-  const x = finiteNumber(value.x, 0);
-  const y = finiteNumber(value.y, 0);
-  const width = finiteNumber(value.width, fallbackWidth);
-  const height = finiteNumber(value.height, fallbackHeight);
-  const left = Math.max(0, Math.min(fallbackWidth - 1, Math.floor(x)));
-  const top = Math.max(0, Math.min(fallbackHeight - 1, Math.floor(y)));
-  return {
-    x: left,
-    y: top,
-    width: Math.max(1, Math.min(fallbackWidth - left, Math.ceil(width))),
-    height: Math.max(1, Math.min(fallbackHeight - top, Math.ceil(height))),
-  };
+  return mapBrowserCaptureClipToNativeRect(
+    nativeSize,
+    logicalClip,
+    compositorScale,
+  );
 }
 
-function finiteNumber(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+function captureNativeSize(record: BrowserSurfaceRecord): { width: number; height: number } {
+  const viewBounds = record.view.getBounds();
+  if (viewBounds.width > 0 && viewBounds.height > 0) {
+    return { width: viewBounds.width, height: viewBounds.height };
+  }
+  if (
+    record.slotVisible
+    && record.slotBounds
+    && record.slotBounds.width > 0
+    && record.slotBounds.height > 0
+  ) {
+    return { width: record.slotBounds.width, height: record.slotBounds.height };
+  }
+  throw staleSurfaceError("browser_surface_slot_unavailable");
+}
+
+function screenshotClipNumber(value: unknown, name: string): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const positive = name === "width" || name === "height";
+    if ((positive && value > 0) || (!positive && value >= 0)) return value;
+  }
+  throw new Error(`browser_screenshot_clip_invalid:${name}`);
 }
 
 function finiteInteger(value: unknown, fallback: number): number {
@@ -2473,7 +3579,7 @@ function quadBounds(value: unknown): { x: number; y: number; width: number; heig
 }
 
 function normalizeJpegQuality(value: unknown): number {
-  const quality = finiteNumber(value, 90);
+  const quality = typeof value === "number" && Number.isFinite(value) ? value : 90;
   return Math.max(0, Math.min(100, Math.round(quality)));
 }
 
@@ -2522,13 +3628,45 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, method: st
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`browser_cdp_timeout:${method}`)), timeoutMs);
+        timer = setTimeout(() => {
+          const error = new Error(`browser_cdp_timeout:${method}`);
+          error.name = "BrowserCdpTimeout";
+          reject(error);
+        }, timeoutMs);
         timer.unref();
       }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function isCdpTimeoutError(value: unknown): boolean {
+  return value instanceof Error && value.name === "BrowserCdpTimeout";
+}
+
+function withAbortSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+  abortError: Error,
+): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortError);
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const settle = (settler: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      settler();
+    };
+    const onAbort = () => settle(() => reject(abortError));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => settle(() => resolve(value)),
+      (error) => settle(() => reject(error)),
+    );
+  });
 }
 
 function clampNavigationTimeout(value: number | undefined): number {
@@ -2549,135 +3687,6 @@ async function withNavigationTimeout<T>(promise: Promise<T>, timeoutMs: number):
   } finally {
     if (timer) clearTimeout(timer);
   }
-}
-
-async function primeInitialDocument(contents: WebContents): Promise<void> {
-  if (contents.isDestroyed()) throw new Error("browser_surface_not_found");
-  await waitForNavigationEvent(
-    contents,
-    () => {
-      // 新建 WebContents 的默认 URL 可能已经显示为 about:blank，但在
-      // Chromium renderer 真正完成初始化前 Runtime domain 仍不可用。
-      // 显式完成一次空白导航，确保后续 debugger.sendCommand 有稳定的
-      // document/renderer 目标。
-      void contents.loadURL("about:blank").catch(() => undefined);
-    },
-    DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-  );
-}
-
-async function waitForNavigationEvent(
-  contents: WebContents,
-  start: () => void,
-  timeoutMs: number,
-): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => {
-      clearTimeout(timer);
-      contents.off("did-stop-loading", done);
-      contents.off("did-fail-load", failed);
-    };
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve();
-    };
-    const done = () => finish();
-    const failed = (
-      _event: Electron.Event,
-      errorCode: number,
-      errorDescription: string,
-      _validatedURL: string,
-      isMainFrame: boolean,
-    ) => {
-      if (!isMainFrame || errorCode === -3) return;
-      finish(new Error(`browser_navigation_failed:${errorCode}:${errorDescription}`));
-    };
-    const timer = setTimeout(() => finish(new Error("browser_navigation_timeout")), timeoutMs);
-    timer.unref();
-    contents.once("did-stop-loading", done);
-    contents.once("did-fail-load", failed);
-    try {
-      start();
-    } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)));
-    }
-  });
-}
-
-async function reloadAndWait(
-  contents: WebContents,
-  ignoreCache: boolean,
-  timeoutMs?: number,
-  handleBeforeUnload?: "accept" | "dismiss",
-): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      try {
-        contents.stop();
-      } catch {
-        // WebContents 销毁竞态下 stop() 可能同步失败，超时状态仍已收敛。
-      }
-      reject(new Error("browser_navigation_timeout"));
-    }, clampNavigationTimeout(timeoutMs));
-    timer.unref();
-    const cleanup = () => {
-      clearTimeout(timer);
-      contents.off("did-stop-loading", done);
-      contents.off("did-fail-load", failed);
-      if (allowBeforeUnload) contents.off("will-prevent-unload", allowBeforeUnload);
-    };
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve();
-    };
-    const allowBeforeUnload = handleBeforeUnload === "accept"
-      ? (event: Electron.Event) => event.preventDefault()
-      : null;
-    const failed = (_event: Electron.Event, errorCode: number, errorDescription: string, _validatedURL: string, isMainFrame: boolean) => {
-      if (!isMainFrame || errorCode === -3) return;
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error(`browser_navigation_failed:${errorCode}:${errorDescription}`));
-    };
-    const done = () => finish();
-    if (allowBeforeUnload) contents.on("will-prevent-unload", allowBeforeUnload);
-    contents.once("did-stop-loading", done);
-    contents.once("did-fail-load", failed);
-    try {
-      if (ignoreCache) contents.reloadIgnoringCache();
-      else contents.reload();
-    } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)));
-    }
-  });
-}
-
-async function loadPopupInCurrentPage(
-  webContents: Electron.WebContents,
-  url: string,
-  details: HandlerDetails,
-): Promise<void> {
-  const postBody = details.postBody;
-  const contentType = postBody?.boundary
-    ? `${postBody.contentType}; boundary=${postBody.boundary}`
-    : postBody?.contentType;
-  await webContents.loadURL(url, {
-    httpReferrer: details.referrer,
-    ...(postBody ? { postData: postBody.data } : {}),
-    ...(contentType ? { extraHeaders: `Content-Type: ${contentType}` } : {}),
-  });
 }
 
 function downloadBytes(item: Electron.DownloadItem): number {

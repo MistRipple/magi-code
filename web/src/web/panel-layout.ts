@@ -13,6 +13,7 @@ export interface PanelLayoutInput {
   viewportWidth: number;
   sidebarWidth: number;
   previewPanelWidth: number;
+  desktopSurface?: boolean;
 }
 
 export interface PanelLayoutResolution {
@@ -27,6 +28,7 @@ export interface PreviewPanelWidthBoundsInput {
   sidebarVisible: boolean;
   rightPaneOpen: boolean;
   previewOverlay: boolean;
+  desktopSurface?: boolean;
 }
 
 export interface PreviewPanelWidthBounds {
@@ -38,10 +40,12 @@ export function resolvePanelLayout(input: PanelLayoutInput): PanelLayoutResoluti
   const viewportWidth = Math.max(0, input.viewportWidth);
   const sidebarWidth = Math.max(0, input.sidebarWidth);
   const previewPanelWidth = Math.max(PANEL_LAYOUT.minPreviewWidth, input.previewPanelWidth);
+  const shellPadding = input.desktopSurface ? 0 : PANEL_LAYOUT.shellPadding;
+  const shellGap = input.desktopSurface ? 0 : PANEL_LAYOUT.shellGap;
   const sidebarDrawer = viewportWidth <= PANEL_LAYOUT.mobileBreakpoint;
   const contentFrameWidth = Math.max(
     0,
-    viewportWidth - PANEL_LAYOUT.shellPadding * 2,
+    viewportWidth - shellPadding * 2,
   );
   const previewSplitWidth =
     PANEL_LAYOUT.minContentWidth
@@ -50,7 +54,7 @@ export function resolvePanelLayout(input: PanelLayoutInput): PanelLayoutResoluti
   const previewOverlay = sidebarDrawer || contentFrameWidth < previewSplitWidth;
   const sideBySideWidth =
     sidebarWidth
-    + PANEL_LAYOUT.shellGap
+    + shellGap
     + previewSplitWidth;
   const panelsCanCoexist = !previewOverlay && contentFrameWidth >= sideBySideWidth;
 
@@ -66,9 +70,11 @@ export function resolvePreviewPanelWidthBounds(
 ): PreviewPanelWidthBounds {
   const viewportWidth = Math.max(0, input.viewportWidth);
   const sidebarWidth = Math.max(0, input.sidebarWidth);
-  const shellWidth = Math.max(0, viewportWidth - PANEL_LAYOUT.shellPadding * 2);
+  const shellPadding = input.desktopSurface ? 0 : PANEL_LAYOUT.shellPadding;
+  const shellGap = input.desktopSurface ? 0 : PANEL_LAYOUT.shellGap;
+  const shellWidth = Math.max(0, viewportWidth - shellPadding * 2);
   const sidebarTakenWidth = input.sidebarVisible
-    ? sidebarWidth + PANEL_LAYOUT.shellGap
+    ? sidebarWidth + shellGap
     : 0;
   const currentWorkbenchWidth = Math.max(0, shellWidth - sidebarTakenWidth);
 

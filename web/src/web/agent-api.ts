@@ -1334,10 +1334,29 @@ export function browserScreenshotUrl(tabId: string): string {
   return agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/screenshot`);
 }
 
-export function browserAnnotationArtifactUrl(annotationId: string, sessionId: string): string {
+function browserAnnotationArtifactUrlForSession(annotationId: string, sessionId: string): string {
   const url = new URL(agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}/artifact`));
   url.searchParams.set('sessionId', sessionId.trim());
   return url.toString();
+}
+
+/**
+ * 为消息所属 Magi 会话构造浏览器标记截图 artifact 地址。
+ *
+ * 消息的 sessionId 是稳定的历史归属；不能再通过当前仍运行的 Browser
+ * Session 反查，因为浏览器运行时关闭或重启后，历史标记仍然应该可读。
+ * 服务端会用标记自身保存的 browser_session_id 做最终归属校验。
+ */
+export function resolveBrowserAnnotationArtifactUrl(
+  annotationId: string,
+  sessionId: string,
+): string {
+  const normalizedAnnotationId = annotationId.trim();
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedAnnotationId || !normalizedSessionId) {
+    throw new Error('浏览器标记预览缺少有效的 annotationId 或 sessionId');
+  }
+  return browserAnnotationArtifactUrlForSession(normalizedAnnotationId, normalizedSessionId);
 }
 
 export function isWebAgentMode(): boolean {
