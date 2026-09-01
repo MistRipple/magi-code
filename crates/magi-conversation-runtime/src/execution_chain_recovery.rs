@@ -43,10 +43,7 @@ fn root_task_allows_continue(status: &TaskStatus) -> bool {
 }
 
 fn task_status_needs_terminal_branch_finalization(status: &TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Failed | TaskStatus::Pending | TaskStatus::Running
-    )
+    matches!(status, TaskStatus::Pending | TaskStatus::Running)
 }
 
 fn branch_stage_is_terminal(stage: &str) -> bool {
@@ -160,25 +157,44 @@ pub fn finalize_terminal_worker_branches(
         }
         let terminal_status =
             terminal_status_for_branch(worker_runtime, branch).unwrap_or(TaskStatus::Completed);
-        if matches!(terminal_status, TaskStatus::Failed) {
-            continue;
-        }
         if matches!(terminal_status, TaskStatus::Completed) {
+            let lease_id = branch.lease_id.as_ref().ok_or_else(|| {
+                format!(
+                    "恢复 branch {} 缺少执行租约，拒绝无 lease 完成回退",
+                    branch.task_id
+                )
+            })?;
             let final_response = task.output_refs.join("\n\n");
-            task_store
-                .complete_task(
+            let attempt = TaskCompletionAttempt {
+                output_refs: task.output_refs.clone(),
+                final_response: Some(final_response),
+                evidence: Vec::new(),
+            };
+            if !task_store
+                .complete_lease_and_task(&branch.task_id, &chain.root_task_id, lease_id, attempt)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "恢复 branch {} 的执行租约已失效，未提交完成事实",
+                    branch.task_id
+                ));
+            }
+        } else {
+            let changed = task_store
+                .revoke_lease_and_set_task_terminal(
                     &branch.task_id,
-                    TaskCompletionAttempt {
-                        output_refs: task.output_refs.clone(),
-                        final_response: Some(final_response),
-                        evidence: Vec::new(),
-                    },
+                    &chain.root_task_id,
+                    branch.lease_id.as_ref(),
+                    terminal_status,
+                    Vec::new(),
                 )
                 .map_err(|error| error.to_string())?;
-        } else {
-            task_store
-                .update_status(&branch.task_id, terminal_status)
-                .map_err(|error| error.to_string())?;
+            if !changed {
+                return Err(format!(
+                    "恢复 branch {} 的执行租约已失效，未提交终止事实",
+                    branch.task_id
+                ));
+            }
         }
         finalized_count += 1;
     }
@@ -211,8 +227,96 @@ pub fn release_resumed_branch_path(
         };
         if task.status == TaskStatus::Failed {
             task_store
-                .update_status(&task_id, TaskStatus::Pending)
+                .reopen_failed_task_for_recovery(&task_id)
                 .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 将一次恢复尝试触及的 branch 路径收口为 Failed。
+///
+/// 该函数只使用当前仍然有效的 lease 做撤销；没有 lease 的 Pending/Running 任务可以
+/// 被标记为 Failed，但绝不允许借此伪造 Completed。它是 Continue 的失败回滚边界，重复
+/// 调用对已终态任务幂等。
+pub fn fail_resumed_execution_paths(
+    task_store: &TaskStore,
+    spawn_graph: &std::sync::Mutex<SpawnGraph>,
+    chain: &ActiveExecutionChain,
+    branches: &[ActiveExecutionBranch],
+) -> Result<(), String> {
+    let mut task_ids = Vec::new();
+    for branch in branches {
+        let mut path_seen = Vec::new();
+        let mut current_task_id = Some(branch.task_id.clone());
+        while let Some(task_id) = current_task_id {
+            if path_seen.iter().any(|seen| seen == &task_id) {
+                return Err(format!("恢复 branch {} 的父任务路径存在环", branch.task_id));
+            }
+            path_seen.push(task_id.clone());
+            if !task_ids.iter().any(|seen| seen == &task_id) {
+                task_ids.push(task_id.clone());
+            }
+            if task_id == chain.root_task_id {
+                break;
+            }
+            let task = task_store
+                .get_task(&task_id)
+                .ok_or_else(|| format!("恢复 branch 任务不存在: {task_id}"))?;
+            if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
+                return Err(format!("恢复 branch 路径任务不属于当前执行链: {task_id}"));
+            }
+            current_task_id = {
+                let graph = spawn_graph
+                    .lock()
+                    .map_err(|error| format!("SpawnGraph 锁中毒: {error}"))?;
+                graph.parent_of(&task_id).cloned()
+            };
+        }
+    }
+    if !task_ids
+        .iter()
+        .any(|task_id| task_id == &chain.root_task_id)
+    {
+        task_ids.push(chain.root_task_id.clone());
+    }
+
+    for task_id in task_ids {
+        let task = task_store
+            .get_task(&task_id)
+            .ok_or_else(|| format!("恢复失败收口任务不存在: {task_id}"))?;
+        if task_status_is_terminal(&task.status) || task.status == TaskStatus::Failed {
+            continue;
+        }
+        if !matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+            return Err(format!(
+                "恢复失败收口任务 {} 当前状态 {:?} 不可写入 Failed",
+                task_id, task.status
+            ));
+        }
+        let active_lease = task_store.get_active_lease(&task_id);
+        let changed = task_store
+            .revoke_lease_and_set_task_terminal(
+                &task_id,
+                &chain.root_task_id,
+                active_lease.as_ref().map(|lease| &lease.lease_id),
+                TaskStatus::Failed,
+                Vec::new(),
+            )
+            .map_err(|error| error.to_string())?;
+        if !changed {
+            let current = task_store
+                .get_task(&task_id)
+                .ok_or_else(|| format!("恢复失败收口任务不存在: {task_id}"))?;
+            if !matches!(
+                current.status,
+                TaskStatus::Failed | TaskStatus::Completed | TaskStatus::Killed
+            ) {
+                return Err(format!(
+                    "恢复失败收口任务 {} 未提交 Failed，当前状态 {:?}",
+                    task_id, current.status
+                ));
+            }
         }
     }
     Ok(())
@@ -343,6 +447,9 @@ pub fn map_recovery_input_error(
         magi_core::DomainError::AlreadyExists { entity } => RecoveryValidationError::Internal {
             message: format!("recovery 输入构建遇到重复实体: {entity}"),
         },
+        magi_core::DomainError::Persistence { message } => {
+            RecoveryValidationError::Internal { message }
+        }
         magi_core::DomainError::CurrentTurnConflict {
             session_id,
             active_turn_id,
@@ -390,8 +497,15 @@ pub fn validate_recovery_input_matches_chain(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub struct ChainRecoveryCommit {
+    recovery_id: String,
+    ownership: ExecutionOwnership,
+}
+
 /// 若 chain.recovery_ref 存在：校验 recovery 状态 / 入口匹配 → 应用 recovery resume
-/// 输入到 session_store → 落盘 writebacks → 消费 recovery → 清理 chain.recovery_ref。
+/// 输入到 session_store → 落盘 writebacks。Recovery 仍保持 Ready，直到 runner 成功启动
+/// 后由 [`commit_chain_recovery`] 完成消费和 chain ref 清理。
 pub fn apply_chain_recovery_if_needed(
     session_store: &SessionStore,
     workspace_registry: &WorkspaceStore,
@@ -399,9 +513,9 @@ pub fn apply_chain_recovery_if_needed(
     session_id: &SessionId,
     chain: &mut ActiveExecutionChain,
     primary_branch: &ActiveExecutionBranch,
-) -> Result<(), RecoveryValidationError> {
+) -> Result<Option<ChainRecoveryCommit>, RecoveryValidationError> {
     let Some(recovery_id) = chain.recovery_ref.clone() else {
-        return Ok(());
+        return Ok(None);
     };
     validate_recovery_status(workspace_registry, &recovery_id)?;
     let input = workspace_registry
@@ -423,27 +537,405 @@ pub fn apply_chain_recovery_if_needed(
         writebacks.apply(memory_store);
     }
 
-    workspace_registry
-        .consume_recovery_with_ownership(
-            &input.recovery_id,
-            ExecutionOwnership {
-                session_id: Some(chain.session_id.clone()),
-                workspace_id: chain.workspace_id.clone(),
-                mission_id: Some(chain.mission_id.clone()),
-                task_id: Some(primary_branch.task_id.clone()),
-                worker_id: Some(primary_branch.worker_id.clone()),
-                execution_chain_ref: Some(chain.execution_chain_ref.clone()),
-            },
-        )
-        .map_err(|error| RecoveryValidationError::Internal {
-            message: error.to_string(),
-        })?;
+    Ok(Some(ChainRecoveryCommit {
+        recovery_id: input.recovery_id,
+        ownership: ExecutionOwnership {
+            session_id: Some(chain.session_id.clone()),
+            workspace_id: chain.workspace_id.clone(),
+            mission_id: Some(chain.mission_id.clone()),
+            task_id: Some(primary_branch.task_id.clone()),
+            worker_id: Some(primary_branch.worker_id.clone()),
+            execution_chain_ref: Some(chain.execution_chain_ref.clone()),
+        },
+    }))
+}
 
-    session_store
-        .attach_recovery_ref(session_id, None)
+/// 在 runner 已成功启动后提交 recovery 消费。
+///
+/// 消费和 session ref 清理跨两个 store，若清理失败，补偿回 Ready 并保留 ref，使下一次
+/// Continue 仍然可以重新进入，而不会留下 consumed recovery + active chain 的裂缝。
+pub fn commit_chain_recovery(
+    session_store: &SessionStore,
+    workspace_registry: &WorkspaceStore,
+    session_id: &SessionId,
+    chain: &mut ActiveExecutionChain,
+    commit: ChainRecoveryCommit,
+) -> Result<(), RecoveryValidationError> {
+    if chain.recovery_ref.as_deref() != Some(commit.recovery_id.as_str()) {
+        return Err(RecoveryValidationError::Mismatch {
+            message: format!(
+                "恢复提交 {} 与当前执行链 recovery_ref 不一致",
+                commit.recovery_id
+            ),
+        });
+    }
+    workspace_registry
+        .consume_recovery_with_ownership(&commit.recovery_id, commit.ownership)
         .map_err(|error| RecoveryValidationError::Internal {
             message: error.to_string(),
         })?;
+    if let Err(error) = session_store.attach_recovery_ref(session_id, None) {
+        let compensation = workspace_registry.mark_recovery_ready(&commit.recovery_id);
+        let message = match compensation {
+            Ok(_) => format!(
+                "恢复 {} 已消费但 chain ref 清理失败，已补偿为 Ready: {}",
+                commit.recovery_id, error
+            ),
+            Err(compensation_error) => format!(
+                "恢复 {} 消费后 chain ref 清理失败，且无法补偿为 Ready: {}; {}",
+                commit.recovery_id, error, compensation_error
+            ),
+        };
+        return Err(RecoveryValidationError::Internal { message });
+    }
     chain.recovery_ref = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{
+        ExecutionOwnership, MissionId, Task, TaskId, TaskKind, TaskRuntimePayload, ThreadId,
+        WorkerId, WorkspaceId,
+    };
+    use magi_session_store::{
+        ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+    };
+    use std::time::SystemTime;
+
+    fn task(
+        task_id: &str,
+        root_task_id: &str,
+        mission_id: &str,
+        parent_task_id: Option<&str>,
+        status: TaskStatus,
+    ) -> Task {
+        let now = UtcMillis(1);
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: MissionId::new(mission_id),
+            root_task_id: TaskId::new(root_task_id),
+            parent_task_id: parent_task_id.map(TaskId::new),
+            kind: TaskKind::LocalAgent,
+            title: task_id.to_string(),
+            goal: task_id.to_string(),
+            status,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: Default::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn branch(
+        task_id: &str,
+        worker_id: &str,
+        stage: &str,
+        lease_id: Option<&str>,
+    ) -> ActiveExecutionBranch {
+        ActiveExecutionBranch {
+            task_id: TaskId::new(task_id),
+            worker_id: WorkerId::new(worker_id),
+            stage: stage.to_string(),
+            lease_id: lease_id.map(magi_core::LeaseId::new),
+            execution_intent_ref: None,
+            binding_lifecycle: None,
+            checkpoint_stage: None,
+            next_step_index: None,
+            checkpoint_at: None,
+            resume_mode: None,
+            resume_token: None,
+            use_tools: true,
+            skill_name: None,
+            is_primary: true,
+            thread_id: ThreadId::new(format!("thread-{task_id}")),
+        }
+    }
+
+    fn chain(
+        session_id: &SessionId,
+        mission_id: &MissionId,
+        root_task_id: &TaskId,
+        branch: ActiveExecutionBranch,
+        recovery_ref: Option<String>,
+    ) -> ActiveExecutionChain {
+        ActiveExecutionChain {
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            execution_chain_ref: "chain-recovery-test".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-recovery-test")),
+            active_branch_task_ids: vec![branch.task_id.clone()],
+            active_worker_bindings: vec![branch.worker_id.clone()],
+            branches: vec![branch],
+            recovery_ref,
+            dispatch_context: ActiveExecutionDispatchContext {
+                accepted_at: UtcMillis(1),
+                entry_id: "entry-recovery-test".to_string(),
+                trimmed_text: None,
+                skill_name: None,
+            },
+            current_turn: None,
+        }
+    }
+
+    #[test]
+    fn terminal_completion_requires_branch_lease() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-terminal-lease");
+        let mission_id = MissionId::new("mission-terminal-lease");
+        let root_task_id = TaskId::new("task-root-terminal-lease");
+        let branch_task_id = TaskId::new("task-branch-terminal-lease");
+        session_store
+            .create_session(session_id.clone(), "terminal lease")
+            .expect("session should exist");
+        task_store
+            .insert_task(task(
+                root_task_id.as_str(),
+                root_task_id.as_str(),
+                mission_id.as_str(),
+                None,
+                TaskStatus::Running,
+            ))
+            .expect("root should insert");
+        task_store
+            .insert_task(task(
+                branch_task_id.as_str(),
+                root_task_id.as_str(),
+                mission_id.as_str(),
+                Some(root_task_id.as_str()),
+                TaskStatus::Running,
+            ))
+            .expect("branch should insert");
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                chain(
+                    &session_id,
+                    &mission_id,
+                    &root_task_id,
+                    branch(
+                        branch_task_id.as_str(),
+                        "worker-terminal-lease",
+                        "finish",
+                        None,
+                    ),
+                    None,
+                ),
+            )
+            .expect("chain should persist");
+
+        let error =
+            finalize_terminal_worker_branches(&session_store, Some(&task_store), None, &session_id)
+                .expect_err("completion without lease must be rejected");
+        assert!(error.contains("拒绝无 lease 完成回退"));
+        assert_eq!(
+            task_store
+                .get_task(&branch_task_id)
+                .expect("branch should remain")
+                .status,
+            TaskStatus::Running
+        );
+    }
+
+    #[test]
+    fn recovery_apply_stays_ready_until_runner_commit() {
+        let session_store = SessionStore::new();
+        let workspace_registry = WorkspaceStore::new();
+        let session_id = SessionId::new("session-recovery-commit");
+        let mission_id = MissionId::new("mission-recovery-commit");
+        let root_task_id = TaskId::new("task-root-recovery-commit");
+        let branch = branch(
+            "task-branch-recovery-commit",
+            "worker-recovery-commit",
+            "execute",
+            None,
+        );
+        let recovery_id = "recovery-commit-boundary";
+        let chain_ref = "chain-recovery-test";
+        session_store
+            .create_session(session_id.clone(), "recovery commit")
+            .expect("session should exist");
+        workspace_registry.prepare_recovery_entry(
+            WorkspaceId::new("workspace-recovery-test"),
+            ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                mission_id: Some(mission_id.clone()),
+                execution_chain_ref: Some(chain_ref.to_string()),
+                ..ExecutionOwnership::default()
+            },
+            "snapshot-recovery-commit",
+            recovery_id,
+            None,
+        );
+        workspace_registry
+            .mark_recovery_ready(recovery_id)
+            .expect("recovery should become ready");
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                chain(
+                    &session_id,
+                    &mission_id,
+                    &root_task_id,
+                    branch.clone(),
+                    Some(recovery_id.to_string()),
+                ),
+            )
+            .expect("chain should persist");
+        let mut active_chain = session_store
+            .active_execution_chain(&session_id)
+            .expect("active chain should exist");
+
+        let commit = apply_chain_recovery_if_needed(
+            &session_store,
+            &workspace_registry,
+            None,
+            &session_id,
+            &mut active_chain,
+            &branch,
+        )
+        .expect("recovery should apply")
+        .expect("recovery commit should be required");
+        assert_eq!(
+            workspace_registry
+                .recovery_sidecar_export(recovery_id)
+                .expect("recovery should exist")
+                .current_status,
+            RecoveryStatus::Ready
+        );
+        assert_eq!(active_chain.recovery_ref.as_deref(), Some(recovery_id));
+        assert_eq!(
+            session_store
+                .active_execution_chain(&session_id)
+                .expect("chain should exist")
+                .recovery_ref
+                .as_deref(),
+            Some(recovery_id)
+        );
+
+        commit_chain_recovery(
+            &session_store,
+            &workspace_registry,
+            &session_id,
+            &mut active_chain,
+            commit,
+        )
+        .expect("recovery commit should succeed");
+        assert_eq!(
+            workspace_registry
+                .recovery_sidecar_export(recovery_id)
+                .expect("recovery should exist")
+                .current_status,
+            RecoveryStatus::Consumed
+        );
+        assert!(active_chain.recovery_ref.is_none());
+        assert!(
+            session_store
+                .active_execution_chain(&session_id)
+                .expect("chain should exist")
+                .recovery_ref
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_recovery_paths_are_idempotent_and_revoke_active_lease() {
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-failed-path");
+        let mission_id = MissionId::new("mission-failed-path");
+        let root_task_id = TaskId::new("task-root-failed-path");
+        let branch_task_id = TaskId::new("task-branch-failed-path");
+        task_store
+            .insert_task(task(
+                root_task_id.as_str(),
+                root_task_id.as_str(),
+                mission_id.as_str(),
+                None,
+                TaskStatus::Running,
+            ))
+            .expect("root should insert");
+        task_store
+            .insert_task(task(
+                branch_task_id.as_str(),
+                root_task_id.as_str(),
+                mission_id.as_str(),
+                Some(root_task_id.as_str()),
+                TaskStatus::Pending,
+            ))
+            .expect("branch should insert");
+        let worker_id = WorkerId::new("worker-failed-path");
+        let lease = task_store
+            .grant_lease_and_start_task(
+                &branch_task_id,
+                &root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should grant")
+            .expect("lease should be active");
+        let mut graph = SpawnGraph::new();
+        graph
+            .add_edge(
+                root_task_id.clone(),
+                branch_task_id.clone(),
+                TaskKind::LocalAgent,
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("spawn edge should insert");
+        let chain = chain(
+            &session_id,
+            &mission_id,
+            &root_task_id,
+            branch(
+                branch_task_id.as_str(),
+                worker_id.as_str(),
+                "execute",
+                Some(lease.lease_id.as_str()),
+            ),
+            None,
+        );
+
+        fail_resumed_execution_paths(
+            &task_store,
+            &std::sync::Mutex::new(graph),
+            &chain,
+            &chain.branches,
+        )
+        .expect("failure path should close");
+        fail_resumed_execution_paths(
+            &task_store,
+            &std::sync::Mutex::new(SpawnGraph::new()),
+            &chain,
+            &chain.branches,
+        )
+        .expect("repeated failure path should be idempotent");
+        assert_eq!(
+            task_store.get_task(&root_task_id).unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            task_store.get_task(&branch_task_id).unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            task_store.get_lease(&lease.lease_id).unwrap().lease_status,
+            magi_orchestrator::task_store::TaskLeaseState::Revoked
+        );
+    }
 }

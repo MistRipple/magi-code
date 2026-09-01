@@ -37,6 +37,16 @@ assert.doesNotMatch(
   /runtimeDiagnostics\.failureTitle|failureDetails|runtime-diagnostics__block--failure|runtime-diagnostics__failure-entry/,
   '失败原因不得在关键运行记录之外重复展示，也不得为错误正文增加内嵌强调层',
 );
+assert.match(
+  runtimePanelSource,
+  /<div class="runtime-diagnostics-slot">\s*\{#if panelVisible\}[\s\S]*?<\/div>/,
+  '运行态面板必须在稳定的 overlay 容器内按可见状态渲染',
+);
+assert.match(
+  runtimePanelSource,
+  /\.runtime-diagnostics-slot\s*\{[\s\S]*?position:\s*absolute;[\s\S]*?height:\s*0;[\s\S]*?pointer-events:\s*none;/,
+  '运行态 overlay 不得参与主内容 flex 布局',
+);
 
 await withGoldenViteServer(async (server) => {
   const panel = await server.ssrLoadModule('/src/lib/runtime-state-panel.ts');

@@ -17,12 +17,14 @@ import { INSTALL_PAGE_RUNTIME, MAGI_AUTOMATION_WORLD } from "./page-script.js";
 interface PageRuntimeState {
   binding: BrowserSurfaceBinding;
   executionContextId: number | null;
+  runtimeInitializationPromise: Promise<number> | null;
   console: Array<Record<string, unknown>>;
   nextConsoleId: number;
   network: Array<Record<string, unknown>>;
   nextNetworkId: number;
   dialog: Record<string, unknown> | null;
   dialogSessionId: string | undefined;
+  dialogWaiters: Set<() => void>;
   heapSnapshotChunks: string[];
   traceActive: boolean;
   traceEvents: Array<Record<string, unknown>>;
@@ -35,6 +37,12 @@ interface PageRuntimeState {
   cdpDomainsReady: boolean;
   cdpDomainsPromise: Promise<void> | null;
 }
+
+interface NativeDialogOpenedResult {
+  __magi_dialog_opened: true;
+}
+
+const DIALOG_WAIT_TIMEOUT_MS = 2_000;
 
 interface HeapSnapshotData {
   meta: Record<string, unknown>;
@@ -61,6 +69,7 @@ export class BrowserAutomationRuntime {
   readonly #cdp: CdpClient;
   readonly #pages = new Map<string, PageRuntimeState>();
   readonly #calls = new Map<string, AbortController>();
+  readonly #commandLanes = new Map<string, Promise<void>>();
   readonly #uploadRoot: string | null;
 
   readonly #workerEpoch: string;
@@ -81,6 +90,7 @@ export class BrowserAutomationRuntime {
     for (const binding of bindings) {
       const current = this.currentPage(binding.surface_id);
       if (current && !samePhysicalBinding(current.binding, binding)) {
+        this.wakeDialogWaiters(current);
         this.#pages.delete(binding.surface_id);
       }
       if (
@@ -104,8 +114,9 @@ export class BrowserAutomationRuntime {
   ): Promise<WorkerCommandResponse> {
     const controller = new AbortController();
     this.#calls.set(callId, controller);
-    try {
-      return await this.#cdp.run({ callId, signal: controller.signal }, async () => {
+    const run = async (): Promise<WorkerCommandResponse> => {
+      if (controller.signal.aborted) return cancelledWorkerResult(callId, binding);
+      return this.#cdp.run({ callId, signal: controller.signal }, async () => {
         try {
           if (command.type !== "ping") await this.ensureCdpDomains(binding);
           const executed = await this.executeCommand(binding, command);
@@ -126,8 +137,26 @@ export class BrowserAutomationRuntime {
           return { type: "worker_result", call_id: callId, binding, outcome };
         }
       });
+    };
+    const isDialogCommand = command.type === "devtools" && command.payload.operation === "dialog";
+    if (isDialogCommand) {
+      try {
+        return await run();
+      } finally {
+        if (this.#calls.get(callId) === controller) this.#calls.delete(callId);
+      }
+    }
+    const previous = this.#commandLanes.get(binding.surface_id) ?? Promise.resolve();
+    const lane: Promise<WorkerCommandResponse> = previous.catch(() => undefined).then(run);
+    const settled = lane.then(() => undefined, () => undefined);
+    this.#commandLanes.set(binding.surface_id, settled);
+    try {
+      return await lane;
     } finally {
       if (this.#calls.get(callId) === controller) this.#calls.delete(callId);
+      if (this.#commandLanes.get(binding.surface_id) === settled) {
+        this.#commandLanes.delete(binding.surface_id);
+      }
     }
   }
 
@@ -213,6 +242,7 @@ export class BrowserAutomationRuntime {
       return current;
     }
     if (current && !samePhysicalBinding(current.binding, binding)) {
+      this.wakeDialogWaiters(current);
       throw protocolFailure("browser_surface_stale", "binding does not match the current physical Surface");
     }
     if (current && current.binding.navigation_revision > binding.navigation_revision) {
@@ -229,15 +259,18 @@ export class BrowserAutomationRuntime {
     );
     const lifecycleChanged = Boolean(current && !sameSurface);
     const resetRuntimeState = navigationChanged || lifecycleChanged;
+    if (resetRuntimeState && current) this.wakeDialogWaiters(current);
     const next: PageRuntimeState = {
       binding,
       executionContextId: null,
+      runtimeInitializationPromise: null,
       console: resetRuntimeState ? [] : current?.console ?? [],
       nextConsoleId: resetRuntimeState ? 1 : current?.nextConsoleId ?? 1,
       network: resetRuntimeState ? [] : current?.network ?? [],
       nextNetworkId: resetRuntimeState ? 1 : current?.nextNetworkId ?? 1,
       dialog: null,
       dialogSessionId: undefined,
+      dialogWaiters: new Set(),
       heapSnapshotChunks: [],
       traceActive: resetRuntimeState ? false : current?.traceActive ?? false,
       traceEvents: resetRuntimeState ? [] : current?.traceEvents ?? [],
@@ -262,6 +295,10 @@ export class BrowserAutomationRuntime {
 
   private currentPage(surfaceId: string): PageRuntimeState | undefined {
     return this.#pages.get(surfaceId);
+  }
+
+  private wakeDialogWaiters(page: PageRuntimeState): void {
+    for (const waiter of [...page.dialogWaiters]) waiter();
   }
 
   private navigationAdvanced(binding: BrowserSurfaceBinding): boolean {
@@ -292,7 +329,32 @@ export class BrowserAutomationRuntime {
 
   private async context(binding: BrowserSurfaceBinding): Promise<number> {
     const page = this.page(binding);
-    if (page.executionContextId !== null) return page.executionContextId;
+    if (page.runtimeInitializationPromise) return page.runtimeInitializationPromise;
+    const initialization = this.initializeRuntime(binding, page);
+    page.runtimeInitializationPromise = initialization;
+    try {
+      return await initialization;
+    } finally {
+      if (page.runtimeInitializationPromise === initialization) {
+        page.runtimeInitializationPromise = null;
+      }
+    }
+  }
+
+  private async initializeRuntime(binding: BrowserSurfaceBinding, page: PageRuntimeState): Promise<number> {
+    if (page.executionContextId !== null) {
+      const healthy = await this.evaluateInContext<boolean>(
+        binding,
+        page.executionContextId,
+        `Boolean(globalThis.__magiBrowserAutomation && globalThis.__magiBrowserAutomation.runtime_epoch === ${JSON.stringify(this.#workerEpoch)} && typeof globalThis.__magiBrowserAutomation.setAnnotations === "function")`,
+      ).catch((cause) => {
+        if (!isExecutionContextFailure(cause)) throw cause;
+        return false;
+      });
+      if (healthy) return page.executionContextId;
+      page.executionContextId = null;
+    }
+
     const frameTree = await this.#cdp.send<{
       frameTree: { frame: { id: string } };
     }>(binding, "Page.getFrameTree");
@@ -306,12 +368,23 @@ export class BrowserAutomationRuntime {
       },
     );
     page.executionContextId = world.executionContextId;
-    await this.evaluate(
-      binding,
-      `${INSTALL_PAGE_RUNTIME}(${JSON.stringify(this.#workerEpoch)})`,
-      true,
-    );
-    return world.executionContextId;
+    try {
+      await this.evaluateInContext(
+        binding,
+        world.executionContextId,
+        `${INSTALL_PAGE_RUNTIME}(${JSON.stringify(this.#workerEpoch)})`,
+      );
+      const installed = await this.evaluateInContext<boolean>(
+        binding,
+        world.executionContextId,
+        `Boolean(globalThis.__magiBrowserAutomation && globalThis.__magiBrowserAutomation.runtime_epoch === ${JSON.stringify(this.#workerEpoch)} && typeof globalThis.__magiBrowserAutomation.setAnnotations === "function")`,
+      );
+      if (!installed) throw protocolFailure("browser_page_runtime_missing", "page automation runtime was not installed");
+      return world.executionContextId;
+    } catch (cause) {
+      if (page.executionContextId === world.executionContextId) page.executionContextId = null;
+      throw cause;
+    }
   }
 
   private async evaluate<T>(
@@ -320,6 +393,26 @@ export class BrowserAutomationRuntime {
     returnByValue = true,
   ): Promise<T> {
     const contextId = await this.context(binding);
+    try {
+      return await this.evaluateInContext(binding, contextId, expression, returnByValue);
+    } catch (cause) {
+      // 页面导航和渲染进程重启可能发生在 context() 健康探测之后。
+      // 这时本次 Runtime.evaluate 尚未执行，清掉当前缓存并只重试一次，
+      // 让后续操作使用新文档的 isolated world，避免把一次性 CDP 错误扩散到整条工具链。
+      if (!isExecutionContextFailure(cause)) throw cause;
+      const page = this.currentPage(binding.surface_id);
+      if (page?.executionContextId === contextId) page.executionContextId = null;
+      const refreshedContextId = await this.context(binding);
+      return this.evaluateInContext(binding, refreshedContextId, expression, returnByValue);
+    }
+  }
+
+  private async evaluateInContext<T>(
+    binding: BrowserSurfaceBinding,
+    contextId: number,
+    expression: string,
+    returnByValue = true,
+  ): Promise<T> {
     const response = await this.#cdp.send<{
       result: { value?: T; description?: string };
       exceptionDetails?: { text?: string; exception?: { description?: string } };
@@ -476,7 +569,7 @@ export class BrowserAutomationRuntime {
     // 让后续 wait_for 误报为页面异步逻辑失败。先用与输入聚焦相同的
     // scrollIntoView 路径把目标收敛到当前视口，再读取滚动后的坐标。
     const target = await this.target(binding, ref, true);
-    await this.pointer(binding, "mouseMoved", target.x, target.y);
+    if (!await this.pointer(binding, "mouseMoved", target.x, target.y)) return;
     if (!await this.pointerOrHandleDialog(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 })) return;
     // mousePressed 可能已经触发了主文档导航。此时点击副作用已经发生，
     // 不能再用旧文档的 token 做 finish/fallback，也不能把 mouseReleased
@@ -522,20 +615,21 @@ export class BrowserAutomationRuntime {
       throw protocolFailure("browser_sensitive_action_requires_user", `sensitive input: ${target.sensitive}`);
     }
     if (replace) {
-      await this.key(binding, "keyDown", "a", process.platform === "darwin" ? 4 : 2);
-      await this.key(binding, "keyUp", "a", process.platform === "darwin" ? 4 : 2);
-      await this.press(binding, "Backspace");
+      if (!await this.key(binding, "keyDown", "a", process.platform === "darwin" ? 4 : 2)) return;
+      if (!await this.key(binding, "keyUp", "a", process.platform === "darwin" ? 4 : 2)) return;
+      if (!await this.press(binding, "Backspace")) return;
     }
-    await this.#cdp.send(binding, "Input.insertText", { text });
+    const inserted = await this.#cdp.send(binding, "Input.insertText", { text });
+    if (isNativeDialogOpenedResult(inserted)) return;
     if (submitKey) await this.press(binding, submitKey);
   }
 
-  private async press(binding: BrowserSurfaceBinding, key: string): Promise<void> {
+  private async press(binding: BrowserSurfaceBinding, key: string): Promise<boolean> {
     const normalized = key.trim();
     if (!normalized) throw protocolFailure("browser_key_invalid", "key is required");
     const description = keyDescription(normalized);
-    await this.key(binding, "keyDown", description.key, description.modifiers, description.code);
-    await this.key(binding, "keyUp", description.key, description.modifiers, description.code);
+    if (!await this.key(binding, "keyDown", description.key, description.modifiers, description.code)) return false;
+    return this.key(binding, "keyUp", description.key, description.modifiers, description.code);
   }
 
   private async key(
@@ -544,10 +638,10 @@ export class BrowserAutomationRuntime {
     key: string,
     modifiers = 0,
     code?: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const description = keyDescription(key, code, modifiers);
     const keyDown = type === "keyDown";
-    await this.#cdp.send(binding, "Input.dispatchKeyEvent", {
+    const result = await this.#cdp.send(binding, "Input.dispatchKeyEvent", {
       // Chromium expects rawKeyDown for non-text keys. Sending keyDown with
       // an empty text payload is accepted inconsistently across Electron/
       // Chromium versions and is the reason Enter/Backspace intermittently
@@ -564,6 +658,7 @@ export class BrowserAutomationRuntime {
       ...(keyDown ? { autoRepeat: false, isKeypad: false, location: 0 } : {}),
       ...(description.commands.length > 0 ? { commands: description.commands } : {}),
     });
+    return !isNativeDialogOpenedResult(result);
   }
 
   private async scroll(
@@ -572,15 +667,15 @@ export class BrowserAutomationRuntime {
     deltaX: number,
     deltaY: number,
   ): Promise<void> {
-    const viewport = await this.pageViewport(binding);
-    const point = target ? await this.target(binding, target) : null;
-    await this.#cdp.send(binding, "Input.dispatchMouseEvent", {
-      type: "mouseWheel",
-      x: point?.x ?? viewport.width / 2,
-      y: point?.y ?? viewport.height / 2,
-      deltaX,
-      deltaY,
-    });
+    const horizontal = finiteNumber(deltaX, "delta_x");
+    const vertical = finiteNumber(deltaY, "delta_y");
+    const expression = target
+      ? `(() => {
+          const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
+          element.scrollBy({ left: ${JSON.stringify(horizontal)}, top: ${JSON.stringify(vertical)}, behavior: "instant" });
+        })()`
+      : `window.scrollBy({ left: ${JSON.stringify(horizontal)}, top: ${JSON.stringify(vertical)}, behavior: "instant" })`;
+    await this.evaluate(binding, expression);
   }
 
   private async pageViewport(binding: BrowserSurfaceBinding): Promise<{ width: number; height: number }> {
@@ -630,8 +725,9 @@ export class BrowserAutomationRuntime {
     x: number,
     y: number,
     extra: Record<string, unknown> = {},
-  ): Promise<void> {
-    await this.#cdp.send(binding, "Input.dispatchMouseEvent", { type, x, y, ...extra });
+  ): Promise<boolean> {
+    const result = await this.#cdp.send(binding, "Input.dispatchMouseEvent", { type, x, y, ...extra });
+    return !isNativeDialogOpenedResult(result);
   }
 
   private async pointerOrHandleDialog(
@@ -642,8 +738,7 @@ export class BrowserAutomationRuntime {
     extra: Record<string, unknown> = {},
   ): Promise<boolean> {
     try {
-      await this.pointer(binding, type, x, y, extra);
-      return true;
+      return await this.pointer(binding, type, x, y, extra);
     } catch (cause) {
       // alert/confirm/prompt 会在 mousePressed 或 mouseReleased 的 CDP
       // 请求尚未返回时阻塞 renderer。只在已经收到对应的对话框事件时
@@ -696,13 +791,10 @@ export class BrowserAutomationRuntime {
       ...(input.quality !== undefined ? { quality: input.quality } : {}),
       ...(clip ? { clip } : {}),
       captureBeyondViewport: input.full_page || hasElementTarget,
-      // WebContentsView 的页面截图必须从同一 WebContents 的 view 内容读取。
-      // Electron 的 fromSurface 路径依赖宿主 compositor surface；当原生
-      // View 处于右栏内容槽、正在切换层级或尚未获得 compositor frame 时，
-      // Chromium 不会完成 Page.captureScreenshot，最终拖垮整个 CDP lane。
-      // fromSurface=false 仍是 Chromium CDP 的真实页面截图，不是 Renderer
-      // 截图、Canvas 投影或图片缩放，并且对 clip/full-page 坐标保持一致。
-      fromSurface: false,
+      // 统一读取当前 WebContents 的 Chromium compositor surface。只有
+      // fromSurface=true 会同时遵守 clip、元素范围和 captureBeyondViewport；
+      // 宿主只负责串行化 Page domain 命令，不再参与截图或坐标换算。
+      fromSurface: true,
     });
     const binary = Buffer.from(captured.data, "base64");
     const mime = screenshotMime(input.format);
@@ -763,7 +855,9 @@ export class BrowserAutomationRuntime {
         const x = finiteNumber(args.x, "x");
         const y = finiteNumber(args.y, "y");
         const doubleClick = args.double_click === true;
-        await this.pointer(binding, "mouseMoved", x, y);
+        if (!await this.pointer(binding, "mouseMoved", x, y)) {
+          return { clicked: true, double_click: doubleClick };
+        }
         const clicks = doubleClick ? 2 : 1;
         for (let index = 0; index < clicks; index += 1) {
           const clickCount = doubleClick ? index + 1 : 1;
@@ -814,9 +908,12 @@ export class BrowserAutomationRuntime {
           const page = this.page(binding);
           if (page.dialog?.virtual === true) {
             await this.resolveVirtualDialog(binding, "dismiss", null);
+          } else if (page.dialog) {
+            await this.#cdp.send(binding, "Page.handleJavaScriptDialog", { accept: false }, 30_000, page.dialogSessionId);
           }
           page.dialog = null;
           page.dialogSessionId = undefined;
+          this.wakeDialogWaiters(page);
           return { cleared: true };
         }
         if (args.action !== "accept" && args.action !== "dismiss") {
@@ -824,6 +921,7 @@ export class BrowserAutomationRuntime {
         }
         const dialog = this.page(binding);
         if (!dialog.dialog) await this.waitForDialog(binding);
+        if (!dialog.dialog) return { handled: false };
         if (dialog.dialog?.virtual === true) {
           await this.resolveVirtualDialog(
             binding,
@@ -832,12 +930,16 @@ export class BrowserAutomationRuntime {
           );
           dialog.dialog = null;
           dialog.dialogSessionId = undefined;
+          this.wakeDialogWaiters(dialog);
           return { handled: true };
         }
         await this.#cdp.send(binding, "Page.handleJavaScriptDialog", {
           accept: args.action !== "dismiss",
           ...(typeof args.prompt_text === "string" ? { promptText: args.prompt_text } : {}),
         }, 30_000, dialog.dialogSessionId);
+        dialog.dialog = null;
+        dialog.dialogSessionId = undefined;
+        this.wakeDialogWaiters(dialog);
         return { handled: true };
       case "webmcp":
         return this.webmcp(binding, args);
@@ -895,15 +997,22 @@ export class BrowserAutomationRuntime {
 
   private async waitForDialog(binding: BrowserSurfaceBinding): Promise<Record<string, unknown> | null> {
     const page = this.page(binding);
-    // Electron 通过主进程转发 WebContents 的 CDP 事件；输入命令刚完成时，
-    // javascriptDialogOpening 可能仍在主进程与 Worker 的 IPC 队列中。给
-    // 事件一个明确的收敛窗口，避免 list 抢在事件前返回 null，随后页面被
-    // 未处理的 alert 阻塞而把后续操作伪装成 wait 超时。
-    const deadline = Date.now() + 2_000;
-    while (!page.dialog && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    return page.dialog;
+    if (page.dialog) return page.dialog;
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        page.dialogWaiters.delete(finish);
+        if (timer) clearTimeout(timer);
+        resolve(page.dialog);
+      };
+      page.dialogWaiters.add(finish);
+      timer = setTimeout(finish, DIALOG_WAIT_TIMEOUT_MS);
+      timer.unref();
+      if (page.dialog) finish();
+    });
   }
 
   private async resolveVirtualDialog(
@@ -1532,6 +1641,8 @@ export class BrowserAutomationRuntime {
       page.profilerActive = false;
       page.coverageActive = false;
       page.cdpDomainsReady = false;
+      page.runtimeInitializationPromise = null;
+      this.wakeDialogWaiters(page);
       return;
     }
     if (method === "Runtime.consoleAPICalled") {
@@ -1574,6 +1685,7 @@ export class BrowserAutomationRuntime {
     if (method === "Page.javascriptDialogOpening") {
       page.dialog = params;
       page.dialogSessionId = sessionId;
+      this.wakeDialogWaiters(page);
     }
     if (method === "Runtime.bindingCalled" && params.name === "__magiBrowserDialog") {
       try {
@@ -1581,9 +1693,11 @@ export class BrowserAutomationRuntime {
         if (event.event === "opening") {
           page.dialog = { ...event, virtual: true };
           page.dialogSessionId = undefined;
+          this.wakeDialogWaiters(page);
         } else if (event.event === "closed") {
           page.dialog = null;
           page.dialogSessionId = undefined;
+          this.wakeDialogWaiters(page);
         }
       } catch {
         // Ignore malformed page bridge payloads; the page remains usable and
@@ -1593,6 +1707,7 @@ export class BrowserAutomationRuntime {
     if (method === "Page.javascriptDialogClosed") {
       page.dialog = null;
       page.dialogSessionId = undefined;
+      this.wakeDialogWaiters(page);
     }
     if (!sessionId && method === "HeapProfiler.addHeapSnapshotChunk") {
       const chunk = typeof params.chunk === "string" ? params.chunk : "";
@@ -1606,6 +1721,14 @@ export class BrowserAutomationRuntime {
 
 function empty(): { result: BrowserCommandResult } {
   return { result: { type: "empty" } };
+}
+
+function isNativeDialogOpenedResult(value: unknown): value is NativeDialogOpenedResult {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && (value as Record<string, unknown>).__magi_dialog_opened === true,
+  );
 }
 
 function cancelledWorkerResult(callId: string, binding: BrowserSurfaceBinding): WorkerCommandResponse {
@@ -2286,6 +2409,13 @@ function isNavigationStaleError(cause: unknown): boolean {
     || message.includes("browser_cdp_session_stale")
     || message.includes("browser_debugger_detached")
     || message.includes("browser_navigation_superseded");
+}
+
+function isExecutionContextFailure(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return /execution context|context with(?: specified)? id|context was destroyed/iu.test(message)
+    && !message.includes("browser_surface_stale")
+    && !message.includes("browser_cdp_session_stale");
 }
 
 function keyDescription(

@@ -1,4 +1,5 @@
 use super::{
+    browser_host::BrowserHostControllerLifecycle,
     config::{DaemonConfig, DaemonError},
     events::publish_ledger_status_event,
     maintenance::{RuntimeMaintenance, RuntimeMaintenanceConfig},
@@ -6,7 +7,8 @@ use super::{
 };
 use magi_api::{
     ApiError, ApiState, DaemonIdentity, DirectHttpModelProbeConfig, RunnerManager,
-    RuntimeStatePersistence, build_router, build_runtime_capability_dependency_provider,
+    RuntimeStatePersistence, TaskCheckpointPersist, build_router,
+    build_runtime_capability_dependency_provider,
     mcp_config::{build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id},
 };
 use magi_bridge_client::{
@@ -25,6 +27,7 @@ use magi_conversation_runtime::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
     task_execution_dispatcher::{LlmTaskDispatcher, LlmTaskDispatcherDependencies},
+    task_execution_registry::TaskExecutionRegistry,
     task_runner_bridge::EventBasedResultReceiver,
     usage_recording::{
         ModelUsageRecordInput, image_generation_model_usage_binding,
@@ -32,7 +35,8 @@ use magi_conversation_runtime::{
     },
 };
 use magi_core::{
-    EventId, ExecutionOwnership, SessionId, TaskStatus, UtcMillis, public_runtime_excerpt,
+    DomainError, EventId, ExecutionOwnership, SessionId, TaskStatus, UtcMillis,
+    public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
@@ -900,6 +904,7 @@ pub(crate) struct DaemonRuntime {
     governance: Arc<GovernanceService>,
     worker_runtime: WorkerRuntime,
     runtime_maintenance: RuntimeMaintenance,
+    browser_host_controller_lifecycle: BrowserHostControllerLifecycle,
 }
 
 impl DaemonRuntime {
@@ -918,19 +923,27 @@ impl DaemonRuntime {
             .into_iter()
             .map(|w| (w.workspace_id.to_string(), w.native_root_path()))
             .collect();
-
-        // 从全局未绑定会话和各工作区 .magi/sessions.json 加载会话。
-        let session_durable = state_repository.load_sessions_from_workspaces(&workspace_roots)?;
+        state_repository.migrate_legacy_state_layout(&workspace_roots)?;
+        let (session_durable, session_sidecars) =
+            state_repository.load_session_projections(&workspace_roots)?;
         let accepted_submissions = state_repository.load_accepted_submissions()?;
-        let session_store = Arc::new(SessionStore::from_persisted_parts(
-            session_durable,
-            state_repository.load_session_sidecars()?,
-        ));
-        session_store.restore_session_acceptance_records(
-            accepted_submissions
-                .into_iter()
-                .map(|record| record.session),
+        let session_store = Arc::new(
+            SessionStore::from_persisted_parts(session_durable, session_sidecars).map_err(
+                |error| DaemonError::internal(format!("恢复 session canonical turn 失败: {error}")),
+            )?,
         );
+        session_store.install_canonical_event_writer(Arc::new(state_repository.clone()));
+        session_store
+            .restore_session_acceptance_records(
+                accepted_submissions
+                    .into_iter()
+                    .filter(|record| !record.session_checkpointed)
+                    .map(|record| record.session),
+            )
+            .map_err(|error| {
+                DaemonError::internal(format!("恢复 accepted session 事实失败: {error}"))
+            })?;
+        state_repository.validate_session_event_log_coverage(&session_store.durable_state())?;
         let knowledge_store = Arc::new(KnowledgeStore::from_state(
             state_repository.load_knowledge_state()?,
         ));
@@ -948,7 +961,6 @@ impl DaemonRuntime {
         Self::persist_initial_runtime_state(
             &state_repository,
             &runtime_persistence,
-            &session_store,
             &workspace_store,
         )?;
         let runtime_maintenance = RuntimeMaintenance::new(
@@ -972,6 +984,7 @@ impl DaemonRuntime {
             governance: Arc::new(GovernanceService::default()),
             worker_runtime,
             runtime_maintenance,
+            browser_host_controller_lifecycle: BrowserHostControllerLifecycle::new(),
         })
     }
 
@@ -1049,7 +1062,6 @@ impl DaemonRuntime {
         Self::persist_initial_runtime_state(
             &state_repository,
             &runtime_persistence,
-            &runtime.session_store,
             &runtime.workspace_store,
         )?;
         Ok(runtime)
@@ -1105,6 +1117,7 @@ impl DaemonRuntime {
         &self,
         reason: impl Into<String>,
     ) -> Result<(), DaemonError> {
+        self.browser_host_controller_lifecycle.request_shutdown();
         let cancelled_process_count = ToolRegistry::cancel_all_active_processes();
         if cancelled_process_count > 0 {
             info!(cancelled_process_count, "daemon 关闭前已终止全部工具进程树");
@@ -1266,7 +1279,7 @@ impl DaemonRuntime {
             })
         };
         let runtime_persistence = Arc::new(RuntimeStatePersistence::new(
-            self.state_root.join("sessions.json"),
+            self.state_root.clone(),
             self.state_root.join("workspaces.json"),
             self.state_root.join("knowledge.json"),
         ));
@@ -1407,93 +1420,104 @@ impl DaemonRuntime {
         let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
         let worker_runtime = self.worker_runtime.clone();
         let tool_registry_for_dispatcher = tool_registry.clone();
-        let task_store_checkpoint_path = self.state_repository.task_store_checkpoint_path();
+        let task_store_projection_path = self.state_repository.task_store_projection_path();
         let event_bus_for_task_store = self.event_bus.clone();
         let session_store_for_task_status = self.session_store.clone();
         let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
-        let task_store = match TaskStore::restore_from_file(&task_store_checkpoint_path) {
-            Ok(Some(restored)) => {
-                let eb = event_bus_for_task_store.clone();
-                let session_store = session_store_for_task_status.clone();
-                restored.set_status_change_callback(Box::new(
-                    move |task_id, old_status, new_status, task: magi_core::Task| {
-                        sync_task_plan_status(
-                            eb.as_ref(),
-                            session_store.as_ref(),
-                            &task,
-                            new_status,
-                        );
-                        settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
-                        publish_task_status_changed_event(
-                            eb.as_ref(),
-                            session_store.as_ref(),
-                            task_id,
-                            old_status,
-                            new_status,
-                            &task,
-                        );
-                        publish_task_status_turn_item_for_active_sessions(
-                            &eb,
-                            session_store.as_ref(),
-                            None,
-                            &task,
-                            new_status,
-                        );
-                    },
-                ));
-                let (revoked_leases, failed_tasks) = restored
-                    .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot());
-                if revoked_leases > 0 || failed_tasks > 0 {
-                    warn!(
-                        revoked_leases,
-                        failed_tasks,
-                        "检测到 checkpoint 中残留的易失执行态，已统一收口为可恢复状态"
+        let task_execution_registry = TaskExecutionRegistry::default();
+        let accepted_submission_repository = self.state_repository.clone();
+        let accepted_submission_repository_for_checkpoint = accepted_submission_repository.clone();
+        let task_checkpoint_persist: TaskCheckpointPersist = Arc::new(move |snapshot| {
+            accepted_submission_repository_for_checkpoint
+                .checkpoint_task_store_snapshot(snapshot)
+                .map_err(|error| DomainError::Persistence {
+                    message: format!("task checkpoint 持久化失败: {error}"),
+                })?;
+            Ok(())
+        });
+        let restored_from_projection =
+            TaskStore::restore_from_projection_directory(&task_store_projection_path)?;
+        let mut task_store_requires_checkpoint = false;
+        let task_store = if let Some(restored) = restored_from_projection {
+            let task_checkpoint_persist_for_store = task_checkpoint_persist.clone();
+            restored.set_checkpoint_callback(Box::new(move |store| {
+                task_checkpoint_persist_for_store(store)
+            }));
+            let (revoked_leases, failed_tasks) = restored
+                .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot())
+                .map_err(|error| {
+                    DaemonError::internal(format!("恢复任务运行态收敛失败: {error}"))
+                })?;
+            if revoked_leases > 0 || failed_tasks > 0 {
+                warn!(
+                    revoked_leases,
+                    failed_tasks, "检测到 projection 中残留的易失执行态，已统一收口为可恢复状态"
+                );
+            }
+            restored
+        } else {
+            TaskStore::new()
+        };
+        let task_checkpoint_persist_for_store = task_checkpoint_persist.clone();
+        task_store.set_checkpoint_callback(Box::new(move |store| {
+            task_checkpoint_persist_for_store(store)
+        }));
+        let eb = event_bus_for_task_store.clone();
+        let session_store = session_store_for_task_status.clone();
+        let task_execution_registry_for_status = task_execution_registry.clone();
+        task_store.set_status_change_callback(Box::new(
+            move |task_id, old_status, new_status, task: magi_core::Task| {
+                if matches!(
+                    new_status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+                ) {
+                    task_execution_registry_for_status.remove(task_id);
+                }
+                sync_task_plan_status(eb.as_ref(), session_store.as_ref(), &task, new_status);
+                settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
+                publish_task_status_changed_event(
+                    eb.as_ref(),
+                    session_store.as_ref(),
+                    task_id,
+                    old_status,
+                    new_status,
+                    &task,
+                );
+                if let Err(error) = publish_task_status_turn_item_for_active_sessions(
+                    &eb,
+                    session_store.as_ref(),
+                    None,
+                    &task,
+                    new_status,
+                ) {
+                    tracing::error!(
+                        task_id = %task_id,
+                        %error,
+                        "任务状态事实写回会话 Turn 失败"
                     );
                 }
-                Arc::new(restored)
-            }
-            _ => {
-                let session_store = session_store_for_task_status.clone();
-                Arc::new(TaskStore::with_status_change_callback(Box::new(
-                    move |task_id, old_status, new_status, task: magi_core::Task| {
-                        sync_task_plan_status(
-                            event_bus_for_task_store.as_ref(),
-                            session_store.as_ref(),
-                            &task,
-                            new_status,
-                        );
-                        settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
-                        publish_task_status_changed_event(
-                            event_bus_for_task_store.as_ref(),
-                            session_store.as_ref(),
-                            task_id,
-                            old_status,
-                            new_status,
-                            &task,
-                        );
-                        publish_task_status_turn_item_for_active_sessions(
-                            &event_bus_for_task_store,
-                            session_store.as_ref(),
-                            None,
-                            &task,
-                            new_status,
-                        );
-                    },
-                )))
-            }
-        };
+            },
+        ));
+        let task_store = Arc::new(task_store);
         let accepted_submissions = self.state_repository.load_accepted_submissions()?;
-        let restored_accepted_task_count = accepted_submissions
+        let mut restored_accepted_task_count = 0;
+        for record in accepted_submissions
             .iter()
-            .filter(|record| {
-                if task_store.get_task(&record.task.task_id).is_some() {
-                    false
-                } else {
-                    task_store.insert_task_without_checkpoint(record.task.clone());
-                    true
-                }
-            })
-            .count();
+            .filter(|record| !record.task_checkpointed)
+        {
+            if task_store.get_task(&record.task.task_id).is_some() {
+                continue;
+            }
+            task_store
+                .insert_task_without_checkpoint(record.task.clone())
+                .map_err(|error| {
+                    DaemonError::internal(format!(
+                        "恢复 accepted task {} 失败: {error}",
+                        record.task.task_id
+                    ))
+                })?;
+            restored_accepted_task_count += 1;
+        }
         let reconciled_threads = reconcile_terminal_task_execution_threads(
             self.session_store.as_ref(),
             task_store.as_ref(),
@@ -1504,11 +1528,8 @@ impl DaemonRuntime {
                 "已将历史终态任务关联的活动线程统一收口为 Idle"
             );
         }
-        if self.reconcile_stale_session_task_chains(task_store.as_ref()) > 0
-            && let Err(error) = task_store.checkpoint_to_file(&task_store_checkpoint_path)
-        {
-            warn!(?error, "收敛重启遗留任务状态后持久化 task-store 失败");
-        }
+        let stale_task_count = self.reconcile_stale_session_task_chains(task_store.as_ref());
+        task_store_requires_checkpoint |= stale_task_count > 0;
         let (rebuilt_spawn_graph, spawn_graph_report) =
             magi_spawn_graph::SpawnGraph::rebuild_from_tasks(task_store.all_tasks());
         if spawn_graph_report.skipped_edges > 0 {
@@ -1526,33 +1547,14 @@ impl DaemonRuntime {
             );
         }
         let spawn_graph = Arc::new(std::sync::Mutex::new(rebuilt_spawn_graph));
-        let task_store_checkpoint_path_for_callback = task_store_checkpoint_path.clone();
-        let accepted_submission_repository = self.state_repository.clone();
-        let accepted_submission_repository_for_callback = accepted_submission_repository.clone();
-        task_store.set_checkpoint_callback(Box::new(move |store| {
-            if let Err(error) = store.checkpoint_to_file(&task_store_checkpoint_path_for_callback) {
-                warn!(?error, "任务状态 checkpoint 持久化失败");
-                return;
-            }
-            if let Err(error) =
-                accepted_submission_repository_for_callback.mark_task_acceptances_durable(store)
-            {
-                warn!(?error, "清理已完成 accepted journal 失败");
-            }
-        }));
-        if restored_accepted_task_count > 0 {
-            task_store
-                .checkpoint_to_file(&task_store_checkpoint_path)
+        if restored_accepted_task_count > 0 || task_store_requires_checkpoint {
+            accepted_submission_repository
+                .checkpoint_task_store(task_store.as_ref())
                 .map_err(|error| {
                     DaemonError::internal(format!("恢复 accepted task 失败: {error}"))
                 })?;
-            if let Err(error) =
-                accepted_submission_repository.mark_task_acceptances_durable(task_store.as_ref())
-            {
-                warn!(?error, "恢复 accepted task 后清理 journal 失败");
-            }
-        } else if let Err(error) = accepted_submission_repository.prune_accepted_submissions() {
-            warn!(?error, "启动时清理 accepted journal 失败");
+        } else {
+            accepted_submission_repository.prune_accepted_submissions()?;
         }
         // 单一事实源：dispatch summary（execution_runtime）与 prompt 注入（LlmTaskDispatcher）
         // 使用同一份 ContextBudget。max_memory ≥ 一批 session-memory 的 slice 数（=5），
@@ -1583,8 +1585,8 @@ impl DaemonRuntime {
         );
         let session_state_checkpoint_persist = Arc::new(move |checkpoint: &str| {
             session_checkpoint_persistence
-                .flush_session_sidecars()
-                .map(|_| ())
+                .persist_session_checkpoint()
+                .map(|_| true)
                 .map_err(|error| {
                     ApiError::internal_assembly(
                         "session turn 关键状态持久化失败",
@@ -1614,29 +1616,27 @@ impl DaemonRuntime {
             session_code_contexts,
             workspace_git_coordinator,
         )
+        .with_task_execution_registry(task_execution_registry)
         .with_spawn_graph(spawn_graph)
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
         .with_runtime_persistence(runtime_persistence)
-        .with_session_state_checkpoint_persist(session_state_checkpoint_persist)
-        .with_session_task_acceptance_persist({
+        .with_canonical_event_next_sequence_provider({
             let repository = self.state_repository.clone();
-            let session_store = self.session_store.clone();
-            let task_store = task_store.clone();
-            Arc::new(move |session_id, turn_id, root_task_id| {
+            Arc::new(move |session_id| {
                 repository
-                    .save_accepted_submission(
-                        &session_store,
-                        session_id,
-                        turn_id,
-                        &task_store,
-                        root_task_id,
-                    )
+                    .canonical_event_next_sequence(session_id)
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .with_session_state_checkpoint_persist(session_state_checkpoint_persist)
+        .with_session_projection_persist({
+            let repository = self.state_repository.clone();
+            Arc::new(move |durable, sidecars| {
+                repository
+                    .save_session_projection_state(durable, sidecars)
                     .map_err(|error| {
-                        ApiError::internal_assembly(
-                            "session/task accepted journal 持久化失败",
-                            error,
-                        )
+                        ApiError::internal_assembly("session projection 持久化失败", error)
                     })
             })
         })
@@ -1654,7 +1654,7 @@ impl DaemonRuntime {
             })?;
         state = state.with_task_store(Arc::clone(&task_store));
         if magi_api::task_turn_finalize::reconcile_terminal_session_task_turns(&state) > 0 {
-            let _ = state.persist_session_durable_state();
+            let _ = state.persist_session_projection();
         }
         let state_for_task_workers = state.clone();
         let state_for_knowledge_persist = state.clone();
@@ -1715,7 +1715,7 @@ impl DaemonRuntime {
             runner_result_receiver,
         )
         .with_agent_role_registry(state.agent_role_registry.clone())
-        .with_checkpoint_path(task_store_checkpoint_path)
+        .with_checkpoint_persist(task_checkpoint_persist)
         .with_terminal_observer(move |root_task_id, session_id, status, turn_id| {
             let Some(session_id) = session_id else {
                 return;
@@ -1750,14 +1750,19 @@ impl DaemonRuntime {
             let callback_state = state_for_runner_terminal
                 .clone()
                 .with_shared_runner_manager(runner_manager);
-            if magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
+            if let Err(error) = magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
                 &callback_state,
                 &session_id,
                 &root_task_id,
                 &status,
                 turn_id.as_deref(),
             ) {
-                let _ = callback_state.persist_session_durable_state();
+                tracing::error!(
+                    %session_id,
+                    %root_task_id,
+                    %error,
+                    "runner 终态回调未能完成 session Turn 收敛"
+                );
             }
         });
         let runner_manager = Arc::new(runner_manager);
@@ -1794,7 +1799,7 @@ impl DaemonRuntime {
         }
         magi_api::task_turn_finalize::schedule_restored_session_turn_queues(&state);
         magi_api::schedule_restored_session_task_dispatches(state.clone());
-        super::browser_host::start_controller(&state);
+        super::browser_host::start_controller(&state, &self.browser_host_controller_lifecycle);
 
         Ok(state)
     }
@@ -1930,12 +1935,30 @@ impl DaemonRuntime {
                 let Some(task) = task_store.get_task(&task_id) else {
                     continue;
                 };
-                if matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-                    && task_store
-                        .update_status(&task_id, TaskStatus::Failed)
-                        .is_ok()
-                {
-                    failed_count += 1;
+                if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+                    let lease_id = task_store
+                        .get_active_lease(&task_id)
+                        .map(|lease| lease.lease_id);
+                    match task_store.revoke_lease_and_set_task_terminal(
+                        &task_id,
+                        &root_task_id,
+                        lease_id.as_ref(),
+                        TaskStatus::Failed,
+                        vec!["daemon 重启时检测到执行链中断，任务已终止".to_string()],
+                    ) {
+                        Ok(true) => failed_count += 1,
+                        Ok(false) => warn!(
+                            %task_id,
+                            %root_task_id,
+                            "忽略未生效的 daemon 重启任务终态收敛"
+                        ),
+                        Err(error) => warn!(
+                            ?error,
+                            %task_id,
+                            %root_task_id,
+                            "daemon 重启任务终态收敛失败"
+                        ),
+                    }
                 }
             }
             match self
@@ -2057,30 +2080,9 @@ impl DaemonRuntime {
     fn persist_initial_runtime_state(
         state_repository: &StateRepository,
         runtime_persistence: &RuntimeSidecarPersistence,
-        session_store: &Arc<SessionStore>,
         workspace_store: &Arc<WorkspaceStore>,
     ) -> Result<(), DaemonError> {
-        session_store.persist_durable_state_with(|durable| {
-            let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
-            for workspace in workspace_store.workspaces() {
-                let root = workspace.native_root_path();
-                let ws_id = workspace.workspace_id.to_string();
-                let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
-                state_repository.save_workspace_session_state(&root, &ws_state)?;
-            }
-            global_state.clear_current_session_if_owned_by_workspace_states(&workspace_states);
-            if global_state.is_empty() {
-                let global_path = state_repository.session_durable_state_path();
-                match std::fs::remove_file(global_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(DaemonError::from(error)),
-                }
-            } else {
-                state_repository.save_session_durable_state(&global_state)?;
-            }
-            Ok(())
-        })?;
+        runtime_persistence.persist_session_checkpoint()?;
         state_repository.save_workspace_durable_state(&workspace_store.durable_state())?;
         runtime_persistence.flush_runtime_sidecars()?;
         Ok(())
@@ -2222,15 +2224,19 @@ fn fail_orphan_session_root_tasks(session_store: &SessionStore, task_store: &Tas
 
     let mut failed_count = 0usize;
     for task_id in orphan_task_ids {
-        task_store.set_output_refs(
+        let lease_id = task_store
+            .get_active_lease(&task_id)
+            .map(|lease| lease.lease_id);
+        match task_store.revoke_lease_and_set_task_terminal(
             &task_id,
+            &task_id,
+            lease_id.as_ref(),
+            TaskStatus::Failed,
             vec!["daemon 重启时检测到任务未绑定 execution chain，已终止孤立执行状态".to_string()],
-        );
-        if task_store
-            .update_status(&task_id, TaskStatus::Failed)
-            .is_ok()
-        {
-            failed_count += 1;
+        ) {
+            Ok(true) => failed_count += 1,
+            Ok(false) => warn!(%task_id, "忽略未生效的孤立任务终态收敛"),
+            Err(error) => warn!(?error, %task_id, "孤立任务终态收敛失败"),
         }
     }
     failed_count
@@ -2605,7 +2611,10 @@ done
                 )
                 .expect("test session should be creatable");
             repository
-                .save_workspace_session_state(&workspace_root, &session_store.durable_state())
+                .save_session_projection_state(
+                    &session_store.durable_state(),
+                    &session_store.execution_sidecar_store_state(),
+                )
                 .expect("test session state should persist");
         }
     }
@@ -2839,7 +2848,9 @@ done
             1_000,
         );
         completed_task.mission_id = mission_id.clone();
-        task_store.insert_task(completed_task);
+        task_store
+            .insert_task(completed_task)
+            .expect("已完成任务应插入");
         let mut running_task = spawn_graph_restore_task(
             running_task_id.as_str(),
             running_task_id.as_str(),
@@ -2848,25 +2859,29 @@ done
             2_000,
         );
         running_task.mission_id = mission_id.clone();
-        task_store.insert_task(running_task);
+        task_store
+            .insert_task(running_task)
+            .expect("运行中任务应插入");
 
         for (thread_id, task_id) in [
             ("thread-terminal-completed", &completed_task_id),
             ("thread-terminal-running", &running_task_id),
         ] {
-            session_store.register_thread(magi_session_store::ExecutionThread {
-                thread_id: ThreadId::new(thread_id),
-                session_id: session_id.clone(),
-                mission_id: mission_id.clone(),
-                role_id: "reviewer".to_string(),
-                worker_instance_id: WorkerId::new(format!("worker-{thread_id}")),
-                status: magi_session_store::ExecutionThreadStatus::Active,
-                created_at: UtcMillis(1_000),
-                last_used_at: UtcMillis(2_000),
-                observed_context_window_tokens: None,
-                handled_task_ids: vec![task_id.clone()],
-                message_history: Vec::new(),
-            });
+            session_store
+                .register_thread(magi_session_store::ExecutionThread {
+                    thread_id: ThreadId::new(thread_id),
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    role_id: "reviewer".to_string(),
+                    worker_instance_id: WorkerId::new(format!("worker-{thread_id}")),
+                    status: magi_session_store::ExecutionThreadStatus::Active,
+                    created_at: UtcMillis(1_000),
+                    last_used_at: UtcMillis(2_000),
+                    observed_context_window_tokens: None,
+                    handled_task_ids: vec![task_id.clone()],
+                    message_history: Vec::new(),
+                })
+                .expect("终态 thread 测试数据应注册成功");
         }
 
         assert_eq!(
@@ -2914,19 +2929,21 @@ done
         session_store
             .create_session(session_id.clone(), "orphan root reconcile")
             .expect("session should be created");
-        session_store.register_thread(magi_session_store::ExecutionThread {
-            thread_id: ThreadId::new("thread-orphan-root-reconcile"),
-            session_id,
-            mission_id: mission_id.clone(),
-            role_id: "coordinator".to_string(),
-            worker_instance_id: WorkerId::new("worker-orphan-root-reconcile"),
-            status: magi_session_store::ExecutionThreadStatus::Active,
-            created_at: now,
-            last_used_at: now,
-            observed_context_window_tokens: None,
-            handled_task_ids: vec![orphan_task_id.clone()],
-            message_history: Vec::new(),
-        });
+        session_store
+            .register_thread(magi_session_store::ExecutionThread {
+                thread_id: ThreadId::new("thread-orphan-root-reconcile"),
+                session_id,
+                mission_id: mission_id.clone(),
+                role_id: "coordinator".to_string(),
+                worker_instance_id: WorkerId::new("worker-orphan-root-reconcile"),
+                status: magi_session_store::ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![orphan_task_id.clone()],
+                message_history: Vec::new(),
+            })
+            .expect("孤儿 root thread 测试数据应注册成功");
         let mut orphan_task = spawn_graph_restore_task(
             orphan_task_id.as_str(),
             orphan_task_id.as_str(),
@@ -2935,7 +2952,7 @@ done
             now.0,
         );
         orphan_task.mission_id = mission_id.clone();
-        task_store.insert_task(orphan_task);
+        task_store.insert_task(orphan_task).expect("孤立任务应插入");
         let mut unrelated_task = spawn_graph_restore_task(
             unrelated_task_id.as_str(),
             unrelated_task_id.as_str(),
@@ -2944,7 +2961,9 @@ done
             now.0,
         );
         unrelated_task.mission_id = mission_id;
-        task_store.insert_task(unrelated_task);
+        task_store
+            .insert_task(unrelated_task)
+            .expect("无关任务应插入");
 
         assert_eq!(
             fail_orphan_session_root_tasks(session_store.as_ref(), &task_store),
@@ -3185,23 +3204,28 @@ done
     #[tokio::test]
     async fn daemon_restore_rebuilds_spawn_graph_from_task_store_checkpoint() {
         let state_root = temp_state_root("spawn-graph-restore");
+        let repository = StateRepository::new(state_root.clone());
         let task_store = TaskStore::new();
-        task_store.insert_task(spawn_graph_restore_task(
-            "task-root-spawn-restore",
-            "task-root-spawn-restore",
-            None,
-            TaskStatus::Running,
-            1,
-        ));
-        task_store.insert_task(spawn_graph_restore_task(
-            "task-child-spawn-restore",
-            "task-root-spawn-restore",
-            Some("task-root-spawn-restore"),
-            TaskStatus::Pending,
-            2,
-        ));
         task_store
-            .checkpoint_to_file(&state_root.join("task-store.json"))
+            .insert_task(spawn_graph_restore_task(
+                "task-root-spawn-restore",
+                "task-root-spawn-restore",
+                None,
+                TaskStatus::Running,
+                1,
+            ))
+            .expect("根任务应插入");
+        task_store
+            .insert_task(spawn_graph_restore_task(
+                "task-child-spawn-restore",
+                "task-root-spawn-restore",
+                Some("task-root-spawn-restore"),
+                TaskStatus::Pending,
+                2,
+            ))
+            .expect("子任务应插入");
+        repository
+            .checkpoint_task_store(&task_store)
             .expect("task store checkpoint should be written");
 
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
@@ -3231,9 +3255,7 @@ done
         assert!(runtime.session_store.current_session().is_none());
         assert!(runtime.workspace_store.workspaces().is_empty());
         assert!(runtime.workspace_store.snapshots().is_empty());
-        assert!(!state_root.join("sessions.json").exists());
         assert!(state_root.join("workspaces.json").exists());
-        assert!(!state_root.join("session-sidecars.json").exists());
         assert!(!state_root.join("workspace-recovery-sidecars.json").exists());
         assert!(state_root.join("audit-usage-ledger.json").exists());
 
@@ -4022,7 +4044,15 @@ done
         state
             .task_store()
             .expect("task store should be configured")
-            .update_status(&recovery_task_id, TaskStatus::Failed)
+            .revoke_lease_and_set_task_terminal(
+                &recovery_task_id,
+                &recovery_task_id,
+                None,
+                TaskStatus::Failed,
+                Vec::new(),
+            )
+            .expect("seed task should become recoverable")
+            .then_some(())
             .expect("seed task should become recoverable");
         runtime
             .session_store

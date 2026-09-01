@@ -370,6 +370,20 @@ async fn restart_task(
         task_id,
     )?;
     let session_id = scope.session_id.clone();
+    let requested_root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("重新执行失败", "runner_manager 未配置"))?;
+    // Restart 与 Continue 使用相同的锁顺序：session 生命周期锁 → root restart 锁。
+    // 旧 runner 必须在创建新执行链前完全退出，避免两条执行链并存。
+    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    let _session_lifecycle_guard = manager.lock_session_lifecycle(&session_id).await;
+    let _restart_guard = manager
+        .lock_for_restart(requested_root_task.task_id.as_str())
+        .await;
+    manager
+        .quiesce_for_restart(requested_root_task.task_id.as_str())
+        .await;
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
     ensure_supported_root_action(&root_task, AgentRunActionKind::Restart, "重新执行")?;
     let previous_plan = resume_blocked_plan_for_retry(

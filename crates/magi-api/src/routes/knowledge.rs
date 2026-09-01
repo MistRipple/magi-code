@@ -1644,7 +1644,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("magi-knowledge-empty-index-{}", UtcMillis::now().0));
         fs::create_dir_all(root.join(".magi")).expect("workspace dir should create");
-        fs::write(root.join(".magi/sessions.json"), "{}\n").expect("ignored file should write");
+        fs::write(root.join(".magi/unrelated.json"), "{}\n").expect("ignored file should write");
         state
             .workspace_registry
             .register(

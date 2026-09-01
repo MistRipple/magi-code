@@ -1,7 +1,9 @@
 #![recursion_limit = "256"]
 
 pub mod auto_learning;
+#[cfg(test)]
 mod execution_overview;
+#[cfg(test)]
 mod execution_runtime;
 mod execution_writeback;
 pub mod risk_policy;
@@ -10,25 +12,36 @@ pub mod task_worker_catalog;
 pub mod verification_policy;
 pub mod verification_runner;
 
+#[cfg(test)]
 use magi_bridge_client::BridgeBindingDispatchPlan;
 use magi_context_runtime::{ContextAssemblyResult, ContextBudget, ContextRuntime};
+#[cfg(test)]
 use magi_core::{
     AssignmentId, EventId, MissionId, SessionId, TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
     WorkspaceId,
 };
-use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
-use magi_skill_runtime::{SkillDispatchRuntime, SkillToolRoutingSummary, SkillToolRuntimePlan};
-use magi_tool_runtime::{ToolExecutionPolicy, ToolExecutionSummary, ToolRegistry};
+use magi_event_bus::InMemoryEventBus;
+#[cfg(test)]
+use magi_event_bus::{EventCategory, EventContext, EventEnvelope};
+use magi_skill_runtime::SkillDispatchRuntime;
+#[cfg(test)]
+use magi_skill_runtime::{SkillToolRoutingSummary, SkillToolRuntimePlan};
+use magi_tool_runtime::ToolRegistry;
+#[cfg(test)]
+use magi_tool_runtime::{ToolExecutionPolicy, ToolExecutionSummary};
+use magi_worker_runtime::WorkerRuntime;
+#[cfg(test)]
 use magi_worker_runtime::{
     SkillDispatchSummary, WorkerExecutionBindingScope, WorkerExecutionIntent,
     WorkerExecutionProfile, WorkerExecutionReusePolicy, WorkerExecutorRequest,
-    WorkerGovernanceSummary, WorkerLoopOutcome, WorkerRuntime, WorkerRuntimeSummary, WorkerStage,
+    WorkerGovernanceSummary, WorkerLoopOutcome, WorkerRuntimeSummary, WorkerStage,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub use execution_writeback::{DispatchMemoryExtractionInput, ExecutionWritebackPlans};
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OrchestratorCommandError {
     MissionNotFound {
@@ -56,6 +69,7 @@ pub enum OrchestratorCommandError {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionRuntimeSnapshot {
     pub mission_id: MissionId,
@@ -65,6 +79,7 @@ pub struct ExecutionRuntimeSnapshot {
     pub failed_tasks: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionOverview {
     pub runtime_snapshot: ExecutionRuntimeSnapshot,
@@ -236,8 +251,10 @@ impl ExecutionContextSummary {
     }
 }
 
+#[cfg(test)]
 pub type ExecutionSkillDispatchSummary = SkillDispatchSummary;
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssignmentGovernanceSummary {
     pub assignment_id: AssignmentId,
@@ -245,6 +262,7 @@ pub struct AssignmentGovernanceSummary {
     pub governance_summary: WorkerGovernanceSummary,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskGovernanceSummary {
     pub task_id: TaskId,
@@ -253,6 +271,7 @@ pub struct TaskGovernanceSummary {
     pub governance_summary: WorkerGovernanceSummary,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssignmentSkillDispatchSummary {
     pub assignment_id: AssignmentId,
@@ -260,6 +279,7 @@ pub struct AssignmentSkillDispatchSummary {
     pub skill_dispatch_summary: ExecutionSkillDispatchSummary,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskSkillDispatchSummary {
     pub task_id: TaskId,
@@ -270,15 +290,19 @@ pub struct TaskSkillDispatchSummary {
 
 #[derive(Clone)]
 pub struct OrchestratorService {
+    #[cfg(test)]
     event_bus: Arc<InMemoryEventBus>,
 }
 
 #[derive(Clone)]
 pub struct OrchestratedExecutionRuntime {
+    #[cfg(test)]
     service: OrchestratorService,
     task_store: Arc<task_store::TaskStore>,
     worker_runtime: WorkerRuntime,
+    #[cfg(test)]
     tool_registry: ToolRegistry,
+    #[cfg(test)]
     skill_dispatch_runtime: SkillDispatchRuntime,
     context_runtime: Option<ContextRuntime>,
     context_config: Option<ExecutionContextConfig>,
@@ -290,6 +314,7 @@ pub struct ExecutionContextConfig {
     pub project_key: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchExecutionResult {
     pub target: TaskExecutionTarget,
@@ -298,7 +323,8 @@ pub struct DispatchExecutionResult {
     pub overview: ExecutionOverview,
 }
 
-pub struct DispatchWritebackRequest {
+#[cfg(test)]
+pub(crate) struct DispatchWritebackRequest {
     pub target: TaskExecutionTarget,
     pub worker_id: WorkerId,
     pub session_id: Option<SessionId>,
@@ -310,7 +336,11 @@ pub struct DispatchWritebackRequest {
 
 impl OrchestratorService {
     pub fn new(event_bus: Arc<InMemoryEventBus>) -> Self {
-        Self { event_bus }
+        let _ = &event_bus;
+        Self {
+            #[cfg(test)]
+            event_bus,
+        }
     }
 
     pub fn execution_runtime(
@@ -319,17 +349,22 @@ impl OrchestratorService {
         tool_registry: ToolRegistry,
         skill_dispatch_runtime: SkillDispatchRuntime,
     ) -> OrchestratedExecutionRuntime {
+        let _ = (&tool_registry, &skill_dispatch_runtime);
         OrchestratedExecutionRuntime {
+            #[cfg(test)]
             service: self.clone(),
             task_store: Arc::new(task_store::TaskStore::new()),
             worker_runtime,
+            #[cfg(test)]
             tool_registry,
+            #[cfg(test)]
             skill_dispatch_runtime,
             context_runtime: None,
             context_config: None,
         }
     }
 
+    #[cfg(test)]
     fn derive_execution_profile(
         &self,
         session_id: &Option<SessionId>,
@@ -365,6 +400,7 @@ impl OrchestratorService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn finalize_execution_profile(
         &self,
         profile: &WorkerExecutionProfile,
@@ -391,6 +427,7 @@ impl OrchestratorService {
         effective_profile
     }
 
+    #[cfg(test)]
     pub(crate) fn derive_executor_request(
         &self,
         intent: &WorkerExecutionIntent,
@@ -399,6 +436,7 @@ impl OrchestratorService {
         intent.executor_request(WorkerStage::Execute, request_source.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn build_execution_overview_from_task_projection(
         &self,
         task_store: &task_store::TaskStore,
@@ -428,6 +466,7 @@ impl OrchestratorService {
         Some(overview)
     }
 
+    #[cfg(test)]
     fn publish_with_category(
         &self,
         event_type: &str,
@@ -466,6 +505,7 @@ impl OrchestratorService {
     }
 }
 
+#[cfg(test)]
 fn scoped_execution_payload(
     mut payload: serde_json::Value,
     session_id: Option<&SessionId>,
@@ -515,6 +555,7 @@ impl OrchestratedExecutionRuntime {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DispatchContextDescriptor {
     pub mission_title: Option<String>,
@@ -522,6 +563,7 @@ pub(crate) struct DispatchContextDescriptor {
     pub task_title: Option<String>,
 }
 
+#[cfg(test)]
 fn default_builtin_skill_plan(tool_name: &str) -> SkillToolRuntimePlan {
     SkillToolRuntimePlan {
         skill_ids: vec!["test-skill".to_string()],
@@ -541,6 +583,7 @@ fn default_builtin_skill_plan(tool_name: &str) -> SkillToolRuntimePlan {
     }
 }
 
+#[cfg(test)]
 fn resolve_skill_tool_name(plan: &SkillToolRuntimePlan) -> String {
     plan.routing
         .requested_bridge_tool_names

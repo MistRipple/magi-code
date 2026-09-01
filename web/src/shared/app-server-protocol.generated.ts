@@ -277,8 +277,6 @@ export type CanonicalTurnItemKind = "user_message" | "assistant_text" | "assista
 
 export type CanonicalTurnItemStatus = "pending" | "running" | "completed" | "blocked" | "failed" | "cancelled";
 
-export type CanonicalTurnEventKind = "turn_started" | "turn_item_upsert" | "turn_completed" | "turn_superseded";
-
 export interface CanonicalTurnVisibility {
   renderable?: boolean;
 }
@@ -332,13 +330,6 @@ export interface CanonicalTurn {
   metadata?: Record<string, JsonValue>;
 }
 
-export interface CanonicalTurnEvent {
-  canonicalSchemaVersion: string;
-  canonicalEventKind: CanonicalTurnEventKind;
-  canonicalTurn?: CanonicalTurn | null;
-  canonicalItem?: CanonicalTurnItem | null;
-}
-
 export type TurnStartKind = "accepted" | "queued";
 
 export type TurnStartRoute = "chat" | "execute" | "task" | "continue" | "steer";
@@ -372,6 +363,9 @@ export interface TurnStartResult {
   steeredTurnId?: string | null;
   canonicalSchemaVersion?: string | null;
   canonicalEventKind?: string | null;
+  canonicalEventId?: string | null;
+  canonicalEventSeq?: number | null;
+  canonicalOccurredAt?: number | null;
 }
 
 export interface EventEnvelope {

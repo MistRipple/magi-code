@@ -98,6 +98,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection);
   assertInterruptedTurnIsTerminalAndKeepsRecoveryNotice(reducer, projection, canonicalProtocol);
+  assertBlockedTurnRemainsRecoverable(canonicalProtocol);
   assertSingleThinkingProjectsAsGroup(reducer, projection);
   assertContinuousThinkingProjectsAsOneGroup(reducer, projection);
   assertModelRoundsKeepThinkingGroupsSeparate(reducer, projection);
@@ -126,11 +127,13 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBootstrapDefersPendingChangesProjection(contract);
   assertBootstrapFiltersForeignWorkspaceSessions(contract);
   assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract);
-  assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
+  assertAuthoritativeIdlePreservesLocalSubmission(messagesStore);
   assertHistoricalIdlePreservesBoundLocalSubmission(messagesStore);
-  assertHistoricalForcedIdlePreservesBoundLocalSubmission(dataHandlers, messagesStore);
+  assertForcedTerminalUsesExactRequestIdentity(dataHandlers, messagesStore);
+  assertProcessingSnapshotIsGenerationBound(messagesStore);
   assertSessionSwitchClearsExecutionState(messagesStore);
   assertLocalTurnSubmissionStartsAtomically(messagesStore);
+  assertRapidLocalSubmissionsSettleIndependently(dataHandlers, messagesStore);
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
   assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol);
   assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection);
@@ -141,6 +144,49 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertUnknownCanonicalBlockHasNoTextFallback(blockRegistry);
   assertMalformedMessageBlocksDoNotBreakPresentation(conversationPresentation);
   assertMarkdownUrlSanitizerKeepsOnlyValidFileLinks(markdownUrl);
+}
+
+function assertBlockedTurnRemainsRecoverable(canonicalProtocol) {
+  assert.equal(
+    canonicalProtocol.isCanonicalTerminalStatus('blocked'),
+    false,
+    'blocked turn is recoverable and must keep processing state alive',
+  );
+  assert.equal(
+    canonicalProtocol.canTransitionCanonicalStatus('blocked', 'running'),
+    true,
+    'blocked turn must be able to resume running',
+  );
+}
+
+function beginGoldenLocalSubmission(messagesStore, input) {
+  const requestId = input.requestId;
+  const userMessageId = input.userMessageId || `user-${requestId}`;
+  const placeholderMessageId = input.placeholderMessageId || `assistant-${requestId}`;
+  const startedAt = input.startedAt || Date.now();
+  messagesStore.beginLocalTurnSubmission({
+    requestId,
+    sessionId: input.sessionId ?? messagesStore.messagesState.currentSessionId,
+    placeholderMessageId,
+    startedAt,
+    message: {
+      id: userMessageId,
+      role: 'user',
+      source: 'user',
+      content: input.content || requestId,
+      timestamp: startedAt,
+      isStreaming: false,
+      isComplete: true,
+      type: 'user_input',
+      metadata: {
+        requestId,
+        localSubmission: true,
+        sendingAnimation: true,
+      },
+    },
+    source: 'orchestrator',
+    agent: 'orchestrator',
+  });
 }
 
 function assertMalformedMessageBlocksDoNotBreakPresentation(conversationPresentation) {
@@ -399,14 +445,13 @@ function assertLocalTurnSubmissionStartsAtomically(messagesStore) {
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
-  messagesStore.beginLocalTurnSubmission({
+  beginGoldenLocalSubmission(messagesStore, {
     requestId: 'request-local-submit',
+    userMessageId: 'user-local-submit',
     placeholderMessageId: 'assistant-local-submit',
     startedAt: 25_000,
-    source: 'orchestrator',
-    agent: 'orchestrator',
+    content: '立即显示的本地消息',
   });
 
   assert.equal(messagesStore.messagesState.isProcessing, true);
@@ -414,8 +459,133 @@ function assertLocalTurnSubmissionStartsAtomically(messagesStore) {
   assert.equal(messagesStore.messagesState.pendingRequests.has('request-local-submit'), true);
   assert.equal(messagesStore.messagesState.activeMessageIds.has('assistant-local-submit'), true);
   assert.equal(messagesStore.messagesState.processingActor.source, 'orchestrator');
+  assert.deepEqual(
+    messagesStore.getLocalTurnSubmissionRenderItems('session-local-submit')
+      .map((item) => [item.key, item.message.id, item.message.content]),
+    [['local-submission:request-local-submit', 'user-local-submit', '立即显示的本地消息']],
+    'local submission must be renderable synchronously before canonical acceptance',
+  );
 
-  messagesStore.settleAuthoritativeIdleState();
+  messagesStore.clearPendingRequest('request-local-submit');
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertRapidLocalSubmissionsSettleIndependently(dataHandlers, messagesStore) {
+  resetMessagesStoreForGoldenProcessing(messagesStore);
+  const sessionId = messagesStore.messagesState.currentSessionId;
+  for (const [requestId, startedAt] of [['request-rapid-a', 30_000], ['request-rapid-b', 30_001]]) {
+    messagesStore.createRequestBinding({
+      requestId,
+      userMessageId: `user-${requestId}`,
+      placeholderMessageId: `assistant-${requestId}`,
+      createdAt: startedAt,
+    });
+    beginGoldenLocalSubmission(messagesStore, { requestId, startedAt });
+  }
+  assert.deepEqual(
+    messagesStore.getLocalTurnSubmissionRenderItems(sessionId).map((item) => item.message.metadata.requestId),
+    ['request-rapid-a', 'request-rapid-b'],
+    'rapid submissions must keep deterministic local order',
+  );
+
+  const dispatchForcedTerminal = (id, payload) => dataHandlers.handleUnifiedData({
+    id,
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: 30_002,
+    updatedAt: 30_002,
+    data: {
+      dataType: 'processingStateChanged',
+      payload: { isProcessing: false, transitionKind: 'forced', ...payload },
+    },
+  });
+  dispatchForcedTerminal('rapid-terminal-a', { sessionId, requestId: 'request-rapid-a' });
+  assert.equal(messagesStore.messagesState.pendingRequests.has('request-rapid-a'), false);
+  assert.equal(messagesStore.messagesState.pendingRequests.has('request-rapid-b'), true);
+  assert.equal(messagesStore.messagesState.isProcessing, true);
+  assert.deepEqual(
+    messagesStore.getLocalTurnSubmissionRenderItems(sessionId).map((item) => item.message.metadata.requestId),
+    ['request-rapid-b'],
+    'terminal A must remove only A and keep the next local turn visible',
+  );
+
+  messagesStore.applyAuthoritativeProcessingState({
+    isProcessing: true,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    startedAt: 30_001,
+    pendingRequestIds: ['request-rapid-b'],
+    stage: 'streaming',
+  });
+  assert.equal(messagesStore.messagesState.turnStage, 'streaming');
+  assert.equal(messagesStore.messagesState.isProcessing, true, 'a new turn must start without time-based cooldown');
+
+  dispatchForcedTerminal('rapid-user-interrupt', {
+    sessionId,
+  });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'terminal without requestId must not clear the current session',
+  );
+  dispatchForcedTerminal('rapid-wrong-session', {
+    sessionId: 'session-rapid-other',
+    requestId: 'request-rapid-b',
+  });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'terminal for another session must not clear the active request',
+  );
+  dispatchForcedTerminal('rapid-terminal-b', {
+    sessionId,
+    requestId: 'request-rapid-b',
+  });
+  assert.equal(messagesStore.messagesState.isProcessing, false);
+  assert.equal(messagesStore.getLocalTurnSubmissionRenderItems(sessionId).length, 0);
+  messagesStore.clearAllRequestBindings();
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertProcessingSnapshotIsGenerationBound(messagesStore) {
+  resetMessagesStoreForGoldenProcessing(messagesStore);
+  const sessionId = messagesStore.messagesState.currentSessionId;
+  const oldRequestId = 'request-bootstrap-old-generation';
+  const newRequestId = 'request-bootstrap-new-generation';
+  let oldSnapshot = [];
+  for (const requestId of [oldRequestId, newRequestId]) {
+    messagesStore.createRequestBinding({
+      requestId,
+      userMessageId: `user-${requestId}`,
+      placeholderMessageId: `assistant-${requestId}`,
+      createdAt: 12_100,
+    });
+    beginGoldenLocalSubmission(messagesStore, { requestId, startedAt: 12_100 });
+    if (requestId === oldRequestId) {
+      oldSnapshot = messagesStore.listPendingRequestIdsForSession(sessionId);
+    }
+  }
+
+  messagesStore.settlePendingRequestSnapshot({
+    sessionId,
+    requestIds: oldSnapshot,
+  });
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has(oldRequestId),
+    false,
+    '异步操作失败必须结算发起时已存在的 request',
+  );
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has(newRequestId),
+    true,
+    '旧 bootstrap/forced terminal 的 request 快照不得清理之后新建的 request',
+  );
+
+  messagesStore.clearAllRequestBindings();
   messagesStore.setCurrentSessionId(null);
 }
 
@@ -482,17 +652,23 @@ function assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol) {
     canonical_item_id: 'assistant-stream',
     canonical_item_version: 3,
     canonical_item_status: 'running',
+    canonical_event_id: 'canonical-event-stream-payload',
+    canonical_event_seq: 12,
+    canonical_occurred_at: 100,
     stream_base_content_length: 2,
     stream_delta: '世界',
     stream_content_length: 4,
     stream_reset: false,
   }, {
-    eventId: 'event-stream-payload',
-    eventSeq: 12,
-    occurredAt: 100,
+    eventId: 'eventbus-envelope-stream-payload',
+    eventSeq: 999,
+    occurredAt: 999,
   });
 
   assert.ok(event, 'delta-only canonical payload should parse without canonical_turn/canonical_item');
+  assert.equal(event.eventId, 'canonical-event-stream-payload');
+  assert.equal(event.eventSeq, 12, 'canonical eventSeq must come from the payload, not the EventBus envelope');
+  assert.equal(event.occurredAt, 100);
   assert.equal(event.turn, undefined, 'delta-only stream payload must not require a full turn snapshot');
   assert.equal(event.item, undefined, 'delta-only stream payload must not require a full item snapshot');
   assert.deepEqual(event.stream, {
@@ -504,6 +680,24 @@ function assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol) {
     contentLength: 4,
     reset: false,
   });
+  assert.equal(
+    canonicalProtocol.parseCanonicalTurnEventPayload({
+      canonical_schema_version: 'canonical-turn.v1',
+      canonical_event_kind: 'turn_item_upsert',
+      session_id: 'session-stream-payload',
+      turn_id: 'turn-stream-payload',
+      turn_seq: 7,
+      canonical_item_id: 'assistant-stream',
+      canonical_item_version: 3,
+      canonical_item_status: 'running',
+      stream_base_content_length: 2,
+      stream_delta: '世界',
+      stream_content_length: 4,
+      stream_reset: false,
+    }),
+    undefined,
+    'canonical parser must reject payloads without eventId/eventSeq/occurredAt',
+  );
 }
 
 function assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection) {
@@ -944,6 +1138,35 @@ function assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol) {
     }),
     undefined,
     'canonical parser must reject unsupported structured blocks at the protocol boundary',
+  );
+  assert.throws(
+    () => canonicalProtocol.normalizeCanonicalTurnStrict(snakeTurn),
+    /canonical protocol invalid/,
+    'strict canonical parser must surface malformed turn data instead of filtering it',
+  );
+  assert.throws(
+    () => canonicalProtocol.normalizeCanonicalTurnStrict({
+      sessionId: 'session-invalid-item',
+      turnId: 'turn-invalid-item',
+      turnSeq: 1,
+      acceptedAt: 1,
+      status: 'completed',
+      items: [{
+        sessionId: 'session-invalid-item',
+        turnId: 'turn-invalid-item',
+        turnSeq: 1,
+        itemId: 'item-invalid-item',
+        itemSeq: 1,
+        kind: 'assistant_text',
+        status: 'completed',
+        createdAt: 1,
+        sourceThreadId: 'thread-invalid-item',
+        visibility: { renderable: true },
+        blocks: [{ type: 'unknown-block' }],
+      }],
+    }),
+    /canonical protocol invalid/,
+    'strict canonical parser must reject an invalid item without producing a partial turn',
   );
 }
 
@@ -1693,7 +1916,6 @@ function assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
 
   const c = baseCase(
@@ -1760,6 +1982,7 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
     12000,
   );
   const imageMetadata = {
+    requestId: 'request-bootstrap-empty-projection',
     images: [
       {
         name: 'bootstrap.png',
@@ -1794,9 +2017,11 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
-  messagesStore.addPendingRequest('request-bootstrap-empty-projection');
+  beginGoldenLocalSubmission(messagesStore, {
+    requestId: 'request-bootstrap-empty-projection',
+    startedAt: c.turnSeq - 1,
+  });
   assert.equal(
     messagesStore.messagesState.canonicalTimelineProjection,
     null,
@@ -1908,7 +2133,6 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
   const local = baseCase(
     'stale-idle-local-turn',
@@ -1938,10 +2162,12 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     placeholderMessageId: localMetadata.placeholderMessageId,
     createdAt: local.turnSeq,
   });
-  messagesStore.beginLocalTurnSubmission({
+  beginGoldenLocalSubmission(messagesStore, {
     requestId,
+    userMessageId: localMetadata.userMessageId,
     placeholderMessageId: localMetadata.placeholderMessageId,
     startedAt: local.turnSeq,
+    content: localUser.content,
   });
   dataHandlers.handleUnifiedData({
     id: 'golden-stale-idle-local-turn',
@@ -2129,7 +2355,7 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     false,
     '包含当前 requestId 的权威终态快照必须收敛 processing',
   );
-  messagesStore.clearProcessingState({ skipAntiLiftBack: true });
+  messagesStore.clearProcessingState();
   messagesStore.clearAllRequestBindings();
   messagesStore.setCurrentSessionId(null);
 }
@@ -2161,9 +2387,14 @@ function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(data
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
-  messagesStore.addPendingRequest(requestMetadata.requestId);
+  beginGoldenLocalSubmission(messagesStore, {
+    requestId: requestMetadata.requestId,
+    userMessageId: requestMetadata.userMessageId,
+    placeholderMessageId: requestMetadata.placeholderMessageId,
+    startedAt: c.turnSeq,
+    content: userItem.content,
+  });
 
   dataHandlers.handleUnifiedData({
     id: 'golden-live-running-canonical-event',
@@ -2190,6 +2421,11 @@ function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(data
     messagesStore.messagesState.isProcessing,
     true,
     'running canonical event should keep processing state active',
+  );
+  assert.equal(
+    messagesStore.getLocalTurnSubmissionRenderItems(c.sessionId).length,
+    0,
+    'canonical turn with the same requestId must atomically adopt the local user projection',
   );
 
   dataHandlers.handleUnifiedData({
@@ -2262,18 +2498,17 @@ function assertTerminalCanonicalTurnWithoutAssistantSettlesBoundRequest(dataHand
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
   messagesStore.createRequestBinding({
     ...requestMetadata,
     createdAt: c.turnSeq,
   });
-  messagesStore.beginLocalTurnSubmission({
+  beginGoldenLocalSubmission(messagesStore, {
     requestId: requestMetadata.requestId,
+    userMessageId: requestMetadata.userMessageId,
     placeholderMessageId: requestMetadata.placeholderMessageId,
     startedAt: c.turnSeq,
-    source: 'orchestrator',
-    agent: 'orchestrator',
+    content: userItem.content,
   });
 
   dataHandlers.handleUnifiedData({
@@ -2377,15 +2612,14 @@ function assertHistoricalTerminalReplayDoesNotClearCurrentTurn(dataHandlers, mes
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
   const localStartedAt = 12_150;
-  messagesStore.beginLocalTurnSubmission({
+  beginGoldenLocalSubmission(messagesStore, {
     requestId: currentMetadata.requestId,
+    userMessageId: currentUser.itemId,
     placeholderMessageId: 'assistant-historical-current',
     startedAt: localStartedAt,
-    source: 'orchestrator',
-    agent: 'orchestrator',
+    content: currentUser.content,
   });
 
   const dispatchCanonicalEvent = (id, canonicalEvent) => {
@@ -2465,15 +2699,16 @@ function resetMessagesStoreForGoldenProcessing(messagesStore) {
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
-  messagesStore.messagesState.lastForcedIdleAt = null;
 }
 
-function assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore) {
+function assertAuthoritativeIdlePreservesLocalSubmission(messagesStore) {
   resetMessagesStoreForGoldenProcessing(messagesStore);
 
-  messagesStore.addPendingRequest('request-authoritative-idle');
+  beginGoldenLocalSubmission(messagesStore, {
+    requestId: 'request-authoritative-idle',
+    startedAt: 8_000,
+  });
   assert.equal(
     messagesStore.messagesState.isProcessing,
     true,
@@ -2487,28 +2722,33 @@ function assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStor
     pendingRequestIds: [],
   });
   assert.equal(
-    messagesStore.messagesState.pendingRequests.size,
-    0,
-    'authoritative idle snapshot must clear local pending request ids',
+    messagesStore.messagesState.pendingRequests.has('request-authoritative-idle'),
+    true,
+    'authoritative idle must not erase a submission that canonical has not accepted yet',
   );
   assert.equal(
     messagesStore.messagesState.isProcessing,
-    false,
-    'authoritative idle snapshot must settle processing state',
+    true,
+    'local submission remains an independent processing fact until its lifecycle settles',
   );
+  messagesStore.clearPendingRequest('request-authoritative-idle');
 
-  messagesStore.addPendingRequest('request-authoritative-null');
+  beginGoldenLocalSubmission(messagesStore, {
+    requestId: 'request-authoritative-null',
+    startedAt: 8_500,
+  });
   messagesStore.applyAuthoritativeProcessingState(null);
   assert.equal(
-    messagesStore.messagesState.pendingRequests.size,
-    0,
-    'missing backend processingState means authoritative idle and must clear local pending',
+    messagesStore.messagesState.pendingRequests.has('request-authoritative-null'),
+    true,
+    'missing canonical processing state must preserve the local submission fact',
   );
   assert.equal(
     messagesStore.messagesState.isProcessing,
-    false,
-    'missing backend processingState must not preserve local processing',
+    true,
+    'missing canonical processing state must not hide an unaccepted local submission',
   );
+  messagesStore.clearPendingRequest('request-authoritative-null');
 
   messagesStore.createRequestBinding({
     requestId: 'request-binding-clear',
@@ -2516,7 +2756,12 @@ function assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStor
     placeholderMessageId: 'assistant-binding-clear',
     createdAt: 9000,
   });
-  messagesStore.addPendingRequest('request-binding-clear');
+  beginGoldenLocalSubmission(messagesStore, {
+    requestId: 'request-binding-clear',
+    userMessageId: 'user-binding-clear',
+    placeholderMessageId: 'assistant-binding-clear',
+    startedAt: 9_000,
+  });
   messagesStore.clearRequestBinding('request-binding-clear');
   assert.equal(
     messagesStore.messagesState.pendingRequests.has('request-binding-clear'),
@@ -2538,12 +2783,11 @@ function assertHistoricalIdlePreservesBoundLocalSubmission(messagesStore) {
     placeholderMessageId: 'assistant-bound-local-submission',
     createdAt: startedAt,
   });
-  messagesStore.beginLocalTurnSubmission({
+  beginGoldenLocalSubmission(messagesStore, {
     requestId,
+    userMessageId: 'user-bound-local-submission',
     placeholderMessageId: 'assistant-bound-local-submission',
     startedAt,
-    source: 'orchestrator',
-    agent: 'orchestrator',
   });
 
   messagesStore.applyAuthoritativeProcessingState(null);
@@ -2572,26 +2816,26 @@ function assertHistoricalIdlePreservesBoundLocalSubmission(messagesStore) {
   messagesStore.setCurrentSessionId(null);
 }
 
-function assertHistoricalForcedIdlePreservesBoundLocalSubmission(dataHandlers, messagesStore) {
+function assertForcedTerminalUsesExactRequestIdentity(dataHandlers, messagesStore) {
   resetMessagesStoreForGoldenProcessing(messagesStore);
 
   const requestId = 'request-bound-forced-idle';
+  const sessionId = messagesStore.messagesState.currentSessionId;
   messagesStore.createRequestBinding({
     requestId,
     userMessageId: 'user-bound-forced-idle',
     placeholderMessageId: 'assistant-bound-forced-idle',
     createdAt: 12_000,
   });
-  messagesStore.beginLocalTurnSubmission({
+  beginGoldenLocalSubmission(messagesStore, {
     requestId,
+    userMessageId: 'user-bound-forced-idle',
     placeholderMessageId: 'assistant-bound-forced-idle',
     startedAt: 12_000,
-    source: 'orchestrator',
-    agent: 'orchestrator',
   });
 
-  dataHandlers.handleUnifiedData({
-    id: 'historical-forced-idle-during-bound-submission',
+  const dispatchForcedTerminal = (id, payload) => dataHandlers.handleUnifiedData({
+    id,
     category: 'data',
     type: 'system',
     source: 'orchestrator',
@@ -2605,46 +2849,43 @@ function assertHistoricalForcedIdlePreservesBoundLocalSubmission(dataHandlers, m
       payload: {
         isProcessing: false,
         transitionKind: 'forced',
-        reason: 'session_turn_completed',
+        ...payload,
       },
     },
+  });
+
+  dispatchForcedTerminal('historical-forced-idle-during-bound-submission', {
+    sessionId,
+    requestId: 'request-historical-turn',
   });
 
   assert.equal(
     messagesStore.messagesState.pendingRequests.has(requestId),
     true,
-    'historical forced idle must not clear a locally bound submission',
+    'a terminal event for another request must not clear the current submission',
   );
   assert.equal(
     messagesStore.messagesState.isProcessing,
     true,
-    'historical forced idle must keep the locally bound submission active',
+    'a terminal event for another request must keep the current submission active',
   );
 
-  dataHandlers.handleUnifiedData({
-    id: 'user-interrupt-forced-idle-during-bound-submission',
-    category: 'data',
-    type: 'system',
-    source: 'orchestrator',
-    agent: 'orchestrator',
-    lifecycle: 'completed',
-    blocks: [],
-    timestamp: 12_002,
-    updatedAt: 12_002,
-    data: {
-      dataType: 'processingStateChanged',
-      payload: {
-        isProcessing: false,
-        transitionKind: 'forced',
-        reason: 'user_session_interrupt_requested',
-      },
-    },
+  dispatchForcedTerminal('foreign-session-terminal-during-bound-submission', {
+    sessionId: 'session-foreign-terminal',
+    requestId,
   });
   assert.equal(
-    messagesStore.messagesState.isProcessing,
-    false,
-    'explicit user interrupt must still settle a locally bound submission',
+    messagesStore.messagesState.pendingRequests.has(requestId),
+    true,
+    'a matching request id from another session must not settle the current session',
   );
+
+  dispatchForcedTerminal('exact-terminal-during-bound-submission', {
+    sessionId,
+    requestId,
+  });
+  assert.equal(messagesStore.messagesState.isProcessing, false);
+  assert.equal(messagesStore.getLocalTurnSubmissionRenderItems(sessionId).length, 0);
   messagesStore.clearAllRequestBindings();
   messagesStore.setCurrentSessionId(null);
 }
@@ -2657,12 +2898,15 @@ function assertSessionSwitchClearsExecutionState(messagesStore) {
     persist: false,
     resetTimelineView: true,
     resetPanelState: true,
-    skipAntiLiftBack: true,
   });
   messagesStore.messagesState.backendProcessing = true;
   messagesStore.messagesState.activeMessageIds = new Set(['assistant-running-a']);
   messagesStore.messagesState.thinkingStartAt = 12_000;
-  messagesStore.addPendingRequest('request-running-a');
+  beginGoldenLocalSubmission(messagesStore, {
+    requestId: 'request-running-a',
+    placeholderMessageId: 'assistant-running-a',
+    startedAt: 12_000,
+  });
   assert.equal(
     messagesStore.messagesState.isProcessing,
     true,

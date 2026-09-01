@@ -495,6 +495,9 @@ export interface AgentSessionTurnResult {
   queuePosition?: number | null;
   canonicalSchemaVersion?: string | null;
   canonicalEventKind?: string | null;
+  canonicalEventId?: string | null;
+  canonicalEventSeq?: number | null;
+  canonicalOccurredAt?: number | null;
   canonicalTurn?: CanonicalTurn | null;
   canonicalItem?: CanonicalTurnItem | null;
   /** 仅在 steer 路由下返回：实际接收引导的 Turn ID。 */
@@ -1827,7 +1830,6 @@ export async function getAgentSessionMessages(options: {
   scope: 'personal' | 'workspace';
   workspaceId?: string;
   workspacePath?: string;
-  beforeCursor?: string | null;
   canonicalBeforeCursor?: string | null;
   limit?: number;
 }): Promise<MessagesResponseDto> {
@@ -1848,7 +1850,6 @@ export async function getAgentSessionMessages(options: {
     const query = buildBoundQueryWithOverride(
       {
         ...(options.limit ? { limit: String(options.limit) } : {}),
-        ...(options.beforeCursor ? { beforeCursor: options.beforeCursor } : {}),
         ...(options.canonicalBeforeCursor
           ? { canonicalBeforeCursor: options.canonicalBeforeCursor }
           : {}),
@@ -2109,6 +2110,9 @@ export async function submitSessionTurn(
       queuePosition?: number | null;
       canonicalSchemaVersion?: string | null;
       canonicalEventKind?: string | null;
+      canonicalEventId?: string | null;
+      canonicalEventSeq?: number | null;
+      canonicalOccurredAt?: number | null;
       canonicalTurn?: CanonicalTurn | null;
       canonicalItem?: CanonicalTurnItem | null;
       steeredTurnId?: string | null;
@@ -2153,6 +2157,15 @@ export async function submitSessionTurn(
         : null,
       canonicalEventKind: typeof raw.canonicalEventKind === 'string' && raw.canonicalEventKind.trim()
         ? raw.canonicalEventKind.trim()
+        : null,
+      canonicalEventId: typeof raw.canonicalEventId === 'string' && raw.canonicalEventId.trim()
+        ? raw.canonicalEventId.trim()
+        : null,
+      canonicalEventSeq: typeof raw.canonicalEventSeq === 'number' && Number.isFinite(raw.canonicalEventSeq)
+        ? Math.floor(raw.canonicalEventSeq)
+        : null,
+      canonicalOccurredAt: typeof raw.canonicalOccurredAt === 'number' && Number.isFinite(raw.canonicalOccurredAt)
+        ? Math.floor(raw.canonicalOccurredAt)
         : null,
       canonicalTurn: raw.canonicalTurn ?? null,
       canonicalItem: raw.canonicalItem ?? null,

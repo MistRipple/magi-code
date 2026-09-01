@@ -59,9 +59,6 @@ export enum ControlMessageType {
   PHASE_CHANGED = 'phase_changed',
   TASK_ACCEPTED = 'task_accepted',
   TASK_REJECTED = 'task_rejected',
-  TASK_STARTED = 'task_started',
-  TASK_COMPLETED = 'task_completed',
-  TASK_FAILED = 'task_failed',
   WORKER_STATUS = 'worker_status',
 }
 
@@ -90,7 +87,6 @@ export type DataMessageType =
   | 'mcpServerTools'
   | 'mcpServerUpdated'
   | 'mcpToolsRefreshed'
-  | 'missionExecutionFailed'
   | 'modelListFetched'
   | 'orchestratorConnectionTestResult'
   | 'orchestratorRuntimeState'

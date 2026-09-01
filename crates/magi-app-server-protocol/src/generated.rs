@@ -674,19 +674,6 @@ pub enum CanonicalTurnItemStatus {
     Cancelled,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CanonicalTurnEventKind {
-    #[serde(rename = "turn_started")]
-    TurnStarted,
-    #[serde(rename = "turn_item_upsert")]
-    TurnItemUpsert,
-    #[serde(rename = "turn_completed")]
-    TurnCompleted,
-    #[serde(rename = "turn_superseded")]
-    TurnSuperseded,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CanonicalTurnVisibility {
@@ -806,23 +793,6 @@ pub struct CanonicalTurn {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CanonicalTurnEvent {
-    #[serde(rename = "canonicalSchemaVersion")]
-    pub canonical_schema_version: String,
-    #[serde(rename = "canonicalEventKind")]
-    pub canonical_event_kind: CanonicalTurnEventKind,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "canonicalTurn")]
-    pub canonical_turn: Option<CanonicalTurn>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "canonicalItem")]
-    pub canonical_item: Option<CanonicalTurnItem>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TurnStartKind {
     #[serde(rename = "accepted")]
@@ -912,6 +882,18 @@ pub struct TurnStartResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "canonicalEventKind")]
     pub canonical_event_kind: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "canonicalEventId")]
+    pub canonical_event_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "canonicalEventSeq")]
+    pub canonical_event_seq: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "canonicalOccurredAt")]
+    pub canonical_occurred_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

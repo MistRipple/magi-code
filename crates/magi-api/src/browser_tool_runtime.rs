@@ -1427,9 +1427,19 @@ impl BrowserToolRuntimeDependencies {
             }
             "activate" => {
                 let tab_id = BrowserTabId::new(string_arg(arguments, "tab_id")?);
-                let target = self
-                    .materialize_tab(tab_in_session(self, session, &tab_id)?, client)
-                    .await?;
+                let tab = tab_in_session(self, session, &tab_id)?;
+                // 与 HTTP 激活入口保持同一顺序：先通知 App Renderer 切换右栏
+                // 的真实内容槽，再让 Host 恢复页面。否则 RestorePage 会在
+                // Renderer 仍显示旧 Tab 时等待新 Tab 的槽位，工具调用会卡住。
+                self.publish_browser_event(
+                    "browser.tab.activation_requested",
+                    session,
+                    json!({
+                        "browser_session_id": session.browser_session_id,
+                        "tab_id": tab_id,
+                    }),
+                );
+                let target = self.materialize_tab(tab, client).await?;
                 self.prepare_agent_write(client, session, &target, scope)
                     .await?;
                 self.mutate(|authority| {

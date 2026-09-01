@@ -66,7 +66,7 @@ export type DesktopOverlayCloseRequest = DesktopOverlayIdentity;
 interface OverlayRecord {
   windowId: string;
   window: BaseWindow;
-  view: WebContentsView;
+  view: WebContentsView | null;
   contentRoot: View;
   state: DesktopOverlayState | null;
   visible: boolean;
@@ -128,24 +128,10 @@ export class DesktopOverlayManager {
 
   create(windowId: string, window: BaseWindow, contentRoot: View): void {
     if (this.#records.has(windowId)) return;
-    const view = this.#createView({
-      webPreferences: {
-        preload: this.#preloadPath,
-        additionalArguments: [
-          "--magi-desktop-surface=overlay",
-          `--magi-desktop-window-id=${windowId}`,
-        ],
-        partition: "persist:magi-app",
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        webSecurity: true,
-      },
-    });
     const record: OverlayRecord = {
       windowId,
       window,
-      view,
+      view: null,
       contentRoot,
       state: null,
       visible: false,
@@ -161,50 +147,12 @@ export class DesktopOverlayManager {
       viewportApplyDirty: false,
     };
     this.#records.set(windowId, record);
-    // Overlay 是浏览器内容槽上的透明交互层。Electron 的原生 View 默认
-    // 会绘制不透明背景；仅依赖 DOM 的 background: transparent 不足以让
-    // 下方 WebContentsView 可见，最终表现为打开标记后整个页面黑屏。
-    view.setBackgroundColor(TRANSPARENT_VIEW_BACKGROUND);
-    this.clearOverlayBounds(record);
-    // 空闲 Overlay 不挂载到 contentView，不能让一个空原生 View 覆盖
-    // App Renderer 的交互区域。
-    this.syncVisibility(record);
-    view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-    view.webContents.on("will-navigate", (event, url) => {
-      if (!this.isTrustedRendererUrl(url, windowId)) event.preventDefault();
-    });
-    view.webContents.on("did-finish-load", () => {
-      if (record.loadFailed) return;
-      record.loaded = true;
-      if (record.state && record.visible) {
-        this.reconcileGeometry(record);
-      }
-      this.scheduleViewportApply(record);
-      this.syncVisibility(record);
-      if (record.state && record.visible && record.ready) this.publishState(record);
-    });
-    view.webContents.on("did-fail-load", (_event, _errorCode, _errorDescription, _validatedURL, isMainFrame) => {
-      if (!isMainFrame) return;
-      record.loaded = false;
-      record.ready = false;
-      record.loadFailed = true;
-      this.syncVisibility(record);
-    });
-    view.webContents.on("render-process-gone", () => {
-      record.loaded = false;
-      record.ready = false;
-      record.loadFailed = true;
-      this.syncVisibility(record);
-      if (record.visible && !window.isDestroyed()) {
-        void this.loadRenderer(record);
-      }
-    });
-    void this.loadRenderer(record);
+    this.createRenderer(record);
   }
 
   async restoreAfterDaemonReady(): Promise<void> {
     const failed = [...this.#records.values()].filter((record) => (
-      record.loadFailed && !record.view.webContents.isDestroyed()
+      record.loadFailed && !!record.view && !record.view.webContents.isDestroyed()
     ));
     await Promise.all(failed.map((record) => this.loadRenderer(record)));
   }
@@ -242,7 +190,7 @@ export class DesktopOverlayManager {
     this.mountOnLayer(record);
     this.setOverlayBounds(record, geometry.bounds);
     this.syncVisibility(record);
-    if (record.loadFailed && !record.view.webContents.isDestroyed()) {
+    if (record.loadFailed && record.view && !record.view.webContents.isDestroyed()) {
       // Overlay Renderer 可能在 daemon/Vite 刚重启的瞬间加载失败。下一次
       // 打开必须主动重试，不能把一次瞬时失败永久变成“按钮无响应”。
       void this.loadRenderer(record);
@@ -256,7 +204,7 @@ export class DesktopOverlayManager {
     // Renderer 自身的状态，不能因为主进程尚未刷新 loaded 标记而丢弃；
     // syncVisibility 会在两个状态都满足后再显示视图，did-finish-load
     // 也会负责补发当前状态。
-    if (!record || record.loadFailed || record.view.webContents.isDestroyed()) return;
+    if (!record || record.loadFailed || !record.view || record.view.webContents.isDestroyed()) return;
     record.ready = true;
     if (record.state && record.visible) {
       this.reconcileGeometry(record);
@@ -296,25 +244,21 @@ export class DesktopOverlayManager {
     record.state = null;
     record.layout = null;
     record.geometryAvailable = false;
-    this.notifyClosed(record, closed);
     this.syncVisibility(record);
-    // 仅隐藏会让原生 Accessibility 树继续保留已关闭菜单并让焦点停在
-    // Overlay Renderer。移除视图但保留 WebContents，下一次打开仍复用同一
-    // Renderer，不会重建页面或引入闪烁。
-    if (record.mounted) {
-      try {
-        record.contentRoot.removeChildView(record.view);
-      } catch {
-        // 窗口销毁与关闭动作可能交错到达，移除必须幂等。
-      }
-      record.mounted = false;
-    }
+    // Overlay 是窗口级合成树的一部分，不能在每次关闭菜单时移除或销毁
+    // WebContentsView。Electron/macOS 在移除一个已显示的兄弟 View 后可能
+    // 让整个 contentView 重新合成，表现为 App Renderer 与 Browser Surface
+    // 同时黑屏；重新创建 Renderer 还会丢失 Accessibility/输入上下文。
+    // 关闭事务只把 View 隐藏并收敛为零尺寸，保持稳定的子 View 层级；下一次
+    // 打开复用同一个 WebContents，窗口关闭时才由 closeWindow 统一释放。
+    this.notifyClosed(record, closed);
     return closed;
   }
 
   private notifyClosed(record: OverlayRecord, event: DesktopOverlayClosedEvent): void {
-    if (!record.view.webContents.isDestroyed()) {
-      record.view.webContents.send("magi-desktop:overlay-closed", event);
+    const view = record.view;
+    if (view && !view.webContents.isDestroyed()) {
+      view.webContents.send("magi-desktop:overlay-closed", event);
     }
     this.#onClosed(record.windowId, event);
   }
@@ -410,12 +354,12 @@ export class DesktopOverlayManager {
   }
 
   isWebContents(webContentsId: number): boolean {
-    return [...this.#records.values()].some((record) => record.view.webContents.id === webContentsId);
+    return [...this.#records.values()].some((record) => record.view?.webContents.id === webContentsId);
   }
 
   windowIdForWebContents(webContentsId: number): string | null {
     for (const record of this.#records.values()) {
-      if (record.view.webContents.id === webContentsId) return record.windowId;
+      if (record.view?.webContents.id === webContentsId) return record.windowId;
     }
     return null;
   }
@@ -423,21 +367,94 @@ export class DesktopOverlayManager {
   closeWindow(windowId: string): void {
     const record = this.#records.get(windowId);
     if (!record) return;
+    const view = record.view;
     record.visible = false;
     record.state = null;
     record.geometryAvailable = false;
     record.layout = null;
+    if (view) {
+      view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+      view.setVisible(false);
+    }
+    record.view = null;
     this.syncVisibility(record);
     if (!record.window.isDestroyed() && record.mounted) {
       try {
-        record.contentRoot.removeChildView(record.view);
+        if (view) record.contentRoot.removeChildView(view);
       } catch {
         // 窗口销毁与关闭动作可能交错到达，移除必须幂等。
       }
       record.mounted = false;
     }
-    if (!record.view.webContents.isDestroyed()) record.view.webContents.close();
+    if (view && !view.webContents.isDestroyed()) view.webContents.close();
     this.#records.delete(windowId);
+  }
+
+  private createRenderer(record: OverlayRecord): void {
+    if (
+      record.window.isDestroyed()
+      || record.view
+      || this.#records.get(record.windowId) !== record
+    ) return;
+    const view = this.#createView({
+      webPreferences: {
+        preload: this.#preloadPath,
+        additionalArguments: [
+          "--magi-desktop-surface=overlay",
+          `--magi-desktop-window-id=${record.windowId}`,
+        ],
+        partition: "persist:magi-app",
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+      },
+    });
+    record.view = view;
+    // Overlay 是浏览器内容槽上的透明交互层。Electron 的原生 View 默认
+    // 会绘制不透明背景；仅依赖 DOM 的 background: transparent 不足以让
+    // 下方 WebContentsView 可见，最终表现为打开标记后整个页面黑屏。
+    view.setBackgroundColor(TRANSPARENT_VIEW_BACKGROUND);
+    this.clearOverlayBounds(record);
+    // 窗口创建阶段就把 Overlay 加入固定的原生子 View 合成树。之后打开、关闭
+    // 只改变可见性和 bounds，不能在用户操作期间动态增删 WebContentsView；
+    // macOS 的 compositor 会在动态改树时重建整棵 contentView，导致 App 和
+    // Browser Surface 黑屏，同时破坏键盘焦点和 Accessibility 树。
+    this.mountOnLayer(record);
+    this.syncVisibility(record);
+    view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    view.webContents.on("will-navigate", (event, url) => {
+      if (record.view !== view) return;
+      if (!this.isTrustedRendererUrl(url, record.windowId)) event.preventDefault();
+    });
+    view.webContents.on("did-finish-load", () => {
+      if (record.view !== view || record.loadFailed) return;
+      record.loaded = true;
+      if (record.state && record.visible) {
+        this.reconcileGeometry(record);
+      }
+      this.scheduleViewportApply(record);
+      this.syncVisibility(record);
+      if (record.state && record.visible && record.ready) this.publishState(record);
+    });
+    view.webContents.on("did-fail-load", (_event, _errorCode, _errorDescription, _validatedURL, isMainFrame) => {
+      if (record.view !== view || !isMainFrame) return;
+      record.loaded = false;
+      record.ready = false;
+      record.loadFailed = true;
+      this.syncVisibility(record);
+    });
+    view.webContents.on("render-process-gone", () => {
+      if (record.view !== view) return;
+      record.loaded = false;
+      record.ready = false;
+      record.loadFailed = true;
+      this.syncVisibility(record);
+      if (record.visible && !record.window.isDestroyed()) {
+        void this.loadRenderer(record);
+      }
+    });
+    void this.loadRenderer(record);
   }
 
   closeAll(): void {
@@ -452,24 +469,33 @@ export class DesktopOverlayManager {
       || !record.ready
       || record.loadFailed
       || !record.geometryAvailable
+      || !record.view
       || record.view.webContents.isDestroyed()
     ) return;
     record.view.webContents.send("magi-desktop:overlay-state", record.state);
   }
 
   private scheduleViewportApply(record: OverlayRecord): void {
+    const view = record.view;
     record.viewportApplyDirty = true;
     if (
       record.window.isDestroyed()
-      || record.view.webContents.isDestroyed()
+      || !view
+      || view.webContents.isDestroyed()
       || !record.loaded
       || record.loadFailed
     ) return;
     if (record.viewportApplyPromise) return;
-    const apply = this.flushViewportApply(record);
+    const apply = this.flushViewportApply(record, view);
     const settled = apply.finally(() => {
       if (record.viewportApplyPromise === settled) record.viewportApplyPromise = null;
-      if (!record.window.isDestroyed() && record.loaded && !record.loadFailed && record.viewportApplyDirty) {
+      if (
+        record.view === view
+        && !record.window.isDestroyed()
+        && record.loaded
+        && !record.loadFailed
+        && record.viewportApplyDirty
+      ) {
         this.scheduleViewportApply(record);
       }
     });
@@ -484,23 +510,24 @@ export class DesktopOverlayManager {
     });
   }
 
-  private async flushViewportApply(record: OverlayRecord): Promise<void> {
+  private async flushViewportApply(record: OverlayRecord, view: WebContentsView): Promise<void> {
     while (record.viewportApplyDirty) {
       record.viewportApplyDirty = false;
       if (
         record.window.isDestroyed()
-        || record.view.webContents.isDestroyed()
+        || record.view !== view
+        || view.webContents.isDestroyed()
         || !record.loaded
         || record.loadFailed
         || !record.geometryAvailable
       ) return;
-      const bounds = record.view.getBounds();
+      const bounds = view.getBounds();
       if (bounds.width <= 0 || bounds.height <= 0) return;
       if (record.viewportAppliedBounds && sameBounds(record.viewportAppliedBounds, bounds)) return;
       // 单独的 Overlay WebContents 与 App Renderer、网页 WebContents 隔离。
       // 这里同步它自身的真实弹层 viewport，避免菜单按整窗默认 800x600
       // 布局后再被原生 bounds 裁切，从而看起来没有吸附到触发按钮。
-      const debuggerApi = record.view.webContents.debugger;
+      const debuggerApi = view.webContents.debugger;
       if (!debuggerApi) return;
       if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
       const width = Math.round(bounds.width);
@@ -518,12 +545,14 @@ export class DesktopOverlayManager {
           angle: width > height ? 90 : 0,
         },
       });
+      if (record.view !== view || view.webContents.isDestroyed()) return;
       record.viewportAppliedBounds = { ...bounds };
     }
   }
 
   private async loadRenderer(record: OverlayRecord): Promise<void> {
-    if (record.window.isDestroyed() || record.view.webContents.isDestroyed()) return;
+    const view = record.view;
+    if (record.window.isDestroyed() || !view || view.webContents.isDestroyed()) return;
     if (record.loadPromise) return record.loadPromise;
     record.loaded = false;
     record.ready = false;
@@ -532,15 +561,15 @@ export class DesktopOverlayManager {
     record.viewportAppliedBounds = null;
     const load = (async () => {
       try {
-        await record.view.webContents.loadURL(this.rendererUrl(record.windowId));
-        if (record.window.isDestroyed() || record.view.webContents.isDestroyed()) return;
+        await view.webContents.loadURL(this.rendererUrl(record.windowId));
+        if (record.window.isDestroyed() || record.view !== view || view.webContents.isDestroyed()) return;
         record.loaded = true;
         record.loadFailed = false;
         this.syncVisibility(record);
         this.scheduleViewportApply(record);
         if (record.state && record.visible && record.ready) this.publishState(record);
       } catch {
-        if (record.window.isDestroyed() || record.view.webContents.isDestroyed()) return;
+        if (record.window.isDestroyed() || record.view !== view || view.webContents.isDestroyed()) return;
         record.loaded = false;
         record.ready = false;
         record.loadFailed = true;
@@ -554,8 +583,8 @@ export class DesktopOverlayManager {
   }
 
   private syncVisibility(record: OverlayRecord): void {
-    if (record.window.isDestroyed()) return;
-    const visible = (
+    if (record.window.isDestroyed() || !record.view) return;
+    const hasRenderableOverlay = (
       !record.view.webContents.isDestroyed()
       && record.visible
       && record.loaded
@@ -563,14 +592,16 @@ export class DesktopOverlayManager {
       && !record.loadFailed
       && record.geometryAvailable
     );
-    // Electron 的原生 View 即使设为不可见，也可能继续参与父窗口的命中测试。
-    // 隐藏时必须收敛为零尺寸；真正关闭时 closeRecord 还会将它从 contentView
-    // 移除，确保不会挡住 App Renderer。
-    if (!visible) {
-      record.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    // 原生 Overlay 在窗口创建时已经挂载。关闭时保留最后一个有效矩形，
+    // 只切换原生 View 的可见性；把 WebContentsView 压到 0x0 会让 Chromium
+    // 在下一次恢复到正常尺寸时丢失 backing surface，表现为 App/Browser
+    // 同时黑屏。View 不可见时不会参与命中测试，窗口销毁时才清零 bounds。
+    if (!hasRenderableOverlay) {
       record.viewportAppliedBounds = null;
     }
-    record.view.setVisible(visible);
+    if (record.view.getVisible() !== hasRenderableOverlay) {
+      record.view.setVisible(hasRenderableOverlay);
+    }
     // 布局事务只负责合成层的可见性和 bounds，不能隐式改变焦点归属。
     // 这里抢焦点会在右栏拖动、菜单重排或页面加载时把键盘输入从对话框
     // 或浏览器地址栏转移到 Overlay WebContents，造成“点击后输入跑错位置”。
@@ -580,17 +611,17 @@ export class DesktopOverlayManager {
     // Overlay 直接挂在 contentView 的第 2 层，因此必须使用 Renderer 提交的
     // 窗口坐标。不能再把菜单坐标转换成中间 Layer 的局部坐标，否则菜单会从
     // 按钮下方漂移，且其 Chromium viewport 会退回默认窗口尺寸。
+    if (!record.view) return;
     if (!sameBounds(record.view.getBounds(), bounds)) record.view.setBounds(bounds);
     this.scheduleViewportApply(record);
   }
 
   private clearOverlayBounds(record: OverlayRecord): void {
-    record.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
     record.viewportAppliedBounds = null;
   }
 
   private mountOnLayer(record: OverlayRecord): void {
-    if (record.window.isDestroyed()) return;
+    if (record.window.isDestroyed() || !record.view) return;
     if (!record.mounted) {
       // Overlay WebContentsView 与 Browser Surface 同为 contentView 的直接
       // 子视图。第 2 层保证菜单和标记覆盖网页，第 0 层仍由 App Renderer

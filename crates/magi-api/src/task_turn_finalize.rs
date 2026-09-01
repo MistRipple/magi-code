@@ -43,14 +43,14 @@ impl SessionStatePersistenceScheduler {
         })
     }
 
-    fn request(self: &Arc<Self>, checkpoint: &'static str) {
+    fn request(self: &Arc<Self>, checkpoint: &'static str) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
             .expect("session persistence state lock poisoned");
         state.pending = Some((checkpoint, state.generation));
         if state.worker_active {
-            return;
+            return Ok(());
         }
         state.worker_active = true;
         drop(state);
@@ -72,9 +72,10 @@ impl SessionStatePersistenceScheduler {
                 pending
             };
             if let Some((checkpoint, generation)) = pending {
-                self.persist_intermediate(checkpoint, generation);
+                return self.persist_intermediate(checkpoint, generation);
             }
         }
+        Ok(())
     }
 
     fn run_worker(self: Arc<Self>) {
@@ -94,12 +95,18 @@ impl SessionStatePersistenceScheduler {
             };
 
             if let Some((checkpoint, generation)) = checkpoint {
-                self.persist_intermediate(checkpoint, generation);
+                if let Err(error) = self.persist_intermediate(checkpoint, generation) {
+                    tracing::warn!(checkpoint, %error, "异步 session 状态持久化失败");
+                }
             }
         }
     }
 
-    fn persist_intermediate(&self, checkpoint: &'static str, generation: u64) {
+    fn persist_intermediate(
+        &self,
+        checkpoint: &'static str,
+        generation: u64,
+    ) -> Result<(), String> {
         let _write_guard = self
             .write_lock
             .lock()
@@ -111,14 +118,15 @@ impl SessionStatePersistenceScheduler {
             .generation
             != generation
         {
-            return;
+            return Ok(());
         }
         if let Err(error) = (self.persist)(checkpoint) {
-            tracing::warn!(checkpoint, %error, "异步 session 状态持久化失败");
+            return Err(format!("checkpoint {checkpoint} 持久化失败：{error}"));
         }
+        Ok(())
     }
 
-    fn persist_terminal(&self, checkpoint: &'static str) {
+    fn persist_terminal(&self, checkpoint: &'static str) -> Result<(), String> {
         {
             let mut state = self
                 .state
@@ -132,8 +140,9 @@ impl SessionStatePersistenceScheduler {
             .lock()
             .expect("session persistence write lock poisoned");
         if let Err(error) = (self.persist)(checkpoint) {
-            tracing::warn!(checkpoint, %error, "session task turn 终态持久化失败");
+            return Err(format!("checkpoint {checkpoint} 持久化失败：{error}"));
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -157,19 +166,21 @@ pub fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersi
             "session_turn_completed"
             | "session_turn_failed"
             | "session_task_chain_archived"
-            | "session_turn_final_item" => {
+            | "session_turn_final_item"
+            | "session_task_turn_goal_updated" => {
                 // 这些 checkpoint 是终态或用户可见最终结果，必须在回调返回前落盘。
                 match checkpoint {
                     "session_turn_completed" => "session_turn_completed",
                     "session_turn_failed" => "session_turn_failed",
                     "session_task_chain_archived" => "session_task_chain_archived",
                     "session_turn_final_item" => "session_turn_final_item",
+                    "session_task_turn_goal_updated" => "session_task_turn_goal_updated",
                     _ => unreachable!(),
                 }
             }
             other => {
                 // 工具开始/结果、思考流和进度通知会在一个 Turn 内高频产生；将它们
-                // 合并到 100ms 窗口内，避免每个事件都同步序列化全量 sessions.json。
+                // 合并到 100ms 窗口内，避免每个事件都同步序列化全量 session projection。
                 let checkpoint = match other {
                     "session_turn_tool_result" => "session_turn_tool_result",
                     "session_turn_tool" => "session_turn_tool",
@@ -188,11 +199,10 @@ pub fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersi
                     }
                     _ => "session_turn_progress",
                 };
-                scheduler.request(checkpoint);
-                return;
+                return scheduler.request(checkpoint);
             }
         };
-        scheduler.persist_terminal(checkpoint);
+        scheduler.persist_terminal(checkpoint)
     })
 }
 
@@ -200,7 +210,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     state: &ApiState,
     session_id: &SessionId,
     root_task_id: &TaskId,
-) -> bool {
+) -> Result<bool, String> {
     finalize_background_session_task_turn_if_root_completed_for_turn(
         state,
         session_id,
@@ -214,10 +224,9 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
     session_id: &SessionId,
     root_task_id: &TaskId,
     expected_turn_id: Option<&str>,
-) -> bool {
-    release_terminal_browser_resources(state, session_id, root_task_id);
+) -> Result<bool, String> {
     let persist_session_state = session_state_persist_callback(state);
-    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
+    let finalized = match magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
         state.session_store.as_ref(),
         &state.event_bus,
         state.task_store(),
@@ -225,17 +234,24 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
         root_task_id,
         expected_turn_id,
         Some(persist_session_state.as_ref()),
-    );
+    ) {
+        Ok(finalized) => finalized,
+        Err(error) => return Err(error),
+    };
     if finalized {
-        state.release_session_git_execution_lease(session_id);
+        release_terminal_browser_resources(state, session_id, root_task_id);
         crate::routes::sessions::record_active_goal_turn_success(
             state,
             session_id,
             root_task_id.as_str(),
         );
+        state
+            .persist_session_state_checkpoint("session_task_turn_goal_updated")
+            .map_err(|error| format!("任务完成后的 Goal 状态持久化失败: {error:?}"))?;
+        state.release_session_git_execution_lease(session_id);
         schedule_next_queued_session_turn(state, session_id);
     }
-    finalized
+    Ok(finalized)
 }
 
 pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
@@ -244,10 +260,9 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
     root_task_id: &TaskId,
     runner_status: &str,
     expected_turn_id: Option<&str>,
-) -> bool {
-    release_terminal_browser_resources(state, session_id, root_task_id);
+) -> Result<bool, String> {
     let persist_session_state = session_state_persist_callback(state);
-    let finalized =
+    let finalized = match
         magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
             magi_conversation_runtime::session_turn_finalize::FinalizeBackgroundSessionTaskTurnContext {
                 session_store: state.session_store.as_ref(),
@@ -259,13 +274,16 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 expected_turn_id,
                 persist_session_state: Some(persist_session_state.as_ref()),
             },
-        );
+        ) {
+        Ok(finalized) => finalized,
+        Err(error) => return Err(error),
+    };
     if finalized {
         let owns_active_plan = state
             .session_store
             .active_plan_for_execution_owner(session_id, root_task_id.as_str())
             .is_some();
-        state.release_session_git_execution_lease(session_id);
+        release_terminal_browser_resources(state, session_id, root_task_id);
         let root_completed = state
             .task_store()
             .and_then(|task_store| task_store.get_task(root_task_id))
@@ -294,39 +312,37 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 &failure_reason,
             );
         }
-        if runner_status != "completed" && !root_completed && owns_active_plan {
+        let paused_plan = if runner_status != "completed" && !root_completed && owns_active_plan {
             let plan_store =
                 magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-            match plan_store.pause() {
-                Ok(Some(plan)) => {
-                    let workspace_id = state
-                        .session_store
-                        .session(session_id)
-                        .and_then(|session| session.workspace_id)
-                        .map(magi_core::WorkspaceId::new);
-                    magi_plan::publish_plan_event(
-                        &state.event_bus,
-                        magi_plan::plan_event_type(&plan),
-                        &plan,
-                        workspace_id.as_ref(),
-                        Some(root_task_id),
-                        None,
-                    );
-                    if let Err(error) =
-                        state.persist_session_state_checkpoint("session_task_turn_plan_paused")
-                    {
-                        tracing::warn!(?error, "任务失败后计划暂停状态持久化失败");
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(session_id = %session_id, %error, "任务失败后暂停计划失败");
-                }
-            }
+            plan_store
+                .pause()
+                .map_err(|error| format!("任务失败后暂停计划失败: {error}"))?
+        } else {
+            None
+        };
+        state
+            .persist_session_state_checkpoint("session_task_turn_goal_updated")
+            .map_err(|error| format!("任务终态后的 Goal/Plan 状态持久化失败: {error:?}"))?;
+        if let Some(plan) = paused_plan {
+            let workspace_id = state
+                .session_store
+                .session(session_id)
+                .and_then(|session| session.workspace_id)
+                .map(magi_core::WorkspaceId::new);
+            magi_plan::publish_plan_event(
+                &state.event_bus,
+                magi_plan::plan_event_type(&plan),
+                &plan,
+                workspace_id.as_ref(),
+                Some(root_task_id),
+                None,
+            );
         }
+        state.release_session_git_execution_lease(session_id);
         schedule_next_queued_session_turn(state, session_id);
     }
-    finalized
+    Ok(finalized)
 }
 
 fn release_terminal_browser_resources(
@@ -414,7 +430,9 @@ mod tests {
             }));
 
         for _ in 0..50 {
-            scheduler.request("task_turn_tool_result");
+            scheduler
+                .request("task_turn_tool_result")
+                .expect("中间 checkpoint 应成功排队");
         }
 
         assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
@@ -438,14 +456,48 @@ mod tests {
             }));
 
         for _ in 0..50 {
-            scheduler.request("task_turn_tool_result");
+            scheduler
+                .request("task_turn_tool_result")
+                .expect("中间 checkpoint 应成功排队");
         }
-        scheduler.persist_terminal("session_turn_completed");
+        scheduler
+            .persist_terminal("session_turn_completed")
+            .expect("终态 checkpoint 应成功落盘");
 
         assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
         assert_eq!(
             writes.lock().expect("writes lock poisoned").as_slice(),
             ["session_turn_completed"]
+        );
+    }
+
+    #[test]
+    fn intermediate_persistence_failure_does_not_poison_follow_up_checkpoint() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_persist = Arc::clone(&attempts);
+        let scheduler = SessionStatePersistenceScheduler::with_persist(Arc::new(move |_| {
+            let attempt = attempts_for_persist.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if attempt == 0 {
+                Err("transient persistence failure".to_string())
+            } else {
+                Ok(())
+            }
+        }));
+
+        scheduler
+            .request("session_turn_progress")
+            .expect("异步 checkpoint 只负责排队，不应被历史失败阻断");
+        assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
+
+        scheduler
+            .request("session_turn_tool_result")
+            .expect("后续 checkpoint 应能重新排队");
+        assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "后续 checkpoint 必须在前一次异步失败后再次执行"
         );
     }
 
@@ -544,32 +596,34 @@ mod tests {
             })
             .expect("plan should persist");
         let task_store = Arc::new(TaskStore::new());
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id,
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::LocalAgent,
-            title: "失败任务".to_string(),
-            goal: "验证失败后计划收敛".to_string(),
-            status: TaskStatus::Failed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: vec!["模型请求未完成".to_string()],
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: TaskRuntimePayload::default(),
-            created_at: now,
-            updated_at: now,
-        });
+        task_store
+            .insert_task(Task {
+                task_id: root_task_id.clone(),
+                mission_id,
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::LocalAgent,
+                title: "失败任务".to_string(),
+                goal: "验证失败后计划收敛".to_string(),
+                status: TaskStatus::Failed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: vec!["模型请求未完成".to_string()],
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("根任务应插入");
         let state = ApiState::new(
             "magi-test",
             Arc::new(InMemoryEventBus::new(32)),
@@ -587,6 +641,7 @@ mod tests {
                 "error",
                 None,
             )
+            .expect("终态 Turn 应成功收口")
         );
         let plan = plan_store.snapshot().expect("plan should remain visible");
         assert_eq!(plan.state, magi_core::PlanState::Paused);
@@ -663,32 +718,34 @@ mod tests {
         );
 
         let task_store = Arc::new(TaskStore::new());
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id,
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::LocalAgent,
-            title: "快速完成任务".to_string(),
-            goal: "验证快速完成路径释放 Goal continuation".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: vec!["快速完成路径已验证".to_string()],
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: TaskRuntimePayload::default(),
-            created_at: now,
-            updated_at: now,
-        });
+        task_store
+            .insert_task(Task {
+                task_id: root_task_id.clone(),
+                mission_id,
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::LocalAgent,
+                title: "快速完成任务".to_string(),
+                goal: "验证快速完成路径释放 Goal continuation".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: vec!["快速完成路径已验证".to_string()],
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("根任务应插入");
         let state = ApiState::new(
             "magi-test",
             Arc::new(InMemoryEventBus::new(32)),
@@ -698,11 +755,14 @@ mod tests {
         )
         .with_task_store(task_store);
 
-        assert!(finalize_background_session_task_turn_if_root_completed(
-            &state,
-            &session_id,
-            &root_task_id,
-        ));
+        assert!(
+            finalize_background_session_task_turn_if_root_completed(
+                &state,
+                &session_id,
+                &root_task_id,
+            )
+            .expect("completed Turn 应成功收口")
+        );
         let goal = session_store
             .current_goal(&session_id)
             .expect("goal should remain active");

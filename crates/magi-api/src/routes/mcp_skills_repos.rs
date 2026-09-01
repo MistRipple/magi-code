@@ -2719,7 +2719,7 @@ mod tests {
 
     fn test_state_with_persistence(root: &Path) -> ApiState {
         test_state().with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
-            root.join("sessions.json"),
+            root,
             root.join("workspaces.json"),
             root.join("knowledge.json"),
         )))

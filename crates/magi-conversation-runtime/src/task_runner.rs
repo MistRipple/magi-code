@@ -9,7 +9,7 @@ use crate::task_runner_bridge::{
     TaskResultReceiver,
 };
 use magi_agent_role::AgentRoleRegistry;
-use magi_core::{SessionId, Task, TaskId, TaskStatus};
+use magi_core::{DomainError, SessionId, Task, TaskId, TaskStatus};
 use magi_event_bus::InMemoryEventBus;
 use magi_orchestrator::{
     task_store::TaskStore,
@@ -166,34 +166,52 @@ impl TaskRunner {
                     continue;
                 }
             };
-            let Some(lease) = self.store.grant_lease(
+            let lease = match self.store.grant_lease_and_start_task(
                 &task.task_id,
                 root_task_id,
                 &worker.worker_id,
                 &worker.role,
                 DEFAULT_LEASE_DURATION_MS,
-            ) else {
-                drop(admission_permit);
-                continue;
+            ) {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
+                    drop(admission_permit);
+                    continue;
+                }
+                Err(error) => {
+                    drop(admission_permit);
+                    return RunCycleOutcome::Error(format!(
+                        "任务 {} 获取执行租约并进入 running 失败: {error}",
+                        task.task_id
+                    ));
+                }
             };
-            if let Err(error) = self
-                .store
-                .update_status_checked(&task.task_id, TaskStatus::Running)
-            {
-                self.store.revoke_lease(&task.task_id, &lease.lease_id);
-                return RunCycleOutcome::Error(format!(
-                    "任务 {} 进入 running 失败: {error}",
-                    task.task_id
-                ));
-            }
             if let Err(error) = self
                 .dispatcher
                 .dispatch(&task, &worker, &lease, admission_permit)
             {
-                self.store.revoke_lease(&task.task_id, &lease.lease_id);
-                let _ = self.store.update_status(&task.task_id, TaskStatus::Failed);
+                let failure_message = format!("任务 {} 派发失败: {error}", task.task_id);
+                match self.store.revoke_lease_and_set_task_terminal(
+                    &task.task_id,
+                    root_task_id,
+                    Some(&lease.lease_id),
+                    TaskStatus::Failed,
+                    vec![failure_message.clone()],
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return RunCycleOutcome::Error(format!(
+                            "{failure_message}；当前租约已失效，未写入失败事实"
+                        ));
+                    }
+                    Err(status_error) => {
+                        return RunCycleOutcome::Error(format!(
+                            "{failure_message}；失败事实持久化失败: {status_error}"
+                        ));
+                    }
+                }
                 self.set_checkpoint_signal();
-                return RunCycleOutcome::Error(format!("任务 {} 派发失败: {error}", task.task_id));
+                return RunCycleOutcome::Error(failure_message);
             }
             dispatched += 1;
         }
@@ -214,21 +232,19 @@ impl TaskRunner {
 
     pub fn finalize_unrunnable_outcome(
         &self,
-        _root_task_id: &TaskId,
+        root_task_id: &TaskId,
         task_ids: &[TaskId],
     ) -> Result<(), String> {
         for task_id in task_ids {
             if let Some(task) = self.store.get_task(task_id)
                 && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
             {
-                if let Some(lease) = self.store.get_active_lease(task_id) {
-                    self.store.revoke_lease(task_id, &lease.lease_id);
-                }
-                self.store
-                    .set_output_refs(task_id, vec![self.unrunnable_task_reason(&task)]);
-                self.store
-                    .update_status(task_id, TaskStatus::Failed)
-                    .map_err(|error| format!("收口不可运行任务 {task_id} 失败: {error}"))?;
+                self.close_task(
+                    root_task_id,
+                    task_id,
+                    TaskStatus::Failed,
+                    vec![self.unrunnable_task_reason(&task)],
+                )?;
             }
         }
         self.set_checkpoint_signal();
@@ -249,14 +265,12 @@ impl TaskRunner {
                 continue;
             };
             if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
-                if let Some(lease) = self.store.get_active_lease(&task_id) {
-                    self.store.revoke_lease(&task_id, &lease.lease_id);
-                }
-                self.store
-                    .set_output_refs(&task_id, vec![reason.to_string()]);
-                self.store
-                    .update_status(&task_id, TaskStatus::Failed)
-                    .map_err(|error| format!("收口异常任务 {task_id} 失败: {error}"))?;
+                self.close_task(
+                    root_task_id,
+                    &task_id,
+                    TaskStatus::Failed,
+                    vec![reason.to_string()],
+                )?;
             }
         }
         self.set_checkpoint_signal();
@@ -287,12 +301,11 @@ impl TaskRunner {
             self.execution_admission.remove_queued_task(task_id);
             return Ok(());
         }
-        if let Some(lease) = self.store.get_active_lease(task_id) {
-            self.store.revoke_lease(task_id, &lease.lease_id);
+        let changed =
+            self.close_task(&task.root_task_id, task_id, TaskStatus::Killed, Vec::new())?;
+        if !changed {
+            return Err(format!("终止任务 {task_id} 时当前任务租约已失效"));
         }
-        self.store
-            .update_status(task_id, TaskStatus::Killed)
-            .map_err(|error| format!("终止任务 {task_id} 失败: {error}"))?;
         self.execution_admission.remove_queued_task(task_id);
         self.set_checkpoint_signal();
         Ok(())
@@ -317,7 +330,7 @@ impl TaskRunner {
             // 这条路径是 `/api/session/continue` 的 root-status==Failed 入口
             TaskStatus::Failed => self
                 .store
-                .update_status(task_id, TaskStatus::Pending)
+                .reopen_failed_task_for_recovery(task_id)
                 .map_err(|error| format!("将任务 {task_id} 回退到 Pending 失败: {error}")),
             // 终态：Completed / Killed 不可恢复；Running 仍在跑也不需要 resume
             other => Err(format!(
@@ -329,35 +342,83 @@ impl TaskRunner {
 
     fn apply_results(&self) -> Result<(), String> {
         for result in self.result_receiver.poll_results() {
-            if !self.store.complete_lease(&result.task_id, &result.lease_id) {
+            let Some(task) = self.store.get_task(&result.task_id) else {
                 tracing::warn!(
                     task_id = %result.task_id,
                     lease_id = %result.lease_id,
-                    "忽略非当前活跃租约的迟到任务结果"
+                    "忽略不存在任务的迟到结果"
                 );
                 continue;
-            }
+            };
+            let root_task_id = task.root_task_id.clone();
             match result.outcome {
                 TaskOutcome::Completed { attempt } => {
-                    if let Err(error) = self.store.complete_task(&result.task_id, attempt) {
-                        let message = format!("任务 {} 完成合同验证失败: {error}", result.task_id);
-                        self.store
-                            .set_output_refs(&result.task_id, vec![message.clone()]);
-                        self.store
-                            .update_status(&result.task_id, TaskStatus::Failed)
-                            .map_err(|status_error| {
-                                format!("{message}；失败状态写入失败: {status_error}")
-                            })?;
-                        return Err(message);
+                    match self.store.complete_lease_and_task(
+                        &result.task_id,
+                        &root_task_id,
+                        &result.lease_id,
+                        attempt,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                task_id = %result.task_id,
+                                lease_id = %result.lease_id,
+                                "忽略非当前活跃租约的迟到任务结果"
+                            );
+                            continue;
+                        }
+                        Err(DomainError::InvalidState { message }) => {
+                            let failure_message =
+                                format!("任务 {} 完成合同验证失败: {message}", result.task_id);
+                            let changed = self
+                                .store
+                                .revoke_lease_and_set_task_terminal(
+                                    &result.task_id,
+                                    &root_task_id,
+                                    Some(&result.lease_id),
+                                    TaskStatus::Failed,
+                                    vec![failure_message.clone()],
+                                )
+                                .map_err(|error| {
+                                    format!("{failure_message}；失败状态持久化失败: {error}")
+                                })?;
+                            if !changed {
+                                return Err(format!(
+                                    "{failure_message}；当前任务租约已失效，未写入失败事实"
+                                ));
+                            }
+                            return Err(failure_message);
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "任务 {} 完成事实持久化失败: {error}",
+                                result.task_id
+                            ));
+                        }
                     }
                 }
                 TaskOutcome::Failed { error } => {
-                    self.store.set_output_refs(&result.task_id, vec![error]);
-                    self.store
-                        .update_status(&result.task_id, TaskStatus::Failed)
+                    let changed = self
+                        .store
+                        .revoke_lease_and_set_task_terminal(
+                            &result.task_id,
+                            &root_task_id,
+                            Some(&result.lease_id),
+                            TaskStatus::Failed,
+                            vec![error],
+                        )
                         .map_err(|err| {
-                            format!("任务 {} 失败状态写入失败: {err}", result.task_id)
+                            format!("任务 {} 失败状态持久化失败: {err}", result.task_id)
                         })?;
+                    if !changed {
+                        tracing::warn!(
+                            task_id = %result.task_id,
+                            lease_id = %result.lease_id,
+                            "忽略非当前活跃租约的迟到失败结果"
+                        );
+                        continue;
+                    }
                 }
             }
             self.set_checkpoint_signal();
@@ -367,17 +428,48 @@ impl TaskRunner {
 
     fn expire_stale_leases(&self, root_task_id: &TaskId) -> Result<(), String> {
         for (task_id, lease_id) in self.store.collect_expired_leases(root_task_id) {
-            self.store.revoke_lease(&task_id, &lease_id);
             if self.store.get_task(&task_id).is_some_and(|task| {
                 matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
             }) {
-                self.store
-                    .update_status(&task_id, TaskStatus::Failed)
+                let changed = self
+                    .store
+                    .revoke_lease_and_set_task_terminal(
+                        &task_id,
+                        root_task_id,
+                        Some(&lease_id),
+                        TaskStatus::Failed,
+                        vec![format!("任务 {task_id} 租约已过期")],
+                    )
                     .map_err(|error| format!("任务 {task_id} 租约过期收口失败: {error}"))?;
+                if !changed {
+                    continue;
+                }
                 self.set_checkpoint_signal();
             }
         }
         Ok(())
+    }
+
+    fn close_task(
+        &self,
+        root_task_id: &TaskId,
+        task_id: &TaskId,
+        status: TaskStatus,
+        output_refs: Vec<String>,
+    ) -> Result<bool, String> {
+        let lease_id = self
+            .store
+            .get_active_lease(task_id)
+            .map(|lease| lease.lease_id);
+        self.store
+            .revoke_lease_and_set_task_terminal(
+                task_id,
+                root_task_id,
+                lease_id.as_ref(),
+                status,
+                output_refs,
+            )
+            .map_err(|error| format!("任务 {task_id} 收口失败: {error}"))
     }
 
     fn match_worker(&self, task: &Task) -> Option<WorkerInfo> {
@@ -475,7 +567,10 @@ mod tests {
         execution_admission::{ExecutionAdmissionLimits, ExecutionAdmissionPermit},
         task_runner_bridge::{EventBasedResultReceiver, TaskResult},
     };
-    use magi_core::{MissionId, TaskKind, TaskRuntimePayload, UtcMillis, WorkerId};
+    use magi_core::{
+        DomainError, MissionId, TaskCompletionAttempt, TaskKind, TaskRuntimePayload, UtcMillis,
+        WorkerId,
+    };
     use std::sync::Mutex;
 
     struct RejectingDispatcher;
@@ -555,7 +650,7 @@ mod tests {
     fn dispatch_gate_blocks_without_lease_or_status_change() {
         let store = Arc::new(TaskStore::new());
         let root = test_task("task-root-gated", "task-root-gated", None);
-        store.insert_task(root.clone());
+        store.insert_task(root.clone()).expect("根任务应插入");
         let receiver = Arc::new(EventBasedResultReceiver::new());
         let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
@@ -589,7 +684,7 @@ mod tests {
     fn unmatched_task_is_reported_as_unrunnable() {
         let store = Arc::new(TaskStore::new());
         let root = test_task("task-root-unmatched", "task-root-unmatched", None);
-        store.insert_task(root.clone());
+        store.insert_task(root.clone()).expect("根任务应插入");
         let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             Vec::new(),
@@ -615,7 +710,7 @@ mod tests {
         let store = Arc::new(TaskStore::new());
         let mut root = test_task("task-stale-result", "task-stale-result", None);
         root.status = TaskStatus::Running;
-        store.insert_task(root.clone());
+        store.insert_task(root.clone()).expect("根任务应插入");
         let worker_id = WorkerId::new("worker-stale-result");
         let stale_lease = store
             .grant_lease(
@@ -669,12 +764,83 @@ mod tests {
     }
 
     #[test]
+    fn completion_persistence_error_is_reported_without_probing_task_memory_state() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task(
+            "task-completion-persistence",
+            "task-completion-persistence",
+            None,
+        );
+        root.status = TaskStatus::Running;
+        store.insert_task(root.clone()).expect("root should insert");
+        let lease = store
+            .grant_lease(
+                &root.task_id,
+                &root.root_task_id,
+                &WorkerId::new("worker-completion-persistence"),
+                "executor",
+                DEFAULT_LEASE_DURATION_MS,
+            )
+            .expect("lease should grant");
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::Persistence {
+                message: "completion checkpoint unavailable".to_string(),
+            })
+        }));
+
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        receiver.push_result(TaskResult {
+            task_id: root.task_id.clone(),
+            lease_id: lease.lease_id.clone(),
+            outcome: TaskOutcome::Completed {
+                attempt: TaskCompletionAttempt {
+                    output_refs: vec!["output://completion".to_string()],
+                    final_response: Some("完成".to_string()),
+                    evidence: Vec::new(),
+                },
+            },
+        });
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            Vec::new(),
+            Arc::new(RejectingDispatcher),
+            receiver,
+        );
+
+        let outcome = runner.run_cycle(&root.task_id);
+        assert!(matches!(
+            outcome,
+            RunCycleOutcome::Error(ref reason)
+                if reason.contains("完成事实持久化失败")
+                    && reason.contains("completion checkpoint unavailable")
+        ));
+        assert_eq!(
+            store
+                .get_task(&root.task_id)
+                .expect("task should exist")
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            store
+                .get_active_lease(&root.task_id)
+                .expect("lease should remain active")
+                .lease_id,
+            lease.lease_id
+        );
+    }
+
+    #[test]
     fn shared_execution_admission_blocks_other_runners_until_the_running_task_finishes() {
         let store = Arc::new(TaskStore::new());
         let first_root = test_task("task-admission-first", "task-admission-first", None);
         let second_root = test_task("task-admission-second", "task-admission-second", None);
-        store.insert_task(first_root.clone());
-        store.insert_task(second_root.clone());
+        store
+            .insert_task(first_root.clone())
+            .expect("第一个根任务应插入");
+        store
+            .insert_task(second_root.clone())
+            .expect("第二个根任务应插入");
         let worker = WorkerInfo {
             worker_id: WorkerId::new("worker-admission-executor"),
             role: "executor".to_string(),

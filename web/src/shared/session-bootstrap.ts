@@ -4,6 +4,7 @@ export interface SessionBootstrapSnapshot {
     runtimeEpoch?: string;
   };
   eventStreamNextSequence?: number;
+  canonicalEventNextSequence?: number;
   workspace?: {
     workspaceId?: string;
     rootPath?: string;
@@ -17,8 +18,6 @@ export interface SessionBootstrapSnapshot {
     notifications: unknown;
   };
   orchestratorRuntimeState?: unknown;
-  hasMoreBefore?: boolean;
-  beforeCursor?: string | null;
   canonicalHasMoreBefore?: boolean;
   canonicalBeforeCursor?: string | null;
   navigationRequestId?: string;

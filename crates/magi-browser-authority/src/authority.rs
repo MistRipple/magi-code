@@ -1489,11 +1489,8 @@ impl BrowserAuthority {
             .map(|session| session.browser_session_id.clone())
             .collect::<Vec<_>>();
         for browser_session_id in &session_ids {
-            let _ = self.transition_session(
-                browser_session_id,
-                BrowserSessionLifecycle::Recovering,
-                now,
-            );
+            self.transition_session(browser_session_id, BrowserSessionLifecycle::Recovering, now)
+                .expect("中断 Browser Session 应能进入恢复状态");
             let tab_ids = self
                 .sessions
                 .get(browser_session_id)
@@ -1509,7 +1506,8 @@ impl BrowserAuthority {
                             | BrowserTabLifecycle::Crashed
                     )
                 }) {
-                    let _ = self.transition_tab(&tab_id, BrowserTabLifecycle::Suspended, now);
+                    self.transition_tab(&tab_id, BrowserTabLifecycle::Suspended, now)
+                        .expect("恢复 Browser Session 时 Tab 应能进入挂起状态");
                 }
             }
         }

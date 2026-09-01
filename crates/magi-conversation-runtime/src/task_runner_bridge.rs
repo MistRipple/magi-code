@@ -7,8 +7,8 @@ use crate::execution_admission::ExecutionAdmissionPermit;
 use magi_core::{LeaseId, Task, TaskCompletionAttempt, TaskId};
 use magi_orchestrator::task_store::TaskLease;
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
-use std::collections::HashSet;
 use std::sync::Mutex;
+use std::{collections::HashSet, future::Future, pin::Pin};
 
 /// The outcome of a single `run_cycle` iteration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +52,16 @@ pub trait TaskDispatcher: Send + Sync {
         lease: &TaskLease,
         admission_permit: ExecutionAdmissionPermit,
     ) -> Result<(), String>;
+
+    /// 等待指定 root 的异步派发工作全部退出。
+    /// Runner 只能直接等待自己的循环任务；异步 dispatcher 若另起
+    /// `spawn_blocking`，必须把该任务纳入同一 quiesce 边界。
+    fn wait_for_quiesce<'a>(
+        &'a self,
+        _root_task_id: &'a TaskId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 // --- Result receiver trait
 

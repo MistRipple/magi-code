@@ -16,6 +16,7 @@ import {
   type BrowserHostRequestEnvelope,
   type BrowserHostResponseEnvelope,
   type BrowserNodeSelection,
+  type BrowserSurfaceBinding,
   type BrowserSurfaceIdentity,
   type DesktopBrowserHandshake,
 } from "@magi/desktop-browser-contracts";
@@ -26,7 +27,11 @@ import {
 } from "@magi/desktop-browser-contracts/validation";
 import { WebSocket, WebSocketServer } from "ws";
 import type { AutomationWorker } from "./automation-worker.js";
-import type { BrowserSurfaceEvent, BrowserSurfaceManager } from "./browser-surface-manager.js";
+import type {
+  BrowserSurfaceActivationInput,
+  BrowserSurfaceEvent,
+  BrowserSurfaceManager,
+} from "./browser-surface-manager.js";
 
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -52,6 +57,10 @@ interface ResourceQueue {
   running: DesktopControlCommand | null;
 }
 
+type EnsureBrowserSurface = (
+  input: BrowserSurfaceActivationInput,
+) => Promise<unknown>;
+
 interface AnnotationProjection {
   revision: number;
   annotations: unknown[];
@@ -63,6 +72,7 @@ export class DesktopControlServer {
   readonly #surfaceManager: BrowserSurfaceManager;
   readonly #worker: AutomationWorker;
   readonly #activeWindowId: () => string;
+  readonly #ensureBrowserSurface: EnsureBrowserSurface;
   readonly #handshake: () => DesktopBrowserHandshake;
   readonly #queues = new Map<string, ResourceQueue>();
   readonly #active = new Map<string, DesktopControlCommand>();
@@ -84,6 +94,7 @@ export class DesktopControlServer {
     surfaceManager: BrowserSurfaceManager;
     worker: AutomationWorker;
     activeWindowId: () => string;
+    ensureBrowserSurface: EnsureBrowserSurface;
     handshake: () => DesktopBrowserHandshake;
   }) {
     this.#socketPath = input.socketPath;
@@ -91,6 +102,7 @@ export class DesktopControlServer {
     this.#surfaceManager = input.surfaceManager;
     this.#worker = input.worker;
     this.#activeWindowId = input.activeWindowId;
+    this.#ensureBrowserSurface = input.ensureBrowserSurface;
     this.#handshake = input.handshake;
   }
 
@@ -239,6 +251,12 @@ export class DesktopControlServer {
         if (selection) this.emit({ type: "node_selection", payload: selection });
         break;
       }
+    }
+  }
+
+  handleSurfaceContentReady(binding: BrowserSurfaceBinding): void {
+    if (this.#surfaceManager.isPrimary(binding)) {
+      this.scheduleAnnotationProjection(binding.tab_id);
     }
   }
 
@@ -608,8 +626,10 @@ export class DesktopControlServer {
       case "create_page":
       case "restore_page": {
         const current = this.#surfaceManager.primaryBindingForTab(command.payload.tab_id);
-        // 已物化的逻辑 Tab 始终复用 Primary Surface。只有首个物理 Surface
-        // 尚不存在时，才以当前窗口作为初始放置入口；后续命令不再读取焦点窗口。
+        // 创建/恢复是资源物化阶段，不能等待 Renderer 内容槽。新建 Tab 的
+        // Renderer 记录只有在这个响应返回后才会出现；如果这里调用
+        // ensureBrowserSurface，就会形成“等待内容槽 -> 内容槽等待创建响应”
+        // 的环路，并让新 Tab 无故卡住一整个内容槽超时周期。
         const windowId = current?.window_id ?? this.#activeWindowId();
         const binding = await this.#surfaceManager.materialize({
           windowId,
@@ -618,10 +638,6 @@ export class DesktopControlServer {
           initialUrl: command.payload.initial_url,
           navigationRevision: command.payload.navigation_revision,
           viewport: command.payload.logical_viewport,
-          // Host RestorePage/CreatePage 只负责把真实 WebContentsView 物化
-          // 并返回当前页面状态，不能把网络导航放在右栏激活的关键路径上。
-          // Chromium 页面继续在原生视图中加载，页面加载状态由 Surface 事件
-          // 单独上报，避免用户看到“正在连接浏览器”而不是实际加载过程。
           awaitPageLoad: false,
         });
         const contents = this.#surfaceManager.recordForBinding(binding);
@@ -640,17 +656,17 @@ export class DesktopControlServer {
         await this.#surfaceManager.closeTab(command.payload.tab_id);
         return succeeded({ type: "empty" });
       case "navigate": {
-        const binding = requirePrimaryBinding(this.#surfaceManager, command.payload.tab_id);
+        const binding = await this.requireRenderablePrimaryBinding(command.payload.tab_id);
         const page = await this.#surfaceManager.navigate(binding, command.payload.navigation);
         return succeeded({ type: "page_state", payload: page });
       }
       case "set_logical_viewport": {
-        const binding = requirePrimaryBinding(this.#surfaceManager, command.payload.tab_id);
+        const binding = await this.requireRenderablePrimaryBinding(command.payload.tab_id);
         await this.#surfaceManager.setViewport(binding, command.payload.viewport);
         return succeeded({ type: "empty" });
       }
       case "get_logical_viewport": {
-        const binding = requirePrimaryBinding(this.#surfaceManager, command.payload.tab_id);
+        const binding = await this.requireRenderablePrimaryBinding(command.payload.tab_id);
         const state = this.#surfaceManager.viewportStateForSurface(binding.surface_id);
         if (!state) throw new Error("browser_surface_not_found");
         return succeeded({
@@ -669,7 +685,7 @@ export class DesktopControlServer {
       }
       case "inspect_start":
       case "inspect_stop": {
-        const binding = requirePrimaryBindingForIdentity(this.#surfaceManager, command.payload);
+        const binding = await this.requireRenderablePrimaryBindingForIdentity(command.payload);
         if (command.type === "inspect_start") {
           await this.#surfaceManager.startInspect(binding);
         } else {
@@ -678,6 +694,7 @@ export class DesktopControlServer {
         return succeeded({ type: "empty" });
       }
       case "update_control":
+        await this.requireRenderablePrimaryBinding(command.payload.tab_id);
         await this.#surfaceManager.updateControl(
           command.payload.tab_id,
           command.payload.surface_id,
@@ -689,7 +706,7 @@ export class DesktopControlServer {
       default: {
         const tabId = commandTabId(command);
         if (!tabId) throw new Error("browser_tab_id_missing");
-        const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
+        const binding = await this.requireRenderablePrimaryBinding(tabId);
         const executed = await this.#worker.execute(binding, command, signal);
         // 交互命令在 Worker 内可能由多个 CDP 输入事件组成。动作中的
         // keyDown/click 可能已经触发导航，因此不能把 Worker 发送前的
@@ -697,7 +714,7 @@ export class DesktopControlServer {
         // WebContents 的最新地址、标题和 navigation revision，统一满足
         // Rust 工具层的 PageState 契约。
         if (executed.outcome.status === "succeeded" && isPageStateInteraction(command)) {
-          const currentBinding = requirePrimaryBinding(this.#surfaceManager, tabId);
+          const currentBinding = await this.requireRenderablePrimaryBinding(tabId);
           const contents = this.#surfaceManager.recordForBinding(currentBinding);
           return {
             outcome: {
@@ -762,6 +779,12 @@ export class DesktopControlServer {
         // 每次真正执行前重新读取 Primary，不能把导航前的 binding 用于
         // 新文档，否则旧 CDP 执行上下文会把标记错误写入下一页或直接超时。
         const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
+        // 标记事实已经在 Authority 持久化。后台 Surface 没有 Chromium
+        // compositor viewport，先保留投影快照，等它真正绑定内容槽时由
+        // handleSurfaceContentReady 触发重放，不把暂态不可见误报成失败。
+        if (!this.#surfaceManager.isRenderableBinding(binding)) {
+          return succeeded({ type: "empty" });
+        }
         return this.#worker.execute(binding, {
           type: "set_annotations",
           payload: {
@@ -778,6 +801,26 @@ export class DesktopControlServer {
       }
     });
     return run;
+  }
+
+  private async requireRenderablePrimaryBinding(tabId: string): Promise<BrowserSurfaceBinding> {
+    const activation = this.#surfaceManager.activationInputForTab(tabId);
+    if (!activation) throw new Error("browser_surface_not_found");
+    await this.#ensureBrowserSurface(activation);
+    return requirePrimaryBinding(this.#surfaceManager, tabId);
+  }
+
+  private async requireRenderablePrimaryBindingForIdentity(
+    identity: BrowserSurfaceIdentity,
+  ): Promise<BrowserSurfaceBinding> {
+    const binding = await this.requireRenderablePrimaryBinding(identity.tab_id);
+    if (
+      binding.surface_id !== identity.surface_id
+      || binding.navigation_revision !== identity.navigation_revision
+    ) {
+      throw new Error("browser_surface_stale");
+    }
+    return binding;
   }
 
   private emit(event: BrowserHostEvent): void {
@@ -849,20 +892,6 @@ function isPageStateInteraction(command: BrowserHostCommand): boolean {
 function requirePrimaryBinding(manager: BrowserSurfaceManager, tabId: string) {
   const binding = manager.primaryBindingForTab(tabId);
   if (!binding) throw new Error("browser_surface_not_found");
-  return binding;
-}
-
-function requirePrimaryBindingForIdentity(
-  manager: BrowserSurfaceManager,
-  identity: BrowserSurfaceIdentity,
-) {
-  const binding = requirePrimaryBinding(manager, identity.tab_id);
-  if (
-    binding.surface_id !== identity.surface_id
-    || binding.navigation_revision !== identity.navigation_revision
-  ) {
-    throw new Error("browser_surface_stale");
-  }
   return binding;
 }
 

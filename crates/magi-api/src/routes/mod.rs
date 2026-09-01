@@ -96,8 +96,8 @@ use conversation_bridge::{finalize_session_turn, ingest_user_input_to_conversati
 pub(crate) use dispatch_flow::schedule_restored_session_task_dispatches;
 use dispatch_flow::{
     SessionTaskSubmissionInput, accept_goal_continuation_task_submission,
-    accept_session_task_submission_at, append_dispatch_assistant_message,
-    dispatch_accepted_canonical_event, schedule_session_task_dispatch,
+    accept_session_task_submission_at, dispatch_accepted_canonical_event,
+    schedule_session_task_dispatch,
 };
 
 pub fn build_router(state: ApiState) -> Router {

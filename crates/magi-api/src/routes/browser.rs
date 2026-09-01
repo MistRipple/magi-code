@@ -40,6 +40,8 @@ static BROWSER_TAB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BROWSER_ANNOTATION_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const BROWSER_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 const BROWSER_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BROWSER_SURFACE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const BROWSER_SURFACE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -146,17 +148,24 @@ async fn register_desktop_connection(
             } => ApiError::Conflict(format!(
                 "桌面浏览器连接所有权冲突，当前代次为 {current_generation}"
             )),
+            crate::state::BrowserHostConnectionRegistrationError::OwnerConflict {
+                current_generation,
+            } => ApiError::Conflict(format!(
+                "当前 daemon 已绑定另一 Desktop 实例，当前代次为 {current_generation}"
+            )),
         })?;
     if changed {
         let previous = state.browser_host_status();
-        state.set_browser_host_status(BrowserHostStatusSnapshot {
+        let status = BrowserHostStatusSnapshot {
             revision: previous.revision,
             in_app_browser_enabled: previous.in_app_browser_enabled,
             browser_use_enabled: previous.browser_use_enabled,
             status: BrowserHostStatus::Starting,
             protocol_compatible: false,
             last_error_code: None,
-        });
+        };
+        state.set_browser_host_status(status.clone());
+        publish_browser_host_status(&state, &status);
     }
     Ok(Json(browser_capabilities_response(
         &state,
@@ -181,14 +190,16 @@ async fn clear_desktop_connection(
     }) {
         state.set_browser_host_connection_config(None);
         let previous = state.browser_host_status();
-        state.set_browser_host_status(BrowserHostStatusSnapshot {
+        let status = BrowserHostStatusSnapshot {
             revision: previous.revision,
             in_app_browser_enabled: previous.in_app_browser_enabled,
             browser_use_enabled: previous.browser_use_enabled,
             status: BrowserHostStatus::Stopped,
             protocol_compatible: false,
             last_error_code: None,
-        });
+        };
+        state.set_browser_host_status(status.clone());
+        publish_browser_host_status(&state, &status);
     }
     Ok(Json(browser_capabilities_response(
         &state,
@@ -203,6 +214,23 @@ fn bounded_connection_value(value: String, field: &str) -> Result<String, ApiErr
         return Err(ApiError::InvalidInput(format!("{field} 无效")));
     }
     Ok(value.to_string())
+}
+
+fn publish_browser_host_status(state: &ApiState, status: &BrowserHostStatusSnapshot) {
+    state.event_bus.publish(EventEnvelope::system(
+        EventId::new(format!(
+            "event-browser-host-status-{:?}-{}",
+            status.status,
+            UtcMillis::now().0
+        )),
+        "browser.host.status_changed",
+        serde_json::json!({
+            "host_status": status.status,
+            "protocol_compatible": status.protocol_compatible,
+            "error_code": status.last_error_code,
+            "revision": status.revision,
+        }),
+    ));
 }
 
 fn browser_annotation_artifact_path(
@@ -1516,25 +1544,44 @@ fn finish_browser_tab_creation(
     tab_id: &BrowserTabId,
     reason: &str,
 ) {
-    if let Err(error) = state.mutate_browser_authority(|authority| {
-        authority.transition_tab(tab_id, BrowserTabLifecycle::Crashed, UtcMillis::now())
-    }) {
-        tracing::error!(%tab_id, ?error, "浏览器逻辑 Tab 创建失败后无法收敛为 crashed 状态");
+    let outcome = state.mutate_browser_authority(|authority| {
+        let Some(current) = authority.tab(tab_id) else {
+            // 创建结果晚于用户关闭/删除 Tab 到达时，逻辑资源已经完成收口。
+            return Ok(None);
+        };
+        if current.lifecycle != BrowserTabLifecycle::Creating {
+            // 创建结果可能晚于激活成功到达。此时 Ready/Suspended/Closed 是
+            // 更新的权威状态，迟到的失败不能覆盖它。
+            return Ok(None);
+        }
+        authority
+            .transition_tab(tab_id, BrowserTabLifecycle::Crashed, UtcMillis::now())
+            .map(Some)
+    });
+    match outcome {
+        Ok(Some(_)) => {
+            tracing::warn!(%tab_id, %reason, "浏览器逻辑 Tab 创建失败，保留为 crashed 状态");
+            publish_browser_event(
+                state,
+                "browser.tab.updated",
+                workspace_id.as_ref(),
+                session_id,
+                serde_json::json!({
+                    "browser_session_id": browser_session_id,
+                    "tab_id": tab_id,
+                    "lifecycle": "crashed",
+                    "surface_id": null,
+                    "reason": reason,
+                }),
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(%tab_id, %reason, "忽略已收敛的浏览器逻辑 Tab 创建失败结果");
+        }
+        Err(error) => {
+            tracing::error!(%tab_id, ?error, "浏览器逻辑 Tab 创建失败后无法收敛为 crashed 状态");
+        }
     }
-    tracing::warn!(%tab_id, %reason, "浏览器逻辑 Tab 创建失败，保留为 crashed 状态");
-    publish_browser_event(
-        state,
-        "browser.tab.updated",
-        workspace_id.as_ref(),
-        session_id,
-        serde_json::json!({
-            "browser_session_id": browser_session_id,
-            "tab_id": tab_id,
-            "lifecycle": "crashed",
-            "surface_id": null,
-            "reason": reason,
-        }),
-    );
 }
 
 async fn list_annotations(
@@ -1968,10 +2015,7 @@ async fn annotation_artifact(
         let browser_session = authority
             .session(&annotation.browser_session_id)
             .ok_or_else(|| {
-                ApiError::not_found(
-                    "浏览器会话不存在",
-                    annotation.browser_session_id.as_str(),
-                )
+                ApiError::not_found("浏览器会话不存在", annotation.browser_session_id.as_str())
             })?;
         if browser_session.session_id != session_id {
             return Err(ApiError::NotFound("浏览器标记不存在".to_string()));
@@ -2006,71 +2050,52 @@ async fn activate_tab(
     Path(tab_id): Path<String>,
 ) -> Result<Json<BrowserSessionResponse>, ApiError> {
     let tab_id = BrowserTabId::new(tab_id);
-    let (tab, session) = browser_tab_scope(&state, &tab_id)?;
+    let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
     ensure_browser_ui_ready(&state, &session.session_id)?;
-    if !matches!(
-        tab.lifecycle,
-        BrowserTabLifecycle::Creating
-            | BrowserTabLifecycle::Ready
-            | BrowserTabLifecycle::Suspended
-            | BrowserTabLifecycle::Crashed
-    ) {
-        return Err(ApiError::Conflict("浏览器 Tab 当前不可激活".to_string()));
-    }
-    let tab = if tab.lifecycle == BrowserTabLifecycle::Crashed {
-        state.mutate_browser_authority(|authority| {
-            authority.transition_tab(&tab_id, BrowserTabLifecycle::Suspended, UtcMillis::now())
-        })?
-    } else {
-        tab
-    };
-    let reply = require_host_success(
-        require_browser_host(&state)?
-            .request(BrowserHostCommand::RestorePage {
-                tab_id: tab_id.clone(),
-                browser_session_id: tab.browser_session_id.clone(),
-                initial_url: tab.url.clone(),
-                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
-                navigation_revision: tab.navigation_revision,
-                snapshot_revision: tab.snapshot_revision,
-                allow_page_eviction: true,
-            })
-            .await,
-        "激活浏览器页面失败",
-    )?;
-    let BrowserHostCommandResult::PageState(page_state) = reply else {
-        return Err(ApiError::InternalAssemblyError(
-            "浏览器 Host 激活页面结果缺少页面状态".to_string(),
-        ));
-    };
-    let session = state.mutate_browser_authority(|authority| {
-        if authority.tab(&tab_id).is_some_and(|tab| {
-            matches!(
-                tab.lifecycle,
-                BrowserTabLifecycle::Creating
-                    | BrowserTabLifecycle::Suspended
-                    | BrowserTabLifecycle::Crashed
-            )
-        }) {
-            authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis::now())?;
-        }
-        authority.apply_host_page_state(
-            &tab_id,
-            page_state.navigation_revision,
-            page_state.url,
-            page_state.origin,
-            page_state.title,
-            UtcMillis::now(),
+    let mut tab = state
+        .mutate_browser_authority(|authority| prepare_browser_tab_activation(authority, &tab_id))?;
+    // Host 的真实 Surface 只有在右栏 Renderer 已经切换到目标 Browser Tab
+    // 后才能取得内容槽。先发出激活意图，让 Renderer 提前切换 DOM；如果把
+    // 这个事件放在 RestorePage 之后，Host 会等待一个永远不会出现的槽位，
+    // 最终表现为激活成功但没有 surface_id 或内容槽超时。
+    publish_browser_event(
+        &state,
+        "browser.tab.activation_requested",
+        session.workspace_id.as_ref(),
+        &session.session_id,
+        serde_json::json!({
+            "browser_session_id": session.browser_session_id,
+            "tab_id": tab_id,
+        }),
+    );
+    let session = loop {
+        let reply = require_host_success(
+            require_browser_host(&state)?
+                .request(BrowserHostCommand::RestorePage {
+                    tab_id: tab_id.clone(),
+                    browser_session_id: tab.browser_session_id.clone(),
+                    initial_url: tab.url.clone(),
+                    logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
+                    navigation_revision: tab.navigation_revision,
+                    snapshot_revision: tab.snapshot_revision,
+                    allow_page_eviction: true,
+                })
+                .await,
+            "激活浏览器页面失败",
         )?;
-        authority
-            .session(&tab.browser_session_id)
-            .cloned()
-            .ok_or_else(|| {
-                magi_browser_authority::BrowserAuthorityError::UnknownSession(
-                    tab.browser_session_id.clone(),
-                )
-            })
-    })?;
+        let BrowserHostCommandResult::PageState(page_state) = reply else {
+            return Err(ApiError::InternalAssemblyError(
+                "浏览器 Host 激活页面结果缺少页面状态".to_string(),
+            ));
+        };
+        match state.mutate_browser_authority(|authority| {
+            apply_browser_tab_activation(authority, &tab_id, page_state)
+        })? {
+            BrowserTabActivation::Retry(next_tab) => tab = next_tab,
+            BrowserTabActivation::Completed(session) => break session,
+        }
+    };
+    wait_for_browser_primary_surface(&state, &tab_id).await?;
     sync_browser_annotations_to_host(&state, &tab_id).await?;
     publish_browser_event(
         &state,
@@ -2312,12 +2337,107 @@ fn browser_tab_scope(
     Ok((tab, session))
 }
 
+enum BrowserTabActivation {
+    Retry(BrowserTab),
+    Completed(BrowserSession),
+}
+
+fn prepare_browser_tab_activation(
+    authority: &mut BrowserAuthority,
+    tab_id: &BrowserTabId,
+) -> Result<BrowserTab, magi_browser_authority::BrowserAuthorityError> {
+    let tab = authority
+        .tab(tab_id)
+        .cloned()
+        .ok_or_else(|| magi_browser_authority::BrowserAuthorityError::UnknownTab(tab_id.clone()))?;
+    match tab.lifecycle {
+        BrowserTabLifecycle::Creating
+        | BrowserTabLifecycle::Ready
+        | BrowserTabLifecycle::Suspended => Ok(tab),
+        BrowserTabLifecycle::Crashed => {
+            authority.transition_tab(tab_id, BrowserTabLifecycle::Suspended, UtcMillis::now())
+        }
+        BrowserTabLifecycle::Closed => {
+            Err(magi_browser_authority::BrowserAuthorityError::TabNotReady {
+                tab_id: tab_id.clone(),
+                lifecycle: tab.lifecycle,
+            })
+        }
+    }
+}
+
+fn apply_browser_tab_activation(
+    authority: &mut BrowserAuthority,
+    tab_id: &BrowserTabId,
+    page_state: magi_browser_authority::BrowserHostPageState,
+) -> Result<BrowserTabActivation, magi_browser_authority::BrowserAuthorityError> {
+    let current = authority
+        .tab(tab_id)
+        .cloned()
+        .ok_or_else(|| magi_browser_authority::BrowserAuthorityError::UnknownTab(tab_id.clone()))?;
+    if current.lifecycle == BrowserTabLifecycle::Closed {
+        return Err(magi_browser_authority::BrowserAuthorityError::TabNotReady {
+            tab_id: tab_id.clone(),
+            lifecycle: current.lifecycle,
+        });
+    }
+    if current.lifecycle == BrowserTabLifecycle::Crashed {
+        return Ok(BrowserTabActivation::Retry(authority.transition_tab(
+            tab_id,
+            BrowserTabLifecycle::Suspended,
+            UtcMillis::now(),
+        )?));
+    }
+    let ready = match current.lifecycle {
+        BrowserTabLifecycle::Creating | BrowserTabLifecycle::Suspended => {
+            authority.transition_tab(tab_id, BrowserTabLifecycle::Ready, UtcMillis::now())?
+        }
+        BrowserTabLifecycle::Ready => current,
+        BrowserTabLifecycle::Crashed | BrowserTabLifecycle::Closed => unreachable!(),
+    };
+    authority.apply_host_page_state(
+        tab_id,
+        page_state.navigation_revision,
+        page_state.url,
+        page_state.origin,
+        page_state.title,
+        UtcMillis::now(),
+    )?;
+    let session = authority
+        .session(&ready.browser_session_id)
+        .cloned()
+        .ok_or_else(|| {
+            magi_browser_authority::BrowserAuthorityError::UnknownSession(
+                ready.browser_session_id.clone(),
+            )
+        })?;
+    Ok(BrowserTabActivation::Completed(session))
+}
+
 fn require_browser_host(
     state: &ApiState,
 ) -> Result<magi_browser_authority::BrowserHostClient, ApiError> {
     state
         .browser_host_client()
         .ok_or_else(|| ApiError::Conflict("桌面浏览器控制通道尚未启动".to_string()))
+}
+
+async fn wait_for_browser_primary_surface(
+    state: &ApiState,
+    tab_id: &BrowserTabId,
+) -> Result<String, ApiError> {
+    let deadline = Instant::now() + BROWSER_SURFACE_WAIT_TIMEOUT;
+    loop {
+        if let Some(surface_id) = state.browser_primary_surface_id(tab_id) {
+            return Ok(surface_id);
+        }
+        if Instant::now() >= deadline {
+            return Err(ApiError::Conflict(
+                "浏览器页面已恢复，但真实 Surface 尚未完成绑定，请稍后重试".to_string(),
+            ));
+        }
+        tokio::time::sleep(BROWSER_SURFACE_POLL_INTERVAL).await;
+    }
 }
 
 async fn sync_browser_annotations_to_host(
@@ -2680,9 +2800,10 @@ mod tests {
     use super::{
         AnnotationArtifactQuery, BrowserAnnotationAnchorResponse, BrowserClientPlatform,
         BrowserElementAnnotationAnchorResponse, BrowserRegionAnnotationAnchorResponse,
-        DesktopConnectionClearRequest, DesktopConnectionRequest, ReclaimBrowserResourcesRequest,
-        annotation_artifact, browser_platform_capabilities, browser_resources_response,
-        browser_session_response, clear_desktop_connection, finish_browser_tab_creation,
+        BrowserTabActivation, DesktopConnectionClearRequest, DesktopConnectionRequest,
+        ReclaimBrowserResourcesRequest, annotation_artifact, apply_browser_tab_activation,
+        browser_platform_capabilities, browser_resources_response, browser_session_response,
+        clear_desktop_connection, finish_browser_tab_creation, prepare_browser_tab_activation,
         reclaim_browser_resources, register_desktop_connection, require_desktop_browser_capability,
         resolve_browser_annotation_context,
     };
@@ -2825,7 +2946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn desktop_connection_registration_requires_generation_cas() {
+    async fn desktop_connection_registration_releases_owner_after_clear() {
         let state = ApiState::new(
             "browser-desktop-connection-cas-test",
             Arc::new(InMemoryEventBus::new(32)),
@@ -2885,9 +3006,24 @@ mod tests {
                 expected_generation: 1,
             }),
         )
+        .await;
+        assert!(matches!(replacement, Err(ApiError::Conflict(_))));
+
+        let _ = clear_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionClearRequest {
+                desktop_epoch: "desktop-second".to_string(),
+                parent_pid: 103,
+                generation: 1,
+            }),
+        )
         .await
-        .expect("CAS replacement should succeed");
-        assert_eq!(replacement.0.desktop_connection_generation, 2);
+        .expect("stale clear should be an idempotent no-op");
+        let current = state
+            .browser_host_connection_config()
+            .expect("first owner should remain registered");
+        assert_eq!(current.desktop_epoch, "desktop-first");
+        assert_eq!(current.generation, 1);
 
         let _ = clear_desktop_connection(
             axum::extract::State(state.clone()),
@@ -2898,12 +3034,42 @@ mod tests {
             }),
         )
         .await
-        .expect("stale clear should be an idempotent no-op");
-        let current = state
-            .browser_host_connection_config()
-            .expect("replacement owner should remain registered");
-        assert_eq!(current.desktop_epoch, "desktop-second");
-        assert_eq!(current.generation, 2);
+        .expect("owner should clear its active connection");
+        assert!(state.browser_host_connection_config().is_none());
+
+        let takeover_after_clear = register_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionRequest {
+                socket_path: "/tmp/magi-second.sock".to_string(),
+                auth_token: "second-token".to_string(),
+                desktop_epoch: "desktop-second".to_string(),
+                parent_pid: 103,
+                expected_generation: 1,
+            }),
+        )
+        .await;
+        let takeover_after_clear = takeover_after_clear
+            .expect("a new Desktop owner should register after the previous owner clears");
+        assert_eq!(takeover_after_clear.0.desktop_connection_generation, 2);
+
+        let stale_clear = clear_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionClearRequest {
+                desktop_epoch: "desktop-first".to_string(),
+                parent_pid: 101,
+                generation: 1,
+            }),
+        )
+        .await
+        .expect("stale clear after takeover should remain idempotent");
+        assert_eq!(stale_clear.0.desktop_connection_generation, 2);
+        assert_eq!(
+            state
+                .browser_host_connection_config()
+                .expect("replacement Desktop should remain registered")
+                .desktop_epoch,
+            "desktop-second"
+        );
     }
 
     #[test]
@@ -2987,7 +3153,7 @@ mod tests {
         )
         .expect("annotation artifact should write");
         let state = state.with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
-            state_root.join("sessions.json"),
+            state_root.clone(),
             state_root.join("workspaces.json"),
             state_root.join("knowledge.json"),
         )));
@@ -3384,6 +3550,166 @@ mod tests {
             .cloned()
             .expect("failed tab should remain in authority");
         assert_eq!(tab.lifecycle, BrowserTabLifecycle::Crashed);
+    }
+
+    #[test]
+    fn late_creation_failure_cannot_overwrite_ready_tab() {
+        let (state, session_id, _, _) = annotation_fixture();
+        let browser_session_id = BrowserSessionId::new("browser-session-annotation-current");
+        let tab_id = BrowserTabId::new("browser-tab-annotation-current");
+
+        finish_browser_tab_creation(
+            &state,
+            &None,
+            &session_id,
+            &browser_session_id,
+            &tab_id,
+            "late create failure",
+        );
+
+        let tab = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold")
+            .tab(&tab_id)
+            .cloned()
+            .expect("ready tab should remain in authority");
+        assert_eq!(tab.lifecycle, BrowserTabLifecycle::Ready);
+    }
+
+    #[test]
+    fn immediate_activation_converges_a_creating_tab_to_ready() {
+        let (state, _, _, _) = annotation_fixture();
+        let browser_session_id = BrowserSessionId::new("browser-session-annotation-current");
+        let tab_id = BrowserTabId::new("browser-tab-activation-creating");
+        state
+            .mutate_browser_authority(|authority| {
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id,
+                    url: "https://example.com/activation".to_string(),
+                    now: UtcMillis(5),
+                })?;
+                Ok(())
+            })
+            .expect("creating tab fixture should succeed");
+
+        let tab = state
+            .mutate_browser_authority(|authority| {
+                prepare_browser_tab_activation(authority, &tab_id)
+            })
+            .expect("creating tab should be eligible for activation");
+        assert_eq!(tab.lifecycle, BrowserTabLifecycle::Creating);
+
+        let resolution = state
+            .mutate_browser_authority(|authority| {
+                apply_browser_tab_activation(
+                    authority,
+                    &tab_id,
+                    magi_browser_authority::BrowserHostPageState {
+                        tab_id: tab_id.clone(),
+                        url: "https://example.com/activation".to_string(),
+                        origin: Some("https://example.com".to_string()),
+                        title: "Activation".to_string(),
+                        navigation_revision: 0,
+                    },
+                )
+            })
+            .expect("creating tab should converge after host restore");
+        assert!(matches!(resolution, BrowserTabActivation::Completed(_)));
+        assert_eq!(
+            state
+                .browser_authority
+                .lock()
+                .expect("browser authority lock should hold")
+                .tab(&tab_id)
+                .expect("activated tab should remain in authority")
+                .lifecycle,
+            BrowserTabLifecycle::Ready
+        );
+    }
+
+    #[test]
+    fn activation_retries_when_creation_failure_wins_the_authority_race() {
+        let (state, session_id, _, _) = annotation_fixture();
+        let browser_session_id = BrowserSessionId::new("browser-session-annotation-current");
+        let tab_id = BrowserTabId::new("browser-tab-activation-race");
+        state
+            .mutate_browser_authority(|authority| {
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    url: "https://example.com/race".to_string(),
+                    now: UtcMillis(5),
+                })
+            })
+            .expect("creating tab fixture should succeed");
+
+        let creating = state
+            .mutate_browser_authority(|authority| {
+                prepare_browser_tab_activation(authority, &tab_id)
+            })
+            .expect("creating tab should be eligible for activation");
+        assert_eq!(creating.lifecycle, BrowserTabLifecycle::Creating);
+
+        finish_browser_tab_creation(
+            &state,
+            &None,
+            &session_id,
+            &browser_session_id,
+            &tab_id,
+            "creation failed while activation was restoring",
+        );
+
+        let retry = state
+            .mutate_browser_authority(|authority| {
+                apply_browser_tab_activation(
+                    authority,
+                    &tab_id,
+                    magi_browser_authority::BrowserHostPageState {
+                        tab_id: tab_id.clone(),
+                        url: "https://example.com/race".to_string(),
+                        origin: Some("https://example.com".to_string()),
+                        title: "Race".to_string(),
+                        navigation_revision: creating.navigation_revision,
+                    },
+                )
+            })
+            .expect("crashed activation should request a retry");
+        let suspended = match retry {
+            BrowserTabActivation::Retry(tab) => tab,
+            BrowserTabActivation::Completed(_) => {
+                panic!("a crashed tab must retry with suspended revisions")
+            }
+        };
+        assert_eq!(suspended.lifecycle, BrowserTabLifecycle::Suspended);
+
+        let resolution = state
+            .mutate_browser_authority(|authority| {
+                apply_browser_tab_activation(
+                    authority,
+                    &tab_id,
+                    magi_browser_authority::BrowserHostPageState {
+                        tab_id: tab_id.clone(),
+                        url: "https://example.com/race".to_string(),
+                        origin: Some("https://example.com".to_string()),
+                        title: "Race".to_string(),
+                        navigation_revision: suspended.navigation_revision,
+                    },
+                )
+            })
+            .expect("retried suspended tab should converge after restore");
+        assert!(matches!(resolution, BrowserTabActivation::Completed(_)));
+        assert_eq!(
+            state
+                .browser_authority
+                .lock()
+                .expect("browser authority lock should hold")
+                .tab(&tab_id)
+                .expect("restored tab should remain in authority")
+                .lifecycle,
+            BrowserTabLifecycle::Ready
+        );
     }
 
     #[tokio::test]

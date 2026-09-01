@@ -1309,7 +1309,8 @@ mod tests {
         state
             .task_store()
             .expect("task store should exist")
-            .insert_task(test_task(task_id.as_str(), &mission_id));
+            .insert_task(test_task(task_id.as_str(), &mission_id))
+            .expect("任务应插入");
 
         let err = require_session_task(
             &state,
@@ -1379,7 +1380,8 @@ mod tests {
         state
             .task_store()
             .expect("task store should exist")
-            .insert_task(test_task(task_id.as_str(), &mission_id));
+            .insert_task(test_task(task_id.as_str(), &mission_id))
+            .expect("任务应插入");
 
         let scope = require_session_task(
             &state,

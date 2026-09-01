@@ -13,8 +13,6 @@ import {
   getRequestBinding,
   createRequestBinding,
   updateRequestBinding,
-  addPendingRequest,
-  settleProcessingForManualInteraction,
 } from '../stores/messages.svelte';
 import { directIncidentError, incidentErrorDiagnostics, reportIncident } from './notifications';
 import type { StandardMessage } from '../shared/protocol/message-protocol';
@@ -169,10 +167,7 @@ function resolveEventTrackingWorkspaceId(message: ClientBridgeMessage): string {
   return '';
 }
 
-function resolveEventTrackingSessionId(
-  message: ClientBridgeMessage,
-  options: { allowCurrentSessionFallback?: boolean } = {},
-): string {
+function resolveEventTrackingSessionId(message: ClientBridgeMessage): string {
   if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
     return message.sessionId.trim();
   }
@@ -192,9 +187,7 @@ function resolveEventTrackingSessionId(
       }
     }
   }
-  return options.allowCurrentSessionFallback === true
-    ? (getState().currentSessionId?.trim() || '')
-    : '';
+  return '';
 }
 
 function syncEventSeqTrackingFromBootstrap(standard: StandardMessage): void {
@@ -293,8 +286,6 @@ function shouldProcessByEventSeq(message: ClientBridgeMessage): boolean {
 
 function handleUnhandledMessageError(error: unknown, message?: ClientBridgeMessage): void {
   console.error('[MessageHandler] 处理消息时发生未捕获异常:', error, message);
-  // 统一降级策略：消息处理崩溃后立即收敛前端运行态，避免用户看到“持续执行但无输出”假象。
-  settleProcessingForManualInteraction();
 
   const title = i18n.t('messageHandler.syncError');
   const directError = directIncidentError(error, title);
@@ -403,7 +394,6 @@ function handleContentMessage(standard: StandardMessage) {
         updateRequestBinding(requestId, { userMessageId: standard.id });
       }
       updateRequestBindingTurnFacts(requestId, incomingTurnOrderSeq, incomingCanonicalTurnSeq);
-      addPendingRequest(requestId);
     }
     return;
   }

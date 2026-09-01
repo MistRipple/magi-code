@@ -17,17 +17,18 @@ use crate::{
     state::ApiState,
     task_dispatch::{
         DispatchSubmissionAccepted, DispatchSubmissionRequest, DispatchTurnOrigin,
-        drive_dispatch_submission, submit_dispatch_submission,
+        drive_dispatch_submission_after_lifecycle_and_restart_lock,
+        materialize_dispatch_submission_after_acceptance, submit_dispatch_submission,
     },
 };
 use magi_browser_authority::ValidateBrowserNodeSelection;
+use magi_conversation_runtime::dispatch_submission::cleanup_materialized_dispatch_submission_if_not_started;
+use magi_conversation_runtime::dispatch_submission::recover_dispatch_submission_request;
 use magi_conversation_runtime::session_images::SessionTurnImage;
-use magi_conversation_runtime::session_writeback::{
-    SessionTurnErrorInput, append_session_turn_error_item, publish_current_session_turn_item_event,
-};
+use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_session_store::{
-    ActiveExecutionTurn, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem,
-    CanonicalTurnItemKind, SessionGoal,
+    CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
+    SessionGoal,
 };
 
 pub(super) fn session_turn_route_name(route: crate::dto::SessionTurnRouteDto) -> &'static str {
@@ -67,6 +68,7 @@ pub(super) async fn accept_session_task_submission(
         },
     )
     .await
+    .map(|(accepted, event_id, _event_seq, _occurred_at)| (accepted, event_id))
 }
 
 pub(super) struct SessionTaskSubmissionInput {
@@ -88,7 +90,7 @@ pub(super) async fn accept_session_task_submission_at(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     input: SessionTaskSubmissionInput,
-) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
+) -> Result<(DispatchSubmissionAccepted, EventId, u64, UtcMillis), ApiError> {
     let SessionTaskSubmissionInput {
         images,
         workspace_id,
@@ -166,16 +168,10 @@ pub(super) async fn accept_goal_continuation_task_submission(
     accepted_at: UtcMillis,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
     let execution_root = if workspace_id.is_none() {
-        Some(state.personal_session_execution_root(&session_id)?)
+        Some(state.personal_session_execution_root_path(&session_id))
     } else {
         None
     };
-    state
-        .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
-        .await?;
-    state
-        .ensure_session_code_context(&session_id, &workspace_id)
-        .await?;
     let entry_id = format!(
         "timeline-goal-continuation-{}-{}",
         session_id, accepted_at.0
@@ -185,6 +181,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         session_id: session_id.clone(),
         workspace_id,
         execution_root,
+        orchestrator_session_config: None,
         entry_id,
         timeline_message: format!("目标自动推进: {}", goal.objective),
         images: Vec::new(),
@@ -213,14 +210,6 @@ pub(super) async fn accept_goal_continuation_task_submission(
         turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
-    if let Err(error) = state.persist_session_task_acceptance(
-        &accepted.session_id,
-        &accepted.turn_id,
-        &accepted.root_task_id,
-    ) {
-        fail_accepted_task_submission(state, &accepted, error.message());
-        return Err(error);
-    }
     Ok(accepted)
 }
 
@@ -280,7 +269,7 @@ fn initial_session_orchestrator_config(
 async fn execute_dispatch_submission(
     state: &ApiState,
     input: ExecuteDispatchSubmissionInput<'_>,
-) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
+) -> Result<(DispatchSubmissionAccepted, EventId, u64, UtcMillis), ApiError> {
     let ExecuteDispatchSubmissionInput {
         requested_session_id,
         requested_workspace_id,
@@ -308,23 +297,11 @@ async fn execute_dispatch_submission(
         placeholder_title,
         accepted_at,
     )?;
-    if let Some(config) = initial_session_orchestrator_config(
-        state,
-        created_session,
-        request.orchestrator_session_config.as_ref(),
-    )? {
-        super::settings::save_orchestrator_session_override_for_session(
-            state,
-            &session_id,
-            &config,
-        )?;
-        super::settings::require_orchestrator_session_model(state, &session_id)?;
-    }
     let execution_root = workspace_id
         .as_ref()
         .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
         .or(if workspace_id.is_none() {
-            Some(state.personal_session_execution_root(&session_id)?)
+            Some(state.personal_session_execution_root_path(&session_id))
         } else {
             None
         });
@@ -351,26 +328,6 @@ async fn execute_dispatch_submission(
         })
         .map_err(ApiError::InvalidInput)?;
     drop(browser_authority);
-    if request.goal_mode {
-        state
-            .session_store
-            .set_active_goal_access_profile(&session_id, request.requested_access_profile())
-            .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
-    } else if let Some((_goal, plan)) = state
-        .session_store
-        .pause_active_goal_for_diversion(&session_id)
-        .map_err(|error| ApiError::internal_assembly("切换任务时暂停当前 Goal 失败", error))?
-        && let Some(plan) = plan.as_ref()
-    {
-        magi_plan::publish_plan_event(
-            &state.event_bus,
-            magi_plan::plan_event_type(plan),
-            plan,
-            workspace_id.as_ref(),
-            None,
-            None,
-        );
-    }
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 
@@ -379,6 +336,7 @@ async fn execute_dispatch_submission(
         session_id: session_id.clone(),
         workspace_id: workspace_id.clone(),
         execution_root,
+        orchestrator_session_config: request.orchestrator_session_config.clone(),
         entry_id: user_timeline_entry_id,
         timeline_message: message.clone(),
         images,
@@ -413,14 +371,6 @@ async fn execute_dispatch_submission(
             return Err(error);
         }
     };
-    if let Err(error) = state.persist_session_task_acceptance(
-        &accepted.session_id,
-        &accepted.turn_id,
-        &accepted.root_task_id,
-    ) {
-        fail_accepted_task_submission(state, &accepted, error.message());
-        return Err(error);
-    }
     ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     publish_session_user_message_event(
         state,
@@ -438,7 +388,8 @@ async fn execute_dispatch_submission(
             superseded_turn,
         );
     }
-    let event_id = publish_session_turn_task_accepted_event(state, request, &accepted)?;
+    let (event_id, event_seq, event_occurred_at) =
+        publish_session_turn_task_accepted_event(state, request, &accepted)?;
     if created_session {
         crate::session_title::spawn_new_session_title_refinement(
             state,
@@ -447,27 +398,13 @@ async fn execute_dispatch_submission(
             placeholder_title,
         );
     }
-    Ok((accepted, event_id))
+    Ok((accepted, event_id, event_seq, event_occurred_at))
 }
 
 pub(super) fn dispatch_accepted_canonical_event(
-    state: &ApiState,
     accepted: &DispatchSubmissionAccepted,
 ) -> (Option<CanonicalTurn>, Option<CanonicalTurnItem>) {
-    let canonical_turn = state
-        .session_store
-        .canonical_turns_for_session(&accepted.session_id)
-        .into_iter()
-        .find(|turn| {
-            turn.turn_id == accepted.turn_id
-                || (turn.accepted_at == accepted.accepted_at
-                    && turn.items.iter().any(|item| {
-                        item.worker
-                            .as_ref()
-                            .and_then(|worker| worker.task_id.as_ref())
-                            == Some(&accepted.action_task_id)
-                    }))
-        });
+    let canonical_turn = accepted.accepted_canonical_turn.clone();
     let canonical_item = canonical_turn
         .as_ref()
         .and_then(|turn| {
@@ -508,7 +445,7 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
         .session_store
         .execution_ownership(&accepted.session_id)
         .and_then(|ownership| ownership.workspace_id);
-    let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(state, accepted);
+    let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(accepted);
     let session_summary = accepted_session_directory_entry(state, accepted);
     let event_id = EventId::new(format!(
         "event-session-turn-task-{}",
@@ -577,11 +514,15 @@ async fn prepare_session_task_dispatch(
         Some(&accepted.turn_id),
         None,
     );
-    let _ = state.session_store.update_current_turn_status_for_turn(
-        &accepted.session_id,
-        Some(&accepted.turn_id),
-        "preparing",
-    );
+    state
+        .session_store
+        .update_current_turn_status_for_turn(
+            &accepted.session_id,
+            Some(&accepted.turn_id),
+            "preparing",
+        )
+        .map_err(|error| ApiError::internal_assembly("更新任务准备状态失败", error))?
+        .ok_or_else(|| ApiError::Conflict("当前任务 Turn 已被新的操作取代".to_string()))?;
     if let Some(item_id) = accepted.user_message_item_id.as_deref() {
         publish_current_session_turn_item_event(
             &state.event_bus,
@@ -593,6 +534,43 @@ async fn prepare_session_task_dispatch(
                 .and_then(|ownership| ownership.workspace_id),
             item_id,
             state.task_store(),
+        )
+        .map_err(|error| ApiError::internal_assembly("发布任务用户消息事实失败", error))?;
+    }
+
+    if let Some(config) = initial_session_orchestrator_config(
+        state,
+        accepted.created_session,
+        accepted.request.orchestrator_session_config.as_ref(),
+    )? {
+        super::settings::save_orchestrator_session_override_for_session(
+            state,
+            &accepted.session_id,
+            &config,
+        )?;
+        super::settings::require_orchestrator_session_model(state, &accepted.session_id)?;
+    }
+    if accepted.request.workspace_id.is_none() {
+        state.personal_session_execution_root(&accepted.session_id)?;
+    }
+    if accepted.request.goal_mode {
+        state
+            .session_store
+            .set_active_goal_access_profile(&accepted.session_id, accepted.request.access_profile)
+            .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
+    } else if let Some((_goal, plan)) = state
+        .session_store
+        .pause_active_goal_for_diversion(&accepted.session_id)
+        .map_err(|error| ApiError::internal_assembly("切换任务时暂停当前 Goal 失败", error))?
+        && let Some(plan) = plan.as_ref()
+    {
+        magi_plan::publish_plan_event(
+            &state.event_bus,
+            magi_plan::plan_event_type(plan),
+            plan,
+            accepted.request.workspace_id.as_ref(),
+            None,
+            None,
         );
     }
 
@@ -614,6 +592,7 @@ async fn prepare_session_task_dispatch(
                 .and_then(|ownership| ownership.workspace_id),
         )
         .await?;
+    materialize_dispatch_submission_after_acceptance(state, accepted)?;
     state.persist_session_state_checkpoint("session_task_turn_prepared")?;
     trace.mark(
         "preparation_completed",
@@ -629,6 +608,30 @@ pub(super) async fn finalize_session_task_dispatch(
     accepted: DispatchSubmissionAccepted,
 ) {
     let mut accepted = accepted;
+    let Some(manager) = state.runner_manager() else {
+        fail_accepted_task_submission(&state, &accepted, "runner_manager 未配置");
+        return;
+    };
+    // accepted 事实写入后，执行面仍可能尚未开始。把 finalizer 纳入与 Continue/Restart
+    // 相同的生命周期锁顺序，确保新旧 Turn 不会同时进入同一 session 的执行入口。
+    let _session_lifecycle_guard = manager.lock_session_lifecycle(&accepted.session_id).await;
+    let _restart_guard = manager
+        .lock_for_restart(accepted.root_task_id.as_str())
+        .await;
+    let current_turn_matches = state
+        .session_store
+        .runtime_sidecar(&accepted.session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .is_some_and(|turn| turn.turn_id == accepted.turn_id);
+    if !current_turn_matches {
+        tracing::info!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            turn_id = %accepted.turn_id,
+            "跳过已被更新 Turn 取代的后台 session finalizer"
+        );
+        return;
+    }
     if let Err(error) = prepare_session_task_dispatch(&state, &accepted).await {
         state.release_session_git_execution_lease(&accepted.session_id);
         tracing::error!(
@@ -640,12 +643,37 @@ pub(super) async fn finalize_session_task_dispatch(
         fail_accepted_task_submission(&state, &accepted, error.message());
         return;
     }
-    let _ = state.session_store.update_current_turn_status_for_turn(
+    match state.session_store.update_current_turn_status_for_turn(
         &accepted.session_id,
         Some(&accepted.turn_id),
         "running",
-    );
-    if let Err(error) = drive_dispatch_submission(&state, &mut accepted).await {
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let error = "当前任务 Turn 已被新的操作取代";
+            tracing::error!(
+                session_id = %accepted.session_id,
+                root_task_id = %accepted.root_task_id,
+                turn_id = %accepted.turn_id,
+                "session turn running 状态写回时未找到当前 Turn"
+            );
+            fail_accepted_task_submission(&state, &accepted, error);
+            return;
+        }
+        Err(error) => {
+            tracing::error!(
+                session_id = %accepted.session_id,
+                root_task_id = %accepted.root_task_id,
+                ?error,
+                "session turn running 状态写回失败"
+            );
+            fail_accepted_task_submission(&state, &accepted, &error.to_string());
+            return;
+        }
+    }
+    if let Err(error) =
+        drive_dispatch_submission_after_lifecycle_and_restart_lock(&state, &mut accepted)
+    {
         tracing::error!(
             session_id = %accepted.session_id,
             root_task_id = %accepted.root_task_id,
@@ -656,7 +684,6 @@ pub(super) async fn finalize_session_task_dispatch(
         fail_accepted_task_submission(&state, &accepted, error.message());
         return;
     }
-    append_dispatch_assistant_message(&state, &accepted);
 }
 
 /// 只把执行面投递到后台；调用方已经完成最小 durable accepted 写入。
@@ -682,15 +709,27 @@ pub(crate) fn schedule_restored_session_task_dispatches(state: ApiState) {
         .runtime_sidecars()
         .into_iter()
         .filter_map(|sidecar| {
-            let turn = sidecar.current_turn?;
+            let turn = sidecar.current_turn.as_ref()?;
             if !matches!(turn.status.as_str(), "accepted" | "preparing") {
                 return None;
             }
-            let chain = sidecar.active_execution_chain?;
+            let chain = sidecar.active_execution_chain.as_ref()?;
             let root_task = task_store.get_task(&chain.root_task_id)?;
             if root_task.status != TaskStatus::Pending {
                 return None;
             }
+            let request = match recover_dispatch_submission_request(&sidecar) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::error!(
+                        session_id = %sidecar.session_id,
+                        turn_id = %turn.turn_id,
+                        %error,
+                        "无法恢复 accepted Turn 的完整派发请求"
+                    );
+                    return None;
+                }
+            };
             let action_task_id = chain
                 .branches
                 .iter()
@@ -703,14 +742,18 @@ pub(crate) fn schedule_restored_session_task_dispatches(state: ApiState) {
                 .find(|item| item.kind == "user_message")
                 .map(|item| item.item_id.clone());
             Some(DispatchSubmissionAccepted {
-                session_id: sidecar.session_id,
-                entry_id: chain.dispatch_context.entry_id,
+                request,
+                session_id: sidecar.session_id.clone(),
+                entry_id: chain.dispatch_context.entry_id.clone(),
                 accepted_at: chain.dispatch_context.accepted_at,
                 created_session: false,
-                root_task_id: chain.root_task_id,
+                root_task_id: chain.root_task_id.clone(),
                 action_task_id,
-                turn_id: turn.turn_id,
+                turn_id: turn.turn_id.clone(),
                 user_message_item_id,
+                accepted_canonical_turn: state
+                    .session_store
+                    .canonical_turn_for_session_turn_id(&sidecar.session_id, &turn.turn_id),
                 runner_started: false,
                 superseded_turn: None,
             })
@@ -731,60 +774,93 @@ fn fail_accepted_task_submission(
     accepted: &DispatchSubmissionAccepted,
     direct_error: &str,
 ) {
-    const TIMELINE_MESSAGE: &str = "任务执行启动失败，可直接重试。";
-    let direct_error = public_runtime_excerpt(direct_error, 4096);
-    if let Some(task_store) = state.task_store()
-        && task_store.get_task(&accepted.root_task_id).is_some()
-    {
-        task_store.set_output_refs(&accepted.root_task_id, vec![direct_error]);
-        let _ = task_store.update_status(&accepted.root_task_id, TaskStatus::Failed);
-        if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
-            state,
+    let mut direct_error = public_runtime_excerpt(direct_error, 4096);
+    let Some(task_store) = state.task_store() else {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            "accepted task 启动失败时 task_store 未配置，无法写入失败事实"
+        );
+        return;
+    };
+    let Some(task) = task_store.get_task(&accepted.root_task_id) else {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            "accepted task 启动失败时根任务不存在，无法写入失败事实"
+        );
+        return;
+    };
+    if task.status == TaskStatus::Pending
+        && let Err(error) = cleanup_materialized_dispatch_submission_if_not_started(
+            &state.session_store,
+            state.task_execution_registry(),
             &accepted.session_id,
             &accepted.root_task_id,
-            "error",
-            Some(&accepted.turn_id),
-        ) {
-            let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
+            &accepted.turn_id,
+        )
+    {
+        direct_error = format!("{direct_error}；清理未启动执行资源失败: {error}");
+    }
+    let lease_id = task_store
+        .get_active_lease(&accepted.root_task_id)
+        .map(|lease| lease.lease_id);
+    let terminalized = match task_store.revoke_lease_and_set_task_terminal(
+        &accepted.root_task_id,
+        &task.root_task_id,
+        lease_id.as_ref(),
+        TaskStatus::Failed,
+        vec![direct_error],
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::error!(
+                session_id = %accepted.session_id,
+                root_task_id = %accepted.root_task_id,
+                ?error,
+                "accepted task 启动失败时写入 Failed 终态失败，等待 durable accepted 状态恢复"
+            );
             return;
         }
-    }
-
-    if let Some(thread) = state
-        .session_store
-        .orchestrator_thread_for_session(&accepted.session_id)
-    {
-        let workspace_id = state
-            .session_store
-            .execution_ownership(&accepted.session_id)
-            .and_then(|ownership| ownership.workspace_id);
-        append_session_turn_error_item(
-            &state.event_bus,
-            &state.session_store,
-            SessionTurnErrorInput {
-                session_id: &accepted.session_id,
-                workspace_id: &workspace_id,
-                task_id: Some(&accepted.root_task_id),
-                request_id: None,
-                user_message_id: accepted.user_message_item_id.as_deref(),
-                placeholder_message_id: None,
-                error_text: TIMELINE_MESSAGE,
-                model_failure: None,
-                tool_call_failure: None,
-                streaming_entry_id: None,
-                source_thread_id: thread.thread_id,
-                persist_session_state: None,
-                expected_turn_id: Some(&accepted.turn_id),
-            },
+    };
+    let already_terminal = task_store
+        .get_task(&accepted.root_task_id)
+        .is_some_and(|current| {
+            matches!(
+                current.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+            )
+        });
+    if !(terminalized || already_terminal) {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            "accepted task 启动失败未能提交根任务终态，等待恢复"
         );
-    } else {
-        let _ = state.session_store.update_current_turn_status_for_turn(
-            &accepted.session_id,
-            Some(&accepted.turn_id),
-            "failed",
-        );
+        return;
     }
-    let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
+    match crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
+        state,
+        &accepted.session_id,
+        &accepted.root_task_id,
+        "error",
+        Some(&accepted.turn_id),
+    ) {
+        Ok(true) => {}
+        Ok(false) => tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            turn_id = %accepted.turn_id,
+            "accepted task 已进入终态，但当前 Turn 未能完成统一收口，等待恢复"
+        ),
+        Err(error) => tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            turn_id = %accepted.turn_id,
+            %error,
+            "accepted task 终态 Turn 统一收口失败，等待恢复"
+        ),
+    }
 }
 
 fn format_action_task_title(mission_title: &str) -> String {
@@ -800,14 +876,14 @@ fn publish_session_turn_task_accepted_event(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     accepted: &DispatchSubmissionAccepted,
-) -> Result<EventId, ApiError> {
+) -> Result<(EventId, u64, UtcMillis), ApiError> {
     let workspace_id = state
         .session_store
         .execution_ownership(&accepted.session_id)
         .and_then(|ownership| ownership.workspace_id)
         .or_else(|| request.requested_workspace_id().map(WorkspaceId::new));
     let workspace_id_payload = workspace_id.as_ref().map(ToString::to_string);
-    let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(state, accepted);
+    let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(accepted);
     let session_summary = accepted_session_directory_entry(state, accepted);
     let event_id = EventId::new(format!(
         "event-session-turn-task-{}",
@@ -844,8 +920,9 @@ fn publish_session_turn_task_accepted_event(
         workspace_id,
         ..EventContext::default()
     });
-    state.event_bus.publish(event);
-    Ok(event_id)
+    let event_occurred_at = event.occurred_at;
+    let event_seq = state.event_bus.publish(event);
+    Ok((event_id, event_seq, event_occurred_at))
 }
 
 pub(super) fn resolve_dispatch_session(
@@ -903,138 +980,17 @@ fn publish_session_user_message_event(
     );
 }
 
-pub(super) fn append_dispatch_assistant_message(
-    state: &ApiState,
-    accepted: &DispatchSubmissionAccepted,
-) {
-    if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
-        state,
-        &accepted.session_id,
-        &accepted.root_task_id,
-        Some(&accepted.turn_id),
-    ) {
-        return;
-    }
-
-    let Some(task_store) = state.task_store() else {
-        return;
-    };
-    let Some(root_task) = task_store.get_task(&accepted.root_task_id) else {
-        return;
-    };
-    if root_task.status != TaskStatus::Completed {
-        return;
-    }
-    let Some(task) = task_store.get_task(&accepted.action_task_id) else {
-        return;
-    };
-    if task.status != TaskStatus::Completed {
-        return;
-    }
-    let current_turn = state
-        .session_store
-        .runtime_sidecar(&accepted.session_id)
-        .and_then(|sidecar| sidecar.current_turn);
-    if current_turn.as_ref().is_some_and(|turn| {
-        turn.status != "completed" && turn.status != "running" && turn.status != "accepted"
-    }) {
-        return;
-    }
-    let current_turn_matches = current_turn
-        .as_ref()
-        .is_some_and(|turn| turn_matches_accepted_dispatch(turn, accepted));
-    let response = current_turn_matches
-        .then(|| {
-            current_turn
-                .clone()
-                .and_then(|turn| assistant_final_from_turn(turn, accepted))
-        })
-        .flatten();
-
-    let Some((response_text, final_item_id)) = response else {
-        return;
-    };
-    let _ = state.session_store.update_current_turn_status_for_turn(
-        &accepted.session_id,
-        Some(&accepted.turn_id),
-        "completed",
-    );
-    if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_completed") {
-        tracing::error!(
-            session_id = %accepted.session_id,
-            final_item_id = %final_item_id,
-            ?error,
-            "session task turn terminal persist failed before event publish"
-        );
-    }
-    let workspace_id = state
-        .session_store
-        .execution_ownership(&accepted.session_id)
-        .and_then(|ownership| ownership.workspace_id);
-    publish_current_session_turn_item_event(
-        &state.event_bus,
-        state.session_store.as_ref(),
-        &accepted.session_id,
-        &workspace_id,
-        &final_item_id,
-        state.task_store(),
-    );
-    let _ = state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-message-assistant-{}", UtcMillis::now().0)),
-            "message.created",
-            json!({
-                "session_id": accepted.session_id.to_string(),
-                "role": "assistant",
-                "content": response_text,
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(accepted.session_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-}
-
-fn turn_matches_accepted_dispatch(
-    turn: &ActiveExecutionTurn,
-    accepted: &DispatchSubmissionAccepted,
-) -> bool {
-    turn.accepted_at == accepted.accepted_at
-        || turn
-            .items
-            .iter()
-            .any(|item| item.task_id.as_ref() == Some(&accepted.action_task_id))
-}
-
-fn assistant_final_from_turn(
-    turn: ActiveExecutionTurn,
-    accepted: &DispatchSubmissionAccepted,
-) -> Option<(String, String)> {
-    turn.items
-        .into_iter()
-        .filter(|item| item.kind == "assistant_final")
-        .filter(|item| {
-            item.task_id
-                .as_ref()
-                .is_none_or(|task_id| task_id == &accepted.action_task_id)
-        })
-        .filter_map(|item| {
-            item.content
-                .filter(|content| !content.trim().is_empty())
-                .map(|content| (item.item_seq, content, item.item_id))
-        })
-        .max_by_key(|(item_seq, _, _)| *item_seq)
-        .map(|(_, content, item_id)| (content, item_id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         fail_accepted_task_submission, format_action_task_title,
         initial_session_orchestrator_config, resolve_dispatch_session,
     };
-    use crate::{errors::ApiError, state::ApiState, task_dispatch::DispatchSubmissionAccepted};
+    use crate::{
+        errors::ApiError,
+        state::ApiState,
+        task_dispatch::{DispatchSubmissionAccepted, DispatchSubmissionRequest},
+    };
     use magi_core::{
         AbsolutePath, MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus,
         UtcMillis, WorkspaceId,
@@ -1127,34 +1083,70 @@ mod tests {
         let task_store = Arc::new(TaskStore::new());
         let root_task_id = TaskId::new("task-dispatch-direct-error");
         let now = UtcMillis::now();
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id: MissionId::new("mission-dispatch-direct-error"),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::LocalAgent,
-            title: "派发失败诊断".to_string(),
-            goal: "保留直接错误".to_string(),
-            status: TaskStatus::Pending,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: TaskRuntimePayload::default(),
-            created_at: now,
-            updated_at: now,
-        });
+        task_store
+            .insert_task(Task {
+                task_id: root_task_id.clone(),
+                mission_id: MissionId::new("mission-dispatch-direct-error"),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::LocalAgent,
+                title: "派发失败诊断".to_string(),
+                goal: "保留直接错误".to_string(),
+                status: TaskStatus::Pending,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("任务应插入");
         let state = test_state().with_task_store(task_store.clone());
         let accepted = DispatchSubmissionAccepted {
+            request: DispatchSubmissionRequest {
+                accepted_at: now,
+                session_id: SessionId::new("session-dispatch-direct-error"),
+                workspace_id: None,
+                execution_root: None,
+                orchestrator_session_config: None,
+                entry_id: "entry-dispatch-direct-error".to_string(),
+                timeline_message: "派发失败诊断".to_string(),
+                images: Vec::new(),
+                context_references: Vec::new(),
+                browser_annotation_refs: Vec::new(),
+                browser_node_selections: Vec::new(),
+                created_session: false,
+                mission_title: "派发失败诊断".to_string(),
+                task_title: "派发失败诊断".to_string(),
+                trimmed_text: Some("保留直接错误".to_string()),
+                execution_goal: Some("保留直接错误".to_string()),
+                task_tier: magi_core::TaskTier::ExecutionChain,
+                access_profile: magi_core::AccessProfile::Restricted,
+                skill_name: None,
+                goal_mode: false,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                replace_turn_id: None,
+                required_tool_chain: Vec::new(),
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                denied_tools: Vec::new(),
+                user_message_metadata: Default::default(),
+                turn_origin:
+                    magi_conversation_runtime::dispatch_submission::DispatchTurnOrigin::User,
+            },
             session_id: SessionId::new("session-dispatch-direct-error"),
             entry_id: "entry-dispatch-direct-error".to_string(),
             accepted_at: now,
@@ -1163,6 +1155,7 @@ mod tests {
             action_task_id: root_task_id.clone(),
             turn_id: "turn-dispatch-direct-error".to_string(),
             user_message_item_id: None,
+            accepted_canonical_turn: None,
             runner_started: false,
             superseded_turn: None,
         };

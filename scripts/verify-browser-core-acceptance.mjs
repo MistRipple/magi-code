@@ -113,14 +113,14 @@ assert.match(
 assert.doesNotMatch(surfaceSlotUpdate, /clipBounds|intersectRect|leaseBounds/u);
 assert.match(
   surfaceSlotUpdate,
-  /const target = records\.find\(\(record\) => record\.tabId === tabId\) \?\? null[\s\S]*?this\.applySlot\(target, bounds, window\);[\s\S]*?if \(record !== target\) this\.unmountSurface\(record, window\);/u,
+  /const target = records\.find\(\(record\) => \([\s\S]*?record\.tabId === tabId && record\.surfaceId === surfaceId[\s\S]*?\) \?\? null[\s\S]*?this\.applySlot\(target, bounds, window\);[\s\S]*?if \(record !== target\) this\.unmountSurface\(record, window\);/u,
   "Browser Tab 切换必须先挂载目标 Surface，再卸载旧 Surface，不能制造空槽",
 );
 assert.doesNotMatch(surfaceSlotUpdate, /createSurface\(|startLoad\(|loadPage\(|loadURL\(|attachDebugger\(|setViewport\(/u);
 
 assert.match(
   windowManager,
-  /bindContentSurface\(\s*record\.windowId,\s*layout\.activeTabId,\s*currentBrowserContentBounds,\s*currentBrowserParentBounds,\s*\)/u,
+  /bindContentSurface\(\s*record\.windowId,\s*layout\.activeTabId,\s*layout\.activeSurfaceId,\s*currentBrowserContentBounds,\s*currentBrowserParentBounds,\s*\)/u,
   "Main 必须把 Renderer 上报的完整窗口坐标内容槽传给原生 Surface",
 );
 assert.doesNotMatch(
@@ -139,7 +139,8 @@ const windowSlotEnd = windowManager.indexOf(
 assert.notEqual(windowSlotStart, -1, "WindowManager.applyLayout 缺少起点");
 assert.notEqual(windowSlotEnd, -1, "WindowManager.applyLayout 缺少终点");
 const windowSlotUpdate = windowManager.slice(windowSlotStart, windowSlotEnd);
-assert.match(windowSlotUpdate, /const currentBrowserContentBounds = browserSurfaceActive \? browserContentBounds\(layout\) : null/u);
+assert.match(windowSlotUpdate, /const rendererGeometryForActiveSurface = browserSurfaceActive[\s\S]*?browserContentSlot\?\.tabId === layout\.activeTabId/u);
+assert.match(windowSlotUpdate, /const currentBrowserContentBounds = browserSurfaceActive && rendererGeometryForActiveSurface\s*\?\s*browserContentBounds\(layout\)\s*:\s*null/u);
 assert.match(windowSlotUpdate, /this\.#surfaceManager\.bindContentSurface\(/u);
 assert.doesNotMatch(windowSlotUpdate, /materialize\(|activateBrowser\(|loadURL\(|setBrowserViewport\(/u);
 assert.doesNotMatch(tabSource, /updateBrowserSlot|bindContentSurface/u);
@@ -172,7 +173,7 @@ assert.match(
 const viewportMethods = section(
   surfaceManager,
   "private async applyViewport(",
-  "private scheduleViewportApply(",
+  "private async setAgentCursor(",
   "BrowserSurfaceManager.applyViewport",
 );
 assert.doesNotMatch(
@@ -192,7 +193,7 @@ assert.match(
 );
 assert.match(
   surfaceManager,
-  /const viewport = record\.viewport;[\s\S]*?if \(viewport\.mode !== "fixed"\) return;/u,
+  /const viewport = commit\.viewport;[\s\S]*?if \(viewport\.mode !== "fixed"\) return;/u,
   "固定视口必须只读取当前 Browser Tab 的逻辑视口配置",
 );
 const applySlotSection = section(
@@ -208,13 +209,13 @@ assert.match(
 );
 assert.match(
   applySlotSection,
-  /if \(sizeChanged && record\.viewport\.mode === "fixed"\)[\s\S]*?scheduleViewportApply\(record\)/u,
-  "内容槽变化只重算 fixed 视口，auto 由原生 WebContentsView 自然响应",
+  /const boundsChanged = !sameBounds\(record\.view\.getBounds\(\), effectiveBounds\)[\s\S]*?if \(boundsChanged\) record\.view\.setBounds\(effectiveBounds\)[\s\S]*?scheduleViewportCommit\(record\)/u,
+  "内容槽变化只更新原生 View bounds 并提交 viewport 生命周期，auto 由原生 WebContentsView 自然响应",
 );
 assert.match(
   applySlotSection,
-  /sizeChanged[\s\S]*?record\.viewport\.mode === "fixed"[\s\S]*?scheduleViewportApply\(record\)/u,
-  "固定视口只在内容槽尺寸变化时更新原生 compositor scale",
+  /record\.view\.setVisible\(true\)[\s\S]*?this\.scheduleViewportCommit\(record\)/u,
+  "固定视口的 compositor scale 由统一 viewport commit 在内容槽更新后处理",
 );
 assert.match(
   surfaceManager,

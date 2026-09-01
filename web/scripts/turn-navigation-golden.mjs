@@ -90,8 +90,18 @@ assert.match(
 );
 assert.match(
   railSource,
-  /function focusTurn\([\s\S]*?container\.scrollTop\s*=\s*Math\.max\(0,\s*targetTop\);[\s\S]*?activeTurnId\s*=\s*item\.turnId/,
-  '点击轮次必须同步定位到目标消息，不能播放消息区滚动过程',
+  /function focusTurn\([\s\S]*?onScrollToPosition\(Math\.max\(0,\s*targetTop\)\);[\s\S]*?activeTurnId\s*=\s*item\.turnId/,
+  '点击轮次必须通过消息列表唯一滚动协调器同步定位，不能播放消息区滚动过程',
+);
+assert.doesNotMatch(
+  railSource,
+  /function focusTurn\([\s\S]*?container\.scrollTop\s*=/,
+  '轮次导航不得绕过消息列表直接写入滚动位置',
+);
+assert.match(
+  railSource,
+  /function scheduleActiveTurnUpdate\(\)[\s\S]*?requestAnimationFrame\([\s\S]*?updateActiveTurn\(\)/,
+  '滚动热路径必须只调度轮次状态更新，不能同步读取所有消息布局',
 );
 assert.doesNotMatch(
   railSource,
@@ -179,6 +189,17 @@ assert.match(
   /async function focusTurn\([\s\S]*?if \(!element && onRevealMessage\)[\s\S]*?await onRevealMessage\(item\.anchorMessageId\);/,
   '点击尚未挂载的历史轮次时必须先扩展时间线窗口，再执行直接定位',
 );
+assert.match(
+  railSource,
+  /const requestNonce = \+\+navigationNonce;[\s\S]*?requestNonce !== navigationNonce/,
+  '轮次定位必须以导航代际收敛，快速点击时只允许最新目标生效',
+);
+assert.match(
+  railSource,
+  /function indexMessageElements\(\)[\s\S]*?querySelectorAll<HTMLElement>\('\[data-message-id\]'\)/,
+  '轮次导航必须一次建立消息元素索引，避免按轮次重复扫描 DOM',
+);
+assert.doesNotMatch(railSource, /items\.indexOf\(item\)/, '轮次渲染不得在模板中重复扫描数组查找索引');
 assert.match(
   messageListSource,
   /awaitingCurrentTurnProjection[\s\S]*?messagesState\.isProcessing[\s\S]*?currentRuntimeRenderItem === null/,

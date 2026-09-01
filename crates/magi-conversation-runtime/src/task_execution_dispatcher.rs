@@ -185,11 +185,14 @@ pub struct LlmTaskDispatcherDependencies {
 struct ExecutionPlanCleanup<'a> {
     registry: &'a TaskExecutionRegistry,
     task_id: &'a TaskId,
+    turn_id: String,
 }
 
 impl Drop for ExecutionPlanCleanup<'_> {
     fn drop(&mut self) {
-        let _ = self.registry.remove(self.task_id);
+        let _ = self
+            .registry
+            .remove_if_turn_matches(self.task_id, &self.turn_id);
     }
 }
 
@@ -1460,7 +1463,7 @@ impl LlmTaskDispatcher {
             )
             .map_err(|error| error.to_string())?;
         if let Some(persist) = self.session_state_persist_callback.as_deref() {
-            persist("agent_worktree_allocated");
+            persist("agent_worktree_allocated")?;
         }
         self.event_bus.publish(
             EventEnvelope::domain(
@@ -1605,7 +1608,14 @@ impl LlmTaskDispatcher {
             return;
         }
         if let Some(persist) = self.session_state_persist_callback.as_deref() {
-            persist("agent_worktree_released");
+            if let Err(error) = persist("agent_worktree_released") {
+                tracing::error!(
+                    session_id = %session_id,
+                    task_id = %task.task_id,
+                    %error,
+                    "agent worktree 生命周期状态持久化失败"
+                );
+            }
         }
         if retained {
             tracing::warn!(
@@ -2347,9 +2357,13 @@ impl LlmTaskDispatcher {
             );
             return Ok(());
         };
+        let plan_turn_id = match &plan {
+            TaskExecutionPlan::Dispatch { turn_id, .. } => turn_id.clone(),
+        };
         let _plan_cleanup = ExecutionPlanCleanup {
             registry: &self.execution_registry,
             task_id: &task.task_id,
+            turn_id: plan_turn_id,
         };
 
         match plan {

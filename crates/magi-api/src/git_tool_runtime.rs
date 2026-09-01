@@ -853,7 +853,7 @@ mod tests {
             .begin_execution("session-git-tool", &observation.git_common_dir)
             .expect("execution lease");
         let persistence = Arc::new(RuntimeStatePersistence::new(
-            temp.path().join("state/sessions.json"),
+            temp.path().join("state"),
             temp.path().join("state/workspaces.json"),
             temp.path().join("state/knowledge.json"),
         ));

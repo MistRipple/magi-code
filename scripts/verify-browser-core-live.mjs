@@ -66,11 +66,14 @@ function jsonBody(value) {
 }
 
 function sessionFromResponse(body) {
-  return body?.session ?? body;
+  if (!body || typeof body !== "object") return null;
+  if (body.session && typeof body.session === "object") return body.session;
+  return Array.isArray(body.tabs) ? body : null;
 }
 
 function tabFromResponse(body, tabId) {
-  return sessionFromResponse(body)?.tabs?.find((candidate) => candidate.tabId === tabId) ?? null;
+  const session = sessionFromResponse(body);
+  return session?.tabs?.find((candidate) => candidate.tabId === tabId) ?? null;
 }
 
 async function activateAndReadTab(tabId) {

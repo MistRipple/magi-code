@@ -267,12 +267,12 @@ pub(crate) fn append_thread_messages_checkpoint(
     messages: Vec<ThreadChatMessage>,
     persist_session_state: Option<&SessionStatePersistCallback>,
     checkpoint: &'static str,
-) {
+) -> Result<(), String> {
     if messages.is_empty() {
-        return;
+        return Ok(());
     }
     session_store.append_thread_messages(thread_id, messages, UtcMillis::now());
-    persist_session_state_checkpoint(persist_session_state, checkpoint);
+    persist_session_state_checkpoint(persist_session_state, checkpoint)
 }
 
 /// 为异常中断时已经写入的 assistant tool call 补齐一个明确的 tool 结果。
@@ -935,6 +935,7 @@ fn run_conversation_loop_inner(
         thread_id,
         agent_role_registry,
     );
+    let writeback_error = std::sync::Mutex::new(None::<String>);
     let turn_writeback_context = TaskTurnWritebackContext {
         event_bus,
         session_store,
@@ -945,6 +946,7 @@ fn run_conversation_loop_inner(
         turn_visibility: &turn_visibility,
         persist_session_state,
         expected_turn_id: expected_turn_id.as_deref(),
+        writeback_error: &writeback_error,
     };
     let prepare_task_history = |phase: &'static str,
                                 context_window: u64,
@@ -964,11 +966,10 @@ fn run_conversation_loop_inner(
             turn_visibility: Some(&turn_visibility),
             expected_turn_id: expected_turn_id.as_deref(),
         };
-        let compaction_observer = |progress| {
-            upsert_context_compaction_progress_notice(compaction_writeback, progress);
-        };
+        let compaction_observer =
+            |progress| upsert_context_compaction_progress_notice(compaction_writeback, progress);
         let compaction_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
-        let prepared = ContextAuthority::new(
+        let mut prepared = ContextAuthority::new(
             client,
             event_bus,
             session_store,
@@ -995,8 +996,18 @@ fn run_conversation_loop_inner(
             )),
             force_compaction,
         });
-        if let Some(compaction) = prepared.compaction.as_ref() {
-            upsert_context_compaction_completed_notice(compaction_writeback, compaction);
+        if let Some(compaction) = prepared.compaction.as_ref()
+            && let Err(error) =
+                upsert_context_compaction_completed_notice(compaction_writeback, compaction)
+        {
+            tracing::error!(
+                %task_id,
+                phase,
+                %error,
+                "任务上下文压缩完成事实写回失败"
+            );
+            prepared.compaction = None;
+            prepared.terminal = Some(ContextCompactionTerminal::Failed);
         }
         prepared
     };
@@ -1009,7 +1020,7 @@ fn run_conversation_loop_inner(
     );
     if let Some(terminal) = initial_prepared_history.terminal {
         return (
-            task_context_compaction_terminal_outcome(
+            task_context_compaction_terminal_outcome_or_failed(
                 turn_writeback_context,
                 terminal,
                 streaming_entry_id,
@@ -1049,10 +1060,19 @@ fn run_conversation_loop_inner(
             persisted_thread_history,
             UtcMillis::now(),
         );
-        persist_session_state_checkpoint(
+        if let Err(error) = persist_session_state_checkpoint(
             persist_session_state,
             "task_thread_interrupted_tool_result",
-        );
+        ) {
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &format!("中断工具结果持久化失败：{error}"),
+                streaming_entry_id,
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
         let normalized_history = prepare_task_history(
             "interrupted_tool_normalization",
             effective_context_window,
@@ -1061,7 +1081,7 @@ fn run_conversation_loop_inner(
         );
         if let Some(terminal) = normalized_history.terminal {
             return (
-                task_context_compaction_terminal_outcome(
+                task_context_compaction_terminal_outcome_or_failed(
                     turn_writeback_context,
                     terminal,
                     streaming_entry_id,
@@ -1103,13 +1123,22 @@ fn run_conversation_loop_inner(
         // 原图由 canonical turn 负责审计与 UI 展示。thread 历史只保留文本语义，
         // 避免后续纯文本回合把历史图片再次发送给主模型。
         persisted_user_message.images.clear();
-        append_thread_messages_checkpoint(
+        if let Err(error) = append_thread_messages_checkpoint(
             session_store,
             thread_id,
             vec![persisted_user_message],
             persist_session_state,
             "task_thread_user_input",
-        );
+        ) {
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &format!("任务用户消息持久化失败：{error}"),
+                streaming_entry_id,
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
     }
     let task_context = task_event_context(task, session_id, workspace_id);
     publish_task_llm_started(
@@ -1268,7 +1297,7 @@ fn run_conversation_loop_inner(
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                append_task_error_turn_item(
+                let error = task_failure_with_error_item(
                     turn_writeback_context,
                     &error,
                     streaming_entry_id,
@@ -1278,13 +1307,22 @@ fn run_conversation_loop_inner(
                 return (TaskOutcome::Failed { error }, context_summary);
             }
         };
-        append_task_final_turn_item(
+        if let Err(writeback_error) = append_task_final_turn_item(
             turn_writeback_context,
             &final_content,
             None,
             streaming_entry_id,
             None,
-        );
+        ) {
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &format!("最终回复写回失败：{writeback_error}"),
+                streaming_entry_id,
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
         return (outcome, context_summary);
     }
 
@@ -1435,19 +1473,14 @@ fn run_conversation_loop_inner(
             let failure_reason = format!(
                 "严格执行契约要求调用工具 {next_required_tool}，但当前工具面没有暴露该工具；拒绝绕过生命周期继续生成文字。"
             );
-            append_task_error_turn_item(
+            let error = task_failure_with_error_item(
                 turn_writeback_context,
                 &failure_reason,
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                 None,
                 None,
             );
-            return (
-                TaskOutcome::Failed {
-                    error: failure_reason,
-                },
-                context_summary,
-            );
+            return (TaskOutcome::Failed { error }, context_summary);
         }
         let discovery_wrap_up = (discovery_only_rounds >= DISCOVERY_WRAP_UP_ROUNDS
             || discovery_tool_calls >= DISCOVERY_WRAP_UP_TOOL_CALLS)
@@ -1489,7 +1522,7 @@ fn run_conversation_loop_inner(
                 Ok(None) => {}
                 Err(terminal) => {
                     return (
-                        task_context_compaction_terminal_outcome(
+                        task_context_compaction_terminal_outcome_or_failed(
                             turn_writeback_context,
                             terminal,
                             streaming_entry_id.or(last_stream_item_id.as_deref()),
@@ -1546,13 +1579,19 @@ fn run_conversation_loop_inner(
 
         let response = if streaming_entry_id.is_some() {
             let on_delta = |delta: &ModelStreamingDelta| {
-                if invocation_cancelled() {
+                if invocation_cancelled()
+                    || turn_writeback_context
+                        .writeback_error
+                        .lock()
+                        .expect("writeback error lock should hold")
+                        .is_some()
+                {
                     return;
                 }
                 if let Some(tracker) = context_usage_tracker.as_ref() {
                     tracker.observe_accumulated_output(&delta.content, &delta.thinking);
                 }
-                publish_task_thinking_delta(
+                if let Err(error) = publish_task_thinking_delta(
                     turn_writeback_context,
                     &thinking_item_id,
                     round,
@@ -1560,8 +1599,11 @@ fn run_conversation_loop_inner(
                     &streamed_thinking,
                     &thinking_publish_gate,
                     &delta.thinking,
-                );
-                publish_task_content_delta(
+                ) {
+                    record_task_writeback_error(turn_writeback_context, error);
+                    return;
+                }
+                if let Err(error) = publish_task_content_delta(
                     turn_writeback_context,
                     TaskContentDelta {
                         item_id: &stream_item_id,
@@ -1572,7 +1614,9 @@ fn run_conversation_loop_inner(
                         publish_gate: &stream_publish_gate,
                         accumulated_content: &delta.content,
                     },
-                );
+                ) {
+                    record_task_writeback_error(turn_writeback_context, error);
+                }
             };
 
             let on_retry = |retry_event: &magi_bridge_client::ModelRetryRuntimeEvent| {
@@ -1655,7 +1699,7 @@ fn run_conversation_loop_inner(
                                 Ok(None) => {}
                                 Err(terminal) => {
                                     return (
-                                        task_context_compaction_terminal_outcome(
+                                        task_context_compaction_terminal_outcome_or_failed(
                                             turn_writeback_context,
                                             terminal,
                                             streaming_entry_id.or(last_stream_item_id.as_deref()),
@@ -1717,7 +1761,7 @@ fn run_conversation_loop_inner(
                                 || !stream_interruption_non_stream_fallback_attempted)
                         {
                             if !partial_thinking.is_empty() {
-                                upsert_task_thinking_turn_item(
+                                if let Err(error) = upsert_task_thinking_turn_item(
                                     turn_writeback_context,
                                     &thinking_item_id,
                                     round,
@@ -1725,10 +1769,20 @@ fn run_conversation_loop_inner(
                                     &partial_thinking,
                                     None,
                                     &thinking_publish_gate,
-                                );
+                                ) {
+                                    let error_text = format!("流式中断后的思考写回失败：{error}");
+                                    let error = task_failure_with_error_item(
+                                        turn_writeback_context,
+                                        &error_text,
+                                        streaming_entry_id.or(last_stream_item_id.as_deref()),
+                                        None,
+                                        None,
+                                    );
+                                    return (TaskOutcome::Failed { error }, context_summary);
+                                }
                             }
                             if !partial_visible_content.is_empty() {
-                                upsert_task_stream_turn_item(
+                                if let Err(error) = upsert_task_stream_turn_item(
                                     turn_writeback_context,
                                     &stream_item_id,
                                     round,
@@ -1736,7 +1790,17 @@ fn run_conversation_loop_inner(
                                     &partial_visible_content,
                                     None,
                                     &stream_publish_gate,
-                                );
+                                ) {
+                                    let error_text = format!("流式中断后的回复写回失败：{error}");
+                                    let error = task_failure_with_error_item(
+                                        turn_writeback_context,
+                                        &error_text,
+                                        streaming_entry_id.or(last_stream_item_id.as_deref()),
+                                        None,
+                                        None,
+                                    );
+                                    return (TaskOutcome::Failed { error }, context_summary);
+                                }
                                 messages.push(ChatMessage {
                                     role: "assistant".to_string(),
                                     content: Some(partial_visible_content.clone()),
@@ -1830,13 +1894,22 @@ fn run_conversation_loop_inner(
                                             + 1,
                                     );
                                     if task_lease_is_current(task_store, task_id, lease_id) {
-                                        append_task_error_turn_item(
+                                        if let Err(writeback_error) = append_task_error_turn_item(
                                             turn_writeback_context,
                                             &fallback_message,
                                             streaming_entry_id.or(last_stream_item_id.as_deref()),
                                             Some(&model_failure),
                                             None,
-                                        );
+                                        ) {
+                                            return (
+                                                TaskOutcome::Failed {
+                                                    error: format!(
+                                                        "{fallback_detail}；失败事实写回失败：{writeback_error}"
+                                                    ),
+                                                },
+                                                context_summary,
+                                            );
+                                        }
                                     }
                                     return (
                                         TaskOutcome::Failed {
@@ -1873,13 +1946,22 @@ fn run_conversation_loop_inner(
                             )
                         };
                         if task_lease_is_current(task_store, task_id, lease_id) {
-                            append_task_error_turn_item(
+                            if let Err(writeback_error) = append_task_error_turn_item(
                                 turn_writeback_context,
                                 &error_message,
                                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                                 Some(&model_failure),
                                 None,
-                            );
+                            ) {
+                                return (
+                                    TaskOutcome::Failed {
+                                        error: format!(
+                                            "{error_detail}；失败事实写回失败：{writeback_error}"
+                                        ),
+                                    },
+                                    context_summary,
+                                );
+                            }
                         }
                         return (
                             TaskOutcome::Failed {
@@ -1954,7 +2036,7 @@ fn run_conversation_loop_inner(
                             Ok(None) => {}
                             Err(terminal) => {
                                 return (
-                                    task_context_compaction_terminal_outcome(
+                                    task_context_compaction_terminal_outcome_or_failed(
                                         turn_writeback_context,
                                         terminal,
                                         streaming_entry_id.or(last_stream_item_id.as_deref()),
@@ -2022,13 +2104,22 @@ fn run_conversation_loop_inner(
                         )
                     };
                     if task_lease_is_current(task_store, task_id, lease_id) {
-                        append_task_error_turn_item(
+                        if let Err(writeback_error) = append_task_error_turn_item(
                             turn_writeback_context,
                             &error_message,
                             streaming_entry_id.or(last_stream_item_id.as_deref()),
                             Some(&model_failure),
                             None,
-                        );
+                        ) {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: format!(
+                                        "{error_detail}；失败事实写回失败：{writeback_error}"
+                                    ),
+                                },
+                                context_summary,
+                            );
+                        }
                     }
                     return (
                         TaskOutcome::Failed {
@@ -2040,6 +2131,17 @@ fn run_conversation_loop_inner(
             }
         };
 
+        if let Some(writeback_error) = take_task_writeback_error(turn_writeback_context) {
+            let error_text = format!("模型流式响应写回失败：{writeback_error}");
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &error_text,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
         if !task_lease_is_current(task_store, task_id, lease_id) {
             return (
                 TaskOutcome::Failed {
@@ -2075,7 +2177,7 @@ fn run_conversation_loop_inner(
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
             });
         if let Some(thinking) = final_thinking {
-            upsert_task_thinking_turn_item(
+            if let Err(error) = upsert_task_thinking_turn_item(
                 turn_writeback_context,
                 &thinking_item_id,
                 round,
@@ -2083,7 +2185,17 @@ fn run_conversation_loop_inner(
                 &thinking,
                 None,
                 &thinking_publish_gate,
-            );
+            ) {
+                let error_text = format!("思考结果写回失败：{error}");
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &error_text,
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
         }
         let streamed_content = streamed_content.into_inner();
         let streamed_visible_content = streamed_visible_content.into_inner();
@@ -2098,7 +2210,7 @@ fn run_conversation_loop_inner(
             parsed_visible_content.clone()
         };
         if let Some(completed_stream_content) = completed_stream_content.as_ref() {
-            upsert_task_stream_turn_item(
+            if let Err(error) = upsert_task_stream_turn_item(
                 turn_writeback_context,
                 &stream_item_id,
                 round,
@@ -2106,7 +2218,17 @@ fn run_conversation_loop_inner(
                 completed_stream_content,
                 None,
                 &stream_publish_gate,
-            );
+            ) {
+                let error_text = format!("回复结果写回失败：{error}");
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &error_text,
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
         }
         let has_actionable_output = completed_stream_content.is_some() || round_has_tool_calls;
         let response_contract_failure = match parsed.status {
@@ -2200,7 +2322,7 @@ fn run_conversation_loop_inner(
                 .is_some_and(|content| !content.trim().is_empty())
                 || !assistant_response_message.provider_context.is_empty())
         {
-            append_thread_messages_checkpoint(
+            if let Err(error) = append_thread_messages_checkpoint(
                 session_store,
                 thread_id,
                 vec![chat_message_to_thread_chat_message(
@@ -2208,23 +2330,32 @@ fn run_conversation_loop_inner(
                 )],
                 persist_session_state,
                 "task_thread_assistant_response",
-            );
+            ) {
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &format!("任务 assistant 响应持久化失败：{error}"),
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
         }
 
         if let Some(failure) = response_contract_failure {
-            append_task_error_turn_item(
+            let error = match append_task_error_turn_item(
                 turn_writeback_context,
                 &failure.summary,
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                 Some(&failure),
                 None,
-            );
-            return (
-                TaskOutcome::Failed {
-                    error: failure.detail,
-                },
-                context_summary,
-            );
+            ) {
+                Ok(()) => failure.detail.clone(),
+                Err(writeback_error) => {
+                    format!("{}；失败事实写回失败：{writeback_error}", failure.detail)
+                }
+            };
+            return (TaskOutcome::Failed { error }, context_summary);
         }
 
         if parsed.tool_calls.is_empty() {
@@ -2333,13 +2464,22 @@ fn run_conversation_loop_inner(
         }
 
         let assistant_tool_message = assistant_response_message;
-        append_thread_messages_checkpoint(
+        if let Err(error) = append_thread_messages_checkpoint(
             session_store,
             thread_id,
             vec![chat_message_to_thread_chat_message(&assistant_tool_message)],
             persist_session_state,
             "task_thread_assistant_tool_calls",
-        );
+        ) {
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &format!("任务工具调用消息持久化失败：{error}"),
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
         messages.push(assistant_tool_message);
 
         let invalid_tool_calls = tool_validation.invalid_calls;
@@ -2349,13 +2489,22 @@ fn run_conversation_loop_inner(
                 &invalid.call,
                 tool_result_message.content.as_deref().unwrap_or_default(),
             ));
-            append_thread_messages_checkpoint(
+            if let Err(error) = append_thread_messages_checkpoint(
                 session_store,
                 thread_id,
                 vec![chat_message_to_thread_chat_message(&tool_result_message)],
                 persist_session_state,
                 "task_thread_invalid_tool_result",
-            );
+            ) {
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &format!("无效工具结果持久化失败：{error}"),
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
             messages.push(tool_result_message);
         }
         // Goal 模式遇到混合批次时，invalid call 不能与 valid call 部分执行；否则模型
@@ -2373,17 +2522,29 @@ fn run_conversation_loop_inner(
                 &valid_tool_calls,
             )
         {
-            append_task_error_turn_item(
+            let error = task_failure_with_error_item(
                 turn_writeback_context,
                 &failure,
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                 None,
                 None,
             );
-            return (TaskOutcome::Failed { error: failure }, context_summary);
+            return (TaskOutcome::Failed { error }, context_summary);
         }
         for tool_call in &valid_tool_calls {
-            append_task_tool_call_started_turn_item(turn_writeback_context, tool_call);
+            if let Err(writeback_error) =
+                append_task_tool_call_started_turn_item(turn_writeback_context, tool_call)
+            {
+                let error_text = format!("工具开始事实写回失败：{writeback_error}");
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &error_text,
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
         }
 
         let tool_progress_callback = |progress: ToolExecutionProgress| {
@@ -2393,7 +2554,13 @@ fn run_conversation_loop_inner(
             else {
                 return;
             };
-            upsert_task_tool_call_progress_turn_item(turn_writeback_context, tool_call, progress);
+            if let Err(error) = upsert_task_tool_call_progress_turn_item(
+                turn_writeback_context,
+                tool_call,
+                progress,
+            ) {
+                record_task_writeback_error(turn_writeback_context, error);
+            }
         };
         let tool_results = execute_task_tool_call_batch(
             event_bus,
@@ -2423,6 +2590,18 @@ fn run_conversation_loop_inner(
             execution_group_id.clone(),
         );
 
+        if let Some(writeback_error) = take_task_writeback_error(turn_writeback_context) {
+            let error_text = format!("工具执行过程写回失败：{writeback_error}");
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &error_text,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
+
         let mut completed_tool_names_this_round = Vec::new();
         let mut content_requirement_failures = Vec::new();
         let mut activated_skill_this_round = None;
@@ -2431,12 +2610,22 @@ fn run_conversation_loop_inner(
         let mut round_had_discovery_tool = false;
         let mut round_had_successful_non_discovery_tool = false;
         for (tool_call, (result, tool_status)) in valid_tool_calls.iter().zip(tool_results) {
-            upsert_task_tool_call_result_turn_item(
+            if let Err(error) = upsert_task_tool_call_result_turn_item(
                 turn_writeback_context,
                 tool_call,
                 &result,
                 tool_status,
-            );
+            ) {
+                let error_text = format!("工具结果事实写回失败：{error}");
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &error_text,
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
             if canonical_tool_name == "tool_catalog"
                 && matches!(tool_status, ExecutionResultStatus::Succeeded)
@@ -2505,13 +2694,22 @@ fn run_conversation_loop_inner(
                 tool_call_id: Some(tool_call.id.clone()),
                 provider_context: Vec::new(),
             };
-            append_thread_messages_checkpoint(
+            if let Err(error) = append_thread_messages_checkpoint(
                 session_store,
                 thread_id,
                 vec![chat_message_to_thread_chat_message(&tool_result_message)],
                 persist_session_state,
                 "task_thread_tool_result",
-            );
+            ) {
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &format!("工具结果消息持久化失败：{error}"),
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
             messages.push(tool_result_message);
         }
         if round_had_successful_non_discovery_tool {
@@ -2527,19 +2725,19 @@ fn run_conversation_loop_inner(
             );
         }
         if let Some(failure) = terminal_tool_failure.or(deterministic_tool_failure) {
-            append_task_error_turn_item(
+            let error = match append_task_error_turn_item(
                 turn_writeback_context,
                 &failure.summary,
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                 None,
                 None,
-            );
-            return (
-                TaskOutcome::Failed {
-                    error: failure.detail,
-                },
-                context_summary,
-            );
+            ) {
+                Ok(()) => failure.detail.clone(),
+                Err(writeback_error) => {
+                    format!("{}；失败事实写回失败：{writeback_error}", failure.detail)
+                }
+            };
+            return (TaskOutcome::Failed { error }, context_summary);
         }
         let repeated_tool_call_failure = if invalid_tool_calls.is_empty() {
             tool_call_validation_tracker.record_valid_round();
@@ -2564,19 +2762,20 @@ fn run_conversation_loop_inner(
             }
         };
         if let Some(tool_call_failure) = repeated_tool_call_failure {
-            append_task_error_turn_item(
+            let error = match append_task_error_turn_item(
                 turn_writeback_context,
                 &tool_call_failure.summary,
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                 None,
                 Some(&tool_call_failure),
-            );
-            return (
-                TaskOutcome::Failed {
-                    error: tool_call_failure.detail,
-                },
-                context_summary,
-            );
+            ) {
+                Ok(()) => tool_call_failure.detail.clone(),
+                Err(writeback_error) => format!(
+                    "{}；失败事实写回失败：{writeback_error}",
+                    tool_call_failure.detail
+                ),
+            };
+            return (TaskOutcome::Failed { error }, context_summary);
         }
         if let Some(skill_id) = activated_skill_this_round
             && active_skill_name.as_deref() != Some(skill_id.as_str())
@@ -2684,54 +2883,39 @@ fn run_conversation_loop_inner(
             &required_tool_chain,
             &completed_required_tool_names,
         );
-        append_task_error_turn_item(
+        let error = task_failure_with_error_item(
             turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
             None,
             None,
         );
-        return (
-            TaskOutcome::Failed {
-                error: failure_reason,
-            },
-            context_summary,
-        );
+        return (TaskOutcome::Failed { error }, context_summary);
     }
 
     if missing_required_evidence_tool(task, &completion_evidence).is_some() {
         let failure_reason = required_evidence_recovery_prompt(task, &completion_evidence);
-        append_task_error_turn_item(
+        let error = task_failure_with_error_item(
             turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
             None,
             None,
         );
-        return (
-            TaskOutcome::Failed {
-                error: failure_reason,
-            },
-            context_summary,
-        );
+        return (TaskOutcome::Failed { error }, context_summary);
     }
 
     if let Some(recovery_prompt) =
         agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
     {
-        append_task_error_turn_item(
+        let error = task_failure_with_error_item(
             turn_writeback_context,
             &recovery_prompt,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
             None,
             None,
         );
-        return (
-            TaskOutcome::Failed {
-                error: recovery_prompt,
-            },
-            context_summary,
-        );
+        return (TaskOutcome::Failed { error }, context_summary);
     }
 
     final_content = normalize_model_visible_content(final_content);
@@ -2745,19 +2929,20 @@ fn run_conversation_loop_inner(
             retry_attempts,
             last_response_observation.as_deref(),
         );
-        append_task_error_turn_item(
+        let error = match append_task_error_turn_item(
             turn_writeback_context,
             &model_failure.summary,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
             Some(&model_failure),
             None,
-        );
-        return (
-            TaskOutcome::Failed {
-                error: model_failure.detail,
-            },
-            context_summary,
-        );
+        ) {
+            Ok(()) => model_failure.detail.clone(),
+            Err(writeback_error) => format!(
+                "{}；失败事实写回失败：{writeback_error}",
+                model_failure.detail
+            ),
+        };
+        return (TaskOutcome::Failed { error }, context_summary);
     }
     if !task_lease_is_current(task_store, task_id, lease_id) {
         return (
@@ -2770,19 +2955,14 @@ fn run_conversation_loop_inner(
 
     if task_has_validation_gate(task) && validation_result_rejects_delivery(&final_content) {
         let failure_reason = compact_validation_failure(&final_content);
-        append_task_error_turn_item(
+        let error = task_failure_with_error_item(
             turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
             None,
             None,
         );
-        return (
-            TaskOutcome::Failed {
-                error: failure_reason,
-            },
-            context_summary,
-        );
+        return (TaskOutcome::Failed { error }, context_summary);
     }
 
     let output_refs = vec![build_output_content(
@@ -2797,7 +2977,7 @@ fn run_conversation_loop_inner(
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
-            append_task_error_turn_item(
+            let error = task_failure_with_error_item(
                 turn_writeback_context,
                 &error,
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
@@ -2808,13 +2988,23 @@ fn run_conversation_loop_inner(
         }
     };
 
-    append_task_final_turn_item(
+    if let Err(writeback_error) = append_task_final_turn_item(
         turn_writeback_context,
         &final_content,
         last_stream_item_id.as_deref().or(streaming_entry_id),
         streaming_entry_id,
         final_model_round,
-    );
+    ) {
+        let error_text = format!("最终回复写回失败：{writeback_error}");
+        let error = task_failure_with_error_item(
+            turn_writeback_context,
+            &error_text,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+            None,
+            None,
+        );
+        return (TaskOutcome::Failed { error }, context_summary);
+    }
 
     (outcome, context_summary)
 }
@@ -3331,24 +3521,75 @@ struct TaskTurnWritebackContext<'a> {
     turn_visibility: &'a TaskTurnVisibility,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
     expected_turn_id: Option<&'a str>,
+    writeback_error: &'a std::sync::Mutex<Option<String>>,
+}
+
+fn record_task_writeback_error(context: TaskTurnWritebackContext<'_>, error: String) {
+    let mut writeback_error = context
+        .writeback_error
+        .lock()
+        .expect("writeback error lock should hold");
+    if writeback_error.is_none() {
+        *writeback_error = Some(error);
+    }
+}
+
+fn take_task_writeback_error(context: TaskTurnWritebackContext<'_>) -> Option<String> {
+    context
+        .writeback_error
+        .lock()
+        .expect("writeback error lock should hold")
+        .take()
+}
+
+fn task_failure_with_error_item(
+    context: TaskTurnWritebackContext<'_>,
+    error_text: &str,
+    timeline_entry_id: Option<&str>,
+    model_failure: Option<&ModelFailureDiagnostic>,
+    tool_call_failure: Option<&ToolCallFailureDiagnostic>,
+) -> String {
+    match append_task_error_turn_item(
+        context,
+        error_text,
+        timeline_entry_id,
+        model_failure,
+        tool_call_failure,
+    ) {
+        Ok(()) => error_text.to_string(),
+        Err(writeback_error) => {
+            format!("{error_text}；失败事实写回失败：{writeback_error}")
+        }
+    }
 }
 
 fn task_context_compaction_terminal_outcome(
     context: TaskTurnWritebackContext<'_>,
     terminal: ContextCompactionTerminal,
     timeline_entry_id: Option<&str>,
-) -> TaskOutcome {
+) -> Result<TaskOutcome, String> {
     match terminal {
-        ContextCompactionTerminal::Cancelled => TaskOutcome::Failed {
+        ContextCompactionTerminal::Cancelled => Ok(TaskOutcome::Failed {
             error: "任务已中断".to_string(),
-        },
+        }),
         ContextCompactionTerminal::Failed => {
             let error = "上下文压缩失败，任务已停止。请检查辅助模型配置或网络后继续目标。";
-            append_task_error_turn_item(context, error, timeline_entry_id, None, None);
-            TaskOutcome::Failed {
+            append_task_error_turn_item(context, error, timeline_entry_id, None, None)?;
+            Ok(TaskOutcome::Failed {
                 error: error.to_string(),
-            }
+            })
         }
+    }
+}
+
+fn task_context_compaction_terminal_outcome_or_failed(
+    context: TaskTurnWritebackContext<'_>,
+    terminal: ContextCompactionTerminal,
+    timeline_entry_id: Option<&str>,
+) -> TaskOutcome {
+    match task_context_compaction_terminal_outcome(context, terminal, timeline_entry_id) {
+        Ok(outcome) => outcome,
+        Err(error) => TaskOutcome::Failed { error },
     }
 }
 
@@ -3384,19 +3625,19 @@ fn publish_task_thinking_delta(
     streamed_thinking: &std::cell::RefCell<String>,
     publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
     accumulated_thinking: &str,
-) {
+) -> Result<(), String> {
     if accumulated_thinking.len() <= last_sent_len.get() {
-        return;
+        return Ok(());
     }
     let trimmed = accumulated_thinking.trim();
     if trimmed.is_empty() {
-        return;
+        return Ok(());
     }
     let stream_update = {
         let previous = streamed_thinking.borrow();
         let update = session_turn_stream_update(previous.trim(), trimmed);
         if update.is_none() {
-            return;
+            return Ok(());
         }
         update
     };
@@ -3414,7 +3655,7 @@ fn publish_task_thinking_delta(
         trimmed,
         stream_update.as_ref(),
         publish_gate,
-    );
+    )
 }
 
 fn upsert_task_thinking_turn_item(
@@ -3425,10 +3666,10 @@ fn upsert_task_thinking_turn_item(
     thinking: &str,
     stream_update: Option<&SessionTurnStreamUpdate>,
     publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
-) {
+) -> Result<(), String> {
     let trimmed = thinking.trim();
     if trimmed.is_empty() {
-        return;
+        return Ok(());
     }
     let mut item = session_turn_item(
         "assistant_thinking",
@@ -3440,13 +3681,20 @@ fn upsert_task_thinking_turn_item(
     );
     apply_model_response_round(&mut item, model_round);
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         item,
         Some(context.task_store),
-    ) {
+    )?
+    else {
+        return Err(format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存任务思考 item {}",
+            context.session_id, item_id
+        ));
+    };
+    {
         if let Some(stream_update) = stream_update {
             publish_session_turn_item_stream_event(
                 context.event_bus,
@@ -3465,6 +3713,7 @@ fn upsert_task_thinking_turn_item(
             );
         }
     }
+    Ok(())
 }
 
 struct TaskContentDelta<'a> {
@@ -3477,7 +3726,10 @@ struct TaskContentDelta<'a> {
     accumulated_content: &'a str,
 }
 
-fn publish_task_content_delta(context: TaskTurnWritebackContext<'_>, input: TaskContentDelta<'_>) {
+fn publish_task_content_delta(
+    context: TaskTurnWritebackContext<'_>,
+    input: TaskContentDelta<'_>,
+) -> Result<(), String> {
     let TaskContentDelta {
         item_id,
         model_round,
@@ -3488,7 +3740,7 @@ fn publish_task_content_delta(context: TaskTurnWritebackContext<'_>, input: Task
         accumulated_content,
     } = input;
     if accumulated_content.len() <= last_sent_len.get() {
-        return;
+        return Ok(());
     }
     last_sent_len.set(accumulated_content.len());
     {
@@ -3498,13 +3750,13 @@ fn publish_task_content_delta(context: TaskTurnWritebackContext<'_>, input: Task
     }
     let visible_content = normalize_model_stream_preview_content(accumulated_content);
     if visible_content.trim().is_empty() {
-        return;
+        return Ok(());
     }
     let stream_update = {
         let previous = streamed_visible_content.borrow();
         let update = session_turn_stream_update(previous.as_str(), &visible_content);
         if update.is_none() {
-            return;
+            return Ok(());
         }
         update
     };
@@ -3521,7 +3773,7 @@ fn publish_task_content_delta(context: TaskTurnWritebackContext<'_>, input: Task
         &visible_content,
         stream_update.as_ref(),
         publish_gate,
-    );
+    )
 }
 
 fn upsert_task_stream_turn_item(
@@ -3532,10 +3784,10 @@ fn upsert_task_stream_turn_item(
     content: &str,
     stream_update: Option<&SessionTurnStreamUpdate>,
     publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
-) {
+) -> Result<(), String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return;
+        return Ok(());
     }
     let mut item = session_turn_item(
         "assistant_stream",
@@ -3547,13 +3799,20 @@ fn upsert_task_stream_turn_item(
     );
     apply_model_response_round(&mut item, model_round);
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         item,
         Some(context.task_store),
-    ) {
+    )?
+    else {
+        return Err(format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存任务回复 item {}",
+            context.session_id, item_id
+        ));
+    };
+    {
         if let Some(stream_update) = stream_update {
             publish_session_turn_item_stream_event(
                 context.event_bus,
@@ -3572,12 +3831,13 @@ fn upsert_task_stream_turn_item(
             );
         }
     }
+    Ok(())
 }
 
 fn append_task_tool_call_started_turn_item(
     context: TaskTurnWritebackContext<'_>,
     tool_call: &ChatToolCall,
-) {
+) -> Result<(), String> {
     let mut item = session_turn_item(
         "tool_call_started",
         "running",
@@ -3591,21 +3851,27 @@ fn append_task_tool_call_started_turn_item(
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_status = Some("running".to_string());
     item.tool_arguments = Some(tool_call.function.arguments.clone());
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         item,
         Some(context.task_store),
-    ) {
-        persist_session_state_checkpoint(context.persist_session_state, "task_turn_tool_started");
-        publish_session_turn_item_event(
-            context.event_bus,
-            context.session_id,
-            context.workspace_id,
-            &published,
-        );
-    }
+    )?
+    else {
+        return Err(format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存工具 {} 的开始事实",
+            context.session_id, tool_call.function.name
+        ));
+    };
+    persist_session_state_checkpoint(context.persist_session_state, "task_turn_tool_started")?;
+    publish_session_turn_item_event(
+        context.event_bus,
+        context.session_id,
+        context.workspace_id,
+        &published,
+    );
+    Ok(())
 }
 
 fn upsert_task_tool_call_result_turn_item(
@@ -3613,7 +3879,7 @@ fn upsert_task_tool_call_result_turn_item(
     tool_call: &ChatToolCall,
     tool_result: &str,
     tool_status: ExecutionResultStatus,
-) {
+) -> Result<(), String> {
     let status_label = tool_execution_status_label(tool_status);
     let mut item = session_turn_item(
         "tool_call_result",
@@ -3637,30 +3903,36 @@ fn upsert_task_tool_call_result_turn_item(
     ) {
         item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         item,
         Some(context.task_store),
-    ) {
-        persist_session_state_checkpoint(context.persist_session_state, "task_turn_tool_result");
-        publish_session_turn_item_event(
-            context.event_bus,
-            context.session_id,
-            context.workspace_id,
-            &published,
-        );
-    }
+    )?
+    else {
+        return Err(format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存工具 {} 的结果事实",
+            context.session_id, tool_call.function.name
+        ));
+    };
+    persist_session_state_checkpoint(context.persist_session_state, "task_turn_tool_result")?;
+    publish_session_turn_item_event(
+        context.event_bus,
+        context.session_id,
+        context.workspace_id,
+        &published,
+    );
+    Ok(())
 }
 
 fn upsert_task_tool_call_progress_turn_item(
     context: TaskTurnWritebackContext<'_>,
     tool_call: &ChatToolCall,
     progress: ToolExecutionProgress,
-) {
+) -> Result<(), String> {
     if progress.tool_call_id.as_str() != tool_call.id {
-        return;
+        return Ok(());
     }
     let progress_status = serde_json::from_str::<serde_json::Value>(&progress.payload)
         .ok()
@@ -3686,20 +3958,26 @@ fn upsert_task_tool_call_progress_turn_item(
     item.tool_status = Some(progress_status);
     item.tool_arguments = Some(tool_call.function.arguments.clone());
     item.tool_result = Some(progress.payload);
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         item,
         Some(context.task_store),
-    ) {
-        publish_session_turn_item_event(
-            context.event_bus,
-            context.session_id,
-            context.workspace_id,
-            &published,
-        );
-    }
+    )?
+    else {
+        return Err(format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存工具 {} 的进度事实",
+            context.session_id, tool_call.function.name
+        ));
+    };
+    publish_session_turn_item_event(
+        context.event_bus,
+        context.session_id,
+        context.workspace_id,
+        &published,
+    );
+    Ok(())
 }
 
 fn tool_call_record(tool_call: &ChatToolCall, result: &str) -> serde_json::Value {
@@ -3724,7 +4002,7 @@ fn append_task_final_turn_item(
     final_item_id: Option<&str>,
     timeline_entry_id: Option<&str>,
     model_round: Option<usize>,
-) {
+) -> Result<(), String> {
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
         "assistant_final",
@@ -3747,48 +4025,61 @@ fn append_task_final_turn_item(
         final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
     }
     let final_item_id = final_item.item_id.clone();
-    if has_requested_final_item_id {
-        if let Some(published) = upsert_session_turn_item_for_turn(
+    let published = if has_requested_final_item_id {
+        upsert_session_turn_item_for_turn(
             context.session_store,
             context.session_id,
             context.expected_turn_id,
             final_item,
             Some(context.task_store),
-        ) {
-            persist_session_state_checkpoint(context.persist_session_state, "task_turn_final_item");
-            publish_session_turn_item_event(
-                context.event_bus,
-                context.session_id,
-                context.workspace_id,
-                &published,
-            );
-        }
-    } else if let Some(published) = append_session_turn_item_for_turn(
-        context.session_store,
-        context.session_id,
-        context.expected_turn_id,
-        final_item,
-        Some(context.task_store),
-    ) {
-        persist_session_state_checkpoint(context.persist_session_state, "task_turn_final_item");
-        publish_session_turn_item_event(
-            context.event_bus,
+        )?
+    } else {
+        append_session_turn_item_for_turn(
+            context.session_store,
             context.session_id,
-            context.workspace_id,
-            &published,
-        );
-    }
+            context.expected_turn_id,
+            final_item,
+            Some(context.task_store),
+        )?
+    };
+    let Some(published) = published else {
+        return Err(format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存最终回复 item {}",
+            context.session_id, final_item_id
+        ));
+    };
+    persist_session_state_checkpoint(context.persist_session_state, "task_turn_final_item")?;
+    publish_session_turn_item_event(
+        context.event_bus,
+        context.session_id,
+        context.workspace_id,
+        &published,
+    );
     let root_task_completed = context
         .task_store
         .get_task(&context.task.root_task_id)
         .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
     if context.turn_visibility.is_mainline() && root_task_completed {
-        let _ = context.session_store.update_current_turn_status_for_turn(
-            context.session_id,
-            context.expected_turn_id,
-            "completed",
-        );
-        persist_session_state_checkpoint(context.persist_session_state, "task_turn_completed");
+        context
+            .session_store
+            .update_current_turn_status_for_turn(
+                context.session_id,
+                context.expected_turn_id,
+                "completed",
+            )
+            .map_err(|error| {
+                format!(
+                    "提交会话 {} 的 Turn completed 状态失败: {error}",
+                    context.session_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "会话 {} 没有可更新的当前 Turn，无法提交 completed 状态",
+                    context.session_id
+                )
+            })?;
+        persist_session_state_checkpoint(context.persist_session_state, "task_turn_completed")?;
         publish_current_session_turn_item_event(
             context.event_bus,
             context.session_store,
@@ -3796,8 +4087,9 @@ fn append_task_final_turn_item(
             context.workspace_id,
             &final_item_id,
             Some(context.task_store),
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn append_task_error_turn_item(
@@ -3806,7 +4098,7 @@ fn append_task_error_turn_item(
     _streaming_entry_id: Option<&str>,
     model_failure: Option<&ModelFailureDiagnostic>,
     tool_call_failure: Option<&ToolCallFailureDiagnostic>,
-) {
+) -> Result<(), String> {
     let mut error_item = session_turn_item(
         "assistant_error",
         "failed",
@@ -3830,27 +4122,46 @@ fn append_task_error_turn_item(
         );
     }
     let error_item_id = error_item.item_id.clone();
-    if let Some(published) = append_session_turn_item_for_turn(
+    let published = append_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         error_item,
         Some(context.task_store),
-    ) {
-        publish_session_turn_item_event(
-            context.event_bus,
-            context.session_id,
-            context.workspace_id,
-            &published,
-        );
-    }
+    )?
+    .ok_or_else(|| {
+        format!(
+            "会话 {} 没有可写入的当前 Turn，无法记录失败 item {}",
+            context.session_id, error_item_id
+        )
+    })?;
+    publish_session_turn_item_event(
+        context.event_bus,
+        context.session_id,
+        context.workspace_id,
+        &published,
+    );
     if context.turn_visibility.is_mainline() {
-        let _ = context.session_store.update_current_turn_status_for_turn(
-            context.session_id,
-            context.expected_turn_id,
-            "failed",
-        );
-        persist_session_state_checkpoint(context.persist_session_state, "task_turn_failed");
+        context
+            .session_store
+            .update_current_turn_status_for_turn(
+                context.session_id,
+                context.expected_turn_id,
+                "failed",
+            )
+            .map_err(|error| {
+                format!(
+                    "提交会话 {} 的 Turn failed 状态失败: {error}",
+                    context.session_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "会话 {} 没有可更新的当前 Turn，无法提交 failed 状态",
+                    context.session_id
+                )
+            })?;
+        persist_session_state_checkpoint(context.persist_session_state, "task_turn_failed")?;
         publish_current_session_turn_item_event(
             context.event_bus,
             context.session_store,
@@ -3858,8 +4169,9 @@ fn append_task_error_turn_item(
             context.workspace_id,
             &error_item_id,
             Some(context.task_store),
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn build_output_content(
@@ -5596,7 +5908,7 @@ mod tests {
 
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task("task-unbounded-tool-rounds");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-unbounded-tool-rounds");
         let lease = task_store
             .grant_lease(
@@ -5711,7 +6023,7 @@ mod tests {
             .expect("session should create");
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task("task-context-limit-after-tool");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-context-limit-after-tool");
         let lease = task_store
             .grant_lease(
@@ -5982,7 +6294,7 @@ mod tests {
             .with_evidence_requirements(vec![
                 magi_core::TaskEvidenceRequirement::successful_tool_call("diagram_render"),
             ]);
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-required-delivery-evidence");
         let lease = task_store
             .grant_lease(
@@ -6130,7 +6442,7 @@ mod tests {
             source_turn_id: "turn-resumed-delivery-source".to_string(),
             source_thread_id: ThreadId::new("thread-resumed-delivery-source"),
         });
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-resumed-delivery-evidence");
         let lease = task_store
             .grant_lease(
@@ -6284,7 +6596,7 @@ mod tests {
         assert!(planning_content.contains("验收标准："));
 
         planning.output_refs = vec![planning_content];
-        task_store.insert_task(planning);
+        task_store.insert_task(planning).expect("规划任务应插入");
         let mut validation = make_task_loop_test_task("task-planning-validation-deterministic");
         validation.kind = TaskKind::LocalAgent;
         validation.title = "规划 验证".to_string();
@@ -6324,7 +6636,7 @@ mod tests {
             })
             .to_string(),
         ];
-        task_store.insert_task(action);
+        task_store.insert_task(action).expect("动作任务应插入");
 
         let mut validation = make_task_loop_test_task("task-execution-validation");
         validation.kind = TaskKind::LocalAgent;
@@ -6499,11 +6811,33 @@ mod tests {
         }
     }
 
+    fn ensure_test_current_turn(
+        session_store: &SessionStore,
+        session_id: &SessionId,
+        user_message: &str,
+    ) {
+        let accepted_at = UtcMillis::now();
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: format!("turn-test-{session_id}"),
+                    turn_seq: accepted_at.0,
+                    accepted_at,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some(user_message.to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("测试 Turn 应持久化");
+    }
+
     fn run_static_task_final(task: &Task, content: &'static str) -> TaskOutcome {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let task_store = TaskStore::new();
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new(format!("worker-{}", task.task_id));
         let lease = task_store
             .grant_lease(
@@ -6526,6 +6860,7 @@ mod tests {
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         // P7：mainline 场景 task 自身 thread = orchestrator thread。
         let thread_id = orchestrator_thread_id.clone();
+        ensure_test_current_turn(&session_store, &session_id, "请执行任务");
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
             event_bus: &event_bus,
@@ -6574,7 +6909,7 @@ mod tests {
         let event_bus = InMemoryEventBus::new(64);
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task("task-model-retry-runtime");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-model-retry-runtime");
         let lease = task_store
             .grant_lease(
@@ -6594,6 +6929,7 @@ mod tests {
         let now = UtcMillis::now();
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+        ensure_test_current_turn(&session_store, &session_id, "请执行任务");
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &RetryEventTaskModelBridgeClient,
@@ -6659,7 +6995,7 @@ mod tests {
         let event_bus = InMemoryEventBus::new(64);
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task("task-current-image-input");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-current-image-input");
         let lease = task_store
             .grant_lease(
@@ -6683,6 +7019,7 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
+        ensure_test_current_turn(&session_store, &session_id, "识别图片");
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
@@ -6803,17 +7140,24 @@ mod tests {
         child.parent_task_id = Some(root.task_id.clone());
         child.title = "目录观察代理".to_string();
         child.status = TaskStatus::Running;
-        task_store.insert_task(root.clone());
-        task_store.insert_task(child.clone());
+        task_store.insert_task(root.clone()).expect("根任务应插入");
+        task_store.insert_task(child.clone()).expect("子任务应插入");
 
         let pending_prompt = agent_coordination_recovery_prompt(&root, &task_store, &[])
             .expect("running child should block final answer");
         assert!(pending_prompt.contains("仍有代理未进入终态"));
         assert!(pending_prompt.contains("agent_wait"));
 
-        child.status = TaskStatus::Completed;
-        child.output_refs = vec!["代理完成".to_string()];
-        task_store.insert_task(child.clone());
+        task_store
+            .complete_task(
+                &child.task_id,
+                TaskCompletionAttempt {
+                    output_refs: vec!["代理完成".to_string()],
+                    final_response: Some("代理完成".to_string()),
+                    evidence: Vec::new(),
+                },
+            )
+            .expect("子任务应通过完成合同进入终态");
         let missing_wait_prompt = agent_coordination_recovery_prompt(&root, &task_store, &[])
             .expect("completed child without agent_wait should block final answer");
         assert!(missing_wait_prompt.contains("尚未通过 agent_wait 收集"));
@@ -6920,7 +7264,7 @@ mod tests {
         let workspace_id = Some(WorkspaceId::new("workspace-task-failed-tool-final"));
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task("task-failed-tool-final");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-task-failed-tool-final");
         let lease = task_store
             .grant_lease(
@@ -6942,6 +7286,7 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
+        ensure_test_current_turn(&session_store, &session_id, "请调用一个失败工具后总结");
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
@@ -7004,7 +7349,7 @@ mod tests {
         let workspace_id = Some(WorkspaceId::new("workspace-task-recovered-tool-final"));
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task("task-recovered-tool-final");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-task-recovered-tool-final");
         let lease = task_store
             .grant_lease(
@@ -7034,6 +7379,11 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
+        ensure_test_current_turn(
+            &session_store,
+            &session_id,
+            "请先处理失败工具，再通过重试完成任务",
+        );
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
@@ -7209,7 +7559,7 @@ mod tests {
         let session_id = SessionId::new("session-root-plan-follow-up");
         let workspace_id = Some(WorkspaceId::new("workspace-root-plan-follow-up"));
         let task = make_task_loop_test_task("task-root-plan-follow-up");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-root-plan-follow-up");
         let lease = task_store
             .grant_lease(
@@ -7230,6 +7580,7 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        ensure_test_current_turn(&session_store, &session_id, "完成全部计划");
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -7318,7 +7669,7 @@ mod tests {
         let session_id = SessionId::new("session-task-waiting-goal-isolation");
         let workspace_id = Some(WorkspaceId::new("workspace-task-waiting-goal-isolation"));
         let task = make_task_loop_test_task("task-ordinary-diversion");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-task-waiting-goal-isolation");
         let lease = task_store
             .grant_lease(
@@ -7339,6 +7690,7 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        ensure_test_current_turn(&session_store, &session_id, "执行普通任务");
         let goal = session_store
             .create_goal(
                 session_id.clone(),
@@ -7457,7 +7809,7 @@ mod tests {
         let session_id = SessionId::new("session-sidechain-plan-isolation");
         let workspace_id = Some(WorkspaceId::new("workspace-sidechain-plan-isolation"));
         let task = make_task_loop_test_task("task-sidechain-plan-isolation");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-sidechain-plan-isolation");
         let lease = task_store
             .grant_lease(
@@ -7478,6 +7830,7 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        ensure_test_current_turn(&session_store, &session_id, "完成子代理任务");
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -7554,7 +7907,7 @@ mod tests {
         let session_id = SessionId::new("session-prompt-priority-boundary");
         let workspace_id = Some(WorkspaceId::new("workspace-prompt-priority-boundary"));
         let task = make_task_loop_test_task("task-prompt-priority-boundary");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-prompt-priority-boundary");
         let lease = task_store
             .grant_lease(
@@ -7575,6 +7928,11 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        ensure_test_current_turn(
+            &session_store,
+            &session_id,
+            "当前任务：输出 CURRENT_TASK_RESULT，不要输出 OLD_REFERENCE_RESULT",
+        );
         session_store.append_thread_messages(
             &thread_id,
             vec![ThreadChatMessage {
@@ -7767,7 +8125,7 @@ mod tests {
             orchestrator_thread_id.clone(),
         );
         let task_store = TaskStore::new();
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         apply_task_final_visibility(&mut final_item, &task_store, &task, &visibility);
 
         assert_eq!(final_item.source_thread_id, worker_thread_id);
@@ -7832,11 +8190,11 @@ mod tests {
         let mut root_task = make_task_loop_test_task(root_task_id.as_str());
         root_task.kind = TaskKind::LocalAgent;
         root_task.status = TaskStatus::Running;
-        task_store.insert_task(root_task);
+        task_store.insert_task(root_task).expect("根任务应插入");
         let mut task = make_task_loop_test_task(task_id.as_str());
         task.root_task_id = root_task_id;
         task.status = TaskStatus::Completed;
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         // 该用例验证"root 未完成时不能提前收尾主线 turn"，因此 task 本身走 Mainline 路径：
         // 传 is_sidechain=false，`task_turn_visibility` 会返回 Mainline，
         // 后续 append_task_final_turn_item 的 `is_mainline()` 分支才会被覆盖到。
@@ -7844,6 +8202,7 @@ mod tests {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let visibility =
             task_turn_visibility(&task, false, None, &orchestrator_thread_id, &registry);
+        let writeback_error = std::sync::Mutex::new(None);
 
         append_task_final_turn_item(
             TaskTurnWritebackContext {
@@ -7856,12 +8215,14 @@ mod tests {
                 turn_visibility: &visibility,
                 persist_session_state: None,
                 expected_turn_id: None,
+                writeback_error: &writeback_error,
             },
             "primary action 已完成",
             Some("timeline-streaming-task-action-final-root-running"),
             Some("timeline-streaming-task-action-final-root-running"),
             None,
-        );
+        )
+        .expect("final item should be persisted");
 
         let current_turn = session_store
             .runtime_sidecar(&session_id)
@@ -7911,7 +8272,7 @@ mod tests {
 
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task(task_id.as_str());
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let lease = task_store
             .grant_lease(
                 &task.task_id,
@@ -8076,7 +8437,7 @@ mod tests {
             .expect("session should be creatable");
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task("task-empty-response-diagnostic");
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let worker_id = WorkerId::new("worker-task-empty-response-diagnostic");
         let lease = task_store
             .grant_lease(
@@ -8210,7 +8571,7 @@ mod tests {
         let task_store = TaskStore::new();
         let mut task = make_task_loop_test_task(task_id.as_str());
         task.parent_task_id = Some(TaskId::new("task-subagent-empty-stream-root"));
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let lease = task_store
             .grant_lease(
                 &task.task_id,
@@ -8224,19 +8585,21 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let worker_thread_id = ThreadId::new("thread-subagent-empty-stream-recovery");
-        session_store.register_thread(ExecutionThread {
-            thread_id: worker_thread_id.clone(),
-            session_id: session_id.clone(),
-            mission_id: task.mission_id.clone(),
-            role_id: "executor".to_string(),
-            worker_instance_id: worker_id.clone(),
-            status: ExecutionThreadStatus::Active,
-            created_at: now,
-            last_used_at: now,
-            observed_context_window_tokens: None,
-            handled_task_ids: vec![task.task_id.clone()],
-            message_history: Vec::new(),
-        });
+        session_store
+            .register_thread(ExecutionThread {
+                thread_id: worker_thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: task.mission_id.clone(),
+                role_id: "executor".to_string(),
+                worker_instance_id: worker_id.clone(),
+                status: ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![task.task_id.clone()],
+                message_history: Vec::new(),
+            })
+            .expect("空流恢复测试 thread 应注册成功");
         let client = EmptyStreamThenRecoveredTaskModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
         };
@@ -8338,7 +8701,7 @@ mod tests {
         let task_store = TaskStore::new();
         let mut task = make_task_loop_test_task(task_id.as_str());
         task.parent_task_id = Some(TaskId::new("task-subagent-stream-recovery-root"));
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let lease = task_store
             .grant_lease(
                 &task.task_id,
@@ -8352,19 +8715,21 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let worker_thread_id = ThreadId::new("thread-subagent-stream-recovery");
-        session_store.register_thread(ExecutionThread {
-            thread_id: worker_thread_id.clone(),
-            session_id: session_id.clone(),
-            mission_id: task.mission_id.clone(),
-            role_id: "executor".to_string(),
-            worker_instance_id: worker_id.clone(),
-            status: ExecutionThreadStatus::Active,
-            created_at: now,
-            last_used_at: now,
-            observed_context_window_tokens: None,
-            handled_task_ids: vec![task.task_id.clone()],
-            message_history: Vec::new(),
-        });
+        session_store
+            .register_thread(ExecutionThread {
+                thread_id: worker_thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: task.mission_id.clone(),
+                role_id: "executor".to_string(),
+                worker_instance_id: worker_id.clone(),
+                status: ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![task.task_id.clone()],
+                message_history: Vec::new(),
+            })
+            .expect("流式恢复测试 thread 应注册成功");
         let client = InterruptedThenRecoveredTaskModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
             non_stream_fallback_count: AtomicUsize::new(0),
@@ -8480,7 +8845,7 @@ mod tests {
             .expect("session should be creatable");
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task(task_id.as_str());
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let now = UtcMillis::now();
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
@@ -8638,7 +9003,7 @@ mod tests {
             .expect("session should be creatable");
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task(task_id.as_str());
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let now = UtcMillis::now();
         let (_, _orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
@@ -8663,7 +9028,9 @@ mod tests {
                 message_history: Vec::new(),
             };
             let thread_id = new_thread.thread_id.clone();
-            session_store.register_thread(new_thread);
+            session_store
+                .register_thread(new_thread)
+                .expect("工具批处理测试 thread 应注册成功");
             thread_id
         };
         session_store
@@ -8852,7 +9219,7 @@ mod tests {
         let task_store = TaskStore::new();
         let mut task = make_task_loop_test_task(&format!("task-duplicate-read-{suffix}"));
         task.goal = "读取 fixture.txt 并确认结果。".to_string();
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let session_id = SessionId::new(format!("session-duplicate-read-{suffix}"));
         let workspace_id = Some(WorkspaceId::new(format!(
             "workspace-duplicate-read-{suffix}"
@@ -8879,7 +9246,9 @@ mod tests {
                 message_history: Vec::new(),
             };
             let thread_id = thread.thread_id.clone();
-            session_store.register_thread(thread);
+            session_store
+                .register_thread(thread)
+                .expect("重复读取测试 thread 应注册成功");
             thread_id
         } else {
             orchestrator_thread_id

@@ -10,6 +10,10 @@ const webClientBridgeSource = await readFile(
   new URL('../src/shared/bridges/web-client-bridge.ts', import.meta.url),
   'utf8',
 );
+const messageProtocolSource = await readFile(
+  new URL('../src/shared/protocol/message-protocol.ts', import.meta.url),
+  'utf8',
+);
 assert.match(
   dataMessageHandlersSource,
   /case 'sessionBootstrapLoaded':[\s\S]*?handleSessionBootstrapLoaded\(asMessage\(\{[\s\S]*?scope: payload\.scope,/,
@@ -20,6 +24,16 @@ assert.match(
   /clearWorkspaceSessionBinding\([\s\S]*?await fetchBootstrap\(\{[\s\S]*?forceFresh: true,[\s\S]*?\}\);[\s\S]*?return;/,
   'missing persisted session must restart bootstrap after clearing the stale binding',
 );
+assert.match(
+  webClientBridgeSource,
+  /captureProcessingRequestSnapshot[\s\S]*?settleProcessingRequestSnapshot[\s\S]*?processingRequestIds/,
+  'bootstrap and interrupt recovery must use an immutable request snapshot',
+);
+assert.doesNotMatch(
+  messageProtocolSource,
+  /TASK_(?:STARTED|COMPLETED|FAILED)\s*=\s*['"]task_(?:started|completed|failed)['"]|task_(?:started|completed|failed)/,
+  'obsolete task lifecycle control messages must have no protocol type or consumer',
+);
 
 const WORKSPACE_ID = 'workspace-bridge-live-adopt';
 const WORKSPACE_PATH = '/tmp/workspace-bridge-live-adopt';
@@ -27,6 +41,7 @@ const PARTIAL_WORKSPACE_ID = 'workspace-bridge-partial-scope';
 const RACE_WORKSPACE_ID = 'workspace-bridge-bootstrap-race';
 const RACE_WORKSPACE_PATH = '/tmp/workspace-bridge-bootstrap-race';
 const RACE_SESSION_ID = 'session-bridge-bootstrap-race';
+const NAVIGATION_BARRIER_SESSION_ID = 'session-bridge-navigation-barrier';
 const SESSION_ID = 'session-bridge-live-adopt';
 const TURN_ID = 'turn-bridge-live-adopt';
 const USER_ITEM_ID = 'user-bridge-live-adopt';
@@ -296,6 +311,7 @@ function bootstrapPayload() {
       notifications: [],
     },
     eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    canonicalEventNextSequence: terminalPublished ? 3 : acceptedPublished ? 2 : 1,
     agent: {
       runtimeEpoch: RUNTIME_EPOCH,
     },
@@ -337,6 +353,7 @@ function scopedBootstrapPayload(workspaceId, workspacePath, sessionId, title) {
       notifications: [],
     },
     eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    canonicalEventNextSequence: 1,
     agent: {
       runtimeEpoch: RUNTIME_EPOCH,
     },
@@ -827,6 +844,23 @@ function completedTurnItemEnvelope() {
   };
 }
 
+function terminalEnvelopeForRequest(requestId, sequence) {
+  return {
+    event_id: `event-session-turn-completed-${requestId}`,
+    event_type: 'session.turn.completed',
+    category: 'domain',
+    occurred_at: ACCEPTED_AT + sequence,
+    sequence,
+    workspace_id: WORKSPACE_ID,
+    session_id: SESSION_ID,
+    payload: {
+      session_id: SESSION_ID,
+      workspace_id: WORKSPACE_ID,
+      request_id: requestId,
+    },
+  };
+}
+
 function messageCreatedEnvelope() {
   return {
     event_id: `event-message-created-${summaryUpdatedAt}`,
@@ -920,6 +954,30 @@ function findArtifactByRequestId(projection, requestId) {
 
 function currentSessionSummary(messagesStore) {
   return messagesStore.messagesState.workspaceSessionProjection.sessions.find((session) => session.id === SESSION_ID);
+}
+
+function beginSyntheticLocalSubmission(messagesStore, requestId) {
+  const startedAt = Date.now();
+  messagesStore.beginLocalTurnSubmission({
+    requestId,
+    sessionId: messagesStore.messagesState.currentSessionId,
+    placeholderMessageId: `assistant-${requestId}`,
+    startedAt,
+    message: {
+      id: `user-${requestId}`,
+      role: 'user',
+      source: 'user',
+      content: requestId,
+      timestamp: startedAt,
+      isStreaming: false,
+      isComplete: true,
+      type: 'user_input',
+      metadata: {
+        requestId,
+        localSubmission: true,
+      },
+    },
+  });
 }
 
 function deferred() {
@@ -1366,7 +1424,7 @@ await withGoldenViteServer(async (server) => {
   const localUrlBeforeTunnelSync = window.location.href;
   const workspaceSessionRequestsBeforeTunnelSync = workspaceSessionsRequestCount;
   const bootstrapRequestsBeforeTunnelSync = bootstrapRequestCount;
-  messagesStore.addPendingRequest('tunnel-stale-running-state', { resetAntiLiftBack: true });
+  beginSyntheticLocalSubmission(messagesStore, 'tunnel-stale-running-state');
   workspaceSessionIsRunning = true;
   window.location.href = `${localUrlBeforeTunnelSync}&tunnel_token=golden-token`;
   const originalDateNowForTunnelSync = Date.now;
@@ -1396,18 +1454,29 @@ await withGoldenViteServer(async (server) => {
     Date.now = () => originalDateNowForTunnelSync() + 6_000;
     window.__runGoldenIntervals();
     await waitFor(
+      () => workspaceSessionRequestsBeforeTunnelSync + 2 === workspaceSessionsRequestCount,
+      'tunnel terminal sync must recheck the lightweight workspace session summary',
+    );
+    assert.equal(
+      messagesStore.messagesState.isProcessing,
+      true,
+      'session summary without request identity must not clear an active local turn',
+    );
+    recoveredStream.onmessage?.({
+      data: JSON.stringify(terminalEnvelopeForRequest('tunnel-stale-running-state', 6)),
+    });
+    await waitFor(
       () => messagesStore.messagesState.isProcessing === false,
-      'backend terminal summary must settle stale public tunnel processing state',
+      'request-scoped terminal event must settle the stale public tunnel turn immediately',
     );
     assert.equal(
       workspaceSessionsRequestCount,
       workspaceSessionRequestsBeforeTunnelSync + 2,
       'tunnel terminal sync must recheck the lightweight workspace session summary',
     );
-    assert.equal(
-      bootstrapRequestCount,
-      bootstrapRequestsBeforeTunnelSync + 1,
-      'tunnel terminal sync must fetch the full bootstrap exactly once for final content',
+    assert.ok(
+      bootstrapRequestCount > bootstrapRequestsBeforeTunnelSync,
+      'request-scoped terminal event must trigger authoritative bootstrap recovery',
     );
   } finally {
     Date.now = originalDateNowForTunnelSync;
@@ -1730,7 +1799,7 @@ await withGoldenViteServer(async (server) => {
 
   const queuedTurnAccepted = deferred();
   sessionTurnInterceptors.push(() => queuedTurnAccepted.promise);
-  messagesStore.addPendingRequest('busy-before-queued-follow-up');
+  beginSyntheticLocalSubmission(messagesStore, 'busy-before-queued-follow-up');
   bridge.postMessage({
     type: 'executeTask',
     text: '排队消息必须在出队提交时立刻进入主线。',
@@ -1929,16 +1998,27 @@ await withGoldenViteServer(async (server) => {
     browserAnnotationRefs: turn.browserAnnotationRefs,
     canGuide: turn.canGuide,
   })));
-  messagesStore.setIsProcessing(true);
+  const interruptRequestId = 'request-interrupt-current';
+  beginSyntheticLocalSubmission(messagesStore, interruptRequestId);
+  const interruptCanonicalTurn = completedCanonicalTurn();
+  interruptCanonicalTurn.status = 'running';
+  delete interruptCanonicalTurn.completedAt;
+  delete interruptCanonicalTurn.responseDurationMs;
+  interruptCanonicalTurn.metadata = { requestId: interruptRequestId };
+  turnStore.replaceCanonicalSessionTurns(
+    SESSION_ID,
+    [interruptCanonicalTurn],
+    2,
+  );
   bridge.postMessage({ type: 'interruptTask' });
   await waitFor(
     () => interruptRequestCount === 1 && messagesStore.messagesState.queuedMessages.length === 0,
     '停止当前轮次后必须同步服务端已按 FIFO 启动的队首消息',
   );
   assert.equal(
-    messagesStore.messagesState.isProcessing,
-    true,
-    '队首消息已启动时，停止响应不得把新轮次覆盖为空闲态',
+    messagesStore.messagesState.pendingRequests.has(interruptRequestId),
+    false,
+    '中断 API 确认后必须在队列同步完成前精确收敛被中断 request',
   );
 
   const streamCountBeforeLagged = FakeEventSource.instances.length;
@@ -2000,6 +2080,87 @@ await withGoldenViteServer(async (server) => {
     'one authoritative changes refresh must accompany a successful workspace recovery',
   );
   pendingChangesPayloadOverride = null;
+
+  const navigationBarrierResponse = deferred();
+  const navigationRequestsBeforeBarrier = sessionNavigationRequestCount;
+  sessionNavigationInterceptors.push(() => navigationBarrierResponse.promise.then(() => jsonResponse(
+    scopedBootstrapPayload(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      NAVIGATION_BARRIER_SESSION_ID,
+      '导航屏障会话',
+    ),
+  )));
+  const terminalRefreshBootstrapRequests = [];
+  bootstrapInterceptors.push((parsed) => {
+    terminalRefreshBootstrapRequests.push(parsed);
+    return jsonResponse(scopedBootstrapPayload(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      NAVIGATION_BARRIER_SESSION_ID,
+      '导航屏障会话',
+    ));
+  });
+  bridge.postMessage({
+    type: 'navigateSession',
+    target: 'session',
+    scope: 'workspace',
+    requestId: 'navigation-terminal-refresh-barrier',
+    sessionId: NAVIGATION_BARRIER_SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => sessionNavigationRequestCount > navigationRequestsBeforeBarrier,
+    '导航屏障场景必须先发起会话导航',
+  );
+  laggedRecoveredStream.onmessage?.({ data: JSON.stringify(completedTurnItemEnvelope()) });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(
+    terminalRefreshBootstrapRequests.length,
+    0,
+    'turn 终态后台 bootstrap 必须等待用户导航原子提交，不能抢占导航事务',
+  );
+  navigationBarrierResponse.resolve();
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId === NAVIGATION_BARRIER_SESSION_ID,
+    '后台终态刷新并发发生时，首次用户导航仍必须提交到目标会话',
+  );
+  await waitFor(
+    () => terminalRefreshBootstrapRequests.length === 1,
+    '导航提交后，排队的终态 bootstrap 必须按最新会话绑定执行',
+  );
+  assert.equal(
+    terminalRefreshBootstrapRequests[0].searchParams.get('sessionId'),
+    NAVIGATION_BARRIER_SESSION_ID,
+    '排队的终态 bootstrap 不得继续读取导航前的旧会话',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    NAVIGATION_BARRIER_SESSION_ID,
+    '导航后的后台 bootstrap 不得夺回旧会话',
+  );
+
+  sessionNavigationInterceptors.push(() => jsonResponse(scopedBootstrapPayload(
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+    SESSION_ID,
+    '返回当前会话',
+  )));
+  bridge.postMessage({
+    type: 'navigateSession',
+    target: 'session',
+    scope: 'workspace',
+    requestId: 'navigation-return-after-terminal-refresh-barrier',
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId === SESSION_ID,
+    '导航屏障回归完成后必须恢复原测试会话',
+  );
 
   const switchBootstrapRequests = [];
   pendingChangesPayloadOverride = scopedBootstrapPayloadWithPendingChange(

@@ -5,6 +5,7 @@ mod events;
 mod maintenance;
 mod persistence;
 mod runtime;
+mod session_event_log;
 mod types;
 
 #[cfg(test)]

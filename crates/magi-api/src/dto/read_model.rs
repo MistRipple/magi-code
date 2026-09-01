@@ -1065,41 +1065,42 @@ mod tests {
                 TaskStatus::Failed,
             ),
         ] {
-            task_store.insert_task(magi_core::Task {
-                task_id: task_id.clone(),
-                mission_id: mission_id.clone(),
-                root_task_id: root_task_id.clone(),
-                parent_task_id,
-                kind: magi_core::TaskKind::LocalAgent,
-                title: task_id.to_string(),
-                goal: task_id.to_string(),
-                status,
-                dependency_ids: Vec::new(),
-                required_children: Vec::new(),
-                policy_snapshot: None,
-                executor_binding: None,
-                completion_contract: magi_core::TaskCompletionContract::default(),
-                recovery_checkpoint: None,
-                knowledge_refs: Vec::new(),
-                workspace_scope: None,
-                write_scope: None,
-                input_refs: Vec::new(),
-                output_refs: Vec::new(),
-                evidence_refs: Vec::new(),
-                retry_count: 0,
-                runtime_payload: magi_core::TaskRuntimePayload::default(),
-                created_at: now,
-                updated_at: now,
-            });
+            task_store
+                .insert_task(magi_core::Task {
+                    task_id: task_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    parent_task_id,
+                    kind: magi_core::TaskKind::LocalAgent,
+                    title: task_id.to_string(),
+                    goal: task_id.to_string(),
+                    status,
+                    dependency_ids: Vec::new(),
+                    required_children: Vec::new(),
+                    policy_snapshot: None,
+                    executor_binding: None,
+                    completion_contract: magi_core::TaskCompletionContract::default(),
+                    recovery_checkpoint: None,
+                    knowledge_refs: Vec::new(),
+                    workspace_scope: None,
+                    write_scope: None,
+                    input_refs: Vec::new(),
+                    output_refs: if status == TaskStatus::Failed {
+                        vec![
+                            "provider timeout at /Users/xie/code/model.rs with sk-test-secret-value"
+                                .to_string(),
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                    evidence_refs: Vec::new(),
+                    retry_count: 0,
+                    runtime_payload: magi_core::TaskRuntimePayload::default(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .expect("任务投影应插入");
         }
-        task_store.set_output_refs(
-            &failed_task_id,
-            vec![
-                "provider timeout at /Users/xie/code/model.rs with sk-test-secret-value"
-                    .to_string(),
-            ],
-        );
-
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
             &[SessionRuntimeSidecarExport {
@@ -1215,48 +1216,16 @@ mod tests {
         let mission_id = magi_core::MissionId::new("mission-recoverable-1");
         let root_task_id = magi_core::TaskId::new("task-root-recoverable-1");
 
-        task_store.insert_task(magi_core::Task {
-            task_id: root_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: magi_core::TaskKind::LocalAgent,
-            title: "root".to_string(),
-            goal: "root".to_string(),
-            status: TaskStatus::Failed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: UtcMillis::now(),
-            updated_at: UtcMillis::now(),
-        });
-        for (task_id, status) in [
-            ("task-branch-failed", TaskStatus::Failed),
-            ("task-branch-pending", TaskStatus::Pending),
-            ("task-branch-running", TaskStatus::Running),
-            ("task-branch-completed", TaskStatus::Completed),
-            ("task-branch-finished-failed", TaskStatus::Failed),
-        ] {
-            task_store.insert_task(magi_core::Task {
-                task_id: magi_core::TaskId::new(task_id),
+        task_store
+            .insert_task(magi_core::Task {
+                task_id: root_task_id.clone(),
                 mission_id: mission_id.clone(),
                 root_task_id: root_task_id.clone(),
-                parent_task_id: Some(root_task_id.clone()),
+                parent_task_id: None,
                 kind: magi_core::TaskKind::LocalAgent,
-                title: task_id.to_string(),
-                goal: task_id.to_string(),
-                status,
+                title: "root".to_string(),
+                goal: "root".to_string(),
+                status: TaskStatus::Failed,
                 dependency_ids: Vec::new(),
                 required_children: Vec::new(),
                 policy_snapshot: None,
@@ -1273,7 +1242,43 @@ mod tests {
                 runtime_payload: magi_core::TaskRuntimePayload::default(),
                 created_at: UtcMillis::now(),
                 updated_at: UtcMillis::now(),
-            });
+            })
+            .expect("根任务应插入");
+        for (task_id, status) in [
+            ("task-branch-failed", TaskStatus::Failed),
+            ("task-branch-pending", TaskStatus::Pending),
+            ("task-branch-running", TaskStatus::Running),
+            ("task-branch-completed", TaskStatus::Completed),
+            ("task-branch-finished-failed", TaskStatus::Failed),
+        ] {
+            task_store
+                .insert_task(magi_core::Task {
+                    task_id: magi_core::TaskId::new(task_id),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    parent_task_id: Some(root_task_id.clone()),
+                    kind: magi_core::TaskKind::LocalAgent,
+                    title: task_id.to_string(),
+                    goal: task_id.to_string(),
+                    status,
+                    dependency_ids: Vec::new(),
+                    required_children: Vec::new(),
+                    policy_snapshot: None,
+                    executor_binding: None,
+                    completion_contract: magi_core::TaskCompletionContract::default(),
+                    recovery_checkpoint: None,
+                    knowledge_refs: Vec::new(),
+                    workspace_scope: None,
+                    write_scope: None,
+                    input_refs: Vec::new(),
+                    output_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    retry_count: 0,
+                    runtime_payload: magi_core::TaskRuntimePayload::default(),
+                    created_at: UtcMillis::now(),
+                    updated_at: UtcMillis::now(),
+                })
+                .expect("分支任务应插入");
         }
 
         let runtime_read_model = runtime_read_model_dto(
@@ -1430,32 +1435,34 @@ mod tests {
                 TaskStatus::Failed,
             ),
         ] {
-            task_store.insert_task(magi_core::Task {
-                task_id: task_id.clone(),
-                mission_id: mission_id.clone(),
-                root_task_id: root_task_id.clone(),
-                parent_task_id,
-                kind: magi_core::TaskKind::LocalAgent,
-                title: task_id.to_string(),
-                goal: task_id.to_string(),
-                status,
-                dependency_ids: Vec::new(),
-                required_children: Vec::new(),
-                policy_snapshot: None,
-                executor_binding: None,
-                completion_contract: magi_core::TaskCompletionContract::default(),
-                recovery_checkpoint: None,
-                knowledge_refs: Vec::new(),
-                workspace_scope: None,
-                write_scope: None,
-                input_refs: Vec::new(),
-                output_refs: Vec::new(),
-                evidence_refs: Vec::new(),
-                retry_count: 0,
-                runtime_payload: magi_core::TaskRuntimePayload::default(),
-                created_at: now,
-                updated_at: now,
-            });
+            task_store
+                .insert_task(magi_core::Task {
+                    task_id: task_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    parent_task_id,
+                    kind: magi_core::TaskKind::LocalAgent,
+                    title: task_id.to_string(),
+                    goal: task_id.to_string(),
+                    status,
+                    dependency_ids: Vec::new(),
+                    required_children: Vec::new(),
+                    policy_snapshot: None,
+                    executor_binding: None,
+                    completion_contract: magi_core::TaskCompletionContract::default(),
+                    recovery_checkpoint: None,
+                    knowledge_refs: Vec::new(),
+                    workspace_scope: None,
+                    write_scope: None,
+                    input_refs: Vec::new(),
+                    output_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    retry_count: 0,
+                    runtime_payload: magi_core::TaskRuntimePayload::default(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .expect("任务投影应插入");
         }
 
         let runtime_read_model = runtime_read_model_dto(
@@ -1848,58 +1855,62 @@ mod tests {
         let root_created_at = UtcMillis::now();
         let branch_created_at = UtcMillis::now();
         let task_store = TaskStore::new();
-        task_store.insert_task(magi_core::Task {
-            task_id: root_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: magi_core::TaskKind::LocalAgent,
-            title: "current root".to_string(),
-            goal: "current root".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: root_created_at,
-            updated_at: UtcMillis::now(),
-        });
-        task_store.insert_task(magi_core::Task {
-            task_id: branch_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: Some(root_task_id.clone()),
-            kind: magi_core::TaskKind::LocalAgent,
-            title: "current branch".to_string(),
-            goal: "current branch".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: branch_created_at,
-            updated_at: UtcMillis::now(),
-        });
+        task_store
+            .insert_task(magi_core::Task {
+                task_id: root_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: magi_core::TaskKind::LocalAgent,
+                title: "current root".to_string(),
+                goal: "current root".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: root_created_at,
+                updated_at: UtcMillis::now(),
+            })
+            .expect("根任务应插入");
+        task_store
+            .insert_task(magi_core::Task {
+                task_id: branch_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: Some(root_task_id.clone()),
+                kind: magi_core::TaskKind::LocalAgent,
+                title: "current branch".to_string(),
+                goal: "current branch".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: branch_created_at,
+                updated_at: UtcMillis::now(),
+            })
+            .expect("分支任务应插入");
 
         let mut input = RuntimeReadModelInput::default();
         input.details.sessions.push(SessionRuntimeSummaryEntry {
@@ -2003,58 +2014,62 @@ mod tests {
         let worker_id = magi_core::WorkerId::new("worker-turn-completed");
         let accepted_at = UtcMillis::now();
         let task_store = TaskStore::new();
-        task_store.insert_task(magi_core::Task {
-            task_id: root_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: magi_core::TaskKind::LocalAgent,
-            title: "completed root".to_string(),
-            goal: "completed root".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: accepted_at,
-            updated_at: accepted_at,
-        });
-        task_store.insert_task(magi_core::Task {
-            task_id: branch_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: Some(root_task_id.clone()),
-            kind: magi_core::TaskKind::LocalAgent,
-            title: "completed branch".to_string(),
-            goal: "completed branch".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: Some(magi_core::TaskExecutorBinding::for_role("reviewer")),
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: accepted_at,
-            updated_at: accepted_at,
-        });
+        task_store
+            .insert_task(magi_core::Task {
+                task_id: root_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: magi_core::TaskKind::LocalAgent,
+                title: "completed root".to_string(),
+                goal: "completed root".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: accepted_at,
+                updated_at: accepted_at,
+            })
+            .expect("根任务应插入");
+        task_store
+            .insert_task(magi_core::Task {
+                task_id: branch_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: Some(root_task_id.clone()),
+                kind: magi_core::TaskKind::LocalAgent,
+                title: "completed branch".to_string(),
+                goal: "completed branch".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: Some(magi_core::TaskExecutorBinding::for_role("reviewer")),
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: accepted_at,
+                updated_at: accepted_at,
+            })
+            .expect("分支任务应插入");
 
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),

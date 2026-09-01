@@ -356,7 +356,8 @@ mod tests {
                     updated_at: now,
                 }],
             },
-        );
+        )
+        .expect("sidecar-only persisted state should construct for rejection test");
         let state = test_state(store);
         register_workspace(&state, "workspace-sidecar-only");
 
@@ -488,7 +489,30 @@ mod tests {
                         completed_at: Some(UtcMillis(index + 1)),
                         status: "completed".to_string(),
                         user_message: Some(format!("消息 {index}")),
-                        items: Vec::new(),
+                        items: vec![magi_session_store::ActiveExecutionTurnItem {
+                            item_id: format!("turn-item-{index:02}"),
+                            item_seq: 1,
+                            kind: "user_message".to_string(),
+                            status: "completed".to_string(),
+                            source: "user".to_string(),
+                            title: None,
+                            content: Some(format!("消息 {index}")),
+                            task_id: None,
+                            worker_id: None,
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_arguments: None,
+                            tool_result: None,
+                            tool_error: None,
+                            request_id: None,
+                            user_message_id: None,
+                            placeholder_message_id: None,
+                            metadata: std::collections::HashMap::new(),
+                            timeline_entry_id: None,
+                            source_thread_id: ThreadId::new("thread-canonical-pagination"),
+                        }],
                     },
                 )
                 .expect("turn should upsert");

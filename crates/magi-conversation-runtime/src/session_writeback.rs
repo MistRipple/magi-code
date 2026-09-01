@@ -52,7 +52,7 @@ use std::{
     thread,
 };
 
-pub type SessionStatePersistCallback = dyn Fn(&str) + Send + Sync;
+pub type SessionStatePersistCallback = dyn Fn(&str) -> Result<(), String> + Send + Sync;
 static CONTEXT_COMPACTION_ITEM_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -85,7 +85,7 @@ pub(crate) fn new_context_compaction_item_id(
 pub(crate) fn upsert_context_compaction_progress_notice(
     context: ContextCompactionWritebackContext<'_>,
     progress: ContextCompactionProgress,
-) {
+) -> Result<(), String> {
     let (status, state, notice_type, stage, completed_chunks, total_chunks) = match progress {
         ContextCompactionProgress::Started {
             stage,
@@ -159,26 +159,38 @@ pub(crate) fn upsert_context_compaction_progress_notice(
         item.metadata
             .insert("totalChunks".to_string(), serde_json::json!(total_chunks));
     }
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    match upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         item,
         None,
     ) {
-        publish_session_turn_item_event(
-            context.event_bus,
-            context.session_id,
-            context.workspace_id,
-            &published,
-        );
+        Ok(Some(published)) => {
+            persist_session_state_checkpoint(
+                context.persist_session_state,
+                "context_compaction_notice",
+            )?;
+            publish_session_turn_item_event(
+                context.event_bus,
+                context.session_id,
+                context.workspace_id,
+                &published,
+            );
+            Ok(())
+        }
+        Ok(None) => Err(format!(
+            "会话 {} 没有可写入上下文压缩进度的当前 Turn",
+            context.session_id
+        )),
+        Err(error) => Err(format!("上下文压缩进度事实写回失败：{error}")),
     }
 }
 
 pub(crate) fn upsert_context_compaction_completed_notice(
     context: ContextCompactionWritebackContext<'_>,
     record: &ContextCompactionRecord,
-) {
+) -> Result<(), String> {
     let mut item = session_turn_item(
         "assistant_phase",
         "completed",
@@ -230,23 +242,31 @@ pub(crate) fn upsert_context_compaction_completed_notice(
         "compactedAt".to_string(),
         serde_json::json!(record.compacted_at.0),
     );
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    match upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         item,
         None,
     ) {
-        persist_session_state_checkpoint(
-            context.persist_session_state,
-            "context_compaction_notice",
-        );
-        publish_session_turn_item_event(
-            context.event_bus,
-            context.session_id,
-            context.workspace_id,
-            &published,
-        );
+        Ok(Some(published)) => {
+            persist_session_state_checkpoint(
+                context.persist_session_state,
+                "context_compaction_notice",
+            )?;
+            publish_session_turn_item_event(
+                context.event_bus,
+                context.session_id,
+                context.workspace_id,
+                &published,
+            );
+            Ok(())
+        }
+        Ok(None) => Err(format!(
+            "会话 {} 没有可写入上下文压缩完成事实的当前 Turn",
+            context.session_id
+        )),
+        Err(error) => Err(format!("上下文压缩完成事实写回失败：{error}")),
     }
 }
 
@@ -264,10 +284,8 @@ pub fn apply_model_response_round(item: &mut ActiveExecutionTurnItem, round: usi
 pub fn persist_session_state_checkpoint(
     callback: Option<&SessionStatePersistCallback>,
     checkpoint: &'static str,
-) {
-    if let Some(callback) = callback {
-        callback(checkpoint);
-    }
+) -> Result<(), String> {
+    callback.map_or(Ok(()), |callback| callback(checkpoint))
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +313,7 @@ pub struct SessionToolCallBatchOutcome {
     pub succeeded_tool_names: Vec<String>,
     pub activated_skill_id: Option<String>,
     pub terminal_failure: Option<DeterministicToolFailure>,
+    pub writeback_error: Option<String>,
 }
 
 const STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS: u64 = 80;
@@ -375,13 +394,21 @@ fn published_session_turn_item_from_sidecar(
     sidecar: SessionRuntimeSidecar,
     item_id: &str,
     task_store: Option<&TaskStore>,
-) -> Option<PublishedSessionTurnItem> {
-    let turn = sidecar.current_turn.as_ref()?;
+) -> Result<Option<PublishedSessionTurnItem>, String> {
+    let Some(turn) = sidecar.current_turn.as_ref() else {
+        return Ok(None);
+    };
     let item = turn
         .items
         .iter()
-        .find(|candidate| candidate.item_id == item_id)?
-        .clone();
+        .find(|candidate| candidate.item_id == item_id)
+        .ok_or_else(|| {
+            format!(
+                "会话 {} 的 Turn {} 已写入 item {}，但无法从当前 Turn 生成发布快照",
+                sidecar.session_id, turn.turn_id, item_id
+            )
+        })
+        .cloned()?;
     let chain = chain_for_turn_summary(&sidecar, turn);
     let response_duration_ms = turn
         .completed_at
@@ -390,18 +417,26 @@ fn published_session_turn_item_from_sidecar(
         .canonical_turns_for_session(&sidecar.session_id)
         .into_iter()
         .find(|canonical| canonical.turn_id == turn.turn_id)
-        .or_else(|| to_canonical_turn(&sidecar.session_id, turn));
+        .or_else(|| to_canonical_turn(&sidecar.session_id, turn))
+        .ok_or_else(|| {
+            format!(
+                "会话 {} 的 Turn {} 无法转换为 canonical 发布快照",
+                sidecar.session_id, turn.turn_id
+            )
+        })?;
     let canonical_item = canonical_turn
-        .as_ref()
-        .and_then(|canonical| {
-            canonical
-                .items
-                .iter()
-                .find(|candidate| candidate.item_id == item.item_id)
-        })
+        .items
+        .iter()
+        .find(|candidate| candidate.item_id == item.item_id)
         .cloned()
-        .or_else(|| to_canonical_turn_item(&sidecar.session_id, turn, &item));
-    Some(PublishedSessionTurnItem {
+        .or_else(|| to_canonical_turn_item(&sidecar.session_id, turn, &item))
+        .ok_or_else(|| {
+            format!(
+                "会话 {} 的 Turn {} item {} 无法转换为 canonical item",
+                sidecar.session_id, turn.turn_id, item_id
+            )
+        })?;
+    Ok(Some(PublishedSessionTurnItem {
         turn_id: turn.turn_id.clone(),
         turn_seq: turn.turn_seq,
         item,
@@ -422,9 +457,9 @@ fn published_session_turn_item_from_sidecar(
             .iter()
             .map(|item| to_turn_item_summary(item, task_store))
             .collect(),
-        canonical_turn,
-        canonical_item,
-    })
+        canonical_turn: Some(canonical_turn),
+        canonical_item: Some(canonical_item),
+    }))
 }
 
 fn chain_for_turn_summary<'a>(
@@ -640,7 +675,8 @@ fn to_canonical_turn_item(
         kind,
         created_at: turn.accepted_at,
         status,
-        item_version: None,
+        // 与 SessionStore 的 canonical 写模型保持一致：新 item 的事实版本从 1 开始。
+        item_version: Some(1),
         updated_at: UtcMillis::now(),
         title: item.title.clone(),
         content: item.content.clone(),
@@ -727,12 +763,14 @@ pub fn append_session_turn_item_for_turn(
     expected_turn_id: Option<&str>,
     item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
-) -> Option<PublishedSessionTurnItem> {
+) -> Result<Option<PublishedSessionTurnItem>, String> {
     let item_id = item.item_id.clone();
     let sidecar = session_store
         .append_current_turn_item_for_turn(session_id, expected_turn_id, item)
-        .ok()
-        .flatten()?;
+        .map_err(|error| error.to_string())?;
+    let Some(sidecar) = sidecar else {
+        return Ok(None);
+    };
     published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
 }
 
@@ -742,12 +780,14 @@ pub fn upsert_session_turn_item_for_turn(
     expected_turn_id: Option<&str>,
     item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
-) -> Option<PublishedSessionTurnItem> {
+) -> Result<Option<PublishedSessionTurnItem>, String> {
     let item_id = item.item_id.clone();
     let sidecar = session_store
         .upsert_current_turn_item_for_turn(session_id, expected_turn_id, item)
-        .ok()
-        .flatten()?;
+        .map_err(|error| error.to_string())?;
+    let Some(sidecar) = sidecar else {
+        return Ok(None);
+    };
     published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
 }
 
@@ -795,7 +835,7 @@ pub fn publish_model_retry_runtime_event(
         "max_attempts": event.max_attempts,
         "delay_ms": event.delay_ms,
     });
-    let _ = event_bus.publish(
+    event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!(
                 "model-retry-runtime-{}-{}",
@@ -867,7 +907,7 @@ fn publish_session_turn_item_payload(
     workspace_id: &Option<WorkspaceId>,
     payload: Value,
 ) {
-    let _ = event_bus.publish(
+    event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!("event-session-turn-item-{}", UtcMillis::now().0)),
             "session.turn.item",
@@ -888,16 +928,20 @@ pub fn publish_current_session_turn_item_event(
     workspace_id: &Option<WorkspaceId>,
     item_id: &str,
     task_store: Option<&TaskStore>,
-) {
-    let Some(sidecar) = session_store.runtime_sidecar(session_id) else {
-        return;
-    };
-    let Some(published) =
-        published_session_turn_item_from_sidecar(session_store, sidecar, item_id, task_store)
-    else {
-        return;
-    };
+) -> Result<(), String> {
+    let sidecar = session_store
+        .runtime_sidecar(session_id)
+        .ok_or_else(|| format!("会话 {} 没有可发布的运行时 sidecar", session_id))?;
+    let published =
+        published_session_turn_item_from_sidecar(session_store, sidecar, item_id, task_store)?
+            .ok_or_else(|| {
+                format!(
+                    "会话 {} 当前 Turn 没有可发布的 item {}",
+                    session_id, item_id
+                )
+            })?;
     publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    Ok(())
 }
 
 pub struct SessionTurnErrorInput<'a> {
@@ -920,7 +964,7 @@ pub fn append_session_turn_error_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     input: SessionTurnErrorInput<'_>,
-) {
+) -> Result<(), String> {
     let SessionTurnErrorInput {
         session_id,
         workspace_id,
@@ -962,16 +1006,30 @@ pub fn append_session_turn_error_item(
             .metadata
             .insert("toolCallFailure".to_string(), tool_call_failure);
     }
-    let _ = append_session_turn_item_for_turn(
+    let item_published = append_session_turn_item_for_turn(
         session_store,
         session_id,
         expected_turn_id,
         error_item,
         None,
-    );
-    let _ =
-        session_store.update_current_turn_status_for_turn(session_id, expected_turn_id, "failed");
-    persist_session_state_checkpoint(persist_session_state, "session_turn_failed");
+    )?
+    .ok_or_else(|| {
+        format!(
+            "会话 {} 没有可写入的当前 Turn，无法记录失败事实",
+            session_id
+        )
+    })?;
+    session_store
+        .update_current_turn_status_for_turn(session_id, expected_turn_id, "failed")
+        .map_err(|error| format!("更新会话 {} 的 Turn failed 状态失败: {error}", session_id))?
+        .ok_or_else(|| {
+            format!(
+                "会话 {} 没有可更新的当前 Turn，无法提交 failed 状态",
+                session_id
+            )
+        })?;
+    persist_session_state_checkpoint(persist_session_state, "session_turn_failed")?;
+    let _ = item_published;
     publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -979,7 +1037,8 @@ pub fn append_session_turn_error_item(
         workspace_id,
         &error_item_id,
         None,
-    );
+    )?;
+    Ok(())
 }
 
 fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<String> {
@@ -1177,17 +1236,37 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         started_item.tool_name = Some(tool_call.function.name.clone());
         started_item.tool_status = Some("running".to_string());
         started_item.tool_arguments = Some(tool_call.function.arguments.clone());
-        if let Some(published) = upsert_session_turn_item_for_turn(
+        let published = match upsert_session_turn_item_for_turn(
             session_store,
             session_id,
             expected_turn_id,
             started_item,
             None,
         ) {
-            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
-        }
+            Ok(Some(published)) => published,
+            Ok(None) => {
+                return SessionToolCallBatchOutcome {
+                    writeback_error: Some(format!(
+                        "会话 {} 的当前 Turn 已不可写，无法保存工具 {} 的开始事实",
+                        session_id, tool_call.function.name
+                    )),
+                    ..SessionToolCallBatchOutcome::default()
+                };
+            }
+            Err(error) => {
+                return SessionToolCallBatchOutcome {
+                    writeback_error: Some(format!(
+                        "保存工具 {} 的开始事实失败：{error}",
+                        tool_call.function.name
+                    )),
+                    ..SessionToolCallBatchOutcome::default()
+                };
+            }
+        };
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 
+    let writeback_error = std::sync::Mutex::new(None::<String>);
     let execution_context = SessionToolExecutionContext {
         session_store,
         event_bus,
@@ -1208,6 +1287,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         browser_execution_id,
         source_thread_id,
         expected_turn_id,
+        writeback_error: &writeback_error,
     };
     let tool_results =
         tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
@@ -1227,6 +1307,18 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
                 &hook_contexts,
             )
         });
+
+    if let Some(error) = writeback_error
+        .lock()
+        .expect("session tool writeback error lock should hold")
+        .take()
+    {
+        tracing::error!(session_id = %session_id.as_str(), %error, "会话工具执行过程写回失败");
+        return SessionToolCallBatchOutcome {
+            writeback_error: Some(error),
+            ..SessionToolCallBatchOutcome::default()
+        };
+    }
 
     if let Some(snapshot) = snapshot_session.as_deref()
         && let Err(err) = snapshot.reconcile()
@@ -1248,9 +1340,19 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         if is_session_goal_write_tool(&tool_call.function.name)
             && matches!(tool_status, ExecutionResultStatus::Succeeded)
         {
-            persist_session_state_checkpoint(persist_session_state, "session_goal_tool");
+            if let Err(error) =
+                persist_session_state_checkpoint(persist_session_state, "session_goal_tool")
+            {
+                return SessionToolCallBatchOutcome {
+                    writeback_error: Some(format!(
+                        "会话目标工具 {} 的状态持久化失败：{error}",
+                        tool_call.function.name
+                    )),
+                    ..SessionToolCallBatchOutcome::default()
+                };
+            }
         }
-        upsert_session_tool_call_result_item(
+        if let Err(error) = upsert_session_tool_call_result_item(
             SessionToolResultWritebackContext {
                 session_store,
                 event_bus,
@@ -1263,7 +1365,15 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
             tool_call,
             &tool_result,
             tool_status,
-        );
+        ) {
+            return SessionToolCallBatchOutcome {
+                writeback_error: Some(format!(
+                    "保存工具 {} 的结果事实失败：{error}",
+                    tool_call.function.name
+                )),
+                ..SessionToolCallBatchOutcome::default()
+            };
+        }
         messages.push(ChatMessage {
             role: "tool".to_string(),
             content: Some(model_visible_tool_result(&tool_result, tool_status)),
@@ -1291,6 +1401,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         succeeded_tool_names,
         activated_skill_id,
         terminal_failure,
+        writeback_error: None,
     }
 }
 
@@ -1310,7 +1421,7 @@ fn upsert_session_tool_call_result_item(
     tool_call: &ChatToolCall,
     tool_result: &str,
     tool_status: ExecutionResultStatus,
-) {
+) -> Result<(), String> {
     let status_label = tool_execution_status_label(tool_status);
     let mut result_item = session_turn_item(
         "tool_call_result",
@@ -1334,21 +1445,27 @@ fn upsert_session_tool_call_result_item(
     ) {
         result_item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) = upsert_session_turn_item_for_turn(
+    let published = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
         context.expected_turn_id,
         result_item,
         None,
-    ) {
-        persist_session_state_checkpoint(context.persist_session_state, "session_turn_tool_result");
-        publish_session_turn_item_event(
-            context.event_bus,
-            context.session_id,
-            context.workspace_id,
-            &published,
-        );
-    }
+    )?
+    .ok_or_else(|| {
+        format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存工具 {} 的结果事实",
+            context.session_id, tool_call.function.name
+        )
+    })?;
+    persist_session_state_checkpoint(context.persist_session_state, "session_turn_tool_result")?;
+    publish_session_turn_item_event(
+        context.event_bus,
+        context.session_id,
+        context.workspace_id,
+        &published,
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1372,6 +1489,40 @@ struct SessionToolExecutionContext<'a> {
     browser_execution_id: Option<&'a str>,
     source_thread_id: &'a ThreadId,
     expected_turn_id: Option<&'a str>,
+    writeback_error: &'a std::sync::Mutex<Option<String>>,
+}
+
+fn record_session_tool_writeback_error(
+    writeback_error: &std::sync::Mutex<Option<String>>,
+    error: String,
+) {
+    let mut slot = writeback_error
+        .lock()
+        .expect("session tool writeback error lock should hold");
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+#[cfg(test)]
+fn take_session_tool_writeback_failure(
+    writeback_error: &std::sync::Mutex<Option<String>>,
+    tool_name: &str,
+) -> Option<(String, ExecutionResultStatus)> {
+    let error = writeback_error
+        .lock()
+        .expect("session tool writeback error lock should hold")
+        .take()?;
+    Some((
+        serde_json::json!({
+            "tool": tool_name,
+            "status": "failed",
+            "error_code": "session_turn_writeback_failed",
+            "error": error,
+        })
+        .to_string(),
+        ExecutionResultStatus::Failed,
+    ))
 }
 
 fn execute_session_turn_tool_call_batch(
@@ -1512,6 +1663,35 @@ struct SessionToolCallTestContext<'a> {
 }
 
 #[cfg(test)]
+fn ensure_test_session_turn(session_store: &SessionStore, session_id: &SessionId) {
+    if session_store.session(session_id).is_none() {
+        session_store
+            .create_session(session_id.clone(), "session tool test")
+            .expect("session tool test session should be creatable");
+    }
+    if session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .is_none()
+    {
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: format!("turn-{session_id}"),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("session tool test".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("session tool test turn should be creatable");
+    }
+}
+
+#[cfg(test)]
 fn execute_session_turn_tool_call(
     context: SessionToolCallTestContext<'_>,
     tool_call: &ChatToolCall,
@@ -1529,11 +1709,13 @@ fn execute_session_turn_tool_call(
         workspace_root_path,
         access_profile,
     } = context;
+    ensure_test_session_turn(session_store, session_id);
     let plan_store = crate::test_plan_store("test-plan");
     let tool_approval_registry = crate::ToolApprovalRegistry::default();
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     let source_thread_id = ThreadId::new(format!("thread-{session_id}"));
-    execute_session_turn_tool_call_scoped(
+    let writeback_error = std::sync::Mutex::new(None);
+    let result = execute_session_turn_tool_call_scoped(
         SessionToolExecutionContext {
             session_store,
             event_bus,
@@ -1554,9 +1736,12 @@ fn execute_session_turn_tool_call(
             browser_execution_id: None,
             source_thread_id: &source_thread_id,
             expected_turn_id: None,
+            writeback_error: &writeback_error,
         },
         tool_call,
-    )
+    );
+    take_session_tool_writeback_failure(&writeback_error, &tool_call.function.name)
+        .unwrap_or(result)
 }
 
 #[cfg(test)]
@@ -1578,35 +1763,12 @@ fn execute_session_turn_tool_call_with_approval(
         workspace_root_path,
         access_profile,
     } = context;
-    if session_store.session(session_id).is_none() {
-        session_store
-            .create_session(session_id.clone(), "tool approval test")
-            .expect("approval test session should be creatable");
-    }
-    if session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .is_none()
-    {
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: format!("turn-{session_id}"),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("approval test".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("approval test turn should be creatable");
-    }
+    ensure_test_session_turn(session_store, session_id);
     let plan_store = crate::test_plan_store("test-plan-approval");
     let tool_approval_registry = crate::ToolApprovalRegistry::default();
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     let source_thread_id = ThreadId::new(format!("thread-{session_id}"));
+    let writeback_error = std::sync::Mutex::new(None);
     let execution_context = SessionToolExecutionContext {
         session_store,
         event_bus,
@@ -1627,9 +1789,10 @@ fn execute_session_turn_tool_call_with_approval(
         browser_execution_id: None,
         source_thread_id: &source_thread_id,
         expected_turn_id: None,
+        writeback_error: &writeback_error,
     };
 
-    thread::scope(|scope| {
+    let result = thread::scope(|scope| {
         let handle =
             scope.spawn(|| execute_session_turn_tool_call_scoped(execution_context, tool_call));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1651,7 +1814,9 @@ fn execute_session_turn_tool_call_with_approval(
             std::thread::yield_now();
         }
         handle.join().expect("approval tool execution should join")
-    })
+    });
+    take_session_tool_writeback_failure(&writeback_error, &tool_call.function.name)
+        .unwrap_or(result)
 }
 
 #[derive(Clone, Copy)]
@@ -1664,6 +1829,7 @@ struct SessionToolApprovalContext<'a> {
     workspace_id: &'a Option<WorkspaceId>,
     source_thread_id: &'a ThreadId,
     expected_turn_id: Option<&'a str>,
+    writeback_error: &'a std::sync::Mutex<Option<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1681,7 +1847,7 @@ fn upsert_session_tool_progress_item(
     tool_call: &ChatToolCall,
     tool_name: String,
     payload: String,
-) {
+) -> Result<(), String> {
     let SessionToolProgressContext {
         session_store,
         event_bus,
@@ -1714,11 +1880,16 @@ fn upsert_session_tool_progress_item(
     item.tool_status = Some(progress_status);
     item.tool_arguments = Some(tool_call.function.arguments.clone());
     item.tool_result = Some(payload);
-    if let Some(published) =
-        upsert_session_turn_item_for_turn(session_store, session_id, expected_turn_id, item, None)
-    {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
-    }
+    let published =
+        upsert_session_turn_item_for_turn(session_store, session_id, expected_turn_id, item, None)?
+            .ok_or_else(|| {
+                format!(
+                    "会话 {} 的当前 Turn 已不可写，无法保存工具 {} 的进度事实",
+                    session_id, tool_call.function.name
+                )
+            })?;
+    publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    Ok(())
 }
 
 fn await_session_tool_approval(
@@ -1735,6 +1906,7 @@ fn await_session_tool_approval(
         workspace_id,
         source_thread_id,
         expected_turn_id,
+        writeback_error,
     } = context;
     let Some(turn_id) = session_store
         .runtime_sidecar(session_id)
@@ -1818,7 +1990,7 @@ fn await_session_tool_approval(
         "approval": request,
     })
     .to_string();
-    upsert_session_tool_progress_item(
+    if let Err(error) = upsert_session_tool_progress_item(
         SessionToolProgressContext {
             session_store,
             event_bus,
@@ -1830,8 +2002,21 @@ fn await_session_tool_approval(
         tool_call,
         tool_call.function.name.clone(),
         progress_payload,
-    );
-    let _ = event_bus.publish(
+    ) {
+        record_session_tool_writeback_error(writeback_error, error.clone());
+        return Err((
+            serde_json::json!({
+                "tool": tool_call.function.name,
+                "status": "failed",
+                "error_code": "session_turn_writeback_failed",
+                "error": error,
+                "approval_id": approval_id,
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        ));
+    }
+    event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!(
                 "event-tool-approval-requested-{}",
@@ -1883,7 +2068,7 @@ fn await_session_tool_approval(
                         ExecutionResultStatus::Cancelled,
                     ));
                 }
-                upsert_session_tool_progress_item(
+                if let Err(error) = upsert_session_tool_progress_item(
                     SessionToolProgressContext {
                         session_store,
                         event_bus,
@@ -1900,7 +2085,20 @@ fn await_session_tool_approval(
                         "approval_id": approval_id,
                     })
                     .to_string(),
-                );
+                ) {
+                    record_session_tool_writeback_error(writeback_error, error.clone());
+                    return Err((
+                        serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "failed",
+                            "error_code": "session_turn_writeback_failed",
+                            "error": error,
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Failed,
+                    ));
+                }
                 return Ok(());
             }
             Ok(crate::ToolApprovalDecision::Deny) => {
@@ -1972,6 +2170,7 @@ fn execute_session_turn_tool_call_scoped(
         browser_execution_id,
         source_thread_id,
         expected_turn_id,
+        writeback_error,
     } = context;
     if let Some(canonical) = BuiltinToolName::from_name(tool_call.function.name.as_str())
         && matches!(
@@ -2030,7 +2229,7 @@ fn execute_session_turn_tool_call_scoped(
         );
     };
 
-    let _ = event_bus.publish(
+    event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!("event-session-turn-tool-{}", UtcMillis::now().0)),
             "session.turn.tool.invoked",
@@ -2116,6 +2315,7 @@ fn execute_session_turn_tool_call_scoped(
                     workspace_id,
                     source_thread_id,
                     expected_turn_id,
+                    writeback_error,
                 },
                 tool_call,
                 &decision,
@@ -2132,7 +2332,7 @@ fn execute_session_turn_tool_call_scoped(
         if progress.tool_call_id.as_str() != tool_call.id {
             return;
         }
-        upsert_session_tool_progress_item(
+        if let Err(error) = upsert_session_tool_progress_item(
             SessionToolProgressContext {
                 session_store,
                 event_bus,
@@ -2144,7 +2344,9 @@ fn execute_session_turn_tool_call_scoped(
             tool_call,
             progress.tool_name,
             progress.payload,
-        );
+        ) {
+            record_session_tool_writeback_error(writeback_error, error);
+        }
     };
     let execute_runtime_tool = |effective_access_profile: magi_core::AccessProfile| {
         let reference_policy = crate::context_reference::session_context_reference_policy(
@@ -2247,6 +2449,7 @@ fn execute_session_turn_tool_call_scoped(
                 workspace_id,
                 source_thread_id,
                 expected_turn_id,
+                writeback_error,
             },
             tool_call,
             &runtime_decision,
@@ -2473,6 +2676,7 @@ mod tests {
             first_item,
             None,
         )
+        .expect("first stream item writeback should succeed")
         .expect("first stream item should be published");
         let first_update = session_turn_stream_update("", first_content)
             .expect("first stream update should exist");
@@ -2501,6 +2705,7 @@ mod tests {
             suppressed_item,
             None,
         )
+        .expect("suppressed stream item writeback should succeed")
         .expect("suppressed stream item should be stored");
         let suppressed_update = session_turn_stream_update(first_content, suppressed_content)
             .expect("suppressed stream update should exist");
@@ -2529,6 +2734,7 @@ mod tests {
             second_item,
             None,
         )
+        .expect("second stream item writeback should succeed")
         .expect("second stream item should be published");
         let second_update = session_turn_stream_update(suppressed_content, &second_content)
             .expect("second stream update should exist");
@@ -3956,6 +4162,7 @@ mod tests {
                 .lock()
                 .expect("checkpoint lock")
                 .push(checkpoint.to_string());
+            Ok(())
         };
         let mut messages = Vec::new();
         let create_call = ChatToolCall {
@@ -4810,6 +5017,7 @@ mod tests {
             "turn-item-plain-final",
             None,
         )
+        .expect("plain final item writeback should succeed")
         .expect("plain final item should publish");
 
         assert_eq!(

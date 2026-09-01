@@ -8,7 +8,7 @@
 //! magi-api 不再实现这两个类型，改为 `pub use` 重导出；本模块是任务派发链路的
 //! 唯一所有者。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -114,11 +114,20 @@ pub struct TaskExecutionRegistry {
 }
 
 impl TaskExecutionRegistry {
-    pub fn insert(&self, task_id: TaskId, plan: TaskExecutionPlan) {
-        self.plans
+    pub fn insert(
+        &self,
+        task_id: TaskId,
+        plan: TaskExecutionPlan,
+    ) -> Result<(), TaskExecutionPlan> {
+        let mut plans = self
+            .plans
             .write()
-            .expect("task execution registry write lock poisoned")
-            .insert(task_id, plan);
+            .expect("task execution registry write lock poisoned");
+        if plans.contains_key(&task_id) {
+            return Err(plan);
+        }
+        plans.insert(task_id, plan);
+        Ok(())
     }
 
     pub fn remove(&self, task_id: &TaskId) -> Option<TaskExecutionPlan> {
@@ -126,6 +135,26 @@ impl TaskExecutionRegistry {
             .write()
             .expect("task execution registry write lock poisoned")
             .remove(task_id)
+    }
+
+    /// 仅删除仍属于指定 Turn 的执行计划。
+    ///
+    /// 一个任务在恢复时可能先结束旧租约、再注册新 Turn。旧 dispatcher 的 Drop
+    /// 不能无条件删除同一 task id 的新计划，否则会把恢复后的执行链再次变成无计划
+    /// 执行。Turn 是计划的生命周期代际，因此这里把代际校验和删除放在同一把写锁内。
+    pub fn remove_if_turn_matches(
+        &self,
+        task_id: &TaskId,
+        expected_turn_id: &str,
+    ) -> Option<TaskExecutionPlan> {
+        let mut plans = self
+            .plans
+            .write()
+            .expect("task execution registry write lock poisoned");
+        let matches = plans.get(task_id).is_some_and(|plan| match plan {
+            TaskExecutionPlan::Dispatch { turn_id, .. } => turn_id == expected_turn_id,
+        });
+        matches.then(|| plans.remove(task_id)).flatten()
     }
 
     pub fn get(&self, task_id: &TaskId) -> Option<TaskExecutionPlan> {
@@ -232,6 +261,7 @@ impl TaskExecutionRegistry {
                     "agent_spawn 需要当前会话存在活跃执行链".to_string(),
                 )
             })?;
+        let original_chain = chain.clone();
         if chain.mission_id != child_task.mission_id
             || chain.root_task_id != child_task.root_task_id
         {
@@ -249,6 +279,19 @@ impl TaskExecutionRegistry {
                 child_task.task_id
             ))
         })?;
+        if task_store.get_task(&child_task.task_id).is_some() {
+            return Err(SpawnedChildExecutionError::InvalidState(format!(
+                "agent_spawn 子任务 {} 已存在于 TaskStore，拒绝重复注册",
+                child_task.task_id
+            )));
+        }
+        if self.get(&child_task.task_id).is_some() {
+            return Err(SpawnedChildExecutionError::InvalidState(format!(
+                "agent_spawn 子任务 {} 已存在于执行注册表，拒绝重复注册",
+                child_task.task_id
+            )));
+        }
+
         let active_role_agent_count = active_execution_agent_count_for_role(
             task_store,
             session_store,
@@ -263,34 +306,8 @@ impl TaskExecutionRegistry {
                 limit: DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE,
             });
         }
-        spawn_graph
-            .lock()
-            .map_err(|err| {
-                SpawnedChildExecutionError::InvalidState(format!(
-                    "SpawnGraph mutex poisoned: {err}"
-                ))
-            })?
-            .add_edge(
-                parent_task_id.clone(),
-                child_task.task_id.clone(),
-                child_task.kind,
-                std::time::SystemTime::now(),
-            )
-            .map_err(|error| {
-                SpawnedChildExecutionError::InvalidState(format!(
-                    "agent_spawn 注册 SpawnGraph 边失败: {error}"
-                ))
-            })?;
+
         let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
-        let thread_id = session_thread::ensure_thread_for_role(
-            session_store,
-            session_id,
-            &chain.mission_id,
-            role,
-            &worker_id,
-            &child_task.task_id,
-            now,
-        );
         let parent_plan = self.get(&parent_task_id);
         let inherited_turn_id = parent_plan
             .as_ref()
@@ -303,6 +320,11 @@ impl TaskExecutionRegistry {
                     "agent_spawn 父任务缺少所属 Turn，无法注册子任务".to_string(),
                 )
             })?;
+        let thread_id = ThreadId::new(format!(
+            "thread-{role}-{}-{}",
+            child_task.task_id.as_str(),
+            now.0
+        ));
         let inherited_skill_name = parent_plan.as_ref().and_then(|plan| match plan {
             TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
         });
@@ -345,54 +367,201 @@ impl TaskExecutionRegistry {
         }
         let execution_chain_ref = chain.execution_chain_ref.clone();
         chain.normalize();
-        session_store
-            .upsert_active_execution_chain(session_id.clone(), chain)
-            .map_err(|error| SpawnedChildExecutionError::InvalidState(error.to_string()))?;
 
         let execution_settings_snapshot = parent_plan
             .as_ref()
             .and_then(TaskExecutionPlan::execution_settings_snapshot);
 
-        self.insert(
-            child_task.task_id.clone(),
-            TaskExecutionPlan::Dispatch {
-                target: TaskExecutionTarget {
-                    mission_id: child_task.mission_id.clone(),
-                    root_task_id: child_task.root_task_id.clone(),
-                    task_id: child_task.task_id.clone(),
-                    requested_worker_id: Some(worker_id.clone()),
-                    recovery_id: None,
-                    execution_chain_ref: Some(execution_chain_ref.clone()),
-                },
-                worker_id: worker_id.clone(),
-                thread_id: thread_id.clone(),
-                is_primary: false,
-                session_id: session_id.clone(),
-                turn_id: inherited_turn_id,
-                workspace_id: workspace_id.clone(),
-                execution_root: inherited_execution_root,
-                ownership: ExecutionOwnership {
-                    session_id: Some(session_id.clone()),
-                    workspace_id: workspace_id.clone(),
-                    mission_id: Some(child_task.mission_id.clone()),
-                    task_id: Some(child_task.task_id.clone()),
-                    worker_id: Some(worker_id.clone()),
-                    execution_chain_ref: Some(execution_chain_ref.clone()),
-                },
-                writebacks: ExecutionWritebackPlans::default(),
-                use_tools: true,
-                skill_name: inherited_skill_name,
-                images: Vec::new(),
-                execution_settings_snapshot,
+        let plan = TaskExecutionPlan::Dispatch {
+            target: TaskExecutionTarget {
+                mission_id: child_task.mission_id.clone(),
+                root_task_id: child_task.root_task_id.clone(),
+                task_id: child_task.task_id.clone(),
+                requested_worker_id: Some(worker_id.clone()),
+                recovery_id: None,
+                execution_chain_ref: Some(execution_chain_ref.clone()),
             },
-        );
-        task_store.insert_task(child_task.clone());
+            worker_id: worker_id.clone(),
+            thread_id: thread_id.clone(),
+            is_primary: false,
+            session_id: session_id.clone(),
+            turn_id: inherited_turn_id,
+            workspace_id: workspace_id.clone(),
+            execution_root: inherited_execution_root,
+            ownership: ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                workspace_id: workspace_id.clone(),
+                mission_id: Some(child_task.mission_id.clone()),
+                task_id: Some(child_task.task_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                execution_chain_ref: Some(execution_chain_ref.clone()),
+            },
+            writebacks: ExecutionWritebackPlans::default(),
+            use_tools: true,
+            skill_name: inherited_skill_name,
+            images: Vec::new(),
+            execution_settings_snapshot,
+        };
+
+        task_store
+            .insert_task(child_task.clone())
+            .map_err(|error| SpawnedChildExecutionError::InvalidState(error.to_string()))?;
+
+        let graph_added = match spawn_graph.lock().map_err(|err| {
+            SpawnedChildExecutionError::InvalidState(format!("SpawnGraph mutex poisoned: {err}"))
+        }) {
+            Ok(mut graph) => graph
+                .add_edge(
+                    parent_task_id.clone(),
+                    child_task.task_id.clone(),
+                    child_task.kind,
+                    std::time::SystemTime::now(),
+                )
+                .map(|_| true)
+                .map_err(|error| {
+                    SpawnedChildExecutionError::InvalidState(format!(
+                        "agent_spawn 注册 SpawnGraph 边失败: {error}"
+                    ))
+                }),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = graph_added {
+            return Err(rollback_spawned_local_agent_child(
+                self,
+                task_store,
+                spawn_graph,
+                session_store,
+                session_id,
+                &child_task.task_id,
+                &original_chain,
+                false,
+                false,
+                false,
+                error,
+            ));
+        }
+
+        if let Err(error) =
+            session_store.upsert_active_execution_chain(session_id.clone(), chain.clone())
+        {
+            return Err(rollback_spawned_local_agent_child(
+                self,
+                task_store,
+                spawn_graph,
+                session_store,
+                session_id,
+                &child_task.task_id,
+                &original_chain,
+                true,
+                false,
+                false,
+                SpawnedChildExecutionError::InvalidState(error.to_string()),
+            ));
+        }
+
+        if let Err(_plan) = self.insert(child_task.task_id.clone(), plan) {
+            return Err(rollback_spawned_local_agent_child(
+                self,
+                task_store,
+                spawn_graph,
+                session_store,
+                session_id,
+                &child_task.task_id,
+                &original_chain,
+                true,
+                true,
+                false,
+                SpawnedChildExecutionError::InvalidState(format!(
+                    "agent_spawn 子任务 {} 已存在于执行注册表，拒绝重复注册",
+                    child_task.task_id
+                )),
+            ));
+        }
+
+        let thread_id = match session_thread::ensure_thread_for_role(
+            session_store,
+            session_id,
+            &chain.mission_id,
+            role,
+            &worker_id,
+            &child_task.task_id,
+            now,
+        ) {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                return Err(rollback_spawned_local_agent_child(
+                    self,
+                    task_store,
+                    spawn_graph,
+                    session_store,
+                    session_id,
+                    &child_task.task_id,
+                    &original_chain,
+                    true,
+                    true,
+                    true,
+                    SpawnedChildExecutionError::InvalidState(format!(
+                        "agent_spawn 注册执行 thread 失败: {error}"
+                    )),
+                ));
+            }
+        };
 
         Ok(SpawnedChildExecution {
             worker_id,
             thread_id,
             execution_chain_ref,
         })
+    }
+}
+
+fn rollback_spawned_local_agent_child(
+    registry: &TaskExecutionRegistry,
+    task_store: &TaskStore,
+    spawn_graph: &Mutex<SpawnGraph>,
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    child_task_id: &TaskId,
+    original_chain: &magi_session_store::ActiveExecutionChain,
+    graph_added: bool,
+    session_chain_updated: bool,
+    registry_inserted: bool,
+    primary_error: SpawnedChildExecutionError,
+) -> SpawnedChildExecutionError {
+    let mut rollback_errors = Vec::new();
+    if registry_inserted && registry.remove(child_task_id).is_none() {
+        rollback_errors.push("执行注册表回滚时未找到子任务".to_string());
+    }
+    if graph_added {
+        let mut task_ids = HashSet::new();
+        task_ids.insert(child_task_id.clone());
+        match spawn_graph.lock() {
+            Ok(mut graph) => {
+                graph.remove_tasks(&task_ids);
+            }
+            Err(error) => rollback_errors.push(format!("SpawnGraph 回滚失败: {error}")),
+        }
+    }
+    if session_chain_updated {
+        if let Err(error) =
+            session_store.upsert_active_execution_chain(session_id.clone(), original_chain.clone())
+        {
+            rollback_errors.push(format!("session active chain 回滚失败: {error}"));
+        }
+    }
+    match task_store.remove_task(child_task_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => rollback_errors.push("TaskStore 回滚时未找到子任务".to_string()),
+        Err(error) => rollback_errors.push(format!("TaskStore 回滚失败: {error}")),
+    }
+
+    if rollback_errors.is_empty() {
+        primary_error
+    } else {
+        SpawnedChildExecutionError::InvalidState(format!(
+            "{primary_error}；回滚失败: {}",
+            rollback_errors.join("；")
+        ))
     }
 }
 
@@ -529,32 +698,34 @@ mod tests {
 
         let parent_settings = SettingsStore::new();
         let parent_settings_snapshot = Arc::new(parent_settings.execution_snapshot());
-        registry.insert(
-            root_task_id.clone(),
-            TaskExecutionPlan::Dispatch {
-                target: magi_core::TaskExecutionTarget {
-                    mission_id: mission_id.clone(),
-                    root_task_id: root_task_id.clone(),
-                    task_id: root_task_id.clone(),
-                    requested_worker_id: None,
-                    recovery_id: None,
-                    execution_chain_ref: Some("chain-atomic-spawn".to_string()),
+        registry
+            .insert(
+                root_task_id.clone(),
+                TaskExecutionPlan::Dispatch {
+                    target: magi_core::TaskExecutionTarget {
+                        mission_id: mission_id.clone(),
+                        root_task_id: root_task_id.clone(),
+                        task_id: root_task_id.clone(),
+                        requested_worker_id: None,
+                        recovery_id: None,
+                        execution_chain_ref: Some("chain-atomic-spawn".to_string()),
+                    },
+                    worker_id: WorkerId::new("worker-parent"),
+                    thread_id: ThreadId::new("thread-atomic-spawn-parent"),
+                    is_primary: true,
+                    session_id: session_id.clone(),
+                    turn_id: "turn-atomic-spawn".to_string(),
+                    workspace_id: workspace_id.clone(),
+                    execution_root: None,
+                    ownership: ExecutionOwnership::default(),
+                    writebacks: ExecutionWritebackPlans::default(),
+                    use_tools: true,
+                    skill_name: None,
+                    images: Vec::new(),
+                    execution_settings_snapshot: Some(parent_settings_snapshot.clone()),
                 },
-                worker_id: WorkerId::new("worker-parent"),
-                thread_id: ThreadId::new("thread-atomic-spawn-parent"),
-                is_primary: true,
-                session_id: session_id.clone(),
-                turn_id: "turn-atomic-spawn".to_string(),
-                workspace_id: workspace_id.clone(),
-                execution_root: None,
-                ownership: ExecutionOwnership::default(),
-                writebacks: ExecutionWritebackPlans::default(),
-                use_tools: true,
-                skill_name: None,
-                images: Vec::new(),
-                execution_settings_snapshot: Some(parent_settings_snapshot.clone()),
-            },
-        );
+            )
+            .expect("父任务执行计划应严格插入注册表");
         registry
             .update_active_skill(
                 &root_task_id,
@@ -634,6 +805,218 @@ mod tests {
         assert_eq!(child_branch.skill_name.as_deref(), Some("code-review"));
         assert!(chain.active_branch_task_ids.contains(&child.task_id));
         assert!(chain.active_worker_bindings.contains(&registered.worker_id));
+
+        let task_state_before = format!("{:?}", task_store.get_task(&child.task_id));
+        let plan_state_before = format!("{:?}", registry.get(&child.task_id));
+        let chain_state_before = format!("{:?}", session_store.active_execution_chain(&session_id));
+        let threads_state_before =
+            format!("{:?}", session_store.thread_registry_snapshot(&session_id));
+        let graph_state_before = format!(
+            "{:?}",
+            spawn_graph
+                .lock()
+                .expect("spawn graph lock should be available")
+                .all_edges()
+        );
+
+        let duplicate_plan = registry
+            .get(&child.task_id)
+            .expect("重复插入测试需要保留原执行计划");
+        assert!(
+            registry
+                .insert(child.task_id.clone(), duplicate_plan)
+                .is_err(),
+            "执行注册表不得覆盖已有执行计划"
+        );
+        let duplicate_error = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                now,
+            })
+            .expect_err("重复注册子任务必须被拒绝");
+        assert!(matches!(
+            duplicate_error,
+            SpawnedChildExecutionError::InvalidState(message)
+                if message.contains("已存在")
+        ));
+        assert_eq!(
+            format!("{:?}", task_store.get_task(&child.task_id)),
+            task_state_before,
+            "重复注册不得改变 TaskStore"
+        );
+        assert_eq!(
+            format!("{:?}", registry.get(&child.task_id)),
+            plan_state_before,
+            "重复注册不得改变执行注册表"
+        );
+        assert_eq!(
+            format!("{:?}", session_store.active_execution_chain(&session_id)),
+            chain_state_before,
+            "重复注册不得改变 session active chain"
+        );
+        assert_eq!(
+            format!("{:?}", session_store.thread_registry_snapshot(&session_id)),
+            threads_state_before,
+            "重复注册不得改变 session thread registry"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                spawn_graph
+                    .lock()
+                    .expect("spawn graph lock should be available")
+                    .all_edges()
+            ),
+            graph_state_before,
+            "重复注册不得改变 SpawnGraph"
+        );
+
+        task_store
+            .remove_task(&child.task_id)
+            .expect("移除测试任务应成功")
+            .expect("测试任务应存在");
+        let task_state_before = format!("{:?}", task_store.get_task(&child.task_id));
+        let plan_state_before = format!("{:?}", registry.get(&child.task_id));
+        let chain_state_before = format!("{:?}", session_store.active_execution_chain(&session_id));
+        let threads_state_before =
+            format!("{:?}", session_store.thread_registry_snapshot(&session_id));
+        let graph_state_before = format!(
+            "{:?}",
+            spawn_graph
+                .lock()
+                .expect("spawn graph lock should be available")
+                .all_edges()
+        );
+        let registry_duplicate_error = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                now,
+            })
+            .expect_err("仅执行注册表中已有的任务也必须被拒绝");
+        assert!(matches!(
+            registry_duplicate_error,
+            SpawnedChildExecutionError::InvalidState(message)
+                if message.contains("执行注册表")
+        ));
+        assert_eq!(
+            format!("{:?}", task_store.get_task(&child.task_id)),
+            task_state_before,
+            "执行注册表重复注册不得写入 TaskStore"
+        );
+        assert_eq!(
+            format!("{:?}", registry.get(&child.task_id)),
+            plan_state_before,
+            "执行注册表重复注册不得改变执行计划"
+        );
+        assert_eq!(
+            format!("{:?}", session_store.active_execution_chain(&session_id)),
+            chain_state_before,
+            "执行注册表重复注册不得改变 session active chain"
+        );
+        assert_eq!(
+            format!("{:?}", session_store.thread_registry_snapshot(&session_id)),
+            threads_state_before,
+            "执行注册表重复注册不得改变 session thread registry"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                spawn_graph
+                    .lock()
+                    .expect("spawn graph lock should be available")
+                    .all_edges()
+            ),
+            graph_state_before,
+            "执行注册表重复注册不得改变 SpawnGraph"
+        );
+
+        let graph_conflict_child = test_task(
+            "task-child-graph-conflict",
+            root_task_id.as_str(),
+            &mission_id,
+        );
+        spawn_graph
+            .lock()
+            .expect("spawn graph lock should be available")
+            .add_edge(
+                root_task_id.clone(),
+                graph_conflict_child.task_id.clone(),
+                graph_conflict_child.kind,
+                std::time::SystemTime::now(),
+            )
+            .expect("应先建立用于验证回滚的冲突边");
+        let task_state_before = format!("{:?}", task_store.get_task(&graph_conflict_child.task_id));
+        let plan_state_before = format!("{:?}", registry.get(&graph_conflict_child.task_id));
+        let chain_state_before = format!("{:?}", session_store.active_execution_chain(&session_id));
+        let threads_state_before =
+            format!("{:?}", session_store.thread_registry_snapshot(&session_id));
+        let graph_state_before = format!(
+            "{:?}",
+            spawn_graph
+                .lock()
+                .expect("spawn graph lock should be available")
+                .all_edges()
+        );
+        let graph_error = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &graph_conflict_child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                now,
+            })
+            .expect_err("SpawnGraph 冲突必须拒绝注册");
+        assert!(matches!(
+            graph_error,
+            SpawnedChildExecutionError::InvalidState(message)
+                if message.contains("SpawnGraph")
+        ));
+        assert_eq!(
+            format!("{:?}", task_store.get_task(&graph_conflict_child.task_id)),
+            task_state_before,
+            "SpawnGraph 失败后必须回滚 TaskStore"
+        );
+        assert_eq!(
+            format!("{:?}", registry.get(&graph_conflict_child.task_id)),
+            plan_state_before,
+            "SpawnGraph 失败后不得写入执行注册表"
+        );
+        assert_eq!(
+            format!("{:?}", session_store.active_execution_chain(&session_id)),
+            chain_state_before,
+            "SpawnGraph 失败后必须回滚 session active chain"
+        );
+        assert_eq!(
+            format!("{:?}", session_store.thread_registry_snapshot(&session_id)),
+            threads_state_before,
+            "SpawnGraph 失败后不得创建 session thread"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                spawn_graph
+                    .lock()
+                    .expect("spawn graph lock should be available")
+                    .all_edges()
+            ),
+            graph_state_before,
+            "SpawnGraph 失败后必须保留原有拓扑"
+        );
     }
 
     #[test]
@@ -647,32 +1030,34 @@ mod tests {
             (TaskId::new("task-a-child"), session_a.clone()),
             (TaskId::new("task-b-root"), session_b.clone()),
         ] {
-            registry.insert(
-                task_id.clone(),
-                TaskExecutionPlan::Dispatch {
-                    target: magi_core::TaskExecutionTarget {
-                        mission_id: mission_id.clone(),
-                        root_task_id: task_id.clone(),
-                        task_id,
-                        requested_worker_id: None,
-                        recovery_id: None,
-                        execution_chain_ref: None,
+            registry
+                .insert(
+                    task_id.clone(),
+                    TaskExecutionPlan::Dispatch {
+                        target: magi_core::TaskExecutionTarget {
+                            mission_id: mission_id.clone(),
+                            root_task_id: task_id.clone(),
+                            task_id,
+                            requested_worker_id: None,
+                            recovery_id: None,
+                            execution_chain_ref: None,
+                        },
+                        worker_id: WorkerId::new("worker-registry-cleanup"),
+                        thread_id: ThreadId::new("thread-registry-cleanup"),
+                        is_primary: true,
+                        session_id,
+                        turn_id: "turn-registry-cleanup".to_string(),
+                        workspace_id: None,
+                        execution_root: None,
+                        ownership: ExecutionOwnership::default(),
+                        writebacks: ExecutionWritebackPlans::default(),
+                        use_tools: true,
+                        skill_name: None,
+                        images: Vec::new(),
+                        execution_settings_snapshot: None,
                     },
-                    worker_id: WorkerId::new("worker-registry-cleanup"),
-                    thread_id: ThreadId::new("thread-registry-cleanup"),
-                    is_primary: true,
-                    session_id,
-                    turn_id: "turn-registry-cleanup".to_string(),
-                    workspace_id: None,
-                    execution_root: None,
-                    ownership: ExecutionOwnership::default(),
-                    writebacks: ExecutionWritebackPlans::default(),
-                    use_tools: true,
-                    skill_name: None,
-                    images: Vec::new(),
-                    execution_settings_snapshot: None,
-                },
-            );
+                )
+                .expect("清理测试执行计划应严格插入注册表");
         }
 
         let removed = registry.remove_session(&session_a);
@@ -807,7 +1192,7 @@ mod tests {
 
         let completed_task_id = TaskId::new("task-child-capacity-executor-0");
         task_store
-            .update_status(&completed_task_id, TaskStatus::Running)
+            .update_status_checked(&completed_task_id, TaskStatus::Running)
             .expect("executor 代理应进入运行态");
         task_store
             .complete_task(

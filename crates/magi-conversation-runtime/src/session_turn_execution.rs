@@ -400,21 +400,21 @@ fn normalize_interrupted_session_tool_history(
     session_id: &SessionId,
     thread_id: &magi_core::ThreadId,
     persist_session_state: Option<&SessionStatePersistCallback>,
-) -> usize {
+) -> Result<usize, String> {
     let mut history = session_store.thread_message_history(thread_id);
     let inserted = insert_interrupted_tool_result_messages(
         &mut history,
         &started_tool_call_ids_for_session_thread(session_store, session_id, thread_id),
     );
     if inserted == 0 {
-        return 0;
+        return Ok(0);
     }
     session_store.replace_thread_messages(thread_id, history, UtcMillis::now());
     persist_session_state_checkpoint(
         persist_session_state,
         "session_turn_interrupted_tool_result",
-    );
-    inserted
+    )?;
+    Ok(inserted)
 }
 
 fn build_session_turn_messages(
@@ -731,9 +731,8 @@ fn rebuild_messages_for_context_window(
         turn_visibility: None,
         expected_turn_id: Some(&request.turn_id),
     };
-    let compaction_observer = |progress| {
-        upsert_context_compaction_progress_notice(compaction_writeback, progress);
-    };
+    let compaction_observer =
+        |progress| upsert_context_compaction_progress_notice(compaction_writeback, progress);
     let compaction_cancelled = || !request_turn_is_writable(session_store, request);
     let prepared = ContextAuthority::new(
         client,
@@ -761,7 +760,8 @@ fn rebuild_messages_for_context_window(
     }
     let compacted = prepared.compaction.is_some();
     if let Some(compaction) = prepared.compaction.as_ref() {
-        upsert_context_compaction_completed_notice(compaction_writeback, compaction);
+        upsert_context_compaction_completed_notice(compaction_writeback, compaction)
+            .map_err(|_| ContextCompactionTerminal::Failed)?;
     }
     let mut history = prepared.messages;
     if history
@@ -905,7 +905,13 @@ fn run_session_turn_execution_inner(
         &request.session_id,
         &orchestrator_thread_id,
         persist_session_state,
-    );
+    )
+    .map_err(|error| {
+        SessionTurnExecutionError::new(
+            SessionTurnFailureReason::RuntimeInvalidState,
+            format!("中断工具历史持久化失败：{error}"),
+        )
+    })?;
     let fallback_history = canonical_session_turn_history(session_store, &request);
     let selected_model = settings_store
         .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
@@ -967,9 +973,8 @@ fn run_session_turn_execution_inner(
         turn_visibility: None,
         expected_turn_id: Some(&request.turn_id),
     };
-    let compaction_observer = |progress| {
-        upsert_context_compaction_progress_notice(compaction_writeback, progress);
-    };
+    let compaction_observer =
+        |progress| upsert_context_compaction_progress_notice(compaction_writeback, progress);
     let compaction_cancelled = || !request_turn_is_writable(session_store, &request);
     mark_turn_timing(
         "context_prepare_started",
@@ -1020,7 +1025,14 @@ fn run_session_turn_execution_inner(
         };
     }
     if let Some(compaction) = prepared_history.compaction.as_ref() {
-        upsert_context_compaction_completed_notice(compaction_writeback, compaction);
+        upsert_context_compaction_completed_notice(compaction_writeback, compaction).map_err(
+            |error| {
+                SessionTurnExecutionError::new(
+                    SessionTurnFailureReason::ContextCompactionFailed,
+                    error,
+                )
+            },
+        )?;
     }
     let mut proactive_context_compaction_completed = prepared_history.compaction.is_some();
     let mut messages =
@@ -1055,7 +1067,13 @@ fn run_session_turn_execution_inner(
             vec![persisted_user_message],
             UtcMillis::now(),
         );
-        persist_session_state_checkpoint(persist_session_state, "session_turn_thread_user");
+        persist_session_state_checkpoint(persist_session_state, "session_turn_thread_user")
+            .map_err(|error| {
+                SessionTurnExecutionError::new(
+                    SessionTurnFailureReason::RuntimeInvalidState,
+                    format!("用户消息持久化失败：{error}"),
+                )
+            })?;
     }
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
@@ -1266,13 +1284,17 @@ fn run_session_turn_execution_inner(
                 round = round.saturating_add(1);
                 continue;
             }
+            Err(SessionTurnRoundError::WritebackFailed(error)) => {
+                tracing::error!(%error, "会话 Turn 运行事实写回失败");
+                return Err(SessionTurnExecutionError::runtime_invalid_state());
+            }
             Err(SessionTurnRoundError::TerminalToolFailure(failure)) => {
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
                 let execution_error =
                     SessionTurnExecutionError::from_terminal_tool_failure(failure);
-                append_session_turn_error_item(
+                if let Err(writeback_error) = append_session_turn_error_item(
                     event_bus,
                     session_store,
                     crate::session_writeback::SessionTurnErrorInput {
@@ -1290,7 +1312,10 @@ fn run_session_turn_execution_inner(
                         persist_session_state,
                         expected_turn_id: Some(&request.turn_id),
                     },
-                );
+                ) {
+                    tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
+                    return Err(SessionTurnExecutionError::runtime_invalid_state());
+                }
                 return Err(execution_error);
             }
             Err(SessionTurnRoundError::InvalidResponse(model_failure)) => {
@@ -1301,7 +1326,7 @@ fn run_session_turn_execution_inner(
                     SessionTurnFailureReason::ModelResponseInvalid,
                     *model_failure,
                 );
-                append_session_turn_error_item(
+                if let Err(writeback_error) = append_session_turn_error_item(
                     event_bus,
                     session_store,
                     crate::session_writeback::SessionTurnErrorInput {
@@ -1319,7 +1344,10 @@ fn run_session_turn_execution_inner(
                         persist_session_state,
                         expected_turn_id: Some(&request.turn_id),
                     },
-                );
+                ) {
+                    tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
+                    return Err(SessionTurnExecutionError::runtime_invalid_state());
+                }
                 return Err(execution_error);
             }
             Err(SessionTurnRoundError::Failed {
@@ -1410,7 +1438,7 @@ fn run_session_turn_execution_inner(
                 } else {
                     session_turn_model_error(&request, &error, retry_attempts)
                 };
-                append_session_turn_error_item(
+                if let Err(writeback_error) = append_session_turn_error_item(
                     event_bus,
                     session_store,
                     crate::session_writeback::SessionTurnErrorInput {
@@ -1433,7 +1461,10 @@ fn run_session_turn_execution_inner(
                         persist_session_state,
                         expected_turn_id: Some(&request.turn_id),
                     },
-                );
+                ) {
+                    tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
+                    return Err(SessionTurnExecutionError::runtime_invalid_state());
+                }
                 return Err(execution_error);
             }
         };
@@ -1452,7 +1483,7 @@ fn run_session_turn_execution_inner(
         {
             let execution_error =
                 SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
-            append_session_turn_error_item(
+            if let Err(writeback_error) = append_session_turn_error_item(
                 event_bus,
                 session_store,
                 crate::session_writeback::SessionTurnErrorInput {
@@ -1473,7 +1504,10 @@ fn run_session_turn_execution_inner(
                     persist_session_state,
                     expected_turn_id: Some(&request.turn_id),
                 },
-            );
+            ) {
+                tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
+                return Err(SessionTurnExecutionError::runtime_invalid_state());
+            }
             return Err(execution_error);
         }
         let repeated_tool_call_failure = if streamed_content.invalid_tool_calls.is_empty() {
@@ -1501,7 +1535,7 @@ fn run_session_turn_execution_inner(
         if let Some(tool_call_failure) = repeated_tool_call_failure {
             let execution_error =
                 SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
-            append_session_turn_error_item(
+            if let Err(writeback_error) = append_session_turn_error_item(
                 event_bus,
                 session_store,
                 crate::session_writeback::SessionTurnErrorInput {
@@ -1522,7 +1556,10 @@ fn run_session_turn_execution_inner(
                     persist_session_state,
                     expected_turn_id: Some(&request.turn_id),
                 },
-            );
+            ) {
+                tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
+                return Err(SessionTurnExecutionError::runtime_invalid_state());
+            }
             return Err(execution_error);
         }
         if main_timeline_entry_id.is_none() {
@@ -1720,7 +1757,7 @@ fn run_session_turn_execution_inner(
             empty_response_recovery_attempts,
             last_response_observation.as_deref(),
         );
-        append_session_turn_error_item(
+        if let Err(writeback_error) = append_session_turn_error_item(
             event_bus,
             session_store,
             crate::session_writeback::SessionTurnErrorInput {
@@ -1741,7 +1778,10 @@ fn run_session_turn_execution_inner(
                 persist_session_state,
                 expected_turn_id: Some(&request.turn_id),
             },
-        );
+        ) {
+            tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
+            return Err(SessionTurnExecutionError::runtime_invalid_state());
+        }
         return Err(failure);
     };
     if !request_turn_is_writable(session_store, &request) {
@@ -1759,7 +1799,11 @@ fn run_session_turn_execution_inner(
         },
         &orchestrator_thread_id,
         persist_session_state,
-    );
+    )
+    .map_err(|error| {
+        tracing::error!(%error, "会话 Turn 最终回复写回失败");
+        SessionTurnExecutionError::runtime_invalid_state()
+    })?;
     Ok(SessionTurnExecutionOutput::completed(final_content))
 }
 
@@ -1906,6 +1950,7 @@ enum SessionTurnRoundError {
     TerminalToolFailure(DeterministicToolFailure),
     PreOutputInvocationRecovered,
     StreamInterruptedRecovered,
+    WritebackFailed(String),
 }
 
 fn record_completed_required_tools(
@@ -2061,6 +2106,7 @@ fn stream_session_turn_round(
     let stream_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
     let thinking_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
     let writeback_aborted = std::cell::Cell::new(false);
+    let writeback_error = std::cell::RefCell::new(None::<String>);
     let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
     let provider_started_at = Instant::now();
     let first_delta_reported = std::cell::Cell::new(false);
@@ -2097,7 +2143,7 @@ fn stream_session_turn_round(
         })
     });
     let on_delta = |delta: &ModelStreamingDelta| {
-        if !request_turn_is_writable(session_store, request) {
+        if writeback_error.borrow().is_some() || !request_turn_is_writable(session_store, request) {
             writeback_aborted.set(true);
             return;
         }
@@ -2136,22 +2182,33 @@ fn stream_session_turn_round(
             );
             apply_request_aliases(&mut item, request);
             apply_model_response_round(&mut item, round);
-            if let Some(published) = upsert_session_turn_item_for_turn(
+            match upsert_session_turn_item_for_turn(
                 session_store,
                 &request.session_id,
                 Some(&request.turn_id),
                 item,
                 None,
-            ) && let Some(stream_update) = stream_update.as_ref()
-            {
-                publish_session_turn_item_stream_event(
-                    event_bus,
-                    &request.session_id,
-                    &request.workspace_id,
-                    &published,
-                    stream_update,
-                    &mut thinking_publish_gate.borrow_mut(),
-                );
+            ) {
+                Ok(Some(published)) => {
+                    if let Some(stream_update) = stream_update.as_ref() {
+                        publish_session_turn_item_stream_event(
+                            event_bus,
+                            &request.session_id,
+                            &request.workspace_id,
+                            &published,
+                            stream_update,
+                            &mut thinking_publish_gate.borrow_mut(),
+                        );
+                    }
+                }
+                Ok(None) => {
+                    writeback_error.replace(Some("当前 Turn 已不存在，无法写入思考流".to_string()));
+                    writeback_aborted.set(true);
+                }
+                Err(error) => {
+                    writeback_error.replace(Some(error));
+                    writeback_aborted.set(true);
+                }
             }
         }
 
@@ -2193,22 +2250,33 @@ fn stream_session_turn_round(
         );
         apply_request_aliases(&mut item, request);
         apply_model_response_round(&mut item, round);
-        if let Some(published) = upsert_session_turn_item_for_turn(
+        match upsert_session_turn_item_for_turn(
             session_store,
             &request.session_id,
             Some(&request.turn_id),
             item,
             None,
-        ) && let Some(stream_update) = stream_update.as_ref()
-        {
-            publish_session_turn_item_stream_event(
-                event_bus,
-                &request.session_id,
-                &request.workspace_id,
-                &published,
-                stream_update,
-                &mut stream_publish_gate.borrow_mut(),
-            );
+        ) {
+            Ok(Some(published)) => {
+                if let Some(stream_update) = stream_update.as_ref() {
+                    publish_session_turn_item_stream_event(
+                        event_bus,
+                        &request.session_id,
+                        &request.workspace_id,
+                        &published,
+                        stream_update,
+                        &mut stream_publish_gate.borrow_mut(),
+                    );
+                }
+            }
+            Ok(None) => {
+                writeback_error.replace(Some("当前 Turn 已不存在，无法写入回复流".to_string()));
+                writeback_aborted.set(true);
+            }
+            Err(error) => {
+                writeback_error.replace(Some(error));
+                writeback_aborted.set(true);
+            }
         }
     };
 
@@ -2319,17 +2387,27 @@ fn stream_session_turn_round(
                 apply_request_aliases(&mut thinking_item, request);
                 apply_model_response_round(&mut thinking_item, round);
                 apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
-                if let Some(published) = upsert_session_turn_item_for_turn(
+                let published = match upsert_session_turn_item_for_turn(
                     session_store,
                     &request.session_id,
                     Some(&request.turn_id),
                     thinking_item,
                     None,
                 ) {
+                    Ok(Some(published)) => published,
+                    Ok(None) => {
+                        return Err(SessionTurnRoundError::WritebackFailed(
+                            "当前 Turn 已不存在，无法保存中断前思考".to_string(),
+                        ));
+                    }
+                    Err(error) => return Err(SessionTurnRoundError::WritebackFailed(error)),
+                };
+                {
                     persist_session_state_checkpoint(
                         persist_session_state,
                         "session_turn_stream_interrupted_thinking",
-                    );
+                    )
+                    .map_err(SessionTurnRoundError::WritebackFailed)?;
                     publish_session_turn_item_event(
                         event_bus,
                         &request.session_id,
@@ -2350,17 +2428,27 @@ fn stream_session_turn_round(
                 apply_request_aliases(&mut stream_item, request);
                 apply_model_response_round(&mut stream_item, round);
                 apply_goal_turn_intermediate_visibility(&mut stream_item, request);
-                if let Some(published) = upsert_session_turn_item_for_turn(
+                let published = match upsert_session_turn_item_for_turn(
                     session_store,
                     &request.session_id,
                     Some(&request.turn_id),
                     stream_item,
                     None,
                 ) {
+                    Ok(Some(published)) => published,
+                    Ok(None) => {
+                        return Err(SessionTurnRoundError::WritebackFailed(
+                            "当前 Turn 已不存在，无法保存中断前回复".to_string(),
+                        ));
+                    }
+                    Err(error) => return Err(SessionTurnRoundError::WritebackFailed(error)),
+                };
+                {
                     persist_session_state_checkpoint(
                         persist_session_state,
                         "session_turn_stream_interrupted_content",
-                    );
+                    )
+                    .map_err(SessionTurnRoundError::WritebackFailed)?;
                     publish_session_turn_item_event(
                         event_bus,
                         &request.session_id,
@@ -2515,6 +2603,9 @@ fn stream_session_turn_round(
         parsed.usage.as_ref(),
     );
     let timeline_entry_id = None;
+    if let Some(error) = writeback_error.into_inner() {
+        return Err(SessionTurnRoundError::WritebackFailed(error));
+    }
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
         return Ok(SessionTurnRoundOutput {
             final_content: None,
@@ -2568,17 +2659,27 @@ fn stream_session_turn_round(
         apply_request_aliases(&mut thinking_item, request);
         apply_model_response_round(&mut thinking_item, round);
         apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
-        if let Some(published) = upsert_session_turn_item_for_turn(
+        let published = match upsert_session_turn_item_for_turn(
             session_store,
             &request.session_id,
             Some(&request.turn_id),
             thinking_item,
             None,
         ) {
+            Ok(Some(published)) => published,
+            Ok(None) => {
+                return Err(SessionTurnRoundError::WritebackFailed(
+                    "当前 Turn 已不存在，无法保存完成思考".to_string(),
+                ));
+            }
+            Err(error) => return Err(SessionTurnRoundError::WritebackFailed(error)),
+        };
+        {
             persist_session_state_checkpoint(
                 persist_session_state,
                 "session_turn_thinking_completed",
-            );
+            )
+            .map_err(SessionTurnRoundError::WritebackFailed)?;
             publish_session_turn_item_event(
                 event_bus,
                 &request.session_id,
@@ -2625,17 +2726,27 @@ fn stream_session_turn_round(
         apply_request_aliases(&mut stream_item, request);
         apply_model_response_round(&mut stream_item, round);
         apply_goal_turn_intermediate_visibility(&mut stream_item, request);
-        if let Some(published) = upsert_session_turn_item_for_turn(
+        let published = match upsert_session_turn_item_for_turn(
             session_store,
             &request.session_id,
             Some(&request.turn_id),
             stream_item,
             None,
         ) {
+            Ok(Some(published)) => published,
+            Ok(None) => {
+                return Err(SessionTurnRoundError::WritebackFailed(
+                    "当前 Turn 已不存在，无法保存完成回复".to_string(),
+                ));
+            }
+            Err(error) => return Err(SessionTurnRoundError::WritebackFailed(error)),
+        };
+        {
             persist_session_state_checkpoint(
                 persist_session_state,
                 "session_turn_stream_completed",
-            );
+            )
+            .map_err(SessionTurnRoundError::WritebackFailed)?;
             publish_session_turn_item_event(
                 event_bus,
                 &request.session_id,
@@ -2675,7 +2786,8 @@ fn stream_session_turn_round(
             )],
             persist_session_state,
             "session_turn_thread_assistant_response",
-        );
+        )
+        .map_err(SessionTurnRoundError::WritebackFailed)?;
     }
 
     if let Some(failure) = response_contract_failure {
@@ -2775,7 +2887,8 @@ fn stream_session_turn_round(
                 .collect(),
             persist_session_state,
             "session_turn_thread_tool_results",
-        );
+        )
+        .map_err(SessionTurnRoundError::WritebackFailed)?;
         if let Some(failure) = tool_batch
             .as_ref()
             .and_then(|batch| batch.terminal_failure.clone())
@@ -2909,7 +3022,7 @@ fn append_final_item(
     input: FinalItemInput<'_>,
     orchestrator_thread_id: &magi_core::ThreadId,
     persist_session_state: Option<&SessionStatePersistCallback>,
-) {
+) -> Result<(), String> {
     let FinalItemInput {
         content: final_content,
         item_id: final_item_id,
@@ -2940,43 +3053,47 @@ fn append_final_item(
             .insert("renderable".to_string(), serde_json::Value::Bool(false));
     }
     let final_item_id = final_item.item_id.clone();
-    if has_requested_final_item_id {
-        if let Some(published) = upsert_session_turn_item_for_turn(
+    let _published = if has_requested_final_item_id {
+        upsert_session_turn_item_for_turn(
             session_store,
             &request.session_id,
             Some(&request.turn_id),
             final_item,
             None,
-        ) {
-            persist_session_state_checkpoint(persist_session_state, "session_turn_final_item");
-            publish_session_turn_item_event(
-                event_bus,
-                &request.session_id,
-                &request.workspace_id,
-                &published,
-            );
-        }
-    } else if let Some(published) = append_session_turn_item_for_turn(
-        session_store,
-        &request.session_id,
-        Some(&request.turn_id),
-        final_item,
-        None,
-    ) {
-        persist_session_state_checkpoint(persist_session_state, "session_turn_final_item");
-        publish_session_turn_item_event(
-            event_bus,
+        )?
+    } else {
+        append_session_turn_item_for_turn(
+            session_store,
             &request.session_id,
-            &request.workspace_id,
-            &published,
-        );
+            Some(&request.turn_id),
+            final_item,
+            None,
+        )?
     }
-    let _ = session_store.update_current_turn_status_for_turn(
-        &request.session_id,
-        Some(&request.turn_id),
-        "completed",
-    );
-    persist_session_state_checkpoint(persist_session_state, "session_turn_completed");
+    .ok_or_else(|| {
+        format!(
+            "会话 {} 的当前 Turn 已不可写，无法保存最终回复",
+            request.session_id
+        )
+    })?;
+    session_store
+        .update_current_turn_status_for_turn(
+            &request.session_id,
+            Some(&request.turn_id),
+            "completed",
+        )
+        .map_err(|error| {
+            format!(
+                "会话 {} 的 Turn completed 状态提交失败: {error}",
+                request.session_id
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "会话 {} 的当前 Turn 已不可写，无法提交 completed 状态",
+                request.session_id
+            )
+        })?;
     publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -2984,7 +3101,11 @@ fn append_final_item(
         &request.workspace_id,
         &final_item_id,
         None,
-    );
+    )?;
+    // 终态事件只代表执行生命周期结束，projection 快照随后合并写入一次；
+    // 否则 UI 停止状态会被几十 MB 级 checkpoint 串行拖住。
+    persist_session_state_checkpoint(persist_session_state, "session_turn_completed")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6001,7 +6122,7 @@ mod tests {
 
         assert_eq!(
             normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
-            1
+            Ok(1)
         );
         let history = store.thread_message_history(&thread_id);
         assert_eq!(
@@ -6017,7 +6138,7 @@ mod tests {
         }));
         assert_eq!(
             normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
-            0,
+            Ok(0),
             "重复进入下一轮不得再次插入中断结果"
         );
     }
@@ -6697,7 +6818,8 @@ mod tests {
             },
             &orchestrator_thread_id,
             None,
-        );
+        )
+        .expect("final item should be stored and published");
 
         let turn = store
             .runtime_sidecar(&session_id)
@@ -6837,7 +6959,8 @@ mod tests {
                 completed_chunks: 2,
                 total_chunks: 4,
             },
-        );
+        )
+        .expect("上下文压缩进度应可写回");
         upsert_context_compaction_completed_notice(
             writeback,
             &ContextCompactionRecord {
@@ -6848,7 +6971,8 @@ mod tests {
                 compacted_token_estimate: 36_000,
                 compacted_at: ts(1_001),
             },
-        );
+        )
+        .expect("上下文压缩完成事实应可写回");
 
         let turn = store
             .canonical_turns_for_session(&session_id)
@@ -7309,7 +7433,8 @@ mod tests {
             },
             &orchestrator_thread_id,
             None,
-        );
+        )
+        .expect("final item should be stored and published");
 
         let terminal_event = event_bus
             .snapshot()

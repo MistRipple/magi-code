@@ -7,12 +7,42 @@ mod tests;
 
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
-    NotificationContext, NotificationRecord, NotificationScope, SessionAcceptanceRecord,
-    SessionDurableState, SessionExecutionSidecarStoreState, SessionPlan, SessionRecord,
-    SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
+    CanonicalTurn, NotificationContext, NotificationRecord, NotificationScope,
+    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionPlan,
+    SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
-use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis};
+use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, Task, UtcMillis};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// canonical 写模型在一次 SessionStore mutation 中准备的原子变更。
+///
+/// `previous` 必须与事件日志当前重放结果一致；持久化实现据此生成逐 item 事件，
+/// 成功后 SessionStore 才会提交 `next` 到内存 projection。
+#[derive(Clone, Debug)]
+pub struct CanonicalTurnMutation {
+    pub previous: Option<CanonicalTurn>,
+    pub next: CanonicalTurn,
+}
+
+pub trait CanonicalTurnEventWriter: Send + Sync {
+    fn append_canonical_turn_transaction(
+        &self,
+        session_id: &SessionId,
+        mutations: &[CanonicalTurnMutation],
+    ) -> DomainResult<()>;
+
+    /// 提交一次新的执行轮 accepted 事实。
+    ///
+    /// 该入口由持久化实现把 accepted 事实与 canonical event 写入同一个事务，
+    /// 让 event segment 成为一次提交的唯一 durable 边界。
+    fn append_canonical_turn_transaction_with_acceptance(
+        &self,
+        session_id: &SessionId,
+        mutations: &[CanonicalTurnMutation],
+        acceptance: &SessionAcceptanceRecord,
+        task: &Task,
+    ) -> DomainResult<()>;
+}
 
 /// orchestrator 主线 thread 的稳定 role 标识。
 ///
@@ -58,9 +88,15 @@ fn normalize_session_title(title: String) -> DomainResult<String> {
 pub struct SessionStore {
     state: Arc<RwLock<SessionStoreState>>,
     durable_persistence_lock: Arc<Mutex<()>>,
+    /// 串行化 canonical 事务的准备、事件写入和内存提交，但不占用 session state 写锁。
+    ///
+    /// canonical event writer 可能执行 fsync；这把锁只阻止另一笔 canonical 事务进入，
+    /// 不阻止普通 session 读取或不相关的内存状态操作。
+    pub(crate) canonical_commit_lock: Arc<Mutex<()>>,
     sidecar_flush_state: Arc<RwLock<SidecarFlushState>>,
     sidecar_flush_lock: Arc<Mutex<()>>,
     lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
+    canonical_event_writer: Arc<RwLock<Option<Arc<dyn CanonicalTurnEventWriter>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,9 +206,11 @@ impl Default for SessionStore {
         Self {
             state: Arc::new(RwLock::new(SessionStoreState::default())),
             durable_persistence_lock: Arc::new(Mutex::new(())),
+            canonical_commit_lock: Arc::new(Mutex::new(())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
+            canonical_event_writer: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -186,34 +224,101 @@ impl SessionStore {
         Self {
             state: Arc::new(RwLock::new(state)),
             durable_persistence_lock: Arc::new(Mutex::new(())),
+            canonical_commit_lock: Arc::new(Mutex::new(())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
+            canonical_event_writer: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn from_persisted_parts(
         durable_state: SessionDurableState,
         execution_sidecar_store: SessionExecutionSidecarStoreState,
-    ) -> Self {
+    ) -> DomainResult<Self> {
         let mut state =
             SessionStoreState::from_persisted_parts(durable_state, execution_sidecar_store);
         prune_incident_notifications(&mut state.notifications);
-        sidecar::restore_canonical_turns_from_sidecars(&mut state)
-            .expect("persisted sidecar current turn should be canonical-compatible");
+        sidecar::reconcile_sidecars_from_canonical(&mut state)?;
         sidecar::reconcile_terminal_goal_continuations(&mut state);
         sidecar::reconcile_goal_response_duration_scopes(&mut state);
-        Self::from_state(state)
+        Ok(Self::from_state(state))
     }
 
-    /// 将 accepted journal 合并回内存状态。
+    pub fn advance_sidecar_projection_from_canonical(
+        sidecar: &mut crate::models::SessionRuntimeSidecar,
+        canonical_turns: &[CanonicalTurn],
+    ) -> DomainResult<()> {
+        sidecar::advance_sidecar_projection_from_canonical(sidecar, canonical_turns)
+    }
+
+    /// 一次性 v1 -> v2 转换。旧 timeline/sidecar 兼容只允许存在于此边界。
+    pub fn convert_v1_persisted_parts(
+        durable_state: SessionDurableState,
+        execution_sidecar_store: SessionExecutionSidecarStoreState,
+    ) -> DomainResult<Self> {
+        let mut state =
+            SessionStoreState::from_persisted_parts(durable_state, execution_sidecar_store);
+        prune_incident_notifications(&mut state.notifications);
+        sidecar::convert_v1_conversation_facts(&mut state)?;
+        sidecar::reconcile_sidecars_from_canonical(&mut state)?;
+        sidecar::reconcile_terminal_goal_continuations(&mut state);
+        sidecar::reconcile_goal_response_duration_scopes(&mut state);
+        Ok(Self::from_state(state))
+    }
+
+    /// 安装 canonical 权威事件 writer。daemon 恢复完成后、接受任何新 mutation 前安装。
+    pub fn install_canonical_event_writer(&self, writer: Arc<dyn CanonicalTurnEventWriter>) {
+        *self
+            .canonical_event_writer
+            .write()
+            .expect("canonical event writer lock poisoned") = Some(writer);
+    }
+
+    pub(super) fn persist_canonical_mutations(
+        &self,
+        session_id: &SessionId,
+        mutations: &[CanonicalTurnMutation],
+    ) -> DomainResult<()> {
+        let writer = self
+            .canonical_event_writer
+            .read()
+            .expect("canonical event writer lock poisoned")
+            .clone();
+        if let Some(writer) = writer {
+            writer.append_canonical_turn_transaction(session_id, mutations)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn persist_canonical_mutations_with_acceptance(
+        &self,
+        session_id: &SessionId,
+        mutations: &[CanonicalTurnMutation],
+        acceptance: &SessionAcceptanceRecord,
+        task: &Task,
+    ) -> DomainResult<()> {
+        let writer = self
+            .canonical_event_writer
+            .read()
+            .expect("canonical event writer lock poisoned")
+            .clone();
+        if let Some(writer) = writer {
+            writer.append_canonical_turn_transaction_with_acceptance(
+                session_id, mutations, acceptance, task,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 将旧版本 accepted journal 合并回内存状态。
     ///
-    /// journal 只在完整 snapshot 成功后删除，因此这里必须允许它与旧 snapshot
-    /// 重复出现；已有终态事实优先，不能被一条过期的 accepted 记录覆盖。
+    /// 旧 journal 只在完整 snapshot 成功后删除，因此这里必须允许它与旧 snapshot
+    /// 重复出现；已有终态事实优先，不能被一条过期的恢复记录覆盖。
     pub fn restore_session_acceptance_records(
         &self,
         records: impl IntoIterator<Item = SessionAcceptanceRecord>,
-    ) -> usize {
+    ) -> DomainResult<usize> {
         let mut state = self
             .state
             .write()
@@ -223,12 +328,53 @@ impl SessionStore {
             let SessionAcceptanceRecord {
                 session,
                 timeline_entry,
+                superseded_turn,
                 canonical_turn,
                 sidecar,
             } = record;
             let session_id = session.session_id.clone();
             let turn_id = canonical_turn.turn_id.clone();
             let mut changed = false;
+
+            let mut mutations = Vec::new();
+            if let Some(superseded_turn) = superseded_turn.as_ref() {
+                let previous = state
+                    .canonical_turns
+                    .iter()
+                    .find(|existing| {
+                        existing.session_id == session_id
+                            && existing.turn_id == superseded_turn.turn_id
+                    })
+                    .cloned()
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: format!(
+                            "replacement accepted journal 缺少被替换 turn {}",
+                            superseded_turn.turn_id
+                        ),
+                    })?;
+                if previous != *superseded_turn {
+                    superseded_turn.validate_update_from(&previous)?;
+                    mutations.push(CanonicalTurnMutation {
+                        previous: Some(previous),
+                        next: superseded_turn.clone(),
+                    });
+                }
+            }
+            let existing_accepted = state
+                .canonical_turns
+                .iter()
+                .find(|existing| existing.session_id == session_id && existing.turn_id == turn_id);
+            if let Some(existing) = existing_accepted {
+                existing.validate_update_from(&canonical_turn)?;
+            } else {
+                mutations.push(CanonicalTurnMutation {
+                    previous: None,
+                    next: canonical_turn.clone(),
+                });
+            }
+            if !mutations.is_empty() {
+                self.persist_canonical_mutations(&session_id, &mutations)?;
+            }
 
             if !state
                 .sessions
@@ -247,6 +393,20 @@ impl SessionStore {
                 changed = true;
             }
 
+            if let Some(superseded_turn) = superseded_turn {
+                let index = state
+                    .canonical_turns
+                    .iter()
+                    .position(|existing| {
+                        existing.session_id == session_id
+                            && existing.turn_id == superseded_turn.turn_id
+                    })
+                    .expect("replacement predecessor was validated");
+                if state.canonical_turns[index] != superseded_turn {
+                    state.canonical_turns[index] = superseded_turn;
+                    changed = true;
+                }
+            }
             let canonical_index = state.canonical_turns.iter().position(|existing| {
                 existing.session_id == session_id && existing.turn_id == turn_id
             });
@@ -299,7 +459,7 @@ impl SessionStore {
             });
             self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
         }
-        restored
+        Ok(restored)
     }
 
     /// 比较 accepted journal 中的 Turn 与当前 sidecar Turn，保证旧 journal
@@ -319,17 +479,22 @@ impl SessionStore {
         )
     }
 
-    /// 串行化完整 durable snapshot 持久化事务。快照必须在锁内生成，避免较早请求
-    /// 延迟写入旧快照，覆盖之后已经完成的会话选择或业务状态。
-    pub fn persist_durable_state_with<T, E>(
+    /// 串行化完整 session projection 持久化事务。durable、sidecar 与 current pointer
+    /// 必须在同一把 state 读锁覆盖的持久化事务中生成并写出，canonical mutation 不能
+    /// 在 projection 回调期间穿透进来。
+    pub fn persist_projection_with<T, E>(
         &self,
-        persist: impl FnOnce(SessionDurableState) -> Result<T, E>,
+        persist: impl FnMut(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<T, E>,
     ) -> Result<T, E> {
         let _persistence_guard = self
             .durable_persistence_lock
             .lock()
             .expect("session durable persistence lock poisoned");
-        persist(self.durable_state())
+        let mut persist = persist;
+        let state = self.state.read().expect("session state read lock poisoned");
+        let durable = state.durable_state();
+        let sidecars = state.execution_sidecar_store.clone();
+        persist(&durable, &sidecars)
     }
 
     /// 安装 session 生命周期 observer。每个 store 同一时间只挂一个 observer，
@@ -827,6 +992,58 @@ impl SessionStore {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::ClearPlan);
         }
         Ok(changed)
+    }
+
+    /// 在确认当前 revision 仍属于本次装配后恢复计划快照。
+    ///
+    /// `original_plan = None` 表示本次装配新建的计划，应直接删除；传入原快照
+    /// 时恢复其完整内容。revision 校验避免回滚覆盖 materialize 之后发生的真实
+    /// 用户或执行更新。
+    pub fn restore_plan_if_current(
+        &self,
+        session_id: &SessionId,
+        expected_current_revision: u64,
+        original_plan: Option<SessionPlan>,
+    ) -> DomainResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let Some(index) = state
+            .plans
+            .iter()
+            .position(|plan| &plan.session_id == session_id)
+        else {
+            return Err(DomainError::NotFound { entity: "plan" });
+        };
+        if state.plans[index].revision != expected_current_revision {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "计划已被其他执行修改，拒绝回滚：期望 revision={}，当前 revision={}",
+                    expected_current_revision, state.plans[index].revision
+                ),
+            });
+        }
+        match original_plan {
+            Some(mut original) => {
+                if original.session_id != *session_id {
+                    return Err(DomainError::Validation {
+                        message: "计划恢复快照 session_id 与写入作用域不一致".to_string(),
+                    });
+                }
+                // revision 是并发控制代际，回滚业务字段不能让它倒退，否则旧的
+                // 客户端可以用已消费过的 revision 再次写入，破坏 optimistic lock。
+                original.revision = expected_current_revision;
+                original.updated_at = UtcMillis::now();
+                state.plans[index] = original;
+            }
+            None => {
+                state.plans.remove(index);
+            }
+        }
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdatePlan);
+        Ok(())
     }
 
     pub fn plan(&self, session_id: &SessionId) -> Option<SessionPlan> {

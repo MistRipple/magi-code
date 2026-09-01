@@ -1131,10 +1131,10 @@ mod tests {
         let state = ApiState::new(
             "magi-test",
             Arc::new(InMemoryEventBus::new(32)),
-            Arc::new(SessionStore::from_persisted_parts(
-                durable_state,
-                sidecar_state,
-            )),
+            Arc::new(
+                SessionStore::from_persisted_parts(durable_state, sidecar_state)
+                    .expect("workspace binding persisted state should restore"),
+            ),
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         );

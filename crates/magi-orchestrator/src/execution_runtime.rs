@@ -1,12 +1,14 @@
+#[cfg(test)]
+use crate::DispatchWritebackRequest;
 use crate::{
-    DispatchExecutionResult, DispatchWritebackRequest, ExecutionContextSummary,
-    OrchestratedExecutionRuntime, OrchestratorCommandError, default_builtin_skill_plan,
-    execution_overview, resolve_skill_tool_name,
+    DispatchExecutionResult, ExecutionContextSummary, OrchestratedExecutionRuntime,
+    OrchestratorCommandError, default_builtin_skill_plan, execution_overview,
+    resolve_skill_tool_name,
 };
 use magi_context_runtime::{ExecutionContextAssemblyRequest, ExecutionContextClues};
 use magi_core::{
-    DomainError, ExecutionResultStatus, SessionId, TaskCompletionAttempt, TaskExecutionTarget,
-    TaskStatus, WorkerId, WorkspaceId,
+    DomainError, ExecutionResultStatus, LeaseId, SessionId, TaskCompletionAttempt,
+    TaskExecutionTarget, TaskStatus, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext};
 use magi_skill_runtime::SkillToolRuntimePlan;
@@ -127,7 +129,8 @@ impl OrchestratedExecutionRuntime {
         self.execute_dispatch_flow(target, worker_id, session_id, workspace_id, skill_plan)
     }
 
-    pub fn execute_dispatch_then<F>(
+    #[cfg(test)]
+    pub(crate) fn execute_dispatch_then<F>(
         &self,
         target: TaskExecutionTarget,
         worker_id: WorkerId,
@@ -145,7 +148,8 @@ impl OrchestratedExecutionRuntime {
         Ok(result)
     }
 
-    pub fn execute_dispatch_with_writebacks(
+    #[cfg(test)]
+    pub(crate) fn execute_dispatch_with_writebacks(
         &self,
         request: DispatchWritebackRequest,
     ) -> Result<DispatchExecutionResult, OrchestratorCommandError> {
@@ -266,9 +270,42 @@ impl OrchestratedExecutionRuntime {
                 }
             })?;
         }
-        self.task_store
-            .update_status_checked(&target.task_id, TaskStatus::Running)
-            .map_err(|error| map_task_store_error(&target.task_id, error))?;
+        if target
+            .requested_worker_id
+            .as_ref()
+            .is_some_and(|requested| requested != &worker_id)
+        {
+            return Err(OrchestratorCommandError::TaskStateViolation {
+                task_id: target.task_id.clone(),
+                message: format!(
+                    "任务请求的 worker 与实际 dispatch worker 不一致: requested={:?}, actual={}",
+                    target.requested_worker_id, worker_id
+                ),
+            });
+        }
+        let task = self.task_store.get_task(&target.task_id).ok_or(
+            OrchestratorCommandError::TaskNotFound {
+                task_id: target.task_id.clone(),
+            },
+        )?;
+        let lease_role = task
+            .executor_binding_target_role()
+            .unwrap_or("executor")
+            .to_string();
+        let lease = self
+            .task_store
+            .grant_lease_and_start_task(
+                &target.task_id,
+                &target.root_task_id,
+                &worker_id,
+                &lease_role,
+                60_000,
+            )
+            .map_err(|error| map_task_store_error(&target.task_id, error))?
+            .ok_or_else(|| OrchestratorCommandError::TaskStateViolation {
+                task_id: target.task_id.clone(),
+                message: "任务已有活跃执行租约，拒绝重复 dispatch".to_string(),
+            })?;
         self.worker_runtime
             .register_execution_intent(intent.clone());
         let loop_controller = match self.worker_runtime.executor_kind() {
@@ -291,7 +328,13 @@ impl OrchestratedExecutionRuntime {
                 mission_id: target.mission_id.clone(),
             })?;
         if let Some(report) = outcome.report.clone() {
-            self.apply_worker_report(&target, &report, &session_id, &workspace_id)?;
+            self.apply_worker_report(
+                &target,
+                &report,
+                &lease.lease_id,
+                &session_id,
+                &workspace_id,
+            )?;
         }
         let snapshot = self.worker_runtime.snapshot_for_task(&target.task_id);
         for observation in &snapshot.skill_dispatches {
@@ -361,41 +404,99 @@ impl OrchestratedExecutionRuntime {
         &self,
         target: &TaskExecutionTarget,
         report: &WorkerExecutionReport,
+        lease_id: &LeaseId,
         session_id: &Option<SessionId>,
         workspace_id: &Option<WorkspaceId>,
     ) -> Result<(), OrchestratorCommandError> {
-        let next_status = match report.termination_reason {
-            Some(magi_core::TerminationReason::Failed | magi_core::TerminationReason::Blocked) => {
-                TaskStatus::Failed
-            }
-            Some(magi_core::TerminationReason::Cancelled) => TaskStatus::Killed,
-            Some(magi_core::TerminationReason::Completed) => TaskStatus::Running,
-            None => match report.stage {
-                WorkerStage::Execute
-                | WorkerStage::Review
-                | WorkerStage::Verify
-                | WorkerStage::Repair
-                | WorkerStage::Finish => TaskStatus::Running,
-            },
-        };
-        let update_result = if matches!(
+        if report.task_id != target.task_id {
+            return Err(OrchestratorCommandError::TaskStateViolation {
+                task_id: target.task_id.clone(),
+                message: format!(
+                    "worker report 指向错误任务: expected={}, actual={}",
+                    target.task_id, report.task_id
+                ),
+            });
+        }
+        self.task_store
+            .validate_active_lease_contract(
+                &target.task_id,
+                &target.root_task_id,
+                lease_id,
+                &report.worker_id,
+            )
+            .map_err(|error| map_task_store_error(&report.task_id, error))?
+            .then_some(())
+            .ok_or_else(|| OrchestratorCommandError::TaskStateViolation {
+                task_id: report.task_id.clone(),
+                message: format!(
+                    "任务 {} 的执行租约已失效，丢弃迟到 worker report",
+                    report.task_id
+                ),
+            })?;
+
+        let completed = matches!(
             report.termination_reason,
             Some(magi_core::TerminationReason::Completed)
         ) || (report.termination_reason.is_none()
             && report.stage == WorkerStage::Finish
             && report.result_kind == Some(magi_core::TaskResultKind::Success)
-            && report.verification_status != magi_core::VerificationStatus::Failed)
-        {
-            self.task_store.complete_task(
-                &report.task_id,
-                TaskCompletionAttempt {
-                    output_refs: vec![report.summary.clone()],
-                    final_response: Some(report.summary.clone()),
-                    evidence: Vec::new(),
-                },
-            )
+            && report.verification_status != magi_core::VerificationStatus::Failed);
+        let next_status = if completed {
+            TaskStatus::Completed
         } else {
-            self.task_store.update_status(&report.task_id, next_status)
+            match report.termination_reason {
+                Some(
+                    magi_core::TerminationReason::Failed | magi_core::TerminationReason::Blocked,
+                ) => TaskStatus::Failed,
+                Some(magi_core::TerminationReason::Cancelled) => TaskStatus::Killed,
+                None => TaskStatus::Running,
+                Some(magi_core::TerminationReason::Completed) => TaskStatus::Completed,
+            }
+        };
+        let update_result = if completed {
+            self.task_store
+                .complete_lease_and_task(
+                    &report.task_id,
+                    &target.root_task_id,
+                    lease_id,
+                    TaskCompletionAttempt {
+                        output_refs: vec![report.summary.clone()],
+                        final_response: Some(report.summary.clone()),
+                        evidence: Vec::new(),
+                    },
+                )
+                .and_then(|changed| {
+                    if changed {
+                        Ok(())
+                    } else {
+                        Err(DomainError::InvalidState {
+                            message: format!("任务 {} 未能提交 Completed 终态", report.task_id),
+                        })
+                    }
+                })
+        } else if matches!(next_status, TaskStatus::Failed | TaskStatus::Killed) {
+            self.task_store
+                .revoke_lease_and_set_task_terminal(
+                    &report.task_id,
+                    &target.root_task_id,
+                    Some(lease_id),
+                    next_status,
+                    vec![report.summary.clone()],
+                )
+                .and_then(|changed| {
+                    if changed {
+                        Ok(())
+                    } else {
+                        Err(DomainError::InvalidState {
+                            message: format!(
+                                "任务 {} 未能提交 {:?} 终态",
+                                report.task_id, next_status
+                            ),
+                        })
+                    }
+                })
+        } else {
+            Ok(())
         };
         update_result.map_err(|error| map_task_store_error(&report.task_id, error))?;
         let assignment_id = execution_overview::assignment_id_for_task(
@@ -480,12 +581,12 @@ fn map_task_store_error(
             task_id: task_id.clone(),
             message: format!("unexpected existing entity while applying report: {entity}"),
         },
-        DomainError::InvalidState { message } | DomainError::Validation { message } => {
-            OrchestratorCommandError::TaskStateViolation {
-                task_id: task_id.clone(),
-                message,
-            }
-        }
+        DomainError::InvalidState { message }
+        | DomainError::Validation { message }
+        | DomainError::Persistence { message } => OrchestratorCommandError::TaskStateViolation {
+            task_id: task_id.clone(),
+            message,
+        },
         DomainError::CurrentTurnConflict {
             session_id,
             active_turn_id,

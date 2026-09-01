@@ -15,18 +15,18 @@ pub use generated::{
     BrowserHostStatus, BrowserNodeSelection, BrowserNodeSelectionBounds, BrowserToolAccess,
     BrowserToolDescriptor, BrowserToolParams, BrowserToolResult, BrowserToolResultStatus,
     BrowserToolsListParams, BrowserToolsListResult, CancelRequestParams, CanonicalToolCall,
-    CanonicalTurn, CanonicalTurnEvent, CanonicalTurnEventKind, CanonicalTurnItem,
-    CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility,
-    CanonicalWorkerRef, ClientCapabilities, ClientInfo, ClientNotification, ClientRequest,
-    ClientResponse, EmptyParams, ErrorObject, EventCategory, EventEnvelope,
-    EventNotificationParams, EventResyncReason, EventResyncRequiredParams, EventSnapshotParams,
-    EventStreamSnapshot, EventSubscribeParams, EventSubscribeResult, InitializeParams,
-    InitializeResult, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcRequestId, JsonRpcResponse, PingResult, ProtocolVersion, RequestId, ServerCapabilities,
-    ServerNotification, ServerRequest, ServerResponse, SessionContextReference,
-    SessionContextReferenceKind, SessionListParams, SessionListResult, SessionReadParams,
-    SessionReadResult, SessionScope, SessionSummary, SessionTurnImage, TurnQueueInfo,
-    TurnStartKind, TurnStartParams, TurnStartResult, TurnStartRoute,
+    CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
+    CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef, ClientCapabilities,
+    ClientInfo, ClientNotification, ClientRequest, ClientResponse, EmptyParams, ErrorObject,
+    EventCategory, EventEnvelope, EventNotificationParams, EventResyncReason,
+    EventResyncRequiredParams, EventSnapshotParams, EventStreamSnapshot, EventSubscribeParams,
+    EventSubscribeResult, InitializeParams, InitializeResult, JsonRpcError, JsonRpcMessage,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcRequestId, JsonRpcResponse, PingResult,
+    ProtocolVersion, RequestId, ServerCapabilities, ServerNotification, ServerRequest,
+    ServerResponse, SessionContextReference, SessionContextReferenceKind, SessionListParams,
+    SessionListResult, SessionReadParams, SessionReadResult, SessionScope, SessionSummary,
+    SessionTurnImage, TurnQueueInfo, TurnStartKind, TurnStartParams, TurnStartResult,
+    TurnStartRoute,
 };
 
 pub use generated::{
@@ -352,5 +352,38 @@ mod tests {
         assert_eq!(value["workspace_id"], "workspace-1");
         assert_eq!(value["occurred_at"], 42);
         assert!(value.get("mission_id").is_none());
+    }
+
+    #[test]
+    fn turn_start_result_accepts_canonical_event_metadata() {
+        let result: TurnStartResult = serde_json::from_value(serde_json::json!({
+            "kind": "accepted",
+            "replayed": false,
+            "requestId": "request-1",
+            "sessionId": "session-1",
+            "turnId": "turn-1",
+            "entryId": "entry-1",
+            "eventId": "event-1",
+            "acceptedAt": 100,
+            "runtimeEpoch": "runtime-1",
+            "eventStreamNextSequence": 8,
+            "createdSession": false,
+            "route": "chat",
+            "sessionSummary": null,
+            "userMessageItemId": "item-1",
+            "canonicalTurn": null,
+            "canonicalItem": null,
+            "queue": null,
+            "canonicalSchemaVersion": "canonical-turn.v1",
+            "canonicalEventKind": "turn_started",
+            "canonicalEventId": "event-1",
+            "canonicalEventSeq": 7,
+            "canonicalOccurredAt": 100
+        }))
+        .expect("turn/start 应接受规范事件元数据");
+
+        assert_eq!(result.canonical_event_id.as_deref(), Some("event-1"));
+        assert_eq!(result.canonical_event_seq, Some(7));
+        assert_eq!(result.canonical_occurred_at, Some(100));
     }
 }

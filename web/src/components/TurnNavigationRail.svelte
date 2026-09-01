@@ -13,9 +13,10 @@
     items: TurnNavigationItem[];
     container: HTMLDivElement | null;
     onRevealMessage?: (messageId: string) => Promise<boolean>;
+    onScrollToPosition: (top: number) => void;
   }
 
-  let { items, container, onRevealMessage }: Props = $props();
+  let { items, container, onRevealMessage, onScrollToPosition }: Props = $props();
 
   let railRef: HTMLDivElement | null = $state(null);
   let markerListRef: HTMLDivElement | null = $state(null);
@@ -28,6 +29,11 @@
   let selectedTurnId = $state('');
   let menuOpen = $state(false);
   let positionFrame = 0;
+  let activeTurnFrame = 0;
+  let layoutFrame = 0;
+  let documentTops = $state<Record<string, number>>({});
+  let messageElementsById = new Map<string, HTMLElement>();
+  let navigationNonce = 0;
 
   const activeItem = $derived(items.find((item) => item.turnId === activeTurnId) || items[items.length - 1]);
   const focusedItem = $derived(items.find((item) => item.turnId === focusedTurnId) || null);
@@ -39,25 +45,65 @@
 
   function findMessageElement(item: TurnNavigationItem): HTMLElement | null {
     if (!container) return null;
-    const messageIds = new Set(item.messageIds);
-    const elements = container.querySelectorAll<HTMLElement>('[data-message-id]');
-    let fallback: HTMLElement | null = null;
-    for (const element of elements) {
-      const messageId = element.dataset.messageId || '';
-      if (!messageIds.has(messageId)) continue;
-      if (messageId === item.anchorMessageId) return element;
-      fallback ||= element;
+    indexMessageElements();
+    const anchor = messageElementsById.get(item.anchorMessageId);
+    if (anchor) return anchor;
+    for (const messageId of item.messageIds) {
+      const element = messageElementsById.get(messageId);
+      if (element) return element;
     }
-    return fallback;
+    return null;
   }
 
-  function resolveMessageDocumentTop(item: TurnNavigationItem): number | null {
-    if (!container) return null;
-    const element = findMessageElement(item);
-    if (!element) return null;
+  function indexMessageElements(): void {
+    if (!container) {
+      messageElementsById = new Map();
+      return;
+    }
+    const next = new Map<string, HTMLElement>();
+    for (const element of container.querySelectorAll<HTMLElement>('[data-message-id]')) {
+      const messageId = element.dataset.messageId || '';
+      if (messageId && !next.has(messageId)) next.set(messageId, element);
+    }
+    messageElementsById = next;
+  }
+
+  function updateDocumentTops(): void {
+    if (!container || items.length === 0) return;
     const containerRect = container.getBoundingClientRect();
-    const elementRect = element.getBoundingClientRect();
-    return container.scrollTop + elementRect.top - containerRect.top;
+    indexMessageElements();
+    const nextTops: Record<string, number> = {};
+    for (const item of items) {
+      let element = messageElementsById.get(item.anchorMessageId) || null;
+      if (!element) {
+        for (const messageId of item.messageIds) {
+          element = messageElementsById.get(messageId) || null;
+          if (element) break;
+        }
+      }
+      if (!element) continue;
+      const elementRect = element.getBoundingClientRect();
+      nextTops[item.turnId] = container.scrollTop + elementRect.top - containerRect.top;
+    }
+    documentTops = nextTops;
+  }
+
+  function scheduleActiveTurnUpdate(): void {
+    if (activeTurnFrame) return;
+    activeTurnFrame = requestAnimationFrame(() => {
+      activeTurnFrame = 0;
+      updateActiveTurn();
+    });
+  }
+
+  function scheduleLayoutUpdate(): void {
+    if (layoutFrame) return;
+    layoutFrame = requestAnimationFrame(() => {
+      layoutFrame = 0;
+      updateDocumentTops();
+      updateMarkerPositions();
+      updateActiveTurn();
+    });
   }
 
   function updateMarkerPositions(): void {
@@ -90,7 +136,7 @@
     const probe = container.scrollTop + Math.min(180, container.clientHeight * 0.32);
     let nextTurnId = items[0]?.turnId || '';
     for (const item of items) {
-      const documentTop = resolveMessageDocumentTop(item);
+      const documentTop = documentTops[item.turnId] ?? null;
       if (documentTop !== null && documentTop <= probe) {
         nextTurnId = item.turnId;
       }
@@ -137,16 +183,18 @@
 
   async function focusTurn(item: TurnNavigationItem): Promise<void> {
     if (!container) return;
+    const requestNonce = ++navigationNonce;
     let element = findMessageElement(item);
     if (!element && onRevealMessage) {
       await onRevealMessage(item.anchorMessageId);
+      if (requestNonce !== navigationNonce || !container) return;
       element = findMessageElement(item);
     }
-    if (!element) return;
+    if (!element || requestNonce !== navigationNonce || !container) return;
     const containerRect = container.getBoundingClientRect();
     const elementRect = element.getBoundingClientRect();
     const targetTop = container.scrollTop + elementRect.top - containerRect.top - 24;
-    container.scrollTop = Math.max(0, targetTop);
+    onScrollToPosition(Math.max(0, targetTop));
     activeTurnId = item.turnId;
     selectedTurnId = item.turnId;
     menuOpen = false;
@@ -170,18 +218,20 @@
   $effect(() => {
     const scrollContainer = container;
     const navigationItems = items;
+    const effectNonce = ++navigationNonce;
     if (!scrollContainer || navigationItems.length === 0) return;
-    const handleScroll = () => updateActiveTurn();
+    const handleScroll = () => scheduleActiveTurnUpdate();
     scrollContainer.addEventListener('scroll', handleScroll, { passive: true });
     let disposed = false;
     let resizeObserver: ResizeObserver | null = null;
     let removeMarkerListScroll = () => {};
     void tick().then(() => {
-      if (disposed) return;
+      if (disposed || effectNonce !== navigationNonce) return;
+      updateDocumentTops();
       updateActiveTurn();
       updateMarkerPositions();
       if (typeof ResizeObserver !== 'undefined') {
-        resizeObserver = new ResizeObserver(() => scheduleMarkerPositionUpdate());
+        resizeObserver = new ResizeObserver(() => scheduleLayoutUpdate());
         resizeObserver.observe(scrollContainer);
         if (markerListRef) resizeObserver.observe(markerListRef);
         for (const element of scrollContainer.querySelectorAll<HTMLElement>('[data-message-id]')) {
@@ -196,10 +246,14 @@
     });
     return () => {
       disposed = true;
+      navigationNonce += 1;
+      messageElementsById = new Map();
       scrollContainer.removeEventListener('scroll', handleScroll);
       resizeObserver?.disconnect();
       removeMarkerListScroll();
       if (positionFrame) cancelAnimationFrame(positionFrame);
+      if (activeTurnFrame) cancelAnimationFrame(activeTurnFrame);
+      if (layoutFrame) cancelAnimationFrame(layoutFrame);
     };
   });
 
@@ -284,7 +338,7 @@
       onmouseleave={resetMagnet}
     >
       <div class="turn-navigation-marker-list" bind:this={markerListRef}>
-        {#each items as item (item.turnId)}
+        {#each items as item, itemIndex (item.turnId)}
           <button
             type="button"
             class="turn-navigation-marker"
@@ -292,7 +346,7 @@
             class:running={item.status === 'running' || item.status === 'pending'}
             class:magnetic-focus={item.turnId === focusedTurnId}
             class:selected={item.turnId === selectedTurnId}
-            class:selected-neighbor={isTurnNavigationNeighbor(items.indexOf(item), selectedIndex)}
+            class:selected-neighbor={isTurnNavigationNeighbor(itemIndex, selectedIndex)}
             style:--turn-wave-strength={markerStrengths[item.turnId] ?? 0}
             data-turn-id={item.turnId}
             aria-label={i18n.t('messageList.turnNavigation.jump', { index: item.index, summary: item.summary })}

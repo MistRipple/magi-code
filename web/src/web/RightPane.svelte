@@ -14,6 +14,7 @@
   } from '../lib/browser-navigation';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../lib/external-link';
   import { measureDesktopOverlayMenuBounds } from '../lib/desktop-overlay-geometry';
+  import { toDesktopOverlayIdentity, toDesktopOverlayState } from '../lib/desktop-overlay-state';
   import { addToast } from '../stores/messages.svelte';
   import { navigateSession, waitForSessionNavigation } from '../shared/session-navigation.svelte';
   import {
@@ -168,7 +169,7 @@
     if (!desktop || !identity) return Promise.resolve();
     addPaneOverlayIdentity = null;
     addPaneMenuLayout = null;
-    return desktop.closeOverlay(identity).then((event) => {
+    return desktop.closeOverlay(toDesktopOverlayIdentity(identity)).then((event) => {
       if (!event) return;
       domAddPaneMenuOpen = false;
     }).catch((error) => {
@@ -188,7 +189,7 @@
     addPaneOverlayIdentity = identity;
     addPaneMenuLayout = { state, anchor, itemCount: addablePaneKinds.length };
     domAddPaneMenuOpen = false;
-    desktop.openOverlay(state).catch((error) => {
+    desktop.openOverlay(toDesktopOverlayState(state)).catch((error) => {
       if (addPaneOverlayIdentity?.overlayId === identity.overlayId) addPaneOverlayIdentity = null;
       console.warn('[RightPane] 打开新增面板菜单失败:', error);
     });
@@ -212,7 +213,7 @@
         && previous.width === popupBounds.width
         && previous.height === popupBounds.height
       ) return;
-      const state = { ...layout.state, popupBounds };
+      const state = toDesktopOverlayState({ ...layout.state, popupBounds });
       addPaneMenuLayout = { ...layout, state };
       void desktop.openOverlay(state).catch((error) => {
         console.warn('[RightPane] 重排新增面板菜单失败:', error);

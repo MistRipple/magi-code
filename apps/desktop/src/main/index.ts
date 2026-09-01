@@ -100,6 +100,9 @@ if (singleInstance) {
   let worker: AutomationWorker | null = null;
   const surfaces = new BrowserSurfaceManager({
     desktopEpoch,
+    onContentSlotReady: (binding) => {
+      control?.handleSurfaceContentReady(binding);
+    },
     partitionRegistryPath: join(app.getPath("userData"), "browser-partitions.json"),
     onEvent: (event) => {
       control?.handleSurfaceEvent(event);
@@ -185,6 +188,7 @@ if (singleInstance) {
     surfaceManager: surfaces,
     worker,
     activeWindowId: () => manager.activeWindowId(),
+    ensureBrowserSurface: (input) => manager.ensureBrowserSurface(input),
     handshake: () => handshake(worker!),
   });
   controlServer = control;
@@ -318,7 +322,7 @@ function registerIpc(): void {
     if (role !== "app" && role !== "overlay") {
       throw new Error("desktop_overlay_close_sender_denied");
     }
-    manager.closeOverlay(windowId, parseOverlayCloseRequest(value));
+    return manager.closeOverlay(windowId, parseOverlayCloseRequest(value));
   });
   handleIpc("magi-desktop:set-blocking-overlay", (event, value: unknown) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);

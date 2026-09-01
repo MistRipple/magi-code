@@ -63,6 +63,17 @@ pub struct BrowserHostIncomingEvent {
     pub binary: Option<Vec<u8>>,
 }
 
+/// 已完成身份校验的 Desktop Host 连接。
+///
+/// 事件接收器必须在读取任务启动前创建并随连接一起返回。若调用方在
+/// `ready` 握手完成后才调用 `subscribe`，Host 紧随握手发送的 Primary
+/// Surface 等启动事件会在 broadcast 尚无订阅者时被永久丢弃。
+pub struct BrowserHostConnection {
+    pub client: BrowserHostClient,
+    pub handshake: BrowserHostHandshake,
+    pub events: broadcast::Receiver<BrowserHostIncomingEvent>,
+}
+
 #[derive(Clone)]
 pub struct BrowserHostClient {
     sink: Arc<tokio::sync::Mutex<HostWebSocketSink>>,
@@ -81,7 +92,7 @@ impl BrowserHostClient {
         expected_desktop_epoch: &str,
         expected_process_id: u32,
         handshake_timeout: Duration,
-    ) -> Result<(Self, BrowserHostHandshake), BrowserHostClientError> {
+    ) -> Result<BrowserHostConnection, BrowserHostClientError> {
         if socket_path.trim().is_empty() {
             return Err(BrowserHostClientError::InvalidConfiguration(
                 "Desktop control socket path cannot be empty".to_string(),
@@ -115,19 +126,21 @@ impl BrowserHostClient {
             .await
             .map_err(|error| BrowserHostClientError::Connect(error.to_string()))?;
         let (sink, source) = stream.split();
-        let (events, _) = broadcast::channel(256);
+        let sink = Arc::new(tokio::sync::Mutex::new(sink));
+        let (events, initial_events) = broadcast::channel(256);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let (handshake_sender, handshake_receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(read_host_messages(
             source,
+            Arc::clone(&sink),
             Arc::clone(&pending),
             events.clone(),
             Arc::clone(&closed),
             Some(handshake_sender),
         ));
         let client = Self {
-            sink: Arc::new(tokio::sync::Mutex::new(sink)),
+            sink,
             pending,
             tab_locks: Arc::new(Mutex::new(HashMap::new())),
             events,
@@ -152,7 +165,11 @@ impl BrowserHostClient {
             client.close().await;
             return Err(error);
         }
-        Ok((client, handshake))
+        Ok(BrowserHostConnection {
+            client,
+            handshake,
+            events: initial_events,
+        })
     }
 
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
@@ -380,6 +397,7 @@ fn request_timeout_for(command: &BrowserHostCommand, default: Duration) -> Durat
 
 async fn read_host_messages(
     mut source: futures_util::stream::SplitStream<HostWebSocket>,
+    sink: Arc<tokio::sync::Mutex<HostWebSocketSink>>,
     pending: Arc<Mutex<HashMap<BrowserCommandId, PendingResponse>>>,
     events: broadcast::Sender<BrowserHostIncomingEvent>,
     closed: Arc<AtomicBool>,
@@ -400,7 +418,13 @@ async fn read_host_messages(
             Ok(Message::Binary(bytes)) => {
                 handle_binary_message(bytes.to_vec(), &events, &mut binary_queue)
             }
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => Ok(()),
+            Ok(Message::Ping(payload)) => sink
+                .lock()
+                .await
+                .send(Message::Pong(payload))
+                .await
+                .map_err(|error| BrowserHostClientError::Transport(error.to_string())),
+            Ok(Message::Pong(_)) => Ok(()),
             Ok(Message::Close(_)) => break,
             Ok(Message::Frame(_)) => Ok(()),
             Err(error) => Err(BrowserHostClientError::Transport(error.to_string())),
@@ -794,6 +818,43 @@ mod tests {
                 ))
                 .await
                 .expect("send ready event");
+            let primary = BrowserHostEventEnvelope {
+                protocol_version: BrowserHostProtocolVersion::CURRENT,
+                sequence: 2,
+                event: BrowserHostEvent::PrimarySurfaceChanged {
+                    binding: crate::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop-epoch".to_string(),
+                        window_id: "window-test".to_string(),
+                        surface_id: "surface-test".to_string(),
+                        surface_revision: 1,
+                        tab_id: magi_core::BrowserTabId::new("test-tab"),
+                        web_contents_id: 7,
+                        target_id: "target-test".to_string(),
+                        browser_context_id: "context-test".to_string(),
+                        navigation_revision: 1,
+                    },
+                },
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&primary)
+                        .expect("serialize Primary Surface event")
+                        .into(),
+                ))
+                .await
+                .expect("send Primary Surface event immediately after ready");
+            websocket
+                .send(Message::Ping(b"desktop-heartbeat".to_vec().into()))
+                .await
+                .expect("send Desktop heartbeat ping");
+            let pong = websocket
+                .next()
+                .await
+                .expect("receive Desktop heartbeat pong")
+                .expect("read Desktop heartbeat pong");
+            assert!(
+                matches!(pong, Message::Pong(payload) if payload == b"desktop-heartbeat".to_vec())
+            );
 
             let request = websocket
                 .next()
@@ -825,7 +886,7 @@ mod tests {
                 .expect("send ping response");
         });
 
-        let (client, received_handshake) = BrowserHostClient::connect_desktop_socket(
+        let mut connection = BrowserHostClient::connect_desktop_socket(
             socket_path.to_str().expect("UTF-8 socket path"),
             "test-token",
             "desktop-epoch",
@@ -834,8 +895,28 @@ mod tests {
         )
         .await
         .expect("connect Desktop client");
-        assert_eq!(received_handshake, handshake());
-        let reply = client
+        assert_eq!(connection.handshake, handshake());
+        let startup_ready = connection
+            .events
+            .recv()
+            .await
+            .expect("receive startup ready event");
+        assert!(matches!(
+            startup_ready.envelope.event,
+            BrowserHostEvent::Ready(_)
+        ));
+        let startup_primary = connection
+            .events
+            .recv()
+            .await
+            .expect("receive startup Primary Surface event");
+        assert!(matches!(
+            startup_primary.envelope.event,
+            BrowserHostEvent::PrimarySurfaceChanged { binding }
+                if binding.surface_id == "surface-test"
+        ));
+        let reply = connection
+            .client
             .request(BrowserHostCommand::Ping)
             .await
             .expect("request ping");
@@ -922,7 +1003,7 @@ mod tests {
                 .expect("send cancelled response");
         });
 
-        let (client, _) = BrowserHostClient::connect_desktop_socket(
+        let connection = BrowserHostClient::connect_desktop_socket(
             socket_path.to_str().expect("UTF-8 socket path"),
             "test-token",
             "desktop-epoch",
@@ -931,7 +1012,9 @@ mod tests {
         )
         .await
         .expect("connect Desktop client");
-        let client = client.with_request_timeout(Duration::from_millis(20));
+        let client = connection
+            .client
+            .with_request_timeout(Duration::from_millis(20));
 
         let reply = client
             .request(BrowserHostCommand::Ping)

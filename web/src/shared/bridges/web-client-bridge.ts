@@ -116,16 +116,17 @@ import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 import {
   normalizeRustBootstrapPayload,
   parseRustEventEnvelope,
-  readRustTimelinePageMeta,
+  readRustCanonicalHistoryPageMeta,
   type BootstrapPayload,
   type RustEventEnvelope,
 } from './rust-daemon-contract';
 import {
-  CANONICAL_TURN_SCHEMA_VERSION,
   parseCanonicalTurnEventPayload,
   isCanonicalTerminalStatus,
   type CanonicalTurnEvent,
 } from '../protocol/canonical-turn';
+import { canonicalTurnRequestId } from '../protocol/canonical-processing';
+import { isTerminalRuntimeTaskStatus } from '../protocol/runtime-task-status';
 import type { SseConnection } from '../transport';
 import {
   AppServerClient,
@@ -148,8 +149,13 @@ import { sanitizeSvgContent } from '../svg-sanitizer';
 import {
   messagesState,
   beginLocalTurnSubmission,
+  markLocalTurnSubmissionQueued,
+  adoptQueuedTurnSubmissions,
   clearRequestBinding,
   clearPendingRequest,
+  listPendingRequestIdsForSession,
+  settlePendingRequestSnapshot,
+  settleAuthoritativeIdleState,
   completeTurnEditing,
   createRequestBinding,
   getRequestBinding,
@@ -159,11 +165,20 @@ import {
   updateRequestBinding,
 } from '../../stores/messages.svelte';
 import {
+  setCanonicalTimelineError,
+  turnStoreState,
+} from '../../stores/turn-store.svelte';
+import {
   SESSION_NAVIGATION_TIMEOUT_MS,
   sessionNavigationState,
 } from '../session-navigation.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
-import type { MessageBrowserNodeSelection, OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
+import type {
+  Message,
+  MessageBrowserNodeSelection,
+  OrchestratorRuntimeSnapshot,
+  QueuedMessage,
+} from '../../types/message';
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
 
@@ -179,6 +194,9 @@ let currentInterruptTaskId = '';
 let currentBindingGeneration = 0;
 let continueRequestId = '';
 let currentRuntimeEpoch = '';
+let terminalBootstrapRefreshInFlight: Promise<void> | null = null;
+let terminalBootstrapRefreshPending = false;
+let terminalBootstrapRefreshReason = '';
 type SessionTurnSubmissionContext = {
   requestId: string;
   scope: 'personal' | 'workspace';
@@ -190,6 +208,11 @@ type SessionTurnSubmissionContext = {
   bindingGeneration: number;
   /** SSE 先于 HTTP 返回时记录已确认的后端会话。 */
   acceptedSessionId?: string;
+};
+
+type ProcessingRequestSnapshot = {
+  sessionId: string;
+  requestIds: string[];
 };
 
 // 每个 request 都有自己的提交上下文。旧实现只有一个全局槽位，第二个会话
@@ -223,6 +246,14 @@ let bridgeRecovering = false;
 let bootstrapInFlight: Promise<void> | null = null;
 let bootstrapInFlightBindingKey = '';
 let bootstrapRequestSeq = 0;
+type SessionNavigationLease = {
+  requestId: string;
+  sequence: number;
+  completion: Promise<void>;
+  release: () => void;
+};
+let sessionNavigationSequence = 0;
+let activeSessionNavigation: SessionNavigationLease | null = null;
 let settingsBootstrapInFlight: Promise<void> | null = null;
 let settingsBootstrapInFlightBindingKey = '';
 let settingsBootstrapRequestSeq = 0;
@@ -240,7 +271,6 @@ type SessionSummaryRefreshTarget =
   | { scope: 'personal'; key: 'personal' }
   | { scope: 'workspace'; key: string; workspaceId: string; workspacePath: string };
 const sessionSummaryRefreshTargets = new Map<string, SessionSummaryRefreshTarget>();
-let terminalTaskRuntimeRefreshTimer: number | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
 
 function invalidateBootstrapRequests(): void {
@@ -249,12 +279,48 @@ function invalidateBootstrapRequests(): void {
   bootstrapInFlightBindingKey = '';
 }
 
-function clearActiveTurnInFlight(): void {
-  // 实时 turn 投影由后端 canonical snapshot 驱动，这里保留统一清理入口。
+function beginSessionNavigation(requestId: string): SessionNavigationLease {
+  // 新导航代表最新用户意图。先释放旧屏障，让等待者继续等待新租约，
+  // 旧导航响应则由独立 sequence 判定为过期，不能提交页面状态。
+  activeSessionNavigation?.release();
+  let release!: () => void;
+  const completion = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const lease: SessionNavigationLease = {
+    requestId,
+    sequence: ++sessionNavigationSequence,
+    completion,
+    release,
+  };
+  activeSessionNavigation = lease;
+  invalidateBootstrapRequests();
+  return lease;
 }
 
-function clearContinueRequestInFlight(): void {
+function isCurrentSessionNavigation(lease: SessionNavigationLease): boolean {
+  return activeSessionNavigation?.sequence === lease.sequence
+    && activeSessionNavigation.requestId === lease.requestId;
+}
+
+function releaseSessionNavigation(lease: SessionNavigationLease): void {
+  if (isCurrentSessionNavigation(lease)) {
+    activeSessionNavigation = null;
+  }
+  lease.release();
+}
+
+async function waitForSessionNavigationCommit(): Promise<void> {
+  while (activeSessionNavigation) {
+    await activeSessionNavigation.completion;
+  }
+}
+
+function clearContinueRequestInFlight(requestId?: string): void {
   if (continueRequestId) {
+    if (requestId && continueRequestId !== requestId) {
+      return;
+    }
     clearPendingRequest(continueRequestId);
     continueRequestId = '';
   }
@@ -663,20 +729,6 @@ interface BootstrapAgentRunTrackingHints {
   activeTaskIds: string[];
 }
 
-function isTerminalRuntimeTaskStatus(status: unknown): boolean {
-  const normalized = trimBridgeString(status).toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-  return normalized.includes('succeed')
-    || normalized.includes('complete')
-    || normalized.includes('fail')
-    || normalized.includes('reject')
-    || normalized.includes('abort')
-    || normalized.includes('cancel')
-    || normalized.includes('skip');
-}
-
 function clearCurrentInterruptTaskId(): void {
   currentInterruptTaskId = '';
 }
@@ -857,42 +909,98 @@ function isExpectedRecoveryBridgeFailure(error: unknown): boolean {
     || detail.includes('当前页面暂时无法连接 magi');
 }
 
-function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown>): void {
-  clearContinueRequestInFlight();
-  clearCurrentInterruptTaskId();
+function emitForcedProcessingTerminal(input: {
+  sessionId: string;
+  requestId: string;
+  reason: string;
+  details?: Record<string, unknown>;
+}): void {
+  const sessionId = trimBridgeString(input.sessionId);
+  const requestId = trimBridgeString(input.requestId);
+  if (!sessionId || !requestId) {
+    console.warn('[web-client-bridge] 忽略缺少 sessionId/requestId 的 forced terminal', {
+      reason: input.reason,
+    });
+    return;
+  }
   emitDataMessage('processingStateChanged', {
     isProcessing: false,
     transitionKind: 'forced',
     source: 'orchestrator',
     agent: 'orchestrator',
-    reason,
+    reason: input.reason,
+    sessionId,
+    requestId,
     timestamp: Date.now(),
-    ...(extra || {}),
+    ...(input.details || {}),
   });
+}
+
+function captureProcessingRequestSnapshot(sessionId?: string | null): ProcessingRequestSnapshot {
+  const normalizedSessionId = trimBridgeString(sessionId)
+    || trimBridgeString(messagesState.currentSessionId)
+    || '__draft__';
+  return {
+    sessionId: normalizedSessionId,
+    requestIds: listPendingRequestIdsForSession(normalizedSessionId),
+  };
+}
+
+function settleProcessingRequestSnapshot(snapshot: ProcessingRequestSnapshot): void {
+  if (snapshot.requestIds.length === 0) {
+    // 没有 requestId 的历史 canonical processing 仍可能阻塞界面；只有在
+    // 当前 session 此刻没有新 pending request 时才允许收敛全局 processing。
+    if (
+      snapshot.sessionId === (messagesState.currentSessionId?.trim() || '__draft__')
+      && messagesState.pendingRequests.size === 0
+      && messagesState.backendProcessing
+    ) {
+      settleAuthoritativeIdleState();
+    }
+    return;
+  }
+  settlePendingRequestSnapshot(snapshot);
 }
 
 function refreshBootstrapAfterTerminalTurn(reason: string): void {
-  void fetchBootstrap({ forceFresh: true }).catch((error) => {
-    reportExpectedRecoveryFailure(i18n.t('bridge.action.syncTurnState'), '[web-client-bridge] turn 终态后 bootstrap 同步失败:', error);
-    scheduleRecovery(reason, error, true);
-  });
-}
-
-function scheduleTerminalTaskRuntimeRefresh(): void {
-  if (terminalTaskRuntimeRefreshTimer !== null) {
-    window.clearTimeout(terminalTaskRuntimeRefreshTimer);
+  terminalBootstrapRefreshPending = true;
+  terminalBootstrapRefreshReason = reason;
+  if (terminalBootstrapRefreshInFlight) {
+    return;
   }
-  terminalTaskRuntimeRefreshTimer = window.setTimeout(() => {
-    terminalTaskRuntimeRefreshTimer = null;
-    void fetchBootstrap({ forceFresh: true }).catch((error) => {
-      reportExpectedRecoveryFailure(
-        i18n.t('bridge.action.syncTurnState'),
-        '[web-client-bridge] 任务终态后 bootstrap 同步失败:',
-        error,
-      );
-      scheduleRecovery('terminal_task_status_refresh', error, true);
-    });
-  }, 180);
+
+  const request = (async (): Promise<void> => {
+    while (terminalBootstrapRefreshPending) {
+      terminalBootstrapRefreshPending = false;
+      const refreshReason = terminalBootstrapRefreshReason || 'terminal_bootstrap_refresh';
+      terminalBootstrapRefreshReason = '';
+      try {
+        // 终态事件已经直接驱动 canonical reducer。bootstrap 只做后台权威校正，
+        // 失败时不得重新猜测或清除当前 UI 的 processing 状态。
+        await fetchBootstrap({
+          forceFresh: true,
+          refreshSettingsBootstrapOnBindingChange: false,
+          refreshSessionTurnQueueAfterBootstrap: false,
+          settleProcessingOnFailure: false,
+        });
+      } catch (error) {
+        reportExpectedRecoveryFailure(
+          i18n.t('bridge.action.syncTurnState'),
+          '[web-client-bridge] turn 终态后 bootstrap 同步失败:',
+          error,
+        );
+        scheduleRecovery(refreshReason, error, true);
+      }
+    }
+  })().finally(() => {
+    terminalBootstrapRefreshInFlight = null;
+    // 终态刷新期间可能发生新的 terminal event；finally 之后重新启动一轮，
+    // 确保会话切换或连续轮次不会被前一轮吞掉。
+    if (terminalBootstrapRefreshPending) {
+      refreshBootstrapAfterTerminalTurn(terminalBootstrapRefreshReason || 'terminal_bootstrap_refresh');
+    }
+  });
+  terminalBootstrapRefreshInFlight = request;
 }
 
 function emitRecoveringState(reason: string, error?: unknown): void {
@@ -1004,9 +1112,6 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
       });
       return;
     }
-    emitForcedProcessingIdle('event_stream_tunnel_terminal_summary', {
-      sessionId: binding.sessionId,
-    });
     await fetchBootstrap({
       forceFresh: true,
       forceEventStreamReconnect: false,
@@ -1252,6 +1357,13 @@ function emitSessionTurnAccepted(
     sessionSummary?: unknown;
     createdSession?: boolean;
     route?: unknown;
+    canonicalSchemaVersion?: string | null;
+    canonicalEventKind?: string | null;
+    canonicalEventId?: string | null;
+    canonicalEventSeq?: number | null;
+    canonicalOccurredAt?: number | null;
+    canonicalTurn?: unknown;
+    canonicalItem?: unknown;
     submissionContext?: SessionTurnSubmissionContext | null;
   },
 ): void {
@@ -1268,6 +1380,17 @@ function emitSessionTurnAccepted(
     ...(payload.sessionSummary === undefined ? {} : { sessionSummary: payload.sessionSummary }),
     ...(payload.createdSession === undefined ? {} : { createdSession: payload.createdSession }),
     ...(payload.route === undefined ? {} : { route: payload.route }),
+    ...(payload.canonicalSchemaVersion ? { canonicalSchemaVersion: payload.canonicalSchemaVersion } : {}),
+    ...(payload.canonicalEventKind ? { canonicalEventKind: payload.canonicalEventKind } : {}),
+    ...(payload.canonicalEventId ? { canonicalEventId: payload.canonicalEventId } : {}),
+    ...(typeof payload.canonicalEventSeq === 'number'
+      ? { canonicalEventSeq: payload.canonicalEventSeq }
+      : {}),
+    ...(typeof payload.canonicalOccurredAt === 'number'
+      ? { canonicalOccurredAt: payload.canonicalOccurredAt }
+      : {}),
+    ...(payload.canonicalTurn === undefined ? {} : { canonicalTurn: payload.canonicalTurn }),
+    ...(payload.canonicalItem === undefined ? {} : { canonicalItem: payload.canonicalItem }),
     ...(submissionContext ? { submissionContext: submissionContextPayload(submissionContext) } : {}),
   });
 }
@@ -1283,21 +1406,58 @@ function emitSessionTurnSubmissionSettled(
   }));
 }
 
+function parseCanonicalTurnEventFromRustEvent(
+  event: RustEventEnvelope,
+): CanonicalTurnEvent | undefined {
+  const payload = event.payload;
+  if (!payload) {
+    return undefined;
+  }
+
+  // canonical turn 事实嵌在 EventBus envelope 中传输。事件生产者只需提供
+  // turn/item 内容，传输层 envelope 才是实时事件 ID、顺序和时间的权威来源。
+  try {
+    return parseCanonicalTurnEventPayload({
+      ...payload,
+      canonical_event_id: payload.canonical_event_id
+        ?? payload.canonicalEventId
+        ?? payload.eventId
+        ?? payload.event_id
+        ?? event.event_id,
+      canonical_event_seq: payload.canonical_event_seq
+        ?? payload.canonicalEventSeq
+        ?? payload.eventSeq
+        ?? payload.event_seq
+        ?? event.sequence,
+      canonical_occurred_at: payload.canonical_occurred_at
+        ?? payload.canonicalOccurredAt
+        ?? payload.occurredAt
+        ?? payload.occurred_at
+        ?? event.occurred_at,
+    });
+  } catch (error) {
+    setCanonicalTimelineError(error);
+    console.error('[web-client-bridge] canonical event 校验失败，已拒绝 live projection:', error);
+    scheduleRecovery('canonical_protocol_invalid', error, true);
+    return undefined;
+  }
+}
+
 function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void {
-  const isTerminalEvent = canonicalEvent.kind === 'turn_completed'
-    || canonicalEvent.kind === 'turn_superseded'
-    || Boolean(
-      canonicalEvent.turn
-      && isCanonicalTerminalStatus(canonicalEvent.turn.status),
-    );
+  const isTerminalEvent = isCanonicalTerminalEvent(canonicalEvent);
   if (
     canonicalEvent.sessionId === currentSessionId
     && isTerminalEvent
   ) {
-    clearContinueRequestInFlight();
+    const requestId = canonicalEvent.turn
+      ? canonicalTurnRequestId(canonicalEvent.turn)
+      : '';
+    if (requestId) {
+      clearContinueRequestInFlight(requestId);
+    }
     // canonical 终态事件是会话执行结束的统一协议入口。增量 reducer 负责即时收敛，
-    // 随后的权威 bootstrap 负责校正任务、代理与运行态快照，不能再依赖某个旧事件名。
-    scheduleTerminalTaskRuntimeRefresh();
+    // 权威 bootstrap 立即在后台校正任务、代理与运行态快照。
+    refreshBootstrapAfterTerminalTurn('canonical_turn_terminal');
   }
   emitDataMessage('sessionTurnCanonicalEventUpdated', {
     sessionId: canonicalEvent.sessionId,
@@ -1305,30 +1465,13 @@ function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void
   });
 }
 
-function emitAcceptedCanonicalTurnFromResult(result: {
-  eventId: string;
-  acceptedAt: number;
-  canonicalSchemaVersion?: string | null;
-  canonicalEventKind?: string | null;
-  canonicalTurn?: unknown;
-  canonicalItem?: unknown;
-}): void {
-  if (!result.canonicalTurn && !result.canonicalItem) {
-    return;
-  }
-  const canonicalEvent = parseCanonicalTurnEventPayload({
-    canonical_schema_version: result.canonicalSchemaVersion || CANONICAL_TURN_SCHEMA_VERSION,
-    canonical_event_kind: result.canonicalEventKind || 'turn_started',
-    canonical_turn: result.canonicalTurn,
-    canonical_item: result.canonicalItem,
-  }, {
-    eventId: result.eventId,
-    eventSeq: 0,
-    occurredAt: result.acceptedAt,
-  });
-  if (canonicalEvent) {
-    emitSessionTurnCanonicalEvent(canonicalEvent);
-  }
+function isCanonicalTerminalEvent(canonicalEvent: CanonicalTurnEvent): boolean {
+  return canonicalEvent.kind === 'turn_completed'
+    || canonicalEvent.kind === 'turn_superseded'
+    || Boolean(
+      canonicalEvent.turn
+      && isCanonicalTerminalStatus(canonicalEvent.turn.status),
+    );
 }
 
 function canonicalTurnSeqFromResult(result: {
@@ -1352,15 +1495,7 @@ function canonicalTurnSeqFromResult(result: {
 }
 
 function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
-  const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
-    eventId: trimBridgeString(event.event_id),
-    eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
-      ? Math.floor(event.sequence)
-      : 0,
-    occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
-      ? Math.floor(event.occurred_at)
-      : Date.now(),
-  });
+  const canonicalEvent = parseCanonicalTurnEventFromRustEvent(event);
   if (!canonicalEvent) {
     console.error('[web-client-bridge] session.turn.item 缺少 canonical payload，已拒绝旧 projection live 写入');
     return false;
@@ -1369,21 +1504,13 @@ function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
-function emitCanonicalTurnEventFromRustEvent(event: RustEventEnvelope): boolean {
-  const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
-    eventId: trimBridgeString(event.event_id),
-    eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
-      ? Math.floor(event.sequence)
-      : 0,
-    occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
-      ? Math.floor(event.occurred_at)
-      : Date.now(),
-  });
+function emitCanonicalTurnEventFromRustEvent(event: RustEventEnvelope): CanonicalTurnEvent | null {
+  const canonicalEvent = parseCanonicalTurnEventFromRustEvent(event);
   if (!canonicalEvent) {
-    return false;
+    return null;
   }
   emitSessionTurnCanonicalEvent(canonicalEvent);
-  return true;
+  return canonicalEvent;
 }
 
 function rustEventPayloadString(event: RustEventEnvelope, snakeKey: string, camelKey: string): string {
@@ -1412,6 +1539,34 @@ function rustEventTaskId(event: RustEventEnvelope): string {
 
 function rustEventRequestId(event: RustEventEnvelope): string {
   return rustEventPayloadString(event, 'request_id', 'requestId');
+}
+
+function terminalTurnIdentity(
+  event: RustEventEnvelope,
+  canonicalEvent: CanonicalTurnEvent | null,
+): { sessionId: string; requestId: string } | null {
+  const eventSessionId = rustEventSessionId(event);
+  const canonicalSessionId = canonicalEvent?.sessionId.trim() || '';
+  if (
+    !eventSessionId
+    || (canonicalSessionId && canonicalSessionId !== eventSessionId)
+  ) {
+    return null;
+  }
+
+  const eventRequestId = rustEventRequestId(event);
+  const canonicalRequestId = canonicalEvent?.turn
+    ? canonicalTurnRequestId(canonicalEvent.turn)
+    : '';
+  if (
+    eventRequestId
+    && canonicalRequestId
+    && eventRequestId !== canonicalRequestId
+  ) {
+    return null;
+  }
+  const requestId = canonicalRequestId || eventRequestId;
+  return requestId ? { sessionId: eventSessionId, requestId } : null;
 }
 
 function activeDraftSubmissionMatchesAcceptedEvent(
@@ -1454,7 +1609,10 @@ function eventMatchesCurrentWorkspace(event: RustEventEnvelope): boolean {
 
 function eventTargetsDifferentSession(event: RustEventEnvelope): boolean {
   const eventSessionId = rustEventSessionId(event);
-  if (event.event_type === 'session.turn.task.accepted' && !eventSessionId) {
+  if (
+    (event.event_type === 'session.turn.task.accepted' || TURN_TERMINAL_EVENTS.has(event.event_type || ''))
+    && !eventSessionId
+  ) {
     return true;
   }
   if (!eventSessionId) {
@@ -2032,15 +2190,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         submissionContext: acceptedMatchesDraftSubmission ? acceptedSubmissionContext : null,
       });
     }
-    const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
-      eventId: trimBridgeString(event.event_id),
-      eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
-        ? Math.floor(event.sequence)
-        : 0,
-      occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
-        ? Math.floor(event.occurred_at)
-        : Date.now(),
-    });
+    const canonicalEvent = parseCanonicalTurnEventFromRustEvent(event);
     if (canonicalEvent) {
       emitSessionTurnCanonicalEvent(canonicalEvent);
       const editingTurn = messagesState.editingTurn;
@@ -2066,15 +2216,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (eventType === 'session.turn.superseded') {
-    const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
-      eventId: trimBridgeString(event.event_id),
-      eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
-        ? Math.floor(event.sequence)
-        : 0,
-      occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
-        ? Math.floor(event.occurred_at)
-        : Date.now(),
-    });
+    const canonicalEvent = parseCanonicalTurnEventFromRustEvent(event);
     if (canonicalEvent) {
       emitSessionTurnCanonicalEvent(canonicalEvent);
       completeTurnEditing(canonicalEvent.turnId);
@@ -2110,8 +2252,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
-    const emittedCanonicalTerminal = emitCanonicalTurnEventFromRustEvent(event);
-    clearActiveTurnInFlight();
+    const canonicalTerminal = emitCanonicalTurnEventFromRustEvent(event);
+    const hasCanonicalTerminal = Boolean(
+      canonicalTerminal && isCanonicalTerminalEvent(canonicalTerminal),
+    );
+    const terminalIdentity = terminalTurnIdentity(event, canonicalTerminal);
     const terminalErrorCode = trimBridgeString(event.payload?.error_code)
       || trimBridgeString(event.payload?.errorCode);
     const terminalPublicMessage = trimBridgeString(event.payload?.public_message)
@@ -2132,15 +2277,24 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         : eventType === 'session.turn.queue_failed'
           ? (terminalErrorCode || 'queued_session_turn_failed')
         : 'session_turn_completed';
-    emitForcedProcessingIdle(
-      terminalReason,
-      {
-        eventType,
-        ...(terminalErrorCode ? { errorCode: terminalErrorCode } : {}),
-        ...(terminalPublicMessage ? { publicMessage: terminalPublicMessage } : {}),
-      },
-    );
-    if (!emittedCanonicalTerminal) {
+    if (!hasCanonicalTerminal) {
+      if (terminalIdentity) {
+        emitForcedProcessingTerminal({
+          ...terminalIdentity,
+          reason: terminalReason,
+          details: {
+            eventType,
+            ...(terminalErrorCode ? { errorCode: terminalErrorCode } : {}),
+            ...(terminalPublicMessage ? { publicMessage: terminalPublicMessage } : {}),
+          },
+        });
+      } else {
+        console.warn('[web-client-bridge] turn 终态缺少精确 sessionId/requestId，等待权威快照收敛', {
+          eventType,
+        });
+      }
+    }
+    if (!hasCanonicalTerminal) {
       refreshBootstrapAfterTerminalTurn(terminalReason);
     }
   }
@@ -2175,7 +2329,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     if (eventType === 'task.status.changed' && event.payload) {
       const taskStatus = event.payload.new_status ?? event.payload.newStatus ?? event.payload.status;
       if (isTerminalRuntimeTaskStatus(taskStatus)) {
-        scheduleTerminalTaskRuntimeRefresh();
+        refreshBootstrapAfterTerminalTurn('terminal_task_status_refresh');
       }
       emitDataMessage('taskStatusChanged', {
         taskId: event.payload.task_id ?? event.payload.taskId ?? '',
@@ -2806,8 +2960,6 @@ function closeEventStream(): void {
   stopEventStreamIdleCheck();
   activeEventStreamOpenReject?.(new Error('事件流连接已关闭'));
   activeEventStreamToken += 1;
-  // 事件流断开后无法接收增量事件，结束活跃 turn 防护
-  clearActiveTurnInFlight();
   if (activeEventStreamConnection) {
     activeEventStreamConnection.close();
     activeEventStreamConnection = null;
@@ -2831,36 +2983,55 @@ function normalizeBootstrapResponse(
   });
 }
 
-async function restoreBridgeState(reason: string, force = false): Promise<void> {
+async function restoreBridgeState(
+  reason: string,
+  force = false,
+  settleProcessingOnFailure = true,
+): Promise<void> {
   const recoveryBinding = resolveWorkspaceQuery();
   const recoveryBindingKey = bootstrapBindingKey(recoveryBinding);
+  const processingSnapshot = settleProcessingOnFailure
+    ? captureProcessingRequestSnapshot(recoveryBinding.sessionId)
+    : null;
   if (recoveryInFlight && !force && recoveryInFlightBindingKey === recoveryBindingKey) {
     return recoveryInFlight;
   }
   recoveryInFlightBindingKey = recoveryBindingKey;
   const request = (async () => {
-    const recovered = bridgeRecovering || recoveryAttempt > 0;
-    const reachableBaseUrl = await probeReachableAgentBaseUrl();
-    if (!reachableBaseUrl) {
-      throw new Error('无法连接 Local Agent，正在等待恢复。');
+    try {
+      const recovered = bridgeRecovering || recoveryAttempt > 0;
+      const reachableBaseUrl = await probeReachableAgentBaseUrl();
+      if (!reachableBaseUrl) {
+        throw new Error('无法连接 Local Agent，正在等待恢复。');
+      }
+      if (force) {
+        clearSettingsBootstrapCache();
+      }
+      await fetchBootstrap({
+        forceEventStreamReconnect: true,
+        refreshSettingsBootstrapOnBindingChange: false,
+        settleProcessingOnFailure,
+        ...(processingSnapshot ? {
+          processingSessionId: processingSnapshot.sessionId,
+          processingRequestIds: processingSnapshot.requestIds,
+        } : {}),
+      });
+      clearRecoveryTimer();
+      recoveryAttempt = 0;
+      emitConnectedState(reason, recovered);
+      void dispatchSettingsBootstrap(force, 'core').catch((error) => {
+        reportExpectedRecoveryFailure(
+          i18n.t('settings.toast.action.loadSettingsData'),
+          '[web-client-bridge] 核心会话恢复后加载设置失败:',
+          error,
+        );
+      });
+    } catch (error) {
+      if (processingSnapshot) {
+        settleProcessingRequestSnapshot(processingSnapshot);
+      }
+      throw error;
     }
-    if (force) {
-      clearSettingsBootstrapCache();
-    }
-    await fetchBootstrap({
-      forceEventStreamReconnect: true,
-      refreshSettingsBootstrapOnBindingChange: false,
-    });
-    clearRecoveryTimer();
-    recoveryAttempt = 0;
-    emitConnectedState(reason, recovered);
-    void dispatchSettingsBootstrap(force, 'core').catch((error) => {
-      reportExpectedRecoveryFailure(
-        i18n.t('settings.toast.action.loadSettingsData'),
-        '[web-client-bridge] 核心会话恢复后加载设置失败:',
-        error,
-      );
-    });
   })().finally(() => {
     if (recoveryInFlight === request) {
       recoveryInFlight = null;
@@ -2888,7 +3059,7 @@ function scheduleRecovery(reason: string, error?: unknown, immediate = false): v
     : Math.min(RECOVERY_MAX_DELAY_MS, RECOVERY_BASE_DELAY_MS * (2 ** Math.min(recoveryAttempt, 3)));
   recoveryTimer = window.setTimeout(() => {
     recoveryTimer = null;
-    void restoreBridgeState(reason, true).catch((recoveryError) => {
+    void restoreBridgeState(reason, true, false).catch((recoveryError) => {
       recoveryAttempt += 1;
       scheduleRecovery('retry', recoveryError);
     });
@@ -3064,6 +3235,7 @@ async function dispatchBootstrap(
     forceEventStreamReconnect?: boolean;
     rawPayload?: unknown;
     refreshSettingsBootstrapOnBindingChange?: boolean;
+    refreshSessionTurnQueueAfterBootstrap?: boolean;
     navigation?: {
       requestId: string;
       target: 'draft' | 'session';
@@ -3072,7 +3244,7 @@ async function dispatchBootstrap(
   } = {},
 ): Promise<void> {
   const previousSessionId = currentSessionId;
-  const pageMeta = readRustTimelinePageMeta(options.rawPayload ?? payload);
+  const pageMeta = readRustCanonicalHistoryPageMeta(options.rawPayload ?? payload);
   // 检测 runtimeEpoch 代际变化：后端重启后执行无刷新状态重建，不允许整页刷新打断用户会话。
   const incomingEpoch = payload.agent?.runtimeEpoch || '';
   if (incomingEpoch && currentRuntimeEpoch && incomingEpoch !== currentRuntimeEpoch) {
@@ -3108,8 +3280,6 @@ async function dispatchBootstrap(
       navigationTarget: options.navigation.target,
       navigationOrchestratorSessionConfig: options.navigation.orchestratorSessionConfig,
     } : {}),
-    hasMoreBefore: pageMeta.hasMoreBefore,
-    beforeCursor: pageMeta.beforeCursor,
     canonicalHasMoreBefore: pageMeta.canonicalHasMoreBefore,
     canonicalBeforeCursor: pageMeta.canonicalBeforeCursor,
   } as Record<string, unknown>);
@@ -3123,13 +3293,15 @@ async function dispatchBootstrap(
       console.warn('[web-client-bridge] bootstrap 后刷新变更列表失败:', error);
     });
   }
-  void syncSessionTurnQueue(
-    payload.sessionId,
-    payload.workspace.workspaceId,
-    payload.workspace.rootPath,
-  ).catch((error) => {
-    console.warn('[web-client-bridge] bootstrap 后同步排队消息失败:', error);
-  });
+  if (options.refreshSessionTurnQueueAfterBootstrap !== false) {
+    void syncSessionTurnQueue(
+      payload.sessionId,
+      payload.workspace.workspaceId,
+      payload.workspace.rootPath,
+    ).catch((error) => {
+      console.warn('[web-client-bridge] bootstrap 后同步排队消息失败:', error);
+    });
+  }
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
@@ -3162,8 +3334,17 @@ async function fetchBootstrap(
     forceFresh?: boolean;
     refreshSettingsBootstrapOnBindingChange?: boolean;
     refreshWorkspaceSessionsAfterBootstrap?: boolean;
+    /** 仅连接恢复流程显式开启；后台 bootstrap 失败不得改写 UI 运行态。 */
+    settleProcessingOnFailure?: boolean;
+    refreshSessionTurnQueueAfterBootstrap?: boolean;
+    /** 内部使用：异步 bootstrap 只能结算发起时已存在的 request。 */
+    processingSessionId?: string;
+    processingRequestIds?: readonly string[];
   } = {},
 ): Promise<void> {
+  // 导航响应携带目标会话的完整 bootstrap，是会话归属的唯一提交者。
+  // 后台恢复和终态刷新必须排在其后，并在屏障释放后重新读取最新绑定。
+  await waitForSessionNavigationCommit();
   const requestBinding = resolveWorkspaceQuery();
   const requestBindingKey = bootstrapBindingKey(requestBinding);
   // 防重入：只有同一 workspace/session 绑定才能复用 bootstrap 请求。
@@ -3175,14 +3356,23 @@ async function fetchBootstrap(
     return bootstrapInFlight;
   }
   const requestSeq = ++bootstrapRequestSeq;
+  const processingSnapshot: ProcessingRequestSnapshot | null = options.settleProcessingOnFailure === true
+    ? options.processingRequestIds
+      ? {
+        sessionId: options.processingSessionId || requestBinding.sessionId || messagesState.currentSessionId || '__draft__',
+        requestIds: [...options.processingRequestIds],
+      }
+      : captureProcessingRequestSnapshot(requestBinding.sessionId)
+    : null;
   const doFetch = async (): Promise<void> => {
-    let effectiveBinding = requestBinding;
-    let response = await getTransport().request(agentUrl('/bootstrap', buildBootstrapQuery(effectiveBinding)));
-    let errorPayload: { errorCode?: string; message?: string; detail?: string } = {};
-    if (!response.ok) {
-      errorPayload = await readAgentErrorPayload(response);
-    }
-    if (!response.ok) {
+    try {
+      let effectiveBinding = requestBinding;
+      let response = await getTransport().request(agentUrl('/bootstrap', buildBootstrapQuery(effectiveBinding)));
+      let errorPayload: { errorCode?: string; message?: string; detail?: string } = {};
+      if (!response.ok) {
+        errorPayload = await readAgentErrorPayload(response);
+      }
+      if (!response.ok) {
       if (response.status === 404) {
         const explicitSessionMissing = Boolean(effectiveBinding.sessionId)
           && /(?:session|会话)/i.test(errorPayload.message || '');
@@ -3229,30 +3419,37 @@ async function fetchBootstrap(
           return;
         }
       }
-      throw new AgentApiError(
-        response.status,
-        errorPayload.message || `bootstrap failed: ${response.status}`,
-        'bootstrap',
-        errorPayload.errorCode,
-        errorPayload.detail,
-      );
-    }
-    const rawPayload = await response.json();
-    let payload = normalizeBootstrapResponse(rawPayload, {
-      workspaceId: agentBindingWorkspaceId(effectiveBinding),
-      workspacePath: agentBindingWorkspacePath(effectiveBinding),
-      sessionId: effectiveBinding.sessionId,
-    });
-    if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
-      return;
-    }
-    await dispatchBootstrap(payload, {
-      forceEventStreamReconnect: options.forceEventStreamReconnect,
-      refreshSettingsBootstrapOnBindingChange: options.refreshSettingsBootstrapOnBindingChange,
-      rawPayload,
-    });
-    if (options.refreshWorkspaceSessionsAfterBootstrap !== false) {
-      void refreshWorkspaceSessionsAfterBootstrap(payload, requestBindingKey, requestSeq);
+        throw new AgentApiError(
+          response.status,
+          errorPayload.message || `bootstrap failed: ${response.status}`,
+          'bootstrap',
+          errorPayload.errorCode,
+          errorPayload.detail,
+        );
+      }
+      const rawPayload = await response.json();
+      const payload = normalizeBootstrapResponse(rawPayload, {
+        workspaceId: agentBindingWorkspaceId(effectiveBinding),
+        workspacePath: agentBindingWorkspacePath(effectiveBinding),
+        sessionId: effectiveBinding.sessionId,
+      });
+      if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
+        return;
+      }
+      await dispatchBootstrap(payload, {
+        forceEventStreamReconnect: options.forceEventStreamReconnect,
+        refreshSettingsBootstrapOnBindingChange: options.refreshSettingsBootstrapOnBindingChange,
+        refreshSessionTurnQueueAfterBootstrap: options.refreshSessionTurnQueueAfterBootstrap,
+        rawPayload,
+      });
+      if (options.refreshWorkspaceSessionsAfterBootstrap !== false) {
+        void refreshWorkspaceSessionsAfterBootstrap(payload, requestBindingKey, requestSeq);
+      }
+    } catch (error) {
+      if (processingSnapshot) {
+        settleProcessingRequestSnapshot(processingSnapshot);
+      }
+      throw error;
     }
   };
   let requestPromise: Promise<void>;
@@ -3480,74 +3677,78 @@ async function commitSessionNavigation(
   const workspacePath = binding.scope === 'workspace' ? binding.workspacePath : '';
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
-  invalidateBootstrapRequests();
+  const navigationLease = beginSessionNavigation(requestId);
   invalidateSessionTurnSubmissionsForNavigation();
-  const navigationRequestSeq = bootstrapRequestSeq;
+  const navigationBootstrapSeq = bootstrapRequestSeq;
   const navigationAbortController = new AbortController();
   let navigationTimedOut = false;
   const navigationTimeoutId = window.setTimeout(() => {
     navigationTimedOut = true;
     navigationAbortController.abort();
   }, SESSION_NAVIGATION_TIMEOUT_MS);
-  // 导航事务拥有新的会话归属；旧提交即使随后收到 HTTP/SSE，也不能重新夺回当前页面。
-  let response: Response;
-  let rawPayload: unknown;
   try {
-    response = await getTransport().request(agentUrl('/api/session/navigation'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        target,
-        scope: binding.scope,
-        ...(binding.scope === 'workspace' ? { workspaceId, workspacePath } : {}),
-        ...(target === 'session' ? { sessionId } : {}),
-      }),
-      signal: navigationAbortController.signal,
+    // 导航事务拥有新的会话归属；旧提交即使随后收到 HTTP/SSE，也不能重新夺回当前页面。
+    let response: Response;
+    let rawPayload: unknown;
+    try {
+      response = await getTransport().request(agentUrl('/api/session/navigation'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target,
+          scope: binding.scope,
+          ...(binding.scope === 'workspace' ? { workspaceId, workspacePath } : {}),
+          ...(target === 'session' ? { sessionId } : {}),
+        }),
+        signal: navigationAbortController.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`session navigation failed: ${response.status}`);
+      }
+      rawPayload = await response.json();
+    } catch (error) {
+      if (navigationTimedOut) {
+        throw new Error('会话导航请求超时');
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(navigationTimeoutId);
+    }
+    if (!isCurrentSessionNavigation(navigationLease)) {
+      return;
+    }
+    const payload = normalizeBootstrapResponse(rawPayload, {
+      workspaceId,
+      workspacePath,
+      sessionId,
     });
-    if (!response.ok) {
-      throw new Error(`session navigation failed: ${response.status}`);
+    if (!payload.state || typeof payload.state !== 'object' || Array.isArray(payload.state)) {
+      throw new Error('会话导航响应缺少有效的 state');
     }
-    rawPayload = await response.json();
-  } catch (error) {
-    if (navigationTimedOut) {
-      throw new Error('会话导航请求超时');
-    }
-    throw error;
+    const navigationBindingKey = bootstrapBindingKey({
+      scope: payload.scope,
+      workspaceId: payload.workspace.workspaceId,
+      workspacePath: payload.workspace.rootPath,
+      sessionId: payload.sessionId,
+    });
+    await dispatchBootstrap(payload, {
+      forceEventStreamReconnect: previousWorkspaceId !== workspaceId
+        || previousWorkspacePath !== workspacePath,
+      rawPayload,
+      navigation: {
+        requestId,
+        target,
+        orchestratorSessionConfig: carriedSessionConfig,
+      },
+    });
+    void refreshWorkspaceSessionsAfterBootstrap(
+      payload,
+      navigationBindingKey,
+      navigationBootstrapSeq,
+    );
   } finally {
-    window.clearTimeout(navigationTimeoutId);
+    releaseSessionNavigation(navigationLease);
   }
-  if (bootstrapRequestSeq !== navigationRequestSeq) {
-    throw new Error('会话导航响应已失效');
-  }
-  const payload = normalizeBootstrapResponse(rawPayload, {
-    workspaceId,
-    workspacePath,
-    sessionId,
-  });
-  if (!payload.state || typeof payload.state !== 'object' || Array.isArray(payload.state)) {
-    throw new Error('会话导航响应缺少有效的 state');
-  }
-  const navigationBindingKey = bootstrapBindingKey({
-    scope: payload.scope,
-    workspaceId: payload.workspace.workspaceId,
-    workspacePath: payload.workspace.rootPath,
-    sessionId: payload.sessionId,
-  });
-  await dispatchBootstrap(payload, {
-    forceEventStreamReconnect: previousWorkspaceId !== workspaceId
-      || previousWorkspacePath !== workspacePath,
-    rawPayload,
-    navigation: {
-      requestId,
-      target,
-      orchestratorSessionConfig: carriedSessionConfig,
-    },
-  });
-  void refreshWorkspaceSessionsAfterBootstrap(
-    payload,
-    navigationBindingKey,
-    navigationRequestSeq,
-  );
 }
 
 async function navigateSession(message: ClientBridgeMessage): Promise<void> {
@@ -3758,8 +3959,12 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
   };
 }
 
-function applyServerQueuedTurns(turns: QueuedSessionTurnDto[]): void {
+function applyServerQueuedTurns(sessionId: string, turns: QueuedSessionTurnDto[]): void {
   setQueuedMessages(turns.map(queuedMessageFromServer));
+  adoptQueuedTurnSubmissions(
+    sessionId,
+    turns.map((turn) => turn.requestId?.trim() || turn.queueId),
+  );
 }
 
 async function syncSessionTurnQueue(
@@ -3778,7 +3983,11 @@ async function syncSessionTurnQueue(
   if (currentSessionId !== normalizedSessionId) {
     return;
   }
-  applyServerQueuedTurns(snapshot.queuedTurns);
+  const snapshotSessionId = trimBridgeString(snapshot.sessionId);
+  if (snapshotSessionId !== normalizedSessionId) {
+    throw new Error('排队消息快照 sessionId 与请求会话不一致');
+  }
+  applyServerQueuedTurns(snapshotSessionId, snapshot.queuedTurns);
 }
 
 async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<void> {
@@ -3791,7 +4000,7 @@ async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<v
       currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
-      applyServerQueuedTurns(snapshot.queuedTurns);
+      applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
     }
   } catch (error) {
     emitBridgeErrorToast(i18n.t('input.queue.delete'), error);
@@ -3810,7 +4019,7 @@ async function guideQueuedMessageFromServer(queuedMessageId: string): Promise<vo
       currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
-      applyServerQueuedTurns(snapshot.queuedTurns);
+      applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
       emitBridgeSuccessToast(
         i18n.t('input.queue.guide'),
         i18n.t('input.queue.guideSuccess'),
@@ -3930,23 +4139,49 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     createdAt: requestCreatedAt,
   });
 
+  const localUserMessage: Message = {
+    id: userMessageId,
+    role: 'user',
+    source: 'user',
+    content: text || '',
+    timestamp: requestCreatedAt,
+    isStreaming: false,
+    isComplete: true,
+    type: 'user_input',
+    images: images.map((image) => ({ ...image })),
+    contextReferences: contextReferences.map((reference) => ({ ...reference })),
+    browserNodeSelections: browserNodeSelections.map((selection) => ({
+      ...selection,
+      attributes: { ...selection.attributes },
+      bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
+    })),
+    metadata: {
+      requestId,
+      localSubmission: true,
+      sendingAnimation: true,
+      ...(browserAnnotationRefs.length > 0 ? { browserAnnotationRefs } : {}),
+      ...(skillName ? { skillName } : {}),
+      ...(input.goalMode === true ? { goalMode: true } : {}),
+    },
+  };
   beginLocalTurnSubmission({
     requestId,
+    sessionId: targetSessionId,
     placeholderMessageId,
     startedAt: requestCreatedAt,
+    message: localUserMessage,
+    workspaceId: targetWorkspaceId,
+    workspacePath: targetWorkspacePath,
     source: 'orchestrator',
     agent: 'orchestrator',
   });
 
   try {
-    try {
-      await warmLiveBridgeForSubmission('execute_task_preflight');
-    } catch (preflightError) {
-      if (!targetWorkspaceId) {
-        throw preflightError;
-      }
-      console.warn('[web-client-bridge] 发送前事件流预连接失败，继续提交本次消息:', preflightError);
-    }
+    void Promise.resolve()
+      .then(() => warmLiveBridgeForSubmission('execute_task_preflight'))
+      .catch((preflightError) => {
+        console.warn('[web-client-bridge] 发送前事件流预连接失败，提交继续执行:', preflightError);
+      });
     const turnResult = await submitSessionTurn({
       text,
       skillName,
@@ -3992,6 +4227,13 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         sessionSummary: turnResult.sessionSummary ?? null,
         createdSession: turnResult.createdSession,
         route: turnResult.route,
+        canonicalSchemaVersion: turnResult.canonicalSchemaVersion,
+        canonicalEventKind: turnResult.canonicalEventKind,
+        canonicalEventId: turnResult.canonicalEventId,
+        canonicalEventSeq: turnResult.canonicalEventSeq,
+        canonicalOccurredAt: turnResult.canonicalOccurredAt,
+        canonicalTurn: turnResult.canonicalTurn,
+        canonicalItem: turnResult.canonicalItem,
         submissionContext: submissionCanCommit ? submissionContext : null,
       });
     }
@@ -4001,10 +4243,38 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       adoptCurrentSessionIdForLiveTurn(resolvedSessionId);
     }
     if (turnResult.queued) {
-      clearPendingRequest(requestId);
-      clearRequestBinding(requestId);
+      const queuedProjectionRetained = resolvedSessionId
+        ? markLocalTurnSubmissionQueued(requestId, resolvedSessionId)
+        : false;
+      if (!queuedProjectionRetained) {
+        clearRequestBinding(requestId);
+      }
       finishSessionTurnSubmission(submissionContext);
-      await fetchBootstrap({ forceFresh: true });
+      if (resolvedSessionId && submissionCanCommit) {
+        void syncSessionTurnQueue(
+          resolvedSessionId,
+          targetWorkspaceId,
+          targetWorkspacePath,
+        ).catch((error) => {
+          reportExpectedRecoveryFailure(
+            i18n.t('bridge.action.syncMessages'),
+            '[web-client-bridge] 排队消息接受后同步队列失败:',
+            error,
+          );
+          scheduleRecovery('queued_turn_queue_sync_failed', error, true);
+        });
+        void fetchBootstrap({
+          forceFresh: true,
+          refreshSessionTurnQueueAfterBootstrap: false,
+        }).catch((error) => {
+          reportExpectedRecoveryFailure(
+            i18n.t('bridge.action.syncTurnState'),
+            '[web-client-bridge] 排队消息接受后 bootstrap 同步失败:',
+            error,
+          );
+          scheduleRecovery('queued_turn_bootstrap_failed', error, true);
+        });
+      }
       emitBridgeSuccessToast(
         i18n.t('bridge.action.sendMessage'),
         i18n.t('input.queue.header', { count: turnResult.queuePosition ?? 1 }),
@@ -4013,9 +4283,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     }
     // 只有仍属于当前提交代际的响应才可进入当前会话时间轴。旧草稿请求
     // 即使服务端稍后返回，也不能把 canonical event 注入新草稿或其他会话。
-    if (submissionCanCommit || (targetSessionId && targetSessionId === currentSessionId)) {
-      emitAcceptedCanonicalTurnFromResult(turnResult);
-    }
     if (replaceTurnId) {
       completeTurnEditing(replaceTurnId);
     }
@@ -4052,21 +4319,12 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     finishSessionTurnSubmission(submissionContext);
     return true;
   } catch (error) {
-    clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
     emitSessionTurnSubmissionSettled(requestId, 'failed');
-    // 失败路径必须与拒绝、终态路径一样回收本地 pending request。
-    // 否则 emitForcedProcessingIdle 会把仍绑定的失败请求误判为活跃轮次，
-    // 让草稿会话一直处于处理中，并阻断后续目录/导航收敛。
-    clearPendingRequest(requestId);
     clearRequestBinding(requestId);
     finishSessionTurnSubmission(submissionContext);
     emitBridgeErrorToast(i18n.t('bridge.action.sendMessage'), error);
-    emitForcedProcessingIdle('execute_task_failed', {
-      error: normalizeErrorMessage(error),
-      requestId,
-    });
     if (shouldRecoverFromBridgeError(error)) {
       closeEventStream();
       scheduleRecovery('execute_task_failed', error, true);
@@ -4076,34 +4334,87 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
 }
 
 async function interruptTask(): Promise<void> {
-  const trigger = 'user_interrupt';
   const sessionId = currentSessionId.trim();
   if (!sessionId) {
-    emitForcedProcessingIdle('user_interrupt_missing_session', { trigger });
     emitBridgeErrorToast(
       i18n.t('bridge.action.stopTask'),
       new Error(i18n.t('bridge.detail.noStoppableSession')),
     );
     return;
   }
+  const processingSnapshot = captureProcessingRequestSnapshot(sessionId);
   try {
     const response = await interruptAgentSession(sessionId);
-    try {
-      await syncSessionTurnQueue(sessionId, currentWorkspaceId, currentWorkspacePath);
-    } catch (queueSyncError) {
+    const responseSessionId = trimBridgeString(response.sessionId);
+    if (responseSessionId !== sessionId) {
+      throw new Error('中断响应 sessionId 与请求会话不一致');
+    }
+    const interruptedTurnId = trimBridgeString(response.turnId);
+    const interruptedTurn = turnStoreState.reducer.sessionId === responseSessionId
+      ? turnStoreState.reducer.turns.find((turn) => turn.turnId === interruptedTurnId)
+      : undefined;
+    const interruptedRequestId = interruptedTurn
+      ? canonicalTurnRequestId(interruptedTurn)
+      : '';
+    const snapshotRequestId = interruptedRequestId
+      && processingSnapshot.requestIds.includes(interruptedRequestId)
+      ? interruptedRequestId
+      : processingSnapshot.requestIds.length === 1
+        ? processingSnapshot.requestIds[0]
+        : '';
+
+    if (response.interrupted === true) {
+      const requestIdsToSettle = snapshotRequestId
+        ? [snapshotRequestId]
+        : processingSnapshot.requestIds;
+      for (const requestId of requestIdsToSettle) {
+        emitForcedProcessingTerminal({
+          sessionId: responseSessionId,
+          requestId,
+          reason: 'user_interrupt_confirmed',
+        });
+      }
+      // forced terminal 由消息处理器消费；这里同步结算同一快照，保证未注册
+      // listener 或 interrupt 发生在 canonical projection 之前时也不会卡住 processing。
+      settleProcessingRequestSnapshot({
+        sessionId: responseSessionId,
+        requestIds: requestIdsToSettle,
+      });
+      if (requestIdsToSettle.length === 0) {
+        settleProcessingRequestSnapshot(processingSnapshot);
+      }
+    }
+    if (response.nextQueuedTurnStarted !== true) {
+      clearContinueRequestInFlight();
+      clearCurrentInterruptTaskId();
+    }
+
+    void syncSessionTurnQueue(
+      responseSessionId,
+      currentWorkspaceId,
+      currentWorkspacePath,
+    ).catch((queueSyncError) => {
       reportExpectedRecoveryFailure(
         i18n.t('bridge.action.syncMessages'),
         '[web-client-bridge] 停止会话后同步排队消息失败:',
         queueSyncError,
       );
       scheduleRecovery('user_interrupt_queue_sync_failed', queueSyncError, true);
-    }
-    clearActiveTurnInFlight();
-    if (response.nextQueuedTurnStarted !== true) {
-      emitForcedProcessingIdle('user_interrupt_confirmed', { trigger, sessionId });
-    }
+    });
+    void fetchBootstrap({
+      forceFresh: true,
+      refreshSessionTurnQueueAfterBootstrap: false,
+    }).catch((bootstrapError) => {
+      reportExpectedRecoveryFailure(
+        i18n.t('bridge.action.syncTurnState'),
+        '[web-client-bridge] 停止会话后 bootstrap 同步失败:',
+        bootstrapError,
+      );
+      scheduleRecovery('user_interrupt_bootstrap_failed', bootstrapError, true);
+    });
   } catch (error) {
     console.error('[web-client-bridge] 中断执行失败:', error);
+    settleProcessingRequestSnapshot(processingSnapshot);
     emitBridgeErrorToast(i18n.t('bridge.action.stopTask'), error);
     scheduleRecovery('user_interrupt_failed', error, true);
   }

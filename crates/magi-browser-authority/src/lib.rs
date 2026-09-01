@@ -32,7 +32,8 @@ pub use domain::{
 };
 pub use error::BrowserAuthorityError;
 pub use host_client::{
-    BrowserHostClient, BrowserHostClientError, BrowserHostCommandReply, BrowserHostIncomingEvent,
+    BrowserHostClient, BrowserHostClientError, BrowserHostCommandReply, BrowserHostConnection,
+    BrowserHostIncomingEvent,
 };
 pub use host_protocol::*;
 pub use navigation::{

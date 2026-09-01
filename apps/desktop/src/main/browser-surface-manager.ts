@@ -11,7 +11,6 @@ import {
   type WebContents,
 } from "electron";
 import { browserDownloadRoot, clearBrowserDownloads } from "./browser-download-storage.js";
-import { mapBrowserCaptureClipToNativeRect } from "./browser-capture-geometry.js";
 import {
   normalizeOptionalDomNodeId,
   type BrowserControlUpdate,
@@ -110,6 +109,8 @@ interface BrowserSurfaceRecord {
   mounted: boolean;
   slotVisible: boolean;
   slotBounds: Rectangle | null;
+  slotLeaseRevision: number;
+  recoverySlot: { bounds: Rectangle; leaseRevision: number } | null;
   activationGeneration: number | null;
   priming: boolean;
   targetId: string;
@@ -127,16 +128,14 @@ interface BrowserSurfaceRecord {
   cursor: { visible: boolean; x: number | null; y: number | null; action: string | null };
   cursorExecutionContextId: number | null;
   cdpLane: Promise<void>;
-  viewportApplied: boolean;
-  viewportAppliedScale: number | null;
-  viewportApplyPromise: Promise<void> | null;
-  viewportApplyDirty: boolean;
+  viewportLifecycle: ViewportCommitLifecycle;
   debuggerListenersInstalled: boolean;
   debuggerMessageListener: DebuggerMessageListener | null;
   debuggerDetachListener: DebuggerDetachListener | null;
   debuggerSessionGeneration: number;
   debuggerSessionInitialized: boolean;
   dialogBridgeInstalled: boolean;
+  nativeDialogOpeningWaiters: Set<() => void>;
   cdpSessionIds: Set<string>;
   debuggerReadyPromise: Promise<void> | null;
   debuggerReconnectTimer: NodeJS.Timeout | null;
@@ -152,6 +151,8 @@ interface BrowserSurfaceRecord {
   inspectGestureActive: boolean;
   inspectStartPromise: Promise<void> | null;
   inspectResourcesEnabled: boolean;
+  inspectHoverPoint: { x: number; y: number } | null;
+  inspectHoverPromise: Promise<void> | null;
   lifecycleEpoch: number;
   lifecycleAbort: AbortController;
 }
@@ -213,6 +214,37 @@ interface NavigationEventExpectation {
   allowSettled?: boolean;
 }
 
+type ViewportCommitState =
+  | "requested"
+  | "applying"
+  | "compositor-ready"
+  | "superseded"
+  | "invalidated"
+  | "failed";
+
+interface ViewportCommit {
+  revision: number;
+  bounds: Rectangle;
+  viewport: BrowserLogicalViewport;
+  navigationGeneration: number;
+  debuggerSessionGeneration: number;
+  state: ViewportCommitState;
+  abort: AbortController;
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+interface ViewportCommitLifecycle {
+  nextRevision: number;
+  current: ViewportCommit | null;
+  running: Promise<void> | null;
+  applied: {
+    viewport: BrowserLogicalViewport;
+    scale: number | null;
+  } | null;
+}
+
 interface NavigationEventClaim {
   operation: NavigationOperation;
   sequence: number;
@@ -230,6 +262,22 @@ type DebuggerDetachListener = (event: Electron.Event, reason: string) => void;
 interface SurfaceLaneContext {
   track(promise: Promise<unknown>): void;
   assertCurrent(): void;
+  debuggerLease(sessionId?: string): DebuggerSessionLease;
+}
+
+interface DebuggerSessionLease {
+  generation: number;
+  sessionId?: string;
+  assertCurrent(): void;
+}
+
+export interface BrowserSurfaceActivationInput {
+  windowId: string;
+  tabId: string;
+  browserSessionId: string;
+  url: string;
+  navigationRevision: number;
+  viewport: BrowserLogicalViewport;
 }
 
 const ALLOWED_NAVIGATION_PROTOCOLS = new Set(["http:", "https:", "about:"]);
@@ -387,6 +435,7 @@ const INSPECT_HIGHLIGHT_CONFIG = {
   marginColor: { r: 66, g: 133, b: 244, a: 0.08 },
 };
 const DIALOG_BRIDGE_BINDING = "__magiBrowserDialog";
+const NATIVE_DIALOG_OPENED_RESULT = Object.freeze({ __magi_dialog_opened: true });
 const DIALOG_BRIDGE_SCRIPT = String.raw`(() => {
   if (globalThis.__magiBrowserDialogInstalled) return;
   let sequence = 0;
@@ -445,16 +494,19 @@ export class BrowserSurfaceManager {
   readonly #contentRoots = new Map<string, View>();
   readonly #activationGenerations = new Map<string, number>();
   readonly #onEvent: (event: BrowserSurfaceEvent) => void;
+  readonly #onContentSlotReady: ((binding: BrowserSurfaceBinding) => void) | undefined;
   #downloadCleanupPromise: Promise<void> | null = null;
   #downloadCleanupInProgress = false;
 
   constructor(input: {
     desktopEpoch: string;
     onEvent: (event: BrowserSurfaceEvent) => void;
+    onContentSlotReady?: (binding: BrowserSurfaceBinding) => void;
     partitionRegistryPath?: string;
   }) {
     this.#desktopEpoch = input.desktopEpoch;
     this.#onEvent = input.onEvent;
+    this.#onContentSlotReady = input.onContentSlotReady;
     this.#partitionRegistryPath = input.partitionRegistryPath?.trim() || null;
     this.#downloadUserDataPath = this.#partitionRegistryPath
       ? dirname(this.#partitionRegistryPath)
@@ -527,7 +579,7 @@ export class BrowserSurfaceManager {
       if (input.awaitPageLoad === true) await load;
       else void load.catch(() => undefined);
     } else if (!record.contents.isLoadingMainFrame()) {
-      this.scheduleViewportApply(record);
+      this.scheduleViewportCommit(record);
     }
     // 真实导航和调试器初始化是两个独立生命周期。页面必须先由
     // WebContents 自己开始加载；CDP 只在工具调用时等待，不能成为首帧
@@ -569,6 +621,8 @@ export class BrowserSurfaceManager {
       mounted: false,
       slotVisible: false,
       slotBounds: null,
+      slotLeaseRevision: 0,
+      recoverySlot: null,
       activationGeneration: input.activationGeneration ?? null,
       priming: true,
       // CDP target 查询是异步握手，不参与 Surface 绑定。这个 ID 只用于
@@ -588,16 +642,19 @@ export class BrowserSurfaceManager {
       cursor: { visible: false, x: null, y: null, action: null },
       cursorExecutionContextId: null,
       cdpLane: Promise.resolve(),
-      viewportApplied: false,
-      viewportAppliedScale: null,
-      viewportApplyPromise: null,
-      viewportApplyDirty: false,
+      viewportLifecycle: {
+        nextRevision: 0,
+        current: null,
+        running: null,
+        applied: null,
+      },
       debuggerListenersInstalled: false,
       debuggerMessageListener: null,
       debuggerDetachListener: null,
       debuggerSessionGeneration: 0,
       debuggerSessionInitialized: false,
       dialogBridgeInstalled: false,
+      nativeDialogOpeningWaiters: new Set(),
       cdpSessionIds: new Set(),
       debuggerReadyPromise: null,
       debuggerReconnectTimer: null,
@@ -609,6 +666,8 @@ export class BrowserSurfaceManager {
       inspectGestureActive: false,
       inspectStartPromise: null,
       inspectResourcesEnabled: false,
+      inspectHoverPoint: null,
+      inspectHoverPromise: null,
       lifecycleEpoch: 0,
       lifecycleAbort: new AbortController(),
     };
@@ -628,6 +687,7 @@ export class BrowserSurfaceManager {
   bindContentSurface(
     windowId: string,
     tabId: string,
+    surfaceId: string | null,
     bounds: Rectangle | null,
     parentBounds: Rectangle | null = null,
   ): void {
@@ -635,12 +695,14 @@ export class BrowserSurfaceManager {
     const records = [...this.#surfaces.values()].filter((record) => (
       record.windowId === windowId && !record.closed
     ));
-    if (!tabId) {
+    if (!tabId || !surfaceId) {
       for (const record of records) this.unmountSurface(record, window);
       return;
     }
 
-    const target = records.find((record) => record.tabId === tabId) ?? null;
+    const target = records.find((record) => (
+      record.tabId === tabId && record.surfaceId === surfaceId
+    )) ?? null;
     if (!target) {
       for (const record of records) this.unmountSurface(record, window);
       return;
@@ -694,6 +756,30 @@ export class BrowserSurfaceManager {
   primaryBindingForTab(tabId: string): BrowserSurfaceBinding | null {
     const record = this.#surfaces.primaryForTab(tabId);
     return record && !record.closed ? this.binding(record) : null;
+  }
+
+  activationInputForTab(tabId: string): BrowserSurfaceActivationInput | null {
+    const record = this.#surfaces.primaryForTab(tabId);
+    if (!record || record.closed || record.contents.isDestroyed()) return null;
+    return {
+      windowId: record.windowId,
+      tabId: record.tabId,
+      browserSessionId: record.browserSessionId,
+      url: record.contents.getURL() || "about:blank",
+      navigationRevision: record.navigationRevision,
+      viewport: structuredClone(record.viewport),
+    };
+  }
+
+  isRenderableBinding(binding: BrowserSurfaceBinding): boolean {
+    const record = this.#surfaces.get(binding.surface_id);
+    if (!record || record.closed) return false;
+    try {
+      this.recordForBinding(binding);
+    } catch {
+      return false;
+    }
+    return this.isRenderable(record);
   }
 
   bindingForSurface(surfaceId: string): BrowserSurfaceBinding | null {
@@ -789,73 +875,100 @@ export class BrowserSurfaceManager {
     if (sessionId && !record.cdpSessionIds.has(sessionId)) {
       throw staleSurfaceError("browser_cdp_session_stale");
     }
-    // 自动化面向逻辑 Browser Tab 的真实 WebContents，而不是右栏当前是否
-    // 正在展示该 Tab。切换到代码、图片或另一个 Browser Tab 时，Surface 会
-    // 暂时从内容槽解绑，但 Chromium 页面仍然是有效的自动化目标；截图、
-    // 命中检测和 DOM 操作不应因此被错误收敛为 no_content_slot。
+    // 所有需要页面 viewport 的自动化都必须绑定当前右栏内容槽。Detached
+    // WebContents 虽然仍保留页面生命周期，但 Chromium compositor 没有有效
+    // viewport，截图会超时，命中检测也不再代表用户看到的页面。
+    if (!this.isPrimary(binding) || !this.isRenderable(record)) {
+      throw staleSurfaceError("browser_surface_content_slot_unavailable");
+    }
     if (!contents.debugger.isAttached()) {
       throw staleSurfaceError("browser_debugger_detached");
     }
+    await this.waitForViewportCommit(record);
+    this.assertRenderableBinding(binding, options);
     if (isDialogCommand) {
       try {
-        return await sendCdpCommandWithTimeout(
-          contents,
+        const lease = this.createDebuggerSessionLease(record, sessionId);
+        const result = await this.sendSurfaceCdpCommand(
+          record,
           method,
           params,
           DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-          sessionId,
+          lease,
         );
+        this.assertRenderableBinding(binding, options);
+        return result;
       } catch (error) {
         if (isCdpTimeoutError(error)) this.invalidateDebuggerSession(record, "cdp-timeout");
         throw error;
       }
     }
     if (method === "Page.captureScreenshot") {
-      // 激活 Browser Tab 的导航是非阻塞的，截图可能紧跟在 Surface
-      // 物化之后到达。先给 Chromium 当前文档一个有限的稳定窗口，避免
-      // 在首帧/导航切换阶段直接让 Page.captureScreenshot 卡满超时；
-      // 超时后仍继续截图，不能把慢站点变成永远不可操作。
+      // 截图统一读取当前 WebContents 的 Chromium compositor surface，
+      // 使 clip、元素范围和 captureBeyondViewport 都遵循 Page domain 的
+      // 页面坐标语义。宿主不再参与截图坐标换算，也不再建立 native
+      // capturePage 旁路；等待页面和视口状态稳定后，统一进入同一个 CDP
+      // lane，与其他页面命令按 Surface 串行执行。
       await this.waitForScreenshotReadiness(record);
-      await this.waitForViewportApply(record);
-      // Electron 原生捕获覆盖普通视口、元素范围和全页范围，避免
-      // Page.captureScreenshot 在 WebContentsView 尚未取得 compositor
-      // frame（尤其是后台 Surface）时阻塞 CDP lane。WebP 仍保留
-      // Chromium CDP 的原生编码语义。
-      if (params.format === "webp") {
-        return this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
-          this.recordForBinding(binding, {
-            allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
-          }),
-          method,
-      // WebP 需要 Chromium compositor 的编码路径；Electron 的
-      // nativeImage 没有 WebP 编码接口，因此明确使用 surface 捕获。
-          { ...params, fromSurface: true },
-          SCREENSHOT_CDP_COMMAND_TIMEOUT_MS,
-          sessionId,
-          track,
-        ));
-      }
-      // readiness 等待期间可能已经完成了另一轮导航。截图必须对应调用
-      // 方提供的原始文档，否则会把新页面误当成旧快照返回给 LLM。
-      this.recordForBinding(binding);
-      return this.capturePageScreenshot(record, params);
+      this.assertRenderableBinding(binding);
     }
     const injectsInput = method.startsWith("Input.");
     if (injectsInput) record.automationInputDepth += 1;
+    let inputCommand: Promise<unknown> | null = null;
+    let inputCompletionTracked = false;
+    let inputReleased = false;
+    const releaseInput = () => {
+      if (inputReleased) return;
+      inputReleased = true;
+      record.automationInputDepth = Math.max(0, record.automationInputDepth - 1);
+    };
     try {
-      const result = await this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
-        // CDP 请求在 lane 中等待期间页面可能已发生导航。重新校验把
-        // 普通 DOM/调试命令限制在原文档；只有输入事件允许完成同一动作的
-        // keyUp/mouseUp 收尾，避免旧命令迟到后作用于新页面。
-        this.recordForBinding(binding, {
-          allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
-        }),
-        method,
-        params,
-        method === "Page.captureScreenshot" ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        sessionId,
-        track,
-      ));
+      inputCommand = this.enqueueCdp(record, async ({ track }) => {
+        // 只在当前输入真正取得 Surface lane 后注册 waiter，避免排队中的
+        // 后续输入被同一次 dialog opening 错误地当成已执行。
+        const nativeDialogOpening = injectsInput
+          ? this.createNativeDialogOpeningWaiter(record)
+          : null;
+        try {
+          // CDP 请求在 lane 中等待期间页面可能已发生导航。重新校验把
+          // 普通 DOM/调试命令限制在原文档；只有输入事件允许完成同一动作的
+          // keyUp/mouseUp 收尾，避免旧命令迟到后作用于新页面。
+          this.recordForBinding(binding, {
+            allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
+          });
+          const command = this.sendSurfaceCdpCommand(
+            record,
+            method,
+            method === "Page.captureScreenshot" ? { ...params, fromSurface: true } : params,
+            method === "Page.captureScreenshot" ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            this.createDebuggerSessionLease(record, sessionId),
+            track,
+          );
+          if (injectsInput) {
+            // native dialog 会阻塞 Input.* 的 CDP response。让输入调用先以
+            //“动作已触发”收口，后续 browser_dialog 才能穿过 Surface lane；
+            // 原始请求仍由 enqueueCdp 追踪直到收敛，期间保持输入深度。
+            inputCompletionTracked = true;
+            track(command.then(releaseInput, releaseInput));
+          }
+          return injectsInput && nativeDialogOpening
+            ? await Promise.race([
+              command,
+              nativeDialogOpening.promise.then(() => NATIVE_DIALOG_OPENED_RESULT),
+            ])
+            : await command;
+        } catch (error) {
+          if (injectsInput && !inputCompletionTracked) releaseInput();
+          throw error;
+        } finally {
+          nativeDialogOpening?.cancel();
+        }
+      });
+      const result = await inputCommand;
+      this.assertRenderableBinding(binding, {
+        allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
+      });
+      if (result === NATIVE_DIALOG_OPENED_RESULT) return result;
       if (injectsInput && record.agentControlled) {
         const input = params as { type?: string; x?: number; y?: number };
         // 一个完整点击包含 pressed/released 两个事件，但视觉反馈只在
@@ -875,39 +988,14 @@ export class BrowserSurfaceManager {
           typeof input.y === "number" ? input.y : record.cursor.y,
           action,
         ).catch(() => undefined);
+        this.assertRenderableBinding(binding, {
+          allowNavigationAdvance: true,
+        });
       }
       return result;
     } finally {
-      if (injectsInput) record.automationInputDepth = Math.max(0, record.automationInputDepth - 1);
+      if (injectsInput && !inputCompletionTracked) releaseInput();
     }
-  }
-
-  private async capturePageScreenshot(
-    record: BrowserSurfaceRecord,
-    params: Record<string, unknown>,
-  ): Promise<{ data: string }> {
-    if (record.closed || record.contents.isDestroyed()) {
-      throw staleSurfaceError("browser_surface_not_found");
-    }
-    const format = params.format === "jpeg" ? "jpeg" : "png";
-    const rect = capturePageRect(record, params);
-    // WebContentsView 在右栏切换/恢复的瞬间，view.getBounds() 可能暂时是
-    // 0×0。capturePage 仍必须使用当前原生 View 或最近一次内容槽的尺寸，
-    // 不能使用与真实视图无关的固定 viewport。
-    const image = await record.contents.capturePage(rect, { stayHidden: true });
-    const bytes = format === "jpeg"
-      ? image.toJPEG(normalizeJpegQuality(params.quality))
-      : image.toPNG();
-    if (bytes.byteLength === 0) throw new Error("browser_screenshot_empty");
-    return { data: bytes.toString("base64") };
-  }
-
-  private async waitForViewportApply(record: BrowserSurfaceRecord): Promise<void> {
-    // 截图的 CSS clip 来自 Worker。fixed 视口通过 Chromium compositor
-    // scale 呈现到原生内容槽，所以必须等同一轮应用完成后再换算坐标。
-    const pending = record.viewportApplyPromise;
-    if (!pending) return;
-    await pending;
   }
 
   private enqueueCdp<T>(
@@ -923,6 +1011,7 @@ export class BrowserSurfaceManager {
         return await operation({
           track: (promise) => tracked.push(promise),
           assertCurrent: () => this.assertSurfaceLifecycleCurrent(record, lifecycleEpoch),
+          debuggerLease: (sessionId) => this.createDebuggerSessionLease(record, sessionId),
         });
       } catch (error) {
         if (isCdpTimeoutError(error)) {
@@ -940,6 +1029,47 @@ export class BrowserSurfaceManager {
     );
     record.cdpLane = settled.then(() => undefined, () => undefined);
     return run;
+  }
+
+  private createDebuggerSessionLease(
+    record: BrowserSurfaceRecord,
+    sessionId?: string,
+    generation = record.debuggerSessionGeneration,
+  ): DebuggerSessionLease {
+    return {
+      generation,
+      ...(sessionId === undefined ? {} : { sessionId }),
+      assertCurrent: () => {
+        this.assertDebuggerSessionCurrent(record, generation);
+        if (sessionId && !record.cdpSessionIds.has(sessionId)) {
+          throw staleSurfaceError("browser_cdp_session_stale");
+        }
+      },
+    };
+  }
+
+  private async sendSurfaceCdpCommand(
+    record: BrowserSurfaceRecord,
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs: number,
+    lease: DebuggerSessionLease,
+    track?: (promise: Promise<unknown>) => void,
+  ): Promise<unknown> {
+    // lease 同时绑定 debugger generation 和 CDP 子 session。超时后即使
+    // Electron 的旧 sendCommand Promise 迟到，也只能在这里被丢弃，不能把
+    // 返回值写入新的 debugger session 状态。
+    lease.assertCurrent();
+    const result = await sendCdpCommandWithTimeout(
+      record.contents,
+      method,
+      params,
+      timeoutMs,
+      lease.sessionId,
+      track,
+    );
+    lease.assertCurrent();
+    return result;
   }
 
   private async waitForScreenshotReadiness(record: BrowserSurfaceRecord): Promise<void> {
@@ -967,6 +1097,189 @@ export class BrowserSurfaceManager {
     ]));
   }
 
+  private async waitForViewportCommit(record: BrowserSurfaceRecord): Promise<void> {
+    while (!record.closed && !record.contents.isDestroyed()) {
+      let commit = record.viewportLifecycle.current;
+      if (!commit) {
+        if (!record.slotVisible || !record.slotBounds || !record.mounted) return;
+        commit = this.scheduleViewportCommit(record);
+        if (!commit) return;
+      }
+      try {
+        await this.withSurfaceLifecycle(record, commit.promise);
+      } catch (error) {
+        // 失效提交只代表布局、导航或 debugger session 已经换代。只要
+        // 当前 Surface 仍有效，就重新等待最新提交；真正的 apply 失败才
+        // 交给调用方，避免把旧提交的错误传给新视口。
+        if (record.viewportLifecycle.current !== commit) continue;
+        if (commit.state === "invalidated" || commit.state === "superseded") continue;
+        throw error;
+      }
+      if (this.isViewportCommitInputCurrent(record, commit) && commit.state === "compositor-ready") return;
+    }
+    throw staleSurfaceError("browser_surface_lifecycle_stale");
+  }
+
+  private scheduleViewportCommit(record: BrowserSurfaceRecord): ViewportCommit | null {
+    const commit = this.requestViewportCommit(record);
+    if (!commit || record.viewportLifecycle.running) return commit;
+
+    const running = this.flushViewportCommits(record);
+    record.viewportLifecycle.running = running;
+    // 后台布局没有调用方等待，但它的拒绝必须被消费；提交本身仍保留
+    // reject 给显式 setViewport/截图调用方。
+    void commit.promise.catch(() => undefined);
+    void running.catch((error) => {
+      if (!record.closed) {
+        console.warn("[BrowserSurfaceManager] Browser Surface viewport 提交失败", {
+          surfaceId: record.surfaceId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }).finally(() => {
+      if (record.viewportLifecycle.running === running) record.viewportLifecycle.running = null;
+    });
+    return commit;
+  }
+
+  private requestViewportCommit(record: BrowserSurfaceRecord): ViewportCommit | null {
+    const bounds = record.slotBounds;
+    if (record.closed || !record.slotVisible || !bounds || !record.mounted) return null;
+    const current = record.viewportLifecycle.current;
+    const debuggerGenerationMatches = record.viewport.mode === "auto"
+      || current?.debuggerSessionGeneration === record.debuggerSessionGeneration;
+    if (
+      current
+      && ["requested", "applying", "compositor-ready"].includes(current.state)
+      && current.navigationGeneration === record.navigationGeneration
+      && debuggerGenerationMatches
+      && sameBounds(current.bounds, bounds)
+      && sameLogicalViewport(current.viewport, record.viewport)
+    ) return current;
+    if (current && !["superseded", "invalidated", "failed"].includes(current.state)) {
+      current.state = "superseded";
+      current.abort.abort();
+      current.resolve();
+    }
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const commit: ViewportCommit = {
+      revision: ++record.viewportLifecycle.nextRevision,
+      bounds: { ...bounds },
+      viewport: structuredClone(record.viewport),
+      navigationGeneration: record.navigationGeneration,
+      debuggerSessionGeneration: record.debuggerSessionGeneration,
+      state: "requested",
+      abort: new AbortController(),
+      promise,
+      resolve,
+      reject,
+    };
+    record.viewportLifecycle.current = commit;
+    return commit;
+  }
+
+  private invalidateViewportCommit(
+    record: BrowserSurfaceRecord,
+    _reason: "slot-unmounted" | "navigation" | "debugger-session" | "surface-closed",
+  ): void {
+    const current = record.viewportLifecycle.current;
+    if (current && !["superseded", "invalidated", "failed"].includes(current.state)) {
+      current.state = "invalidated";
+      current.abort.abort();
+      current.resolve();
+    }
+    record.viewportLifecycle.current = null;
+  }
+
+  private async flushViewportCommits(record: BrowserSurfaceRecord): Promise<void> {
+    while (!record.closed && !record.contents.isDestroyed()) {
+      const commit = record.viewportLifecycle.current;
+      if (!commit || commit.state !== "requested" && commit.state !== "applying") return;
+      if (!this.isViewportCommitInputCurrent(record, commit)) return;
+      // 导航期间保留旧的原生 WebContentsView 和最后一帧；新提交等到主
+      // 文档结束后再进入 compositor，避免刷新/跳转期间黑屏闪烁。
+      if (record.priming || record.contents.isLoadingMainFrame()) return;
+      if (
+        commit.viewport.mode === "fixed"
+        && (!record.contents.debugger.isAttached() || !record.debuggerSessionInitialized)
+      ) return;
+      commit.state = "applying";
+      try {
+        await this.enqueueCdp(record, ({ track, debuggerLease }) => this.applyViewport(
+          record,
+          commit,
+          debuggerLease(),
+          track,
+        ));
+        if (!this.isViewportCommitInputCurrent(record, commit)) continue;
+        commit.state = "compositor-ready";
+        await this.waitForCompositorFrame(record, commit);
+        if (!this.isViewportCommitInputCurrent(record, commit)) continue;
+        commit.resolve();
+        this.#onContentSlotReady?.(this.binding(record));
+        if (record.agentControlled) {
+          void this.setAgentCursor(record, true, record.cursor.x, record.cursor.y, record.cursor.action)
+            .catch(() => undefined);
+        }
+        return;
+      } catch (error) {
+        if (!this.isViewportCommitInputCurrent(record, commit)) continue;
+        commit.state = "failed";
+        commit.reject(toError(error));
+        return;
+      }
+    }
+  }
+
+  private async waitForCompositorFrame(
+    record: BrowserSurfaceRecord,
+    commit: ViewportCommit,
+  ): Promise<void> {
+    if (!this.isViewportCommitInputCurrent(record, commit)) {
+      throw staleSurfaceError("browser_viewport_commit_stale");
+    }
+    // WebContentsView 没有稳定公开的 compositor frame 事件。双 RAF 是
+    // Chromium renderer 可验证的 frame barrier：第一帧完成布局，第二帧
+    // 在中间一次合成之后确认当前文档仍能绘制。它不截图、不变换坐标，
+    // 只等待真实原生 View 自己的渲染链路。
+    const frame = record.contents.executeJavaScript(
+      "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))",
+      true,
+    );
+    await withAbortSignal(
+      withTimeout(frame, SCREENSHOT_READINESS_TIMEOUT_MS, "browser_compositor_ready"),
+      commit.abort.signal,
+      staleSurfaceError("browser_viewport_commit_stale"),
+    );
+    if (!this.isViewportCommitInputCurrent(record, commit)) {
+      throw staleSurfaceError("browser_viewport_commit_stale");
+    }
+  }
+
+  private isViewportCommitInputCurrent(
+    record: BrowserSurfaceRecord,
+    commit: ViewportCommit,
+  ): boolean {
+    return record.viewportLifecycle.current === commit
+      && !record.closed
+      && !record.contents.isDestroyed()
+      && record.slotVisible
+      && record.slotBounds !== null
+      && record.mounted
+      && record.view.getVisible()
+      && sameBounds(record.slotBounds, commit.bounds)
+      && record.navigationGeneration === commit.navigationGeneration
+      && (
+        commit.viewport.mode === "auto"
+        || record.debuggerSessionGeneration === commit.debuggerSessionGeneration
+      );
+  }
+
   private withSurfaceLifecycle<T>(record: BrowserSurfaceRecord, promise: Promise<T>): Promise<T> {
     this.assertSurfaceLifecycleCurrent(record, record.lifecycleEpoch);
     return withAbortSignal(
@@ -982,16 +1295,19 @@ export class BrowserSurfaceManager {
   ): Promise<BrowserPageState> {
     const record = this.requireRecord(binding.surface_id);
     await this.waitForDebugger(record);
-    const contents = this.recordForBinding(binding);
+    const currentRecord = this.assertRenderableBinding(binding);
+    const contents = currentRecord.contents;
     switch (navigation.action) {
       case "url": {
         let initScriptId: string | null = null;
         if (navigation.init_script?.trim()) {
-          const installed = await this.enqueueCdp(record, () => sendCdpCommandWithTimeout(
-            contents,
+          const installed = await this.enqueueCdp(record, ({ debuggerLease, track }) => this.sendSurfaceCdpCommand(
+            record,
             "Page.addScriptToEvaluateOnNewDocument",
             { source: navigation.init_script },
             DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            debuggerLease(),
+            track,
           )) as { identifier?: string };
           initScriptId = typeof installed.identifier === "string" ? installed.identifier : null;
         }
@@ -1004,11 +1320,13 @@ export class BrowserSurfaceManager {
           );
         } finally {
           if (initScriptId) {
-            await this.enqueueCdp(record, () => sendCdpCommandWithTimeout(
-              contents,
+            await this.enqueueCdp(record, ({ debuggerLease, track }) => this.sendSurfaceCdpCommand(
+              record,
               "Page.removeScriptToEvaluateOnNewDocument",
               { identifier: initScriptId },
               DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+              debuggerLease(),
+              track,
             )).catch(() => undefined);
           }
         }
@@ -1054,8 +1372,8 @@ export class BrowserSurfaceManager {
         );
         break;
     }
-    const currentRecord = this.requireRecord(binding.surface_id);
-    return this.pageState(currentRecord);
+    const finalRecord = this.assertRenderableBinding(binding);
+    return this.pageState(finalRecord);
   }
 
   async setViewport(
@@ -1064,12 +1382,12 @@ export class BrowserSurfaceManager {
   ): Promise<void> {
     const record = this.requireRecord(binding.surface_id);
     await this.waitForDebugger(record);
-    this.recordForBinding(binding);
+    this.assertRenderableBinding(binding);
     record.viewport = viewport;
-    record.viewportApplied = false;
     if (record.contents.isLoadingMainFrame()) return;
-    this.scheduleViewportApply(record);
-    await record.viewportApplyPromise;
+    this.scheduleViewportCommit(record);
+    await this.waitForViewportCommit(record);
+    this.assertRenderableBinding(binding);
   }
 
   async updateControl(tabId: string, surfaceId: string, control: BrowserControlUpdate): Promise<void> {
@@ -1100,13 +1418,11 @@ export class BrowserSurfaceManager {
 
   async startInspect(binding: BrowserSurfaceBinding): Promise<void> {
     const record = this.requireRecord(binding.surface_id);
-    this.recordForBinding(binding);
-    if (!this.isPrimary(binding) || !this.isRenderable(record)) {
-      throw staleSurfaceError("browser_inspect_surface_inactive");
-    }
+    this.assertRenderableBinding(binding, {});
     await this.waitForDebugger(record);
-    this.recordForBinding(binding);
-    if (!this.isPrimary(binding) || !this.isRenderable(record)) {
+    try {
+      this.assertRenderableBinding(binding, {});
+    } catch {
       throw staleSurfaceError("browser_inspect_surface_inactive");
     }
     if (record.inspectActive) {
@@ -1116,11 +1432,10 @@ export class BrowserSurfaceManager {
         // stopInspect() or a lifecycle transition may have invalidated the
         // first start while this caller was waiting. Revalidate before
         // starting a new generation instead of reporting a false success.
-        if (!record.inspectActive) {
-          this.recordForBinding(binding);
-          if (!this.isPrimary(binding) || !this.isRenderable(record)) {
-            throw staleSurfaceError("browser_inspect_surface_inactive");
-          }
+        try {
+          this.assertRenderableBinding(binding);
+        } catch {
+          throw staleSurfaceError("browser_inspect_surface_inactive");
         }
       }
       if (record.inspectActive) return;
@@ -1129,44 +1444,45 @@ export class BrowserSurfaceManager {
     const generation = ++record.inspectGeneration;
     record.inspectActive = true;
     record.inspectGestureActive = false;
-    const start = this.enqueueCdp(record, async ({ track }) => {
+    record.inspectHoverPoint = null;
+    const start = this.enqueueCdp(record, async ({ track, debuggerLease }) => {
       if (!this.isInspectGenerationActive(record, generation)) return;
+      const lease = debuggerLease();
       // Chromium 的 Overlay Agent 依赖已启用的 DOM Agent。先启用 DOM，
       // 再启用 Overlay，才能在所有 Electron/Chromium 版本中建立真正的
       // Inspect Mode；反过来会直接返回 “DOM should be enabled first”。
-      await sendCdpCommandWithTimeout(
-        record.contents,
+      await this.sendSurfaceCdpCommand(
+        record,
         "DOM.enable",
         {},
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        undefined,
+        lease,
         track,
       );
       if (!this.isInspectGenerationActive(record, generation)) return;
-      await sendCdpCommandWithTimeout(
-        record.contents,
+      await this.sendSurfaceCdpCommand(
+        record,
         "Overlay.enable",
         {},
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        undefined,
+        lease,
         track,
       );
       if (!this.isInspectGenerationActive(record, generation)) return;
       record.inspectResourcesEnabled = true;
-      // Chromium 的 Overlay API 将“search for node”定义为 inspect mode，
-      // 不是一个坐标命中或截图模拟。用户在真实 WebContents 中选中元素后，
-      // 由 Overlay.inspectNodeRequested 返回该节点的 backendNodeId。
-      await sendCdpCommandWithTimeout(
-        record.contents,
-        "Overlay.setInspectMode",
-        {
-          mode: "searchForNode",
-          highlightConfig: INSPECT_HIGHLIGHT_CONFIG,
-        },
+      // Electron 的独立 WebContentsView 不会稳定发出 DevTools 前端使用的
+      // DevTools 前端节点选择事件。选择事务由 before-mouse-event 拦截真实
+      // 鼠标，再通过 Chromium DOM.getNodeForLocation 命中节点；Overlay
+      // 只负责原生高亮，避免点击穿透到网页并触发业务操作。
+      await this.sendSurfaceCdpCommand(
+        record,
+        "Overlay.hideHighlight",
+        {},
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        undefined,
+        lease,
         track,
       );
+      if (!this.isInspectGenerationActive(record, generation)) return;
     });
     record.inspectStartPromise = start;
     try {
@@ -1174,8 +1490,8 @@ export class BrowserSurfaceManager {
       // 导航、Primary 切换或卸载可能在 CDP lane 等待期间取消了本次
       // inspect。不能把被取消的操作报告成成功，否则 Renderer/Host 会
       // 认为后续点击一定会产生 node_inspected 事件。
-      this.recordForBinding(binding);
-      if (!this.isPrimary(binding) || !this.isRenderable(record) || !record.inspectActive) {
+      this.assertRenderableBinding(binding);
+      if (!record.inspectActive) {
         throw staleSurfaceError("browser_inspect_surface_inactive");
       }
     } catch (error) {
@@ -1201,13 +1517,15 @@ export class BrowserSurfaceManager {
 
   async stopInspect(binding: BrowserSurfaceBinding): Promise<void> {
     const record = this.requireRecord(binding.surface_id);
-    this.recordForBinding(binding);
+    this.assertRenderableBinding(binding);
     await this.stopInspectRecord(record);
+    this.assertRenderableBinding(binding);
   }
 
   private isInspectGenerationActive(record: BrowserSurfaceRecord, generation: number): boolean {
     return !record.closed
       && !record.contents.isDestroyed()
+      && this.isRenderable(record)
       && record.primary
       && this.#surfaces.isPrimary(record)
       && record.inspectActive
@@ -1242,6 +1560,7 @@ export class BrowserSurfaceManager {
 
     const generation = ++record.inspectGeneration;
     record.inspectActive = false;
+    record.inspectHoverPoint = null;
     if (!preserveGesture) record.inspectGestureActive = false;
     const pendingStart = record.inspectStartPromise;
     return (async () => {
@@ -1257,26 +1576,23 @@ export class BrowserSurfaceManager {
       // into a spurious "domain not enabled" failure.
       const resourcesEnabled = resourcesEnabledAtRequest || record.inspectResourcesEnabled;
       if (!resourcesEnabled) return;
-      await this.enqueueCdp(record, async ({ track }) => {
+      await this.enqueueCdp(record, async ({ track, debuggerLease }) => {
         if (record.closed || record.contents.isDestroyed() || record.inspectGeneration !== generation || record.inspectActive) {
           return;
         }
         if (!resourcesEnabledAtRequest && !record.inspectResourcesEnabled) return;
         let firstError: unknown = null;
         for (const [method, params] of [
-          // 当前 Chromium 版本即使 mode=none 也要求传入 highlightConfig；
-          // 保持完整参数才能让 stop、导航和 Surface 销毁清理真正幂等。
-          ["Overlay.setInspectMode", { mode: "none", highlightConfig: INSPECT_HIGHLIGHT_CONFIG }],
           ["Overlay.hideHighlight", {}],
           ["Overlay.disable", {}],
         ] as const) {
           try {
-            await sendCdpCommandWithTimeout(
-              record.contents,
+            await this.sendSurfaceCdpCommand(
+              record,
               method,
               params,
               DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-              undefined,
+              debuggerLease(),
               track,
             );
           } catch (error) {
@@ -1382,12 +1698,13 @@ export class BrowserSurfaceManager {
     bounds: Rectangle | null,
     window: BaseWindow | undefined,
   ): void {
-    const previousBounds = record.slotBounds;
+    const hadSlotLease = record.slotVisible || record.slotBounds !== null;
     if (bounds) record.slotBounds = { ...bounds };
     // 原生 View 的 bounds 必须始终等于本次 Renderer 已确认的内容槽。
     // null 表示当前几何不可用，不能继续显示上一次的 bounds。
     const effectiveBounds = bounds ? { ...bounds } : null;
     record.slotVisible = effectiveBounds !== null;
+    if (effectiveBounds && !hadSlotLease) record.slotLeaseRevision += 1;
     const contentRoot = this.#contentRoots.get(record.windowId);
     if (!window || window.isDestroyed() || !contentRoot) {
       this.detachSurface(record);
@@ -1396,12 +1713,7 @@ export class BrowserSurfaceManager {
     if (!effectiveBounds) {
       // 页面状态仍保留在 WebContents 中，但不可验证的中间帧必须隐藏
       // 并退出命中树。重新得到内容槽时只复用该 WebContents，不重新导航。
-      record.slotVisible = false;
-      try {
-        record.view.setVisible(false);
-      } catch {
-        // 窗口销毁与布局提交可能交错到达。
-      }
+      this.detachSurface(record);
       return;
     }
     if (!record.mounted) {
@@ -1413,22 +1725,16 @@ export class BrowserSurfaceManager {
     }
     const boundsChanged = !sameBounds(record.view.getBounds(), effectiveBounds);
     if (boundsChanged) record.view.setBounds(effectiveBounds);
-    const sizeChanged = !previousBounds
-      || previousBounds.width !== effectiveBounds.width
-      || previousBounds.height !== effectiveBounds.height;
-    if (sizeChanged && record.viewport.mode === "fixed") {
-      // 位置变化不影响页面 viewport；只有真实内容槽尺寸变化才会重放
-      // Chromium 的固定设备指标。auto 模式完全由原生 View bounds 驱动，
-      // 不能因为右栏拖动再次发出 CDP 视口命令。
-      record.viewportApplied = false;
-      this.scheduleViewportApply(record);
-    }
     // 页面加载和调试器初始化是 Surface 内部状态，不能阻塞真实浏览器
     // 视图进入内容槽。Chromium 自行展示当前文档及加载过程；只有失败页
     // 才隐藏，避免激活流程变成“正在连接浏览器”的空白等待层。
     // 导航过程由 Chromium 自己绘制。只有 Surface 生命周期失败才解绑，
     // 页面导航失败仍保留真实 WebContentsView，避免右栏黑屏或空槽。
     record.view.setVisible(true);
+    // 这是唯一的 Viewport 提交入口。它会捕获本次物理内容槽、逻辑
+    // viewport、导航代次和 debugger session 代次，并在真正的 renderer
+    // frame 到达后才发出 content-ready；这里不能再提前通知上层。
+    this.scheduleViewportCommit(record);
     // 内容槽只管理原生 View 的物理承载范围；只有 fixed 模式才由
     // applyViewport 设置 Chromium 设备指标，禁止 CSS transform、截图映射
     // 或宿主坐标缩放。
@@ -1608,6 +1914,7 @@ export class BrowserSurfaceManager {
     record.navigationFailureReportedGeneration = null;
     record.priming = kind !== "in-page";
     record.cursorExecutionContextId = null;
+    this.invalidateViewportCommit(record, "navigation");
     this.stopInspectForLifecycle(record, "navigation");
     if (operation.loadingEmitted) {
       this.#onEvent({
@@ -1710,7 +2017,7 @@ export class BrowserSurfaceManager {
       record.slotVisible ? record.slotBounds : null,
       this.#windows.get(record.windowId),
     );
-    this.scheduleViewportApply(record);
+    this.scheduleViewportCommit(record);
     if (operation.loadingEmitted) {
       this.#onEvent({
         type: "loading_changed",
@@ -1762,7 +2069,7 @@ export class BrowserSurfaceManager {
       this.#windows.get(record.windowId),
     );
     this.publishNavigationFailure(record, error.message);
-    this.scheduleViewportApply(record);
+    this.scheduleViewportCommit(record);
     if (operation.loadingEmitted) {
       this.#onEvent({
         type: "loading_changed",
@@ -1894,6 +2201,14 @@ export class BrowserSurfaceManager {
   }
 
   private detachSurface(record: BrowserSurfaceRecord, _window?: BaseWindow): void {
+    // slotVisible/slotBounds 是一次绑定租约的状态。解绑时必须同时失效，
+    // 并递增租约代次；崩溃恢复只能重新挂载它自己捕获的那一份租约，不能
+    // 把面板切换后已经失效的旧 Surface 又挂回当前右栏。
+    const hadSlotLease = record.slotVisible || record.slotBounds !== null || record.mounted;
+    if (hadSlotLease) record.slotLeaseRevision += 1;
+    this.invalidateViewportCommit(record, "slot-unmounted");
+    record.slotVisible = false;
+    record.slotBounds = null;
     this.stopInspectForLifecycle(record, "surface-unmounted");
     if (!record.mounted) return;
     try {
@@ -1913,6 +2228,7 @@ export class BrowserSurfaceManager {
     slotBounds: Rectangle;
   } {
     return !record.closed
+      && !record.contents.isDestroyed()
       && record.mounted
       && record.slotVisible
       && record.slotBounds !== null
@@ -2028,10 +2344,72 @@ export class BrowserSurfaceManager {
     return null;
   }
 
-  private handleInspectNodeRequested(
+  private scheduleInspectHighlight(
     record: BrowserSurfaceRecord,
-    params: Record<string, unknown>,
-    sessionId?: string,
+    x: number,
+    y: number,
+  ): void {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !record.inspectActive) return;
+    record.inspectHoverPoint = { x: Math.max(0, Math.floor(x)), y: Math.max(0, Math.floor(y)) };
+    if (record.inspectHoverPromise) return;
+    const generation = record.inspectGeneration;
+    const hover = (async () => {
+      // 合并同一帧内的高频 mouseMove，只处理最新坐标，避免 CDP lane
+      // 因指针移动积压并拖慢点击选择。
+      await new Promise<void>((resolve) => setTimeout(resolve, 16));
+      while (this.isInspectGenerationActive(record, generation) && record.inspectHoverPoint) {
+        const point = record.inspectHoverPoint;
+        record.inspectHoverPoint = null;
+        await this.enqueueCdp(record, async ({ track, debuggerLease }) => {
+          if (!this.isInspectGenerationActive(record, generation)) return;
+          const lease = debuggerLease();
+          const hit = await this.sendSurfaceCdpCommand(
+            record,
+            "DOM.getNodeForLocation",
+            {
+              x: point.x,
+              y: point.y,
+              includeUserAgentShadowDOM: true,
+              ignorePointerEventsNone: true,
+            },
+            DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            lease,
+            track,
+          ) as { backendNodeId?: unknown };
+          const backendNodeId = normalizeOptionalDomNodeId(hit.backendNodeId);
+          if (backendNodeId === null || !this.isInspectGenerationActive(record, generation)) return;
+          await this.sendSurfaceCdpCommand(
+            record,
+            "Overlay.highlightNode",
+            { backendNodeId, highlightConfig: INSPECT_HIGHLIGHT_CONFIG },
+            DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            lease,
+            track,
+          );
+        });
+      }
+    })();
+    record.inspectHoverPromise = hover;
+    void hover.catch((error) => {
+      if (!record.closed && record.inspectActive && record.inspectGeneration === generation) {
+        console.warn("[BrowserSurfaceManager] 节点悬停高亮失败", {
+          surfaceId: record.surfaceId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }).finally(() => {
+      if (record.inspectHoverPromise === hover) record.inspectHoverPromise = null;
+      if (record.inspectActive && record.inspectGeneration === generation && record.inspectHoverPoint) {
+        const point = record.inspectHoverPoint;
+        this.scheduleInspectHighlight(record, point.x, point.y);
+      }
+    });
+  }
+
+  private handleInspectPointRequested(
+    record: BrowserSurfaceRecord,
+    x: number,
+    y: number,
   ): void {
     if (
       record.closed
@@ -2039,20 +2417,39 @@ export class BrowserSurfaceManager {
       || !this.#surfaces.isPrimary(record)
       || !record.inspectActive
       || record.contents.isDestroyed()
+      || !this.isRenderable(record)
       || !record.contents.debugger.isAttached()
+      || !Number.isFinite(x)
+      || !Number.isFinite(y)
     ) return;
-    const backendNodeId = normalizeOptionalDomNodeId(params.backendNodeId);
-    if (backendNodeId === null) return;
     const generation = record.inspectGeneration;
-    const commandSessionId = sessionId?.trim() || undefined;
-    void this.enqueueCdp(record, async ({ track }) => {
+    const commandSessionId = undefined;
+    let requestedBackendNodeId: number | null = null;
+    void this.enqueueCdp(record, async ({ track, debuggerLease }) => {
       if (!this.isInspectGenerationActive(record, generation)) return;
-      const description = await sendCdpCommandWithTimeout(
-        record.contents,
+      const lease = debuggerLease(commandSessionId);
+      const hit = await this.sendSurfaceCdpCommand(
+        record,
+        "DOM.getNodeForLocation",
+        {
+          x: Math.max(0, Math.floor(x)),
+          y: Math.max(0, Math.floor(y)),
+          includeUserAgentShadowDOM: true,
+          ignorePointerEventsNone: true,
+        },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        lease,
+        track,
+      ) as { backendNodeId?: unknown };
+      const backendNodeId = normalizeOptionalDomNodeId(hit.backendNodeId);
+      if (backendNodeId === null || !this.isInspectGenerationActive(record, generation)) return;
+      requestedBackendNodeId = backendNodeId;
+      const description = await this.sendSurfaceCdpCommand(
+        record,
         "DOM.describeNode",
         { backendNodeId, depth: 0, pierce: true },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        commandSessionId,
+        lease,
         track,
       ) as { node?: CdpNodeDescription };
       const node = description.node;
@@ -2067,6 +2464,7 @@ export class BrowserSurfaceManager {
         backendNodeId,
         commandSessionId,
         generation,
+        lease,
         track,
       );
       if (!frameId || !this.isInspectGenerationActive(record, generation)) return;
@@ -2075,14 +2473,15 @@ export class BrowserSurfaceManager {
       const nodeId = normalizeOptionalDomNodeId(node.nodeId);
       if (nodeId !== null && this.isInspectGenerationActive(record, generation)) {
         try {
-          const attributes = await sendCdpCommandWithTimeout(
-            record.contents,
+          const attributes = await this.sendSurfaceCdpCommand(
+            record,
             "DOM.getAttributes",
             { nodeId },
             DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-            commandSessionId,
+            lease,
             track,
           ) as { attributes?: unknown };
+          if (!this.isInspectGenerationActive(record, generation)) return;
           if (Array.isArray(attributes.attributes)) attributeList = attributes.attributes;
         } catch {
           // describeNode 已经携带属性时，单独的 getAttributes 失败不应丢弃
@@ -2093,14 +2492,15 @@ export class BrowserSurfaceManager {
       let outerHtml = "";
       if (this.isInspectGenerationActive(record, generation)) {
         try {
-          const outer = await sendCdpCommandWithTimeout(
-            record.contents,
+          const outer = await this.sendSurfaceCdpCommand(
+            record,
             "DOM.getOuterHTML",
             { backendNodeId },
             DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-            commandSessionId,
+            lease,
             track,
           ) as { outerHTML?: unknown };
+          if (!this.isInspectGenerationActive(record, generation)) return;
           if (typeof outer.outerHTML === "string") outerHtml = outer.outerHTML;
         } catch {
           // 节点仍然有效时，允许调用方使用结构化描述和属性继续处理。
@@ -2114,6 +2514,7 @@ export class BrowserSurfaceManager {
           backendNodeId,
           commandSessionId,
           generation,
+          lease,
           track,
         );
       }
@@ -2121,14 +2522,15 @@ export class BrowserSurfaceManager {
       let bounds: { x: number; y: number; width: number; height: number } | null = null;
       if (this.isInspectGenerationActive(record, generation)) {
         try {
-          const box = await sendCdpCommandWithTimeout(
-            record.contents,
+          const box = await this.sendSurfaceCdpCommand(
+            record,
             "DOM.getBoxModel",
             { backendNodeId },
             DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-            commandSessionId,
+            lease,
             track,
           ) as CdpBoxModelResponse;
+          if (!this.isInspectGenerationActive(record, generation)) return;
           bounds = quadBounds(box.model?.border);
         } catch {
           // 文本节点、不可布局节点和导航中的节点可能没有 box model。
@@ -2163,6 +2565,7 @@ export class BrowserSurfaceManager {
       // 选择结果可以立即再次触发下一次 Inspect。
       const selectionGeneration = ++record.inspectGeneration;
       record.inspectActive = false;
+      record.inspectHoverPoint = null;
       this.#onEvent({
         type: "node_inspected",
         binding: this.binding(record),
@@ -2180,7 +2583,7 @@ export class BrowserSurfaceManager {
       if (!record.closed && record.inspectActive && record.inspectGeneration === generation) {
         console.warn("[BrowserSurfaceManager] 真实 DOM 节点采集失败", {
           surfaceId: record.surfaceId,
-          backendNodeId,
+          backendNodeId: requestedBackendNodeId,
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -2192,25 +2595,26 @@ export class BrowserSurfaceManager {
     backendNodeId: number,
     sessionId: string | undefined,
     generation: number,
+    lease: DebuggerSessionLease,
     track: (promise: Promise<unknown>) => void,
   ): Promise<string> {
     if (!this.isInspectGenerationActive(record, generation)) return "";
     const objectGroup = "magi-inspect-text";
     try {
-      const resolved = await sendCdpCommandWithTimeout(
-        record.contents,
+      const resolved = await this.sendSurfaceCdpCommand(
+        record,
         "DOM.resolveNode",
         { backendNodeId, objectGroup },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        sessionId,
+        lease,
         track,
       ) as { object?: { objectId?: unknown } };
       const objectId = resolved.object?.objectId;
       if (typeof objectId !== "string" || objectId.length === 0 || !this.isInspectGenerationActive(record, generation)) {
         return "";
       }
-      const response = await sendCdpCommandWithTimeout(
-        record.contents,
+      const response = await this.sendSurfaceCdpCommand(
+        record,
         "Runtime.callFunctionOn",
         {
           objectId,
@@ -2220,9 +2624,10 @@ export class BrowserSurfaceManager {
           awaitPromise: false,
         },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        sessionId,
+        lease,
         track,
       ) as { result?: { value?: unknown } };
+      if (!this.isInspectGenerationActive(record, generation)) return "";
       const value = response.result?.value;
       return typeof value === "string"
         ? value.replace(/\s+/gu, " ").trim().slice(0, MAX_INSPECTED_TEXT_LENGTH)
@@ -2233,12 +2638,12 @@ export class BrowserSurfaceManager {
       return "";
     } finally {
       if (!record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
-        await sendCdpCommandWithTimeout(
-          record.contents,
+        await this.sendSurfaceCdpCommand(
+          record,
           "Runtime.releaseObjectGroup",
           { objectGroup },
           DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-          sessionId,
+          lease,
           track,
         ).catch(() => undefined);
       }
@@ -2251,6 +2656,7 @@ export class BrowserSurfaceManager {
     backendNodeId: number,
     sessionId: string | undefined,
     generation: number,
+    lease: DebuggerSessionLease,
     track: (promise: Promise<unknown>) => void,
   ): Promise<string | null> {
     if (typeof nodeFrameId === "string" && nodeFrameId.length > 0) return nodeFrameId;
@@ -2262,18 +2668,18 @@ export class BrowserSurfaceManager {
       // 文档所属的 iframe。整个过程仍在 Chromium CDP 内完成，只读取 DOM
       // 关联的 frameElement，不执行页面业务代码、不依赖坐标，也不会把
       // 主 frame 猜作子 frame。
-      const resolved = await sendCdpCommandWithTimeout(
-        record.contents,
+      const resolved = await this.sendSurfaceCdpCommand(
+        record,
         "DOM.resolveNode",
         { backendNodeId, objectGroup },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        sessionId,
+        lease,
         track,
       ) as { object?: { objectId?: unknown } };
       const objectId = resolved.object?.objectId;
       if (typeof objectId === "string" && objectId.length > 0 && this.isInspectGenerationActive(record, generation)) {
-        const frameElement = await sendCdpCommandWithTimeout(
-          record.contents,
+        const frameElement = await this.sendSurfaceCdpCommand(
+          record,
           "Runtime.callFunctionOn",
           {
             objectId,
@@ -2283,35 +2689,38 @@ export class BrowserSurfaceManager {
             awaitPromise: false,
           },
           DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-          sessionId,
+          lease,
           track,
         ) as { result?: { objectId?: unknown; subtype?: unknown; } };
+        if (!this.isInspectGenerationActive(record, generation)) return null;
         const frameElementObjectId = frameElement.result?.objectId;
         if (typeof frameElementObjectId === "string" && frameElementObjectId.length > 0) {
-          const describedFrameElement = await sendCdpCommandWithTimeout(
-            record.contents,
+          const describedFrameElement = await this.sendSurfaceCdpCommand(
+            record,
             "DOM.describeNode",
             { objectId: frameElementObjectId, depth: 0, pierce: false },
             DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-            sessionId,
+            lease,
             track,
           ) as { node?: CdpNodeDescription };
+          if (!this.isInspectGenerationActive(record, generation)) return null;
           const frameId = describedFrameElement.node?.frameId;
           if (typeof frameId === "string" && frameId.length > 0) return frameId;
         }
       }
 
       if (!this.isInspectGenerationActive(record, generation)) return null;
-      const response = await sendCdpCommandWithTimeout(
-        record.contents,
+      const response = await this.sendSurfaceCdpCommand(
+        record,
         "Page.getFrameTree",
         {},
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        sessionId,
+        lease,
         track,
       ) as {
         frameTree?: { frame?: { id?: unknown } };
       };
+      if (!this.isInspectGenerationActive(record, generation)) return null;
       const frameId = response.frameTree?.frame?.id;
       return typeof frameId === "string" && frameId.length > 0 ? frameId : null;
     } catch {
@@ -2323,12 +2732,12 @@ export class BrowserSurfaceManager {
       // frame 解析成功、失败还是导航竞态，都必须释放对象组，避免每次
       // 选中节点都把远程对象留在 Chromium heap 中。
       if (!record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
-        await sendCdpCommandWithTimeout(
-          record.contents,
+        await this.sendSurfaceCdpCommand(
+          record,
           "Runtime.releaseObjectGroup",
           { objectGroup },
           DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-          sessionId,
+          lease,
           track,
         ).catch(() => undefined);
       }
@@ -2503,6 +2912,12 @@ export class BrowserSurfaceManager {
       operation.finishEventSequence = sequence;
       operation.documentFinished = true;
       this.completeWhenMainFrameSettled(record, operation);
+      // 某些 Chromium 页面会先结束文档事件，再由导航状态机完成最终
+      // operation；无论事件顺序如何，文档已可绘制时都要重新唤醒当前
+      // viewport commit，不能把加载期 requested commit 留到下一次 resize。
+      if (!record.contents.isLoadingMainFrame() && !record.closed) {
+        this.scheduleViewportCommit(record);
+      }
       // Electron 的 contextIsolation 会让 CDP 注入的 new-document 脚本与
       // 自动化执行世界拥有不同的全局对象；在真实文档完成后，再通过
       // executeJavaScript 在页面主世界收敛一次同一桥接脚本，确保页面内
@@ -2556,6 +2971,9 @@ export class BrowserSurfaceManager {
       ) return;
       operation.stopEventSequence = sequence;
       this.completeWhenMainFrameSettled(record, operation);
+      if (!record.contents.isLoadingMainFrame() && !record.closed) {
+        this.scheduleViewportCommit(record);
+      }
     });
     webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame, frameProcessId, frameRoutingId) => {
       if (record.closed || !isMainFrame) return;
@@ -2597,26 +3015,33 @@ export class BrowserSurfaceManager {
       void this.setAgentCursor(record, false, null, null, null).catch(() => undefined);
       this.#onEvent({ type: "user_takeover", binding: this.binding(record) });
     });
-    webContents.on("before-mouse-event", (_event, input) => {
+    webContents.on("before-mouse-event", (event, input) => {
       if (record.closed || record.automationInputDepth > 0) return;
 
-      // Inspect Mode 使用 Chromium 的真实输入管线。Overlay 在 mouseDown
-      // 后异步发出 inspectNodeRequested，而 stopInspect 会很快关闭 Overlay；
-      // 因此必须以 mouseDown/mouseUp 组成一次完整手势，而不能只看
-      // inspectActive。否则同一次点击的迟到事件会被误报成 user_takeover。
+      // 节点选择使用 WebContentsView 的真实鼠标坐标和 Chromium DOM 命中。
+      // Electron 不保证独立 WebContentsView 发出 DevTools 前端节点选择事件，
+      // 因此必须在页面分发前拦截完整点击手势，避免选择动作穿透到网页。
       if (record.inspectActive || record.inspectGestureActive) {
-        if (record.inspectActive && input.type === "mouseDown") {
+        if (record.inspectActive && input.type === "mouseMove") {
+          this.scheduleInspectHighlight(record, input.x, input.y);
+        } else if (
+          record.inspectActive
+          && input.type === "mouseDown"
+          && (input.button === undefined || input.button === "left")
+        ) {
+          event.preventDefault();
           record.inspectGestureActive = true;
+          this.handleInspectPointRequested(record, input.x, input.y);
         } else if (record.inspectGestureActive && input.type === "mouseUp") {
+          event.preventDefault();
           record.inspectGestureActive = false;
         }
         return;
       }
 
       if (
-        // Chromium Inspect Mode 的真实鼠标事件是选择节点的输入，不是
-        // 用户接管。若在 mouseMove 上先关闭检查模式，
-        // Overlay.inspectNodeRequested 永远不会产生。
+        // 普通浏览模式下的真实输入才表示用户接管；节点选择已在上方
+        // 单独消费，不得改变 Browser Tab 的控制权状态。
         !["mouseMove", "mouseDown", "contextMenu", "mouseWheel"].includes(input.type)
       ) return;
       this.promote(record.surfaceId);
@@ -2625,7 +3050,6 @@ export class BrowserSurfaceManager {
     });
     webContents.on("render-process-gone", (_event, details) => {
       if (record.closed) return;
-      this.unmountSurface(record, this.#windows.get(record.windowId));
       const binding = this.binding(record);
       this.#onEvent({
         type: "page_crashed",
@@ -2688,37 +3112,38 @@ export class BrowserSurfaceManager {
       if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
       if (!record.debuggerListenersInstalled) this.installDebuggerListeners(record);
       const sessionGeneration = record.debuggerSessionGeneration;
+      const lease = this.createDebuggerSessionLease(record, undefined, sessionGeneration);
       record.debuggerSessionInitialized = false;
       // Runtime.addBinding 在 Electron 中需要先显式启用 Runtime domain；
       // 每次新的 debugger session 都完整执行一遍初始化，不复用 detach
       // 前的 domain、binding、isolated world 或 Target session 状态。
-      await sendCdpCommandWithTimeout(record.contents, "Page.enable", {}, DEFAULT_CDP_COMMAND_TIMEOUT_MS);
-      this.assertDebuggerSessionCurrent(record, sessionGeneration);
-      await sendCdpCommandWithTimeout(record.contents, "Runtime.enable", {}, DEFAULT_CDP_COMMAND_TIMEOUT_MS);
-      this.assertDebuggerSessionCurrent(record, sessionGeneration);
-      await sendCdpCommandWithTimeout(
-        record.contents,
+      await this.sendSurfaceCdpCommand(record, "Page.enable", {}, DEFAULT_CDP_COMMAND_TIMEOUT_MS, lease);
+      await this.sendSurfaceCdpCommand(record, "Runtime.enable", {}, DEFAULT_CDP_COMMAND_TIMEOUT_MS, lease);
+      await this.sendSurfaceCdpCommand(
+        record,
         "Runtime.addBinding",
         { name: DIALOG_BRIDGE_BINDING },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        lease,
       );
-      this.assertDebuggerSessionCurrent(record, sessionGeneration);
-      await sendCdpCommandWithTimeout(
-        record.contents,
+      await this.sendSurfaceCdpCommand(
+        record,
         "Page.addScriptToEvaluateOnNewDocument",
         { source: DIALOG_BRIDGE_SCRIPT },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        lease,
       );
-      this.assertDebuggerSessionCurrent(record, sessionGeneration);
       record.dialogBridgeInstalled = true;
       if (!record.contents.isLoadingMainFrame()) {
         await record.contents.executeJavaScript(DIALOG_BRIDGE_SCRIPT, true);
-        this.assertDebuggerSessionCurrent(record, sessionGeneration);
+        lease.assertCurrent();
       }
-      record.viewportApplyDirty = false;
-      await this.applyViewport(record);
-      this.assertDebuggerSessionCurrent(record, sessionGeneration);
+      lease.assertCurrent();
       record.debuggerSessionInitialized = true;
+      // attach 完成后重新提交当前物理内容槽。初始加载可能早于 debugger
+      // 握手结束，viewport commit 必须由这条真实生命周期补齐，不能依赖
+      // 下一次尺寸变化才能解除 waitForViewportCommit。
+      this.scheduleViewportCommit(record);
     } catch (error) {
       // Page/Runtime domain 初始化只要有一步失败，当前 session 就不能继续
       // 复用。先解绑监听器再 detach，避免清理动作触发第二条重连链；外层
@@ -2768,9 +3193,6 @@ export class BrowserSurfaceManager {
       if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
         record.cdpSessionIds.delete(eventParams.sessionId);
       }
-      if (method === "Overlay.inspectNodeRequested") {
-        this.handleInspectNodeRequested(record, eventParams, sessionId);
-      }
       this.#onEvent({
         type: "cdp_event",
         binding: this.binding(record),
@@ -2778,6 +3200,9 @@ export class BrowserSurfaceManager {
         params: eventParams,
         ...(sessionId ? { sessionId } : {}),
       });
+      if (method === "Page.javascriptDialogOpening") {
+        this.notifyNativeDialogOpening(record);
+      }
     };
     const detachListener: DebuggerDetachListener = (_event, reason) => {
       if (record.closed || record.debuggerSessionGeneration !== generation) return;
@@ -2815,10 +3240,41 @@ export class BrowserSurfaceManager {
     record.debuggerListenersInstalled = false;
   }
 
+  private createNativeDialogOpeningWaiter(record: BrowserSurfaceRecord): {
+    promise: Promise<void>;
+    cancel: () => void;
+  } {
+    let active = true;
+    let resolvePromise: (() => void) | null = null;
+    const waiter = () => {
+      if (!active) return;
+      active = false;
+      record.nativeDialogOpeningWaiters.delete(waiter);
+      resolvePromise?.();
+    };
+    const promise = new Promise<void>((resolve) => {
+      resolvePromise = resolve;
+      record.nativeDialogOpeningWaiters.add(waiter);
+    });
+    return {
+      promise,
+      cancel: () => {
+        if (!active) return;
+        active = false;
+        record.nativeDialogOpeningWaiters.delete(waiter);
+      },
+    };
+  }
+
+  private notifyNativeDialogOpening(record: BrowserSurfaceRecord): void {
+    for (const waiter of [...record.nativeDialogOpeningWaiters]) waiter();
+  }
+
   private resetDebuggerSession(record: BrowserSurfaceRecord): void {
     // stopInspectForLifecycle 必须先读取并排队清理 Overlay 资源；下面的
     // 状态清零只负责阻止新请求，不能覆盖这次清理已经捕获的事实。
     this.stopInspectForLifecycle(record, "debugger-detached");
+    this.invalidateViewportCommit(record, "debugger-session");
     this.removeDebuggerListeners(record);
     record.debuggerSessionGeneration += 1;
     record.debuggerSessionInitialized = false;
@@ -2828,11 +3284,13 @@ export class BrowserSurfaceManager {
     // debugger session。
     record.debuggerReadyPromise = null;
     record.dialogBridgeInstalled = false;
+    // 等待原生对话框的输入请求绑定在旧 debugger session 上；session
+    // 重置后不能让新文档的 opening 事件误唤醒旧请求。
+    record.nativeDialogOpeningWaiters.clear();
     record.inspectResourcesEnabled = false;
     record.cdpSessionIds.clear();
     record.cursorExecutionContextId = null;
-    record.viewportApplied = false;
-    record.viewportApplyDirty = true;
+    record.viewportLifecycle.applied = null;
   }
 
   private invalidateDebuggerSession(record: BrowserSurfaceRecord, reason: string): void {
@@ -2957,8 +3415,14 @@ export class BrowserSurfaceManager {
 
   private invalidateAndRecover(record: BrowserSurfaceRecord, reason: string): void {
     if (record.recoveryPromise || record.closed || record.contents.isDestroyed()) return;
+    const previousSlot = record.slotVisible && record.slotBounds
+      ? { ...record.slotBounds }
+      : null;
     record.priming = true;
     this.unmountSurface(record, this.#windows.get(record.windowId));
+    record.recoverySlot = previousSlot
+      ? { bounds: previousSlot, leaseRevision: record.slotLeaseRevision }
+      : null;
     // render-process-gone 不保证 Electron 先发 debugger.detach。无论事件
     // 顺序如何，恢复都必须从全新的 session 开始，不能把旧 domain/session
     // 状态带进 reload。
@@ -2996,13 +3460,12 @@ export class BrowserSurfaceManager {
       await this.attachDebugger(record);
       record.priming = false;
       record.debuggerReconnectAttempt = 0;
-      record.viewportApplied = false;
-      this.scheduleViewportApply(record);
-      this.applySlot(
-        record,
-        record.slotVisible ? record.slotBounds : null,
-        this.#windows.get(record.windowId),
-      );
+      const recoverySlot = record.recoverySlot;
+      record.recoverySlot = null;
+      if (recoverySlot && recoverySlot.leaseRevision === record.slotLeaseRevision) {
+        this.applySlot(record, recoverySlot.bounds, this.#windows.get(record.windowId));
+      }
+      this.scheduleViewportCommit(record);
       if (record.primary) this.#onEvent({ type: "primary_changed", binding: this.binding(record) });
     } catch (cause) {
       if (!record.closed) {
@@ -3019,49 +3482,53 @@ export class BrowserSurfaceManager {
 
   private async applyViewport(
     record: BrowserSurfaceRecord,
+    commit: ViewportCommit,
+    lease: DebuggerSessionLease,
     track?: (promise: Promise<unknown>) => void,
   ): Promise<void> {
-    if (record.closed || !record.contents.debugger.isAttached()) return;
+    if (record.closed || record.contents.isDestroyed()) return;
     if (record.contents.isLoadingMainFrame()) return;
-    if (record.viewport.mode === "auto") {
+    const lifecycle = record.viewportLifecycle;
+    const applied = lifecycle.applied;
+    if (commit.viewport.mode === "auto") {
       // auto 不写入任何设备指标。WebContentsView 的真实 bounds 就是页面
       // viewport，Chromium 会自行触发 resize、media query 和 flex/grid 重排。
       // 这条路径不能把右栏尺寸再次转成 CDP override，否则每次拖动都会
       // 让页面经历第二套 viewport 变更，产生闪烁、跳动或状态不同步。
       // 只有从 fixed 切换回来时才需要清理旧的 CDP override；清理动作也
       // 必须允许在 Surface 暂时隐藏时执行，避免隐藏期间残留固定视口。
-      if (record.viewportAppliedScale === null) {
-        record.viewportApplied = true;
+      if (!applied || applied.scale === null) {
+        lifecycle.applied = { viewport: structuredClone(commit.viewport), scale: null };
         return;
       }
-      await sendCdpCommandWithTimeout(
-        record.contents,
+      await this.sendSurfaceCdpCommand(
+        record,
         "Emulation.clearDeviceMetricsOverride",
         {},
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-        undefined,
+        lease,
         track,
       );
-      record.viewportApplied = true;
-      record.viewportAppliedScale = null;
+      if (record.viewportLifecycle.current !== commit) {
+        throw staleSurfaceError("browser_viewport_commit_stale");
+      }
+      lifecycle.applied = { viewport: structuredClone(commit.viewport), scale: null };
       return;
     }
-    const viewport = record.viewport;
+    const viewport = commit.viewport;
     if (viewport.mode !== "fixed") return;
     const width = Math.max(320, Math.round(viewport.width));
     const height = Math.max(240, Math.round(viewport.height));
     const mobile = viewport.device_type === "mobile";
-    const slot = record.view.getBounds();
-    const availableWidth = slot.width > 0 ? slot.width : record.slotBounds?.width ?? 0;
-    const availableHeight = slot.height > 0 ? slot.height : record.slotBounds?.height ?? 0;
-    const scale = nativeViewportScale(width, height, availableWidth, availableHeight);
+    const scale = nativeViewportScale(width, height, commit.bounds.width, commit.bounds.height);
     if (
-      record.viewportApplied
-      && record.viewportAppliedScale !== null
-      && Math.abs(record.viewportAppliedScale - scale) < VIEWPORT_SCALE_EPSILON
+      applied
+      && applied.scale !== null
+      && Math.abs(applied.scale - scale) < VIEWPORT_SCALE_EPSILON
+      && sameLogicalViewport(applied.viewport, viewport)
     ) return;
-    await sendCdpCommandWithTimeout(
-      record.contents,
+    await this.sendSurfaceCdpCommand(
+      record,
       "Emulation.setDeviceMetricsOverride",
       {
         width,
@@ -3080,41 +3547,13 @@ export class BrowserSurfaceManager {
         },
       },
       DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-      undefined,
+      lease,
       track,
     );
-    record.viewportApplied = true;
-    record.viewportAppliedScale = scale;
-  }
-
-  private scheduleViewportApply(record: BrowserSurfaceRecord): void {
-    record.viewportApplyDirty = true;
-    if (record.viewportApplyPromise) return;
-    const applyPromise = this.flushViewportApply(record);
-    const settledPromise = applyPromise.finally(() => {
-      record.viewportApplyPromise = null;
-      if (!record.closed && record.viewportApplyDirty) this.scheduleViewportApply(record);
-    });
-    record.viewportApplyPromise = settledPromise;
-    // 保留调用方对 CDP 失败的感知，同时为没有调用方等待的后台布局任务
-    // 安装 rejection handler。Surface 关闭时的 target 销毁不应形成未处理
-    // Promise，更不能污染同一 Host 的其他 Browser Tab。
-    void settledPromise.catch((error) => {
-      if (!record.closed) {
-        console.warn("[BrowserSurfaceManager] Browser Surface 视口更新失败", {
-          surfaceId: record.surfaceId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    });
-  }
-
-  private async flushViewportApply(record: BrowserSurfaceRecord): Promise<void> {
-    while (!record.closed && record.viewportApplyDirty) {
-      record.viewportApplyDirty = false;
-      if (record.contents.isLoadingMainFrame()) return;
-      await this.enqueueCdp(record, ({ track }) => this.applyViewport(record, track));
+    if (record.viewportLifecycle.current !== commit) {
+      throw staleSurfaceError("browser_viewport_commit_stale");
     }
+    lifecycle.applied = { viewport: structuredClone(viewport), scale };
   }
 
   private async setAgentCursor(
@@ -3133,43 +3572,56 @@ export class BrowserSurfaceManager {
       type: "agent_cursor",
       binding: this.binding(record),
       visible,
-      x,
-      y,
+      x: position.x,
+      y: position.y,
       action,
     });
-    const update = async ({ track }: SurfaceLaneContext) => {
-      if (record.closed || record.contents.isDestroyed()) return;
+    const update = async ({ track, debuggerLease }: SurfaceLaneContext) => {
+      if (record.closed || record.contents.isDestroyed() || !this.isRenderable(record)) return;
       // Page.getFrameTree 对尚未建立首个文档的 WebContents 不会返回。首个
       // 文档由 materialize 统一完成；导航期间则由 did-finish-load 重新应用
       // 最新状态，不能把页面命令队列绑定到绘制光标的 CDP 请求。
       if (record.priming || record.contents.isLoadingMainFrame() || !record.contents.getURL()) return;
       try {
         if (!record.contents.debugger.isAttached()) return;
+        const lease = debuggerLease();
         if (record.cursorExecutionContextId === null) {
-          const frameTree = await sendCdpCommandWithTimeout(
-            record.contents,
+          const frameTree = await this.sendSurfaceCdpCommand(
+            record,
             "Page.getFrameTree",
             {},
             CURSOR_CDP_COMMAND_TIMEOUT_MS,
-            undefined,
+            lease,
             track,
           ) as {
             frameTree?: { frame?: { id?: string } };
           };
+          if (!this.isRenderable(record)) return;
           const frameId = frameTree.frameTree?.frame?.id;
           if (!frameId) return;
-          const world = await sendCdpCommandWithTimeout(record.contents, "Page.createIsolatedWorld", {
-            frameId,
-            worldName: "magi-agent-cursor",
-            grantUniveralAccess: false,
-          }, CURSOR_CDP_COMMAND_TIMEOUT_MS, undefined, track) as { executionContextId?: number };
+          const world = await this.sendSurfaceCdpCommand(
+            record,
+            "Page.createIsolatedWorld",
+            {
+              frameId,
+              worldName: "magi-agent-cursor",
+              grantUniveralAccess: false,
+            },
+            CURSOR_CDP_COMMAND_TIMEOUT_MS,
+            lease,
+            track,
+          ) as { executionContextId?: number };
+          if (!this.isRenderable(record)) return;
           if (!world.executionContextId) return;
           record.cursorExecutionContextId = world.executionContextId;
         }
-        await sendCdpCommandWithTimeout(record.contents, "Runtime.evaluate", {
-          contextId: record.cursorExecutionContextId,
-          returnByValue: true,
-          expression: `(() => {
+        await this.sendSurfaceCdpCommand(
+          record,
+          "Runtime.evaluate",
+          {
+            contextId: record.cursorExecutionContextId,
+            returnByValue: true,
+            expression: `(() => {
             const state = ${JSON.stringify({ visible, ...position, action })};
             const cursorAsset = ${JSON.stringify(AGENT_CURSOR_ASSET)};
             const hostStyle = 'position:fixed;z-index:2147483647;pointer-events:none;width:26px;height:26px;overflow:visible;transform:translate(-3px,-3px);transition:left 60ms linear,top 60ms linear;display:none;will-change:left,top;';
@@ -3215,12 +3667,18 @@ export class BrowserSurfaceManager {
               window.setTimeout(() => clickPulse.remove(), 400);
             }
             return true;
-          })()`,
-        }, CURSOR_CDP_COMMAND_TIMEOUT_MS, undefined, track);
+            })()`,
+          },
+          CURSOR_CDP_COMMAND_TIMEOUT_MS,
+          lease,
+          track,
+        );
+        if (!this.isRenderable(record)) return;
         // Runtime.evaluate 返回只代表 DOM 已更新，不代表 Chromium 已经
         // 完成下一帧合成。等待一个渲染帧，保证紧跟在输入动作后的截图
         // 能看到代理指针和点击反馈，而不是捕获到更新前的 compositor frame。
         await new Promise<void>((resolve) => setTimeout(resolve, 16));
+        if (!this.isRenderable(record)) return;
       } catch {
         // 导航会清理 isolated world；did-finish-load 会按最新状态重建它。
         record.cursorExecutionContextId = null;
@@ -3283,6 +3741,18 @@ export class BrowserSurfaceManager {
   private requireRecord(surfaceId: string): BrowserSurfaceRecord {
     const record = this.#surfaces.get(surfaceId);
     if (!record || record.closed) throw staleSurfaceError("browser_surface_not_found");
+    return record;
+  }
+
+  private assertRenderableBinding(
+    binding: BrowserSurfaceBinding,
+    options: { allowNavigationAdvance?: boolean } = {},
+  ): BrowserSurfaceRecord {
+    const record = this.requireRecord(binding.surface_id);
+    this.recordForBinding(binding, options);
+    if (!this.isPrimary(binding) || !this.isRenderable(record)) {
+      throw staleSurfaceError("browser_surface_content_slot_unavailable");
+    }
     return record;
   }
 
@@ -3470,6 +3940,18 @@ function sameBounds(left: Rectangle, right: Rectangle): boolean {
     && left.height === right.height;
 }
 
+function sameLogicalViewport(
+  left: BrowserLogicalViewport,
+  right: BrowserLogicalViewport,
+): boolean {
+  if (left.mode !== right.mode) return false;
+  if (left.mode === "auto" || right.mode === "auto") return true;
+  return left.width === right.width
+    && left.height === right.height
+    && left.device_scale_factor_millis === right.device_scale_factor_millis
+    && left.device_type === right.device_type;
+}
+
 function containsBounds(parent: Rectangle, child: Rectangle): boolean {
   return parent.width > 0
     && parent.height > 0
@@ -3479,57 +3961,6 @@ function containsBounds(parent: Rectangle, child: Rectangle): boolean {
     && child.y >= parent.y
     && child.x + child.width <= parent.x + parent.width
     && child.y + child.height <= parent.y + parent.height;
-}
-
-function capturePageRect(
-  record: BrowserSurfaceRecord,
-  params: Record<string, unknown>,
-): Rectangle {
-  const nativeSize = captureNativeSize(record);
-  const clip = params.clip;
-  const value = clip && typeof clip === "object" ? clip as Record<string, unknown> : null;
-  const logicalClip = value ? {
-    x: screenshotClipNumber(value.x, "x"),
-    y: screenshotClipNumber(value.y, "y"),
-    width: screenshotClipNumber(value.width, "width"),
-    height: screenshotClipNumber(value.height, "height"),
-  } : null;
-  let compositorScale = 1;
-  if (record.viewport.mode === "fixed") {
-    if (!record.viewportApplied || record.viewportAppliedScale === null) {
-      throw staleSurfaceError("browser_viewport_unavailable");
-    }
-    compositorScale = record.viewportAppliedScale;
-  }
-  return mapBrowserCaptureClipToNativeRect(
-    nativeSize,
-    logicalClip,
-    compositorScale,
-  );
-}
-
-function captureNativeSize(record: BrowserSurfaceRecord): { width: number; height: number } {
-  const viewBounds = record.view.getBounds();
-  if (viewBounds.width > 0 && viewBounds.height > 0) {
-    return { width: viewBounds.width, height: viewBounds.height };
-  }
-  if (
-    record.slotVisible
-    && record.slotBounds
-    && record.slotBounds.width > 0
-    && record.slotBounds.height > 0
-  ) {
-    return { width: record.slotBounds.width, height: record.slotBounds.height };
-  }
-  throw staleSurfaceError("browser_surface_slot_unavailable");
-}
-
-function screenshotClipNumber(value: unknown, name: string): number {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const positive = name === "width" || name === "height";
-    if ((positive && value > 0) || (!positive && value >= 0)) return value;
-  }
-  throw new Error(`browser_screenshot_clip_invalid:${name}`);
 }
 
 function finiteInteger(value: unknown, fallback: number): number {
@@ -3576,11 +4007,6 @@ function quadBounds(value: unknown): { x: number; y: number; width: number; heig
     width: Math.max(0, Math.max(...xValues) - left),
     height: Math.max(0, Math.max(...yValues) - top),
   };
-}
-
-function normalizeJpegQuality(value: unknown): number {
-  const quality = typeof value === "number" && Number.isFinite(value) ? value : 90;
-  return Math.max(0, Math.min(100, Math.round(quality)));
 }
 
 async function sendCdpCommandWithTimeout(

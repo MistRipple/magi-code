@@ -6,8 +6,6 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const sourcePaths = {
   surfaceManager: "apps/desktop/src/main/browser-surface-manager.ts",
   surfaceTests: "apps/desktop/src/main/browser-surface-manager.test.ts",
-  captureGeometry: "apps/desktop/src/main/browser-capture-geometry.ts",
-  captureGeometryTests: "apps/desktop/src/main/browser-capture-geometry.test.ts",
   windowManager: "apps/desktop/src/main/window-manager.ts",
   windowLayout: "apps/desktop/src/main/window-layout.ts",
   windowTests: "apps/desktop/src/main/window-layout.test.ts",
@@ -141,17 +139,16 @@ matches("surfaceManager", /focusOnNavigation:\s*false/u, "导航不会强制抢�
 hasTest("workerTests", "浏览器截图收到快照根节点时必须捕获整页范围而不是把 root 当成 DOM ref");
 hasTest("workerTests", "浏览器截图必须拒绝互斥范围组合，并校验图片文件头");
 hasTest("workerTests", "元素截图先滚动到元素并重新读取最终 bounds");
-hasTest("captureGeometryTests", "fixed 响应式视口的标记截图按 Chromium compositor scale 映射到原生内容槽");
-matches(
-  "captureGeometry",
-  /finiteNumber\(clip\.x, 0\) \* scale[\s\S]*?finiteNumber\(clip\.width, nativeWidth\) \* scale/u,
-  "固定视口截图裁剪使用 Chromium compositor scale 映射，不把 CSS 坐标直接交给 capturePage",
-);
 matches(
   "surfaceManager",
-  /await this\.waitForViewportApply\(record\)[\s\S]*?capturePageScreenshot\(record, params\)[\s\S]*?capturePageRect\(record, params\)[\s\S]*?mapBrowserCaptureClipToNativeRect/u,
-  "截图前等待当前视口完成应用，再换算并裁剪原生页面",
+  /waitForViewportCommit\(record\)[\s\S]*?method === "Page\.captureScreenshot"[\s\S]*?waitForScreenshotReadiness\(record\)[\s\S]*?fromSurface: true/u,
+  "截图通过 Chromium Page domain 从真实 WebContents compositor 读取，宿主不参与坐标映射",
 );
+if (/capturePage\(|capturePageRect|mapBrowserCaptureClipToNativeRect/u.test(sources.surfaceManager)) {
+  record("apps/desktop/src/main/browser-surface-manager.ts 不保留 native capturePage 双实现", false);
+} else {
+  record("apps/desktop/src/main/browser-surface-manager.ts 不保留 native capturePage 双实现", true);
+}
 matches("browserRoutes", /persist_browser_annotation_screenshot\([\s\S]*?screenshot_clip/u, "标记截图使用区域锚点裁剪");
 matches("browserRoutes", /browser_annotation_artifact_path\([\s\S]*?image\/png/u, "标记截图通过持久化 artifact 以 PNG 返回");
 matches("canonicalGolden", /browserAnnotationRefs[\s\S]*?browser annotation metadata/u, "标记 ID 进入 canonical 消息链路");
@@ -172,9 +169,9 @@ matches(
 );
 
 hasTest("workerTests", "Accessibility 节点引用使用 Worker isolated world 的执行上下文");
-hasTest("surfaceTests", "节点检查使用 Chromium Overlay Inspect Mode 和真实 DOM 后端节点");
+hasTest("surfaceTests", "节点检查使用真实鼠标坐标、Chromium DOM 命中和原生高亮");
 hasTest("surfaceTests", "节点选择只向 Host 发送当前 Primary 的完整结构化上下文");
-matches("surfaceManager", /Overlay\.setInspectMode[\s\S]*?mode: "searchForNode"/u, "节点选择使用 Chromium Overlay inspect mode");
+matches("surfaceManager", /before-mouse-event[\s\S]*?DOM\.getNodeForLocation[\s\S]*?Overlay\.highlightNode/u, "节点选择拦截真实鼠标并使用 Chromium DOM 命中与原生高亮");
 matches("sessionTurn", /validate_browser_node_selections\(/u, "节点选择在进入会话前进行结构化校验");
 matches("sessionTurn", /pub outer_html_truncated: bool/u, "节点 HTML 截断状态在 App Server DTO 中为必填协议字段");
 

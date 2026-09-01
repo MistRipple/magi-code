@@ -209,7 +209,33 @@ impl PlanStore {
         task_id: TaskId,
         item_id: PlanItemId,
     ) -> Result<SessionPlan, PlanUpdateError> {
-        let mut plan = self.snapshot().ok_or(PlanUpdateError::MissingPlan)?;
+        let plan = self.snapshot().ok_or(PlanUpdateError::MissingPlan)?;
+        let original = plan.clone();
+        Ok(self
+            .bind_task_from_snapshot(plan, task_id, item_id)?
+            .map(|(_, updated)| updated)
+            .unwrap_or(original))
+    }
+
+    /// 绑定一次执行任务并返回变更前后的快照，供跨 store 装配失败时精确回滚。
+    ///
+    /// 快照在本方法内部读取，并通过 expected revision 写入；如果读取之后有并发
+    /// 计划更新，写入会冲突而不会把旧快照当成当前计划恢复。
+    pub fn bind_task_for_materialization(
+        &self,
+        task_id: TaskId,
+        item_id: PlanItemId,
+    ) -> Result<Option<(SessionPlan, SessionPlan)>, PlanUpdateError> {
+        let plan = self.snapshot().ok_or(PlanUpdateError::MissingPlan)?;
+        self.bind_task_from_snapshot(plan, task_id, item_id)
+    }
+
+    fn bind_task_from_snapshot(
+        &self,
+        mut plan: SessionPlan,
+        task_id: TaskId,
+        item_id: PlanItemId,
+    ) -> Result<Option<(SessionPlan, SessionPlan)>, PlanUpdateError> {
         let Some(item) = plan.items.iter().find(|item| item.item_id == item_id) else {
             return Err(PlanUpdateError::UnknownItem(item_id.to_string()));
         };
@@ -217,13 +243,15 @@ impl PlanStore {
             return Err(PlanUpdateError::ItemNotActive(item_id.to_string()));
         }
         if plan.task_bindings.get(&task_id) == Some(&item_id) {
-            return Ok(plan);
+            return Ok(None);
         }
+        let original = plan.clone();
         let expected_revision = plan.revision;
         plan.task_bindings.insert(task_id.clone(), item_id);
         plan.task_statuses.insert(task_id, TaskStatus::Pending);
         self.session_store
             .upsert_plan(&self.session_id, plan, Some(expected_revision))
+            .map(|updated| Some((original, updated)))
             .map_err(|error| PlanUpdateError::Store(error.to_string()))
     }
 

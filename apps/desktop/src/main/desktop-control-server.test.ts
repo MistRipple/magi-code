@@ -261,6 +261,55 @@ test("不同 Browser Tab 使用独立资源队列，可以并行执行而不互�
   }
 });
 
+test("新建 Browser Page 只物化 WebContents，不等待可见内容槽", async () => {
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  let materializeCalled = false;
+  let ensureCalled = false;
+  const contentSlotGate = new Promise<void>(() => undefined);
+  const newBinding = bindingForTab("tab-new");
+  const { server, socketPath } = createControlServer(worker, {
+    bindings: [newBinding],
+    primaryTabId: newBinding.tab_id,
+    materialize: async () => {
+      materializeCalled = true;
+      return newBinding;
+    },
+    recordForBinding: () => ({
+      getURL: () => "https://example.test/",
+      getTitle: () => "Example",
+    }),
+    ensureBrowserSurface: async () => {
+      ensureCalled = true;
+      await contentSlotGate;
+    },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(
+      client,
+      (message) => message.request_id === "create-page",
+    );
+    client.send(JSON.stringify(request("create-page", createPageCommand(newBinding.tab_id))));
+    const response = await Promise.race([
+      responsePromise,
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("创建 Browser Page 不应等待内容槽")), 500);
+        timer.unref();
+      }),
+    ]);
+    assert.equal(response.outcome?.status, "succeeded");
+    assert.equal(materializeCalled, true);
+    assert.equal(ensureCalled, false);
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("Host 重新连接时重放当前 Primary Surface，重启后自动化仍有权威 Tab 身份", async () => {
   const primary = bindingForTab("tab-primary");
   const background = bindingForTab("tab-background");
@@ -395,7 +444,13 @@ test("规范化后的 Chromium DOM.nodeId=null 可以完整进入节点选择消
 
 function createControlServer(
   worker: AutomationWorker,
-  options: { bindings?: BrowserSurfaceBinding[]; primaryTabId?: string } = {},
+  options: {
+    bindings?: BrowserSurfaceBinding[];
+    primaryTabId?: string;
+    materialize?: (input: unknown) => Promise<BrowserSurfaceBinding>;
+    recordForBinding?: () => { getURL: () => string; getTitle: () => string };
+    ensureBrowserSurface?: (input: unknown) => Promise<void>;
+  } = {},
 ): { server: DesktopControlServer; socketPath: string } {
   // macOS limits Unix-domain socket paths to a little over 100 bytes. The
   // system temp directory is already long enough that a UUID-based name can
@@ -403,11 +458,31 @@ function createControlServer(
   const socketRoot = process.platform === "win32" ? tmpdir() : "/tmp";
   const socketPath = join(socketRoot, `magi-dc-${process.pid}-${socketSequence++}.sock`);
   const bindings = options.bindings ?? [binding];
-  const primaryTabId = options.primaryTabId ?? binding.tab_id;
+  let primaryTabId = options.primaryTabId ?? binding.tab_id;
   const surfaceManager = {
-    primaryBindingForTab: (tabId: string) => bindings.find((candidate) => candidate.tab_id === tabId) ?? null,
+    primaryBindingForTab: (tabId: string) => (
+      bindings.find((candidate) => candidate.tab_id === tabId && candidate.tab_id === primaryTabId) ?? null
+    ),
+    activationInputForTab: (tabId: string) => {
+      const candidate = bindings.find((item) => item.tab_id === tabId);
+      if (!candidate) return null;
+      return {
+        windowId: candidate.window_id,
+        tabId: candidate.tab_id,
+        browserSessionId: candidate.browser_context_id,
+        url: "https://example.test/",
+        navigationRevision: candidate.navigation_revision,
+        viewport: { mode: "auto" as const },
+      };
+    },
+    isRenderableBinding: (candidate: BrowserSurfaceBinding) => candidate.tab_id === primaryTabId,
     bindings: () => bindings,
     isPrimary: (candidate: BrowserSurfaceBinding) => candidate.tab_id === primaryTabId,
+    materialize: options.materialize ?? (async () => binding),
+    recordForBinding: options.recordForBinding ?? (() => ({
+      getURL: () => "https://example.test/",
+      getTitle: () => "Example",
+    })),
   } as unknown as BrowserSurfaceManager;
   const server = new DesktopControlServer({
     socketPath,
@@ -415,6 +490,13 @@ function createControlServer(
     surfaceManager,
     worker,
     activeWindowId: () => binding.window_id,
+    ensureBrowserSurface: async (input) => {
+      if (options.ensureBrowserSurface) {
+        await options.ensureBrowserSurface(input);
+        return;
+      }
+      primaryTabId = input.tabId;
+    },
     handshake: () => handshake,
   });
   return { server, socketPath };
@@ -475,6 +557,21 @@ function request(requestId: string, command: BrowserHostCommand): BrowserHostReq
 
 function snapshotCommand(): BrowserHostCommand {
   return snapshotCommandFor(binding);
+}
+
+function createPageCommand(tabId: string): BrowserHostCommand {
+  return {
+    type: "create_page",
+    payload: {
+      tab_id: tabId,
+      browser_session_id: "browser-session-test",
+      initial_url: "https://example.test/",
+      logical_viewport: { mode: "auto" },
+      navigation_revision: 0,
+      snapshot_revision: 0,
+      allow_page_eviction: false,
+    },
+  };
 }
 
 function snapshotCommandFor(target: BrowserSurfaceBinding): BrowserHostCommand {

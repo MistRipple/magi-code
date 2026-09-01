@@ -4,6 +4,7 @@
 
 import type { AgentId, AnyAgentId } from '../shared/types/agent-types';
 import type { LocaleCode } from '../i18n/types';
+import type { ProcessingStateSnapshot } from '../shared/protocol/processing-state';
 
 // --- 从 orchestrator/runtime/orchestration-runtime-state-types 内联前端所需子集 ---
 
@@ -192,13 +193,7 @@ export interface OrchestrationRuntimeKnowledgeAuditView {
 
 export type MessageSource = 'orchestrator' | 'system' | string;
 
-export interface UIProcessingState {
-  isProcessing: boolean;
-  source: MessageSource | null;
-  agent: string | null;
-  startedAt: number | null;
-  pendingRequestIds: string[];
-}
+export type UIProcessingState = ProcessingStateSnapshot;
 
 // 消息角色
 export type MessageRole = 'user' | 'assistant' | 'system';

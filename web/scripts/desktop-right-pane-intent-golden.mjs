@@ -119,8 +119,13 @@ assert.equal(
 );
 assert.match(
   desktopControlSource,
-  /case "create_page":[\s\S]*?case "restore_page":[\s\S]*?surfaceManager\.materialize\(/,
-  'Worker 创建或恢复页面时必须先由 Main 物化真实 WebContentsView，不能返回无 Surface 的伪 page_state',
+  /case "create_page":[\s\S]*?case "restore_page":[\s\S]*?this\.#ensureBrowserSurface\(/,
+  'Worker 创建或恢复页面时必须先由 WindowManager 确认真实内容槽，不能返回无 Surface 的伪 page_state',
+);
+assert.match(
+  desktopControlSource,
+  /private async requireRenderablePrimaryBinding\(tabId: string\)[\s\S]*?await this\.#ensureBrowserSurface\(activation\)/,
+  '所有需要页面 viewport 的浏览器命令必须先完成真实内容槽激活',
 );
 assert.doesNotMatch(
   desktopControlSource,

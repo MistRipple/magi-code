@@ -407,10 +407,6 @@
       "type": "string",
       "enum": ["pending", "running", "completed", "blocked", "failed", "cancelled"]
     },
-    "CanonicalTurnEventKind": {
-      "type": "string",
-      "enum": ["turn_started", "turn_item_upsert", "turn_completed", "turn_superseded"]
-    },
     "CanonicalTurnVisibility": {
       "type": "object",
       "x-rust-derive-default": true,
@@ -481,17 +477,6 @@
         "usage": { "type": ["object", "array", "string", "number", "boolean", "null"], "x-rust-type": "Option<Value>", "x-ts-type": "JsonValue | null" },
         "items": { "type": "array", "items": { "$ref": "#/$defs/CanonicalTurnItem" }, "default": [], "x-rust-default": true },
         "metadata": { "type": "object", "default": {}, "x-rust-default": true, "x-rust-type": "std::collections::HashMap<String, Value>", "x-ts-type": "Record<string, JsonValue>" }
-      }
-    },
-    "CanonicalTurnEvent": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["canonicalSchemaVersion", "canonicalEventKind"],
-      "properties": {
-        "canonicalSchemaVersion": { "type": "string", "minLength": 1 },
-        "canonicalEventKind": { "$ref": "#/$defs/CanonicalTurnEventKind" },
-        "canonicalTurn": { "oneOf": [{ "$ref": "#/$defs/CanonicalTurn" }, { "type": "null" }] },
-        "canonicalItem": { "oneOf": [{ "$ref": "#/$defs/CanonicalTurnItem" }, { "type": "null" }] }
       }
     },
     "TurnStartKind": {
@@ -567,7 +552,10 @@
         "executionChainRef": { "type": ["string", "null"] },
         "steeredTurnId": { "type": ["string", "null"] },
         "canonicalSchemaVersion": { "type": ["string", "null"] },
-        "canonicalEventKind": { "type": ["string", "null"] }
+        "canonicalEventKind": { "type": ["string", "null"] },
+        "canonicalEventId": { "type": ["string", "null"] },
+        "canonicalEventSeq": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
+        "canonicalOccurredAt": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<i64>" }
       }
     },
     "EventEnvelope": {

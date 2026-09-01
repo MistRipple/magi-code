@@ -39,8 +39,8 @@ use magi_conversation_runtime::{
     },
 };
 use magi_core::{
-    AccessProfile, BrowserProfileId, BrowserTabId, SessionId, SessionLifecycleStatus, TaskId,
-    TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
+    AccessProfile, BrowserProfileId, BrowserTabId, DomainError, DomainResult, SessionId,
+    SessionLifecycleStatus, TaskId, TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
@@ -50,11 +50,12 @@ use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
     OrchestratedExecutionRuntime, OrchestratorService,
-    task_store::TaskStore,
+    task_store::{TaskStore, TaskStoreSnapshot},
     task_worker_catalog::{WorkerInfo, build_worker_catalog_for_roles},
 };
 use magi_session_store::{
-    NotificationContext, SessionLifecycleObserver, SessionRecord, SessionStore,
+    NotificationContext, SessionDurableState, SessionExecutionSidecarStoreState,
+    SessionLifecycleObserver, SessionRecord, SessionStore,
 };
 use magi_settings_store::SettingsStore;
 use magi_snapshot::{BaselinePatchEntry, SnapshotManager, SnapshotSession};
@@ -129,9 +130,16 @@ pub struct RunnerHandle {
 
 type RunnerTerminalObserver =
     Arc<dyn Fn(TaskId, Option<SessionId>, String, Option<String>) + Send + Sync>;
-pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<(), ApiError> + Send + Sync>;
-pub type SessionTaskAcceptancePersist =
-    Arc<dyn Fn(&SessionId, &str, &TaskId) -> Result<(), ApiError> + Send + Sync>;
+pub type TaskCheckpointPersist = Arc<dyn Fn(&TaskStoreSnapshot) -> DomainResult<()> + Send + Sync>;
+pub type CanonicalEventNextSequenceProvider =
+    Arc<dyn Fn(&SessionId) -> Result<u64, String> + Send + Sync>;
+/// 返回值表示回调是否已经把 durable session projection 一并写入。
+pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<bool, ApiError> + Send + Sync>;
+pub type SessionProjectionPersist = Arc<
+    dyn Fn(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<(), ApiError>
+        + Send
+        + Sync,
+>;
 
 fn snapshot_baseline_patch(
     entries: Vec<magi_git::GitTreeBaselineEntry>,
@@ -185,14 +193,39 @@ pub(crate) struct QueuedRegularSessionTurn {
     pub retry_count: u8,
 }
 
+/// 为一个用户发起的 session turn 生成并规范化唯一请求身份。
+///
+/// 入口允许客户端省略这些字段，但一旦进入 accepted、queued 或 preparing，
+/// 两个用户身份必须同时存在且不能再因为空白差异改变。`identity_seed` 必须来自
+/// 当前提交事实（例如 acceptedAt 或 queueId），这样排队持久化和 daemon 重启
+/// 恢复可以继续使用同一对身份；目标自动续跑不经过此函数，因为它没有用户消息。
+pub(crate) fn normalize_session_turn_identity(
+    request_id: Option<String>,
+    user_message_id: Option<String>,
+    identity_seed: &str,
+) -> (String, String) {
+    let identity_seed = identity_seed.trim();
+    debug_assert!(!identity_seed.is_empty());
+    let request_id = request_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("request-{identity_seed}"));
+    let user_message_id = user_message_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("turn-item-user-{identity_seed}"));
+    (request_id, user_message_id)
+}
+
 impl QueuedRegularSessionTurn {
     fn normalize_identity(&mut self) {
-        if self.request.request_id().is_none() {
-            self.request.request_id = Some(format!("request-{}", self.queue_id));
-        }
-        if self.request.user_message_id().is_none() {
-            self.request.user_message_id = Some(format!("turn-item-user-{}", self.queue_id));
-        }
+        let (request_id, user_message_id) = normalize_session_turn_identity(
+            self.request.request_id.take(),
+            self.request.user_message_id.take(),
+            &self.queue_id,
+        );
+        self.request.request_id = Some(request_id);
+        self.request.user_message_id = Some(user_message_id);
     }
 }
 
@@ -216,8 +249,9 @@ pub struct RunnerManager {
     /// Shared result receiver that collects task completion/failure results
     /// pushed from the TaskStore's status-change callback.
     result_receiver: Arc<EventBasedResultReceiver>,
-    /// Optional path for periodic task-store checkpoints.
-    checkpoint_path: Option<PathBuf>,
+    /// 任务快照提交回调。daemon 在这里把 manifest 提交与 accepted WAL 收敛绑定为
+    /// 同一个持久化事务，Runner 不允许绕过该入口直接写 projection。
+    checkpoint_persist: Option<TaskCheckpointPersist>,
     /// Maps a session to the root task IDs whose runners should be killed
     /// when the session is closed (design 1.5: Session-Runner linkage).
     session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
@@ -226,6 +260,33 @@ pub struct RunnerManager {
 
 /// Number of runner cycles between periodic checkpoints.
 const CHECKPOINT_INTERVAL_CYCLES: u64 = 5;
+
+fn fail_runner_for_checkpoint_error(
+    handle: &RunnerHandle,
+    active: &AtomicBool,
+    root_task_id: &TaskId,
+    session_id: &Option<SessionId>,
+    turn_id: &Option<String>,
+    terminal_observer: Option<&RunnerTerminalObserver>,
+    error: &DomainError,
+) {
+    let message = format!("任务 checkpoint 持久化失败: {error}");
+    *handle.status.lock().expect("status lock should hold") = "error".to_string();
+    *handle
+        .last_error
+        .lock()
+        .expect("last_error lock should hold") = Some(message);
+    active.store(false, Ordering::Relaxed);
+    if let Some(observer) = terminal_observer {
+        observer(
+            root_task_id.clone(),
+            session_id.clone(),
+            "error".to_string(),
+            turn_id.clone(),
+        );
+    }
+}
+
 impl RunnerManager {
     pub fn with_dispatcher_and_worker_catalog(
         task_store: Arc<TaskStore>,
@@ -246,7 +307,7 @@ impl RunnerManager {
             dispatch_gate: None,
             execution_admission: Arc::new(ExecutionAdmissionController::default()),
             result_receiver,
-            checkpoint_path: None,
+            checkpoint_persist: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
             terminal_observer: None,
         }
@@ -301,9 +362,9 @@ impl RunnerManager {
         runner
     }
 
-    /// Set the file path used for periodic task-store checkpoints.
-    pub fn with_checkpoint_path(mut self, path: PathBuf) -> Self {
-        self.checkpoint_path = Some(path);
+    /// 设置 Runner 周期性及终态 task checkpoint 的唯一提交入口。
+    pub fn with_checkpoint_persist(mut self, persist: TaskCheckpointPersist) -> Self {
+        self.checkpoint_persist = Some(persist);
         self
     }
 
@@ -389,7 +450,7 @@ impl RunnerManager {
         let bg_handle = Arc::clone(&handle);
         let bg_active = Arc::clone(&handle.active);
         let bg_task_store = Arc::clone(&self.task_store);
-        let bg_checkpoint_path = self.checkpoint_path.clone();
+        let bg_checkpoint_persist = self.checkpoint_persist.clone();
         let terminal_observer = self.terminal_observer.clone();
         let join_handle = tokio::spawn(async move {
             let mut waiting_streak = 0u32;
@@ -445,9 +506,10 @@ impl RunnerManager {
                     }
                 };
                 let cycle = bg_handle.cycle_count.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut checkpointed_this_cycle = false;
 
                 // Checkpoint policy consumption (design 3.2).
-                if let Some(ref path) = bg_checkpoint_path {
+                if let Some(ref persist) = bg_checkpoint_persist {
                     let should_checkpoint =
                         if let Some(root_task) = bg_task_store.get_task(&root_id) {
                             if let Some(ref policy) = root_task.policy_snapshot {
@@ -463,7 +525,19 @@ impl RunnerManager {
                             cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES)
                         };
                     if should_checkpoint {
-                        let _ = bg_task_store.checkpoint_to_file(path);
+                        if let Err(error) = persist(&bg_task_store.snapshot()) {
+                            fail_runner_for_checkpoint_error(
+                                bg_handle.as_ref(),
+                                bg_active.as_ref(),
+                                &root_id,
+                                &observer_session_id,
+                                &observer_turn_id,
+                                terminal_observer.as_ref(),
+                                &error,
+                            );
+                            break;
+                        }
+                        checkpointed_this_cycle = true;
                     }
                 }
 
@@ -485,8 +559,20 @@ impl RunnerManager {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     RunCycleOutcome::AllComplete => {
-                        if let Some(ref path) = bg_checkpoint_path {
-                            let _ = bg_task_store.checkpoint_to_file(path);
+                        if !checkpointed_this_cycle && let Some(ref persist) = bg_checkpoint_persist
+                        {
+                            if let Err(error) = persist(&bg_task_store.snapshot()) {
+                                fail_runner_for_checkpoint_error(
+                                    bg_handle.as_ref(),
+                                    bg_active.as_ref(),
+                                    &root_id,
+                                    &observer_session_id,
+                                    &observer_turn_id,
+                                    terminal_observer.as_ref(),
+                                    &error,
+                                );
+                                break;
+                            }
                         }
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "completed".to_string();
@@ -519,8 +605,20 @@ impl RunnerManager {
                                     "error"
                                 }
                             };
-                        if let Some(ref path) = bg_checkpoint_path {
-                            let _ = bg_task_store.checkpoint_to_file(path);
+                        if !checkpointed_this_cycle && let Some(ref persist) = bg_checkpoint_persist
+                        {
+                            if let Err(error) = persist(&bg_task_store.snapshot()) {
+                                fail_runner_for_checkpoint_error(
+                                    bg_handle.as_ref(),
+                                    bg_active.as_ref(),
+                                    &root_id,
+                                    &observer_session_id,
+                                    &observer_turn_id,
+                                    terminal_observer.as_ref(),
+                                    &error,
+                                );
+                                break;
+                            }
                         }
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = runner_status.to_string();
@@ -552,8 +650,20 @@ impl RunnerManager {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     RunCycleOutcome::Error(err) => {
-                        if let Some(ref path) = bg_checkpoint_path {
-                            let _ = bg_task_store.checkpoint_to_file(path);
+                        if !checkpointed_this_cycle && let Some(ref persist) = bg_checkpoint_persist
+                        {
+                            if let Err(error) = persist(&bg_task_store.snapshot()) {
+                                fail_runner_for_checkpoint_error(
+                                    bg_handle.as_ref(),
+                                    bg_active.as_ref(),
+                                    &root_id,
+                                    &observer_session_id,
+                                    &observer_turn_id,
+                                    terminal_observer.as_ref(),
+                                    &error,
+                                );
+                                break;
+                            }
                         }
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "error".to_string();
@@ -864,8 +974,24 @@ pub struct BrowserHostConnectionConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserHostOwner {
+    desktop_epoch: String,
+    parent_pid: u32,
+}
+
+impl From<&BrowserHostConnectionConfig> for BrowserHostOwner {
+    fn from(config: &BrowserHostConnectionConfig) -> Self {
+        Self {
+            desktop_epoch: config.desktop_epoch.clone(),
+            parent_pid: config.parent_pid,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowserHostConnectionRegistrationError {
     Conflict { current_generation: u64 },
+    OwnerConflict { current_generation: u64 },
 }
 
 impl Default for BrowserHostStatusSnapshot {
@@ -1113,8 +1239,9 @@ pub struct ApiState {
     pub settings_store: Arc<SettingsStore>,
     pub appearance_library: Arc<magi_appearance::AppearanceLibrary>,
     runtime_persistence: Option<Arc<RuntimeStatePersistence>>,
+    canonical_event_next_sequence_provider: Option<CanonicalEventNextSequenceProvider>,
     session_state_checkpoint_persist: Option<SessionStateCheckpointPersist>,
-    session_task_acceptance_persist: Option<SessionTaskAcceptancePersist>,
+    session_projection_persist: Option<SessionProjectionPersist>,
     bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider,
     bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider,
     bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider,
@@ -1136,6 +1263,7 @@ pub struct ApiState {
     browser_host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
     browser_host_connection: Arc<watch::Sender<Option<BrowserHostConnectionConfig>>>,
     browser_host_connection_generation: Arc<AtomicU64>,
+    browser_host_owner: Arc<Mutex<Option<BrowserHostOwner>>>,
     browser_host_client: Arc<RwLock<Option<BrowserHostClient>>>,
     browser_host_generation: Arc<AtomicU64>,
     execution_resources: ExecutionResourceCoordinator,
@@ -1159,7 +1287,7 @@ pub struct ApiState {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeStatePersistence {
-    session_path: PathBuf,
+    root_path: PathBuf,
     workspace_path: PathBuf,
     knowledge_path: PathBuf,
     write_lock: Arc<Mutex<()>>,
@@ -1175,12 +1303,12 @@ const DEFAULT_BROWSER_PROFILE_ID: &str = "browser-profile-default";
 
 impl RuntimeStatePersistence {
     pub fn new(
-        session_path: impl Into<PathBuf>,
+        root_path: impl Into<PathBuf>,
         workspace_path: impl Into<PathBuf>,
         knowledge_path: impl Into<PathBuf>,
     ) -> Self {
         Self {
-            session_path: session_path.into(),
+            root_path: root_path.into(),
             workspace_path: workspace_path.into(),
             knowledge_path: knowledge_path.into(),
             write_lock: Arc::new(Mutex::new(())),
@@ -1190,7 +1318,7 @@ impl RuntimeStatePersistence {
     }
 
     pub fn state_root(&self) -> Option<&Path> {
-        self.session_path.parent()
+        Some(self.root_path.as_path())
     }
 
     pub(crate) fn save_json<T>(&self, path: &Path, value: &T) -> Result<(), ApiError>
@@ -1513,8 +1641,9 @@ impl ApiState {
             settings_store: Arc::new(SettingsStore::new()),
             appearance_library: Arc::new(magi_appearance::AppearanceLibrary::in_memory()),
             runtime_persistence: None,
+            canonical_event_next_sequence_provider: None,
             session_state_checkpoint_persist: None,
-            session_task_acceptance_persist: None,
+            session_projection_persist: None,
             bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider::default(),
             bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider::default(),
             bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider::default(),
@@ -1536,6 +1665,7 @@ impl ApiState {
             browser_host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             browser_host_connection: Arc::new(watch::channel(None).0),
             browser_host_connection_generation: Arc::new(AtomicU64::new(0)),
+            browser_host_owner: Arc::new(Mutex::new(None)),
             browser_host_client,
             browser_host_generation: Arc::new(AtomicU64::new(0)),
             execution_resources,
@@ -2014,8 +2144,28 @@ impl ApiState {
 
     pub fn set_browser_host_connection_config(&self, config: Option<BrowserHostConnectionConfig>) {
         if let Some(config) = config.as_ref() {
+            let candidate_owner = BrowserHostOwner::from(config);
+            let mut owner = self
+                .browser_host_owner
+                .lock()
+                .expect("browser Host owner lock poisoned");
+            match owner.as_ref() {
+                Some(current) => assert_eq!(
+                    current, &candidate_owner,
+                    "同一 daemon 生命周期不能切换 Electron Desktop 所有者"
+                ),
+                None => *owner = Some(candidate_owner),
+            }
             self.browser_host_connection_generation
                 .fetch_max(config.generation, Ordering::AcqRel);
+        } else {
+            // 清除连接同时释放 Desktop 所有权。开发 daemon 会被多个 Electron
+            // 生命周期复用；如果正常退出只清了 config 却保留 owner，下一次
+            // Desktop 永远会收到 409，浏览器能力会永久停在 stopped。
+            self.browser_host_owner
+                .lock()
+                .expect("browser Host owner lock poisoned")
+                .take();
         }
         self.browser_host_connection.send_replace(config);
     }
@@ -2036,6 +2186,19 @@ impl ApiState {
         candidate: BrowserHostConnectionConfig,
         expected_generation: u64,
     ) -> Result<(BrowserHostConnectionConfig, bool), BrowserHostConnectionRegistrationError> {
+        let candidate_owner = BrowserHostOwner::from(&candidate);
+        let mut owner = self
+            .browser_host_owner
+            .lock()
+            .expect("browser Host owner lock poisoned");
+        if owner
+            .as_ref()
+            .is_some_and(|current| current != &candidate_owner)
+        {
+            return Err(BrowserHostConnectionRegistrationError::OwnerConflict {
+                current_generation: self.browser_host_connection_generation(),
+            });
+        }
         let mut outcome = Ok((candidate.clone(), false));
         self.browser_host_connection.send_if_modified(|current| {
             let next_generation = || {
@@ -2083,6 +2246,9 @@ impl ApiState {
                 }
             }
         });
+        if outcome.is_ok() && owner.is_none() {
+            *owner = Some(candidate_owner);
+        }
         outcome
     }
 
@@ -2299,6 +2465,21 @@ impl ApiState {
         BootstrapDto::from_state_with_selected_session(self, requested_session_id)
     }
 
+    pub(crate) fn canonical_event_next_sequence_for(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Option<u64>, ApiError> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let Some(provider) = self.canonical_event_next_sequence_provider.as_ref() else {
+            return Ok(None);
+        };
+        provider(session_id)
+            .map(Some)
+            .map_err(|error| ApiError::internal_assembly("读取 canonical event 游标失败", error))
+    }
+
     pub fn bootstrap_dto_for_workspace_session(
         &self,
         workspace_id: Option<&str>,
@@ -2368,18 +2549,22 @@ impl ApiState {
     /// 未绑定项目的个人会话使用 Magi 管理的私有执行目录。
     ///
     /// 这是工具 cwd/权限根目录，不属于项目注册表，因而不会出现在文件树、Git、变更或项目知识中。
-    pub(crate) fn personal_session_execution_root(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<PathBuf, ApiError> {
+    pub(crate) fn personal_session_execution_root_path(&self, session_id: &SessionId) -> PathBuf {
         let state_root = self
             .runtime_persistence()
             .and_then(RuntimeStatePersistence::state_root)
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::temp_dir().join("magi"));
-        let root = state_root
+        state_root
             .join("personal-sessions")
-            .join(session_id.as_str());
+            .join(session_id.as_str())
+    }
+
+    pub(crate) fn personal_session_execution_root(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<PathBuf, ApiError> {
+        let root = self.personal_session_execution_root_path(session_id);
         std::fs::create_dir_all(&root)
             .map_err(|error| ApiError::internal_assembly("创建个人会话执行目录失败", error))?;
         Ok(root)
@@ -2808,6 +2993,14 @@ impl ApiState {
         self
     }
 
+    pub fn with_canonical_event_next_sequence_provider(
+        mut self,
+        provider: CanonicalEventNextSequenceProvider,
+    ) -> Self {
+        self.canonical_event_next_sequence_provider = Some(provider);
+        self
+    }
+
     pub fn persist_browser_durable_state(&self) -> Result<(), ApiError> {
         if !self.browser_state_writable.load(Ordering::Acquire) {
             return Err(ApiError::InternalAssemblyError(
@@ -2894,6 +3087,13 @@ impl ApiState {
         let mut queues = HashMap::<SessionId, VecDeque<QueuedRegularSessionTurn>>::new();
         for mut turn in turns {
             turn.normalize_identity();
+            if turn.request_fingerprint.is_none() {
+                turn.request_fingerprint = Some(
+                    turn.request
+                        .request_fingerprint()
+                        .map_err(ApiError::InvalidInput)?,
+                );
+            }
             let session_is_active = self
                 .session_store
                 .session(&turn.session_id)
@@ -2941,32 +3141,20 @@ impl ApiState {
         self
     }
 
-    pub fn with_session_task_acceptance_persist(
-        mut self,
-        persist: SessionTaskAcceptancePersist,
-    ) -> Self {
-        self.session_task_acceptance_persist = Some(persist);
+    pub fn with_session_projection_persist(mut self, persist: SessionProjectionPersist) -> Self {
+        self.session_projection_persist = Some(persist);
         self
     }
 
-    /// 在 HTTP accepted 返回前写入最小提交恢复记录；完整 session/task snapshot 由后台维护线程处理。
-    pub fn persist_session_task_acceptance(
-        &self,
-        session_id: &SessionId,
-        turn_id: &str,
-        root_task_id: &TaskId,
-    ) -> Result<(), ApiError> {
-        if let Some(persist) = &self.session_task_acceptance_persist {
-            persist(session_id, turn_id, root_task_id)?;
-        }
-        Ok(())
-    }
-
     pub fn persist_session_state_checkpoint(&self, checkpoint: &str) -> Result<(), ApiError> {
-        if let Some(persist) = &self.session_state_checkpoint_persist {
-            persist(checkpoint)?;
+        let durable_persisted = if let Some(persist) = &self.session_state_checkpoint_persist {
+            persist(checkpoint)?
+        } else {
+            false
+        };
+        if !durable_persisted {
+            self.persist_session_projection()?;
         }
-        self.persist_session_durable_state()?;
         self.persist_session_git_contexts()
     }
 
@@ -3262,56 +3450,16 @@ impl ApiState {
         }
     }
 
-    pub fn persist_session_durable_state(&self) -> Result<(), ApiError> {
-        let Some(persistence) = &self.runtime_persistence else {
+    pub fn persist_session_projection(&self) -> Result<(), ApiError> {
+        let Some(persist) = &self.session_projection_persist else {
             return Ok(());
         };
-
-        self.session_store.persist_durable_state_with(|durable| {
-            let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
-            let workspaces = self.workspace_registry.workspaces();
-            for workspace in &workspaces {
-                let ws_id = workspace.workspace_id.to_string();
-                let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
-                let magi_dir = workspace.native_root_path().join(".magi");
-                let session_path = magi_dir.join("sessions.json");
-                persistence.save_json(&session_path, &ws_state)?;
-            }
-
-            let orphan_session_count: usize = workspace_states
-                .values()
-                .map(|state| state.sessions.len())
-                .sum();
-            if orphan_session_count > 0 {
-                global_state.clear_current_session_if_owned_by_workspace_states(&workspace_states);
-                tracing::warn!(
-                    orphan_session_count,
-                    "跳过未注册 workspace 的会话持久化；workspace 绑定会话必须写入对应工作区状态"
-                );
-            }
-
-            let Some(state_root) = persistence.state_root() else {
-                return Ok(());
-            };
-            let global_session_path = state_root.join("sessions.json");
-            if global_state.is_empty() {
-                match fs::remove_file(&global_session_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(ApiError::internal_assembly("删除全局会话状态失败", error));
-                    }
-                }
-            } else {
-                persistence.save_json(&global_session_path, &global_state)?;
-            }
-
-            Ok(())
-        })
+        self.session_store
+            .persist_projection_with(|durable, sidecars| persist(durable, sidecars))
     }
 
-    pub fn persist_session_durable_state_for_api(&self) -> Result<(), ApiError> {
-        self.persist_session_durable_state().map_err(|error| {
+    pub fn persist_session_projection_for_api(&self) -> Result<(), ApiError> {
+        self.persist_session_projection().map_err(|error| {
             public_runtime_persistence_error("session", SESSION_PERSISTENCE_PUBLIC_ERROR, error)
         })
     }
@@ -3390,7 +3538,7 @@ impl ApiState {
     }
 
     pub fn persist_runtime_durable_state(&self) -> Result<(), ApiError> {
-        self.persist_session_durable_state()?;
+        self.persist_session_projection()?;
         self.persist_workspace_durable_state()?;
         self.persist_knowledge_state()?;
         self.persist_session_git_contexts()?;
@@ -3398,7 +3546,7 @@ impl ApiState {
     }
 
     pub fn persist_runtime_durable_state_for_api(&self) -> Result<(), ApiError> {
-        self.persist_session_durable_state_for_api()?;
+        self.persist_session_projection_for_api()?;
         self.persist_workspace_durable_state_for_api()?;
         self.persist_knowledge_state_for_api()?;
         Ok(())
@@ -3406,6 +3554,11 @@ impl ApiState {
 
     pub fn with_task_store(mut self, store: Arc<TaskStore>) -> Self {
         self.task_store = Some(store);
+        self
+    }
+
+    pub fn with_task_execution_registry(mut self, registry: TaskExecutionRegistry) -> Self {
+        self.task_execution_registry = registry;
         self
     }
 
@@ -3496,6 +3649,7 @@ impl ApiState {
         &self,
         mut turn: QueuedRegularSessionTurn,
     ) -> Result<usize, ApiError> {
+        turn.normalize_identity();
         if turn.request_fingerprint.is_none() {
             turn.request_fingerprint = Some(
                 turn.request
@@ -3503,7 +3657,6 @@ impl ApiState {
                     .map_err(ApiError::InvalidInput)?,
             );
         }
-        turn.normalize_identity();
         let session_id = turn.session_id.clone();
         let mut queues = self
             .session_turn_queue
@@ -3765,15 +3918,17 @@ impl ApiState {
                 }
             }
             for mission_id in mission_ids {
-                task_ids.extend(
-                    task_store
-                        .remove_tasks_by_mission(&mission_id)
-                        .into_iter()
-                        .map(|task| task.task_id),
-                );
+                let removed = task_store
+                    .remove_tasks_by_mission(&mission_id)
+                    .map_err(|error| {
+                        ApiError::internal_assembly("删除会话任务 checkpoint 失败", error)
+                    })?;
+                task_ids.extend(removed.into_iter().map(|task| task.task_id));
             }
             for task_id in task_ids.clone() {
-                let _ = task_store.remove_task(&task_id);
+                task_store.remove_task(&task_id).map_err(|error| {
+                    ApiError::internal_assembly("删除会话残留任务 checkpoint 失败", error)
+                })?;
             }
         }
         self.spawn_graph
@@ -4340,6 +4495,63 @@ mod tests {
     }
 
     #[test]
+    fn session_turn_identity_normalization_is_stable_and_trims_client_values() {
+        assert_eq!(
+            normalize_session_turn_identity(
+                Some("  request-client  ".to_string()),
+                None,
+                "queue-identity-1",
+            ),
+            (
+                "request-client".to_string(),
+                "turn-item-user-queue-identity-1".to_string(),
+            )
+        );
+        assert_eq!(
+            normalize_session_turn_identity(None, None, "queue-identity-1"),
+            (
+                "request-queue-identity-1".to_string(),
+                "turn-item-user-queue-identity-1".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn enqueue_regular_session_turn_persists_complete_identity_and_fingerprint() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let session_id = SessionId::new("session-queue-identity");
+        let workspace_id = WorkspaceId::new("workspace-queue-identity");
+        let mut queued = queued_turn_fixture(&session_id, &workspace_id, "queue-identity", 100);
+        queued.request.request_id = None;
+        queued.request.user_message_id = None;
+
+        state
+            .enqueue_regular_session_turn(queued)
+            .expect("queued turn should persist");
+        let restored = state
+            .peek_next_regular_session_turn(&session_id)
+            .expect("queued turn should remain available");
+        assert_eq!(
+            restored.request.request_id().as_deref(),
+            Some("request-queue-identity")
+        );
+        assert_eq!(
+            restored.request.user_message_id().as_deref(),
+            Some("turn-item-user-queue-identity")
+        );
+        assert!(
+            restored.request_fingerprint.is_some(),
+            "队列状态必须同时持有可重放的完整请求指纹"
+        );
+    }
+
+    #[test]
     fn queued_turn_request_id_lookup_returns_stable_queue_position() {
         let state = ApiState::new(
             "magi-test",
@@ -4664,7 +4876,7 @@ mod tests {
         task.root_task_id = task.task_id.clone();
         task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("auditor"));
         let root_task_id = task.root_task_id.clone();
-        store.insert_task(task);
+        store.insert_task(task).expect("任务应插入");
 
         let observed_role = Arc::new(Mutex::new(None));
         let dispatcher = Arc::new(RecordingDispatcher {
@@ -4716,7 +4928,7 @@ mod tests {
         let store = Arc::new(TaskStore::new());
         let mut root_task = task_with_status("task-runner-interrupt", TaskStatus::Running);
         root_task.root_task_id = root_task.task_id.clone();
-        store.insert_task(root_task);
+        store.insert_task(root_task).expect("根任务应插入");
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
             store.clone(),
             Arc::new(SessionStore::new()),
@@ -4872,7 +5084,7 @@ mod tests {
         let root_task_id = "task-runner-restart-race";
         let mut root_task = task_with_status(root_task_id, TaskStatus::Running);
         root_task.root_task_id = root_task.task_id.clone();
-        store.insert_task(root_task);
+        store.insert_task(root_task).expect("根任务应插入");
         let session_store = Arc::new(SessionStore::new());
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
             store,
@@ -4951,7 +5163,7 @@ mod tests {
         let root_task_id = "task-archived-session-runner";
         let mut root_task = task_with_status(root_task_id, TaskStatus::Pending);
         root_task.root_task_id = root_task.task_id.clone();
-        store.insert_task(root_task);
+        store.insert_task(root_task).expect("根任务应插入");
         let session_store = Arc::new(SessionStore::new());
         let session_id = SessionId::new("session-archived-runner");
         session_store
@@ -4983,7 +5195,7 @@ mod tests {
         let root_task_id = "task-runner-cycle-panic";
         let mut root_task = task_with_status(root_task_id, TaskStatus::Pending);
         root_task.root_task_id = root_task.task_id.clone();
-        store.insert_task(root_task);
+        store.insert_task(root_task).expect("根任务应插入");
         let observed_status = Arc::new(Mutex::new(None));
         let observed_status_for_observer = observed_status.clone();
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
@@ -5051,6 +5263,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runner_checkpoint_failure_never_publishes_completed_terminal_status() {
+        let store = Arc::new(TaskStore::new());
+        let root_task_id = "task-runner-checkpoint-failure";
+        let mut root_task = task_with_status(root_task_id, TaskStatus::Completed);
+        root_task.root_task_id = root_task.task_id.clone();
+        store
+            .insert_task(root_task)
+            .expect("completed root should insert before runner starts");
+        let observed_statuses = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_statuses_for_observer = observed_statuses.clone();
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store,
+            Arc::new(SessionStore::new()),
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+            Arc::new(EventBasedResultReceiver::new()),
+        )
+        .with_checkpoint_persist(Arc::new(|_| {
+            Err(DomainError::Persistence {
+                message: "checkpoint unavailable".to_string(),
+            })
+        }))
+        .with_terminal_observer(move |_task_id, _session_id, status, _turn_id| {
+            observed_statuses_for_observer
+                .lock()
+                .expect("observer statuses lock should not poison")
+                .push(status);
+        });
+
+        let handle = manager
+            .start(root_task_id, None)
+            .await
+            .expect("runner should start");
+        for _ in 0..50 {
+            if !handle.active.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(!handle.active.load(Ordering::Relaxed));
+        assert_eq!(
+            handle.status.lock().expect("status should lock").as_str(),
+            "error"
+        );
+        assert!(
+            handle
+                .last_error
+                .lock()
+                .expect("last error should lock")
+                .as_deref()
+                .is_some_and(|error| error.contains("checkpoint 持久化失败"))
+        );
+        assert_eq!(
+            observed_statuses
+                .lock()
+                .expect("observer statuses should lock")
+                .as_slice(),
+            ["error"]
+        );
+    }
+
     #[test]
     fn builtin_tools_json_does_not_assume_missing_runtime_status_ready() {
         let state = ApiState::new(
@@ -5092,7 +5369,7 @@ mod tests {
         let root = tempfile::tempdir().expect("state root");
         let persistence = || {
             Arc::new(RuntimeStatePersistence::new(
-                root.path().join("sessions.json"),
+                root.path(),
                 root.path().join("workspaces.json"),
                 root.path().join("knowledge.json"),
             ))
@@ -5149,7 +5426,7 @@ mod tests {
         let root = tempfile::tempdir().expect("state root");
         let persistence = || {
             Arc::new(RuntimeStatePersistence::new(
-                root.path().join("sessions.json"),
+                root.path(),
                 root.path().join("workspaces.json"),
                 root.path().join("knowledge.json"),
             ))
@@ -5247,7 +5524,7 @@ mod tests {
         let root = tempfile::tempdir().expect("state root");
         let persistence = || {
             Arc::new(RuntimeStatePersistence::new(
-                root.path().join("sessions.json"),
+                root.path(),
                 root.path().join("workspaces.json"),
                 root.path().join("knowledge.json"),
             ))
@@ -5415,6 +5692,7 @@ mod tests {
             .expect("session should create");
         let observed_checkpoints = Arc::new(Mutex::new(Vec::<String>::new()));
         let observed_for_callback = observed_checkpoints.clone();
+        let projection_state_root = state_root.clone();
 
         let state = ApiState::new(
             "magi-test",
@@ -5424,16 +5702,34 @@ mod tests {
             governance,
         )
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
-            state_root.join("sessions.json"),
+            state_root.clone(),
             state_root.join("workspaces.json"),
             state_root.join("knowledge.json"),
         )))
-        .with_session_state_checkpoint_persist(Arc::new(move |checkpoint| {
-            observed_for_callback
-                .lock()
-                .expect("checkpoint observer lock should not poison")
-                .push(checkpoint.to_string());
+        .with_session_projection_persist(Arc::new(move |durable, _sidecars| {
+            let projection_dir = projection_state_root.join("session-projections");
+            std::fs::create_dir_all(&projection_dir)
+                .map_err(|error| ApiError::internal_assembly("创建 projection 目录失败", error))?;
+            for session in &durable.sessions {
+                let path = projection_dir.join(format!("{}.json", session.session_id));
+                let content = serde_json::to_vec_pretty(session).map_err(|error| {
+                    ApiError::internal_assembly("序列化 session projection 失败", error)
+                })?;
+                std::fs::write(&path, content).map_err(|error| {
+                    ApiError::internal_assembly("写入 session projection 失败", error)
+                })?;
+            }
             Ok(())
+        }))
+        .with_session_state_checkpoint_persist(Arc::new({
+            let observed_for_callback = observed_for_callback.clone();
+            move |checkpoint| {
+                observed_for_callback
+                    .lock()
+                    .expect("checkpoint observer lock should not poison")
+                    .push(checkpoint.to_string());
+                Ok(false)
+            }
         }));
 
         state
@@ -5447,17 +5743,17 @@ mod tests {
                 .as_slice(),
             ["checkpoint-test"]
         );
-        let persisted = std::fs::read_to_string(state_root.join("sessions.json"))
-            .expect("global session durable state should be written");
+        let persisted = std::fs::read_to_string(
+            state_root
+                .join("session-projections")
+                .join(format!("{session_id}.json")),
+        )
+        .expect("session projection should be written");
         assert!(persisted.contains(session_id.as_str()));
     }
 
     #[test]
-    fn session_durable_persistence_drops_orphan_workspace_sessions() {
-        let state_root = std::env::temp_dir().join(format!(
-            "magi-api-orphan-session-persistence-{}",
-            UtcMillis::now().0
-        ));
+    fn session_projection_persist_is_injected_at_api_boundary() {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
@@ -5470,6 +5766,8 @@ mod tests {
                 Some("workspace-missing-current".to_string()),
             )
             .expect("session should create");
+        let observed_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_for_callback = observed_sessions.clone();
 
         let state = ApiState::new(
             "magi-test",
@@ -5478,20 +5776,30 @@ mod tests {
             workspace_store,
             governance,
         )
-        .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
-            state_root.join("sessions.json"),
-            state_root.join("workspaces.json"),
-            state_root.join("knowledge.json"),
-        )));
+        .with_session_projection_persist(Arc::new(move |durable, sidecars| {
+            observed_for_callback
+                .lock()
+                .expect("session projection observer lock should not poison")
+                .extend(
+                    durable
+                        .sessions
+                        .iter()
+                        .map(|session| session.session_id.to_string()),
+                );
+            assert_eq!(sidecars.runtime_sidecars.len(), 0);
+            Ok(())
+        }));
 
         state
-            .persist_session_durable_state()
-            .expect("session durable state should persist");
-        assert!(
-            !state_root.join("sessions.json").exists(),
-            "未注册 workspace 的绑定会话不能写回全局 sessions.json"
+            .persist_session_projection()
+            .expect("session projection should persist");
+        assert_eq!(
+            observed_sessions
+                .lock()
+                .expect("session projection observer lock should not poison")
+                .as_slice(),
+            [session_id.to_string()]
         );
-        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -5500,10 +5808,10 @@ mod tests {
             "magi-api-redacted-persistence-{}",
             UtcMillis::now().0
         ));
-        let session_path = state_root.join("sessions.json");
+        let session_persist_root = state_root.join("session-persist-conflict");
         let workspace_path = state_root.join("workspaces.json");
         let knowledge_path = state_root.join("knowledge.json");
-        std::fs::create_dir_all(&session_path).expect("session conflict dir should create");
+        std::fs::create_dir_all(&session_persist_root).expect("session conflict dir should create");
         std::fs::create_dir_all(&workspace_path).expect("workspace conflict dir should create");
         std::fs::create_dir_all(&knowledge_path).expect("knowledge conflict dir should create");
 
@@ -5515,14 +5823,20 @@ mod tests {
             Arc::new(GovernanceService::default()),
         )
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
-            session_path,
+            session_persist_root,
             workspace_path,
             knowledge_path,
-        )));
+        )))
+        .with_session_projection_persist(Arc::new(|_durable, _sidecars| {
+            Err(ApiError::internal_assembly(
+                "session projection 持久化失败",
+                "projection conflict",
+            ))
+        }));
 
         assert_public_persistence_error(
             state
-                .persist_session_durable_state_for_api()
+                .persist_session_projection_for_api()
                 .expect_err("session persistence should fail"),
             SESSION_PERSISTENCE_PUBLIC_ERROR,
         );

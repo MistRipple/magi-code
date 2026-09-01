@@ -8,6 +8,7 @@ use magi_browser_authority::{
 };
 use magi_core::{BrowserTabId, EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
+use magi_session_store::ActiveExecutionTurn;
 use magi_tool_runtime::ToolRegistry;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::{broadcast, watch};
@@ -22,6 +23,26 @@ const DESKTOP_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
 const DESKTOP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const DESKTOP_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const DESKTOP_PARENT_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Debug)]
+pub(super) struct BrowserHostControllerLifecycle {
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl BrowserHostControllerLifecycle {
+    pub(super) fn new() -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
+        Self { shutdown_tx }
+    }
+
+    pub(super) fn request_shutdown(&self) {
+        self.shutdown_tx.send_replace(true);
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DesktopBrowserConnectionConfig {
@@ -131,9 +152,18 @@ fn non_empty(name: &'static str, value: String) -> Result<String, DesktopBrowser
     Ok(trimmed.to_string())
 }
 
-pub(super) fn start_controller(state: &ApiState) {
+pub(super) fn start_controller(state: &ApiState, lifecycle: &BrowserHostControllerLifecycle) {
     if let Err(error) = restore_browser_sessions(state) {
         tracing::error!(%error, "恢复浏览器逻辑会话失败");
+        set_host_status(
+            state,
+            BrowserHostStatus::Failed,
+            "failed",
+            false,
+            Some("browser_session_restore_failed".to_string()),
+            None,
+        );
+        publish_host_status(state);
     }
 
     match DesktopBrowserConnectionConfig::from_env() {
@@ -168,8 +198,12 @@ pub(super) fn start_controller(state: &ApiState) {
     };
 
     let state = state.clone();
-    handle.spawn(monitor_desktop_parent_process(state.clone()));
-    handle.spawn(async move { run_desktop_browser_controller(state).await });
+    handle.spawn(monitor_desktop_parent_process(
+        state.clone(),
+        lifecycle.subscribe(),
+    ));
+    let shutdown_rx = lifecycle.subscribe();
+    handle.spawn(async move { run_desktop_browser_controller(state, shutdown_rx).await });
 }
 
 /// Electron owns the daemon in Desktop mode. The connection socket alone is
@@ -177,11 +211,17 @@ pub(super) fn start_controller(state: &ApiState) {
 /// daemon listening on the development port with stale browser leases. Keep a
 /// process-level watchdog tied to the registered parent PID and terminate the
 /// daemon after synchronously closing its execution resources.
-async fn monitor_desktop_parent_process(state: ApiState) {
+async fn monitor_desktop_parent_process(state: ApiState, mut shutdown_rx: watch::Receiver<bool>) {
     let mut system = System::new();
     loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
         let Some(config) = state.browser_host_connection_config() else {
-            tokio::time::sleep(DESKTOP_PARENT_PROCESS_POLL_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(DESKTOP_PARENT_PROCESS_POLL_INTERVAL) => {}
+                _ = shutdown_rx.changed() => return,
+            }
             continue;
         };
         let parent_pid = Pid::from_u32(config.parent_pid);
@@ -211,7 +251,10 @@ async fn monitor_desktop_parent_process(state: ApiState) {
                 std::process::exit(0);
             }
         }
-        tokio::time::sleep(DESKTOP_PARENT_PROCESS_POLL_INTERVAL).await;
+        tokio::select! {
+            _ = tokio::time::sleep(DESKTOP_PARENT_PROCESS_POLL_INTERVAL) => {}
+            _ = shutdown_rx.changed() => return,
+        }
     }
 }
 
@@ -220,11 +263,14 @@ fn is_process_alive(system: &mut System, pid: Pid) -> bool {
     system.process(pid).is_some()
 }
 
-async fn run_desktop_browser_controller(state: ApiState) {
+async fn run_desktop_browser_controller(state: ApiState, mut shutdown_rx: watch::Receiver<bool>) {
     let mut reconnecting = false;
     let mut active_config: Option<DesktopBrowserConnectionConfig> = None;
     let mut config_rx = state.browser_host_connection_receiver();
     loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
         let Some(config) = state
             .browser_host_connection_config()
             .and_then(|config| DesktopBrowserConnectionConfig::from_runtime(config).ok())
@@ -232,8 +278,13 @@ async fn run_desktop_browser_controller(state: ApiState) {
             active_config = None;
             reconnecting = false;
             set_waiting_status(&state);
-            if config_rx.changed().await.is_err() {
-                return;
+            tokio::select! {
+                changed = config_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = shutdown_rx.changed() => return,
             }
             continue;
         };
@@ -241,11 +292,22 @@ async fn run_desktop_browser_controller(state: ApiState) {
             active_config = Some(config.clone());
             reconnecting = false;
         }
-        let Some((client, handshake)) =
-            connect_with_retries(&state, &config, reconnecting, &mut config_rx).await
+        let Some(connection) = connect_with_retries(
+            &state,
+            &config,
+            reconnecting,
+            &mut config_rx,
+            &mut shutdown_rx,
+        )
+        .await
         else {
             continue;
         };
+        let magi_browser_authority::BrowserHostConnection {
+            client,
+            handshake,
+            mut events,
+        } = connection;
         if state
             .browser_host_connection_config()
             .and_then(|current| DesktopBrowserConnectionConfig::from_runtime(current).ok())
@@ -261,7 +323,21 @@ async fn run_desktop_browser_controller(state: ApiState) {
                 Ok(())
             })
             .expect("Desktop epoch should be accepted by BrowserAuthority");
-        let mut events = client.subscribe();
+        if let Err(error) = resume_interrupted_browser_sessions(&state) {
+            tracing::error!(%error, "Electron Desktop 浏览器重连后恢复 Browser Session 失败");
+            client.close().await;
+            set_host_status(
+                &state,
+                BrowserHostStatus::Failed,
+                "failed",
+                true,
+                Some("browser_session_restore_failed".to_string()),
+                Some(&handshake),
+            );
+            publish_host_status(&state);
+            reconnecting = true;
+            continue;
+        }
         let generation = state.set_browser_host_client(Some(client.clone()));
         set_host_status(
             &state,
@@ -273,14 +349,34 @@ async fn run_desktop_browser_controller(state: ApiState) {
         );
         publish_host_status(&state);
 
-        let disconnect =
-            monitor_desktop_connection(&state, &client, &mut events, generation, &mut config_rx)
-                .await;
+        let disconnect = monitor_desktop_connection(
+            &state,
+            &client,
+            &mut events,
+            generation,
+            &mut config_rx,
+            &mut shutdown_rx,
+        )
+        .await;
         if state.browser_host_generation() == generation {
             state.set_browser_host_client(None);
         }
         client.close().await;
         tracing::warn!(reason = disconnect, "Electron Desktop 浏览器控制连接中断");
+
+        if disconnect == "daemon_shutdown" {
+            interrupt_browser_tasks_for_runtime_failure(&state);
+            set_host_status(
+                &state,
+                BrowserHostStatus::Stopped,
+                "stopped",
+                false,
+                None,
+                None,
+            );
+            publish_host_status(&state);
+            return;
+        }
 
         if disconnect == "configuration_changed" {
             // 清理连接也可能由 Worker 崩溃触发。配置通道变化意味着旧
@@ -333,7 +429,8 @@ async fn connect_with_retries(
     config: &DesktopBrowserConnectionConfig,
     reconnecting: bool,
     config_rx: &mut watch::Receiver<Option<BrowserHostConnectionConfig>>,
-) -> Option<(BrowserHostClient, BrowserHostHandshake)> {
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<magi_browser_authority::BrowserHostConnection> {
     let mut last_error = None;
     for attempt in 1..=DESKTOP_CONNECT_ATTEMPTS {
         let host_status = if reconnecting || attempt > 1 {
@@ -369,6 +466,7 @@ async fn connect_with_retries(
                 }
                 return None;
             }
+            _ = shutdown_rx.changed() => return None,
         };
         match connection {
             Ok(connection) => return Some(connection),
@@ -388,6 +486,7 @@ async fn connect_with_retries(
                     }
                     return None;
                 }
+                _ = shutdown_rx.changed() => return None,
             }
         }
     }
@@ -414,6 +513,7 @@ async fn connect_with_retries(
                 return None;
             }
         }
+        _ = shutdown_rx.changed() => return None,
     }
     None
 }
@@ -446,6 +546,7 @@ async fn monitor_desktop_connection(
     events: &mut broadcast::Receiver<BrowserHostIncomingEvent>,
     generation: u64,
     config_rx: &mut watch::Receiver<Option<BrowserHostConnectionConfig>>,
+    shutdown_rx: &mut watch::Receiver<bool>,
 ) -> &'static str {
     loop {
         tokio::select! {
@@ -476,6 +577,10 @@ async fn monitor_desktop_connection(
                 }
                 client.close().await;
                 return "configuration_channel_closed";
+            }
+            _ = shutdown_rx.changed() => {
+                client.close().await;
+                return "daemon_shutdown";
             }
         }
     }
@@ -524,6 +629,23 @@ fn restore_browser_sessions(state: &ApiState) -> Result<(), String> {
                 ..EventContext::default()
             }),
         );
+    }
+    Ok(())
+}
+
+/// Browser Host 重连后，恢复本次连接中被标记为 Interrupted 的逻辑会话。
+///
+/// 断线时只撤销控制租约并把会话标记为 Interrupted，避免把真实 Chromium
+/// 页面当作已关闭。连接恢复后必须先经过 Recovering 再回到 Ready，才能让
+/// 后续的 Tab 激活、工具调用与当前 Host 代次重新建立一致的运行边界。
+fn resume_interrupted_browser_sessions(state: &ApiState) -> Result<(), String> {
+    let resumed = state
+        .mutate_browser_authority(|authority| {
+            Ok(authority.resume_interrupted_sessions(UtcMillis::now()))
+        })
+        .map_err(|error| format!("投入浏览器会话恢复失败: {error:?}"))?;
+    if !resumed.is_empty() {
+        restore_browser_sessions(state)?;
     }
     Ok(())
 }
@@ -1027,6 +1149,46 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
         .collect::<Vec<_>>();
 
     for browser_session in sessions {
+        let interrupted_session = match state.mutate_browser_authority(|authority| {
+            authority.transition_session(
+                &browser_session.browser_session_id,
+                BrowserSessionLifecycle::Interrupted,
+                UtcMillis::now(),
+            )
+        }) {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(
+                    browser_session_id = %browser_session.browser_session_id,
+                    ?error,
+                    "Desktop 浏览器失效后收敛 Browser Session 状态失败"
+                );
+                continue;
+            }
+        };
+        state.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!(
+                    "event-browser-session-interrupted-{}-{}",
+                    interrupted_session.browser_session_id,
+                    UtcMillis::now().0
+                )),
+                "browser.session.status_changed",
+                serde_json::json!({
+                    "browser_session_id": interrupted_session.browser_session_id,
+                    "session_id": interrupted_session.session_id,
+                    "workspace_id": interrupted_session.workspace_id,
+                    "lifecycle": interrupted_session.lifecycle,
+                    "reason": "browser_host_unavailable",
+                    "revision": interrupted_session.revision,
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: interrupted_session.workspace_id.clone(),
+                session_id: Some(interrupted_session.session_id.clone()),
+                ..EventContext::default()
+            }),
+        );
         state.cancel_execution_resources(
             Some(&browser_session.session_id),
             browser_session.workspace_id.as_ref(),
@@ -1050,6 +1212,7 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
             .session_store
             .active_goal_for_execution_owner(&browser_session.session_id, &current_turn.turn_id)
             .is_some();
+        let request_id = request_id_for_turn(&current_turn);
         if let Some(chain) = state
             .session_store
             .active_execution_chain(&browser_session.session_id)
@@ -1111,6 +1274,7 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
                         "session.turn.interrupted",
                         serde_json::json!({
                             "session_id": browser_session.session_id,
+                            "request_id": request_id,
                             "workspace_id": browser_session.workspace_id,
                             "turn_id": current_turn.turn_id,
                             "interrupted": true,
@@ -1132,6 +1296,22 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
             ),
         }
     }
+}
+
+fn request_id_for_turn(turn: &ActiveExecutionTurn) -> String {
+    turn.items
+        .iter()
+        .find_map(|item| {
+            item.request_id.clone().or_else(|| {
+                item.metadata
+                    .get("request_id")
+                    .or_else(|| item.metadata.get("requestId"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .filter(|request_id| !request_id.trim().is_empty())
+        .unwrap_or_else(|| turn.turn_id.clone())
 }
 
 fn set_host_status(
@@ -1183,11 +1363,11 @@ mod tests {
     };
     use magi_core::{
         BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId, ExecutionOwnership,
-        SessionId, TaskId, UtcMillis, WorkspaceId,
+        SessionId, TaskId, ThreadId, UtcMillis, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{ActiveExecutionTurnItem, SessionStore};
     use magi_workspace::WorkspaceStore;
 
     use super::*;
@@ -1441,6 +1621,68 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_restores_interrupted_browser_sessions_before_tab_activation() {
+        let state = test_state();
+        let profile_id = BrowserProfileId::new("browser-profile-reconnect");
+        let browser_session_id = BrowserSessionId::new("browser-session-reconnect");
+        let tab_id = BrowserTabId::new("browser-tab-reconnect");
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: std::env::temp_dir().join("magi-browser-reconnect-test"),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })?;
+                authority.create_session(CreateBrowserSession {
+                    browser_session_id: browser_session_id.clone(),
+                    workspace_id: None,
+                    session_id: SessionId::new("session-reconnect"),
+                    profile_id,
+                    now: UtcMillis(1),
+                })?;
+                authority.transition_session(
+                    &browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(2),
+                )?;
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    url: "https://example.com".to_string(),
+                    now: UtcMillis(2),
+                })?;
+                authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis(2))?;
+                authority.transition_session(
+                    &browser_session_id,
+                    BrowserSessionLifecycle::Interrupted,
+                    UtcMillis(3),
+                )?;
+                Ok(())
+            })
+            .expect("interrupted browser session fixture should create");
+
+        resume_interrupted_browser_sessions(&state)
+            .expect("reconnected Browser Host should restore interrupted session");
+
+        let authority = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold");
+        assert_eq!(
+            authority
+                .session(&browser_session_id)
+                .map(|session| session.lifecycle),
+            Some(BrowserSessionLifecycle::Ready)
+        );
+        assert_eq!(
+            authority.tab(&tab_id).map(|tab| tab.lifecycle),
+            Some(BrowserTabLifecycle::Suspended)
+        );
+    }
+
+    #[test]
     fn page_updated_does_not_drop_the_current_primary_surface() {
         let state = test_state();
         let profile_id = BrowserProfileId::new("browser-profile-page-update");
@@ -1596,8 +1838,8 @@ mod tests {
                     tab_id: tab_id.clone(),
                     surface_id: "surface-disconnect".to_string(),
                     owner: ExecutionOwnership {
-                        workspace_id: Some(workspace_id),
-                        session_id: Some(session_id),
+                        workspace_id: Some(workspace_id.clone()),
+                        session_id: Some(session_id.clone()),
                         task_id: Some(TaskId::new("task-disconnect")),
                         ..ExecutionOwnership::default()
                     },
@@ -1610,6 +1852,7 @@ mod tests {
             })
             .expect("browser disconnect fixture should create");
 
+        let mut events = state.event_bus.subscribe();
         interrupt_browser_tasks_for_runtime_failure(&state);
 
         let authority = state
@@ -1630,5 +1873,73 @@ mod tests {
                 .and_then(|lease| lease.end_reason),
             Some(BrowserLeaseEndReason::RuntimeUnavailable)
         );
+        assert_eq!(
+            authority
+                .session(&browser_session_id)
+                .map(|session| session.lifecycle),
+            Some(BrowserSessionLifecycle::Interrupted)
+        );
+        drop(authority);
+
+        let event = events
+            .try_recv()
+            .expect("Browser Session 中断后应发布状态终态事件");
+        assert_eq!(event.event_type, "browser.session.status_changed");
+        assert_eq!(
+            event.payload["browser_session_id"],
+            browser_session_id.to_string()
+        );
+        assert_eq!(event.payload["session_id"], session_id.to_string());
+        assert_eq!(event.payload["workspace_id"], workspace_id.to_string());
+        assert_eq!(event.payload["lifecycle"], "interrupted");
+    }
+
+    #[test]
+    fn interrupted_turn_identity_includes_request_session_and_turn() {
+        let mut item = ActiveExecutionTurnItem {
+            item_id: "item-identity".to_string(),
+            item_seq: 1,
+            kind: "user_message".to_string(),
+            status: "running".to_string(),
+            source: "user".to_string(),
+            title: None,
+            content: None,
+            task_id: None,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id: Some("request-identity".to_string()),
+            user_message_id: None,
+            placeholder_message_id: None,
+            metadata: Default::default(),
+            timeline_entry_id: None,
+            source_thread_id: ThreadId::new("thread-identity"),
+        };
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-identity".to_string(),
+            turn_seq: 1,
+            accepted_at: UtcMillis(1),
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: None,
+            items: vec![item.clone()],
+        };
+        assert_eq!(request_id_for_turn(&turn), "request-identity");
+
+        item.request_id = None;
+        item.metadata.insert(
+            "requestId".to_string(),
+            serde_json::Value::String("request-from-metadata".to_string()),
+        );
+        let turn = ActiveExecutionTurn {
+            items: vec![item],
+            ..turn
+        };
+        assert_eq!(request_id_for_turn(&turn), "request-from-metadata");
     }
 }

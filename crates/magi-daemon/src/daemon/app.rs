@@ -38,6 +38,7 @@ const WEB_DEV_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_DEV_READY_INTERVAL: Duration = Duration::from_millis(250);
 const WEB_DEV_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WEB_DEV_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const GRACEFUL_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const STATIC_APP_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws://127.0.0.1:38123 ws://localhost:38123 ws://127.0.0.1:3000 ws://localhost:3000 ws://0.0.0.0:3000; form-action 'self'";
 
 #[derive(Clone, Debug)]
@@ -84,9 +85,14 @@ impl DaemonHandle {
     }
 
     pub async fn wait_until_stopped(&mut self) -> Result<(), DaemonError> {
-        let result = (&mut self.server_task).await.map_err(|error| {
-            DaemonError::internal(format!("daemon server task failed: {error}"))
-        })?;
+        let shutdown_requested = *self.shutdown_tx.borrow();
+        let result = if shutdown_requested {
+            self.wait_for_graceful_server_shutdown().await
+        } else {
+            (&mut self.server_task).await.map_err(|error| {
+                DaemonError::internal(format!("daemon server task failed: {error}"))
+            })?
+        };
         if !*self.shutdown_tx.borrow() {
             self.runtime
                 .prepare_graceful_shutdown("daemon server task exited")?;
@@ -112,11 +118,34 @@ impl DaemonHandle {
             signal = wait_for_process_shutdown_signal() => {
                 let reason = signal?;
                 self.shutdown(reason)?;
-                (&mut self.server_task).await.map_err(|error| {
-                    DaemonError::internal(format!("daemon server task failed: {error}"))
-                })?
+                self.wait_for_graceful_server_shutdown().await
             }
         }
+    }
+
+    async fn wait_for_graceful_server_shutdown(&mut self) -> Result<(), DaemonError> {
+        match tokio::time::timeout(GRACEFUL_SERVER_SHUTDOWN_TIMEOUT, &mut self.server_task).await {
+            Ok(result) => {
+                result.map_err(|error| {
+                    DaemonError::internal(format!("daemon server task failed: {error}"))
+                })??;
+            }
+            Err(_) => {
+                warn!(
+                    timeout_ms = GRACEFUL_SERVER_SHUTDOWN_TIMEOUT.as_millis(),
+                    "daemon 长连接超过优雅关闭时限，终止剩余 HTTP 连接"
+                );
+                self.server_task.abort();
+                match (&mut self.server_task).await {
+                    Err(error) if error.is_cancelled() => Ok(()),
+                    Ok(result) => result,
+                    Err(error) => Err(DaemonError::internal(format!(
+                        "daemon server task failed: {error}"
+                    ))),
+                }?;
+            }
+        }
+        Ok(())
     }
 }
 

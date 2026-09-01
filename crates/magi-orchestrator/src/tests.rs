@@ -1,5 +1,5 @@
 use super::*;
-use crate::task_store::TaskStore;
+use crate::task_store::{TaskLeaseState, TaskStore};
 use magi_core::{
     AccessProfile, RiskLevel, Task, TaskCompletionAttempt, TaskKind, TaskPolicy, TaskResultKind,
     TaskStatus, TaskTier, TerminationReason, ToolCallId, VerificationStatus, WorkerId,
@@ -40,49 +40,33 @@ fn seed_action_tasks(
     mission_title: &str,
     tasks: &[(TaskId, &str, TaskStatus)],
 ) -> TaskId {
+    seed_action_tasks_with_policy(task_store, mission_id, mission_title, tasks, None)
+}
+
+fn seed_action_tasks_with_policy(
+    task_store: &TaskStore,
+    mission_id: &MissionId,
+    mission_title: &str,
+    tasks: &[(TaskId, &str, TaskStatus)],
+    task_policy: Option<TaskPolicy>,
+) -> TaskId {
     let root_task_id = root_task_id_for_mission(mission_id);
     let now = UtcMillis::now();
-    task_store.insert_task(Task {
-        task_id: root_task_id.clone(),
-        mission_id: mission_id.clone(),
-        root_task_id: root_task_id.clone(),
-        parent_task_id: None,
-        kind: TaskKind::LocalAgent,
-        title: mission_title.to_string(),
-        goal: mission_title.to_string(),
-        status: TaskStatus::Running,
-        dependency_ids: Vec::new(),
-        required_children: tasks
-            .iter()
-            .map(|(task_id, _, _)| task_id.clone())
-            .collect(),
-        policy_snapshot: None,
-        executor_binding: None,
-        completion_contract: magi_core::TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        knowledge_refs: Vec::new(),
-        workspace_scope: None,
-        write_scope: None,
-        input_refs: Vec::new(),
-        output_refs: Vec::new(),
-        evidence_refs: Vec::new(),
-        retry_count: 0,
-        runtime_payload: magi_core::TaskRuntimePayload::default(),
-        created_at: now,
-        updated_at: now,
-    });
-    for (task_id, title, status) in tasks {
-        task_store.insert_task(Task {
-            task_id: task_id.clone(),
+    task_store
+        .insert_task(Task {
+            task_id: root_task_id.clone(),
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
-            parent_task_id: Some(root_task_id.clone()),
+            parent_task_id: None,
             kind: TaskKind::LocalAgent,
-            title: (*title).to_string(),
-            goal: (*title).to_string(),
-            status: *status,
+            title: mission_title.to_string(),
+            goal: mission_title.to_string(),
+            status: TaskStatus::Running,
             dependency_ids: Vec::new(),
-            required_children: Vec::new(),
+            required_children: tasks
+                .iter()
+                .map(|(task_id, _, _)| task_id.clone())
+                .collect(),
             policy_snapshot: None,
             executor_binding: None,
             completion_contract: magi_core::TaskCompletionContract::default(),
@@ -97,7 +81,37 @@ fn seed_action_tasks(
             runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
-        });
+        })
+        .expect("根任务应插入");
+    for (task_id, title, status) in tasks {
+        task_store
+            .insert_task(Task {
+                task_id: task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: Some(root_task_id.clone()),
+                kind: TaskKind::LocalAgent,
+                title: (*title).to_string(),
+                goal: (*title).to_string(),
+                status: *status,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: task_policy.clone(),
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("子任务应插入");
     }
     root_task_id
 }
@@ -145,48 +159,18 @@ fn seed_task_hierarchy(
         child_map.entry(parent).or_default().push(task_id.clone());
     }
 
-    task_store.insert_task(Task {
-        task_id: root_task_id.clone(),
-        mission_id: mission_id.clone(),
-        root_task_id: root_task_id.clone(),
-        parent_task_id: None,
-        kind: TaskKind::LocalAgent,
-        title: mission_title.to_string(),
-        goal: mission_title.to_string(),
-        status: root_status,
-        dependency_ids: Vec::new(),
-        required_children: child_map.get(&root_task_id).cloned().unwrap_or_default(),
-        policy_snapshot: None,
-        executor_binding: None,
-        completion_contract: magi_core::TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        knowledge_refs: Vec::new(),
-        workspace_scope: None,
-        write_scope: None,
-        input_refs: Vec::new(),
-        output_refs: Vec::new(),
-        evidence_refs: Vec::new(),
-        retry_count: 0,
-        runtime_payload: magi_core::TaskRuntimePayload::default(),
-        created_at: now,
-        updated_at: now,
-    });
-
-    for (task_id, parent_task_id, title, status) in tasks {
-        let parent = parent_task_id
-            .clone()
-            .unwrap_or_else(|| root_task_id.clone());
-        task_store.insert_task(Task {
-            task_id: task_id.clone(),
+    task_store
+        .insert_task(Task {
+            task_id: root_task_id.clone(),
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
-            parent_task_id: Some(parent.clone()),
+            parent_task_id: None,
             kind: TaskKind::LocalAgent,
-            title: (*title).to_string(),
-            goal: (*title).to_string(),
-            status: *status,
+            title: mission_title.to_string(),
+            goal: mission_title.to_string(),
+            status: root_status,
             dependency_ids: Vec::new(),
-            required_children: child_map.get(task_id).cloned().unwrap_or_default(),
+            required_children: child_map.get(&root_task_id).cloned().unwrap_or_default(),
             policy_snapshot: None,
             executor_binding: None,
             completion_contract: magi_core::TaskCompletionContract::default(),
@@ -201,7 +185,41 @@ fn seed_task_hierarchy(
             runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
-        });
+        })
+        .expect("根任务应插入");
+
+    for (task_id, parent_task_id, title, status) in tasks {
+        let parent = parent_task_id
+            .clone()
+            .unwrap_or_else(|| root_task_id.clone());
+        task_store
+            .insert_task(Task {
+                task_id: task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: Some(parent.clone()),
+                kind: TaskKind::LocalAgent,
+                title: (*title).to_string(),
+                goal: (*title).to_string(),
+                status: *status,
+                dependency_ids: Vec::new(),
+                required_children: child_map.get(task_id).cloned().unwrap_or_default(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("子任务应插入");
     }
 
     root_task_id
@@ -741,7 +759,7 @@ fn agent_run_projection_preserves_all_completed_children_after_later_status_upda
             .is_some_and(|task| task.status == TaskStatus::Pending)
         {
             task_store
-                .update_status(task_id, TaskStatus::Running)
+                .update_status_checked(task_id, TaskStatus::Running)
                 .expect("代理任务应进入运行态");
         }
         task_store
@@ -824,10 +842,11 @@ fn execution_runtime_can_run_dispatch_through_worker_loop() {
         &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
+    let worker_id = WorkerId::new("worker-exec");
     let result = execution_runtime
         .execute_dispatch(
             direct_execution_target(&mission_id, &task_id),
-            WorkerId::new("worker-exec"),
+            worker_id.clone(),
             Some(SessionId::new("session-exec")),
             Some(WorkspaceId::new("workspace-exec")),
             None,
@@ -854,6 +873,21 @@ fn execution_runtime_can_run_dispatch_through_worker_loop() {
     );
     assert_eq!(result.overview.tool_summary.total_invocations, 2);
     assert!(!result.overview.running_task_ids.contains(&task_id));
+    assert_eq!(
+        task_store
+            .get_task(&task_id)
+            .expect("dispatched task should remain in the store")
+            .status,
+        TaskStatus::Completed
+    );
+    let persisted_lease = task_store
+        .snapshot()
+        .leases
+        .into_iter()
+        .find(|lease| lease.worker_id == worker_id)
+        .expect("dispatch should persist its lease history");
+    assert_eq!(persisted_lease.task_id, task_id);
+    assert_eq!(persisted_lease.lease_status, TaskLeaseState::Completed);
 
     let snapshot = event_bus.snapshot();
     for event_type in [
@@ -1227,22 +1261,18 @@ fn execution_intent_inherits_task_tool_policy() {
     );
     let mission_id = MissionId::new("mission-worker-policy");
     let task_id = TaskId::new("task-worker-policy");
-    seed_action_tasks(
+    seed_action_tasks_with_policy(
         &task_store,
         &mission_id,
         "mission",
         &[(task_id.clone(), "task", TaskStatus::Pending)],
+        Some(test_task_policy(
+            AccessProfile::FullAccess,
+            "read_only",
+            vec!["process_inspect".to_string()],
+            vec!["file_remove".to_string()],
+        )),
     );
-    let mut task = task_store
-        .get_task(&task_id)
-        .expect("seeded task should exist");
-    task.policy_snapshot = Some(test_task_policy(
-        AccessProfile::FullAccess,
-        "read_only",
-        vec!["process_inspect".to_string()],
-        vec!["file_remove".to_string()],
-    ));
-    task_store.insert_task(task);
 
     let intent = execution_runtime
         .build_execution_intent(
@@ -2162,9 +2192,8 @@ fn task_store_remove_mission_removes_tasks_leases_and_checkpoints_once() {
 
     let task_store = TaskStore::new();
     let mission_id = MissionId::new("mission-delete");
-    let root_task_id = TaskId::new("task-root-delete");
     let child_task_id = TaskId::new("task-child-delete");
-    seed_action_tasks(
+    let root_task_id = seed_action_tasks(
         &task_store,
         &mission_id,
         "delete mission",
@@ -2183,9 +2212,12 @@ fn task_store_remove_mission_removes_tasks_leases_and_checkpoints_once() {
     let observed_checkpoint_count = checkpoint_count.clone();
     task_store.set_checkpoint_callback(Box::new(move |_| {
         observed_checkpoint_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }));
 
-    let removed = task_store.remove_tasks_by_mission(&mission_id);
+    let removed = task_store
+        .remove_tasks_by_mission(&mission_id)
+        .expect("mission removal should checkpoint");
 
     assert_eq!(removed.len(), 2);
     assert!(task_store.get_tasks_by_mission(&mission_id).is_empty());

@@ -20,6 +20,7 @@
   } from '../lib/runtime-state-panel';
   import { mergeCurrentRuntimeTimelineEntries } from '../lib/runtime-timeline';
   import { resolveToolDisplayName } from '../lib/tool-display-name';
+  import type { TurnStage } from '../shared/protocol/processing-state';
 
   interface Props {
     runtimeState: OrchestratorRuntimeState | null;
@@ -27,6 +28,7 @@
     conversationStartedAt?: number | null;
     isProcessing?: boolean;
     processingStartedAt?: number | null;
+    turnStage?: TurnStage | null;
   }
 
   let {
@@ -35,6 +37,7 @@
     conversationStartedAt = null,
     isProcessing = false,
     processingStartedAt = null,
+    turnStage = null,
   }: Props = $props();
   let isPanelExpanded = $state(false);
   let expandedRecordIds = $state<Set<string>>(new Set());
@@ -226,10 +229,7 @@
   });
 
   const canonicalProcessingActive = $derived.by(() => {
-    return resolveRuntimePanelStatus({
-      status: runtimeState?.status,
-      isProcessing,
-    }) === 'running' && runtimeState?.status !== 'running';
+    return isProcessing && turnStage !== null && turnStage !== 'done';
   });
 
   const effectiveStatus = $derived(resolveRuntimePanelStatus({
@@ -238,7 +238,7 @@
   }));
   const effectivePhase = $derived.by(() => (
     canonicalProcessingActive
-      ? 'running'
+      ? turnStage || 'running'
       : runtimeState?.phase
   ));
   const effectiveLastEventAt = $derived.by(() => (
@@ -352,6 +352,11 @@
       case 'analysis': return i18n.t('runtimeDiagnostics.phase.analysis');
       case 'planning': return i18n.t('runtimeDiagnostics.phase.planning');
       case 'running': return i18n.t('runtimeDiagnostics.phase.running');
+      case 'pending': return i18n.t('runtimeDiagnostics.phase.pending');
+      case 'preparing': return i18n.t('runtimeDiagnostics.phase.preparing');
+      case 'streaming': return i18n.t('runtimeDiagnostics.phase.streaming');
+      case 'finalizing': return i18n.t('runtimeDiagnostics.phase.finalizing');
+      case 'done': return i18n.t('runtimeDiagnostics.phase.done');
       case 'waiting': return i18n.t('runtimeDiagnostics.phase.waiting');
       case 'blocked': return i18n.t('runtimeState.status.blocked');
       case 'reviewing': return i18n.t('runtimeDiagnostics.phase.reviewing');
@@ -686,15 +691,8 @@
   }
 
   function resolveRuntimeRecordKind(
-    item: Pick<OrchestrationRuntimeTimelineEntry, 'type' | 'kind'>,
+    item: Pick<OrchestrationRuntimeTimelineEntry, 'kind'>,
   ): NonNullable<OrchestrationRuntimeTimelineEntry['kind']> {
-    const type = item.type.trim().toLowerCase();
-    if (type.includes('interrupted')) {
-      return item.kind === 'warning' ? 'warning' : 'error';
-    }
-    if (type.includes('failed') || type.includes('blocked')) {
-      return 'error';
-    }
     return item.kind || 'progress';
   }
 
@@ -784,7 +782,8 @@
   }
 </script>
 
-{#if panelVisible}
+<div class="runtime-diagnostics-slot">
+  {#if panelVisible}
   <section
     bind:this={panelRef}
     class="runtime-diagnostics runtime-diagnostics--{statusModifier}"
@@ -1010,9 +1009,20 @@
     </div>
     {/if}
   </section>
-{/if}
+  {/if}
+</div>
 
 <style>
+  .runtime-diagnostics-slot {
+    position: absolute;
+    inset: 0 0 auto;
+    height: 0;
+    min-height: 0;
+    overflow: visible;
+    pointer-events: none;
+    z-index: 12;
+  }
+
   .runtime-diagnostics {
     --runtime-status-color: var(--vscode-editorWidget-border, var(--border));
     margin: 6px 12px 0;
@@ -1023,7 +1033,9 @@
     color: var(--vscode-foreground, var(--foreground));
     overflow: visible;
     position: relative;
-    z-index: 12;
+    z-index: 1;
+    pointer-events: auto;
+    height: 36px;
   }
 
   .runtime-diagnostics--expanded {
@@ -1044,6 +1056,7 @@
   .runtime-diagnostics__summary-button {
     width: 100%;
     cursor: pointer;
+    height: 34px;
     min-height: 34px;
     padding: 7px 10px;
     font-size: 12px;
@@ -1056,6 +1069,7 @@
     color: inherit;
     text-align: left;
     border-radius: 8px;
+    overflow: hidden;
   }
 
   .runtime-diagnostics__summary-button:hover {
@@ -1079,6 +1093,7 @@
 
   .summary__title {
     font-weight: 600;
+    flex: 0 0 auto;
   }
 
   .summary__badge {
@@ -1124,6 +1139,10 @@
   .summary__phase {
     font-size: 11px;
     opacity: 0.72;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .summary__meta {
@@ -1467,9 +1486,11 @@
     .runtime-diagnostics__summary-button {
       padding: 7px 9px;
       gap: 6px;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
     }
 
+    .summary__phase,
+    .summary__meta,
     .summary__time {
       display: none;
     }

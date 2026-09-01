@@ -35,6 +35,6 @@ pub fn schedule_restored_session_task_dispatches(state: ApiState) {
 pub use state::{
     ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot,
     ExecutionResourceCancellationReport, ExecutionResourceCoordinator, RunnerManager,
-    RunnerStartError, RunnerStopError, RuntimeStatePersistence,
+    RunnerStartError, RunnerStopError, RuntimeStatePersistence, TaskCheckpointPersist,
     build_runtime_capability_dependency_provider,
 };

@@ -120,7 +120,7 @@ await withGoldenViteServer(async (server) => {
     'Browser Tab 不得保留只按 overlayId 管理的旧状态',
   );
   assert.match(browserPaneSource, /function enqueueDesktopOverlayOperation\([\s\S]*?desktopOverlayOperations = next\.catch\(\(\) => undefined\)/u);
-  assert.match(browserPaneSource, /function closeDesktopOverlay\([\s\S]*?expected: BrowserOverlayIdentity \| null = desktopOverlayIdentity[\s\S]*?desktop\.closeOverlay\(pending\.identity\)[\s\S]*?await pending\.confirmation/u);
+  assert.match(browserPaneSource, /function closeDesktopOverlay\([\s\S]*?expected: BrowserOverlayIdentity \| null = desktopOverlayIdentity[\s\S]*?desktop\.closeOverlay\(toDesktopOverlayIdentity\(pending\.identity\)\)[\s\S]*?await pending\.confirmation/u);
   assert.match(browserPaneSource, /function confirmDesktopOverlayClosed\([\s\S]*?sameOverlayIdentity\(pending\.identity, event\)[\s\S]*?pending\.resolve\(\)/u);
   assert.match(browserPaneSource, /function openDesktopOverlay\([\s\S]*?const previousUi = captureOverlayUi\(\)[\s\S]*?await pendingClose\.confirmation[\s\S]*?await desktop\.openOverlay\(state\)/u);
   assert.match(browserPaneSource, /if \(waitsForClose && closeConfirmed\) clearDesktopOverlayUi\(nextIdentity\)[\s\S]*?else restoreOverlayUi\(previousUi\)/u);
@@ -157,7 +157,8 @@ await withGoldenViteServer(async (server) => {
   assert.match(windowManagerSource, /private applyLayout\(record: DesktopWindowRecord\)/u);
   assert.match(
     windowManagerSource,
-    /const browserSurfaceActive = !record\.blockingOverlayActive[\s\S]*?const currentBrowserContentBounds = browserSurfaceActive \? browserContentBounds\(layout\) : null/u,
+    /const browserSurfaceActive = !record\.blockingOverlayActive[\s\S]*?const rendererGeometryForActiveSurface = browserSurfaceActive[\s\S]*?layout\.rendererGeometry\?\.browserContentSlot\?\.tabId === layout\.activeTabId[\s\S]*?const currentBrowserContentBounds = browserSurfaceActive && rendererGeometryForActiveSurface[\s\S]*?browserContentBounds\(layout\)/u,
+    '原生浏览器只能绑定到当前 Browser Tab/Surface 已确认的 Renderer 内容槽',
   );
   assert.match(windowManagerSource, /this\.#surfaceManager\.bindContentSurface\(/u);
   assert.match(windowManagerSource, /setViewBounds\(record\.appView, layout\.appBounds/u);
@@ -185,9 +186,13 @@ await withGoldenViteServer(async (server) => {
   assert.match(surfaceManagerSource, /private async waitForDebugger\(/u);
   assert.match(surfaceManagerSource, /debugger-detached:[\s\S]*?reconnectDebugger/u);
   assert.match(surfaceManagerSource, /method === "Page\.captureScreenshot"/u);
-  assert.match(surfaceManagerSource, /sendCdpCommandWithTimeout\([\s\S]*?Page\.captureScreenshot/u);
-  assert.match(surfaceManagerSource, /private async capturePageScreenshot[\s\S]*?record\.contents\.capturePage\(/u);
-  assert.match(surfaceManagerSource, /record\.contents\.capturePage\([\s\S]*?stayHidden:\s*true/u);
+  assert.match(
+    surfaceManagerSource,
+    /method === "Page\.captureScreenshot"[\s\S]*?sendSurfaceCdpCommand\([\s\S]*?sendCdpCommandWithTimeout\([\s\S]*?method/u,
+    '截图必须沿用当前 Browser Surface 的 CDP lane，并由真实 WebContents 执行',
+  );
+  assert.match(surfaceManagerSource, /method === "Page\.captureScreenshot"[\s\S]*?fromSurface: true/u);
+  assert.doesNotMatch(surfaceManagerSource, /capturePage\(|capturePageRect|mapBrowserCaptureClipToNativeRect/u);
   assert.doesNotMatch(surfaceManagerSource, /startScreencast|drawImage\(/u);
 
   // 右栏激活只有 Workbench Shell 一个所有者。RightPane 只记录用户 Tab
@@ -221,7 +226,10 @@ await withGoldenViteServer(async (server) => {
   assert.match(overlayManagerSource, /const geometry = resolveCurrentOverlayGeometry\(state, layout\)/u);
   assert.match(overlayManagerSource, /resolveCurrentOverlayGeometry\(record\.state, layout\)/u);
   assert.match(overlayManagerSource, /const frame = layout\.rendererGeometry[\s\S]*?const parent = frame\?\.rightPaneBounds/u);
-  assert.match(windowManagerSource, /const currentBrowserParentBounds = browserSurfaceActive[\s\S]*?layout\.rendererGeometry\?\.rightPaneBounds/u);
+  assert.match(
+    windowManagerSource,
+    /const currentBrowserParentBounds = browserSurfaceActive && rendererGeometryForActiveSurface[\s\S]*?rendererGeometryForActiveSurface\.rightPaneBounds/u,
+  );
   assert.match(overlayManagerSource, /record\.geometryAvailable = false;[\s\S]*?clearOverlayBounds\(record\)/u);
   assert.match(workbenchShellSource, /getBoundingClientRect\(\)/u);
   assert.match(workbenchShellSource, /new ResizeObserver/u);

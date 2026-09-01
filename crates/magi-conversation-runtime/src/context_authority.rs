@@ -114,7 +114,8 @@ pub(crate) struct ContextAuthority<'a> {
     ///
     /// 生产执行路径必须传入固定 Turn，避免异步返回时把旧 Turn 的用量归到新 Turn。
     expected_turn_id: Option<&'a str>,
-    compaction_observer: Option<&'a (dyn Fn(ContextCompactionProgress) + Sync)>,
+    compaction_observer:
+        Option<&'a (dyn Fn(ContextCompactionProgress) -> Result<(), String> + Sync)>,
     is_cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
     compaction_progress_gate: Mutex<ContextCompactionProgressGate>,
 }
@@ -219,7 +220,7 @@ impl<'a> ContextAuthority<'a> {
 
     pub(crate) fn with_compaction_runtime(
         mut self,
-        observer: &'a (dyn Fn(ContextCompactionProgress) + Sync),
+        observer: &'a (dyn Fn(ContextCompactionProgress) -> Result<(), String> + Sync),
         is_cancelled: &'a (dyn Fn() -> bool + Sync),
     ) -> Self {
         self.compaction_observer = Some(observer);
@@ -414,18 +415,25 @@ impl<'a> ContextAuthority<'a> {
                 };
             }
             Err(error) => {
-                let terminal = if self.cancelled() {
-                    self.notify_compaction(ContextCompactionProgress::Cancelled);
-                    ContextCompactionTerminal::Cancelled
+                let (terminal, notification_error) = if self.cancelled() {
+                    (
+                        ContextCompactionTerminal::Cancelled,
+                        self.notify_compaction(ContextCompactionProgress::Cancelled)
+                            .err(),
+                    )
                 } else {
-                    self.notify_compaction(ContextCompactionProgress::Failed);
-                    ContextCompactionTerminal::Failed
+                    (
+                        ContextCompactionTerminal::Failed,
+                        self.notify_compaction(ContextCompactionProgress::Failed)
+                            .err(),
+                    )
                 };
                 tracing::warn!(
                     thread_id = %self.thread_id,
                     session_id = %self.session_id,
                     phase = request.phase,
                     %error,
+                    notification_error = ?notification_error,
                     "上下文语义压缩失败，停止当前执行以避免重复压缩"
                 );
                 return PreparedThreadHistory {
@@ -437,11 +445,22 @@ impl<'a> ContextAuthority<'a> {
         };
 
         if self.cancelled() {
-            self.notify_compaction(ContextCompactionProgress::Cancelled);
+            let terminal = match self.notify_compaction(ContextCompactionProgress::Cancelled) {
+                Ok(()) => ContextCompactionTerminal::Cancelled,
+                Err(error) => {
+                    tracing::error!(
+                        thread_id = %self.thread_id,
+                        session_id = %self.session_id,
+                        %error,
+                        "上下文压缩取消事实写回失败，改为失败终态"
+                    );
+                    ContextCompactionTerminal::Failed
+                }
+            };
             return PreparedThreadHistory {
                 messages: history,
                 compaction: None,
-                terminal: Some(ContextCompactionTerminal::Cancelled),
+                terminal: Some(terminal),
             };
         }
 
@@ -522,7 +541,14 @@ impl<'a> ContextAuthority<'a> {
                     compacted_at,
                 );
             if !installed {
-                self.notify_compaction(ContextCompactionProgress::Failed);
+                if let Err(error) = self.notify_compaction(ContextCompactionProgress::Failed) {
+                    tracing::error!(
+                        thread_id = %self.thread_id,
+                        session_id = %self.session_id,
+                        %error,
+                        "上下文压缩失败事实写回失败"
+                    );
+                }
                 return PreparedThreadHistory {
                     messages: history,
                     compaction: None,
@@ -592,7 +618,7 @@ impl<'a> ContextAuthority<'a> {
         compacted.push(summary);
         compacted.extend(history[split..].iter().cloned());
         if estimate_thread_history_tokens(&compacted) >= original_tokens {
-            self.notify_compaction(ContextCompactionProgress::Skipped);
+            self.notify_compaction(ContextCompactionProgress::Skipped)?;
             return Ok(None);
         }
         Ok(Some((compacted, split)))
@@ -627,7 +653,7 @@ impl<'a> ContextAuthority<'a> {
         self.notify_compaction(ContextCompactionProgress::Started {
             stage: "history_summary",
             total_chunks: 1,
-        });
+        })?;
         let summary = self.invoke_compaction_summary(
             compaction_client,
             &source,
@@ -640,7 +666,7 @@ impl<'a> ContextAuthority<'a> {
             stage: "history_summary",
             completed_chunks: 1,
             total_chunks: 1,
-        });
+        })?;
         let summary = validate_compaction_summary(&summary, summary_target_tokens)?;
         let content = render_prompt_fragment(
             PromptFragmentKind::ThreadHistoryBoundary,
@@ -666,18 +692,18 @@ impl<'a> ContextAuthority<'a> {
         })
     }
 
-    fn notify_compaction(&self, progress: ContextCompactionProgress) {
+    fn notify_compaction(&self, progress: ContextCompactionProgress) -> Result<(), String> {
         let Some(observer) = self.compaction_observer else {
-            return;
+            return Ok(());
         };
         let mut gate = self
             .compaction_progress_gate
             .lock()
             .expect("context compaction progress gate lock poisoned");
         if !gate.accepts(&progress) {
-            return;
+            return Ok(());
         }
-        observer(progress);
+        observer(progress)
     }
 
     fn cancelled(&self) -> bool {

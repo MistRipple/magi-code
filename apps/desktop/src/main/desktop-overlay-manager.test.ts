@@ -19,10 +19,13 @@ const ZERO_BOUNDS: Rectangle = { x: 0, y: 0, width: 0, height: 0 };
 type Listener = (...args: unknown[]) => void;
 
 class FakeWebContents {
-  readonly id = 701;
+  static #nextId = 701;
+  readonly id = FakeWebContents.#nextId++;
   readonly loadedUrls: string[] = [];
   readonly sent: Array<{ channel: string; payload: unknown }> = [];
   closed = false;
+  closeRequested = false;
+  destroyOnClose = true;
   #listeners = new Map<string, Listener[]>();
 
   setWindowOpenHandler(_handler: unknown): void {}
@@ -32,6 +35,15 @@ class FakeWebContents {
     listeners.push(listener);
     this.#listeners.set(channel, listeners);
     return this;
+  }
+
+  once(channel: string, listener: Listener): this {
+    const onceListener: Listener = (...args) => {
+      const listeners = this.#listeners.get(channel) ?? [];
+      this.#listeners.set(channel, listeners.filter((candidate) => candidate !== onceListener));
+      listener(...args);
+    };
+    return this.on(channel, onceListener);
   }
 
   emit(channel: string, ...args: unknown[]): void {
@@ -51,7 +63,14 @@ class FakeWebContents {
   }
 
   close(): void {
+    this.closeRequested = true;
+    if (this.destroyOnClose) this.destroy();
+  }
+
+  destroy(): void {
+    if (this.closed) return;
     this.closed = true;
+    this.emit("destroyed");
   }
 }
 
@@ -70,6 +89,10 @@ class FakeView {
 
   setVisible(visible: boolean): void {
     this.visible = visible;
+  }
+
+  getVisible(): boolean {
+    return this.visible;
   }
 
   setBackgroundColor(color: string): void {
@@ -116,24 +139,31 @@ interface Harness {
   window: FakeWindow;
   layer: FakeLayer;
   view: FakeOverlayView;
+  views: FakeOverlayView[];
   closed: DesktopOverlayClosedEvent[];
 }
 
 function createHarness(): Harness {
   const window = new FakeWindow();
   const layer = new FakeLayer();
-  const view = new FakeOverlayView();
+  const views: FakeOverlayView[] = [];
   const closed: DesktopOverlayClosedEvent[] = [];
   const manager = new DesktopOverlayManager({
     preloadPath: "/tmp/magi-overlay-preload.js",
     agentOrigin: "http://127.0.0.1:38123",
     desktopEpoch: "desktop-test",
-    createView: () => view as unknown as WebContentsView,
+    createView: () => {
+      const view = new FakeOverlayView();
+      views.push(view);
+      return view as unknown as WebContentsView;
+    },
     onAction: () => undefined,
     onClosed: (_windowId, event) => closed.push(event),
   });
   manager.create("window-1", window as unknown as BaseWindow, layer as unknown as View);
-  return { manager, window, layer, view, closed };
+  const view = views[0];
+  assert.ok(view);
+  return { manager, window, layer, view, views, closed };
 }
 
 function layoutWithGeometry(
@@ -249,14 +279,15 @@ async function openReadyOverlay(
   return layoutData;
 }
 
-test("创建 Overlay 时仅初始化自身透明背景、零 bounds 和隐藏状态", async () => {
+test("创建 Overlay 时一次性挂载自身并保持透明、零 bounds 和隐藏状态", async () => {
   const harness = createHarness();
   await settleLoad();
 
   assert.deepEqual(harness.view.bounds, ZERO_BOUNDS);
   assert.equal(harness.view.visible, false);
   assert.equal(harness.view.backgroundColor, "rgba(0, 0, 0, 0)");
-  assert.equal(harness.layer.children.length, 0);
+  assert.equal(harness.layer.children.length, 1);
+  assert.equal(harness.layer.addCount, 1);
   assert.deepEqual(harness.view.webContents.loadedUrls, [
     "http://127.0.0.1:38123/web.html?desktopSurface=overlay&desktopWindowId=window-1&desktopEpoch=desktop-test",
   ]);
@@ -275,7 +306,7 @@ test("缺少当前几何时拒绝打开且不替换现有 Overlay", async () => 
     () => harness.manager.open("window-1", annotationState("overlay-1"), invalidLayout),
     /desktop_overlay_browser_content_unavailable/u,
   );
-  assert.equal(harness.layer.children.length, 0);
+  assert.equal(harness.layer.children.length, 1);
   assert.equal(harness.closed.length, 0);
 
   await openReadyOverlay(harness);
@@ -326,7 +357,7 @@ test("几何提交短暂缺失时保留命中租约，有效新租约到达后�
   // 非法几何帧必须让原生浮层退出命中树，但不能销毁或重建其
   // WebContents。下一份完整 Renderer frame 到达后继续复用同一 View。
   assert.equal(harness.view.visible, false);
-  assert.deepEqual(harness.view.bounds, ZERO_BOUNDS);
+  assert.deepEqual(harness.view.bounds, first.content);
   assert.equal(harness.layer.children.length, 1);
   assert.equal(harness.closed.length, 0);
 
@@ -342,7 +373,7 @@ test("几何提交短暂缺失时保留命中租约，有效新租约到达后�
 
 test("close 只接受当前 owner，过期请求不能关闭或清空当前 View", async () => {
   const harness = createHarness();
-  await openReadyOverlay(harness);
+  const data = await openReadyOverlay(harness);
   const stale = harness.manager.close("window-1", {
     overlayId: "stale-overlay",
     ownerId: "browser:tab-1",
@@ -363,10 +394,54 @@ test("close 只接受当前 owner，过期请求不能关闭或清空当前 View
   assert.equal(closed?.overlayId, "overlay-1");
   assert.equal(closed?.reason, "closed");
   assert.equal(harness.view.visible, false);
-  assert.deepEqual(harness.view.bounds, ZERO_BOUNDS);
+  assert.deepEqual(harness.view.bounds, data.content);
+  assert.equal(harness.layer.children.length, 1);
+  assert.equal(harness.layer.removeCount, 0);
+  assert.equal(harness.manager.close("window-1"), null);
+});
+
+test("关闭 Overlay 只隐藏并复用同一个 Renderer，避免重建合成树", async () => {
+  const harness = createHarness();
+  const data = await openReadyOverlay(harness);
+  const oldView = harness.views[0];
+  assert.ok(oldView);
+
+  const closed = harness.manager.close("window-1", {
+    overlayId: "overlay-1",
+    ownerId: "browser:tab-1",
+  });
+
+  assert.equal(closed?.reason, "closed");
+  assert.equal(oldView.webContents.closed, false);
+  assert.equal(harness.views.length, 1);
+  assert.equal(harness.layer.children.length, 1);
+  assert.deepEqual(oldView.bounds, data.content);
+  assert.equal(harness.layer.removeCount, 0);
+
+  harness.manager.open("window-1", annotationState("overlay-2"), data.layout);
+  harness.manager.handleReady("window-1");
+  assert.equal(harness.views.length, 1);
+  assert.equal(harness.manager.isWebContents(oldView.webContents.id), true);
+  assert.equal(oldView.visible, true);
+  assert.equal(harness.layer.children.length, 1);
+});
+
+test("窗口销毁才关闭并移除 Overlay Renderer", async () => {
+  const harness = createHarness();
+  await openReadyOverlay(harness);
+  const oldView = harness.views[0];
+  assert.ok(oldView);
+  oldView.webContents.destroyOnClose = false;
+
+  harness.manager.closeWindow("window-1");
+  assert.equal(oldView.webContents.closeRequested, true);
+  assert.equal(oldView.webContents.closed, false);
+  assert.equal(harness.views.length, 1);
   assert.equal(harness.layer.children.length, 0);
   assert.equal(harness.layer.removeCount, 1);
-  assert.equal(harness.manager.close("window-1"), null);
+
+  oldView.webContents.destroy();
+  assert.equal(harness.manager.isWebContents(oldView.webContents.id), false);
 });
 
 test("同一 View 替换 Overlay，旧 owner 收到 replacement，子 View 不重复挂载", async () => {

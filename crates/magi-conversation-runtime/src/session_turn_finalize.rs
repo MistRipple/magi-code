@@ -4,10 +4,9 @@
 //! 不再耦合 ApiState。magi-api 侧保留薄壳转发。
 
 use magi_core::{
-    EventId, SessionId, Task, TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, WorkspaceId,
-    public_runtime_excerpt,
+    SessionId, Task, TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, public_runtime_excerpt,
 };
-use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_event_bus::InMemoryEventBus;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{ActiveExecutionTurn, SessionStore};
 
@@ -21,6 +20,12 @@ const TASK_CONTEXT_MAX_CHARS: usize = 4000;
 const TASK_CONTEXT_MAX_REFS: usize = 8;
 const ROOT_COMPLETION_SUMMARY_MAX_CHARS: usize = 2400;
 const TASK_FAILURE_DETAIL_MAX_CHARS: usize = 4096;
+const SESSION_INTERRUPTION_NOTICE_KIND: &str = "session_interrupted";
+const SESSION_INTERRUPTION_SOURCE_KEY: &str = "interruptionSource";
+const SESSION_INTERRUPTION_SOURCE_DAEMON_RESTART: &str = "daemon_restart";
+const SESSION_INTERRUPTION_RECOVERY_STATE_KEY: &str = "recoveryState";
+const SESSION_INTERRUPTION_RECOVERY_READY: &str = "ready";
+const SESSION_INTERRUPTION_RECOVERY_CLAIMED: &str = "claimed";
 
 pub struct FinalizeBackgroundSessionTaskTurnContext<'a> {
     pub session_store: &'a SessionStore,
@@ -75,7 +80,7 @@ pub fn publish_task_status_turn_item_for_active_sessions(
     task_store: Option<&TaskStore>,
     task: &Task,
     new_status: TaskStatus,
-) {
+) -> Result<(), String> {
     for sidecar in session_store.active_execution_sidecars() {
         let Some(turn) = sidecar.current_turn.as_ref() else {
             continue;
@@ -130,25 +135,28 @@ pub fn publish_task_status_turn_item_for_active_sessions(
         if let Some(branch) = branch {
             item.worker_id = Some(branch.worker_id.clone());
         }
-        if let Some(published) = append_session_turn_item_for_turn(
+        let published = append_session_turn_item_for_turn(
             session_store,
             &sidecar.session_id,
             Some(&turn.turn_id),
             item,
             task_store,
-        ) {
-            let workspace_id = sidecar
-                .active_execution_chain
-                .as_ref()
-                .and_then(|chain| chain.workspace_id.clone());
-            publish_session_turn_item_event(
-                event_bus,
-                &sidecar.session_id,
-                &workspace_id,
-                &published,
-            );
-        }
+        )?
+        .ok_or_else(|| {
+            format!(
+                "会话 {} 的当前 Turn 已不可写，无法记录任务 {} 的状态 {}",
+                sidecar.session_id,
+                task.task_id,
+                task_status_text(new_status)
+            )
+        })?;
+        let workspace_id = sidecar
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.workspace_id.clone());
+        publish_session_turn_item_event(event_bus, &sidecar.session_id, &workspace_id, &published);
     }
+    Ok(())
 }
 
 pub fn compact_task_context_text(text: &str) -> String {
@@ -451,23 +459,28 @@ pub fn build_root_completion_summary(task_store: &TaskStore, root_task: &Task) -
 
 fn ensure_root_completion_final_item(
     session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
     session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
     root_task: &Task,
     task_store: &TaskStore,
     expected_turn_id: Option<&str>,
-) -> Option<(String, String)> {
-    let sidecar = session_store.runtime_sidecar(session_id)?;
-    let turn = sidecar.current_turn.as_ref()?;
+) -> Result<Option<(String, String)>, String> {
+    let Some(sidecar) = session_store.runtime_sidecar(session_id) else {
+        return Ok(None);
+    };
+    let Some(turn) = sidecar.current_turn.as_ref() else {
+        return Ok(None);
+    };
     if expected_turn_id.is_some_and(|expected| expected != turn.turn_id) {
-        return None;
+        return Ok(None);
     }
-    let orchestrator_thread = session_store.orchestrator_thread_for_session(session_id)?;
+    let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
+    else {
+        return Ok(None);
+    };
     if let Some(response) = latest_root_task_assistant_final(turn, &root_task.task_id)
         .or_else(|| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
     {
-        return Some(response);
+        return Ok(Some(response));
     }
 
     let item_id = format!("turn-item-orchestrator-final-{}", root_task.task_id);
@@ -482,17 +495,17 @@ fn ensure_root_completion_final_item(
     final_item.source = "orchestrator".to_string();
     final_item.task_id = Some(root_task.task_id.clone());
 
-    if let Some(published) = append_session_turn_item_for_turn(
+    let Some(_published) = append_session_turn_item_for_turn(
         session_store,
         session_id,
         expected_turn_id,
         final_item,
         Some(task_store),
-    ) {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
-    }
-
-    session_store
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(session_store
         .runtime_sidecar(session_id)
         .and_then(|sidecar| sidecar.current_turn)
         .as_ref()
@@ -500,7 +513,7 @@ fn ensure_root_completion_final_item(
             latest_root_task_assistant_final(turn, &root_task.task_id).or_else(|| {
                 latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id)
             })
-        })
+        }))
 }
 
 pub fn finalize_background_session_task_turn_if_root_completed(
@@ -510,7 +523,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     session_id: &SessionId,
     root_task_id: &TaskId,
     persist_session_state: Option<&SessionStatePersistCallback>,
-) -> bool {
+) -> Result<bool, String> {
     finalize_background_session_task_turn_if_root_completed_for_turn(
         session_store,
         event_bus,
@@ -530,99 +543,86 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
     root_task_id: &TaskId,
     expected_turn_id: Option<&str>,
     persist_session_state: Option<&SessionStatePersistCallback>,
-) -> bool {
+) -> Result<bool, String> {
     let Some(task_store) = task_store else {
-        return false;
+        return Ok(false);
     };
     let Some(root_task) = task_store.get_task(root_task_id) else {
-        return false;
+        return Ok(false);
     };
     if root_task.status != TaskStatus::Completed {
-        return false;
+        return Ok(false);
     }
 
     let Some(sidecar) = session_store.runtime_sidecar(session_id) else {
-        return false;
+        return Ok(false);
     };
     let Some(active_chain) = sidecar.active_execution_chain.as_ref() else {
-        return false;
+        return Ok(false);
     };
     if active_chain.root_task_id != *root_task_id {
-        return false;
+        return Ok(false);
     }
     let workspace_id = active_chain.workspace_id.clone();
     let Some(turn) = sidecar.current_turn.as_ref() else {
-        return false;
+        return Ok(false);
     };
     if expected_turn_id.is_some_and(|expected| expected != turn.turn_id) {
-        return false;
+        return Ok(false);
     }
     if current_turn_status_is_terminal(&turn.status) {
         let archived =
-            archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
+            archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?;
         if archived {
-            persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived");
+            persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived")?;
         }
-        return current_turn_status_is_completed(&turn.status) || archived;
+        return Ok(current_turn_status_is_completed(&turn.status) || archived);
     }
     let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
     else {
-        return false;
+        return Ok(false);
     };
-    let response = latest_root_task_assistant_final(turn, &root_task.task_id)
+    let response = match latest_root_task_assistant_final(turn, &root_task.task_id)
         .or_else(|| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
-        .or_else(|| {
-            ensure_root_completion_final_item(
-                session_store,
-                event_bus,
-                session_id,
-                &workspace_id,
-                &root_task,
-                task_store,
-                expected_turn_id,
-            )
-        });
+    {
+        Some(response) => Some(response),
+        None => match ensure_root_completion_final_item(
+            session_store,
+            session_id,
+            &root_task,
+            task_store,
+            expected_turn_id,
+        ) {
+            Ok(response) => response,
+            Err(error) => return Err(error),
+        },
+    };
     let event_item_id = response
         .as_ref()
         .map(|(_, item_id)| item_id.clone())
         .or_else(|| terminal_turn_event_anchor_item_id(turn, &orchestrator_thread.thread_id));
     let Some(event_item_id) = event_item_id else {
-        return false;
+        return Ok(false);
     };
 
-    if update_current_turn_completed_from_root(session_store, session_id, expected_turn_id).is_err()
+    if let Err(error) =
+        update_current_turn_completed_from_root(session_store, session_id, expected_turn_id)
     {
-        return false;
+        return Err(format!("根任务完成时 Turn completed 状态提交失败: {error}"));
     }
-    persist_session_state_checkpoint(persist_session_state, "session_task_turn_completed");
-    publish_current_session_turn_item_event(
+    archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?;
+    persist_session_state_checkpoint(persist_session_state, "session_task_turn_completed")?;
+    if let Err(error) = publish_current_session_turn_item_event(
         event_bus,
         session_store,
         session_id,
         &workspace_id,
         &event_item_id,
         Some(task_store),
-    );
-    if let Some((response_text, _)) = response {
-        let _ = event_bus.publish(
-            EventEnvelope::domain(
-                EventId::new(format!("event-message-assistant-{}", UtcMillis::now().0)),
-                "message.created",
-                serde_json::json!({
-                    "session_id": session_id.to_string(),
-                    "role": "assistant",
-                    "content": response_text,
-                }),
-            )
-            .with_context(EventContext {
-                session_id: Some(session_id.clone()),
-                ..EventContext::default()
-            }),
-        );
+    ) {
+        return Err(format!("根任务完成时 Turn 终态事件发布失败: {error}"));
     }
-    archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
-    persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived");
-    true
+    Ok(true)
 }
 
 /// 终态 root 不再占用会话的 active execution chain。
@@ -633,26 +633,57 @@ fn archive_terminal_active_execution_chain(
     session_store: &SessionStore,
     session_id: &SessionId,
     root_task_id: &TaskId,
-) -> bool {
+) -> Result<bool, String> {
+    let Some(sidecar) = session_store.runtime_sidecar(session_id) else {
+        return Ok(false);
+    };
+    let Some(chain) = sidecar.active_execution_chain.as_ref() else {
+        return Ok(false);
+    };
+    if chain.root_task_id != *root_task_id
+        || chain.recovery_ref.is_some()
+        || sidecar
+            .current_turn
+            .as_ref()
+            .is_some_and(daemon_restart_recovery_is_pending)
+    {
+        return Ok(false);
+    }
     session_store
-        .runtime_sidecar(session_id)
-        .filter(|sidecar| sidecar.recovery_id.is_none())
-        .and_then(|sidecar| sidecar.active_execution_chain)
-        .filter(|chain| chain.recovery_ref.is_none())
-        .filter(|chain| chain.root_task_id == *root_task_id)
-        .is_some_and(|_| {
-            session_store
-                .archive_active_execution_chain(session_id, root_task_id)
-                .is_ok()
-        })
+        .archive_active_execution_chain(session_id, root_task_id)
+        .map(|_| true)
+        .map_err(|error| format!("归档终态执行链失败: {error}"))
+}
+
+fn daemon_restart_recovery_is_pending(turn: &ActiveExecutionTurn) -> bool {
+    turn.items.iter().any(|item| {
+        item.metadata
+            .get("noticeKind")
+            .and_then(serde_json::Value::as_str)
+            == Some(SESSION_INTERRUPTION_NOTICE_KIND)
+            && item
+                .metadata
+                .get(SESSION_INTERRUPTION_SOURCE_KEY)
+                .and_then(serde_json::Value::as_str)
+                == Some(SESSION_INTERRUPTION_SOURCE_DAEMON_RESTART)
+            && matches!(
+                item.metadata
+                    .get(SESSION_INTERRUPTION_RECOVERY_STATE_KEY)
+                    .and_then(serde_json::Value::as_str),
+                Some(SESSION_INTERRUPTION_RECOVERY_READY)
+                    | Some(SESSION_INTERRUPTION_RECOVERY_CLAIMED)
+            )
+    })
 }
 
 fn terminal_chain_requires_archival(root_status: TaskStatus, turn_status: &str) -> bool {
-    matches!(root_status, TaskStatus::Completed | TaskStatus::Killed)
-        || matches!(
-            turn_status.trim().to_ascii_lowercase().as_str(),
-            "cancelled" | "canceled"
-        )
+    matches!(
+        root_status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+    ) || matches!(
+        turn_status.trim().to_ascii_lowercase().as_str(),
+        "interrupted" | "cancelled" | "canceled"
+    )
 }
 
 fn task_failure_output(task: &Task) -> Option<String> {
@@ -695,13 +726,13 @@ fn update_current_turn_completed_from_root(
     session_store: &SessionStore,
     session_id: &SessionId,
     expected_turn_id: Option<&str>,
-) -> Result<(), ()> {
+) -> Result<(), String> {
     match session_store
         .complete_current_turn_from_completed_root_task_for_turn(session_id, expected_turn_id)
-        .map_err(|_| ())?
+        .map_err(|error| format!("完成当前 Turn 失败: {error}"))?
     {
         Some(_) => Ok(()),
-        None => Err(()),
+        None => Err(format!("会话 {} 没有可完成的当前 Turn", session_id)),
     }
 }
 
@@ -719,7 +750,7 @@ pub fn terminal_turn_event_anchor_item_id(
 
 pub fn finalize_background_session_task_turn_if_root_terminal(
     context: FinalizeBackgroundSessionTaskTurnContext<'_>,
-) -> bool {
+) -> Result<bool, String> {
     let FinalizeBackgroundSessionTaskTurnContext {
         session_store,
         event_bus,
@@ -730,7 +761,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         expected_turn_id,
         persist_session_state,
     } = context;
-    if finalize_background_session_task_turn_if_root_completed_for_turn(
+    match finalize_background_session_task_turn_if_root_completed_for_turn(
         session_store,
         event_bus,
         task_store,
@@ -739,14 +770,16 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         expected_turn_id,
         persist_session_state,
     ) {
-        return true;
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(error) => return Err(error),
     }
 
     let Some(task_store) = task_store else {
-        return false;
+        return Ok(false);
     };
     let Some(root_task) = task_store.get_task(root_task_id) else {
-        return false;
+        return Ok(false);
     };
     let (turn_status, title, message) = match root_task.status {
         TaskStatus::Failed => (
@@ -769,17 +802,17 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             "任务执行已终止",
             "任务执行已终止。".to_string(),
         ),
-        _ => return false,
+        _ => return Ok(false),
     };
 
     let Some(sidecar) = session_store.runtime_sidecar(session_id) else {
-        return false;
+        return Ok(false);
     };
     let Some(active_chain) = sidecar.active_execution_chain.as_ref() else {
-        return false;
+        return Ok(false);
     };
     if active_chain.root_task_id != *root_task_id {
-        return false;
+        return Ok(false);
     }
     if expected_turn_id.is_some_and(|expected| {
         sidecar
@@ -787,72 +820,87 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             .as_ref()
             .is_none_or(|turn| turn.turn_id != expected)
     }) {
-        return false;
+        return Ok(false);
     }
     let workspace_id = active_chain.workspace_id.clone();
-    if let Some(turn) = sidecar.current_turn.as_ref()
-        && current_turn_status_is_terminal(&turn.status)
-    {
-        if terminal_chain_requires_archival(root_task.status, &turn.status) {
-            let archived =
-                archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
-            if archived {
-                persist_session_state_checkpoint(
-                    persist_session_state,
-                    "session_task_chain_archived",
-                );
-            }
-        }
-        return true;
-    }
     let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
     else {
-        return false;
+        return Ok(false);
     };
-    if sidecar.current_turn.as_ref().is_some_and(|turn| {
-        turn.status == turn_status
-            && turn.items.iter().any(|item| {
-                item.kind == "assistant_error"
-                    && item.source_thread_id == orchestrator_thread.thread_id
-            })
-    }) {
-        return true;
+    let Some(current_turn) = sidecar.current_turn.as_ref() else {
+        return Ok(false);
+    };
+    let existing_error_item_id = current_turn
+        .items
+        .iter()
+        .find(|item| {
+            item.kind == "assistant_error" && item.source_thread_id == orchestrator_thread.thread_id
+        })
+        .map(|item| item.item_id.clone());
+
+    // 已经收口的 Turn 不再重复 checkpoint 或广播同一个错误 item。只有仍占用
+    // active chain 的历史终态需要在这里完成一次归档，归档成功后由调用方释放 lease。
+    if current_turn_status_is_terminal(&current_turn.status) {
+        let archived = if terminal_chain_requires_archival(root_task.status, &current_turn.status) {
+            archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?
+        } else {
+            false
+        };
+        if archived {
+            persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived")?;
+        }
+        return Ok(archived);
     }
 
-    if session_store
+    let item_id = if let Some(item_id) = existing_error_item_id {
+        item_id
+    } else {
+        let item_id = format!("turn-item-assistant-error-{}", UtcMillis::now().0);
+        let mut error_item = session_turn_item(
+            "assistant_error",
+            turn_status,
+            Some(title.to_string()),
+            Some(message),
+            Some(item_id.clone()),
+            orchestrator_thread.thread_id.clone(),
+        );
+        error_item.task_id = Some(root_task_id.clone());
+        append_session_turn_item_for_turn(
+            session_store,
+            session_id,
+            expected_turn_id,
+            error_item,
+            Some(task_store),
+        )?
+        .ok_or_else(|| {
+            format!("终态 Turn 没有可写入的错误 item: session={session_id}, task={root_task_id}")
+        })?
+        .item
+        .item_id
+    };
+
+    session_store
         .update_current_turn_status_for_turn(session_id, expected_turn_id, turn_status)
-        .is_err()
-    {
-        return false;
+        .map_err(|error| format!("终态 Turn 失败状态提交失败: {error}"))?
+        .ok_or_else(|| {
+            format!("终态 Turn 没有可更新的失败状态: session={session_id}, task={root_task_id}")
+        })?;
+    if terminal_chain_requires_archival(root_task.status, turn_status) {
+        archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?;
     }
-
-    let item_id = format!("turn-item-assistant-error-{}", UtcMillis::now().0);
-    let mut error_item = session_turn_item(
-        "assistant_error",
-        turn_status,
-        Some(title.to_string()),
-        Some(message),
-        Some(item_id.clone()),
-        orchestrator_thread.thread_id.clone(),
-    );
-    error_item.task_id = Some(root_task_id.clone());
-    if let Some(published) = append_session_turn_item_for_turn(
+    persist_session_state_checkpoint(persist_session_state, "session_task_turn_failed")?;
+    if let Err(error) = publish_current_session_turn_item_event(
+        event_bus,
         session_store,
         session_id,
-        expected_turn_id,
-        error_item,
+        &workspace_id,
+        &item_id,
         Some(task_store),
     ) {
-        persist_session_state_checkpoint(persist_session_state, "session_task_turn_failed");
-        publish_session_turn_item_event(event_bus, session_id, &workspace_id, &published);
+        return Err(format!("根任务失败时 Turn 终态事件发布失败: {error}"));
     }
 
-    if terminal_chain_requires_archival(root_task.status, turn_status) {
-        archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
-        persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived");
-    }
-
-    true
+    Ok(true)
 }
 
 pub fn reconcile_terminal_session_task_turns(
@@ -906,6 +954,7 @@ pub fn reconcile_terminal_session_task_turns(
                     persist_session_state: None,
                 },
             )
+            .is_ok_and(|finalized| finalized)
         })
         .count()
 }
@@ -1079,13 +1128,15 @@ mod tests {
             None,
             Vec::new(),
         );
-        task_store.insert_task(failed_task(
-            "task-child-failure-worker",
-            &mission_id,
-            &root_task_id,
-            Some(root_task_id.clone()),
-            vec!["工具 file_write 执行失败：permission denied".to_string()],
-        ));
+        task_store
+            .insert_task(failed_task(
+                "task-child-failure-worker",
+                &mission_id,
+                &root_task_id,
+                Some(root_task_id.clone()),
+                vec!["工具 file_write 执行失败：permission denied".to_string()],
+            ))
+            .expect("子任务应插入");
 
         let message = task_failure_message(&task_store, &root_task);
 
@@ -1159,32 +1210,34 @@ mod tests {
                 },
             )
             .expect("terminal chain should persist");
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id,
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::LocalAgent,
-            title: "已停止任务".to_string(),
-            goal: "验证旧任务不会继续占用会话".to_string(),
-            status: TaskStatus::Failed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: TaskRuntimePayload::default(),
-            created_at: now,
-            updated_at: now,
-        });
+        task_store
+            .insert_task(Task {
+                task_id: root_task_id.clone(),
+                mission_id,
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::LocalAgent,
+                title: "已停止任务".to_string(),
+                goal: "验证旧任务不会继续占用会话".to_string(),
+                status: TaskStatus::Failed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("任务应插入");
 
         assert_eq!(
             reconcile_terminal_session_task_turns(&session_store, &event_bus, Some(&task_store),),

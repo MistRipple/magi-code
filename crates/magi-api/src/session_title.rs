@@ -111,7 +111,7 @@ pub(crate) fn refine_new_session_title_and_publish(
     let Some(title) = refined_title else {
         return false;
     };
-    if let Err(error) = state.persist_session_durable_state() {
+    if let Err(error) = state.persist_session_projection() {
         tracing::warn!(
             session_id = %session_id,
             ?error,

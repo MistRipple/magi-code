@@ -14,6 +14,7 @@
   import {
     clearMessageJump,
     beginTurnEditing,
+    commitOlderSessionHistoryPage,
     messagesState,
     setSessionHistoryState,
     updatePanelScrollState,
@@ -26,8 +27,19 @@
   } from '../stores/session-suggestions.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { getAgentSessionMessages } from '../web/agent-api';
-  import { normalizeCanonicalTurn } from '../shared/protocol/canonical-turn';
-  import { prependCanonicalSessionTurns } from '../stores/turn-store.svelte';
+  import { normalizeCanonicalTurnStrict } from '../shared/protocol/canonical-turn';
+  import { setCanonicalTimelineError } from '../stores/turn-store.svelte';
+  import { postBridgeMessage } from '../shared/bridges/bridge-runtime';
+  import {
+    MessageScrollCoordinator,
+    MessageLayoutStabilizer,
+    type ProgrammaticScrollIntent,
+  } from '../lib/message-scroll-coordinator';
+  import {
+    canScrollableElementConsumeWheel,
+    deriveMessageScrollDirection,
+    isMainMessageWheelInput,
+  } from '../lib/message-scroll-input';
   import {
     buildTurnNavigationItems,
     isTurnNavigationStatus,
@@ -84,7 +96,7 @@
   let previousLastRenderItemKey = '';
   let previousRenderWindowScope = '';
   const renderWindowScope = $derived(
-    `${displayContext}:${taskId || ''}:${safeRenderItems[safeRenderItems.length - 1]?.sessionId || ''}`
+    `${displayContext}:${taskId || ''}:${(messagesState.currentWorkspaceId || '').trim()}:${(messagesState.currentWorkspacePath || '').trim()}:${safeRenderItems[safeRenderItems.length - 1]?.sessionId || ''}`
   );
 
   $effect.pre(() => {
@@ -103,9 +115,13 @@
       if (previousLastIndex < 0) {
         visibleRenderLimit = Math.min(count, INITIAL_RENDER_WINDOW);
       } else {
+        const prependedCount = Math.max(0, previousLastIndex);
         const appendedCount = Math.max(0, count - previousLastIndex - 1);
-        if (appendedCount > 0) {
-          visibleRenderLimit = Math.min(count, visibleRenderLimit + appendedCount);
+        const newlyVisibleCount = prependedCount + appendedCount;
+        if (newlyVisibleCount > 0) {
+          // 保留原可见窗口的起点：前置历史也必须进入 DOM，否则滚到顶部后
+          // 分页虽然提交成功，用户仍看不到刚加载的消息。
+          visibleRenderLimit = Math.min(count, visibleRenderLimit + newlyVisibleCount);
         }
       }
     }
@@ -261,7 +277,7 @@
       .map((message) => `${message.id}:${resolveMessageRenderRevision(message)}`)
       .join('|');
   });
-  const messageElementSignature = $derived(safeRenderItems.map((item) => item.key).join('|'));
+  const messageElementSignature = $derived(activeRenderItems.map((item) => item.key).join('|'));
 
   const currentStreamingRenderItem = $derived.by(() => {
     for (let i = activeRenderItems.length - 1; i >= 0; i -= 1) {
@@ -618,33 +634,56 @@
   const persistedScrollAnchor = $derived(messagesState.scrollAnchors[panelKey]);
   const shouldAutoScroll = $derived(messagesState.autoScrollEnabled[panelKey]);
   const sessionHistory = $derived(messagesState.sessionHistory);
+
+  function currentScrollScopeKey(): string {
+    return `${panelKey}\u0000${currentHistoryLoadScopeKey()}`;
+  }
   const canLoadOlderHistory = $derived(Boolean(
     hasHiddenLocalHistory
     || (
       currentSessionId
       && sessionHistory.sessionId === currentSessionId
+      && (sessionHistory.workspaceId || '') === currentWorkspaceId
+      && (sessionHistory.workspacePath || '') === (messagesState.currentWorkspacePath || '').trim()
       && (
-        (sessionHistory.hasMoreBefore && sessionHistory.beforeCursor)
-        || (sessionHistory.canonicalHasMoreBefore && sessionHistory.canonicalBeforeCursor)
+        sessionHistory.canonicalHasMoreBefore
+        && sessionHistory.canonicalBeforeCursor
       )
-      && !sessionHistory.isLoadingBefore
+      && sessionHistory.historyLoadStatus !== 'loading'
+      && sessionHistory.historyLoadStatus !== 'exhausted'
     )
   ));
 
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
-  let historySentinelRef: HTMLDivElement | null = $state(null);
   const showScrollBtn = $derived(!shouldAutoScroll && safeRenderMessages.length > 0);
   let wasActive = $state(false);
-  let lastObservedScrollTop = $state(0);
+  let lastObservedScrollTop = 0;
   let activationRestoreNonce = 0;
-  let restoreAttemptTimers: Array<ReturnType<typeof setTimeout>> = [];
-  let historyObserver: IntersectionObserver | null = null;
   let contentResizeObserver: ResizeObserver | null = null;
   let contentResizeFrame = 0;
-  let programmaticScrollDepth = 0;
+  let layoutObservationNonce = 0;
+  let autoScrollScheduleNonce = 0;
+  const scrollCoordinator = new MessageScrollCoordinator();
+  const layoutStabilizer = new MessageLayoutStabilizer();
+  let scrollStateFrame = 0;
+  let pendingScrollState: {
+    scrollTop: number;
+    autoScrollEnabled: boolean;
+    persist: boolean;
+    panelKey: keyof ScrollPositions;
+    scopeKey: string;
+    interactionEpoch: number;
+    recoveryEpoch: number;
+  } | null = null;
   let historyLoadGeneration = 0;
   let historyLoadScopeKey = '';
+  let historyLoadRequest: { id: number; scopeKey: string; promise: Promise<boolean> } | null = null;
+  let nextHistoryLoadRequestId = 0;
+  let scrollInteractionEpoch = 0;
+  let scrollRecoveryEpoch = 0;
+  let renderWindowNonce = 0;
+  let destroyed = false;
 
   const HISTORY_LOAD_THRESHOLD_PX = 120;
 
@@ -652,21 +691,36 @@
     const workspaceId = (messagesState.currentWorkspaceId || '').trim();
     const workspacePath = (messagesState.currentWorkspacePath || '').trim();
     const sessionId = (messagesState.currentSessionId || '').trim();
-    return `${workspaceId || workspacePath}\u0000${sessionId}`;
+    return `${displayContext}\u0000${taskId || ''}\u0000${workspaceId}\u0000${workspacePath}\u0000${sessionId}`;
   }
+
+  // 在 DOM 结构变更前保留阅读锚点，变更后由统一布局事务补偿真实位移。
+  // 这个 effect 必须放在滚动状态和容器引用初始化之后。Svelte 5 的
+  // $effect.pre 可能在组件初始化阶段立即运行，提前读取 const 会触发
+  // TDZ 异常并让整个桌面 Renderer 变成黑屏。
+  $effect.pre(() => {
+    const signature = `${messageElementSignature}:${runtimeLayoutSignature}`;
+    void signature;
+    if (!isActive || shouldAutoScroll || !containerRef) return;
+    rememberCurrentLayoutAnchor();
+  });
 
   $effect(() => {
     const nextScopeKey = currentHistoryLoadScopeKey();
     if (nextScopeKey === historyLoadScopeKey) return;
     historyLoadScopeKey = nextScopeKey;
     historyLoadGeneration += 1;
+    renderWindowNonce += 1;
+    scrollInteractionEpoch += 1;
+    scrollRecoveryEpoch += 1;
+    lastObservedScrollTop = containerRef?.scrollTop || 0;
+    layoutObservationNonce += 1;
+    autoScrollScheduleNonce += 1;
+    disconnectContentResizeObserver();
+    cancelScheduledScrollStateSync();
+    scrollCoordinator.cancel();
+    layoutStabilizer.clear();
   });
-
-  function disconnectHistoryObserver() {
-    if (!historyObserver) return;
-    historyObserver.disconnect();
-    historyObserver = null;
-  }
 
   function disconnectContentResizeObserver() {
     contentResizeObserver?.disconnect();
@@ -677,62 +731,141 @@
     }
   }
 
-  function observeMessageLayoutChanges() {
-    disconnectContentResizeObserver();
-    if (!containerRef || typeof ResizeObserver === 'undefined') {
-      return;
-    }
-    contentResizeObserver = new ResizeObserver(() => {
-      if (!isActive || !shouldAutoScroll || !containerRef || contentResizeFrame) {
-        return;
-      }
-      contentResizeFrame = requestAnimationFrame(() => {
-        contentResizeFrame = 0;
-        if (isActive && shouldAutoScroll && containerRef) {
-          scrollPanelToBottom();
-        }
-      });
+  function settleOwnedHistoryRequest(
+    sessionId: string,
+    workspaceId: string,
+    workspacePath: string,
+    requestRevision: number,
+    requestCanonicalBeforeCursor: string | null,
+    requestId: number,
+  ): void {
+    const historyState = messagesState.sessionHistory;
+    if (
+      destroyed
+      || historyState.sessionId !== sessionId
+      || (historyState.workspaceId || '') !== workspaceId
+      || (historyState.workspacePath || '') !== workspacePath
+      || historyState.historyLoadStatus !== 'loading'
+      || (messagesState.currentSessionId || '').trim() !== sessionId
+      || (messagesState.currentWorkspaceId || '').trim() !== workspaceId
+      || (messagesState.currentWorkspacePath || '').trim() !== workspacePath
+      || historyLoadRequest?.id !== requestId
+    ) return;
+    setSessionHistoryState(sessionId, {
+      workspaceId,
+      workspacePath,
+      historyLoadStatus: 'idle',
+      expectedRevision: requestRevision,
+      expectedCanonicalBeforeCursor: requestCanonicalBeforeCursor,
     });
-    for (const element of containerRef.querySelectorAll<HTMLElement>('[data-message-id]')) {
-      contentResizeObserver.observe(element);
-    }
   }
 
-  function clearRestoreAttemptTimers() {
-    if (restoreAttemptTimers.length === 0) return;
-    for (const timer of restoreAttemptTimers) {
-      clearTimeout(timer);
+  function compensateLayoutAfterUpdate(
+    observationNonce: number,
+    observationScopeKey: string,
+    observationInteractionEpoch: number,
+    observationRecoveryEpoch: number,
+  ): void {
+    if (
+      destroyed
+      || !isActive
+      || observationNonce !== layoutObservationNonce
+      || observationScopeKey !== currentHistoryLoadScopeKey()
+      || observationInteractionEpoch !== scrollInteractionEpoch
+      || observationRecoveryEpoch !== scrollRecoveryEpoch
+      || !containerRef
+    ) return;
+    if (shouldAutoScroll) {
+      scrollPanelToBottom();
+      return;
     }
-    restoreAttemptTimers = [];
+    const currentAnchor = captureVisibleLayoutAnchor();
+    const compensatedTop = layoutStabilizer.compensate(
+      currentAnchor,
+      containerRef.scrollTop,
+      {
+        scopeKey: currentScrollScopeKey(),
+        interactionEpoch: observationInteractionEpoch,
+        recoveryEpoch: observationRecoveryEpoch,
+      },
+    );
+    if (compensatedTop !== null) {
+      setContainerScrollPosition(compensatedTop, 'restore');
+    }
+    rememberCurrentLayoutAnchor();
+    scheduleScrollStateSync(containerRef.scrollTop, false, false);
+  }
+
+  function observeMessageLayoutChanges(observationNonce: number) {
+    disconnectContentResizeObserver();
+    if (
+      observationNonce !== layoutObservationNonce
+      || destroyed
+      || !isActive
+      || !containerRef
+      || typeof ResizeObserver === 'undefined'
+    ) {
+      return;
+    }
+    const observationScopeKey = currentHistoryLoadScopeKey();
+    contentResizeObserver = new ResizeObserver(() => {
+      if (
+        observationNonce !== layoutObservationNonce
+        || destroyed
+        || !isActive
+        || observationScopeKey !== currentHistoryLoadScopeKey()
+        || !containerRef
+        || contentResizeFrame
+      ) {
+        return;
+      }
+      const observationInteractionEpoch = scrollInteractionEpoch;
+      const observationRecoveryEpoch = scrollRecoveryEpoch;
+      contentResizeFrame = requestAnimationFrame(() => {
+        contentResizeFrame = 0;
+        compensateLayoutAfterUpdate(
+          observationNonce,
+          observationScopeKey,
+          observationInteractionEpoch,
+          observationRecoveryEpoch,
+        );
+      });
+    });
+    for (const element of containerRef.querySelectorAll<HTMLElement>(
+      '[data-message-id], [data-layout-observation]',
+    )) {
+      contentResizeObserver.observe(element);
+    }
+    if (!layoutStabilizer.hasAnchor) {
+      rememberCurrentLayoutAnchor();
+    }
   }
 
   function scheduleActivationScrollRestore() {
     const restoreNonce = ++activationRestoreNonce;
-    clearRestoreAttemptTimers();
 
     const attemptRestore = () => {
       if (restoreNonce !== activationRestoreNonce) return;
-      if (!containerRef || !isActive) return;
+      if (destroyed || !containerRef || !isActive) return;
       restorePanelScrollPosition(false);
     };
 
-    // 多阶段恢复：覆盖 tab 切换后异步布局变化（代码高亮/卡片内容扩展）导致的位置漂移。
-    tick().then(async () => {
+    void tick().then(async () => {
+      if (restoreNonce !== activationRestoreNonce) return;
       if (persistedScrollAnchor?.messageId) {
         await revealRenderMessage(persistedScrollAnchor.messageId);
       }
+      if (restoreNonce !== activationRestoreNonce) return;
       attemptRestore();
       requestAnimationFrame(() => {
         attemptRestore();
       });
-      restoreAttemptTimers = [
-        setTimeout(() => attemptRestore(), 96),
-        setTimeout(() => attemptRestore(), 220),
-      ];
     });
   }
 
   async function revealRenderMessage(messageId: string): Promise<boolean> {
+    const scopeKey = currentHistoryLoadScopeKey();
+    const windowNonce = renderWindowNonce;
     const targetIndex = safeRenderItems.findIndex((item) => item.message.id === messageId);
     if (targetIndex < 0) {
       return false;
@@ -741,24 +874,39 @@
     if (requiredLimit > visibleRenderLimit) {
       visibleRenderLimit = requiredLimit;
       await tick();
+      if (
+        destroyed
+        || windowNonce !== renderWindowNonce
+        || scopeKey !== currentHistoryLoadScopeKey()
+      ) {
+        return false;
+      }
     }
     return true;
   }
 
-  function setContainerScrollPosition(nextTop: number) {
+  function setContainerScrollPosition(
+    nextTop: number,
+    intent: ProgrammaticScrollIntent = 'restore',
+  ) {
     if (!containerRef) return;
-    programmaticScrollDepth += 1;
     const maxScrollTop = Math.max(0, containerRef.scrollHeight - containerRef.clientHeight);
     const clampedTop = Math.max(0, Math.min(nextTop, maxScrollTop));
-    containerRef.style.scrollBehavior = 'auto';
+    const previousTop = containerRef.scrollTop;
+    const transaction = scrollCoordinator.begin(
+      clampedTop,
+      scrollInteractionEpoch,
+      currentScrollScopeKey(),
+      intent,
+    );
     containerRef.scrollTop = clampedTop;
+    scrollCoordinator.retarget(transaction.id, containerRef.scrollTop);
+    scrollCoordinator.completeIfUnchanged(
+      transaction.id,
+      previousTop,
+      containerRef.scrollTop,
+    );
     lastObservedScrollTop = containerRef.scrollTop;
-    requestAnimationFrame(() => {
-      if (containerRef) {
-        containerRef.style.scrollBehavior = '';
-      }
-      programmaticScrollDepth = Math.max(0, programmaticScrollDepth - 1);
-    });
   }
 
   function captureVisibleAnchor() {
@@ -777,7 +925,7 @@
       }
       return {
         messageId: candidate.dataset.messageId || null,
-        offsetTop: Math.round(rect.top - containerRect.top),
+        offsetTop: rect.top - containerRect.top,
       };
     }
     const lastCandidate = candidates[candidates.length - 1];
@@ -787,22 +935,100 @@
     const rect = lastCandidate.getBoundingClientRect();
     return {
       messageId: lastCandidate.dataset.messageId || null,
-      offsetTop: Math.round(rect.top - containerRect.top),
+      offsetTop: rect.top - containerRect.top,
     };
   }
 
-  function syncPanelScrollState(scrollTop: number, autoScrollEnabled: boolean, persist = true, anchor = captureVisibleAnchor()) {
-    updatePanelScrollState(panelKey, { scrollTop, autoScrollEnabled, anchor }, { persist });
+  function captureVisibleLayoutAnchor() {
+    const anchor = captureVisibleAnchor();
+    if (!anchor?.messageId) return null;
+    return {
+      messageId: anchor.messageId,
+      offsetTop: anchor.offsetTop,
+    };
+  }
+
+  function rememberCurrentLayoutAnchor(): void {
+    if (shouldAutoScroll) {
+      layoutStabilizer.clear();
+      return;
+    }
+    layoutStabilizer.remember(captureVisibleLayoutAnchor(), {
+      scopeKey: currentScrollScopeKey(),
+      interactionEpoch: scrollInteractionEpoch,
+      recoveryEpoch: scrollRecoveryEpoch,
+    });
+  }
+
+  function syncPanelScrollState(
+    scrollTop: number,
+    autoScrollEnabled: boolean,
+    persist = true,
+    anchor?: ReturnType<typeof captureVisibleAnchor>,
+  ) {
+    const input: {
+      scrollTop: number;
+      autoScrollEnabled: boolean;
+      anchor?: ReturnType<typeof captureVisibleAnchor>;
+    } = { scrollTop, autoScrollEnabled };
+    if (anchor !== undefined) input.anchor = anchor;
+    updatePanelScrollState(panelKey, input, { persist });
+  }
+
+  function cancelScheduledScrollStateSync() {
+    pendingScrollState = null;
+    if (scrollStateFrame) {
+      cancelAnimationFrame(scrollStateFrame);
+      scrollStateFrame = 0;
+    }
+  }
+
+  function scheduleScrollStateSync(scrollTop: number, autoScrollEnabled: boolean, persist = true) {
+    pendingScrollState = {
+      scrollTop,
+      autoScrollEnabled,
+      persist,
+      panelKey,
+      scopeKey: currentScrollScopeKey(),
+      interactionEpoch: scrollInteractionEpoch,
+      recoveryEpoch: scrollRecoveryEpoch,
+    };
+    if (scrollStateFrame) return;
+    scrollStateFrame = requestAnimationFrame(() => {
+      scrollStateFrame = 0;
+      const next = pendingScrollState;
+      pendingScrollState = null;
+      if (!next || destroyed || !containerRef || !isActive) return;
+      if (
+        next.panelKey !== panelKey
+        || next.scopeKey !== currentScrollScopeKey()
+        || next.interactionEpoch !== scrollInteractionEpoch
+        || next.recoveryEpoch !== scrollRecoveryEpoch
+      ) return;
+      syncPanelScrollState(
+        next.scrollTop,
+        next.autoScrollEnabled,
+        next.persist,
+        captureVisibleAnchor(),
+      );
+      rememberCurrentLayoutAnchor();
+    });
   }
 
   function scrollPanelToBottom(persist = true) {
     if (!containerRef) return;
-    setContainerScrollPosition(containerRef.scrollHeight - containerRef.clientHeight);
+    cancelScheduledScrollStateSync();
+    setContainerScrollPosition(
+      containerRef.scrollHeight - containerRef.clientHeight,
+      'follow-bottom',
+    );
+    layoutStabilizer.clear();
     syncPanelScrollState(containerRef.scrollTop, true, persist);
   }
 
   function restorePanelScrollPosition(persist = false) {
     if (!containerRef) return;
+    cancelScheduledScrollStateSync();
     if (shouldAutoScroll) {
       scrollPanelToBottom(persist);
       return;
@@ -815,13 +1041,18 @@
         const containerRect = containerRef.getBoundingClientRect();
         const elementRect = targetElement.getBoundingClientRect();
         const currentOffsetTop = elementRect.top - containerRect.top;
-        setContainerScrollPosition(containerRef.scrollTop + currentOffsetTop - anchor.offsetTop);
-        syncPanelScrollState(containerRef.scrollTop, false, persist, anchor);
+        setContainerScrollPosition(
+          containerRef.scrollTop + currentOffsetTop - anchor.offsetTop,
+          'restore',
+        );
+        rememberCurrentLayoutAnchor();
+        syncPanelScrollState(containerRef.scrollTop, false, persist, captureVisibleAnchor());
         return;
       }
     }
-    setContainerScrollPosition(persistedScrollTop);
-    syncPanelScrollState(containerRef.scrollTop, false, persist);
+    setContainerScrollPosition(persistedScrollTop, 'restore');
+    rememberCurrentLayoutAnchor();
+    syncPanelScrollState(containerRef.scrollTop, false, persist, captureVisibleAnchor());
   }
 
   // 任何可见卡片内容或状态变化都触发滚动判断，覆盖文本、思考、工具和文件卡片。
@@ -830,31 +1061,110 @@
     const _len = safeRenderMessages.length;
     const _sig = renderContentSignature;
     const _runtimeSig = runtimeLayoutSignature;
+    const scheduleNonce = ++autoScrollScheduleNonce;
     void _len;
     void _sig;
     void _runtimeSig;
     if (!active || !shouldAutoScroll || !containerRef) return;
     tick().then(() => {
-      if (!containerRef || !isActive || !shouldAutoScroll) return;
+      if (
+        scheduleNonce !== autoScrollScheduleNonce
+        || !containerRef
+        || !isActive
+        || !shouldAutoScroll
+      ) return;
       scrollPanelToBottom();
     });
   });
 
   $effect(() => {
     const active = isActive;
-    const signature = messageElementSignature;
+    const signature = `${messageElementSignature}:${runtimeLayoutSignature}`;
     void signature;
+    const observationNonce = ++layoutObservationNonce;
     if (!active || !containerRef) {
       disconnectContentResizeObserver();
       return;
     }
-    tick().then(observeMessageLayoutChanges);
+    tick().then(() => {
+      if (
+        observationNonce !== layoutObservationNonce
+        || destroyed
+        || !isActive
+        || !containerRef
+      ) return;
+      observeMessageLayoutChanges(observationNonce);
+      compensateLayoutAfterUpdate(
+        observationNonce,
+        currentHistoryLoadScopeKey(),
+        scrollInteractionEpoch,
+        scrollRecoveryEpoch,
+      );
+    });
   });
 
-  // 面板切回可见后，按 panel 维度恢复之前的位置；仅在可见性切换瞬间执行，避免覆盖用户手动滚动
+  // 没有形成溢出时浏览器不会派发 scroll 事件；历史窗口仍必须能继续向前展开。
+  // 必须在同一事务内连续加载，不能依赖加载状态切换后 effect 再次触发，
+  // 因为“展开本地窗口”本身可能不改变 effect 依赖值。
+  async function loadHistoryUntilScrollable(scopeKey: string): Promise<void> {
+    while (
+      !destroyed
+      && isActive
+      && scopeKey === currentHistoryLoadScopeKey()
+      && containerRef
+      && canLoadOlderHistory
+      && messagesState.sessionHistory.historyLoadStatus === 'idle'
+      && containerRef.scrollHeight <= containerRef.clientHeight + 1
+    ) {
+      const loaded = await requestOlderHistoryLoad();
+      if (!loaded) return;
+      await tick();
+    }
+  }
+
   $effect(() => {
     const active = isActive;
-    if (active && !wasActive && containerRef) {
+    const canLoad = canLoadOlderHistory;
+    const itemCount = safeRenderItems.length;
+    const historyLoadStatus = sessionHistory.historyLoadStatus;
+    void itemCount;
+    if (
+      !active
+      || !canLoad
+      || (historyLoadStatus !== 'idle' && !hasHiddenLocalHistory)
+      || !containerRef
+    ) return;
+    const scopeKey = currentHistoryLoadScopeKey();
+    void tick().then(() => {
+      if (
+        destroyed
+        || !isActive
+        || scopeKey !== currentHistoryLoadScopeKey()
+        || !containerRef
+        || !canLoadOlderHistory
+        || (
+          messagesState.sessionHistory.historyLoadStatus !== 'idle'
+          && !hasHiddenLocalHistory
+        )
+      ) return;
+      if (containerRef.scrollHeight <= containerRef.clientHeight + 1) {
+        void loadHistoryUntilScrollable(scopeKey);
+      }
+    });
+  });
+
+  // 面板可见性或会话作用域变化后恢复对应位置。作用域变化也必须触发恢复，
+  // 因为同一个面板实例可能只更新 session 而不会经历重新挂载。
+  let previousPanelRestoreScope = '';
+  $effect(() => {
+    const active = isActive;
+    const scope = `${displayContext}\u0000${taskId || ''}\u0000${currentWorkspaceId}\u0000${messagesState.currentWorkspacePath || ''}\u0000${currentSessionId}`;
+    const scopeChanged = scope !== previousPanelRestoreScope;
+    if (scopeChanged) {
+      previousPanelRestoreScope = scope;
+      activationRestoreNonce += 1;
+    }
+    if (active && (scopeChanged || !wasActive) && containerRef) {
       scheduleActivationScrollRestore();
     }
     wasActive = active;
@@ -865,6 +1175,7 @@
   $effect(() => {
     const jumpNonce = messagesState.messageJump.nonce;
     const targetMessageId = messagesState.messageJump.messageId;
+    const jumpScope = currentHistoryLoadScopeKey();
     if (!targetMessageId) return;
     if (jumpNonce === handledMessageJumpNonce) return;
     if (displayContext !== 'thread') return;
@@ -878,12 +1189,22 @@
     void revealRenderMessage(targetMessageId).then(async (revealed) => {
       if (!revealed) return;
       await tick();
-      if (!containerRef) return;
+      if (
+        !containerRef
+        || jumpNonce !== messagesState.messageJump.nonce
+        || jumpScope !== currentHistoryLoadScopeKey()
+      ) return;
       const selectorSafeId = targetMessageId.replace(/"/g, '\\"');
       const targetElement = containerRef.querySelector(`[data-message-id="${selectorSafeId}"]`) as HTMLElement | null;
       if (!targetElement) return;
 
-      targetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const containerRect = containerRef.getBoundingClientRect();
+      const elementRect = targetElement.getBoundingClientRect();
+      const targetTop = containerRef.scrollTop
+        + elementRect.top
+        - containerRect.top
+        - Math.max(0, (containerRef.clientHeight - elementRect.height) / 2);
+      scrollToPositionFromNavigation(targetTop);
       try {
         targetElement.animate(
           [
@@ -901,209 +1222,479 @@
     });
   });
 
-  $effect(() => {
-    const container = containerRef;
-    const sentinel = historySentinelRef;
-    const sessionId = currentSessionId;
-    const historyState = sessionHistory;
-    const canObserveHistory = Boolean(
-      container
-      && sentinel
-      && isActive
-      && (
-        hasHiddenLocalHistory
-        || (
-          sessionId
-          && historyState.sessionId === sessionId
-          && (
-            (historyState.hasMoreBefore && historyState.beforeCursor)
-            || (historyState.canonicalHasMoreBefore && historyState.canonicalBeforeCursor)
-          )
-        )
-      )
-    );
-
-    disconnectHistoryObserver();
-    if (!canObserveHistory || !container || !sentinel) {
-      return;
-    }
-
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) {
-        void loadOlderHistory();
-      }
-    }, {
-      root: container,
-      rootMargin: `${HISTORY_LOAD_THRESHOLD_PX}px 0px 0px 0px`,
-      threshold: 0,
-    });
-    observer.observe(sentinel);
-    historyObserver = observer;
-
-    return () => {
-      if (historyObserver === observer) {
-        historyObserver = null;
-      }
-      observer.disconnect();
+  function captureScrollSnapshot() {
+    if (!containerRef) return null;
+    return {
+      panelKey,
+      scopeKey: currentScrollScopeKey(),
+      interactionEpoch: scrollInteractionEpoch,
+      recoveryEpoch: scrollRecoveryEpoch,
+      anchor: captureVisibleAnchor(),
     };
-  });
-
-  async function revealPreviousRenderItems(): Promise<void> {
-    if (!hasHiddenLocalHistory) return;
-    const previousScrollHeight = containerRef?.scrollHeight ?? 0;
-    const previousScrollTop = containerRef?.scrollTop ?? 0;
-    visibleRenderLimit = Math.min(safeRenderItems.length, visibleRenderLimit + RENDER_WINDOW_CHUNK);
-    await tick();
-    if (containerRef) {
-      const addedHeight = Math.max(0, containerRef.scrollHeight - previousScrollHeight);
-      setContainerScrollPosition(previousScrollTop + addedHeight);
-      syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll);
-    }
   }
 
-  async function loadOlderHistory(): Promise<void> {
-    const sessionId = (messagesState.currentSessionId || '').trim();
-    const workspaceId = (messagesState.currentWorkspaceId || '').trim();
-    if (hasHiddenLocalHistory) {
-      await revealPreviousRenderItems();
+  function restoreScrollSnapshot(
+    snapshot: ReturnType<typeof captureScrollSnapshot>,
+    persist = false,
+  ) {
+    if (destroyed || !snapshot || !containerRef) return;
+    if (snapshot.panelKey !== panelKey || snapshot.scopeKey !== currentScrollScopeKey()) {
       return;
     }
-    if (!sessionId || hasActiveLocalTimelineTurn()) {
+    if (
+      snapshot.interactionEpoch !== scrollInteractionEpoch
+      || snapshot.recoveryEpoch !== scrollRecoveryEpoch
+    ) {
+      scheduleScrollStateSync(containerRef.scrollTop, shouldAutoScroll);
       return;
+    }
+
+    // 自动跟随底部时，历史窗口扩展只改变了视口上方内容；此时唯一正确的
+    // 恢复目标仍是底部，不能用旧的可见消息锚点把视口拉回历史位置。
+    if (shouldAutoScroll) {
+      scrollPanelToBottom(persist);
+      return;
+    }
+
+    let nextTop: number | null = null;
+    const snapshotAnchor = snapshot.anchor;
+    const messageId = snapshotAnchor?.messageId;
+    if (messageId) {
+      const selectorSafeId = messageId.replace(/"/g, '\\"');
+      const targetElement = containerRef.querySelector(
+        `[data-message-id="${selectorSafeId}"]`,
+      ) as HTMLElement | null;
+      if (targetElement) {
+        const containerRect = containerRef.getBoundingClientRect();
+        const elementRect = targetElement.getBoundingClientRect();
+        nextTop = containerRef.scrollTop
+          + elementRect.top
+          - containerRect.top
+          - snapshotAnchor.offsetTop;
+      }
+    }
+    // 没有稳定的可见消息锚点时不能用总高度差猜测位置：消息高度、折叠状态和
+    // 字体布局变化都可能让该差值与锚点上方的真实增量不同。保留浏览器当前
+    // 位置，等待下一次明确的布局事务重新捕获锚点。
+    if (nextTop === null) return;
+    setContainerScrollPosition(nextTop, 'restore');
+    rememberCurrentLayoutAnchor();
+    syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll, persist, captureVisibleAnchor());
+  }
+
+  async function revealPreviousRenderItems(
+    snapshot: ReturnType<typeof captureScrollSnapshot> = captureScrollSnapshot(),
+  ): Promise<boolean> {
+    if (!hasHiddenLocalHistory) return false;
+    const previousLimit = visibleRenderLimit;
+    visibleRenderLimit = Math.min(safeRenderItems.length, visibleRenderLimit + RENDER_WINDOW_CHUNK);
+    await tick();
+    restoreScrollSnapshot(snapshot);
+    return visibleRenderLimit > previousLimit;
+  }
+
+  async function loadOlderHistory(requestId: number): Promise<boolean> {
+    const sessionId = (messagesState.currentSessionId || '').trim();
+    const workspaceId = (messagesState.currentWorkspaceId || '').trim();
+    const workspacePath = (messagesState.currentWorkspacePath || '').trim();
+    if (hasHiddenLocalHistory) {
+      return revealPreviousRenderItems();
+    }
+    if (displayContext !== 'thread' || !sessionId || hasActiveLocalTimelineTurn()) {
+      return false;
     }
     const historyState = messagesState.sessionHistory;
     if (
       historyState.sessionId !== sessionId
-      || historyState.workspaceId !== workspaceId
-      || historyState.isLoadingBefore
-      || !(
-        (historyState.hasMoreBefore && historyState.beforeCursor)
-        || (historyState.canonicalHasMoreBefore && historyState.canonicalBeforeCursor)
-      )
+      || (historyState.workspaceId || '') !== workspaceId
+      || (historyState.workspacePath || '') !== workspacePath
+      || historyState.historyLoadStatus === 'loading'
+      || historyState.historyLoadStatus === 'exhausted'
+      || !(historyState.canonicalHasMoreBefore && historyState.canonicalBeforeCursor)
     ) {
-      return;
+      return false;
     }
-    const previousScrollHeight = containerRef?.scrollHeight ?? 0;
-    const previousScrollTop = containerRef?.scrollTop ?? 0;
     const requestGeneration = historyLoadGeneration;
     const requestScopeKey = currentHistoryLoadScopeKey();
+    const requestRevision = historyState.revision;
+    const requestCanonicalBeforeCursor = historyState.canonicalBeforeCursor;
     setSessionHistoryState(sessionId, {
       workspaceId,
-      isLoadingBefore: true,
+      workspacePath,
+      historyLoadStatus: 'loading',
     });
     try {
-      const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
       const response = await getAgentSessionMessages({
         sessionId,
         scope: workspaceId || workspacePath ? 'workspace' : 'personal',
         workspaceId,
         workspacePath,
-        beforeCursor: historyState.beforeCursor,
-        canonicalBeforeCursor: historyState.canonicalBeforeCursor,
+        canonicalBeforeCursor: requestCanonicalBeforeCursor,
         limit: 50,
       });
       if (
         requestGeneration !== historyLoadGeneration
         || requestScopeKey !== currentHistoryLoadScopeKey()
       ) {
-        return;
+        settleOwnedHistoryRequest(
+          sessionId,
+          workspaceId,
+          workspacePath,
+          requestRevision,
+          requestCanonicalBeforeCursor,
+          requestId,
+        );
+        return false;
       }
       const turns = Array.isArray(response.canonicalTurns)
-        ? response.canonicalTurns
-          .map((turn) => normalizeCanonicalTurn(turn))
-          .filter((turn): turn is NonNullable<ReturnType<typeof normalizeCanonicalTurn>> => Boolean(turn))
+        ? response.canonicalTurns.map((turn, index) => (
+          normalizeCanonicalTurnStrict(turn, `history.canonicalTurns[${index}]`)
+        ))
         : [];
-      prependCanonicalSessionTurns(sessionId, turns);
-      setSessionHistoryState(sessionId, {
+      // 请求期间用户可能已经改变阅读位置；快照必须在真正插入历史前捕获，不能写回请求开始时的旧位置。
+      const snapshot = captureScrollSnapshot();
+      const committed = commitOlderSessionHistoryPage({
+        sessionId,
         workspaceId,
-        hasMoreBefore: response.hasMoreBefore === true,
-        beforeCursor: typeof response.beforeCursor === 'string' ? response.beforeCursor : null,
+        workspacePath,
+        revision: requestRevision,
+        canonicalBeforeCursor: requestCanonicalBeforeCursor,
+        turns,
         canonicalHasMoreBefore: response.canonicalHasMoreBefore === true,
-        canonicalBeforeCursor: typeof response.canonicalBeforeCursor === 'string'
+        nextCanonicalBeforeCursor: typeof response.canonicalBeforeCursor === 'string'
           ? response.canonicalBeforeCursor
           : null,
       });
+      if (!committed.accepted) {
+        console.warn('[message-list] 更早的会话历史没有产生可提交的前进量', committed.reason);
+        if (committed.reason === 'stale') {
+          settleOwnedHistoryRequest(
+            sessionId,
+            workspaceId,
+            workspacePath,
+            requestRevision,
+            requestCanonicalBeforeCursor,
+            requestId,
+          );
+        }
+        return false;
+      }
       await tick();
-      if (hasHiddenLocalHistory) {
-        await revealPreviousRenderItems();
-        return;
-      }
-      if (containerRef) {
-        setContainerScrollPosition(
-          previousScrollTop + (containerRef.scrollHeight - previousScrollHeight),
+      if (
+        requestGeneration !== historyLoadGeneration
+        || requestScopeKey !== currentHistoryLoadScopeKey()
+      ) {
+        settleOwnedHistoryRequest(
+          sessionId,
+          workspaceId,
+          workspacePath,
+          requestRevision,
+          requestCanonicalBeforeCursor,
+          requestId,
         );
-        syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll);
+        return false;
       }
+      if (hasHiddenLocalHistory) {
+        await revealPreviousRenderItems(snapshot);
+        if (
+          requestGeneration !== historyLoadGeneration
+          || requestScopeKey !== currentHistoryLoadScopeKey()
+        ) {
+          settleOwnedHistoryRequest(
+            sessionId,
+            workspaceId,
+            workspacePath,
+            requestRevision,
+            requestCanonicalBeforeCursor,
+            requestId,
+          );
+          return false;
+        }
+        return true;
+      }
+      restoreScrollSnapshot(snapshot);
+      return committed.addedTurnCount > 0;
     } catch (error) {
       if (
         requestGeneration !== historyLoadGeneration
         || requestScopeKey !== currentHistoryLoadScopeKey()
       ) {
-        return;
+        settleOwnedHistoryRequest(
+          sessionId,
+          workspaceId,
+          workspacePath,
+          requestRevision,
+          requestCanonicalBeforeCursor,
+          requestId,
+        );
+        return false;
       }
       console.error('[message-list] 加载更早的会话历史失败:', error);
-    } finally {
-      if (
-        requestGeneration === historyLoadGeneration
-        && requestScopeKey === currentHistoryLoadScopeKey()
-      ) {
-        setSessionHistoryState(sessionId, {
-          workspaceId,
-          isLoadingBefore: false,
-        });
+      setSessionHistoryState(sessionId, {
+        workspaceId,
+        workspacePath,
+        historyLoadStatus: 'error',
+        expectedRevision: requestRevision,
+        expectedCanonicalBeforeCursor: requestCanonicalBeforeCursor,
+      });
+      setCanonicalTimelineError(error);
+      postBridgeMessage({ type: 'requestState' });
+      return false;
+    }
+  }
+
+  function requestOlderHistoryLoad(): Promise<boolean> {
+    const scopeKey = currentHistoryLoadScopeKey();
+    if (historyLoadRequest?.scopeKey === scopeKey) return historyLoadRequest.promise;
+    const id = ++nextHistoryLoadRequestId;
+    const promise = loadOlderHistory(id);
+    const request = { id, scopeKey, promise };
+    historyLoadRequest = request;
+    void promise.then(() => {
+      if (historyLoadRequest === request) historyLoadRequest = null;
+    }, () => {
+      if (historyLoadRequest === request) historyLoadRequest = null;
+    });
+    return promise;
+  }
+
+  function cancelScrollRecoveryForUserIntent(): void {
+    scrollRecoveryEpoch += 1;
+    layoutStabilizer.clear();
+    activationRestoreNonce += 1;
+    autoScrollScheduleNonce += 1;
+    scrollCoordinator.cancel();
+    if (contentResizeFrame) {
+      cancelAnimationFrame(contentResizeFrame);
+      contentResizeFrame = 0;
+    }
+    cancelScheduledScrollStateSync();
+  }
+
+  function canNestedScrollerConsumeWheel(target: EventTarget | null, deltaY: number): boolean {
+    if (!(target instanceof Element) || deltaY === 0) return false;
+    let element = target instanceof HTMLElement ? target : target.parentElement;
+    while (element && element !== containerRef) {
+      const style = getComputedStyle(element);
+      if (canScrollableElementConsumeWheel(deltaY, element, style.overflowY)) return true;
+      element = element.parentElement;
+    }
+    return false;
+  }
+
+  function handleWheelIntent(event: WheelEvent, node: HTMLDivElement): void {
+    const nestedScrollerCanConsume = canNestedScrollerConsumeWheel(event.target, event.deltaY);
+    if (!isMainMessageWheelInput({
+      deltaY: event.deltaY,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      nestedScrollerCanConsume,
+    })) return;
+    // 只有主列表会实际消费这次滚轮输入时，才取消它的程序滚动恢复。
+    if (event.target instanceof Element && !node.contains(event.target)) return;
+    cancelScrollRecoveryForUserIntent();
+    if (event.deltaY < 0) {
+      // 滚动条已经在顶端时浏览器不会再派发 scroll，但这仍是明确的历史阅读意图。
+      if (shouldAutoScroll) {
+        updatePanelScrollState(panelKey, { autoScrollEnabled: false }, { persist: false });
+      }
+      if (node.scrollTop <= HISTORY_LOAD_THRESHOLD_PX) {
+        void requestOlderHistoryLoad();
       }
     }
+  }
+
+  function handleKeydownIntent(event: KeyboardEvent): void {
+    const scrollingUp = event.key === 'ArrowUp'
+      || event.key === 'PageUp'
+      || event.key === 'Home'
+      || (event.key === ' ' && event.shiftKey);
+    const scrollingDown = event.key === 'ArrowDown'
+      || event.key === 'PageDown'
+      || event.key === 'End'
+      || (event.key === ' ' && !event.shiftKey);
+    if (scrollingUp || scrollingDown) {
+      cancelScrollRecoveryForUserIntent();
+    }
+  }
+
+  function installScrollIntentHandlers(node: HTMLDivElement) {
+    let pointerStart: { x: number; y: number; pointerType: string } | null = null;
+    let touchStart: { x: number; y: number } | null = null;
+    const isInteractiveTarget = (target: EventTarget | null): boolean => (
+      target instanceof Element
+      && Boolean(target.closest('button, a, input, textarea, select, [contenteditable="true"]'))
+    );
+    const onWheel = (event: WheelEvent) => handleWheelIntent(event, node);
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.isPrimary === false) return;
+      pointerStart = { x: event.clientX, y: event.clientY, pointerType: event.pointerType };
+      if (!isInteractiveTarget(event.target)) {
+        node.focus({ preventScroll: true });
+      }
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      if (
+        !pointerStart
+        || event.isPrimary === false
+        || (pointerStart.pointerType === 'mouse' && event.buttons === 0)
+      ) return;
+      const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y);
+      if (moved > 3) {
+        pointerStart = null;
+        cancelScrollRecoveryForUserIntent();
+      }
+    };
+    const onPointerEnd = () => {
+      pointerStart = null;
+    };
+    const onTouchStart = (event: TouchEvent) => {
+      const touch = event.touches[0];
+      if (touch) touchStart = { x: touch.clientX, y: touch.clientY };
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      const touch = event.touches[0];
+      if (!touchStart || !touch) return;
+      const moved = Math.hypot(touch.clientX - touchStart.x, touch.clientY - touchStart.y);
+      if (moved > 3) {
+        touchStart = null;
+        cancelScrollRecoveryForUserIntent();
+      }
+    };
+    const onTouchEnd = () => {
+      touchStart = null;
+    };
+    const onKeydown = (event: KeyboardEvent) => handleKeydownIntent(event);
+
+    node.addEventListener('wheel', onWheel, { passive: true });
+    node.addEventListener('pointerdown', onPointerDown);
+    node.addEventListener('pointermove', onPointerMove);
+    node.addEventListener('pointerup', onPointerEnd);
+    node.addEventListener('pointercancel', onPointerEnd);
+    node.addEventListener('touchstart', onTouchStart, { passive: true });
+    node.addEventListener('touchmove', onTouchMove, { passive: true });
+    node.addEventListener('touchend', onTouchEnd, { passive: true });
+    node.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    node.addEventListener('keydown', onKeydown);
+    return {
+      destroy() {
+        node.removeEventListener('wheel', onWheel);
+        node.removeEventListener('pointerdown', onPointerDown);
+        node.removeEventListener('pointermove', onPointerMove);
+        node.removeEventListener('pointerup', onPointerEnd);
+        node.removeEventListener('pointercancel', onPointerEnd);
+        node.removeEventListener('touchstart', onTouchStart);
+        node.removeEventListener('touchmove', onTouchMove);
+        node.removeEventListener('touchend', onTouchEnd);
+        node.removeEventListener('touchcancel', onTouchEnd);
+        node.removeEventListener('keydown', onKeydown);
+      },
+    };
   }
 
   // 检测用户是否手动滚动
   function handleScroll(event: Event) {
     const target = event.target as HTMLDivElement;
+    if (target !== containerRef) return;
     const { scrollTop, scrollHeight, clientHeight } = target;
     const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
     const isNearBottom = distanceFromBottom < 100;
-    const userScrolledUp = scrollTop < lastObservedScrollTop - 4;
-    let nextAutoScroll = shouldAutoScroll;
-    if (isNearBottom) {
-      nextAutoScroll = true;
-    } else if (userScrolledUp) {
-      nextAutoScroll = false;
+    const scrollScopeKey = currentScrollScopeKey();
+    const hadPendingProgrammaticScroll = scrollCoordinator.isPendingFor(
+      scrollInteractionEpoch,
+      scrollScopeKey,
+    );
+    const programmaticIntent = scrollCoordinator.consumeIntentIfMatches(
+      scrollTop,
+      scrollInteractionEpoch,
+      scrollScopeKey,
+    );
+    const isProgrammaticScroll = programmaticIntent !== null;
+    const isUnconfirmedProgrammaticScroll = hadPendingProgrammaticScroll && !isProgrammaticScroll;
+    const userScrollDirection = deriveMessageScrollDirection(scrollTop, lastObservedScrollTop);
+    if (isUnconfirmedProgrammaticScroll) {
+      // 旧的应用 scroll 事件可能晚于新的目标写入到达。它没有携带来源，
+      // 不能把当前事务取消或写入错误的位置；真实输入会先由 wheel/pointer/touch/keyboard
+      // 监听器显式取消事务。
+      lastObservedScrollTop = scrollTop;
+      return;
     }
-    if (programmaticScrollDepth === 0) {
-      activationRestoreNonce += 1;
-      clearRestoreAttemptTimers();
+    const userScroll = !isProgrammaticScroll && userScrollDirection !== 'none';
+    if (userScroll) {
+      scrollInteractionEpoch += 1;
+    }
+    let nextAutoScroll = shouldAutoScroll;
+    if (programmaticIntent === 'follow-bottom') {
+      nextAutoScroll = true;
+    } else if (programmaticIntent) {
+      nextAutoScroll = false;
+    } else if (userScrollDirection === 'up') {
+      nextAutoScroll = false;
+    } else if (isNearBottom) {
+      nextAutoScroll = true;
     }
     lastObservedScrollTop = scrollTop;
-    syncPanelScrollState(scrollTop, nextAutoScroll);
-    if (scrollTop <= HISTORY_LOAD_THRESHOLD_PX) {
-      void loadOlderHistory();
+    if (nextAutoScroll !== shouldAutoScroll) {
+      updatePanelScrollState(panelKey, { autoScrollEnabled: nextAutoScroll }, { persist: false });
+    }
+    rememberCurrentLayoutAnchor();
+    scheduleScrollStateSync(scrollTop, nextAutoScroll);
+    if (!isProgrammaticScroll && userScrollDirection === 'up' && scrollTop <= HISTORY_LOAD_THRESHOLD_PX) {
+      void requestOlderHistoryLoad();
     }
   }
 
-  function handleWheel(event: WheelEvent) {
-    if (
-      event.deltaY < 0
-      && containerRef
-      && containerRef.scrollTop <= HISTORY_LOAD_THRESHOLD_PX
-    ) {
-      void loadOlderHistory();
-    }
+  function scrollToPositionFromNavigation(nextTop: number): void {
+    if (!containerRef) return;
+    scrollInteractionEpoch += 1;
+    activationRestoreNonce += 1;
+    cancelScheduledScrollStateSync();
+    setContainerScrollPosition(nextTop, 'navigation');
+    syncPanelScrollState(containerRef.scrollTop, false, true, captureVisibleAnchor());
   }
 
   // 滚动到底部
   function scrollToBottom() {
+    scrollInteractionEpoch += 1;
+    activationRestoreNonce += 1;
     updatePanelScrollState(panelKey, { autoScrollEnabled: true }, { persist: false });
     scrollPanelToBottom(false);
   }
 
   onDestroy(() => {
+    destroyed = true;
     activationRestoreNonce += 1;
-    clearRestoreAttemptTimers();
-    disconnectHistoryObserver();
+    layoutObservationNonce += 1;
+    autoScrollScheduleNonce += 1;
+    historyLoadGeneration += 1;
     disconnectContentResizeObserver();
+    cancelScheduledScrollStateSync();
+    scrollCoordinator.destroy();
+    layoutStabilizer.clear();
+    const historyState = messagesState.sessionHistory;
+    const sessionId = (messagesState.currentSessionId || '').trim();
+    const workspaceId = (messagesState.currentWorkspaceId || '').trim();
+    const workspacePath = (messagesState.currentWorkspacePath || '').trim();
+    if (
+      displayContext === 'thread'
+      && historyLoadRequest?.scopeKey === currentHistoryLoadScopeKey()
+      && historyState.historyLoadStatus === 'loading'
+      && historyState.sessionId === sessionId
+      && (historyState.workspaceId || '') === workspaceId
+      && (historyState.workspacePath || '') === workspacePath
+    ) {
+      setSessionHistoryState(sessionId, {
+        workspaceId,
+        workspacePath,
+        historyLoadStatus: 'idle',
+        expectedRevision: historyState.revision,
+        expectedCanonicalBeforeCursor: historyState.canonicalBeforeCursor,
+      });
+    }
     if (!containerRef) {
       return;
     }
-    syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll);
+    syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll, true, captureVisibleAnchor());
   });
 </script>
 
@@ -1112,20 +1703,20 @@
     items={turnNavigationItems}
     container={containerRef}
     onRevealMessage={revealRenderMessage}
+    onScrollToPosition={scrollToPositionFromNavigation}
   />
   <div
     class="message-list"
     bind:this={containerRef}
+    role="log"
+    tabindex="-1"
+    use:installScrollIntentHandlers
     onscroll={handleScroll}
-    onwheel={handleWheel}
     data-panel-id={displayContext === 'thread' ? 'thread' : (taskId || 'task')}
     data-display-context={displayContext}
     data-conversation-display-mode={conversationDisplayMode}
     data-panel-active={isActive ? 'true' : 'false'}
   >
-    {#if safeRenderItems.length > 0 && (canLoadOlderHistory || sessionHistory.isLoadingBefore)}
-      <div class="history-sentinel" bind:this={historySentinelRef} aria-hidden="true"></div>
-    {/if}
     {#if timelineRenderEntries.length === 0}
       <div class="empty-state">
         <div class:empty-icon-with-suggestions={showSuggestions} class="empty-icon">
@@ -1195,15 +1786,15 @@
             {/if}
           </div>
         {/if}
-        {#if canLoadOlderHistory || sessionHistory.isLoadingBefore}
+        {#if canLoadOlderHistory || sessionHistory.historyLoadStatus === 'loading'}
           <button
             type="button"
             class="empty-history-load"
-            onclick={() => void loadOlderHistory()}
+            onclick={() => requestOlderHistoryLoad()}
             disabled={!canLoadOlderHistory}
           >
-            <Icon name={sessionHistory.isLoadingBefore ? 'loader' : 'chevron-up'} size={14} />
-            <span>{sessionHistory.isLoadingBefore ? i18n.t('messageList.loadingOlder') : i18n.t('messageList.loadOlder')}</span>
+            <Icon name={sessionHistory.historyLoadStatus === 'loading' ? 'loader' : 'chevron-up'} size={14} />
+            <span>{sessionHistory.historyLoadStatus === 'loading' ? i18n.t('messageList.loadingOlder') : i18n.t('messageList.loadOlder')}</span>
           </button>
         {/if}
       </div>
@@ -1235,12 +1826,16 @@
           />
         {:else}
           {#if entry.kind === 'runtime'}
-            <TurnRuntimeIndicator elapsedSeconds={elapsedSeconds} />
+            <div class="message-runtime-entry" data-layout-observation="runtime">
+              <TurnRuntimeIndicator elapsedSeconds={elapsedSeconds} />
+            </div>
           {:else}
-            <TurnRuntimeSummary
-              durationMs={normalizedRuntimeDurationMs}
-              completedAt={normalizedRuntimeCompletedAt}
-            />
+            <div class="message-runtime-entry" data-layout-observation="runtime-summary">
+              <TurnRuntimeSummary
+                durationMs={normalizedRuntimeDurationMs}
+                completedAt={normalizedRuntimeCompletedAt}
+              />
+            </div>
           {/if}
         {/if}
       {/each}
@@ -1274,11 +1869,16 @@
     min-height: 0; /* flex 布局防溢出 */
     overflow-y: auto;
     overflow-x: hidden;
+    scrollbar-gutter: stable;
     /* 消息列随中间面板自适应铺满，仅保留基础安全留白。 */
     padding-block: var(--space-4);
     padding-inline: var(--space-4);
-    /* 🔧 优化：禁用浏览器默认的滚动锚定，防止与自动滚动逻辑冲突导致抖动 */
+    /* 阅读位置由应用消息锚点统一维护，避免浏览器锚点与应用恢复竞争。 */
     overflow-anchor: none;
+  }
+
+  .message-runtime-entry {
+    flex: 0 0 auto;
   }
 
   /* 轮次导航轨道只占用左侧窄条，不限制消息列的横向自适应宽度。 */
@@ -1286,14 +1886,6 @@
     .message-list-wrapper.has-turn-navigation .message-list {
       padding-left: calc(var(--space-4) + 8px);
     }
-  }
-
-  .history-sentinel {
-    flex: 0 0 1px;
-    width: 100%;
-    height: 1px;
-    margin-bottom: calc(-1 * var(--space-3));
-    pointer-events: none;
   }
 
   /* 纵向居中由全局 .empty-state 的 flex: 1 + justify-content: center 负责，

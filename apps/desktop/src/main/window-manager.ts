@@ -11,7 +11,10 @@ import type {
   BrowserSurfaceBinding,
   BrowserSurfaceIdentity,
 } from "@magi/desktop-browser-contracts";
-import type { BrowserSurfaceManager } from "./browser-surface-manager.js";
+import type {
+  BrowserSurfaceActivationInput,
+  BrowserSurfaceManager,
+} from "./browser-surface-manager.js";
 import {
   DesktopOverlayManager,
   type DesktopOverlayAction,
@@ -45,6 +48,14 @@ interface DesktopWindowRecord {
   closed: boolean;
 }
 
+interface BrowserSurfaceReadinessWaiter {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+const BROWSER_SURFACE_READY_TIMEOUT_MS = 15_000;
+
 export interface DesktopAppearance {
   backgroundColor: string;
   accentColor: string;
@@ -76,6 +87,7 @@ export class WindowManager {
   readonly #overlayManager: DesktopOverlayManager;
   readonly #windows: Map<string, BaseWindow>;
   readonly #records = new Map<string, DesktopWindowRecord>();
+  readonly #browserSurfaceReadiness = new Map<string, Set<BrowserSurfaceReadinessWaiter>>();
   readonly #onSnapshot: (snapshot: DesktopWindowSnapshot) => void;
   #appearance: DesktopAppearance = {
     backgroundColor: "#0f1115",
@@ -191,6 +203,13 @@ export class WindowManager {
       record,
       record.rendererRecoveryUrl ?? this.rendererUrl(record.windowId),
     )));
+    // Worker/daemon 重连只恢复控制协议，不会触发 Renderer 再次上报几何。
+    // 对当前窗口重放同一份完整布局事务，重新校验并挂载当前 Browser Tab
+    // 的物理内容槽；未确认的几何仍保持不可挂载，不使用过期 bounds。
+    for (const record of [...this.#records.values()]) {
+      if (record.closed || record.window.isDestroyed()) continue;
+      this.applyLayout(record);
+    }
   }
 
   activeWindowId(): string {
@@ -204,6 +223,7 @@ export class WindowManager {
 
   snapshot(windowId: string): DesktopWindowSnapshot {
     const record = this.requireWindow(windowId);
+    this.reconcileActiveBrowserSurface(record);
     const layout = snapshotWindowLayout(record.layout);
     return {
       desktopEpoch: this.#desktopEpoch,
@@ -270,6 +290,19 @@ export class WindowManager {
       surfaceId: binding.surface_id,
     });
     return this.applyLayout(record);
+  }
+
+  async ensureBrowserSurface(
+    input: BrowserSurfaceActivationInput,
+  ): Promise<DesktopWindowSnapshot> {
+    const readiness = this.waitForBrowserSurface(input.windowId, input.tabId);
+    try {
+      await this.activateBrowser(input);
+      await readiness.promise;
+      return this.snapshot(input.windowId);
+    } finally {
+      readiness.cancel();
+    }
   }
 
   activatePanel(windowId: string, kind: PanelKind, tabId: string | null): DesktopWindowSnapshot {
@@ -755,9 +788,20 @@ export class WindowManager {
       && layout.activePanelKind === "browser"
       && Boolean(layout.activeTabId)
       && Boolean(layout.activeSurfaceId);
-    const currentBrowserContentBounds = browserSurfaceActive ? browserContentBounds(layout) : null;
-    const currentBrowserParentBounds = browserSurfaceActive
-      ? layout.rendererGeometry?.rightPaneBounds ?? null
+    // layoutRevision 变化只表示父布局正在等待 Renderer 完成一次新的 DOM
+    // 排版。只要仍是同一个 Browser Tab/Surface，就继续使用最后一份完整
+    // frame，让 Chromium 原生视图连续显示；下一份确认 frame 到达后再原子
+    // 更新 bounds。把这个等待窗口当成“不可用”会先卸载 WebContentsView，
+    // 直接制造拖拽时的黑屏和闪烁。
+    const rendererGeometryForActiveSurface = browserSurfaceActive
+      && layout.rendererGeometry?.browserContentSlot?.tabId === layout.activeTabId
+      ? layout.rendererGeometry
+      : null;
+    const currentBrowserContentBounds = browserSurfaceActive && rendererGeometryForActiveSurface
+      ? browserContentBounds(layout)
+      : null;
+    const currentBrowserParentBounds = browserSurfaceActive && rendererGeometryForActiveSurface
+      ? rendererGeometryForActiveSurface.rightPaneBounds ?? null
       : null;
     // Root View 是所有原生子 View 的坐标系，必须在每个布局事务开始时
     // 先收敛到同一内容区，不能只调整子 View。
@@ -765,7 +809,7 @@ export class WindowManager {
     setViewBounds(record.appView, layout.appBounds as Rectangle);
     record.appView.setVisible(true);
     if (!browserSurfaceActive) {
-      this.#surfaceManager.bindContentSurface(record.windowId, "", null);
+      this.#surfaceManager.bindContentSurface(record.windowId, "", null, null);
     } else if (layout.activeTabId) {
       // Renderer 已在 DOM 完成排版后报告真实内容槽。Main 只消费经过
       // revision 校验的槽位并同步原生 Surface，不反向修改 Renderer 布局，
@@ -774,13 +818,116 @@ export class WindowManager {
       this.#surfaceManager.bindContentSurface(
         record.windowId,
         layout.activeTabId,
+        layout.activeSurfaceId,
         currentBrowserContentBounds,
         currentBrowserParentBounds,
       );
     }
+    this.resolveBrowserSurfaceReadiness(record);
     this.#overlayManager.updateLayout(record.windowId, layout);
     this.#onSnapshot(snapshot);
     return snapshot;
+  }
+
+  private reconcileActiveBrowserSurface(record: DesktopWindowRecord): void {
+    const { layout } = record;
+    if (
+      layout.activePanelKind !== "browser"
+      || !layout.activeTabId
+      || !layout.activeSurfaceId
+    ) return;
+    const binding = this.#surfaceManager.bindingForSurface(layout.activeSurfaceId);
+    if (
+      binding
+      && binding.window_id === record.windowId
+      && binding.tab_id === layout.activeTabId
+    ) return;
+    // activeSurfaceId 是物理 Surface 的身份，不是逻辑 Tab 的存在标记。
+    // Surface 已销毁或被替换后必须立刻清除它，避免后续布局继续消费旧的
+    // renderer geometry，并让 Renderer 收到一个明确的无 Surface 状态。
+    record.layout = reduceWindowLayout(record.layout, {
+      type: "active_panel",
+      kind: "browser",
+      tabId: layout.activeTabId,
+      surfaceId: null,
+    });
+  }
+
+  private waitForBrowserSurface(windowId: string, tabId: string): {
+    promise: Promise<void>;
+    cancel: () => void;
+  } {
+    const record = this.requireWindow(windowId);
+    if (this.isBrowserSurfaceReady(record, tabId)) {
+      return { promise: Promise.resolve(), cancel: () => undefined };
+    }
+
+    const key = browserSurfaceReadinessKey(windowId, tabId);
+    let active = true;
+    let resolvePromise!: () => void;
+    let rejectPromise!: (error: Error) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    // ensureBrowserSurface owns this promise, including activation failure
+    // paths. This handler prevents a concurrent window close from creating an
+    // unhandled rejection after that path has already returned.
+    void promise.catch(() => undefined);
+    const finish = (error?: Error): void => {
+      if (!active) return;
+      active = false;
+      clearTimeout(timer);
+      const waiters = this.#browserSurfaceReadiness.get(key);
+      waiters?.delete(waiter);
+      if (waiters && waiters.size === 0) this.#browserSurfaceReadiness.delete(key);
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    };
+    const timer = setTimeout(() => {
+      finish(new Error("browser_surface_content_slot_unavailable"));
+    }, BROWSER_SURFACE_READY_TIMEOUT_MS);
+    timer.unref();
+    const waiter: BrowserSurfaceReadinessWaiter = {
+      resolve: () => finish(),
+      reject: (error) => finish(error),
+      timer,
+    };
+    const waiters = this.#browserSurfaceReadiness.get(key) ?? new Set();
+    waiters.add(waiter);
+    this.#browserSurfaceReadiness.set(key, waiters);
+    this.resolveBrowserSurfaceReadiness(record);
+    return {
+      promise,
+      cancel: () => finish(),
+    };
+  }
+
+  private resolveBrowserSurfaceReadiness(record: DesktopWindowRecord): void {
+    for (const [key, waiters] of this.#browserSurfaceReadiness) {
+      if (!key.startsWith(`${record.windowId}\u0000`)) continue;
+      const tabId = key.slice(record.windowId.length + 1);
+      if (!this.isBrowserSurfaceReady(record, tabId)) continue;
+      for (const waiter of [...waiters]) waiter.resolve();
+    }
+  }
+
+  private isBrowserSurfaceReady(record: DesktopWindowRecord, tabId: string): boolean {
+    const layout = record.layout;
+    if (
+      record.closed
+      || !layout.rightPaneVisible
+      || layout.activePanelKind !== "browser"
+      || layout.activeTabId !== tabId
+      || !layout.activeSurfaceId
+    ) return false;
+    const binding = this.#surfaceManager.bindingForTabInWindow(tabId, record.windowId);
+    return Boolean(
+      binding
+      && binding.surface_id === layout.activeSurfaceId
+      && this.#surfaceManager.isPrimary(binding)
+      && this.#surfaceManager.isRenderableBinding(binding),
+    );
   }
 
   private clearRendererGeometry(record: DesktopWindowRecord): void {
@@ -799,6 +946,10 @@ export class WindowManager {
   private closeRecord(record: DesktopWindowRecord): void {
     if (record.closed) return;
     record.closed = true;
+    for (const [key, waiters] of this.#browserSurfaceReadiness) {
+      if (!key.startsWith(`${record.windowId}\u0000`)) continue;
+      for (const waiter of [...waiters]) waiter.reject(new Error("desktop_window_closed"));
+    }
     this.#overlayManager.closeWindow(record.windowId);
     this.#surfaceManager.closeWindow(record.windowId);
     if (!record.window.isDestroyed()) {
@@ -820,6 +971,10 @@ function sameBounds(left: Rectangle, right: Rectangle): boolean {
     && left.y === right.y
     && left.width === right.width
     && left.height === right.height;
+}
+
+function browserSurfaceReadinessKey(windowId: string, tabId: string): string {
+  return `${windowId}\u0000${tabId}`;
 }
 
 function isStaleActivationError(error: unknown): boolean {

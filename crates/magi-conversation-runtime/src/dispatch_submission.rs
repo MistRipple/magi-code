@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
-    AccessProfile, DomainError, ExecutionOwnership, GoalId, MissionId, PlanItemId, SessionId,
-    TaskCompletionContract, TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind,
-    TaskRecoveryCheckpoint, TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, DomainError, DomainResult, ExecutionOwnership, GoalId, MissionId, PlanItemId,
+    SessionId, TaskCompletionContract, TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind,
+    TaskRecoveryCheckpoint, TaskStatus, TaskTier, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, InMemoryEventBus, task_events};
 use magi_orchestrator::{
@@ -21,10 +21,11 @@ use magi_orchestrator::{
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnItemKind,
-    SessionStore, ThreadChatMessage, ThreadContextCheckpoint, TimelineEntryInput,
-    TimelineEntryKind,
+    ExecutionThread, SessionPlan, SessionRuntimeSidecar, SessionStore, ThreadChatMessage,
+    ThreadContextCheckpoint, TimelineEntryInput, TimelineEntryKind,
 };
 use magi_spawn_graph::SpawnGraph;
+use serde::{Deserialize, Serialize};
 
 use crate::session_thread;
 
@@ -43,13 +44,240 @@ pub struct DispatchSubmissionGraph {
     pub root_task_id: TaskId,
     pub action_task_id: TaskId,
     pub active_execution_chain: Option<ActiveExecutionChain>,
+    pub(crate) materialize_rollback: Option<MaterializeRollback>,
+}
+
+impl DispatchSubmissionGraph {
+    pub fn new(
+        root_task_id: TaskId,
+        action_task_id: TaskId,
+        active_execution_chain: Option<ActiveExecutionChain>,
+    ) -> Self {
+        Self {
+            root_task_id,
+            action_task_id,
+            active_execution_chain,
+            materialize_rollback: None,
+        }
+    }
+}
+
+struct PlanMaterialization {
+    original_plan: Option<SessionPlan>,
+    current_revision: u64,
+}
+
+/// materialize 阶段跨 SessionStore、PlanStore 和执行注册表的补偿记录。
+///
+/// 这些 store 没有共享事务锁，因此提交顺序必须由本记录管理：任何一个步骤失败
+/// 都按“只回收本次写入、遇到并发修改则拒绝覆盖”的规则补偿。直接 runtime 入口
+/// 在交给 accepted 流程前也持有该记录，避免接受失败留下半装配状态。
+pub(crate) struct MaterializeRollback {
+    session_store: SessionStore,
+    execution_registry: TaskExecutionRegistry,
+    session_id: SessionId,
+    task_id: TaskId,
+    turn_id: String,
+    created_threads: Vec<ExecutionThread>,
+    coordinator_thread_before: Option<ExecutionThread>,
+    coordinator_thread_after: Option<ExecutionThread>,
+    plan_materialization: Option<PlanMaterialization>,
+    registry_inserted: bool,
+    committed: bool,
+}
+
+impl MaterializeRollback {
+    fn new(
+        session_store: &SessionStore,
+        execution_registry: &TaskExecutionRegistry,
+        session_id: SessionId,
+        task_id: TaskId,
+        turn_id: String,
+    ) -> Self {
+        Self {
+            session_store: session_store.clone(),
+            execution_registry: execution_registry.clone(),
+            session_id,
+            task_id,
+            turn_id,
+            created_threads: Vec::new(),
+            coordinator_thread_before: None,
+            coordinator_thread_after: None,
+            plan_materialization: None,
+            registry_inserted: false,
+            committed: false,
+        }
+    }
+
+    fn record_created_thread(&mut self, thread: ExecutionThread) {
+        self.created_threads.push(thread);
+    }
+
+    fn refresh_created_thread(&mut self, thread_id: &ThreadId) -> Result<(), String> {
+        let thread = self
+            .session_store
+            .thread_registry_snapshot(&self.session_id)
+            .into_iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .ok_or_else(|| format!("回滚记录缺少已创建 thread {thread_id}"))?;
+        let Some(created) = self
+            .created_threads
+            .iter_mut()
+            .find(|created| &created.thread_id == thread_id)
+        else {
+            return Err(format!("thread {thread_id} 不属于本次 materialize"));
+        };
+        *created = thread;
+        Ok(())
+    }
+
+    fn record_coordinator_before(&mut self, thread: ExecutionThread) {
+        self.coordinator_thread_before = Some(thread);
+    }
+
+    fn record_coordinator_after(&mut self, thread: ExecutionThread) {
+        self.coordinator_thread_after = Some(thread);
+    }
+
+    fn record_plan_materialization(&mut self, materialization: PlanMaterialization) {
+        self.plan_materialization = Some(materialization);
+    }
+
+    fn record_registry_inserted(&mut self) {
+        self.registry_inserted = true;
+    }
+
+    fn rollback_resources(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.registry_inserted {
+            if self
+                .execution_registry
+                .remove_if_turn_matches(&self.task_id, &self.turn_id)
+                .is_none()
+            {
+                errors.push(format!(
+                    "执行注册表中未找到属于 Turn {} 的任务 {}",
+                    self.turn_id, self.task_id
+                ));
+            }
+            self.registry_inserted = false;
+        }
+        if let Some(materialization) = self.plan_materialization.take()
+            && let Err(error) = self.session_store.restore_plan_if_current(
+                &self.session_id,
+                materialization.current_revision,
+                materialization.original_plan,
+            )
+        {
+            errors.push(format!("计划回滚失败: {error}"));
+        }
+        if let Some(original) = self.coordinator_thread_before.take() {
+            let thread_id = original.thread_id.clone();
+            let Some(expected_current) = self.coordinator_thread_after.take() else {
+                errors.push(format!(
+                    "coordinator thread {} 缺少 materialize 后快照，拒绝回滚",
+                    thread_id
+                ));
+                return errors;
+            };
+            if let Err(error) = self.session_store.restore_thread_after_materialization(
+                &self.session_id,
+                &thread_id,
+                &expected_current,
+                original,
+            ) {
+                errors.push(format!("coordinator thread 回滚失败: {error}"));
+            }
+        }
+        for expected in self.created_threads.drain(..).rev() {
+            if let Err(error) = self.session_store.remove_thread_if_current(
+                &self.session_id,
+                &expected.thread_id,
+                &expected,
+            ) {
+                errors.push(format!("thread {} 回收失败: {error}", expected.thread_id));
+            }
+        }
+        errors
+    }
+
+    fn rollback_now(mut self) -> Vec<String> {
+        let errors = self.rollback_resources();
+        self.committed = true;
+        errors
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for MaterializeRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let errors = self.rollback_resources();
+        if !errors.is_empty() {
+            tracing::error!(errors = ?errors, "materialize 事务自动回滚不完整");
+        }
+    }
+}
+
+struct MaterializeExecutionAttempt {
+    rollback: MaterializeRollback,
+}
+
+impl MaterializeExecutionAttempt {
+    fn new(
+        session_store: &SessionStore,
+        execution_registry: &TaskExecutionRegistry,
+        session_id: SessionId,
+        task_id: TaskId,
+        turn_id: String,
+    ) -> Self {
+        Self {
+            rollback: MaterializeRollback::new(
+                session_store,
+                execution_registry,
+                session_id,
+                task_id,
+                turn_id,
+            ),
+        }
+    }
+
+    fn fail(
+        self,
+        error: DispatchSubmissionRunError,
+    ) -> Result<DispatchSubmissionGraph, DispatchSubmissionRunError> {
+        let rollback = self.rollback;
+        let rollback_errors = rollback.rollback_now();
+        if rollback_errors.is_empty() {
+            Err(error)
+        } else {
+            Err(DispatchSubmissionRunError::Internal(format!(
+                "{}；materialize 回滚失败: {}",
+                error.into_message(),
+                rollback_errors.join("；")
+            )))
+        }
+    }
+
+    fn into_rollback(self) -> MaterializeRollback {
+        self.rollback
+    }
+
+    fn commit(self) {
+        self.rollback.commit();
+    }
 }
 
 /// Root coordinator Turn 的来源。
 ///
 /// 用户输入和 Goal 自动续跑都使用同一条 ExecutionChain；区别只体现在持久化的
 /// 时间线及 canonical item，可见性不能再由另一套 session runner 决定。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DispatchTurnOrigin {
     User,
     GoalContinuation(GoalId),
@@ -75,13 +303,17 @@ impl DispatchTurnOrigin {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchSubmissionRequest {
     pub accepted_at: UtcMillis,
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
     /// 任务执行 cwd。项目会话使用项目根目录；个人会话使用 Magi 管理的私有目录。
     pub execution_root: Option<std::path::PathBuf>,
+    /// 新会话首次执行时使用的模型配置。它是 accepted 请求事实的一部分，实际写入
+    /// settings store 必须延后到后台 materialize 阶段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_session_config: Option<serde_json::Value>,
     pub entry_id: String,
     pub timeline_message: String,
     pub images: Vec<SessionTurnImage>,
@@ -115,6 +347,9 @@ pub struct DispatchSubmissionRequest {
 
 #[derive(Clone, Debug)]
 pub struct DispatchSubmissionAccepted {
+    /// accepted 后后台 materialize 需要的完整请求。请求本身不直接出现在对外事件中，
+    /// 但会随 current turn 的 pendingDispatch 元数据进入 accepted journal，供重启恢复。
+    pub request: DispatchSubmissionRequest,
     pub session_id: SessionId,
     pub entry_id: String,
     pub accepted_at: UtcMillis,
@@ -123,8 +358,38 @@ pub struct DispatchSubmissionAccepted {
     pub action_task_id: TaskId,
     pub turn_id: String,
     pub user_message_item_id: Option<String>,
+    /// accepted 持久化时已经构建出的 canonical turn，供事件和 HTTP 响应直接复用。
+    pub accepted_canonical_turn: Option<CanonicalTurn>,
     pub runner_started: bool,
     pub superseded_turn: Option<CanonicalTurn>,
+}
+
+/// accepted 前只写入一个 root task 和一条最小 Turn，供直接调用 runtime 的内部入口使用。
+pub struct PendingDispatchSubmission {
+    pub task: magi_core::Task,
+    pub active_execution_chain: ActiveExecutionChain,
+    pub turn_id: String,
+    pub user_message_item_id: Option<String>,
+}
+
+/// 从 accepted journal 中恢复后台 materialize 所需的完整请求。
+///
+/// pending dispatch 是控制面 accepted 事实的一部分，不能依赖进程内的 future 或
+/// runner 闭包；重启后唯一可信来源是 current turn item 的持久化元数据。
+pub fn recover_dispatch_submission_request(
+    sidecar: &SessionRuntimeSidecar,
+) -> Result<DispatchSubmissionRequest, String> {
+    let pending_dispatch = sidecar
+        .current_turn
+        .as_ref()
+        .and_then(|turn| {
+            turn.items
+                .iter()
+                .find_map(|item| item.metadata.get("pendingDispatch"))
+        })
+        .ok_or_else(|| "accepted Turn 缺少 pendingDispatch 请求事实".to_string())?;
+    serde_json::from_value(pending_dispatch.clone())
+        .map_err(|error| format!("解析 accepted Turn 的 pendingDispatch 请求失败: {error}"))
 }
 
 pub struct DispatchSubmissionRuntime<'a> {
@@ -203,16 +468,97 @@ pub fn ensure_dispatch_submission_acceptance_available(
 pub fn cleanup_rejected_dispatch(
     task_store: Option<&TaskStore>,
     execution_registry: &TaskExecutionRegistry,
-    graph: &DispatchSubmissionGraph,
-) {
+    mut graph: DispatchSubmissionGraph,
+) -> DomainResult<()> {
+    if let Some(rollback) = graph.materialize_rollback.take() {
+        let rollback_errors = rollback.rollback_now();
+        if !rollback_errors.is_empty() {
+            return Err(DomainError::InvalidState {
+                message: format!("materialize 回滚失败: {}", rollback_errors.join("；")),
+            });
+        }
+    }
     if let Some(chain) = graph.active_execution_chain.as_ref() {
-        for branch in &chain.branches {
-            let _ = execution_registry.remove(&branch.task_id);
+        if let Some(turn_id) = chain
+            .current_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.as_str())
+        {
+            for branch in &chain.branches {
+                let _ = execution_registry.remove_if_turn_matches(&branch.task_id, turn_id);
+            }
         }
     }
     if let Some(task_store) = task_store {
-        let _ = task_store.remove_task(&graph.root_task_id);
+        task_store.remove_task(&graph.root_task_id)?;
     }
+    Ok(())
+}
+
+/// 清理已 accepted、但 runner 尚未启动就失败的执行资源。
+///
+/// accepted Turn 和 root task 是用户动作事实，不能删除；这里只按当前 Turn
+/// 身份回收执行注册、一次性 worker thread 和计划绑定。主线 coordinator thread
+/// 是 session 的长期上下文，只收口为 idle，不会随单个失败任务删除。
+pub fn cleanup_materialized_dispatch_submission_if_not_started(
+    session_store: &SessionStore,
+    execution_registry: &TaskExecutionRegistry,
+    session_id: &SessionId,
+    task_id: &TaskId,
+    turn_id: &str,
+) -> DomainResult<()> {
+    let sidecar = session_store
+        .runtime_sidecar(session_id)
+        .ok_or(DomainError::NotFound {
+            entity: "session runtime",
+        })?;
+    let current_turn = sidecar.current_turn.as_ref().ok_or(DomainError::NotFound {
+        entity: "current turn",
+    })?;
+    if current_turn.turn_id != turn_id {
+        return Err(DomainError::InvalidState {
+            message: format!("当前 Turn 已变化，拒绝清理任务 {} 的执行资源", task_id),
+        });
+    }
+    let chain = sidecar
+        .active_execution_chain
+        .as_ref()
+        .filter(|chain| &chain.root_task_id == task_id)
+        .ok_or(DomainError::InvalidState {
+            message: format!("当前执行链不属于任务 {}，拒绝清理执行资源", task_id),
+        })?;
+    let branch = chain
+        .branches
+        .iter()
+        .find(|branch| &branch.task_id == task_id)
+        .ok_or(DomainError::InvalidState {
+            message: format!("当前执行链缺少任务 {} 的主分支", task_id),
+        })?;
+    // 清理入口必须幂等：accepted 事实可能在 materialize 已经回滚后才收到
+    // 启动失败通知，此时注册表为空，但仍应继续校验并回收其他残留资源。
+    let _ = execution_registry.remove_if_turn_matches(task_id, turn_id);
+    let now = UtcMillis::now();
+    let is_orchestrator = session_store
+        .orchestrator_thread_for_session(session_id)
+        .is_some_and(|thread| thread.thread_id == branch.thread_id);
+    if is_orchestrator {
+        session_store.mark_task_threads_idle(task_id, now);
+    } else {
+        session_store.remove_recovery_thread_if_owned(
+            session_id,
+            &branch.thread_id,
+            &chain.mission_id,
+            task_id,
+            &branch.worker_id,
+        )?;
+    }
+    let plan_store = magi_plan::PlanStore::from_store(session_store, session_id.clone());
+    plan_store
+        .unbind_task(task_id)
+        .map_err(|error| DomainError::InvalidState {
+            message: format!("清理任务 {} 的计划绑定失败: {error}", task_id),
+        })?;
+    Ok(())
 }
 
 fn build_task_policy(
@@ -365,25 +711,61 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
     }
 }
 
-pub fn run_dispatch_submission(
+struct PreparedDispatchSubmission {
+    task: magi_core::Task,
+    mission_id: MissionId,
+    orchestrator_thread_id: ThreadId,
+    worker_id: WorkerId,
+    worker_thread_id: ThreadId,
+    action_task_id: TaskId,
+    turn_id: String,
+    execution_chain_ref: String,
+    plan_item_id: Option<PlanItemId>,
+    target_role: String,
+    now: UtcMillis,
+}
+
+fn map_acceptance_error(error: DispatchSubmissionAcceptError) -> DispatchSubmissionRunError {
+    match error {
+        DispatchSubmissionAcceptError::Conflict { message }
+        | DispatchSubmissionAcceptError::Internal { message } => {
+            DispatchSubmissionRunError::Internal(message)
+        }
+    }
+}
+
+fn resolve_session_mission(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    accepted_at: UtcMillis,
+) -> (MissionId, ThreadId) {
+    if let Some(thread) = session_store.orchestrator_thread_for_session(session_id) {
+        return (thread.mission_id, thread.thread_id);
+    }
+    if let Some(mission_id) = session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.ownership.mission_id)
+    {
+        return (
+            mission_id,
+            ThreadId::new(format!("thread-orchestrator-{session_id}")),
+        );
+    }
+    (
+        MissionId::new(format!("mission-session-action-{}", accepted_at.0)),
+        ThreadId::new(format!("thread-orchestrator-{session_id}")),
+    )
+}
+
+fn validate_dispatch_request(
     runtime: &DispatchSubmissionRuntime<'_>,
     request: &DispatchSubmissionRequest,
-) -> Result<DispatchSubmissionGraph, DispatchSubmissionRunError> {
-    runtime
-        .session_store
-        .ensure_current_turn_acceptance_available(&request.session_id)
-        .map_err(DispatchSubmissionAcceptError::from_store_error)
-        .map_err(|err| match err {
-            DispatchSubmissionAcceptError::Conflict { message }
-            | DispatchSubmissionAcceptError::Internal { message } => {
-                DispatchSubmissionRunError::Internal(message)
-            }
-        })?;
-
-    let accepted_at = request.accepted_at;
-    let session_id = &request.session_id;
-    let entry_id = request.entry_id.as_str();
-    let trimmed_text = request.trimmed_text.as_deref();
+    check_current_turn: bool,
+) -> Result<PreparedDispatchSubmission, DispatchSubmissionRunError> {
+    if check_current_turn {
+        ensure_dispatch_submission_acceptance_available(runtime.session_store, request)
+            .map_err(map_acceptance_error)?;
+    }
     let execution_goal = request
         .execution_goal
         .as_deref()
@@ -394,16 +776,10 @@ pub fn run_dispatch_submission(
                 "任务派发必须提供非空 execution_goal".to_string(),
             )
         })?;
-
-    // 恢复来源校验必须先于任何任务、thread 或事件写入。否则无效检查点会在返回错误时
-    // 留下没有 execution chain 的 pending task。
-    let interrupted_turn_checkpoint = request
-        .recovery_checkpoint
-        .as_ref()
-        .map(|checkpoint| prepare_interrupted_turn_checkpoint(runtime.session_store, checkpoint))
-        .transpose()?;
-    // Skill 是本轮方法上下文，不是角色路由信号。聊天框进入的主线任务必须保留 coordinator
-    // 权限面，具体 worker role 只能由显式 target_role 或后续 agent_spawn 决定。
+    if let Some(checkpoint) = request.recovery_checkpoint.as_ref() {
+        validate_interrupted_turn_checkpoint(runtime.session_store, checkpoint)?;
+    }
+    // Skill 是本轮方法上下文，不是角色路由信号。主线任务必须保留 coordinator 权限面。
     let target_role = request.target_role.as_deref().unwrap_or("coordinator");
     if request.goal_mode && target_role != "coordinator" {
         return Err(DispatchSubmissionRunError::InvalidInput(
@@ -419,26 +795,20 @@ pub fn run_dispatch_submission(
         )));
     }
 
-    let now = UtcMillis::now();
+    let accepted_at = request.accepted_at;
     let (mission_id, orchestrator_thread_id) =
-        runtime
-            .session_store
-            .ensure_session_mission(session_id, now, || {
-                MissionId::new(format!("mission-session-action-{}", accepted_at.0))
-            });
+        resolve_session_mission(runtime.session_store, &request.session_id, accepted_at);
     let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
-
-    let act_task_id = TaskId::new(format!("task-local-agent-{}", accepted_at.0));
-
-    let task_goal_text = execution_goal.to_string();
-    let plan_store =
-        magi_plan::PlanStore::from_store(runtime.session_store, request.session_id.clone());
-    let plan_item_id = plan_store.active_item_id();
+    let action_task_id = TaskId::new(format!("task-local-agent-{}", accepted_at.0));
+    let plan_item_id =
+        magi_plan::PlanStore::from_store(runtime.session_store, request.session_id.clone())
+            .active_item_id();
+    let now = UtcMillis::now();
     let task = make_dispatch_task(DispatchTaskInput {
-        task_id: act_task_id.clone(),
+        task_id: action_task_id.clone(),
         mission_id: mission_id.clone(),
         title: request.task_title.clone(),
-        goal: task_goal_text.clone(),
+        goal: execution_goal.to_string(),
         now,
         target_role,
         active_skill_id: request.skill_name.as_deref(),
@@ -455,141 +825,73 @@ pub fn run_dispatch_submission(
         denied_tools: request.denied_tools.clone(),
         plan_item_id: plan_item_id.clone(),
     });
-    runtime.task_store.insert_task_without_checkpoint(task);
-    if let Some(plan_item_id) = plan_item_id {
-        match plan_store.bind_task(act_task_id.clone(), plan_item_id) {
-            Ok(_) => {}
-            Err(error) => {
-                let _ = runtime.task_store.remove_task(&act_task_id);
-                return Err(DispatchSubmissionRunError::Internal(format!(
-                    "将主线任务绑定到当前计划阶段失败: {error}"
-                )));
-            }
-        }
-    }
-    let event =
-        task_events::task_submission_created_event(mission_id.as_str(), act_task_id.as_str(), 1)
-            .with_context(EventContext {
-                mission_id: Some(mission_id.clone()),
-                task_id: Some(act_task_id.clone()),
-                ..EventContext::default()
-            });
-    let _ = runtime.event_bus.publish(event);
-
-    let workspace_id = request.workspace_id.clone();
-    let execution_chain_ref = format!("session-action-chain-{}", accepted_at.0);
+    let worker_thread_id = if target_role == "coordinator" && request.recovery_checkpoint.is_none()
+    {
+        orchestrator_thread_id.clone()
+    } else {
+        ThreadId::new(format!(
+            "thread-{target_role}-{}-{}",
+            action_task_id, accepted_at.0
+        ))
+    };
     let turn_id = match &request.turn_origin {
         DispatchTurnOrigin::User => format!("turn-session-action-{}", accepted_at.0),
         DispatchTurnOrigin::GoalContinuation(_) => {
-            format!("turn-goal-continuation-{}-{}", session_id, accepted_at.0)
+            format!(
+                "turn-goal-continuation-{}-{}",
+                request.session_id, accepted_at.0
+            )
         }
     };
-    // coordinator 是 session 主线的唯一执行角色，必须复用 session 的
-    // orchestrator thread。否则每个普通回合都会生成一个空 worker thread，
-    // 上下文权威层只能看到空历史，连续对话和自动压缩都会被架空。
-    // 显式指定的非 coordinator role 仍使用独占 thread，避免 sidechain 事实
-    // 污染主线上下文。
-    let use_orchestrator_thread =
-        target_role == "coordinator" && request.recovery_checkpoint.is_none();
-    let worker_thread_id = if use_orchestrator_thread {
-        runtime
-            .session_store
-            .activate_thread(&orchestrator_thread_id, &act_task_id, now);
-        orchestrator_thread_id.clone()
-    } else {
-        session_thread::ensure_thread_for_role(
-            runtime.session_store,
-            session_id,
-            &mission_id,
-            target_role,
-            &worker_id,
-            &act_task_id,
-            now,
-        )
-    };
-    if let Some(checkpoint) = interrupted_turn_checkpoint {
-        install_interrupted_turn_checkpoint(
-            runtime.session_store,
-            &worker_thread_id,
-            checkpoint,
-            now,
-        );
-    }
-    let ownership = ExecutionOwnership {
-        session_id: Some(session_id.clone()),
-        workspace_id: workspace_id.clone(),
-        mission_id: Some(mission_id.clone()),
-        task_id: Some(act_task_id.clone()),
-        worker_id: Some(worker_id.clone()),
-        execution_chain_ref: Some(execution_chain_ref.clone()),
-    };
-    let execution_settings_snapshot = runtime
-        .settings_store
-        .map(|store| Arc::new(store.execution_snapshot()));
-    runtime.execution_registry.insert(
-        act_task_id.clone(),
-        TaskExecutionPlan::Dispatch {
-            target: TaskExecutionTarget {
-                mission_id: mission_id.clone(),
-                root_task_id: act_task_id.clone(),
-                task_id: act_task_id.clone(),
-                requested_worker_id: Some(worker_id.clone()),
-                recovery_id: None,
-                execution_chain_ref: Some(execution_chain_ref.clone()),
-            },
-            worker_id: worker_id.clone(),
-            thread_id: worker_thread_id.clone(),
-            is_primary: true,
-            session_id: session_id.clone(),
-            turn_id: turn_id.clone(),
-            workspace_id: workspace_id.clone(),
-            execution_root: request.execution_root.clone(),
-            ownership: ownership.clone(),
-            writebacks: ExecutionWritebackPlans::from_session_action_input(
-                DispatchMemoryExtractionInput {
-                    accepted_at,
-                    session_id,
-                    timeline_entry_id: entry_id,
-                    text: trimmed_text,
-                    skill_name: request.skill_name.as_deref(),
-                },
-            ),
-            use_tools: true,
-            skill_name: request.skill_name.clone(),
-            images: request.images.clone(),
-            execution_settings_snapshot,
-        },
-    );
+    Ok(PreparedDispatchSubmission {
+        task,
+        mission_id,
+        orchestrator_thread_id,
+        worker_id,
+        worker_thread_id,
+        action_task_id,
+        turn_id,
+        execution_chain_ref: format!("session-action-chain-{}", accepted_at.0),
+        plan_item_id,
+        target_role: target_role.to_string(),
+        now,
+    })
+}
 
-    let branches = vec![ActiveExecutionBranch {
-        task_id: act_task_id.clone(),
-        worker_id: worker_id.clone(),
+fn build_active_execution_chain(
+    prepared: &PreparedDispatchSubmission,
+    request: &DispatchSubmissionRequest,
+) -> Result<(ActiveExecutionChain, Option<String>), DispatchSubmissionRunError> {
+    let branch = ActiveExecutionBranch {
+        task_id: prepared.action_task_id.clone(),
+        worker_id: prepared.worker_id.clone(),
         stage: "execute".to_string(),
         lease_id: None,
         execution_intent_ref: None,
         binding_lifecycle: None,
         checkpoint_stage: Some("execute".to_string()),
         next_step_index: Some(0),
-        checkpoint_at: Some(now),
+        checkpoint_at: Some(prepared.now),
         resume_mode: Some("stage-restart".to_string()),
         resume_token: None,
         use_tools: true,
         skill_name: request.skill_name.clone(),
         is_primary: true,
-        thread_id: worker_thread_id.clone(),
-    }];
-    let request_id = request.request_id.clone();
+        thread_id: prepared.worker_thread_id.clone(),
+    };
     let user_message_id = request.user_message_id.clone();
-    let placeholder_message_id = request.placeholder_message_id.clone();
     let user_message_item_id = request.turn_origin.creates_user_message_item().then(|| {
         user_message_id
             .clone()
-            .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0))
+            .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0))
     });
+    let pending_dispatch = serde_json::to_value(request).map_err(|error| {
+        DispatchSubmissionRunError::Internal(format!("保存 pending dispatch 请求失败: {error}"))
+    })?;
     let mut current_turn = ActiveExecutionTurn {
-        turn_id,
-        turn_seq: accepted_at.0,
-        accepted_at,
+        turn_id: prepared.turn_id.clone(),
+        turn_seq: request.accepted_at.0,
+        accepted_at: request.accepted_at,
         status: "accepted".to_string(),
         completed_at: None,
         user_message: request
@@ -599,91 +901,500 @@ pub fn run_dispatch_submission(
         items: user_message_item_id
             .clone()
             .into_iter()
-            .map(|item_id| ActiveExecutionTurnItem {
-                item_id,
-                item_seq: 1,
-                kind: "user_message".to_string(),
-                status: "completed".to_string(),
-                source: "user".to_string(),
-                title: None,
-                content: Some(request.timeline_message.clone()),
-                task_id: Some(act_task_id.clone()),
-                worker_id: None,
-                role_id: None,
-                tool_call_id: None,
-                tool_name: None,
-                tool_status: None,
-                tool_arguments: None,
-                tool_result: None,
-                tool_error: None,
-                request_id: request_id.clone(),
-                user_message_id: user_message_id.clone(),
-                placeholder_message_id: placeholder_message_id.clone(),
-                metadata: {
-                    let mut metadata =
-                        crate::session_images::session_turn_images_metadata(&request.images);
-                    metadata.extend(session_context_references_metadata(
-                        &request.context_references,
-                    ));
-                    metadata.extend(browser_annotation_references_metadata(
-                        &request.browser_annotation_refs,
-                    ));
-                    metadata.extend(browser_node_selections_metadata(
-                        &request.browser_node_selections,
-                    ));
-                    if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
-                        metadata.insert(
-                            "replacesTurnId".to_string(),
-                            serde_json::Value::String(replace_turn_id.clone()),
-                        );
-                    }
-                    if let Some(skill_name) = request.skill_name.as_deref() {
-                        metadata.insert(
-                            "skillName".to_string(),
-                            serde_json::Value::String(skill_name.to_string()),
-                        );
-                    }
-                    metadata.extend(request.user_message_metadata.clone());
+            .map(|item_id| {
+                let mut metadata =
+                    crate::session_images::session_turn_images_metadata(&request.images);
+                metadata.extend(session_context_references_metadata(
+                    &request.context_references,
+                ));
+                metadata.extend(browser_annotation_references_metadata(
+                    &request.browser_annotation_refs,
+                ));
+                metadata.extend(browser_node_selections_metadata(
+                    &request.browser_node_selections,
+                ));
+                if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
                     metadata.insert(
-                        "goalMode".to_string(),
-                        serde_json::Value::Bool(request.goal_mode),
+                        "replacesTurnId".to_string(),
+                        serde_json::Value::String(replace_turn_id.clone()),
                     );
-                    metadata
-                },
-                timeline_entry_id: Some(entry_id.to_string()),
-                source_thread_id: orchestrator_thread_id.clone(),
+                }
+                if let Some(skill_name) = request.skill_name.as_deref() {
+                    metadata.insert(
+                        "skillName".to_string(),
+                        serde_json::Value::String(skill_name.to_string()),
+                    );
+                }
+                metadata.extend(request.user_message_metadata.clone());
+                metadata.insert(
+                    "goalMode".to_string(),
+                    serde_json::Value::Bool(request.goal_mode),
+                );
+                metadata.insert("pendingDispatch".to_string(), pending_dispatch.clone());
+                Ok(ActiveExecutionTurnItem {
+                    item_id,
+                    item_seq: 1,
+                    kind: "user_message".to_string(),
+                    status: "completed".to_string(),
+                    source: "user".to_string(),
+                    title: None,
+                    content: Some(request.timeline_message.clone()),
+                    task_id: Some(prepared.action_task_id.clone()),
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_status: None,
+                    tool_arguments: None,
+                    tool_result: None,
+                    tool_error: None,
+                    request_id: request.request_id.clone(),
+                    user_message_id: user_message_id.clone(),
+                    placeholder_message_id: request.placeholder_message_id.clone(),
+                    metadata,
+                    timeline_entry_id: Some(request.entry_id.clone()),
+                    source_thread_id: prepared.orchestrator_thread_id.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, DispatchSubmissionRunError>>()?,
     };
+    if !request.turn_origin.creates_user_message_item() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("pendingDispatch".to_string(), pending_dispatch);
+        metadata.insert("renderable".to_string(), serde_json::Value::Bool(false));
+        current_turn.items.push(ActiveExecutionTurnItem {
+            item_id: format!("turn-item-dispatch-{}", request.accepted_at.0),
+            item_seq: 1,
+            kind: "assistant_phase".to_string(),
+            status: "completed".to_string(),
+            source: "system".to_string(),
+            title: None,
+            content: None,
+            task_id: Some(prepared.action_task_id.clone()),
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id: request.request_id.clone(),
+            user_message_id: None,
+            placeholder_message_id: None,
+            metadata,
+            timeline_entry_id: Some(request.entry_id.clone()),
+            source_thread_id: prepared.orchestrator_thread_id.clone(),
+        });
+    }
     current_turn.normalize();
-    Ok(DispatchSubmissionGraph {
-        root_task_id: act_task_id.clone(),
-        action_task_id: act_task_id.clone(),
-        active_execution_chain: Some(ActiveExecutionChain {
+    let branches = vec![branch];
+    Ok((
+        ActiveExecutionChain {
             session_id: request.session_id.clone(),
-            mission_id,
-            root_task_id: act_task_id,
-            execution_chain_ref,
-            workspace_id,
-            active_branch_task_ids: branches
-                .iter()
-                .map(|branch| branch.task_id.clone())
-                .collect(),
-            active_worker_bindings: branches
-                .iter()
-                .map(|branch| branch.worker_id.clone())
-                .collect(),
+            mission_id: prepared.mission_id.clone(),
+            root_task_id: prepared.action_task_id.clone(),
+            execution_chain_ref: prepared.execution_chain_ref.clone(),
+            workspace_id: request.workspace_id.clone(),
+            active_branch_task_ids: vec![prepared.action_task_id.clone()],
+            active_worker_bindings: vec![prepared.worker_id.clone()],
             branches,
             recovery_ref: None,
             dispatch_context: ActiveExecutionDispatchContext {
-                accepted_at,
-                entry_id: entry_id.to_string(),
-                trimmed_text: trimmed_text.map(str::to_string),
+                accepted_at: request.accepted_at,
+                entry_id: request.entry_id.clone(),
+                trimmed_text: request.trimmed_text.clone(),
                 skill_name: request.skill_name.clone(),
             },
             current_turn: Some(current_turn),
-        }),
+        },
+        user_message_item_id,
+    ))
+}
+
+fn bind_dispatch_task_to_plan(
+    runtime: &DispatchSubmissionRuntime<'_>,
+    session_id: &SessionId,
+    prepared: &PreparedDispatchSubmission,
+) -> Result<Option<PlanMaterialization>, DispatchSubmissionRunError> {
+    let Some(plan_item_id) = prepared.plan_item_id.clone() else {
+        return Ok(None);
+    };
+    let plan_store = magi_plan::PlanStore::from_store(runtime.session_store, session_id.clone());
+    plan_store
+        .bind_task_for_materialization(prepared.action_task_id.clone(), plan_item_id)
+        .map(|mutation| {
+            mutation.map(|(original_plan, updated_plan)| PlanMaterialization {
+                original_plan: Some(original_plan),
+                current_revision: updated_plan.revision,
+            })
+        })
+        .map_err(|error| {
+            DispatchSubmissionRunError::Internal(format!(
+                "将主线任务绑定到当前计划阶段失败: {error}"
+            ))
+        })
+}
+
+fn materialize_execution(
+    runtime: &DispatchSubmissionRuntime<'_>,
+    request: &DispatchSubmissionRequest,
+    prepared: &PreparedDispatchSubmission,
+    pending_chain: Option<ActiveExecutionChain>,
+) -> Result<DispatchSubmissionGraph, DispatchSubmissionRunError> {
+    let accepted_materialize = pending_chain.is_some();
+    let active_execution_chain = match pending_chain {
+        Some(chain) => chain,
+        None => build_active_execution_chain(prepared, request)?.0,
+    };
+    let interrupted_checkpoint = request
+        .recovery_checkpoint
+        .as_ref()
+        .map(|checkpoint| prepare_interrupted_turn_checkpoint(runtime.session_store, checkpoint))
+        .transpose()?;
+    let mut attempt = MaterializeExecutionAttempt::new(
+        runtime.session_store,
+        runtime.execution_registry,
+        request.session_id.clone(),
+        prepared.action_task_id.clone(),
+        prepared.turn_id.clone(),
+    );
+    let (mission_id, orchestrator_thread_id, coordinator_created) = runtime
+        .session_store
+        .ensure_session_mission_with_created(&request.session_id, request.accepted_at, || {
+            prepared.mission_id.clone()
+        });
+    if coordinator_created {
+        let coordinator = runtime
+            .session_store
+            .thread_registry_snapshot(&request.session_id)
+            .into_iter()
+            .find(|thread| thread.thread_id == orchestrator_thread_id)
+            .ok_or_else(|| {
+                DispatchSubmissionRunError::Internal(
+                    "创建 coordinator thread 后无法读取其快照".to_string(),
+                )
+            });
+        let coordinator = match coordinator {
+            Ok(coordinator) => coordinator,
+            Err(error) => return attempt.fail(error),
+        };
+        attempt.rollback.record_created_thread(coordinator);
+    }
+    if mission_id != prepared.mission_id
+        || orchestrator_thread_id != prepared.orchestrator_thread_id
+    {
+        return attempt.fail(DispatchSubmissionRunError::Internal(
+            "materialize 后 session mission/thread 身份发生变化".to_string(),
+        ));
+    }
+    let worker_thread_id =
+        if prepared.target_role == "coordinator" && request.recovery_checkpoint.is_none() {
+            prepared.orchestrator_thread_id.clone()
+        } else {
+            let new_thread = session_thread::build_thread_for_role(
+                &request.session_id,
+                &prepared.mission_id,
+                &prepared.target_role,
+                &prepared.worker_id,
+                &prepared.action_task_id,
+                request.accepted_at,
+            );
+            let thread_id = new_thread.thread_id.clone();
+            if let Err(error) = runtime.session_store.register_thread(new_thread.clone()) {
+                return attempt.fail(DispatchSubmissionRunError::Internal(format!(
+                    "为任务 {} 注册执行 thread 失败: {error}",
+                    prepared.action_task_id
+                )));
+            }
+            attempt.rollback.record_created_thread(new_thread);
+            thread_id
+        };
+    if worker_thread_id != prepared.worker_thread_id {
+        return attempt.fail(DispatchSubmissionRunError::Internal(
+            "materialize 后 worker thread 身份发生变化".to_string(),
+        ));
+    }
+    let coordinator_reused = worker_thread_id == orchestrator_thread_id && !coordinator_created;
+    if coordinator_reused {
+        let coordinator = runtime
+            .session_store
+            .thread_registry_snapshot(&request.session_id)
+            .into_iter()
+            .find(|thread| thread.thread_id == orchestrator_thread_id)
+            .or_else(|| {
+                runtime
+                    .session_store
+                    .orchestrator_thread_for_session(&request.session_id)
+            });
+        let Some(coordinator) = coordinator else {
+            return attempt.fail(DispatchSubmissionRunError::Internal(
+                "激活 coordinator thread 前无法读取其原始快照".to_string(),
+            ));
+        };
+        attempt.rollback.record_coordinator_before(coordinator);
+    }
+    let activated_thread = match runtime.session_store.activate_thread_checked(
+        &worker_thread_id,
+        &prepared.action_task_id,
+        prepared.now,
+    ) {
+        Ok(thread) => thread,
+        Err(error) => {
+            return attempt.fail(DispatchSubmissionRunError::Internal(format!(
+                "激活任务 {} 的执行 thread 失败: {error}",
+                prepared.action_task_id
+            )));
+        }
+    };
+    if coordinator_reused {
+        attempt.rollback.record_coordinator_after(activated_thread);
+    }
+    if let Some(checkpoint) = interrupted_checkpoint {
+        if let Err(error) = install_interrupted_turn_checkpoint(
+            runtime.session_store,
+            &worker_thread_id,
+            checkpoint,
+            UtcMillis::now(),
+        ) {
+            return attempt.fail(error);
+        }
+    }
+    if let Some(created_thread) = attempt
+        .rollback
+        .created_threads
+        .iter()
+        .find(|thread| thread.thread_id == worker_thread_id)
+    {
+        let thread_id = created_thread.thread_id.clone();
+        if let Err(error) = attempt.rollback.refresh_created_thread(&thread_id) {
+            return attempt.fail(DispatchSubmissionRunError::Internal(error));
+        }
+    }
+    let plan_materialization =
+        match bind_dispatch_task_to_plan(runtime, &request.session_id, prepared) {
+            Ok(materialization) => materialization,
+            Err(error) => return attempt.fail(error),
+        };
+    if let Some(materialization) = plan_materialization {
+        attempt
+            .rollback
+            .record_plan_materialization(materialization);
+    }
+    let ownership = ExecutionOwnership {
+        session_id: Some(request.session_id.clone()),
+        workspace_id: request.workspace_id.clone(),
+        mission_id: Some(prepared.mission_id.clone()),
+        task_id: Some(prepared.action_task_id.clone()),
+        worker_id: Some(prepared.worker_id.clone()),
+        execution_chain_ref: Some(prepared.execution_chain_ref.clone()),
+    };
+    let execution_plan = TaskExecutionPlan::Dispatch {
+        target: TaskExecutionTarget {
+            mission_id: prepared.mission_id.clone(),
+            root_task_id: prepared.action_task_id.clone(),
+            task_id: prepared.action_task_id.clone(),
+            requested_worker_id: Some(prepared.worker_id.clone()),
+            recovery_id: None,
+            execution_chain_ref: Some(prepared.execution_chain_ref.clone()),
+        },
+        worker_id: prepared.worker_id.clone(),
+        thread_id: worker_thread_id,
+        is_primary: true,
+        session_id: request.session_id.clone(),
+        turn_id: prepared.turn_id.clone(),
+        workspace_id: request.workspace_id.clone(),
+        execution_root: request.execution_root.clone(),
+        ownership,
+        writebacks: ExecutionWritebackPlans::from_session_action_input(
+            DispatchMemoryExtractionInput {
+                accepted_at: request.accepted_at,
+                session_id: &request.session_id,
+                timeline_entry_id: &request.entry_id,
+                text: request.trimmed_text.as_deref(),
+                skill_name: request.skill_name.as_deref(),
+            },
+        ),
+        use_tools: true,
+        skill_name: request.skill_name.clone(),
+        images: request.images.clone(),
+        execution_settings_snapshot: runtime
+            .settings_store
+            .map(|store| Arc::new(store.execution_snapshot())),
+    };
+    if runtime
+        .execution_registry
+        .insert(prepared.action_task_id.clone(), execution_plan)
+        .is_err()
+    {
+        return attempt.fail(DispatchSubmissionRunError::Internal(format!(
+            "主线任务 {} 已存在执行计划，拒绝重复注册",
+            prepared.action_task_id
+        )));
+    }
+    attempt.rollback.record_registry_inserted();
+    if accepted_materialize
+        && let Err(error) = runtime.session_store.upsert_active_execution_chain(
+            request.session_id.clone(),
+            active_execution_chain.clone(),
+        )
+    {
+        return attempt.fail(DispatchSubmissionRunError::Internal(format!(
+            "写回 materialize execution chain 失败: {error}"
+        )));
+    }
+    let materialize_rollback = if accepted_materialize {
+        attempt.commit();
+        None
+    } else {
+        Some(attempt.into_rollback())
+    };
+    let event = task_events::task_submission_created_event(
+        prepared.mission_id.as_str(),
+        prepared.action_task_id.as_str(),
+        1,
+    )
+    .with_context(EventContext {
+        mission_id: Some(prepared.mission_id.clone()),
+        task_id: Some(prepared.action_task_id.clone()),
+        ..EventContext::default()
+    });
+    let _ = runtime.event_bus.publish(event);
+    Ok(DispatchSubmissionGraph {
+        root_task_id: prepared.action_task_id.clone(),
+        action_task_id: prepared.action_task_id.clone(),
+        active_execution_chain: Some(active_execution_chain),
+        materialize_rollback,
     })
+}
+
+/// accepted 前只写入一个 root task 和一条带原始请求的最小 Turn。
+pub fn prepare_pending_dispatch_submission(
+    runtime: &DispatchSubmissionRuntime<'_>,
+    request: &DispatchSubmissionRequest,
+) -> Result<PendingDispatchSubmission, DispatchSubmissionRunError> {
+    let prepared = validate_dispatch_request(runtime, request, true)?;
+    let (active_execution_chain, user_message_item_id) =
+        build_active_execution_chain(&prepared, request)?;
+    runtime
+        .task_store
+        .insert_task_without_checkpoint(prepared.task.clone())
+        .map_err(|error| {
+            DispatchSubmissionRunError::Internal(format!("写入 pending root task 失败: {error}"))
+        })?;
+    Ok(PendingDispatchSubmission {
+        task: prepared.task,
+        active_execution_chain,
+        turn_id: prepared.turn_id,
+        user_message_item_id,
+    })
+}
+
+/// 由直接调用 runtime 的旧测试/内部入口使用，完整装配仍在返回 graph 前完成。
+pub fn run_dispatch_submission(
+    runtime: &DispatchSubmissionRuntime<'_>,
+    request: &DispatchSubmissionRequest,
+) -> Result<DispatchSubmissionGraph, DispatchSubmissionRunError> {
+    let prepared = validate_dispatch_request(runtime, request, true)?;
+    runtime
+        .task_store
+        .insert_task_without_checkpoint(prepared.task.clone())
+        .map_err(|error| {
+            DispatchSubmissionRunError::Internal(format!("写入 root task 失败: {error}"))
+        })?;
+    match materialize_execution(runtime, request, &prepared, None) {
+        Ok(graph) => Ok(graph),
+        Err(error) => {
+            let error_message = error.into_message();
+            if let Err(cleanup_error) = runtime.task_store.remove_task(&prepared.action_task_id) {
+                return Err(DispatchSubmissionRunError::Internal(format!(
+                    "{}；清理 root task 失败: {}",
+                    error_message, cleanup_error
+                )));
+            }
+            Err(DispatchSubmissionRunError::Internal(error_message))
+        }
+    }
+}
+
+/// accepted 后构建 Thread、执行计划和模型设置快照；不会重新写 canonical Turn 或 timeline。
+pub fn materialize_dispatch_submission(
+    runtime: &DispatchSubmissionRuntime<'_>,
+    request: &DispatchSubmissionRequest,
+    expected_turn_id: &str,
+) -> Result<(), DispatchSubmissionRunError> {
+    let sidecar = runtime
+        .session_store
+        .runtime_sidecar(&request.session_id)
+        .ok_or_else(|| {
+            DispatchSubmissionRunError::Internal("accepted Turn 缺少 runtime sidecar".to_string())
+        })?;
+    let current_turn = sidecar.current_turn.as_ref().ok_or_else(|| {
+        DispatchSubmissionRunError::Internal("accepted Turn 缺少 current_turn".to_string())
+    })?;
+    if current_turn.turn_id != expected_turn_id
+        || !matches!(current_turn.status.as_str(), "accepted" | "preparing")
+    {
+        return Err(DispatchSubmissionRunError::InvalidInput(
+            "accepted Turn 已被终态或新的 Turn 取代".to_string(),
+        ));
+    }
+    let pending_chain = sidecar.active_execution_chain.clone().ok_or_else(|| {
+        DispatchSubmissionRunError::Internal(
+            "accepted Turn 缺少 active execution chain".to_string(),
+        )
+    })?;
+    let prepared = validate_dispatch_request(runtime, request, false)?;
+    if pending_chain.root_task_id != prepared.action_task_id
+        || pending_chain.session_id != request.session_id
+        || pending_chain.execution_chain_ref != prepared.execution_chain_ref
+    {
+        return Err(DispatchSubmissionRunError::Internal(
+            "accepted active execution chain 与请求身份不一致".to_string(),
+        ));
+    }
+    let task = runtime
+        .task_store
+        .get_task(&prepared.action_task_id)
+        .ok_or_else(|| {
+            DispatchSubmissionRunError::Internal("accepted root task 不存在".to_string())
+        })?;
+    if task.status != TaskStatus::Pending
+        || task.mission_id != prepared.task.mission_id
+        || task.root_task_id != prepared.task.root_task_id
+        || task.goal != prepared.task.goal
+    {
+        return Err(DispatchSubmissionRunError::InvalidInput(
+            "accepted root task 已被修改或不再可执行".to_string(),
+        ));
+    }
+    if let Some(existing_plan) = runtime.execution_registry.get(&prepared.action_task_id) {
+        let TaskExecutionPlan::Dispatch {
+            target,
+            worker_id,
+            thread_id,
+            session_id,
+            turn_id,
+            ..
+        } = existing_plan;
+        let identity_matches = turn_id == expected_turn_id
+            && session_id == request.session_id
+            && target.mission_id == prepared.mission_id
+            && target.root_task_id == prepared.action_task_id
+            && target.task_id == prepared.action_task_id
+            && target.requested_worker_id.as_ref() == Some(&prepared.worker_id)
+            && target.execution_chain_ref.as_deref() == Some(prepared.execution_chain_ref.as_str())
+            && worker_id == prepared.worker_id
+            && thread_id == prepared.worker_thread_id;
+        if identity_matches {
+            return Ok(());
+        }
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "accepted root task 已被其他执行身份装配：期望 Turn {expected_turn_id}，当前 Turn {turn_id}"
+        )));
+    }
+    materialize_execution(runtime, request, &prepared, Some(pending_chain))?;
+    Ok(())
 }
 
 struct InterruptedTurnCheckpointSeed {
@@ -691,10 +1402,78 @@ struct InterruptedTurnCheckpointSeed {
     context_checkpoint: Option<ThreadContextCheckpoint>,
 }
 
+fn validate_interrupted_turn_checkpoint(
+    session_store: &SessionStore,
+    checkpoint: &TaskRecoveryCheckpoint,
+) -> Result<(), DispatchSubmissionRunError> {
+    let source_turn = session_store
+        .canonical_turns_for_session(&checkpoint.source_session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == checkpoint.source_turn_id)
+        .ok_or_else(|| {
+            DispatchSubmissionRunError::InvalidInput(format!(
+                "续接来源 Turn 不存在: {}",
+                checkpoint.source_turn_id
+            ))
+        })?;
+    if source_turn.status != magi_session_store::CanonicalTurnStatus::Cancelled {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Turn 不是用户中断状态: {}",
+            checkpoint.source_turn_id
+        )));
+    }
+    let interrupted_by_user = source_turn.items.iter().any(|item| {
+        item.kind == CanonicalTurnItemKind::UserMessage
+            && item
+                .metadata
+                .get("interruptionSource")
+                .and_then(serde_json::Value::as_str)
+                == Some("user")
+    });
+    if !interrupted_by_user {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Turn 不是用户主动中断: {}",
+            checkpoint.source_turn_id
+        )));
+    }
+    let source_thread = session_store
+        .thread_registry_snapshot(&checkpoint.source_session_id)
+        .into_iter()
+        .find(|thread| thread.thread_id == checkpoint.source_thread_id)
+        .ok_or_else(|| {
+            DispatchSubmissionRunError::InvalidInput(format!(
+                "续接来源任务缺少持久化 Thread: {}",
+                checkpoint.source_task_id
+            ))
+        })?;
+    if !source_thread
+        .handled_task_ids
+        .contains(&checkpoint.source_task_id)
+    {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Thread 与任务不匹配: {}",
+            checkpoint.source_task_id
+        )));
+    }
+    if !source_turn.items.iter().any(|item| {
+        item.worker
+            .as_ref()
+            .and_then(|worker| worker.task_id.as_ref())
+            == Some(&checkpoint.source_task_id)
+    }) {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Turn 与任务不匹配: {}",
+            checkpoint.source_task_id
+        )));
+    }
+    Ok(())
+}
+
 fn prepare_interrupted_turn_checkpoint(
     session_store: &SessionStore,
     checkpoint: &TaskRecoveryCheckpoint,
 ) -> Result<InterruptedTurnCheckpointSeed, DispatchSubmissionRunError> {
+    validate_interrupted_turn_checkpoint(session_store, checkpoint)?;
     let source_turn = session_store
         .canonical_turns_for_session(&checkpoint.source_session_id)
         .into_iter()
@@ -767,27 +1546,46 @@ fn install_interrupted_turn_checkpoint(
     destination_thread_id: &magi_core::ThreadId,
     checkpoint: InterruptedTurnCheckpointSeed,
     now: UtcMillis,
-) {
-    session_store.replace_thread_messages(destination_thread_id, checkpoint.message_history, now);
+) -> Result<(), DispatchSubmissionRunError> {
+    session_store
+        .replace_thread_messages_checked(destination_thread_id, checkpoint.message_history, now)
+        .map_err(|error| {
+            DispatchSubmissionRunError::Internal(format!("替换恢复 thread 对话历史失败: {error}"))
+        })?;
     if let Some(source_checkpoint) = checkpoint.context_checkpoint {
-        session_store.install_thread_context_checkpoint(
-            destination_thread_id,
-            magi_session_store::ThreadContextCheckpoint {
-                thread_id: destination_thread_id.clone(),
-                ..source_checkpoint
-            },
-            now,
-        );
+        session_store
+            .install_thread_context_checkpoint_checked(
+                destination_thread_id,
+                magi_session_store::ThreadContextCheckpoint {
+                    thread_id: destination_thread_id.clone(),
+                    ..source_checkpoint
+                },
+                now,
+            )
+            .map_err(|error| {
+                DispatchSubmissionRunError::Internal(format!(
+                    "安装恢复 thread 上下文检查点失败: {error}"
+                ))
+            })?;
     }
+    Ok(())
 }
 
 pub fn accept_dispatch_submission(
     session_store: &SessionStore,
-    task_store: Option<&TaskStore>,
+    task_store: &TaskStore,
     execution_registry: &TaskExecutionRegistry,
     request: DispatchSubmissionRequest,
-    graph: DispatchSubmissionGraph,
+    mut graph: DispatchSubmissionGraph,
 ) -> Result<DispatchSubmissionAccepted, DispatchSubmissionAcceptError> {
+    let acceptance_task = task_store.get_task(&graph.root_task_id).ok_or_else(|| {
+        DispatchSubmissionAcceptError::Internal {
+            message: format!(
+                "接纳任务派发前缺少 root task {}，拒绝提交不完整的 accepted 事实",
+                graph.root_task_id
+            ),
+        }
+    })?;
     let turn_id = graph
         .active_execution_chain
         .as_ref()
@@ -805,7 +1603,7 @@ pub fn accept_dispatch_submission(
     if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
         let accept_result = if let Some(goal_id) = request.turn_origin.continuation_goal_id() {
             session_store
-                .accept_goal_continuation_with_timeline_entry(
+                .accept_goal_continuation_with_timeline_entry_and_task(
                     request.session_id.clone(),
                     goal_id,
                     TimelineEntryInput::new(
@@ -815,11 +1613,12 @@ pub fn accept_dispatch_submission(
                         request.accepted_at,
                     ),
                     active_execution_chain,
+                    &acceptance_task,
                 )
-                .map(|_| None)
+                .map(|(_, _, canonical_turn)| (None, canonical_turn))
         } else if let Some(replace_turn_id) = request.replace_turn_id.as_deref() {
             session_store
-                .replace_current_turn_with_active_execution_chain_and_timeline_entry(
+                .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
                     request.session_id.clone(),
                     replace_turn_id,
                     TimelineEntryInput::new(
@@ -829,11 +1628,14 @@ pub fn accept_dispatch_submission(
                         request.accepted_at,
                     ),
                     active_execution_chain,
+                    &acceptance_task,
                 )
-                .map(|(_, _, superseded_turn)| Some(superseded_turn))
+                .map(|(_, _, superseded_turn, canonical_turn)| {
+                    (Some(superseded_turn), Some(canonical_turn))
+                })
         } else {
             session_store
-                .accept_active_execution_chain_with_timeline_entry(
+                .accept_active_execution_chain_with_timeline_entry_and_task(
                     request.session_id.clone(),
                     TimelineEntryInput::new(
                         request.entry_id.clone(),
@@ -842,25 +1644,29 @@ pub fn accept_dispatch_submission(
                         request.accepted_at,
                     ),
                     active_execution_chain,
+                    &acceptance_task,
                 )
-                .map(|_| None)
+                .map(|(_, _, canonical_turn)| (None, canonical_turn))
         };
-        let superseded_turn = match accept_result {
-            Ok(superseded_turn) => superseded_turn,
+        let (superseded_turn, accepted_canonical_turn) = match accept_result {
+            Ok(result) => result,
             Err(error) => {
-                cleanup_rejected_dispatch(task_store, execution_registry, &graph);
-                let plan_store =
-                    magi_plan::PlanStore::from_store(session_store, request.session_id.clone());
-                if let Err(unbind_error) = plan_store.unbind_task(&graph.root_task_id) {
-                    tracing::warn!(
-                        task_id = %graph.root_task_id,
-                        error = %unbind_error,
-                        "拒绝的派发清理计划任务绑定失败"
-                    );
+                if let Err(checkpoint_error) =
+                    cleanup_rejected_dispatch(Some(task_store), execution_registry, graph)
+                {
+                    return Err(DispatchSubmissionAcceptError::Internal {
+                        message: format!(
+                            "接纳派发失败: {error}；回收任务 checkpoint 失败: {checkpoint_error}"
+                        ),
+                    });
                 }
                 return Err(DispatchSubmissionAcceptError::from_store_error(error));
             }
         };
+
+        if let Some(rollback) = graph.materialize_rollback.take() {
+            rollback.commit();
+        }
 
         let user_message_item_id = request.turn_origin.creates_user_message_item().then(|| {
             request
@@ -869,15 +1675,21 @@ pub fn accept_dispatch_submission(
                 .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0))
         });
 
+        let accepted_session_id = request.session_id.clone();
+        let accepted_entry_id = request.entry_id.clone();
+        let accepted_at = request.accepted_at;
+        let created_session = request.created_session;
         return Ok(DispatchSubmissionAccepted {
-            session_id: request.session_id,
-            entry_id: request.entry_id,
-            accepted_at: request.accepted_at,
-            created_session: request.created_session,
+            request,
+            session_id: accepted_session_id,
+            entry_id: accepted_entry_id,
+            accepted_at,
+            created_session,
             root_task_id: graph.root_task_id,
             action_task_id: graph.action_task_id,
             turn_id: turn_id.clone(),
             user_message_item_id,
+            accepted_canonical_turn,
             runner_started: false,
             superseded_turn,
         });
@@ -890,15 +1702,24 @@ pub fn accept_dispatch_submission(
             .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0))
     });
 
+    let accepted_session_id = request.session_id.clone();
+    let accepted_entry_id = request.entry_id.clone();
+    let accepted_at = request.accepted_at;
+    let created_session = request.created_session;
+    if let Some(rollback) = graph.materialize_rollback.take() {
+        rollback.commit();
+    }
     Ok(DispatchSubmissionAccepted {
-        session_id: request.session_id,
-        entry_id: request.entry_id,
-        accepted_at: request.accepted_at,
-        created_session: request.created_session,
+        request,
+        session_id: accepted_session_id,
+        entry_id: accepted_entry_id,
+        accepted_at,
+        created_session,
         root_task_id: graph.root_task_id,
         action_task_id: graph.action_task_id,
         turn_id,
         user_message_item_id,
+        accepted_canonical_turn: None,
         runner_started: false,
         superseded_turn: None,
     })
@@ -908,9 +1729,116 @@ pub fn accept_dispatch_submission(
 mod tests {
     use super::*;
     use magi_session_store::{
-        ExecutionThread, ExecutionThreadStatus, GoalContinuationPhase, GoalStatus,
-        ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
+        CanonicalTurnEventWriter, CanonicalTurnMutation, ExecutionThread, ExecutionThreadStatus,
+        GoalContinuationPhase, GoalStatus, SessionAcceptanceRecord, ThreadChatMessage,
+        ThreadChatToolCall, ThreadChatToolFunction,
     };
+
+    struct RejectingCanonicalWriter;
+
+    impl CanonicalTurnEventWriter for RejectingCanonicalWriter {
+        fn append_canonical_turn_transaction(
+            &self,
+            _session_id: &SessionId,
+            _mutations: &[CanonicalTurnMutation],
+        ) -> DomainResult<()> {
+            Err(DomainError::Persistence {
+                message: "test canonical write rejection".to_string(),
+            })
+        }
+
+        fn append_canonical_turn_transaction_with_acceptance(
+            &self,
+            _session_id: &SessionId,
+            _mutations: &[CanonicalTurnMutation],
+            _acceptance: &SessionAcceptanceRecord,
+            _task: &magi_core::Task,
+        ) -> DomainResult<()> {
+            Err(DomainError::Persistence {
+                message: "test acceptance write rejection".to_string(),
+            })
+        }
+    }
+
+    fn rollback_test_request(
+        session_id: SessionId,
+        accepted_at: UtcMillis,
+        target_role: &str,
+    ) -> DispatchSubmissionRequest {
+        DispatchSubmissionRequest {
+            accepted_at,
+            session_id,
+            workspace_id: Some(WorkspaceId::new("workspace-materialize-rollback")),
+            execution_root: None,
+            orchestrator_session_config: None,
+            entry_id: format!("timeline-materialize-rollback-{}", accepted_at.0),
+            timeline_message: "验证执行装配回滚".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
+            browser_node_selections: Vec::new(),
+            created_session: false,
+            mission_title: "执行装配回滚".to_string(),
+            task_title: "执行: 装配回滚".to_string(),
+            trimmed_text: Some("验证执行装配回滚".to_string()),
+            execution_goal: Some("验证执行装配失败时不留下任何运行资源".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            goal_mode: false,
+            target_role: Some(target_role.to_string()),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            denied_tools: Vec::new(),
+            user_message_metadata: Default::default(),
+            turn_origin: DispatchTurnOrigin::User,
+        }
+    }
+
+    fn rollback_test_execution_plan(
+        session_id: &SessionId,
+        mission_id: &MissionId,
+        task_id: &TaskId,
+        worker_id: &WorkerId,
+        thread_id: &ThreadId,
+        turn_id: &str,
+    ) -> TaskExecutionPlan {
+        TaskExecutionPlan::Dispatch {
+            target: TaskExecutionTarget {
+                mission_id: mission_id.clone(),
+                root_task_id: task_id.clone(),
+                task_id: task_id.clone(),
+                requested_worker_id: Some(worker_id.clone()),
+                recovery_id: None,
+                execution_chain_ref: Some("chain-materialize-rollback".to_string()),
+            },
+            worker_id: worker_id.clone(),
+            thread_id: thread_id.clone(),
+            is_primary: true,
+            session_id: session_id.clone(),
+            turn_id: turn_id.to_string(),
+            workspace_id: None,
+            execution_root: None,
+            ownership: ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                mission_id: Some(mission_id.clone()),
+                task_id: Some(task_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                execution_chain_ref: Some("chain-materialize-rollback".to_string()),
+                ..ExecutionOwnership::default()
+            },
+            writebacks: ExecutionWritebackPlans::default(),
+            use_tools: true,
+            skill_name: None,
+            images: Vec::new(),
+            execution_settings_snapshot: None,
+        }
+    }
 
     #[test]
     fn dispatch_submission_creates_fresh_worker_thread_even_when_role_has_idle_history() {
@@ -927,35 +1855,38 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "dispatch fresh thread")
             .expect("session should be creatable");
-        session_store.register_thread(ExecutionThread {
-            thread_id: old_thread_id.clone(),
-            session_id: session_id.clone(),
-            mission_id: mission_id.clone(),
-            role_id: "executor".to_string(),
-            worker_instance_id: WorkerId::new("worker-old"),
-            status: ExecutionThreadStatus::Idle,
-            created_at: UtcMillis(1_000),
-            last_used_at: UtcMillis(1_000),
-            observed_context_window_tokens: None,
-            handled_task_ids: vec![TaskId::new("task-old")],
-            message_history: vec![ThreadChatMessage {
-                role: "user".to_string(),
-                content: Some(
-                    "历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK"
-                        .to_string(),
-                ),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            }],
-        });
+        session_store
+            .register_thread(ExecutionThread {
+                thread_id: old_thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                role_id: "executor".to_string(),
+                worker_instance_id: WorkerId::new("worker-old"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: UtcMillis(1_000),
+                last_used_at: UtcMillis(1_000),
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![TaskId::new("task-old")],
+                message_history: vec![ThreadChatMessage {
+                    role: "user".to_string(),
+                    content: Some(
+                        "历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK"
+                            .to_string(),
+                    ),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                }],
+            })
+            .expect("旧 thread 测试数据应注册成功");
 
         let request = DispatchSubmissionRequest {
             accepted_at: UtcMillis(2_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-fresh-thread")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-dispatch-fresh-thread".to_string(),
             timeline_message: "创建当前任务文件".to_string(),
             images: Vec::new(),
@@ -1046,6 +1977,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: None,
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: format!("timeline-{}", accepted_at.0),
             timeline_message: format!("主线回合 {}", accepted_at.0),
             images: Vec::new(),
@@ -1139,6 +2071,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-browser-annotation")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-dispatch-browser-annotation".to_string(),
             timeline_message: "根据浏览器标记检查页面".to_string(),
             images: Vec::new(),
@@ -1220,7 +2153,7 @@ mod tests {
         );
         accept_dispatch_submission(
             &session_store,
-            Some(&task_store),
+            &task_store,
             &execution_registry,
             request,
             graph,
@@ -1291,19 +2224,21 @@ mod tests {
                 provider_context: Vec::new(),
             },
         ];
-        session_store.register_thread(ExecutionThread {
-            thread_id: source_thread_id.clone(),
-            session_id: session_id.clone(),
-            mission_id,
-            role_id: "coordinator".to_string(),
-            worker_instance_id: WorkerId::new("worker-dispatch-resume-source"),
-            status: ExecutionThreadStatus::Idle,
-            created_at: now,
-            last_used_at: now,
-            observed_context_window_tokens: None,
-            handled_task_ids: vec![source_task_id.clone()],
-            message_history: source_history.clone(),
-        });
+        session_store
+            .register_thread(ExecutionThread {
+                thread_id: source_thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id,
+                role_id: "coordinator".to_string(),
+                worker_instance_id: WorkerId::new("worker-dispatch-resume-source"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: now,
+                last_used_at: now,
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![source_task_id.clone()],
+                message_history: source_history.clone(),
+            })
+            .expect("source thread 测试数据应注册成功");
         session_store
             .upsert_current_turn(
                 session_id.clone(),
@@ -1350,6 +2285,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-resume-checkpoint")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-dispatch-resume-checkpoint".to_string(),
             timeline_message: "继续".to_string(),
             images: Vec::new(),
@@ -1505,6 +2441,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-invalid-resume-checkpoint")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-invalid-resume-checkpoint".to_string(),
             timeline_message: "继续".to_string(),
             images: Vec::new(),
@@ -1608,6 +2545,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-exec-chain-tier")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-exec-chain-tier".to_string(),
             timeline_message: "修复明确 bug 并跑相关验证".to_string(),
             images: Vec::new(),
@@ -1718,6 +2656,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-plan-root-binding")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-plan-root-binding".to_string(),
             timeline_message: "继续计划".to_string(),
             images: Vec::new(),
@@ -1788,6 +2727,7 @@ mod tests {
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-skill-mainline-role")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-dispatch-skill-mainline-role".to_string(),
             timeline_message: "使用 browser Skill 创建 explorer 子代理".to_string(),
             images: Vec::new(),
@@ -1864,6 +2804,7 @@ mod tests {
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-active-skill")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-dispatch-active-skill".to_string(),
             timeline_message: "使用代码审查 skill 检查当前改动".to_string(),
             images: Vec::new(),
@@ -1942,6 +2883,7 @@ mod tests {
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-context-reference")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-dispatch-context-reference".to_string(),
             timeline_message: "检查引用文件".to_string(),
             images: Vec::new(),
@@ -2051,6 +2993,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-dispatch")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-goal-continuation-dispatch".to_string(),
             timeline_message: "目标自动推进: 完成验收".to_string(),
             images: Vec::new(),
@@ -2100,7 +3043,15 @@ mod tests {
             .as_ref()
             .expect("continuation turn should exist");
         assert!(turn.user_message.is_none());
-        assert!(turn.items.is_empty());
+        assert_eq!(turn.items.len(), 1);
+        assert_eq!(turn.items[0].kind, "assistant_phase");
+        assert_eq!(
+            turn.items[0]
+                .metadata
+                .get("renderable")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
         let root_task = task_store
             .get_task(&graph.root_task_id)
             .expect("root task should exist");
@@ -2112,7 +3063,7 @@ mod tests {
         let root_task_id = graph.root_task_id.clone();
         accept_dispatch_submission(
             &session_store,
-            Some(&task_store),
+            &task_store,
             &execution_registry,
             request,
             graph,
@@ -2168,6 +3119,7 @@ mod tests {
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-pause-race")),
             execution_root: None,
+            orchestrator_session_config: None,
             entry_id: "timeline-goal-continuation-pause-race".to_string(),
             timeline_message: "目标自动推进: 验证暂停竞态".to_string(),
             images: Vec::new(),
@@ -2220,7 +3172,7 @@ mod tests {
         assert!(
             accept_dispatch_submission(
                 &session_store,
-                Some(&task_store),
+                &task_store,
                 &execution_registry,
                 request,
                 graph,
@@ -2256,7 +3208,7 @@ mod tests {
         assert!(
             accept_dispatch_submission(
                 &session_store,
-                Some(&task_store),
+                &task_store,
                 &execution_registry,
                 clear_request,
                 clear_graph,
@@ -2277,6 +3229,588 @@ mod tests {
                 .timeline_for_session(&session_id)
                 .iter()
                 .all(|entry| entry.entry_id != "timeline-goal-continuation-clear-race")
+        );
+    }
+
+    #[test]
+    fn worker_thread_conflict_rolls_back_new_coordinator_task_and_registry() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-worker-thread-conflict-rollback");
+        session_store
+            .create_session(session_id.clone(), "worker thread conflict rollback")
+            .expect("session should be creatable");
+        let request = rollback_test_request(session_id.clone(), UtcMillis(7_100), "executor");
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+        let prepared = validate_dispatch_request(&runtime, &request, true)
+            .expect("request should validate before conflict injection");
+        session_store
+            .register_thread(ExecutionThread {
+                thread_id: prepared.worker_thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: prepared.mission_id.clone(),
+                role_id: "executor".to_string(),
+                worker_instance_id: WorkerId::new("worker-existing-conflict"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: UtcMillis(7_000),
+                last_used_at: UtcMillis(7_000),
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![TaskId::new("task-existing-conflict")],
+                message_history: Vec::new(),
+            })
+            .expect("conflicting thread should register");
+
+        let error = match run_dispatch_submission(&runtime, &request) {
+            Ok(_) => panic!("duplicate worker thread id must reject materialization"),
+            Err(error) => error,
+        };
+
+        assert!(error.into_message().contains("拒绝重复注册"));
+        assert!(task_store.get_task(&prepared.action_task_id).is_none());
+        assert!(execution_registry.get(&prepared.action_task_id).is_none());
+        assert!(
+            session_store
+                .orchestrator_thread_for_session(&session_id)
+                .is_none(),
+            "materialize 创建的 coordinator 必须随失败一起回收"
+        );
+        let threads = session_store.thread_registry_snapshot(&session_id);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(
+            threads[0].worker_instance_id.as_str(),
+            "worker-existing-conflict"
+        );
+    }
+
+    #[test]
+    fn materialize_rollback_restores_full_resources_and_keeps_plan_revision_monotonic() {
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let session_id = SessionId::new("session-materialize-owned-resource-rollback");
+        let mission_id = MissionId::new("mission-materialize-owned-resource-rollback");
+        let task_id = TaskId::new("task-materialize-owned-resource-rollback");
+        let worker_id = WorkerId::new("worker-materialize-owned-resource-rollback");
+        let turn_id = "turn-materialize-owned-resource-rollback";
+        session_store
+            .create_session(session_id.clone(), "materialize owned resource rollback")
+            .expect("session should be creatable");
+        let (_, coordinator_thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis(8_000), || mission_id.clone());
+        let coordinator_before = session_store
+            .orchestrator_thread_for_session(&session_id)
+            .expect("coordinator should exist");
+        let coordinator_after = session_store
+            .activate_thread_checked(&coordinator_thread_id, &task_id, UtcMillis(8_100))
+            .expect("coordinator should activate");
+
+        let worker_thread_id = ThreadId::new("thread-materialize-owned-resource-rollback");
+        let worker_thread = ExecutionThread {
+            thread_id: worker_thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            role_id: "executor".to_string(),
+            worker_instance_id: worker_id.clone(),
+            status: ExecutionThreadStatus::Active,
+            created_at: UtcMillis(8_000),
+            last_used_at: UtcMillis(8_100),
+            observed_context_window_tokens: None,
+            handled_task_ids: vec![task_id.clone()],
+            message_history: vec![ThreadChatMessage {
+                role: "user".to_string(),
+                content: Some("恢复上下文".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            }],
+        };
+        session_store
+            .register_thread(worker_thread.clone())
+            .expect("worker thread should register");
+        session_store
+            .install_thread_context_checkpoint_checked(
+                &worker_thread_id,
+                ThreadContextCheckpoint {
+                    thread_id: worker_thread_id.clone(),
+                    checkpoint_id: "checkpoint-materialize-rollback".to_string(),
+                    source_message_count: 1,
+                    summary_message: ThreadChatMessage {
+                        role: "system".to_string(),
+                        content: Some("恢复摘要".to_string()),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        provider_context: Vec::new(),
+                    },
+                    reason: "test".to_string(),
+                    original_token_estimate: 100,
+                    checkpoint_token_estimate: 20,
+                    created_at: UtcMillis(8_100),
+                    generation: 1,
+                    source_fingerprint: "fingerprint-materialize-rollback".to_string(),
+                    model_provider: None,
+                    model: None,
+                    binding_revision: None,
+                    projected_request_tokens: 20,
+                    context_window_limit_tokens: None,
+                    preserved_tail_message_count: 0,
+                    file_fact_versions: Vec::new(),
+                },
+                UtcMillis(8_100),
+            )
+            .expect("worker checkpoint should install");
+
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        let original_plan = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("materialize-step".to_string()),
+                    step: "验证装配回滚".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let (plan_before_binding, plan_after_binding) = plan_store
+            .bind_task_for_materialization(task_id.clone(), original_plan.items[0].item_id.clone())
+            .expect("plan binding should succeed")
+            .expect("new task binding should mutate plan");
+        execution_registry
+            .insert(
+                task_id.clone(),
+                rollback_test_execution_plan(
+                    &session_id,
+                    &mission_id,
+                    &task_id,
+                    &worker_id,
+                    &worker_thread_id,
+                    turn_id,
+                ),
+            )
+            .expect("execution plan should register");
+
+        let mut rollback = MaterializeRollback::new(
+            &session_store,
+            &execution_registry,
+            session_id.clone(),
+            task_id.clone(),
+            turn_id.to_string(),
+        );
+        rollback.record_created_thread(worker_thread);
+        rollback.record_coordinator_before(coordinator_before.clone());
+        rollback.record_coordinator_after(coordinator_after);
+        rollback.record_plan_materialization(PlanMaterialization {
+            original_plan: Some(plan_before_binding.clone()),
+            current_revision: plan_after_binding.revision,
+        });
+        rollback.record_registry_inserted();
+
+        assert!(rollback.rollback_now().is_empty());
+        assert!(execution_registry.get(&task_id).is_none());
+        assert_eq!(
+            session_store
+                .orchestrator_thread_for_session(&session_id)
+                .expect("coordinator should remain"),
+            coordinator_before
+        );
+        assert!(
+            session_store
+                .thread_registry_snapshot(&session_id)
+                .iter()
+                .all(|thread| thread.thread_id != worker_thread_id)
+        );
+        assert!(
+            session_store
+                .thread_context_checkpoint(&worker_thread_id)
+                .is_none(),
+            "回收恢复 thread 时必须同步删除 context checkpoint"
+        );
+        let restored_plan = plan_store.snapshot().expect("plan should remain");
+        assert_eq!(restored_plan.items, plan_before_binding.items);
+        assert_eq!(restored_plan.state, plan_before_binding.state);
+        assert_eq!(
+            restored_plan.task_bindings,
+            plan_before_binding.task_bindings
+        );
+        assert_eq!(
+            restored_plan.task_statuses,
+            plan_before_binding.task_statuses
+        );
+        assert_eq!(restored_plan.revision, plan_after_binding.revision);
+        assert!(restored_plan.revision > plan_before_binding.revision);
+    }
+
+    #[test]
+    fn accepted_runner_start_cleanup_is_idempotent_for_registry_worker_and_plan_binding() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-accepted-runner-cleanup");
+        session_store
+            .create_session(session_id.clone(), "accepted runner cleanup")
+            .expect("session should be creatable");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("accepted-runner-step".to_string()),
+                    step: "验证 runner 启动失败清理".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let request = rollback_test_request(session_id.clone(), UtcMillis(9_100), "executor");
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+        let pending = prepare_pending_dispatch_submission(&runtime, &request)
+            .expect("pending dispatch should prepare");
+        let graph = DispatchSubmissionGraph::new(
+            pending.task.task_id.clone(),
+            pending.task.task_id,
+            Some(pending.active_execution_chain),
+        );
+        let accepted = accept_dispatch_submission(
+            &session_store,
+            &task_store,
+            &execution_registry,
+            request.clone(),
+            graph,
+        )
+        .expect("dispatch should be accepted");
+        materialize_dispatch_submission(&runtime, &request, &accepted.turn_id)
+            .expect("accepted dispatch should materialize");
+        let worker_thread_id = session_store
+            .active_execution_chain(&session_id)
+            .and_then(|chain| {
+                chain
+                    .branches
+                    .first()
+                    .map(|branch| branch.thread_id.clone())
+            })
+            .expect("accepted chain should contain worker thread");
+        assert!(execution_registry.get(&accepted.root_task_id).is_some());
+        assert!(
+            plan_store
+                .snapshot()
+                .expect("plan should remain")
+                .task_bindings
+                .contains_key(&accepted.root_task_id)
+        );
+
+        for _ in 0..2 {
+            cleanup_materialized_dispatch_submission_if_not_started(
+                &session_store,
+                &execution_registry,
+                &session_id,
+                &accepted.root_task_id,
+                &accepted.turn_id,
+            )
+            .expect("runner start cleanup should be idempotent");
+        }
+
+        assert!(execution_registry.get(&accepted.root_task_id).is_none());
+        assert!(
+            session_store
+                .thread_registry_snapshot(&session_id)
+                .iter()
+                .all(|thread| thread.thread_id != worker_thread_id)
+        );
+        assert!(
+            !plan_store
+                .snapshot()
+                .expect("plan should remain")
+                .task_bindings
+                .contains_key(&accepted.root_task_id)
+        );
+        assert_eq!(
+            task_store
+                .get_task(&accepted.root_task_id)
+                .expect("accepted task fact must remain")
+                .status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            session_store
+                .runtime_sidecar(&session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .expect("accepted turn fact must remain")
+                .turn_id,
+            accepted.turn_id
+        );
+    }
+
+    #[test]
+    fn accepted_materialize_rejects_registry_owned_by_another_execution_identity() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-stale-materialize-registry");
+        session_store
+            .create_session(session_id.clone(), "stale materialize registry")
+            .expect("session should be creatable");
+        let request = rollback_test_request(session_id.clone(), UtcMillis(9_200), "executor");
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+        let pending = prepare_pending_dispatch_submission(&runtime, &request)
+            .expect("pending dispatch should prepare");
+        let prepared = validate_dispatch_request(&runtime, &request, false)
+            .expect("accepted request should validate");
+        let graph = DispatchSubmissionGraph::new(
+            pending.task.task_id.clone(),
+            pending.task.task_id,
+            Some(pending.active_execution_chain),
+        );
+        let accepted = accept_dispatch_submission(
+            &session_store,
+            &task_store,
+            &execution_registry,
+            request.clone(),
+            graph,
+        )
+        .expect("dispatch should be accepted");
+        execution_registry
+            .insert(
+                accepted.root_task_id.clone(),
+                rollback_test_execution_plan(
+                    &session_id,
+                    &prepared.mission_id,
+                    &accepted.root_task_id,
+                    &prepared.worker_id,
+                    &prepared.worker_thread_id,
+                    &accepted.turn_id,
+                ),
+            )
+            .expect("conflicting execution plan should register");
+
+        let error = materialize_dispatch_submission(&runtime, &request, &accepted.turn_id)
+            .expect_err("different Turn registry entry must not count as idempotent success");
+
+        assert!(error.into_message().contains("已被其他执行身份装配"));
+        assert_eq!(
+            execution_registry
+                .turn_id(&accepted.root_task_id)
+                .as_deref(),
+            Some(accepted.turn_id.as_str())
+        );
+        assert!(
+            session_store
+                .thread_registry_snapshot(&session_id)
+                .is_empty(),
+            "身份冲突必须在创建执行 thread 前被拒绝"
+        );
+    }
+
+    #[test]
+    fn active_chain_writeback_failure_rolls_back_materialized_execution_resources() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-chain-writeback-rollback");
+        session_store
+            .create_session(session_id.clone(), "chain writeback rollback")
+            .expect("session should be creatable");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        let original_plan = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("chain-writeback-step".to_string()),
+                    step: "验证 chain 写回失败回滚".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let request = rollback_test_request(session_id.clone(), UtcMillis(9_300), "executor");
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+        let pending = prepare_pending_dispatch_submission(&runtime, &request)
+            .expect("pending dispatch should prepare");
+        let graph = DispatchSubmissionGraph::new(
+            pending.task.task_id.clone(),
+            pending.task.task_id,
+            Some(pending.active_execution_chain),
+        );
+        let accepted = accept_dispatch_submission(
+            &session_store,
+            &task_store,
+            &execution_registry,
+            request.clone(),
+            graph,
+        )
+        .expect("dispatch should be accepted");
+        let prepared = validate_dispatch_request(&runtime, &request, false)
+            .expect("accepted request should validate");
+        let mut changed_chain = session_store
+            .active_execution_chain(&session_id)
+            .expect("accepted chain should exist");
+        changed_chain
+            .current_turn
+            .as_mut()
+            .and_then(|turn| turn.items.first_mut())
+            .expect("accepted user item should exist")
+            .metadata
+            .insert("forceWriteback".to_string(), serde_json::json!(true));
+        session_store.install_canonical_event_writer(Arc::new(RejectingCanonicalWriter));
+
+        let error = match materialize_execution(&runtime, &request, &prepared, Some(changed_chain))
+        {
+            Ok(_) => panic!("canonical write rejection must fail materialization"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .into_message()
+                .contains("写回 materialize execution chain 失败")
+        );
+        assert!(execution_registry.get(&accepted.root_task_id).is_none());
+        assert!(
+            session_store
+                .thread_registry_snapshot(&session_id)
+                .is_empty(),
+            "写回失败后 coordinator 和 worker thread 都必须回收"
+        );
+        let restored_plan = plan_store.snapshot().expect("plan should remain");
+        assert_eq!(restored_plan.items, original_plan.items);
+        assert!(
+            !restored_plan
+                .task_bindings
+                .contains_key(&accepted.root_task_id)
+        );
+        assert!(restored_plan.revision > original_plan.revision);
+        assert!(
+            session_store
+                .canonical_turns_for_session(&session_id)
+                .into_iter()
+                .flat_map(|turn| turn.items)
+                .all(|item| !item.metadata.contains_key("forceWriteback")),
+            "失败的 chain 写回不能污染 canonical projection"
+        );
+    }
+
+    #[test]
+    fn rejected_dispatch_cleanup_does_not_remove_foreign_registry_generation() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-rejected-cleanup-generation");
+        session_store
+            .create_session(session_id.clone(), "rejected cleanup generation")
+            .expect("session should be creatable");
+        let request = rollback_test_request(session_id.clone(), UtcMillis(9_400), "executor");
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+        let pending = prepare_pending_dispatch_submission(&runtime, &request)
+            .expect("pending dispatch should prepare");
+        let prepared = validate_dispatch_request(&runtime, &request, false)
+            .expect("pending request should validate");
+        let task_id = pending.task.task_id.clone();
+        execution_registry
+            .insert(
+                task_id.clone(),
+                rollback_test_execution_plan(
+                    &session_id,
+                    &prepared.mission_id,
+                    &task_id,
+                    &prepared.worker_id,
+                    &prepared.worker_thread_id,
+                    "turn-foreign-generation",
+                ),
+            )
+            .expect("foreign generation should register");
+        let graph = DispatchSubmissionGraph::new(
+            task_id.clone(),
+            task_id.clone(),
+            Some(pending.active_execution_chain),
+        );
+
+        cleanup_rejected_dispatch(Some(&task_store), &execution_registry, graph)
+            .expect("rejected dispatch facts should clean up");
+
+        assert!(task_store.get_task(&task_id).is_none());
+        assert_eq!(
+            execution_registry.turn_id(&task_id).as_deref(),
+            Some("turn-foreign-generation"),
+            "拒绝旧 Turn 时不能删除同 task id 下的新执行代际"
         );
     }
 }

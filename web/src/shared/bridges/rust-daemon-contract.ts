@@ -1,7 +1,8 @@
 import type { SessionBootstrapSnapshot } from '../session-bootstrap';
 import type { CanonicalTurn, CanonicalTurnItem } from '../protocol/canonical-turn';
-import { normalizeCanonicalTurn } from '../protocol/canonical-turn';
+import { normalizeCanonicalTurnStrict } from '../protocol/canonical-turn';
 import { deriveProcessingStateFromCanonicalTurns } from '../protocol/canonical-processing';
+import { parseRuntimeTaskStatus } from '../protocol/runtime-task-status';
 import { deriveHasUnreadCompletion } from '../../lib/session-activity-indicator';
 import { parseModelFailureDiagnostic } from '../../lib/model-failure';
 import { parseToolCallFailureDiagnostic } from '../../lib/tool-call-failure';
@@ -29,6 +30,7 @@ export type BootstrapPayload = SessionBootstrapSnapshot & {
   };
   canonicalTurns?: CanonicalTurn[];
   eventStreamNextSequence?: number;
+  canonicalEventNextSequence?: number;
   sessions: Session[];
   state: AppState;
   workspace: {
@@ -414,6 +416,7 @@ interface RustBootstrapDto {
   runtimeReadModel?: RustRuntimeReadModelDto;
   notifications?: RustNotificationRecord[];
   eventStreamNextSequence?: number;
+  canonicalEventNextSequence?: number;
   recentEvents?: RustEventEnvelope[];
   hasMoreBefore?: boolean;
   beforeCursor?: string | null;
@@ -424,10 +427,8 @@ interface RustBootstrapDto {
   };
 }
 
-interface RustTimelinePageDto {
+interface RustCanonicalHistoryPageDto {
   sessionId?: string;
-  hasMoreBefore?: boolean;
-  beforeCursor?: string | null;
   canonicalHasMoreBefore?: boolean;
   canonicalBeforeCursor?: string | null;
 }
@@ -879,42 +880,20 @@ function buildLookupMaps(events: RustEventEnvelope[]): {
   };
 }
 
-function normalizeSubTaskStatus(status: string, failedDispatchCount = 0): SubTaskItem['status'] {
-  const normalized = status.toLowerCase();
-  if (normalized.includes('approval')) {
-    return 'awaiting_approval';
+function normalizeSubTaskStatus(status: string): SubTaskItem['status'] {
+  switch (parseRuntimeTaskStatus(status)) {
+    case 'running':
+      return 'running';
+    case 'completed':
+      return 'completed';
+    case 'failed':
+      return 'failed';
+    case 'killed':
+      return 'cancelled';
+    case 'pending':
+    default:
+      return 'pending';
   }
-  if (normalized.includes('review')) {
-    return 'review_required';
-  }
-  if (normalized.includes('cancel') || normalized.includes('abort') || normalized.includes('kill')) {
-    return 'cancelled';
-  }
-  if (normalized.includes('reject')) {
-    return 'failed';
-  }
-  if (normalized.includes('block') || failedDispatchCount > 0) {
-    return 'blocked';
-  }
-  if (normalized.includes('fail')) {
-    return 'failed';
-  }
-  if (normalized.includes('success') || normalized.includes('complete')) {
-    return 'completed';
-  }
-  if (normalized.includes('run') || normalized.includes('resume') || normalized.includes('execute')) {
-    return 'running';
-  }
-  if (normalized.includes('pause')) {
-    return 'paused';
-  }
-  if (normalized.includes('wait')) {
-    return 'waiting_deps';
-  }
-  if (normalized.includes('skip')) {
-    return 'skipped';
-  }
-  return 'pending';
 }
 
 function buildAssignmentsFromRuntime(
@@ -955,7 +934,6 @@ function buildAssignmentsFromRuntime(
     }
     const assignmentTaskStatuses = assignmentTasks.map((task) => normalizeSubTaskStatus(
       normalizeString(task.current_status),
-      typeof task.failed_dispatch_count === 'number' ? task.failed_dispatch_count : 0,
     ));
     const taskTotal = assignmentTasks.length || declaredTaskIds.length;
     const completedTaskCount = assignmentTasks.length > 0
@@ -1128,10 +1106,7 @@ function buildSessionTaskStatusSummary(
     if (!taskId) {
       continue;
     }
-    const status = normalizeSubTaskStatus(
-      normalizeString(task.current_status),
-      typeof task.failed_dispatch_count === 'number' ? task.failed_dispatch_count : 0,
-    );
+    const status = normalizeSubTaskStatus(normalizeString(task.current_status));
     if (status === 'running') {
       runningTaskIds.push(taskId);
       continue;
@@ -1150,29 +1125,10 @@ function buildSessionTaskStatusSummary(
 }
 
 function deriveProcessingState(
-  runtimeReadModel: RustRuntimeReadModelDto | undefined,
   sessionId: string,
   canonicalTurns: CanonicalTurn[],
 ): AppState['processingState'] {
-  const canonicalProcessingState = deriveProcessingStateFromCanonicalTurns(canonicalTurns, sessionId);
-  if (canonicalProcessingState) {
-    return canonicalProcessingState;
-  }
-
-  const { runningTaskIds } = buildSessionTaskStatusSummary(runtimeReadModel, sessionId);
-  const isProcessing = runningTaskIds.length > 0;
-
-  if (!isProcessing) {
-    return null;
-  }
-
-  return {
-    isProcessing: true,
-    source: 'orchestrator',
-    agent: 'orchestrator',
-    startedAt: 0,
-    pendingRequestIds: [],
-  };
+  return deriveProcessingStateFromCanonicalTurns(canonicalTurns, sessionId);
 }
 
 /**
@@ -2105,16 +2061,15 @@ export function normalizeRustBootstrapPayload(
   const rawCanonicalTurns = Array.isArray(payload.canonicalTurns)
     ? payload.canonicalTurns
     : [];
-  const canonicalTurns = rawCanonicalTurns
-    .map(normalizeCanonicalTurn)
-    .filter((turn): turn is CanonicalTurn => Boolean(turn));
+  const canonicalTurns = rawCanonicalTurns.map((turn, index) => (
+    normalizeCanonicalTurnStrict(turn, `bootstrap.canonicalTurns[${index}]`)
+  ));
   const assignments = buildAssignmentsFromRuntime(
     payload.runtimeReadModel,
     normalizedEvents,
     currentSession?.id || '',
   );
   const processingState = deriveProcessingState(
-    payload.runtimeReadModel,
     currentSession?.id || '',
     canonicalTurns,
   );
@@ -2130,6 +2085,7 @@ export function normalizeRustBootstrapPayload(
     stateUpdatedAt: generatedAt,
   };
   const normalizedNotifications = normalizeNotifications(payload.notifications);
+  const canonicalEventNextSequence = normalizeNumber(payload.canonicalEventNextSequence, 0);
 
   return {
     scope,
@@ -2143,6 +2099,7 @@ export function normalizeRustBootstrapPayload(
     state,
     canonicalTurns,
     eventStreamNextSequence: normalizeNumber(payload.eventStreamNextSequence, 0),
+    ...(canonicalEventNextSequence >= 1 ? { canonicalEventNextSequence } : {}),
     notifications: currentSession?.id || workspace.workspaceId
         ? {
           workspaceId: workspace.workspaceId || null,
@@ -2164,18 +2121,14 @@ export function normalizeRustBootstrapPayload(
   };
 }
 
-export function readRustTimelinePageMeta(rawPayload: unknown): {
+export function readRustCanonicalHistoryPageMeta(rawPayload: unknown): {
   sessionId: string;
-  hasMoreBefore: boolean;
-  beforeCursor: string | null;
   canonicalHasMoreBefore: boolean;
   canonicalBeforeCursor: string | null;
 } {
-  const payload = (rawPayload ?? {}) as RustTimelinePageDto;
+  const payload = (rawPayload ?? {}) as RustCanonicalHistoryPageDto;
   return {
     sessionId: normalizeString(payload.sessionId),
-    hasMoreBefore: payload.hasMoreBefore === true,
-    beforeCursor: normalizeString(payload.beforeCursor) || null,
     canonicalHasMoreBefore: payload.canonicalHasMoreBefore === true,
     canonicalBeforeCursor: normalizeString(payload.canonicalBeforeCursor) || null,
   };

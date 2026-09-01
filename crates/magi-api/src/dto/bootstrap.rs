@@ -55,6 +55,8 @@ pub struct BootstrapDto {
     pub audit_usage_ledger: AuditUsageLedgerDto,
     pub notifications: Vec<NotificationRecord>,
     pub event_stream_next_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_event_next_sequence: Option<u64>,
     pub recent_events: Vec<EventEnvelope>,
     pub has_more_before: bool,
     pub before_cursor: Option<String>,
@@ -108,6 +110,8 @@ impl BootstrapDto {
             &mut dto.runtime_read_model,
             &state.settings_store,
         );
+        dto.canonical_event_next_sequence =
+            state.canonical_event_next_sequence_for(runtime_session_scope.as_ref())?;
         if let Some(workspace_id) = dto
             .current_session
             .as_ref()
@@ -266,6 +270,7 @@ impl BootstrapDto {
             audit_usage_ledger,
             notifications: session_projection.notifications,
             event_stream_next_sequence: event_snapshot.next_sequence,
+            canonical_event_next_sequence: None,
             recent_events,
             has_more_before: false,
             before_cursor: None,

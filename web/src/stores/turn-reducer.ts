@@ -166,7 +166,7 @@ function canonicalItemRequestId(item: CanonicalTurnItem | undefined): string {
   return item ? readMetadataString(item.metadata, 'requestId') : '';
 }
 
-function isLocalOptimisticTurn(turn: CanonicalTurn | undefined): boolean {
+export function isLocalOptimisticTurn(turn: CanonicalTurn | undefined): boolean {
   if (!turn) {
     return false;
   }

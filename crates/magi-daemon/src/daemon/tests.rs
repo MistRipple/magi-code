@@ -19,6 +19,7 @@ use magi_core::{
     TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
+use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, ExecutionThread, ExecutionThreadStatus,
@@ -76,9 +77,19 @@ fn test_sidecar_persistence_with_worker_runtime(
 fn workspace_session_loader_preserves_goals() {
     let state_root = temp_state_root("workspace-goal-load");
     let workspace_root = temp_state_root("workspace-goal-load-root");
-    let repository = StateRepository::new(state_root);
-    let session_store = SessionStore::default();
+    let repository = StateRepository::new(state_root.clone());
     let workspace_id = WorkspaceId::new("workspace-goal-load");
+    let workspace_store = WorkspaceStore::new();
+    workspace_store
+        .register(
+            workspace_id.clone(),
+            AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+        )
+        .expect("workspace should register");
+    repository
+        .save_workspace_durable_state(&workspace_store.durable_state())
+        .expect("workspace state should save");
+    let session_store = SessionStore::default();
     let session_id = SessionId::new("session-goal-load");
     session_store
         .create_session_for_workspace(
@@ -101,21 +112,24 @@ fn workspace_session_loader_preserves_goals() {
             Some(256_000),
         )
         .expect("goal should create");
-    let (_global_state, workspace_states) = session_store.durable_state().partition_by_workspace();
-    let workspace_state = workspace_states
-        .get(workspace_id.as_str())
-        .expect("workspace state should contain session");
+    let workspace_state = session_store.durable_state();
     repository
-        .save_workspace_session_state(&workspace_root, workspace_state)
+        .save_session_projection_state(
+            &workspace_state,
+            &session_store.execution_sidecar_store_state(),
+        )
         .expect("workspace session state should save");
 
-    let loaded = repository
-        .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root)])
+    let (loaded, _) = repository
+        .load_session_projections(&[(workspace_id.to_string(), workspace_root.clone())])
         .expect("workspace sessions should load");
 
     assert_eq!(loaded.goals.len(), 1);
     assert_eq!(loaded.goals[0].goal_id, goal.goal_id);
     assert_eq!(loaded.goals[0].objective, "恢复工作区目标");
+
+    let _ = fs::remove_dir_all(state_root);
+    let _ = fs::remove_dir_all(workspace_root);
 }
 
 async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
@@ -462,7 +476,7 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
             worker_runtime_snapshot_flushed: false,
         }
     );
-    assert!(repository.session_sidecars_path().exists());
+    assert!(repository.session_projection_root().exists());
     assert!(repository.workspace_recovery_sidecars_path().exists());
     assert_eq!(
         persistence
@@ -484,6 +498,7 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
         session_store.clone(),
         workspace_store.clone(),
     );
+    session_store.install_canonical_event_writer(Arc::new(repository.clone()));
     let session_id = SessionId::new("session-flush-canonical");
     let workspace_id = WorkspaceId::new("workspace-flush-canonical");
 
@@ -549,15 +564,15 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
         .expect("sidecar flush should also persist canonical turns");
     assert!(report.session_sidecars_flushed);
 
-    let workspace_sessions = repository
-        .load_workspace_session_state(&workspace_root)
+    let (session_durable, _) = repository
+        .load_session_projections(&[])
         .expect("workspace sessions should reload");
-    assert_eq!(workspace_sessions.canonical_turns.len(), 1);
+    assert_eq!(session_durable.canonical_turns.len(), 1);
     assert_eq!(
-        workspace_sessions.canonical_turns[0].turn_id,
+        session_durable.canonical_turns[0].turn_id,
         "turn-flush-canonical"
     );
-    assert_eq!(workspace_sessions.canonical_turns[0].items.len(), 1);
+    assert_eq!(session_durable.canonical_turns[0].items.len(), 1);
 }
 
 #[test]
@@ -768,8 +783,8 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
         }
     );
 
-    let reloaded_session_sidecars = repository
-        .load_session_sidecars()
+    let (_, reloaded_session_sidecars) = repository
+        .load_session_projections(&[])
         .expect("session sidecars should reload");
     let reloaded_workspace_sidecars = repository
         .load_workspace_recovery_sidecars()
@@ -898,58 +913,62 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
     let task_store = state.task_store().expect("task store should be configured");
     let root_task_id = TaskId::new("task-root-router-recovery");
     let now = UtcMillis::now();
-    task_store.insert_task(Task {
-        task_id: root_task_id.clone(),
-        mission_id: mission_id.clone(),
-        root_task_id: root_task_id.clone(),
-        parent_task_id: None,
-        kind: TaskKind::LocalAgent,
-        title: "recovery mission".to_string(),
-        goal: "recovery mission".to_string(),
-        status: TaskStatus::Running,
-        dependency_ids: Vec::new(),
-        required_children: vec![task_id.clone()],
-        policy_snapshot: None,
-        executor_binding: None,
-        completion_contract: magi_core::TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        knowledge_refs: Vec::new(),
-        workspace_scope: None,
-        write_scope: None,
-        input_refs: Vec::new(),
-        output_refs: Vec::new(),
-        evidence_refs: Vec::new(),
-        retry_count: 0,
-        runtime_payload: magi_core::TaskRuntimePayload::default(),
-        created_at: now,
-        updated_at: now,
-    });
-    task_store.insert_task(Task {
-        task_id: task_id.clone(),
-        mission_id: mission_id.clone(),
-        root_task_id,
-        parent_task_id: Some(TaskId::new("task-root-router-recovery")),
-        kind: TaskKind::LocalAgent,
-        title: "recovery task".to_string(),
-        goal: "recovery task".to_string(),
-        status: TaskStatus::Failed,
-        dependency_ids: Vec::new(),
-        required_children: Vec::new(),
-        policy_snapshot: None,
-        executor_binding: None,
-        completion_contract: magi_core::TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        knowledge_refs: Vec::new(),
-        workspace_scope: None,
-        write_scope: None,
-        input_refs: Vec::new(),
-        output_refs: Vec::new(),
-        evidence_refs: Vec::new(),
-        retry_count: 0,
-        runtime_payload: magi_core::TaskRuntimePayload::default(),
-        created_at: now,
-        updated_at: now,
-    });
+    task_store
+        .insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "recovery mission".to_string(),
+            goal: "recovery mission".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: vec![task_id.clone()],
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("根任务应插入");
+    task_store
+        .insert_task(Task {
+            task_id: task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id,
+            parent_task_id: Some(TaskId::new("task-root-router-recovery")),
+            kind: TaskKind::LocalAgent,
+            title: "recovery task".to_string(),
+            goal: "recovery task".to_string(),
+            status: TaskStatus::Failed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("任务应插入");
 
     let expected_extraction_id =
         format!("extract-session-continue-{}", recovery_handle.recovery_id);
@@ -1026,7 +1045,10 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .iter()
         .find(|entry| entry["session_id"] == session_id.to_string())
         .expect("session summary should exist");
-    assert_eq!(session_summary["current_status"], "resumed");
+    assert_eq!(
+        session_summary["current_status"], "detached",
+        "恢复 runner 已进入失败终态后应释放执行链，后续普通 followup 再重新绑定新链"
+    );
     assert!(session_summary["recovery_ref"].is_null());
     let workspace_summary = first_read_model["details"]["workspaces"]
         .as_array()
@@ -1293,7 +1315,15 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     state
         .task_store()
         .expect("task store should be configured")
-        .update_status(&recovery_task_id, TaskStatus::Failed)
+        .revoke_lease_and_set_task_terminal(
+            &recovery_task_id,
+            &recovery_task_id,
+            None,
+            TaskStatus::Failed,
+            Vec::new(),
+        )
+        .expect("seed task should become recoverable")
+        .then_some(())
         .expect("seed task should become recoverable");
     let snapshot = state.workspace_registry.append_execution_snapshot(
         workspace_id.clone(),
@@ -1537,7 +1567,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     assert!(ledger.is_persist_healthy);
     assert!(ledger.last_persisted_at.is_some());
     assert!(!ledger.pending_flush);
-    assert!(repository.session_sidecars_path().exists());
+    assert!(repository.session_projection_root().exists());
     assert!(repository.workspace_recovery_sidecars_path().exists());
     assert!(repository.audit_usage_ledger_path().exists());
 }
@@ -1816,10 +1846,13 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
         .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
         .expect("recovery ref should be attachable");
 
-    // Persist durable state (sessions.json + workspaces.json)
+    // Persist session projection and workspace state
     repository
-        .save_session_durable_state(&session_store.durable_state())
-        .expect("session durable state should save");
+        .save_session_projection_state(
+            &session_store.durable_state(),
+            &session_store.execution_sidecar_store_state(),
+        )
+        .expect("session projection should save");
     repository
         .save_workspace_durable_state(&workspace_store.durable_state())
         .expect("workspace durable state should save");
@@ -1872,14 +1905,13 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
     drop(session_store);
     drop(workspace_store);
 
-    let restarted_session_store = Arc::new(SessionStore::from_persisted_parts(
-        repository
-            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
-            .expect("session durable state should reload"),
-        repository
-            .load_session_sidecars()
-            .expect("session sidecars should reload"),
-    ));
+    let (restarted_durable, restarted_sidecars) = repository
+        .load_session_projections(&[(workspace_id.to_string(), workspace_root.clone())])
+        .expect("session durable state should reload");
+    let restarted_session_store = Arc::new(
+        SessionStore::from_persisted_parts(restarted_durable, restarted_sidecars)
+            .expect("重启后的会话存储持久化恢复应成功"),
+    );
     let restarted_workspace_store = Arc::new(WorkspaceStore::from_persisted_parts(
         repository
             .load_workspace_durable_state()
@@ -2002,8 +2034,11 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
         );
 
         repository
-            .save_session_durable_state(&session_store.durable_state())
-            .expect("durable session save should succeed");
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("session projection save should succeed");
         repository
             .save_workspace_durable_state(&workspace_store.durable_state())
             .expect("durable workspace save should succeed");
@@ -2016,12 +2051,13 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
     }
 
     // ── Phase 2: Restart and mutate ──
-    let session_store_2 = Arc::new(SessionStore::from_persisted_parts(
-        repository
-            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
-            .expect("load"),
-        repository.load_session_sidecars().expect("load"),
-    ));
+    let (durable_2, sidecars_2) = repository
+        .load_session_projections(&[(workspace_id.to_string(), workspace_root.clone())])
+        .expect("load");
+    let session_store_2 = Arc::new(
+        SessionStore::from_persisted_parts(durable_2, sidecars_2)
+            .expect("重启后的会话存储二次恢复应成功"),
+    );
     let workspace_store_2 = Arc::new(WorkspaceStore::from_persisted_parts(
         repository.load_workspace_durable_state().expect("load"),
         repository.load_workspace_recovery_sidecars().expect("load"),
@@ -2084,12 +2120,11 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
     drop(session_store_2);
     drop(workspace_store_2);
 
-    let session_store_3 = SessionStore::from_persisted_parts(
-        repository
-            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
-            .expect("load"),
-        repository.load_session_sidecars().expect("load"),
-    );
+    let (durable_3, sidecars_3) = repository
+        .load_session_projections(&[(workspace_id.to_string(), workspace_root.clone())])
+        .expect("load");
+    let session_store_3 = SessionStore::from_persisted_parts(durable_3, sidecars_3)
+        .expect("二次重启后的会话存储持久化恢复应成功");
     let workspace_store_3 = WorkspaceStore::from_persisted_parts(
         repository.load_workspace_durable_state().expect("load"),
         repository.load_workspace_recovery_sidecars().expect("load"),
@@ -2174,8 +2209,11 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
 
     // Persist durable state
     repository
-        .save_session_durable_state(&session_store.durable_state())
-        .expect("durable save should succeed");
+        .save_session_projection_state(
+            &session_store.durable_state(),
+            &session_store.execution_sidecar_store_state(),
+        )
+        .expect("session projection save should succeed");
     repository
         .save_workspace_durable_state(&workspace_store.durable_state())
         .expect("durable save should succeed");
@@ -2226,12 +2264,13 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
     drop(session_store);
     drop(workspace_store);
 
-    let restarted_session = Arc::new(SessionStore::from_persisted_parts(
-        repository
-            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
-            .expect("load"),
-        repository.load_session_sidecars().expect("load"),
-    ));
+    let (restarted_durable, restarted_sidecars) = repository
+        .load_session_projections(&[(workspace_id.to_string(), workspace_root.clone())])
+        .expect("load");
+    let restarted_session = Arc::new(
+        SessionStore::from_persisted_parts(restarted_durable, restarted_sidecars)
+            .expect("维护周期后的会话存储持久化恢复应成功"),
+    );
     let restarted_workspace = Arc::new(WorkspaceStore::from_persisted_parts(
         repository.load_workspace_durable_state().expect("load"),
         repository.load_workspace_recovery_sidecars().expect("load"),
@@ -2454,7 +2493,7 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
 
     let runtime = DaemonRuntime::restore_with_test_fixture(&config)
         .expect("runtime restore should load explicit test fixture");
-    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let (status, body) = post_json(
         app.clone(),
         "/api/session/turn",
@@ -2477,13 +2516,64 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
         .as_str()
         .expect("session id should serialize as string")
         .to_string();
+    let turn_id = body["canonicalTurn"]["turnId"]
+        .as_str()
+        .expect("accepted response should carry canonical turn id")
+        .to_string();
+    let request_id = body["canonicalItem"]["metadata"]["requestId"]
+        .as_str()
+        .expect("accepted response should carry request id")
+        .to_string();
+    let user_message_id = body["canonicalItem"]["metadata"]["userMessageId"]
+        .as_str()
+        .expect("accepted response should carry user message id")
+        .to_string();
+    let initial_sidecar = state
+        .session_store
+        .runtime_sidecar(&SessionId::new(session_id.clone()))
+        .expect("accepted turn should have a runtime sidecar");
+    let initial_turn = initial_sidecar
+        .current_turn
+        .expect("accepted turn should be present before restart");
+    assert_eq!(initial_turn.turn_id, turn_id);
+    let initial_user_item = initial_turn
+        .items
+        .iter()
+        .find(|item| item.item_id == user_message_id)
+        .expect("accepted turn should contain the canonical user item");
+    assert_eq!(
+        initial_user_item.request_id.as_deref(),
+        Some(request_id.as_str())
+    );
+    assert_eq!(
+        initial_user_item.user_message_id.as_deref(),
+        Some(user_message_id.as_str())
+    );
 
-    let accepted_journal_path = state_root.join("accepted-submissions.json");
-    let durable_payload = fs::read_to_string(&accepted_journal_path)
-        .expect("accepted journal should be written before the HTTP response");
+    let event_root = state_root.join("session-events").join(&session_id);
+    let event_path = fs::read_dir(&event_root)
+        .expect("accepted canonical event directory should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("accepted canonical event transaction should exist");
+    let event_payload: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(event_path).expect("accepted canonical event should be readable"),
+    )
+    .expect("accepted canonical event should be valid JSON");
+    assert_eq!(
+        event_payload["acceptance"]["session"]["canonicalTurn"]["turnId"], turn_id,
+        "accepted facts must be stored in the same canonical event transaction"
+    );
     assert!(
-        durable_payload.contains("request-no-subscriber-recovery"),
-        "accepted journal should contain the turn before any SSE subscriber is present"
+        event_payload["acceptance"]
+            .to_string()
+            .contains("request-no-subscriber-recovery"),
+        "canonical event acceptance must be durable before any SSE subscriber is present"
+    );
+    assert!(
+        !state_root.join("accepted-submissions.json").exists(),
+        "new accepted submissions must not create the legacy journal"
     );
 
     drop(app);
@@ -2491,8 +2581,29 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
 
     let restarted_runtime =
         DaemonRuntime::restore(&config).expect("restart should recover persisted session state");
-    let (restarted_app, _restarted_state) =
+    let (restarted_app, restarted_state) =
         restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
+    let restarted_sidecar = restarted_state
+        .session_store
+        .runtime_sidecar(&SessionId::new(session_id.clone()))
+        .expect("restart should recover the runtime sidecar");
+    let restarted_turn = restarted_sidecar
+        .current_turn
+        .expect("restart should recover the current turn");
+    assert_eq!(restarted_turn.turn_id, turn_id);
+    let restarted_user_item = restarted_turn
+        .items
+        .iter()
+        .find(|item| item.item_id == user_message_id)
+        .expect("restart should recover the canonical user item");
+    assert_eq!(
+        restarted_user_item.request_id.as_deref(),
+        Some(request_id.as_str())
+    );
+    assert_eq!(
+        restarted_user_item.user_message_id.as_deref(),
+        Some(user_message_id.as_str())
+    );
     let bootstrap = get_json(
         restarted_app.clone(),
         &format!(
@@ -2623,9 +2734,22 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
         "workspace two bootstrap should include its own message"
     );
 
-    let accepted_journal = fs::read_to_string(state_root.join("accepted-submissions.json"))
-        .expect("accepted journal should persist workspace two submission");
-    assert!(accepted_journal.contains("request-workspace-two-isolated"));
+    let event_root = state_root.join("session-events").join(session_id);
+    let event_payload = fs::read_dir(event_root)
+        .expect("workspace accepted canonical event directory should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .expect("workspace accepted canonical event transaction should be readable");
+    assert!(
+        event_payload.contains("request-workspace-two-isolated"),
+        "workspace accepted facts must be in the canonical event transaction"
+    );
+    assert!(
+        !state_root.join("accepted-submissions.json").exists(),
+        "new workspace submissions must not create the legacy journal"
+    );
 }
 
 #[tokio::test]
@@ -3021,14 +3145,14 @@ async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_mis
         )
         .expect("active execution chain should persist to sidecar");
     repository
-        .save_session_durable_state(&session_store.durable_state())
-        .expect("session durable state should save");
+        .save_session_projection_state(
+            &session_store.durable_state(),
+            &session_store.execution_sidecar_store_state(),
+        )
+        .expect("session projection should save");
     repository
         .save_workspace_durable_state(&workspace_store.durable_state())
         .expect("workspace durable state should save");
-    repository
-        .save_session_sidecars(&session_store.execution_sidecar_store_state())
-        .expect("session sidecars should save");
 
     let runtime =
         DaemonRuntime::restore(&config).expect("runtime restore should load stale sidecar");
@@ -3056,8 +3180,8 @@ async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_mis
     assert!(session_summary.active_task_ids.is_empty());
     assert!(session_summary.active_execution_group_ids.is_empty());
 
-    let persisted_sidecars = repository
-        .load_session_sidecars()
+    let (_, persisted_sidecars) = repository
+        .load_session_projections(&[])
         .expect("reconciled sidecars should persist");
     let persisted = persisted_sidecars
         .runtime_sidecars
@@ -3118,7 +3242,15 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     let task_store = state.task_store().expect("task store should be configured");
 
     task_store
-        .update_status(&primary_branch.task_id, TaskStatus::Failed)
+        .revoke_lease_and_set_task_terminal(
+            &primary_branch.task_id,
+            &root_task_id,
+            None,
+            TaskStatus::Failed,
+            Vec::new(),
+        )
+        .expect("primary branch should become recoverable")
+        .then_some(())
         .expect("primary branch should become recoverable");
 
     let now = UtcMillis::now();
@@ -3135,32 +3267,34 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         ),
     ];
     for (task_id, worker_id, lease_id) in extra_branch_specs {
-        task_store.insert_task(Task {
-            task_id: TaskId::new(task_id),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: Some(primary_branch.task_id.clone()),
-            kind: TaskKind::LocalAgent,
-            title: format!("restart branch {task_id}"),
-            goal: format!("resume branch {task_id}"),
-            status: TaskStatus::Failed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: now,
-            updated_at: now,
-        });
+        task_store
+            .insert_task(Task {
+                task_id: TaskId::new(task_id),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: Some(primary_branch.task_id.clone()),
+                kind: TaskKind::LocalAgent,
+                title: format!("restart branch {task_id}"),
+                goal: format!("resume branch {task_id}"),
+                status: TaskStatus::Failed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("分支任务应插入");
         chain.branches.push(ActiveExecutionBranch {
             task_id: TaskId::new(task_id),
             worker_id: WorkerId::new(worker_id),
@@ -3179,32 +3313,34 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             thread_id: ThreadId::new(format!("thread-{task_id}")),
         });
     }
-    task_store.insert_task(Task {
-        task_id: TaskId::new("task-restart-branch-completed"),
-        mission_id: mission_id.clone(),
-        root_task_id: root_task_id.clone(),
-        parent_task_id: Some(primary_branch.task_id.clone()),
-        kind: TaskKind::LocalAgent,
-        title: "restart branch completed".to_string(),
-        goal: "completed branch should stay terminal".to_string(),
-        status: TaskStatus::Completed,
-        dependency_ids: Vec::new(),
-        required_children: Vec::new(),
-        policy_snapshot: None,
-        executor_binding: None,
-        completion_contract: magi_core::TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        knowledge_refs: Vec::new(),
-        workspace_scope: None,
-        write_scope: None,
-        input_refs: Vec::new(),
-        output_refs: Vec::new(),
-        evidence_refs: Vec::new(),
-        retry_count: 0,
-        runtime_payload: magi_core::TaskRuntimePayload::default(),
-        created_at: now,
-        updated_at: now,
-    });
+    task_store
+        .insert_task(Task {
+            task_id: TaskId::new("task-restart-branch-completed"),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: Some(primary_branch.task_id.clone()),
+            kind: TaskKind::LocalAgent,
+            title: "restart branch completed".to_string(),
+            goal: "completed branch should stay terminal".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("已完成分支任务应插入");
     chain.branches.push(ActiveExecutionBranch {
         task_id: TaskId::new("task-restart-branch-completed"),
         worker_id: WorkerId::new("worker-restart-branch-completed"),
@@ -3222,20 +3358,32 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         is_primary: false,
         thread_id: ThreadId::new("thread-restart-branch-completed"),
     });
+    let registered_thread_ids = state
+        .session_store
+        .thread_registry_snapshot(&session_id)
+        .into_iter()
+        .map(|thread| thread.thread_id)
+        .collect::<std::collections::HashSet<_>>();
     for branch in &chain.branches {
-        state.session_store.register_thread(ExecutionThread {
-            thread_id: branch.thread_id.clone(),
-            session_id: session_id.clone(),
-            mission_id: mission_id.clone(),
-            role_id: "coordinator".to_string(),
-            worker_instance_id: branch.worker_id.clone(),
-            status: ExecutionThreadStatus::Active,
-            created_at: now,
-            last_used_at: now,
-            observed_context_window_tokens: None,
-            handled_task_ids: vec![branch.task_id.clone()],
-            message_history: Vec::new(),
-        });
+        if registered_thread_ids.contains(&branch.thread_id) {
+            continue;
+        }
+        state
+            .session_store
+            .register_thread(ExecutionThread {
+                thread_id: branch.thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                role_id: "coordinator".to_string(),
+                worker_instance_id: branch.worker_id.clone(),
+                status: ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![branch.task_id.clone()],
+                message_history: Vec::new(),
+            })
+            .expect("恢复 branch thread 测试数据应注册成功");
     }
     chain.active_branch_task_ids = chain
         .branches
@@ -3315,7 +3463,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
 
     fs::create_dir_all(&state_root).expect("state root should exist before task checkpoint");
     task_store
-        .checkpoint_to_file(&state_root.join("task-store.json"))
+        .checkpoint_to_projection_directory(&state_root.join("task-store-projections"))
         .expect("task store checkpoint should persist");
     let flush_report = RuntimeSidecarPersistence::new(
         repository.clone(),
@@ -3506,15 +3654,15 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         "已完成 branch 不应在 continue 后重新产生 checkpoint"
     );
 
-    let task_store_json = fs::read_to_string(state_root.join("task-store.json"))
-        .expect("task store checkpoint should remain readable");
-    let task_store_value: Value =
-        serde_json::from_str(&task_store_json).expect("task store checkpoint should be valid json");
-    let mission_ids = task_store_value["tasks"]
-        .as_array()
-        .expect("checkpoint tasks should be an array")
+    let task_store_projection_dir = state_root.join("task-store-projections");
+    let restored_task_store =
+        TaskStore::restore_from_projection_directory(&task_store_projection_dir)
+            .expect("task store projection directory should remain readable")
+            .expect("task store projection should have a committed manifest");
+    let mission_ids = restored_task_store
+        .all_tasks()
         .iter()
-        .filter_map(|task| task["mission_id"].as_str())
+        .map(|task| task.mission_id.to_string())
         .collect::<Vec<_>>();
     assert!(
         mission_ids
@@ -3596,19 +3744,49 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
     let task_store = state.task_store().expect("task store should be configured");
 
     task_store
-        .update_status(&root_task_id, TaskStatus::Failed)
+        .revoke_lease_and_set_task_terminal(
+            &root_task_id,
+            &root_task_id,
+            None,
+            TaskStatus::Failed,
+            Vec::new(),
+        )
+        .expect("root task should become blocked")
+        .then_some(())
         .expect("root task should become blocked");
     for branch in &chain.branches {
-        task_store
-            .update_status(&branch.task_id, TaskStatus::Failed)
-            .expect("branch task should become blocked");
+        let branch_status = task_store
+            .get_task(&branch.task_id)
+            .expect("branch task should remain in task store")
+            .status;
+        if branch_status != TaskStatus::Failed {
+            task_store
+                .revoke_lease_and_set_task_terminal(
+                    &branch.task_id,
+                    &root_task_id,
+                    None,
+                    TaskStatus::Failed,
+                    Vec::new(),
+                )
+                .expect("branch task should become failed")
+                .then_some(())
+                .expect("branch task should become failed");
+        }
+        assert_eq!(
+            task_store
+                .get_task(&branch.task_id)
+                .expect("branch task should remain after terminalization")
+                .status,
+            TaskStatus::Failed,
+            "workspace-bound continue fixture must expose failed branches"
+        );
     }
 
     state
-        .persist_session_durable_state()
-        .expect("workspace-bound session durable state should persist");
+        .persist_session_projection()
+        .expect("workspace-bound session projection should persist");
     task_store
-        .checkpoint_to_file(&state_root.join("task-store.json"))
+        .checkpoint_to_projection_directory(&state_root.join("task-store-projections"))
         .expect("task store checkpoint should persist");
     let worker_runtime = state
         .execution_pipeline()
@@ -3624,8 +3802,12 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
     )
     .flush_runtime_sidecars()
     .expect("runtime sidecars should flush");
-    let persisted_sidecars = repository
-        .load_session_sidecars()
+    let workspace_roots = repository
+        .workspace_projection_roots()
+        .expect("workspace projection roots should load");
+    let workspace_roots = workspace_roots.into_iter().collect::<Vec<_>>();
+    let (persisted_durable, persisted_sidecars) = repository
+        .load_session_projections(&workspace_roots)
         .expect("session sidecars should be persisted by checkpoint or explicit flush");
     assert!(
         persisted_sidecars
@@ -3635,27 +3817,14 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
         "session sidecar must be persisted even when checkpoint already flushed before explicit flush"
     );
 
-    let workspace_session_state = repository
-        .load_workspace_session_state(&state_root.join("test-workspace"))
-        .expect("workspace session durable state should reload");
+    let _ = persisted_sidecars;
     assert!(
-        workspace_session_state.sessions.iter().any(|session| {
+        persisted_durable.sessions.iter().any(|session| {
             session.session_id == session_id
                 && session.workspace_id.as_deref() == Some(DEFAULT_TEST_WORKSPACE_ID)
         }),
-        "workspace-bound session must persist under workspace sessions.json"
+        "workspace-bound session must persist in its workspace projection"
     );
-    let global_session_state = repository
-        .load_session_durable_state()
-        .expect("global session durable state should reload");
-    assert!(
-        !global_session_state
-            .sessions
-            .iter()
-            .any(|session| session.session_id == session_id),
-        "workspace-bound session must not remain in global sessions.json"
-    );
-
     drop(app);
     drop(state);
     drop(runtime);

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { OrchestratorRuntimeState } from '../types/message';
   import {
+    getLocalTurnSubmissionRenderItems,
     messagesState,
   } from '../stores/messages.svelte';
   import {
@@ -27,21 +28,24 @@
   }
   let { isTopActive = true }: Props = $props();
 
-  const threadRenderItems = $derived.by(() => (
-    !isTopActive
-      ? []
-      : messagesState.canonicalTimelineProjection
-        ? buildTimelineRenderItems(
-            messagesState.canonicalTimelineProjection,
-            'thread',
-            undefined,
-            {
-              workspaceId: messagesState.currentWorkspaceId,
-              workspacePath: messagesState.currentWorkspacePath,
-            },
-          )
-        : []
-  ));
+  const threadRenderItems = $derived.by(() => {
+    if (!isTopActive) return [];
+    const canonicalItems = messagesState.canonicalTimelineProjection
+      ? buildTimelineRenderItems(
+          messagesState.canonicalTimelineProjection,
+          'thread',
+          undefined,
+          {
+            workspaceId: messagesState.currentWorkspaceId,
+            workspacePath: messagesState.currentWorkspacePath,
+          },
+        )
+      : [];
+    return [
+      ...canonicalItems,
+      ...getLocalTurnSubmissionRenderItems(messagesState.currentSessionId),
+    ];
+  });
   const runtimeState = $derived.by<OrchestratorRuntimeState | null>(() => messagesState.orchestratorRuntimeState);
   const conversationRecords = $derived.by(() => buildConversationRuntimeRecords(
     threadRenderItems,
@@ -96,6 +100,7 @@
     {conversationStartedAt}
     isProcessing={messagesState.isProcessing}
     processingStartedAt={messagesState.thinkingStartAt}
+    turnStage={messagesState.turnStage}
   />
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
@@ -111,6 +116,7 @@
 
 <style>
   .thread-panel {
+    position: relative;
     display: flex;
     flex-direction: column;
     height: 100%;

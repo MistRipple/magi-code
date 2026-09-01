@@ -5,6 +5,7 @@
 
 import type {
   Message,
+  TimelineRenderItem,
   TimelineProjectionArtifact,
   SessionTimelineProjection,
   Session,
@@ -39,12 +40,19 @@ import {
 } from '../lib/timeline-render-items';
 import {
   clearCanonicalSessionTurns,
+  prependCanonicalSessionTurns as prependCanonicalTurns,
 } from './turn-store.svelte';
 import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import { shouldUseHostProxyTransport } from '../shared/transport';
 import { hasPendingToolApproval, toolApprovalState } from './tool-approval-store.svelte';
+import {
+  isCanonicalTerminalStatus,
+  type CanonicalTurn,
+} from '../shared/protocol/canonical-turn';
+import { canonicalTurnRequestId } from '../shared/protocol/canonical-processing';
+import type { TurnStage } from '../shared/protocol/processing-state';
 
 interface SettingsRegistrySnapshot {
   roleTemplates: RoleTemplate[];
@@ -67,6 +75,18 @@ interface NotificationOperationScope {
   sessionId?: string;
 }
 
+export type SessionHistoryLoadStatus = 'idle' | 'loading' | 'exhausted' | 'error' | 'no-progress';
+
+export interface SessionHistoryState {
+  workspaceId: string | null;
+  workspacePath: string | null;
+  sessionId: string | null;
+  canonicalHasMoreBefore: boolean;
+  canonicalBeforeCursor: string | null;
+  historyLoadStatus: SessionHistoryLoadStatus;
+  revision: number;
+}
+
 export interface TurnEditingDraft {
   sessionId: string;
   turnId: string;
@@ -78,6 +98,16 @@ export interface TurnEditingDraft {
   browserNodeSelections: NonNullable<Message['browserNodeSelections']>;
   skillName: string | null;
   goalMode: boolean;
+}
+
+export interface LocalTurnSubmissionProjection {
+  requestId: string;
+  sessionId: string;
+  status: 'submitting' | 'queued';
+  workspaceId: string | null;
+  workspacePath: string;
+  placeholderMessageId: string;
+  message: Message;
 }
 
 // ============ 状态定义 ============
@@ -123,13 +153,13 @@ export const messagesState = $state({
   sessionHydrating: false,
   sessionHistory: {
     workspaceId: null as string | null,
+    workspacePath: null as string | null,
     sessionId: null as string | null,
-    hasMoreBefore: false,
-    beforeCursor: null as string | null,
     canonicalHasMoreBefore: false,
     canonicalBeforeCursor: null as string | null,
-    isLoadingBefore: false,
-  },
+    historyLoadStatus: 'idle' as SessionHistoryLoadStatus,
+    revision: 0,
+  } as SessionHistoryState,
   queuedMessages: [] as QueuedMessage[],
   editingTurn: null as TurnEditingDraft | null,
   notificationCenter: {
@@ -142,11 +172,10 @@ export const messagesState = $state({
   // 处理状态
   isProcessing: false,
   backendProcessing: false,
+  turnStage: null as TurnStage | null,
   activeMessageIds: new Set<string>(),
   pendingRequests: new Set<string>(),
   thinkingStartAt: null as number | null,
-  // 防回抬保护：记录最后一次强制 idle 的时间戳
-  lastForcedIdleAt: null as number | null,
   processingActor: {
     source: 'orchestrator',
     agent: 'orchestrator',
@@ -212,6 +241,28 @@ export function isPersistedSessionId(value: string | null | undefined): boolean 
 function normalizeWorkspaceId(value: string | null | undefined): string | null {
   const workspaceId = typeof value === 'string' ? value.trim() : '';
   return workspaceId || null;
+}
+
+function normalizeWorkspacePath(value: string | null | undefined): string | null {
+  const workspacePath = typeof value === 'string' ? value.trim() : '';
+  return workspacePath || null;
+}
+
+function createEmptySessionHistoryState(
+  workspaceId: string | null | undefined,
+  workspacePath: string | null | undefined,
+  sessionId: string | null | undefined,
+  revision = 0,
+): SessionHistoryState {
+  return {
+    workspaceId: normalizeWorkspaceId(workspaceId),
+    workspacePath: normalizeWorkspacePath(workspacePath),
+    sessionId: normalizeSessionId(sessionId),
+    canonicalHasMoreBefore: false,
+    canonicalBeforeCursor: null,
+    historyLoadStatus: 'idle',
+    revision,
+  };
 }
 
 function createSessionScopeKey(
@@ -765,12 +816,20 @@ function normalizeProcessingStateSnapshot(
   const startedAt = typeof input.startedAt === 'number' && Number.isFinite(input.startedAt) && input.startedAt > 0
     ? Math.floor(input.startedAt)
     : null;
+  const stage = input.stage === 'pending'
+    || input.stage === 'preparing'
+    || input.stage === 'streaming'
+    || input.stage === 'finalizing'
+    || input.stage === 'done'
+    ? input.stage
+    : null;
   return {
     isProcessing: input.isProcessing === true,
     source,
     agent,
     startedAt,
     pendingRequestIds,
+    stage,
   };
 }
 
@@ -809,58 +868,43 @@ function shouldReplaceOrchestratorRuntimeState(
 export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
   const previousPendingRequestIds = messagesState.pendingRequests;
   const previousThinkingStartAt = messagesState.thinkingStartAt;
-  const localPendingRequestIds = new Set(
-    [...previousPendingRequestIds].filter((requestId) => {
-      const binding = requestBindings.get(requestId);
-      return Boolean(
-        binding
-        && (!binding.sessionId
-          || binding.sessionId.trim() === (messagesState.currentSessionId?.trim() || '__draft__')),
-      );
-    }),
-  );
+  const sessionKey = executionSessionKey(messagesState.currentSessionId);
+  const localPendingRequestIds = localSubmissionRequestIdsForSession(sessionKey);
+  const settledRequestIds = terminalRequestIdsBySession.get(sessionKey) ?? new Set<string>();
   const snapshot = normalizeProcessingStateSnapshot(input);
   if (!snapshot) {
-    // 后端 idle 只负责收敛后端处理态。本地已经建立请求绑定、但尚未进入 canonical
-    // reducer 的提交仍由请求生命周期负责，不能被历史事件回放或提交前 bootstrap 清除。
     messagesState.backendProcessing = false;
     messagesState.pendingRequests = localPendingRequestIds;
     if (localPendingRequestIds.size === 0) {
       messagesState.activeMessageIds = new Set();
       messagesState.thinkingStartAt = null;
+      messagesState.turnStage = 'done';
     } else if (!messagesState.thinkingStartAt) {
       messagesState.thinkingStartAt = Date.now();
+      messagesState.turnStage = 'pending';
     }
     updateProcessingState();
     saveCurrentExecutionProjection();
     return;
   }
+  const canonicalPendingRequestIds = snapshot.pendingRequestIds
+    .filter((requestId) => !settledRequestIds.has(requestId));
+  const canonicalIsProcessing = snapshot.isProcessing
+    && (snapshot.pendingRequestIds.length === 0 || canonicalPendingRequestIds.length > 0);
   const pendingRequestIds = new Set([
-    ...snapshot.pendingRequestIds,
+    ...canonicalPendingRequestIds,
     ...localPendingRequestIds,
   ]);
-  // 防回抬保护：如果在 forced idle 冷却期内，拒绝后端权威状态覆盖
-  const lastForcedIdleAt = messagesState.lastForcedIdleAt;
-  if (
-    lastForcedIdleAt !== null
-    && (Date.now() - lastForcedIdleAt) < ANTI_LIFT_BACK_COOLDOWN_MS
-    && (snapshot.isProcessing || pendingRequestIds.size > 0)
-  ) {
-    // 冷却期内只拒绝 running 回抬；idle 快照仍必须继续收敛本地状态。
-    if (snapshot.source) {
-      setProcessingActor(snapshot.source, snapshot.agent || undefined);
-    }
-    return;
-  }
-  const activeMessageIds = snapshot.isProcessing || localPendingRequestIds.size > 0
+  const activeMessageIds = canonicalIsProcessing || localPendingRequestIds.size > 0
     ? messagesState.activeMessageIds
     : new Set<string>();
-  // 单一事实源：后端权威 isProcessing + 本地乐观 pendingRequests。
-  // 不再叠加 runtimeState / canonical projection 推断，避免多路 OR 信号让陈旧状态
-  // 把发送按钮卡在"响应中"。
-  const nextIsProcessing = snapshot.isProcessing || pendingRequestIds.size > 0;
+  const nextIsProcessing = canonicalIsProcessing || localPendingRequestIds.size > 0;
+  const nextTurnStage = canonicalIsProcessing
+    ? snapshot.stage || 'pending'
+    : localPendingRequestIds.size > 0 ? 'pending' : 'done';
 
-  messagesState.backendProcessing = snapshot.isProcessing;
+  messagesState.backendProcessing = canonicalIsProcessing;
+  messagesState.turnStage = nextTurnStage;
   messagesState.pendingRequests = pendingRequestIds;
   messagesState.activeMessageIds = activeMessageIds;
   if (snapshot.source) {
@@ -884,14 +928,16 @@ let waveState = $state<WaveState | null>(null);
 
 // 请求-响应绑定状态（消息响应流设计）
 let requestBindings = $state<Map<string, RequestResponseBinding>>(new Map());
+let localTurnSubmissionProjections = $state<Map<string, LocalTurnSubmissionProjection>>(new Map());
+let terminalRequestIdsBySession = $state<Map<string, Set<string>>>(new Map());
 
 type SessionExecutionProjection = {
   backendProcessing: boolean;
+  turnStage: TurnStage | null;
   pendingRequests: Set<string>;
   activeMessageIds: Set<string>;
   thinkingStartAt: number | null;
   isProcessing: boolean;
-  lastForcedIdleAt: number | null;
   processingActor: ProcessingActor;
 };
 
@@ -904,6 +950,109 @@ function executionSessionKey(sessionId: string | null | undefined): string {
   return normalized || '__draft__';
 }
 
+function localSubmissionRequestIdsForSession(sessionId: string): Set<string> {
+  return new Set(
+    [...localTurnSubmissionProjections.values()]
+      .filter((submission) => (
+        submission.sessionId === sessionId
+        && submission.status === 'submitting'
+      ))
+      .map((submission) => submission.requestId),
+  );
+}
+
+function requestBelongsToSession(sessionId: string, requestId: string): boolean {
+  if (terminalRequestIdsBySession.get(sessionId)?.has(requestId)) {
+    return true;
+  }
+  const binding = requestBindings.get(requestId);
+  if (binding && executionSessionKey(binding.sessionId) === sessionId) {
+    return true;
+  }
+  const submission = localTurnSubmissionProjections.get(requestId);
+  if (submission?.sessionId === sessionId) {
+    return true;
+  }
+  if (
+    executionSessionKey(messagesState.currentSessionId) === sessionId
+    && messagesState.pendingRequests.has(requestId)
+  ) {
+    return true;
+  }
+  return sessionExecutionProjections.get(sessionId)?.pendingRequests.has(requestId) === true;
+}
+
+function removeRequestBindingOnly(requestId: string): RequestResponseBinding | undefined {
+  const binding = requestBindings.get(requestId);
+  if (!binding) return undefined;
+  if (binding.timeoutId) {
+    clearTimeout(binding.timeoutId);
+  }
+  const next = new Map(requestBindings);
+  next.delete(requestId);
+  requestBindings = next;
+  return binding;
+}
+
+function rekeyLocalTurnSubmissionProjections(
+  previousSessionId: string | null,
+  nextSessionId: string,
+): void {
+  const previousKey = executionSessionKey(previousSessionId);
+  const nextKey = executionSessionKey(nextSessionId);
+  if (previousKey === nextKey) return;
+  const next = new Map(localTurnSubmissionProjections);
+  let changed = false;
+  for (const [requestId, submission] of next) {
+    if (submission.sessionId !== previousKey) continue;
+    next.set(requestId, { ...submission, sessionId: nextKey });
+    changed = true;
+  }
+  if (changed) {
+    localTurnSubmissionProjections = next;
+  }
+}
+
+function rekeyRequestBindings(previousSessionId: string | null, nextSessionId: string): void {
+  const previousKey = executionSessionKey(previousSessionId);
+  const nextKey = executionSessionKey(nextSessionId);
+  if (previousKey === nextKey) return;
+  const next = new Map(requestBindings);
+  let changed = false;
+  for (const [requestId, binding] of next) {
+    if (executionSessionKey(binding.sessionId) !== previousKey) continue;
+    next.set(requestId, { ...binding, sessionId: nextKey });
+    changed = true;
+  }
+  if (changed) {
+    requestBindings = next;
+  }
+}
+
+function rememberTerminalRequest(sessionId: string, requestId: string): void {
+  const existing = terminalRequestIdsBySession.get(sessionId) ?? new Set<string>();
+  if (existing.has(requestId)) return;
+  const nextIds = new Set(existing);
+  nextIds.add(requestId);
+  const next = new Map(terminalRequestIdsBySession);
+  next.set(sessionId, nextIds);
+  terminalRequestIdsBySession = next;
+}
+
+function forgetTerminalRequest(sessionId: string, requestId: string): void {
+  const existing = terminalRequestIdsBySession.get(sessionId);
+  if (!existing?.has(requestId)) return;
+  const nextIds = new Set(existing);
+  nextIds.delete(requestId);
+  const next = new Map(terminalRequestIdsBySession);
+  if (nextIds.size > 0) {
+    next.set(sessionId, nextIds);
+  } else {
+    next.delete(sessionId);
+  }
+  terminalRequestIdsBySession = next;
+}
+
 function cloneExecutionProjection(
   projection: SessionExecutionProjection,
 ): SessionExecutionProjection {
@@ -912,18 +1061,18 @@ function cloneExecutionProjection(
     pendingRequests: new Set(projection.pendingRequests),
     activeMessageIds: new Set(projection.activeMessageIds),
     processingActor: { ...projection.processingActor },
-  };
+};
 }
 
 function saveCurrentExecutionProjection(sessionId = messagesState.currentSessionId): void {
   const next = new Map(sessionExecutionProjections);
   next.set(executionSessionKey(sessionId), {
     backendProcessing: messagesState.backendProcessing,
+    turnStage: messagesState.turnStage,
     pendingRequests: new Set(messagesState.pendingRequests),
     activeMessageIds: new Set(messagesState.activeMessageIds),
     thinkingStartAt: messagesState.thinkingStartAt,
     isProcessing: messagesState.isProcessing,
-    lastForcedIdleAt: messagesState.lastForcedIdleAt,
     processingActor: { ...messagesState.processingActor },
   });
   sessionExecutionProjections = next;
@@ -935,19 +1084,19 @@ function restoreExecutionProjection(sessionId: string | null): void {
     ? cloneExecutionProjection(stored)
     : {
       backendProcessing: false,
+      turnStage: null,
       pendingRequests: new Set<string>(),
       activeMessageIds: new Set<string>(),
       thinkingStartAt: null,
       isProcessing: false,
-      lastForcedIdleAt: null,
       processingActor: { source: 'orchestrator', agent: 'orchestrator' } as ProcessingActor,
     };
   messagesState.backendProcessing = projection.backendProcessing;
+  messagesState.turnStage = projection.turnStage;
   messagesState.pendingRequests = projection.pendingRequests;
   messagesState.activeMessageIds = projection.activeMessageIds;
   messagesState.thinkingStartAt = projection.thinkingStartAt;
   messagesState.isProcessing = projection.isProcessing;
-  messagesState.lastForcedIdleAt = projection.lastForcedIdleAt;
   messagesState.processingActor = projection.processingActor;
 }
 
@@ -977,11 +1126,11 @@ function updateStoredExecutionProjection(
   const key = executionSessionKey(sessionId);
   const existing = sessionExecutionProjections.get(key) ?? {
     backendProcessing: false,
+    turnStage: null,
     pendingRequests: new Set<string>(),
     activeMessageIds: new Set<string>(),
     thinkingStartAt: null,
     isProcessing: false,
-    lastForcedIdleAt: null,
     processingActor: { source: 'orchestrator', agent: 'orchestrator' } as ProcessingActor,
   };
   const next = new Map(sessionExecutionProjections);
@@ -1113,6 +1262,7 @@ export function getState() {
     get queuedMessages() { return messagesState.queuedMessages; },
     set queuedMessages(v) { setQueuedMessages(ensureArray<QueuedMessage>(v)); },
     get isProcessing() { return messagesState.isProcessing; },
+    get turnStage() { return messagesState.turnStage; },
     get thinkingStartAt() { return messagesState.thinkingStartAt; },
     get processingActor() { return messagesState.processingActor; },
     get appState() { return messagesState.appState; },
@@ -1274,7 +1424,7 @@ function saveWebviewState() {
 }
 
 // 非 hosted webview 环境（独立 web 客户端）注册 beforeunload 同步保存，
-// 防止 900ms debounce 窗口内的刷新丢失数据。
+// 防止短暂的 debounce 窗口内刷新丢失数据。
 if (!IS_HOSTED_WEBVIEW && typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
     if (deferredWebviewStateSaveTimer) {
@@ -1394,15 +1544,12 @@ export function setCurrentSessionId(id: string | null) {
   messagesState.currentSessionId = nextSessionId;
   if (hasChanged) {
     messagesState.editingTurn = null;
-    messagesState.sessionHistory = {
-      workspaceId: messagesState.currentWorkspaceId,
-      sessionId: nextSessionId,
-      hasMoreBefore: false,
-      beforeCursor: null,
-      canonicalHasMoreBefore: false,
-      canonicalBeforeCursor: null,
-      isLoadingBefore: false,
-    };
+    messagesState.sessionHistory = createEmptySessionHistoryState(
+      messagesState.currentWorkspaceId,
+      messagesState.currentWorkspacePath,
+      nextSessionId,
+      messagesState.sessionHistory.revision + 1,
+    );
     resetNotificationCenterStatus();
   }
   if (hasChanged) {
@@ -1435,17 +1582,16 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
   }
   saveCurrentExecutionProjection(currentSessionId);
   rekeyExecutionProjection(currentSessionId, nextSessionId);
+  rekeyLocalTurnSubmissionProjections(currentSessionId, nextSessionId);
+  rekeyRequestBindings(currentSessionId, nextSessionId);
   clearCanonicalSessionTurns(nextSessionId);
   messagesState.currentSessionId = nextSessionId;
-  messagesState.sessionHistory = {
-    workspaceId: messagesState.currentWorkspaceId,
-    sessionId: nextSessionId,
-    hasMoreBefore: false,
-    beforeCursor: null,
-    canonicalHasMoreBefore: false,
-    canonicalBeforeCursor: null,
-    isLoadingBefore: false,
-  };
+  messagesState.sessionHistory = createEmptySessionHistoryState(
+    messagesState.currentWorkspaceId,
+    messagesState.currentWorkspacePath,
+    nextSessionId,
+    messagesState.sessionHistory.revision + 1,
+  );
   resetNotificationCenterStatus();
   syncNotificationsFromContext(nextSessionId);
   saveWebviewState();
@@ -1749,12 +1895,6 @@ export function setQueuedMessages(newQueuedMessages: QueuedMessage[]) {
   messagesState.queuedMessages = normalized;
 }
 
-// 处理状态操作
-export function setIsProcessing(value: boolean) {
-  messagesState.backendProcessing = value;
-  updateProcessingState();
-}
-
 export function setProcessingActor(source: string, agent?: string) {
   messagesState.processingActor = {
     source: source as ProcessingActor['source'],
@@ -1773,23 +1913,11 @@ export function setAppState(nextState: AppState | null) {
   }
 }
 
-// 防回抬冷却期（ms）：forced idle 后的短暂窗口内，拒绝任何来源的 processing=true
-const ANTI_LIFT_BACK_COOLDOWN_MS = 2000;
-
 function updateProcessingState() {
-  // 单一事实源：后端权威 backendProcessing + 本地乐观 pendingRequests。
-  // 不再叠加 orchestratorRuntimeState / canonical projection / activeMessageIds，
-  // 这些都是同一份后端事实的衍生订阅，多路 OR 会让陈旧状态把按钮卡死。
   const nextIsProcessing = messagesState.backendProcessing
     || messagesState.pendingRequests.size > 0;
 
-  // 防回抬保护：forced idle 冷却期内，拒绝从 false 被抬回 true
   if (nextIsProcessing && !messagesState.isProcessing) {
-    const lastForcedIdleAt = messagesState.lastForcedIdleAt;
-    if (lastForcedIdleAt !== null && (Date.now() - lastForcedIdleAt) < ANTI_LIFT_BACK_COOLDOWN_MS) {
-      // 冷却期内，拒绝抬回 — 保持 idle
-      return;
-    }
     messagesState.thinkingStartAt = Date.now();
   } else if (!nextIsProcessing && messagesState.isProcessing) {
     messagesState.thinkingStartAt = null;
@@ -1830,34 +1958,48 @@ export function markMessageComplete(id: string) {
   clearRetryRuntime(id);
 }
 
-export function addPendingRequest(id: string, options?: { resetAntiLiftBack?: boolean }) {
-  if (!id) return;
-  if (options?.resetAntiLiftBack) {
-    messagesState.lastForcedIdleAt = null;
-  }
-  if (!messagesState.pendingRequests.has(id)) {
-    const next = new Set(messagesState.pendingRequests);
-    next.add(id);
-    messagesState.pendingRequests = next;
-    updateProcessingState();
-    saveCurrentExecutionProjection();
-  }
-}
-
 export function beginLocalTurnSubmission(input: {
   requestId: string;
+  sessionId?: string | null;
   placeholderMessageId: string;
   startedAt: number;
+  message: Message;
+  workspaceId?: string | null;
+  workspacePath?: string;
   source?: string;
   agent?: string;
 }): void {
   const requestId = input.requestId.trim();
   const placeholderMessageId = input.placeholderMessageId.trim();
-  if (!requestId || !placeholderMessageId) {
-    throw new Error('本地轮次提交缺少 requestId 或 placeholderMessageId');
+  const messageId = input.message.id.trim();
+  if (!requestId || !placeholderMessageId || !messageId) {
+    throw new Error('本地轮次提交缺少 requestId、messageId 或 placeholderMessageId');
   }
+  const sessionId = executionSessionKey(input.sessionId ?? messagesState.currentSessionId);
+  const nextSubmissions = new Map(localTurnSubmissionProjections);
+  nextSubmissions.set(requestId, {
+    requestId,
+    sessionId,
+    status: 'submitting',
+    workspaceId: normalizeWorkspaceId(input.workspaceId ?? messagesState.currentWorkspaceId),
+    workspacePath: typeof input.workspacePath === 'string'
+      ? input.workspacePath.trim()
+      : messagesState.currentWorkspacePath.trim(),
+    placeholderMessageId,
+    message: {
+      ...input.message,
+      id: messageId,
+      metadata: {
+        ...(input.message.metadata || {}),
+        requestId,
+        localSubmission: true,
+      },
+    },
+  });
+  localTurnSubmissionProjections = nextSubmissions;
+  forgetTerminalRequest(sessionId, requestId);
 
-  messagesState.lastForcedIdleAt = null;
+  messagesState.turnStage = 'pending';
   messagesState.pendingRequests = new Set([...messagesState.pendingRequests, requestId]);
   messagesState.activeMessageIds = new Set([
     ...messagesState.activeMessageIds,
@@ -1874,10 +2016,161 @@ export function beginLocalTurnSubmission(input: {
   saveCurrentExecutionProjection();
 }
 
+export function getLocalTurnSubmissionRenderItems(
+  sessionId: string | null | undefined = messagesState.currentSessionId,
+): TimelineRenderItem[] {
+  const sessionKey = executionSessionKey(sessionId);
+  return [...localTurnSubmissionProjections.values()]
+    .filter((submission) => submission.sessionId === sessionKey)
+    .sort((left, right) => (
+      left.message.timestamp - right.message.timestamp
+      || left.requestId.localeCompare(right.requestId)
+    ))
+    .map((submission) => ({
+      key: `local-submission:${submission.requestId}`,
+      message: submission.message,
+      ...(submission.sessionId === '__draft__' ? {} : { sessionId: submission.sessionId }),
+      ...(submission.workspaceId ? { workspaceId: submission.workspaceId } : {}),
+      ...(submission.workspacePath ? { workspacePath: submission.workspacePath } : {}),
+    }));
+}
+
+export function removeLocalTurnSubmission(requestId: string): void {
+  const normalizedRequestId = requestId.trim();
+  if (!normalizedRequestId) return;
+  const submission = localTurnSubmissionProjections.get(normalizedRequestId);
+  if (!submission) return;
+  const next = new Map(localTurnSubmissionProjections);
+  next.delete(normalizedRequestId);
+  localTurnSubmissionProjections = next;
+  if (submission.sessionId === executionSessionKey(messagesState.currentSessionId)) {
+    const activeMessageIds = new Set(messagesState.activeMessageIds);
+    activeMessageIds.delete(submission.placeholderMessageId);
+    messagesState.activeMessageIds = activeMessageIds;
+  }
+}
+
+export function markLocalTurnSubmissionQueued(
+  requestId: string,
+  sessionId: string,
+): boolean {
+  const normalizedRequestId = requestId.trim();
+  const normalizedSessionId = sessionId.trim();
+  if (
+    !normalizedRequestId
+    || !normalizedSessionId
+    || normalizedSessionId === '__draft__'
+    || !requestBelongsToSession(normalizedSessionId, normalizedRequestId)
+  ) {
+    return false;
+  }
+
+  const submission = localTurnSubmissionProjections.get(normalizedRequestId);
+  if (submission && submission.sessionId === normalizedSessionId) {
+    const nextSubmissions = new Map(localTurnSubmissionProjections);
+    nextSubmissions.set(normalizedRequestId, {
+      ...submission,
+      status: 'queued',
+      message: {
+        ...submission.message,
+        metadata: {
+          ...(submission.message.metadata || {}),
+          sendingAnimation: false,
+          queuedSubmission: true,
+        },
+      },
+    });
+    localTurnSubmissionProjections = nextSubmissions;
+  }
+
+  const binding = removeRequestBindingOnly(normalizedRequestId);
+  const currentSessionId = executionSessionKey(messagesState.currentSessionId);
+  if (normalizedSessionId !== currentSessionId) {
+    updateStoredExecutionProjection(normalizedSessionId, (projection) => {
+      projection.pendingRequests.delete(normalizedRequestId);
+      projection.activeMessageIds.delete(
+        submission?.placeholderMessageId || binding?.placeholderMessageId || '',
+      );
+      projection.isProcessing = projection.backendProcessing || projection.pendingRequests.size > 0;
+      if (!projection.isProcessing) {
+        projection.thinkingStartAt = null;
+        projection.turnStage = 'done';
+      }
+      return projection;
+    });
+    return true;
+  }
+
+  const pendingRequests = new Set(messagesState.pendingRequests);
+  pendingRequests.delete(normalizedRequestId);
+  messagesState.pendingRequests = pendingRequests;
+  const activeMessageIds = new Set(messagesState.activeMessageIds);
+  activeMessageIds.delete(submission?.placeholderMessageId || binding?.placeholderMessageId || '');
+  messagesState.activeMessageIds = activeMessageIds;
+  updateProcessingState();
+  if (!messagesState.isProcessing) {
+    messagesState.turnStage = 'done';
+  }
+  saveCurrentExecutionProjection();
+  return true;
+}
+
+export function adoptQueuedTurnSubmissions(
+  sessionId: string,
+  requestIds: readonly string[],
+): void {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) return;
+  const authoritativeRequestIds = new Set(
+    requestIds.map((requestId) => requestId.trim()).filter(Boolean),
+  );
+  if (authoritativeRequestIds.size === 0) return;
+  for (const [requestId, submission] of localTurnSubmissionProjections) {
+    if (
+      submission.sessionId === normalizedSessionId
+      && authoritativeRequestIds.has(requestId)
+    ) {
+      removeLocalTurnSubmission(requestId);
+    }
+  }
+}
+
+export function adoptCanonicalTurnSubmissions(
+  sessionId: string,
+  turns: readonly CanonicalTurn[],
+): void {
+  const sessionKey = executionSessionKey(sessionId);
+  const canonicalRequestIds = new Set<string>();
+  const terminalRequestIds = new Set<string>();
+  for (const turn of turns) {
+    if (turn.sessionId !== sessionId) continue;
+    const requestId = canonicalTurnRequestId(turn);
+    if (!requestId) continue;
+    canonicalRequestIds.add(requestId);
+    if (isCanonicalTerminalStatus(turn.status)) {
+      terminalRequestIds.add(requestId);
+    }
+  }
+  if (canonicalRequestIds.size === 0) return;
+  for (const [requestId, submission] of localTurnSubmissionProjections) {
+    if (submission.sessionId === sessionKey && canonicalRequestIds.has(requestId)) {
+      removeLocalTurnSubmission(requestId);
+    }
+  }
+  for (const requestId of terminalRequestIds) {
+    settleTerminalTurn({ sessionId, requestId });
+  }
+}
+
 export function clearPendingRequest(id: string) {
   if (!id) return;
   const binding = requestBindings.get(id);
-  const ownerSessionId = binding?.sessionId?.trim() || messagesState.currentSessionId?.trim() || '__draft__';
+  const localSubmission = localTurnSubmissionProjections.get(id);
+  const ownerSessionId = binding?.sessionId?.trim()
+    || localSubmission?.sessionId
+    || messagesState.currentSessionId?.trim()
+    || '__draft__';
+  removeLocalTurnSubmission(id);
   if (ownerSessionId !== (messagesState.currentSessionId?.trim() || '__draft__')) {
     updateStoredExecutionProjection(ownerSessionId, (projection) => {
       projection.pendingRequests.delete(id);
@@ -1885,6 +2178,7 @@ export function clearPendingRequest(id: string) {
       projection.isProcessing = projection.backendProcessing || projection.pendingRequests.size > 0;
       if (!projection.isProcessing) {
         projection.thinkingStartAt = null;
+        projection.turnStage = 'done';
       }
       return projection;
     });
@@ -1895,22 +2189,61 @@ export function clearPendingRequest(id: string) {
     next.delete(id);
     messagesState.pendingRequests = next;
     updateProcessingState();
+    if (!messagesState.isProcessing) {
+      messagesState.turnStage = 'done';
+    }
     saveCurrentExecutionProjection();
   }
 }
 
+/**
+ * 捕获指定 session 在某个异步操作开始时的 pending request 集合。
+ * 调用方必须把返回值当作不可变代际快照使用，不能在异步完成时重新读取全局 pending 集合。
+ */
+export function listPendingRequestIdsForSession(
+  sessionId: string | null | undefined,
+): string[] {
+  const sessionKey = executionSessionKey(sessionId);
+  const currentSessionKey = executionSessionKey(messagesState.currentSessionId);
+  const pendingRequests = currentSessionKey === sessionKey
+    ? messagesState.pendingRequests
+    : sessionExecutionProjections.get(sessionKey)?.pendingRequests;
+  return pendingRequests ? [...pendingRequests] : [];
+}
+
+/**
+ * 仅终结调用方事先捕获的 request。旧异步操作完成后不得重新扫描并清理新 request。
+ */
+export function settlePendingRequestSnapshot(input: {
+  sessionId: string | null | undefined;
+  requestIds: readonly string[];
+}): void {
+  const sessionKey = executionSessionKey(input.sessionId);
+  for (const requestId of input.requestIds) {
+    const normalizedRequestId = requestId.trim();
+    if (!normalizedRequestId) continue;
+    if (sessionKey === '__draft__') {
+      clearRequestBinding(normalizedRequestId);
+      continue;
+    }
+    settleTerminalTurn({
+      sessionId: sessionKey,
+      requestId: normalizedRequestId,
+    });
+  }
+}
+
 export function settleProcessingAfterResponseCompletion() {
-  // 后端权威发出"已结束"信号时尝试落 idle：只看单一事实源。
   if (messagesState.backendProcessing || messagesState.pendingRequests.size > 0) {
     return;
   }
-  messagesState.lastForcedIdleAt = Date.now();
+  messagesState.turnStage = 'done';
   updateProcessingState();
 }
 
 export function settleAuthoritativeIdleState() {
-  // 后端权威 idle：直接把单一事实源以及衍生状态全部清零。
   messagesState.backendProcessing = false;
+  messagesState.turnStage = 'done';
   messagesState.pendingRequests = new Set();
   messagesState.activeMessageIds = new Set();
   messagesState.thinkingStartAt = null;
@@ -1918,35 +2251,76 @@ export function settleAuthoritativeIdleState() {
   saveCurrentExecutionProjection();
 }
 
-export function clearProcessingState(options?: {
-  /** 跳过防回抬保护（会话切换场景使用）。
-   *  会话切换后紧接着 applyAuthoritativeProcessingState 恢复新会话的权威状态，
-   *  不能让旧的 lastForcedIdleAt 阻断新状态写入。 */
-  skipAntiLiftBack?: boolean;
-}) {
-  messagesState.backendProcessing = false;
-  messagesState.activeMessageIds = new Set();
-  messagesState.pendingRequests = new Set();
-  // 不再在此清 orchestratorRuntimeState：
-  // 该函数被「轮次正常结束」事件（processingStateChanged forced idle / canonical 终态）调用，
-  // 那时 runtimeState 仍持有「completed / failed / cancelled」的终态语义，需要继续在
-  // 顶部状态栏展示，避免出现「面板瞬间消失再被下一个 runtimeState 事件重新挂载」的跳动。
-  // runtimeState 的清理生命周期由专属路径负责（session/workspace 切换 + bootstrap 恢复）。
-  clearAllRetryRuntime();
-  if (options?.skipAntiLiftBack) {
-    // 会话切换：清除防回抬标记，允许新会话的权威状态正常写入
-    messagesState.lastForcedIdleAt = null;
-  } else {
-    // 用户手动中断/强制 idle：设置防回抬，阻止后端残留事件抬回 processing
-    messagesState.lastForcedIdleAt = Date.now();
+export function settleTerminalTurn(input: {
+  sessionId: string;
+  requestId: string;
+}): boolean {
+  const sessionId = input.sessionId.trim();
+  const requestId = input.requestId.trim();
+  if (
+    !sessionId
+    || sessionId === '__draft__'
+    || !requestId
+    || !requestBelongsToSession(sessionId, requestId)
+  ) {
+    return false;
+  }
+  if (terminalRequestIdsBySession.get(sessionId)?.has(requestId)) {
+    return true;
+  }
+
+  const currentSessionId = executionSessionKey(messagesState.currentSessionId);
+  const binding = requestBindings.get(requestId);
+  const submission = localTurnSubmissionProjections.get(requestId);
+  rememberTerminalRequest(sessionId, requestId);
+  removeRequestBindingOnly(requestId);
+  removeLocalTurnSubmission(requestId);
+
+  if (sessionId !== currentSessionId) {
+    updateStoredExecutionProjection(sessionId, (projection) => {
+      projection.pendingRequests.delete(requestId);
+      projection.activeMessageIds.delete(
+        submission?.placeholderMessageId || binding?.placeholderMessageId || '',
+      );
+      if (projection.pendingRequests.size === 0) {
+        projection.backendProcessing = false;
+      }
+      projection.isProcessing = projection.backendProcessing || projection.pendingRequests.size > 0;
+      if (!projection.isProcessing) {
+        projection.thinkingStartAt = null;
+        projection.turnStage = 'done';
+      }
+      return projection;
+    });
+    return true;
+  }
+
+  const pendingRequests = new Set(messagesState.pendingRequests);
+  pendingRequests.delete(requestId);
+  messagesState.pendingRequests = pendingRequests;
+  const activeMessageIds = new Set(messagesState.activeMessageIds);
+  activeMessageIds.delete(submission?.placeholderMessageId || binding?.placeholderMessageId || '');
+  messagesState.activeMessageIds = activeMessageIds;
+  if (messagesState.pendingRequests.size === 0) {
+    messagesState.backendProcessing = false;
   }
   updateProcessingState();
+  if (!messagesState.isProcessing) {
+    messagesState.turnStage = 'done';
+    messagesState.thinkingStartAt = null;
+  }
   saveCurrentExecutionProjection();
+  return true;
 }
 
-export function settleProcessingForManualInteraction() {
-  clearPendingInteractions();
-  clearProcessingState();
+export function clearProcessingState() {
+  messagesState.backendProcessing = false;
+  messagesState.turnStage = null;
+  messagesState.activeMessageIds = new Set();
+  messagesState.pendingRequests = new Set();
+  clearAllRetryRuntime();
+  updateProcessingState();
+  saveCurrentExecutionProjection();
 }
 
 /** 获取后端处理状态（用于时序判断） */
@@ -1968,9 +2342,17 @@ export function clearPendingInteractions() {
     nextBindings.delete(requestId);
   }
   requestBindings = nextBindings;
+  const nextSubmissions = new Map(localTurnSubmissionProjections);
+  for (const [requestId, submission] of nextSubmissions) {
+    if (submission.sessionId === currentSessionId) {
+      nextSubmissions.delete(requestId);
+    }
+  }
+  localTurnSubmissionProjections = nextSubmissions;
   messagesState.pendingRequests = new Set();
   messagesState.activeMessageIds = new Set();
   messagesState.backendProcessing = false;
+  messagesState.turnStage = null;
   messagesState.isProcessing = false;
   messagesState.thinkingStartAt = null;
   saveCurrentExecutionProjection(currentSessionId);
@@ -2294,23 +2676,18 @@ export function clearAllMessages(options: {
   resetPanelState?: boolean;
   /** 切换会话时保留后台请求的执行态，由 setCurrentSessionId 负责切换投影。 */
   preserveExecutionState?: boolean;
-  /** 跨 session 切换时设为 true，跳过防回抬保护 */
-  skipAntiLiftBack?: boolean;
 } = {}) {
   captureCurrentSessionViewState();
   if (options.resetTimelineView !== false) {
     messagesState.canonicalTimelineProjection = null;
   }
   messagesState.orchestratorRuntimeState = null;
-  messagesState.sessionHistory = {
-    workspaceId: messagesState.currentWorkspaceId,
-    sessionId: messagesState.currentSessionId,
-    hasMoreBefore: false,
-    beforeCursor: null,
-    canonicalHasMoreBefore: false,
-    canonicalBeforeCursor: null,
-    isLoadingBefore: false,
-  };
+  messagesState.sessionHistory = createEmptySessionHistoryState(
+    messagesState.currentWorkspaceId,
+    messagesState.currentWorkspacePath,
+    messagesState.currentSessionId,
+    messagesState.sessionHistory.revision + 1,
+  );
   messagesState.queuedMessages = [];
   messagesState.editingTurn = null;
   messagesState.messageJump = {
@@ -2319,7 +2696,7 @@ export function clearAllMessages(options: {
   };
   if (options.preserveExecutionState !== true) {
     clearPendingInteractions();
-    clearProcessingState({ skipAntiLiftBack: options.skipAntiLiftBack });
+    clearProcessingState();
   }
   // 会话级运行时状态：会话切换时必须清理，避免旧数据泄漏到新会话
   waveState = null;
@@ -2335,81 +2712,213 @@ export function setSessionHistoryState(
   sessionId: string | null | undefined,
   input: {
     workspaceId?: string | null;
-    hasMoreBefore?: boolean;
-    beforeCursor?: string | null;
+    workspacePath?: string | null;
     canonicalHasMoreBefore?: boolean;
     canonicalBeforeCursor?: string | null;
-    isLoadingBefore?: boolean;
+    historyLoadStatus?: SessionHistoryLoadStatus;
     preserveLoadedWindow?: boolean;
+    expectedRevision?: number;
+    expectedCanonicalBeforeCursor?: string | null;
   },
 ): void {
   const normalizedSessionId = normalizeSessionId(sessionId);
-  if (!normalizedSessionId) {
-    messagesState.sessionHistory = {
-      workspaceId: null,
-      sessionId: null,
-      hasMoreBefore: false,
-      beforeCursor: null,
-      canonicalHasMoreBefore: false,
-      canonicalBeforeCursor: null,
-      isLoadingBefore: false,
-    };
+  const current = messagesState.sessionHistory;
+  if (
+    input.expectedRevision !== undefined
+    && current.revision !== input.expectedRevision
+  ) {
     return;
   }
-  const current = messagesState.sessionHistory;
-  const normalizedWorkspaceId = typeof input.workspaceId === 'string'
-    ? input.workspaceId.trim() || null
-    : (messagesState.currentWorkspaceId || null);
-  const inputBeforeCursor = typeof input.beforeCursor === 'string' && input.beforeCursor.trim()
-    ? input.beforeCursor.trim()
-    : null;
   if (
-    (current.sessionId && current.sessionId !== normalizedSessionId)
-    || (current.workspaceId && current.workspaceId !== normalizedWorkspaceId)
+    input.expectedCanonicalBeforeCursor !== undefined
+    && current.canonicalBeforeCursor !== normalizeHistoryCursor(input.expectedCanonicalBeforeCursor)
   ) {
+    return;
+  }
+  if (!normalizedSessionId) {
+    messagesState.sessionHistory = createEmptySessionHistoryState(
+      input.workspaceId,
+      input.workspacePath ?? messagesState.currentWorkspacePath,
+      null,
+      current.revision + 1,
+    );
+    return;
+  }
+  const normalizedWorkspaceId = input.workspaceId !== undefined
+    ? normalizeWorkspaceId(input.workspaceId)
+    : normalizeWorkspaceId(messagesState.currentWorkspaceId);
+  const normalizedWorkspacePath = input.workspacePath !== undefined
+    ? normalizeWorkspacePath(input.workspacePath)
+    : normalizeWorkspacePath(messagesState.currentWorkspacePath);
+  if (
+    current.sessionId !== normalizedSessionId
+    || current.workspaceId !== normalizedWorkspaceId
+    || current.workspacePath !== normalizedWorkspacePath
+  ) {
+    const canonicalHasMoreBefore = input.canonicalHasMoreBefore === true;
+    const canonicalBeforeCursor = normalizeHistoryCursor(input.canonicalBeforeCursor);
     messagesState.sessionHistory = {
       workspaceId: normalizedWorkspaceId,
+      workspacePath: normalizedWorkspacePath,
       sessionId: normalizedSessionId,
-      hasMoreBefore: input.hasMoreBefore === true,
-      beforeCursor: inputBeforeCursor,
-      canonicalHasMoreBefore: input.canonicalHasMoreBefore === true,
-      canonicalBeforeCursor: normalizeHistoryCursor(input.canonicalBeforeCursor),
-      isLoadingBefore: input.isLoadingBefore === true,
+      canonicalHasMoreBefore,
+      canonicalBeforeCursor,
+      historyLoadStatus: resolveHistoryLoadStatus(
+        canonicalHasMoreBefore,
+        canonicalBeforeCursor,
+        input.historyLoadStatus,
+        'idle',
+      ),
+      revision: current.revision + 1,
     };
     return;
   }
   const shouldPreserveLoadedWindow = input.preserveLoadedWindow === true
     && current.sessionId === normalizedSessionId
     && current.workspaceId === normalizedWorkspaceId
+    && current.workspacePath === normalizedWorkspacePath
     && (
-      current.beforeCursor !== null
-      || current.hasMoreBefore
-      || current.canonicalBeforeCursor !== null
+      current.canonicalBeforeCursor !== null
       || current.canonicalHasMoreBefore
     );
-  messagesState.sessionHistory = {
+  const canonicalHasMoreBefore = shouldPreserveLoadedWindow
+    ? current.canonicalHasMoreBefore
+    : (input.canonicalHasMoreBefore ?? current.canonicalHasMoreBefore);
+  const canonicalBeforeCursor = shouldPreserveLoadedWindow
+    ? current.canonicalBeforeCursor
+    : (input.canonicalBeforeCursor !== undefined
+      ? normalizeHistoryCursor(input.canonicalBeforeCursor)
+      : current.canonicalBeforeCursor);
+  const preserveFailedLoad = shouldPreserveLoadedWindow
+    && input.historyLoadStatus === undefined
+    && (current.historyLoadStatus === 'error' || current.historyLoadStatus === 'no-progress');
+  const preserveInFlightLoad = shouldPreserveLoadedWindow
+    && input.historyLoadStatus === undefined
+    && current.historyLoadStatus === 'loading';
+  const hasWindowInput = input.canonicalHasMoreBefore !== undefined
+    || input.canonicalBeforeCursor !== undefined;
+  const historyLoadStatus = preserveFailedLoad || preserveInFlightLoad
+    ? current.historyLoadStatus
+    : hasWindowInput || input.historyLoadStatus !== undefined
+      ? resolveHistoryLoadStatus(
+        canonicalHasMoreBefore,
+        canonicalBeforeCursor,
+        input.historyLoadStatus,
+        'idle',
+      )
+      : current.historyLoadStatus;
+  const nextState: SessionHistoryState = {
     workspaceId: normalizedWorkspaceId,
+    workspacePath: normalizedWorkspacePath,
     sessionId: normalizedSessionId,
-    hasMoreBefore: shouldPreserveLoadedWindow
-      ? current.hasMoreBefore
-      : (input.hasMoreBefore ?? current.hasMoreBefore),
-    beforeCursor: shouldPreserveLoadedWindow
-      ? current.beforeCursor
-      : (input.beforeCursor !== undefined ? inputBeforeCursor : current.beforeCursor),
-    canonicalHasMoreBefore: shouldPreserveLoadedWindow
-      ? current.canonicalHasMoreBefore
-      : (input.canonicalHasMoreBefore ?? current.canonicalHasMoreBefore),
-    canonicalBeforeCursor: shouldPreserveLoadedWindow
-      ? current.canonicalBeforeCursor
-      : (input.canonicalBeforeCursor !== undefined
-        ? normalizeHistoryCursor(input.canonicalBeforeCursor)
-        : current.canonicalBeforeCursor),
-    isLoadingBefore: input.isLoadingBefore ?? current.isLoadingBefore,
+    canonicalHasMoreBefore,
+    canonicalBeforeCursor,
+    historyLoadStatus,
+    revision: current.revision,
   };
+  const loadedWindowChanged = nextState.canonicalHasMoreBefore !== current.canonicalHasMoreBefore
+    || nextState.canonicalBeforeCursor !== current.canonicalBeforeCursor;
+  messagesState.sessionHistory = loadedWindowChanged
+    ? { ...nextState, revision: current.revision + 1 }
+    : nextState;
 }
 
 function normalizeHistoryCursor(value: string | null | undefined): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function resolveHistoryLoadStatus(
+  canonicalHasMoreBefore: boolean,
+  canonicalBeforeCursor: string | null,
+  requestedStatus: SessionHistoryLoadStatus | undefined,
+  fallbackStatus: SessionHistoryLoadStatus,
+): SessionHistoryLoadStatus {
+  if (requestedStatus === 'loading' || requestedStatus === 'error' || requestedStatus === 'no-progress') {
+    return requestedStatus;
+  }
+  if (canonicalHasMoreBefore && !canonicalBeforeCursor) {
+    return 'no-progress';
+  }
+  if (!canonicalHasMoreBefore) {
+    return 'exhausted';
+  }
+  return requestedStatus === 'idle' || fallbackStatus === 'idle' ? 'idle' : fallbackStatus;
+}
+
+export interface SessionHistoryPageCommitResult {
+  accepted: boolean;
+  reason: 'committed' | 'stale' | 'no-progress';
+  addedTurnCount: number;
+}
+
+function noProgressHistoryPageResult(): SessionHistoryPageCommitResult {
+  const current = messagesState.sessionHistory;
+  if (current.historyLoadStatus === 'loading') {
+    messagesState.sessionHistory = {
+      ...current,
+      historyLoadStatus: 'no-progress',
+      revision: current.revision + 1,
+    };
+  }
+  return { accepted: false, reason: 'no-progress', addedTurnCount: 0 };
+}
+
+export function commitOlderSessionHistoryPage(input: {
+  sessionId: string;
+  workspaceId: string | null;
+  workspacePath: string | null;
+  revision: number;
+  canonicalBeforeCursor: string | null;
+  turns: readonly CanonicalTurn[];
+  canonicalHasMoreBefore: boolean;
+  nextCanonicalBeforeCursor: string | null;
+}): SessionHistoryPageCommitResult {
+  const sessionId = normalizeSessionId(input.sessionId);
+  const workspaceId = normalizeWorkspaceId(input.workspaceId);
+  const workspacePath = normalizeWorkspacePath(input.workspacePath);
+  const current = messagesState.sessionHistory;
+  if (
+    !sessionId
+    || current.sessionId !== sessionId
+    || current.workspaceId !== workspaceId
+    || current.workspacePath !== workspacePath
+    || current.revision !== input.revision
+    || current.canonicalBeforeCursor !== normalizeHistoryCursor(input.canonicalBeforeCursor)
+    || current.historyLoadStatus !== 'loading'
+    || normalizeSessionId(messagesState.currentSessionId) !== sessionId
+    || normalizeWorkspaceId(messagesState.currentWorkspaceId) !== workspaceId
+    || normalizeWorkspacePath(messagesState.currentWorkspacePath) !== workspacePath
+  ) {
+    return { accepted: false, reason: 'stale', addedTurnCount: 0 };
+  }
+
+  const nextCanonicalBeforeCursor = normalizeHistoryCursor(input.nextCanonicalBeforeCursor);
+  const canonicalHasMoreBefore = input.canonicalHasMoreBefore === true;
+  // /messages 的 canonical cursor 始终指向本页最早 turn，即使本页已经是最后一页；
+  // 非空页缺少 cursor 时，不能把它当作已耗尽，否则下一次请求会重复同一页。
+  if (!nextCanonicalBeforeCursor || !Array.isArray(input.turns) || input.turns.length === 0) {
+    return noProgressHistoryPageResult();
+  }
+  const pageCommit = prependCanonicalTurns(sessionId, [...input.turns], {
+    expectedBeforeCursor: normalizeHistoryCursor(input.canonicalBeforeCursor),
+    nextBeforeCursor: nextCanonicalBeforeCursor,
+  });
+  if (!pageCommit || pageCommit.addedTurnCount < 1 || !setCanonicalTimelineProjection(pageCommit.projection)) {
+    return noProgressHistoryPageResult();
+  }
+
+  messagesState.sessionHistory = {
+    ...current,
+    canonicalHasMoreBefore,
+    canonicalBeforeCursor: nextCanonicalBeforeCursor,
+    historyLoadStatus: canonicalHasMoreBefore ? 'idle' : 'exhausted',
+    revision: current.revision + 1,
+  };
+  return {
+    accepted: true,
+    reason: 'committed',
+    addedTurnCount: pageCommit.addedTurnCount,
+  };
 }
 
 export function setCanonicalTimelineProjection(projection: SessionTimelineProjection): boolean {
@@ -2454,7 +2963,7 @@ export function initializeState() {
     // 浏览器本地持久化只保留按 session 归档的轻量视图状态，
     // 避免旧 workspace 的本地列表在首屏污染当前工作区。
     clearPendingInteractions();
-    clearProcessingState({ skipAntiLiftBack: true });
+    clearProcessingState();
     saveWebviewState();
   }
 }
@@ -2546,9 +3055,7 @@ export function updateRequestBinding(
 export function clearRequestBinding(requestId: string): void {
   if (!requestId) return;
   clearPendingRequest(requestId);
-  const next = new Map(requestBindings);
-  next.delete(requestId);
-  requestBindings = next;
+  removeRequestBindingOnly(requestId);
 }
 
 /**
@@ -2564,6 +3071,8 @@ export function clearAllRequestBindings(): void {
     }
   }
   requestBindings = new Map();
+  localTurnSubmissionProjections = new Map();
+  terminalRequestIdsBySession = new Map();
   sessionExecutionProjections = new Map();
   messagesState.pendingRequests = new Set();
   messagesState.activeMessageIds = new Set();

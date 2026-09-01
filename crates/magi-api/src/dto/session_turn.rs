@@ -556,6 +556,12 @@ pub struct SessionTurnResponseDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_event_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_event_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_occurred_at: Option<UtcMillis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_turn: Option<CanonicalTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_item: Option<CanonicalTurnItem>,
@@ -614,6 +620,9 @@ impl SessionTurnResponseDto {
             queue_position: None,
             canonical_schema_version: None,
             canonical_event_kind: None,
+            canonical_event_id: None,
+            canonical_event_seq: None,
+            canonical_occurred_at: None,
             canonical_turn: None,
             canonical_item: None,
             steered_turn_id: None,
@@ -651,6 +660,20 @@ impl SessionTurnResponseDto {
             self.canonical_event_kind = Some(event_kind.to_string());
             self.canonical_turn = turn;
             self.canonical_item = item;
+        }
+        self
+    }
+
+    pub fn with_canonical_event_metadata(
+        mut self,
+        event_id: EventId,
+        event_seq: u64,
+        occurred_at: UtcMillis,
+    ) -> Self {
+        if self.canonical_turn.is_some() || self.canonical_item.is_some() {
+            self.canonical_event_id = Some(event_id.to_string());
+            self.canonical_event_seq = Some(event_seq);
+            self.canonical_occurred_at = Some(occurred_at);
         }
         self
     }

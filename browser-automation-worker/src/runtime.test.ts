@@ -62,6 +62,7 @@ class ScriptedPort implements ParentPort {
 
   constructor(
     private readonly respond: (method: string, params: Record<string, unknown>) => unknown,
+    private readonly runtimeProbe: (() => boolean) | null = null,
   ) {}
 
   on(_event: "message", listener: (event: { data: MainToWorkerMessage }) => void): void {
@@ -77,7 +78,10 @@ class ScriptedPort implements ParentPort {
       ...(message.session_id ? { sessionId: message.session_id } : {}),
     });
     queueMicrotask(() => {
-      const result = this.respond(message.method, message.params ?? {});
+      const result = message.method === "Runtime.evaluate"
+        && String(message.params?.expression ?? "").includes("typeof globalThis.__magiBrowserAutomation.setAnnotations")
+        ? { result: { value: this.runtimeProbe?.() ?? true } }
+        : this.respond(message.method, message.params ?? {});
       this.#listener?.({
         data: {
           type: "cdp_response",
@@ -91,6 +95,7 @@ class ScriptedPort implements ParentPort {
                   message: result.message,
                   recoverable: true,
                   side_effect_started: false,
+                  diagnostic: null,
                 },
               }
             : { result }),
@@ -406,11 +411,11 @@ test("浏览器截图的归一化区域必须转换为当前布局视口的真�
     format: "png",
     clip: { x: 300, y: 80, width: 600, height: 200, scale: 1 },
     captureBeyondViewport: false,
-    fromSurface: false,
+    fromSurface: true,
   });
 });
 
-test("截图和滚动使用页面脚本视口坐标，不把 CDP layoutViewport 的物理尺寸混入归一化坐标", async () => {
+test("截图使用页面脚本视口坐标，滚动直接在当前文档执行", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") {
       return { frameTree: { frame: { id: "frame-1" } } };
@@ -454,7 +459,7 @@ test("截图和滚动使用页面脚本视口坐标，不把 CDP layoutViewport 
       format: "png",
       clip: { x: 48, y: 85.4, width: 96, height: 170.8, scale: 1 },
       captureBeyondViewport: false,
-      fromSurface: false,
+      fromSurface: true,
     },
   );
 
@@ -467,9 +472,13 @@ test("截图和滚动使用页面脚本视口坐标，不把 CDP layoutViewport 
       delta_y: 400,
     },
   });
-  assert.deepEqual(
-    port.requests.find((request) => request.method === "Input.dispatchMouseEvent")?.params,
-    { type: "mouseWheel", x: 240, y: 427, deltaX: 0, deltaY: 400 },
+  assert.equal(
+    port.requests.some((request) => request.method === "Input.dispatchMouseEvent"),
+    false,
+  );
+  assert.match(
+    String(port.requests.find((request) => request.method === "Runtime.evaluate" && String(request.params.expression).includes("window.scrollBy"))?.params.expression),
+    /window\.scrollBy/,
   );
 });
 
@@ -519,25 +528,16 @@ test("页面脚本视口失效时兼容 CDP 仅返回 clientWidth/clientHeight �
       format: "png",
       clip: { x: 0, y: 0, width: 240, height: 427, scale: 1 },
       captureBeyondViewport: false,
-      fromSurface: false,
+      fromSurface: true,
     },
   );
 });
 
-test("滚动目标元素时使用元素中心作为 wheel 坐标", async () => {
+test("滚动目标元素时直接调用元素 scrollBy，不依赖鼠标坐标", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
-    if (method === "Runtime.evaluate") {
-      const expression = String(params.expression);
-      if (expression.trim().endsWith("globalThis.__magiBrowserAutomation.viewport()")) {
-        return { result: { value: { width: 800, height: 600 } } };
-      }
-      if (expression.includes("globalThis.__magiBrowserAutomation.target")) {
-        return { result: { value: { x: 120, y: 240, bounds: { x: 100, y: 220, width: 40, height: 40 }, editable: false, sensitive: null } } };
-      }
-      return { result: { value: null } };
-    }
+    if (method === "Runtime.evaluate") return { result: { value: null } };
     return {};
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
@@ -552,10 +552,44 @@ test("滚动目标元素时使用元素中心作为 wheel 坐标", async () => {
     },
   });
   assert.equal(result.outcome.status, "succeeded");
-  assert.deepEqual(
-    port.requests.find((request) => request.method === "Input.dispatchMouseEvent")?.params,
-    { type: "mouseWheel", x: 120, y: 240, deltaX: 0, deltaY: 300 },
+  assert.equal(
+    port.requests.some((request) => request.method === "Input.dispatchMouseEvent"),
+    false,
   );
+  const scroll = port.requests.find((request) => request.method === "Runtime.evaluate" && String(request.params.expression).includes("scrollBy"));
+  assert.ok(scroll);
+  assert.match(String(scroll.params.expression), /__magiBrowserAutomation\.resolve/);
+  assert.match(String(scroll.params.expression), /left: 0/);
+  assert.match(String(scroll.params.expression), /top: 300/);
+});
+
+test("页面滚动不再经过会超时的 Input.dispatchMouseEvent CDP 通道", async () => {
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Input.dispatchMouseEvent") {
+      return new Error("browser_cdp_timeout:Input.dispatchMouseEvent");
+    }
+    return { result: { value: null } };
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+
+  const result = await runtime.execute("scroll-without-input-cdp", binding, {
+    type: "scroll",
+    payload: {
+      tab_id: binding.tab_id,
+      control: { mode: "user", fence: 1 },
+      delta_x: 0,
+      delta_y: 400,
+    },
+  });
+
+  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(
+    port.requests.some((request) => request.method === "Input.dispatchMouseEvent"),
+    false,
+  );
+  assert.ok(port.requests.some((request) => request.method === "Runtime.evaluate" && String(request.params.expression).includes("window.scrollBy")));
 });
 
 test("click_at 的 double_click 产生完整双击序列", async () => {
@@ -981,7 +1015,7 @@ test("浏览器截图收到快照根节点时必须捕获整页范围而不是�
   assert.equal(port.requests.some((request) => request.method === "Runtime.evaluate"), false);
   assert.deepEqual(
     port.requests.find((request) => request.method === "Page.captureScreenshot")?.params,
-    { format: "png", captureBeyondViewport: false, fromSurface: false },
+    { format: "png", captureBeyondViewport: false, fromSurface: true },
   );
 });
 
@@ -1063,7 +1097,7 @@ test("整页截图使用 Chromium contentSize 和 captureBeyondViewport", async 
       format: "png",
       clip: { x: 0, y: 0, width: 1400, height: 3000, scale: 1 },
       captureBeyondViewport: true,
-      fromSurface: false,
+      fromSurface: true,
     },
   );
 });
@@ -1103,7 +1137,7 @@ test("元素截图先滚动到元素并重新读取最终 bounds", async () => {
       format: "png",
       clip: { x: 20, y: 30, width: 400, height: 200, scale: 1 },
       captureBeyondViewport: true,
-      fromSurface: false,
+      fromSurface: true,
     },
   );
 });
@@ -1179,6 +1213,105 @@ test("持久化浏览器标记通过 Host 同步到当前 Chromium 文档", asyn
     String(port.requests.find((request) => request.method === "Runtime.evaluate")?.params.expression),
     /setAnnotations/u,
   );
+});
+
+test("同一 Surface 的并发工具调用按资源串行，运行时安装不会暴露半初始化状态", async () => {
+  let isolatedWorlds = 0;
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: ++isolatedWorlds };
+    if (method === "Runtime.evaluate" && String(params.expression).includes("setAnnotations")) {
+      return { result: { value: { rendered: 1 } } };
+    }
+    return { result: { value: null } };
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const command = (call: string): Promise<unknown> => runtime.execute(call, binding, {
+    type: "set_annotations",
+    payload: {
+      tab_id: binding.tab_id,
+      annotations: [{ annotation_id: call, sequence: 1, status: "active" }],
+    },
+  });
+
+  const [first, second] = await Promise.all([command("annotation-a"), command("annotation-b")]);
+  assert.equal((first as { outcome: { status: string } }).outcome.status, "succeeded");
+  assert.equal((second as { outcome: { status: string } }).outcome.status, "succeeded");
+  assert.equal(isolatedWorlds, 1, "同一 Surface 只能创建一个自动化 isolated world");
+});
+
+test("页面运行上下文清理后必须重建 runtime，而不是调用失效的 setAnnotations", async () => {
+  let isolatedWorlds = 0;
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: ++isolatedWorlds };
+    if (method === "Runtime.evaluate") return { result: { value: { rendered: 1 } } };
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const command = (call: string): Promise<unknown> => runtime.execute(call, binding, {
+    type: "set_annotations",
+    payload: { tab_id: binding.tab_id, annotations: [] },
+  });
+
+  assert.equal((await command("annotation-before-clear") as { outcome: { status: string } }).outcome.status, "succeeded");
+  port.emit("Runtime.executionContextsCleared");
+  assert.equal((await command("annotation-after-clear") as { outcome: { status: string } }).outcome.status, "succeeded");
+  assert.equal(isolatedWorlds, 2, "上下文清理后必须为当前文档重建 isolated world");
+});
+
+test("缓存的执行上下文缺少页面 runtime 时会先重新安装并验证", async () => {
+  let isolatedWorlds = 0;
+  let probeCount = 0;
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: ++isolatedWorlds };
+    if (method === "Runtime.evaluate") return { result: { value: { rendered: 1 } } };
+    return {};
+  }, () => probeCount++ !== 1);
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const command = (call: string): Promise<unknown> => runtime.execute(call, binding, {
+    type: "set_annotations",
+    payload: { tab_id: binding.tab_id, annotations: [] },
+  });
+
+  const first = await command("annotation-runtime-present") as { outcome: { status: string } };
+  const second = await command("annotation-runtime-missing") as { outcome: { status: string; payload?: unknown } };
+  assert.equal(first.outcome.status, "succeeded");
+  assert.equal(second.outcome.status, "succeeded");
+  assert.equal(isolatedWorlds, 2, "缓存上下文中的 runtime 缺失时不能继续复用该上下文");
+  assert.equal(probeCount, 3, "安装前后都必须完成 runtime 健康检查");
+});
+
+test("Runtime.evaluate 竞态遇到失效 context 时只重试一次并重建 isolated world", async () => {
+  let isolatedWorlds = 0;
+  let failedStaleEvaluation = false;
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: ++isolatedWorlds };
+    if (
+      method === "Runtime.evaluate"
+      && String(params.expression).includes("globalThis.__magiBrowserAutomation.setAnnotations(")
+      && params.contextId === 1
+      && !failedStaleEvaluation
+    ) {
+      failedStaleEvaluation = true;
+      return new Error("Cannot find context with specified id");
+    }
+    return { result: { value: null } };
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("annotation-context-race", binding, {
+    type: "set_annotations",
+    payload: { tab_id: binding.tab_id, annotations: [] },
+  });
+
+  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(isolatedWorlds, 2, "失效 context 必须重建 isolated world");
+  const annotationEvaluations = port.requests.filter((request) =>
+    request.method === "Runtime.evaluate"
+    && String(request.params.expression).includes("globalThis.__magiBrowserAutomation.setAnnotations("));
+  assert.deepEqual(annotationEvaluations.map((request) => request.params.contextId), [1, 2]);
 });
 
 test("浏览器标记层的 MutationObserver 不会观察自身 Shadow DOM 重绘", () => {

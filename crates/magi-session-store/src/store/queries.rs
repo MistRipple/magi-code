@@ -317,6 +317,24 @@ impl SessionStore {
         turns
     }
 
+    /// 按 session 和 turn 精确读取单条 canonical 事实，避免为响应一个新 Turn 复制整段会话历史。
+    pub fn canonical_turn_for_session_turn_id(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Option<crate::models::CanonicalTurn> {
+        let mut turn = self
+            .state
+            .read()
+            .expect("session state read lock poisoned")
+            .canonical_turns
+            .iter()
+            .find(|turn| &turn.session_id == session_id && turn.turn_id == turn_id)
+            .cloned()?;
+        turn.normalize();
+        Some(turn)
+    }
+
     /// 按协议 requestId 找回已经持久化的 canonical Turn。
     ///
     /// App Server 客户端可能在服务端已经接受请求、但响应尚未送达时重试同一个
@@ -485,6 +503,18 @@ impl SessionStore {
             .iter()
             .find(|turn| &turn.session_id == session_id && turn.turn_id == turn_id)?
             .clone();
+        let superseded_turn = canonical_turn
+            .metadata
+            .get("replacesTurnId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|replaced_turn_id| {
+                state.canonical_turns.iter().find(|turn| {
+                    &turn.session_id == session_id
+                        && turn.turn_id == replaced_turn_id
+                        && turn.status == crate::models::CanonicalTurnStatus::Superseded
+                })
+            })
+            .cloned();
         let entry_id = sidecar
             .active_execution_chain
             .as_ref()
@@ -504,6 +534,7 @@ impl SessionStore {
         Some(SessionAcceptanceRecord {
             session,
             timeline_entry,
+            superseded_turn,
             canonical_turn,
             sidecar,
         })

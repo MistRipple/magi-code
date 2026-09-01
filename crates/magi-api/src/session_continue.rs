@@ -10,8 +10,8 @@ use crate::{
 };
 use magi_conversation_runtime::{
     execution_chain_recovery::{
-        apply_chain_recovery_if_needed, release_resumed_branch_path,
-        sync_branch_checkpoint_to_worker_runtime,
+        apply_chain_recovery_if_needed, commit_chain_recovery, fail_resumed_execution_paths,
+        release_resumed_branch_path, sync_branch_checkpoint_to_worker_runtime,
     },
     session_images::SessionTurnImage,
     task_execution_registry::TaskExecutionPlan,
@@ -160,6 +160,129 @@ impl Drop for SessionGitExecutionLeaseGuard<'_> {
         if !self.committed {
             self.state
                 .release_session_git_execution_lease(self.session_id);
+        }
+    }
+}
+
+/// Continue 的恢复尝试边界：在 runner 成功启动并完成 recovery 提交前，任何错误都必须
+/// 清理本轮执行计划、把已重新打开的任务路径收口为 Failed，并把新 Turn 收口为 failed。
+/// Drop 语义保证所有 `?` 路径都走同一失败收口，不依赖调用方记住某个补丁分支。
+struct ContinueRecoveryAttempt<'a> {
+    state: &'a ApiState,
+    session_id: SessionId,
+    chain: ActiveExecutionChain,
+    branches: Vec<ActiveExecutionBranch>,
+    resumed_turn_id: String,
+    registered_task_ids: Vec<magi_core::TaskId>,
+    registered_threads: Vec<ExecutionThread>,
+    committed: bool,
+}
+
+impl<'a> ContinueRecoveryAttempt<'a> {
+    fn new(
+        state: &'a ApiState,
+        session_id: &SessionId,
+        chain: &ActiveExecutionChain,
+        branches: &[ActiveExecutionBranch],
+        resumed_turn_id: &str,
+    ) -> Self {
+        Self {
+            state,
+            session_id: session_id.clone(),
+            chain: chain.clone(),
+            branches: branches.to_vec(),
+            resumed_turn_id: resumed_turn_id.to_string(),
+            registered_task_ids: Vec::new(),
+            registered_threads: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn record_registered_task(&mut self, task_id: magi_core::TaskId) {
+        self.registered_task_ids.push(task_id);
+    }
+
+    fn record_registered_thread(&mut self, thread: ExecutionThread) {
+        self.registered_threads.push(thread);
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ContinueRecoveryAttempt<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(task_store) = self.state.task_store()
+            && let Err(error) = fail_resumed_execution_paths(
+                task_store,
+                self.state.spawn_graph.as_ref(),
+                &self.chain,
+                &self.branches,
+            )
+        {
+            tracing::error!(
+                ?error,
+                session_id = %self.session_id,
+                root_task_id = %self.chain.root_task_id,
+                "Continue 恢复失败后的任务路径收口失败"
+            );
+        }
+        for thread in &self.registered_threads {
+            let Some(branch) = self
+                .branches
+                .iter()
+                .find(|branch| branch.thread_id == thread.thread_id)
+            else {
+                tracing::error!(
+                    thread_id = %thread.thread_id,
+                    session_id = %self.session_id,
+                    "Continue 恢复失败后的 thread 回滚缺少 branch 所有权信息"
+                );
+                continue;
+            };
+            if let Err(error) = self.state.session_store.remove_recovery_thread_if_owned(
+                &self.session_id,
+                &thread.thread_id,
+                &thread.mission_id,
+                &branch.task_id,
+                &thread.worker_instance_id,
+            ) {
+                tracing::error!(
+                    ?error,
+                    thread_id = %thread.thread_id,
+                    task_id = %branch.task_id,
+                    session_id = %self.session_id,
+                    turn_id = %self.resumed_turn_id,
+                    "Continue 恢复失败后的 thread 回滚所有权校验失败"
+                );
+            }
+        }
+        for task_id in &self.registered_task_ids {
+            if self
+                .state
+                .task_execution_registry()
+                .remove_if_turn_matches(task_id, &self.resumed_turn_id)
+                .is_none()
+            {
+                tracing::debug!(
+                    %task_id,
+                    session_id = %self.session_id,
+                    turn_id = %self.resumed_turn_id,
+                    "Continue 恢复失败后的执行计划已经被清理"
+                );
+            }
+        }
+        fail_prepared_continue_turn(self.state, &self.session_id, &self.resumed_turn_id);
+        if let Err(error) = self.state.persist_runtime_durable_state_for_api() {
+            tracing::error!(
+                ?error,
+                session_id = %self.session_id,
+                "Continue 恢复失败后的 durable 状态持久化失败"
+            );
         }
     }
 }
@@ -384,7 +507,7 @@ pub(crate) fn restore_missing_resumed_branch_threads(
     session_id: &SessionId,
     chain: &ActiveExecutionChain,
     branches: &[ActiveExecutionBranch],
-) -> Result<usize, ApiError> {
+) -> Result<Vec<ExecutionThread>, ApiError> {
     let registered_threads = state.session_store.thread_registry_snapshot(session_id);
     let missing_branches = branches
         .iter()
@@ -395,13 +518,14 @@ pub(crate) fn restore_missing_resumed_branch_threads(
         })
         .collect::<Vec<_>>();
     if missing_branches.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "task_store 未配置"))?;
     let canonical_turns = state.session_store.canonical_turns_for_session(session_id);
+    let mut threads_to_register = Vec::with_capacity(missing_branches.len());
     for branch in &missing_branches {
         let task = task_store.get_task(&branch.task_id).ok_or_else(|| {
             ApiError::not_found("恢复 branch 任务不存在", branch.task_id.as_str())
@@ -419,7 +543,7 @@ pub(crate) fn restore_missing_resumed_branch_threads(
             .map(|item| item.created_at)
             .min_by_key(|time| time.0)
             .unwrap_or(chain.dispatch_context.accepted_at);
-        state.session_store.register_thread(ExecutionThread {
+        let thread = ExecutionThread {
             thread_id: branch.thread_id.clone(),
             session_id: session_id.clone(),
             mission_id: chain.mission_id.clone(),
@@ -437,10 +561,77 @@ pub(crate) fn restore_missing_resumed_branch_threads(
                 &canonical_turns,
                 &branch.thread_id,
             ),
-        });
+        };
+        if threads_to_register
+            .iter()
+            .any(|existing: &ExecutionThread| existing.thread_id == thread.thread_id)
+        {
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                format!("恢复分支重复使用 thread: {}", thread.thread_id),
+            ));
+        }
+        threads_to_register.push(thread);
     }
-    state.persist_session_state_checkpoint("session_continue_thread_rebuild")?;
-    Ok(missing_branches.len())
+
+    let mut registered_threads = Vec::with_capacity(threads_to_register.len());
+    for thread in threads_to_register {
+        if let Err(error) = state.session_store.register_thread(thread.clone()) {
+            let rollback_errors =
+                rollback_restored_branch_threads(state, session_id, chain, &registered_threads);
+            let detail = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("；回滚失败: {}", rollback_errors.join("；"))
+            };
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                format!("恢复分支注册 thread 失败: {error}{detail}"),
+            ));
+        }
+        registered_threads.push(thread);
+    }
+    if let Err(error) = state.persist_session_state_checkpoint("session_continue_thread_rebuild") {
+        let rollback_errors =
+            rollback_restored_branch_threads(state, session_id, chain, &registered_threads);
+        let detail = if rollback_errors.is_empty() {
+            String::new()
+        } else {
+            format!("；回滚失败: {}", rollback_errors.join("；"))
+        };
+        return Err(ApiError::internal_assembly(
+            "继续会话失败",
+            format!("恢复分支 thread 状态持久化失败: {error:?}{detail}"),
+        ));
+    }
+    Ok(registered_threads)
+}
+
+fn rollback_restored_branch_threads(
+    state: &ApiState,
+    session_id: &SessionId,
+    chain: &ActiveExecutionChain,
+    threads: &[ExecutionThread],
+) -> Vec<String> {
+    threads
+        .iter()
+        .filter_map(|thread| {
+            let branch = chain
+                .branches
+                .iter()
+                .find(|branch| branch.thread_id == thread.thread_id)?;
+            match state.session_store.remove_recovery_thread_if_owned(
+                session_id,
+                &thread.thread_id,
+                &thread.mission_id,
+                &branch.task_id,
+                &thread.worker_instance_id,
+            ) {
+                Ok(Some(_)) | Ok(None) => None,
+                Err(error) => Some(format!("thread {}: {error}", thread.thread_id)),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn persist_resumed_branch_user_input(
@@ -573,95 +764,23 @@ where
             "当前会话已关闭，不能继续执行".to_string(),
         ));
     }
-    let worker_runtime_handle = state
-        .execution_pipeline()
-        .map(|pipeline| pipeline.execution_runtime.worker_runtime());
-    finalize_terminal_worker_branches(
-        &state.session_store,
-        state.task_store(),
-        worker_runtime_handle,
-        session_id,
-    )
-    .map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))?;
-
-    let resumable_branches = chain
-        .branches
-        .iter()
-        .filter(|&branch| {
-            active_execution_branch_is_continue_recoverable(
-                worker_runtime_handle,
-                state.task_store(),
-                &chain,
-                branch,
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if resumable_branches.is_empty() {
-        return Err(ApiError::InvalidInput(
-            "当前会话没有可继续的 branch".to_string(),
+    // Session lifecycle lock 必须先于 root restart lock；在拿到两把锁之前只允许读取状态。
+    chain = state
+        .session_store
+        .active_execution_chain(session_id)
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可继续的执行链".to_string()))?;
+    let root_task = task_store
+        .get_task(&chain.root_task_id)
+        .ok_or_else(|| ApiError::not_found("根任务不存在", chain.root_task_id.as_str()))?;
+    if root_task.mission_id != chain.mission_id {
+        return Err(ApiError::internal_assembly(
+            "继续会话失败",
+            format!(
+                "active chain 的 mission_id 与根任务不一致: {} != {}",
+                chain.mission_id, root_task.mission_id
+            ),
         ));
     }
-    if !requested_agent_ids.is_empty() {
-        for agent_id in requested_agent_ids {
-            if !chain
-                .branches
-                .iter()
-                .any(|branch| &branch.worker_id == agent_id)
-            {
-                return Err(ApiError::InvalidInput(format!(
-                    "请求继续的代理不属于当前执行链: {}",
-                    agent_id
-                )));
-            }
-        }
-        let has_requested_resumable_agent = requested_agent_ids.iter().any(|agent_id| {
-            resumable_branches
-                .iter()
-                .any(|branch| &branch.worker_id == agent_id)
-        });
-        if !has_requested_resumable_agent {
-            return Err(ApiError::InvalidInput(
-                "请求继续的代理当前不可继续".to_string(),
-            ));
-        }
-    }
-
-    let branches_to_resume = if requested_agent_ids.is_empty() {
-        resumable_branches.clone()
-    } else {
-        resumable_branches
-            .iter()
-            .filter(|branch| {
-                requested_agent_ids
-                    .iter()
-                    .any(|agent_id| agent_id == &branch.worker_id)
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    if branches_to_resume.is_empty() {
-        return Err(ApiError::InvalidInput(
-            "请求继续的代理当前不可继续".to_string(),
-        ));
-    }
-
-    let workspace_id = state
-        .session_workspace_id(&session)
-        .or_else(|| chain.workspace_id.clone());
-    let execution_root = if workspace_id.is_none() {
-        Some(state.personal_session_execution_root(session_id)?)
-    } else {
-        None
-    };
-    state
-        .ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)
-        .await?;
-    state
-        .ensure_session_code_context(session_id, &workspace_id)
-        .await?;
-    let git_execution_lease = SessionGitExecutionLeaseGuard::new(state, session_id);
-
     let _restart_guard = manager.lock_for_restart(chain.root_task_id.as_str()).await;
     manager
         .quiesce_for_restart(chain.root_task_id.as_str())
@@ -674,6 +793,25 @@ where
     let root_task = task_store
         .get_task(&chain.root_task_id)
         .ok_or_else(|| ApiError::not_found("根任务不存在", chain.root_task_id.as_str()))?;
+    if root_task.mission_id != chain.mission_id {
+        return Err(ApiError::internal_assembly(
+            "继续会话失败",
+            format!(
+                "active chain 的 mission_id 与根任务不一致: {} != {}",
+                chain.mission_id, root_task.mission_id
+            ),
+        ));
+    }
+    let worker_runtime_handle = state
+        .execution_pipeline()
+        .map(|pipeline| pipeline.execution_runtime.worker_runtime());
+    finalize_terminal_worker_branches(
+        &state.session_store,
+        Some(task_store),
+        worker_runtime_handle,
+        session_id,
+    )
+    .map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))?;
     let resumable_branches = chain
         .branches
         .iter()
@@ -705,6 +843,22 @@ where
         ));
     }
 
+    let workspace_id = state
+        .session_workspace_id(&session)
+        .or_else(|| chain.workspace_id.clone());
+    let execution_root = if workspace_id.is_none() {
+        Some(state.personal_session_execution_root(session_id)?)
+    } else {
+        None
+    };
+    state
+        .ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)
+        .await?;
+    state
+        .ensure_session_code_context(session_id, &workspace_id)
+        .await?;
+    let git_execution_lease = SessionGitExecutionLeaseGuard::new(state, session_id);
+
     let primary_branch = branches_to_resume
         .iter()
         .find(|branch| {
@@ -718,7 +872,7 @@ where
     let memory_store = state
         .execution_pipeline()
         .map(|pipeline| &pipeline.memory_store);
-    apply_chain_recovery_if_needed(
+    let recovery_commit = apply_chain_recovery_if_needed(
         &state.session_store,
         &state.workspace_registry,
         memory_store,
@@ -761,7 +915,18 @@ where
     }
 
     let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
-    restore_missing_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)?;
+    let mut recovery_attempt = ContinueRecoveryAttempt::new(
+        state,
+        session_id,
+        &chain,
+        &branches_to_resume,
+        resumed_turn_id,
+    );
+    for thread in
+        restore_missing_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)?
+    {
+        recovery_attempt.record_registered_thread(thread);
+    }
     let prepared_input = prepare_input(&branches_to_resume)?;
     let goal_resume_guard = InterruptedGoalResumeGuard::prepare(
         &state.session_store,
@@ -784,7 +949,7 @@ where
     let mut root_status = root_task.status;
     if matches!(root_status, TaskStatus::Completed) {
         task_store
-            .update_status(&chain.root_task_id, TaskStatus::Failed)
+            .reopen_completed_root_for_recovery(&chain.root_task_id)
             .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
         root_status = TaskStatus::Failed;
     } else if task_status_is_terminal(&root_status) {
@@ -795,16 +960,26 @@ where
 
     let execution_settings_snapshot = Some(Arc::new(state.settings_store.execution_snapshot()));
     for branch in &branches_to_resume {
-        state.task_execution_registry().insert(
-            branch.task_id.clone(),
-            rebuild_dispatch_plan_for_branch(
-                &chain,
-                branch,
-                resumed_turn_id,
-                execution_root.clone(),
-                execution_settings_snapshot.clone(),
-            ),
-        );
+        if state
+            .task_execution_registry()
+            .insert(
+                branch.task_id.clone(),
+                rebuild_dispatch_plan_for_branch(
+                    &chain,
+                    branch,
+                    resumed_turn_id,
+                    execution_root.clone(),
+                    execution_settings_snapshot.clone(),
+                ),
+            )
+            .is_err()
+        {
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                format!("恢复分支 {} 已存在执行计划，拒绝重复注册", branch.task_id),
+            ));
+        }
+        recovery_attempt.record_registered_task(branch.task_id.clone());
         if let Some(worker_runtime) = worker_runtime_handle {
             sync_branch_checkpoint_to_worker_runtime(worker_runtime, branch);
         }
@@ -831,7 +1006,7 @@ where
             .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?,
         TaskStatus::Failed => {
             task_store
-                .update_status(&chain.root_task_id, TaskStatus::Running)
+                .start_failed_root_for_recovery(&chain.root_task_id)
                 .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
         }
         TaskStatus::Running => {}
@@ -854,21 +1029,34 @@ where
     match manager.start_after_quiesce(chain.root_task_id.as_str(), Some(session_id.clone())) {
         Ok(_) => {}
         Err(RunnerStartError::AlreadyRunning) => {
-            fail_prepared_continue_turn(state, session_id, resumed_turn_id);
             return Err(ApiError::internal_assembly(
                 "继续会话失败",
                 "恢复锁内仍存在活动 runner",
             ));
         }
         Err(RunnerStartError::NotFound) => {
-            fail_prepared_continue_turn(state, session_id, resumed_turn_id);
             return Err(ApiError::internal_assembly("继续会话失败", "根任务不存在"));
         }
         Err(RunnerStartError::SessionUnavailable) => {
-            fail_prepared_continue_turn(state, session_id, resumed_turn_id);
             return Err(ApiError::InvalidInput(
                 "当前会话已关闭，不能继续执行".to_string(),
             ));
+        }
+    }
+
+    if let Some(commit) = recovery_commit {
+        if let Err(error) = commit_chain_recovery(
+            &state.session_store,
+            &state.workspace_registry,
+            session_id,
+            &mut chain,
+            commit,
+        ) {
+            manager
+                .quiesce_for_restart(chain.root_task_id.as_str())
+                .await;
+            let message = error.into_message();
+            return Err(ApiError::internal_assembly("提交恢复状态失败", message));
         }
     }
 
@@ -885,5 +1073,6 @@ where
     };
     recovery_claim.commit();
     git_execution_lease.commit();
+    recovery_attempt.commit();
     Ok((accepted, prepared_input, prepared_turn))
 }

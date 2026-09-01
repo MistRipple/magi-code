@@ -960,7 +960,19 @@ fn execute_coordinator_tool(
                             canonical_task_name,
                             "agent_spawn 计划绑定失败"
                         );
-                        let _ = task_store.update_status(&child_id, TaskStatus::Killed);
+                        if let Err(terminal_error) = task_store.revoke_lease_and_set_task_terminal(
+                            &child_id,
+                            &child.root_task_id,
+                            None,
+                            TaskStatus::Killed,
+                            vec!["代理计划绑定失败，执行已终止".to_string()],
+                        ) {
+                            tracing::error!(
+                                error = %terminal_error,
+                                child_task_id = %child_id,
+                                "agent_spawn 计划绑定失败后的终止事实提交失败"
+                            );
+                        }
                         return (
                             agent_spawn_failure_payload_for_child(
                                 tool_call,
@@ -5720,7 +5732,7 @@ mod tests {
         let target = dir.path().join("probe.txt");
         std::fs::write(&target, "probe").expect("write probe");
         let task = test_task("task-file-remove", "task-file-remove", None);
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
         let session_id = SessionId::new("session-file-remove");
         session_store
             .create_session(session_id.clone(), "task approval test")
@@ -6287,7 +6299,7 @@ mod tests {
             })
             .to_string(),
         ];
-        task_store.insert_task(child);
+        task_store.insert_task(child).expect("子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
@@ -6336,7 +6348,7 @@ mod tests {
         child.executor_binding = Some(TaskExecutorBinding::for_role("reviewer"));
         child.output_refs = vec!["旧 Task output，不应覆盖 thread transcript。".to_string()];
         let child_id = child.task_id.clone();
-        task_store.insert_task(child);
+        task_store.insert_task(child).expect("子任务应插入");
         let session_threads = vec![ExecutionThread {
             thread_id: magi_core::ThreadId::new("thread-agent-wait-reviewer"),
             session_id: SessionId::new("session-agent-wait-thread"),
@@ -6422,7 +6434,9 @@ mod tests {
         );
         foreign_child.status = TaskStatus::Completed;
         foreign_child.output_refs = vec!["foreign result".to_string()];
-        task_store.insert_task(foreign_child);
+        task_store
+            .insert_task(foreign_child)
+            .expect("跨作用域子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
@@ -6460,7 +6474,9 @@ mod tests {
         foreign_child.mission_id = MissionId::new("mission-other");
         foreign_child.status = TaskStatus::Completed;
         foreign_child.output_refs = vec!["foreign scoped result".to_string()];
-        task_store.insert_task(foreign_child);
+        task_store
+            .insert_task(foreign_child)
+            .expect("跨作用域子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
@@ -6510,7 +6526,7 @@ mod tests {
                 std::time::SystemTime::now(),
             )
             .expect("test spawn graph edge should be accepted");
-        task_store.insert_task(child);
+        task_store.insert_task(child).expect("子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
@@ -6549,7 +6565,7 @@ mod tests {
         child.goal = "检查模型配置是否可用".to_string();
         child.executor_binding = Some(TaskExecutorBinding::for_role("reviewer"));
         child.output_refs = vec!["provider transport failed: connection refused".to_string()];
-        task_store.insert_task(child);
+        task_store.insert_task(child).expect("子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
@@ -6606,7 +6622,7 @@ mod tests {
         child.goal = "运行冒烟测试并报告失败原因".to_string();
         child.executor_binding = Some(TaskExecutorBinding::for_role("tester"));
         child.output_refs = vec!["测试失败：断言不匹配".to_string()];
-        task_store.insert_task(child);
+        task_store.insert_task(child).expect("子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
@@ -6651,7 +6667,7 @@ mod tests {
             "测试失败：断言不匹配".to_string(),
             "provider transport failed: connection refused".to_string(),
         ];
-        task_store.insert_task(child);
+        task_store.insert_task(child).expect("子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
@@ -6784,7 +6800,7 @@ mod tests {
             }),
             accesses: Vec::new(),
         };
-        task_store.insert_task(task.clone());
+        task_store.insert_task(task.clone()).expect("任务应插入");
 
         let (search_payload, search_status) = execute_context_search(
             &task_store,
@@ -6853,8 +6869,10 @@ mod tests {
             }),
             accesses: Vec::new(),
         };
-        task_store.insert_task(parent.clone());
-        task_store.insert_task(child.clone());
+        task_store
+            .insert_task(parent.clone())
+            .expect("父任务应插入");
+        task_store.insert_task(child.clone()).expect("子任务应插入");
         registry.open_task_signal_channel(&session_id, &child.task_id);
 
         let (payload, status) = execute_agent_send(
@@ -6910,8 +6928,10 @@ mod tests {
             }),
             accesses: Vec::new(),
         };
-        task_store.insert_task(parent.clone());
-        task_store.insert_task(child.clone());
+        task_store
+            .insert_task(parent.clone())
+            .expect("父任务应插入");
+        task_store.insert_task(child.clone()).expect("子任务应插入");
         registry.open_task_signal_channel(&session_id, &parent.task_id);
         registry.open_task_signal_channel(&session_id, &child.task_id);
 

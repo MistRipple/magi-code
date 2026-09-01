@@ -186,6 +186,23 @@
       const createdTabId = typeof detail?.payload?.tab_id === 'string'
         ? detail.payload.tab_id.trim()
         : '';
+      if (
+        eventType === 'browser.tab.activation_requested'
+        || eventType === 'browser.tab.activated'
+      ) {
+        // Browser Host 的 RestorePage 会等待当前右栏内容槽。激活事件到达
+        // Renderer 后必须立即把目标 Tab 投影为当前项，先完成 DOM 排版，
+        // 再由 Desktop Main 绑定同一个真实 Chromium Surface。
+        const requestedTabId = typeof detail?.payload?.tab_id === 'string'
+          ? detail.payload.tab_id.trim()
+          : (typeof detail?.payload?.tabId === 'string'
+            ? detail.payload.tabId.trim()
+            : '');
+        if (requestedTabId) {
+          void synchronizeCurrentBrowserAuthority(requestedTabId);
+          return;
+        }
+      }
       if (eventType === 'browser.tab.closed') {
         const closedTabId = typeof detail?.payload?.tab_id === 'string'
           ? detail.payload.tab_id.trim()

@@ -6,7 +6,6 @@
 import type { ClientBridgeMessage } from '../shared/bridges/client-bridge';
 import {
   getState,
-  setIsProcessing,
   setCurrentSessionId,
   adoptCurrentSessionIdForLiveTurn,
   advanceWorkspaceSessionProjectionCursor,
@@ -18,20 +17,19 @@ import {
   setAppState,
   clearAllMessages,
   setCanonicalTimelineProjection,
-  clearPendingRequest,
   setProcessingActor,
   getRequestBinding,
   clearRequestBinding,
   listRequestBindings,
-  clearProcessingState,
   setOrchestratorRuntimeState,
   replaceOrchestratorRuntimeState,
   applyAuthoritativeProcessingState,
   markMessageComplete,
-  updateRequestBinding,
   getTimelineProjectionMessageById,
   settleProcessingAfterResponseCompletion,
   settleAuthoritativeIdleState,
+  settleTerminalTurn,
+  adoptCanonicalTurnSubmissions,
   applyNotificationsSnapshot,
   applyNotificationsStatus,
   batchWebviewStatePersistence,
@@ -68,14 +66,21 @@ import { selectComposerDraftWorkspace } from '../stores/composer-workspace.svelt
 import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
 import {
   isCanonicalTerminalStatus,
+  normalizeCanonicalTurnStrict,
+  parseCanonicalTurnEventPayload,
   type CanonicalTurn,
   type CanonicalTurnEvent,
 } from '../shared/protocol/canonical-turn';
-import { deriveProcessingStateFromCanonicalTurns } from '../shared/protocol/canonical-processing';
+import {
+  canonicalTurnRequestId,
+  deriveProcessingStateFromCanonicalTurns,
+} from '../shared/protocol/canonical-processing';
 import {
   applyCanonicalTurnEvent,
   clearCanonicalSessionTurns,
+  mergeCanonicalSessionTurns,
   replaceCanonicalSessionTurns,
+  setCanonicalTimelineError,
   turnStoreState,
 } from '../stores/turn-store.svelte';
 import { postBridgeMessage } from '../shared/bridges/bridge-runtime';
@@ -540,14 +545,7 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       }
 
       if (requestId) {
-        clearPendingRequest(requestId);
-        const binding = getRequestBinding(requestId);
-        if (binding?.timeoutId) {
-          clearTimeout(binding.timeoutId);
-        }
-        if (binding) {
-          clearRequestBinding(requestId);
-        }
+        clearRequestBinding(requestId);
       }
 
       reportIncident(finalReason, {
@@ -560,15 +558,6 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       });
       break;
     }
-
-    case 'task_started':
-      // 任务开始执行后由权威快照和实时流接管
-      break;
-
-    case 'task_completed':
-    case 'task_failed':
-      // 请求级终态由 unifiedComplete 和 processingStateChanged 处理
-      break;
 
     case 'worker_status': {
       // 代理状态更新：从控制消息同步状态到 UI
@@ -658,25 +647,17 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'processingStateChanged': {
       const isProcessing = payload.isProcessing as boolean | undefined;
       const transitionKind = payload.transitionKind as 'derived' | 'forced' | undefined;
-      const reason = typeof payload.reason === 'string' ? payload.reason.trim() : '';
       const eventSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
-      const currentSessionId = messagesState.currentSessionId?.trim() || '';
-      if (eventSessionId && currentSessionId && eventSessionId !== currentSessionId) {
-        break;
-      }
-      // 当前只接受强制 idle 终态信号。
-      // processing=true 统一由本地 pending request 或后端 authoritative snapshot 驱动，
-      // 这里不再保留兜底抬升路径，避免处理态出现双真相源。
+      const eventRequestId = typeof payload.requestId === 'string' ? payload.requestId.trim() : '';
+      const currentSessionId = messagesState.currentSessionId?.trim() || '__draft__';
       if (isProcessing === false && transitionKind === 'forced') {
-        // 同一 workspace 的 SSE 重放会包含当前 session 的历史终态。新请求已经建立
-        // 本地绑定、但 canonical started 尚未投影时，历史 forced idle 不得终止新轮次。
-        // 用户主动中断是唯一允许越过本地绑定直接收敛的显式操作。
-        const isExplicitUserInterrupt = reason.startsWith('user_') && reason.includes('interrupt');
-        const shouldPreserveBoundSubmission = hasBoundLocalPendingRequest()
-          && !isExplicitUserInterrupt;
-        if (!shouldPreserveBoundSubmission) {
-          clearProcessingState();
+        if (!eventSessionId || !eventRequestId || eventSessionId !== currentSessionId) {
+          break;
         }
+        settleTerminalTurn({
+          sessionId: eventSessionId,
+          requestId: eventRequestId,
+        });
       }
       const source = payload.source as string | undefined;
       const agent = payload.agent as string | undefined;
@@ -724,10 +705,9 @@ export function handleUnifiedData(standard: StandardMessage) {
         state: payload.state,
         canonicalTurns: payload.canonicalTurns,
         eventStreamNextSequence: payload.eventStreamNextSequence,
+        canonicalEventNextSequence: payload.canonicalEventNextSequence,
         notifications: payload.notifications,
         orchestratorRuntimeState: payload.orchestratorRuntimeState,
-        hasMoreBefore: payload.hasMoreBefore,
-        beforeCursor: payload.beforeCursor,
         canonicalHasMoreBefore: payload.canonicalHasMoreBefore,
         canonicalBeforeCursor: payload.canonicalBeforeCursor,
         navigationRequestId: payload.navigationRequestId,
@@ -776,6 +756,25 @@ export function handleUnifiedData(standard: StandardMessage) {
           runtimeEpoch,
           eventStreamNextSequence,
         });
+      }
+      const canonicalEvent = parseCanonicalTurnEventPayload({
+        schemaVersion: payload.canonicalSchemaVersion,
+        canonicalEventKind: payload.canonicalEventKind,
+        canonicalEventId: payload.canonicalEventId,
+        canonicalEventSeq: payload.canonicalEventSeq,
+        canonicalOccurredAt: payload.canonicalOccurredAt,
+        canonicalTurn: payload.canonicalTurn,
+        canonicalItem: payload.canonicalItem,
+      });
+      if (
+        canonicalEvent
+        && sessionId
+        && (currentSessionId === sessionId || matchesPendingSubmission)
+      ) {
+        handleSessionTurnCanonicalEventUpdated(asMessage({
+          sessionId,
+          canonicalEvent,
+        }));
       }
       break;
     }
@@ -832,13 +831,6 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'auxiliaryConnectionTestResult':
       handleConnectionTestResult({ ...asMessage(payload), _target: 'auxiliary' });
       break;
-
-    case 'missionExecutionFailed': {
-      // Mission 级失败：只同步 backendProcessing=false。
-      // activeMessageIds/pendingRequests 应由消息完成链路和请求绑定分别清理。
-      setIsProcessing(false);
-      break;
-    }
 
     case 'registryAgentsLoaded': {
       // Registry agents 加载完成：写入全局 enabledAgents 状态
@@ -951,7 +943,6 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
         persist: false,
         resetTimelineView: true,
         resetPanelState: true,
-        skipAntiLiftBack: true,
       });
       clearCanonicalSessionTurns();
       messagesState.canonicalTimelineProjection = null;
@@ -1073,24 +1064,6 @@ function hasBoundLocalPendingRequest(): boolean {
   ));
 }
 
-function canonicalTurnRequestId(turn: CanonicalTurn): string {
-  const turnRequestId = typeof turn.metadata?.requestId === 'string'
-    ? turn.metadata.requestId.trim()
-    : '';
-  if (turnRequestId) {
-    return turnRequestId;
-  }
-  for (const item of turn.items) {
-    const itemRequestId = typeof item.metadata?.requestId === 'string'
-      ? item.metadata.requestId.trim()
-      : '';
-    if (itemRequestId) {
-      return itemRequestId;
-    }
-  }
-  return '';
-}
-
 function canonicalTurnMatchesRequestBinding(
   turn: CanonicalTurn,
   binding: ReturnType<typeof listRequestBindings>[number],
@@ -1193,15 +1166,6 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
     if (matchedAssistant) {
       markMessageComplete(matchedAssistant.id);
     }
-    clearPendingRequest(binding.requestId);
-    updateRequestBinding(binding.requestId, {
-      ...(matchedAssistant ? { realMessageId: matchedAssistant.id } : {}),
-      turnSeq: matchedTurn.turnSeq,
-      timeoutId: undefined,
-    });
-    if (binding.timeoutId) {
-      clearTimeout(binding.timeoutId);
-    }
     clearRequestBinding(binding.requestId);
     settledResponse = true;
   }
@@ -1226,6 +1190,7 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
     return;
   }
   if (projection && setCanonicalTimelineProjection(projection)) {
+    adoptCanonicalTurnSubmissions(sessionId, turnStoreState.reducer.turns);
     // processing 是会话级状态，必须从 reducer 中该会话的完整 turn 集合推导。
     // 事件流重连会回放历史 turn；若只看当前单条历史终态事件，会错误清除刚提交的新轮次。
     const processingState = deriveProcessingStateFromCanonicalTurns(
@@ -1244,14 +1209,37 @@ function applyCanonicalTurnsSnapshot(
   lastAppliedEventSeq: number,
 ): boolean {
   if (!Array.isArray(turns)) {
+    setCanonicalTimelineError(new Error('canonical snapshot turns must be an array'));
+    requestCanonicalTimelineRecovery();
     return false;
   }
-  const canonicalTurns = canonicalTurnsForSession(sessionId, turns);
-  const projection = replaceCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq);
+  let normalizedTurns: CanonicalTurn[];
+  try {
+    normalizedTurns = turns.map((turn, index) => (
+      normalizeCanonicalTurnStrict(turn, `session.${sessionId}.canonicalTurns[${index}]`)
+    ));
+  } catch (error) {
+    setCanonicalTimelineError(error);
+    console.error('[MessageHandler] canonical snapshot 校验失败，已拒绝部分 projection:', error);
+    requestCanonicalTimelineRecovery();
+    return false;
+  }
+  const canonicalTurns = canonicalTurnsForSession(sessionId, normalizedTurns);
+  const projection = turnStoreState.reducer.sessionId === sessionId
+    ? mergeCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq)
+    : replaceCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq);
   if (!projection) {
     return false;
   }
-  return setCanonicalTimelineProjection(projection);
+  if (!setCanonicalTimelineProjection(projection)) {
+    return false;
+  }
+  const authoritativeTurns = turnStoreState.reducer.turns;
+  adoptCanonicalTurnSubmissions(sessionId, authoritativeTurns);
+  applyAuthoritativeProcessingState(
+    deriveProcessingStateFromCanonicalTurns(authoritativeTurns, sessionId),
+  );
+  return true;
 }
 
 function clearStaleSettingsBootstrapSnapshot(): void {
@@ -1273,14 +1261,13 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
     : null;
   const workspaceId = typeof workspace?.workspaceId === 'string' ? workspace.workspaceId.trim() : '';
   const workspacePath = typeof workspace?.rootPath === 'string' ? workspace.rootPath.trim() : '';
-  const hasMoreBefore = message.hasMoreBefore === true;
-  const beforeCursor = typeof message.beforeCursor === 'string' && message.beforeCursor.trim()
-    ? message.beforeCursor.trim()
-    : null;
   const canonicalTurns = (message as Record<string, unknown>).canonicalTurns;
-  const eventStreamNextSequence = Number((message as Record<string, unknown>).eventStreamNextSequence);
-  const canonicalEventWatermark = Number.isFinite(eventStreamNextSequence)
-    ? Math.max(0, Math.floor(eventStreamNextSequence) - 1)
+  const canonicalEventNextSequence = Number(
+    (message as Record<string, unknown>).canonicalEventNextSequence,
+  );
+  const canonicalEventWatermark = Number.isFinite(canonicalEventNextSequence)
+    && canonicalEventNextSequence >= 1
+    ? Math.floor(canonicalEventNextSequence) - 1
     : 0;
   const navigationRequestId = typeof message.navigationRequestId === 'string'
     ? message.navigationRequestId.trim()
@@ -1394,7 +1381,6 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
           persist: false,
           resetTimelineView: true,
           resetPanelState: true,
-          skipAntiLiftBack: true,
         });
         clearCanonicalSessionTurns();
         messagesState.canonicalTimelineProjection = null;
@@ -1433,10 +1419,18 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
     return;
   }
 
-  const currentSessionId = getState().currentSessionId || '';
+  const currentSessionId = getState().currentSessionId?.trim() || '';
   const currentWorkspaceId = getState().currentWorkspaceId?.trim() || '';
-  const isSameSession = currentSessionId === sessionId
-    && (!workspaceId || !currentWorkspaceId || workspaceId === currentWorkspaceId);
+  const currentWorkspacePath = getState().currentWorkspacePath?.trim() || '';
+  const isSameSession = currentSessionId === sessionId && (
+    sessionScope === 'workspace'
+      ? Boolean(workspaceId)
+        && workspaceId === currentWorkspaceId
+        && workspacePath === currentWorkspacePath
+      : !workspaceId
+        && !currentWorkspaceId
+        && workspacePath === currentWorkspacePath
+  );
 
   // 同 session 恢复按事件水位决定是否接管快照；水位不落后的快照必须进入 reducer，
   // 否则 bridge 已推进 SSE cursor 而 canonical 状态未同步，会永久跳过恢复区间。
@@ -1490,14 +1484,11 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
       }
       setSessionHistoryState(sessionId, {
         workspaceId,
-        hasMoreBefore,
-        beforeCursor,
         canonicalHasMoreBefore: message.canonicalHasMoreBefore === true,
         canonicalBeforeCursor: typeof message.canonicalBeforeCursor === 'string'
           && message.canonicalBeforeCursor.trim()
           ? message.canonicalBeforeCursor.trim()
           : null,
-        isLoadingBefore: false,
         preserveLoadedWindow: true,
       });
 
@@ -1522,13 +1513,10 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
   batchWebviewStatePersistence(() => {
     messagesState.sessionHydrating = false;
     messagesState.draftOrchestratorSessionConfig = {};
-    // skipAntiLiftBack: 跨 session 切换后紧接着 applyAuthoritativeProcessingState
-    // 恢复新会话的权威状态，不能让防回抬保护阻断新会话的 processing 写入
     clearAllMessages({
       persist: false,
       resetTimelineView: false,
       resetPanelState: false,
-      skipAntiLiftBack: true,
       preserveExecutionState: true,
     });
     clearCanonicalSessionTurns(sessionId);
@@ -1564,14 +1552,11 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
     }
     setSessionHistoryState(sessionId, {
       workspaceId,
-      hasMoreBefore,
-      beforeCursor,
       canonicalHasMoreBefore: message.canonicalHasMoreBefore === true,
       canonicalBeforeCursor: typeof message.canonicalBeforeCursor === 'string'
         && message.canonicalBeforeCursor.trim()
         ? message.canonicalBeforeCursor.trim()
         : null,
-      isLoadingBefore: false,
     });
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   });

@@ -5,7 +5,7 @@ use magi_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionExecutionSidecarStatus {
@@ -229,8 +229,30 @@ impl CanonicalTurnItemStatus {
 pub enum CanonicalTurnEventKind {
     TurnStarted,
     TurnItemUpsert,
+    TurnUpdated,
     TurnCompleted,
     TurnSuperseded,
+}
+
+/// 单个 session 内可持久化、可重放的 canonical 对话事件。
+///
+/// `event_seq` 是会话内连续序号，和 EventBus 的全局传输 sequence 无关。流式 token
+/// delta 只用于实时传输，不进入此持久事实；持久化事件始终携带完整 turn 或 item 快照。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalTurnEvent {
+    pub schema_version: String,
+    pub event_id: String,
+    pub event_seq: u64,
+    pub kind: CanonicalTurnEventKind,
+    pub session_id: SessionId,
+    pub turn_id: String,
+    pub turn_seq: u64,
+    pub occurred_at: UtcMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<CanonicalTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<CanonicalTurnItem>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -572,9 +594,12 @@ pub struct SessionRuntimeSidecarExport {
 /// 该记录只包含本次提交新增的 session、timeline、canonical turn 与运行 sidecar，
 /// 不复制整个历史会话；维护线程完成完整 snapshot 后会删除对应 journal。
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionAcceptanceRecord {
     pub session: SessionRecord,
     pub timeline_entry: TimelineEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_turn: Option<CanonicalTurn>,
     pub canonical_turn: CanonicalTurn,
     pub sidecar: SessionRuntimeSidecar,
 }
@@ -597,6 +622,10 @@ impl SessionRuntimeSidecar {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSidecarFlushReason {
     UpsertRuntimeSidecar,
+    RegisterThread,
+    RemoveThread,
+    RestoreThread,
+    SettleThread,
     BindExecutionOwnership,
     ApplyRecoveryResumeInput,
     ApplyResumeExecutionTarget,
@@ -1037,7 +1066,7 @@ pub struct SessionStoreState {
     pub notifications: Vec<NotificationRecord>,
     #[serde(default)]
     pub goals: Vec<SessionGoal>,
-    #[serde(default, alias = "todo_lists")]
+    #[serde(default)]
     pub plans: Vec<SessionPlan>,
     #[serde(default, flatten)]
     pub execution_sidecar_store: SessionExecutionSidecarStoreState,
@@ -1050,20 +1079,16 @@ pub struct SessionStoreState {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionDurableState {
     pub current_session_id: Option<SessionId>,
     pub sessions: Vec<SessionRecord>,
     pub timeline: Vec<TimelineEntry>,
-    #[serde(default)]
     pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
-    #[serde(default)]
     pub goals: Vec<SessionGoal>,
-    #[serde(default, alias = "todo_lists")]
     pub plans: Vec<SessionPlan>,
-    #[serde(default)]
     pub thread_registry: Vec<ExecutionThread>,
-    #[serde(default)]
     pub thread_context_checkpoints: Vec<ThreadContextCheckpoint>,
 }
 
@@ -1099,233 +1124,76 @@ impl SessionDurableState {
             .extend(other.thread_context_checkpoints);
     }
 
-    pub fn clear_current_session_if_owned_by_workspace_states(
-        &mut self,
-        workspace_states: &HashMap<String, SessionDurableState>,
-    ) {
-        let Some(current_session_id) = self.current_session_id.as_ref() else {
-            return;
-        };
-        if workspace_states.values().any(|state| {
-            state
-                .sessions
-                .iter()
-                .any(|session| &session.session_id == current_session_id)
-        }) {
-            self.current_session_id = None;
-        }
-    }
-
-    pub fn partition_by_workspace(
-        &self,
-    ) -> (SessionDurableState, HashMap<String, SessionDurableState>) {
-        let mut global_sessions = Vec::new();
-        let mut workspace_sessions = HashMap::<String, Vec<SessionRecord>>::new();
-
-        for session in &self.sessions {
-            if let Some(workspace_id) = session.workspace_id.as_deref() {
-                workspace_sessions
-                    .entry(workspace_id.to_string())
-                    .or_default()
-                    .push(session.clone());
-            } else {
-                global_sessions.push(session.clone());
-            }
-        }
-
-        let global_session_ids = global_sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<HashSet<_>>();
-
-        let mut workspace_states = HashMap::<String, SessionDurableState>::new();
-        let mut workspace_session_ids = HashMap::<String, HashSet<SessionId>>::new();
-        for (workspace_id, sessions) in workspace_sessions {
-            let session_ids = sessions
-                .iter()
-                .map(|session| session.session_id.clone())
-                .collect::<HashSet<_>>();
-            workspace_session_ids.insert(workspace_id.clone(), session_ids);
-            workspace_states.insert(
-                workspace_id,
-                SessionDurableState {
-                    current_session_id: None,
-                    sessions,
-                    timeline: Vec::new(),
-                    canonical_turns: Vec::new(),
-                    notifications: Vec::new(),
-                    goals: Vec::new(),
-                    plans: Vec::new(),
-                    thread_registry: Vec::new(),
-                    thread_context_checkpoints: Vec::new(),
-                },
-            );
-        }
-
-        let mut global_state = SessionDurableState {
-            // 当前打开的会话是 daemon 级唯一导航选择，不属于任一 workspace 的业务历史。
-            // 统一写入全局状态，避免多个 workspace 文件各自携带旧选择并在重启时互相覆盖。
-            current_session_id: self.current_session_id.clone(),
-            sessions: global_sessions,
-            timeline: Vec::new(),
-            canonical_turns: Vec::new(),
-            notifications: Vec::new(),
-            goals: Vec::new(),
-            plans: Vec::new(),
-            thread_registry: Vec::new(),
-            thread_context_checkpoints: Vec::new(),
-        };
-
-        for entry in &self.timeline {
-            if global_session_ids.contains(&entry.session_id) {
-                global_state.timeline.push(entry.clone());
-                continue;
-            }
-            for (workspace_id, session_ids) in &workspace_session_ids {
-                if session_ids.contains(&entry.session_id) {
-                    workspace_states
-                        .get_mut(workspace_id)
-                        .expect("workspace durable state should exist")
-                        .timeline
-                        .push(entry.clone());
-                    break;
-                }
-            }
-        }
-
-        for turn in &self.canonical_turns {
-            if global_session_ids.contains(&turn.session_id) {
-                global_state.canonical_turns.push(turn.clone());
-                continue;
-            }
-            for (workspace_id, session_ids) in &workspace_session_ids {
-                if session_ids.contains(&turn.session_id) {
-                    workspace_states
-                        .get_mut(workspace_id)
-                        .expect("workspace durable state should exist")
-                        .canonical_turns
-                        .push(turn.clone());
-                    break;
-                }
-            }
-        }
-
-        for notification in self.notifications.iter().filter(|item| item.is_incident()) {
-            match notification.scope {
-                NotificationScope::App => global_state.notifications.push(notification.clone()),
-                NotificationScope::Workspace => {
-                    if let Some(workspace_id) = notification.workspace_id.as_deref() {
-                        workspace_states
-                            .entry(workspace_id.to_string())
-                            .or_default()
-                            .notifications
-                            .push(notification.clone());
-                    }
-                }
-                NotificationScope::Session => {
-                    let Some(session_id) = notification.session_id.as_ref() else {
-                        continue;
-                    };
-                    if global_session_ids.contains(session_id) {
-                        global_state.notifications.push(notification.clone());
-                        continue;
-                    }
-                    for (workspace_id, session_ids) in &workspace_session_ids {
-                        if session_ids.contains(session_id) {
-                            workspace_states
-                                .get_mut(workspace_id)
-                                .expect("workspace durable state should exist")
-                                .notifications
-                                .push(notification.clone());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        for goal in &self.goals {
-            if global_session_ids.contains(&goal.session_id) {
-                global_state.goals.push(goal.clone());
-                continue;
-            }
-            for (workspace_id, session_ids) in &workspace_session_ids {
-                if session_ids.contains(&goal.session_id) {
-                    workspace_states
-                        .get_mut(workspace_id)
-                        .expect("workspace durable state should exist")
-                        .goals
-                        .push(goal.clone());
-                    break;
-                }
-            }
-        }
-
-        for plan in &self.plans {
-            if global_session_ids.contains(&plan.session_id) {
-                global_state.plans.push(plan.clone());
-                continue;
-            }
-            for (workspace_id, session_ids) in &workspace_session_ids {
-                if session_ids.contains(&plan.session_id) {
-                    workspace_states
-                        .get_mut(workspace_id)
-                        .expect("workspace durable state should exist")
-                        .plans
-                        .push(plan.clone());
-                    break;
-                }
-            }
-        }
-
-        for thread in &self.thread_registry {
-            if global_session_ids.contains(&thread.session_id) {
-                global_state.thread_registry.push(thread.clone());
-                continue;
-            }
-            for (workspace_id, session_ids) in &workspace_session_ids {
-                if session_ids.contains(&thread.session_id) {
-                    workspace_states
-                        .get_mut(workspace_id)
-                        .expect("workspace durable state should exist")
-                        .thread_registry
-                        .push(thread.clone());
-                    break;
-                }
-            }
-        }
-
-        let global_thread_ids = global_state
+    /// 提取单个会话的完整 durable 投影。
+    ///
+    /// 这是新投影存储的归属边界：一个会话的所有 durable 事实都必须能从该会话
+    /// 的 projection 文件恢复，daemon 级 `current_session_id` 单独保存在全局文件。
+    pub fn durable_state_for_session(&self, session_id: &SessionId) -> SessionDurableState {
+        let thread_session_ids = self
             .thread_registry
             .iter()
-            .map(|thread| thread.thread_id.clone())
-            .collect::<HashSet<_>>();
-        for checkpoint in &self.thread_context_checkpoints {
-            if global_thread_ids.contains(&checkpoint.thread_id) {
-                global_state
-                    .thread_context_checkpoints
-                    .push(checkpoint.clone());
-                continue;
-            }
-            let workspace_id = workspace_states
+            .map(|thread| (thread.thread_id.clone(), thread.session_id.clone()))
+            .collect::<HashMap<_, _>>();
+        SessionDurableState {
+            current_session_id: None,
+            sessions: self
+                .sessions
                 .iter()
-                .find(|(_, state)| {
-                    state
-                        .thread_registry
-                        .iter()
-                        .any(|thread| thread.thread_id == checkpoint.thread_id)
+                .filter(|session| &session.session_id == session_id)
+                .cloned()
+                .collect(),
+            timeline: self
+                .timeline
+                .iter()
+                .filter(|entry| &entry.session_id == session_id)
+                .cloned()
+                .collect(),
+            canonical_turns: self
+                .canonical_turns
+                .iter()
+                .filter(|turn| &turn.session_id == session_id)
+                .cloned()
+                .collect(),
+            notifications: self
+                .notifications
+                .iter()
+                .filter(|notification| {
+                    notification
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|notification_session| notification_session == session_id)
                 })
-                .map(|(workspace_id, _)| workspace_id.clone());
-            if let Some(workspace_id) = workspace_id {
-                workspace_states
-                    .get_mut(&workspace_id)
-                    .expect("workspace durable state should exist")
-                    .thread_context_checkpoints
-                    .push(checkpoint.clone());
-            }
+                .cloned()
+                .collect(),
+            goals: self
+                .goals
+                .iter()
+                .filter(|goal| &goal.session_id == session_id)
+                .cloned()
+                .collect(),
+            plans: self
+                .plans
+                .iter()
+                .filter(|plan| &plan.session_id == session_id)
+                .cloned()
+                .collect(),
+            thread_registry: self
+                .thread_registry
+                .iter()
+                .filter(|thread| &thread.session_id == session_id)
+                .cloned()
+                .collect(),
+            thread_context_checkpoints: self
+                .thread_context_checkpoints
+                .iter()
+                .filter(|checkpoint| {
+                    thread_session_ids
+                        .get(&checkpoint.thread_id)
+                        .is_some_and(|checkpoint_session| checkpoint_session == session_id)
+                })
+                .cloned()
+                .collect(),
         }
-
-        (global_state, workspace_states)
     }
 }
 
@@ -1511,7 +1379,7 @@ pub enum ExecutionThreadStatus {
 /// `mission_id` 为必填。Session 首次接收 user 输入时通过 `ensure_session_mission`
 /// 创建该 session 的常驻 mission，并同时 spawn `role_id = ORCHESTRATOR_ROLE_ID`
 /// 的主线 thread；后续每次任务派发也复用这同一个 mission。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionThread {
     pub thread_id: ThreadId,
@@ -1578,7 +1446,7 @@ pub struct ThreadFileFactVersion {
 
 /// ExecutionThread 消息历史的最小存储格式：与 magi_bridge_client::ChatMessage 同构，
 /// 但保留独立定义避免 session-store 反向依赖 bridge-client。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadChatMessage {
     pub role: String,
@@ -1595,7 +1463,7 @@ pub struct ThreadChatMessage {
     pub provider_context: Vec<ThreadModelProviderContext>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadModelProviderContext {
     pub provider: String,
@@ -1612,7 +1480,7 @@ pub struct ThreadChatImageSource {
     pub data: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadChatToolCall {
     pub id: String,
@@ -1621,7 +1489,7 @@ pub struct ThreadChatToolCall {
     pub function: ThreadChatToolFunction,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadChatToolFunction {
     pub name: String,

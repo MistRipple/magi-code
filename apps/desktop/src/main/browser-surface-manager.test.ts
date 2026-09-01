@@ -58,11 +58,11 @@ test("右栏布局和原生 Surface 使用同一 Main 事务", () => {
   assert.match(windowManagerSource, /private applyLayout\(record: DesktopWindowRecord\)/u);
   assert.match(
     windowManagerSource,
-    /const browserSurfaceActive = !record\.blockingOverlayActive[\s\S]*?const currentBrowserContentBounds = browserSurfaceActive \? browserContentBounds\(layout\) : null/u,
+    /const browserSurfaceActive = !record\.blockingOverlayActive[\s\S]*?const rendererGeometryForActiveSurface = browserSurfaceActive[\s\S]*?browserContentSlot\?\.tabId === layout\.activeTabId[\s\S]*?const currentBrowserContentBounds = browserSurfaceActive && rendererGeometryForActiveSurface\s*\?\s*browserContentBounds\(layout\)\s*:\s*null/u,
   );
   assert.match(windowManagerSource, /this\.#surfaceManager\.bindContentSurface\(/u);
   const applyLayout = section(windowManagerSource, "private applyLayout(", "private clearRendererGeometry(");
-  assert.match(applyLayout, /bindContentSurface\(\s*record\.windowId,\s*layout\.activeTabId,\s*currentBrowserContentBounds,\s*currentBrowserParentBounds,\s*\)/u);
+  assert.match(applyLayout, /bindContentSurface\(\s*record\.windowId,\s*layout\.activeTabId,\s*layout\.activeSurfaceId,\s*currentBrowserContentBounds,\s*currentBrowserParentBounds,\s*\)/u);
   assert.doesNotMatch(applyLayout, /x:\s*0,\s*y:\s*0,\s*width:\s*currentBrowserContentBounds\.width/u);
   assert.doesNotMatch(windowManagerSource, /updateBrowserSlot/u);
 });
@@ -216,7 +216,9 @@ test("页面导航期间保持原生页面可见，只有渲染进程崩溃才�
   assert.doesNotMatch(navigationEvents, /did-fail-load[\s\S]*?this\.unmountSurface\(record/u);
   assert.match(navigationEvents, /did-finish-load[\s\S]*?this\.completeWhenMainFrameSettled\(/u);
   assert.match(source, /private unmountSurface\([\s\S]*?只解绑原生 View，不关闭 WebContents/u);
-  assert.match(crashEvents, /render-process-gone[\s\S]*?this\.unmountSurface\(record[\s\S]*?invalidateAndRecover/u);
+  assert.match(crashEvents, /render-process-gone[\s\S]*?this\.invalidateAndRecover\(record/u);
+  const recovery = section(source, "private invalidateAndRecover(", "private async recover(");
+  assert.match(recovery, /this\.unmountSurface\(record[\s\S]*?this\.resetDebuggerSession\(record/u);
   assert.doesNotMatch(navigationEvents, /did-start-navigation[\s\S]*?setBounds\(\{ x: 0, y: 0, width: 0/u);
 });
 
@@ -313,7 +315,7 @@ test("Surface 重启恢复会让 Worker 清理旧页面运行态", () => {
 
 test("切换 Browser Tab 保留各自 WebContents，非当前 Surface 不参与命中测试", () => {
   const binding = section(source, "bindContentSurface(", "bindingForTabInWindow(");
-  assert.match(binding, /const target = records\.find\(\(record\) => record\.tabId === tabId\) \?\? null/u);
+  assert.match(binding, /const target = records\.find\(\(record\) => \([\s\S]*?record\.tabId === tabId && record\.surfaceId === surfaceId[\s\S]*?\) \?\? null/u);
   assert.match(binding, /this\.applySlot\(target, bounds, window\);/u);
   assert.match(binding, /for \(const record of records\) \{[\s\S]*?if \(record !== target\) this\.unmountSurface\(record, window\);/u);
   assert.ok(
@@ -326,6 +328,85 @@ test("切换 Browser Tab 保留各自 WebContents，非当前 Surface 不参与�
   const activateBrowser = section(windowManagerSource, "async activateBrowser(", "activatePanel(");
   assert.doesNotMatch(activateBrowser, /bindContentSurface\(input\.windowId, "", null\)/u);
   assert.match(activateBrowser, /await this\.#surfaceManager\.materialize\([\s\S]*?record\.layout = reduceWindowLayout\([\s\S]*?type: "active_panel"/u);
+});
+
+test("Surface 卸载会使内容槽租约失效，迟到的导航回调不得重新挂载", () => {
+  const detach = section(source, "private detachSurface(", "private isRenderable(");
+  assert.match(detach, /record\.slotVisible = false[\s\S]*?record\.slotBounds = null/u);
+  assert.match(detach, /this\.stopInspectForLifecycle\(record, "surface-unmounted"\)/u);
+  const emptySlot = section(source, "private applySlot(", "private async loadPage(");
+  assert.match(emptySlot, /if \(!effectiveBounds\) \{[\s\S]*?this\.detachSurface\(record\)[\s\S]*?return;/u);
+  const lateNavigation = section(source, "private completeNavigationOperation(", "private completeWhenMainFrameSettled(");
+  assert.match(lateNavigation, /record\.slotVisible \? record\.slotBounds : null/u);
+});
+
+test("内容槽绑定必须同时匹配窗口、Tab 和目标 Surface 身份", () => {
+  const binding = section(source, "bindContentSurface(", "bindingForTabInWindow(");
+  assert.match(binding, /surfaceId: string \| null/u);
+  assert.match(binding, /record\.tabId === tabId && record\.surfaceId === surfaceId/u);
+  const applyLayout = section(windowManagerSource, "private applyLayout(", "private reconcileActiveBrowserSurface(");
+  assert.match(applyLayout, /layout\.activeTabId,[\s\S]*?layout\.activeSurfaceId,[\s\S]*?currentBrowserContentBounds/u);
+});
+
+test("activeSurfaceId 失效时布局立即清除物理 Surface 身份", () => {
+  const reconcile = section(windowManagerSource, "private reconcileActiveBrowserSurface(", "private waitForBrowserSurface(");
+  assert.match(reconcile, /bindingForSurface\(layout\.activeSurfaceId\)/u);
+  assert.match(reconcile, /binding\.window_id === record\.windowId/u);
+  assert.match(reconcile, /binding\.tab_id === layout\.activeTabId/u);
+  assert.match(reconcile, /type: "active_panel"[\s\S]*?surfaceId: null/u);
+  assert.match(windowManagerSource, /snapshot\(windowId: string\)[\s\S]*?reconcileActiveBrowserSurface\(record\)/u);
+});
+
+test("布局 revision 过期时同一 Browser Tab 保留最后确认的原生 Surface", () => {
+  const applyLayout = section(windowManagerSource, "private applyLayout(", "private reconcileActiveBrowserSurface(");
+  assert.match(applyLayout, /const rendererGeometryForActiveSurface = browserSurfaceActive[\s\S]*?browserContentSlot\?\.tabId === layout\.activeTabId/u);
+  assert.match(applyLayout, /browserSurfaceActive && rendererGeometryForActiveSurface\s*\?/u);
+  assert.match(applyLayout, /layout\.activeSurfaceId,[\s\S]*?currentBrowserContentBounds,[\s\S]*?currentBrowserParentBounds/u);
+});
+
+test("Surface 崩溃恢复只重挂载崩溃前仍有效的内容槽租约", () => {
+  assert.match(source, /slotLeaseRevision: number/u);
+  assert.match(source, /recoverySlot: \{ bounds: Rectangle; leaseRevision: number \} \| null/u);
+  const detach = section(source, "private detachSurface(", "private isRenderable(");
+  assert.match(detach, /slotLeaseRevision \+= 1/u);
+  const recovery = section(source, "private invalidateAndRecover(", "private async recover(");
+  assert.match(recovery, /const previousSlot = record\.slotVisible && record\.slotBounds/u);
+  assert.match(recovery, /record\.recoverySlot = previousSlot[\s\S]*?leaseRevision: record\.slotLeaseRevision/u);
+  const recover = section(source, "private async recover(", "private async applyViewport(");
+  assert.match(recover, /const recoverySlot = record\.recoverySlot[\s\S]*?recoverySlot\.leaseRevision === record\.slotLeaseRevision[\s\S]*?this\.applySlot\(record, recoverySlot\.bounds/u);
+});
+
+test("加载期 viewport commit 由真实文档完成事件重新唤醒", () => {
+  const finish = section(source, 'webContents.on("did-finish-load"', 'webContents.on("page-title-updated"');
+  const stop = section(source, 'webContents.on("did-stop-loading"', 'webContents.on("did-fail-load"');
+  assert.match(finish, /this\.scheduleViewportCommit\(record\)/u);
+  assert.match(stop, /this\.scheduleViewportCommit\(record\)/u);
+  const flush = section(source, "private async flushViewportCommits(", "private async waitForCompositorFrame(");
+  assert.match(flush, /record\.priming \|\| record\.contents\.isLoadingMainFrame\(\)/u);
+  assert.match(source, /private async waitForViewportCommit\([\s\S]*?commit\.promise[\s\S]*?commit\.state === "compositor-ready"/u);
+});
+
+test("debugger 重连定时器只清理当前持有的句柄一次", () => {
+  const cleanup = section(source, "private clearDebuggerReconnectTimer(", "private invalidateAndRecover(");
+  assert.match(cleanup, /if \(!record\.debuggerReconnectTimer\) return;/u);
+  assert.match(cleanup, /clearTimeout\(record\.debuggerReconnectTimer\);[\s\S]*?record\.debuggerReconnectTimer = null;/u);
+  assert.equal((cleanup.match(/clearTimeout\(/gu) ?? []).length, 1);
+});
+
+test("CDP 和 DOM await 返回后必须重新确认当前可渲染内容槽", () => {
+  const cdp = section(source, "async sendCdp(", "private enqueueCdp<T>(");
+  assert.match(cdp, /await this\.waitForViewportCommit\(record\)[\s\S]*?this\.assertRenderableBinding\(binding, options\)/u);
+  assert.match(cdp, /const lease = this\.createDebuggerSessionLease\(record, sessionId\)[\s\S]*?const result = await this\.sendSurfaceCdpCommand\([\s\S]*?this\.assertRenderableBinding\(binding, options\)/u);
+  assert.doesNotMatch(cdp, /sendCdpCommandWithTimeout|waitForViewportApply/u);
+  const cdpCommand = section(source, "private async sendSurfaceCdpCommand(", "private async waitForScreenshotReadiness(");
+  assert.match(cdpCommand, /lease\.assertCurrent\(\)[\s\S]*?const result = await sendCdpCommandWithTimeout\([\s\S]*?lease\.assertCurrent\(\)/u);
+  const inspect = section(source, "private isInspectGenerationActive(", "private stopInspectForLifecycle(");
+  assert.match(inspect, /this\.isRenderable\(record\)/u);
+  const inspectDom = section(source, "private handleInspectPointRequested(", "private async readInspectNodeText(");
+  assert.match(inspectDom, /await this\.sendSurfaceCdpCommand\([\s\S]*?if \(!this\.isInspectGenerationActive\(record, generation\)\) return;/u);
+  const cursor = section(source, "private async setAgentCursor(", "private promote(");
+  assert.match(cursor, /await this\.sendSurfaceCdpCommand\([\s\S]*?if \(!this\.isRenderable\(record\)\) return;/u);
+  assert.match(cursor, /await new Promise<void>\([\s\S]*?if \(!this\.isRenderable\(record\)\) return;/u);
 });
 
 test("Surface 激活使用代次，过期请求不能抢占当前槽", () => {
@@ -344,26 +425,16 @@ test("viewport 的逻辑尺寸与原生内容槽统一，右栏尺寸会触发 C
   assert.match(applySlot, /不可验证的中间帧必须隐藏[\s\S]*?退出命中树/u);
   assert.match(source, /private unmountSurface\([\s\S]*?只解绑原生 View，不关闭 WebContents/u);
   assert.doesNotMatch(applySlot, /leaseBounds|clipBounds|intersectRect|x:\s*\(leaseBounds/u);
-  assert.match(applySlot, /scheduleViewportApply\(record\)/u);
-  assert.match(applySlot, /sizeChanged[\s\S]*?scheduleViewportApply\(record\)/u);
-  assert.match(applySlot, /sizeChanged && record\.viewport\.mode === "fixed"/u);
-  assert.doesNotMatch(applySlot, /if \(record\.viewport\.mode === "auto"[\s\S]*?scheduleViewportApply\(record\)/u);
-  assert.match(applySlot, /viewportApplied\s*=\s*false/u);
-  const viewportMethods = section(source, "private async applyViewport(", "private scheduleViewportApply(");
-  assert.match(viewportMethods, /slotBounds|availableWidth|availableHeight/u);
+  assert.match(applySlot, /this\.scheduleViewportCommit\(record\)/u);
+  assert.doesNotMatch(applySlot, /scheduleViewportApply|viewportApplied|sizeChanged/u);
+  const viewportMethods = section(source, "private async applyViewport(", "private async setAgentCursor(");
+  assert.match(viewportMethods, /commit\.bounds/u);
   assert.match(viewportMethods, /nativeViewportScale\(/u);
   assert.match(viewportMethods, /scale,/u);
   const autoViewportMethods = viewportMethods.slice(0, viewportMethods.indexOf("const viewport"));
   assert.match(autoViewportMethods, /Emulation\.clearDeviceMetricsOverride/u);
   assert.doesNotMatch(autoViewportMethods, /Emulation\.setDeviceMetricsOverride/u);
   assert.doesNotMatch(autoViewportMethods, /scale: 1/u);
-  const captureMethods = section(source, "function capturePageRect(", "async function sendCdpCommandWithTimeout(");
-  assert.match(captureMethods, /record\.viewport\.mode === "fixed"/u);
-  assert.match(captureMethods, /record\.viewportAppliedScale/u);
-  assert.match(captureMethods, /mapBrowserCaptureClipToNativeRect/u);
-  assert.match(captureMethods, /viewBounds|slotBounds/u);
-  assert.match(captureMethods, /browser_surface_slot_unavailable/u);
-  assert.doesNotMatch(captureMethods, /Math\.max\(1,\s*Math\.floor/u);
   const cursorMethods = section(source, "private initialAgentCursorPosition(", "async closeTab(");
   assert.match(cursorMethods, /return null/u);
   assert.doesNotMatch(cursorMethods, /record\.viewport\.width|record\.viewport\.height|640|480/u);
@@ -372,27 +443,49 @@ test("viewport 的逻辑尺寸与原生内容槽统一，右栏尺寸会触发 C
     /const ALLOWED_WORKER_CDP_METHODS = new Set\(\[[\s\S]*?"Emulation\.setTouchEmulationEnabled"/u,
   );
   assert.doesNotMatch(viewportMethods, /capturePage\(|startScreencast|drawImage\(/u);
+  assert.match(source, /navigationGeneration === record\.navigationGeneration/u);
+  assert.match(source, /sameLogicalViewport\(current\.viewport, record\.viewport\)/u);
+  assert.match(source, /debuggerSessionGeneration === commit\.debuggerSessionGeneration/u);
   assert.match(browserTabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/u);
   assert.match(browserTabSource, /scheduleCustomViewportUpdate\(\)/u);
   assert.match(browserTabSource, /viewport: mode === 'auto'\s*\n?\s*\? \{ mode: 'auto' \}/u);
 });
 
-test("截图统一通过同一 WebContents 的原生 Chromium 捕获，root 不依赖 DOM ref", () => {
+test("截图统一通过同一 WebContents 的 Chromium CDP 页面捕获，root 不依赖 DOM ref", () => {
   assert.match(source, /method === "Page\.captureScreenshot"/u);
-  assert.match(source, /sendCdpCommandWithTimeout\([\s\S]*?method/u);
-  assert.match(source, /private async capturePageScreenshot\([\s\S]*?record\.contents\.capturePage\(/u);
-  assert.match(source, /Page\.captureScreenshot[\s\S]*?waitForViewportApply\(record\)/u);
-  assert.doesNotMatch(source, /captureScreenshot\(/u);
+  assert.match(source, /private async sendSurfaceCdpCommand\([\s\S]*?sendCdpCommandWithTimeout\([\s\S]*?method/u);
+  assert.doesNotMatch(source, /waitForViewportApply/u);
+  assert.match(source, /method === "Page\.captureScreenshot"[\s\S]*?fromSurface: true/u);
+  assert.doesNotMatch(source, /capturePage\(|capturePageRect|mapBrowserCaptureClipToNativeRect/u);
   assert.match(source, /private enqueueCdp[\s\S]*?record\.cdpLane/u);
-  assert.match(browserRuntimeSource, /fromSurface: false/u);
+  assert.match(browserRuntimeSource, /fromSurface: true/u);
   assert.doesNotMatch(source, /startScreencast|drawImage\(/u);
   assert.match(browserRuntimeSource, /element_ref !== "root"[\s\S]*?else if \(input\.clip\)/u);
   assert.match(browserRuntimeSource, /input\.clip\.width \* viewport\.width/u);
 });
 
-test("后台 Browser Surface 仍可被自动化，内容槽只决定可见性", () => {
-  assert.doesNotMatch(source, /Page\.captureScreenshot[\s\S]*?browser_surface_no_content_slot/u);
-  assert.match(source, /自动化面向逻辑 Browser Tab 的真实 WebContents/u);
+test("后台 Browser Surface 必须先恢复到真实内容槽，不能对 0x0 WebContents 做自动化", () => {
+  const sendCdp = section(source, "async sendCdp(", "private enqueueCdp<T>(");
+  assert.match(sendCdp, /所有需要页面 viewport 的自动化都必须绑定当前右栏内容槽/u);
+  assert.match(sendCdp, /!this\.isPrimary\(binding\) \|\| !this\.isRenderable\(record\)/u);
+  assert.match(source, /activationInputForTab\(tabId: string\)/u);
+  assert.match(source, /isRenderableBinding\(binding: BrowserSurfaceBinding\)/u);
+});
+
+test("Worker/daemon 重连后重新执行当前布局事务以恢复 Browser Surface 内容槽", () => {
+  const restore = section(windowManagerSource, "async restoreAfterDaemonReady(): Promise<void>", "activeWindowId(): string");
+  assert.match(restore, /for \(const record of \[\.\.\.this\.#records\.values\(\)\]\)[\s\S]*?this\.applyLayout\(record\)/u);
+  assert.match(restore, /未确认的几何仍保持不可挂载/u);
+});
+
+test("桌面 Overlay IPC 只接收显式复制后的纯数据状态和身份", () => {
+  assert.match(rightPaneSource, /toDesktopOverlayState\(state\)/u);
+  assert.match(rightPaneSource, /const state = toDesktopOverlayState\(\{ \.\.\.layout\.state, popupBounds \}\)/u);
+  assert.match(rightPaneSource, /desktop\.closeOverlay\(toDesktopOverlayIdentity\(identity\)\)/u);
+  assert.match(browserTabSource, /const safeState = toDesktopOverlayState\(state\)/u);
+  assert.match(browserTabSource, /desktop\.openOverlay\(safeState\)/u);
+  assert.match(browserTabSource, /const state = toDesktopOverlayState\(\{ \.\.\.layout\.state, popupBounds \}\)/u);
+  assert.match(browserTabSource, /desktop\.closeOverlay\(toDesktopOverlayIdentity\(pending\.identity\)\)/u);
 });
 
 test("WebContents 销毁时必须清理 Surface 挂载和注册索引", () => {
@@ -407,16 +500,26 @@ test("WebContents 销毁时必须清理 Surface 挂载和注册索引", () => {
 });
 
 test("后台截图复用同一个 WebContents，不创建隐藏窗口或临时挂载 Surface", () => {
-  assert.match(source, /capturePageScreenshot\([\s\S]*?record\.contents\.capturePage/u);
+  assert.match(source, /Page\.captureScreenshot[\s\S]*?this\.enqueueCdp\(record[\s\S]*?sendSurfaceCdpCommand/u);
   assert.doesNotMatch(source, /captureWindow/u);
 });
 
-test("所有工具截图都从真实 WebContents 读取，并通过 Surface CDP lane 串行化", () => {
+test("所有工具截图都从真实 WebContents 读取，并通过同一个 Surface CDP lane 串行化", () => {
   const cdpSection = section(source, "async sendCdp(", "private enqueueCdp<T>(");
-  assert.match(cdpSection, /method === "Page\.captureScreenshot"[\s\S]*?capturePageScreenshot\(record, params\)/u);
-  assert.match(cdpSection, /method === "Page\.captureScreenshot"[\s\S]*?waitForScreenshotReadiness\(record\)/u);
+  assert.match(cdpSection, /await this\.waitForViewportCommit\(record\)[\s\S]*?method === "Page\.captureScreenshot"[\s\S]*?waitForScreenshotReadiness\(record\)/u);
+  assert.doesNotMatch(cdpSection, /waitForViewportApply/u);
+  assert.match(cdpSection, /method === "Page\.captureScreenshot"[\s\S]*?this\.enqueueCdp\(record[\s\S]*?sendSurfaceCdpCommand/u);
   assert.match(cdpSection, /this\.enqueueCdp\(record/u);
   assert.match(source, /private async waitForScreenshotReadiness\(record: BrowserSurfaceRecord\)/u);
+  assert.doesNotMatch(source, /screenshotLane|screenshotInFlight|enqueueScreenshot|flushDeferredContentBinding/u);
+});
+
+test("截图不锁定右栏原生布局，页面命令统一通过 CDP lane 收口", () => {
+  const applySlot = section(source, "private applySlot(", "private async loadPage(");
+  assert.doesNotMatch(applySlot, /screenshotInFlight/u);
+  const bind = section(source, "bindContentSurface(", "bindingForTabInWindow(");
+  assert.doesNotMatch(bind, /screenshotInFlight|deferredContentBindings/u);
+  assert.doesNotMatch(source, /waitForScreenshotIdle|deferredContentBindings/u);
 });
 
 test("输入动作允许同一 WebContents 在动作内部推进导航 revision", () => {
@@ -441,9 +544,10 @@ test("交互命令完成后由 Main 返回当前页面状态契约", () => {
 
 test("render-process-gone 才触发页面崩溃恢复", () => {
   const renderProcessGone = section(source, 'webContents.on("render-process-gone"', "private async waitForDebugger(");
-  assert.match(renderProcessGone, /this\.unmountSurface\(record/u);
   assert.match(renderProcessGone, /type: "page_crashed"/u);
   assert.match(renderProcessGone, /this\.invalidateAndRecover\(record/u);
+  const recovery = section(source, "private invalidateAndRecover(", "private async recover(");
+  assert.match(recovery, /this\.unmountSurface\(record/u);
   assert.doesNotMatch(renderProcessGone, /debugger-detached/u);
 });
 
@@ -481,6 +585,19 @@ test("原生浏览器页面接管时关闭同一 Browser Tab 的菜单 Overlay",
   assert.match(indexSource, /event\.type === "user_takeover"[\s\S]*?closeOverlay\(event\.binding\.window_id\)/u);
 });
 
+test("关闭 Overlay 的 IPC 必须返回主进程确认事件", () => {
+  const closeOverlayHandler = section(
+    indexSource,
+    'handleIpc("magi-desktop:close-overlay"',
+    'handleIpc("magi-desktop:set-blocking-overlay"',
+  );
+  assert.match(
+    closeOverlayHandler,
+    /return manager\.closeOverlay\(windowId, parseOverlayCloseRequest\(value\)\);/u,
+    "Renderer 必须收到 DesktopOverlayClosedEvent，才能结束关闭事务并释放交互状态",
+  );
+});
+
 test("右栏非浏览器面板不依赖 Browser Surface", () => {
   assert.doesNotMatch(rightPaneSource, /activatePanel\(|activateBrowser\(/u);
   assert.doesNotMatch(browserTabSource, /activateBrowser\(/u);
@@ -514,7 +631,7 @@ test("JavaScript 对话框处理命令绕过输入事件队列，避免点击与
   const cdpSection = section(source, "async sendCdp(", "private enqueueCdp<T>(");
   assert.match(cdpSection, /const isDialogCommand = method === "Page\.handleJavaScriptDialog"/u);
   assert.match(cdpSection, /if \(!isDialogCommand\) \{[\s\S]*?await this\.waitForDebugger\(record\)/u);
-  assert.match(cdpSection, /if \(isDialogCommand\) \{[\s\S]*?sendCdpCommandWithTimeout\(/u);
+  assert.match(cdpSection, /if \(isDialogCommand\) \{[\s\S]*?sendSurfaceCdpCommand\(/u);
   assert.match(cdpSection, /JavaScript 对话框会阻塞触发它的 Input\.dispatchMouseEvent/u);
   assert.match(source, /Runtime\.addBinding/u);
   assert.match(source, /Page\.addScriptToEvaluateOnNewDocument/u);
@@ -580,14 +697,14 @@ test("下载生命周期只清理 Magi 私有目录，并覆盖启动、退出�
   assert.match(indexSource, /const browserUploadRoot = join\(app\.getPath\("userData"\), "browser-uploads"\)/u);
 });
 
-test("节点检查使用 Chromium Overlay Inspect Mode 和真实 DOM 后端节点", () => {
+test("节点检查使用真实鼠标坐标、Chromium DOM 命中和原生高亮", () => {
   assert.match(source, /export interface BrowserInspectedNodeContext/u);
   assert.match(source, /async startInspect\(binding: BrowserSurfaceBinding\)/u);
   assert.match(source, /async stopInspect\(binding: BrowserSurfaceBinding\)/u);
   assert.match(source, /Overlay\.enable/u);
-  assert.match(source, /DOM\.enable[\s\S]*?Overlay\.enable[\s\S]*?Overlay\.setInspectMode/u);
-  assert.match(source, /Overlay\.setInspectMode/u);
-  assert.match(source, /mode: "searchForNode"/u);
+  assert.match(source, /DOM\.enable[\s\S]*?Overlay\.enable[\s\S]*?Overlay\.hideHighlight/u);
+  assert.match(source, /private scheduleInspectHighlight\(/u);
+  assert.match(source, /Overlay\.highlightNode/u);
   const mousePolicy = section(source, 'webContents.on("before-mouse-event"', 'webContents.on("render-process-gone"');
   assert.match(
     mousePolicy,
@@ -596,11 +713,11 @@ test("节点检查使用 Chromium Overlay Inspect Mode 和真实 DOM 后端节�
   );
   assert.match(
     mousePolicy,
-    /record\.inspectGestureActive[\s\S]*?input\.type === "mouseDown"[\s\S]*?input\.type === "mouseUp"/u,
+    /record\.inspectGestureActive[\s\S]*?input\.type === "mouseDown"[\s\S]*?event\.preventDefault\(\)[\s\S]*?handleInspectPointRequested[\s\S]*?input\.type === "mouseUp"[\s\S]*?event\.preventDefault\(\)/u,
     "节点选择完成后的迟到 mouseUp 必须仍归属于同一次 Inspect 手势",
   );
-  assert.match(source, /mode: "none", highlightConfig: INSPECT_HIGHLIGHT_CONFIG/u);
-  assert.match(source, /Overlay\.inspectNodeRequested/u);
+  assert.match(source, /DOM\.getNodeForLocation/u);
+  assert.doesNotMatch(source, /Overlay\.inspectNodeRequested/u);
   assert.match(source, /DOM\.describeNode/u);
   assert.match(source, /DOM\.getAttributes/u);
   assert.match(source, /DOM\.getOuterHTML/u);
@@ -616,20 +733,21 @@ test("节点检查使用 Chromium Overlay Inspect Mode 和真实 DOM 后端节�
   assert.match(source, /frameId = await this\.resolveInspectFrameId/u);
   assert.match(source, /backendNodeId/u);
   assert.match(source, /normalizeOptionalDomNodeId\(node\.nodeId\)/u);
-  assert.match(source, /normalizeOptionalDomNodeId\(params\.backendNodeId\)/u);
+  assert.match(source, /normalizeOptionalDomNodeId\(hit\.backendNodeId\)/u);
   assert.doesNotMatch(
     section(source, "async startInspect(", "private initialAgentCursorPosition("),
-    /Input\.dispatchMouseEvent|DOM\.getNodeForLocation|capturePage\(/u,
+    /Input\.dispatchMouseEvent|capturePage\(/u,
   );
 });
 
 test("节点检查命令通过 Desktop Control Server 进入同一 Surface 生命周期", () => {
   const executeCommand = section(desktopControlSource, "private async executeCommand(", "private emit(");
   assert.match(executeCommand, /case "inspect_start":\n\s*case "inspect_stop":/u);
-  assert.match(executeCommand, /requirePrimaryBindingForIdentity\(this\.#surfaceManager, command\.payload\)/u);
+  assert.match(executeCommand, /requireRenderablePrimaryBindingForIdentity\(command\.payload\)/u);
   assert.match(executeCommand, /await this\.#surfaceManager\.startInspect\(binding\)/u);
   assert.match(executeCommand, /await this\.#surfaceManager\.stopInspect\(binding\)/u);
-  assert.match(desktopControlSource, /function requirePrimaryBindingForIdentity\(/u);
+  assert.doesNotMatch(desktopControlSource, /function requirePrimaryBindingForIdentity\(/u);
+  assert.match(desktopControlSource, /private async requireRenderablePrimaryBindingForIdentity\(/u);
   assert.match(desktopControlSource, /binding\.surface_id !== identity\.surface_id/u);
   assert.match(desktopControlSource, /binding\.navigation_revision !== identity\.navigation_revision/u);
 });
@@ -687,7 +805,7 @@ test("节点检查在导航、卸载、detach、Primary 切换和销毁时失效
   assert.match(source, /const generation = \+\+record\.inspectGeneration;\n\s*record\.inspectActive = false/u);
   assert.match(
     section(source, "record.inspectStartPromise = start;", "private isInspectGenerationActive("),
-    /this\.recordForBinding\(binding\)[\s\S]*?record\.inspectActive/u,
+    /this\.assertRenderableBinding\(binding[\s\S]*?record\.inspectActive/u,
   );
   assert.match(source, /const selectionGeneration = \+\+record\.inspectGeneration[\s\S]*?record\.inspectActive = false/u);
   assert.match(source, /this\.stopInspectForLifecycle\(record, "node-selected"\)/u);

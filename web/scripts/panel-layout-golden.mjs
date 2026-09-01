@@ -132,18 +132,138 @@ assert.match(
 );
 assert.match(
   messageListSource,
-  /async function loadOlderHistory\(\): Promise<void> \{[\s\S]*?if \(hasHiddenLocalHistory\) \{[\s\S]*?await revealPreviousRenderItems\(\);[\s\S]*?return;/,
+  /async function loadOlderHistory\(requestId: number\): Promise<boolean> \{[\s\S]*?if \(hasHiddenLocalHistory\) \{[\s\S]*?return revealPreviousRenderItems\(\);/,
   '向上滚动时必须先展开内存中的本地历史，再请求后端分页',
 );
 assert.match(
   messageListSource,
-  /\(historyState\.hasMoreBefore && historyState\.beforeCursor\)[\s\S]*?\|\| \(historyState\.canonicalHasMoreBefore && historyState\.canonicalBeforeCursor\)/,
-  '旧时间线与规范轮次必须独立判断分页能力',
+  /historyState\.canonicalHasMoreBefore && historyState\.canonicalBeforeCursor/,
+  '历史分页能力必须只由规范轮次 canonical cursor 决定',
 );
 assert.match(
   messageListSource,
-  /function setContainerScrollPosition\(nextTop: number\)[\s\S]*?async function revealPreviousRenderItems\(\)[\s\S]*?setContainerScrollPosition\(previousScrollTop \+ addedHeight\);/,
-  '时间线扩窗必须复用统一的程序化滚动入口并保持可见锚点',
+  /const prependedCount = Math\.max\(0, previousLastIndex\);[\s\S]*?const newlyVisibleCount = prependedCount \+ appendedCount;[\s\S]*?visibleRenderLimit = Math\.min\(count, visibleRenderLimit \+ newlyVisibleCount\);/,
+  '历史 prepend 后必须扩展渲染窗口，确保新加载消息实际进入 DOM',
+);
+assert.doesNotMatch(
+  messageListSource,
+  /isLoadingBefore/,
+  '历史分页不得继续使用会被 effect 自动唤醒的旧 loading 布尔状态',
+);
+assert.match(
+  messageListSource,
+  /historyLoadStatus === 'idle'/,
+  '历史分页 effect 只能由 idle 状态自动触发，失败和无进展必须停止自动请求',
+);
+assert.match(
+  messageListSource,
+  /historyLoadStatus:\s*'error'/,
+  '请求失败必须收敛到显式 error 状态并保留用户重试入口',
+);
+assert.match(
+  messageListSource,
+  /commitOlderSessionHistoryPage\([\s\S]*?committed\.accepted[\s\S]*?committed\.addedTurnCount/,
+  '历史分页 UI 必须只接受 store 已确认实际前进的提交结果',
+);
+assert.match(
+  messageListSource,
+  /function captureScrollSnapshot\(\)[\s\S]*?interactionEpoch: scrollInteractionEpoch,[\s\S]*?anchor: captureVisibleAnchor\(\)[\s\S]*?function restoreScrollSnapshot\([\s\S]*?snapshot\.interactionEpoch !== scrollInteractionEpoch/,
+  '时间线扩窗必须使用带交互代际的消息锚点快照，不能写回过期滚动位置',
+);
+assert.match(
+  messageListSource,
+  /function captureScrollSnapshot\(\)[\s\S]*?recoveryEpoch: scrollRecoveryEpoch,[\s\S]*?snapshot\.recoveryEpoch !== scrollRecoveryEpoch/,
+  '滚动恢复必须校验恢复代际，真实用户输入后不能被旧布局观察回写',
+);
+assert.match(
+  messageListSource,
+  /pendingScrollState:[\s\S]*?panelKey:[\s\S]*?scopeKey:[\s\S]*?interactionEpoch:[\s\S]*?recoveryEpoch:/,
+  '异步滚动状态必须绑定面板和作用域，不能跨会话或跨面板串写',
+);
+assert.match(
+  messageListSource,
+  /function requestOlderHistoryLoad\(\): Promise<boolean> \{[\s\S]*?historyLoadRequest\?\.scopeKey === scopeKey[\s\S]*?const id = \+\+nextHistoryLoadRequestId;[\s\S]*?loadOlderHistory\(id\)/,
+  '历史加载必须由单飞协调器收敛，避免 scroll、wheel 和 observer 重复请求',
+);
+assert.doesNotMatch(messageListSource, /IntersectionObserver/, '历史加载不得保留第二条 observer 触发路径');
+assert.match(
+  messageListSource,
+  /function installScrollIntentHandlers\(node: HTMLDivElement\)[\s\S]*?handleWheelIntent\(event, node\)/,
+  '滚动意图必须由统一原生监听器接管，不得把来源归因交给事件数量预算',
+);
+assert.match(messageListSource, /use:installScrollIntentHandlers/, '消息列表必须在 scroll 之前接管用户滚动意图');
+assert.match(messageListSource, /MessageScrollCoordinator/, '应用滚动必须使用唯一的目标位置事务协调器');
+assert.doesNotMatch(messageListSource, /programmaticScrollEventBudget/, '不得使用固定 scroll 事件预算猜测事件来源');
+assert.match(messageListSource, /node\.addEventListener\('pointerdown', onPointerDown\)[\s\S]*?node\.addEventListener\('pointermove', onPointerMove\)[\s\S]*?node\.addEventListener\('touchstart', onTouchStart/, '指针和触摸意图必须在真实拖动发生时取消过期应用滚动');
+assert.match(messageListSource, /userScrollDirection === 'up' && scrollTop <= HISTORY_LOAD_THRESHOLD_PX/, '历史分页只能由真实向上滚动触发，不能被延迟或向下 scroll 事件误触发');
+assert.match(messageListSource, /scrollbar-gutter:\s*stable/, '滚动条出现和消失不能改变消息列的可用宽度');
+assert.doesNotMatch(messageListSource, /previousScrollTop \+ addedHeight/, '历史加载不得使用过期 scrollTop 加总高度回写');
+assert.doesNotMatch(messageListSource, /content-visibility:\s*auto|contain-intrinsic-block-size/, '消息高度未知时不得使用固定虚拟高度估算');
+assert.match(messageListSource, /overflow-anchor:\s*none/, '滚动锚点必须由应用唯一协调，不能与浏览器锚点竞争');
+assert.match(
+  messageListSource,
+  /commitOlderSessionHistoryPage\([\s\S]*?revision:\s*requestRevision[\s\S]*?canonicalBeforeCursor:\s*requestCanonicalBeforeCursor/,
+  '历史分页必须由 store 以 revision 和 cursor 快照原子提交',
+);
+assert.match(
+  messageListSource,
+  /historyState\.workspacePath[\s\S]*?workspacePath/,
+  '历史分页作用域必须同时校验 workspace id 和 path',
+);
+assert.match(
+  messageListSource,
+  /const userScrollDirection = deriveMessageScrollDirection\([\s\S]*?const userScroll = !isProgrammaticScroll[\s\S]*?else if \(userScrollDirection === 'up'\) \{[\s\S]*?nextAutoScroll = false;[\s\S]*?\} else if \(isNearBottom\)/,
+  '只有已确认的用户向上滚动才能退出自动跟随，普通 scroll 事件不得误判为用户操作',
+);
+assert.match(
+  messageListSource,
+  /let layoutObservationNonce = 0;[\s\S]*?observationNonce !== layoutObservationNonce/,
+  '异步布局观察必须具备代际校验，不能在过期 tick 完成后回写滚动位置',
+);
+assert.match(
+  messageListSource,
+  /let autoScrollScheduleNonce = 0;[\s\S]*?scheduleNonce !== autoScrollScheduleNonce/,
+  '异步布局观察和自动滚动必须具备代际校验，不能在过期 tick 完成后回写滚动位置',
+);
+assert.match(
+  messageListSource,
+  /if \(node\.scrollTop <= HISTORY_LOAD_THRESHOLD_PX\) \{\s*void requestOlderHistoryLoad\(\);/,
+  '触顶滚轮必须立即进入单飞历史请求，不得额外等待固定帧数',
+);
+assert.doesNotMatch(
+  messageListSource,
+  /function scheduleOlderHistoryLoadAfterNativeScroll|remainingFrames > 1|waitForSettledScroll/,
+  '历史请求不得依赖固定延迟或第二套滚轮调度器',
+);
+assert.match(
+  messageListSource,
+  /historyLoadScopeKey = nextScopeKey;[\s\S]*?layoutObservationNonce \+= 1;[\s\S]*?disconnectContentResizeObserver\(\)/,
+  '会话作用域切换必须立即断开旧布局观察，不能让旧 ResizeObserver 作用于新会话',
+);
+assert.match(
+  messageListSource,
+  /function compensateLayoutAfterUpdate\([\s\S]*?observationNonce !== layoutObservationNonce[\s\S]*?observationScopeKey !== currentHistoryLoadScopeKey\(\)[\s\S]*?observationInteractionEpoch !== scrollInteractionEpoch[\s\S]*?observationRecoveryEpoch !== scrollRecoveryEpoch[\s\S]*?contentResizeFrame = requestAnimationFrame/,
+  'ResizeObserver 的排队帧必须通过统一布局事务校验观察代际、作用域和滚动代际',
+);
+assert.match(
+  messageListSource,
+  /function scrollToPositionFromNavigation\(nextTop: number\): void \{[\s\S]*?scrollInteractionEpoch \+= 1;[\s\S]*?function scrollToBottom\(\) \{[\s\S]*?scrollInteractionEpoch \+= 1;/,
+  '导航和回到底部必须推进滚动交互代际，使旧事务失效',
+);
+assert.match(
+  messageListSource,
+  /const messageElementSignature = \$derived\(activeRenderItems\.map\(\(item\) => item\.key\)\.join\('\|'\)\);/,
+  '新增可见消息必须触发布局观察，不能只观察完整但未挂载的历史窗口',
+);
+assert.match(
+  messageListSource,
+  /const signature = `\$\{messageElementSignature\}:\$\{runtimeLayoutSignature\}`;[\s\S]*?rememberCurrentLayoutAnchor\(\);/,
+  '运行态条目结构变化前必须保留阅读锚点',
+);
+assert.match(
+  messageListSource,
+  /displayContext === 'thread'[\s\S]*?historyLoadRequest\?\.scopeKey === currentHistoryLoadScopeKey\(\)[\s\S]*?historyState\.historyLoadStatus === 'loading'/,
+  '只有拥有主线程历史请求的 MessageList 实例才能在销毁时收口共享 loading 状态',
 );
 assert.match(
   messageListSource,

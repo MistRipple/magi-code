@@ -3370,7 +3370,7 @@ mod tests {
         let state =
             build_state_with_workspace_root(&workspace_root, "workspace-managed-skill-content")
                 .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
-                    state_root.join("sessions.json"),
+                    state_root.clone(),
                     state_root.join("workspaces.json"),
                     state_root.join("knowledge.json"),
                 )));

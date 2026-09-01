@@ -23,6 +23,7 @@
   import type { MessageBrowserNodeSelection } from '../../types/message';
   import { normalizeOptionalDomNodeId } from '@magi/desktop-browser-contracts';
   import { measureDesktopOverlayMenuBounds } from '../../lib/desktop-overlay-geometry';
+  import { toDesktopOverlayIdentity, toDesktopOverlayState } from '../../lib/desktop-overlay-state';
 
   interface Props {
     browserSessionId: string;
@@ -188,8 +189,8 @@
       && Boolean(desktopSnapshot?.layout.activeSurfaceId)
       // activeSurfaceId 只代表 Main 已物化 WebContents。只有同一 Tab 的
       // renderer_geometry 已确认真实内容槽后，原生 View 才进入可见状态；
-      // 在这之前必须保留稳定占位，不能渲染透明占位元素造成黑屏窗口。
-      && desktopSnapshot.layout.rendererGeometry?.layoutRevision === desktopSnapshot.layout.layoutRevision
+      // 父布局等待下一份 DOM 几何期间，Main 保留最后一份有效原生 bounds，
+      // 因此同一 Tab 不应退回“正在连接”占位态。
       && desktopSnapshot.layout.rendererGeometry?.browserContentSlot?.tabId === tabId,
   );
   // activeSurfaceId 由 Main 在完成物理挂载和 bounds 更新后发布。它不是
@@ -328,16 +329,17 @@
   ): void {
     const desktop = window.magiDesktop;
     if (!desktop) return;
+    const safeState = toDesktopOverlayState(state);
     const previousUi = captureOverlayUi();
     const nextIdentity: BrowserOverlayIdentity = {
-      overlayId: state.overlayId,
-      ownerId: state.ownerId,
+      overlayId: safeState.overlayId,
+      ownerId: safeState.ownerId,
     };
     const pendingClose = pendingDesktopOverlayClose;
     const waitsForClose = Boolean(pendingClose && !sameOverlayIdentity(pendingClose.identity, nextIdentity));
     configure();
     desktopOverlayIdentity = nextIdentity;
-    desktopOverlayKind = state.kind;
+    desktopOverlayKind = safeState.kind;
 
     void enqueueDesktopOverlayOperation(async () => {
       let closeConfirmed = !waitsForClose;
@@ -346,7 +348,7 @@
           await pendingClose.confirmation;
           closeConfirmed = true;
         }
-        await desktop.openOverlay(state);
+        await desktop.openOverlay(safeState);
       } catch (cause) {
         if (sameOverlayIdentity(desktopOverlayIdentity, nextIdentity)) {
           // 若新打开失败且旧 Overlay 尚未关闭，主进程仍保留旧状态，必须
@@ -378,7 +380,7 @@
         && previous.width === popupBounds.width
         && previous.height === popupBounds.height
       ) return;
-      const state = { ...layout.state, popupBounds };
+      const state = toDesktopOverlayState({ ...layout.state, popupBounds });
       desktopMenuLayout = { ...layout, state };
       void enqueueDesktopOverlayOperation(async () => {
         await desktop.openOverlay(state);
@@ -1085,7 +1087,7 @@
 
     const operation = enqueueDesktopOverlayOperation(async () => {
       try {
-        const response = await desktop.closeOverlay(pending.identity);
+        const response = await desktop.closeOverlay(toDesktopOverlayIdentity(pending.identity));
         // 主进程以 overlay-closed 事件作为跨 Renderer 的提交确认；若桥接
         // 层直接返回同一事件，也可作为同一确认，不重复等待广播。
         if (response && sameOverlayIdentity(response, pending.identity)) {

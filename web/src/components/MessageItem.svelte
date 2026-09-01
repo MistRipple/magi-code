@@ -723,11 +723,6 @@
     margin-left: 4px;
   }
 
-  .message-item:not(.streaming) {
-    content-visibility: auto;
-    contain-intrinsic-block-size: auto 120px;
-  }
-
   /* ===== 用户消息样式（简洁） ===== */
   .message-item.user {
     position: relative;

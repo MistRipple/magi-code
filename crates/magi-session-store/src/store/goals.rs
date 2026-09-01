@@ -1074,7 +1074,8 @@ mod tests {
         let restored = SessionStore::from_persisted_parts(
             store.durable_state(),
             SessionExecutionSidecarStoreState::default(),
-        );
+        )
+        .expect("目标访问模式的持久化恢复应成功");
         let restored_goal = restored
             .active_goal(&session_id)
             .expect("active goal should survive durable restore");

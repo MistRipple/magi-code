@@ -233,7 +233,11 @@
   }
 </script>
 
-<article class="conversation-turn" data-conversation-turn-id={turnId}>
+<article
+  class="conversation-turn"
+  data-conversation-turn-id={turnId}
+  data-layout-observation="conversation-turn"
+>
   {#each userItems as item (item.key)}
     <MessageItem
       message={item.message}
