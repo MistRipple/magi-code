@@ -280,6 +280,7 @@ impl BrowserAuthority {
             ));
         }
         let tab = self.require_ready_tab(&annotation.tab_id)?.clone();
+        let browser_session_id = tab.browser_session_id.clone();
         if tab.browser_session_id != annotation.browser_session_id {
             return Err(BrowserAuthorityError::AnnotationSessionMismatch {
                 annotation_id: annotation.annotation_id,
@@ -305,6 +306,7 @@ impl BrowserAuthority {
         annotation.status = BrowserAnnotationStatus::Active;
         self.annotations
             .insert(annotation.annotation_id.clone(), annotation.clone());
+        self.bump_session_revision(&browser_session_id, annotation.updated_at);
         self.bump_revision();
         Ok(annotation)
     }
@@ -323,10 +325,14 @@ impl BrowserAuthority {
             if annotation.status == BrowserAnnotationStatus::Deleted {
                 return Ok(annotation.clone());
             }
+            if annotation.status == status {
+                return Ok(annotation.clone());
+            }
             annotation.status = status;
             annotation.updated_at = now;
             annotation.clone()
         };
+        self.bump_session_revision(&updated.browser_session_id, now);
         self.bump_revision();
         Ok(updated)
     }
@@ -342,10 +348,14 @@ impl BrowserAuthority {
                 .annotations
                 .get_mut(annotation_id)
                 .ok_or_else(|| BrowserAuthorityError::UnknownAnnotation(annotation_id.clone()))?;
+            if annotation.comment == comment {
+                return Ok(annotation.clone());
+            }
             annotation.comment = comment;
             annotation.updated_at = now;
             annotation.clone()
         };
+        self.bump_session_revision(&updated.browser_session_id, now);
         self.bump_revision();
         Ok(updated)
     }
@@ -442,8 +452,17 @@ impl BrowserAuthority {
             BrowserLeaseEndReason::RuntimeUnavailable,
             now,
         );
+        let affected_sessions = self
+            .primary_surfaces
+            .keys()
+            .filter_map(|tab_id| self.tabs.get(tab_id))
+            .map(|tab| tab.browser_session_id.clone())
+            .collect::<HashSet<_>>();
         self.primary_surfaces.clear();
         self.active_desktop_epoch = Some(desktop_epoch);
+        for browser_session_id in affected_sessions {
+            self.bump_session_revision(&browser_session_id, now);
+        }
         self.bump_revision();
         revoked
     }
@@ -453,7 +472,8 @@ impl BrowserAuthority {
         binding: BrowserSurfaceBinding,
         now: UtcMillis,
     ) -> Result<Vec<BrowserControlLease>, BrowserAuthorityError> {
-        self.require_tab(&binding.tab_id)?;
+        let tab = self.require_tab(&binding.tab_id)?;
+        let browser_session_id = tab.browser_session_id.clone();
         if binding.desktop_epoch.trim().is_empty()
             || binding.window_id.trim().is_empty()
             || binding.surface_id.trim().is_empty()
@@ -462,6 +482,12 @@ impl BrowserAuthority {
             || binding.web_contents_id == 0
         {
             return Err(BrowserAuthorityError::InvalidSurfaceBinding);
+        }
+        // Surface 事件不能把已经由 Authority 推进过的旧文档代次重新带回
+        // 运行态。否则 daemon 重启后旧 WebContents 的重放事件会重新注册
+        // 失效页面，并让 Ready/Suspended 在 Renderer 中来回覆盖。
+        if binding.navigation_revision < tab.navigation_revision {
+            return Ok(Vec::new());
         }
         if let Some(active_epoch) = &self.active_desktop_epoch {
             if active_epoch != &binding.desktop_epoch {
@@ -488,6 +514,7 @@ impl BrowserAuthority {
                     );
                     self.primary_surfaces
                         .insert(binding.tab_id.clone(), binding);
+                    self.bump_session_revision(&browser_session_id, now);
                     self.bump_revision();
                     return Ok(revoked);
                 }
@@ -505,8 +532,43 @@ impl BrowserAuthority {
         );
         self.primary_surfaces
             .insert(binding.tab_id.clone(), binding);
+        self.bump_session_revision(&browser_session_id, now);
         self.bump_revision();
         Ok(revoked)
+    }
+
+    /// 接受 Electron 当前的 Primary Surface，并在同一 Authority 事务中恢复
+    /// 逻辑 Tab。Surface 绑定和 Tab lifecycle 必须原子收敛，不能先让 UI 看见
+    /// 一个可见的 Chromium Page，再等待另一个 API 请求把 Tab 从 Suspended
+    /// 改成 Ready。
+    ///
+    /// 返回值中的 bool 表示这份 binding 是否仍是当前 Primary。旧 epoch、旧
+    /// surface 或旧导航代次都返回 false；调用方不得据此发布成功状态。
+    pub fn accept_primary_surface(
+        &mut self,
+        binding: BrowserSurfaceBinding,
+        now: UtcMillis,
+    ) -> Result<(bool, BrowserTab, Vec<BrowserControlLease>), BrowserAuthorityError> {
+        let revoked = self.set_primary_surface(binding.clone(), now)?;
+        let current = self.require_tab(&binding.tab_id)?.clone();
+        let accepted = current.navigation_revision == binding.navigation_revision
+            && self
+                .primary_surface(&binding.tab_id)
+                .is_some_and(|surface| surface == &binding);
+        if !accepted {
+            return Ok((false, current, revoked));
+        }
+
+        let tab = match current.lifecycle {
+            BrowserTabLifecycle::Creating
+            | BrowserTabLifecycle::Suspended
+            | BrowserTabLifecycle::Crashed => {
+                self.transition_tab(&binding.tab_id, BrowserTabLifecycle::Ready, now)?
+            }
+            BrowserTabLifecycle::Ready => current,
+            BrowserTabLifecycle::Closed => return Ok((false, current, revoked)),
+        };
+        Ok((true, tab, revoked))
     }
 
     pub fn accept_page_binding(
@@ -533,6 +595,11 @@ impl BrowserAuthority {
             );
             self.primary_surfaces
                 .insert(binding.tab_id.clone(), binding.clone());
+            let browser_session_id = self
+                .require_tab(&binding.tab_id)?
+                .browser_session_id
+                .clone();
+            self.bump_session_revision(&browser_session_id, now);
             self.bump_revision();
         }
         Ok((true, revoked))
@@ -557,8 +624,17 @@ impl BrowserAuthority {
             BrowserLeaseEndReason::RuntimeUnavailable,
             now,
         );
+        let affected_sessions = self
+            .primary_surfaces
+            .keys()
+            .filter_map(|tab_id| self.tabs.get(tab_id))
+            .map(|tab| tab.browser_session_id.clone())
+            .collect::<HashSet<_>>();
         self.primary_surfaces.clear();
         self.active_desktop_epoch = None;
+        for browser_session_id in affected_sessions {
+            self.bump_session_revision(&browser_session_id, now);
+        }
         self.bump_revision();
         revoked
     }
@@ -724,8 +800,17 @@ impl BrowserAuthority {
                 lifecycle: tab.lifecycle,
             });
         }
+        if self.active_tabs.get(browser_session_id) == Some(tab_id) {
+            return Ok(());
+        }
         self.active_tabs
             .insert(browser_session_id.clone(), tab_id.clone());
+        let session = self
+            .sessions
+            .get_mut(browser_session_id)
+            .expect("browser session was validated before mutation");
+        session.revision = session.revision.saturating_add(1);
+        self.bump_revision();
         Ok(())
     }
 
@@ -777,8 +862,6 @@ impl BrowserAuthority {
                 .get_mut(&browser_session_id)
                 .expect("browser tab cannot outlive its owning session");
             session.tab_ids.retain(|candidate| candidate != tab_id);
-            session.revision = session.revision.saturating_add(1);
-            session.updated_at = now;
             if self
                 .active_tabs
                 .get(&browser_session_id)
@@ -808,6 +891,7 @@ impl BrowserAuthority {
             );
             self.primary_surfaces.remove(tab_id);
         }
+        self.bump_session_revision(&browser_session_id, now);
         let tab = self
             .tabs
             .get(tab_id)
@@ -826,6 +910,7 @@ impl BrowserAuthority {
         now: UtcMillis,
     ) -> Result<BrowserTab, BrowserAuthorityError> {
         self.require_ready_tab(tab_id)?;
+        let browser_session_id = self.require_tab(tab_id)?.browser_session_id.clone();
         let tab = self
             .tabs
             .get_mut(tab_id)
@@ -837,6 +922,7 @@ impl BrowserAuthority {
         tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
         tab.updated_at = now;
         let tab = tab.clone();
+        self.bump_session_revision(&browser_session_id, now);
         self.bump_revision();
         Ok(tab)
     }
@@ -851,6 +937,7 @@ impl BrowserAuthority {
         now: UtcMillis,
     ) -> Result<BrowserTab, BrowserAuthorityError> {
         self.require_ready_tab(tab_id)?;
+        let browser_session_id = self.require_tab(tab_id)?.browser_session_id.clone();
         let (url, origin, title) = normalize_browser_page_state(url, origin, title);
         let (tab, document_changed, changed) = {
             let tab = self
@@ -882,6 +969,7 @@ impl BrowserAuthority {
             self.mark_active_annotations_stale(tab_id, now);
         }
         if changed {
+            self.bump_session_revision(&browser_session_id, now);
             self.bump_revision();
             return Ok(tab);
         }
@@ -896,6 +984,7 @@ impl BrowserAuthority {
         now: UtcMillis,
     ) -> Result<BrowserTab, BrowserAuthorityError> {
         self.require_ready_tab(tab_id)?;
+        let browser_session_id = self.require_tab(tab_id)?.browser_session_id.clone();
         let (tab, document_changed, changed) = {
             let tab = self
                 .tabs
@@ -932,6 +1021,7 @@ impl BrowserAuthority {
             self.mark_active_annotations_stale(tab_id, now);
         }
         if changed {
+            self.bump_session_revision(&browser_session_id, now);
             self.bump_revision();
         }
         Ok(tab)
@@ -943,6 +1033,7 @@ impl BrowserAuthority {
         now: UtcMillis,
     ) -> Result<(u64, u64), BrowserAuthorityError> {
         self.require_ready_tab(tab_id)?;
+        let browser_session_id = self.require_tab(tab_id)?.browser_session_id.clone();
         let tab = self
             .tabs
             .get_mut(tab_id)
@@ -950,6 +1041,7 @@ impl BrowserAuthority {
         tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
         tab.updated_at = now;
         let revisions = (tab.navigation_revision, tab.snapshot_revision);
+        self.bump_session_revision(&browser_session_id, now);
         self.bump_revision();
         Ok(revisions)
     }
@@ -1105,6 +1197,7 @@ impl BrowserAuthority {
         }
         let tab = self.require_ready_tab(&input.tab_id)?;
         let session = self.require_ready_session(&tab.browser_session_id)?;
+        let browser_session_id = tab.browser_session_id.clone();
         validate_lease_owner(&input.owner, session)?;
         let primary = self
             .primary_surfaces
@@ -1156,6 +1249,8 @@ impl BrowserAuthority {
         self.active_surface_leases
             .insert(key, lease.lease_id.clone());
         self.leases.insert(lease.lease_id.clone(), lease.clone());
+        self.bump_session_revision(&browser_session_id, input.acquired_at);
+        self.bump_revision();
         Ok(lease)
     }
 
@@ -1707,6 +1802,10 @@ impl BrowserAuthority {
         if existing.lifecycle.is_terminal() {
             return Ok(existing);
         }
+        let browser_session_id = self
+            .require_tab(&existing.tab_id)?
+            .browser_session_id
+            .clone();
         let key = (existing.tab_id.clone(), existing.surface_id.clone());
         if self.active_surface_leases.get(&key) == Some(lease_id) {
             self.active_surface_leases.remove(&key);
@@ -1720,6 +1819,8 @@ impl BrowserAuthority {
         lease.end_reason = Some(reason);
         lease.ended_at = Some(now);
         let lease = lease.clone();
+        self.bump_session_revision(&browser_session_id, now);
+        self.bump_revision();
         Ok(lease)
     }
 
@@ -1743,6 +1844,15 @@ impl BrowserAuthority {
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
+    }
+
+    fn bump_session_revision(&mut self, browser_session_id: &BrowserSessionId, now: UtcMillis) {
+        let session = self
+            .sessions
+            .get_mut(browser_session_id)
+            .expect("browser tab cannot outlive its owning session");
+        session.revision = session.revision.saturating_add(1);
+        session.updated_at = now;
     }
 
     fn require_profile(

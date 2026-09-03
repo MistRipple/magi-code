@@ -118,13 +118,13 @@ impl TaskExecutionRegistry {
         &self,
         task_id: TaskId,
         plan: TaskExecutionPlan,
-    ) -> Result<(), TaskExecutionPlan> {
+    ) -> Result<(), Box<TaskExecutionPlan>> {
         let mut plans = self
             .plans
             .write()
             .expect("task execution registry write lock poisoned");
         if plans.contains_key(&task_id) {
-            return Err(plan);
+            return Err(Box::new(plan));
         }
         plans.insert(task_id, plan);
         Ok(())
@@ -515,6 +515,7 @@ impl TaskExecutionRegistry {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rollback_spawned_local_agent_child(
     registry: &TaskExecutionRegistry,
     task_store: &TaskStore,
@@ -542,12 +543,11 @@ fn rollback_spawned_local_agent_child(
             Err(error) => rollback_errors.push(format!("SpawnGraph 回滚失败: {error}")),
         }
     }
-    if session_chain_updated {
-        if let Err(error) =
+    if session_chain_updated
+        && let Err(error) =
             session_store.upsert_active_execution_chain(session_id.clone(), original_chain.clone())
-        {
-            rollback_errors.push(format!("session active chain 回滚失败: {error}"));
-        }
+    {
+        rollback_errors.push(format!("session active chain 回滚失败: {error}"));
     }
     match task_store.remove_task(child_task_id) {
         Ok(Some(_)) => {}

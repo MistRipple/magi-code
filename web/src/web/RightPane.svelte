@@ -48,8 +48,6 @@
     closeTerminalSession,
     createBrowserSession,
     createBrowserTab,
-    getBrowserSession,
-    waitForBrowserTabReady,
     getBrowserCapabilities,
     materializeSession,
     getAgentChangeDiff,
@@ -59,6 +57,7 @@
     isPublicTunnelAccess,
     type BrowserCapabilitiesSnapshot,
   } from './agent-api';
+  import { loadBrowserAuthoritySession } from './browser-authority-coordinator';
 
   type HtmlBrowserOpenRequest = {
     requestId: number;
@@ -313,10 +312,11 @@
       clearBrowserTabClosePending(scopeKey, payload.browserSessionId, payload.tabId);
     }
     try {
-      const snapshot = await getBrowserSession(payload.browserSessionId);
-      synchronizeBrowserSessionSnapshot(snapshot, payload.workspacePath, {
-        workspaceId: payload.workspaceId,
-        sessionId: payload.sessionId,
+      await loadBrowserAuthoritySession(payload.browserSessionId, (snapshot) => {
+        synchronizeBrowserSessionSnapshot(snapshot, payload.workspacePath, {
+          workspaceId: payload.workspaceId,
+          sessionId: payload.sessionId,
+        });
       });
     } catch (error) {
       if (closeError) {
@@ -395,57 +395,6 @@
       url,
       navigationRevision,
     });
-    // 创建响应和 Authority 事件可能以任意顺序到达。无论响应已经是 ready
-    // 还是仍处于 creating，都必须走一次同一条权威收敛链路并显式 reveal
-    // 新 Tab，否则后台事件只会把 Tab 插入列表，当前选中项仍停留在旧 Tab。
-    // waitForBrowserTabReady 对 ready 结果会立即返回，因此这里不会额外阻塞
-    // 已经完成的创建。
-    reconcileCreatedBrowserPane(
-      browserSessionId,
-      tabId,
-      workspaceId,
-      sessionId,
-      workspacePath,
-    );
-  }
-
-  function reconcileCreatedBrowserPane(
-    browserSessionId: string,
-    tabId: string,
-    workspaceId: string,
-    sessionId: string,
-    workspacePath?: string,
-  ): void {
-    void waitForBrowserTabReady(browserSessionId, tabId)
-      .then((snapshot) => {
-        synchronizeBrowserSessionSnapshot(snapshot, workspacePath, {
-          workspaceId,
-          sessionId,
-          revealTabId: tabId,
-          newTabLabel: i18n.t('browser.tab.new'),
-        });
-      })
-      .catch((error) => {
-        // 超时或权威请求失败不能继续保留 creating，否则 UI 会永久显示“正在连接”。
-        // crashed 是 Authority 已定义的明确失败态；后续用户再次激活时仍可通过
-        // activateBrowserTab 走恢复流程，不会丢失逻辑 Tab。
-        openBrowserTab(browserSessionId, tabId, {
-          workspaceId,
-          workspacePath,
-          sessionId,
-          label: i18n.t('browser.tab.new'),
-          lifecycle: 'crashed',
-          url: 'about:blank',
-          navigationRevision: 0,
-        });
-        console.warn('[RightPane] 浏览器 Tab 权威状态收敛失败，已进入失败态:', {
-          browserSessionId,
-          tabId,
-          workspaceId,
-          sessionId,
-          error,
-        });
-      });
   }
 
   function browserOpenFailureFeedback(error: unknown): {

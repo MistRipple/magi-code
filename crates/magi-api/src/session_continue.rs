@@ -1044,20 +1044,20 @@ where
         }
     }
 
-    if let Some(commit) = recovery_commit {
-        if let Err(error) = commit_chain_recovery(
+    if let Some(commit) = recovery_commit
+        && let Err(error) = commit_chain_recovery(
             &state.session_store,
             &state.workspace_registry,
             session_id,
             &mut chain,
             commit,
-        ) {
-            manager
-                .quiesce_for_restart(chain.root_task_id.as_str())
-                .await;
-            let message = error.into_message();
-            return Err(ApiError::internal_assembly("提交恢复状态失败", message));
-        }
+        )
+    {
+        manager
+            .quiesce_for_restart(chain.root_task_id.as_str())
+            .await;
+        let message = error.into_message();
+        return Err(ApiError::internal_assembly("提交恢复状态失败", message));
     }
 
     goal_resume_guard.commit();

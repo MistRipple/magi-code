@@ -103,6 +103,9 @@ if (singleInstance) {
     onContentSlotReady: (binding) => {
       control?.handleSurfaceContentReady(binding);
     },
+    onDocumentReady: (binding) => {
+      control?.handleSurfaceDocumentReady(binding);
+    },
     partitionRegistryPath: join(app.getPath("userData"), "browser-partitions.json"),
     onEvent: (event) => {
       control?.handleSurfaceEvent(event);

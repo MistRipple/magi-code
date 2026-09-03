@@ -18,9 +18,11 @@ static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TASK_PROJECTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static TASK_PROJECTION_WRITE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
-static TASK_PROJECTION_AFTER_SNAPSHOT_HOOK: Mutex<
-    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
-> = Mutex::new(None);
+type TaskProjectionAfterSnapshotHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static TASK_PROJECTION_AFTER_SNAPSHOT_HOOK: Mutex<Option<TaskProjectionAfterSnapshotHook>> =
+    Mutex::new(None);
 
 const TASK_PROJECTION_SCHEMA_VERSION: u32 = 2;
 const TASK_PROJECTION_MANIFEST_FILE: &str = "manifest.json";
@@ -533,20 +535,19 @@ impl TaskStore {
             .ok_or(DomainError::NotFound { entity: "Task" })?;
         task.parent_task_id = Some(new_parent_id.clone());
         task.updated_at = UtcMillis::now();
-        if let Some(old_parent_id) = old_parent.clone() {
-            if let Some(parent) = tasks.get_mut(&old_parent_id) {
-                parent.required_children.retain(|id| id != task_id);
-                parent.updated_at = UtcMillis::now();
-            }
+        if let Some(old_parent_id) = old_parent.clone()
+            && let Some(parent) = tasks.get_mut(&old_parent_id)
+        {
+            parent.required_children.retain(|id| id != task_id);
+            parent.updated_at = UtcMillis::now();
         }
 
-        if was_required {
-            if let Some(parent) = tasks.get_mut(new_parent_id)
-                && !parent.required_children.iter().any(|id| id == task_id)
-            {
-                parent.required_children.push(task_id.clone());
-                parent.updated_at = UtcMillis::now();
-            }
+        if was_required
+            && let Some(parent) = tasks.get_mut(new_parent_id)
+            && !parent.required_children.iter().any(|id| id == task_id)
+        {
+            parent.required_children.push(task_id.clone());
+            parent.updated_at = UtcMillis::now();
         }
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         Ok(())
@@ -1759,12 +1760,10 @@ impl TaskStore {
             _ => {}
         }
 
-        if requested_lease.is_some() {
-            if task.status != TaskStatus::Running {
-                return Err(DomainError::InvalidState {
-                    message: format!("带租约的任务 {} 必须处于 Running", task_id),
-                });
-            }
+        if requested_lease.is_some() && task.status != TaskStatus::Running {
+            return Err(DomainError::InvalidState {
+                message: format!("带租约的任务 {} 必须处于 Running", task_id),
+            });
         }
 
         let task = tasks
@@ -3940,8 +3939,7 @@ mod tests {
             let projection_dir = checkpoint_dir.path().join("projection");
             assert_eq!(
                 TaskStore::checkpoint_snapshot_to_projection_directory(&snapshot, &projection_dir)
-                    .err()
-                    .expect("invalid active lease must reject checkpoint")
+                    .expect_err("invalid active lease must reject checkpoint")
                     .kind(),
                 io::ErrorKind::InvalidData
             );
@@ -4006,8 +4004,7 @@ mod tests {
         let projection_dir = checkpoint_dir.path().join("projection");
         assert_eq!(
             TaskStore::checkpoint_snapshot_to_projection_directory(&snapshot, &projection_dir)
-                .err()
-                .expect("duplicate active leases must reject checkpoint")
+                .expect_err("duplicate active leases must reject checkpoint")
                 .kind(),
             io::ErrorKind::InvalidData
         );

@@ -9,9 +9,13 @@ import type {
   MainToWorkerMessage,
   WorkerToMainMessage,
 } from "@magi/desktop-browser-contracts";
+import { isAllowedBrowserChildTarget } from "@magi/desktop-browser-contracts";
 import { CdpClient, type ParentPort } from "./cdp-client.js";
 import { INSTALL_PAGE_RUNTIME } from "./page-script.js";
-import { BrowserAutomationRuntime } from "./runtime.js";
+import {
+  BrowserAutomationRuntime,
+  LighthouseCdpSession,
+} from "./runtime.js";
 
 function assertScreenshotHeader(binary: Buffer, format: "png" | "jpeg" | "webp"): void {
   const valid = format === "png"
@@ -48,6 +52,16 @@ class FakePort implements ParentPort {
         },
       });
     });
+  }
+}
+
+class SilentPort implements ParentPort {
+  readonly messages: WorkerToMainMessage[] = [];
+
+  on(_event: "message", _listener: (event: { data: MainToWorkerMessage }) => void): void {}
+
+  postMessage(message: WorkerToMainMessage): void {
+    this.messages.push(message);
   }
 }
 
@@ -144,6 +158,56 @@ function consoleCommand(): BrowserHostCommand {
   };
 }
 
+test("Lighthouse 只附着 iframe/Worker，页面型和未知 Target 永远不会产生子会话", async () => {
+  assert.equal(isAllowedBrowserChildTarget(undefined), false);
+  assert.equal(isAllowedBrowserChildTarget({}), false);
+  assert.equal(isAllowedBrowserChildTarget({ type: "page" }), false);
+  assert.equal(isAllowedBrowserChildTarget({ type: "webview" }), false);
+  assert.equal(isAllowedBrowserChildTarget({ type: "unknown" }), false);
+  assert.equal(isAllowedBrowserChildTarget({ type: "iframe" }), true);
+  assert.equal(isAllowedBrowserChildTarget({ type: "worker" }), true);
+  assert.equal(isAllowedBrowserChildTarget({ type: "service_worker" }), true);
+  assert.equal(isAllowedBrowserChildTarget({ type: "shared_worker" }), true);
+
+  const port = new ScriptedPort(() => ({}));
+  const cdp = new CdpClient(port);
+  const root = new LighthouseCdpSession(cdp, binding);
+  const attached: LighthouseCdpSession[] = [];
+  root.on("sessionattached", (child) => attached.push(child as LighthouseCdpSession));
+
+  port.emit("Target.attachedToTarget", {
+    sessionId: "page-session",
+    targetInfo: { targetId: "page-target", type: "page" },
+  });
+  port.emit("Target.attachedToTarget", {
+    sessionId: "missing-type-session",
+    targetInfo: { targetId: "unknown-target" },
+  });
+  port.emit("Target.attachedToTarget", {
+    sessionId: "iframe-session",
+    targetInfo: { targetId: "iframe-target", type: "iframe" },
+  });
+
+  assert.equal(attached.length, 1);
+  assert.equal(attached[0]?.id(), "iframe-session");
+  await root.detach();
+
+  const workerPort = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(workerPort), "worker-test");
+  assert.equal((await runtime.execute("child-target-init", binding, consoleCommand())).outcome.status, "succeeded");
+  workerPort.emit("Target.attachedToTarget", {
+    sessionId: "blocked-page-session",
+    targetInfo: { targetId: "blocked-page-target", type: "page" },
+  });
+  workerPort.emit("Runtime.consoleAPICalled", { type: "error", args: [{ value: "must-not-leak" }] }, binding, "blocked-page-session");
+  const consoleResult = await runtime.execute("child-target-console", binding, consoleCommand());
+  assert.equal(consoleResult.outcome.status, "succeeded");
+  const consoleValue = consoleResult.outcome.payload.type === "json"
+    ? consoleResult.outcome.payload.payload.value as { entries?: Array<Record<string, unknown>> }
+    : null;
+  assert.deepEqual(consoleValue?.entries, []);
+});
+
 test("Worker 为每个 CDP Surface 显式启用页面、运行时和网络事件域", async () => {
   const port = new FakePort();
   const runtime = new BrowserAutomationRuntime(new CdpClient(port));
@@ -213,6 +277,20 @@ test("CDP 响应的完整 Surface 身份变化必须被拒绝", async () => {
   await assert.rejects(
     client.send(binding, "Runtime.enable"),
     /browser_surface_stale/u,
+  );
+});
+
+test("CDP 请求超时会通知 Main 取消底层请求，并保留超时错误语义", async () => {
+  const port = new SilentPort();
+  const client = new CdpClient(port);
+
+  await assert.rejects(
+    client.send(binding, "Runtime.enable", {}, 5),
+    /browser_cdp_timeout:Runtime\.enable/u,
+  );
+  assert.deepEqual(
+    port.messages.map((message) => message.type),
+    ["cdp_request", "cdp_cancel"],
   );
 });
 
@@ -603,6 +681,64 @@ test("click_at 的 double_click 产生完整双击序列", async () => {
   assert.deepEqual(
     port.requests.filter((request) => request.method === "Input.dispatchMouseEvent").map((request) => request.params.clickCount),
     [undefined, 1, 1, 2, 2],
+  );
+});
+
+test("click_at 按下触发导航后不向新文档发送释放事件", async () => {
+  const nextBinding = { ...binding, navigation_revision: binding.navigation_revision + 1 };
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+      port.emit("Page.frameStartedLoading", {}, nextBinding);
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+
+  const result = await runtime.execute("click-at-navigation", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30 } },
+  });
+
+  assert.equal(result.outcome.status, "succeeded");
+  assert.deepEqual(
+    port.requests
+      .filter((request) => request.method === "Input.dispatchMouseEvent")
+      .map((request) => request.params.type),
+    ["mouseMoved", "mousePressed"],
+  );
+});
+
+test("文本插入触发导航后不再向新文档提交旧按键", async () => {
+  const nextBinding = { ...binding, navigation_revision: binding.navigation_revision + 1 };
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate" && String(params.expression).includes(".focus(")) {
+      return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: true, sensitive: null } } };
+    }
+    if (method === "Input.insertText") {
+      port.emit("Page.frameStartedLoading", {}, nextBinding);
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+
+  const result = await runtime.execute("type-navigation", binding, {
+    type: "type",
+    payload: {
+      tab_id: binding.tab_id,
+      control: { mode: "user", fence: 1 },
+      target: { snapshot_revision: 1, element_ref: "e:1:search" },
+      text: "magi",
+      replace: false,
+      submit_key: "Enter",
+    },
+  });
+
+  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(
+    port.requests.some((request) => request.method === "Input.dispatchKeyEvent"),
+    false,
   );
 });
 
@@ -1258,6 +1394,11 @@ test("页面运行上下文清理后必须重建 runtime，而不是调用失效
   port.emit("Runtime.executionContextsCleared");
   assert.equal((await command("annotation-after-clear") as { outcome: { status: string } }).outcome.status, "succeeded");
   assert.equal(isolatedWorlds, 2, "上下文清理后必须为当前文档重建 isolated world");
+  assert.equal(
+    port.requests.filter((request) => ["Page.enable", "Runtime.enable", "Network.enable"].includes(request.method)).length,
+    3,
+    "文档上下文清理后不能重复启用 WebContents 级 CDP 域",
+  );
 });
 
 test("缓存的执行上下文缺少页面 runtime 时会先重新安装并验证", async () => {

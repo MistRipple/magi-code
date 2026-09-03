@@ -64,7 +64,7 @@ impl DaemonConfig {
                 env!("CARGO_PKG_VERSION").to_string()
             }),
             build_identity: env_or_default("MAGI_BUILD_ID", || "source".to_string()),
-            startup_nonce: env_or_default("MAGI_DAEMON_START_NONCE", || new_startup_nonce()),
+            startup_nonce: env_or_default("MAGI_DAEMON_START_NONCE", new_startup_nonce),
             state_root,
             web_dist_root: None,
             open_browser: false,

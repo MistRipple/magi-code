@@ -12,6 +12,7 @@ import {
 } from "electron";
 import { browserDownloadRoot, clearBrowserDownloads } from "./browser-download-storage.js";
 import {
+  isAllowedBrowserChildTarget,
   normalizeOptionalDomNodeId,
   type BrowserControlUpdate,
   type BrowserLogicalViewport,
@@ -20,6 +21,7 @@ import {
   type BrowserSurfaceBinding,
 } from "@magi/desktop-browser-contracts";
 import { BrowserSurfaceRegistry } from "./browser-surface-registry.js";
+import { matchesNavigationRevision } from "./browser-navigation-revision.js";
 
 export interface BrowserInspectedNodeContext {
   browser_session_id: string;
@@ -137,6 +139,8 @@ interface BrowserSurfaceRecord {
   dialogBridgeInstalled: boolean;
   nativeDialogOpeningWaiters: Set<() => void>;
   cdpSessionIds: Set<string>;
+  /** 被明确拒绝的页面型 popup Target；其后续事件不能进入 Worker。 */
+  blockedCdpSessionIds: Set<string>;
   debuggerReadyPromise: Promise<void> | null;
   debuggerReconnectTimer: NodeJS.Timeout | null;
   debuggerReconnectAttempt: number;
@@ -217,7 +221,7 @@ interface NavigationEventExpectation {
 type ViewportCommitState =
   | "requested"
   | "applying"
-  | "compositor-ready"
+  | "ready"
   | "superseded"
   | "invalidated"
   | "failed";
@@ -495,6 +499,7 @@ export class BrowserSurfaceManager {
   readonly #activationGenerations = new Map<string, number>();
   readonly #onEvent: (event: BrowserSurfaceEvent) => void;
   readonly #onContentSlotReady: ((binding: BrowserSurfaceBinding) => void) | undefined;
+  readonly #onDocumentReady: ((binding: BrowserSurfaceBinding) => void) | undefined;
   #downloadCleanupPromise: Promise<void> | null = null;
   #downloadCleanupInProgress = false;
 
@@ -502,11 +507,13 @@ export class BrowserSurfaceManager {
     desktopEpoch: string;
     onEvent: (event: BrowserSurfaceEvent) => void;
     onContentSlotReady?: (binding: BrowserSurfaceBinding) => void;
+    onDocumentReady?: (binding: BrowserSurfaceBinding) => void;
     partitionRegistryPath?: string;
   }) {
     this.#desktopEpoch = input.desktopEpoch;
     this.#onEvent = input.onEvent;
     this.#onContentSlotReady = input.onContentSlotReady;
+    this.#onDocumentReady = input.onDocumentReady;
     this.#partitionRegistryPath = input.partitionRegistryPath?.trim() || null;
     this.#downloadUserDataPath = this.#partitionRegistryPath
       ? dirname(this.#partitionRegistryPath)
@@ -601,6 +608,14 @@ export class BrowserSurfaceManager {
         contextIsolation: true,
         sandbox: true,
         webSecurity: true,
+        // Electron 18 起 window.open 使用原生 Chromium 行为，所有新窗口
+        // 请求统一先经过下面唯一的 setWindowOpenHandler 策略；Browser Tab
+        // 不依赖已移除的 nativeWindowOpen 选项，也不会为弹窗创建第二个
+        // BrowserWindow/Target。
+        // 页面不得再创建嵌套的 Electron guest WebContents。右栏的一级
+        // Browser Tab 是唯一浏览器容器，页面内部不存在可持久化的子 Tab。
+        webviewTag: false,
+        allowRunningInsecureContent: false,
         // 页面导航不应改变桌面当前输入归属。用户点击浏览器内容时由
         // Chromium 原生命中测试接管焦点；主 Renderer 获得焦点后，导航中
         // 的 did-finish-load 不能再把键盘输入抢回网页。
@@ -656,6 +671,7 @@ export class BrowserSurfaceManager {
       dialogBridgeInstalled: false,
       nativeDialogOpeningWaiters: new Set(),
       cdpSessionIds: new Set(),
+      blockedCdpSessionIds: new Set(),
       debuggerReadyPromise: null,
       debuggerReconnectTimer: null,
       debuggerReconnectAttempt: 0,
@@ -832,10 +848,10 @@ export class BrowserSurfaceManager {
       || binding.web_contents_id !== record.contents.id
       || binding.target_id !== record.targetId
       || binding.browser_context_id !== record.partitionId
-      || (
-        options.allowNavigationAdvance !== true
-          ? binding.navigation_revision !== record.navigationRevision
-          : binding.navigation_revision > record.navigationRevision
+      || !matchesNavigationRevision(
+        binding.navigation_revision,
+        record.navigationRevision,
+        options.allowNavigationAdvance === true,
       )
     ) {
       throw staleSurfaceError("browser_surface_stale");
@@ -848,8 +864,9 @@ export class BrowserSurfaceManager {
     method: string,
     params: Record<string, unknown> = {},
     sessionId?: string,
-    options: { allowNavigationAdvance?: boolean } = {},
+    options: { allowNavigationAdvance?: boolean; signal?: AbortSignal } = {},
   ): Promise<unknown> {
+    throwIfAborted(options.signal);
     if (!ALLOWED_WORKER_CDP_METHODS.has(method)) {
       throw new Error(`browser_cdp_method_denied:${method}`);
     }
@@ -860,18 +877,18 @@ export class BrowserSurfaceManager {
     // 并把本来已经成功的点击错误收敛为 browser_host_disconnected。
     const isDialogCommand = method === "Page.handleJavaScriptDialog";
     if (!isDialogCommand) {
-      await this.waitForDebugger(record);
+      await withOptionalAbort(this.waitForDebugger(record), options.signal);
     } else if (!record.contents.debugger.isAttached()) {
-      await this.waitForDebugger(record);
+      await withOptionalAbort(this.waitForDebugger(record), options.signal);
     }
     // 输入事件属于一个完整的用户动作。Enter、点击或输入事件可能在
     // keyDown/mousePressed 之后立即推进 navigation_revision；后续的
     // keyUp/mouseReleased 仍然必须送到同一个 WebContents，而不是被页面
     // 自身导航误判成 Surface 已失效。Surface/Tab/桌面代次仍由上面的
     // 完整身份校验严格保护。
-    const contents = this.recordForBinding(binding, {
-      allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
-    });
+    // 命令真正进入 Surface lane 前必须严格绑定发起时的文档。允许导航
+    // 代次前进只适用于命令完成后的结果校验，不能让旧命令迟到后进入新文档。
+    const contents = this.recordForBinding(binding);
     if (sessionId && !record.cdpSessionIds.has(sessionId)) {
       throw staleSurfaceError("browser_cdp_session_stale");
     }
@@ -884,8 +901,8 @@ export class BrowserSurfaceManager {
     if (!contents.debugger.isAttached()) {
       throw staleSurfaceError("browser_debugger_detached");
     }
-    await this.waitForViewportCommit(record);
-    this.assertRenderableBinding(binding, options);
+    await withOptionalAbort(this.waitForViewportCommit(record), options.signal);
+    this.assertRenderableBinding(binding);
     if (isDialogCommand) {
       try {
         const lease = this.createDebuggerSessionLease(record, sessionId);
@@ -895,11 +912,16 @@ export class BrowserSurfaceManager {
           params,
           DEFAULT_CDP_COMMAND_TIMEOUT_MS,
           lease,
+          undefined,
+          options.signal,
         );
         this.assertRenderableBinding(binding, options);
         return result;
       } catch (error) {
         if (isCdpTimeoutError(error)) this.invalidateDebuggerSession(record, "cdp-timeout");
+        if (isBrowserCommandCancelledError(error)) {
+          this.invalidateDebuggerSession(record, "command-cancelled");
+        }
         throw error;
       }
     }
@@ -909,7 +931,7 @@ export class BrowserSurfaceManager {
       // 页面坐标语义。宿主不再参与截图坐标换算，也不再建立 native
       // capturePage 旁路；等待页面和视口状态稳定后，统一进入同一个 CDP
       // lane，与其他页面命令按 Surface 串行执行。
-      await this.waitForScreenshotReadiness(record);
+      await withOptionalAbort(this.waitForScreenshotReadiness(record), options.signal);
       this.assertRenderableBinding(binding);
     }
     const injectsInput = method.startsWith("Input.");
@@ -933,9 +955,9 @@ export class BrowserSurfaceManager {
           // CDP 请求在 lane 中等待期间页面可能已发生导航。重新校验把
           // 普通 DOM/调试命令限制在原文档；只有输入事件允许完成同一动作的
           // keyUp/mouseUp 收尾，避免旧命令迟到后作用于新页面。
-          this.recordForBinding(binding, {
-            allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
-          });
+          // 与 lane 外的校验保持一致：排队期间文档已经换代时，旧命令必须
+          // 失败并交给上层使用新的 binding 重试，不能把旧 DOM 操作投递到新页。
+          this.recordForBinding(binding);
           const command = this.sendSurfaceCdpCommand(
             record,
             method,
@@ -943,6 +965,7 @@ export class BrowserSurfaceManager {
             method === "Page.captureScreenshot" ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
             this.createDebuggerSessionLease(record, sessionId),
             track,
+            options.signal,
           );
           if (injectsInput) {
             // native dialog 会阻塞 Input.* 的 CDP response。让输入调用先以
@@ -963,7 +986,7 @@ export class BrowserSurfaceManager {
         } finally {
           nativeDialogOpening?.cancel();
         }
-      });
+      }, options.signal);
       const result = await inputCommand;
       this.assertRenderableBinding(binding, {
         allowNavigationAdvance: options.allowNavigationAdvance === true || method.startsWith("Input."),
@@ -1001,13 +1024,17 @@ export class BrowserSurfaceManager {
   private enqueueCdp<T>(
     record: BrowserSurfaceRecord,
     operation: (context: SurfaceLaneContext) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
     const previous = record.cdpLane;
     const lifecycleEpoch = record.lifecycleEpoch;
     const tracked: Promise<unknown>[] = [];
-    const run = previous.catch(() => undefined).then(async () => {
+    let operationStarted = false;
+    const lane = previous.catch(() => undefined).then(async () => {
       this.assertSurfaceLifecycleCurrent(record, lifecycleEpoch);
+      throwIfAborted(signal);
       try {
+        operationStarted = true;
         return await operation({
           track: (promise) => tracked.push(promise),
           assertCurrent: () => this.assertSurfaceLifecycleCurrent(record, lifecycleEpoch),
@@ -1020,9 +1047,17 @@ export class BrowserSurfaceManager {
           // 的响应会继续污染同一 Surface 的后续命令队列。
           this.invalidateDebuggerSession(record, "cdp-timeout");
         }
+        if (operationStarted && isBrowserCommandCancelledError(error)) {
+          // Electron 的 debugger.sendCommand 没有取消句柄。取消已经发给
+          // Main 的 CDP 请求时，直接废弃当前 debugger session，让迟到的
+          // Chromium Promise 只能落在旧 lease 上；Surface lane 则立即释放
+          // 给后续导航/刷新，不再等待旧请求的 30 秒超时。
+          this.invalidateDebuggerSession(record, "command-cancelled");
+        }
         throw error;
       }
     });
+    const run = withOptionalAbort(lane, signal);
     const settled = run.then(
       async () => { await Promise.allSettled(tracked); },
       async () => { await Promise.allSettled(tracked); },
@@ -1055,6 +1090,7 @@ export class BrowserSurfaceManager {
     timeoutMs: number,
     lease: DebuggerSessionLease,
     track?: (promise: Promise<unknown>) => void,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     // lease 同时绑定 debugger generation 和 CDP 子 session。超时后即使
     // Electron 的旧 sendCommand Promise 迟到，也只能在这里被丢弃，不能把
@@ -1063,10 +1099,11 @@ export class BrowserSurfaceManager {
     const result = await sendCdpCommandWithTimeout(
       record.contents,
       method,
-      params,
+      constrainCdpCommandParams(method, params),
       timeoutMs,
       lease.sessionId,
       track,
+      signal,
     );
     lease.assertCurrent();
     return result;
@@ -1115,7 +1152,7 @@ export class BrowserSurfaceManager {
         if (commit.state === "invalidated" || commit.state === "superseded") continue;
         throw error;
       }
-      if (this.isViewportCommitInputCurrent(record, commit) && commit.state === "compositor-ready") return;
+      if (this.isViewportCommitInputCurrent(record, commit) && commit.state === "ready") return;
     }
     throw staleSurfaceError("browser_surface_lifecycle_stale");
   }
@@ -1150,7 +1187,7 @@ export class BrowserSurfaceManager {
       || current?.debuggerSessionGeneration === record.debuggerSessionGeneration;
     if (
       current
-      && ["requested", "applying", "compositor-ready"].includes(current.state)
+      && ["requested", "applying", "ready"].includes(current.state)
       && current.navigationGeneration === record.navigationGeneration
       && debuggerGenerationMatches
       && sameBounds(current.bounds, bounds)
@@ -1217,8 +1254,12 @@ export class BrowserSurfaceManager {
           track,
         ));
         if (!this.isViewportCommitInputCurrent(record, commit)) continue;
-        commit.state = "compositor-ready";
-        await this.waitForCompositorFrame(record, commit);
+        // `applyViewport` 已通过同一条 Surface CDP lane 完成，且此提交只
+        // 在主文档完成加载后执行。这里直接把原生 WebContentsView 标为可用。
+        // 不再调用 executeJavaScript 等待 RAF：RAF 只证明页面脚本调度，不能
+        // 证明 WebContentsView 的宿主合成，而且在真实桌面窗口的可见/焦点
+        // 状态切换时可能永不返回，曾导致截图和标记被无故阻塞 5 秒。
+        commit.state = "ready";
         if (!this.isViewportCommitInputCurrent(record, commit)) continue;
         commit.resolve();
         this.#onContentSlotReady?.(this.binding(record));
@@ -1233,31 +1274,6 @@ export class BrowserSurfaceManager {
         commit.reject(toError(error));
         return;
       }
-    }
-  }
-
-  private async waitForCompositorFrame(
-    record: BrowserSurfaceRecord,
-    commit: ViewportCommit,
-  ): Promise<void> {
-    if (!this.isViewportCommitInputCurrent(record, commit)) {
-      throw staleSurfaceError("browser_viewport_commit_stale");
-    }
-    // WebContentsView 没有稳定公开的 compositor frame 事件。双 RAF 是
-    // Chromium renderer 可验证的 frame barrier：第一帧完成布局，第二帧
-    // 在中间一次合成之后确认当前文档仍能绘制。它不截图、不变换坐标，
-    // 只等待真实原生 View 自己的渲染链路。
-    const frame = record.contents.executeJavaScript(
-      "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))",
-      true,
-    );
-    await withAbortSignal(
-      withTimeout(frame, SCREENSHOT_READINESS_TIMEOUT_MS, "browser_compositor_ready"),
-      commit.abort.signal,
-      staleSurfaceError("browser_viewport_commit_stale"),
-    );
-    if (!this.isViewportCommitInputCurrent(record, commit)) {
-      throw staleSurfaceError("browser_viewport_commit_stale");
     }
   }
 
@@ -1372,7 +1388,11 @@ export class BrowserSurfaceManager {
         );
         break;
     }
-    const finalRecord = this.assertRenderableBinding(binding);
+    // URL/back/forward/reload 都会在导航事务开始时推进 navigation_revision。
+    // 物理 Surface 身份仍必须严格匹配，但完成结果应读取同一 WebContents
+    // 的新文档代次；继续用旧 binding 做严格 revision 相等校验会把已完成
+    // 的真实导航错误收敛成 browser_surface_stale。
+    const finalRecord = this.assertRenderableBinding(binding, { allowNavigationAdvance: true });
     return this.pageState(finalRecord);
   }
 
@@ -1745,7 +1765,6 @@ export class BrowserSurfaceManager {
     url: string,
     timeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS,
     handleBeforeUnload?: "accept" | "dismiss",
-    track?: (promise: Promise<unknown>) => void,
     request?: () => Promise<void>,
   ): Promise<void> {
     if (record.closed || record.contents.isDestroyed()) {
@@ -1758,25 +1777,30 @@ export class BrowserSurfaceManager {
     if (allowBeforeUnload) record.contents.on("will-prevent-unload", allowBeforeUnload);
     try {
       const loadPromise = request ? request() : record.contents.loadURL(url);
-      track?.(loadPromise);
+      // Electron 的 loadURL Promise 与 WebContents 导航事件不是同一个
+      // 生命周期：部分版本会在 did-finish-load 之后才结算，另一些页面则
+      // 只可靠地发出 did-stop-loading。它只能作为无事件导航的完成信号，
+      // 不能和 navigationWait 一起放进 Promise.all，否则任一信号迟到都会
+      // 把已可操作的页面和 Host 请求一起拖到超时。
+      void loadPromise.then(() => {
+        if (!this.isCurrentNavigationOperation(record, operation) || operation.settled) return;
+        const settledUrl = record.contents.getURL() || url;
+        if (!sameNavigationUrl(settledUrl, url)) return;
+        this.completeNavigationFromSettledEvent(
+          record,
+          operation,
+          settledUrl,
+          this.nextNavigationEventSequence(record),
+        );
+      }, () => {
+        // 失败详情由 did-fail-load 统一收口；这里消费 Promise rejection，
+        // 避免 Electron 对网络错误或被替换导航产生未处理拒绝。
+      });
       const navigationWait = this.waitForNavigationOperation(record, operation, timeoutMs);
-      await this.withSurfaceLifecycle(record, withNavigationTimeout(Promise.all([
-        loadPromise.then(() => {
-          // Electron 的 loadURL Promise 在部分版本会先于 did-start/
-          // did-finish 事件完成，about:blank 还可能省略 start 事件。它是
-          // 当前 request 的唯一完成信号时，用当前 URL 收敛操作，避免
-          // debugger 永久等待一个永远不会再来的 renderer 事件。
-          if (this.isCurrentNavigationOperation(record, operation) && !operation.settled) {
-            this.completeNavigationFromSettledEvent(
-              record,
-              operation,
-              record.contents.getURL() || url,
-              this.nextNavigationEventSequence(record),
-            );
-          }
-        }),
-        navigationWait,
-      ]), clampNavigationTimeout(timeoutMs)));
+      await this.withSurfaceLifecycle(
+        record,
+        withNavigationTimeout(navigationWait, clampNavigationTimeout(timeoutMs)),
+      );
       if (!this.isCurrentNavigationOperation(record, operation) || !operation.completed) {
         throw staleSurfaceError("browser_navigation_superseded");
       }
@@ -1792,7 +1816,8 @@ export class BrowserSurfaceManager {
     if (!this.isCurrentNavigationOperation(record, operation) || !operation.completed) {
       throw staleSurfaceError("browser_navigation_superseded");
     }
-    await this.installDialogBridgeInCurrentDocument(record);
+    // did-finish-load 已经负责在新文档中安装桥接。导航完成不能再等待
+    // 这条非关键的 CDP lane，否则导航本身会被旧的 Overlay/调试命令拖住。
   }
 
   private startLoad(record: BrowserSurfaceRecord, url: string): Promise<void> {
@@ -1882,6 +1907,9 @@ export class BrowserSurfaceManager {
     if (previous && !previous.settled) {
       this.supersedeNavigationOperation(previous);
     }
+    // 每个真实导航事务都必须获得新的文档代次。快照、DOM 节点和标记
+    // 只能绑定到当前代次，不能因为地址变化而继续复用旧页面身份。
+    record.navigationRevision += 1;
     const id = ++record.navigationOperationId;
     const operation: NavigationOperation = {
       id,
@@ -2012,6 +2040,10 @@ export class BrowserSurfaceManager {
     operation.completed = true;
     operation.settled = true;
     record.priming = false;
+    // 页面文档生命周期与 viewport commit 相互独立。标记投影必须在
+    // 主文档事务真正完成后重新触发，不能只依赖某一次物理内容槽提交，
+    // 否则刷新时 Worker 可能在新 isolated world 建立前错过唯一投影机会。
+    this.#onDocumentReady?.(this.binding(record));
     this.applySlot(
       record,
       record.slotVisible ? record.slotBounds : null,
@@ -2183,7 +2215,6 @@ export class BrowserSurfaceManager {
       record,
       url,
       DEFAULT_NAVIGATION_TIMEOUT_MS,
-      undefined,
       undefined,
       () => record.contents.loadURL(url, {
         httpReferrer: details.referrer,
@@ -2746,27 +2777,40 @@ export class BrowserSurfaceManager {
 
   private installSurfacePolicy(record: BrowserSurfaceRecord): void {
     const { contents: webContents } = record;
+    // 页面中的 webview element 是另一种 guest WebContents 创建入口。即使
+    // webviewTag 默认关闭，也在生命周期层明确拒绝，保证单页单 Target
+    // 不依赖 Electron 的默认值。
+    webContents.on("will-attach-webview", (event) => {
+      event.preventDefault();
+      console.warn("[BrowserSurfaceManager] 拒绝浏览器页面嵌套 WebView", {
+        tabId: record.tabId,
+        surfaceId: record.surfaceId,
+      });
+    });
     webContents.setWindowOpenHandler((details) => {
+      // 这是 Chromium 创建新 WebContents 前的唯一边界。右栏 Browser Tab
+      // 只有一个顶层页面：合法的网页弹窗请求转成当前页导航，禁止创建
+      // 第二个 WebContents、BrowserWindow 或 Magi 子 Tab。
       try {
-        const url = normalizeNavigableUrl(details.url);
-        void this.loadPopupInCurrentPage(record, url, details).catch(() => {
+        const url = normalizePopupNavigationUrl(details.url);
+        void this.loadPopupInCurrentPage(record, url, details).catch((error) => {
           if (!record.closed) {
-            this.#onEvent({
-              type: "popup_blocked",
-              binding: this.binding(record),
-              url: details.url,
+            console.warn("[BrowserSurfaceManager] 当前 Browser Tab 接管 popup 导航失败", {
+              tabId: record.tabId,
+              surfaceId: record.surfaceId,
+              url,
+              error: error instanceof Error ? error.message : String(error),
             });
           }
         });
-        return { action: "deny" };
       } catch {
-        // 统一走 popup_blocked 事件，不创建第二个 Target。
+        // about:blank、脚本协议和其他不受信任的 popup 不能转移到当前页。
+        this.#onEvent({
+          type: "popup_blocked",
+          binding: this.binding(record),
+          url: details.url,
+        });
       }
-      this.#onEvent({
-        type: "popup_blocked",
-        binding: this.binding(record),
-        url: details.url,
-      });
       return { action: "deny" };
     });
     webContents.on("will-navigate", (event, url) => {
@@ -2816,7 +2860,14 @@ export class BrowserSurfaceManager {
         phase: "start-loading",
       });
       if (!claim) return;
+      // Chromium 不保证 reload/history 一定先发 did-start-navigation。
+      // did-start-loading 本身已经是当前事务的启动证据：记录它可以让
+      // 后续 did-frame-finish-load/did-finish-load 正常收敛，而不把工具链
+      // 永久阻塞到导航超时。保留 awaitingStart 让迟到的
+      // did-start-navigation 仍能复用同一个事务，而不是再创建一代。
+      claim.operation.started = true;
       claim.operation.loadingStarted = true;
+      claim.operation.startEventSequence ??= claim.sequence;
     });
     webContents.on("did-frame-navigate", (_event, url, _httpResponseCode, _httpStatusText, isMainFrame, frameProcessId, frameRoutingId) => {
       if (!isMainFrame) return;
@@ -3187,12 +3238,26 @@ export class BrowserSurfaceManager {
           message: eventParams.message ?? null,
         });
       }
+      // Lighthouse 需要接收 iframe/OOPIF/Worker 等内部 Target 的 CDP 会话，
+      // 但页面型 Target 只能代表 popup/子窗口。它们不属于右栏一级 Browser
+      // Tab，不能进入 Worker 的 child session，也不能让任何旁路把它误显示
+      // 成子 Tab。收到附着事件后立即从当前根 Target detach，并丢弃该会话
+      // 的后续事件；这条边界位于 Electron Main，是 Renderer/Worker 之前的
+      // 唯一物理入口。
       if (method === "Target.attachedToTarget" && typeof eventParams.sessionId === "string") {
+        const targetInfo = eventParams.targetInfo;
+        if (isForbiddenChildPageTarget(targetInfo)) {
+          record.blockedCdpSessionIds.add(eventParams.sessionId);
+          void this.detachCdpTarget(record, eventParams.sessionId);
+          return;
+        }
         record.cdpSessionIds.add(eventParams.sessionId);
       }
       if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
+        if (record.blockedCdpSessionIds.delete(eventParams.sessionId)) return;
         record.cdpSessionIds.delete(eventParams.sessionId);
       }
+      if (sessionId && record.blockedCdpSessionIds.has(sessionId)) return;
       this.#onEvent({
         type: "cdp_event",
         binding: this.binding(record),
@@ -3229,6 +3294,22 @@ export class BrowserSurfaceManager {
     record.debuggerMessageListener = messageListener;
     record.debuggerDetachListener = detachListener;
     record.debuggerListenersInstalled = true;
+  }
+
+  private async detachCdpTarget(record: BrowserSurfaceRecord, sessionId: string): Promise<void> {
+    if (record.closed || record.contents.isDestroyed() || !record.contents.debugger.isAttached()) return;
+    try {
+      await record.contents.debugger.sendCommand("Target.detachFromTarget", { sessionId });
+    } catch (error) {
+      // 拒绝动作已经在 attached 事件边界完成；Target 可能在 detach 前自行
+      // 消失，因此这里只记录诊断，不把失败传播为当前一级 Tab 的故障。
+      console.warn("[BrowserSurfaceManager] 拒绝页面型子 Target 时目标已消失", {
+        tabId: record.tabId,
+        surfaceId: record.surfaceId,
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private removeDebuggerListeners(record: BrowserSurfaceRecord): void {
@@ -3289,6 +3370,7 @@ export class BrowserSurfaceManager {
     record.nativeDialogOpeningWaiters.clear();
     record.inspectResourcesEnabled = false;
     record.cdpSessionIds.clear();
+    record.blockedCdpSessionIds.clear();
     record.cursorExecutionContextId = null;
     record.viewportLifecycle.applied = null;
   }
@@ -3856,6 +3938,12 @@ function normalizeNavigableUrl(value: string): string {
   return url.href;
 }
 
+function normalizePopupNavigationUrl(value: string): string {
+  const url = normalizeNavigableUrl(value);
+  if (url === "about:blank") throw new Error("browser_popup_about_blank_rejected");
+  return url;
+}
+
 function safeOrigin(value: string): string | null {
   try {
     const url = new URL(value);
@@ -3930,6 +4018,34 @@ function frameIdentity(value: unknown): NavigationFrameIdentity | null {
   return {
     processId: frame.processId as number,
     routingId: frame.routingId as number,
+  };
+}
+
+function isForbiddenChildPageTarget(value: unknown): boolean {
+  // 这个函数只处理 `Target.attachedToTarget` 报告的关联 Target；当前
+  // Browser Tab 的根 WebContents 不会以该事件作为自己的子 session 到达。
+  // 协议共享的 allow-list 让 page、webview 和未知/缺失类型全部 fail-closed，
+  // 只保留 iframe/OOPIF/Worker 这类页面内部 Target。
+  return !isAllowedBrowserChildTarget(value);
+}
+
+function constrainCdpCommandParams(method: string, params: Record<string, unknown>): Record<string, unknown> {
+  if (method !== "Target.setAutoAttach" || params.autoAttach !== true) return params;
+  // Lighthouse 需要 iframe/OOPIF/worker 的 CDP session，但一级 Browser Tab
+  // 不允许任何页面型子 Target。由 Main 在唯一 CDP 出口覆盖 Worker 传入的
+  // filter，避免某个调用方遗漏过滤条件后重新打开 popup Target 旁路。
+  return {
+    ...params,
+    flatten: true,
+    waitForDebuggerOnStart: false,
+    // 空过滤项会重新匹配所有 Target，抵消 page 排除规则。显式列出
+    // 页面内部资源类型，才能从 CDP 源头杜绝页面型 popup 子 Target。
+    filter: [
+      { type: "iframe" },
+      { type: "worker" },
+      { type: "service_worker" },
+      { type: "shared_worker" },
+    ],
   };
 }
 
@@ -4016,6 +4132,7 @@ async function sendCdpCommandWithTimeout(
   timeoutMs: number,
   sessionId?: string,
   track?: (promise: Promise<unknown>) => void,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const startedAt = performance.now();
   let command: Promise<unknown>;
@@ -4028,9 +4145,10 @@ async function sendCdpCommandWithTimeout(
   // 解绑或某些截图参数不被当前宿主接受时，sendCommand 可能永远不结算；
   // 如果 lane 继续等待它，单次超时就会永久阻塞后续快照、输入和标记。
   const timed = withTimeout(command, timeoutMs, method);
-  track?.(timed.then(() => undefined, () => undefined));
+  const settled = withOptionalAbort(timed, signal);
+  track?.(settled.then(() => undefined, () => undefined));
   try {
-    const result = await timed;
+    const result = await settled;
     if (method === "Page.handleJavaScriptDialog" || method === "Input.dispatchMouseEvent") {
       console.info("[BrowserSurfaceManager] CDP command settled", {
         method,
@@ -4071,6 +4189,10 @@ function isCdpTimeoutError(value: unknown): boolean {
   return value instanceof Error && value.name === "BrowserCdpTimeout";
 }
 
+function isBrowserCommandCancelledError(value: unknown): boolean {
+  return value instanceof Error && value.message === "browser_command_cancelled";
+}
+
 function withAbortSignal<T>(
   promise: Promise<T>,
   signal: AbortSignal,
@@ -4093,6 +4215,16 @@ function withAbortSignal<T>(
       (error) => settle(() => reject(error)),
     );
   });
+}
+
+function withOptionalAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  return signal
+    ? withAbortSignal(promise, signal, new Error("browser_command_cancelled"))
+    : promise;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("browser_command_cancelled");
 }
 
 function clampNavigationTimeout(value: number | undefined): number {

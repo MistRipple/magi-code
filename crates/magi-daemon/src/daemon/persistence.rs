@@ -203,6 +203,117 @@ impl StateRepository {
         self.save_session_projection_parts(durable, sidecars, &workspace_roots, true)
     }
 
+    /// 持久化导航状态时只提交当前指针，以及缺失的目标会话 projection。
+    ///
+    /// 导航不改变任何会话事实，因此不能为了保存一个指针重新遍历、重放并序列化
+    /// 全部历史会话。新建 materialized session 没有 projection 时才在这里补写该
+    /// 单个会话；已有 projection 则保持原文件不动。
+    pub(crate) fn save_session_navigation_state(
+        &self,
+        durable: &SessionDurableState,
+        sidecars: &SessionExecutionSidecarStoreState,
+        target_session_id: Option<&SessionId>,
+    ) -> Result<(), DaemonError> {
+        let workspace_roots = self.workspace_projection_roots()?;
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        let mut cache = self
+            .session_projection_cache
+            .lock()
+            .expect("session projection cache lock poisoned");
+        let mut event_cache = self
+            .session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned");
+        let mut next_cache = cache.clone();
+        let mut next_event_cache = event_cache.clone();
+        let mut writes = Vec::new();
+
+        match (durable.current_session_id.as_ref(), target_session_id) {
+            (Some(current), Some(target)) if current != target => {
+                return Err(DaemonError::internal(format!(
+                    "导航目标与 current session 不一致: {target} != {current}"
+                )));
+            }
+            (Some(current), None) => {
+                return Err(DaemonError::internal(format!(
+                    "草稿导航仍保留 current session 指针: {current}"
+                )));
+            }
+            _ => {}
+        }
+
+        if let Some(session_id) = target_session_id {
+            let target = durable.durable_state_for_session(session_id);
+            let session = target.sessions.first().ok_or_else(|| {
+                DaemonError::internal(format!(
+                    "导航目标 session 不存在，拒绝写入 current 指针: {session_id}"
+                ))
+            })?;
+            let path = self.session_projection_path(
+                session_id,
+                session.workspace_id.as_deref(),
+                &workspace_roots,
+            );
+            if !path.exists() {
+                let sidecar = sidecars
+                    .runtime_sidecars
+                    .iter()
+                    .find(|sidecar| sidecar.session_id == *session_id)
+                    .cloned();
+                let (path, content) = self.build_session_projection_content(
+                    &target,
+                    sidecar,
+                    &workspace_roots,
+                    session_id,
+                    &mut next_event_cache,
+                )?;
+                writes.push(SessionProjectionWrite {
+                    path: path.clone(),
+                    content: content.clone(),
+                });
+                next_cache
+                    .snapshots
+                    .insert(session_id.clone(), (path, content));
+            }
+        }
+
+        let current_path = self.state_root.join("session-current.json");
+        let current_content = serde_json::to_vec_pretty(&durable.current_session_id)
+            .map_err(DaemonError::from)
+            .and_then(|content| {
+                String::from_utf8(content).map_err(|error| {
+                    DaemonError::internal(format!("session current state 不是 UTF-8: {error}"))
+                })
+            })?;
+        if next_cache
+            .global
+            .as_ref()
+            .map(|(_, previous)| previous != &current_content)
+            .unwrap_or(true)
+        {
+            writes.push(SessionProjectionWrite {
+                path: current_path.clone(),
+                content: current_content.clone(),
+            });
+        }
+        next_cache.global = Some((current_path, current_content));
+
+        let transaction = SessionProjectionTransaction {
+            schema_version: SESSION_PROJECTION_TRANSACTION_SCHEMA_VERSION,
+            transaction_id: format!("session-navigation-{}", magi_core::UtcMillis::now().0),
+            writes,
+            removals: Vec::new(),
+        };
+        self.commit_session_projection_transaction_locked(&transaction, &workspace_roots)?;
+        self.ensure_state_layout_marker_locked()?;
+        *cache = next_cache;
+        *event_cache = next_event_cache;
+        Ok(())
+    }
+
     /// v1 -> v2 converter 的唯一事件初始化入口。正常 v2 checkpoint 禁止调用。
     fn initialize_session_events(&self, durable: &SessionDurableState) -> Result<(), DaemonError> {
         let mut turns_by_session = HashMap::<SessionId, Vec<_>>::new();
@@ -934,7 +1045,7 @@ impl StateRepository {
             notifications.extend(
                 meta.notifications
                     .into_iter()
-                    .map(|notification| serde_json::to_value(notification))
+                    .map(serde_json::to_value)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(DaemonError::from)?,
             );
@@ -1810,6 +1921,52 @@ impl StateRepository {
         Ok(())
     }
 
+    fn build_session_projection_content(
+        &self,
+        durable: &SessionDurableState,
+        sidecar: Option<SessionRuntimeSidecar>,
+        workspace_roots: &HashMap<String, PathBuf>,
+        session_id: &SessionId,
+        event_cache: &mut HashMap<SessionId, SessionConversationProjection>,
+    ) -> Result<(PathBuf, String), DaemonError> {
+        let path = self.session_projection_path(
+            session_id,
+            durable
+                .sessions
+                .first()
+                .and_then(|session| session.workspace_id.as_deref()),
+            workspace_roots,
+        );
+        let mut next_durable = durable.clone();
+        let event_root = self.session_event_root(session_id);
+        let event_projection = match event_cache.get(session_id) {
+            Some(projection) => projection.clone(),
+            None => SessionConversationProjection::load(&event_root, session_id)?,
+        };
+        let memory_canonical =
+            serde_json::to_value(&next_durable.canonical_turns).map_err(DaemonError::from)?;
+        let authoritative =
+            serde_json::to_value(event_projection.canonical_turns()).map_err(DaemonError::from)?;
+        if memory_canonical != authoritative {
+            return Err(DaemonError::internal(format!(
+                "session projection 不能反向生成 canonical 事实: {session_id}"
+            )));
+        }
+        next_durable.canonical_turns = event_projection.canonical_turns().to_vec();
+        let snapshot = SessionProjectionSnapshot {
+            canonical_event_seq: event_projection.last_event_seq(),
+            durable: next_durable,
+            sidecar,
+        };
+        Self::validate_session_projection(&snapshot, &path)?;
+        let content = serde_json::to_vec_pretty(&snapshot).map_err(DaemonError::from)?;
+        let content = String::from_utf8(content).map_err(|error| {
+            DaemonError::internal(format!("session projection 不是 UTF-8: {error}"))
+        })?;
+        event_cache.insert(session_id.clone(), event_projection);
+        Ok((path, content))
+    }
+
     fn save_session_projection_parts(
         &self,
         durable: &SessionDurableState,
@@ -1883,34 +2040,15 @@ impl StateRepository {
                 .get(&session_id)
                 .filter(|(previous_path, _)| previous_path == &path)
                 .map(|(_, content)| content.clone());
-            let mut next_durable = durable.durable_state_for_session(&session_id);
-            let event_root = self.session_event_root(&session_id);
-            let event_projection = match next_event_cache.get(&session_id) {
-                Some(projection) => projection.clone(),
-                None => SessionConversationProjection::load(&event_root, &session_id)?,
-            };
-            let memory_canonical =
-                serde_json::to_value(&next_durable.canonical_turns).map_err(DaemonError::from)?;
-            let authoritative = serde_json::to_value(event_projection.canonical_turns())
-                .map_err(DaemonError::from)?;
-            if memory_canonical != authoritative {
-                return Err(DaemonError::internal(format!(
-                    "session projection 不能反向生成 canonical 事实: {session_id}"
-                )));
-            }
-            next_durable.canonical_turns = event_projection.canonical_turns().to_vec();
-            let canonical_event_seq = event_projection.last_event_seq();
-            next_event_cache.insert(session_id.clone(), event_projection);
-            let snapshot = SessionProjectionSnapshot {
-                canonical_event_seq,
-                durable: next_durable,
-                sidecar: sidecar_by_session.get(&session_id).cloned(),
-            };
-            Self::validate_session_projection(&snapshot, &path)?;
-            let content = serde_json::to_vec_pretty(&snapshot).map_err(DaemonError::from)?;
-            let content = String::from_utf8(content).map_err(|error| {
-                DaemonError::internal(format!("session projection 不是 UTF-8: {error}"))
-            })?;
+            let session_durable = durable.durable_state_for_session(&session_id);
+            let (built_path, content) = self.build_session_projection_content(
+                &session_durable,
+                sidecar_by_session.get(&session_id).cloned(),
+                workspace_roots,
+                &session_id,
+                &mut next_event_cache,
+            )?;
+            debug_assert_eq!(built_path, path);
             if previous.as_deref() != Some(content.as_str()) {
                 writes.push(SessionProjectionWrite {
                     path: path.clone(),
@@ -2187,14 +2325,14 @@ impl StateRepository {
         if reconciled {
             let mut legacy_journal = self.read_accepted_submission_journal_strict(&path)?;
             for record in &records {
-                if record.task_checkpointed {
-                    if let Some(legacy) = legacy_journal.records.iter_mut().find(|legacy| {
+                if record.task_checkpointed
+                    && let Some(legacy) = legacy_journal.records.iter_mut().find(|legacy| {
                         legacy.session.session.session_id == record.session.session.session_id
                             && legacy.session.canonical_turn.turn_id
                                 == record.session.canonical_turn.turn_id
-                    }) {
-                        legacy.task_checkpointed = true;
-                    }
+                    })
+                {
+                    legacy.task_checkpointed = true;
                 }
             }
             self.finish_accepted_submission_journal_locked(path, legacy_journal)?;
@@ -3449,6 +3587,86 @@ mod tests {
             .load_session_projections(&[])
             .expect("deleted session state should remain valid");
         assert!(restored.sessions.is_empty());
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn session_navigation_only_writes_pointer_and_missing_target_projection() {
+        let state_root = unique_temp_dir("magi-session-navigation-targeted");
+        let repository = StateRepository::new(state_root.clone());
+        let store = SessionStore::new();
+        let first_session_id = SessionId::new("session-navigation-first");
+        let second_session_id = SessionId::new("session-navigation-second");
+        store
+            .create_session(first_session_id.clone(), "first")
+            .expect("first session should create");
+        repository
+            .save_session_projection_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+            )
+            .expect("first session should persist");
+        let first_projection_path = state_root.join("session-projections").join(
+            StateRepository::session_projection_file_name(&first_session_id),
+        );
+        let first_projection_before =
+            fs::read(&first_projection_path).expect("first projection should exist");
+
+        store
+            .create_session(second_session_id.clone(), "second")
+            .expect("second session should create");
+        repository
+            .save_session_navigation_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+                Some(&second_session_id),
+            )
+            .expect("new target navigation should persist");
+        let second_projection_path = state_root.join("session-projections").join(
+            StateRepository::session_projection_file_name(&second_session_id),
+        );
+        assert!(second_projection_path.exists());
+        let second_projection_before =
+            fs::read(&second_projection_path).expect("second projection should exist");
+        assert_eq!(
+            fs::read(&first_projection_path).expect("first projection should remain readable"),
+            first_projection_before
+        );
+
+        store
+            .select_current_session(&first_session_id)
+            .expect("first session should select");
+        repository
+            .save_session_navigation_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+                Some(&first_session_id),
+            )
+            .expect("existing target navigation should persist");
+        assert_eq!(
+            fs::read(&second_projection_path).expect("second projection should remain readable"),
+            second_projection_before
+        );
+
+        store.clear_current_session();
+        repository
+            .save_session_navigation_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+                None,
+            )
+            .expect("draft navigation should persist");
+        let current: Option<SessionId> = serde_json::from_str(
+            &fs::read_to_string(state_root.join("session-current.json"))
+                .expect("current pointer should exist"),
+        )
+        .expect("current pointer should parse");
+        assert_eq!(current, None);
+        assert_eq!(
+            fs::read(&first_projection_path).expect("first projection should remain stable"),
+            first_projection_before
+        );
 
         let _ = fs::remove_dir_all(state_root);
     }

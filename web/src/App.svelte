@@ -22,10 +22,10 @@
   import {
     RUNTIME_CONNECTION_EVENT,
     BROWSER_AUTHORITY_CHANGED_EVENT,
-    getCurrentBrowserSession,
     isWebAgentMode,
     type AgentConnectionEventDetail,
   } from './web/agent-api';
+  import { synchronizeBrowserAuthority } from './web/browser-authority-coordinator';
 
   type TopTabType = 'thread' | 'edits' | 'knowledge';
 
@@ -37,8 +37,6 @@
   );
   const isWebMode = isWebAgentMode();
   const changeRefreshIntervalMs = 1000;
-  let browserAuthoritySyncRequest = 0;
-
   async function synchronizeCurrentBrowserAuthority(revealTabId = ''): Promise<void> {
     if (!messagesState.bootstrapped) return;
     const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
@@ -46,24 +44,22 @@
     const sessionId = messagesState.currentSessionId?.trim() || '';
     if (!isPersistedSessionId(sessionId)) return;
 
-    const request = ++browserAuthoritySyncRequest;
     try {
-      const snapshot = await getCurrentBrowserSession(workspaceId, sessionId, workspacePath);
-      if (
-        request !== browserAuthoritySyncRequest
-        || workspaceId !== (messagesState.currentWorkspaceId?.trim() || '')
-        || sessionId !== (messagesState.currentSessionId?.trim() || '')
-      ) {
-        return;
-      }
-      synchronizeBrowserTabs(workspaceId, workspacePath, sessionId, snapshot, {
-        revealTabId,
-        newTabLabel: i18n.t('browser.tab.new'),
-      });
+      await synchronizeBrowserAuthority(
+        { workspaceId, workspacePath, sessionId },
+        (snapshot) => {
+          if (
+            workspaceId !== (messagesState.currentWorkspaceId?.trim() || '')
+            || sessionId !== (messagesState.currentSessionId?.trim() || '')
+          ) return;
+          synchronizeBrowserTabs(workspaceId, workspacePath, sessionId, snapshot, {
+            revealTabId,
+            newTabLabel: i18n.t('browser.tab.new'),
+          });
+        },
+      );
     } catch (error) {
-      if (request === browserAuthoritySyncRequest) {
-        console.warn('[App] 同步浏览器权威状态失败:', error);
-      }
+      console.warn('[App] 同步浏览器权威状态失败:', error);
     }
   }
 

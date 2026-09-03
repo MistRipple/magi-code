@@ -1615,8 +1615,11 @@ async fn create_annotation(
             "标记内容不能为空且不能超过 4000 个字符".to_string(),
         ));
     }
+    // 用户接管可能需要中断当前 Session Turn。该异步操作必须在取得全局
+    // browser_control_lock 之前完成，否则会与 close_session 的
+    // session_turn_lock -> browser_control_lock 顺序形成反向等待。
+    ensure_user_control_for_ui(&state, &session, &tab_id).await?;
     let _control_guard = state.browser_control_lock.lock().await;
-    ensure_user_control_for_ui_locked(&state, &session, &tab_id).await?;
     // 获得控制锁后重新读取权威 Tab；请求等待期间可能已完成面板调整或导航。
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
     let (kind, navigation_revision, hit_x, hit_y, region) = match request.selection {
@@ -1938,8 +1941,8 @@ async fn update_annotation_status(
         .cloned()
         .ok_or_else(|| ApiError::not_found("浏览器标记不存在", annotation_id.as_str()))?;
     let (_tab, session) = browser_tab_scope(&state, &annotation.tab_id)?;
+    ensure_user_control_for_ui(&state, &session, &annotation.tab_id).await?;
     let _control_guard = state.browser_control_lock.lock().await;
-    ensure_user_control_for_ui_locked(&state, &session, &annotation.tab_id).await?;
     let updated = state.mutate_browser_authority(|authority| {
         authority.update_annotation_status(&annotation_id, request.status, UtcMillis::now())
     })?;
@@ -1978,8 +1981,8 @@ async fn update_annotation_comment(
         .cloned()
         .ok_or_else(|| ApiError::not_found("浏览器标记不存在", annotation_id.as_str()))?;
     let (_tab, session) = browser_tab_scope(&state, &annotation.tab_id)?;
+    ensure_user_control_for_ui(&state, &session, &annotation.tab_id).await?;
     let _control_guard = state.browser_control_lock.lock().await;
-    ensure_user_control_for_ui_locked(&state, &session, &annotation.tab_id).await?;
     let updated = state.mutate_browser_authority(|authority| {
         authority.update_annotation_comment(&annotation_id, comment, UtcMillis::now())
     })?;
@@ -2117,12 +2120,12 @@ async fn close_tab(
 ) -> Result<StatusCode, ApiError> {
     let tab_id = BrowserTabId::new(tab_id);
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
-    let _control_guard = state.browser_control_lock.lock().await;
     if state.browser_host_client().is_some()
-        && let Err(error) = ensure_user_control_for_ui_locked(&state, &session, &tab_id).await
+        && let Err(error) = ensure_user_control_for_ui(&state, &session, &tab_id).await
     {
         tracing::warn!(tab_id = %tab_id, ?error, "关闭浏览器 Tab 时同步用户控制权失败，继续收口逻辑状态");
     }
+    let _control_guard = state.browser_control_lock.lock().await;
     state.mutate_browser_authority(|authority| {
         authority.transition_tab(&tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
     })?;
@@ -2177,7 +2180,6 @@ async fn navigate_tab(
     require_desktop_browser_capability(&headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_, session) = browser_tab_scope(&state, &tab_id)?;
-    let _control_guard = state.browser_control_lock.lock().await;
     ensure_browser_ui_ready(&state, &session.session_id)?;
     let action = request.action.trim();
     let navigation = match action {
@@ -2210,9 +2212,10 @@ async fn navigate_tab(
             ));
         }
     };
-    let fence = ensure_user_control_for_ui_locked(&state, &session, &tab_id)
+    let fence = ensure_user_control_for_ui(&state, &session, &tab_id)
         .await?
         .fence;
+    let _control_guard = state.browser_control_lock.lock().await;
     let reply = require_host_success(
         require_browser_host(&state)?
             .request(BrowserHostCommand::Navigate {
@@ -2238,7 +2241,11 @@ async fn navigate_tab(
             UtcMillis::now(),
         )
     })?;
-    sync_browser_annotations_to_host(&state, &tab_id).await?;
+    // 导航请求已经在 Desktop Host 的 Tab 资源队列中占用当前资源。
+    // 此处不能重新发送同一 Tab 的标记投影并等待它完成，否则 Host 必须
+    // 先结算 navigate 才会执行 set_annotations，而当前请求又在等待后者，
+    // 形成跨进程的资源队列死锁。标记事实已经由 Authority 收敛；导航完成
+    // 后由 Host 的 page_updated/content-ready 事件按最新 Surface 重放。
     publish_browser_event(
         &state,
         "browser.tab.updated",
@@ -2470,25 +2477,31 @@ async fn sync_browser_annotations_to_host(
     Ok(())
 }
 
-async fn ensure_user_control_for_ui_locked(
+async fn ensure_user_control_for_ui(
     state: &ApiState,
     session: &BrowserSession,
     tab_id: &BrowserTabId,
 ) -> Result<BrowserSurfaceControlSnapshot, ApiError> {
     ensure_browser_ui_ready(state, &session.session_id)?;
-    let (control, revoked) = state.mutate_browser_authority(|authority| {
-        let surface_id = authority
-            .primary_surface(tab_id)
-            .map(|surface| surface.surface_id.clone())
-            .ok_or_else(|| {
-                magi_browser_authority::BrowserAuthorityError::PrimarySurfaceUnavailable(
-                    tab_id.clone(),
-                )
-            })?;
-        let (control, revoked) =
-            authority.take_user_control(tab_id, &surface_id, UtcMillis::now())?;
-        Ok((control, revoked))
-    })?;
+    // Authority 的短临界区与 Session/Host 的异步等待分开。这里不能由调用方
+    // 先持有 browser_control_lock 再进入 interrupt_session_turn，否则关闭
+    // 会话的固定顺序（session turn -> browser control）会与用户接管互锁。
+    let (control, revoked) = {
+        let _control_guard = state.browser_control_lock.lock().await;
+        state.mutate_browser_authority(|authority| {
+            let surface_id = authority
+                .primary_surface(tab_id)
+                .map(|surface| surface.surface_id.clone())
+                .ok_or_else(|| {
+                    magi_browser_authority::BrowserAuthorityError::PrimarySurfaceUnavailable(
+                        tab_id.clone(),
+                    )
+                })?;
+            let (control, revoked) =
+                authority.take_user_control(tab_id, &surface_id, UtcMillis::now())?;
+            Ok((control, revoked))
+        })?
+    };
     if !revoked.is_empty() {
         if let Err(error) = super::sessions::interrupt_session_turn_for_browser_takeover(
             state,
@@ -2504,6 +2517,7 @@ async fn ensure_user_control_for_ui_locked(
             );
         }
         if let Some(client) = state.browser_host_client() {
+            let _control_guard = state.browser_control_lock.lock().await;
             require_host_success(
                 client
                     .request(BrowserHostCommand::UpdateControl {

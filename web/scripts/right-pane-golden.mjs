@@ -28,6 +28,7 @@ await withGoldenViteServer(async (server) => {
     'session-restore-golden',
     {
       browserSessionId: 'browser-session-restore-golden',
+      revision: 1,
       agentOccupied: false,
       tabs: [{
         tabId: 'browser-tab-restore-golden',
@@ -42,6 +43,62 @@ await withGoldenViteServer(async (server) => {
   assert.equal(restoredPane.collapsed, false, '首次恢复权威 Browser Tab 必须展开右栏');
   assert.equal(restoredPane.openTabs.length, 1, '首次恢复权威 Browser Tab 必须投影到右栏');
   assert.equal(restoredPane.activeTabId, restoredPane.openTabs[0].id, '首次恢复必须激活权威 Browser Tab');
+
+  rightPane.synchronizeBrowserTabs(
+    'workspace-restore-golden',
+    '/tmp/workspace-restore-golden',
+    'session-restore-golden',
+    {
+      browserSessionId: 'browser-session-restore-golden',
+      revision: 3,
+      agentOccupied: false,
+      tabs: [{
+        tabId: 'browser-tab-restore-golden',
+        lifecycle: 'ready',
+        url: 'https://example.com/next',
+        title: 'Next',
+        navigationRevision: 2,
+      }],
+    },
+  );
+  assert.equal(
+    restoredPane.openTabs[0].payload.url,
+    'https://example.com/next',
+    '更新的 BrowserAuthority revision 必须更新页面地址',
+  );
+  rightPane.synchronizeBrowserTabs(
+    'workspace-restore-golden',
+    '/tmp/workspace-restore-golden',
+    'session-restore-golden',
+    {
+      browserSessionId: 'browser-session-restore-golden',
+      revision: 2,
+      agentOccupied: false,
+      tabs: [{
+        tabId: 'browser-tab-restore-golden',
+        lifecycle: 'ready',
+        url: 'https://example.com/stale',
+        title: 'Stale',
+        navigationRevision: 1,
+      }],
+    },
+  );
+  assert.equal(
+    restoredPane.openTabs[0].payload.url,
+    'https://example.com/next',
+    '迟到的旧 BrowserAuthority revision 不得覆盖当前页面',
+  );
+  rightPane.synchronizeBrowserTabs(
+    'workspace-restore-golden',
+    '/tmp/workspace-restore-golden',
+    'session-restore-golden',
+    null,
+  );
+  assert.equal(
+    restoredPane.openTabs.filter((tab) => tab.kind === 'browser').length,
+    0,
+    '空权威快照必须清理当前作用域的 Browser Tab 投影',
+  );
 
   const [rightPaneSource, browserPaneSource, appSource, modalSource, overlayContractSource,
     overlayShellSource, overlayManagerSource, windowManagerSource, surfaceManagerSource,

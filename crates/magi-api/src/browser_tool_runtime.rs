@@ -1344,6 +1344,7 @@ impl BrowserToolRuntimeDependencies {
         scope: BrowserToolCallScope<'_>,
         client: &BrowserHostClient,
     ) -> Result<String, BrowserToolError> {
+        validate_browser_tabs_arguments(arguments)?;
         let action = string_arg(arguments, "action")?;
         if action == "list" {
             let authority = self
@@ -1488,6 +1489,21 @@ impl BrowserToolRuntimeDependencies {
             )),
         }
     }
+}
+
+fn validate_browser_tabs_arguments(arguments: &Map<String, Value>) -> Result<(), BrowserToolError> {
+    if let Some(unknown) = arguments
+        .keys()
+        .find(|key| !matches!(key.as_str(), "action" | "tab_id" | "url"))
+    {
+        return Err(BrowserToolError::new(
+            "browser_nested_tab_unsupported",
+            format!(
+                "browser_tabs 只支持 Magi 右栏一级浏览器标签，不接受 {unknown}；网页 popup、window.open 和 target=_blank 会被阻止，不会创建子标签",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn browser_devtools_operation(tool_name: &str) -> Option<&'static str> {
@@ -2439,11 +2455,25 @@ mod tests {
     use super::{
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_requested_access,
         browser_tool_snapshot_value, normalize_screenshot_clip, optional_snapshot_target,
-        parse_normalized_rect, screenshot_has_element_scope, validate_devtools_arguments,
-        validate_screenshot_binary, validate_screenshot_scope,
+        parse_normalized_rect, screenshot_has_element_scope, validate_browser_tabs_arguments,
+        validate_devtools_arguments, validate_screenshot_binary, validate_screenshot_scope,
     };
     use crate::state::BrowserHostStatusSnapshot;
     use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
+
+    #[test]
+    fn browser_tabs_rejects_nested_tab_fields_at_runtime_boundary() {
+        let mut arguments = Map::new();
+        arguments.insert("action".to_string(), Value::String("new".to_string()));
+        arguments.insert(
+            "parent_tab_id".to_string(),
+            Value::String("tab-parent".to_string()),
+        );
+
+        let error = validate_browser_tabs_arguments(&arguments)
+            .expect_err("browser_tabs must reject a nested tab identity");
+        assert_eq!(error.code, "browser_nested_tab_unsupported");
+    }
 
     #[test]
     fn ensuring_browser_session_does_not_implicitly_create_page() {

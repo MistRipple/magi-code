@@ -135,8 +135,20 @@ pub type CanonicalEventNextSequenceProvider =
     Arc<dyn Fn(&SessionId) -> Result<u64, String> + Send + Sync>;
 /// 返回值表示回调是否已经把 durable session projection 一并写入。
 pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<bool, ApiError> + Send + Sync>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionProjectionPersistMode {
+    Full,
+    Navigation {
+        target_session_id: Option<SessionId>,
+    },
+}
+
 pub type SessionProjectionPersist = Arc<
-    dyn Fn(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<(), ApiError>
+    dyn Fn(
+            &SessionDurableState,
+            &SessionExecutionSidecarStoreState,
+            SessionProjectionPersistMode,
+        ) -> Result<(), ApiError>
         + Send
         + Sync,
 >;
@@ -559,20 +571,20 @@ impl RunnerManager {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     RunCycleOutcome::AllComplete => {
-                        if !checkpointed_this_cycle && let Some(ref persist) = bg_checkpoint_persist
+                        if !checkpointed_this_cycle
+                            && let Some(ref persist) = bg_checkpoint_persist
+                            && let Err(error) = persist(&bg_task_store.snapshot())
                         {
-                            if let Err(error) = persist(&bg_task_store.snapshot()) {
-                                fail_runner_for_checkpoint_error(
-                                    bg_handle.as_ref(),
-                                    bg_active.as_ref(),
-                                    &root_id,
-                                    &observer_session_id,
-                                    &observer_turn_id,
-                                    terminal_observer.as_ref(),
-                                    &error,
-                                );
-                                break;
-                            }
+                            fail_runner_for_checkpoint_error(
+                                bg_handle.as_ref(),
+                                bg_active.as_ref(),
+                                &root_id,
+                                &observer_session_id,
+                                &observer_turn_id,
+                                terminal_observer.as_ref(),
+                                &error,
+                            );
+                            break;
                         }
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "completed".to_string();
@@ -605,20 +617,20 @@ impl RunnerManager {
                                     "error"
                                 }
                             };
-                        if !checkpointed_this_cycle && let Some(ref persist) = bg_checkpoint_persist
+                        if !checkpointed_this_cycle
+                            && let Some(ref persist) = bg_checkpoint_persist
+                            && let Err(error) = persist(&bg_task_store.snapshot())
                         {
-                            if let Err(error) = persist(&bg_task_store.snapshot()) {
-                                fail_runner_for_checkpoint_error(
-                                    bg_handle.as_ref(),
-                                    bg_active.as_ref(),
-                                    &root_id,
-                                    &observer_session_id,
-                                    &observer_turn_id,
-                                    terminal_observer.as_ref(),
-                                    &error,
-                                );
-                                break;
-                            }
+                            fail_runner_for_checkpoint_error(
+                                bg_handle.as_ref(),
+                                bg_active.as_ref(),
+                                &root_id,
+                                &observer_session_id,
+                                &observer_turn_id,
+                                terminal_observer.as_ref(),
+                                &error,
+                            );
+                            break;
                         }
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = runner_status.to_string();
@@ -650,20 +662,20 @@ impl RunnerManager {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     RunCycleOutcome::Error(err) => {
-                        if !checkpointed_this_cycle && let Some(ref persist) = bg_checkpoint_persist
+                        if !checkpointed_this_cycle
+                            && let Some(ref persist) = bg_checkpoint_persist
+                            && let Err(error) = persist(&bg_task_store.snapshot())
                         {
-                            if let Err(error) = persist(&bg_task_store.snapshot()) {
-                                fail_runner_for_checkpoint_error(
-                                    bg_handle.as_ref(),
-                                    bg_active.as_ref(),
-                                    &root_id,
-                                    &observer_session_id,
-                                    &observer_turn_id,
-                                    terminal_observer.as_ref(),
-                                    &error,
-                                );
-                                break;
-                            }
+                            fail_runner_for_checkpoint_error(
+                                bg_handle.as_ref(),
+                                bg_active.as_ref(),
+                                &root_id,
+                                &observer_session_id,
+                                &observer_turn_id,
+                                terminal_observer.as_ref(),
+                                &error,
+                            );
+                            break;
                         }
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "error".to_string();
@@ -3455,7 +3467,9 @@ impl ApiState {
             return Ok(());
         };
         self.session_store
-            .persist_projection_with(|durable, sidecars| persist(durable, sidecars))
+            .persist_projection_with(|durable, sidecars| {
+                persist(durable, sidecars, SessionProjectionPersistMode::Full)
+            })
     }
 
     pub fn persist_session_projection_for_api(&self) -> Result<(), ApiError> {
@@ -3549,6 +3563,36 @@ impl ApiState {
         self.persist_session_projection_for_api()?;
         self.persist_workspace_durable_state_for_api()?;
         self.persist_knowledge_state_for_api()?;
+        Ok(())
+    }
+
+    /// 会话导航只改变当前会话指针和工作区选择。
+    ///
+    /// 导航处于全局串行锁内，不能把无关的 knowledge 快照同步写盘，否则
+    /// 本地知识库增长后，普通切换会话会被拖成一次长耗时请求。知识状态有
+    /// 独立的生命周期和持久化入口，不属于导航提交事务。
+    pub fn persist_session_navigation_state_for_api(
+        &self,
+        target_session_id: Option<SessionId>,
+    ) -> Result<(), ApiError> {
+        let Some(persist) = &self.session_projection_persist else {
+            self.persist_workspace_durable_state_for_api()?;
+            return Ok(());
+        };
+        self.session_store
+            .persist_projection_with(|durable, sidecars| {
+                persist(
+                    durable,
+                    sidecars,
+                    SessionProjectionPersistMode::Navigation {
+                        target_session_id: target_session_id.clone(),
+                    },
+                )
+            })
+            .map_err(|error| {
+                public_runtime_persistence_error("session", SESSION_PERSISTENCE_PUBLIC_ERROR, error)
+            })?;
+        self.persist_workspace_durable_state_for_api()?;
         Ok(())
     }
 
@@ -5706,7 +5750,7 @@ mod tests {
             state_root.join("workspaces.json"),
             state_root.join("knowledge.json"),
         )))
-        .with_session_projection_persist(Arc::new(move |durable, _sidecars| {
+        .with_session_projection_persist(Arc::new(move |durable, _sidecars, _mode| {
             let projection_dir = projection_state_root.join("session-projections");
             std::fs::create_dir_all(&projection_dir)
                 .map_err(|error| ApiError::internal_assembly("创建 projection 目录失败", error))?;
@@ -5776,7 +5820,7 @@ mod tests {
             workspace_store,
             governance,
         )
-        .with_session_projection_persist(Arc::new(move |durable, sidecars| {
+        .with_session_projection_persist(Arc::new(move |durable, sidecars, _mode| {
             observed_for_callback
                 .lock()
                 .expect("session projection observer lock should not poison")
@@ -5827,7 +5871,7 @@ mod tests {
             workspace_path,
             knowledge_path,
         )))
-        .with_session_projection_persist(Arc::new(|_durable, _sidecars| {
+        .with_session_projection_persist(Arc::new(|_durable, _sidecars, _mode| {
             Err(ApiError::internal_assembly(
                 "session projection 持久化失败",
                 "projection conflict",

@@ -682,7 +682,6 @@ pub(super) async fn finalize_session_task_dispatch(
             "session turn task dispatch failed"
         );
         fail_accepted_task_submission(&state, &accepted, error.message());
-        return;
     }
 }
 

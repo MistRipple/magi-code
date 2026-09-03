@@ -586,16 +586,13 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
         .or_else(|| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
     {
         Some(response) => Some(response),
-        None => match ensure_root_completion_final_item(
+        None => ensure_root_completion_final_item(
             session_store,
             session_id,
             &root_task,
             task_store,
             expected_turn_id,
-        ) {
-            Ok(response) => response,
-            Err(error) => return Err(error),
-        },
+        )?,
     };
     let event_item_id = response
         .as_ref()

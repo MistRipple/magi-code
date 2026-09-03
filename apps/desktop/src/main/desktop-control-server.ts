@@ -81,6 +81,14 @@ export class DesktopControlServer {
   // 用于 Chromium 文档导航或 Worker 重启后重放，不把标记状态写回 Desktop。
   readonly #annotationProjections = new Map<string, AnnotationProjection>();
   readonly #annotationProjectionLanes = new Map<string, Promise<void>>();
+  // 标记是页面上的最新状态同步，不是需要占用 Tab 资源直到完成的交互命令。
+  // 每个 Tab 只保留一个当前投影控制器；新状态或普通浏览器命令到来时，
+  // 旧投影立即失效，迟到的 Chromium 结果不能阻塞或覆盖当前页面。
+  readonly #annotationProjectionControllers = new Map<string, AbortController>();
+  readonly #appliedAnnotationProjections = new Map<string, {
+    revision: number;
+    bindingKey: string;
+  }>();
   #server: Server | null = null;
   #websocketServer: WebSocketServer | null = null;
   #client: WebSocket | null = null;
@@ -192,6 +200,7 @@ export class DesktopControlServer {
         break;
       case "page_updated":
         if (this.#surfaceManager.isPrimary(event.binding)) {
+          this.#appliedAnnotationProjections.delete(event.binding.tab_id);
           this.emit({
             type: "page_updated",
             payload: { binding: event.binding, page_state: event.page },
@@ -260,6 +269,12 @@ export class DesktopControlServer {
     }
   }
 
+  handleSurfaceDocumentReady(binding: BrowserSurfaceBinding): void {
+    if (this.#surfaceManager.isPrimary(binding)) {
+      this.scheduleAnnotationProjection(binding.tab_id);
+    }
+  }
+
   async close(): Promise<void> {
     return this.enqueueLifecycle(() => this.closeInternal());
   }
@@ -267,6 +282,8 @@ export class DesktopControlServer {
   private async closeInternal(): Promise<void> {
     if (this.#heartbeat) clearInterval(this.#heartbeat);
     this.#heartbeat = null;
+    for (const controller of this.#annotationProjectionControllers.values()) controller.abort();
+    this.#annotationProjectionControllers.clear();
     for (const connection of [...this.#connections]) {
       this.releaseConnection(connection);
       connection.websocket.terminate();
@@ -314,11 +331,12 @@ export class DesktopControlServer {
     });
   }
 
-  /** Worker 恢复后重放所有仍在当前 Primary Surface 上的标记投影。 */
+  /** Worker 恢复后调度所有仍在当前 Primary Surface 上的标记投影。 */
   async replayCachedAnnotations(): Promise<void> {
-    await Promise.allSettled(
-      [...this.#annotationProjections.keys()].map((tabId) => this.enqueueAnnotationProjection(tabId)),
-    );
+    // 标记重放属于最终一致性的 UI 同步，不能成为 Worker ready 或普通浏览器
+    // 命令的前置条件。具体投影失败会由 scheduleAnnotationProjection 记录，
+    // 下一次 Surface 生命周期事件仍可按 Authority 快照重试。
+    for (const tabId of this.#annotationProjections.keys()) this.scheduleAnnotationProjection(tabId);
   }
 
   private acceptClient(websocket: WebSocket): void {
@@ -597,8 +615,9 @@ export class DesktopControlServer {
     ]);
     if (result.kind === "cancelled") {
       this.sendEnvelope(connection, indeterminateResponse(request.request_id));
-      // The cancellation response is immediate, but the resource remains
-      // occupied until the underlying Worker/Main operation has settled.
+      // 普通命令的资源仍由底层操作持有，直到它真正收口。否则旧点击、输入
+      // 或导航尚未结束时，新连接会同时操作同一个 WebContents。只有标记
+      // 投影通过独立的最新状态链绕开这里，不会进入普通命令资源队列。
       await operation.catch(() => undefined);
       return;
     }
@@ -620,6 +639,13 @@ export class DesktopControlServer {
     outcome: BrowserCommandOutcome;
     binary?: Buffer;
   }> {
+    const tabId = commandTabId(command);
+    if (tabId && command.type !== "set_annotations") {
+      // 普通浏览器命令优先于页面标记重放。标记事实已经由 Authority
+      // 持久化，当前页面换代或用户开始操作时，旧投影没有继续占用资源的
+      // 价值；重新绑定后会按最新快照再次投影。
+      this.cancelAnnotationProjection(tabId);
+    }
     switch (command.type) {
       case "ping":
         return succeeded({ type: "pong", payload: { monotonic_millis: Math.floor(performance.now()) } });
@@ -681,7 +707,11 @@ export class DesktopControlServer {
       }
       case "set_annotations": {
         this.recordAnnotationProjection(command.payload.tab_id, command.payload.annotations);
-        return this.enqueueAnnotationProjection(command.payload.tab_id);
+        this.scheduleAnnotationProjection(command.payload.tab_id);
+        // set_annotations 的成功语义是 Desktop 已接受最新 Authority 快照。
+        // 页面投影是可重放的最终一致性同步，不能让标记请求反向阻塞导航、
+        // 刷新、输入或 Worker ready。
+        return succeeded({ type: "empty" });
       }
       case "inspect_start":
       case "inspect_stop": {
@@ -739,6 +769,7 @@ export class DesktopControlServer {
   }
 
   private recordAnnotationProjection(tabId: string, annotations: unknown[]): void {
+    this.cancelAnnotationProjection(tabId);
     const previous = this.#annotationProjections.get(tabId);
     this.#annotationProjections.set(tabId, {
       revision: (previous?.revision ?? 0) + 1,
@@ -769,29 +800,73 @@ export class DesktopControlServer {
     });
   }
 
-  private enqueueAnnotationProjection(tabId: string): Promise<{ outcome: BrowserCommandOutcome; binary?: Buffer }> {
+  private enqueueAnnotationProjection(
+    tabId: string,
+  ): Promise<{ outcome: BrowserCommandOutcome; binary?: Buffer }> {
     const previous = this.#annotationProjectionLanes.get(tabId) ?? Promise.resolve();
+    const controller = new AbortController();
+    this.#annotationProjectionControllers.set(tabId, controller);
     const run = previous
       .catch(() => undefined)
       .then(async () => {
-        const projection = this.#annotationProjections.get(tabId);
-        if (!projection) throw new Error("browser_annotation_projection_missing");
-        // 每次真正执行前重新读取 Primary，不能把导航前的 binding 用于
-        // 新文档，否则旧 CDP 执行上下文会把标记错误写入下一页或直接超时。
-        const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
-        // 标记事实已经在 Authority 持久化。后台 Surface 没有 Chromium
-        // compositor viewport，先保留投影快照，等它真正绑定内容槽时由
-        // handleSurfaceContentReady 触发重放，不把暂态不可见误报成失败。
-        if (!this.#surfaceManager.isRenderableBinding(binding)) {
+        if (this.#annotationProjectionControllers.get(tabId) !== controller || controller.signal.aborted) {
           return succeeded({ type: "empty" });
         }
-        return this.#worker.execute(binding, {
-          type: "set_annotations",
-          payload: {
-            tab_id: tabId,
-            annotations: projection.annotations,
-          },
-        });
+        let latestResult: { outcome: BrowserCommandOutcome; binary?: Buffer } | null = null;
+        while (true) {
+          if (controller.signal.aborted) return succeeded({ type: "empty" });
+          const projection = this.#annotationProjections.get(tabId);
+          if (!projection) throw new Error("browser_annotation_projection_missing");
+          // 每次真正执行前重新读取 Primary，不能把导航前的 binding 用于
+          // 新文档，否则旧 CDP 执行上下文会把标记错误写入下一页或直接超时。
+          const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
+          const bindingKey = annotationBindingKey(binding);
+          const applied = this.#appliedAnnotationProjections.get(tabId);
+          if (
+            applied?.revision === projection.revision
+            && applied.bindingKey === bindingKey
+          ) return latestResult ?? succeeded({ type: "empty" });
+          // 标记事实已经在 Authority 持久化。后台 Surface 没有 Chromium
+          // compositor viewport，先保留投影快照，等它真正绑定内容槽时由
+          // handleSurfaceContentReady 触发重放，不把暂态不可见误报成失败。
+          if (!this.#surfaceManager.isRenderableBinding(binding)) {
+            return succeeded({ type: "empty" });
+          }
+          const operation = this.#worker.execute(binding, {
+              type: "set_annotations",
+              payload: {
+                tab_id: tabId,
+                annotations: projection.annotations,
+              },
+            }, controller.signal);
+          // 即使底层 Chromium Promise 无法取消，投影控制器也必须能够
+          // 立即结束这条“最新状态同步”链。底层 Promise 由 Worker 的
+          // cancellation/代次围栏继续收口，绝不在这里等待它。
+          void operation.catch(() => undefined);
+          let result: { outcome: BrowserCommandOutcome; binary?: Buffer };
+          try {
+            result = await Promise.race([
+              operation,
+              waitForAbort(controller.signal).then(() => {
+                throw new Error("browser_command_cancelled");
+              }),
+            ]);
+          } catch (cause) {
+            if (controller.signal.aborted) return succeeded({ type: "empty" });
+            throw cause;
+          }
+          if (controller.signal.aborted) return succeeded({ type: "empty" });
+          latestResult = result;
+          if (result.outcome.status === "succeeded") {
+            this.#appliedAnnotationProjections.set(tabId, {
+              revision: projection.revision,
+              bindingKey,
+            });
+          }
+          if (this.#annotationProjections.get(tabId)?.revision === projection.revision) {
+            return result;
+          }
+        }
       });
     const settled = run.then(() => undefined, () => undefined);
     this.#annotationProjectionLanes.set(tabId, settled);
@@ -799,8 +874,16 @@ export class DesktopControlServer {
       if (this.#annotationProjectionLanes.get(tabId) === settled) {
         this.#annotationProjectionLanes.delete(tabId);
       }
+      if (this.#annotationProjectionControllers.get(tabId) === controller) {
+        this.#annotationProjectionControllers.delete(tabId);
+      }
     });
     return run;
+  }
+
+  private cancelAnnotationProjection(tabId: string): void {
+    this.#annotationProjectionControllers.get(tabId)?.abort();
+    this.#annotationProjectionControllers.delete(tabId);
   }
 
   private async requireRenderablePrimaryBinding(tabId: string): Promise<BrowserSurfaceBinding> {
@@ -893,6 +976,19 @@ function requirePrimaryBinding(manager: BrowserSurfaceManager, tabId: string) {
   const binding = manager.primaryBindingForTab(tabId);
   if (!binding) throw new Error("browser_surface_not_found");
   return binding;
+}
+
+function annotationBindingKey(binding: BrowserSurfaceBinding): string {
+  return [
+    binding.desktop_epoch,
+    binding.window_id,
+    binding.surface_id,
+    binding.surface_revision,
+    binding.web_contents_id,
+    binding.target_id,
+    binding.browser_context_id,
+    binding.navigation_revision,
+  ].join("\u001f");
 }
 
 function nodeSelectionFromEvent(

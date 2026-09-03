@@ -1607,15 +1607,15 @@ impl LlmTaskDispatcher {
             );
             return;
         }
-        if let Some(persist) = self.session_state_persist_callback.as_deref() {
-            if let Err(error) = persist("agent_worktree_released") {
-                tracing::error!(
-                    session_id = %session_id,
-                    task_id = %task.task_id,
-                    %error,
-                    "agent worktree 生命周期状态持久化失败"
-                );
-            }
+        if let Some(persist) = self.session_state_persist_callback.as_deref()
+            && let Err(error) = persist("agent_worktree_released")
+        {
+            tracing::error!(
+                session_id = %session_id,
+                task_id = %task.task_id,
+                %error,
+                "agent worktree 生命周期状态持久化失败"
+            );
         }
         if retained {
             tracing::warn!(

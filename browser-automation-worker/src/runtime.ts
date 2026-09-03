@@ -11,6 +11,7 @@ import type {
   BrowserSurfaceBinding,
   WorkerCommandResponse,
 } from "@magi/desktop-browser-contracts";
+import { isAllowedBrowserChildTarget } from "@magi/desktop-browser-contracts";
 import { CdpClient } from "./cdp-client.js";
 import { INSTALL_PAGE_RUNTIME, MAGI_AUTOMATION_WORLD } from "./page-script.js";
 
@@ -34,6 +35,8 @@ interface PageRuntimeState {
   coverageActive: boolean;
   heapSnapshot: HeapSnapshotData | null;
   previousHeapSnapshot: HeapSnapshotData | null;
+  /** Main 拒绝的页面型 Target 会话；其迟到事件不能污染当前一级页面状态。 */
+  blockedTargetSessionIds: Set<string>;
   cdpDomainsReady: boolean;
   cdpDomainsPromise: Promise<void> | null;
 }
@@ -70,6 +73,7 @@ export class BrowserAutomationRuntime {
   readonly #pages = new Map<string, PageRuntimeState>();
   readonly #calls = new Map<string, AbortController>();
   readonly #commandLanes = new Map<string, Promise<void>>();
+  readonly #annotationLanes = new Map<string, Promise<void>>();
   readonly #uploadRoot: string | null;
 
   readonly #workerEpoch: string;
@@ -146,16 +150,20 @@ export class BrowserAutomationRuntime {
         if (this.#calls.get(callId) === controller) this.#calls.delete(callId);
       }
     }
-    const previous = this.#commandLanes.get(binding.surface_id) ?? Promise.resolve();
+    // 标记投影是可丢弃的最终一致性状态同步。它必须拥有独立的 Worker
+    // 调度链，不能排在 wait_for、Lighthouse 或其他普通浏览器命令之后，
+    // 也不能因为普通命令占用同一 Surface 而反过来拖慢用户操作。
+    const laneMap = command.type === "set_annotations" ? this.#annotationLanes : this.#commandLanes;
+    const previous = laneMap.get(binding.surface_id) ?? Promise.resolve();
     const lane: Promise<WorkerCommandResponse> = previous.catch(() => undefined).then(run);
     const settled = lane.then(() => undefined, () => undefined);
-    this.#commandLanes.set(binding.surface_id, settled);
+    laneMap.set(binding.surface_id, settled);
     try {
       return await lane;
     } finally {
       if (this.#calls.get(callId) === controller) this.#calls.delete(callId);
-      if (this.#commandLanes.get(binding.surface_id) === settled) {
-        this.#commandLanes.delete(binding.surface_id);
+      if (laneMap.get(binding.surface_id) === settled) {
+        laneMap.delete(binding.surface_id);
       }
     }
   }
@@ -280,6 +288,7 @@ export class BrowserAutomationRuntime {
       coverageActive: resetRuntimeState ? false : current?.coverageActive ?? false,
       heapSnapshot: null,
       previousHeapSnapshot: null,
+      blockedTargetSessionIds: resetRuntimeState ? new Set() : current?.blockedTargetSessionIds ?? new Set(),
       // Page/Runtime/Network domains belong to the same WebContents target,
       // not to a single document. Navigation resets document-bound runtime
       // state above, but re-enabling the domains for every navigation can
@@ -306,7 +315,7 @@ export class BrowserAutomationRuntime {
     return Boolean(
       current
       && samePhysicalBinding(current.binding, binding)
-      && current.binding.navigation_revision !== binding.navigation_revision,
+      && current.binding.navigation_revision > binding.navigation_revision,
     );
   }
 
@@ -574,6 +583,7 @@ export class BrowserAutomationRuntime {
     // mousePressed 可能已经触发了主文档导航。此时点击副作用已经发生，
     // 不能再用旧文档的 token 做 finish/fallback，也不能把 mouseReleased
     // 之外的旧 DOM 操作投递到新页面。
+    if (this.navigationAdvanced(binding)) return;
     if (!await this.pointerOrHandleDialog(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 })) return;
     if (this.navigationAdvanced(binding)) return;
     // 某些 Electron WebContentsView 的后台/非激活 Surface 会接受 CDP
@@ -621,6 +631,7 @@ export class BrowserAutomationRuntime {
     }
     const inserted = await this.#cdp.send(binding, "Input.insertText", { text });
     if (isNativeDialogOpenedResult(inserted)) return;
+    if (this.navigationAdvanced(binding)) return;
     if (submitKey) await this.press(binding, submitKey);
   }
 
@@ -629,6 +640,7 @@ export class BrowserAutomationRuntime {
     if (!normalized) throw protocolFailure("browser_key_invalid", "key is required");
     const description = keyDescription(normalized);
     if (!await this.key(binding, "keyDown", description.key, description.modifiers, description.code)) return false;
+    if (this.navigationAdvanced(binding)) return false;
     return this.key(binding, "keyUp", description.key, description.modifiers, description.code);
   }
 
@@ -862,7 +874,9 @@ export class BrowserAutomationRuntime {
         for (let index = 0; index < clicks; index += 1) {
           const clickCount = doubleClick ? index + 1 : 1;
           if (!await this.pointerOrHandleDialog(binding, "mousePressed", x, y, { button: "left", buttons: 1, clickCount })) break;
+          if (this.navigationAdvanced(binding)) break;
           if (!await this.pointerOrHandleDialog(binding, "mouseReleased", x, y, { button: "left", buttons: 0, clickCount })) break;
+          if (this.navigationAdvanced(binding)) break;
         }
         return { clicked: true, double_click: doubleClick };
       }
@@ -1621,6 +1635,21 @@ export class BrowserAutomationRuntime {
     const page = binding.navigation_revision === current.binding.navigation_revision
       ? current
       : this.page(binding);
+    const targetSessionId = method === "Target.attachedToTarget" || method === "Target.detachedFromTarget"
+      ? typeof params.sessionId === "string" ? params.sessionId : ""
+      : sessionId ?? "";
+    if (method === "Target.attachedToTarget") {
+      // Main 已经在唯一 CDP 出口拒绝页面型 Target；Worker 仍必须在协议边界
+      // 再次 fail-closed，避免未来新增的 Host/Renderer 通道把 popup 事件漏进来。
+      if (!isAllowedBrowserChildTarget(params.targetInfo)) {
+        if (targetSessionId) page.blockedTargetSessionIds.add(targetSessionId);
+        return;
+      }
+    }
+    if (targetSessionId && page.blockedTargetSessionIds.has(targetSessionId)) {
+      if (method === "Target.detachedFromTarget") page.blockedTargetSessionIds.delete(targetSessionId);
+      return;
+    }
     if (method === "Runtime.executionContextsCleared") {
       // Renderer 进程重启或页面导航会清掉 Chromium 中的所有 CDP 运行态。
       // Worker 自己保存的活动标志必须同步清零，否则下一次调用会误以为
@@ -1640,8 +1669,10 @@ export class BrowserAutomationRuntime {
       page.traceCompletionResolve = null;
       page.profilerActive = false;
       page.coverageActive = false;
-      page.cdpDomainsReady = false;
-      page.runtimeInitializationPromise = null;
+      // Page/Runtime/Network enablement belongs to the WebContents target,
+      // while this event only invalidates the document execution context.
+      // Re-enabling target domains for every navigation creates a command
+      // storm and can block the real page transition.
       this.wakeDialogWaiters(page);
       return;
     }
@@ -2172,7 +2203,7 @@ function heapRetainingPaths(snapshot: HeapSnapshotData, target: number, maxDepth
 
 type LighthouseListener = (...args: unknown[]) => void;
 
-class LighthouseCdpSession {
+export class LighthouseCdpSession {
   readonly #cdp: CdpClient;
   #binding: BrowserSurfaceBinding;
   readonly #sessionId: string | undefined;
@@ -2241,11 +2272,16 @@ class LighthouseCdpSession {
   }
 
   private emit(event: string, params: Record<string, unknown>): void {
+    if (event === "Target.attachedToTarget") {
+      // 即使 Main 已经做过过滤，Lighthouse 适配层也不能把不完整或页面型
+      // Target 转成 sessionattached；否则任何旁路都可能再次产生“子 Tab”。
+      if (!isAllowedBrowserChildTarget(params.targetInfo)) return;
+    }
     for (const listener of this.#listeners.get("*") ?? []) listener(event, params);
     for (const listener of this.#listeners.get(event) ?? []) listener(params);
     if (event === "Target.attachedToTarget") {
       const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
-      const targetInfo = params.targetInfo && typeof params.targetInfo === "object"
+      const targetInfo = params.targetInfo && typeof params.targetInfo === "object" && !Array.isArray(params.targetInfo)
         ? params.targetInfo as Record<string, unknown>
         : undefined;
       if (sessionId) {

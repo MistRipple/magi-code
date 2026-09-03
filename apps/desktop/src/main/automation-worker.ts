@@ -26,6 +26,14 @@ interface PendingCommand {
   cancelSent: boolean;
 }
 
+interface PendingCdpRequest {
+  child: UtilityProcess;
+  workerEpoch: string;
+  callId: string;
+  binding: BrowserSurfaceBinding;
+  controller: AbortController;
+}
+
 interface RebindWaiter {
   child: UtilityProcess;
   workerEpoch: string;
@@ -64,6 +72,7 @@ export class AutomationWorker {
   readonly #onReady: WorkerLifecycleCallback | undefined;
   readonly #fork: UtilityProcessFork;
   readonly #pending = new Map<string, PendingCommand>();
+  readonly #pendingCdp = new Map<string, PendingCdpRequest>();
   #process: UtilityProcess | null = null;
   #workerEpoch = "";
   #status: AutomationWorkerStatus = "stopped";
@@ -423,15 +432,39 @@ export class AutomationWorker {
       });
       return;
     }
+    if (message.type === "cdp_cancel") {
+      const pending = this.#pendingCdp.get(message.request_id);
+      if (
+        !pending
+        || pending.child !== this.#process
+        || pending.workerEpoch !== this.#workerEpoch
+        || pending.callId !== message.call_id
+        || !samePhysicalBinding(pending.binding, message.binding)
+      ) return;
+      pending.controller.abort();
+      return;
+    }
     const child = this.#process;
     const workerEpoch = this.#workerEpoch;
     if (!child || !this.#ready) return;
+    const controller = new AbortController();
+    const pendingCdp: PendingCdpRequest = {
+      child,
+      workerEpoch,
+      callId: message.call_id,
+      binding: message.binding,
+      controller,
+    };
+    this.#pendingCdp.set(message.request_id, pendingCdp);
     void this.#surfaceManager.sendCdp(
       message.binding,
       message.method,
       message.params ?? {},
       message.session_id,
-      { allowNavigationAdvance: message.allow_navigation_advance === true },
+      {
+        allowNavigationAdvance: message.allow_navigation_advance === true,
+        signal: controller.signal,
+      },
     )
       .then((result) => {
         if (this.#process !== child || this.#workerEpoch !== workerEpoch || !this.#ready) return;
@@ -460,6 +493,11 @@ export class AutomationWorker {
           },
         };
         this.postMessage(child, response);
+      })
+      .finally(() => {
+        if (this.#pendingCdp.get(message.request_id) === pendingCdp) {
+          this.#pendingCdp.delete(message.request_id);
+        }
       });
   }
 
@@ -469,6 +507,8 @@ export class AutomationWorker {
       pending.reject(error);
     }
     this.#pending.clear();
+    for (const pending of this.#pendingCdp.values()) pending.controller.abort();
+    this.#pendingCdp.clear();
   }
 
   private sendCancel(pending: PendingCommand): void {

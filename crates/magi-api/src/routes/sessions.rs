@@ -238,7 +238,7 @@ async fn materialize_session(
         .session_store
         .select_current_session(&session_id)
         .map_err(|error| ApiError::internal_assembly("选择浏览器会话所属会话失败", error))?;
-    state.persist_runtime_durable_state_for_api()?;
+    state.persist_session_navigation_state_for_api(Some(session_id.clone()))?;
     publish_session_directory_event(
         &state,
         "session.created",
@@ -2923,6 +2923,7 @@ fn append_terminal_canonical_payload(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_regular_session_turn_queued_event(
     state: &ApiState,
     session_id: &SessionId,
@@ -2960,6 +2961,7 @@ fn publish_regular_session_turn_queued_event(
     event_id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_regular_session_turn_queue_failed_event(
     state: &ApiState,
     session_id: &SessionId,
@@ -3650,7 +3652,7 @@ async fn navigate_session(
             state.session_store.clear_current_session();
         }
     }
-    state.persist_runtime_durable_state_for_api()?;
+    state.persist_session_navigation_state_for_api(selected_session_id.clone())?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         workspace_id.as_ref().map(WorkspaceId::as_str),
         selected_session_id.as_ref(),
@@ -9571,14 +9573,15 @@ mod tests {
     async fn delete_session_returns_workspace_scoped_bootstrap() {
         let persisted_current = Arc::new(Mutex::new(None));
         let persisted_current_capture = Arc::clone(&persisted_current);
-        let state =
-            test_state().with_session_projection_persist(Arc::new(move |durable, _sidecars| {
+        let state = test_state().with_session_projection_persist(Arc::new(
+            move |durable, _sidecars, _mode| {
                 *persisted_current_capture
                     .lock()
                     .expect("persisted current capture should lock") =
                     durable.current_session_id.clone();
                 Ok(())
-            }));
+            },
+        ));
         register_workspace(&state, "workspace-a", "delete-scoped-a");
         register_workspace(&state, "workspace-b", "delete-scoped-b");
         let deleted_session_id = SessionId::new("session-delete-scoped-a1");

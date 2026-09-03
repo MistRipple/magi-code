@@ -26,6 +26,8 @@ class FakeWebContents {
   closed = false;
   closeRequested = false;
   destroyOnClose = true;
+  focused = false;
+  focusCount = 0;
   #listeners = new Map<string, Listener[]>();
 
   setWindowOpenHandler(_handler: unknown): void {}
@@ -60,6 +62,11 @@ class FakeWebContents {
 
   send(channel: string, payload: unknown): void {
     this.sent.push({ channel, payload });
+  }
+
+  focus(): void {
+    this.focused = true;
+    this.focusCount += 1;
   }
 
   close(): void {
@@ -337,6 +344,20 @@ test("菜单只绑定 Renderer 提交的最终弹窗矩形，不从内容槽推�
     /desktop_overlay_browser_content_unavailable/u,
   );
   assert.deepEqual(harness.view.bounds, state.popupBounds);
+});
+
+test("每个交互 Overlay 首次显示时获得焦点，布局重排不重复抢焦点", async () => {
+  const harness = createHarness();
+  await settleLoad();
+  const data = layoutWithGeometry();
+  harness.manager.open("window-1", menuState("menu-1"), data.layout);
+  harness.manager.handleReady("window-1");
+
+  assert.equal(harness.view.webContents.focused, true);
+  assert.equal(harness.view.webContents.focusCount, 1);
+
+  harness.manager.updateLayout("window-1", data.layout);
+  assert.equal(harness.view.webContents.focusCount, 1);
 });
 
 test("几何提交短暂缺失时保留命中租约，有效新租约到达后复用同一个 View", async () => {

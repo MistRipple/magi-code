@@ -94,10 +94,10 @@ impl SessionStatePersistenceScheduler {
                 state.pending.take()
             };
 
-            if let Some((checkpoint, generation)) = checkpoint {
-                if let Err(error) = self.persist_intermediate(checkpoint, generation) {
-                    tracing::warn!(checkpoint, %error, "异步 session 状态持久化失败");
-                }
+            if let Some((checkpoint, generation)) = checkpoint
+                && let Err(error) = self.persist_intermediate(checkpoint, generation)
+            {
+                tracing::warn!(checkpoint, %error, "异步 session 状态持久化失败");
             }
         }
     }
@@ -226,7 +226,7 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
     expected_turn_id: Option<&str>,
 ) -> Result<bool, String> {
     let persist_session_state = session_state_persist_callback(state);
-    let finalized = match magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
+    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
         state.session_store.as_ref(),
         &state.event_bus,
         state.task_store(),
@@ -234,10 +234,7 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
         root_task_id,
         expected_turn_id,
         Some(persist_session_state.as_ref()),
-    ) {
-        Ok(finalized) => finalized,
-        Err(error) => return Err(error),
-    };
+    )?;
     if finalized {
         release_terminal_browser_resources(state, session_id, root_task_id);
         crate::routes::sessions::record_active_goal_turn_success(
@@ -262,8 +259,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
     expected_turn_id: Option<&str>,
 ) -> Result<bool, String> {
     let persist_session_state = session_state_persist_callback(state);
-    let finalized = match
-        magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
+    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
             magi_conversation_runtime::session_turn_finalize::FinalizeBackgroundSessionTaskTurnContext {
                 session_store: state.session_store.as_ref(),
                 event_bus: &state.event_bus,
@@ -274,10 +270,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 expected_turn_id,
                 persist_session_state: Some(persist_session_state.as_ref()),
             },
-        ) {
-        Ok(finalized) => finalized,
-        Err(error) => return Err(error),
-    };
+        )?;
     if finalized {
         let owns_active_plan = state
             .session_store

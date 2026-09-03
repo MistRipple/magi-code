@@ -179,7 +179,9 @@ impl BrowserToolKind {
             Self::Press => "向当前页面发送按键或组合键。",
             Self::Scroll => "滚动页面或指定快照元素。",
             Self::Screenshot => "截取当前视口、整页、指定元素或规范化区域。",
-            Self::Tabs => "列出、创建、激活或在用户明确要求时关闭会话浏览器标签。",
+            Self::Tabs => {
+                "列出、创建、激活或在用户明确要求时关闭 Magi 右栏的一级浏览器标签。每个一级浏览器标签只有一个 Chromium 页面；网页 popup、window.open 或 target=_blank 只在当前一级页面内导航，绝不创建网页子标签。"
+            }
             Self::Viewport => "读取或通过 Chromium 原生设备指标设置页面视口。",
             Self::WaitFor => "等待文本、选择器或 URL 条件在当前页面满足。",
             Self::Hover => "将浏览器指针悬停到当前快照元素。",
@@ -225,7 +227,7 @@ impl BrowserToolKind {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string","description":"可选；省略时截取页面；与 clip、full_page 互斥"},"clip":{"type":"object","properties":{"x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1},"width":{"type":"number","exclusiveMinimum":0,"maximum":1},"height":{"type":"number","exclusiveMinimum":0,"maximum":1}},"required":["x","y","width","height"],"description":"按当前视口归一化坐标截取区域；与 element_ref、full_page 互斥，只能三选一"},"format":{"type":"string","enum":["png","jpeg","webp"],"description":"图片格式，默认 png"},"quality":{"type":"integer","minimum":0,"maximum":100,"description":"jpeg/webp 压缩质量；format=png 时不要传此字段"},"full_page":{"type":"boolean","description":"设为 true 截取整页；不能同时传 element_ref 或 clip，默认 false"}},"required":[]}"#
             }
             Self::Tabs => {
-                r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","new","activate","close"],"description":"任务完成后不要使用 close；仅在用户明确要求关闭指定标签时使用。"},"tab_id":{"type":"string","description":"activate/close 时必填；close 只能响应用户明确的关闭要求"},"url":{"type":"string","description":"new 时可选；新建后立即打开的 URL，省略时为 about:blank"}},"required":["action"]}"#
+                r#"{"type":"object","additionalProperties":false,"properties":{"action":{"type":"string","enum":["list","new","activate","close"],"description":"任务完成后不要使用 close；仅在用户明确要求关闭指定的 Magi 右栏一级标签时使用。网页 popup、window.open 或 target=_blank 不得通过此 action 创建子标签。"},"tab_id":{"type":"string","description":"activate/close 时必填，指向 Magi 右栏一级浏览器标签；不存在 parent_tab_id 或子标签身份"},"url":{"type":"string","description":"new 时可选；创建新的 Magi 右栏一级浏览器标签并立即打开 URL，省略时为 about:blank。不要为网页 popup 调用 new"}},"required":["action"]}"#
             }
             Self::Viewport => {
                 r#"{"type":"object","properties":{"action":{"type":"string","enum":["get","set"]},"mode":{"type":"string","enum":["auto","fixed"],"description":"action=set 时必填；auto 跟随右侧内容槽，fixed 使用 width/height 进行 Chromium 响应式设备仿真。"},"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"width":{"type":"integer","minimum":320,"maximum":7680,"description":"action=set 时必填"},"height":{"type":"integer","minimum":240,"maximum":4320,"description":"action=set 时必填"},"device_scale_factor_millis":{"type":"integer","minimum":500,"maximum":4000,"description":"action=set、mode=fixed 时可选，设备像素比乘以 1000，默认 1000。"},"device_type":{"type":"string","enum":["desktop","mobile"],"description":"action=set 时可选；宽度 320-600 固定为 mobile，601 以上固定为 desktop，传入值必须与 width 一致。mobile 启用手机窄屏仿真，desktop 表示电脑/平板宽屏。"}},"required":["action"],"oneOf":[{"description":"读取当前视口","properties":{"action":{"const":"get"}},"not":{"anyOf":[{"required":["mode"]},{"required":["width"]},{"required":["height"]},{"required":["device_scale_factor_millis"]},{"required":["device_type"]}]}},{"description":"恢复跟随右侧内容槽的自适应视口","properties":{"action":{"const":"set"},"mode":{"const":"auto"}},"required":["action","mode"],"not":{"anyOf":[{"required":["width"]},{"required":["height"]},{"required":["device_scale_factor_millis"]},{"required":["device_type"]}]}},{"description":"设置固定的 Chromium 响应式设备视口","properties":{"action":{"const":"set"},"mode":{"const":"fixed"}},"required":["action","mode","width","height"]}]}"#

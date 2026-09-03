@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { matchesNavigationRevision } from "./browser-navigation-revision.js";
 
 const source = readFileSync(new URL("./browser-surface-manager.ts", import.meta.url), "utf8");
 const windowManagerSource = readFileSync(new URL("./window-manager.ts", import.meta.url), "utf8");
@@ -29,6 +30,43 @@ const settingsBrowserSource = readFileSync(
   new URL("../../../../web/src/components/SettingsBrowserTab.svelte", import.meta.url),
   "utf8",
 );
+const rightPaneStoreSource = readFileSync(
+  new URL("../../../../web/src/stores/right-pane.svelte.ts", import.meta.url),
+  "utf8",
+);
+const browserHostProtocolSource = readFileSync(
+  new URL("../../../../crates/magi-browser-authority/src/host_protocol.rs", import.meta.url),
+  "utf8",
+);
+const browserAuthorityDomainSource = readFileSync(
+  new URL("../../../../crates/magi-browser-authority/src/domain.rs", import.meta.url),
+  "utf8",
+);
+const browserHostSource = readFileSync(
+  new URL("../../../../crates/magi-daemon/src/daemon/browser_host.rs", import.meta.url),
+  "utf8",
+);
+const browserRoutesSource = readFileSync(
+  new URL("../../../../crates/magi-api/src/routes/browser.rs", import.meta.url),
+  "utf8",
+);
+const browserContractsSource = readFileSync(
+  new URL("../../../../contracts/desktop-browser/src/index.ts", import.meta.url),
+  "utf8",
+);
+const browserToolSchema = JSON.parse(readFileSync(
+  new URL("../../../../contracts/desktop-browser/browser-tool.schema.json", import.meta.url),
+  "utf8",
+)) as {
+  "x-magi-browser-tool-catalog": Array<{
+    name: string;
+    description: string;
+    inputSchema: {
+      additionalProperties?: boolean;
+      properties?: Record<string, unknown>;
+    };
+  }>;
+};
 
 function section(value: string, startMarker: string, endMarker: string): string {
   const start = value.indexOf(startMarker);
@@ -49,6 +87,115 @@ test("Browser Surface 只接受 Main 布局计算出的内容槽", () => {
   assert.match(source, /contentRoot\.addChildView\(record\.view, 1\)/u);
   assert.match(source, /record\.view\.setBounds\(effectiveBounds\)/u);
   assert.match(source, /this\.#contentRoots\.get\(record\.windowId\)\?\.removeChildView\(record\.view\)/u);
+});
+
+test("Browser Tab 在 Chromium 创建前严格禁止网页子 Tab", () => {
+  const policy = section(source, "private installSurfacePolicy(", "webContents.on(\"will-navigate\"");
+  assert.match(policy, /setWindowOpenHandler\(\(details\) => \{/u);
+  assert.doesNotMatch(policy, /did-create-window|childWindow\.close\(\)/u);
+  assert.match(policy, /will-attach-webview[\s\S]*?event\.preventDefault\(\)/u);
+  assert.match(policy, /return \{ action: "deny" \};/u);
+  assert.doesNotMatch(policy, /action:\s*"allow"/u);
+  assert.doesNotMatch(policy, /createWindow|new-window/u);
+  assert.match(policy, /type: "popup_blocked"/u);
+  assert.doesNotMatch(policy, /\.loadURL\(/u);
+  assert.doesNotMatch(policy, /new\s+(BrowserWindow|WebContentsView)/u);
+  assert.equal(
+    [...source.matchAll(/new WebContentsView\(/gu)].length,
+    1,
+    "BrowserSurfaceManager 只能在 Surface 工厂创建 WebContentsView，窗口打开请求不得创建第二个 View",
+  );
+  const preferences = section(source, "const view = new WebContentsView({", "const contents = view.webContents;");
+  assert.doesNotMatch(withoutLineComments(preferences), /nativeWindowOpen/u);
+  assert.match(preferences, /webviewTag:\s*false/u);
+  assert.match(preferences, /allowRunningInsecureContent:\s*false/u);
+});
+
+test("target=_blank、window.open 和表单 popup 复用当前一级页面，不创建子 Tab", () => {
+  const policy = section(source, "webContents.setWindowOpenHandler(", "webContents.on(\"will-navigate\"");
+  assert.match(policy, /return \{ action: "deny" \};/u);
+  assert.match(policy, /type: "popup_blocked"/u);
+  assert.match(policy, /normalizePopupNavigationUrl\(details\.url\)/u);
+  assert.match(policy, /void this\.loadPopupInCurrentPage\(record, url, details\)/u);
+  assert.doesNotMatch(policy, /\.loadURL\(/u);
+  assert.doesNotMatch(policy, /new\s+(BrowserWindow|WebContentsView)/u);
+  const popupNavigation = section(source, "private async loadPopupInCurrentPage(", "private unmountSurface(");
+  assert.match(popupNavigation, /this\.loadPage\(\s*record,\s*url/u);
+  assert.match(popupNavigation, /httpReferrer:\s*details\.referrer/u);
+  assert.match(popupNavigation, /postData:\s*postBody\.data/u);
+  assert.match(popupNavigation, /Content-Type: \$\{contentType\}/u);
+  assert.match(source, /function normalizePopupNavigationUrl\(/u);
+  assert.match(source, /url === "about:blank"\) throw/u);
+});
+
+test("唯一 CDP 出口强制自动附着排除页面型 Target", () => {
+  const cdpSend = section(source, "private async sendSurfaceCdpCommand(", "private async waitForScreenshotReadiness(");
+  assert.match(cdpSend, /constrainCdpCommandParams\(method, params\)/u);
+  const policy = section(source, "function constrainCdpCommandParams(", "function sameBounds(");
+  assert.match(policy, /method !== "Target\.setAutoAttach"/u);
+  assert.match(policy, /params\.autoAttach !== true/u);
+  assert.match(policy, /flatten: true/u);
+  assert.match(policy, /waitForDebuggerOnStart: false/u);
+  assert.match(policy, /filter:\s*\[[\s\S]*\{ type: "iframe" \}[\s\S]*\{ type: "worker" \}[\s\S]*\{ type: "service_worker" \}[\s\S]*\{ type: "shared_worker" \}[\s\S]*\]/u);
+  assert.doesNotMatch(policy, /filter:[\s\S]*\{\}/u);
+  assert.match(source, /Target\.attachedToTarget/u);
+  assert.match(source, /isForbiddenChildPageTarget\(targetInfo\)/u);
+  assert.match(source, /blockedCdpSessionIds\.add\(eventParams\.sessionId\)/u);
+  assert.match(source, /detachCdpTarget\(record, eventParams\.sessionId\)/u);
+  assert.match(source, /blockedCdpSessionIds\.has\(sessionId\)/u);
+});
+
+test("browser_tabs 只描述右栏一级 Tab，不允许协议出现子 Tab 字段", () => {
+  const entry = browserToolSchema["x-magi-browser-tool-catalog"].find((item) => item.name === "browser_tabs");
+  assert.ok(entry, "浏览器工具目录缺少 browser_tabs");
+  assert.equal(entry.inputSchema.additionalProperties, false);
+  assert.match(entry.description, /一级浏览器标签/u);
+  assert.match(entry.description, /绝不创建网页子标签/u);
+  assert.match(entry.description, /target=_blank/u);
+  assert.ok(entry.inputSchema.properties);
+  assert.equal(Object.hasOwn(entry.inputSchema.properties, "parent_tab_id"), false);
+  assert.equal(Object.hasOwn(entry.inputSchema.properties, "child_tab_id"), false);
+});
+
+test("页面 popup 只在 Main 被拒绝，iframe 和 worker Target 仍可供自动化使用", () => {
+  const targetBoundary = section(source, "if (method === \"Target.attachedToTarget\"", "const detachListener:");
+  assert.match(targetBoundary, /targetInfo/u);
+  assert.match(targetBoundary, /isForbiddenChildPageTarget\(targetInfo\)/u);
+  assert.match(targetBoundary, /return;/u);
+  const targetPolicy = section(source, "function isForbiddenChildPageTarget(", "function constrainCdpCommandParams(");
+  assert.match(targetPolicy, /return !isAllowedBrowserChildTarget\(value\)/u);
+  assert.match(browserContractsSource, /BROWSER_CHILD_TARGET_TYPES = \[[\s\S]*?"iframe"[\s\S]*?"worker"[\s\S]*?"service_worker"[\s\S]*?"shared_worker"/u);
+  assert.match(browserContractsSource, /isAllowedBrowserChildTarget[\s\S]*?return typeof type === "string"[\s\S]*?includes\(type\)/u);
+  assert.match(source, /record\.cdpSessionIds\.add\(eventParams\.sessionId\)/u);
+  assert.doesNotMatch(targetBoundary, /cdpSessionIds\.add\(eventParams\.sessionId\)[\s\S]*?isForbiddenChildPageTarget/u);
+});
+
+test("Main、Browser Host、Authority 和 Renderer 没有子 Tab 或 Target 创建旁路", () => {
+  const forbiddenTargetCommands = [
+    "createTarget",
+    "createBrowserContext",
+    "disposeBrowserContext",
+    "attachToTarget",
+    "closeTarget",
+    "activateTarget",
+    "getTargets",
+  ];
+  for (const command of forbiddenTargetCommands) {
+    const pattern = new RegExp(`Target\\.${command}`, "u");
+    assert.doesNotMatch(source, pattern, `Main 不得暴露 ${command}`);
+    assert.doesNotMatch(workerSource, pattern, `Worker 不得调用 ${command}`);
+    assert.doesNotMatch(browserHostProtocolSource, pattern, `Host 协议不得暴露 ${command}`);
+    assert.doesNotMatch(browserHostSource, pattern, `Browser Host 不得调用 ${command}`);
+  }
+  assert.doesNotMatch(browserHostProtocolSource, /CreateTarget|CreateBrowserContext|ChildTab|SubTab/u);
+  // Authority 的 target_id 是当前一级 Surface 的绑定身份，不是子 Target
+  // 创建入口；禁止的是额外的子 Tab 数据模型或创建命令。
+  assert.match(browserAuthorityDomainSource, /pub struct BrowserTab\s*\{/u);
+  assert.doesNotMatch(browserAuthorityDomainSource, /ChildTab|SubTab|child_tab|sub_tab|create_target|createTarget/u);
+  assert.doesNotMatch(browserTabSource, /Target\.|sessionattached|createCDPSession/u);
+  assert.doesNotMatch(rightPaneStoreSource, /Target\.|sessionattached|createCDPSession/u);
+  assert.match(rightPaneStoreSource, /authorityTabs\.map\(\(tab\) => `browser:\$\{browserSessionId\}:\$\{tab\.tabId\.trim\(\)\}`/u);
+  assert.doesNotMatch(rightPaneStoreSource, /target(?:_|[A-Z])id/u);
 });
 
 test("右栏布局和原生 Surface 使用同一 Main 事务", () => {
@@ -222,6 +369,59 @@ test("页面导航期间保持原生页面可见，只有渲染进程崩溃才�
   assert.doesNotMatch(navigationEvents, /did-start-navigation[\s\S]*?setBounds\(\{ x: 0, y: 0, width: 0/u);
 });
 
+test("每个真实导航事务都会推进 navigationRevision，旧页面身份不可复用", () => {
+  const navigation = section(source, "private beginNavigationOperation(", "private nextNavigationEventSequence");
+  assert.match(
+    navigation,
+    /supersedeNavigationOperation\(previous\)[\s\S]*?record\.navigationRevision \+= 1;[\s\S]*?const id = \+\+record\.navigationOperationId/u,
+  );
+});
+
+test("Surface binding 的导航代次只允许严格匹配或单向前进", () => {
+  assert.equal(matchesNavigationRevision(1, 1, false), true);
+  assert.equal(matchesNavigationRevision(1, 2, false), false);
+  assert.equal(matchesNavigationRevision(2, 1, false), false);
+  assert.equal(matchesNavigationRevision(1, 1, true), true);
+  assert.equal(matchesNavigationRevision(1, 2, true), true);
+  assert.equal(matchesNavigationRevision(2, 1, true), false);
+});
+
+test("CDP 命令发起和完成使用不同的导航代次校验语义", () => {
+  const cdp = section(source, "async sendCdp(", "private enqueueCdp<T>(");
+  const commandStart = cdp.slice(0, cdp.indexOf("const result = await this.sendSurfaceCdpCommand"));
+  assert.match(commandStart, /const contents = this\.recordForBinding\(binding\)/u);
+  assert.doesNotMatch(commandStart, /this\.recordForBinding\(binding,\s*\{/u);
+  assert.match(cdp, /this\.assertRenderableBinding\(binding, \{\s*allowNavigationAdvance: options\.allowNavigationAdvance/u);
+  const queuedCommand = cdp.slice(cdp.indexOf("this.enqueueCdp(record"));
+  assert.match(queuedCommand, /this\.recordForBinding\(binding\)/u);
+});
+
+test("导航响应只等待主文档生命周期，不把 loadURL Promise 作为第二个完成条件", () => {
+  const loadPage = section(source, "private async loadPage(", "private startLoad(");
+  assert.doesNotMatch(loadPage, /Promise\.all\(/u);
+  assert.match(loadPage, /void loadPromise\.then\(/u);
+  assert.match(loadPage, /withNavigationTimeout\(navigationWait/u);
+  assert.doesNotMatch(loadPage, /await this\.installDialogBridgeInCurrentDocument/u);
+});
+
+test("导航完成后读取新的文档代次，不把成功导航误判为旧 Surface 失效", () => {
+  const navigate = section(source, "async navigate(", "async setViewport(");
+  assert.match(
+    navigate,
+    /const finalRecord = this\.assertRenderableBinding\(binding, \{ allowNavigationAdvance: true \}\)/u,
+  );
+  assert.match(navigate, /return this\.pageState\(finalRecord\)/u);
+});
+
+test("导航请求不等待同一 Tab 的标记投影，页面事件负责异步重放", () => {
+  const navigate = section(browserRoutesSource, "async fn navigate_tab(", "fn validate_navigation_url(");
+  assert.doesNotMatch(navigate, /sync_browser_annotations_to_host/u);
+  assert.match(
+    browserHostSource,
+    /BrowserHostEvent::PageUpdated[\s\S]*?schedule_browser_annotation_sync\(state, &binding\.tab_id\)/u,
+  );
+});
+
 test("Surface 布局和加载回调不隐式抢占 App Renderer 焦点", () => {
   const applySlot = section(source, "private applySlot(", "private async loadPage(");
   assert.doesNotMatch(applySlot, /contents\.focus\(\)/u);
@@ -381,9 +581,12 @@ test("加载期 viewport commit 由真实文档完成事件重新唤醒", () => 
   const stop = section(source, 'webContents.on("did-stop-loading"', 'webContents.on("did-fail-load"');
   assert.match(finish, /this\.scheduleViewportCommit\(record\)/u);
   assert.match(stop, /this\.scheduleViewportCommit\(record\)/u);
-  const flush = section(source, "private async flushViewportCommits(", "private async waitForCompositorFrame(");
+  const navigationComplete = section(source, "private completeNavigationOperation(", "private completeWhenMainFrameSettled(");
+  assert.match(navigationComplete, /this\.#onDocumentReady\?\.\(this\.binding\(record\)\)/u);
+  const flush = section(source, "private async flushViewportCommits(", "private isViewportCommitInputCurrent(");
   assert.match(flush, /record\.priming \|\| record\.contents\.isLoadingMainFrame\(\)/u);
-  assert.match(source, /private async waitForViewportCommit\([\s\S]*?commit\.promise[\s\S]*?commit\.state === "compositor-ready"/u);
+  assert.match(source, /private async waitForViewportCommit\([\s\S]*?commit\.promise[\s\S]*?commit\.state === "ready"/u);
+  assert.doesNotMatch(withoutLineComments(flush), /executeJavaScript|requestAnimationFrame|browser_compositor_ready/u);
 });
 
 test("debugger 重连定时器只清理当前持有的句柄一次", () => {
@@ -395,7 +598,7 @@ test("debugger 重连定时器只清理当前持有的句柄一次", () => {
 
 test("CDP 和 DOM await 返回后必须重新确认当前可渲染内容槽", () => {
   const cdp = section(source, "async sendCdp(", "private enqueueCdp<T>(");
-  assert.match(cdp, /await this\.waitForViewportCommit\(record\)[\s\S]*?this\.assertRenderableBinding\(binding, options\)/u);
+  assert.match(cdp, /await (?:this\.waitForViewportCommit\(record\)|withOptionalAbort\(this\.waitForViewportCommit\(record\), options\.signal\))[\s\S]*?this\.assertRenderableBinding\(binding, options\)/u);
   assert.match(cdp, /const lease = this\.createDebuggerSessionLease\(record, sessionId\)[\s\S]*?const result = await this\.sendSurfaceCdpCommand\([\s\S]*?this\.assertRenderableBinding\(binding, options\)/u);
   assert.doesNotMatch(cdp, /sendCdpCommandWithTimeout|waitForViewportApply/u);
   const cdpCommand = section(source, "private async sendSurfaceCdpCommand(", "private async waitForScreenshotReadiness(");
@@ -506,7 +709,7 @@ test("后台截图复用同一个 WebContents，不创建隐藏窗口或临时�
 
 test("所有工具截图都从真实 WebContents 读取，并通过同一个 Surface CDP lane 串行化", () => {
   const cdpSection = section(source, "async sendCdp(", "private enqueueCdp<T>(");
-  assert.match(cdpSection, /await this\.waitForViewportCommit\(record\)[\s\S]*?method === "Page\.captureScreenshot"[\s\S]*?waitForScreenshotReadiness\(record\)/u);
+  assert.match(cdpSection, /await (?:this\.waitForViewportCommit\(record\)|withOptionalAbort\(this\.waitForViewportCommit\(record\), options\.signal\))[\s\S]*?method === "Page\.captureScreenshot"[\s\S]*?waitForScreenshotReadiness\(record\)/u);
   assert.doesNotMatch(cdpSection, /waitForViewportApply/u);
   assert.match(cdpSection, /method === "Page\.captureScreenshot"[\s\S]*?this\.enqueueCdp\(record[\s\S]*?sendSurfaceCdpCommand/u);
   assert.match(cdpSection, /this\.enqueueCdp\(record/u);
@@ -624,13 +827,13 @@ test("浏览器动作沿现有统一工具和单 Tab 队列执行", () => {
       && workerReadyIndex < controlStartIndex && controlStartIndex < daemonStartIndex,
     "daemon 注册 Desktop Control 前必须完成 Worker 握手和 Host 监听，ready 事件不得携带空 worker_epoch",
   );
-  assert.match(rightPaneSource, /getBrowserSession\(/u);
+  assert.match(rightPaneSource, /loadBrowserAuthoritySession\(/u);
 });
 
 test("JavaScript 对话框处理命令绕过输入事件队列，避免点击与授权互相等待", () => {
   const cdpSection = section(source, "async sendCdp(", "private enqueueCdp<T>(");
   assert.match(cdpSection, /const isDialogCommand = method === "Page\.handleJavaScriptDialog"/u);
-  assert.match(cdpSection, /if \(!isDialogCommand\) \{[\s\S]*?await this\.waitForDebugger\(record\)/u);
+  assert.match(cdpSection, /if \(!isDialogCommand\) \{[\s\S]*?await (?:this\.waitForDebugger\(record\)|withOptionalAbort\(this\.waitForDebugger\(record\), options\.signal\))/u);
   assert.match(cdpSection, /if \(isDialogCommand\) \{[\s\S]*?sendSurfaceCdpCommand\(/u);
   assert.match(cdpSection, /JavaScript 对话框会阻塞触发它的 Input\.dispatchMouseEvent/u);
   assert.match(source, /Runtime\.addBinding/u);

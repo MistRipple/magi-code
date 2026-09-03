@@ -58,18 +58,19 @@
     resolveAgentPath,
     getWorkspaceSessions,
     getPersonalSessions,
-    getBrowserSession,
     listAgentWorkspaces,
     markAgentSessionViewed,
     registerAgentWorkspace,
     removeAgentWorkspace,
     renameAgentSession,
     resolveAgentBaseUrl,
-    activateBrowserTab,
-    setActiveBrowserTab,
     type AgentConnectionEventDetail,
     type AgentWorkspaceSummary,
   } from './agent-api';
+  import {
+    loadBrowserAuthoritySession,
+    prepareBrowserAuthorityForDesktop,
+  } from './browser-authority-coordinator';
   import {
     agentBindingWorkspaceId,
     agentBindingWorkspacePath,
@@ -219,9 +220,8 @@
   // 这避免 Renderer 已渲染终端/代码、而旧 WebContentsView 仍保留在命中树。
   let desktopPanelActivationRequest: DesktopPanelActivationRequest | null = null;
   let desktopPanelActivationRequestId = 0;
-  let desktopPanelActivationRetryAttempt = 0;
-  let desktopPanelActivationRetryKey = '';
-  let desktopPanelActivationRetryTimer: number | null = null;
+  let desktopPanelActivationAwaitingGeometryKey = '';
+  let desktopPanelActivationFailureKey = '';
   let desktopPanelActivationEpoch = $state(0);
   let sidebarElement = $state<HTMLElement | null>(null);
   let desktopDropIndicator = $state<{
@@ -643,34 +643,6 @@
     };
   }
 
-  function clearDesktopPanelActivationRetry(): void {
-    if (desktopPanelActivationRetryTimer !== null) {
-      window.clearTimeout(desktopPanelActivationRetryTimer);
-      desktopPanelActivationRetryTimer = null;
-    }
-    desktopPanelActivationRetryAttempt = 0;
-    desktopPanelActivationRetryKey = '';
-  }
-
-  function scheduleDesktopPanelActivationRetry(target: DesktopPanelTarget): void {
-    const key = desktopPanelTargetKey(target);
-    if (desktopPanelActivationRetryKey !== key) {
-      clearDesktopPanelActivationRetry();
-      desktopPanelActivationRetryKey = key;
-    }
-    if (desktopPanelActivationRetryTimer !== null || desktopPanelActivationRetryAttempt >= 3) {
-      return;
-    }
-    const delay = 80 * (2 ** desktopPanelActivationRetryAttempt);
-    desktopPanelActivationRetryAttempt += 1;
-    desktopPanelActivationRetryTimer = window.setTimeout(() => {
-      desktopPanelActivationRetryTimer = null;
-      if (desktopPanelActivationRetryKey === key) {
-        desktopPanelActivationEpoch += 1;
-      }
-    }, delay);
-  }
-
   function isClosedBrowserTabError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
     return /browser tab is not ready:[\s\S]*\(Closed\)/u.test(message);
@@ -681,9 +653,8 @@
     if (!browser) return;
     // “已关闭”是权威状态，不是可重试的 Surface 激活失败。必须立即拉取
     // BrowserAuthority 快照收敛本地 Tab，避免旧 Tab 一直占据右栏内容槽。
-    void getBrowserSession(browser.browserSessionId)
-      .then((snapshot) => {
-        synchronizeBrowserSessionSnapshot(snapshot, browser.workspacePath, {
+    void loadBrowserAuthoritySession(browser.browserSessionId, (snapshot) => {
+      synchronizeBrowserSessionSnapshot(snapshot, browser.workspacePath, {
           workspaceId: browser.workspaceId,
           sessionId: browser.sessionId,
         });
@@ -693,70 +664,74 @@
       });
   }
 
-  function synchronizeDesktopBrowserAuthority(target: DesktopPanelTarget): void {
-    const browser = target.browser;
-    if (target.kind !== 'browser' || !browser) return;
-    // 浏览器 Surface 已经通过 Main 的单一 Panel 事务进入右栏；Authority 的
-    // 默认工具目标和 suspended 恢复属于后台状态同步，不能阻塞可见页面。
-    void setActiveBrowserTab(browser.browserSessionId, browser.tabId)
-      .catch((error) => {
-        if (isClosedBrowserTabError(error)) {
-          resyncAfterClosedBrowserTab(target);
-          return;
-        }
-        console.warn('[WebWorkbenchShell] 同步浏览器工具默认 Tab 失败:', error);
-      });
-    if (browser.lifecycle === 'suspended' || browser.lifecycle === 'crashed') {
-      void activateBrowserTab(browser.tabId).catch((error) => {
-        console.warn('[WebWorkbenchShell] 恢复浏览器逻辑 Tab 失败:', error);
-      });
-    }
-  }
-
-  function activateDesktopPanelTarget(request: DesktopPanelActivationRequest): void {
+  async function activateDesktopPanelTarget(request: DesktopPanelActivationRequest): Promise<void> {
     const desktop = window.magiDesktop;
     if (!desktop) return;
-    const run = request.kind === 'browser' && request.browser
-      ? desktop.activateBrowser({
-          tabId: request.browser.tabId,
-          browserSessionId: request.browser.browserSessionId,
-          url: request.browser.url || 'about:blank',
-          navigationRevision: request.browser.navigationRevision,
-          viewport: { mode: 'auto' },
-        })
-      : desktop.activatePanel({ kind: request.kind, tabId: request.tabId });
-    void run.then((snapshot) => {
+    try {
+      if (request.kind === 'browser' && request.browser) {
+        const browser = request.browser;
+        if (browser.lifecycle === 'closed') {
+          resyncAfterClosedBrowserTab(request);
+          return;
+        }
+        await prepareBrowserAuthorityForDesktop(
+          {
+            browserSessionId: browser.browserSessionId,
+            tabId: browser.tabId,
+            lifecycle: browser.lifecycle,
+          },
+          (authoritySnapshot) => {
+            synchronizeBrowserSessionSnapshot(authoritySnapshot, browser.workspacePath, {
+              workspaceId: browser.workspaceId,
+              sessionId: browser.sessionId,
+              revealTabId: browser.tabId,
+              newTabLabel: i18n.t('browser.tab.new'),
+            });
+          },
+        );
+        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) return;
+      }
+      const snapshot = request.kind === 'browser' && request.browser
+        ? await desktop.activateBrowser({
+            tabId: request.browser.tabId,
+            browserSessionId: request.browser.browserSessionId,
+            url: request.browser.url || 'about:blank',
+            navigationRevision: request.browser.navigationRevision,
+            viewport: { mode: 'auto' },
+          })
+        : await desktop.activatePanel({ kind: request.kind, tabId: request.tabId });
       applyDesktopSnapshot(snapshot);
       if (desktopPanelActivationRequest?.requestId !== request.requestId) return;
       desktopPanelActivationRequest = null;
       const target = currentDesktopPanelTarget();
       if (sameDesktopPanelTarget(target, request)) {
         if (desktopPanelTargetAcknowledged(snapshot, target)) {
-          clearDesktopPanelActivationRetry();
+          desktopPanelActivationAwaitingGeometryKey = '';
+          desktopPanelActivationFailureKey = '';
           if (target.kind) {
             clearPendingDesktopPanelIntent(target.scopeKey, target.kind, target.tabId ?? '');
           }
-          synchronizeDesktopBrowserAuthority(target);
+        } else if (target.kind === 'browser') {
+          desktopPanelActivationAwaitingGeometryKey = request.key;
         } else {
-          scheduleDesktopPanelActivationRetry(target);
+          desktopPanelActivationFailureKey = request.key;
         }
       }
       desktopPanelActivationEpoch += 1;
-    }).catch((error) => {
+    } catch (error) {
       if (desktopPanelActivationRequest?.requestId !== request.requestId) return;
       desktopPanelActivationRequest = null;
       const target = currentDesktopPanelTarget();
       if (sameDesktopPanelTarget(target, request)) {
         if (isClosedBrowserTabError(error)) {
-          clearDesktopPanelActivationRetry();
           resyncAfterClosedBrowserTab(target);
         } else {
-          scheduleDesktopPanelActivationRetry(target);
+          desktopPanelActivationFailureKey = request.key;
         }
       }
       desktopPanelActivationEpoch += 1;
       console.warn('[WebWorkbenchShell] 激活桌面右栏面板失败:', error);
-    });
+    }
   }
   /** 项目文件树高亮：active code tab 的 filepath */
   const activeCodeTabFilePath = $derived.by<string>(() => {
@@ -2563,9 +2538,11 @@
       snapshot,
       target,
       desktopPanelActivationRequest !== null,
+      desktopPanelActivationAwaitingGeometryKey === targetKey,
     );
     if (activationDecision === 'acknowledged') {
-      clearDesktopPanelActivationRetry();
+      desktopPanelActivationAwaitingGeometryKey = '';
+      desktopPanelActivationFailureKey = '';
       if (target.kind) {
         clearPendingDesktopPanelIntent(target.scopeKey, target.kind, target.tabId ?? '');
       }
@@ -2578,10 +2555,14 @@
       return;
     }
 
-    if (desktopPanelActivationRetryKey && desktopPanelActivationRetryKey !== targetKey) {
-      clearDesktopPanelActivationRetry();
+    if (desktopPanelActivationAwaitingGeometryKey && desktopPanelActivationAwaitingGeometryKey !== targetKey) {
+      desktopPanelActivationAwaitingGeometryKey = '';
     }
-    if (desktopPanelActivationRetryTimer !== null) return;
+    if (desktopPanelActivationFailureKey && desktopPanelActivationFailureKey !== targetKey) {
+      desktopPanelActivationFailureKey = '';
+    }
+    if (desktopPanelActivationAwaitingGeometryKey === targetKey) return;
+    if (desktopPanelActivationFailureKey === targetKey) return;
 
     const request: DesktopPanelActivationRequest = {
       ...target,

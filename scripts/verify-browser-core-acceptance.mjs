@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 const read = (path) => readFile(join(root, path), "utf8");
-const [workerSource, tabSource, inputSource, messageSource, browserRoutes, browserTools, controlSchema, overlayShell, overlayManager, desktopIndex, surfaceManager, windowManager, desktopControlServer] =
+const [workerSource, tabSource, inputSource, messageSource, browserRoutes, browserTools, controlSchema, overlayShell, overlayManager, desktopIndex, surfaceManager, windowManager, desktopControlServer, browserContracts] =
   await Promise.all([
     read("browser-automation-worker/src/runtime.ts"),
     read("web/src/components/tabs/BrowserTabContent.svelte"),
@@ -21,6 +21,7 @@ const [workerSource, tabSource, inputSource, messageSource, browserRoutes, brows
     read("apps/desktop/src/main/browser-surface-manager.ts"),
     read("apps/desktop/src/main/window-manager.ts"),
     read("apps/desktop/src/main/desktop-control-server.ts"),
+    read("contracts/desktop-browser/src/index.ts"),
   ]);
 const workbenchShell = await read("web/src/web/WebWorkbenchShell.svelte");
 const rightPaneSource = await read("web/src/web/RightPane.svelte");
@@ -242,6 +243,21 @@ assert.match(
   workerSource,
   /case "clear":[\s\S]*?Emulation\.setUserAgentOverride[\s\S]*?Network\.setExtraHTTPHeaders/u,
   "清理浏览器仿真必须同时清除 UA 和额外请求头",
+);
+assert.match(
+  browserContracts,
+  /BROWSER_CHILD_TARGET_TYPES = \[[\s\S]*?"iframe"[\s\S]*?"worker"[\s\S]*?"service_worker"[\s\S]*?"shared_worker"/u,
+  "Browser Surface 的子 Target allow-list 必须由共享协议定义",
+);
+assert.match(
+  surfaceManager,
+  /isForbiddenChildPageTarget[\s\S]*?return !isAllowedBrowserChildTarget\(value\)/u,
+  "Main 必须在唯一 CDP 出口拒绝页面、WebView 和未知子 Target",
+);
+assert.match(
+  workerSource,
+  /Target\.attachedToTarget[\s\S]*?isAllowedBrowserChildTarget\(params\.targetInfo\)[\s\S]*?blockedTargetSessionIds/u,
+  "Worker 必须在 Lighthouse 和页面运行态边界再次 fail-closed",
 );
 
 assert.match(

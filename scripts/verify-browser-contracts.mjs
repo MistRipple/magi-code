@@ -94,6 +94,19 @@ for (const entry of browserToolCatalog) {
   ajv.compile(entry.inputSchema);
 }
 
+const browserTabsEntry = browserToolCatalog.find((entry) => entry.name === "browser_tabs");
+assert.ok(browserTabsEntry, "浏览器工具目录缺少 browser_tabs");
+assert.equal(browserTabsEntry.inputSchema.additionalProperties, false, "browser_tabs 不得接受未知字段或子 Tab 身份字段");
+assert.match(browserTabsEntry.description, /一级浏览器标签/u, "browser_tabs 必须明确是右栏一级标签");
+assert.match(browserTabsEntry.description, /target=_blank/u, "browser_tabs 必须明确网页 popup 不得创建子标签");
+for (const forbidden of ["parent_tab_id", "parentTabId", "child_tab_id", "childTabId"]) {
+  assert.equal(
+    Object.hasOwn(browserTabsEntry.inputSchema.properties ?? {}, forbidden),
+    false,
+    `browser_tabs 不得暴露 ${forbidden}`,
+  );
+}
+
 const viewportSchema = browserToolCatalog.find((entry) => entry.name === "browser_viewport")?.inputSchema;
 assert.ok(viewportSchema, "浏览器工具目录缺少 browser_viewport");
 const validateViewport = ajv.compile(viewportSchema);

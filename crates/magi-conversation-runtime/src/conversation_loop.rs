@@ -1760,8 +1760,8 @@ fn run_conversation_loop_inner(
                                 < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
                                 || !stream_interruption_non_stream_fallback_attempted)
                         {
-                            if !partial_thinking.is_empty() {
-                                if let Err(error) = upsert_task_thinking_turn_item(
+                            if !partial_thinking.is_empty()
+                                && let Err(error) = upsert_task_thinking_turn_item(
                                     turn_writeback_context,
                                     &thinking_item_id,
                                     round,
@@ -1769,17 +1769,17 @@ fn run_conversation_loop_inner(
                                     &partial_thinking,
                                     None,
                                     &thinking_publish_gate,
-                                ) {
-                                    let error_text = format!("流式中断后的思考写回失败：{error}");
-                                    let error = task_failure_with_error_item(
-                                        turn_writeback_context,
-                                        &error_text,
-                                        streaming_entry_id.or(last_stream_item_id.as_deref()),
-                                        None,
-                                        None,
-                                    );
-                                    return (TaskOutcome::Failed { error }, context_summary);
-                                }
+                                )
+                            {
+                                let error_text = format!("流式中断后的思考写回失败：{error}");
+                                let error = task_failure_with_error_item(
+                                    turn_writeback_context,
+                                    &error_text,
+                                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                                    None,
+                                    None,
+                                );
+                                return (TaskOutcome::Failed { error }, context_summary);
                             }
                             if !partial_visible_content.is_empty() {
                                 if let Err(error) = upsert_task_stream_turn_item(
@@ -1893,23 +1893,23 @@ fn run_conversation_loop_inner(
                                             + stream_interruption_recovery_attempts
                                             + 1,
                                     );
-                                    if task_lease_is_current(task_store, task_id, lease_id) {
-                                        if let Err(writeback_error) = append_task_error_turn_item(
+                                    if task_lease_is_current(task_store, task_id, lease_id)
+                                        && let Err(writeback_error) = append_task_error_turn_item(
                                             turn_writeback_context,
                                             &fallback_message,
                                             streaming_entry_id.or(last_stream_item_id.as_deref()),
                                             Some(&model_failure),
                                             None,
-                                        ) {
-                                            return (
-                                                TaskOutcome::Failed {
-                                                    error: format!(
-                                                        "{fallback_detail}；失败事实写回失败：{writeback_error}"
-                                                    ),
-                                                },
-                                                context_summary,
-                                            );
-                                        }
+                                        )
+                                    {
+                                        return (
+                                            TaskOutcome::Failed {
+                                                error: format!(
+                                                    "{fallback_detail}；失败事实写回失败：{writeback_error}"
+                                                ),
+                                            },
+                                            context_summary,
+                                        );
                                     }
                                     return (
                                         TaskOutcome::Failed {
@@ -1945,23 +1945,23 @@ fn run_conversation_loop_inner(
                                 retry_attempts,
                             )
                         };
-                        if task_lease_is_current(task_store, task_id, lease_id) {
-                            if let Err(writeback_error) = append_task_error_turn_item(
+                        if task_lease_is_current(task_store, task_id, lease_id)
+                            && let Err(writeback_error) = append_task_error_turn_item(
                                 turn_writeback_context,
                                 &error_message,
                                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                                 Some(&model_failure),
                                 None,
-                            ) {
-                                return (
-                                    TaskOutcome::Failed {
-                                        error: format!(
-                                            "{error_detail}；失败事实写回失败：{writeback_error}"
-                                        ),
-                                    },
-                                    context_summary,
-                                );
-                            }
+                            )
+                        {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: format!(
+                                        "{error_detail}；失败事实写回失败：{writeback_error}"
+                                    ),
+                                },
+                                context_summary,
+                            );
                         }
                         return (
                             TaskOutcome::Failed {
@@ -2103,23 +2103,23 @@ fn run_conversation_loop_inner(
                             retry_attempts,
                         )
                     };
-                    if task_lease_is_current(task_store, task_id, lease_id) {
-                        if let Err(writeback_error) = append_task_error_turn_item(
+                    if task_lease_is_current(task_store, task_id, lease_id)
+                        && let Err(writeback_error) = append_task_error_turn_item(
                             turn_writeback_context,
                             &error_message,
                             streaming_entry_id.or(last_stream_item_id.as_deref()),
                             Some(&model_failure),
                             None,
-                        ) {
-                            return (
-                                TaskOutcome::Failed {
-                                    error: format!(
-                                        "{error_detail}；失败事实写回失败：{writeback_error}"
-                                    ),
-                                },
-                                context_summary,
-                            );
-                        }
+                        )
+                    {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!(
+                                    "{error_detail}；失败事实写回失败：{writeback_error}"
+                                ),
+                            },
+                            context_summary,
+                        );
                     }
                     return (
                         TaskOutcome::Failed {
@@ -2176,8 +2176,8 @@ fn run_conversation_loop_inner(
                 let trimmed = thinking.trim();
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
             });
-        if let Some(thinking) = final_thinking {
-            if let Err(error) = upsert_task_thinking_turn_item(
+        if let Some(thinking) = final_thinking
+            && let Err(error) = upsert_task_thinking_turn_item(
                 turn_writeback_context,
                 &thinking_item_id,
                 round,
@@ -2185,17 +2185,17 @@ fn run_conversation_loop_inner(
                 &thinking,
                 None,
                 &thinking_publish_gate,
-            ) {
-                let error_text = format!("思考结果写回失败：{error}");
-                let error = task_failure_with_error_item(
-                    turn_writeback_context,
-                    &error_text,
-                    streaming_entry_id.or(last_stream_item_id.as_deref()),
-                    None,
-                    None,
-                );
-                return (TaskOutcome::Failed { error }, context_summary);
-            }
+            )
+        {
+            let error_text = format!("思考结果写回失败：{error}");
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &error_text,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
         }
         let streamed_content = streamed_content.into_inner();
         let streamed_visible_content = streamed_visible_content.into_inner();
@@ -2209,8 +2209,8 @@ fn run_conversation_loop_inner(
         } else {
             parsed_visible_content.clone()
         };
-        if let Some(completed_stream_content) = completed_stream_content.as_ref() {
-            if let Err(error) = upsert_task_stream_turn_item(
+        if let Some(completed_stream_content) = completed_stream_content.as_ref()
+            && let Err(error) = upsert_task_stream_turn_item(
                 turn_writeback_context,
                 &stream_item_id,
                 round,
@@ -2218,17 +2218,17 @@ fn run_conversation_loop_inner(
                 completed_stream_content,
                 None,
                 &stream_publish_gate,
-            ) {
-                let error_text = format!("回复结果写回失败：{error}");
-                let error = task_failure_with_error_item(
-                    turn_writeback_context,
-                    &error_text,
-                    streaming_entry_id.or(last_stream_item_id.as_deref()),
-                    None,
-                    None,
-                );
-                return (TaskOutcome::Failed { error }, context_summary);
-            }
+            )
+        {
+            let error_text = format!("回复结果写回失败：{error}");
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &error_text,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
         }
         let has_actionable_output = completed_stream_content.is_some() || round_has_tool_calls;
         let response_contract_failure = match parsed.status {
@@ -2321,8 +2321,7 @@ fn run_conversation_loop_inner(
                 .as_deref()
                 .is_some_and(|content| !content.trim().is_empty())
                 || !assistant_response_message.provider_context.is_empty())
-        {
-            if let Err(error) = append_thread_messages_checkpoint(
+            && let Err(error) = append_thread_messages_checkpoint(
                 session_store,
                 thread_id,
                 vec![chat_message_to_thread_chat_message(
@@ -2330,16 +2329,16 @@ fn run_conversation_loop_inner(
                 )],
                 persist_session_state,
                 "task_thread_assistant_response",
-            ) {
-                let error = task_failure_with_error_item(
-                    turn_writeback_context,
-                    &format!("任务 assistant 响应持久化失败：{error}"),
-                    streaming_entry_id.or(last_stream_item_id.as_deref()),
-                    None,
-                    None,
-                );
-                return (TaskOutcome::Failed { error }, context_summary);
-            }
+            )
+        {
+            let error = task_failure_with_error_item(
+                turn_writeback_context,
+                &format!("任务 assistant 响应持久化失败：{error}"),
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
         }
 
         if let Some(failure) = response_contract_failure {

@@ -7,7 +7,7 @@ use super::{
 };
 use magi_api::{
     ApiError, ApiState, DaemonIdentity, DirectHttpModelProbeConfig, RunnerManager,
-    RuntimeStatePersistence, TaskCheckpointPersist, build_router,
+    RuntimeStatePersistence, SessionProjectionPersistMode, TaskCheckpointPersist, build_router,
     build_runtime_capability_dependency_provider,
     mcp_config::{build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id},
 };
@@ -1632,12 +1632,21 @@ impl DaemonRuntime {
         .with_session_state_checkpoint_persist(session_state_checkpoint_persist)
         .with_session_projection_persist({
             let repository = self.state_repository.clone();
-            Arc::new(move |durable, sidecars| {
-                repository
-                    .save_session_projection_state(durable, sidecars)
-                    .map_err(|error| {
-                        ApiError::internal_assembly("session projection 持久化失败", error)
-                    })
+            Arc::new(move |durable, sidecars, mode| {
+                let result = match mode {
+                    SessionProjectionPersistMode::Full => {
+                        repository.save_session_projection_state(durable, sidecars)
+                    }
+                    SessionProjectionPersistMode::Navigation { target_session_id } => repository
+                        .save_session_navigation_state(
+                            durable,
+                            sidecars,
+                            target_session_id.as_ref(),
+                        ),
+                };
+                result.map_err(|error| {
+                    ApiError::internal_assembly("session projection 持久化失败", error)
+                })
             })
         })
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)

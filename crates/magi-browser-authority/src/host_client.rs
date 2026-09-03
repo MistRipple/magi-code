@@ -11,7 +11,7 @@ use std::{
 use std::path::Path;
 
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use magi_core::{BrowserCommandId, BrowserTabId, UtcMillis};
+use magi_core::{BrowserCommandId, UtcMillis};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -30,7 +30,6 @@ use crate::{
     BrowserHostBinaryPayload, BrowserHostCommand, BrowserHostCommandOutcome,
     BrowserHostCommandResult, BrowserHostEvent, BrowserHostEventEnvelope, BrowserHostHandshake,
     BrowserHostProtocolVersion, BrowserHostRequestEnvelope, BrowserHostResponseEnvelope,
-    BrowserSurfaceIdentity,
 };
 
 trait DesktopControlStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -78,7 +77,6 @@ pub struct BrowserHostConnection {
 pub struct BrowserHostClient {
     sink: Arc<tokio::sync::Mutex<HostWebSocketSink>>,
     pending: Arc<Mutex<HashMap<BrowserCommandId, PendingResponse>>>,
-    tab_locks: Arc<Mutex<HashMap<BrowserTabId, Arc<tokio::sync::Mutex<()>>>>>,
     events: broadcast::Sender<BrowserHostIncomingEvent>,
     command_sequence: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
@@ -142,7 +140,6 @@ impl BrowserHostClient {
         let client = Self {
             sink,
             pending,
-            tab_locks: Arc::new(Mutex::new(HashMap::new())),
             events,
             command_sequence: Arc::new(AtomicU64::new(1)),
             closed,
@@ -189,11 +186,11 @@ impl BrowserHostClient {
         &self,
         command: BrowserHostCommand,
     ) -> Result<BrowserHostCommandReply, BrowserHostClientError> {
-        if let Some(tab_id) = command_tab_id(&command) {
-            let lock = self.tab_lock(tab_id);
-            let _guard = lock.lock().await;
-            return self.request_inner(command).await;
-        }
+        // Desktop Control Server 是每个 Browser Tab 的唯一资源调度器。
+        // 客户端不能再持有跨完整响应生命周期的 Tab 锁，否则后台标记
+        // 投影超时时会把导航、刷新和后退挡在锁外，表现为页面永久卡住。
+        // 多个请求可以并发写入同一 WebSocket，由 Desktop 端按资源排队，
+        // 并允许高优先级导航中止可重放的标记投影。
         self.request_inner(command).await
     }
 
@@ -281,47 +278,12 @@ impl BrowserHostClient {
             .map_err(|error| BrowserHostClientError::Transport(error.to_string()))
     }
 
-    fn tab_lock(&self, tab_id: &BrowserTabId) -> Arc<tokio::sync::Mutex<()>> {
-        self.tab_locks
-            .lock()
-            .expect("browser Host tab lock map poisoned")
-            .entry(tab_id.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
     pub async fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         let _ = self.sink.lock().await.send(Message::Close(None)).await;
         fail_pending(&self.pending, BrowserHostClientError::Disconnected);
-    }
-}
-
-fn command_tab_id(command: &BrowserHostCommand) -> Option<&BrowserTabId> {
-    match command {
-        BrowserHostCommand::Ping
-        | BrowserHostCommand::Cancel { .. }
-        | BrowserHostCommand::Shutdown => None,
-        BrowserHostCommand::CreatePage { tab_id, .. }
-        | BrowserHostCommand::RestorePage { tab_id, .. }
-        | BrowserHostCommand::SetLogicalViewport { tab_id, .. }
-        | BrowserHostCommand::GetLogicalViewport { tab_id }
-        | BrowserHostCommand::SetAnnotations { tab_id, .. }
-        | BrowserHostCommand::InspectStart(BrowserSurfaceIdentity { tab_id, .. })
-        | BrowserHostCommand::InspectStop(BrowserSurfaceIdentity { tab_id, .. })
-        | BrowserHostCommand::ClosePage { tab_id }
-        | BrowserHostCommand::Navigate { tab_id, .. }
-        | BrowserHostCommand::Snapshot { tab_id, .. }
-        | BrowserHostCommand::Click { tab_id, .. }
-        | BrowserHostCommand::Type { tab_id, .. }
-        | BrowserHostCommand::Press { tab_id, .. }
-        | BrowserHostCommand::Scroll { tab_id, .. }
-        | BrowserHostCommand::Devtools { tab_id, .. }
-        | BrowserHostCommand::Screenshot { tab_id, .. }
-        | BrowserHostCommand::HitTest { tab_id, .. }
-        | BrowserHostCommand::UpdateControl { tab_id, .. } => Some(tab_id),
     }
 }
 

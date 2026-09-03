@@ -1,6 +1,25 @@
 export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 4 } as const;
 
 /**
+ * Browser Surface 允许自动化附着的页面内部 Target 类型。
+ * `page`、`webview` 及未知类型都不是当前一级 Browser Tab 的组成部分，
+ * 不能沿协议边界被转换成子 Tab 或额外页面。
+ */
+export const BROWSER_CHILD_TARGET_TYPES = [
+  "iframe",
+  "worker",
+  "service_worker",
+  "shared_worker",
+] as const;
+
+export function isAllowedBrowserChildTarget(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const type = (value as Record<string, unknown>).type;
+  return typeof type === "string"
+    && (BROWSER_CHILD_TARGET_TYPES as readonly string[]).includes(type);
+}
+
+/**
  * 规范化 Chromium 返回的可选 DOM.nodeId。
  *
  * Chromium 的 nodeId=0 表示没有可复用的 DOM 节点身份，必须在协议边界
@@ -404,6 +423,14 @@ export interface WorkerCdpRequest {
   allow_navigation_advance?: boolean;
 }
 
+/** 取消 Worker 已转发给 Desktop Main 的单个 CDP 请求。 */
+export interface WorkerCdpCancelRequest {
+  type: "cdp_cancel";
+  call_id: string;
+  request_id: string;
+  binding: BrowserSurfaceBinding;
+}
+
 export type WorkerCdpResponse =
   | {
       type: "cdp_response";
@@ -451,4 +478,4 @@ export interface WorkerReadyMessage {
 }
 
 export type MainToWorkerMessage = WorkerCommandRequest | WorkerCancelRequest | WorkerCdpResponse | WorkerCdpEvent | WorkerRebindRequest;
-export type WorkerToMainMessage = WorkerCommandResponse | WorkerCdpRequest | WorkerReadyMessage | WorkerRebindAck;
+export type WorkerToMainMessage = WorkerCommandResponse | WorkerCdpRequest | WorkerCdpCancelRequest | WorkerReadyMessage | WorkerRebindAck;

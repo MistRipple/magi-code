@@ -23,6 +23,7 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  signalCleanup: (() => void) | null;
 }
 
 export interface CdpCallContext {
@@ -88,24 +89,32 @@ export class CdpClient {
       ...(options.allowNavigationAdvance ? { allow_navigation_advance: true } : {}),
     };
     return new Promise<T>((resolve, reject) => {
+      let pending!: PendingRequest;
       const timer = setTimeout(() => {
-        this.#pending.delete(requestId);
-        reject(new Error(`browser_cdp_timeout:${method}`));
+        if (!this.#pending.has(requestId)) return;
+        this.cancelPending(requestId, pending, new Error(`browser_cdp_timeout:${method}`));
       }, timeoutMs);
       timer.unref();
-      this.#pending.set(requestId, {
+      pending = {
         callId,
         binding,
         resolve: (value) => resolve(value as T),
         reject,
         timer,
-      });
+        signalCleanup: null,
+      };
+      this.#pending.set(requestId, pending);
+      if (context?.signal) {
+        const onAbort = () => this.cancelPending(requestId, pending);
+        pending.signalCleanup = () => context.signal.removeEventListener("abort", onAbort);
+        context.signal.addEventListener("abort", onAbort, { once: true });
+        if (context.signal.aborted) onAbort();
+      }
+      if (this.#pending.get(requestId) !== pending) return;
       try {
         this.#port.postMessage(parseWorkerToMainMessage(request));
       } catch (cause) {
-        this.#pending.delete(requestId);
-        clearTimeout(timer);
-        reject(cause instanceof Error ? cause : new Error(String(cause)));
+        this.settlePending(requestId, pending, cause instanceof Error ? cause : new Error(String(cause)));
       }
     });
   }
@@ -123,6 +132,7 @@ export class CdpClient {
   close(error = new Error("browser_worker_stopped")): void {
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
+      pending.signalCleanup?.();
       pending.reject(error);
     }
     this.#pending.clear();
@@ -137,6 +147,8 @@ export class CdpClient {
       if (pending.callId !== message.call_id) return;
       this.#pending.delete(message.request_id);
       clearTimeout(pending.timer);
+      pending.signalCleanup?.();
+      pending.signalCleanup = null;
       if (!sameBinding(pending.binding, message.binding)) {
         pending.reject(new Error("browser_surface_stale"));
       } else if (message.error) {
@@ -151,6 +163,44 @@ export class CdpClient {
         listener(message.binding, message.method, message.params, message.session_id);
       }
     }
+  }
+
+  private cancelPending(
+    requestId: string,
+    pending: PendingRequest,
+    error = new Error("browser_command_cancelled"),
+  ): void {
+    if (this.#pending.get(requestId) !== pending) return;
+    this.settlePending(requestId, pending, error, true);
+  }
+
+  private settlePending(
+    requestId: string,
+    pending: PendingRequest,
+    error: Error,
+    notifyMain = false,
+  ): void {
+    if (this.#pending.get(requestId) !== pending) return;
+    this.#pending.delete(requestId);
+    clearTimeout(pending.timer);
+    pending.signalCleanup?.();
+    pending.signalCleanup = null;
+    if (notifyMain) {
+      try {
+        this.#port.postMessage(parseWorkerToMainMessage({
+          type: "cdp_cancel",
+          call_id: pending.callId,
+          request_id: requestId,
+          binding: pending.binding,
+        }));
+      } catch (cause) {
+        console.warn(
+          "[browser-worker] CDP cancel message failed",
+          cause instanceof Error ? cause.message : String(cause),
+        );
+      }
+    }
+    pending.reject(error);
   }
 }
 

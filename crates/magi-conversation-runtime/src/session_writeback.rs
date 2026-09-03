@@ -1339,18 +1339,16 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         }
         if is_session_goal_write_tool(&tool_call.function.name)
             && matches!(tool_status, ExecutionResultStatus::Succeeded)
-        {
-            if let Err(error) =
+            && let Err(error) =
                 persist_session_state_checkpoint(persist_session_state, "session_goal_tool")
-            {
-                return SessionToolCallBatchOutcome {
-                    writeback_error: Some(format!(
-                        "会话目标工具 {} 的状态持久化失败：{error}",
-                        tool_call.function.name
-                    )),
-                    ..SessionToolCallBatchOutcome::default()
-                };
-            }
+        {
+            return SessionToolCallBatchOutcome {
+                writeback_error: Some(format!(
+                    "会话目标工具 {} 的状态持久化失败：{error}",
+                    tool_call.function.name
+                )),
+                ..SessionToolCallBatchOutcome::default()
+            };
         }
         if let Err(error) = upsert_session_tool_call_result_item(
             SessionToolResultWritebackContext {

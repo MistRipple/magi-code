@@ -41,6 +41,13 @@ await withGoldenViteServer(async (server) => {
       activePanelKind: 'browser',
       activeTabId: 'browser-a',
       activeSurfaceId: 'surface-a',
+      rendererGeometry: {
+        rightPaneBounds: { x: 800, y: 0, width: 480, height: 900 },
+        browserContentSlot: {
+          tabId: 'browser-a',
+          bounds: { x: 800, y: 40, width: 480, height: 860 },
+        },
+      },
     },
   };
   const activeTerminal = {
@@ -71,7 +78,14 @@ await withGoldenViteServer(async (server) => {
   assert.equal(
     activation.decideDesktopPanelActivation(activeBrowserA, browserA, true),
     'acknowledged',
-    'Main 快照已确认 Browser Surface 时不得重复物化',
+    'Main 快照已确认 Browser Surface 和当前内容槽时不得重复物化',
+  );
+  assert.equal(
+    activation.decideDesktopPanelActivation({
+      layout: { ...activeBrowserA.layout, rendererGeometry: null },
+    }, browserA, false, true),
+    'wait_for_geometry',
+    'Surface 已物化但 Renderer 内容槽尚未确认时只能等待真实几何事件',
   );
   assert.equal(
     activation.decideDesktopPanelActivation(activeBrowserA, browserB, false),
@@ -112,6 +126,16 @@ await withGoldenViteServer(async (server) => {
     }, browserA),
     false,
     'Browser 没有真实 Surface 时不能被误判为已激活',
+  );
+  assert.equal(
+    activation.desktopPanelTargetAcknowledged({
+      layout: { ...activeBrowserA.layout, rendererGeometry: {
+        ...activeBrowserA.layout.rendererGeometry,
+        browserContentSlot: { ...activeBrowserA.layout.rendererGeometry.browserContentSlot, tabId: 'browser-b' },
+      } },
+    }, browserA),
+    false,
+    '其他 Browser Tab 的内容槽不能确认当前激活目标',
   );
   assert.equal(
     activation.sameDesktopPanelTarget(browserA, browserB),

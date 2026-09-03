@@ -81,6 +81,7 @@ interface OverlayRecord {
   viewportAppliedBounds: Rectangle | null;
   viewportApplyPromise: Promise<void> | null;
   viewportApplyDirty: boolean;
+  focusedIdentity: DesktopOverlayIdentity | null;
 }
 
 const TRANSPARENT_VIEW_BACKGROUND = "rgba(0, 0, 0, 0)";
@@ -145,6 +146,7 @@ export class DesktopOverlayManager {
       viewportAppliedBounds: null,
       viewportApplyPromise: null,
       viewportApplyDirty: false,
+      focusedIdentity: null,
     };
     this.#records.set(windowId, record);
     this.createRenderer(record);
@@ -602,9 +604,25 @@ export class DesktopOverlayManager {
     if (record.view.getVisible() !== hasRenderableOverlay) {
       record.view.setVisible(hasRenderableOverlay);
     }
-    // 布局事务只负责合成层的可见性和 bounds，不能隐式改变焦点归属。
-    // 这里抢焦点会在右栏拖动、菜单重排或页面加载时把键盘输入从对话框
-    // 或浏览器地址栏转移到 Overlay WebContents，造成“点击后输入跑错位置”。
+    const state = record.state;
+    if (!hasRenderableOverlay || !state) {
+      record.focusedIdentity = null;
+      return;
+    }
+    if (
+      (!record.focusedIdentity || !sameDesktopOverlayIdentity(record.focusedIdentity, state))
+      && !record.view.webContents.isDestroyed()
+    ) {
+      // 交互 Overlay 必须在首次显示时成为第一响应者，否则其菜单按钮、
+      // Escape 和标记拖拽事件会继续落到下方 App Renderer。焦点只在身份
+      // 变化时设置一次，布局重排不会重复抢焦点；关闭时由 WindowManager
+      // 明确把焦点交还给 App Renderer。
+      record.view.webContents.focus();
+      record.focusedIdentity = {
+        overlayId: state.overlayId,
+        ownerId: state.ownerId,
+      };
+    }
   }
 
   private setOverlayBounds(record: OverlayRecord, bounds: Rectangle): void {

@@ -172,6 +172,17 @@
         "allow_navigation_advance": { "type": "boolean" }
       }
     },
+    "cdpCancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "call_id", "request_id", "binding"],
+      "properties": {
+        "type": { "const": "cdp_cancel" },
+        "call_id": { "$ref": "#/$defs/id" },
+        "request_id": { "$ref": "#/$defs/id" },
+        "binding": { "$ref": "https://magi.dev/contracts/desktop-control.schema.json#/$defs/surfaceBinding" }
+      }
+    },
     "workerReady": {
       "type": "object",
       "additionalProperties": false,
@@ -195,6 +206,7 @@
       "oneOf": [
         { "$ref": "#/$defs/workerResult" },
         { "$ref": "#/$defs/cdpRequest" },
+        { "$ref": "#/$defs/cdpCancel" },
         { "$ref": "#/$defs/workerReady" },
         { "$ref": "#/$defs/workerRebindAck" }
       ]

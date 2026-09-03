@@ -36,7 +36,7 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 - 当前会话的 Agent 可以操作用户正在查看的同一个页面，不启动隐藏浏览器或第二份 Chromium。
 - Agent 接管期间持续显示虚拟鼠标和 Tab 占用状态；用户输入立即接管当前 Surface。
 - Agent 任务完成、暂停、失败或取消后只释放控制权，不关闭 Tab，不改变最终页面。
-- `target="_blank"`、`window.open()` 和新窗口链接在当前 Browser Tab 中打开，不创建额外窗口或隐藏 Target。
+- `target="_blank"`、`window.open()` 和新窗口链接全部由当前 Browser Tab 接管，不创建额外窗口、子 Tab 或隐藏 Target；合法的 HTTP(S) 请求在同一个顶层页面内导航，无法安全转移的动态窗口发布明确阻止事件。
 - 右侧面板可以从最小宽度拖到窗口约三分之二，浏览器始终严格位于内容区。
 - 右栏宽度和拖拽手柄由统一 `WindowLayout` 约束，主 Renderer 的 DOM/CSS 只呈现这份状态；当前 Browser Tab 的 `WebContentsView` 只消费 Renderer 在真实 DOM 排版后报告、经 Main 校验的内容槽。`ResizeObserver -> 合并后的 renderer_geometry -> Main setBounds` 仅用于同步原生 View 到既有 DOM 槽位，不得反向修改 Renderer 布局、触发导航/刷新或形成第二套尺寸计算；禁止额外窗口、悬浮层、全右栏覆盖或浏览器专用几何计算改变面板几何。
 - 页面刷新、跳转、慢请求和工具执行期间不黑屏、不闪烁、不重建页面、不显示截图投影。
@@ -433,6 +433,14 @@ displayLabel ?? pageTitle ?? canonicalUrl ?? 新建浏览器
 
 网页标题更新不得覆盖用户编辑标题。
 
+Browser Tab 层级是固定的一层：右栏可以有多个彼此平级的 Magi Browser Tab，
+但每个 Browser Tab 内只有一个 Chromium 页面和一个 WebContents。网页的
+`window.open()`、`target=_blank`、表单 popup 和浏览器页面型 Target 都不得
+创建子 Tab；合法的 HTTP(S) 请求在 Chromium 创建新 WebContents 前被拒绝创建，
+并转交当前 WebContents 的统一导航生命周期。只有用户或 Agent 明确调用
+`browser_tabs new` 才能创建右栏的另一个平级 Browser Tab。
+`browser_tabs new` 只创建右栏一级 Browser Tab，不接受 parent/child Tab 身份。
+
 BrowserAuthority 不再持久化：
 
 - `activeTabId`
@@ -511,9 +519,8 @@ BrowserAutomationWorker 不得调用 `newPage()`、创建 BrowserWindow、关闭
 
 在每个 Browser Surface 的 WebContents 创建时安装 `setWindowOpenHandler()`：
 
-- `http/https` GET 请求：`deny` 新窗口，并在当前 WebContents 导航。
-- 可安全转移的 POST：`deny` 新窗口，并在当前 WebContents 重放原请求。
-- 无法安全转移的 `about:blank` 动态窗口、脚本写入窗口和不受支持 Scheme：阻止并展示明确错误。
+- `http/https` GET 和带可重放 POST：返回 `deny` 阻止新 WebContents，并把请求转交当前 WebContents 的统一导航生命周期。
+- 动态 `about:blank`、脚本写入窗口和不受支持 Scheme：返回 `deny` 并发布阻止事件，不能创建子 Tab。
 - OAuth、下载和外部协议由产品策略接管，不允许创建隐藏 Target。
 
 必须在 Chromium 创建新 WebContents 之前阻止请求。禁止“先创建 popup，再关闭并导航原页”。

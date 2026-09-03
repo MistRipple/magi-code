@@ -371,15 +371,16 @@ test("持久化标记在页面刷新后按最后一次 Authority 投影重放", 
     assert.equal(response.outcome?.status, "succeeded");
     assert.equal(calls.length, 1);
 
+    const refreshedBinding = { ...binding, navigation_revision: binding.navigation_revision + 1 };
     server.handleSurfaceEvent({
       type: "page_updated",
-      binding,
+      binding: refreshedBinding,
       page: {
         tab_id: binding.tab_id,
         url: "https://example.test/after-refresh",
         origin: "https://example.test",
         title: "After refresh",
-        navigation_revision: binding.navigation_revision,
+        navigation_revision: refreshedBinding.navigation_revision,
       },
     } as BrowserSurfaceEvent);
     await waitUntil(() => calls.length === 2);
@@ -391,6 +392,179 @@ test("持久化标记在页面刷新后按最后一次 Authority 投影重放", 
       },
     });
   } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
+test("文档就绪信号会重放刷新后尚未落地的标记投影", async () => {
+  const calls: BrowserHostCommand[] = [];
+  let attempts = 0;
+  const worker = {
+    execute: async (_targetBinding: BrowserSurfaceBinding, command: BrowserHostCommand) => {
+      calls.push(command);
+      attempts += 1;
+      if (attempts === 1) return failedOutcome("browser_page_runtime_not_ready");
+      return {
+        outcome: {
+          status: "succeeded" as const,
+          payload: { type: "empty" as const },
+        },
+      };
+    },
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker);
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const annotations = [{ annotation_id: "annotation-ready", sequence: 1, status: "active" }];
+    client.send(JSON.stringify(request("set-annotations-ready", {
+      type: "set_annotations",
+      payload: { tab_id: binding.tab_id, annotations },
+    })));
+    await waitUntil(() => calls.length === 1);
+    server.handleSurfaceDocumentReady(binding);
+    await waitUntil(() => calls.length === 2);
+    assert.deepEqual(calls[1], {
+      type: "set_annotations",
+      payload: { tab_id: binding.tab_id, annotations },
+    });
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
+test("标记投影按 Tab 合并最新 revision，不取消正在执行的 Chromium 请求", async () => {
+  const firstOperation = deferred<{ outcome: BrowserCommandOutcome }>();
+  const calls: BrowserHostCommand[] = [];
+  const worker = {
+    execute: async (_binding: BrowserSurfaceBinding, command: BrowserHostCommand) => {
+      calls.push(command);
+      if (calls.length === 1) return firstOperation.promise;
+      return {
+        outcome: {
+          status: "succeeded" as const,
+          payload: { type: "empty" as const },
+        },
+      };
+    },
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker);
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = new Promise<Map<string, { request_id?: string; outcome?: { status: string }; event?: unknown }>>((resolve) => {
+      const responses = new Map<string, { request_id?: string; outcome?: { status: string }; event?: unknown }>();
+      const onMessage = (data: RawData) => {
+        const message = JSON.parse(data.toString()) as { request_id?: string; outcome?: { status: string }; event?: unknown };
+        if (message.request_id === "set-annotations-1" || message.request_id === "set-annotations-2") {
+          responses.set(message.request_id, message);
+        }
+        if (responses.size === 2) {
+          client.off("message", onMessage);
+          resolve(responses);
+        }
+      };
+      client.on("message", onMessage);
+    });
+    client.send(JSON.stringify(request("set-annotations-1", {
+      type: "set_annotations",
+      payload: {
+        tab_id: binding.tab_id,
+        annotations: [{ annotation_id: "annotation-1", sequence: 1, status: "active" }],
+      },
+    })));
+    await waitUntil(() => calls.length === 1);
+
+    client.send(JSON.stringify(request("set-annotations-2", {
+      type: "set_annotations",
+      payload: {
+        tab_id: binding.tab_id,
+        annotations: [
+          { annotation_id: "annotation-1", sequence: 1, status: "active" },
+          { annotation_id: "annotation-2", sequence: 2, status: "active" },
+        ],
+      },
+    })));
+    firstOperation.resolve({
+      outcome: {
+        status: "succeeded",
+        payload: { type: "empty" },
+      },
+    });
+
+    const responses = await responsePromise;
+    const firstResponse = responses.get("set-annotations-1");
+    const secondResponse = responses.get("set-annotations-2");
+    assert.ok(firstResponse);
+    assert.ok(secondResponse);
+    assert.equal(firstResponse.outcome?.status, "succeeded");
+    assert.equal(secondResponse.outcome?.status, "succeeded");
+    assert.equal(calls.length, 2, "连续更新只能向 Chromium 投影首个和最新 revision");
+    assert.deepEqual(
+      (calls[1] as Extract<BrowserHostCommand, { type: "set_annotations" }>).payload.annotations,
+      [
+        { annotation_id: "annotation-1", sequence: 1, status: "active" },
+        { annotation_id: "annotation-2", sequence: 2, status: "active" },
+      ],
+    );
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
+test("标记投影执行缓慢时不占用普通浏览器命令队列", async () => {
+  const annotationOperation = deferred<{ outcome: BrowserCommandOutcome }>();
+  const calls: BrowserHostCommand[] = [];
+  const worker = {
+    execute: async (_binding: BrowserSurfaceBinding, command: BrowserHostCommand) => {
+      calls.push(command);
+      if (command.type === "set_annotations") return annotationOperation.promise;
+      return {
+        outcome: {
+          status: "succeeded" as const,
+          payload: { type: "empty" as const },
+        },
+      };
+    },
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker);
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    client.send(JSON.stringify(request("set-annotations-slow", {
+      type: "set_annotations",
+      payload: {
+        tab_id: binding.tab_id,
+        annotations: [{ annotation_id: "annotation-1", sequence: 1, status: "active" }],
+      },
+    })));
+    await waitUntil(() => calls.some((command) => command.type === "set_annotations"));
+
+    const commandResponse = nextJsonMatching(client, (message) => message.request_id === "snapshot-fast");
+    client.send(JSON.stringify(request("snapshot-fast", snapshotCommand())));
+    const response = await commandResponse;
+    assert.equal(response.outcome?.status, "succeeded");
+    assert.equal(calls.filter((command) => command.type === "snapshot").length, 1);
+
+    annotationOperation.resolve({
+      outcome: {
+        status: "succeeded",
+        payload: { type: "empty" },
+      },
+    });
+  } finally {
+    annotationOperation.resolve({
+      outcome: {
+        status: "succeeded",
+        payload: { type: "empty" },
+      },
+    });
     await closeSocket(client);
     await server.close();
   }

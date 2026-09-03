@@ -92,6 +92,7 @@ export interface BrowserAuthorityTabProjection {
 
 export interface BrowserAuthoritySessionProjection {
   browserSessionId: string;
+  revision: number;
   agentOccupied: boolean;
   tabs: BrowserAuthorityTabProjection[];
 }
@@ -372,6 +373,9 @@ let pendingDesktopPanelIntent: PendingDesktopPanelIntent | null = null;
 // 用户关闭 Browser Tab 后，HTTP 删除和下一次权威快照之间存在竞态。
 // 这些键只在确认失败或权威快照确认删除后清理，不允许旧快照把 Tab 重新投影回 UI。
 const pendingBrowserTabClosures = new Set<string>();
+// BrowserAuthority revision 只用于拒绝迟到快照。浏览器 Tab 实体不进入本地持久化，
+// 因此这个索引与 Renderer 生命周期一致，并按右栏作用域隔离。
+const browserAuthorityRevisions = new Map<string, number>();
 
 function browserTabClosureKey(
   scopeKey: string,
@@ -517,19 +521,8 @@ function upsertTab(
     rightPaneState.activeSessionId = normalizeSessionId(terminalPayload.sessionId);
   }
   const session = ensureSession(scopeKey);
-  const existingId = tabKey(kind, payload);
-  const existing = session.openTabs.find((tab) => tab.id === existingId);
-  const effectivePayload = kind === 'browser'
-    && existing?.kind === 'browser'
-    && (payload as BrowserTabPayload).lifecycle === 'creating'
-    && (existing.payload as BrowserTabPayload).lifecycle !== 'creating'
-    ? {
-        ...(payload as BrowserTabPayload),
-        lifecycle: (existing.payload as BrowserTabPayload).lifecycle,
-        agentOccupied: (existing.payload as BrowserTabPayload).agentOccupied,
-      }
-    : payload;
-  const id = tabKey(kind, effectivePayload);
+  const id = tabKey(kind, payload);
+  const existing = session.openTabs.find((tab) => tab.id === id);
   const timestamp = now();
 
   if (existing) {
@@ -539,9 +532,9 @@ function upsertTab(
       && existing.kind === 'browser'
       && sameBrowserTabPayload(
         existing.payload as BrowserTabPayload,
-        effectivePayload as BrowserTabPayload,
+        payload as BrowserTabPayload,
       );
-    if (!browserPayloadUnchanged) existing.payload = effectivePayload;
+    if (!browserPayloadUnchanged) existing.payload = payload;
     if (activate) {
       existing.lastActivatedAt = timestamp;
       session.activeTabId = id;
@@ -556,7 +549,7 @@ function upsertTab(
     kind,
     label,
     accentToken,
-    payload: effectivePayload,
+    payload,
     lastActivatedAt: timestamp,
   };
   session.openTabs = [...session.openTabs, tab];
@@ -573,6 +566,8 @@ function sameBrowserTabPayload(left: BrowserTabPayload, right: BrowserTabPayload
     && left.tabId === right.tabId
     && left.lifecycle === right.lifecycle
     && left.agentOccupied === right.agentOccupied
+    && left.url === right.url
+    && left.navigationRevision === right.navigationRevision
     && left.workspaceId === right.workspaceId
     && left.workspacePath === right.workspacePath
     && left.sessionId === right.sessionId;
@@ -801,7 +796,7 @@ export function openBrowserTab(
 export function synchronizeBrowserSessionSnapshot(
   snapshot: Pick<
     BrowserSessionSnapshot,
-    'browserSessionId' | 'workspaceId' | 'sessionId' | 'agentOccupied' | 'tabs'
+    'browserSessionId' | 'workspaceId' | 'sessionId' | 'revision' | 'agentOccupied' | 'tabs'
   >,
   workspacePath?: string | null,
   options?: {
@@ -817,6 +812,7 @@ export function synchronizeBrowserSessionSnapshot(
     options?.sessionId ?? snapshot.sessionId,
     {
       browserSessionId: snapshot.browserSessionId,
+      revision: snapshot.revision,
       agentOccupied: snapshot.agentOccupied,
       tabs: snapshot.tabs.map((tab) => ({
         tabId: tab.tabId,
@@ -915,11 +911,30 @@ export function synchronizeBrowserTabs(
   const scopeKey = sessionScopeKey(normalizedWorkspaceId, normalizedSessionId);
   if (!scopeKey) return;
 
+  const browserSessionId = snapshot?.browserSessionId.trim() || '';
+  if (snapshot === null) {
+    const scopePrefix = `${scopeKey}\u0001`;
+    for (const key of browserAuthorityRevisions.keys()) {
+      if (key.startsWith(scopePrefix)) browserAuthorityRevisions.delete(key);
+    }
+  } else {
+    if (!browserSessionId) return;
+    const revisionKey = `${scopeKey}\u0001${browserSessionId}`;
+    const acceptedRevision = browserAuthorityRevisions.get(revisionKey);
+    if (acceptedRevision !== undefined && snapshot.revision < acceptedRevision) return;
+    const scopePrefix = `${scopeKey}\u0001`;
+    for (const key of browserAuthorityRevisions.keys()) {
+      if (key.startsWith(scopePrefix) && key !== revisionKey) {
+        browserAuthorityRevisions.delete(key);
+      }
+    }
+    browserAuthorityRevisions.set(revisionKey, snapshot.revision);
+  }
+
   const pane = ensureSession(scopeKey);
   pane.browserAuthoritySynchronized = true;
   const previousActiveTabId = pane.activeTabId;
   const hadBrowserProjection = pane.openTabs.some((tab) => tab.kind === 'browser');
-  const browserSessionId = snapshot?.browserSessionId.trim() || '';
   const rawAuthorityTabs = (snapshot?.tabs ?? []).filter((tab) => tab.tabId.trim());
   const rawAuthorityTabsById = new Map(
     rawAuthorityTabs.map((tab) => [tab.tabId.trim(), tab.lifecycle]),
@@ -967,7 +982,7 @@ export function synchronizeBrowserTabs(
         navigationRevision: tab.navigationRevision,
         agentOccupied: snapshot?.agentOccupied === true,
         workspaceId: normalizedWorkspaceId,
-        workspacePath: normalizeWorkspaceId(workspacePath) || undefined,
+        workspacePath: typeof workspacePath === 'string' ? workspacePath.trim() || undefined : undefined,
         sessionId: normalizedSessionId,
       },
       label,

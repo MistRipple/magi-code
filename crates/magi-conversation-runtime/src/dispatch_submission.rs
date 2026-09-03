@@ -478,15 +478,14 @@ pub fn cleanup_rejected_dispatch(
             });
         }
     }
-    if let Some(chain) = graph.active_execution_chain.as_ref() {
-        if let Some(turn_id) = chain
+    if let Some(chain) = graph.active_execution_chain.as_ref()
+        && let Some(turn_id) = chain
             .current_turn
             .as_ref()
             .map(|turn| turn.turn_id.as_str())
-        {
-            for branch in &chain.branches {
-                let _ = execution_registry.remove_if_turn_matches(&branch.task_id, turn_id);
-            }
+    {
+        for branch in &chain.branches {
+            let _ = execution_registry.remove_if_turn_matches(&branch.task_id, turn_id);
         }
     }
     if let Some(task_store) = task_store {
@@ -1150,15 +1149,15 @@ fn materialize_execution(
     if coordinator_reused {
         attempt.rollback.record_coordinator_after(activated_thread);
     }
-    if let Some(checkpoint) = interrupted_checkpoint {
-        if let Err(error) = install_interrupted_turn_checkpoint(
+    if let Some(checkpoint) = interrupted_checkpoint
+        && let Err(error) = install_interrupted_turn_checkpoint(
             runtime.session_store,
             &worker_thread_id,
             checkpoint,
             UtcMillis::now(),
-        ) {
-            return attempt.fail(error);
-        }
+        )
+    {
+        return attempt.fail(error);
     }
     if let Some(created_thread) = attempt
         .rollback

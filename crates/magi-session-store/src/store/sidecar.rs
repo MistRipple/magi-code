@@ -3089,9 +3089,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, candidate, changed)) = updated else {
-                    return None;
-                };
+                let (sidecar_index, candidate, changed) = updated?;
                 if changed {
                     state.execution_sidecar_store.runtime_sidecars[sidecar_index] =
                         candidate.clone();
@@ -3232,9 +3230,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((item_id, updated)) = updated else {
-                    return None;
-                };
+                let (item_id, updated) = updated?;
                 state.timeline.push(TimelineEntry {
                     entry_id: entry_id.clone(),
                     session_id: session_id.clone(),
@@ -3536,19 +3532,18 @@ impl SessionStore {
                     session.updated_at = occurred_at;
                 }
                 upsert_runtime_sidecar_in_state(state, updated.clone());
-                if let Some(goal_id) = continuation_goal_id {
-                    if let Some(goal) = state
+                if let Some(goal_id) = continuation_goal_id
+                    && let Some(goal) = state
                         .goals
                         .iter_mut()
                         .find(|goal| goal.session_id == session_id && &goal.goal_id == goal_id)
-                    {
-                        goal.continuation = GoalContinuationState {
-                            phase: GoalContinuationPhase::Running,
-                            turn_id: Some(continuation_turn_id.clone()),
-                            reason: None,
-                        };
-                        goal.updated_at = occurred_at;
-                    }
+                {
+                    goal.continuation = GoalContinuationState {
+                        phase: GoalContinuationPhase::Running,
+                        turn_id: Some(continuation_turn_id.clone()),
+                        reason: None,
+                    };
+                    goal.updated_at = occurred_at;
                 }
                 (updated, canonical_turn)
             },
@@ -4104,9 +4099,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, updated)) = updated else {
-                    return None;
-                };
+                let (sidecar_index, updated) = updated?;
                 state.execution_sidecar_store.runtime_sidecars[sidecar_index] = updated.clone();
                 Some(updated)
             },
@@ -4230,9 +4223,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, candidate)) = updated.as_ref() else {
-                    return None;
-                };
+                let (sidecar_index, candidate) = updated.as_ref()?;
                 state.execution_sidecar_store.runtime_sidecars[*sidecar_index] = candidate.clone();
                 Some(candidate.clone())
             },
@@ -4303,9 +4294,7 @@ impl SessionStore {
                 })
             },
             |state, update| {
-                let Some((sidecar_index, candidate, updated)) = update else {
-                    return None;
-                };
+                let (sidecar_index, candidate, updated) = update?;
                 if updated.is_some() {
                     state.execution_sidecar_store.runtime_sidecars[sidecar_index] = candidate;
                 }
@@ -4416,9 +4405,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, candidate)) = updated else {
-                    return None;
-                };
+                let (sidecar_index, candidate) = updated?;
                 state.execution_sidecar_store.runtime_sidecars[sidecar_index] = candidate.clone();
                 Some(candidate)
             },
@@ -4499,9 +4486,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, candidate, changed)) = updated else {
-                    return None;
-                };
+                let (sidecar_index, candidate, changed) = updated?;
                 if changed {
                     state.execution_sidecar_store.runtime_sidecars[sidecar_index] =
                         candidate.clone();
@@ -4588,9 +4573,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, candidate)) = updated else {
-                    return None;
-                };
+                let (sidecar_index, candidate) = updated?;
                 state.execution_sidecar_store.runtime_sidecars[sidecar_index] = candidate.clone();
                 if let Some(turn) = candidate.current_turn.as_ref()
                     && let Some(completed_at) = turn.completed_at
@@ -4758,10 +4741,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, continuation_turn_id, interrupted_at, updated)) = updated
-                else {
-                    return None;
-                };
+                let (sidecar_index, continuation_turn_id, interrupted_at, updated) = updated?;
                 release_running_goal_continuation(
                     state,
                     session_id,
@@ -5077,9 +5057,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, turn_id, candidate)) = updated else {
-                    return None;
-                };
+                let (sidecar_index, turn_id, candidate) = updated?;
                 state.execution_sidecar_store.runtime_sidecars[sidecar_index] = candidate;
                 Some(turn_id)
             },
@@ -5169,10 +5147,7 @@ impl SessionStore {
                 })
             },
             |state, updated| {
-                let Some((sidecar_index, continuation_turn_id, updated_at, updated)) = updated
-                else {
-                    return None;
-                };
+                let (sidecar_index, continuation_turn_id, updated_at, updated) = updated?;
                 if interrupted_by_user {
                     let goal_index = state.goals.iter().position(|goal| {
                         &goal.session_id == session_id

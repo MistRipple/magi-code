@@ -364,9 +364,10 @@
       "name": "browser_tabs",
       "rustVariant": "Tabs",
       "access": "mixed",
-      "description": "列出、创建、激活或在用户明确要求时关闭会话浏览器标签。",
+      "description": "列出、创建、激活或在用户明确要求时关闭 Magi 右栏的一级浏览器标签。每个一级浏览器标签只有一个 Chromium 页面；网页 popup、window.open 或 target=_blank 只在当前一级页面内导航，绝不创建网页子标签。",
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "action": {
             "type": "string",
@@ -376,15 +377,15 @@
               "activate",
               "close"
             ],
-            "description": "任务完成后不要使用 close；仅在用户明确要求关闭指定标签时使用。"
+            "description": "任务完成后不要使用 close；仅在用户明确要求关闭指定的 Magi 右栏一级标签时使用。网页 popup、window.open 或 target=_blank 不得通过此 action 创建子标签。"
           },
           "tab_id": {
             "type": "string",
-            "description": "activate/close 时必填；close 只能响应用户明确的关闭要求"
+            "description": "activate/close 时必填，指向 Magi 右栏一级浏览器标签；不存在 parent_tab_id 或子标签身份"
           },
           "url": {
             "type": "string",
-            "description": "new 时可选；新建后立即打开的 URL，省略时为 about:blank"
+            "description": "new 时可选；创建新的 Magi 右栏一级浏览器标签并立即打开 URL，省略时为 about:blank。不要为网页 popup 调用 new"
           }
         },
         "required": [

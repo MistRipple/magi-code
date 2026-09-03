@@ -69,7 +69,16 @@ function renderRust(schema, catalog) {
   const names = catalog.map((entry) => `            Self::${entry.rustVariant} => ${rustString(entry.name)},`);
   const fromName = catalog.map((entry) => `            ${rustString(entry.name)} => Some(Self::${entry.rustVariant}),`);
   const access = catalog.map((entry) => `            Self::${entry.rustVariant} => BrowserToolAccess::${entry.access[0].toUpperCase()}${entry.access.slice(1)},`);
-  const descriptions = catalog.map((entry) => `            Self::${entry.rustVariant} => ${rustString(entry.description)},`);
+  const descriptions = catalog.map((entry) => {
+    const value = rustString(entry.description);
+    return entry.description.length > 100
+      ? [
+        `            Self::${entry.rustVariant} => {`,
+        `                ${value}`,
+        '            }',
+      ].join('\n')
+      : `            Self::${entry.rustVariant} => ${value},`;
+  });
   const schemas = catalog.map((entry) => [
     `            Self::${entry.rustVariant} => {`,
     `                r#"${JSON.stringify(entry.inputSchema)}"#`,

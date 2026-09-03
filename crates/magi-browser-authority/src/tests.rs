@@ -478,6 +478,250 @@ fn stale_primary_surface_events_cannot_rewind_the_binding() {
 }
 
 #[test]
+fn primary_surface_acceptance_restores_only_the_current_navigation() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+
+    let suspended_tab_id = ready_tab_with_id(
+        &mut authority,
+        &browser_session_id,
+        "browser-tab-surface-suspended",
+    );
+    let suspended = authority
+        .transition_tab(&suspended_tab_id, BrowserTabLifecycle::Suspended, at(6))
+        .expect("ready tab should become suspended");
+    let before_restore = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    let mut suspended_binding = binding(&suspended_tab_id, "surface-suspended", 1);
+    suspended_binding.navigation_revision = suspended.navigation_revision;
+    let (accepted, restored, revoked) = authority
+        .accept_primary_surface(suspended_binding.clone(), at(7))
+        .expect("current suspended surface should be accepted");
+    assert!(accepted);
+    assert!(revoked.is_empty());
+    assert_eq!(restored.lifecycle, BrowserTabLifecycle::Ready);
+    assert!(
+        authority
+            .session(&browser_session_id)
+            .expect("session should exist")
+            .revision
+            > before_restore
+    );
+    let stable_revision = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    let (accepted, replayed, revoked) = authority
+        .accept_primary_surface(suspended_binding, at(8))
+        .expect("the same surface replay should be accepted idempotently");
+    assert!(accepted);
+    assert!(revoked.is_empty());
+    assert_eq!(replayed.lifecycle, BrowserTabLifecycle::Ready);
+    assert_eq!(
+        authority
+            .session(&browser_session_id)
+            .expect("session should exist")
+            .revision,
+        stable_revision
+    );
+
+    let creating_tab_id = BrowserTabId::new("browser-tab-surface-creating");
+    authority
+        .create_tab(CreateBrowserTab {
+            tab_id: creating_tab_id.clone(),
+            browser_session_id: browser_session_id.clone(),
+            url: "about:blank".to_string(),
+            now: at(9),
+        })
+        .expect("tab should start in creating state");
+    let creating_binding = binding(&creating_tab_id, "surface-creating", 2);
+    let (accepted, restored, _) = authority
+        .accept_primary_surface(creating_binding, at(11))
+        .expect("creating surface should be accepted and recovered");
+    assert!(accepted);
+    assert_eq!(restored.lifecycle, BrowserTabLifecycle::Ready);
+
+    let crashed_tab_id = ready_tab_with_id(
+        &mut authority,
+        &browser_session_id,
+        "browser-tab-surface-crashed",
+    );
+    authority
+        .transition_tab(&crashed_tab_id, BrowserTabLifecycle::Crashed, at(12))
+        .expect("tab should be crashed before host recreation");
+    let crashed_binding = binding(&crashed_tab_id, "surface-crashed", 3);
+    let (accepted, restored, _) = authority
+        .accept_primary_surface(crashed_binding, at(13))
+        .expect("crashed surface should be accepted and recovered");
+    assert!(accepted);
+    assert_eq!(restored.lifecycle, BrowserTabLifecycle::Ready);
+
+    let stale_tab_id = ready_tab_with_id(
+        &mut authority,
+        &browser_session_id,
+        "browser-tab-surface-stale-navigation",
+    );
+    authority
+        .set_primary_surface(binding(&stale_tab_id, "surface-stale", 4), at(14))
+        .expect("stale-navigation surface should bind");
+    authority
+        .apply_host_page_state(
+            &stale_tab_id,
+            1,
+            "https://example.com/".to_string(),
+            Some("https://example.com".to_string()),
+            "Example".to_string(),
+            at(15),
+        )
+        .expect("navigation should advance the tab");
+    let (accepted, current, _) = authority
+        .accept_primary_surface(binding(&stale_tab_id, "surface-stale", 4), at(16))
+        .expect("old navigation surface should be ignored");
+    assert!(!accepted);
+    assert_eq!(current.navigation_revision, 1);
+}
+
+#[test]
+fn session_revision_tracks_surface_page_snapshot_annotation_and_lease_changes() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+
+    let revision_after_tab = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    authority
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+    let revision_after_surface = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    assert!(revision_after_surface > revision_after_tab);
+
+    authority
+        .set_active_tab(&browser_session_id, &tab_id)
+        .expect("active tab should be recorded");
+    let revision_after_active = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    assert!(revision_after_active > revision_after_surface);
+    authority
+        .set_active_tab(&browser_session_id, &tab_id)
+        .expect("replaying the same active tab should be idempotent");
+    assert_eq!(
+        authority
+            .session(&browser_session_id)
+            .expect("session should exist")
+            .revision,
+        revision_after_active
+    );
+
+    authority
+        .apply_host_page_state(
+            &tab_id,
+            1,
+            "https://example.com/".to_string(),
+            Some("https://example.com".to_string()),
+            "Example".to_string(),
+            at(7),
+        )
+        .expect("page state should apply");
+    let revision_after_page = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    assert!(revision_after_page > revision_after_active);
+
+    let (_, snapshot_revision) = authority
+        .record_snapshot(&tab_id, at(8))
+        .expect("snapshot should be recorded");
+    let revision_after_snapshot = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    assert!(revision_after_snapshot > revision_after_page);
+
+    let annotation = BrowserAnnotation {
+        annotation_id: magi_core::BrowserAnnotationId::new("annotation-revision"),
+        browser_session_id: browser_session_id.clone(),
+        tab_id: tab_id.clone(),
+        sequence: 0,
+        author: BrowserAnnotationAuthor::User,
+        kind: BrowserAnnotationKind::Region,
+        anchor: BrowserAnnotationAnchor::Region(crate::BrowserRegionAnnotationAnchor {
+            url: "https://example.com/".to_string(),
+            origin: Some("https://example.com".to_string()),
+            viewport: BrowserViewport::default(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            rect: crate::BrowserNormalizedRect {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+            snapshot_revision,
+        }),
+        comment: "revision".to_string(),
+        status: crate::BrowserAnnotationStatus::Active,
+        screenshot_artifact_id: None,
+        created_at: at(9),
+        updated_at: at(9),
+    };
+    let annotation = authority
+        .create_annotation(annotation)
+        .expect("annotation should be recorded");
+    let revision_after_annotation = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    assert!(revision_after_annotation > revision_after_snapshot);
+    authority
+        .update_annotation_comment(&annotation.annotation_id, "updated".to_string(), at(10))
+        .expect("annotation comment should update");
+    let revision_after_comment = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    assert!(revision_after_comment > revision_after_annotation);
+
+    let lease = authority
+        .acquire_lease(AcquireBrowserLease {
+            lease_id: BrowserLeaseId::new("lease-revision"),
+            tab_id: tab_id.clone(),
+            surface_id: surface_id(),
+            owner: owner(),
+            turn_id: "turn-revision".to_string(),
+            goal_binding: None,
+            acquired_at: at(11),
+            expires_at: at(100),
+        })
+        .expect("lease should acquire");
+    let revision_after_lease = authority
+        .session(&browser_session_id)
+        .expect("session should exist")
+        .revision;
+    assert!(revision_after_lease > revision_after_comment);
+    authority
+        .release_lease(&lease.lease_id, at(12))
+        .expect("lease should release");
+    assert!(
+        authority
+            .session(&browser_session_id)
+            .expect("session should exist")
+            .revision
+            > revision_after_lease
+    );
+}
+
+#[test]
 fn stale_epoch_and_window_bindings_cannot_replace_the_current_surface() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);

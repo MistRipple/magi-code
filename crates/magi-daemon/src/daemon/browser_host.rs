@@ -666,19 +666,27 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
         BrowserHostEvent::PrimarySurfaceChanged { binding } => {
             let context = browser_tab_context(state, &binding.tab_id);
             let result = state.mutate_browser_authority(|authority| {
-                let revoked = authority.set_primary_surface(binding.clone(), UtcMillis::now())?;
-                let accepted = authority
-                    .primary_surface(&binding.tab_id)
-                    .is_some_and(|surface| surface == &binding);
-                Ok((revoked, accepted))
+                authority.accept_primary_surface(binding.clone(), UtcMillis::now())
             });
             match result {
-                Ok((revoked, true)) => {
+                Ok((true, tab, revoked)) => {
                     // Host 重连时 Control Server 只会重放当前 Primary Surface；
                     // 之前已经完成加载的页面不会再次发送 page_updated。标记
                     // 投影必须在 Primary 确认后立即由 Authority 重新下发，
                     // 否则服务或 Electron 重启后持久化标记会永久消失。
                     schedule_browser_annotation_sync(state, &binding.tab_id);
+                    publish_tab_event(
+                        state,
+                        "browser.tab.status_changed",
+                        context.clone(),
+                        serde_json::json!({
+                            "tab_id": tab.tab_id,
+                            "lifecycle": tab.lifecycle,
+                            "surface_id": binding.surface_id,
+                            "surface_revision": binding.surface_revision,
+                            "navigation_revision": tab.navigation_revision,
+                        }),
+                    );
                     publish_tab_event(
                         state,
                         "browser.surface.primary_changed",
@@ -698,7 +706,7 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                         );
                     }
                 }
-                Ok((_, false)) => tracing::debug!(
+                Ok((false, _, _)) => tracing::debug!(
                     tab_id = %binding.tab_id,
                     surface_id = %binding.surface_id,
                     surface_revision = binding.surface_revision,

@@ -108,7 +108,7 @@ impl BrowserTabLifecycle {
                 Self::Ready | Self::Suspended | Self::Crashed | Self::Closed
             ) | (Self::Ready, Self::Suspended | Self::Crashed | Self::Closed)
                 | (Self::Suspended, Self::Ready | Self::Crashed | Self::Closed)
-                | (Self::Crashed, Self::Suspended | Self::Closed)
+                | (Self::Crashed, Self::Suspended | Self::Ready | Self::Closed)
         )
     }
 }
