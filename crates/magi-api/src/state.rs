@@ -53,9 +53,10 @@ use magi_orchestrator::{
     task_store::{TaskStore, TaskStoreSnapshot},
     task_worker_catalog::{WorkerInfo, build_worker_catalog_for_roles},
 };
+use magi_process::ManagedProcessGroup;
 use magi_session_store::{
-    NotificationContext, SessionDurableState, SessionExecutionSidecarStoreState,
-    SessionLifecycleObserver, SessionRecord, SessionStore,
+    NotificationContext, SessionDurableState, SessionExecutionSidecarStoreState, SessionRecord,
+    SessionStore,
 };
 use magi_settings_store::SettingsStore;
 use magi_snapshot::{BaselinePatchEntry, SnapshotManager, SnapshotSession};
@@ -140,6 +141,13 @@ pub enum SessionProjectionPersistMode {
     Full,
     Navigation {
         target_session_id: Option<SessionId>,
+    },
+    Delete {
+        deleted_session_id: SessionId,
+        replacement_session_id: Option<SessionId>,
+    },
+    Rename {
+        session_id: SessionId,
     },
 }
 
@@ -243,6 +251,24 @@ impl QueuedRegularSessionTurn {
 
 pub(crate) fn session_has_user_content(session: &SessionRecord) -> bool {
     session.message_count.unwrap_or(0) > 0
+}
+
+/// 会话执行生命周期提交的统一锁顺序。
+///
+/// Session Turn 和 Runner 属于一个会话的执行资源，必须先取得 per-session Turn 锁，
+/// 再取得 Runner 生命周期锁。当前会话指针是独立的导航事实，不属于执行生命周期；
+/// 因此执行准备、Runner 启动、模型执行和终态收口都不能持有全局导航锁。
+pub(crate) struct SessionLifecycleCommitGuard {
+    _session_turn_guard: tokio::sync::OwnedMutexGuard<()>,
+    _runner_lifecycle_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// 会话 Turn 提交锁只保护指定会话的 Turn 状态，不串行化无关会话的导航。
+///
+/// 导航指针由 `lock_session_navigation` 单独保护；只有创建新会话或提交当前指针
+/// 的路径才需要显式取得那把全局锁。这样一个会话的后台执行不会阻塞另一个会话切换。
+pub(crate) struct SessionTurnCommitGuard {
+    _session_turn_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// Manages active Runner instances keyed by root_task_id.
@@ -397,7 +423,7 @@ impl RunnerManager {
         &self.result_receiver
     }
 
-    /// 串行化 session 与 root task 生命周期后启动 runner。
+    /// 串行化指定 session 与 root task 生命周期后启动 runner。
     pub async fn start(
         &self,
         root_task_id: &str,
@@ -1075,6 +1101,21 @@ impl ExecutionResourceCoordinator {
             .expect("execution resource tool registry lock poisoned")
             .as_ref()
             .map_or(0, |registry| registry.cancel_active_processes(&query));
+        let browser_lease_count = self.revoke_browser_leases(&query, reason, now);
+        ExecutionResourceCancellationReport {
+            process_count,
+            browser_lease_count,
+        }
+    }
+
+    /// 只撤销 Chromium 自动化控制租约，不影响同一会话中仍可继续运行的
+    /// shell、文件或其他非浏览器工具。
+    pub fn revoke_browser_leases(
+        &self,
+        query: &ToolExecutionContextQuery,
+        reason: BrowserLeaseEndReason,
+        now: UtcMillis,
+    ) -> usize {
         let selector = BrowserLeaseSelector {
             session_id: query.session_id.clone(),
             workspace_id: query.workspace_id.clone(),
@@ -1128,10 +1169,7 @@ impl ExecutionResourceCoordinator {
                 }),
             );
         }
-        ExecutionResourceCancellationReport {
-            process_count,
-            browser_lease_count: revoked.len(),
-        }
+        revoked.len()
     }
 
     fn cancel_surface(
@@ -1278,6 +1316,7 @@ pub struct ApiState {
     browser_host_owner: Arc<Mutex<Option<BrowserHostOwner>>>,
     browser_host_client: Arc<RwLock<Option<BrowserHostClient>>>,
     browser_host_generation: Arc<AtomicU64>,
+    managed_process_group: ManagedProcessGroup,
     execution_resources: ExecutionResourceCoordinator,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
@@ -1680,6 +1719,7 @@ impl ApiState {
             browser_host_owner: Arc::new(Mutex::new(None)),
             browser_host_client,
             browser_host_generation: Arc::new(AtomicU64::new(0)),
+            managed_process_group: ManagedProcessGroup::new(),
             execution_resources,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -1697,37 +1737,17 @@ impl ApiState {
     }
 
     /// 安装 SessionLifecycleObserver，把 session 创建/归档/删除事件桥接到 SnapshotManager。
+    ///
+    /// 历史 session 不在启动阶段批量建立快照。快照的整树初始化属于变更视图的
+    /// 按需资源，启动时批量恢复会把所有 workspace 扫描排进同一条生命周期队列，
+    /// 既浪费 IO，也会让用户第一次导航等待与当前会话无关的历史任务。实际访问
+    /// 变更视图或执行需要快照的操作时，由 ensure_snapshot_session 懒加载。
     pub fn install_snapshot_lifecycle_observer(&self) {
         let observer = Arc::new(crate::snapshot_lifecycle::SnapshotLifecycleObserver::new(
             self.snapshot_manager.clone(),
             self.workspace_registry.clone(),
         ));
         self.session_store.set_lifecycle_observer(observer.clone());
-        let registered_workspace_ids = self
-            .workspace_registry
-            .workspaces()
-            .into_iter()
-            .map(|workspace| workspace.workspace_id.to_string())
-            .collect::<HashSet<_>>();
-        let mut skipped_orphan_workspace_sessions = 0usize;
-        for session in self.session_store.sessions() {
-            if session.status != SessionLifecycleStatus::Active {
-                continue;
-            }
-            if let Some(workspace_id) = session.workspace_id.as_deref()
-                && !registered_workspace_ids.contains(workspace_id)
-            {
-                skipped_orphan_workspace_sessions += 1;
-                continue;
-            }
-            observer.on_session_created(&session.session_id, session.workspace_id.as_deref());
-        }
-        if skipped_orphan_workspace_sessions > 0 {
-            tracing::warn!(
-                skipped_orphan_workspace_sessions,
-                "snapshot lifecycle: 启动重放跳过未注册 workspace 的历史 session"
-            );
-        }
     }
 
     /// 同步取 session + workspace 对应的 SnapshotSession。未装载表示生命周期接线异常，
@@ -1776,7 +1796,8 @@ impl ApiState {
             .await?;
         if force_reconcile {
             snapshot
-                .reconcile()
+                .reconcile_async()
+                .await
                 .map_err(|error| ApiError::internal_assembly("刷新磁盘变更状态失败", error))?;
         }
 
@@ -1902,7 +1923,7 @@ impl ApiState {
         workspace_root: &Path,
         existing_context: &magi_git::SessionCodeContext,
         observation: &magi_git::GitObservation,
-        snapshot: &SnapshotSession,
+        snapshot: &Arc<SnapshotSession>,
     ) -> Result<(), ApiError> {
         let previous_head = existing_context.git.base_head.as_deref().ok_or_else(|| {
             ApiError::InternalAssemblyError("原 Git baseline HEAD 缺失".to_string())
@@ -1911,7 +1932,8 @@ impl ApiState {
             ApiError::InternalAssemblyError("新 Git baseline HEAD 缺失".to_string())
         })?;
         snapshot
-            .reconcile()
+            .reconcile_async()
+            .await
             .map_err(|error| ApiError::internal_assembly("Git 快进前刷新磁盘状态失败", error))?;
         let git_patch = self
             .git_service
@@ -1934,12 +1956,12 @@ impl ApiState {
         &self,
         workspace_root: &Path,
         observation: &magi_git::GitObservation,
-        snapshot: &SnapshotSession,
+        snapshot: &Arc<SnapshotSession>,
     ) -> Result<(), ApiError> {
         let Some(head) = observation.head.as_deref() else {
             return Ok(());
         };
-        snapshot.reconcile().map_err(|error| {
+        snapshot.reconcile_async().await.map_err(|error| {
             ApiError::internal_assembly("Git baseline 校准前刷新磁盘失败", error)
         })?;
         let mut paths = snapshot
@@ -1990,6 +2012,15 @@ impl ApiState {
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
         self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
         self
+    }
+
+    pub fn with_managed_process_group(mut self, process_group: ManagedProcessGroup) -> Self {
+        self.managed_process_group = process_group;
+        self
+    }
+
+    pub fn terminate_managed_processes(&self) -> usize {
+        self.managed_process_group.terminate_all()
     }
 
     pub fn with_bridge_probe_transport(
@@ -2107,6 +2138,27 @@ impl ApiState {
     ) -> ExecutionResourceCancellationReport {
         self.execution_resources.cancel(
             ToolExecutionContextQuery {
+                session_id: session_id.cloned(),
+                workspace_id: workspace_id.cloned(),
+                task_id: task_id.cloned(),
+                worker_id: None,
+            },
+            reason,
+            UtcMillis::now(),
+        )
+    }
+
+    /// Browser Host 连接断开时的窄域清理。连接断开只代表浏览器自动化暂时
+    /// 不可用，不能把它升级为整个会话执行被取消。
+    pub fn revoke_browser_execution_resources(
+        &self,
+        session_id: Option<&SessionId>,
+        workspace_id: Option<&WorkspaceId>,
+        task_id: Option<&TaskId>,
+        reason: BrowserLeaseEndReason,
+    ) -> usize {
+        self.execution_resources.revoke_browser_leases(
+            &ToolExecutionContextQuery {
                 session_id: session_id.cloned(),
                 workspace_id: workspace_id.cloned(),
                 task_id: task_id.cloned(),
@@ -3478,6 +3530,37 @@ impl ApiState {
         })
     }
 
+    pub(crate) fn rename_session_with_persistence_for_api(
+        &self,
+        session_id: &SessionId,
+        title: impl Into<String>,
+    ) -> Result<SessionRecord, ApiError> {
+        let persist = self.session_projection_persist.clone();
+        self.session_store
+            .rename_session_with_persistence(session_id, title, |durable, sidecars| {
+                if let Some(persist) = &persist {
+                    persist(
+                        durable,
+                        sidecars,
+                        SessionProjectionPersistMode::Rename {
+                            session_id: session_id.clone(),
+                        },
+                    )
+                } else {
+                    Ok(())
+                }
+            })
+            .map_err(|error| match error {
+                magi_session_store::SessionMutationTransactionError::Domain(
+                    magi_core::DomainError::Validation { message },
+                ) => ApiError::InvalidInput(message),
+                magi_session_store::SessionMutationTransactionError::Domain(error) => {
+                    ApiError::internal_assembly("重命名会话失败", error)
+                }
+                magi_session_store::SessionMutationTransactionError::Persistence(error) => error,
+            })
+    }
+
     pub fn persist_workspace_durable_state(&self) -> Result<(), ApiError> {
         let Some(persistence) = &self.runtime_persistence else {
             return Ok(());
@@ -3653,6 +3736,77 @@ impl ApiState {
 
     pub(crate) async fn lock_session_navigation(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.session_navigation_lock.lock().await
+    }
+
+    /// 取得指定 session 的 Turn 提交锁。
+    ///
+    /// 该锁不包含全局导航锁。导航只在修改当前会话指针或创建新会话的短提交中
+    /// 显式取得，避免后台执行生命周期把所有会话切换串行化。
+    pub(crate) async fn lock_session_turn_commit(
+        &self,
+        session_id: &SessionId,
+    ) -> SessionTurnCommitGuard {
+        let session_turn_guard = self.lock_session_turn(session_id).await;
+        SessionTurnCommitGuard {
+            _session_turn_guard: session_turn_guard,
+        }
+    }
+
+    /// 在调用方已经持有 session Turn 锁后取得 Runner 生命周期锁。
+    ///
+    /// 该入口只允许被已持有 session Turn 锁的路径调用，避免 Continue、
+    /// 新会话回滚等流程再次获取 Turn 锁而形成自锁。
+    pub(crate) async fn lock_runner_lifecycle_after_turn_commit(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let manager = self.runner_manager()?.clone();
+        Some(manager.lock_session_lifecycle(session_id).await)
+    }
+
+    /// 取得完整执行生命周期提交锁：session Turn -> Runner lifecycle。
+    ///
+    /// 这里明确不取得全局导航锁。导航锁只属于当前会话指针的短提交，不能被
+    /// 后台 preparation、Runner 启动或模型执行带出控制面。
+    pub(crate) async fn lock_session_lifecycle(
+        &self,
+        session_id: &SessionId,
+    ) -> SessionLifecycleCommitGuard {
+        let session_turn_guard = self.lock_session_turn(session_id).await;
+        let runner_lifecycle_guard = self
+            .runner_manager()
+            .map(|manager| manager.clone())
+            .map(|manager| async move { manager.lock_session_lifecycle(session_id).await });
+        let runner_lifecycle_guard = match runner_lifecycle_guard {
+            Some(lock) => Some(lock.await),
+            None => None,
+        };
+        SessionLifecycleCommitGuard {
+            _session_turn_guard: session_turn_guard,
+            _runner_lifecycle_guard: runner_lifecycle_guard,
+        }
+    }
+
+    /// 回滚一个尚未成功接纳首条消息的新会话。
+    ///
+    /// 调用方必须已经持有 navigation 锁。新会话创建会自动改写 current，
+    /// 因此删除资源后必须显式恢复创建前的 current，并将删除与恢复作为同一次
+    /// 完整 projection 提交持久化。创建提交可能已经把新 session projection 写入磁盘，
+    /// 回滚必须同时清理该 projection。Turn 与 Runner 锁在这里按统一顺序补齐。
+    pub(crate) async fn rollback_created_session_after_navigation_lock(
+        &self,
+        session_id: &SessionId,
+        previous_current_session_id: Option<SessionId>,
+    ) -> Result<(), ApiError> {
+        let _session_turn_guard = self.lock_session_turn(session_id).await;
+        let _runner_lifecycle_guard = self
+            .lock_runner_lifecycle_after_turn_commit(session_id)
+            .await;
+        self.delete_session_and_resources_after_lifecycle_lock(
+            session_id,
+            previous_current_session_id,
+        )
+        .await
     }
 
     async fn lock_session_change_sync(
@@ -3910,12 +4064,22 @@ impl ApiState {
         &self,
         session_id: &SessionId,
     ) -> Result<(), ApiError> {
-        let _session_turn_guard = self.lock_session_turn(session_id).await;
+        let _lifecycle_guard = self.lock_session_lifecycle(session_id).await;
+        let replacement = self.replacement_session_for_delete(session_id);
+        self.delete_session_and_resources_after_lifecycle_lock(session_id, replacement)
+            .await
+    }
+
+    /// 在调用方已经持有 `navigation -> Turn -> Runner lifecycle` 后删除 session。
+    ///
+    /// 该入口让删除路由可以把替代 current 选择和最终持久化继续放在同一个
+    /// navigation 临界区内；不能从未持有完整生命周期锁的路径调用。
+    pub(crate) async fn delete_session_and_resources_after_lifecycle_lock(
+        &self,
+        session_id: &SessionId,
+        replacement_session_id: Option<SessionId>,
+    ) -> Result<(), ApiError> {
         let manager = self.runner_manager();
-        let _session_lifecycle_guard = match manager {
-            Some(manager) => Some(manager.lock_session_lifecycle(session_id).await),
-            None => None,
-        };
         if let Some(manager) = manager {
             manager
                 .unbind_session_after_lifecycle_lock(session_id)
@@ -3981,10 +4145,30 @@ impl ApiState {
             .remove_tasks(&task_ids);
         self.conversation_registry.remove_session(session_id);
         self.session_store
-            .delete_session(session_id)
-            .map_err(|error| ApiError::internal_assembly("删除会话失败", error))?;
-        drop(_session_lifecycle_guard);
-        drop(_session_turn_guard);
+            .delete_session_with_persistence(
+                session_id,
+                replacement_session_id.as_ref(),
+                |durable, sidecars| {
+                    if let Some(persist) = &self.session_projection_persist {
+                        persist(
+                            durable,
+                            sidecars,
+                            SessionProjectionPersistMode::Delete {
+                                deleted_session_id: session_id.clone(),
+                                replacement_session_id: replacement_session_id.clone(),
+                            },
+                        )
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .map_err(|error| match error {
+                magi_session_store::SessionMutationTransactionError::Domain(error) => {
+                    ApiError::internal_assembly("删除会话失败", error)
+                }
+                magi_session_store::SessionMutationTransactionError::Persistence(error) => error,
+            })?;
         self.session_turn_locks
             .lock()
             .expect("session turn locks should hold")
@@ -3994,6 +4178,28 @@ impl ApiState {
             .expect("session change sync locks should hold")
             .remove(session_id);
         Ok(())
+    }
+
+    fn replacement_session_for_delete(&self, session_id: &SessionId) -> Option<SessionId> {
+        if self.session_store.current_session_id().as_ref() != Some(session_id) {
+            return None;
+        }
+        let target_workspace = self
+            .session_store
+            .session(session_id)
+            .and_then(|session| session.workspace_id);
+        self.session_store
+            .sessions()
+            .into_iter()
+            .filter(|session| {
+                &session.session_id != session_id && session.workspace_id == target_workspace
+            })
+            .max_by(|left, right| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+            })
+            .map(|session| session.session_id)
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -4560,6 +4766,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_execution_lifecycle_does_not_block_global_navigation() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let session_id = SessionId::new("session-navigation-isolation");
+        let _execution_guard = state.lock_session_lifecycle(&session_id).await;
+
+        // 执行生命周期可以等待同一 session 的 Turn/Runner，但不能占用全局
+        // current 指针锁；否则任一后台 Turn 都会阻塞其他会话的切换。
+        let navigation_guard =
+            tokio::time::timeout(Duration::from_millis(50), state.lock_session_navigation())
+                .await
+                .expect("session execution lifecycle must not hold navigation lock");
+        drop(navigation_guard);
+    }
+
     #[test]
     fn enqueue_regular_session_turn_persists_complete_identity_and_fingerprint() {
         let state = ApiState::new(
@@ -4636,7 +4863,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_resource_coordinator_revokes_browser_lease_by_session_scope() {
+    fn execution_resource_coordinator_revokes_browser_lease_by_task_scope() {
         let state = ApiState::new(
             "magi-test",
             Arc::new(InMemoryEventBus::new(32)),
@@ -4650,6 +4877,10 @@ mod tests {
         let profile_id = BrowserProfileId::new("browser-profile-resource-coordinator");
         let tab_id = BrowserTabId::new("browser-tab-resource-coordinator");
         let lease_id = BrowserLeaseId::new("browser-lease-resource-coordinator");
+        let retained_tab_id = BrowserTabId::new("browser-tab-resource-coordinator-retained");
+        let retained_lease_id = BrowserLeaseId::new("browser-lease-resource-coordinator-retained");
+        let completed_task_id = TaskId::new("task-resource-coordinator-completed");
+        let retained_task_id = TaskId::new("task-resource-coordinator-retained");
         let now = UtcMillis(100);
 
         state
@@ -4707,10 +4938,50 @@ mod tests {
                     owner: ExecutionOwnership {
                         session_id: Some(session_id.clone()),
                         workspace_id: Some(workspace_id.clone()),
-                        task_id: Some(TaskId::new("task-resource-coordinator")),
+                        task_id: Some(completed_task_id.clone()),
                         ..ExecutionOwnership::default()
                     },
                     turn_id: "turn-resource-coordinator".to_string(),
+                    goal_binding: None,
+                    acquired_at: now,
+                    expires_at: UtcMillis(1_000),
+                })?;
+                authority.create_tab(magi_browser_authority::CreateBrowserTab {
+                    tab_id: retained_tab_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    url: "https://example.com/retained".to_string(),
+                    now,
+                })?;
+                authority.transition_tab(
+                    &retained_tab_id,
+                    magi_browser_authority::BrowserTabLifecycle::Ready,
+                    now,
+                )?;
+                authority.set_primary_surface(
+                    magi_browser_authority::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop-resource-coordinator".to_string(),
+                        window_id: "window-resource-coordinator".to_string(),
+                        surface_id: "surface-resource-coordinator-retained".to_string(),
+                        surface_revision: 1,
+                        tab_id: retained_tab_id.clone(),
+                        web_contents_id: 24,
+                        target_id: "target-resource-coordinator-retained".to_string(),
+                        browser_context_id: "context-resource-coordinator".to_string(),
+                        navigation_revision: 0,
+                    },
+                    now,
+                )?;
+                authority.acquire_lease(magi_browser_authority::AcquireBrowserLease {
+                    lease_id: retained_lease_id.clone(),
+                    tab_id: retained_tab_id.clone(),
+                    surface_id: "surface-resource-coordinator-retained".to_string(),
+                    owner: ExecutionOwnership {
+                        session_id: Some(session_id.clone()),
+                        workspace_id: Some(workspace_id.clone()),
+                        task_id: Some(retained_task_id.clone()),
+                        ..ExecutionOwnership::default()
+                    },
+                    turn_id: "turn-resource-coordinator-retained".to_string(),
                     goal_binding: None,
                     acquired_at: now,
                     expires_at: UtcMillis(1_000),
@@ -4722,7 +4993,7 @@ mod tests {
         let report = state.cancel_execution_resources(
             Some(&session_id),
             None,
-            None,
+            Some(&completed_task_id),
             magi_browser_authority::BrowserLeaseEndReason::TaskFinished,
         );
         assert_eq!(report.browser_lease_count, 1);
@@ -4741,6 +5012,12 @@ mod tests {
                 .and_then(|lease| lease.end_reason),
             Some(magi_browser_authority::BrowserLeaseEndReason::TaskFinished)
         );
+        assert_eq!(
+            authority
+                .lease(&retained_lease_id)
+                .map(|lease| lease.lifecycle),
+            Some(magi_browser_authority::BrowserLeaseLifecycle::Held)
+        );
         let browser_session = authority
             .session(&browser_session_id)
             .expect("completed task must retain its browser session");
@@ -4757,6 +5034,14 @@ mod tests {
             magi_browser_authority::BrowserTabLifecycle::Ready
         );
         assert_eq!(tab.url, "about:blank");
+        let retained_tab = authority
+            .tab(&retained_tab_id)
+            .expect("并行任务的 Browser Tab 必须继续保留");
+        assert_eq!(
+            retained_tab.lifecycle,
+            magi_browser_authority::BrowserTabLifecycle::Ready
+        );
+        assert_eq!(retained_tab.url, "https://example.com/retained");
     }
 
     #[tokio::test]
@@ -5617,7 +5902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_lifecycle_replay_skips_unregistered_workspace_sessions() {
+    async fn snapshot_lifecycle_install_defers_historical_sessions_until_access() {
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
         let governance = Arc::new(GovernanceService::default());
@@ -5663,8 +5948,8 @@ mod tests {
             state
                 .snapshot_manager
                 .get_session(known_session_id.as_str())
-                .is_some(),
-            "registered workspace session should replay into snapshot lifecycle"
+                .is_none(),
+            "historical sessions must not trigger a startup-wide snapshot scan"
         );
         assert!(
             state
@@ -5672,6 +5957,17 @@ mod tests {
                 .get_session(orphan_session_id.as_str())
                 .is_none(),
             "unregistered workspace session should not start a stale snapshot lifecycle"
+        );
+        state
+            .ensure_snapshot_session(&known_session_id, &workspace_root)
+            .await
+            .expect("accessing the session must lazily start its snapshot lifecycle");
+        assert!(
+            state
+                .snapshot_manager
+                .get_session(known_session_id.as_str())
+                .is_some(),
+            "lazy snapshot start must materialize the requested historical session"
         );
         let _ = std::fs::remove_dir_all(workspace_root);
     }

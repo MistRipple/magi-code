@@ -382,7 +382,7 @@ body::after {
   background: rgb(0 0 0 / var(--magi-wallpaper-dim));
 }
 
-/* 独立窗口材质：背景与页面共用同一视口坐标，避免弹窗内壁纸重新裁切跳变。 */
+/* DOM 浮层统一使用应用主题材质，避免各组件自行创建不一致的背景层。 */
 [data-magi-surface] {
   --magi-surface-overlay: var(--magi-window-overlay);
   background-color: var(--magi-canvas) !important;
@@ -453,11 +453,6 @@ body.theme-dark,
 [data-magi-desktop-surface='app'] #app {
   background: transparent !important;
   background-clip: border-box;
-}
-
-/* Overlay 是透明原生兄弟视图，只承载临时菜单和标记交互，不能拥有外壳底色。 */
-[data-magi-desktop-surface='overlay'] #app {
-  background: transparent !important;
 }
 
 /* 滚动条样式 — 精致细窄风格 */

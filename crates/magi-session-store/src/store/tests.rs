@@ -291,6 +291,32 @@ fn test_turn_item(item_id: &str, content: &str) -> ActiveExecutionTurnItem {
 }
 
 #[test]
+fn active_turn_request_id_prefers_root_user_item_and_supports_metadata_names() {
+    let mut turn = test_turn("turn-request-identity", "running", 10);
+    let mut assistant_item = test_turn_item("assistant-request", "assistant");
+    assistant_item.kind = "assistant_stream".to_string();
+    assistant_item.item_seq = 2;
+    assistant_item.request_id = Some("assistant-request-id".to_string());
+    let mut user_item = test_turn_item("user-request", "user");
+    user_item.item_seq = 1;
+    user_item
+        .metadata
+        .insert("request_id".to_string(), json!(" user-request-id "));
+    turn.items = vec![assistant_item, user_item];
+
+    assert_eq!(
+        crate::models::active_execution_turn_request_id(&turn).as_deref(),
+        Some("user-request-id")
+    );
+
+    turn.items.retain(|item| item.kind != "user_message");
+    assert_eq!(
+        crate::models::active_execution_turn_request_id(&turn).as_deref(),
+        Some("assistant-request-id")
+    );
+}
+
+#[test]
 fn unique_timeline_entry_id_appends_suffix_for_duplicate_base() {
     let session_id = SessionId::new("session-duplicate-entry");
     let occurred_at = UtcMillis(42);
@@ -568,6 +594,49 @@ fn rename_session_validates_title_and_skips_noop_history() {
 }
 
 #[test]
+fn rename_session_transaction_keeps_title_and_timeline_when_persistence_fails() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-rename-transaction");
+    store
+        .create_session(session_id.clone(), "旧标题")
+        .expect("session should create");
+    let before = serde_json::to_value(store.durable_state()).expect("state should serialize");
+
+    let result =
+        store.rename_session_with_persistence(&session_id, "新标题", |_durable, _sidecars| {
+            Err::<(), _>("projection write failed")
+        });
+
+    assert!(matches!(
+        result,
+        Err(SessionMutationTransactionError::Persistence(
+            "projection write failed"
+        ))
+    ));
+    assert_eq!(
+        serde_json::to_value(store.durable_state()).expect("state should serialize"),
+        before,
+        "projection 失败不得提交标题或重命名事件"
+    );
+    assert_eq!(
+        store
+            .session(&session_id)
+            .expect("session should exist")
+            .title,
+        "旧标题"
+    );
+    assert_eq!(
+        store
+            .timeline()
+            .iter()
+            .filter(|entry| matches!(&entry.kind, TimelineEntryKind::SessionRenamed))
+            .count(),
+        0,
+        "projection 失败不得新增重命名事件"
+    );
+}
+
+#[test]
 fn session_projection_persistence_serializes_snapshot_and_write_transactions() {
     let store = SessionStore::new();
     let first_session_id = SessionId::new("session-persist-order-first");
@@ -737,6 +806,65 @@ fn persistence_callback_holds_projection_snapshot_until_write_finishes() {
     mutation.join().expect("timeline mutation should join");
 
     assert_eq!(store.timeline().len(), 2);
+}
+
+#[test]
+fn persistence_waits_for_canonical_commit_before_capturing_projection() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-persistence-canonical-order");
+    let turn_id = "turn-persistence-canonical-order";
+    store
+        .create_session(session_id.clone(), "Persistence canonical order")
+        .expect("session should create");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
+        .expect("initial turn should be stored");
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    store.install_canonical_event_writer(Arc::new(BlockingCanonicalWriter {
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+    }));
+
+    let mutation_store = store.clone();
+    let mutation_session_id = session_id.clone();
+    let mutation = thread::spawn(move || {
+        mutation_store
+            .update_current_turn_status_for_turn(&mutation_session_id, Some(turn_id), "completed")
+            .expect("canonical mutation should complete");
+    });
+    entered_rx
+        .recv()
+        .expect("canonical writer should be entered");
+
+    let (persist_entered_tx, persist_entered_rx) = std::sync::mpsc::channel();
+    let persist_store = store.clone();
+    let persist = thread::spawn(move || {
+        persist_store
+            .persist_projection_with(|_, _| {
+                persist_entered_tx
+                    .send(())
+                    .expect("projection callback should signal entry");
+                Ok::<(), ()>(())
+            })
+            .expect("projection should persist");
+    });
+    assert!(
+        persist_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "projection callback must wait for the canonical event commit"
+    );
+
+    release_tx
+        .send(())
+        .expect("canonical writer should be released");
+    mutation.join().expect("canonical mutation should join");
+    persist.join().expect("projection persistence should join");
+    persist_entered_rx
+        .try_recv()
+        .expect("projection callback should run after canonical commit");
 }
 
 #[test]
@@ -2743,12 +2871,18 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
     store
         .create_session(session_id.clone(), "Durable Canonical Log")
         .expect("session should be creatable");
+    let mut running_turn = test_turn("turn-durable", "running", 10);
+    let mut user_item = test_turn_item("turn-item-durable-user", "持久用户消息");
+    user_item.item_seq = 1;
+    user_item.request_id = Some("request-durable-turn".to_string());
+    running_turn.items.push(user_item);
     store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-durable", "running", 10))
+        .upsert_current_turn(session_id.clone(), running_turn)
         .expect("running turn should upsert");
 
     let mut assistant_item = test_turn_item("turn-item-durable-assistant", "持久回复");
     assistant_item.kind = "assistant_stream".to_string();
+    assistant_item.item_seq = 2;
     assistant_item.status = "running".to_string();
     store
         .upsert_current_turn_item_for_turn(&session_id, Some("turn-durable"), assistant_item)
@@ -2765,13 +2899,17 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
         .find(|turn| turn.turn_id == "turn-durable")
         .expect("canonical turn should be durable");
     assert_eq!(turn.status, crate::models::CanonicalTurnStatus::Completed);
-    assert_eq!(turn.items.len(), 1);
-    assert_eq!(turn.items[0].item_id, "turn-item-durable-assistant");
     assert_eq!(
-        turn.items[0].kind,
+        turn.metadata.get("requestId"),
+        Some(&json!("request-durable-turn"))
+    );
+    assert_eq!(turn.items.len(), 2);
+    assert_eq!(turn.items[1].item_id, "turn-item-durable-assistant");
+    assert_eq!(
+        turn.items[1].kind,
         crate::models::CanonicalTurnItemKind::AssistantText
     );
-    assert_eq!(turn.items[0].content.as_deref(), Some("持久回复"));
+    assert_eq!(turn.items[1].content.as_deref(), Some("持久回复"));
 }
 
 #[test]
@@ -5292,6 +5430,79 @@ fn delete_session_removes_canonical_turns_and_execution_threads() {
             .iter()
             .all(|turn| turn.session_id != session_id)
     );
+}
+
+#[test]
+fn delete_session_transaction_keeps_memory_state_when_persistence_fails() {
+    let store = SessionStore::new();
+    let deleted_id = SessionId::new("session-delete-transaction-target");
+    let replacement_id = SessionId::new("session-delete-transaction-replacement");
+    store
+        .create_session(deleted_id.clone(), "target")
+        .expect("target session should create");
+    store
+        .create_session(replacement_id.clone(), "replacement")
+        .expect("replacement session should create");
+    store
+        .select_current_session(&deleted_id)
+        .expect("target session should become current");
+    let before = serde_json::to_value(store.durable_state()).expect("state should serialize");
+
+    let result = store.delete_session_with_persistence(
+        &deleted_id,
+        Some(&replacement_id),
+        |_durable, _sidecars| Err::<(), _>("projection write failed"),
+    );
+
+    assert!(matches!(
+        result,
+        Err(SessionMutationTransactionError::Persistence(
+            "projection write failed"
+        ))
+    ));
+    assert_eq!(
+        serde_json::to_value(store.durable_state()).expect("state should serialize"),
+        before,
+        "projection 失败不得提交内存删除或 current 替换"
+    );
+    assert!(store.session(&deleted_id).is_some());
+    assert_eq!(store.current_session_id(), Some(deleted_id));
+}
+
+#[test]
+fn delete_session_transaction_preserves_non_current_and_replaces_current() {
+    let store = SessionStore::new();
+    let current_id = SessionId::new("session-delete-transaction-current");
+    let other_id = SessionId::new("session-delete-transaction-other");
+    store
+        .create_session(current_id.clone(), "current")
+        .expect("current session should create");
+    store
+        .create_session(other_id.clone(), "other")
+        .expect("other session should create");
+    store
+        .select_current_session(&current_id)
+        .expect("current session should select");
+
+    store
+        .delete_session_with_persistence(&other_id, None, |_durable, _sidecars| Ok::<_, ()>(()))
+        .expect("non-current session should delete");
+    assert!(store.session(&other_id).is_none());
+    assert_eq!(store.current_session_id(), Some(current_id.clone()));
+
+    store
+        .create_session(other_id.clone(), "other again")
+        .expect("replacement session should recreate");
+    store
+        .select_current_session(&current_id)
+        .expect("current session should be reselected");
+    store
+        .delete_session_with_persistence(&current_id, Some(&other_id), |_durable, _sidecars| {
+            Ok::<_, ()>(())
+        })
+        .expect("current session should delete with replacement");
+    assert!(store.session(&current_id).is_none());
+    assert_eq!(store.current_session_id(), Some(other_id));
 }
 
 #[test]

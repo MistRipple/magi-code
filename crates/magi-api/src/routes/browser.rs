@@ -1307,8 +1307,8 @@ struct CreateBrowserAnnotationRequest {
 enum BrowserAnnotationSelectionRequest {
     Element {
         navigation_revision: u64,
-        x: f64,
-        y: f64,
+        normalized_x: f64,
+        normalized_y: f64,
     },
     Region {
         navigation_revision: u64,
@@ -1352,9 +1352,9 @@ async fn create_tab(
             now,
         })
     })?;
-    // 浏览器页面由 Electron Main 持有的 WebContentsView 承载，并且只绑定
-    // 当前桌面右栏 Browser Tab 的内容槽。先发布逻辑 Tab，再要求 Host 物化
-    // 真实 Chromium 页面，使统一 App Renderer 可以立即渲染加载状态。
+    // 浏览器页面由 Electron Main 管理真实 Chromium guest，并绑定到当前
+    // 桌面右栏 Browser Tab 的内容槽。先发布逻辑 Tab，再要求 Host 物化
+    // 页面，使统一 App Renderer 可以立即渲染加载状态。
     publish_browser_event(
         &state,
         "browser.tab.created",
@@ -1625,15 +1625,15 @@ async fn create_annotation(
     let (kind, navigation_revision, hit_x, hit_y, region) = match request.selection {
         BrowserAnnotationSelectionRequest::Element {
             navigation_revision,
-            x,
-            y,
+            normalized_x,
+            normalized_y,
         } => {
-            validate_annotation_point(x, y)?;
+            validate_annotation_point(normalized_x, normalized_y)?;
             (
                 BrowserAnnotationKind::Element,
                 navigation_revision,
-                x,
-                y,
+                normalized_x,
+                normalized_y,
                 None,
             )
         }
@@ -1854,8 +1854,8 @@ async fn browser_hit_test(
             .request(BrowserHostCommand::HitTest {
                 tab_id: tab_id.clone(),
                 navigation_revision,
-                x,
-                y,
+                normalized_x: x,
+                normalized_y: y,
             })
             .await,
         "页面标记命中检测失败",
@@ -2058,9 +2058,9 @@ async fn activate_tab(
     let mut tab = state
         .mutate_browser_authority(|authority| prepare_browser_tab_activation(authority, &tab_id))?;
     // Host 的真实 Surface 只有在右栏 Renderer 已经切换到目标 Browser Tab
-    // 后才能取得内容槽。先发出激活意图，让 Renderer 提前切换 DOM；如果把
-    // 这个事件放在 RestorePage 之后，Host 会等待一个永远不会出现的槽位，
-    // 最终表现为激活成功但没有 surface_id 或内容槽超时。
+    // 后才能取得内容槽。先发出激活意图，再等待 Renderer 注册真实
+    // <webview>；RestorePage 必须排在内容槽绑定之后，否则会把页面恢复请求
+    // 送进没有 WebContents 的逻辑 Surface，形成“双方互等”的激活死锁。
     publish_browser_event(
         &state,
         "browser.tab.activation_requested",
@@ -2071,6 +2071,7 @@ async fn activate_tab(
             "tab_id": tab_id,
         }),
     );
+    wait_for_browser_primary_surface(&state, &tab_id).await?;
     let session = loop {
         let reply = require_host_success(
             require_browser_host(&state)?
@@ -2098,7 +2099,6 @@ async fn activate_tab(
             BrowserTabActivation::Completed(session) => break session,
         }
     };
-    wait_for_browser_primary_surface(&state, &tab_id).await?;
     sync_browser_annotations_to_host(&state, &tab_id).await?;
     publish_browser_event(
         &state,
@@ -2129,6 +2129,19 @@ async fn close_tab(
     state.mutate_browser_authority(|authority| {
         authority.transition_tab(&tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
     })?;
+    // 先发布逻辑关闭事实，让 App Renderer 卸载其 <webview> 内容槽；
+    // Host 的 ClosePage 只能清理已经由 Renderer 放弃所有权的物理 guest。
+    // 不能反过来在 Renderer 仍持有 guest 时让 Main 直接 close WebContents。
+    publish_browser_event(
+        &state,
+        "browser.tab.closed",
+        session.workspace_id.as_ref(),
+        &session.session_id,
+        serde_json::json!({
+            "browser_session_id": tab.browser_session_id,
+            "tab_id": tab_id,
+        }),
+    );
     if let Some(client) = state.browser_host_client() {
         match client
             .request(BrowserHostCommand::ClosePage {
@@ -2149,16 +2162,6 @@ async fn close_tab(
             ),
         }
     }
-    publish_browser_event(
-        &state,
-        "browser.tab.closed",
-        session.workspace_id.as_ref(),
-        &session.session_id,
-        serde_json::json!({
-            "browser_session_id": tab.browser_session_id,
-            "tab_id": tab_id,
-        }),
-    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2201,6 +2204,7 @@ async fn navigate_tab(
         }
         "back" => BrowserNavigation::Back { timeout_ms: None },
         "forward" => BrowserNavigation::Forward { timeout_ms: None },
+        "stop" => BrowserNavigation::Stop,
         "reload" => BrowserNavigation::Reload {
             ignore_cache: false,
             handle_before_unload: None,
@@ -2208,24 +2212,36 @@ async fn navigate_tab(
         },
         _ => {
             return Err(ApiError::InvalidInput(
-                "action 必须是 url、back、forward 或 reload".to_string(),
+                "action 必须是 url、back、forward、stop 或 reload".to_string(),
             ));
         }
     };
-    let fence = ensure_user_control_for_ui(&state, &session, &tab_id)
-        .await?
-        .fence;
-    let _control_guard = state.browser_control_lock.lock().await;
-    let reply = require_host_success(
-        require_browser_host(&state)?
-            .request(BrowserHostCommand::Navigate {
-                tab_id: tab_id.clone(),
-                control: BrowserHostControl::User { fence },
-                navigation,
-            })
-            .await,
-        "浏览器导航失败",
-    )?;
+    let reply = match navigation {
+        BrowserNavigation::Stop => require_host_success(
+            require_browser_host(&state)?
+                .request(BrowserHostCommand::StopNavigation {
+                    tab_id: tab_id.clone(),
+                })
+                .await,
+            "停止浏览器导航失败",
+        )?,
+        navigation => {
+            let fence = ensure_user_control_for_ui(&state, &session, &tab_id)
+                .await?
+                .fence;
+            let _control_guard = state.browser_control_lock.lock().await;
+            require_host_success(
+                require_browser_host(&state)?
+                    .request(BrowserHostCommand::Navigate {
+                        tab_id: tab_id.clone(),
+                        control: BrowserHostControl::User { fence },
+                        navigation,
+                    })
+                    .await,
+                "浏览器导航失败",
+            )?
+        }
+    };
     let BrowserHostCommandResult::PageState(page_state) = reply else {
         return Err(ApiError::InternalAssemblyError(
             "浏览器 Host 导航结果缺少页面状态".to_string(),
@@ -2798,9 +2814,9 @@ mod tests {
     };
     use magi_browser_authority::{
         BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor, BrowserAnnotationKind,
-        BrowserAnnotationStatus, BrowserProfile, BrowserProfileKind, BrowserRegionAnnotationAnchor,
-        BrowserSessionLifecycle, BrowserTabLifecycle, BrowserViewport, CreateBrowserSession,
-        CreateBrowserTab,
+        BrowserAnnotationStatus, BrowserHostRect, BrowserProfile, BrowserProfileKind,
+        BrowserRegionAnnotationAnchor, BrowserSessionLifecycle, BrowserTabLifecycle,
+        BrowserViewport, CreateBrowserSession, CreateBrowserTab,
     };
     use magi_core::{
         BrowserAnnotationId, BrowserProfileId, BrowserSessionId, BrowserTabId, SessionId,
@@ -2817,9 +2833,9 @@ mod tests {
         BrowserTabActivation, DesktopConnectionClearRequest, DesktopConnectionRequest,
         ReclaimBrowserResourcesRequest, annotation_artifact, apply_browser_tab_activation,
         browser_platform_capabilities, browser_resources_response, browser_session_response,
-        clear_desktop_connection, finish_browser_tab_creation, prepare_browser_tab_activation,
-        reclaim_browser_resources, register_desktop_connection, require_desktop_browser_capability,
-        resolve_browser_annotation_context,
+        clear_desktop_connection, finish_browser_tab_creation, normalize_hit_bounds,
+        prepare_browser_tab_activation, reclaim_browser_resources, register_desktop_connection,
+        require_desktop_browser_capability, resolve_browser_annotation_context,
     };
     use crate::{
         errors::ApiError,
@@ -2911,6 +2927,56 @@ mod tests {
             })
             .expect("annotation authority fixture should create");
         (state, current_session_id, other_session_id, annotation_id)
+    }
+
+    #[test]
+    fn annotation_hit_bounds_are_normalized_against_the_chromium_viewport() {
+        let normalized = normalize_hit_bounds(
+            1280,
+            720,
+            BrowserHostRect {
+                x: 640.0,
+                y: 180.0,
+                width: 120.0,
+                height: 40.0,
+            },
+        )
+        .expect("valid Chromium element bounds should normalize");
+
+        assert_eq!(normalized.x, 0.5);
+        assert_eq!(normalized.y, 0.25);
+        assert!((normalized.width - 120.0 / 1280.0).abs() < 1e-12);
+        assert!((normalized.height - 40.0 / 720.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn annotation_hit_bounds_reject_an_empty_or_unavailable_viewport() {
+        assert!(
+            normalize_hit_bounds(
+                0,
+                720,
+                BrowserHostRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_hit_bounds(
+                1280,
+                720,
+                BrowserHostRect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 0.0,
+                    height: 40.0,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

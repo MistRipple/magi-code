@@ -186,7 +186,7 @@ assert.match(apiRoutes, /!target_path\.is_file\(\)/, 'daemon 不得把目录或�
 assert.match(desktopFiles, /relative\(workspaceRoot, targetPath\)[\s\S]*?startsWith\(`\.\.\$\{sep\}`\)/, '桌面命令必须再次校验工作区边界');
 assert.match(desktopFiles, /canonicalPath\(input\.targetPathRef, "file"\)/, '桌面命令必须再次确认目标是文件');
 assert.match(desktopFiles, /canonicalPath\(workspaceRootPathRef, "directory"\)/, '打开工作区前必须再次确认目标是目录');
-assert.match(workbench, /use:desktopContextMenu=\{\{[\s\S]*?kind: 'workspace'[\s\S]*?workspacePathRef: workspaceBindingPath\(workspace\)/, '工作区标题必须声明打开文件夹菜单语义');
+assert.match(workbench, /use:desktopContextMenu=\{\{[\s\S]*?kind: 'workspace'[\s\S]*?workspacePathRef: workspacePathRef\(workspace\)/, '工作区标题必须声明打开文件夹菜单语义');
 
 for (const [source, label] of [
   [codeBlock, '代码块'],

@@ -754,7 +754,10 @@ where
     let manager = state
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "runner_manager 未配置"))?;
-    let _session_lifecycle_guard = manager.lock_session_lifecycle(session_id).await;
+    let _runner_lifecycle_guard = state
+        .lock_runner_lifecycle_after_turn_commit(session_id)
+        .await
+        .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "runner_manager 未配置"))?;
     let session = state
         .session_store
         .session(session_id)

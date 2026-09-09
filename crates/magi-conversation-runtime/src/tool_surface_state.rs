@@ -3,13 +3,14 @@ use crate::{
     builtin_tool_schema::public_builtin_tool_definition, parse_skill_custom_tool_name,
 };
 use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
-use magi_core::{AccessProfile, ExecutionResultStatus, SessionId};
+use magi_browser_authority::BrowserCapabilitySnapshot;
+use magi_core::{AccessProfile, ExecutionResultStatus};
 use magi_skill_runtime::{SkillRuntime, SkillSelection};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 
 pub(crate) struct BrowserToolSurfaceSnapshot {
     pub definitions: Vec<ChatToolDefinition>,
-    pub capability_revision: Option<u64>,
+    pub capability: Option<BrowserCapabilitySnapshot>,
 }
 
 pub(crate) struct BrowserToolSurfaceContext<'a> {
@@ -18,7 +19,6 @@ pub(crate) struct BrowserToolSurfaceContext<'a> {
     access_profile: AccessProfile,
     allowed_tools: Option<&'a [String]>,
     denied_tools: &'a [String],
-    session_id: Option<&'a SessionId>,
 }
 
 impl<'a> BrowserToolSurfaceContext<'a> {
@@ -28,7 +28,6 @@ impl<'a> BrowserToolSurfaceContext<'a> {
         access_profile: AccessProfile,
         allowed_tools: Option<&'a [String]>,
         denied_tools: &'a [String],
-        session_id: Option<&'a SessionId>,
     ) -> Self {
         Self {
             skill_runtime,
@@ -36,29 +35,28 @@ impl<'a> BrowserToolSurfaceContext<'a> {
             access_profile,
             allowed_tools,
             denied_tools,
-            session_id,
         }
     }
 }
 
-pub(crate) fn refresh_live_browser_tool_definitions(
+pub(crate) fn build_browser_tool_surface(
     mut definitions: Vec<ChatToolDefinition>,
     tool_registry: &ToolRegistry,
     context: BrowserToolSurfaceContext<'_>,
+    capability: Option<BrowserCapabilitySnapshot>,
 ) -> BrowserToolSurfaceSnapshot {
     definitions.retain(|definition| {
         BuiltinToolName::from_name(&definition.function.name)
             .is_none_or(|tool| tool.browser_tool_kind().is_none())
     });
 
-    let Some(capability) =
-        tool_registry.browser_capability_snapshot(context.access_profile, context.session_id)
-    else {
+    let Some(mut capability) = capability else {
         return BrowserToolSurfaceSnapshot {
             definitions,
-            capability_revision: None,
+            capability: None,
         };
     };
+    capability.access_profile = context.access_profile;
     let skill_allowed_tools = context.active_skill_id.and_then(|skill_id| {
         context.skill_runtime.and_then(|runtime| {
             let policy = runtime
@@ -103,7 +101,7 @@ pub(crate) fn refresh_live_browser_tool_definitions(
 
     BrowserToolSurfaceSnapshot {
         definitions,
-        capability_revision: Some(capability.revision),
+        capability: Some(capability),
     }
 }
 
@@ -286,19 +284,16 @@ mod tests {
         );
         registry.register_default_builtins();
 
-        let first = refresh_live_browser_tool_definitions(
+        let first = build_browser_tool_surface(
             Vec::new(),
             &registry,
-            BrowserToolSurfaceContext::new(
-                None,
-                None,
-                AccessProfile::FullAccess,
-                None,
-                &[],
-                Some(&SessionId::new("session-browser-surface")),
-            ),
+            BrowserToolSurfaceContext::new(None, None, AccessProfile::FullAccess, None, &[]),
+            registry.browser_capability_snapshot(AccessProfile::FullAccess, None),
         );
-        assert_eq!(first.capability_revision, Some(7));
+        assert_eq!(
+            first.capability.as_ref().map(|snapshot| snapshot.revision),
+            Some(7)
+        );
         let browser_tool_count = BuiltinToolName::ALL
             .iter()
             .filter(|tool| {
@@ -322,34 +317,28 @@ mod tests {
 
         revision.store(8, Ordering::Release);
         enabled.store(false, Ordering::Release);
-        let disabled = refresh_live_browser_tool_definitions(
+        let disabled = build_browser_tool_surface(
             first.definitions,
             &registry,
-            BrowserToolSurfaceContext::new(
-                None,
-                None,
-                AccessProfile::FullAccess,
-                None,
-                &[],
-                Some(&SessionId::new("session-browser-surface")),
-            ),
+            BrowserToolSurfaceContext::new(None, None, AccessProfile::FullAccess, None, &[]),
+            registry.browser_capability_snapshot(AccessProfile::FullAccess, None),
         );
-        assert_eq!(disabled.capability_revision, Some(8));
+        assert_eq!(
+            disabled
+                .capability
+                .as_ref()
+                .map(|snapshot| snapshot.revision),
+            Some(8)
+        );
         assert!(disabled.definitions.is_empty());
 
         revision.store(9, Ordering::Release);
         enabled.store(true, Ordering::Release);
-        let read_only = refresh_live_browser_tool_definitions(
+        let read_only = build_browser_tool_surface(
             disabled.definitions,
             &registry,
-            BrowserToolSurfaceContext::new(
-                None,
-                None,
-                AccessProfile::ReadOnly,
-                None,
-                &[],
-                Some(&SessionId::new("session-browser-surface")),
-            ),
+            BrowserToolSurfaceContext::new(None, None, AccessProfile::ReadOnly, None, &[]),
+            registry.browser_capability_snapshot(AccessProfile::ReadOnly, None),
         );
         let names = read_only
             .definitions
@@ -364,7 +353,13 @@ mod tests {
             })
             .map(BuiltinToolName::as_str)
             .collect::<Vec<_>>();
-        assert_eq!(read_only.capability_revision, Some(9));
+        assert_eq!(
+            read_only
+                .capability
+                .as_ref()
+                .map(|snapshot| snapshot.revision),
+            Some(9)
+        );
         assert_eq!(names, expected_names);
     }
 

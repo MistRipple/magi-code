@@ -97,7 +97,6 @@ async function applyTheme(pack: ThemePack): Promise<void> {
   const sequence = ++applySequence;
   const nextMode = resolveMode(pack);
   const scheme = resolveScheme(pack, nextMode);
-  const desktopSurface = document.documentElement.dataset.magiDesktopSurface;
   const wallpaperUrl = pack.wallpaper ? await resolveAppearanceAssetUrl(pack.wallpaper.assetId) : '';
   if (sequence !== applySequence) {
     pruneAssetUrls(referencedAppearanceAssetIds(activeTheme?.wallpaper?.assetId));
@@ -107,9 +106,7 @@ async function applyTheme(pack: ThemePack): Promise<void> {
   mode = nextMode;
   const desktopAppearance = applyRootTheme(pack, scheme, wallpaperUrl);
   pruneAssetUrls(referencedAppearanceAssetIds(pack.wallpaper?.assetId));
-  // 只有 App Renderer 拥有窗口外壳。Overlay 是同一窗口里的透明原生兄弟
-  // 视图，不能再次用“无壁纸”的局部主题覆盖 App 已同步的外壳材质。
-  if (desktopSurface === 'app') {
+  if (desktopSurfaceIsApp()) {
     try {
       // 在初始化完成前等待 native 外壳确认材质，WindowManager 才会放行
       // 首次显示，避免浅色主题启动时短暂露出深色默认背景。
@@ -175,10 +172,8 @@ function applyRootTheme(
 ): { nativeBackgroundColor: string } {
   const root = document.documentElement;
   const body = document.body;
-  const desktopSurface = root.dataset.magiDesktopSurface;
-  // App Renderer 是 Desktop 唯一的窗口背景所有者，必须绘制完整壁纸；
-  // 只有透明 Overlay 不拥有背景，避免它在自己的原生视图中再次裁切壁纸。
-  const effectiveWallpaperUrl = desktopSurface === 'overlay' ? '' : wallpaperUrl;
+  // App Renderer 是 Desktop 唯一的窗口背景所有者，负责绘制完整壁纸。
+  const effectiveWallpaperUrl = wallpaperUrl;
   root.classList.remove('theme-light', 'theme-dark');
   body.classList.remove('theme-light', 'theme-dark');
   root.classList.add(`theme-${mode}`);
@@ -285,6 +280,10 @@ function applyRootTheme(
     // 的 CSS 壳层消费，避免原生层透出桌面或出现黑色闪烁。
     nativeBackgroundColor: toHex(background),
   };
+}
+
+function desktopSurfaceIsApp(): boolean {
+  return document.documentElement.dataset.magiDesktopSurface === 'app';
 }
 
 function parseHex(value: string): [number, number, number] {

@@ -36,7 +36,7 @@ assert.doesNotMatch(runtime, /localStorage\.setItem/, '外观运行时不得把 
 assert.match(runtime, /fetchAppearanceSnapshot[\s\S]*?applyAppearanceSnapshot/, '主题恢复必须从 daemon 快照进入唯一应用链路');
 assert.match(runtime, /synchronizeDesktopAppearance[\s\S]*?backgroundColor: desktopAppearance\.nativeBackgroundColor[\s\S]*?accentColor: scheme\.accent[\s\S]*?material: pack\.material[\s\S]*?mode: nextMode/, '权威主题应用链路必须同步桌面外壳的原生底色、强调色、材质与明暗模式');
 assert.match(runtime, /sequence !== applySequence[\s\S]*?emit\(\)/, '异步主题同步返回后必须丢弃过期主题快照');
-assert.match(runtime, /desktopSurface === 'app'[\s\S]*?synchronizeDesktopAppearance/, '透明 Overlay 不得覆盖 App Renderer 已同步的窗口外壳主题');
+assert.match(runtime, /desktopSurfaceIsApp\(\)[\s\S]*?synchronizeDesktopAppearance/, '桌面 App Renderer 必须同步窗口外壳主题');
 assert.match(desktopAppearance, /isDesktopRuntime[\s\S]*?desktop\.setAppearance\(appearance\)/, 'Renderer 必须通过 preload 同步桌面壳外观');
 assert.match(desktopAppearance, /accentColor[\s\S]*?material/, '桌面外观载荷必须包含主题强调色与材质');
 assert.match(desktopPreload, /setAppearance:[\s\S]*?magi-desktop:set-appearance/, 'preload 必须暴露受限外观 IPC');
@@ -50,8 +50,8 @@ assert.doesNotMatch(desktopAppearance + desktopPreload + desktopMain, /@tauri-ap
 assert.match(runtime, /--magi-surface-dialog[\s\S]*?--magi-surface-popover[\s\S]*?--magi-surface-critical[\s\S]*?--magi-window-overlay[\s\S]*?--magi-popover-overlay[\s\S]*?--magi-critical-overlay/, '主题必须提供完整的语义材质表面');
 assert.match(runtime, /'--magi-surface-sidebar': panel[\s\S]*?'--magi-surface-main': panel[\s\S]*?'--magi-surface-right-pane': panel/, '三栏结构面板必须共享同一主题材质令牌');
 assert.doesNotMatch(runtime, /desktopShellBackground|--magi-desktop-shell-background/, '主题运行时不得保留已移除的第四层 Desktop 外壳背景令牌');
-assert.match(runtime, /desktopSurface === 'overlay' \? '' : wallpaperUrl/, 'Desktop App Renderer 必须保留整窗壁纸，只有透明 Overlay 禁止重复绘制壁纸');
-assert.match(mainWeb, /desktopSurface === 'app' \|\| desktopSurface === 'overlay'[\s\S]*?magiDesktopSurface/, 'Desktop App 与 Overlay 必须显式声明 Surface 身份以应用统一材质策略');
+assert.match(runtime, /const effectiveWallpaperUrl = wallpaperUrl/, 'Desktop App Renderer 必须由主 Renderer 统一绘制整窗壁纸');
+assert.match(mainWeb, /desktopSurface === 'app'[\s\S]*?magiDesktopSurface/, 'Desktop App 必须显式声明 Surface 身份以应用统一材质策略');
 assert.match(runtime, /pruneAssetUrls[\s\S]*?URL\.revokeObjectURL/, '切换背景后必须释放未使用的 Blob URL');
 assert.match(runtime, /resolveAppearanceAssetUrl[\s\S]*?referencedAppearanceAssetIds[\s\S]*?library\?\.themes/, '主题卡片与运行时必须共享资源 URL，并按主题库引用统一管理生命周期');
 assert.match(client, /themes\/import[\s\S]*?themes\/\$\{encodeURIComponent\(themeId\)\}\/export/, '用户主题必须支持导入和导出');
@@ -104,7 +104,7 @@ assert.doesNotMatch(settingsCss, /\.btn-icon\s*\{|\.form-field\s+(?:input|textar
 assert.doesNotMatch(settingsCss, /\.modal-(?:overlay|dialog|header|body|footer)|\.dialog-(?:overlay|content|header|body|footer)/, '设置样式不得保留重复弹窗系统');
 assert.match(globalCss, /body::before[\s\S]*?background-image: var\(--magi-wallpaper-image\)/, '页面根背景必须复用权威壁纸变量');
 assert.match(globalCss, /data-magi-desktop-surface='app'\]\s*#app[\s\S]*?background: transparent !important/, 'Desktop App 根节点不能叠加第四层背景');
-assert.match(globalCss, /data-magi-desktop-surface='overlay'[\s\S]*?background: transparent !important/, 'Overlay 外壳必须保持透明，不能重复绘制 Desktop 背景');
+assert.doesNotMatch(globalCss, /data-magi-desktop-surface='overlay'/, '应用内不得保留已删除的 Overlay Renderer');
 assert.match(workbenchShell, /workbench-app-pane" data-testid="workbench-app-pane"[\s\S]*?\.workbench-app-pane \{[\s\S]*?border-radius: var\(--radius-lg\)[\s\S]*?overflow: hidden/, '主对话容器必须具备统一圆角和裁切边界');
 assert.doesNotMatch(workbenchShell, /\.workbench-app-pane\s*\{[^}]*background:\s*var\(--magi-surface-main\)/, '中栏外层不得与 App 容器重复消费主材质');
 assert.match(

@@ -514,6 +514,43 @@ impl ActiveExecutionTurn {
     }
 }
 
+/// 提取一个 Active Turn 的稳定请求身份。
+///
+/// requestId 属于 Turn 的关联身份，不应只依赖某个可被事件 shell 省略的 item。
+/// 用户消息 item 优先；同一 item 内优先结构化字段，再读取两种历史 metadata 命名。
+/// 其余 item 仅作为无用户消息 Turn（例如 goal continuation）的合法来源。
+pub fn active_execution_turn_request_id(turn: &ActiveExecutionTurn) -> Option<String> {
+    fn item_request_id(item: &ActiveExecutionTurnItem) -> Option<String> {
+        item.request_id
+            .as_deref()
+            .or_else(|| item.metadata.get("requestId").and_then(Value::as_str))
+            .or_else(|| item.metadata.get("request_id").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    turn.items
+        .iter()
+        .filter(|item| item.kind == "user_message")
+        .min_by(|left, right| {
+            left.item_seq
+                .cmp(&right.item_seq)
+                .then_with(|| left.item_id.cmp(&right.item_id))
+        })
+        .and_then(item_request_id)
+        .or_else(|| {
+            turn.items
+                .iter()
+                .min_by(|left, right| {
+                    left.item_seq
+                        .cmp(&right.item_seq)
+                        .then_with(|| left.item_id.cmp(&right.item_id))
+                })
+                .and_then(item_request_id)
+        })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveExecutionChain {

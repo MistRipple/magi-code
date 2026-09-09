@@ -12,11 +12,15 @@ export const BROWSER_CHILD_TARGET_TYPES = [
   "shared_worker",
 ] as const;
 
-export function isAllowedBrowserChildTarget(value: unknown): value is Record<string, unknown> {
+export function isAllowedBrowserChildTarget(
+  value: unknown,
+): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const type = (value as Record<string, unknown>).type;
-  return typeof type === "string"
-    && (BROWSER_CHILD_TARGET_TYPES as readonly string[]).includes(type);
+  return (
+    typeof type === "string" &&
+    (BROWSER_CHILD_TARGET_TYPES as readonly string[]).includes(type)
+  );
 }
 
 /**
@@ -26,7 +30,9 @@ export function isAllowedBrowserChildTarget(value: unknown): value is Record<str
  * 归一化为 null；只有正的安全整数才可以继续沿着节点选择链路传递。
  */
 export function normalizeOptionalDomNodeId(value: unknown): number | null {
-  return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : null;
+  return Number.isSafeInteger(value) && (value as number) > 0
+    ? (value as number)
+    : null;
 }
 
 export type DesktopEpoch = string;
@@ -133,6 +139,7 @@ export type BrowserNavigation =
     }
   | { action: "back"; timeout_ms?: number }
   | { action: "forward"; timeout_ms?: number }
+  | { action: "stop" }
   | {
       action: "reload";
       ignore_cache?: boolean;
@@ -156,6 +163,10 @@ export type BrowserHostCommand =
       };
     }
   | {
+      type: "ensure_surface";
+      payload: { tab_id: BrowserTabId };
+    }
+  | {
       type: "set_logical_viewport";
       payload: { tab_id: BrowserTabId; viewport: BrowserLogicalViewport };
     }
@@ -172,8 +183,18 @@ export type BrowserHostCommand =
   | { type: "close_page"; payload: { tab_id: BrowserTabId } }
   | {
       type: "navigate";
-      payload: { tab_id: BrowserTabId; control: BrowserControl; navigation: BrowserNavigation };
+      payload: {
+        tab_id: BrowserTabId;
+        control: BrowserControl;
+        navigation: BrowserNavigation;
+      };
     }
+  /**
+   * 立即中断当前 Tab 的 Chromium 导航。该命令是唯一允许绕过同一 Tab
+   * 普通资源队列的高优先级控制命令；它不会创建新 Surface，也不会改变
+   * 右栏布局或 Browser Tab 身份。
+   */
+  | { type: "stop_navigation"; payload: { tab_id: BrowserTabId } }
   | {
       type: "snapshot";
       payload: {
@@ -186,7 +207,11 @@ export type BrowserHostCommand =
     }
   | {
       type: "click";
-      payload: { tab_id: BrowserTabId; control: BrowserControl; target: BrowserSnapshotTarget };
+      payload: {
+        tab_id: BrowserTabId;
+        control: BrowserControl;
+        target: BrowserSnapshotTarget;
+      };
     }
   | {
       type: "type";
@@ -235,7 +260,14 @@ export type BrowserHostCommand =
     }
   | {
       type: "hit_test";
-      payload: { tab_id: BrowserTabId; navigation_revision: number; x: number; y: number };
+      payload: {
+        tab_id: BrowserTabId;
+        navigation_revision: number;
+        /** 内容槽相对于当前 Chromium CSS 视口的归一化横坐标。 */
+        normalized_x: number;
+        /** 内容槽相对于当前 Chromium CSS 视口的归一化纵坐标。 */
+        normalized_y: number;
+      };
     }
   | {
       type: "update_control";
@@ -268,6 +300,7 @@ export type BrowserCommandResult =
   | { type: "snapshot"; payload: BrowserSnapshot }
   | { type: "binary_payload"; payload: BrowserBinaryPayload }
   | { type: "hit_test"; payload: BrowserHitTest }
+  | { type: "surface_binding"; payload: BrowserSurfaceBinding }
   | { type: "json"; payload: { value: unknown } };
 
 export type BrowserCommandOutcome =
@@ -361,7 +394,10 @@ export interface BrowserHitTest {
 
 export type BrowserHostEvent =
   | { type: "ready"; payload: DesktopBrowserHandshake }
-  | { type: "primary_surface_changed"; payload: { binding: BrowserSurfaceBinding } }
+  | {
+      type: "primary_surface_changed";
+      payload: { binding: BrowserSurfaceBinding };
+    }
   | { type: "user_takeover"; payload: { binding: BrowserSurfaceBinding } }
   | {
       type: "control_revoked";
@@ -371,15 +407,59 @@ export type BrowserHostEvent =
       type: "page_updated";
       payload: { binding: BrowserSurfaceBinding; page_state: BrowserPageState };
     }
-  | { type: "page_failed"; payload: { binding: BrowserSurfaceBinding; reason: string } }
-  | { type: "loading_changed"; payload: { binding: BrowserSurfaceBinding; loading: boolean } }
-  | { type: "page_crashed"; payload: { binding: BrowserSurfaceBinding; diagnostic?: string | null } }
-  | { type: "console"; payload: { tab_id: BrowserTabId; level: string; text: string } }
-  | { type: "dialog"; payload: { tab_id: BrowserTabId; dialog_id: number; dialog_type: string; message: string } }
-  | { type: "download"; payload: { tab_id: BrowserTabId; suggested_filename: string; state: string; byte_length?: number; error?: string } }
-  | { type: "popup_blocked"; payload: { binding: BrowserSurfaceBinding; url: string } }
+  | {
+      type: "page_failed";
+      payload: { binding: BrowserSurfaceBinding; reason: string };
+    }
+  | {
+      type: "loading_changed";
+      payload: { binding: BrowserSurfaceBinding; loading: boolean };
+    }
+  | {
+      type: "page_crashed";
+      payload: { binding: BrowserSurfaceBinding; diagnostic?: string | null };
+    }
+  | {
+      type: "console";
+      payload: { tab_id: BrowserTabId; level: string; text: string };
+    }
+  | {
+      type: "dialog";
+      payload: {
+        tab_id: BrowserTabId;
+        dialog_id: number;
+        dialog_type: string;
+        message: string;
+      };
+    }
+  | {
+      type: "download";
+      payload: {
+        tab_id: BrowserTabId;
+        download_id: string;
+        suggested_filename: string;
+        state: string;
+        received_bytes: number;
+        total_bytes: number | null;
+        byte_length?: number;
+        error?: string;
+      };
+    }
+  | {
+      type: "popup_blocked";
+      payload: { binding: BrowserSurfaceBinding; url: string };
+    }
   | { type: "node_selection"; payload: BrowserNodeSelection }
-  | { type: "agent_cursor"; payload: { tab_id: BrowserTabId; visible: boolean; x: number | null; y: number | null; action: BrowserAgentCursorAction | null } }
+  | {
+      type: "agent_cursor";
+      payload: {
+        tab_id: BrowserTabId;
+        visible: boolean;
+        x: number | null;
+        y: number | null;
+        action: BrowserAgentCursorAction | null;
+      };
+    }
   | { type: "binary_payload_ready"; payload: BrowserBinaryPayload }
   | { type: "heartbeat"; payload: { monotonic_millis: number } };
 
@@ -389,7 +469,8 @@ export interface BrowserHostEventEnvelope {
   event: BrowserHostEvent;
 }
 
-export type BrowserAgentCursorAction = "move" | "click" | "drag" | "type" | "scroll";
+export type BrowserAgentCursorAction =
+  "move" | "click" | "drag" | "type" | "scroll";
 
 export interface WorkerCommandRequest {
   type: "worker_command";
@@ -477,5 +558,15 @@ export interface WorkerReadyMessage {
   protocol_version: ProtocolVersion;
 }
 
-export type MainToWorkerMessage = WorkerCommandRequest | WorkerCancelRequest | WorkerCdpResponse | WorkerCdpEvent | WorkerRebindRequest;
-export type WorkerToMainMessage = WorkerCommandResponse | WorkerCdpRequest | WorkerCdpCancelRequest | WorkerReadyMessage | WorkerRebindAck;
+export type MainToWorkerMessage =
+  | WorkerCommandRequest
+  | WorkerCancelRequest
+  | WorkerCdpResponse
+  | WorkerCdpEvent
+  | WorkerRebindRequest;
+export type WorkerToMainMessage =
+  | WorkerCommandResponse
+  | WorkerCdpRequest
+  | WorkerCdpCancelRequest
+  | WorkerReadyMessage
+  | WorkerRebindAck;

@@ -290,6 +290,7 @@ async fn execute_dispatch_submission(
         user_message_metadata,
     } = input;
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
+    let previous_current_session_id = state.session_store.current_session_id();
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
         state,
         requested_session_id,
@@ -305,14 +306,29 @@ async fn execute_dispatch_submission(
         } else {
             None
         });
-    let browser_annotation_refs =
-        resolve_browser_annotation_context(state, &session_id, &request.browser_annotation_refs())?;
-    let browser_authority = state
-        .browser_authority
-        .lock()
-        .expect("browser authority lock poisoned");
-    let browser_node_selections = request
-        .validate_browser_node_selections_with(|index, selection| {
+    let browser_annotation_refs = match resolve_browser_annotation_context(
+        state,
+        &session_id,
+        &request.browser_annotation_refs(),
+    ) {
+        Ok(refs) => refs,
+        Err(error) if created_session => {
+            return Err(rollback_created_session_on_dispatch_error(
+                state,
+                &session_id,
+                previous_current_session_id.clone(),
+                error,
+            )
+            .await);
+        }
+        Err(error) => return Err(error),
+    };
+    let browser_node_selection_result = {
+        let browser_authority = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned");
+        request.validate_browser_node_selections_with(|index, selection| {
             let browser_session_id = BrowserSessionId::new(selection.browser_session_id.clone());
             let tab_id = BrowserTabId::new(selection.tab_id.clone());
             browser_authority
@@ -326,8 +342,20 @@ async fn execute_dispatch_submission(
                 })
                 .map_err(|error| format!("浏览器节点选择[{index}] 无效: {error}"))
         })
-        .map_err(ApiError::InvalidInput)?;
-    drop(browser_authority);
+    };
+    let browser_node_selections = match browser_node_selection_result {
+        Ok(selections) => selections,
+        Err(error) if created_session => {
+            return Err(rollback_created_session_on_dispatch_error(
+                state,
+                &session_id,
+                previous_current_session_id.clone(),
+                ApiError::InvalidInput(error),
+            )
+            .await);
+        }
+        Err(error) => return Err(ApiError::InvalidInput(error)),
+    };
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 
@@ -366,6 +394,15 @@ async fn execute_dispatch_submission(
     };
     let accepted = match submit_dispatch_submission(state, dispatch) {
         Ok(accepted) => accepted,
+        Err(error) if created_session => {
+            return Err(rollback_created_session_on_dispatch_error(
+                state,
+                &session_id,
+                previous_current_session_id.clone(),
+                error,
+            )
+            .await);
+        }
         Err(error) => {
             state.release_session_git_execution_lease(&session_id);
             return Err(error);
@@ -389,7 +426,19 @@ async fn execute_dispatch_submission(
         );
     }
     let (event_id, event_seq, event_occurred_at) =
-        publish_session_turn_task_accepted_event(state, request, &accepted)?;
+        match publish_session_turn_task_accepted_event(state, request, &accepted) {
+            Ok(event) => event,
+            Err(error) if created_session => {
+                return Err(rollback_created_session_on_dispatch_error(
+                    state,
+                    &session_id,
+                    previous_current_session_id,
+                    error,
+                )
+                .await);
+            }
+            Err(error) => return Err(error),
+        };
     if created_session {
         crate::session_title::spawn_new_session_title_refinement(
             state,
@@ -399,6 +448,32 @@ async fn execute_dispatch_submission(
         );
     }
     Ok((accepted, event_id, event_seq, event_occurred_at))
+}
+
+/// 新会话只有在首条消息完成接纳并发布事实后才算成立。
+///
+/// `execute_dispatch_submission` 在创建新会话后仍可能失败于引用校验、任务接纳或
+/// 事实发布。所有这些失败都必须删除同一会话的任务、sidecar、队列、执行注册和
+/// 浏览器资源，并恢复创建前的 current；否则前端会看到“会话消失”，后台却留下
+/// 一个污染后续导航的空会话。
+async fn rollback_created_session_on_dispatch_error(
+    state: &ApiState,
+    session_id: &SessionId,
+    previous_current_session_id: Option<SessionId>,
+    error: ApiError,
+) -> ApiError {
+    let original_message = error.message().to_string();
+    state.release_session_git_execution_lease(session_id);
+    match state
+        .rollback_created_session_after_navigation_lock(session_id, previous_current_session_id)
+        .await
+    {
+        Ok(()) => error,
+        Err(cleanup_error) => ApiError::internal_assembly(
+            "创建会话失败且回滚失败",
+            format!("{original_message}；回滚失败: {cleanup_error:?}"),
+        ),
+    }
 }
 
 pub(super) fn dispatch_accepted_canonical_event(
@@ -608,13 +683,16 @@ pub(super) async fn finalize_session_task_dispatch(
     accepted: DispatchSubmissionAccepted,
 ) {
     let mut accepted = accepted;
-    let Some(manager) = state.runner_manager() else {
+    if state.runner_manager().is_none() {
         fail_accepted_task_submission(&state, &accepted, "runner_manager 未配置");
         return;
-    };
+    }
     // accepted 事实写入后，执行面仍可能尚未开始。把 finalizer 纳入与 Continue/Restart
     // 相同的生命周期锁顺序，确保新旧 Turn 不会同时进入同一 session 的执行入口。
-    let _session_lifecycle_guard = manager.lock_session_lifecycle(&accepted.session_id).await;
+    let _session_lifecycle_guard = state.lock_session_lifecycle(&accepted.session_id).await;
+    let manager = state
+        .runner_manager()
+        .expect("runner_manager 已在生命周期锁前校验存在");
     let _restart_guard = manager
         .lock_for_restart(accepted.root_task_id.as_str())
         .await;

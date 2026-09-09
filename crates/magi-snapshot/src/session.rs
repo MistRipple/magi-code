@@ -38,7 +38,8 @@ pub struct SnapshotSession {
 }
 
 impl SnapshotSession {
-    /// 启动一个新 session。立即构建 baseline 并启动 watcher。
+    /// 启动一个新 session。磁盘初始化必须在 blocking worker 中完成，避免整树扫描
+    /// 占用 Tokio 请求运行时，进而阻塞会话导航、SSE 和桌面控制请求。
     pub async fn start(
         session_id: String,
         workspace_root: PathBuf,
@@ -46,6 +47,58 @@ impl SnapshotSession {
         snapshots_root: PathBuf,
         respect_gitignore: bool,
         mut watcher_events: broadcast::Receiver<DebouncedEvent>,
+    ) -> SnapshotResult<Arc<Self>> {
+        let session = tokio::task::spawn_blocking(move || {
+            Self::start_sync(
+                session_id,
+                workspace_root,
+                blobs,
+                snapshots_root,
+                respect_gitignore,
+            )
+        })
+        .await
+        .map_err(|error| {
+            SnapshotError::Internal(format!(
+                "snapshot session initialization task failed: {error}"
+            ))
+        })??;
+
+        let weak = Arc::downgrade(&session);
+        let watcher_task = tokio::spawn(async move {
+            loop {
+                match watcher_events.recv().await {
+                    Ok(event) => {
+                        let Some(session) = weak.upgrade() else {
+                            break;
+                        };
+                        let _ = tokio::task::spawn_blocking(move || {
+                            session.handle_watcher_event(event)
+                        })
+                        .await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(session) = weak.upgrade() else {
+                            break;
+                        };
+                        let _ = tokio::task::spawn_blocking(move || session.reconcile()).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        *session.watcher_task.lock().await = Some(watcher_task);
+
+        Ok(session)
+    }
+
+    /// 构建快照账本的同步部分。调用方必须将其放入 blocking worker。
+    fn start_sync(
+        session_id: String,
+        workspace_root: PathBuf,
+        blobs: Arc<BlobStore>,
+        snapshots_root: PathBuf,
+        respect_gitignore: bool,
     ) -> SnapshotResult<Arc<Self>> {
         if !workspace_root.is_absolute() {
             return Err(SnapshotError::InvalidRoot(format!(
@@ -105,32 +158,6 @@ impl SnapshotSession {
             session.retain_loaded_blob_ownership();
             session.reconcile()?;
         }
-
-        let weak = Arc::downgrade(&session);
-        let watcher_task = tokio::spawn(async move {
-            loop {
-                match watcher_events.recv().await {
-                    Ok(event) => {
-                        let Some(session) = weak.upgrade() else {
-                            break;
-                        };
-                        let _ = tokio::task::spawn_blocking(move || {
-                            session.handle_watcher_event(event)
-                        })
-                        .await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(session) = weak.upgrade() else {
-                            break;
-                        };
-                        let _ = tokio::task::spawn_blocking(move || session.reconcile()).await;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        *session.watcher_task.lock().await = Some(watcher_task);
-
         Ok(session)
     }
 
@@ -461,6 +488,17 @@ impl SnapshotSession {
             }
         }
         Ok(())
+    }
+
+    /// 在 blocking worker 中执行整树对账，供 async API 和生命周期任务使用。
+    /// `reconcile` 保留为同步账本核心；所有 async 生产入口必须经过本方法。
+    pub async fn reconcile_async(self: &Arc<Self>) -> SnapshotResult<()> {
+        let session = Arc::clone(self);
+        tokio::task::spawn_blocking(move || session.reconcile())
+            .await
+            .map_err(|error| {
+                SnapshotError::Internal(format!("snapshot reconcile task failed: {error}"))
+            })?
     }
 
     /// 使用外部权威代码树提供的增量推进 baseline。

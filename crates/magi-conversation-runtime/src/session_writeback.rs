@@ -22,6 +22,7 @@ use magi_bridge_client::{
     ChatMessage, ChatToolCall, ModelRetryRuntimeEvent, ModelRetryRuntimePhase,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
+use magi_browser_authority::BrowserCapabilitySnapshot;
 use magi_core::{
     EventId, ExecutionResultStatus, SessionId, TaskId, ThreadId, ToolCallId, UtcMillis, WorkspaceId,
 };
@@ -35,6 +36,7 @@ use magi_session_store::{
     CANONICAL_TURN_SCHEMA_VERSION, CanonicalToolCall, CanonicalTurn, CanonicalTurnEventKind,
     CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
     CanonicalTurnVisibility, CanonicalWorkerRef, SessionRuntimeSidecar, SessionStore,
+    active_execution_turn_request_id,
 };
 use magi_skill_runtime::{SkillDispatchRuntime, SkillRuntime};
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
@@ -705,6 +707,10 @@ fn to_canonical_turn(session_id: &SessionId, turn: &ActiveExecutionTurn) -> Opti
         .iter()
         .filter_map(|item| to_canonical_turn_item(session_id, turn, item))
         .collect::<Vec<_>>();
+    let mut metadata = HashMap::new();
+    if let Some(request_id) = active_execution_turn_request_id(turn) {
+        metadata.insert("requestId".to_string(), Value::String(request_id));
+    }
     let mut canonical_turn = CanonicalTurn {
         session_id: session_id.clone(),
         turn_id: turn.turn_id.clone(),
@@ -717,7 +723,7 @@ fn to_canonical_turn(session_id: &SessionId, turn: &ActiveExecutionTurn) -> Opti
             .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0)),
         usage: None,
         items,
-        metadata: HashMap::new(),
+        metadata,
     };
     canonical_turn.normalize();
     Some(canonical_turn)
@@ -1094,7 +1100,7 @@ struct SessionToolCallBatchTestContext<'a> {
     workspace_id: &'a Option<WorkspaceId>,
     workspace_root_path: Option<PathBuf>,
     access_profile: magi_core::AccessProfile,
-    browser_capability_revision: Option<u64>,
+    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
     source_thread_id: &'a ThreadId,
@@ -1120,7 +1126,7 @@ fn append_session_tool_call_items_batch(
         workspace_id,
         workspace_root_path,
         access_profile,
-        browser_capability_revision,
+        browser_capability_snapshot,
         snapshot_session,
         execution_group_id,
         source_thread_id,
@@ -1147,7 +1153,7 @@ fn append_session_tool_call_items_batch(
             workspace_root_path,
             context_references: &[],
             access_profile,
-            browser_capability_revision,
+            browser_capability_snapshot,
             browser_execution_id: None,
             snapshot_session,
             execution_group_id,
@@ -1178,7 +1184,7 @@ pub(crate) struct SessionToolCallBatchContext<'a> {
     pub workspace_root_path: Option<PathBuf>,
     pub context_references: &'a [crate::context_reference::SessionContextReference],
     pub access_profile: magi_core::AccessProfile,
-    pub browser_capability_revision: Option<u64>,
+    pub browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     pub browser_execution_id: Option<&'a str>,
     pub snapshot_session: Option<Arc<SnapshotSession>>,
     pub execution_group_id: Option<String>,
@@ -1210,7 +1216,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         workspace_root_path,
         context_references,
         access_profile,
-        browser_capability_revision,
+        browser_capability_snapshot,
         browser_execution_id,
         snapshot_session,
         execution_group_id,
@@ -1283,7 +1289,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         workspace_root_path: workspace_root_path.as_ref(),
         context_references,
         access_profile,
-        browser_capability_revision,
+        browser_capability_snapshot,
         browser_execution_id,
         source_thread_id,
         expected_turn_id,
@@ -1301,7 +1307,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
                 })
                 .collect::<Vec<_>>();
             execute_session_turn_tool_call_batch(
-                execution_context,
+                execution_context.clone(),
                 execution_calls,
                 snapshot_session.as_ref(),
                 &hook_contexts,
@@ -1466,7 +1472,7 @@ fn upsert_session_tool_call_result_item(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SessionToolExecutionContext<'a> {
     session_store: &'a SessionStore,
     event_bus: &'a InMemoryEventBus,
@@ -1483,7 +1489,7 @@ struct SessionToolExecutionContext<'a> {
     workspace_root_path: Option<&'a PathBuf>,
     context_references: &'a [crate::context_reference::SessionContextReference],
     access_profile: magi_core::AccessProfile,
-    browser_capability_revision: Option<u64>,
+    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     browser_execution_id: Option<&'a str>,
     source_thread_id: &'a ThreadId,
     expected_turn_id: Option<&'a str>,
@@ -1554,7 +1560,10 @@ fn execute_session_turn_tool_call_batch(
                         snapshot.before_tool(&hook_ctx);
                     }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute_session_turn_tool_call_scoped(context, &tool_calls[tool_index])
+                        execute_session_turn_tool_call_scoped(
+                            context.clone(),
+                            &tool_calls[tool_index],
+                        )
                     }))
                     .unwrap_or_else(|_| {
                         tracing::warn!(
@@ -1582,6 +1591,7 @@ fn execute_session_turn_tool_call_batch(
                             let tool_call = &tool_calls[tool_index];
                             let mut hook_ctx = hook_contexts[tool_index].clone();
                             let snapshot_session = snapshot_session.cloned();
+                            let execution_context = context.clone();
                             (
                                 tool_index,
                                 scope.spawn(move || {
@@ -1591,7 +1601,8 @@ fn execute_session_turn_tool_call_batch(
                                     let result = std::panic::catch_unwind(
                                         std::panic::AssertUnwindSafe(|| {
                                             execute_session_turn_tool_call_scoped(
-                                                context, tool_call,
+                                                execution_context.clone(),
+                                                tool_call,
                                             )
                                         }),
                                     );
@@ -1599,7 +1610,7 @@ fn execute_session_turn_tool_call_batch(
                                         tracing::warn!(
                                             tool_name = %tool_call.function.name,
                                             tool_call_id = %tool_call.id,
-                                            session_id = %context.session_id.as_str(),
+                                            session_id = %execution_context.session_id.as_str(),
                                             "session turn tool execution panicked"
                                         );
                                         tool_execution_failed_result(&tool_call.function.name)
@@ -1730,7 +1741,7 @@ fn execute_session_turn_tool_call(
             workspace_root_path,
             context_references: &[],
             access_profile,
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             source_thread_id: &source_thread_id,
             expected_turn_id: None,
@@ -1783,7 +1794,7 @@ fn execute_session_turn_tool_call_with_approval(
         workspace_root_path,
         context_references: &[],
         access_profile,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         source_thread_id: &source_thread_id,
         expected_turn_id: None,
@@ -2164,7 +2175,7 @@ fn execute_session_turn_tool_call_scoped(
         workspace_root_path,
         context_references,
         access_profile,
-        browser_capability_revision,
+        browser_capability_snapshot,
         browser_execution_id,
         source_thread_id,
         expected_turn_id,
@@ -2380,7 +2391,7 @@ fn execute_session_turn_tool_call_scoped(
                     workspace_id: workspace_id.clone(),
                     access_profile: effective_access_profile,
                     working_directory: workspace_root_path.cloned(),
-                    browser_capability_revision,
+                    browser_capability_snapshot: browser_capability_snapshot.clone(),
                     browser_execution_id: browser_execution_id.map(str::to_string),
                 },
                 workspace_root_path
@@ -2414,7 +2425,7 @@ fn execute_session_turn_tool_call_scoped(
                 workspace_id: workspace_id.clone(),
                 access_profile: tool_policy.access_profile,
                 working_directory: workspace_root_path.cloned(),
-                browser_capability_revision,
+                browser_capability_snapshot: browser_capability_snapshot.clone(),
                 browser_execution_id: browser_execution_id.map(str::to_string),
             },
             &tool_policy,
@@ -3005,6 +3016,45 @@ mod tests {
     }
 
     #[test]
+    fn canonical_turn_carries_request_identity_for_terminal_shell() {
+        let session_id = SessionId::new("session-terminal-shell-runtime");
+        let thread_id = ThreadId::new("thread-terminal-shell-runtime");
+        let now = UtcMillis(10);
+        let mut user_item = session_turn_item(
+            "user_message",
+            "completed",
+            None,
+            Some("终态 shell 请求身份".to_string()),
+            Some("user-terminal-shell-runtime".to_string()),
+            thread_id,
+        );
+        user_item.item_seq = 1;
+        user_item.request_id = Some("request-terminal-shell-runtime".to_string());
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-terminal-shell-runtime".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: Some(UtcMillis(20)),
+            status: "completed".to_string(),
+            user_message: Some("终态 shell 请求身份".to_string()),
+            items: vec![user_item],
+        };
+
+        let canonical = to_canonical_turn(&session_id, &turn).expect("turn should canonicalize");
+        assert_eq!(
+            canonical.metadata.get("requestId"),
+            Some(&Value::String("request-terminal-shell-runtime".to_string()))
+        );
+
+        let mut shell = canonical;
+        shell.items.clear();
+        assert_eq!(
+            shell.metadata.get("requestId"),
+            Some(&Value::String("request-terminal-shell-runtime".to_string()))
+        );
+    }
+
+    #[test]
     fn canonical_turn_hides_agent_wait_tool_call() {
         let session_id = SessionId::new("session-agent-wait-hidden");
         let thread_id = ThreadId::new("thread-agent-wait-hidden");
@@ -3553,6 +3603,7 @@ mod tests {
         );
         tool_registry.register_default_builtins();
         let event_bus = InMemoryEventBus::new(8);
+        let workspace_id = Some(WorkspaceId::new("workspace-skill-policy"));
         let call = ChatToolCall {
             id: "tool-call-file-read".to_string(),
             kind: "function".to_string(),
@@ -3572,7 +3623,7 @@ mod tests {
                 skill_name: Some("search-only"),
                 safety_gate: None,
                 session_id: &SessionId::new("session-1"),
-                workspace_id: &None,
+                workspace_id: &workspace_id,
                 workspace_root_path: None,
                 access_profile: magi_core::AccessProfile::Restricted,
             },
@@ -3645,6 +3696,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().to_path_buf();
         let target = root.join("blocked.txt");
+        let workspace_id = Some(WorkspaceId::new("workspace-read-only-file"));
         let call = ChatToolCall {
             id: "tool-call-read-only-file-write".to_string(),
             kind: "function".to_string(),
@@ -3668,7 +3720,7 @@ mod tests {
                 skill_name: None,
                 safety_gate: None,
                 session_id: &SessionId::new("session-read-only-tool"),
-                workspace_id: &None,
+                workspace_id: &workspace_id,
                 workspace_root_path: Some(&root),
                 access_profile: magi_core::AccessProfile::ReadOnly,
             },
@@ -3695,6 +3747,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().to_path_buf();
         let target = root.join("blocked-shell.txt");
+        let workspace_id = Some(WorkspaceId::new("workspace-restricted-shell"));
         let call = ChatToolCall {
             id: "tool-call-restricted-shell".to_string(),
             kind: "function".to_string(),
@@ -3717,7 +3770,7 @@ mod tests {
                 skill_name: None,
                 safety_gate: None,
                 session_id: &SessionId::new("session-restricted-shell"),
-                workspace_id: &None,
+                workspace_id: &workspace_id,
                 workspace_root_path: Some(&root),
                 access_profile: magi_core::AccessProfile::Restricted,
             },
@@ -3740,6 +3793,7 @@ mod tests {
         );
         tool_registry.register_default_builtins();
         let event_bus = InMemoryEventBus::new(8);
+        let workspace_id = Some(WorkspaceId::new("workspace-read-only-shell"));
         let call = ChatToolCall {
             id: "tool-call-read-only-shell".to_string(),
             kind: "function".to_string(),
@@ -3763,7 +3817,7 @@ mod tests {
                 skill_name: None,
                 safety_gate: None,
                 session_id: &SessionId::new("session-read-only-shell"),
-                workspace_id: &None,
+                workspace_id: &workspace_id,
                 workspace_root_path: None,
                 access_profile: magi_core::AccessProfile::ReadOnly,
             },
@@ -3837,6 +3891,7 @@ mod tests {
                 "printf full-access-ok",
                 magi_safety_gate::SafetyCategory::Custom,
             )]);
+        let workspace_id = Some(WorkspaceId::new("workspace-full-access-shell"));
         let call = ChatToolCall {
             id: "tool-call-full-access-shell".to_string(),
             kind: "function".to_string(),
@@ -3859,7 +3914,7 @@ mod tests {
                 skill_name: None,
                 safety_gate: Some(&safety_gate),
                 session_id: &SessionId::new("session-1"),
-                workspace_id: &None,
+                workspace_id: &workspace_id,
                 workspace_root_path: None,
                 access_profile: magi_core::AccessProfile::FullAccess,
             },
@@ -3880,7 +3935,9 @@ mod tests {
         tool_registry.register_default_builtins();
         let event_bus = InMemoryEventBus::new(8);
         let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
         let target = dir.path().join("probe.txt");
+        let workspace_id = Some(WorkspaceId::new("workspace-file-remove"));
         std::fs::write(&target, "probe").expect("write probe");
         let call = ChatToolCall {
             id: "tool-call-file-remove".to_string(),
@@ -3904,8 +3961,8 @@ mod tests {
                 skill_name: None,
                 safety_gate: None,
                 session_id: &SessionId::new("session-1"),
-                workspace_id: &None,
-                workspace_root_path: None,
+                workspace_id: &workspace_id,
+                workspace_root_path: Some(&root),
                 access_profile: magi_core::AccessProfile::Restricted,
             },
             &call,
@@ -3999,7 +4056,7 @@ mod tests {
                 workspace_id: &workspace_id,
                 workspace_root_path: None,
                 access_profile: magi_core::AccessProfile::Restricted,
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 snapshot_session: None,
                 execution_group_id: None,
                 source_thread_id: &ThreadId::new("thread-shell-batch"),
@@ -4190,7 +4247,7 @@ mod tests {
                     workspace_id: &workspace_id,
                     workspace_root_path: None,
                     access_profile: magi_core::AccessProfile::Restricted,
-                    browser_capability_revision: None,
+                    browser_capability_snapshot: None,
                     snapshot_session: None,
                     execution_group_id: None,
                     source_thread_id: &thread_id,
@@ -4249,7 +4306,7 @@ mod tests {
                     workspace_id: &workspace_id,
                     workspace_root_path: None,
                     access_profile: magi_core::AccessProfile::Restricted,
-                    browser_capability_revision: None,
+                    browser_capability_snapshot: None,
                     snapshot_session: None,
                     execution_group_id: None,
                     source_thread_id: &thread_id,
@@ -4356,7 +4413,7 @@ mod tests {
                 workspace_root_path: None,
                 context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 browser_execution_id: None,
                 snapshot_session: None,
                 execution_group_id: None,
@@ -4416,7 +4473,7 @@ mod tests {
                 workspace_root_path: None,
                 context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 browser_execution_id: None,
                 snapshot_session: None,
                 execution_group_id: None,
@@ -4516,7 +4573,7 @@ mod tests {
                 workspace_root_path: None,
                 context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 browser_execution_id: None,
                 snapshot_session: None,
                 execution_group_id: None,
@@ -4638,7 +4695,7 @@ mod tests {
                     workspace_root_path: Some(root.clone()),
                     context_references: &[],
                     access_profile: magi_core::AccessProfile::Restricted,
-                    browser_capability_revision: None,
+                    browser_capability_snapshot: None,
                     browser_execution_id: None,
                     snapshot_session: None,
                     execution_group_id: None,
@@ -4755,7 +4812,7 @@ mod tests {
                     workspace_id: &workspace_id,
                     workspace_root_path: None,
                     access_profile: magi_core::AccessProfile::Restricted,
-                    browser_capability_revision: None,
+                    browser_capability_snapshot: None,
                     snapshot_session: None,
                     execution_group_id: None,
                     source_thread_id: &ThreadId::new("thread-panic-tool"),
@@ -4900,7 +4957,7 @@ mod tests {
                 workspace_id: &workspace_id,
                 workspace_root_path: Some(workspace_root.clone()),
                 access_profile: magi_core::AccessProfile::FullAccess,
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 snapshot_session: Some(snapshot.clone()),
                 execution_group_id: Some("session-turn-group".to_string()),
                 source_thread_id: &ThreadId::new("thread-session-snapshot"),

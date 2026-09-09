@@ -77,16 +77,9 @@ impl BrowserCapabilitySnapshot {
 
     pub fn allows_execution(
         &self,
-        catalog_revision: u64,
         tool: BrowserToolKind,
         requested_access: BrowserToolAccess,
     ) -> Result<(), BrowserCapabilityRejection> {
-        if catalog_revision != self.revision {
-            return Err(BrowserCapabilityRejection::SnapshotRevisionMismatch {
-                catalog_revision,
-                current_revision: self.revision,
-            });
-        }
         if let Some(reason) = self.unavailable_reason() {
             return Err(BrowserCapabilityRejection::Unavailable(reason));
         }
@@ -116,13 +109,6 @@ impl BrowserToolAccess {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BrowserCapabilityRejection {
-    #[error(
-        "browser capability snapshot revision changed: catalog={catalog_revision}, current={current_revision}"
-    )]
-    SnapshotRevisionMismatch {
-        catalog_revision: u64,
-        current_revision: u64,
-    },
     #[error("browser capability is unavailable: {0:?}")]
     Unavailable(BrowserCapabilityUnavailableReason),
     #[error("browser tool is not visible in this capability snapshot: {tool:?}")]
@@ -156,7 +142,7 @@ mod tests {
     fn read_only_pwa_cannot_be_called_with_write_action() {
         let snapshot = ready_snapshot();
         let error = snapshot
-            .allows_execution(1, BrowserToolKind::Pwa, BrowserToolAccess::Write)
+            .allows_execution(BrowserToolKind::Pwa, BrowserToolAccess::Write)
             .expect_err("PWA write operations are not part of the exposed capability");
         assert!(matches!(
             error,
@@ -172,10 +158,10 @@ mod tests {
         let snapshot = ready_snapshot();
         for tool in [BrowserToolKind::Heap, BrowserToolKind::ThirdParty] {
             snapshot
-                .allows_execution(1, tool, BrowserToolAccess::Read)
+                .allows_execution(tool, BrowserToolAccess::Read)
                 .expect("diagnostic reads should be allowed");
             snapshot
-                .allows_execution(1, tool, BrowserToolAccess::Write)
+                .allows_execution(tool, BrowserToolAccess::Write)
                 .expect("diagnostic state changes should be allowed");
         }
     }
@@ -184,15 +170,24 @@ mod tests {
     fn navigation_is_write_and_read_only_tools_remain_read_only() {
         let snapshot = ready_snapshot();
         snapshot
-            .allows_execution(1, BrowserToolKind::Navigate, BrowserToolAccess::Write)
+            .allows_execution(BrowserToolKind::Navigate, BrowserToolAccess::Write)
             .expect("navigation should be a write operation");
         snapshot
-            .allows_execution(1, BrowserToolKind::Snapshot, BrowserToolAccess::Read)
+            .allows_execution(BrowserToolKind::Snapshot, BrowserToolAccess::Read)
             .expect("snapshot should be a read operation");
         assert!(
             snapshot
-                .allows_execution(1, BrowserToolKind::Snapshot, BrowserToolAccess::Write)
+                .allows_execution(BrowserToolKind::Snapshot, BrowserToolAccess::Write)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn capability_revision_is_metadata_and_does_not_invalidate_execution() {
+        let mut snapshot = ready_snapshot();
+        snapshot.revision = 42;
+        snapshot
+            .allows_execution(BrowserToolKind::Navigate, BrowserToolAccess::Write)
+            .expect("a captured capability snapshot remains valid for its turn");
     }
 }

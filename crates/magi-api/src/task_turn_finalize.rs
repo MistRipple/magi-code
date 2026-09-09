@@ -348,7 +348,7 @@ fn release_terminal_browser_resources(
     let report = state.cancel_execution_resources(
         Some(session_id),
         None,
-        None,
+        Some(root_task_id),
         BrowserLeaseEndReason::TaskFinished,
     );
     if report.browser_lease_count > 0 {

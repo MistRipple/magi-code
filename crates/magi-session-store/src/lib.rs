@@ -18,7 +18,10 @@ pub use models::{
     SessionSidecarFlushReason, SessionStoreState, ThreadChatImageSource, ThreadChatMessage,
     ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
     ThreadModelProviderContext, ThreadVisibility, TimelineEntry, TimelineEntryKind,
-    timeline_entry_visible_text,
+    active_execution_turn_request_id, timeline_entry_visible_text,
 };
 pub use store::{CanonicalTurnEventWriter, CanonicalTurnMutation};
-pub use store::{ORCHESTRATOR_ROLE_ID, SESSION_TITLE_MAX_CHARS, SessionStore, TimelineEntryInput};
+pub use store::{
+    ORCHESTRATOR_ROLE_ID, SESSION_TITLE_MAX_CHARS, SessionMutationTransactionError, SessionStore,
+    TimelineEntryInput,
+};

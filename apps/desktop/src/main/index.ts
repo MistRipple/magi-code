@@ -20,19 +20,25 @@ import {
 } from "@magi/desktop-browser-contracts";
 import { assertDesktopIpcMessage } from "@magi/desktop-browser-contracts/validation";
 import { AutomationWorker } from "./automation-worker.js";
-import { BrowserSurfaceManager, type BrowserSurfaceEvent } from "./browser-surface-manager.js";
-import { DesktopOverlayManager } from "./desktop-overlay-manager.js";
+import {
+  BrowserSurfaceManager,
+  type BrowserSurfaceEvent,
+  type EmbeddedBrowserWebviewInput,
+} from "./browser-surface-manager.js";
 import { DesktopControlServer } from "./desktop-control-server.js";
 import { openWorkspaceFolder, revealWorkspaceFile } from "./desktop-files.js";
 import { ProcessSupervisor } from "./process-supervisor.js";
+import { DesktopRuntimeRecoveryCoordinator } from "./desktop-runtime-recovery.js";
 import { UpdateManager } from "./update-manager.js";
 import { WindowManager } from "./window-manager.js";
 import type { PanelKind, WindowLayoutIntent } from "./window-layout.js";
 
-const stateRoot = process.env.MAGI_STATE_ROOT?.trim() || join(homedir(), ".magi");
+const stateRoot =
+  process.env.MAGI_STATE_ROOT?.trim() || join(homedir(), ".magi");
 app.setPath("userData", join(stateRoot, "desktop"));
 app.commandLine.appendSwitch("use-mock-keychain");
-if (process.platform === "linux") app.commandLine.appendSwitch("password-store", "basic");
+if (process.platform === "linux")
+  app.commandLine.appendSwitch("password-store", "basic");
 app.commandLine.appendSwitch("disable-background-networking");
 app.commandLine.appendSwitch("disable-component-update");
 app.commandLine.appendSwitch("disable-default-apps");
@@ -46,20 +52,27 @@ app.commandLine.appendSwitch(
 
 const AGENT_ORIGIN = "http://127.0.0.1:38123";
 const MAGI_DAEMON_SERVICE_NAME = "magi-rust-backend";
+const DESKTOP_HOST_READY_POLL_INTERVAL_MS = 50;
+const DESKTOP_HOST_READY_TIMEOUT_MS = 65_000;
 const BROWSER_CAPABILITY_MANIFEST = readBrowserCapabilityManifest();
-const PRODUCT_VERSION = process.env.MAGI_PRODUCT_VERSION
-  || BROWSER_CAPABILITY_MANIFEST.productVersion
-  || "unknown";
-const BUILD_IDENTITY = process.env.MAGI_BUILD_ID
-  || BROWSER_CAPABILITY_MANIFEST.buildIdentity
-  || "unknown";
-const DAEMON_VERSION = BROWSER_CAPABILITY_MANIFEST.daemonVersion || PRODUCT_VERSION;
-const AUTOMATION_WORKER_VERSION = BROWSER_CAPABILITY_MANIFEST.automationWorkerVersion || PRODUCT_VERSION;
+const PRODUCT_VERSION =
+  process.env.MAGI_PRODUCT_VERSION ||
+  BROWSER_CAPABILITY_MANIFEST.productVersion ||
+  "unknown";
+const BUILD_IDENTITY =
+  process.env.MAGI_BUILD_ID ||
+  BROWSER_CAPABILITY_MANIFEST.buildIdentity ||
+  "unknown";
+const DAEMON_VERSION =
+  BROWSER_CAPABILITY_MANIFEST.daemonVersion || PRODUCT_VERSION;
+const AUTOMATION_WORKER_VERSION =
+  BROWSER_CAPABILITY_MANIFEST.automationWorkerVersion || PRODUCT_VERSION;
 const desktopEpoch = `desktop-${randomUUID()}`;
 const controlToken = randomBytes(32).toString("hex");
-const controlSocket = process.platform === "win32"
-  ? `\\\\.\\pipe\\magi-${process.pid}`
-  : join(tmpdir(), `magi-${process.pid}.sock`);
+const controlSocket =
+  process.platform === "win32"
+    ? `\\\\.\\pipe\\magi-${process.pid}`
+    : join(tmpdir(), `magi-${process.pid}.sock`);
 const windows = new Map<string, BaseWindow>();
 
 let windowManager: WindowManager | null = null;
@@ -76,9 +89,33 @@ let lastBrowserComponentSnapshot = "";
 let daemonHostStatus: BrowserComponentStatus | null = null;
 let daemonHostProtocolCompatible = false;
 let daemonHostErrorCode: string | null = null;
+let daemonHostConnectionGeneration: number | null = null;
 let daemonHostProbeAt = 0;
 let daemonHostProbe: Promise<void> | null = null;
+let desktopControlConnected = false;
+let desktopControlConnectionRevision = 0;
 let shuttingDown = false;
+
+const desktopRuntimeRecoveryCoordinator = new DesktopRuntimeRecoveryCoordinator(
+  {
+    hasWindow: () => windows.size > 0,
+    waitForHostReady: waitForDesktopHostReady,
+    restoreAfterDaemonReady: async () => {
+      await windowManager?.restoreAfterDaemonReady();
+    },
+    notifyBrowserRuntimeReady: () => {
+      windowManager?.notifyBrowserRuntimeReady();
+    },
+    onFailure: (cause) => {
+      browserComponentError = componentError(
+        "daemon",
+        "browser_desktop_recovery_failed",
+        cause,
+      );
+      console.error("Magi Desktop 浏览器运行时恢复失败", cause);
+    },
+  },
+);
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
@@ -94,156 +131,173 @@ if (singleInstance) {
     window.focus();
   });
 
-  app.whenReady().then(async () => {
-  const paths = resolveRuntimePaths();
-  let control: DesktopControlServer | null = null;
-  let worker: AutomationWorker | null = null;
-  const surfaces = new BrowserSurfaceManager({
-    desktopEpoch,
-    onContentSlotReady: (binding) => {
-      control?.handleSurfaceContentReady(binding);
-    },
-    onDocumentReady: (binding) => {
-      control?.handleSurfaceDocumentReady(binding);
-    },
-    partitionRegistryPath: join(app.getPath("userData"), "browser-partitions.json"),
-    onEvent: (event) => {
-      control?.handleSurfaceEvent(event);
-      if (event.type === "user_takeover") {
-        try {
-          // 原生 Browser Surface 接收到鼠标/键盘事件时，App Renderer 不会
-          // 收到同一事件。由 Main 统一收口当前窗口的所有临时浮层，确保
-          // 浏览器页面上的一次真实点击不会留下右栏新增菜单或工具菜单的
-          // 原生命中层。该关闭仍经过当前 owner 校验，不会影响别的窗口。
-          windowManager?.closeOverlay(event.binding.window_id);
-        } catch {
-          // 用户点击和窗口关闭可能并发发生；此时窗口清理优先，忽略过期的
-          // Overlay 收口请求，不能让输入事件回调反向阻断桌面退出。
-        }
-      }
-      publishBrowserEvent(event);
-    },
-  });
-  await surfaces.clearDownloads();
-  const browserUploadRoot = join(app.getPath("userData"), "browser-uploads");
-  mkdirSync(browserUploadRoot, { recursive: true });
-  surfaceManager = surfaces;
-  const overlays = new DesktopOverlayManager({
-    preloadPath: paths.preload,
-    agentOrigin: AGENT_ORIGIN,
-    desktopEpoch,
-    onAction: (windowId, action) => {
-      windowManager?.broadcast(windowId, "magi-desktop:overlay-action", action);
-    },
-    onClosed: (windowId, event) => {
-      windowManager?.broadcast(windowId, "magi-desktop:overlay-closed", event);
-    },
-  });
-  worker = new AutomationWorker({
-    entryPath: paths.workerEntry,
-    surfaceManager: surfaces,
-    uploadRoot: browserUploadRoot,
-    onFailure: async (cause) => {
-      if (shuttingDown) return;
-      workerInvalidatedDesktopConnection = desktopConnectionGeneration !== null;
-      browserComponentError = componentError("worker", "browser_worker_failed", cause);
-      // Releasing the local Surface flag is not enough: the daemon owns the
-      // authoritative Browser Lease. Removing this Desktop registration makes
-      // the daemon revoke every lease before the recovered Worker reconnects.
-      await unregisterDesktopBrowserConnection();
-    },
-    onReady: async () => {
-      if (shuttingDown) return;
-      if (workerInvalidatedDesktopConnection) {
-        await registerDesktopBrowserConnection();
-        workerInvalidatedDesktopConnection = false;
-        await windowManager?.restoreAfterDaemonReady();
-      }
-      // Worker 重启会丢失 isolated world 中的标记层。标记事实仍由 daemon
-      // Authority 持久化，Desktop 只重放已收到的当前投影，不修改任何会话数据。
-      await controlServer?.replayCachedAnnotations();
-    },
-  });
-  automationWorker = worker;
-  const manager = new WindowManager({
-    desktopEpoch,
-    preloadPath: paths.preload,
-    agentOrigin: AGENT_ORIGIN,
-    surfaceManager: surfaces,
-    overlayManager: overlays,
-    windows,
-    onSnapshot: (snapshot) => {
+  app
+    .whenReady()
+    .then(async () => {
+      const paths = resolveRuntimePaths();
+      let control: DesktopControlServer | null = null;
+      let worker: AutomationWorker | null = null;
+      const surfaces = new BrowserSurfaceManager({
+        desktopEpoch,
+        onDocumentReady: (binding) => {
+          control?.handleSurfaceDocumentReady(binding);
+        },
+        partitionRegistryPath: join(
+          app.getPath("userData"),
+          "browser-partitions.json",
+        ),
+        onEvent: (event) => {
+          control?.handleSurfaceEvent(event);
+          if (event.type === "primary_changed") {
+            windowManager?.resolveBrowserSurfaceReadinessForBinding(
+              event.binding,
+            );
+          }
+          if (
+            event.type === "download" &&
+            !["completed", "cancelled", "interrupted"].includes(event.state)
+          ) {
+            const downloadWindowId = surfaces.downloadSnapshotWindowId(
+              event.binding.tab_id,
+            );
+            if (downloadWindowId) publishBrowserSnapshot(downloadWindowId);
+          }
+          publishBrowserEvent(event);
+        },
+      });
+      await surfaces.clearDownloads();
+      const browserUploadRoot = join(
+        app.getPath("userData"),
+        "browser-uploads",
+      );
+      mkdirSync(browserUploadRoot, { recursive: true });
+      surfaceManager = surfaces;
+      worker = new AutomationWorker({
+        entryPath: paths.workerEntry,
+        surfaceManager: surfaces,
+        uploadRoot: browserUploadRoot,
+        onFailure: async (cause) => {
+          if (shuttingDown) return;
+          workerInvalidatedDesktopConnection =
+            desktopConnectionGeneration !== null;
+          browserComponentError = componentError(
+            "worker",
+            "browser_worker_failed",
+            cause,
+          );
+          // Releasing the local Surface flag is not enough: the daemon owns the
+          // authoritative Browser Lease. Removing this Desktop registration makes
+          // the daemon revoke every lease before the recovered Worker reconnects.
+          await unregisterDesktopBrowserConnection();
+        },
+        onReady: async () => {
+          if (shuttingDown) return;
+          if (workerInvalidatedDesktopConnection) {
+            await registerDesktopBrowserConnection();
+            workerInvalidatedDesktopConnection = false;
+          }
+          // Worker 重启会丢失 isolated world 中的标记层。标记事实仍由 daemon
+          // Authority 持久化，Desktop 只重放已收到的当前投影，不修改任何会话数据。
+          await controlServer?.replayCachedAnnotations();
+        },
+      });
+      automationWorker = worker;
+      const manager = new WindowManager({
+        desktopEpoch,
+        preloadPath: paths.preload,
+        agentOrigin: AGENT_ORIGIN,
+        surfaceManager: surfaces,
+        windows,
+        onSnapshot: (snapshot) => {
+          try {
+            windowManager?.broadcast(
+              snapshot.windowId,
+              "magi-desktop:snapshot",
+              snapshot,
+            );
+          } catch {
+            // Window may have closed between reducer and publication.
+          }
+        },
+      });
+      windowManager = manager;
+      registerIpc();
+      control = new DesktopControlServer({
+        socketPath: controlSocket,
+        token: controlToken,
+        surfaceManager: surfaces,
+        worker,
+        waitForActiveWindow: (signal) => manager.waitForActiveWindow(signal),
+        ensureBrowserSurface: (input) => manager.ensureBrowserSurface(input),
+        handshake: () => handshake(worker!),
+        onConnectionState: (connected) => {
+          desktopControlConnected = connected;
+          desktopControlConnectionRevision =
+            desktopRuntimeRecoveryCoordinator.onControlConnection(connected);
+          if (!connected) {
+            publishBrowserComponentSnapshot();
+            return;
+          }
+          publishBrowserComponentSnapshot();
+        },
+      });
+      controlServer = control;
+      // Desktop Control 的 ready 事件是 daemon 接入自动化能力的唯一握手。
+      // 先完成 Worker 进程握手，保证首个 ready 永远带有有效 worker_epoch；
+      // daemon 随后再注册控制端点，不能让协议层收到一个不可用的桌面宿主。
+      await worker.start();
+      await control.start();
+      processSupervisor = new ProcessSupervisor({
+        daemonPath: paths.daemon,
+        agentOrigin: AGENT_ORIGIN,
+        daemonIdentity: {
+          serviceName: MAGI_DAEMON_SERVICE_NAME,
+          productVersion: PRODUCT_VERSION,
+          buildIdentity: BUILD_IDENTITY,
+        },
+        onReady: handleDaemonReady,
+        environment: {
+          ...process.env,
+          MAGI_HOST: "127.0.0.1",
+          MAGI_PORT: "38123",
+          MAGI_SERVICE_NAME: MAGI_DAEMON_SERVICE_NAME,
+          MAGI_PRODUCT_VERSION: PRODUCT_VERSION,
+          MAGI_BUILD_ID: BUILD_IDENTITY,
+          MAGI_OPEN_BROWSER: "0",
+          MAGI_DESKTOP_PARENT_PID: String(process.pid),
+          MAGI_DESKTOP_EPOCH: desktopEpoch,
+          MAGI_DESKTOP_CONTROL_SOCKET: controlSocket,
+          MAGI_DESKTOP_CONTROL_TOKEN: controlToken,
+          MAGI_STATE_ROOT: stateRoot,
+          ...(app.isPackaged
+            ? { MAGI_WEB_DIST_ROOT: paths.webDist }
+            : { MAGI_WEB_DEV: "1", MAGI_WEB_DEV_ROOT: paths.webRoot }),
+        },
+      });
+      await processSupervisor.start();
+      // 先让 daemon、桌面控制端点和前端入口全部就绪，再创建唯一桌面窗口。
+      // 如果窗口早于 daemon 加载 Renderer，首次 loadURL 会收到 connection refused；
+      // 这会留下一个只有原生外框的空白窗口，并把后续 Browser Surface 恢复带入竞态。
+      // 外部 daemon 复用路径同样在这里完成注册，因此不需要提前创建窗口。
       try {
-        windowManager?.broadcast(snapshot.windowId, "magi-desktop:snapshot", snapshot);
-      } catch {
-        // Window may have closed between reducer and publication.
+        manager.createWindow();
+      } catch (error) {
+        manager.notifyWindowCreationFailed(error);
+        throw error;
       }
-    },
-  });
-  windowManager = manager;
-  // Overlay Renderer 会在加载完成后立即发送 ready 握手。IPC 必须先于
-  // 创建窗口注册，否则启动阶段的握手会落在“无 handler”窗口期，Overlay
-  // 永远保持零尺寸，菜单和标记选择都会表现为可见但无法交互。
-  registerIpc();
-  control = new DesktopControlServer({
-    socketPath: controlSocket,
-    token: controlToken,
-    surfaceManager: surfaces,
-    worker,
-    activeWindowId: () => manager.activeWindowId(),
-    ensureBrowserSurface: (input) => manager.ensureBrowserSurface(input),
-    handshake: () => handshake(worker!),
-  });
-  controlServer = control;
-  // Desktop Control 的 ready 事件是 daemon 接入自动化能力的唯一握手。
-  // 先完成 Worker 进程握手，保证首个 ready 永远带有有效 worker_epoch；
-  // daemon 随后再注册控制端点，不能让协议层收到一个不可用的桌面宿主。
-  await worker.start();
-  await control.start();
-  processSupervisor = new ProcessSupervisor({
-    daemonPath: paths.daemon,
-    agentOrigin: AGENT_ORIGIN,
-    daemonIdentity: {
-      serviceName: MAGI_DAEMON_SERVICE_NAME,
-      productVersion: PRODUCT_VERSION,
-      buildIdentity: BUILD_IDENTITY,
-    },
-    onReady: handleDaemonReady,
-    environment: {
-      ...process.env,
-      MAGI_HOST: "127.0.0.1",
-      MAGI_PORT: "38123",
-      MAGI_SERVICE_NAME: MAGI_DAEMON_SERVICE_NAME,
-      MAGI_PRODUCT_VERSION: PRODUCT_VERSION,
-      MAGI_BUILD_ID: BUILD_IDENTITY,
-      MAGI_OPEN_BROWSER: "0",
-      MAGI_DESKTOP_PARENT_PID: String(process.pid),
-      MAGI_DESKTOP_EPOCH: desktopEpoch,
-      MAGI_DESKTOP_CONTROL_SOCKET: controlSocket,
-      MAGI_DESKTOP_CONTROL_TOKEN: controlToken,
-      MAGI_STATE_ROOT: stateRoot,
-      ...(app.isPackaged
-        ? { MAGI_WEB_DIST_ROOT: paths.webDist }
-        : { MAGI_WEB_DEV: "1", MAGI_WEB_DEV_ROOT: paths.webRoot }),
-    },
-  });
-  await processSupervisor.start();
-  // 先让 daemon、桌面控制端点和前端入口全部就绪，再创建唯一桌面窗口。
-  // 如果窗口早于 daemon 加载 Renderer，首次 loadURL 会收到 connection refused；
-  // 这会留下一个只有原生外框的空白窗口，并把后续 Browser Surface 恢复带入竞态。
-  // 外部 daemon 复用路径同样在这里完成注册，因此不需要提前创建窗口。
-  manager.createWindow();
-  updateManager = new UpdateManager(PRODUCT_VERSION, (snapshot) => {
-    broadcastAll("magi-desktop:update", snapshot);
-  });
-  startBrowserComponentSnapshots();
-  }).catch(async (error) => {
-    console.error("Magi Desktop 启动失败", error);
-    await shutdown().catch((cleanupError) => {
-      console.error("Magi Desktop 启动清理失败", cleanupError);
+      desktopRuntimeRecoveryCoordinator.onWindowAvailable();
+      updateManager = new UpdateManager(PRODUCT_VERSION, (snapshot) => {
+        broadcastAll("magi-desktop:update", snapshot);
+      });
+      startBrowserComponentSnapshots();
+    })
+    .catch(async (error) => {
+      console.error("Magi Desktop 启动失败", error);
+      await shutdown().catch((cleanupError) => {
+        console.error("Magi Desktop 启动清理失败", cleanupError);
+      });
+      app.exit(1);
     });
-    app.exit(1);
-  });
 }
 
 app.on("window-all-closed", () => app.quit());
@@ -281,32 +335,105 @@ function registerIpc(): void {
     const request = parseBrowserActivation(value);
     return manager.activateBrowser({ windowId, ...request });
   });
+  handleIpc(
+    "magi-desktop:register-browser-webview",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = parseEmbeddedBrowserWebview(value);
+      return manager.registerEmbeddedWebview(windowId, request);
+    },
+  );
+  handleIpc(
+    "magi-desktop:release-browser-webview",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = parseReleasedBrowserWebview(value);
+      return manager.releaseEmbeddedWebview(windowId, request);
+    },
+  );
+  handleIpc(
+    "magi-desktop:wait-for-browser-surface",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = rejectUnknownFields(
+        object(value),
+        ["tabId"],
+        "waitForBrowserSurface",
+      );
+      return manager.waitForBrowserSurface({
+        windowId,
+        tabId: text(request.tabId, "tabId"),
+      });
+    },
+  );
   handleIpc("magi-desktop:activate-panel", (event, value: unknown) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
-    const request = rejectUnknownFields(object(value), ["kind", "tabId"], "activatePanel");
+    const request = rejectUnknownFields(
+      object(value),
+      ["kind", "tabId"],
+      "activatePanel",
+    );
     return manager.activatePanel(
       windowId,
       parsePanelKind(request.kind),
       typeof request.tabId === "string" ? request.tabId : null,
     );
   });
-  handleIpc("magi-desktop:set-browser-viewport", async (event, value: unknown) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
-    const request = rejectUnknownFields(object(value), ["tabId", "viewport"], "browserViewport");
-    return manager.setBrowserViewport(
-      windowId,
-      text(request.tabId, "tabId"),
-      parseViewport(request.viewport),
-    );
-  });
-  handleIpc("magi-desktop:start-browser-inspect", async (event, value: unknown) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
-    return manager.startBrowserInspect(windowId, parseBrowserInspectRequest(value));
-  });
-  handleIpc("magi-desktop:stop-browser-inspect", async (event, value: unknown) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
-    return manager.stopBrowserInspect(windowId, parseBrowserInspectRequest(value));
-  });
+  handleIpc(
+    "magi-desktop:set-browser-viewport",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = rejectUnknownFields(
+        object(value),
+        ["tabId", "viewport"],
+        "browserViewport",
+      );
+      return manager.setBrowserViewport(
+        windowId,
+        text(request.tabId, "tabId"),
+        parseViewport(request.viewport),
+      );
+    },
+  );
+  handleIpc(
+    "magi-desktop:cancel-browser-download",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = rejectUnknownFields(
+        object(value),
+        ["tabId", "downloadId"],
+        "browserDownloadCancel",
+      );
+      const cancelled = manager.cancelBrowserDownload(
+        windowId,
+        text(request.tabId, "tabId"),
+        text(request.downloadId, "downloadId"),
+      );
+      if (!cancelled) throw new Error("browser_download_not_found");
+      publishBrowserSnapshot(windowId);
+      return manager.snapshot(windowId);
+    },
+  );
+  handleIpc(
+    "magi-desktop:start-browser-inspect",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      return manager.startBrowserInspect(
+        windowId,
+        parseBrowserInspectRequest(value),
+      );
+    },
+  );
+  handleIpc(
+    "magi-desktop:stop-browser-inspect",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      return manager.stopBrowserInspect(
+        windowId,
+        parseBrowserInspectRequest(value),
+      );
+    },
+  );
   handleIpc("magi-desktop:focus-app", (event) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.focusApp(windowId);
@@ -315,65 +442,43 @@ function registerIpc(): void {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.handleRightPaneReady(windowId);
   });
-  handleIpc("magi-desktop:open-overlay", (event, value: unknown) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
-    manager.openOverlay(windowId, parseOverlayState(value));
-  });
-  handleIpc("magi-desktop:close-overlay", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    const role = manager.rendererRoleForWebContents(event.sender.id);
-    if (role !== "app" && role !== "overlay") {
-      throw new Error("desktop_overlay_close_sender_denied");
-    }
-    return manager.closeOverlay(windowId, parseOverlayCloseRequest(value));
-  });
-  handleIpc("magi-desktop:set-blocking-overlay", (event, value: unknown) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
-    const request = rejectUnknownFields(object(value), ["active"], "blockingOverlay");
-    if (typeof request.active !== "boolean") throw new Error("desktop_blocking_overlay_invalid");
-    return manager.setBlockingOverlay(windowId, request.active);
-  });
-  handleIpc("magi-desktop:overlay-ready", (event) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    if (manager.rendererRoleForWebContents(event.sender.id) !== "overlay") {
-      throw new Error("desktop_overlay_ready_sender_denied");
-    }
-    manager.handleOverlayReady(windowId);
-  });
-  handleIpc("magi-desktop:overlay-action", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    if (manager.rendererRoleForWebContents(event.sender.id) !== "overlay") {
-      throw new Error("desktop_overlay_action_sender_denied");
-    }
-    manager.handleOverlayAction(windowId, parseOverlayAction(value));
-  });
   handleIpc("magi-desktop:open-external", async (event, value: unknown) => {
     trustedAppSender(event.sender.id);
     if (typeof value !== "string") throw new Error("external_url_invalid");
     const url = new URL(value);
-    if (!["http:", "https:"].includes(url.protocol)) throw new Error("external_url_invalid");
+    if (!["http:", "https:"].includes(url.protocol))
+      throw new Error("external_url_invalid");
     await shell.openExternal(url.href);
   });
   handleIpc("magi-desktop:show-context-menu", async (event, value: unknown) => {
     const { windowId } = trustedAppSender(event.sender.id);
     return showContextMenu(windowId, parseContextMenuItems(value));
   });
-  handleIpc("magi-desktop:open-workspace-folder", async (event, value: unknown) => {
-    trustedAppSender(event.sender.id);
-    await openWorkspaceFolder(text(value, "workspaceRootPathRef"));
-  });
-  handleIpc("magi-desktop:reveal-workspace-file", async (event, value: unknown) => {
-    trustedAppSender(event.sender.id);
-    const request = rejectUnknownFields(
-      object(value),
-      ["targetPathRef", "workspaceRootPathRef"],
-      "revealWorkspaceFile",
-    );
-    await revealWorkspaceFile({
-      targetPathRef: text(request.targetPathRef, "targetPathRef"),
-      workspaceRootPathRef: text(request.workspaceRootPathRef, "workspaceRootPathRef"),
-    });
-  });
+  handleIpc(
+    "magi-desktop:open-workspace-folder",
+    async (event, value: unknown) => {
+      trustedAppSender(event.sender.id);
+      await openWorkspaceFolder(text(value, "workspaceRootPathRef"));
+    },
+  );
+  handleIpc(
+    "magi-desktop:reveal-workspace-file",
+    async (event, value: unknown) => {
+      trustedAppSender(event.sender.id);
+      const request = rejectUnknownFields(
+        object(value),
+        ["targetPathRef", "workspaceRootPathRef"],
+        "revealWorkspaceFile",
+      );
+      await revealWorkspaceFile({
+        targetPathRef: text(request.targetPathRef, "targetPathRef"),
+        workspaceRootPathRef: text(
+          request.workspaceRootPathRef,
+          "workspaceRootPathRef",
+        ),
+      });
+    },
+  );
   handleIpc("magi-desktop:set-appearance", (event, value: unknown) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     const request = rejectUnknownFields(
@@ -385,18 +490,28 @@ function registerIpc(): void {
     const backgroundColor = text(request.backgroundColor, "backgroundColor");
     const accentColor = text(request.accentColor, "accentColor");
     const material = request.material;
-    if (mode !== "light" && mode !== "dark") throw new Error("desktop_appearance_mode_invalid");
+    if (mode !== "light" && mode !== "dark")
+      throw new Error("desktop_appearance_mode_invalid");
     if (!isDesktopBackgroundColor(backgroundColor)) {
       throw new Error("desktop_appearance_background_invalid");
     }
     if (!isDesktopBackgroundColor(accentColor)) {
       throw new Error("desktop_appearance_accent_invalid");
     }
-    if (material !== "clear" && material !== "translucent" && material !== "immersive") {
+    if (
+      material !== "clear" &&
+      material !== "translucent" &&
+      material !== "immersive"
+    ) {
       throw new Error("desktop_appearance_material_invalid");
     }
     nativeTheme.themeSource = mode;
-    manager.setAppearance(windowId, { mode, backgroundColor, accentColor, material });
+    manager.setAppearance(windowId, {
+      mode,
+      backgroundColor,
+      accentColor,
+      material,
+    });
   });
   handleIpc("magi-desktop:get-app-version", (event) => {
     trustedAppSender(event.sender.id);
@@ -413,7 +528,11 @@ function registerIpc(): void {
       browserComponentError = null;
       return browserComponentSnapshot();
     } catch (cause) {
-      browserComponentError = componentError("worker", "browser_worker_restart_failed", cause);
+      browserComponentError = componentError(
+        "worker",
+        "browser_worker_restart_failed",
+        cause,
+      );
       throw cause;
     }
   });
@@ -452,9 +571,13 @@ type ContextMenuItem =
   | { type: "separator" }
   | { type: "action"; id: string; label: string; enabled: boolean };
 
-function showContextMenu(windowId: string, items: ContextMenuItem[]): Promise<string | null> {
+function showContextMenu(
+  windowId: string,
+  items: ContextMenuItem[],
+): Promise<string | null> {
   const window = windows.get(windowId);
-  if (!window || window.isDestroyed()) throw new Error("desktop_window_not_found");
+  if (!window || window.isDestroyed())
+    throw new Error("desktop_window_not_found");
   return new Promise((resolveMenu) => {
     let selectedAction: string | null = null;
     const template: MenuItemConstructorOptions[] = items.map((item) => {
@@ -478,7 +601,11 @@ function showContextMenu(windowId: string, items: ContextMenuItem[]): Promise<st
 
 function parseContextMenuItems(value: unknown): ContextMenuItem[] {
   const request = rejectUnknownFields(object(value), ["items"], "contextMenu");
-  if (!Array.isArray(request.items) || request.items.length === 0 || request.items.length > 32) {
+  if (
+    !Array.isArray(request.items) ||
+    request.items.length === 0 ||
+    request.items.length > 32
+  ) {
     throw new Error("desktop_context_menu_items_invalid");
   }
   const allowedRoles = new Set<ContextMenuRole>([
@@ -495,12 +622,20 @@ function parseContextMenuItems(value: unknown): ContextMenuItem[] {
       rejectUnknownFields(item, ["type"], "contextMenu.separator");
       return { type: "separator" };
     }
-    if (item.type === "role" && allowedRoles.has(item.role as ContextMenuRole)) {
+    if (
+      item.type === "role" &&
+      allowedRoles.has(item.role as ContextMenuRole)
+    ) {
       rejectUnknownFields(item, ["type", "role"], "contextMenu.role");
       return { type: "role", role: item.role as ContextMenuRole };
     }
-    if (item.type !== "action") throw new Error("desktop_context_menu_item_invalid");
-    rejectUnknownFields(item, ["type", "id", "label", "enabled"], "contextMenu.action");
+    if (item.type !== "action")
+      throw new Error("desktop_context_menu_item_invalid");
+    rejectUnknownFields(
+      item,
+      ["type", "id", "label", "enabled"],
+      "contextMenu.action",
+    );
     const id = text(item.id, "contextMenu.id");
     const label = text(item.label, "contextMenu.label");
     if (!/^[a-z][a-z0-9-]{0,63}$/u.test(id) || label.length > 160) {
@@ -522,7 +657,8 @@ function handshake(worker: AutomationWorker): DesktopBrowserHandshake {
   };
 }
 
-type BrowserComponentStatus = "starting" | "ready" | "restarting" | "failed" | "stopped";
+type BrowserComponentStatus =
+  "starting" | "ready" | "restarting" | "failed" | "stopped";
 type BrowserProtocolStatus = BrowserComponentStatus | "incompatible";
 type BrowserComponentErrorTarget = "daemon" | "worker" | "protocol" | "version";
 
@@ -544,9 +680,11 @@ function browserComponentSnapshot() {
   const daemon = processSupervisor;
   const daemonStatus = daemon?.status ?? "stopped";
   const workerStatus = worker?.status ?? "stopped";
-  const protocolCompatible = daemonStatus === "ready"
-    && desktopConnectionGeneration !== null
-    && daemonHostProtocolCompatible;
+  const protocolCompatible =
+    daemonStatus === "ready" &&
+    desktopControlConnected &&
+    desktopConnectionGeneration !== null &&
+    daemonHostProtocolCompatible;
   const protocolStatus = browserProtocolStatus(
     daemonStatus,
     daemonHostStatus,
@@ -586,8 +724,11 @@ function browserComponentSnapshot() {
       version: DESKTOP_BROWSER_PROTOCOL_VERSION,
       status: protocolStatus,
       compatible: protocolCompatible,
-      error: (protocolStatus === "incompatible" || protocolStatus === "failed")
-        && error?.target === "protocol" ? error : null,
+      error:
+        (protocolStatus === "incompatible" || protocolStatus === "failed") &&
+        error?.target === "protocol"
+          ? error
+          : null,
     },
     runtime: {
       status: runtimeStatus,
@@ -600,11 +741,13 @@ function browserComponentSnapshot() {
 }
 
 function componentVersionsCompatible(): boolean {
-  return PRODUCT_VERSION !== "unknown"
-    && DAEMON_VERSION !== "unknown"
-    && AUTOMATION_WORKER_VERSION !== "unknown"
-    && PRODUCT_VERSION === DAEMON_VERSION
-    && PRODUCT_VERSION === AUTOMATION_WORKER_VERSION;
+  return (
+    PRODUCT_VERSION !== "unknown" &&
+    DAEMON_VERSION !== "unknown" &&
+    AUTOMATION_WORKER_VERSION !== "unknown" &&
+    PRODUCT_VERSION === DAEMON_VERSION &&
+    PRODUCT_VERSION === AUTOMATION_WORKER_VERSION
+  );
 }
 
 function browserProtocolStatus(
@@ -647,12 +790,20 @@ function currentBrowserComponentError(
   if (daemonStatus === "failed") {
     return browserComponentError?.target === "daemon"
       ? browserComponentError
-      : { target: "daemon", code: "browser_daemon_failed", message: "Browser daemon failed" };
+      : {
+          target: "daemon",
+          code: "browser_daemon_failed",
+          message: "Browser daemon failed",
+        };
   }
   if (workerStatus === "failed") {
     return browserComponentError?.target === "worker"
       ? browserComponentError
-      : { target: "worker", code: "browser_worker_failed", message: "Browser automation worker failed" };
+      : {
+          target: "worker",
+          code: "browser_worker_failed",
+          message: "Browser automation worker failed",
+        };
   }
   // starting/restarting/stopped 是生命周期状态，不应被当成错误；界面会
   // 为每个组件单独展示这些状态。
@@ -661,25 +812,37 @@ function currentBrowserComponentError(
     return browserComponentError?.target === "version"
       ? browserComponentError
       : {
-        target: "version",
-        code: "browser_component_version_mismatch",
-        message: `Browser component versions are inconsistent: product=${PRODUCT_VERSION}, daemon=${DAEMON_VERSION}, worker=${AUTOMATION_WORKER_VERSION}`,
-      };
+          target: "version",
+          code: "browser_component_version_mismatch",
+          message: `Browser component versions are inconsistent: product=${PRODUCT_VERSION}, daemon=${DAEMON_VERSION}, worker=${AUTOMATION_WORKER_VERSION}`,
+        };
   }
   if (protocolStatus === "incompatible") {
     return browserComponentError?.target === "protocol"
       ? browserComponentError
-      : { target: "protocol", code: "browser_protocol_incompatible", message: "Browser protocol is incompatible" };
+      : {
+          target: "protocol",
+          code: "browser_protocol_incompatible",
+          message: "Browser protocol is incompatible",
+        };
   }
   if (protocolStatus === "failed") {
     return browserComponentError?.target === "protocol"
       ? browserComponentError
-      : { target: "protocol", code: "browser_protocol_failed", message: "Browser protocol failed" };
+      : {
+          target: "protocol",
+          code: "browser_protocol_failed",
+          message: "Browser protocol failed",
+        };
   }
   return null;
 }
 
-function componentError(target: BrowserComponentErrorTarget, code: string, cause: unknown): BrowserComponentError {
+function componentError(
+  target: BrowserComponentErrorTarget,
+  code: string,
+  cause: unknown,
+): BrowserComponentError {
   return {
     target,
     code,
@@ -706,7 +869,10 @@ function publishBrowserComponentSnapshot(): void {
   broadcastAll("magi-desktop:browser-component", snapshot);
 }
 
-async function refreshDaemonHostStatus(force = false): Promise<void> {
+async function refreshDaemonHostStatus(
+  force = false,
+  signal?: AbortSignal,
+): Promise<void> {
   const daemon = processSupervisor;
   if (!daemon || daemon.status !== "ready") return;
   const now = Date.now();
@@ -715,10 +881,15 @@ async function refreshDaemonHostStatus(force = false): Promise<void> {
   daemonHostProbeAt = now;
   daemonHostProbe = (async () => {
     try {
-      const response = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error(`browser_host_status_failed:${response.status}`);
+      const response = await fetch(
+        `${AGENT_ORIGIN}/api/browser/desktop/connection`,
+        {
+          cache: "no-store",
+          ...(signal ? { signal } : {}),
+        },
+      );
+      if (!response.ok)
+        throw new Error(`browser_host_status_failed:${response.status}`);
       const payload: unknown = await response.json();
       updateDaemonHostStatus(payload);
       publishBrowserComponentSnapshot();
@@ -734,23 +905,34 @@ async function refreshDaemonHostStatus(force = false): Promise<void> {
 }
 
 function updateDaemonHostStatus(value: unknown): void {
-  if (!value || typeof value !== "object") throw new Error("browser_host_status_invalid");
+  if (!value || typeof value !== "object")
+    throw new Error("browser_host_status_invalid");
   const record = value as Record<string, unknown>;
   const status = normalizeDaemonHostStatus(record.hostStatus);
   if (!status) throw new Error("browser_host_status_invalid");
   daemonHostStatus = status;
+  daemonHostConnectionGeneration = browserConnectionGeneration(record);
   daemonHostProtocolCompatible = record.hostProtocolCompatible === true;
-  daemonHostErrorCode = typeof record.lastErrorCode === "string" ? record.lastErrorCode : null;
+  daemonHostErrorCode =
+    typeof record.lastErrorCode === "string" ? record.lastErrorCode : null;
 }
 
-function normalizeDaemonHostStatus(value: unknown): BrowserComponentStatus | null {
+function normalizeDaemonHostStatus(
+  value: unknown,
+): BrowserComponentStatus | null {
   switch (value) {
-    case "stopped": return "stopped";
-    case "starting": return "starting";
-    case "ready": return "ready";
-    case "reconnecting": return "restarting";
-    case "failed": return "failed";
-    default: return null;
+    case "stopped":
+      return "stopped";
+    case "starting":
+      return "starting";
+    case "ready":
+      return "ready";
+    case "reconnecting":
+      return "restarting";
+    case "failed":
+      return "failed";
+    default:
+      return null;
   }
 }
 
@@ -762,19 +944,28 @@ function readBrowserCapabilityManifest(): BrowserCapabilityManifest {
     if (!value || typeof value !== "object") return {};
     const record = value as Record<string, unknown>;
     return {
-      ...(typeof record.productVersion === "string" ? { productVersion: record.productVersion } : {}),
-      ...(typeof record.daemonVersion === "string" ? { daemonVersion: record.daemonVersion } : {}),
+      ...(typeof record.productVersion === "string"
+        ? { productVersion: record.productVersion }
+        : {}),
+      ...(typeof record.daemonVersion === "string"
+        ? { daemonVersion: record.daemonVersion }
+        : {}),
       ...(typeof record.automationWorkerVersion === "string"
         ? { automationWorkerVersion: record.automationWorkerVersion }
         : {}),
-      ...(typeof record.buildIdentity === "string" ? { buildIdentity: record.buildIdentity } : {}),
+      ...(typeof record.buildIdentity === "string"
+        ? { buildIdentity: record.buildIdentity }
+        : {}),
     };
   } catch {
     return {};
   }
 }
 
-function trustedSender(webContentsId: number): { manager: WindowManager; windowId: string } {
+function trustedSender(webContentsId: number): {
+  manager: WindowManager;
+  windowId: string;
+} {
   const manager = windowManager;
   if (!manager) throw new Error("desktop_not_ready");
   const windowId = manager.windowIdForWebContents(webContentsId);
@@ -782,7 +973,10 @@ function trustedSender(webContentsId: number): { manager: WindowManager; windowI
   return { manager, windowId };
 }
 
-function trustedAppSender(webContentsId: number): { manager: WindowManager; windowId: string } {
+function trustedAppSender(webContentsId: number): {
+  manager: WindowManager;
+  windowId: string;
+} {
   const sender = trustedSender(webContentsId);
   if (sender.manager.rendererRoleForWebContents(webContentsId) !== "app") {
     throw new Error("desktop_app_sender_denied");
@@ -794,9 +988,25 @@ function publishBrowserEvent(event: BrowserSurfaceEvent): void {
   // Surface 事件属于创建它的窗口。广播给所有窗口会让同一逻辑 Tab 的
   // Secondary Surface 污染另一个窗口的地址、加载状态和 Agent 光标。
   try {
-    windowManager?.broadcast(event.binding.window_id, "magi-desktop:browser-event", event);
+    windowManager?.broadcast(
+      event.binding.window_id,
+      "magi-desktop:browser-event",
+      event,
+    );
   } catch {
     // 目标窗口可能刚好关闭，WindowManager 会负责清理它的 Surface。
+  }
+}
+
+function publishBrowserSnapshot(windowId: string): void {
+  try {
+    windowManager?.broadcast(
+      windowId,
+      "magi-desktop:snapshot",
+      windowManager.snapshot(windowId),
+    );
+  } catch {
+    // 目标窗口可能刚好关闭；WindowManager 会负责清理它的 Surface。
   }
 }
 
@@ -813,9 +1023,12 @@ function broadcastAll(channel: string, value: unknown): void {
 }
 
 async function shutdown(): Promise<void> {
-  if (browserComponentSnapshotTimer) clearInterval(browserComponentSnapshotTimer);
+  if (browserComponentSnapshotTimer)
+    clearInterval(browserComponentSnapshotTimer);
   browserComponentSnapshotTimer = null;
   lastBrowserComponentSnapshot = "";
+  desktopControlConnected = false;
+  desktopRuntimeRecoveryCoordinator.shutdown();
   windowManager?.closeAll();
   surfaceManager?.closeAll();
   await automationWorker?.stop();
@@ -826,60 +1039,160 @@ async function shutdown(): Promise<void> {
 }
 
 async function registerDesktopBrowserConnection(): Promise<void> {
-  const currentResponse = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
-    cache: "no-store",
-  });
+  const currentResponse = await fetch(
+    `${AGENT_ORIGIN}/api/browser/desktop/connection`,
+    {
+      cache: "no-store",
+    },
+  );
   if (!currentResponse.ok) {
-    throw new Error(`browser_desktop_connection_snapshot_failed:${currentResponse.status}`);
+    throw new Error(
+      `browser_desktop_connection_snapshot_failed:${currentResponse.status}`,
+    );
   }
   const currentPayload: unknown = await currentResponse.json();
   const expectedGeneration = browserConnectionGeneration(currentPayload);
-  const response = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      socketPath: controlSocket,
-      authToken: controlToken,
-      desktopEpoch,
-      parentPid: process.pid,
-      expectedGeneration,
-    }),
-  });
+  const response = await fetch(
+    `${AGENT_ORIGIN}/api/browser/desktop/connection`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        socketPath: controlSocket,
+        authToken: controlToken,
+        desktopEpoch,
+        parentPid: process.pid,
+        expectedGeneration,
+      }),
+    },
+  );
   if (!response.ok) {
-    throw new Error(`browser_desktop_connection_register_failed:${response.status}`);
+    throw new Error(
+      `browser_desktop_connection_register_failed:${response.status}`,
+    );
   }
   const payload: unknown = await response.json();
   updateDaemonHostStatus(payload);
   desktopConnectionGeneration = browserConnectionGeneration(payload);
+  desktopRuntimeRecoveryCoordinator.onDaemonRegistered(
+    desktopConnectionGeneration,
+  );
 }
 
 async function handleDaemonReady(): Promise<void> {
   try {
     await registerDesktopBrowserConnection();
     browserComponentError = null;
-    await windowManager?.restoreAfterDaemonReady();
   } catch (cause) {
-    browserComponentError = componentError("daemon", "browser_daemon_registration_failed", cause);
+    browserComponentError = componentError(
+      "daemon",
+      "browser_daemon_registration_failed",
+      cause,
+    );
     throw cause;
   }
+}
+
+async function waitForDesktopHostReady(
+  connectionRevision: number,
+  expectedGeneration: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  const deadline = Date.now() + DESKTOP_HOST_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (
+      !isCurrentDesktopConnection(
+        connectionRevision,
+        expectedGeneration,
+        signal,
+      )
+    )
+      return false;
+    await refreshDaemonHostStatus(true, signal);
+    if (
+      !isCurrentDesktopConnection(
+        connectionRevision,
+        expectedGeneration,
+        signal,
+      )
+    )
+      return false;
+    if (
+      daemonHostStatus === "ready" &&
+      daemonHostProtocolCompatible &&
+      daemonHostConnectionGeneration === expectedGeneration
+    ) {
+      return true;
+    }
+    try {
+      await waitForMilliseconds(DESKTOP_HOST_READY_POLL_INTERVAL_MS, signal);
+    } catch (cause) {
+      if (signal.aborted) return false;
+      throw cause;
+    }
+  }
+  return false;
+}
+
+function isCurrentDesktopConnection(
+  connectionRevision: number,
+  expectedGeneration: number,
+  signal: AbortSignal,
+): boolean {
+  return (
+    !signal.aborted &&
+    desktopControlConnected &&
+    desktopControlConnectionRevision === connectionRevision &&
+    desktopConnectionGeneration === expectedGeneration
+  );
+}
+
+function waitForMilliseconds(
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(
+      new DOMException("The operation was aborted", "AbortError"),
+    );
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("The operation was aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 async function unregisterDesktopBrowserConnection(): Promise<void> {
   if (desktopConnectionGeneration === null) return;
   try {
-    const response = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
-      method: "DELETE",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        desktopEpoch,
-        parentPid: process.pid,
-        generation: desktopConnectionGeneration,
-      }),
-    });
+    const response = await fetch(
+      `${AGENT_ORIGIN}/api/browser/desktop/connection`,
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          desktopEpoch,
+          parentPid: process.pid,
+          generation: desktopConnectionGeneration,
+        }),
+      },
+    );
     if (!response.ok) {
-      throw new Error(`browser_desktop_connection_unregister_failed:${response.status}`);
+      throw new Error(
+        `browser_desktop_connection_unregister_failed:${response.status}`,
+      );
     }
     desktopConnectionGeneration = null;
+    desktopRuntimeRecoveryCoordinator.onDaemonUnregistered();
+    daemonHostConnectionGeneration = null;
     daemonHostStatus = "stopped";
     daemonHostProtocolCompatible = false;
     daemonHostErrorCode = null;
@@ -894,7 +1207,11 @@ function browserConnectionGeneration(value: unknown): number {
   }
   const generation = (value as { desktopConnectionGeneration?: unknown })
     .desktopConnectionGeneration;
-  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+  if (
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation < 0
+  ) {
     throw new Error("browser_desktop_connection_generation_invalid");
   }
   return generation;
@@ -910,8 +1227,18 @@ function resolveRuntimePaths(): {
   const moduleDirectory = fileURLToPath(new URL(".", import.meta.url));
   if (app.isPackaged) {
     return {
-      daemon: join(process.resourcesPath, "daemon", process.platform === "win32" ? "magi-daemon-app.exe" : "magi-daemon-app"),
-      workerEntry: join(process.resourcesPath, "browser-automation-worker", "index.cjs"),
+      daemon: join(
+        process.resourcesPath,
+        "daemon",
+        process.platform === "win32"
+          ? "magi-daemon-app.exe"
+          : "magi-daemon-app",
+      ),
+      workerEntry: join(
+        process.resourcesPath,
+        "browser-automation-worker",
+        "index.cjs",
+      ),
       preload: join(moduleDirectory, "..", "preload", "index.cjs"),
       webDist: join(process.resourcesPath, "web", "dist"),
       webRoot: join(process.resourcesPath, "web"),
@@ -919,7 +1246,12 @@ function resolveRuntimePaths(): {
   }
   const root = resolve(moduleDirectory, "../../../..");
   return {
-    daemon: join(root, "target", "debug", process.platform === "win32" ? "magi-daemon-app.exe" : "magi-daemon-app"),
+    daemon: join(
+      root,
+      "target",
+      "debug",
+      process.platform === "win32" ? "magi-daemon-app.exe" : "magi-daemon-app",
+    ),
     workerEntry: join(root, "browser-automation-worker", "dist", "index.cjs"),
     preload: join(root, "apps", "desktop", "dist", "preload", "index.cjs"),
     webDist: join(root, "web", "dist"),
@@ -930,59 +1262,52 @@ function resolveRuntimePaths(): {
 function parseLayoutIntent(value: unknown): WindowLayoutIntent {
   const input = rejectUnknownFields(
     object(value),
-    ["type", "width", "visible", "frame"],
+    [
+      "type",
+      "width",
+      "visible",
+      "bounds",
+      "displayScaleFactor",
+      "fullscreen",
+      "kind",
+      "tabId",
+      "surfaceId",
+    ],
     "layoutIntent",
   );
   switch (input.type) {
+    case "client_bounds": {
+      const bounds = parseLayoutRectangle(input.bounds, "bounds");
+      if (!bounds) throw new Error("desktop_ipc_bounds_required");
+      return {
+        type: "client_bounds",
+        bounds,
+        displayScaleFactor: finite(
+          input.displayScaleFactor,
+          "displayScaleFactor",
+        ),
+        fullscreen: input.fullscreen === true,
+      };
+    }
     case "right_pane_width":
       return { type: "right_pane_width", width: finite(input.width, "width") };
     case "right_pane_reset_width":
       return { type: "right_pane_reset_width" };
     case "right_pane_visibility":
       return { type: "right_pane_visibility", visible: input.visible === true };
-    case "renderer_geometry": {
-      const frame = rejectUnknownFields(object(input.frame), [
-        "revision",
-        "layoutRevision",
-        "coordinateSpace",
-        "rightPaneBounds",
-        "browserContentSlot",
-      ], "layoutIntent.frame");
-      const revision = nonNegativeInteger(frame.revision, "layoutIntent.frame.revision");
-      const layoutRevision = nonNegativeInteger(frame.layoutRevision, "layoutIntent.frame.layoutRevision");
-      if (frame.coordinateSpace !== "window-content-css-px") {
-        throw new Error("desktop_layout_coordinate_space_invalid");
-      }
-      const rightPaneBounds = parseLayoutRectangle(frame.rightPaneBounds, "rightPaneBounds");
-      let browserContentSlot: Extract<WindowLayoutIntent, { type: "renderer_geometry" }>["frame"]["browserContentSlot"];
-      const rawSlot = frame.browserContentSlot;
-      if (rawSlot === null || rawSlot === undefined) {
-        browserContentSlot = null;
-      } else {
-        const slot = rejectUnknownFields(
-          object(rawSlot),
-          ["tabId", "bounds"],
-          "layoutIntent.frame.browserContentSlot",
-        );
-        browserContentSlot = {
-          tabId: text(slot.tabId, "layoutIntent.frame.browserContentSlot.tabId"),
-          bounds: parseLayoutRectangle(
-            slot.bounds,
-            "layoutIntent.frame.browserContentSlot.bounds",
-          )!,
-        };
-      }
+    case "active_panel":
       return {
-        type: "renderer_geometry",
-        frame: {
-          revision,
-          layoutRevision,
-          coordinateSpace: "window-content-css-px",
-          rightPaneBounds,
-          browserContentSlot,
-        },
+        type: "active_panel",
+        kind: parsePanelKind(input.kind),
+        tabId:
+          input.tabId === null || input.tabId === undefined
+            ? null
+            : text(input.tabId, "tabId"),
+        surfaceId:
+          input.surfaceId === null || input.surfaceId === undefined
+            ? null
+            : text(input.surfaceId, "surfaceId"),
       };
-    }
     default:
       throw new Error("desktop_layout_intent_invalid");
   }
@@ -990,13 +1315,22 @@ function parseLayoutIntent(value: unknown): WindowLayoutIntent {
 
 function parseLayoutRectangle(value: unknown, name: string): Rectangle | null {
   if (value === null || value === undefined) return null;
-  const input = rejectUnknownFields(object(value), ["x", "y", "width", "height"], name);
+  const input = rejectUnknownFields(
+    object(value),
+    ["x", "y", "width", "height"],
+    name,
+  );
   const x = finite(input.x, `${name}.x`);
   const y = finite(input.y, `${name}.y`);
   const width = finite(input.width, `${name}.width`);
   const height = finite(input.height, `${name}.height`);
   if (width <= 0 || height <= 0) throw new Error(`desktop_ipc_${name}_empty`);
-  if (Math.abs(x) > 100_000 || Math.abs(y) > 100_000 || width > 100_000 || height > 100_000) {
+  if (
+    Math.abs(x) > 100_000 ||
+    Math.abs(y) > 100_000 ||
+    width > 100_000 ||
+    height > 100_000
+  ) {
     throw new Error(`desktop_ipc_${name}_out_of_range`);
   }
   return { x, y, width, height };
@@ -1017,9 +1351,60 @@ function parseBrowserActivation(value: unknown): {
   const tabId = text(input.tabId, "tabId");
   const browserSessionId = text(input.browserSessionId, "browserSessionId");
   const url = text(input.url, "url");
-  const navigationRevision = finite(input.navigationRevision, "navigationRevision");
+  const navigationRevision = finite(
+    input.navigationRevision,
+    "navigationRevision",
+  );
   const viewport = parseViewport(input.viewport);
   return { tabId, browserSessionId, url, navigationRevision, viewport };
+}
+
+function parseEmbeddedBrowserWebview(
+  value: unknown,
+): EmbeddedBrowserWebviewInput {
+  const input = rejectUnknownFields(
+    object(value),
+    ["tabId", "browserSessionId", "navigationRevision", "webContentsId"],
+    "embeddedBrowserWebview",
+  );
+  return {
+    tabId: text(input.tabId, "tabId"),
+    browserSessionId: text(input.browserSessionId, "browserSessionId"),
+    navigationRevision: nonNegativeInteger(
+      input.navigationRevision,
+      "navigationRevision",
+    ),
+    webContentsId: integerInRange(
+      input.webContentsId,
+      "webContentsId",
+      1,
+      2_147_483_647,
+    ),
+  };
+}
+
+function parseReleasedBrowserWebview(
+  value: unknown,
+): EmbeddedBrowserWebviewInput {
+  const input = rejectUnknownFields(
+    object(value),
+    ["tabId", "browserSessionId", "navigationRevision", "webContentsId"],
+    "releasedBrowserWebview",
+  );
+  return {
+    tabId: text(input.tabId, "tabId"),
+    browserSessionId: text(input.browserSessionId, "browserSessionId"),
+    navigationRevision: nonNegativeInteger(
+      input.navigationRevision,
+      "navigationRevision",
+    ),
+    webContentsId: integerInRange(
+      input.webContentsId,
+      "webContentsId",
+      1,
+      2_147_483_647,
+    ),
+  };
 }
 
 function parseBrowserInspectRequest(value: unknown): {
@@ -1035,7 +1420,10 @@ function parseBrowserInspectRequest(value: unknown): {
   return {
     tabId: text(input.tabId, "tabId"),
     surfaceId: text(input.surfaceId, "surfaceId"),
-    navigationRevision: nonNegativeInteger(input.navigationRevision, "navigationRevision"),
+    navigationRevision: nonNegativeInteger(
+      input.navigationRevision,
+      "navigationRevision",
+    ),
   };
 }
 
@@ -1045,7 +1433,8 @@ function parseViewport(value: unknown): BrowserLogicalViewport {
     rejectUnknownFields(viewportInput, ["mode"], "viewport");
     return { mode: "auto" };
   }
-  if (viewportInput.mode !== "fixed") throw new Error("desktop_ipc_viewport_mode_invalid");
+  if (viewportInput.mode !== "fixed")
+    throw new Error("desktop_ipc_viewport_mode_invalid");
   rejectUnknownFields(
     viewportInput,
     ["mode", "width", "height", "deviceScaleFactorMillis", "deviceType"],
@@ -1065,7 +1454,12 @@ function parseViewport(value: unknown): BrowserLogicalViewport {
   };
 }
 
-function integerInRange(value: unknown, name: string, minimum: number, maximum: number): number {
+function integerInRange(
+  value: unknown,
+  name: string,
+  minimum: number,
+  maximum: number,
+): number {
   const number = finite(value, name);
   if (!Number.isInteger(number) || number < minimum || number > maximum) {
     throw new Error(`${name}_out_of_range`);
@@ -1075,137 +1469,27 @@ function integerInRange(value: unknown, name: string, minimum: number, maximum: 
 
 function nonNegativeInteger(value: unknown, name: string): number {
   const number = finite(value, name);
-  if (!Number.isInteger(number) || number < 0) throw new Error(`${name}_invalid`);
+  if (!Number.isInteger(number) || number < 0)
+    throw new Error(`${name}_invalid`);
   return number;
 }
 
 function parsePanelKind(value: unknown): PanelKind {
   return ["agent", "browser", "code", "terminal"].includes(String(value))
-    ? value as PanelKind
+    ? (value as PanelKind)
     : null;
-}
-
-function parseOverlayState(value: unknown): import("./desktop-overlay-manager.js").DesktopOverlayState {
-  const input = rejectUnknownFields(
-    object(value),
-    ["overlayId", "kind", "phase", "ownerId", "placement", "popupBounds", "title", "items", "fields"],
-    "overlay",
-  );
-  const kind = input.kind === "menu" || input.kind === "annotation" ? input.kind : null;
-  if (!kind) throw new Error("desktop_overlay_kind_invalid");
-  const menuPlacements = ["right-pane-add", "browser-viewport", "browser-annotations"];
-  const placement = menuPlacements.includes(String(input.placement))
-    ? input.placement as import("./desktop-overlay-manager.js").DesktopOverlayPlacement
-    : null;
-  if (!placement) throw new Error("desktop_overlay_placement_invalid");
-  if (kind === "annotation" && placement !== "browser-annotations") throw new Error("desktop_overlay_placement_invalid");
-  const expectedPhase = kind === "menu" ? "menu" : null;
-  const phase = expectedPhase ?? (input.phase === "select" || input.phase === "comment" ? input.phase : null);
-  if (!phase) throw new Error("desktop_overlay_phase_invalid");
-  const rawItems = Array.isArray(input.items) ? input.items : [];
-  if (rawItems.length > 32) throw new Error("desktop_overlay_items_invalid");
-  const items = rawItems.map((value) => {
-    const item = rejectUnknownFields(
-      object(value),
-      ["id", "label", "icon", "selected", "disabled"],
-      "overlay.item",
-    );
-    const id = text(item.id, "overlay.item.id");
-    const label = text(item.label, "overlay.item.label");
-    if (id.length > 200 || label.length > 240) throw new Error("desktop_overlay_item_invalid");
-    return {
-      id,
-      label,
-      icon: typeof item.icon === "string" && item.icon.trim() ? item.icon : null,
-      selected: item.selected === true,
-      disabled: item.disabled === true,
-    };
-  });
-  const rawFields = Array.isArray(input.fields) ? input.fields : [];
-  if (rawFields.length > 4) throw new Error("desktop_overlay_fields_invalid");
-  const fields = rawFields.map((value) => {
-    const field = rejectUnknownFields(
-      object(value),
-      ["id", "label", "type", "value", "min", "max"],
-      "overlay.field",
-    );
-    const id = text(field.id, "overlay.field.id");
-    const label = text(field.label, "overlay.field.label");
-    const fieldValue = typeof field.value === "string" ? field.value : String(field.value ?? "");
-    if (id.length > 120 || label.length > 120 || fieldValue.length > 32) throw new Error("desktop_overlay_field_invalid");
-    return {
-      id,
-      label,
-      type: field.type === "text" ? ("text" as const) : ("number" as const),
-      value: fieldValue,
-      min: finiteOrNull(field.min),
-      max: finiteOrNull(field.max),
-    };
-  });
-  const popupBounds = parseLayoutRectangle(input.popupBounds, "overlay.popupBounds");
-  if ((kind === "menu") !== Boolean(popupBounds)) {
-    throw new Error("desktop_overlay_popup_bounds_invalid");
-  }
-  return {
-    overlayId: typeof input.overlayId === "string" && input.overlayId.trim()
-      ? input.overlayId.trim()
-      : `overlay-${randomUUID()}`,
-    kind,
-    phase,
-    ownerId: text(input.ownerId, "overlay.ownerId"),
-    placement,
-    popupBounds,
-    title: text(input.title, "overlay.title"),
-    items,
-    fields,
-  };
-}
-
-function parseOverlayCloseRequest(value: unknown): import("./desktop-overlay-manager.js").DesktopOverlayCloseRequest {
-  const input = rejectUnknownFields(
-    object(value),
-    ["overlayId", "ownerId"],
-    "overlayCloseRequest",
-  );
-  const overlayId = text(input.overlayId, "overlayCloseRequest.overlayId");
-  const ownerId = text(input.ownerId, "overlayCloseRequest.ownerId");
-  if (overlayId.length > 200 || ownerId.length > 200) {
-    throw new Error("desktop_overlay_close_request_invalid");
-  }
-  return { overlayId, ownerId };
-}
-
-function parseOverlayAction(value: unknown): import("./desktop-overlay-manager.js").DesktopOverlayAction {
-  const input = rejectUnknownFields(
-    object(value),
-    ["overlayId", "kind", "ownerId", "interaction", "id", "value"],
-    "overlayAction",
-  );
-  const interaction = input.interaction;
-  if (interaction !== "select" && interaction !== "input") throw new Error("desktop_overlay_interaction_invalid");
-  const kind = input.kind === "menu" || input.kind === "annotation" ? input.kind : null;
-  if (!kind) throw new Error("desktop_overlay_kind_invalid");
-  return {
-    overlayId: text(input.overlayId, "overlay.overlayId"),
-    kind,
-    ownerId: text(input.ownerId, "overlay.ownerId"),
-    interaction,
-    id: text(input.id, "overlay.action.id"),
-    value: typeof input.value === "string" ? input.value : null,
-  };
-}
-
-function finiteOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function object(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("desktop_ipc_payload_invalid");
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("desktop_ipc_payload_invalid");
   return value as Record<string, unknown>;
 }
 
 function isDesktopBackgroundColor(value: string): boolean {
-  return /^(?:#[0-9a-f]{6}(?:[0-9a-f]{2})?|rgba?\(\s*(?:\d{1,3}\s*,\s*){2}\d{1,3}(?:\s*,\s*(?:0(?:\.\d+)?|1(?:\.0+)?|0?\.\d+))?\s*\))$/iu.test(value);
+  return /^(?:#[0-9a-f]{6}(?:[0-9a-f]{2})?|rgba?\(\s*(?:\d{1,3}\s*,\s*){2}\d{1,3}(?:\s*,\s*(?:0(?:\.\d+)?|1(?:\.0+)?|0?\.\d+))?\s*\))$/iu.test(
+    value,
+  );
 }
 
 function rejectUnknownFields(
@@ -1220,7 +1504,8 @@ function rejectUnknownFields(
 }
 
 function text(value: unknown, name: string): string {
-  if (typeof value !== "string" || !value.trim()) throw new Error(`desktop_ipc_${name}_invalid`);
+  if (typeof value !== "string" || !value.trim())
+    throw new Error(`desktop_ipc_${name}_invalid`);
   return value.trim();
 }
 
@@ -1228,11 +1513,13 @@ function optionalText(value: unknown, name: string): string {
   if (value === undefined || value === null || value === "") return "";
   if (typeof value !== "string") throw new Error(`desktop_ipc_${name}_invalid`);
   const normalized = value.trim();
-  if (normalized.length > 16_384) throw new Error(`desktop_ipc_${name}_invalid`);
+  if (normalized.length > 16_384)
+    throw new Error(`desktop_ipc_${name}_invalid`);
   return normalized;
 }
 
 function finite(value: unknown, name: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`desktop_ipc_${name}_invalid`);
+  if (typeof value !== "number" || !Number.isFinite(value))
+    throw new Error(`desktop_ipc_${name}_invalid`);
   return value;
 }

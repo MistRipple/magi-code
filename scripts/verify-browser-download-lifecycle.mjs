@@ -31,7 +31,7 @@ ordered(
   [
     "const surfaces = new BrowserSurfaceManager({",
     "await surfaces.clearDownloads();",
-    "const browserUploadRoot = join(app.getPath(\"userData\"), \"browser-uploads\");",
+    "const browserUploadRoot = join(",
   ],
   "启动下载清理",
 );

@@ -1,7 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Magi">
-  <title>Magi</title>
-  <!-- 透明画布只保留字形，交给操作系统处理托盘/桌面容器 -->
-  <path
-    d="M38 54h45l45 35 46-35h44v150h-44v-78l-46 35L38 91V54Z"
-    fill="#07090d"/>
-</svg>

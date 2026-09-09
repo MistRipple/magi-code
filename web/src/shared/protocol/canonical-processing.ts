@@ -44,7 +44,8 @@ function readMetadataString(
 }
 
 export function canonicalTurnRequestId(turn: CanonicalTurn): string {
-  const turnRequestId = readMetadataString(turn.metadata, 'requestId');
+  const turnRequestId = readMetadataString(turn.metadata, 'requestId')
+    || readMetadataString(turn.metadata, 'request_id');
   if (turnRequestId) {
     return turnRequestId;
   }
@@ -52,7 +53,8 @@ export function canonicalTurnRequestId(turn: CanonicalTurn): string {
   const rootUserItem = turn.items
     .filter((item) => item.kind === 'user_message')
     .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId))[0];
-  return readMetadataString(rootUserItem?.metadata, 'requestId');
+  return readMetadataString(rootUserItem?.metadata, 'requestId')
+    || readMetadataString(rootUserItem?.metadata, 'request_id');
 }
 
 export function deriveProcessingStateFromCanonicalTurns(

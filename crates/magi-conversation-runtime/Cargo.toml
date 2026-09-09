@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 magi-core = { path = "../magi-core" }
+magi-browser-authority = { path = "../magi-browser-authority" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
@@ -38,6 +39,5 @@ sha2.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
-magi-browser-authority = { path = "../magi-browser-authority" }
 magi-process = { path = "../magi-process" }
 tempfile = "3"

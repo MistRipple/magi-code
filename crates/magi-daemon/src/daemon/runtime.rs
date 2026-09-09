@@ -43,6 +43,7 @@ use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
+use magi_process::ManagedProcessGroup;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
 use magi_settings_store::SettingsStore;
 use magi_skill_runtime::SkillDispatchRuntime;
@@ -904,6 +905,7 @@ pub(crate) struct DaemonRuntime {
     governance: Arc<GovernanceService>,
     worker_runtime: WorkerRuntime,
     runtime_maintenance: RuntimeMaintenance,
+    managed_process_group: ManagedProcessGroup,
     browser_host_controller_lifecycle: BrowserHostControllerLifecycle,
 }
 
@@ -958,7 +960,7 @@ impl DaemonRuntime {
         );
 
         Self::restore_ledger(&state_repository, &event_bus)?;
-        Self::persist_initial_runtime_state(
+        Self::persist_restored_runtime_state(
             &state_repository,
             &runtime_persistence,
             &workspace_store,
@@ -984,6 +986,7 @@ impl DaemonRuntime {
             governance: Arc::new(GovernanceService::default()),
             worker_runtime,
             runtime_maintenance,
+            managed_process_group: ManagedProcessGroup::new(),
             browser_host_controller_lifecycle: BrowserHostControllerLifecycle::new(),
         })
     }
@@ -1122,7 +1125,7 @@ impl DaemonRuntime {
         if cancelled_process_count > 0 {
             info!(cancelled_process_count, "daemon 关闭前已终止全部工具进程树");
         }
-        let cancelled_managed_process_count = magi_process::terminate_all_managed_processes();
+        let cancelled_managed_process_count = self.managed_process_group.terminate_all();
         if cancelled_managed_process_count > 0 {
             info!(
                 cancelled_managed_process_count,
@@ -1157,10 +1160,16 @@ impl DaemonRuntime {
     ) -> Result<ApiState, DaemonError> {
         let orchestrator = OrchestratorService::new(self.event_bus.clone());
         let mcp_connections = Arc::new(RwLock::new(HashMap::new()));
-        let model_transport =
-            Self::bridge_loopback_transport_with_env("model_bridge_loopback", bridge_env);
-        let mcp_transport =
-            Self::bridge_loopback_transport_with_env("mcp_bridge_loopback", bridge_env);
+        let model_transport = Self::bridge_loopback_transport_with_env(
+            "model_bridge_loopback",
+            bridge_env,
+            self.managed_process_group.clone(),
+        );
+        let mcp_transport = Self::bridge_loopback_transport_with_env(
+            "mcp_bridge_loopback",
+            bridge_env,
+            self.managed_process_group.clone(),
+        );
 
         // 创建带持久化路径的设置存储，并从磁盘恢复已有设置
         let settings_store = Arc::new(SettingsStore::with_persistence_path(
@@ -1378,7 +1387,8 @@ impl DaemonRuntime {
         // Use StdioMcpBridgeClient for direct MCP server connections when
         // MAGI_MCP_SERVER_COMMAND is configured, falling back to the
         // JSON-RPC subprocess loopback.
-        let direct_mcp_client = StdioMcpBridgeClient::from_env();
+        let direct_mcp_client = StdioMcpBridgeClient::from_env()
+            .map(|client| client.with_process_group(self.managed_process_group.clone()));
 
         let business_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             match model_bridge_override.clone() {
@@ -1603,6 +1613,7 @@ impl DaemonRuntime {
             self.governance.clone(),
         )
         .with_daemon_identity(self.daemon_identity.clone())
+        .with_managed_process_group(self.managed_process_group.clone())
         .with_knowledge_store(self.knowledge_store.clone())
         .with_settings_store(settings_store.clone())
         .with_appearance_library(appearance_library)
@@ -1643,6 +1654,12 @@ impl DaemonRuntime {
                             sidecars,
                             target_session_id.as_ref(),
                         ),
+                    SessionProjectionPersistMode::Delete { .. } => {
+                        repository.save_session_projection_state(durable, sidecars)
+                    }
+                    SessionProjectionPersistMode::Rename { .. } => {
+                        repository.save_session_projection_state(durable, sidecars)
+                    }
                 };
                 result.map_err(|error| {
                     ApiError::internal_assembly("session projection 持久化失败", error)
@@ -2077,15 +2094,31 @@ impl DaemonRuntime {
         event_bus: &Arc<InMemoryEventBus>,
     ) -> Result<(), DaemonError> {
         let audit_usage_ledger = state_repository.load_audit_usage_ledger()?;
+        let ledger_path = state_repository.audit_usage_ledger_path();
         event_bus.import_audit_usage_ledger_snapshot(audit_usage_ledger);
-        event_bus.set_audit_usage_ledger_persistence(state_repository.audit_usage_ledger_path());
-        if let Err(error) = event_bus.refresh_audit_usage_ledger_persistence() {
-            warn!(error = %error, "审计/用量账本初始刷新失败，后续事件仍会继续运行");
+        event_bus.set_audit_usage_ledger_persistence(ledger_path.clone());
+        if !ledger_path.exists()
+            && let Err(error) = event_bus.refresh_audit_usage_ledger_persistence()
+        {
+            warn!(error = %error, "审计/用量账本初始落盘失败，后续事件仍会继续运行");
         }
         publish_ledger_status_event(event_bus, "system-ledger-ready", "system.ledger.ready");
         Ok(())
     }
 
+    /// 恢复只加载已经提交的状态；启动阶段不得因重建内存缓存而重写全部 session。
+    fn persist_restored_runtime_state(
+        state_repository: &StateRepository,
+        runtime_persistence: &RuntimeSidecarPersistence,
+        workspace_store: &Arc<WorkspaceStore>,
+    ) -> Result<(), DaemonError> {
+        state_repository.save_workspace_durable_state(&workspace_store.durable_state())?;
+        runtime_persistence.flush_runtime_sidecars()?;
+        Ok(())
+    }
+
+    /// 仅用于测试 fixture：fixture 在内存中创建了全新的 session，必须显式建立 projection。
+    #[cfg(test)]
     fn persist_initial_runtime_state(
         state_repository: &StateRepository,
         runtime_persistence: &RuntimeSidecarPersistence,
@@ -2100,9 +2133,11 @@ impl DaemonRuntime {
     fn bridge_loopback_transport_with_env(
         binary_name: &str,
         bridge_env: &[(&str, &str)],
+        process_group: ManagedProcessGroup,
     ) -> Arc<dyn BridgeTransport> {
         let transport = bridge_env.iter().fold(
-            JsonRpcStdioTransport::new(Self::bridge_loopback_executable(binary_name)),
+            JsonRpcStdioTransport::new(Self::bridge_loopback_executable(binary_name))
+                .with_process_group(process_group),
             |transport, (key, value)| transport.with_env(*key, *value),
         );
         Arc::new(transport)
@@ -2447,7 +2482,7 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
-        sync::{Arc, Mutex, MutexGuard, RwLock, mpsc},
+        sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, mpsc},
         thread::{self, JoinHandle},
         time::{Duration, Instant},
     };
@@ -3278,6 +3313,55 @@ done
     }
 
     #[test]
+    fn restore_does_not_rewrite_existing_session_projection_or_ledger() {
+        let state_root = temp_state_root("restore-without-rewrite");
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+
+        let fixture = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("test fixture should create a persisted session");
+        drop(fixture);
+
+        let projection_path = fs::read_dir(state_root.join("session-projections"))
+            .expect("session projection directory should exist")
+            .map(|entry| {
+                entry
+                    .expect("session projection entry should be readable")
+                    .path()
+            })
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("fixture should persist a session projection");
+        let ledger_path = state_root.join("audit-usage-ledger.json");
+        let projection_modified = fs::metadata(&projection_path)
+            .expect("session projection metadata should exist")
+            .modified()
+            .expect("session projection mtime should exist");
+        let ledger_modified = fs::metadata(&ledger_path)
+            .expect("ledger metadata should exist")
+            .modified()
+            .expect("ledger mtime should exist");
+
+        std::thread::sleep(Duration::from_millis(30));
+        DaemonRuntime::restore(&config).expect("persisted runtime should restore");
+
+        assert_eq!(
+            fs::metadata(&projection_path)
+                .expect("session projection should remain")
+                .modified()
+                .expect("session projection mtime should remain"),
+            projection_modified,
+            "恢复已有 session 不应重写 projection"
+        );
+        assert_eq!(
+            fs::metadata(&ledger_path)
+                .expect("ledger should remain")
+                .modified()
+                .expect("ledger mtime should remain"),
+            ledger_modified,
+            "恢复已有账本不应重复重写"
+        );
+    }
+
+    #[test]
     fn restore_persists_authoritative_path_ref_for_legacy_workspace_state() {
         let state_root = temp_state_root("legacy-workspace-path");
         let workspace_root = state_root.join("legacy-workspace");
@@ -3656,10 +3740,40 @@ done
             .collect()
     }
 
+    fn ensure_test_bridge_binaries_built() {
+        static BUILD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+        let result = BUILD_RESULT.get_or_init(|| {
+            let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let output = magi_process::std_command(cargo)
+                .args(["build", "-p", "magi-bridge-client", "--bins", "--locked"])
+                .current_dir(workspace_root)
+                .output()
+                .map_err(|error| format!("failed to build bridge binaries: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "failed to build bridge binaries (status {}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        });
+
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    }
+
     fn test_bridge_binary_path(binary_name: &str) -> PathBuf {
         let env_key = format!("CARGO_BIN_EXE_{binary_name}");
         if let Some(path) = std::env::var_os(&env_key) {
-            return PathBuf::from(path);
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return path;
+            }
         }
 
         let mut path = std::env::current_exe().expect("current exe should exist");
@@ -3668,6 +3782,9 @@ done
             path.pop();
         }
         path.push(format!("{binary_name}{}", std::env::consts::EXE_SUFFIX));
+        if !path.is_file() {
+            ensure_test_bridge_binaries_built();
+        }
         path
     }
 
@@ -5328,15 +5445,9 @@ done
             );
         }
 
-        // Bind a port, capture the address, then drop the listener so nothing
-        // is listening — any connection attempt will be refused.
-        let unreachable_address = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind should succeed");
-            let address = listener.local_addr().expect("bound address should exist");
-            drop(listener);
-            address
-        };
-        let unreachable_url = format!("http://{unreachable_address}/v1");
+        // TCP port 0 不能作为远端监听端口。使用它能稳定得到连接失败，而不是先
+        // 释放一个临时端口再让并行测试或其他进程重新占用该地址。
+        let unreachable_url = "http://127.0.0.1:0/v1";
 
         let state_root = temp_state_root("router-bridge-cutover-env-transport-failure");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
@@ -5345,7 +5456,7 @@ done
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
-                ("MAGI_OPENAI_COMPAT_BASE_URL", unreachable_url.as_str()),
+                ("MAGI_OPENAI_COMPAT_BASE_URL", unreachable_url),
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
                 ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
@@ -5373,8 +5484,8 @@ done
             "transport failure cutover snapshot should include bridge and provider checks: {snapshot:?}"
         );
         assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["model_provider_transport_failed"],
-            2
+            snapshot["blocking_issue_counts_by_reason_code"]["model_provider_transport_failed"], 2,
+            "provider transport failures should be counted by their provider reason code across bridge and direct HTTP checks: {snapshot:?}"
         );
         assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["model"], 2);
         assert!(

@@ -2,7 +2,7 @@ use crate::types::{
     BridgeErrorLayer, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     BridgeTransportResponse,
 };
-use magi_process::{spawn_managed, std_command};
+use magi_process::{ManagedProcessGroup, spawn_managed, std_command};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -19,6 +19,7 @@ pub struct JsonRpcStdioTransportConfig {
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+    pub process_group: Option<ManagedProcessGroup>,
 }
 
 impl JsonRpcStdioTransportConfig {
@@ -28,6 +29,7 @@ impl JsonRpcStdioTransportConfig {
             args: Vec::new(),
             working_directory: None,
             env: BTreeMap::new(),
+            process_group: None,
         }
     }
 }
@@ -58,6 +60,11 @@ impl JsonRpcStdioTransport {
         self.config.env.insert(key.into(), value.into());
         self
     }
+
+    pub fn with_process_group(mut self, process_group: ManagedProcessGroup) -> Self {
+        self.config.process_group = Some(process_group);
+        self
+    }
 }
 
 impl BridgeTransport for JsonRpcStdioTransport {
@@ -77,10 +84,14 @@ impl BridgeTransport for JsonRpcStdioTransport {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child =
-            spawn_managed(&mut command).map_err(|error| BridgeTransportError::Transport {
-                message: format!("spawn {} failed: {error}", self.config.executable),
-            })?;
+        let spawn_result = if let Some(process_group) = self.config.process_group.as_ref() {
+            process_group.spawn(&mut command)
+        } else {
+            spawn_managed(&mut command)
+        };
+        let mut child = spawn_result.map_err(|error| BridgeTransportError::Transport {
+            message: format!("spawn {} failed: {error}", self.config.executable),
+        })?;
 
         let mut stdin = child
             .take_stdin()

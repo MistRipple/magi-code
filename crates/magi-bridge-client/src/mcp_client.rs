@@ -1,7 +1,7 @@
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, McpBridgeClient, McpToolCallRequest,
 };
-use magi_process::{ManagedChild, spawn_managed, std_command};
+use magi_process::{ManagedChild, ManagedProcessGroup, spawn_managed, std_command};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -120,6 +120,7 @@ impl McpServerConfig {
 /// streams.
 pub struct StdioMcpBridgeClient {
     config: McpServerConfig,
+    process_group: Option<ManagedProcessGroup>,
     connection: Mutex<Option<McpConnection>>,
     initialized: AtomicBool,
     next_id: AtomicU64,
@@ -146,6 +147,7 @@ impl StdioMcpBridgeClient {
     pub fn new(config: McpServerConfig) -> Self {
         Self {
             config,
+            process_group: None,
             connection: Mutex::new(None),
             initialized: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
@@ -157,6 +159,11 @@ impl StdioMcpBridgeClient {
     /// Returns `None` if `MAGI_MCP_SERVER_COMMAND` is not set.
     pub fn from_env() -> Option<Self> {
         McpServerConfig::from_env().map(Self::new)
+    }
+
+    pub fn with_process_group(mut self, process_group: ManagedProcessGroup) -> Self {
+        self.process_group = Some(process_group);
+        self
     }
 
     /// Returns the list of tools exposed by the connected MCP server.
@@ -213,7 +220,12 @@ impl StdioMcpBridgeClient {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = spawn_managed(&mut cmd).map_err(|error| {
+        let spawn_result = if let Some(process_group) = self.process_group.as_ref() {
+            process_group.spawn(&mut cmd)
+        } else {
+            spawn_managed(&mut cmd)
+        };
+        let mut child = spawn_result.map_err(|error| {
             mcp_transport_error(format!(
                 "spawn MCP server {} failed: {error}",
                 self.config.command
@@ -747,6 +759,13 @@ impl McpServerClient {
 
     pub fn from_stdio(config: McpServerConfig) -> Self {
         Self::Stdio(StdioMcpBridgeClient::new(config))
+    }
+
+    pub fn with_process_group(self, process_group: ManagedProcessGroup) -> Self {
+        match self {
+            Self::Stdio(client) => Self::Stdio(client.with_process_group(process_group)),
+            Self::StreamableHttp(client) => Self::StreamableHttp(client),
+        }
     }
 
     pub fn list_tools(&self) -> Result<Vec<McpToolInfo>, BridgeClientError> {

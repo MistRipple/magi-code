@@ -56,12 +56,12 @@ pub struct ToolExecutionContext {
     pub access_profile: magi_core::AccessProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
-    /// 当前模型轮次收到的浏览器能力快照 revision。
+    /// 当前模型轮次捕获的浏览器能力快照。
     ///
-    /// 浏览器工具目录与执行校验必须使用同一 revision；该值由对话运行时在
-    /// 每次模型调用前捕获，不能在工具执行时重新读取最新 revision。
+    /// 该快照只在当前 Turn 内使用；执行阶段不得用实时 Host revision 替换或
+    /// 比较它。实时 Host 状态只用于判断当前连接是否仍可执行。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub browser_capability_revision: Option<u64>,
+    pub browser_capability_snapshot: Option<magi_browser_authority::BrowserCapabilitySnapshot>,
     /// 一次浏览器自动化流程的稳定执行标识。
     ///
     /// 同一用户轮次或任务中的所有浏览器工具调用必须携带同一值，浏览器运行时

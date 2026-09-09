@@ -92,13 +92,13 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /function workspaceBindingPath\(workspace: ComposerWorkspaceOption\)[\s\S]*?workspace\.rootPathRef\?\.trim\(\) \|\| workspace\.rootPath\.trim\(\)/,
-  '输入区工作空间绑定必须优先使用后端不透明 pathRef',
+  /function workspaceNavigationPath\(workspace: ComposerWorkspaceOption\)[\s\S]*?workspace\.rootPath\.trim\(\)/,
+  '输入区工作空间导航必须使用规范化的真实工作区路径',
 );
 assert.match(
   inputAreaSource,
-  /function selectWorkspace\([\s\S]*?navigateSession\(\{[\s\S]*?kind: 'draft'[\s\S]*?workspaceId: workspace\.workspaceId[\s\S]*?workspacePath: workspaceBindingPath\(workspace\)/,
-  '草稿态选择已有项目后必须通过统一导航事务使用权威 pathRef',
+  /function selectWorkspace\([\s\S]*?navigateSession\(\{[\s\S]*?kind: 'draft'[\s\S]*?workspaceId: workspace\.workspaceId[\s\S]*?workspacePath: workspaceNavigationPath\(workspace\)/,
+  '草稿态选择已有项目后必须通过统一导航事务使用规范化工作区路径',
 );
 assert.match(
   shellSource,
@@ -107,18 +107,18 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function registerWorkspaceRoot\(rootPath: string, openDraft: boolean\)[\s\S]*?if \(openDraft\)[\s\S]*?navigateSession\(\{[\s\S]*?kind: 'draft'[\s\S]*?workspaceId: addedWorkspace\.workspaceId[\s\S]*?workspacePath: workspaceBindingPath\(addedWorkspace\)/,
-  '共享工作区注册流程必须通过统一导航事务打开新工作区草稿',
+  /async function registerWorkspaceRoot\(rootPath: string\)[\s\S]*?workspaceId === registration\.workspaceId[\s\S]*?navigateSession\(\{[\s\S]*?kind: 'draft'[\s\S]*?workspaceId: addedWorkspace\.workspaceId[\s\S]*?workspacePath: workspaceNavigationPath\(addedWorkspace\)[\s\S]*?waitForSessionNavigation\(navigation\)/,
+  '共享工作区注册流程必须以服务端返回的 workspaceId 为权威身份，并等待统一导航事务完成',
 );
 assert.match(
   shellSource,
-  /handleFolderSelected[\s\S]*?registerWorkspaceRoot\(normalizedRootPath, onboardingOrigin === 'composer'\)/,
-  '目录选择器必须通过显式草稿参数复用唯一工作区注册流程',
+  /handleFolderSelected[\s\S]*?registerWorkspaceRoot\(normalizedRootPath\)/,
+  '目录选择器必须复用唯一工作区注册并绑定当前会话流程',
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?const workspacePath = workspaceBindingPath\(workspace\)[\s\S]*?navigateSession\(\{ kind: 'draft', scope: 'workspace', workspaceId, workspacePath \}\)/,
-  '工作空间快捷新会话必须使用权威 pathRef 进入统一导航事务',
+  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?const workspacePath = workspaceNavigationPath\(workspace\)[\s\S]*?navigateSession\(\{ kind: 'draft', scope: 'workspace', workspaceId, workspacePath \}\)/,
+  '工作空间快捷新会话必须使用规范化工作区路径进入统一导航事务',
 );
 assert.match(
   shellSource,

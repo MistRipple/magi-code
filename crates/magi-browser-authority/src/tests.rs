@@ -491,6 +491,10 @@ fn primary_surface_acceptance_restores_only_the_current_navigation() {
     let suspended = authority
         .transition_tab(&suspended_tab_id, BrowserTabLifecycle::Suspended, at(6))
         .expect("ready tab should become suspended");
+    assert_eq!(
+        suspended.navigation_revision, 0,
+        "挂起只改变运行时可用性，不得伪造新的页面导航代次"
+    );
     let before_restore = authority
         .session(&browser_session_id)
         .expect("session should exist")
@@ -582,6 +586,103 @@ fn primary_surface_acceptance_restores_only_the_current_navigation() {
         .expect("old navigation surface should be ignored");
     assert!(!accepted);
     assert_eq!(current.navigation_revision, 1);
+}
+
+#[test]
+fn suspending_tab_preserves_navigation_revision_for_surface_rebinding() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .apply_host_page_state(
+            &tab_id,
+            1,
+            "https://example.com/".to_string(),
+            Some("https://example.com".to_string()),
+            "Example".to_string(),
+            at(6),
+        )
+        .expect("页面状态应推进导航代次");
+    let mut surface = binding(&tab_id, "surface-rebind", 1);
+    surface.navigation_revision = 1;
+    authority
+        .set_primary_surface(surface.clone(), at(7))
+        .expect("当前 Surface 应绑定");
+
+    let suspended = authority
+        .transition_tab(&tab_id, BrowserTabLifecycle::Suspended, at(8))
+        .expect("Ready Tab 应进入 Suspended");
+    assert_eq!(suspended.navigation_revision, 1);
+
+    let (accepted, restored, revoked) = authority
+        .accept_primary_surface(surface.clone(), at(9))
+        .expect("重连时应接受原页面的真实 Surface");
+    assert!(accepted);
+    assert!(revoked.is_empty());
+    assert_eq!(restored.lifecycle, BrowserTabLifecycle::Ready);
+    assert_eq!(restored.navigation_revision, 1);
+    assert_eq!(authority.primary_surface(&tab_id), Some(&surface));
+}
+
+#[test]
+fn runtime_recovery_preserves_navigation_revision_for_replayed_surface() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .apply_host_page_state(
+            &tab_id,
+            1,
+            "https://example.com/".to_string(),
+            Some("https://example.com".to_string()),
+            "Example".to_string(),
+            at(6),
+        )
+        .expect("页面状态应推进导航代次");
+    let mut surface = binding(&tab_id, "surface-recovery", 1);
+    surface.navigation_revision = 1;
+    authority
+        .set_primary_surface(surface.clone(), at(7))
+        .expect("当前 Surface 应绑定");
+
+    authority.begin_runtime_recovery(at(8));
+    let recovering_tab = authority.tab(&tab_id).expect("Tab 应保留");
+    assert_eq!(recovering_tab.lifecycle, BrowserTabLifecycle::Suspended);
+    assert_eq!(recovering_tab.navigation_revision, 1);
+
+    let (accepted, restored, revoked) = authority
+        .accept_primary_surface(surface.clone(), at(9))
+        .expect("运行时恢复应接受仍指向当前页面的 Surface");
+    assert!(accepted);
+    assert!(revoked.is_empty());
+    assert_eq!(restored.lifecycle, BrowserTabLifecycle::Ready);
+    assert_eq!(restored.navigation_revision, 1);
+}
+
+#[test]
+fn durable_restore_suspends_tabs_without_changing_navigation_revision() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .apply_host_page_state(
+            &tab_id,
+            1,
+            "https://example.com/".to_string(),
+            Some("https://example.com".to_string()),
+            "Example".to_string(),
+            at(6),
+        )
+        .expect("页面状态应推进导航代次");
+
+    let restored = BrowserAuthority::restore(authority.snapshot(), at(7))
+        .expect("持久化恢复应成功");
+    let tab = restored.tab(&tab_id).expect("恢复后 Tab 应存在");
+    assert_eq!(tab.lifecycle, BrowserTabLifecycle::Suspended);
+    assert_eq!(tab.navigation_revision, 1);
 }
 
 #[test]

@@ -510,6 +510,7 @@ await withGoldenViteServer(async (server) => {
       viewportWidth: 1440,
       sidebarWidth: 320,
       previewPanelWidth: 320,
+      sidebarVisible: true,
     }),
     {
       sidebarDrawer: false,
@@ -524,6 +525,7 @@ await withGoldenViteServer(async (server) => {
       viewportWidth: 1100,
       sidebarWidth: 240,
       previewPanelWidth: 320,
+      sidebarVisible: true,
     }),
     {
       sidebarDrawer: false,
@@ -538,13 +540,14 @@ await withGoldenViteServer(async (server) => {
       viewportWidth: 930,
       sidebarWidth: 240,
       previewPanelWidth: 320,
+      sidebarVisible: true,
     }),
     {
       sidebarDrawer: false,
-      previewOverlay: false,
+      previewOverlay: true,
       panelsCanCoexist: false,
     },
-    'narrow tablet should keep the browser split while temporarily suppressing the sidebar',
+    'narrow tablet should use a workbench-local browser overlay without suppressing the sidebar',
   );
 
   assert.deepEqual(
@@ -569,8 +572,8 @@ await withGoldenViteServer(async (server) => {
       sidebarDrawerOpen: false,
       rightPaneOpen: true,
     }),
-    { sidebarVisible: false, rightPaneVisible: true },
-    'compact mode should temporarily suppress the preferred left pane while the right pane is open',
+    { sidebarVisible: true, rightPaneVisible: true },
+    'right pane width must not implicitly suppress the preferred left pane',
   );
 
   assert.deepEqual(
@@ -629,8 +632,8 @@ await withGoldenViteServer(async (server) => {
       rightPaneOpen: true,
       previewOverlay: false,
     }),
-    { minWidth: 320, maxWidth: 808 },
-    'browser focus width should use the full workbench after the sidebar yields space',
+    { minWidth: 320, maxWidth: 480 },
+    'browser width must reserve the sidebar and conversation minimum together',
   );
 
   assert.deepEqual(

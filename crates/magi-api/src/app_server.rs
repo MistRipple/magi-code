@@ -1386,6 +1386,7 @@ async fn execute_browser_tool(
             ErrorObject::new(ERROR_SESSION_NOT_FOUND, "会话不存在"),
         );
     }
+    let browser_capability_snapshot = state.browser_capability_snapshot(Some(&session_id));
     let call_id = params
         .call_id
         .filter(|value| !value.trim().is_empty())
@@ -1403,18 +1404,13 @@ async fn execute_browser_tool(
     let workspace_id = params
         .workspace_id
         .map(|value| WorkspaceId::new(value.trim()));
-    let capability_revision = params.browser_capability_revision.unwrap_or_else(|| {
-        state
-            .browser_capability_snapshot(Some(&session_id))
-            .revision
-    });
     let context = magi_tool_runtime::ToolExecutionContext {
         session_id: Some(session_id.clone()),
         workspace_id,
         task_id: params.task_id.map(magi_core::TaskId::new),
         worker_id: params.worker_id.map(magi_core::WorkerId::new),
         access_profile: browser_access_profile(params.access_profile),
-        browser_capability_revision: Some(capability_revision),
+        browser_capability_snapshot: Some(browser_capability_snapshot),
         browser_execution_id: params.browser_execution_id,
         ..magi_tool_runtime::ToolExecutionContext::default()
     };

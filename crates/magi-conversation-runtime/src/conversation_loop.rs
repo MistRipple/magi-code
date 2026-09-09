@@ -33,7 +33,7 @@ use crate::tool_result_utils::{
 };
 use crate::tool_surface_state::{
     BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput, activate_skill_tool_definitions,
-    activated_skill_id_from_tool_result, refresh_live_browser_tool_definitions,
+    activated_skill_id_from_tool_result, build_browser_tool_surface,
     refresh_live_mcp_tool_definitions_with_mode,
 };
 use crate::{
@@ -1155,6 +1155,14 @@ fn run_conversation_loop_inner(
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
     let mut deferred_mcp_tools_loaded = false;
+    let task_access_profile = task
+        .policy_snapshot
+        .as_ref()
+        .map(magi_core::TaskPolicy::effective_access_profile)
+        .unwrap_or_default();
+    let task_browser_capability = tool_registry.and_then(|registry| {
+        registry.browser_capability_snapshot(task_access_profile, Some(session_id))
+    });
     let mut tool_call_records = if recovery_history {
         tool_call_records_from_thread_history(&thread_history_snapshot)
     } else {
@@ -1332,7 +1340,7 @@ fn run_conversation_loop_inner(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
         );
-        let mut browser_capability_revision = None;
+        let mut browser_capability_snapshot = task_browser_capability.clone();
         if let Some(registry) = tool_registry {
             let policy = task.policy_snapshot.as_ref();
             let access_profile = policy
@@ -1344,7 +1352,7 @@ fn run_conversation_loop_inner(
             let denied_tools = policy
                 .map(|policy| policy.denied_tools.as_slice())
                 .unwrap_or_default();
-            let browser_surface = refresh_live_browser_tool_definitions(
+            let browser_surface = build_browser_tool_surface(
                 active_tools,
                 registry,
                 BrowserToolSurfaceContext::new(
@@ -1353,11 +1361,11 @@ fn run_conversation_loop_inner(
                     access_profile,
                     allowed_tools,
                     denied_tools,
-                    Some(session_id),
                 ),
+                browser_capability_snapshot.clone(),
             );
             active_tools = browser_surface.definitions;
-            browser_capability_revision = browser_surface.capability_revision;
+            browser_capability_snapshot = browser_surface.capability;
             active_tools =
                 refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
                     definitions: active_tools,
@@ -2581,7 +2589,7 @@ fn run_conversation_loop_inner(
             workspace_id,
             workspace_root_path.as_ref(),
             turn_visibility.worker_id(),
-            browser_capability_revision,
+            browser_capability_snapshot,
             &valid_tool_calls,
             &mut tool_execution_ledger,
             Some(&tool_progress_callback),

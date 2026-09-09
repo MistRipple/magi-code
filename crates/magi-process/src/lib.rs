@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
     sync::{
-        Mutex, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -24,8 +24,6 @@ use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-#[cfg(windows)]
-use std::sync::Arc;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -39,11 +37,11 @@ const LOGIN_ENVIRONMENT_MAX_BYTES: u64 = 1024 * 1024;
 
 static PROCESS_ENVIRONMENT: OnceLock<RwLock<ProcessEnvironment>> = OnceLock::new();
 static NEXT_MANAGED_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
-static ACTIVE_MANAGED_PROCESSES: OnceLock<Mutex<BTreeMap<u64, ManagedProcessTerminator>>> =
-    OnceLock::new();
+static DEFAULT_MANAGED_PROCESS_GROUP: OnceLock<ManagedProcessGroup> = OnceLock::new();
 
 pub struct ManagedChild {
     child: Child,
+    process_group: Arc<ManagedProcessRegistry>,
     registration_id: u64,
     #[cfg(windows)]
     job_handle: Arc<WindowsJobHandle>,
@@ -51,6 +49,7 @@ pub struct ManagedChild {
 
 pub struct AsyncManagedChild {
     child: tokio::process::Child,
+    process_group: Arc<ManagedProcessRegistry>,
     registration_id: u64,
     #[cfg(windows)]
     job_handle: Arc<WindowsJobHandle>,
@@ -59,12 +58,28 @@ pub struct AsyncManagedChild {
 #[cfg(windows)]
 struct WindowsJobHandle(isize);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ManagedProcessTerminator {
     #[cfg(unix)]
     process_group_id: u32,
     #[cfg(windows)]
     job_handle: Arc<WindowsJobHandle>,
+}
+
+/// 一组具有相同生命周期边界的受管进程。
+///
+/// Desktop/daemon 可能在同一宿主进程内被测试或嵌入多次。进程注册表必须属于
+/// 具体的生命周期所有者，关闭一个 owner 只能终止它创建的子进程，不能误杀其他
+/// owner 正在使用的桥接、MCP 或工具进程。默认工厂仍保留进程级组，供没有显式
+/// 生命周期对象的旧调用方使用。
+#[derive(Clone, Debug)]
+pub struct ManagedProcessGroup {
+    inner: Arc<ManagedProcessRegistry>,
+}
+
+#[derive(Debug, Default)]
+struct ManagedProcessRegistry {
+    processes: Mutex<BTreeMap<u64, ManagedProcessTerminator>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,85 +204,172 @@ pub fn tokio_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
 /// Unix 使用独立进程组，Windows 使用 Job Object。调用方停止会话、关闭服务或释放
 /// 进程句柄时，都能终止该命令派生的完整进程树，而不是只终止最外层 Shell。
 pub fn spawn_managed(command: &mut Command) -> io::Result<ManagedChild> {
-    prepare_managed_std_command(command);
-    let child = command.spawn()?;
-    #[cfg(windows)]
-    let (child, job_handle) = {
-        let mut child = child;
-        let job_handle = match WindowsJobHandle::assign_std_child(&child).map(Arc::new) {
-            Ok(job_handle) => job_handle,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        if let Err(error) = resume_windows_process(child.id()) {
-            let _ = job_handle.terminate();
-            let _ = child.wait();
-            return Err(error);
-        }
-        (child, job_handle)
-    };
-    #[cfg(unix)]
-    let registration_id = register_managed_process(ManagedProcessTerminator {
-        process_group_id: child.id(),
-    });
-    #[cfg(windows)]
-    let registration_id = register_managed_process(ManagedProcessTerminator {
-        job_handle: job_handle.clone(),
-    });
-    Ok(ManagedChild {
-        child,
-        registration_id,
-        #[cfg(windows)]
-        job_handle,
-    })
+    default_managed_process_group().spawn(command)
+}
+
+/// 启动一个属于指定生命周期组、可整体终止子进程树的同步进程。
+pub fn spawn_managed_in_group(
+    process_group: &ManagedProcessGroup,
+    command: &mut Command,
+) -> io::Result<ManagedChild> {
+    process_group.spawn(command)
 }
 
 /// 启动一个可整体终止子进程树的异步进程。
 pub fn spawn_managed_tokio(command: &mut tokio::process::Command) -> io::Result<AsyncManagedChild> {
-    prepare_managed_std_command(command.as_std_mut());
-    let child = command.spawn()?;
-    #[cfg(windows)]
-    let (child, job_handle) = {
-        let mut child = child;
-        let job_handle = match WindowsJobHandle::assign_tokio_child(&child).map(Arc::new) {
-            Ok(job_handle) => job_handle,
-            Err(error) => {
+    default_managed_process_group().spawn_tokio(command)
+}
+
+/// 启动一个属于指定生命周期组、可整体终止子进程树的异步进程。
+pub fn spawn_managed_tokio_in_group(
+    process_group: &ManagedProcessGroup,
+    command: &mut tokio::process::Command,
+) -> io::Result<AsyncManagedChild> {
+    process_group.spawn_tokio(command)
+}
+
+impl ManagedProcessGroup {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ManagedProcessRegistry::default()),
+        }
+    }
+
+    pub fn spawn(&self, command: &mut Command) -> io::Result<ManagedChild> {
+        prepare_managed_std_command(command);
+        let child = command.spawn()?;
+        #[cfg(windows)]
+        let (child, job_handle) = {
+            let mut child = child;
+            let job_handle = match WindowsJobHandle::assign_std_child(&child).map(Arc::new) {
+                Ok(job_handle) => job_handle,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = resume_windows_process(child.id()) {
+                let _ = job_handle.terminate();
+                let _ = child.wait();
+                return Err(error);
+            }
+            (child, job_handle)
+        };
+        #[cfg(unix)]
+        let registration_id = register_managed_process(
+            &self.inner,
+            ManagedProcessTerminator {
+                process_group_id: child.id(),
+            },
+        );
+        #[cfg(windows)]
+        let registration_id = register_managed_process(
+            &self.inner,
+            ManagedProcessTerminator {
+                job_handle: job_handle.clone(),
+            },
+        );
+        Ok(ManagedChild {
+            child,
+            process_group: Arc::clone(&self.inner),
+            registration_id,
+            #[cfg(windows)]
+            job_handle,
+        })
+    }
+
+    pub fn spawn_tokio(
+        &self,
+        command: &mut tokio::process::Command,
+    ) -> io::Result<AsyncManagedChild> {
+        prepare_managed_std_command(command.as_std_mut());
+        let child = command.spawn()?;
+        #[cfg(windows)]
+        let (child, job_handle) = {
+            let mut child = child;
+            let job_handle = match WindowsJobHandle::assign_tokio_child(&child).map(Arc::new) {
+                Ok(job_handle) => job_handle,
+                Err(error) => {
+                    let _ = child.start_kill();
+                    return Err(error);
+                }
+            };
+            let process_id = child.id().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "异步子进程在恢复执行前已退出")
+            })?;
+            if let Err(error) = resume_windows_process(process_id) {
+                let _ = job_handle.terminate();
                 let _ = child.start_kill();
                 return Err(error);
             }
+            (child, job_handle)
         };
-        let process_id = child.id().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "异步子进程在恢复执行前已退出")
-        })?;
-        if let Err(error) = resume_windows_process(process_id) {
-            let _ = job_handle.terminate();
-            let _ = child.start_kill();
-            return Err(error);
-        }
-        (child, job_handle)
-    };
-    #[cfg(unix)]
-    let registration_id = register_managed_process(ManagedProcessTerminator {
-        process_group_id: child.id().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "异步子进程在注册受管进程前已退出",
-            )
-        })?,
-    });
-    #[cfg(windows)]
-    let registration_id = register_managed_process(ManagedProcessTerminator {
-        job_handle: job_handle.clone(),
-    });
-    Ok(AsyncManagedChild {
-        child,
-        registration_id,
+        #[cfg(unix)]
+        let registration_id = register_managed_process(
+            &self.inner,
+            ManagedProcessTerminator {
+                process_group_id: child.id().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "异步子进程在注册受管进程前已退出",
+                    )
+                })?,
+            },
+        );
         #[cfg(windows)]
-        job_handle,
-    })
+        let registration_id = register_managed_process(
+            &self.inner,
+            ManagedProcessTerminator {
+                job_handle: job_handle.clone(),
+            },
+        );
+        Ok(AsyncManagedChild {
+            child,
+            process_group: Arc::clone(&self.inner),
+            registration_id,
+            #[cfg(windows)]
+            job_handle,
+        })
+    }
+
+    pub fn terminate_all(&self) -> usize {
+        let processes = {
+            let mut registry = self
+                .inner
+                .processes
+                .lock()
+                .expect("managed process registry lock poisoned");
+            std::mem::take(&mut *registry)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
+        let count = processes.len();
+
+        #[cfg(unix)]
+        {
+            for process in &processes {
+                let _ = terminate_unix_process_tree(process.process_group_id);
+            }
+        }
+
+        #[cfg(windows)]
+        for process in &processes {
+            let _ = process.job_handle.terminate();
+        }
+
+        count
+    }
+}
+
+impl Default for ManagedProcessGroup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn default_managed_process_group() -> &'static ManagedProcessGroup {
+    DEFAULT_MANAGED_PROCESS_GROUP.get_or_init(ManagedProcessGroup::new)
 }
 
 impl ManagedChild {
@@ -315,7 +417,7 @@ impl ManagedChild {
     }
 
     fn unregister(&mut self) {
-        unregister_managed_process(self.registration_id);
+        unregister_managed_process(&self.process_group, self.registration_id);
         self.registration_id = 0;
     }
 }
@@ -377,7 +479,7 @@ impl AsyncManagedChild {
     }
 
     fn unregister(&mut self) {
-        unregister_managed_process(self.registration_id);
+        unregister_managed_process(&self.process_group, self.registration_id);
         self.registration_id = 0;
     }
 }
@@ -389,24 +491,25 @@ impl Drop for AsyncManagedChild {
     }
 }
 
-fn active_managed_processes() -> &'static Mutex<BTreeMap<u64, ManagedProcessTerminator>> {
-    ACTIVE_MANAGED_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn register_managed_process(terminator: ManagedProcessTerminator) -> u64 {
+fn register_managed_process(
+    process_group: &Arc<ManagedProcessRegistry>,
+    terminator: ManagedProcessTerminator,
+) -> u64 {
     let registration_id = NEXT_MANAGED_PROCESS_ID.fetch_add(1, Ordering::Relaxed);
-    active_managed_processes()
+    process_group
+        .processes
         .lock()
         .expect("managed process registry lock poisoned")
         .insert(registration_id, terminator);
     registration_id
 }
 
-fn unregister_managed_process(registration_id: u64) {
+fn unregister_managed_process(process_group: &Arc<ManagedProcessRegistry>, registration_id: u64) {
     if registration_id == 0 {
         return;
     }
-    active_managed_processes()
+    process_group
+        .processes
         .lock()
         .expect("managed process registry lock poisoned")
         .remove(&registration_id);
@@ -417,29 +520,7 @@ fn unregister_managed_process(registration_id: u64) {
 /// daemon 优雅退出和异常收口都调用此入口，覆盖工具 Shell、后台进程、MCP、Tunnel、
 /// Vite 以及一次性本地执行器，避免某条调用栈阻塞时留下孤儿进程。
 pub fn terminate_all_managed_processes() -> usize {
-    let processes = {
-        let mut registry = active_managed_processes()
-            .lock()
-            .expect("managed process registry lock poisoned");
-        std::mem::take(&mut *registry)
-            .into_values()
-            .collect::<Vec<_>>()
-    };
-    let count = processes.len();
-
-    #[cfg(unix)]
-    {
-        for process in &processes {
-            let _ = terminate_unix_process_tree(process.process_group_id);
-        }
-    }
-
-    #[cfg(windows)]
-    for process in &processes {
-        let _ = process.job_handle.terminate();
-    }
-
-    count
+    default_managed_process_group().terminate_all()
 }
 
 fn prepare_managed_std_command(command: &mut Command) {
@@ -1009,12 +1090,12 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use super::{
+        ManagedProcessGroup, initialize_user_process_environment, spawn_managed,
+        spawn_managed_tokio, std_command, tokio_command,
+    };
     #[cfg(unix)]
     use super::{environment_overrides, unix_process_alive};
-    use super::{
-        initialize_user_process_environment, spawn_managed, spawn_managed_tokio, std_command,
-        tokio_command,
-    };
 
     #[cfg(unix)]
     fn configure_long_running_std_command(command: &mut std::process::Command) {
@@ -1084,6 +1165,37 @@ mod tests {
 
         managed.terminate().expect("managed tree should terminate");
         assert!(!unix_process_alive(descendant_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_process_groups_do_not_terminate_each_other() {
+        let first_group = ManagedProcessGroup::new();
+        let second_group = ManagedProcessGroup::new();
+        let mut first_command = std_command(super::user_shell());
+        let mut second_command = std_command(super::user_shell());
+        configure_long_running_std_command(&mut first_command);
+        configure_long_running_std_command(&mut second_command);
+
+        let first_child = first_group
+            .spawn(&mut first_command)
+            .expect("first managed child should start");
+        let mut second_child = second_group
+            .spawn(&mut second_command)
+            .expect("second managed child should start");
+        let second_pid = second_child.id();
+
+        assert_eq!(first_group.terminate_all(), 1);
+        assert!(!unix_process_alive(first_child.id()));
+        assert!(
+            unix_process_alive(second_pid),
+            "terminating one owner group must not kill another owner's process"
+        );
+
+        second_child
+            .terminate()
+            .expect("second managed child should terminate");
+        assert!(!unix_process_alive(second_pid));
     }
 
     #[cfg(windows)]

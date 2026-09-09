@@ -140,6 +140,12 @@ pub enum BrowserHostCommand {
         #[serde(default)]
         allow_page_eviction: bool,
     },
+    /// 等待逻辑 Tab 绑定当前 Renderer 内容槽，并返回真实 Chromium Surface。
+    /// 该命令是 Host 与 Authority 之间的物化事务边界，不能返回推断或伪造的
+    /// WebContents 身份。
+    EnsureSurface {
+        tab_id: BrowserTabId,
+    },
     /// 调整 Chromium 自身的设备仿真视口。原生显示区域始终由桌面父容器管理。
     SetLogicalViewport {
         tab_id: BrowserTabId,
@@ -164,6 +170,10 @@ pub enum BrowserHostCommand {
         tab_id: BrowserTabId,
         control: BrowserHostControl,
         navigation: BrowserNavigation,
+    },
+    /// 立即中断当前主文档导航，不进入同一 Tab 的普通命令队列。
+    StopNavigation {
+        tab_id: BrowserTabId,
     },
     Snapshot {
         tab_id: BrowserTabId,
@@ -217,8 +227,8 @@ pub enum BrowserHostCommand {
     HitTest {
         tab_id: BrowserTabId,
         navigation_revision: u64,
-        x: f64,
-        y: f64,
+        normalized_x: f64,
+        normalized_y: f64,
     },
     UpdateControl {
         tab_id: BrowserTabId,
@@ -295,6 +305,7 @@ pub enum BrowserNavigation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u32>,
     },
+    Stop,
     Reload {
         #[serde(default)]
         ignore_cache: bool,
@@ -379,6 +390,7 @@ pub enum BrowserHostCommandResult {
     Snapshot(BrowserHostSnapshot),
     BinaryPayload(BrowserHostBinaryPayload),
     HitTest(BrowserHostHitTest),
+    SurfaceBinding(BrowserSurfaceBinding),
     Json { value: serde_json::Value },
 }
 
@@ -539,8 +551,11 @@ pub enum BrowserHostEvent {
     },
     Download {
         tab_id: BrowserTabId,
+        download_id: String,
         suggested_filename: String,
         state: String,
+        received_bytes: u64,
+        total_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         byte_length: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -635,6 +650,51 @@ mod tests {
             })
         );
 
+        let hit_test = BrowserHostCommand::HitTest {
+            tab_id: BrowserTabId::new("tab-1"),
+            navigation_revision: 3,
+            normalized_x: 0.5,
+            normalized_y: 0.25,
+        };
+        assert_eq!(
+            serde_json::to_value(&hit_test).expect("serialize hit_test"),
+            serde_json::json!({
+                "type": "hit_test",
+                "payload": {
+                    "tab_id": "tab-1",
+                    "navigation_revision": 3,
+                    "normalized_x": 0.5,
+                    "normalized_y": 0.25
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<BrowserHostCommand>(serde_json::json!({
+                "type": "hit_test",
+                "payload": {
+                    "tab_id": "tab-1",
+                    "navigation_revision": 3,
+                    "normalized_x": 0.5,
+                    "normalized_y": 0.25
+                }
+            }))
+            .expect("deserialize hit_test"),
+            hit_test
+        );
+        assert!(
+            serde_json::from_value::<BrowserHostCommand>(serde_json::json!({
+                "type": "hit_test",
+                "payload": {
+                    "tab_id": "tab-1",
+                    "navigation_revision": 3,
+                    "x": 0.5,
+                    "y": 0.25
+                }
+            }))
+            .is_err(),
+            "hit_test must reject ambiguous CSS-coordinate fields"
+        );
+
         assert_eq!(
             serde_json::to_value(BrowserHostCommandResult::Json {
                 value: serde_json::json!({ "title": "Example" }),
@@ -653,6 +713,47 @@ mod tests {
             serde_json::json!({
                 "type": "get_logical_viewport",
                 "payload": { "tab_id": "tab-1" }
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(BrowserHostCommand::EnsureSurface {
+                tab_id: BrowserTabId::new("tab-1"),
+            })
+            .expect("serialize ensure surface"),
+            serde_json::json!({
+                "type": "ensure_surface",
+                "payload": { "tab_id": "tab-1" }
+            })
+        );
+
+        let binding = BrowserSurfaceBinding {
+            desktop_epoch: "desktop-1".to_string(),
+            window_id: "window-1".to_string(),
+            surface_id: "surface-1".to_string(),
+            surface_revision: 2,
+            tab_id: BrowserTabId::new("tab-1"),
+            web_contents_id: 42,
+            target_id: "target-1".to_string(),
+            browser_context_id: "partition-1".to_string(),
+            navigation_revision: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(BrowserHostCommandResult::SurfaceBinding(binding.clone()))
+                .expect("serialize surface binding result"),
+            serde_json::json!({
+                "type": "surface_binding",
+                "payload": {
+                    "desktop_epoch": "desktop-1",
+                    "window_id": "window-1",
+                    "surface_id": "surface-1",
+                    "surface_revision": 2,
+                    "tab_id": "tab-1",
+                    "web_contents_id": 42,
+                    "target_id": "target-1",
+                    "browser_context_id": "partition-1",
+                    "navigation_revision": 3
+                }
             })
         );
     }

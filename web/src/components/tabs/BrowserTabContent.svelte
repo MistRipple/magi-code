@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
   import { i18n } from '../../stores/i18n.svelte';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
@@ -22,8 +22,6 @@
   import { synchronizeBrowserSessionSnapshot } from '../../stores/right-pane.svelte';
   import type { MessageBrowserNodeSelection } from '../../types/message';
   import { normalizeOptionalDomNodeId } from '@magi/desktop-browser-contracts';
-  import { measureDesktopOverlayMenuBounds } from '../../lib/desktop-overlay-geometry';
-  import { toDesktopOverlayIdentity, toDesktopOverlayState } from '../../lib/desktop-overlay-state';
 
   interface Props {
     browserSessionId: string;
@@ -46,32 +44,11 @@
     navigationRevision: number;
   }
 
-  interface BrowserOverlayIdentity {
-    overlayId: string;
-    ownerId: string;
+  interface EmbeddedBrowserWebviewElement extends HTMLElement {
+    getWebContentsId(): number;
   }
 
-  interface BrowserOverlayUiSnapshot {
-    identity: BrowserOverlayIdentity | null;
-    kind: MagiDesktopOverlayState['kind'] | null;
-    annotationSelection: BrowserAnnotationSelection | null;
-    annotationComment: string;
-  }
-
-  interface PendingBrowserOverlayClose {
-    identity: BrowserOverlayIdentity;
-    confirmation: Promise<void>;
-    resolve: () => void;
-    reject: (cause: unknown) => void;
-    operation: Promise<void> | null;
-  }
-
-  interface DesktopMenuLayout {
-    state: MagiDesktopOverlayState;
-    anchor: HTMLElement;
-    itemCount: number;
-    fieldCount: number;
-  }
+  type TopLayerPopoverElement = HTMLDivElement;
 
   interface DesktopBrowserEvent {
     type?: string;
@@ -86,6 +63,12 @@
     diagnostic?: string;
     node?: DesktopInspectedNode;
     payload?: Record<string, unknown>;
+    downloadId?: string;
+    suggestedFilename?: string;
+    state?: string;
+    receivedBytes?: number;
+    totalBytes?: number | null;
+    error?: string;
   }
 
   interface DesktopInspectedNode {
@@ -122,11 +105,18 @@
     onTitleChange,
     desktopSurface = false,
   }: Props = $props();
-  // Browser Tab 的运行通道由右栏宿主显式决定。Desktop 使用 Main 进程创建的
-  // WebContentsView；右栏 DOM 只负责保留内容槽，物理 Surface 的几何由
-  // WindowManager 在同一个布局事务中计算。
+  // Browser Tab 的运行通道由右栏宿主显式决定。Desktop 使用主 Renderer
+  // 直接承载 Electron <webview>；Main 只负责控制 guest 的生命周期和 CDP，
+  // 不参与右栏几何计算。
   const desktopRuntime = $derived(desktopSurface);
   let desktopSnapshot = $state<MagiDesktopWindowSnapshot | null>(null);
+  let browserWebview = $state<EmbeddedBrowserWebviewElement | undefined>();
+  let browserToolbar = $state<HTMLDivElement | undefined>();
+  let registeredWebviewKey = '';
+  let registeredWebviewRelease: MagiDesktopEmbeddedBrowserWebviewRequest | null = null;
+  let webviewRegistered = $state(false);
+  let webviewRegistrationTimer: number | null = null;
+  let webviewRegistrationAttempts = 0;
   let snapshot = $state<BrowserSessionSnapshot | null>(null);
   let address = $state('');
   let addressEditing = $state(false);
@@ -135,10 +125,16 @@
   let sessionError = $state('');
   let actionError = $state('');
   let busy = $state(false);
-  let viewportMenuElement = $state<HTMLDivElement | undefined>();
-  let annotationMenuElement = $state<HTMLDivElement | undefined>();
+  let viewportMenuElement = $state<TopLayerPopoverElement | undefined>();
+  let annotationMenuElement = $state<TopLayerPopoverElement | undefined>();
   let viewportMenuButton = $state<HTMLButtonElement | undefined>();
   let annotationHistoryButton = $state<HTMLButtonElement | undefined>();
+  let annotationCaptureElement = $state<TopLayerPopoverElement | undefined>();
+  let annotationEditorElement = $state<TopLayerPopoverElement | undefined>();
+  let pageErrorElement = $state<TopLayerPopoverElement | undefined>();
+  let tooltipElement = $state<TopLayerPopoverElement | undefined>();
+  let tooltipAnchorElement = $state<HTMLElement | undefined>();
+  let tooltipText = $state('');
   let viewportMenuOpen = $state(false);
   let annotationMenuOpen = $state(false);
   let localViewportMode = $state<BrowserViewportMode>('auto');
@@ -153,19 +149,11 @@
   let customViewportTimer: number | null = null;
   let pendingViewport: { width: number; height: number; deviceType: BrowserDeviceType } | null = null;
   let viewportMutationGeneration = 0;
-  // 桌面端一次只允许一个原生弹层；标记编辑、标记记录和视口菜单都走同一
-  // Overlay 身份事务。ownerId 不能从当前 tab 推导替代，因为组件切换 Tab
-  // 后，旧关闭请求仍必须携带旧 owner 才能被主进程精确校验。
-  let desktopOverlayIdentity = $state<BrowserOverlayIdentity | null>(null);
-  let desktopOverlayKind = $state<MagiDesktopOverlayState['kind'] | null>(null);
-  let pendingDesktopOverlayClose: PendingBrowserOverlayClose | null = null;
-  let desktopOverlayClosing = $state(false);
-  let desktopOverlayOperations = Promise.resolve();
-  let overlayInstanceSequence = 0;
-  let desktopMenuLayout = $state<DesktopMenuLayout | null>(null);
-  let desktopMenuReflowFrame: number | null = null;
+  let latestDesktopSnapshotRevision = 0;
   let annotationSelection = $state<BrowserAnnotationSelection | null>(null);
   let annotationComment = $state('');
+  let annotationPhase = $state<'select' | 'comment' | null>(null);
+  let annotationEditor = $state<HTMLTextAreaElement | undefined>();
   let pageError = $state('');
   let nodeInspectActive = $state(false);
   let nodeInspectBusy = $state(false);
@@ -175,11 +163,43 @@
   let refreshGeneration = 0;
   let desktopSurfaceSyncGeneration = 0;
   let activeBrowserIdentityKey = '';
+  let activeDownloads = $state<MagiDesktopBrowserDownloadSnapshot[]>([]);
+
+  $effect(() => {
+    if (annotationPhase !== 'comment') return;
+    void tick().then(() => {
+      if (annotationPhase === 'comment') annotationEditor?.focus();
+    });
+  });
+
+  // Electron 的 <webview> guest 是独立的原生合成层，普通 z-index 无法
+  // 覆盖它。Popover Top Layer 仍由当前 Renderer 管理，但会被 Chromium
+  // 放到 guest 之上，因此菜单、标记选择层和工具提示不会再被网页盖住。
+  $effect(() => {
+    const popovers: Array<[TopLayerPopoverElement | undefined, boolean]> = [
+      [viewportMenuElement, viewportMenuOpen],
+      [annotationMenuElement, annotationMenuOpen],
+      [annotationCaptureElement, annotationPhase === 'select'],
+      [annotationEditorElement, annotationPhase === 'comment' && Boolean(annotationSelection)],
+      [pageErrorElement, Boolean(pageError && browserReady && !browserLoading)],
+      [tooltipElement, Boolean(tooltipText)],
+    ];
+    for (const [element, open] of popovers) {
+      if (!element) continue;
+      if (open) element.showPopover?.();
+      else element.hidePopover?.();
+    }
+  });
 
   const activeTab = $derived.by<BrowserTabSnapshot | null>(() => (
     snapshot?.tabs.find((tab) => tab.tabId === tabId && tab.lifecycle !== 'closed') ?? null
   ));
   const savedAnnotations = $derived((activeTab?.annotations ?? []).filter((annotation) => annotation.status !== 'deleted'));
+  const activeDownload = $derived.by<MagiDesktopBrowserDownloadSnapshot | null>(() => {
+    if (!desktopRuntime) return null;
+    const downloads = activeDownloads.filter((download) => download.tabId === tabId);
+    return downloads[downloads.length - 1] ?? null;
+  });
   const externalUrl = $derived(normalizeExternalWebUrl(activeTab?.url || address));
   const browserSurfaceAvailable = $derived(
     desktopRuntime
@@ -187,22 +207,22 @@
       && desktopSnapshot?.layout.activePanelKind === 'browser'
       && desktopSnapshot.layout.activeTabId === tabId
       && Boolean(desktopSnapshot?.layout.activeSurfaceId)
-      // activeSurfaceId 只代表 Main 已物化 WebContents。只有同一 Tab 的
-      // renderer_geometry 已确认真实内容槽后，原生 View 才进入可见状态；
-      // 父布局等待下一份 DOM 几何期间，Main 保留最后一份有效原生 bounds，
-      // 因此同一 Tab 不应退回“正在连接”占位态。
-      && desktopSnapshot.layout.rendererGeometry?.browserContentSlot?.tabId === tabId,
+      && webviewRegistered,
   );
-  // activeSurfaceId 由 Main 在完成物理挂载和 bounds 更新后发布。它不是
+  // activeSurfaceId 是 Main 为当前 Browser Tab 分配的逻辑页面身份。它不是
   // Authority/Worker 握手状态，也不会因页面刷新或右栏拖动而重置。
   const browserReady = $derived(browserSurfaceAvailable);
   const activeBrowserIdentity = $derived.by<BrowserInspectIdentity | null>(() => {
     const tab = activeTab;
     const surfaceId = desktopSnapshot?.layout.activeSurfaceId;
+    const navigationRevision = desktopSnapshot?.activeBrowserNavigationRevision;
     if (
       !desktopRuntime
       || !tab
       || !surfaceId
+      || typeof navigationRevision !== 'number'
+      || !Number.isSafeInteger(navigationRevision)
+      || navigationRevision < 0
       || desktopSnapshot?.layout.rightPaneVisible !== true
       || desktopSnapshot.layout.activePanelKind !== 'browser'
       || desktopSnapshot.layout.activeTabId !== tabId
@@ -210,7 +230,7 @@
     return {
       tabId,
       surfaceId,
-      navigationRevision: tab.navigationRevision,
+      navigationRevision,
     };
   });
   const error = $derived(actionError || pageError || sessionError);
@@ -230,12 +250,78 @@
     }
     if (connectionState === 'ready') {
       // 页面导航的 loading 与 BrowserSurface 连接状态是两个独立状态。
-      // WebContentsView 已经就绪时，即使页面正在请求资源，也不能把连接状态
+      // Chromium guest 已经就绪时，即使页面正在请求资源，也不能把连接状态
       // 显示成“正在连接”，否则用户会误以为内置浏览器尚未启动。
       return i18n.t('browser.status.connected');
     }
     return i18n.t('browser.status.connecting');
   });
+
+  function browserPartitionForSession(id: string): string {
+    return `magi-browser-${id.replace(/[^A-Za-z0-9._-]/gu, '_')}`;
+  }
+
+  function scheduleWebviewRegistration(delay = 0): void {
+    if (webviewRegistrationTimer !== null || webviewRegistrationAttempts >= 40) return;
+    const run = () => {
+      webviewRegistrationTimer = null;
+      registerCurrentWebview();
+    };
+    if (delay === 0) queueMicrotask(run);
+    else webviewRegistrationTimer = window.setTimeout(run, delay);
+  }
+
+  function registerCurrentWebview(): void {
+    const desktop = window.magiDesktop;
+    const identity = activeBrowserIdentity;
+    const view = browserWebview;
+    if (!desktop || !identity || !view) return;
+    let webContentsId: number;
+    try {
+      webContentsId = view.getWebContentsId();
+    } catch {
+      webviewRegistrationAttempts += 1;
+      scheduleWebviewRegistration(Math.min(250, 40 + webviewRegistrationAttempts * 5));
+      return;
+    }
+    if (!Number.isSafeInteger(webContentsId) || webContentsId <= 0) {
+      webviewRegistrationAttempts += 1;
+      scheduleWebviewRegistration(Math.min(250, 40 + webviewRegistrationAttempts * 5));
+      return;
+    }
+    const key = [identity.tabId, identity.surfaceId, identity.navigationRevision, webContentsId].join('\u0000');
+    if (registeredWebviewKey === key) return;
+    if (registeredWebviewRelease && registeredWebviewRelease.webContentsId !== webContentsId) {
+      const previousRelease = registeredWebviewRelease;
+      registeredWebviewRelease = null;
+      void desktop.releaseBrowserWebview(previousRelease).catch(() => undefined);
+    }
+    registeredWebviewKey = key;
+    webviewRegistrationAttempts = 0;
+    webviewRegistered = false;
+    void desktop.registerBrowserWebview({
+      tabId: identity.tabId,
+      browserSessionId,
+      navigationRevision: identity.navigationRevision,
+      webContentsId,
+    }).then((next) => {
+      if (registeredWebviewKey !== key) return;
+      applyDesktopViewport(next);
+      webviewRegistered = true;
+      registeredWebviewRelease = {
+        tabId: identity.tabId,
+        browserSessionId,
+        navigationRevision: identity.navigationRevision,
+        webContentsId,
+      };
+    }).catch((cause) => {
+      if (registeredWebviewKey !== key) return;
+      registeredWebviewKey = '';
+      webviewRegistered = false;
+      actionError = errorMessage(cause);
+      scheduleWebviewRegistration(250);
+    });
+  }
 
   $effect(() => {
     const tab = activeTab;
@@ -245,149 +331,6 @@
 
   function errorMessage(value: unknown): string {
     return value instanceof Error ? value.message : String(value);
-  }
-
-  function browserOverlayOwner(tab = tabId): string {
-    return `browser:${tab}`;
-  }
-
-  function nextBrowserOverlayId(kind: MagiDesktopOverlayState['kind']): string {
-    overlayInstanceSequence += 1;
-    const token = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `${Date.now()}-${overlayInstanceSequence}`;
-    return `browser-${kind}-${token}`;
-  }
-
-  function sameOverlayIdentity(
-    left: BrowserOverlayIdentity | null,
-    right: BrowserOverlayIdentity | null,
-  ): boolean {
-    return Boolean(
-      left
-      && right
-      && left.overlayId === right.overlayId
-      && left.ownerId === right.ownerId,
-    );
-  }
-
-  function captureOverlayUi(): BrowserOverlayUiSnapshot {
-    return {
-      identity: desktopOverlayIdentity
-        ? { ...desktopOverlayIdentity }
-        : null,
-      kind: desktopOverlayKind,
-      annotationSelection,
-      annotationComment,
-    };
-  }
-
-  function clearDesktopOverlayUi(expected: BrowserOverlayIdentity | null = null): void {
-    if (expected && !sameOverlayIdentity(desktopOverlayIdentity, expected)) return;
-    desktopOverlayIdentity = null;
-    desktopOverlayKind = null;
-    desktopMenuLayout = null;
-    annotationSelection = null;
-    annotationComment = '';
-  }
-
-  function restoreOverlayUi(previous: BrowserOverlayUiSnapshot): void {
-    desktopOverlayIdentity = previous.identity;
-    desktopOverlayKind = previous.kind;
-    annotationSelection = previous.annotationSelection;
-    annotationComment = previous.annotationComment;
-  }
-
-  function enqueueDesktopOverlayOperation(operation: () => Promise<void>): Promise<void> {
-    const next = desktopOverlayOperations.then(operation, operation);
-    // 每个操作自己负责把失败反映到 actionError；队列不能因一次 IPC
-    // 失败而拒绝后续的打开/关闭事务。
-    desktopOverlayOperations = next.catch(() => undefined);
-    return next;
-  }
-
-  function confirmDesktopOverlayClosed(event: MagiDesktopOverlayClosedEvent): void {
-    const current = desktopOverlayIdentity;
-    const pending = pendingDesktopOverlayClose;
-    const currentMatches = sameOverlayIdentity(current, event);
-    const pendingMatches = Boolean(pending && sameOverlayIdentity(pending.identity, event));
-    if (!currentMatches && !pendingMatches) return;
-
-    // replacement 事件确认的是旧身份的终结；即使 replacement 已经是
-    // 当前本地期望，也不能用旧事件清空新 Overlay。
-    if (currentMatches) clearDesktopOverlayUi(event);
-    if (pendingMatches && pending) {
-      pendingDesktopOverlayClose = null;
-      desktopOverlayClosing = false;
-      pending.resolve();
-    }
-  }
-
-  function openDesktopOverlay(
-    state: MagiDesktopOverlayState,
-    configure: () => void,
-  ): void {
-    const desktop = window.magiDesktop;
-    if (!desktop) return;
-    const safeState = toDesktopOverlayState(state);
-    const previousUi = captureOverlayUi();
-    const nextIdentity: BrowserOverlayIdentity = {
-      overlayId: safeState.overlayId,
-      ownerId: safeState.ownerId,
-    };
-    const pendingClose = pendingDesktopOverlayClose;
-    const waitsForClose = Boolean(pendingClose && !sameOverlayIdentity(pendingClose.identity, nextIdentity));
-    configure();
-    desktopOverlayIdentity = nextIdentity;
-    desktopOverlayKind = safeState.kind;
-
-    void enqueueDesktopOverlayOperation(async () => {
-      let closeConfirmed = !waitsForClose;
-      try {
-        if (pendingClose && waitsForClose) {
-          await pendingClose.confirmation;
-          closeConfirmed = true;
-        }
-        await desktop.openOverlay(safeState);
-      } catch (cause) {
-        if (sameOverlayIdentity(desktopOverlayIdentity, nextIdentity)) {
-          // 若新打开失败且旧 Overlay 尚未关闭，主进程仍保留旧状态，必须
-          // 恢复其完整本地上下文；旧状态已确认关闭时只能清空，不能复活。
-          if (waitsForClose && closeConfirmed) clearDesktopOverlayUi(nextIdentity);
-          else restoreOverlayUi(previousUi);
-          actionError = errorMessage(cause);
-        }
-        throw cause;
-      }
-    }).catch(() => undefined);
-  }
-
-  function scheduleDesktopMenuReflow(): void {
-    if (desktopMenuReflowFrame !== null) return;
-    desktopMenuReflowFrame = requestAnimationFrame(() => {
-      desktopMenuReflowFrame = null;
-      const desktop = window.magiDesktop;
-      const layout = desktopMenuLayout;
-      const identity = desktopOverlayIdentity;
-      if (!desktop || !layout || !identity || desktopOverlayClosing || !sameOverlayIdentity(identity, layout.state)) return;
-      const popupBounds = measureDesktopOverlayMenuBounds(layout.anchor, layout.itemCount, layout.fieldCount);
-      if (!popupBounds) return;
-      const previous = layout.state.popupBounds;
-      if (
-        previous
-        && previous.x === popupBounds.x
-        && previous.y === popupBounds.y
-        && previous.width === popupBounds.width
-        && previous.height === popupBounds.height
-      ) return;
-      const state = toDesktopOverlayState({ ...layout.state, popupBounds });
-      desktopMenuLayout = { ...layout, state };
-      void enqueueDesktopOverlayOperation(async () => {
-        await desktop.openOverlay(state);
-      }).catch((cause) => {
-        if (sameOverlayIdentity(desktopOverlayIdentity, state)) actionError = errorMessage(cause);
-      });
-    });
   }
 
   async function refreshSession(initialLoad = false): Promise<void> {
@@ -463,7 +406,7 @@
     nodeInspectBusy = false;
 
     const desktop = window.magiDesktop;
-    // 节点选中后由 Main 的一次性 Inspect 事务负责清理 Chromium Overlay。
+    // 节点选中后由 Main 的一次性 Inspect 事务负责清理 Chromium 检查态。
     // 这里仅清除 Renderer 的本地状态，不能再等待一个重复 stop 请求，
     // 否则节点采集完成后的慢 CDP 清理会把工具按钮锁成 disabled。
     if (preserveSelection || !identity || !desktop) return;
@@ -696,18 +639,32 @@
   }
 
   function applyDesktopViewport(next: MagiDesktopWindowSnapshot): void {
+    if (next.snapshotRevision < latestDesktopSnapshotRevision) return;
+    latestDesktopSnapshotRevision = next.snapshotRevision;
     desktopSnapshot = next;
+    const activeDownloadIds = new Set(
+      next.activeBrowserDownloads.map((download) => download.downloadId),
+    );
+    const terminalDownloads = activeDownloads
+      .filter((download) => (
+        !activeDownloadIds.has(download.downloadId)
+        && download.state !== 'started'
+        && download.state !== 'progressing'
+      ))
+      .slice(-8);
+    activeDownloads = [...terminalDownloads, ...next.activeBrowserDownloads];
     if (next.layout.activeTabId !== tabId || !next.activeBrowserViewport) return;
     const viewport = next.activeBrowserViewport;
     localViewportMode = viewport.mode;
-    if (viewport.mode === 'auto') return;
-    localViewport = {
-      width: viewport.width,
-      height: viewport.height,
-      deviceType: viewport.device_type,
-    };
-    if (!customViewportWidthEditing) customViewportWidthInput = String(viewport.width);
-    if (!customViewportHeightEditing) customViewportHeightInput = String(viewport.height);
+    if (viewport.mode !== 'auto') {
+      localViewport = {
+        width: viewport.width,
+        height: viewport.height,
+        deviceType: viewport.device_type,
+      };
+      if (!customViewportWidthEditing) customViewportWidthInput = String(viewport.width);
+      if (!customViewportHeightEditing) customViewportHeightInput = String(viewport.height);
+    }
   }
 
   async function synchronizeDesktopSurface(): Promise<void> {
@@ -809,352 +766,84 @@
     scheduleCustomViewportCommit(viewport, 0);
   }
 
-  function desktopViewportMenuState(popupBounds: MagiDesktopRectangle): MagiDesktopOverlayState {
-    return {
-      overlayId: nextBrowserOverlayId('menu'),
-      kind: 'menu',
-      phase: 'menu',
-      ownerId: browserOverlayOwner(),
-      placement: 'browser-viewport',
-      popupBounds,
-      title: i18n.t('browser.viewport.control'),
-      items: [
-        ...VIEWPORT_DEVICE_MODES.map((mode) => ({
-          id: `viewport:${mode.id}`,
-          label: `${i18n.t(`browser.viewport.mode.${mode.id}`)} ${mode.width} x ${mode.height}`,
-          icon: mode.id === 'narrow' ? 'smartphone' : 'monitor',
-          selected: fixedPresetSelected(mode),
-          disabled: false,
-        })),
-        {
-          id: 'viewport:auto',
-          label: i18n.t('browser.viewport.auto'),
-          icon: 'maximize',
-          selected: localViewportMode === 'auto',
-          disabled: false,
-        },
-      ],
-      fields: [
-        {
-          id: 'viewport-width',
-          label: i18n.t('browser.viewport.width'),
-          type: 'number',
-          value: customViewportWidthInput,
-          min: VIEWPORT_DIMENSION_LIMITS.width.min,
-          max: VIEWPORT_DIMENSION_LIMITS.width.max,
-        },
-        {
-          id: 'viewport-height',
-          label: i18n.t('browser.viewport.height'),
-          type: 'number',
-          value: customViewportHeightInput,
-          min: VIEWPORT_DIMENSION_LIMITS.height.min,
-          max: VIEWPORT_DIMENSION_LIMITS.height.max,
-        },
-      ],
-    };
-  }
-
-  function openDesktopViewportMenu(): void {
-    const desktop = window.magiDesktop;
-    if (!desktop || !activeTab || !browserReady || desktopOverlayIdentity || desktopOverlayClosing) return;
-    const anchor = viewportMenuButton;
-    if (!anchor) return;
-    const popupBounds = measureDesktopOverlayMenuBounds(anchor, 3, 2);
-    if (!popupBounds) return;
-    const state = desktopViewportMenuState(popupBounds);
-    openDesktopOverlay(state, () => {
-      desktopMenuLayout = {
-        state,
-        anchor,
-        itemCount: 3,
-        fieldCount: 2,
-      };
-      viewportMenuOpen = false;
-      annotationMenuOpen = false;
-    });
-  }
-
-  function openDesktopAnnotationHistory(): void {
-    const desktop = window.magiDesktop;
-    if (!desktop || !activeTab || !browserReady || desktopOverlayIdentity || desktopOverlayClosing) return;
-    const anchor = annotationHistoryButton;
-    if (!anchor) return;
-    const popupBounds = measureDesktopOverlayMenuBounds(anchor, savedAnnotations.length, 0);
-    if (!popupBounds) return;
-    const state: MagiDesktopOverlayState = {
-      overlayId: nextBrowserOverlayId('menu'),
-      kind: 'menu',
-      phase: 'menu',
-      ownerId: browserOverlayOwner(),
-      placement: 'browser-annotations',
-      popupBounds,
-      title: i18n.t('browser.annotation.history'),
-      items: savedAnnotations.map((annotation) => ({
-        id: `annotation:${annotation.annotationId}`,
-        label: annotation.comment,
-        icon: null,
-        selected: false,
-        disabled: false,
-      })),
-      fields: [],
-    };
-    openDesktopOverlay(state, () => {
-      desktopMenuLayout = {
-        state,
-        anchor,
-        itemCount: savedAnnotations.length,
-        fieldCount: 0,
-      };
-      viewportMenuOpen = false;
-      annotationMenuOpen = false;
-    });
-  }
-
   function toggleViewportMenu(): void {
-    if (!activeTab || busy || desktopOverlayClosing) return;
-    if (desktopRuntime) {
-      if (desktopOverlayIdentity) {
-        void closeDesktopOverlay().catch(() => undefined);
-        return;
-      }
-      annotationMenuOpen = false;
-      openDesktopViewportMenu();
-      return;
-    }
+    if (!activeTab || busy || !browserReady) return;
     annotationMenuOpen = false;
     viewportMenuOpen = !viewportMenuOpen;
   }
 
-  function handleDesktopViewportInput(fieldId: string, value: string): void {
-    if (fieldId === 'viewport-width') {
-      customViewportWidthEditing = true;
-      customViewportWidthInput = value;
-    } else if (fieldId === 'viewport-height') {
-      customViewportHeightEditing = true;
-      customViewportHeightInput = value;
-    } else return;
-    customViewportInputDirty = true;
-    ++viewportMutationGeneration;
-    scheduleCustomViewportUpdate();
+  function tooltipTarget(event: Event): HTMLElement | null {
+    const target = event.target;
+    return target instanceof Element
+      ? target.closest<HTMLElement>('[data-tooltip]')
+      : null;
   }
 
-  function handleDesktopMenuAction(action: MagiDesktopOverlayAction): void {
-    if (action.kind !== 'menu') return;
-    if (action.interaction === 'input') {
-      handleDesktopViewportInput(action.id, action.value ?? '');
+  function clearToolbarTooltip(): void {
+    tooltipAnchorElement?.style.removeProperty('anchor-name');
+    tooltipAnchorElement = undefined;
+    tooltipText = '';
+  }
+
+  function updateToolbarTooltip(event: Event): void {
+    const target = tooltipTarget(event);
+    const text = target?.dataset.tooltip?.trim() ?? '';
+    if (!target || !text || target.matches(':disabled')) {
+      clearToolbarTooltip();
       return;
     }
-    if (action.id === 'viewport:auto') {
-      void closeDesktopOverlay().then(() => useAutomaticViewport()).catch(() => undefined);
-      return;
+    if (tooltipAnchorElement !== target) {
+      tooltipAnchorElement?.style.removeProperty('anchor-name');
+      target.style.setProperty('anchor-name', '--browser-tooltip-anchor');
+      tooltipAnchorElement = target;
     }
-    if (action.id.startsWith('viewport:')) {
-      const mode = VIEWPORT_DEVICE_MODES.find((item) => `viewport:${item.id}` === action.id);
-      if (!mode) return;
-      void closeDesktopOverlay().then(() => useFixedViewport(mode.width, mode.height)).catch(() => undefined);
-      return;
-    }
-    if (action.id.startsWith('annotation:')) {
-      const annotation = savedAnnotations.find((item) => `annotation:${item.annotationId}` === action.id);
-      if (!annotation) return;
-      annotationMenuOpen = false;
-      void closeDesktopOverlay().then(() => {
-        window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: annotation }));
-      }).catch(() => undefined);
-    }
+    tooltipText = text;
+  }
+
+  function handleToolbarPointerOut(event: PointerEvent): void {
+    const target = tooltipTarget(event);
+    const related = event.relatedTarget;
+    if (target && related instanceof Node && target.contains(related)) return;
+    if (related instanceof Node && browserToolbar?.contains(related)) return;
+    clearToolbarTooltip();
+  }
+
+  function handleToolbarFocusOut(event: FocusEvent): void {
+    const related = event.relatedTarget;
+    if (related instanceof Node && browserToolbar?.contains(related)) return;
+    clearToolbarTooltip();
   }
 
   function openDesktopAnnotationCreation(): void {
-    const desktop = window.magiDesktop;
-    if (!desktop || !activeTab || !browserReady || desktopOverlayIdentity || desktopOverlayClosing) return;
-    const overlayId = nextBrowserOverlayId('annotation');
-    openDesktopOverlay({
-      overlayId,
-      kind: 'annotation',
-      phase: 'select',
-      ownerId: browserOverlayOwner(),
-      placement: 'browser-annotations',
-      popupBounds: null,
-      title: i18n.t('browser.annotation.title'),
-      items: [],
-      fields: [],
-    }, () => {
-      desktopMenuLayout = null;
-      annotationSelection = null;
-      annotationComment = '';
-      viewportMenuOpen = false;
-      annotationMenuOpen = false;
-    });
+    if (!activeTab || !browserReady || annotationPhase) return;
+    annotationSelection = null;
+    annotationComment = '';
+    annotationPhase = 'select';
+    viewportMenuOpen = false;
+    annotationMenuOpen = false;
   }
 
   function clampUnit(value: number): number {
     return Math.max(0, Math.min(1, value));
   }
 
-  function parseAnnotationSelection(value: string | null): BrowserAnnotationSelection | null {
-    if (!value || !activeTab) return null;
-    try {
-      const parsed = JSON.parse(value) as {
-        kind?: string;
-        x?: number;
-        y?: number;
-        rect?: Partial<BrowserNormalizedRect>;
-      };
-      const navigationRevision = activeTab.navigationRevision;
-      if (parsed.kind === 'element' && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) {
-        return {
-          kind: 'element',
-          navigationRevision,
-          x: clampUnit(Number(parsed.x)),
-          y: clampUnit(Number(parsed.y)),
-        };
-      }
-      if (parsed.kind === 'region' && parsed.rect) {
-        const rect = parsed.rect;
-        if (![rect.x, rect.y, rect.width, rect.height].every((item) => Number.isFinite(item))) return null;
-        return {
-          kind: 'region',
-          navigationRevision,
-          rect: {
-            x: clampUnit(Number(rect.x)),
-            y: clampUnit(Number(rect.y)),
-            width: clampUnit(Number(rect.width)),
-            height: clampUnit(Number(rect.height)),
-          },
-        };
-      }
-    } catch {
-      return null;
-    }
-    return null;
-  }
-
-  function openAnnotationCommentOverlay(): void {
-    const desktop = window.magiDesktop;
-    const identity = desktopOverlayIdentity;
-    if (!desktop || !identity) return;
-    openDesktopOverlay({
-      overlayId: identity.overlayId,
-      kind: 'annotation',
-      phase: 'comment',
-      ownerId: identity.ownerId,
-      placement: 'browser-annotations',
-      popupBounds: null,
-      title: i18n.t('browser.annotation.title'),
-      items: [],
-      fields: [{
-        id: 'comment',
-        label: i18n.t('browser.annotation.placeholder'),
-        type: 'text',
-        value: annotationComment,
-        min: null,
-        max: 4000,
-      }],
-    }, () => {
-      desktopMenuLayout = null;
-      // 同一身份的 select -> comment 更新失败时保留主进程的旧状态，
-      // 不伪造已关闭事件；错误由 openDesktopOverlay 统一展示。
-    });
-  }
-
-  function closeDesktopOverlay(
-    expected: BrowserOverlayIdentity | null = desktopOverlayIdentity,
-    options: { silent?: boolean } = {},
-  ): Promise<void> {
-    const desktop = window.magiDesktop;
-    if (!expected || !desktop) return Promise.resolve();
-    const existing = pendingDesktopOverlayClose;
-    if (existing && sameOverlayIdentity(existing.identity, expected)) {
-      return existing.operation ?? existing.confirmation;
-    }
-
-    let resolveConfirmation!: () => void;
-    let rejectConfirmation!: (cause: unknown) => void;
-    const confirmation = new Promise<void>((resolve, reject) => {
-      resolveConfirmation = resolve;
-      rejectConfirmation = reject;
-    });
-    const pending: PendingBrowserOverlayClose = {
-      identity: { ...expected },
-      confirmation,
-      resolve: resolveConfirmation,
-      reject: rejectConfirmation,
-      operation: null,
-    };
-    pendingDesktopOverlayClose = pending;
-    desktopOverlayClosing = true;
-
-    const operation = enqueueDesktopOverlayOperation(async () => {
-      try {
-        const response = await desktop.closeOverlay(toDesktopOverlayIdentity(pending.identity));
-        // 主进程以 overlay-closed 事件作为跨 Renderer 的提交确认；若桥接
-        // 层直接返回同一事件，也可作为同一确认，不重复等待广播。
-        if (response && sameOverlayIdentity(response, pending.identity)) {
-          confirmDesktopOverlayClosed(response);
-        } else if (response === null) {
-          throw new Error('desktop_overlay_close_not_confirmed');
-        }
-        await pending.confirmation;
-      } catch (cause) {
-        if (pendingDesktopOverlayClose === pending) {
-          pendingDesktopOverlayClose = null;
-          desktopOverlayClosing = false;
-          pending.reject(cause);
-        }
-        if (!options.silent && sameOverlayIdentity(desktopOverlayIdentity, pending.identity)) {
-          actionError = errorMessage(cause);
-        }
-        throw cause;
-      } finally {
-        if (pendingDesktopOverlayClose === pending && !desktopOverlayClosing) {
-          pendingDesktopOverlayClose = null;
-        }
-      }
-    });
-    pending.operation = operation;
-    // 调用方可以选择等待确认；组件生命周期清理等场景不应产生未处理
-    // rejection，但也不能把失败伪装成已关闭。
-    operation.catch(() => undefined);
-    return operation;
-  }
-
   function submitCreatedAnnotation(): void {
     const tab = activeTab;
     const selection = annotationSelection;
     const comment = annotationComment.trim();
-    const identity = desktopOverlayIdentity;
-    if (!tab || !selection || !comment || !identity) return;
+    if (!tab || !selection || !comment || annotationPhase !== 'comment') return;
     void run(async () => {
       const created = await createBrowserAnnotation(tab.tabId, selection, comment);
       await refreshSession(true);
       window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: created }));
       annotationSelection = null;
       annotationComment = '';
-      await closeDesktopOverlay(identity);
+      annotationPhase = null;
     });
   }
 
   function toggleAnnotationMenu(): void {
-    if (!activeTab || busy || desktopOverlayClosing) return;
-    if (desktopRuntime) {
-      if (desktopOverlayIdentity) {
-        void closeDesktopOverlay().catch(() => undefined);
-        return;
-      }
-      viewportMenuOpen = false;
-      openDesktopAnnotationHistory();
-      return;
-    }
-    if (desktopOverlayIdentity) {
-      void closeDesktopOverlay().then(() => {
-        annotationSelection = null;
-        annotationComment = '';
-        viewportMenuOpen = false;
-        annotationMenuOpen = true;
-      }).catch(() => undefined);
-      return;
-    }
+    if (!activeTab || busy || !browserReady || annotationPhase) return;
     viewportMenuOpen = false;
     annotationMenuOpen = !annotationMenuOpen;
   }
@@ -1182,6 +871,51 @@
       address = updated.url;
       await refreshSession();
     });
+  }
+
+  function stopNavigation(): void {
+    const tab = activeTab;
+    if (!tab || !browserReady || !browserLoading) return;
+    void (async () => {
+      actionError = '';
+      try {
+        const updated = await navigateBrowserTab(tab.tabId, 'stop');
+        address = updated.url;
+        await refreshSession();
+      } catch (cause) {
+        actionError = errorMessage(cause);
+      }
+    })();
+  }
+
+  function cancelBrowserDownload(): void {
+    const download = activeDownload;
+    if (!download || download.state !== 'started' && download.state !== 'progressing') return;
+    void (async () => {
+      actionError = '';
+      try {
+        const next = await window.magiDesktop?.cancelBrowserDownload({
+          tabId,
+          downloadId: download.downloadId,
+        });
+        if (!next) throw new Error(i18n.t('browser.error.internalUnavailable'));
+        applyDesktopViewport(next);
+      } catch (cause) {
+        actionError = errorMessage(cause);
+      }
+    })();
+  }
+
+  function formatDownloadBytes(value: number): string {
+    if (value < 1024) return `${value} B`;
+    const units = ['KB', 'MB', 'GB'];
+    let size = value;
+    let unitIndex = -1;
+    do {
+      size /= 1024;
+      unitIndex += 1;
+    } while (size >= 1024 && unitIndex < units.length - 1);
+    return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`;
   }
 
   function openCurrentPageExternally(): void {
@@ -1233,6 +967,78 @@
     window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: annotation }));
   }
 
+  function normalizedAnnotationPoint(event: PointerEvent | MouseEvent): { x: number; y: number } | null {
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLElement)) return null;
+    const rect = target.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    return {
+      x: clampUnit((event.clientX - rect.left) / rect.width),
+      y: clampUnit((event.clientY - rect.top) / rect.height),
+    };
+  }
+
+  let annotationDragStart = $state<{ x: number; y: number } | null>(null);
+  let annotationDragCurrent = $state<{ x: number; y: number } | null>(null);
+
+  function finishAnnotationSelection(event: PointerEvent | MouseEvent): void {
+    if (annotationPhase !== 'select' || !annotationDragStart) return;
+    event.preventDefault();
+    const start = annotationDragStart;
+    const end = normalizedAnnotationPoint(event) ?? annotationDragCurrent ?? start;
+    annotationDragStart = null;
+    annotationDragCurrent = null;
+    const width = Math.abs(end.x - start.x);
+    const height = Math.abs(end.y - start.y);
+        annotationSelection = width < 0.012 && height < 0.012
+      ? {
+          kind: 'element',
+          navigationRevision: activeBrowserIdentity?.navigationRevision ?? 0,
+          normalizedX: end.x,
+          normalizedY: end.y,
+        }
+      : {
+          kind: 'region',
+          navigationRevision: activeBrowserIdentity?.navigationRevision ?? 0,
+          rect: {
+            x: Math.min(start.x, end.x),
+            y: Math.min(start.y, end.y),
+            width,
+            height,
+          },
+        };
+    annotationComment = '';
+    annotationPhase = 'comment';
+  }
+
+  function handleAnnotationPointerDown(event: PointerEvent): void {
+    if (annotationPhase !== 'select' || !browserReady) return;
+    event.preventDefault();
+    const point = normalizedAnnotationPoint(event);
+    if (!point) return;
+    const target = event.currentTarget as HTMLElement;
+    target.setPointerCapture?.(event.pointerId);
+    annotationDragStart = point;
+    annotationDragCurrent = point;
+  }
+
+  function handleAnnotationPointerMove(event: PointerEvent): void {
+    if (annotationPhase !== 'select' || !annotationDragStart) return;
+    const point = normalizedAnnotationPoint(event);
+    if (point) annotationDragCurrent = point;
+  }
+
+  function handleAnnotationPointerUp(event: PointerEvent): void {
+    finishAnnotationSelection(event);
+    const target = event.currentTarget as HTMLElement;
+    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
+  }
+
+  function annotationSelectionStyle(): string {
+    if (!annotationDragStart || !annotationDragCurrent) return '';
+    return `left:${Math.min(annotationDragStart.x, annotationDragCurrent.x) * 100}%;top:${Math.min(annotationDragStart.y, annotationDragCurrent.y) * 100}%;width:${Math.abs(annotationDragCurrent.x - annotationDragStart.x) * 100}%;height:${Math.abs(annotationDragCurrent.y - annotationDragStart.y) * 100}%;`;
+  }
+
   function browserEventBinding(event: DesktopBrowserEvent): BrowserInspectIdentity | null {
     // Main Renderer 的 node_selection 事件使用与 Host 相同的结构化 payload，
     // 其身份不再放在旁路 binding 中。其它页面生命周期事件仍使用顶层
@@ -1264,6 +1070,13 @@
     const currentIdentity = activeBrowserIdentity;
     const tab = activeTab;
     if (!binding || binding.tabId !== tabId) return;
+
+    if (event.type === 'download') {
+      if (event.downloadId !== undefined) {
+        applyDownloadEvent(event);
+      }
+      return;
+    }
 
     if (
       event.type === 'primary_changed'
@@ -1306,14 +1119,19 @@
         { detail: selection },
       ));
       // Chromium 的 inspect mode 是一次选择动作。选中后立即退出，避免
-      // 后续普通网页点击继续被 Overlay 拦截；已选上下文仍保留给消息层。
+      // 后续普通网页点击继续被检查态拦截；已选上下文仍保留给消息层。
       clearNodeInspection(true);
       return;
     }
 
-    if (binding.navigationRevision !== tab.navigationRevision) {
-      if (binding.navigationRevision > tab.navigationRevision) clearNodeInspection();
-      return;
+    if (binding.navigationRevision < tab.navigationRevision) return;
+    const pageEventIsNewerThanSnapshot = binding.navigationRevision > tab.navigationRevision;
+    if (pageEventIsNewerThanSnapshot) {
+      // Desktop Surface 事件与 Authority 快照是两条异步链。页面已经由
+      // Chromium 提交时，右栏组件可能仍持有上一代快照；新页面事件本身
+      // 是当前 Surface 的权威事实，不能因为快照尚未到达而丢弃地址、标题
+      // 和加载状态。
+      clearNodeInspection();
     }
     if (event.type === 'user_takeover') {
       // 普通鼠标移动/点击只代表用户重新接管浏览器，不代表已经选中的
@@ -1328,26 +1146,95 @@
       if (browserLoading) {
         pageError = '';
         clearNodeInspection();
+        // 页面导航会使未提交选择失去语义；已保存的标记仍由 Authority
+        // 持久化并在新文档就绪后重放。
+        annotationPhase = null;
+        annotationSelection = null;
+        annotationComment = '';
+        annotationDragStart = null;
+        annotationDragCurrent = null;
+        viewportMenuOpen = false;
+        annotationMenuOpen = false;
       }
+      if (pageEventIsNewerThanSnapshot) void refreshSession();
       return;
     }
     if (event.type === 'page_failed') {
       clearNodeInspection();
       pageError = event.reason?.trim() || i18n.t('browser.error.pageLoadFailed');
       browserLoading = false;
+      if (pageEventIsNewerThanSnapshot) void refreshSession();
       return;
     }
     if (event.type !== 'page_updated' || !event.page) return;
-    pageError = '';
     if (event.page.url?.trim()) {
       if (!addressEditing) address = event.page.url;
     }
     if (event.page.title?.trim()) onTitleChange?.(event.page.title);
+    if (pageEventIsNewerThanSnapshot) void refreshSession();
+  }
+
+  function applyDownloadEvent(event: DesktopBrowserEvent): void {
+    const downloadId = event.downloadId;
+    const suggestedFilename = event.suggestedFilename?.trim();
+    const state = event.state;
+    if (
+      typeof downloadId !== 'string'
+      || !downloadId
+      || typeof suggestedFilename !== 'string'
+      || !suggestedFilename
+      || state !== 'started'
+      && state !== 'progressing'
+      && state !== 'completed'
+      && state !== 'cancelled'
+      && state !== 'interrupted'
+    ) return;
+    const receivedBytes = event.receivedBytes;
+    const totalBytes = event.totalBytes;
+    if (
+      typeof receivedBytes !== 'number'
+      || !Number.isFinite(receivedBytes)
+      || receivedBytes < 0
+      || totalBytes !== null && (
+        typeof totalBytes !== 'number'
+        || !Number.isFinite(totalBytes)
+        || totalBytes < 0
+      )
+    ) return;
+    const next: MagiDesktopBrowserDownloadSnapshot = {
+      downloadId,
+      tabId,
+      suggestedFilename,
+      state,
+      receivedBytes: Math.floor(receivedBytes),
+      totalBytes: totalBytes === null ? null : Math.floor(totalBytes),
+    };
+    activeDownloads = [
+      ...activeDownloads.filter((download) => download.downloadId !== downloadId),
+      next,
+    ];
   }
 
   $effect(() => {
     if (!desktopRuntime) return;
     void synchronizeDesktopSurface();
+  });
+
+  $effect(() => {
+    const identity = activeBrowserIdentity;
+    if (!identity) {
+      registeredWebviewKey = '';
+      webviewRegistered = false;
+      webviewRegistrationAttempts = 0;
+      if (webviewRegistrationTimer !== null) {
+        window.clearTimeout(webviewRegistrationTimer);
+        webviewRegistrationTimer = null;
+      }
+      return;
+    }
+    // <webview> 的 guest 在元素 did-attach 后才有 WebContents id；把注册
+    // 放到当前渲染提交之后，避免 activation IPC 与 DOM guest 建立竞争。
+    scheduleWebviewRegistration();
   });
 
   $effect(() => {
@@ -1370,16 +1257,8 @@
     const expectedTabId = tabId.trim();
     const identityKey = `${expectedSessionId}\u0000${expectedTabId}`;
     if (identityKey === activeBrowserIdentityKey) return;
-    const previousOverlay = desktopOverlayIdentity;
     activeBrowserIdentityKey = identityKey;
     untrack(() => {
-      // BrowserTabContent 可能因 RightPane 切换而复用实例。先以旧身份
-      // 提交关闭，再清理本地可见状态；新 Tab 的任何迟到 state/close
-      // 事件都必须经过新的 overlayId + ownerId 校验，不能复用旧状态。
-      if (previousOverlay) {
-        void closeDesktopOverlay(previousOverlay, { silent: true }).catch(() => undefined);
-        clearDesktopOverlayUi(previousOverlay);
-      }
       clearNodeInspection();
       cancelPendingCustomViewport();
       ++viewportMutationGeneration;
@@ -1393,6 +1272,14 @@
       actionError = '';
       pageError = '';
       browserLoading = false;
+      annotationPhase = null;
+      annotationSelection = null;
+      annotationComment = '';
+      annotationDragStart = null;
+      annotationDragCurrent = null;
+      viewportMenuOpen = false;
+      annotationMenuOpen = false;
+      activeDownloads = [];
       loading = Boolean(expectedSessionId && expectedTabId);
       if (!expectedSessionId || !expectedTabId) return;
       void refreshSession(true);
@@ -1402,37 +1289,31 @@
   onMount(() => {
     const desktop = window.magiDesktop;
     if (desktop) void synchronizeDesktopSurface();
-    const menuPane = viewportMenuButton?.closest<HTMLElement>('.right-pane') ?? null;
-    const menuGeometryObserver = typeof ResizeObserver === 'undefined' || !menuPane
-      ? null
-      : new ResizeObserver(() => scheduleDesktopMenuReflow());
-    if (menuPane) menuGeometryObserver?.observe(menuPane);
-    const windowResize = () => scheduleDesktopMenuReflow();
+    const view = browserWebview;
+    const handleWebviewAttached = () => scheduleWebviewRegistration();
+    const handleWebviewReady = () => scheduleWebviewRegistration();
+    view?.addEventListener('did-attach', handleWebviewAttached);
+    view?.addEventListener('dom-ready', handleWebviewReady);
+    scheduleWebviewRegistration();
     const pointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (
-        viewportMenuElement
-        && !viewportMenuElement.contains(target)
-        && !viewportMenuButton?.contains(target)
-      ) viewportMenuOpen = false;
-      if (
-        annotationMenuElement
-        && !annotationMenuElement.contains(target)
-        && !annotationHistoryButton?.contains(target)
-      ) annotationMenuOpen = false;
+      if (viewportMenuElement && !viewportMenuElement.contains(target) && !viewportMenuButton?.contains(target)) viewportMenuOpen = false;
+      if (annotationMenuElement && !annotationMenuElement.contains(target) && !annotationHistoryButton?.contains(target)) annotationMenuOpen = false;
     };
     const keyboard = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      const hasOpenOverlay = Boolean(desktopOverlayIdentity || desktopOverlayClosing || viewportMenuOpen || annotationMenuOpen);
+      const hasOpenOverlay = Boolean(annotationPhase || viewportMenuOpen || annotationMenuOpen);
       if (!hasOpenOverlay) return;
       event.preventDefault();
       event.stopPropagation();
       viewportMenuOpen = false;
       annotationMenuOpen = false;
-      if (desktopOverlayIdentity) {
-        void closeDesktopOverlay();
-      }
+      annotationPhase = null;
+      annotationSelection = null;
+      annotationComment = '';
+      annotationDragStart = null;
+      annotationDragCurrent = null;
     };
     const browserAuthorityChanged = (event: Event) => {
       const detail = (event as CustomEvent<{
@@ -1443,95 +1324,30 @@
       if (typeof changedTabId === 'string' && changedTabId !== tabId) return;
       void refreshSession();
     };
-    const unsubscribeOverlayAction = desktop?.onOverlayAction((action) => {
-      if (
-        desktopOverlayClosing
-        || !desktopOverlayIdentity
-        || action.overlayId !== desktopOverlayIdentity.overlayId
-        || action.ownerId !== desktopOverlayIdentity.ownerId
-      ) return;
-      if (action.kind === 'menu') {
-        handleDesktopMenuAction(action);
-        return;
-      }
-      if (action.interaction === 'input') {
-        if (action.kind === 'annotation' && action.id === 'comment') {
-          annotationComment = action.value ?? '';
-          return;
-        }
-        return;
-      }
-      if (action.kind === 'annotation') {
-        if (action.id === 'selection') {
-          const selection = parseAnnotationSelection(action.value);
-          if (!selection) {
-            actionError = i18n.t('browser.annotation.pageChanged');
-            void closeDesktopOverlay();
-            return;
-          }
-          annotationSelection = selection;
-          annotationComment = '';
-          openAnnotationCommentOverlay();
-          return;
-        }
-        if (action.id === 'save') {
-          submitCreatedAnnotation();
-          return;
-        }
-        if (action.id === 'cancel') {
-          annotationSelection = null;
-          annotationComment = '';
-          void closeDesktopOverlay();
-          return;
-        }
-      }
-    });
-    const unsubscribeOverlayState = desktop?.onOverlayState((state) => {
-      // 只接受当前组件明确发起的身份。不能因为 ownerId 相同就接收
-      // 旧 session/旧实例的迟到 state，否则会把本地状态重新复活。
-      if (
-        !desktopOverlayIdentity
-        || state.overlayId !== desktopOverlayIdentity.overlayId
-        || state.ownerId !== desktopOverlayIdentity.ownerId
-      ) return;
-      desktopOverlayIdentity = {
-        overlayId: state.overlayId,
-        ownerId: state.ownerId,
-      };
-      desktopOverlayKind = state.kind;
-    });
-    const unsubscribeOverlayClosed = desktop?.onOverlayClosed((event) => {
-      // replacement/closed 都必须先匹配完整身份。旧 owner 的迟到关闭
-      // 不能清除已替换的新 Overlay；匹配 pending close 时才算提交确认。
-      confirmDesktopOverlayClosed(event);
-    });
     const unsubscribeDesktopSnapshot = desktop?.onSnapshot((next) => {
       applyDesktopViewport(next);
     });
     const unsubscribeBrowserEvent = window.magiDesktop?.onBrowserEvent(handleDesktopBrowserEvent);
     window.addEventListener('pointerdown', pointerDown);
     window.addEventListener('keydown', keyboard, true);
-    window.addEventListener('resize', windowResize);
     window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, browserAuthorityChanged);
     return () => {
-      const overlayAtUnmount = desktopOverlayIdentity;
-      if (desktop && overlayAtUnmount) {
-        void closeDesktopOverlay(overlayAtUnmount, { silent: true }).catch(() => undefined);
+      const release = registeredWebviewRelease;
+      registeredWebviewRelease = null;
+      if (desktop && release) {
+        void desktop.releaseBrowserWebview(release).catch(() => undefined);
       }
       unsubscribeBrowserEvent?.();
-      unsubscribeOverlayAction?.();
-      unsubscribeOverlayState?.();
-      unsubscribeOverlayClosed?.();
       unsubscribeDesktopSnapshot?.();
       window.removeEventListener('pointerdown', pointerDown);
       window.removeEventListener('keydown', keyboard, true);
-      window.removeEventListener('resize', windowResize);
-      menuGeometryObserver?.disconnect();
-      if (desktopMenuReflowFrame !== null) {
-        cancelAnimationFrame(desktopMenuReflowFrame);
-        desktopMenuReflowFrame = null;
-      }
       clearNodeInspection();
+      view?.removeEventListener('did-attach', handleWebviewAttached);
+      view?.removeEventListener('dom-ready', handleWebviewReady);
+      if (webviewRegistrationTimer !== null) {
+        window.clearTimeout(webviewRegistrationTimer);
+        webviewRegistrationTimer = null;
+      }
       window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, browserAuthorityChanged);
       if (customViewportTimer !== null) window.clearTimeout(customViewportTimer);
       customViewportTimer = null;
@@ -1545,11 +1361,24 @@
   class="browser-pane"
   aria-label={i18n.t('browser.pane.label')}
 >
-  <div class="browser-toolbar">
+  <div
+    bind:this={browserToolbar}
+    class="browser-toolbar"
+    role="toolbar"
+    tabindex="-1"
+    onpointerover={updateToolbarTooltip}
+    onpointerout={handleToolbarPointerOut}
+    onfocusin={updateToolbarTooltip}
+    onfocusout={handleToolbarFocusOut}
+  >
     {#if desktopRuntime}
       <button type="button" class="icon-button flip" onclick={() => navigate('back')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.back')} aria-label={i18n.t('browser.navigation.back')}><Icon name="chevron-right" size={13} /></button>
       <button type="button" class="icon-button" onclick={() => navigate('forward')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.forward')} aria-label={i18n.t('browser.navigation.forward')}><Icon name="chevron-right" size={13} /></button>
-      <button type="button" class="icon-button" onclick={() => navigate('reload')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.reload')} aria-label={i18n.t('browser.navigation.reload')}><Icon name="refresh" size={13} /></button>
+      {#if browserLoading}
+        <button type="button" class="icon-button" onclick={stopNavigation} disabled={!browserReady} data-tooltip={i18n.t('browser.navigation.stop')} aria-label={i18n.t('browser.navigation.stop')}><Icon name="stop" size={13} /></button>
+      {:else}
+        <button type="button" class="icon-button" onclick={() => navigate('reload')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.reload')} aria-label={i18n.t('browser.navigation.reload')}><Icon name="refresh" size={13} /></button>
+      {/if}
       <form class="address-form" onsubmit={(event) => { event.preventDefault(); navigate('url'); }}>
         <input
           bind:value={address}
@@ -1563,7 +1392,7 @@
         <button type="submit" class="address-submit" disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}><Icon name="chevron-right" size={12} /></button>
       </form>
       <div class="menu-wrap">
-      <button bind:this={viewportMenuButton} type="button" class="icon-button" class:active={localViewportMode === 'fixed'} onclick={toggleViewportMenu} disabled={!browserReady || busy || desktopOverlayClosing} data-tooltip={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')}><Icon name="monitor" size={13} /></button>
+      <button bind:this={viewportMenuButton} type="button" class="icon-button" class:active={localViewportMode === 'fixed'} onclick={toggleViewportMenu} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')} aria-expanded={viewportMenuOpen}><Icon name="monitor" size={13} /></button>
       </div>
       <button
         type="button"
@@ -1587,7 +1416,7 @@
     {/if}
     <div class="menu-wrap">
       {#if desktopRuntime}
-        <button type="button" class="icon-button toolbar-edge-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(desktopOverlayIdentity) || desktopOverlayClosing} data-tooltip={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
+        <button type="button" class="icon-button toolbar-edge-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(annotationPhase)} data-tooltip={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
       {/if}
       {#if savedAnnotations.length > 0}
         <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button toolbar-edge-button" class:active={annotationMenuOpen} onclick={toggleAnnotationMenu} data-tooltip={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')} aria-expanded={annotationMenuOpen}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
@@ -1600,8 +1429,41 @@
     {/if}
   </div>
 
-  {#if viewportMenuOpen && !desktopRuntime}
-    <div bind:this={viewportMenuElement} class="viewport-popover" data-menu="viewport">
+  {#if tooltipText}
+    <div
+      bind:this={tooltipElement}
+      class="browser-toolbar-tooltip"
+      popover="manual"
+      role="tooltip"
+    >{tooltipText}</div>
+  {/if}
+
+  {#if activeDownload && (activeDownload.state === 'started' || activeDownload.state === 'progressing' || activeDownload.state === 'completed' || activeDownload.state === 'cancelled' || activeDownload.state === 'interrupted')}
+    <div
+      class="browser-download-panel"
+      role="status"
+      aria-label={i18n.t('browser.download.status')}
+    >
+      <span class="browser-download-name" title={activeDownload.suggestedFilename}>{activeDownload.suggestedFilename}</span>
+      {#if activeDownload.state === 'started' || activeDownload.state === 'progressing'}
+        <span class="browser-download-state">{i18n.t('browser.download.progressing')}</span>
+        {#if activeDownload.totalBytes}
+          <span class="browser-download-bytes">{formatDownloadBytes(activeDownload.receivedBytes)} / {formatDownloadBytes(activeDownload.totalBytes)}</span>
+        {:else}
+          <span class="browser-download-bytes">{formatDownloadBytes(activeDownload.receivedBytes)}</span>
+        {/if}
+        <button type="button" onclick={cancelBrowserDownload} aria-label={i18n.t('browser.download.cancel')}>{i18n.t('browser.download.cancel')}</button>
+      {:else}
+        <span class="browser-download-state">{i18n.t(`browser.download.${activeDownload.state}`)}</span>
+        {#if activeDownload.state === 'interrupted'}
+          <span class="browser-download-bytes">{formatDownloadBytes(activeDownload.receivedBytes)}</span>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+
+  {#if viewportMenuOpen}
+    <div bind:this={viewportMenuElement} class="viewport-popover" data-menu="viewport" popover="manual">
       <div class="viewport-menu" role="menu" aria-label={i18n.t('browser.viewport.control')}>
         <button type="button" class:selected={localViewportMode === 'auto'} role="menuitem" onclick={() => { viewportMenuOpen = false; useAutomaticViewport(); }}>
           <Icon name="monitor" size={14} />
@@ -1648,8 +1510,8 @@
     </div>
   {/if}
 
-  {#if annotationMenuOpen && !desktopRuntime}
-    <div bind:this={annotationMenuElement} class="annotation-history-popover" data-menu="annotations">
+  {#if annotationMenuOpen}
+    <div bind:this={annotationMenuElement} class="annotation-history-popover" data-menu="annotations" popover="manual">
       <div class="annotation-menu" role="menu" aria-label={i18n.t('browser.annotation.history')}>
         {#each savedAnnotations as annotation (annotation.annotationId)}
           <button type="button" onclick={() => selectSavedAnnotation(annotation)} title={annotation.comment}><span class="annotation-menu-number">{annotation.sequence}</span><span>{annotation.comment}</span></button>
@@ -1663,10 +1525,59 @@
     data-browser-tab-id={tabId}
     aria-label={i18n.t('browser.viewport.label')}
   >
-    {#if desktopRuntime && !browserReady}
-      <div class="browser-placeholder" class:error={connectionState === 'error'} aria-live="polite">{connectionStatusText}</div>
-    {:else if desktopRuntime && browserReady}
-      <div class="browser-native-surface" aria-hidden="true"></div>
+    {#if desktopRuntime}
+      <webview
+        bind:this={browserWebview}
+        class="browser-webview"
+        src="about:blank"
+        partition={browserPartitionForSession(browserSessionId)}
+        allowpopups={false}
+        webpreferences="focusOnNavigation=no"
+        aria-label={i18n.t('browser.viewport.label')}
+      ></webview>
+      {#if !browserReady}
+        <div class="browser-placeholder browser-placeholder-overlay" class:error={connectionState === 'error'} aria-live="polite">{connectionStatusText}</div>
+      {/if}
+      {#if pageError && browserReady && !browserLoading}
+        <div bind:this={pageErrorElement} class="browser-page-error" popover="manual" role="alert" aria-live="assertive">
+          <Icon name="alert-circle" size={28} />
+          <strong>{i18n.t('browser.error.pageLoadFailed')}</strong>
+          <span>{pageError}</span>
+          <button type="button" onclick={() => navigate('reload')} disabled={busy}>
+            <Icon name="refresh" size={13} />
+            <span>{i18n.t('app.recoveryRetry')}</span>
+          </button>
+        </div>
+      {/if}
+      {#if annotationPhase === 'select'}
+        <!-- 标记选择层属于当前 Browser Tab 内容槽，不能成为窗口级原生视图。 -->
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        <div
+          bind:this={annotationCaptureElement}
+          class="annotation-capture"
+          popover="manual"
+          role="application"
+          aria-label={i18n.t('browser.annotation.title')}
+          onpointerdown={handleAnnotationPointerDown}
+          onpointermove={handleAnnotationPointerMove}
+          onpointerup={handleAnnotationPointerUp}
+        >
+          <div class="annotation-selection" style={annotationSelectionStyle()}></div>
+        </div>
+      {:else if annotationPhase === 'comment' && annotationSelection}
+        <div bind:this={annotationEditorElement} class="annotation-editor" popover="manual" role="dialog" aria-label={i18n.t('browser.annotation.title')}>
+          <textarea
+            bind:this={annotationEditor}
+            bind:value={annotationComment}
+            placeholder={i18n.t('browser.annotation.placeholder')}
+            maxlength="4000"
+          ></textarea>
+          <div class="annotation-editor-actions">
+            <button type="button" onclick={() => { annotationPhase = null; annotationSelection = null; annotationComment = ''; }}>{i18n.t('common.cancel')}</button>
+            <button type="button" class="primary" disabled={!annotationComment.trim()} onclick={submitCreatedAnnotation}>{i18n.t('common.save')}</button>
+          </div>
+        </div>
+      {/if}
     {:else}
       {#if loading}
         <div class="browser-placeholder">{i18n.t('browser.status.loading')}</div>
@@ -1704,74 +1615,28 @@
 
 <style>
   .browser-pane { position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: var(--background); }
-  /* Main 的 browserContentBounds 使用的是内容槽外框高度。显式采用
-     border-box，确保 padding 和底边框不会把工具栏撑高后侵入 Chromium
-     Surface，避免拖动/刷新时出现工具栏被页面覆盖。 */
-  .browser-toolbar { position: relative; z-index: 2; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
+  /* 工具栏固定在右栏内容区内，边框不改变内容槽的有效尺寸。 */
+  .browser-toolbar { position: relative; z-index: 10; isolation: isolate; anchor-name: --browser-toolbar-anchor; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
   .icon-button, .address-submit { position: relative; }
   .icon-button { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; }
   .icon-button:hover:not(:disabled) { background: var(--surface-2); color: var(--foreground); }
   .icon-button.active { color: var(--primary); background: var(--surface-2); }
   .icon-button:disabled { opacity: .45; cursor: default; }
   .flip :global(svg) { transform: scaleX(-1); }
-  /* 原生 title 提示在 Electron 的分层视图中不稳定：提示层可能落到
-     Browser Surface 后面。把说明绘制在工具栏上方，始终留在 App Renderer
-     的可见区域内，同时保留 aria-label 供键盘和辅助技术使用。 */
-  .icon-button[data-tooltip]::after,
-  .address-submit[data-tooltip]::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    z-index: var(--z-tooltip, 1200);
-    right: auto;
-    bottom: calc(100% - 1px);
-    left: 50%;
-    max-width: min(240px, calc(100vw - 16px));
-    padding: 4px 7px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--glass-bg, var(--dropdown-bg));
-    box-shadow: var(--shadow-sm);
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium, 500);
-    line-height: 1.25;
-    white-space: nowrap;
-    pointer-events: none;
-    opacity: 0;
-    visibility: hidden;
-    transform: translate(-50%, 3px);
-    transition: opacity var(--transition-fast), visibility var(--transition-fast), transform var(--transition-fast);
-  }
-  .toolbar-edge-button[data-tooltip]::after {
-    right: 0;
-    left: auto;
-    transform: translate(0, 3px);
-  }
-  .icon-button[data-tooltip]:hover:not(:disabled)::after,
-  .address-submit[data-tooltip]:hover:not(:disabled)::after,
-  .icon-button[data-tooltip]:focus-visible::after,
-  .address-submit[data-tooltip]:focus-visible::after {
-    opacity: 1;
-    visibility: visible;
-    transform: translate(-50%, 0);
-  }
-  .toolbar-edge-button[data-tooltip]:hover:not(:disabled)::after,
-  .toolbar-edge-button[data-tooltip]:focus-visible::after {
-    transform: translate(0, 0);
-  }
-  .icon-button[data-tooltip]:disabled::after,
-  .address-submit[data-tooltip]:disabled::after { display: none; }
+  /* 原生 title 和普通伪元素都会落在 <webview> 后面；工具提示通过
+     Popover Top Layer 从当前工具栏向下展示，仍由 Renderer DOM 管理。 */
+  .browser-toolbar-tooltip { position: fixed; position-anchor: --browser-tooltip-anchor; top: calc(anchor(bottom) + 5px); left: anchor(center); z-index: var(--z-tooltip, 1200); max-width: min(240px, calc(100vw - 16px)); padding: 4px 7px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--glass-bg, var(--dropdown-bg)); box-shadow: var(--shadow-sm); color: var(--foreground); font-size: var(--text-xs); font-weight: var(--font-medium, 500); line-height: 1.25; white-space: nowrap; pointer-events: none; transform: translateX(-50%); }
   .address-form { display: flex; flex: 1 1 0; min-width: 0; }
   .address-form input { box-sizing: border-box; width: 100%; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-right: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); background: var(--surface-1); color: var(--foreground); font: inherit; }
   .address-submit { display: grid; place-items: center; width: 27px; height: 27px; flex: 0 0 27px; padding: 0; border: 1px solid var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--surface-1); color: var(--foreground-muted); cursor: pointer; }
   .record-address { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-1); color: var(--foreground-muted); font-size: var(--text-xs); }
   .record-address span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .menu-wrap { position: relative; display: flex; flex: 0 0 auto; }
-  /* 顶部工具菜单是浏览器框架上的浮层，不属于页面内容的排版轨道。
-     桌面端由同一位置的原生 Overlay 承载；非桌面端使用此绝对定位版本，
-     两条路径都不会打开菜单时改变内容槽高度。 */
+  /* 顶部工具菜单是浏览器框架上的 Renderer 浮层，不属于页面内容的排版轨道。
+     CSS Anchor Positioning 让它跟随真实工具栏位置，Popover Top Layer 解决
+     Electron webview 原生合成层的遮挡，不需要任何浏览器内容坐标映射。 */
   .viewport-popover,
-  .annotation-history-popover { position: absolute; top: 40px; right: 6px; z-index: 4; box-sizing: border-box; width: min(300px, calc(100% - 12px)); pointer-events: auto; }
+  .annotation-history-popover { position: fixed; position-anchor: --browser-toolbar-anchor; top: calc(anchor(bottom) + 4px); right: calc(100vw - anchor(right) + 6px); z-index: 20; box-sizing: border-box; width: min(300px, calc(100vw - 12px)); pointer-events: auto; }
   .viewport-menu, .annotation-menu { box-sizing: border-box; width: min(300px, 100%); overflow: hidden; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
   .annotation-history-popover .annotation-menu { width: 100%; max-height: min(420px, calc(100vh - 48px)); overflow-y: auto; scrollbar-width: none; }
   .annotation-history-popover .annotation-menu::-webkit-scrollbar { display: none; }
@@ -1793,8 +1658,36 @@
   .status-light.loading { background: var(--warning); }
   .status-light.error { background: var(--error); }
   .record-status { min-width: 0; max-width: 180px; overflow: hidden; color: var(--foreground-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-  .browser-surface-slot { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
-  .browser-native-surface { flex: 1 1 auto; width: 100%; min-width: 0; min-height: 0; background: transparent; }
+  .browser-download-panel { position: fixed; position-anchor: --browser-surface-anchor; bottom: calc(100vh - anchor(bottom) + 10px); left: calc(anchor(left) + 10px); z-index: 5; box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 30px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); pointer-events: auto; }
+  .browser-download-name { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--foreground); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+  .browser-download-state { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; white-space: nowrap; }
+  .browser-download-bytes { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .browser-download-panel button { flex: 0 0 auto; height: 22px; padding: 0 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: 10px; cursor: pointer; }
+  .browser-download-panel button:hover { background: var(--surface-hover); }
+  .browser-surface-slot { position: relative; z-index: 0; anchor-name: --browser-surface-anchor; display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
+  /* Electron 的 webview 自定义元素依赖自身的 flex 内部布局把 guest
+     视口同步到内容槽。覆盖为 block 会让 guest 退回默认 150px 高度，
+     从而出现页面被截断、滚动条异常和截图范围错误。 */
+  .browser-webview { display: flex; flex: 1 1 auto; width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: #fff; }
+  .browser-placeholder-overlay { position: absolute; inset: 0; pointer-events: none; background: var(--surface-1); }
+  /* 失败页仍由 Chromium guest 负责导航，但 guest 的 chrome-error 页面在
+     Electron webview 中不保证有可见错误文案。使用当前内容槽的 Top Layer
+     呈现同一失败事实，避免普通 DOM 被原生 guest 合成层覆盖。 */
+  .browser-page-error { position: fixed; position-anchor: --browser-surface-anchor; top: anchor(top); left: anchor(left); width: anchor-size(width); height: anchor-size(height); box-sizing: border-box; display: grid; place-content: center; justify-items: center; gap: 9px; margin: 0; padding: 24px; border: 0; background: var(--surface-1); color: var(--foreground-muted); text-align: center; }
+  .browser-page-error :global(svg) { color: var(--error); }
+  .browser-page-error strong { color: var(--foreground); font-size: var(--text-md); font-weight: 600; }
+  .browser-page-error span { max-width: min(520px, 100%); overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-xs); }
+  .browser-page-error button { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; margin-top: 4px; padding: 0 10px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
+  .browser-page-error button:hover:not(:disabled) { background: var(--surface-hover); }
+  .browser-page-error button:disabled { cursor: default; opacity: .5; }
+  .annotation-capture { position: fixed; position-anchor: --browser-surface-anchor; top: anchor(top); left: anchor(left); width: anchor-size(width); height: anchor-size(height); z-index: 3; cursor: crosshair; pointer-events: auto; touch-action: none; user-select: none; background: rgba(0, 0, 0, 0.001); }
+  .annotation-selection { position: absolute; border: 1px solid var(--primary); background: color-mix(in srgb, var(--primary) 18%, transparent); pointer-events: none; }
+  .annotation-editor { position: fixed; position-anchor: --browser-surface-anchor; left: anchor(left); bottom: calc(100vh - anchor(bottom) + 12px); width: min(360px, calc(anchor-size(width) - 24px)); z-index: 4; box-sizing: border-box; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
+  .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; resize: vertical; padding: 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
+  .annotation-editor-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
+  .annotation-editor-actions button { min-width: 58px; height: 28px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); cursor: pointer; }
+  .annotation-editor-actions button.primary { border-color: var(--primary); background: var(--primary); color: var(--primary-foreground); }
+  .annotation-editor-actions button:disabled { opacity: .5; cursor: default; }
   .browser-placeholder { display: grid; flex: 1; place-items: center; padding: 20px; color: var(--foreground-muted); font-size: var(--text-sm); text-align: center; }
   .browser-placeholder.error { color: var(--error); }
   .browser-record { display: flex; flex: 1; flex-direction: column; align-items: center; gap: 9px; min-width: 0; padding: 44px 24px; color: var(--foreground-muted); text-align: center; }

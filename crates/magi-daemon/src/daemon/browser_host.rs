@@ -4,7 +4,7 @@ use magi_api::{ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot}
 use magi_browser_authority::{
     BrowserHostClient, BrowserHostClientError, BrowserHostCommand, BrowserHostEvent,
     BrowserHostHandshake, BrowserHostIncomingEvent, BrowserHostStatus, BrowserLeaseEndReason,
-    BrowserSessionLifecycle,
+    BrowserSession, BrowserSessionLifecycle,
 };
 use magi_core::{BrowserTabId, EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
@@ -239,10 +239,9 @@ async fn monitor_desktop_parent_process(state: ApiState, mut shutdown_rx: watch:
                     desktop_epoch = %config.desktop_epoch,
                     "Electron Desktop 已退出，daemon 正在收口浏览器运行资源"
                 );
-                interrupt_browser_tasks_for_runtime_failure(&state);
+                interrupt_all_tasks_for_daemon_shutdown(&state);
                 let cancelled_process_count = ToolRegistry::cancel_all_active_processes();
-                let cancelled_managed_process_count =
-                    magi_process::terminate_all_managed_processes();
+                let cancelled_managed_process_count = state.terminate_managed_processes();
                 tracing::info!(
                     cancelled_process_count,
                     cancelled_managed_process_count,
@@ -365,7 +364,7 @@ async fn run_desktop_browser_controller(state: ApiState, mut shutdown_rx: watch:
         tracing::warn!(reason = disconnect, "Electron Desktop 浏览器控制连接中断");
 
         if disconnect == "daemon_shutdown" {
-            interrupt_browser_tasks_for_runtime_failure(&state);
+            interrupt_all_tasks_for_daemon_shutdown(&state);
             set_host_status(
                 &state,
                 BrowserHostStatus::Stopped,
@@ -382,14 +381,14 @@ async fn run_desktop_browser_controller(state: ApiState, mut shutdown_rx: watch:
             // 清理连接也可能由 Worker 崩溃触发。配置通道变化意味着旧
             // Desktop 运行边界已经失效，必须先撤销所有 Agent Lease，
             // 再等待新的 Worker/Host 注册，避免旧 Lease 跨代残留。
-            interrupt_browser_tasks_for_runtime_failure(&state);
+            suspend_browser_sessions_for_host_disconnect(&state);
             reconnecting = false;
             continue;
         }
 
         // Desktop 页面由 Electron Main 持有。daemon 断线只撤销 Agent 控制边界，
         // 不关闭逻辑 Tab、不销毁 Surface，也不改变页面当前状态。
-        interrupt_browser_tasks_for_runtime_failure(&state);
+        suspend_browser_sessions_for_host_disconnect(&state);
         set_host_status(
             &state,
             BrowserHostStatus::Reconnecting,
@@ -917,8 +916,11 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
         }
         BrowserHostEvent::Download {
             tab_id,
+            download_id,
             suggested_filename,
             state: download_state,
+            received_bytes,
+            total_bytes,
             byte_length,
             error,
         } => {
@@ -928,8 +930,11 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 browser_tab_context(state, &tab_id),
                 serde_json::json!({
                     "tab_id": tab_id,
+                    "download_id": download_id,
                     "suggested_filename": suggested_filename,
                     "state": download_state,
+                    "received_bytes": received_bytes,
+                    "total_bytes": total_bytes,
                     "byte_length": byte_length,
                     "error": error.map(|value| magi_core::public_runtime_excerpt(&value, 1024)),
                 }),
@@ -1145,7 +1150,10 @@ fn publish_tab_event(
     );
 }
 
-fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
+/// 仅收口 Browser Host 资源。Host 控制连接属于浏览器运行时，不是普通会话
+/// Turn 的执行边界；断线时必须释放 Browser Lease，但不能中断对话、Goal 或
+/// 其他工具执行。
+fn suspend_browser_sessions_for_host_disconnect(state: &ApiState) -> Vec<BrowserSession> {
     let sessions = state
         .browser_authority
         .lock()
@@ -1156,7 +1164,7 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
         .filter(|session| session.lifecycle.is_recoverable())
         .collect::<Vec<_>>();
 
-    for browser_session in sessions {
+    for browser_session in &sessions {
         let interrupted_session = match state.mutate_browser_authority(|authority| {
             authority.transition_session(
                 &browser_session.browser_session_id,
@@ -1197,12 +1205,21 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
                 ..EventContext::default()
             }),
         );
-        state.cancel_execution_resources(
+        state.revoke_browser_execution_resources(
             Some(&browser_session.session_id),
             browser_session.workspace_id.as_ref(),
             None,
             BrowserLeaseEndReason::RuntimeUnavailable,
         );
+    }
+    sessions
+}
+
+/// daemon 真正关闭时才允许全局中断执行。该路径由 daemon_shutdown 或父进程
+/// 已退出触发，和 Browser Host 的普通断线严格分离。
+fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
+    let sessions = suspend_browser_sessions_for_host_disconnect(state);
+    for browser_session in sessions {
         let Some(current_turn) = state
             .session_store
             .runtime_sidecar(&browser_session.session_id)
@@ -1231,7 +1248,7 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
                 session_id = %browser_session.session_id,
                 task_id = %chain.root_task_id,
                 ?error,
-                "Desktop 浏览器失效后终止执行树失败"
+                "daemon 关闭时终止浏览器执行树失败"
             );
         }
         match state
@@ -1259,17 +1276,15 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
                         Err(error) => tracing::warn!(
                             session_id = %browser_session.session_id,
                             ?error,
-                            "Desktop 浏览器失效后暂停 Goal 与计划失败"
+                            "daemon 关闭时暂停 Goal 与计划失败"
                         ),
                     }
                 }
-                if let Err(error) =
-                    state.persist_session_state_checkpoint("browser_desktop_disconnected_session")
-                {
+                if let Err(error) = state.persist_session_state_checkpoint("daemon_shutdown") {
                     tracing::warn!(
                         session_id = %browser_session.session_id,
                         ?error,
-                        "Desktop 浏览器失效后的 session 状态持久化失败"
+                        "daemon 关闭时 session 状态持久化失败"
                     );
                 }
                 state.event_bus.publish(
@@ -1286,7 +1301,7 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
                             "workspace_id": browser_session.workspace_id,
                             "turn_id": current_turn.turn_id,
                             "interrupted": true,
-                            "reason": "browser_host_unavailable",
+                            "reason": "daemon_shutdown",
                         }),
                     )
                     .with_context(EventContext {
@@ -1300,7 +1315,7 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
             Err(error) => tracing::warn!(
                 session_id = %browser_session.session_id,
                 ?error,
-                "Desktop 浏览器失效后的 session Turn 收敛失败"
+                "daemon 关闭时中断活动 Turn 失败"
             ),
         }
     }
@@ -1371,11 +1386,11 @@ mod tests {
     };
     use magi_core::{
         BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId, ExecutionOwnership,
-        SessionId, TaskId, ThreadId, UtcMillis, WorkspaceId,
+        SessionId, TaskId, UtcMillis, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_session_store::{ActiveExecutionTurnItem, SessionStore};
+    use magi_session_store::{ActiveExecutionTurn, SessionStore};
     use magi_workspace::WorkspaceStore;
 
     use super::*;
@@ -1800,6 +1815,30 @@ mod tests {
         let workspace_id = WorkspaceId::new("workspace-disconnect");
         let session_id = SessionId::new("session-disconnect");
         state
+            .session_store
+            .create_session_for_workspace_at(
+                session_id.clone(),
+                "Browser disconnect session",
+                Some(workspace_id.to_string()),
+                UtcMillis(1),
+            )
+            .expect("session fixture should create");
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-disconnect".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(1),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("普通会话 Turn 应保持运行".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("running turn fixture should create");
+        state
             .mutate_browser_authority(|authority| {
                 authority.register_profile(BrowserProfile {
                     profile_id: profile_id.clone(),
@@ -1861,7 +1900,7 @@ mod tests {
             .expect("browser disconnect fixture should create");
 
         let mut events = state.event_bus.subscribe();
-        interrupt_browser_tasks_for_runtime_failure(&state);
+        suspend_browser_sessions_for_host_disconnect(&state);
 
         let authority = state
             .browser_authority
@@ -1888,6 +1927,15 @@ mod tests {
             Some(BrowserSessionLifecycle::Interrupted)
         );
         drop(authority);
+        assert_eq!(
+            state
+                .session_store
+                .runtime_sidecar(&session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .map(|turn| turn.status),
+            Some("running".to_string()),
+            "Browser Host 断线不得中断普通会话 Turn"
+        );
 
         let event = events
             .try_recv()
@@ -1900,54 +1948,5 @@ mod tests {
         assert_eq!(event.payload["session_id"], session_id.to_string());
         assert_eq!(event.payload["workspace_id"], workspace_id.to_string());
         assert_eq!(event.payload["lifecycle"], "interrupted");
-    }
-
-    #[test]
-    fn interrupted_turn_identity_includes_request_session_and_turn() {
-        let mut item = ActiveExecutionTurnItem {
-            item_id: "item-identity".to_string(),
-            item_seq: 1,
-            kind: "user_message".to_string(),
-            status: "running".to_string(),
-            source: "user".to_string(),
-            title: None,
-            content: None,
-            task_id: None,
-            worker_id: None,
-            role_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            tool_status: None,
-            tool_arguments: None,
-            tool_result: None,
-            tool_error: None,
-            request_id: Some("request-identity".to_string()),
-            user_message_id: None,
-            placeholder_message_id: None,
-            metadata: Default::default(),
-            timeline_entry_id: None,
-            source_thread_id: ThreadId::new("thread-identity"),
-        };
-        let turn = ActiveExecutionTurn {
-            turn_id: "turn-identity".to_string(),
-            turn_seq: 1,
-            accepted_at: UtcMillis(1),
-            completed_at: None,
-            status: "running".to_string(),
-            user_message: None,
-            items: vec![item.clone()],
-        };
-        assert_eq!(request_id_for_turn(&turn), "request-identity");
-
-        item.request_id = None;
-        item.metadata.insert(
-            "requestId".to_string(),
-            serde_json::Value::String("request-from-metadata".to_string()),
-        );
-        let turn = ActiveExecutionTurn {
-            items: vec![item],
-            ..turn
-        };
-        assert_eq!(request_id_for_turn(&turn), "request-from-metadata");
     }
 }

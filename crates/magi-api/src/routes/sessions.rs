@@ -225,6 +225,7 @@ async fn materialize_session(
         request.workspace_path.as_deref(),
     )?;
     let workspace_id = scope.workspace_id();
+    let previous_current_session_id = state.session_store.current_session_id();
     let session_id = super::new_session_id();
     state
         .session_store
@@ -234,11 +235,27 @@ async fn materialize_session(
             workspace_id.as_ref().map(ToString::to_string),
         )
         .map_err(|error| ApiError::internal_assembly("创建浏览器会话所属会话失败", error))?;
-    state
-        .session_store
-        .select_current_session(&session_id)
-        .map_err(|error| ApiError::internal_assembly("选择浏览器会话所属会话失败", error))?;
-    state.persist_session_navigation_state_for_api(Some(session_id.clone()))?;
+    // 新建会话会同时写入 session 记录和 current 指针；这里用完整 projection
+    // 提交这次实体创建，确保旧 projection、sidecar 和 current 在同一个持久化事务中
+    // 收口。导航专用写入只适合已有实体，不能把新实体的回滚留在旧文件之外。
+    if let Err(error) = state.persist_session_projection_for_api() {
+        let original_message = error.message().to_string();
+        return Err(
+            match state
+                .rollback_created_session_after_navigation_lock(
+                    &session_id,
+                    previous_current_session_id,
+                )
+                .await
+            {
+                Ok(()) => error,
+                Err(rollback_error) => ApiError::internal_assembly(
+                    "创建浏览器会话失败且回滚失败",
+                    format!("{original_message}；回滚失败: {rollback_error:?}"),
+                ),
+            },
+        );
+    }
     publish_session_directory_event(
         &state,
         "session.created",
@@ -434,7 +451,7 @@ async fn remove_session_turn_queue_item(
     if queue_id.is_empty() {
         return Err(ApiError::InvalidInput("queueId 不能为空".to_string()));
     }
-    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     state.remove_regular_session_turn(&session_id, queue_id)?;
     Ok(Json(session_turn_queue_response(&state, &session_id)))
 }
@@ -452,7 +469,7 @@ async fn guide_session_turn_queue_item(
     // 队列消费、删除和转引导必须共用同一个 session 临界区，避免后台出队与用户操作
     // 同时取得同一条消息。引导先写入 canonical Turn，再持久化移除队列项；若第二步
     // 失败，重试会通过 requestId + userMessageId 识别已提交消息，不会重复引导。
-    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     let queued = state
         .queued_regular_session_turns(&session_id)
         .into_iter()
@@ -486,7 +503,7 @@ async fn guide_session_turn_queue_item(
         steer_request.workspace_id = scope.workspace_id().as_ref().map(ToString::to_string);
         steer_request.steer_current_turn = true;
         steer_request.expected_turn_id = Some(expected_turn_id);
-        submit_steer_current_turn(
+        submit_steer_current_turn_after_turn_commit(
             &state,
             &steer_request,
             &scope,
@@ -572,6 +589,22 @@ pub(crate) async fn submit_session_turn(
             "编辑上一条消息必须开始新的对话轮次".to_string(),
         ));
     }
+    // 只有创建新 session 的主线提交需要保护全局 current 指针。已有 session 的
+    // Turn 事实由 per-session Turn 锁保护，不能因为后台执行阻塞其他 session 导航。
+    // 新 session 尚未有 session_id，因此在 resolve_dispatch_session 创建并提交首条
+    // 消息的短控制面事务内持有导航锁，失败时由同一边界执行回滚。
+    let _navigation_guard = if matches!(
+        decision.route,
+        SessionTurnRouteDto::Chat
+            | SessionTurnRouteDto::Execute
+            | SessionTurnRouteDto::Task
+            | SessionTurnRouteDto::Continue
+    ) && request.requested_session_id().is_none()
+    {
+        Some(state.lock_session_navigation().await)
+    } else {
+        None
+    };
     let session_turn_guard = if matches!(
         decision.route,
         SessionTurnRouteDto::Chat
@@ -610,7 +643,11 @@ pub(crate) async fn submit_session_turn(
             })?;
             drop(session_turn_guard);
             if should_schedule {
-                schedule_next_queued_regular_session_turn(state, session_id, session_workspace_id);
+                schedule_next_queued_regular_session_turn(
+                    state.clone(),
+                    session_id,
+                    session_workspace_id,
+                );
             }
             return Ok(Json(response));
         }
@@ -661,7 +698,7 @@ pub(crate) async fn submit_session_turn(
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task => {
             submit_mainline_session_turn(
-                state,
+                state.clone(),
                 request,
                 images,
                 workspace_id,
@@ -862,6 +899,18 @@ fn enqueue_session_turn_response(
 }
 
 async fn submit_steer_current_turn(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    scope: &SessionScope,
+    accepted_at: UtcMillis,
+) -> Result<SessionTurnResponseDto, ApiError> {
+    let session_id = parse_session_id(request.session_id.as_deref())?;
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
+    submit_steer_current_turn_after_turn_commit(state, request, scope, accepted_at).await
+}
+
+/// 调用方已经持有 `navigation -> session Turn` 时提交 steer。
+async fn submit_steer_current_turn_after_turn_commit(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     scope: &SessionScope,
@@ -2563,7 +2612,7 @@ async fn schedule_goal_continuation_turn_if_idle(
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
 ) {
-    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     let Some(goal) = state.session_store.active_goal(&session_id) else {
         return;
     };
@@ -2591,7 +2640,9 @@ async fn schedule_goal_continuation_turn_if_idle(
     {
         return;
     }
-    if let Err(error) = submit_goal_continuation_turn(state, session_id, workspace_id, goal).await {
+    if let Err(error) =
+        submit_goal_continuation_turn(state.clone(), session_id, workspace_id, goal).await
+    {
         tracing::warn!("goal continuation turn submit failed: {error:?}");
     }
 }
@@ -2624,7 +2675,7 @@ pub(crate) fn ensure_goal_continuation_runtime_available(
     Ok(())
 }
 
-pub(crate) async fn resume_active_goal_continuation_turn(
+pub(crate) async fn resume_active_goal_continuation_turn_after_turn_commit(
     state: ApiState,
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
@@ -2686,7 +2737,7 @@ async fn drain_next_queued_regular_session_turn(
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
 ) -> QueuedRegularSessionTurnDrainOutcome {
-    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     if state.queued_regular_session_turn_count(&session_id) == 0 {
         return QueuedRegularSessionTurnDrainOutcome::Empty;
     }
@@ -2709,7 +2760,7 @@ async fn drain_next_queued_regular_session_turn(
             .is_ok()
             && state.queued_regular_session_turn_count(&session_id) > 0
         {
-            schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
+            schedule_next_queued_regular_session_turn(state.clone(), session_id, workspace_id);
         }
         return QueuedRegularSessionTurnDrainOutcome::Started;
     }
@@ -3373,7 +3424,7 @@ async fn interrupt_session_turn(
 ) -> Result<Json<SessionInterruptResponseDto>, ApiError> {
     let session = resolve_interrupt_session_record(&state, &request)?;
     let session_id = session.session_id.clone();
-    let session_turn_guard = state.lock_session_turn(&session_id).await;
+    let session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     let now = UtcMillis::now();
     let workspace_id = session_workspace_id(&state, &session);
     let current_turn = state
@@ -3635,6 +3686,8 @@ async fn navigate_session(
             Some(session_id)
         }
     };
+    // 导航请求只提交当前会话指针和工作区选择。Turn 状态由执行生命周期独立管理，
+    // 切换会话不应等待后台 Runner 或模型执行。
     if let SessionScope::Workspace(binding) = &scope {
         state
             .workspace_registry
@@ -3715,7 +3768,7 @@ async fn execute_session_continue(
 ) -> Result<ContinueSessionResponseDto, ApiError> {
     // /session/continue 和 agent-run Continue 都绕过普通 turn 分类器，必须在这里
     // 取得同一把 session 锁，才能与新消息、队列 drain 和另一个 Continue 请求串行。
-    let _session_turn_guard = state.lock_session_turn(session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(session_id).await;
     let requested_prompt_text = request
         .prompt_text
         .as_deref()
@@ -3850,6 +3903,7 @@ async fn delete_session(
     Json(request): Json<DeleteSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    let _lifecycle_guard = state.lock_session_lifecycle(&session_id).await;
     let scope = resolve_existing_session_scope(
         &state,
         &session_id,
@@ -3857,24 +3911,27 @@ async fn delete_session(
         request.requested_workspace_path(),
     )?;
     let workspace_id = scope.workspace_id();
-    state.delete_session_and_resources(&session_id).await?;
-    let replacement_session_id = state
-        .session_records_for_workspace(workspace_id.as_ref().map(WorkspaceId::as_str))
-        .into_iter()
-        .max_by(|left, right| {
-            left.updated_at
-                .cmp(&right.updated_at)
-                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
-        })
-        .map(|session| session.session_id);
-    if let Some(replacement_session_id) = replacement_session_id.as_ref() {
-        state
-            .session_store
-            .select_current_session(replacement_session_id)
-            .map_err(|error| ApiError::internal_assembly("选择删除后的替代会话失败", error))?;
-    }
-    // 删除与最终 current 选择属于同一个用户动作事实，必须一次持久化。
-    state.persist_session_projection_for_api()?;
+    let replacement_session_id =
+        if state.session_store.current_session_id().as_ref() == Some(&session_id) {
+            state
+                .session_records_for_workspace(workspace_id.as_ref().map(WorkspaceId::as_str))
+                .into_iter()
+                .filter(|session| session.session_id != session_id)
+                .max_by(|left, right| {
+                    left.updated_at
+                        .cmp(&right.updated_at)
+                        .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+                })
+                .map(|session| session.session_id)
+        } else {
+            None
+        };
+    state
+        .delete_session_and_resources_after_lifecycle_lock(
+            &session_id,
+            replacement_session_id.clone(),
+        )
+        .await?;
     publish_session_directory_event(
         &state,
         "session.deleted",
@@ -3913,6 +3970,7 @@ async fn rename_session(
     Json(request): Json<RenameSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    let _lifecycle_guard = state.lock_session_lifecycle(&session_id).await;
     let scope = resolve_existing_session_scope(
         &state,
         &session_id,
@@ -3924,15 +3982,8 @@ async fn rename_session(
         .session_store
         .session(&session_id)
         .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-    let renamed = state
-        .session_store
-        .rename_session(&session_id, &request.name)
-        .map_err(|error| match error {
-            DomainError::Validation { message } => ApiError::InvalidInput(message),
-            other => ApiError::internal_assembly("重命名会话失败", other),
-        })?;
+    let renamed = state.rename_session_with_persistence_for_api(&session_id, &request.name)?;
     if current.title != renamed.title {
-        state.persist_session_projection_for_api()?;
         crate::session_title::publish_session_title_updated(
             &state,
             &session_id,
@@ -3957,6 +4008,7 @@ async fn mark_session_viewed(
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     let session = state
         .session_store
         .mark_session_viewed(&session_id)
@@ -4020,6 +4072,7 @@ async fn close_session(
     Json(request): Json<CloseSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    let _lifecycle_guard = state.lock_session_lifecycle(&session_id).await;
     let scope = resolve_existing_session_scope(
         &state,
         &session_id,
@@ -4027,12 +4080,7 @@ async fn close_session(
         request.requested_workspace_path(),
     )?;
     let workspace_id = scope.workspace_id();
-    let _session_turn_guard = state.lock_session_turn(&session_id).await;
     let manager = state.runner_manager();
-    let _session_lifecycle_guard = match manager {
-        Some(manager) => Some(manager.lock_session_lifecycle(&session_id).await),
-        None => None,
-    };
     cancel_active_session_turn_for_lifecycle(&state, &session_id);
     state
         .session_store
@@ -4566,7 +4614,10 @@ mod tests {
     use magi_workspace::WorkspaceStore;
     use std::{
         fs,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
     use tower::ServiceExt;
@@ -6164,7 +6215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_interrupt_cancels_shell_by_session_even_without_workspace_context() {
+    async fn session_interrupt_cancels_shell_by_session_scope() {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let governance = Arc::new(GovernanceService::default());
         let mut tool_registry = ToolRegistry::new(governance.clone(), event_bus.clone());
@@ -6210,6 +6261,7 @@ mod tests {
             .expect("current turn should persist");
 
         let runner_session_id = session_id.clone();
+        let runner_workspace_id = workspace_id.clone();
         let runner = std::thread::spawn(move || {
             runner_registry.execute_with_policy(
                 ToolExecutionInput::for_builtin_invocation(
@@ -6223,7 +6275,9 @@ mod tests {
                 ),
                 ToolExecutionContext {
                     session_id: Some(runner_session_id),
-                    workspace_id: None,
+                    // shell_exec 的执行根必须来自 workspace；本测试验证的是中断
+                    // 按 session 取消，而不是允许无 workspace 执行 shell。
+                    workspace_id: Some(runner_workspace_id),
                     access_profile: AccessProfile::FullAccess,
                     ..ToolExecutionContext::default()
                 },
@@ -9623,6 +9677,10 @@ mod tests {
                 "hello",
             );
         }
+        state
+            .session_store
+            .select_current_session(&deleted_session_id)
+            .expect("deleted session should be current for replacement assertion");
 
         let (status, body) = post_json(
             state,
@@ -10277,6 +10335,61 @@ mod tests {
                 .current_session()
                 .map(|item| item.session_id),
             Some(session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_session_rolls_back_entity_and_current_on_persist_failure() {
+        let existing_session_id = SessionId::new("session-materialize-existing-current");
+        let base_state = test_state();
+        base_state
+            .session_store
+            .create_session(existing_session_id.clone(), "已有会话")
+            .expect("existing session should create");
+        base_state
+            .session_store
+            .select_current_session(&existing_session_id)
+            .expect("existing session should select");
+
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let persist_calls_for_callback = persist_calls.clone();
+        let state = base_state.with_session_projection_persist(Arc::new(
+            move |_durable, _sidecars, _mode| {
+                if persist_calls_for_callback.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(ApiError::internal_assembly(
+                        "测试 projection 持久化失败",
+                        "injected failure",
+                    ));
+                }
+                Ok(())
+            },
+        ));
+
+        let (status, _body) = post_json(
+            state.clone(),
+            "/session/materialize",
+            serde_json::json!({ "scope": "personal" }),
+        )
+        .await;
+
+        assert_ne!(status, StatusCode::OK);
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.session_store.sessions().len(), 1);
+        assert_eq!(
+            state
+                .session_store
+                .current_session()
+                .map(|session| session.session_id),
+            Some(existing_session_id)
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .all(|event| event.event_type != "session.created"),
+            "持久化失败的会话不能发布 session.created"
         );
     }
 

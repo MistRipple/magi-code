@@ -56,7 +56,7 @@ use crate::{
     tool_result_utils::DeterministicToolFailure,
     tool_surface_state::{
         BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput,
-        activate_skill_tool_definitions, refresh_live_browser_tool_definitions,
+        activate_skill_tool_definitions, build_browser_tool_surface,
         refresh_live_mcp_tool_definitions_with_mode,
     },
     usage_recording::{
@@ -70,6 +70,7 @@ use magi_bridge_client::{
     ChatMessage, ChatToolChoice, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
     ModelProviderContext, ModelResponseStatus, ModelStreamingDelta,
 };
+use magi_browser_authority::BrowserCapabilitySnapshot;
 use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{CanonicalTurnItemKind, SessionStore, ThreadChatMessage};
@@ -1084,6 +1085,13 @@ fn run_session_turn_execution_inner(
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
     let mut deferred_mcp_tools_loaded = false;
+    let turn_browser_capability = if request.use_tools {
+        tool_registry.and_then(|registry| {
+            registry.browser_capability_snapshot(request.access_profile, Some(&request.session_id))
+        })
+    } else {
+        None
+    };
     let mut tool_execution_ledger = ToolExecutionLedger::from_thread_history(
         &request.prompt,
         &session_store.thread_message_history(&orchestrator_thread_id),
@@ -1116,11 +1124,11 @@ fn run_session_turn_execution_inner(
     let mut last_response_observation: Option<String> = None;
     let mut round = 0usize;
     loop {
-        let mut browser_capability_revision = None;
+        let mut browser_capability_snapshot = turn_browser_capability.clone();
         if request.use_tools
             && let Some(registry) = tool_registry
         {
-            let browser_surface = refresh_live_browser_tool_definitions(
+            let browser_surface = build_browser_tool_surface(
                 active_tools,
                 registry,
                 BrowserToolSurfaceContext::new(
@@ -1129,11 +1137,11 @@ fn run_session_turn_execution_inner(
                     request.access_profile,
                     None,
                     &[],
-                    Some(&request.session_id),
                 ),
+                browser_capability_snapshot.clone(),
             );
             active_tools = browser_surface.definitions;
-            browser_capability_revision = browser_surface.capability_revision;
+            browser_capability_snapshot = browser_surface.capability;
             active_tools =
                 refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
                     definitions: active_tools,
@@ -1256,7 +1264,7 @@ fn run_session_turn_execution_inner(
                 usage_binding: &usage_binding,
                 prompt: &prompt,
                 tools: round_tools,
-                browser_capability_revision,
+                browser_capability_snapshot,
                 messages: &mut messages,
                 completed_required_tool_names: &completed_required_tool_names,
                 required_tool_chain: &required_tool_chain,
@@ -1909,7 +1917,7 @@ struct SessionTurnRoundRuntime<'a> {
     usage_binding: &'a ModelUsageBinding,
     prompt: &'a str,
     tools: Option<Vec<ChatToolDefinition>>,
-    browser_capability_revision: Option<u64>,
+    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     messages: &'a mut Vec<ChatMessage>,
     completed_required_tool_names: &'a [String],
     required_tool_chain: &'a [String],
@@ -2064,7 +2072,7 @@ fn stream_session_turn_round(
         usage_binding,
         prompt,
         tools,
-        browser_capability_revision,
+        browser_capability_snapshot,
         messages,
         completed_required_tool_names,
         required_tool_chain,
@@ -2864,7 +2872,7 @@ fn stream_session_turn_round(
                     workspace_root_path: request.workspace_root_path.as_deref().map(PathBuf::from),
                     context_references: &request.context_references,
                     access_profile: request.access_profile,
-                    browser_capability_revision,
+                    browser_capability_snapshot,
                     browser_execution_id: Some(&request.turn_id),
                     snapshot_session,
                     execution_group_id: Some(execution_group_id),
@@ -5627,7 +5635,7 @@ mod tests {
                 usage_binding: &usage_binding,
                 prompt: &request.prompt,
                 tools: None,
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
                 required_tool_chain: &[],
@@ -5764,7 +5772,7 @@ mod tests {
                 usage_binding: &usage_binding,
                 prompt: &request.prompt,
                 tools: None,
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
                 required_tool_chain: &[],

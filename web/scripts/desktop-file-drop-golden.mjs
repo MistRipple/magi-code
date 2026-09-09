@@ -205,8 +205,8 @@ assert.doesNotMatch(
 );
 assert.match(
   shellSource,
-  /handleDesktopWorkspaceDrop[\s\S]*?resolveAgentPath[\s\S]*?kind !== 'directory'[\s\S]*?registerWorkspaceRoot\([^,]+, true\)/,
-  '左侧拖放必须只接受目录，并通过共享注册流程进入草稿态',
+  /handleDesktopWorkspaceDrop[\s\S]*?resolveAgentPath[\s\S]*?kind !== 'directory'[\s\S]*?registerWorkspaceRoot\([^)]*\)/,
+  '左侧拖放必须只接受目录，并通过共享注册流程完成工作区注册',
 );
 assert.match(
   shellSource,

@@ -13,8 +13,8 @@ use magi_browser_authority::{
     BrowserHostClient, BrowserHostClientError, BrowserHostCommand, BrowserHostCommandError,
     BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
     BrowserHostControlUpdate, BrowserHostSnapshot, BrowserLeaseEndReason, BrowserNavigation,
-    BrowserSnapshotNode, BrowserSnapshotTarget, BrowserToolAccess, BrowserToolKind,
-    BrowserViewport, BrowserViewportMode, CreateBrowserSession, CreateBrowserTab,
+    BrowserSnapshotNode, BrowserSnapshotTarget, BrowserSurfaceBinding, BrowserToolAccess,
+    BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession, CreateBrowserTab,
     GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
 };
 use magi_core::{
@@ -165,18 +165,24 @@ impl BrowserToolRuntimeDependencies {
         let Some(kind) = BrowserToolKind::from_name(tool_name) else {
             return failure(tool_name, "unknown_browser_tool", "未知的浏览器工具");
         };
-        let mut capability = self.capabilities(Some(&session_id));
-        capability.access_profile = context.access_profile;
-        let requested_access = browser_tool_requested_access(kind, arguments);
-        let Some(catalog_revision) = context.browser_capability_revision else {
+        let Some(mut capability) = context.browser_capability_snapshot.clone() else {
             return failure(
                 tool_name,
                 "browser_capability_snapshot_missing",
                 "浏览器工具调用缺少当前模型轮次的能力快照",
             );
         };
-        if let Err(error) = capability.allows_execution(catalog_revision, kind, requested_access) {
+        capability.access_profile = context.access_profile;
+        let requested_access = browser_tool_requested_access(kind, arguments);
+        if let Err(error) = capability.allows_execution(kind, requested_access) {
             return capability_unavailable(tool_name, &error.to_string());
+        }
+        let live_capability = self.capabilities(Some(&session_id));
+        if let Some(reason) = live_capability.unavailable_reason() {
+            return capability_unavailable(
+                tool_name,
+                &format!("浏览器 Host 当前不可用: {reason:?}"),
+            );
         }
         let client = self
             .host_client
@@ -219,9 +225,20 @@ impl BrowserToolRuntimeDependencies {
                 .execute_tabs(arguments, &browser_session, scope, &client)
                 .await;
         }
+        // 导航参数必须在自动创建 Browser Tab 之前完成校验。否则一个无效 URL
+        // 会先创建并展示 about:blank，再返回参数错误，留下与失败请求无关的
+        // 物理页面和 revision 事件。
+        let navigation = (tool_name == "browser_navigate")
+            .then(|| parse_browser_navigation(arguments))
+            .transpose()?;
         let tab = self
             .ensure_tab(&browser_session, arguments, &client)
             .await?;
+        // ensure_tab 只完成逻辑 Tab 的创建或恢复；真实 Chromium guest
+        // 由右栏 Renderer 异步注册。所有需要访问页面的工具必须先通过
+        // 同一个 Host 事务拿到真实 Surface，并同步回 Authority，不能在
+        // 这里依赖迟到的 primary_surface_changed 事件。
+        self.ensure_surface(&client, &tab.tab_id).await?;
         if browser_devtools_operation(tool_name).is_some() {
             return self
                 .execute_devtools_operation(
@@ -398,81 +415,27 @@ impl BrowserToolRuntimeDependencies {
                 .to_string())
             }
             "browser_navigate" => {
-                let action = optional_string(arguments, "action")
-                    .or_else(|| optional_string(arguments, "url").map(|_| "url".to_string()))
-                    .ok_or_else(|| {
-                        BrowserToolError::new(
-                            "invalid_navigation",
-                            "必须提供 url，或显式指定 back、forward、reload action",
-                        )
-                    })?;
-                let timeout_ms = arguments
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
-                    .map(|value| {
-                        u32::try_from(value).map_err(|_| {
-                            BrowserToolError::new("invalid_navigation", "timeout_ms 超出支持范围")
-                        })
-                    })
-                    .transpose()?
-                    .map(|value| value.clamp(1, 60_000));
-                let handle_before_unload = match optional_string(arguments, "handle_before_unload")
-                {
-                    None => None,
-                    Some(value) => Some(match value.as_str() {
-                        "accept" => BeforeUnloadAction::Accept,
-                        "dismiss" => BeforeUnloadAction::Dismiss,
-                        _ => {
-                            return Err(BrowserToolError::new(
-                                "invalid_navigation",
-                                "handle_before_unload 必须是 accept 或 dismiss",
-                            ));
-                        }
-                    }),
-                };
-                let init_script = optional_string(arguments, "init_script");
-                let navigation = match action.as_str() {
-                    "url" => {
-                        if bool_arg(arguments, "ignore_cache", false) {
-                            return Err(BrowserToolError::new(
-                                "invalid_navigation",
-                                "ignore_cache 只支持 reload action",
-                            ));
-                        }
-                        let url = string_arg(arguments, "url")?;
-                        validate_browser_navigation_url(&url).map_err(|error| {
-                            BrowserToolError::new(
-                                "browser_navigation_url_rejected",
-                                format!("浏览器导航 URL 不合法: {error}"),
-                            )
-                        })?;
-                        BrowserNavigation::Url {
-                            url,
-                            handle_before_unload,
-                            init_script,
-                            timeout_ms,
-                        }
-                    }
-                    "back" => BrowserNavigation::Back { timeout_ms },
-                    "forward" => BrowserNavigation::Forward { timeout_ms },
-                    "reload" => BrowserNavigation::Reload {
-                        ignore_cache: bool_arg(arguments, "ignore_cache", false),
-                        handle_before_unload,
-                        timeout_ms,
-                    },
-                    _ => return Err(BrowserToolError::new("invalid_navigation", "action 不合法")),
-                };
+                let navigation = navigation
+                    .ok_or_else(|| BrowserToolError::new("invalid_navigation", "缺少导航参数"))?;
                 let control = self
                     .prepare_agent_write(&client, &browser_session, &tab, scope)
                     .await?;
-                let reply = client
-                    .request(BrowserHostCommand::Navigate {
-                        tab_id: tab.tab_id.clone(),
-                        control,
-                        navigation,
-                    })
-                    .await
-                    .map_err(browser_host_client_error)?;
+                let reply = match navigation {
+                    BrowserNavigation::Stop => client
+                        .request(BrowserHostCommand::StopNavigation {
+                            tab_id: tab.tab_id.clone(),
+                        })
+                        .await
+                        .map_err(browser_host_client_error)?,
+                    navigation => client
+                        .request(BrowserHostCommand::Navigate {
+                            tab_id: tab.tab_id.clone(),
+                            control,
+                            navigation,
+                        })
+                        .await
+                        .map_err(browser_host_client_error)?,
+                };
                 let page = page_state(reply.response.outcome, "浏览器导航失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
                 let snapshot = if bool_arg(arguments, "include_snapshot", false) {
@@ -950,6 +913,45 @@ impl BrowserToolRuntimeDependencies {
             .map_err(browser_host_client_error)?;
         let page = page_state(reply.response.outcome, "恢复浏览器 Tab 失败")?;
         self.apply_page_state(&tab.tab_id, page)
+    }
+
+    async fn ensure_surface(
+        &self,
+        client: &BrowserHostClient,
+        tab_id: &BrowserTabId,
+    ) -> Result<BrowserSurfaceBinding, BrowserToolError> {
+        let reply = client
+            .request(BrowserHostCommand::EnsureSurface {
+                tab_id: tab_id.clone(),
+            })
+            .await
+            .map_err(browser_host_client_error)?;
+        let BrowserHostCommandResult::SurfaceBinding(binding) =
+            succeeded_result(reply.response.outcome, "等待浏览器真实 Surface 失败")?
+        else {
+            return Err(BrowserToolError::new(
+                "browser_result_invalid",
+                "浏览器真实 Surface 返回结果无效",
+            ));
+        };
+        if binding.tab_id != *tab_id || binding.web_contents_id == 0 {
+            return Err(BrowserToolError::new(
+                "browser_surface_invalid",
+                "浏览器 Host 返回了无效的真实 Surface 身份",
+            ));
+        }
+        let accepted = self.mutate(|authority| {
+            let (accepted, _, _) =
+                authority.accept_primary_surface(binding.clone(), UtcMillis::now())?;
+            Ok(accepted)
+        })?;
+        if !accepted {
+            return Err(BrowserToolError::new(
+                "browser_surface_stale",
+                "浏览器真实 Surface 在确认前已经变更",
+            ));
+        }
+        Ok(binding)
     }
 
     async fn prepare_agent_write(
@@ -1441,6 +1443,7 @@ impl BrowserToolRuntimeDependencies {
                     }),
                 );
                 let target = self.materialize_tab(tab, client).await?;
+                self.ensure_surface(client, &target.tab_id).await?;
                 self.prepare_agent_write(client, session, &target, scope)
                     .await?;
                 self.mutate(|authority| {
@@ -1462,11 +1465,6 @@ impl BrowserToolRuntimeDependencies {
             "close" => {
                 let tab_id = BrowserTabId::new(string_arg(arguments, "tab_id")?);
                 let _target = tab_in_session(self, session, &tab_id)?;
-                let close_result = client
-                    .request(BrowserHostCommand::ClosePage {
-                        tab_id: tab_id.clone(),
-                    })
-                    .await;
                 let closed = self.mutate(|authority| {
                     authority.transition_tab(
                         &tab_id,
@@ -1475,6 +1473,14 @@ impl BrowserToolRuntimeDependencies {
                     )
                 })?;
                 self.publish_tab_event("browser.tab.closed", &closed);
+                // 权威关闭事件必须先到达 App Renderer，使其卸载
+                // <webview>；Host 只负责随后收口物理 guest，不能在
+                // Renderer 仍持有 guest 时直接 close WebContents。
+                let close_result = client
+                    .request(BrowserHostCommand::ClosePage {
+                        tab_id: tab_id.clone(),
+                    })
+                    .await;
                 if let Err(error) = close_result {
                     return Err(BrowserToolError::new(
                         "browser_host_disconnected",
@@ -1504,6 +1510,87 @@ fn validate_browser_tabs_arguments(arguments: &Map<String, Value>) -> Result<(),
         ));
     }
     Ok(())
+}
+
+fn parse_browser_navigation(
+    arguments: &Map<String, Value>,
+) -> Result<BrowserNavigation, BrowserToolError> {
+    let action = optional_string(arguments, "action")
+        .or_else(|| optional_string(arguments, "url").map(|_| "url".to_string()))
+        .ok_or_else(|| {
+            BrowserToolError::new(
+                "invalid_navigation",
+                "必须提供 url，或显式指定 back、forward、reload action",
+            )
+        })?;
+    let timeout_ms = arguments
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .map(|value| {
+            u32::try_from(value)
+                .map_err(|_| BrowserToolError::new("invalid_navigation", "timeout_ms 超出支持范围"))
+        })
+        .transpose()?
+        .map(|value| value.clamp(1, 60_000));
+    let handle_before_unload = match optional_string(arguments, "handle_before_unload") {
+        None => None,
+        Some(value) => Some(match value.as_str() {
+            "accept" => BeforeUnloadAction::Accept,
+            "dismiss" => BeforeUnloadAction::Dismiss,
+            _ => {
+                return Err(BrowserToolError::new(
+                    "invalid_navigation",
+                    "handle_before_unload 必须是 accept 或 dismiss",
+                ));
+            }
+        }),
+    };
+    let init_script = optional_string(arguments, "init_script");
+    match action.as_str() {
+        "url" => {
+            if bool_arg(arguments, "ignore_cache", false) {
+                return Err(BrowserToolError::new(
+                    "invalid_navigation",
+                    "ignore_cache 只支持 reload action",
+                ));
+            }
+            let url = string_arg(arguments, "url")?;
+            validate_browser_navigation_url(&url).map_err(|error| {
+                BrowserToolError::new(
+                    "browser_navigation_url_rejected",
+                    format!("浏览器导航 URL 不合法: {error}"),
+                )
+            })?;
+            Ok(BrowserNavigation::Url {
+                url,
+                handle_before_unload,
+                init_script,
+                timeout_ms,
+            })
+        }
+        "back" => Ok(BrowserNavigation::Back { timeout_ms }),
+        "forward" => Ok(BrowserNavigation::Forward { timeout_ms }),
+        "stop" => {
+            if arguments.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "url" | "ignore_cache" | "init_script" | "handle_before_unload" | "timeout_ms"
+                )
+            }) {
+                return Err(BrowserToolError::new(
+                    "invalid_navigation",
+                    "stop action 不接受 URL、缓存、脚本、beforeunload 或 timeout 参数",
+                ));
+            }
+            Ok(BrowserNavigation::Stop)
+        }
+        "reload" => Ok(BrowserNavigation::Reload {
+            ignore_cache: bool_arg(arguments, "ignore_cache", false),
+            handle_before_unload,
+            timeout_ms,
+        }),
+        _ => Err(BrowserToolError::new("invalid_navigation", "action 不合法")),
+    }
 }
 
 fn browser_devtools_operation(tool_name: &str) -> Option<&'static str> {
@@ -2440,9 +2527,9 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock, atomic::AtomicBool};
 
     use magi_browser_authority::{
-        BrowserAuthority, BrowserHostPageState, BrowserHostRect, BrowserHostSnapshot,
-        BrowserProfile, BrowserProfileKind, BrowserSessionLifecycle, BrowserSnapshotNode,
-        CreateBrowserSession, CreateBrowserTab,
+        BrowserAuthority, BrowserCapabilitySnapshot, BrowserHostPageState, BrowserHostRect,
+        BrowserHostSnapshot, BrowserHostStatus, BrowserProfile, BrowserProfileKind,
+        BrowserSessionLifecycle, BrowserSnapshotNode, CreateBrowserSession, CreateBrowserTab,
     };
     use magi_core::{
         BrowserProfileId, BrowserSessionId, BrowserTabId, ExecutionResultStatus, SessionId,
@@ -2455,8 +2542,9 @@ mod tests {
     use super::{
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_requested_access,
         browser_tool_snapshot_value, normalize_screenshot_clip, optional_snapshot_target,
-        parse_normalized_rect, screenshot_has_element_scope, validate_browser_tabs_arguments,
-        validate_devtools_arguments, validate_screenshot_binary, validate_screenshot_scope,
+        parse_browser_navigation, parse_normalized_rect, screenshot_has_element_scope,
+        validate_browser_tabs_arguments, validate_devtools_arguments, validate_screenshot_binary,
+        validate_screenshot_scope,
     };
     use crate::state::BrowserHostStatusSnapshot;
     use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
@@ -2473,6 +2561,37 @@ mod tests {
         let error = validate_browser_tabs_arguments(&arguments)
             .expect_err("browser_tabs must reject a nested tab identity");
         assert_eq!(error.code, "browser_nested_tab_unsupported");
+    }
+
+    #[test]
+    fn browser_navigation_is_rejected_before_tab_materialization() {
+        let mut arguments = Map::new();
+        arguments.insert("action".to_string(), Value::String("url".to_string()));
+        arguments.insert(
+            "url".to_string(),
+            Value::String("file:///Users/xie/.magi/personal-sessions/session/".to_string()),
+        );
+
+        let error = parse_browser_navigation(&arguments)
+            .expect_err("invalid navigation must fail before ensure_tab can create a tab");
+        assert_eq!(error.code, "browser_navigation_url_rejected");
+    }
+
+    #[test]
+    fn browser_navigation_stop_has_no_url_or_timeout_side_effects() {
+        let arguments = Map::from_iter([("action".to_string(), Value::String("stop".to_string()))]);
+        assert!(matches!(
+            parse_browser_navigation(&arguments),
+            Ok(magi_browser_authority::BrowserNavigation::Stop)
+        ));
+
+        let invalid = Map::from_iter([
+            ("action".to_string(), Value::String("stop".to_string())),
+            ("timeout_ms".to_string(), Value::from(1000)),
+        ]);
+        let error = parse_browser_navigation(&invalid)
+            .expect_err("stop must reject timeout because it is an immediate interrupt");
+        assert_eq!(error.code, "invalid_navigation");
     }
 
     #[test]
@@ -2634,7 +2753,14 @@ mod tests {
         };
         let context = magi_tool_runtime::ToolExecutionContext {
             session_id: Some(SessionId::new("session-browser-capability")),
-            browser_capability_revision: Some(1),
+            browser_capability_snapshot: Some(BrowserCapabilitySnapshot {
+                revision: 1,
+                in_app_browser_enabled: true,
+                browser_use_enabled: true,
+                host_status: BrowserHostStatus::Ready,
+                host_protocol_compatible: true,
+                access_profile: magi_core::AccessProfile::Restricted,
+            }),
             ..Default::default()
         };
         let (payload, status) = runtime.execute(

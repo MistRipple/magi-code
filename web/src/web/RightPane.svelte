@@ -13,8 +13,6 @@
     type OpenUrlInBrowserRequest,
   } from '../lib/browser-navigation';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../lib/external-link';
-  import { measureDesktopOverlayMenuBounds } from '../lib/desktop-overlay-geometry';
-  import { toDesktopOverlayIdentity, toDesktopOverlayState } from '../lib/desktop-overlay-state';
   import { addToast } from '../stores/messages.svelte';
   import { navigateSession, waitForSessionNavigation } from '../shared/session-navigation.svelte';
   import {
@@ -112,17 +110,7 @@
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
   let domAddPaneMenuOpen = $state(false);
-  let addPaneOverlayIdentity = $state<{ overlayId: string; ownerId: string } | null>(null);
-  let addPaneMenuLayout = $state<{
-    state: MagiDesktopOverlayState;
-    anchor: HTMLElement;
-    itemCount: number;
-  } | null>(null);
-  let addPaneMenuReflowFrame: number | null = null;
   let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
-  let addPaneMenuButton = $state<HTMLButtonElement | undefined>(undefined);
-  // 普通面板菜单在 Web 模式由右栏 DOM 承载；Desktop 模式交给原生 Overlay，
-  // 避免主 Renderer 的 z-index 与真实 Chromium Surface 竞争层级。
   const addPaneMenuOpen = $derived(domAddPaneMenuOpen);
   const canCreateBrowserPane = $derived(Boolean(
     desktopSurface
@@ -139,86 +127,19 @@
     browserCapabilities = snapshot;
   }
 
-  function desktopAddPaneMenuState(popupBounds: MagiDesktopRectangle): MagiDesktopOverlayState {
-    const overlayId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `right-pane-add-${Date.now()}`;
-    return {
-      overlayId: `right-pane-add-${overlayId}`,
-      kind: 'menu',
-      phase: 'menu',
-      ownerId: `right-pane:${paneScopeKey}`,
-      placement: 'right-pane-add',
-      popupBounds,
-      title: i18n.t('rightPane.addPanel'),
-      items: addablePaneKinds.map((item) => ({
-        id: `pane:${item.kind}`,
-        label: item.label,
-        icon: item.icon,
-        selected: false,
-        disabled: !item.enabled,
-      })),
-      fields: [],
-    };
-  }
-
-  function closeDesktopAddPaneOverlay(): Promise<void> {
-    const desktop = window.magiDesktop;
-    const identity = addPaneOverlayIdentity;
-    if (!desktop || !identity) return Promise.resolve();
-    addPaneOverlayIdentity = null;
-    addPaneMenuLayout = null;
-    return desktop.closeOverlay(toDesktopOverlayIdentity(identity)).then((event) => {
-      if (!event) return;
-      domAddPaneMenuOpen = false;
-    }).catch((error) => {
-      console.warn('[RightPane] 关闭新增面板菜单失败:', error);
-    });
-  }
-
-  function openDesktopAddPaneMenu(): void {
-    const desktop = window.magiDesktop;
-    if (!desktop || !canOpenAddPaneMenu || addPaneOverlayIdentity) return;
-    const anchor = addPaneMenuButton;
-    if (!anchor) return;
-    const popupBounds = measureDesktopOverlayMenuBounds(anchor, addablePaneKinds.length, 0);
-    if (!popupBounds) return;
-    const state = desktopAddPaneMenuState(popupBounds);
-    const identity = { overlayId: state.overlayId, ownerId: state.ownerId };
-    addPaneOverlayIdentity = identity;
-    addPaneMenuLayout = { state, anchor, itemCount: addablePaneKinds.length };
-    domAddPaneMenuOpen = false;
-    desktop.openOverlay(toDesktopOverlayState(state)).catch((error) => {
-      if (addPaneOverlayIdentity?.overlayId === identity.overlayId) addPaneOverlayIdentity = null;
-      console.warn('[RightPane] 打开新增面板菜单失败:', error);
-    });
-  }
-
-  function scheduleDesktopAddPaneMenuReflow(): void {
-    if (addPaneMenuReflowFrame !== null) return;
-    addPaneMenuReflowFrame = requestAnimationFrame(() => {
-      addPaneMenuReflowFrame = null;
-      const desktop = window.magiDesktop;
-      const layout = addPaneMenuLayout;
-      const identity = addPaneOverlayIdentity;
-      if (!desktop || !layout || !identity || layout.state.overlayId !== identity.overlayId || layout.state.ownerId !== identity.ownerId) return;
-      const popupBounds = measureDesktopOverlayMenuBounds(layout.anchor, layout.itemCount, 0);
-      if (!popupBounds) return;
-      const previous = layout.state.popupBounds;
-      if (
-        previous
-        && previous.x === popupBounds.x
-        && previous.y === popupBounds.y
-        && previous.width === popupBounds.width
-        && previous.height === popupBounds.height
-      ) return;
-      const state = toDesktopOverlayState({ ...layout.state, popupBounds });
-      addPaneMenuLayout = { ...layout, state };
-      void desktop.openOverlay(state).catch((error) => {
-        console.warn('[RightPane] 重排新增面板菜单失败:', error);
-      });
-    });
-  }
+  // 新增菜单必须进入 Renderer Top Layer。普通绝对定位元素会被活动
+  // Browser Tab 的原生 webview 合成层覆盖，导致右栏其他功能无法操作。
+  // 菜单的开关、Escape 和外部点击统一交给 Chromium 原生 popover，避免
+  // Renderer 捕获层与菜单项 click 产生竞态。
+  $effect(() => {
+    const menu = addPaneMenuElement;
+    if (!menu) return;
+    if (addPaneMenuOpen) {
+      if (!menu.matches(':popover-open')) menu.showPopover?.();
+    } else if (menu.matches(':popover-open')) {
+      menu.hidePopover?.();
+    }
+  });
 
   onMount(() => {
     void getBrowserCapabilities()
@@ -228,41 +149,6 @@
       applyBrowserCapabilities((event as CustomEvent<BrowserCapabilitiesSnapshot>).detail);
     };
     window.addEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
-    const menuPane = addPaneMenuButton?.closest<HTMLElement>('.right-pane') ?? null;
-    const menuGeometryObserver = typeof ResizeObserver === 'undefined' || !menuPane
-      ? null
-      : new ResizeObserver(() => scheduleDesktopAddPaneMenuReflow());
-    if (menuPane) menuGeometryObserver?.observe(menuPane);
-    const windowResize = () => scheduleDesktopAddPaneMenuReflow();
-    const handleOutsidePointer = (event: PointerEvent) => {
-      const target = event.target;
-      const outsideMenu = addPaneMenuOpen
-        && addPaneMenuElement
-        && target instanceof Node
-        && !addPaneMenuElement.contains(target)
-        && !addPaneMenuButton?.contains(target);
-      if (outsideMenu) domAddPaneMenuOpen = false;
-    };
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      if (!domAddPaneMenuOpen) return;
-      event.preventDefault();
-      event.stopPropagation();
-      domAddPaneMenuOpen = false;
-    };
-    const unsubscribeOverlayAction = window.magiDesktop?.onOverlayAction((action) => {
-      if (action.kind !== 'menu' || action.interaction !== 'select' || !action.id.startsWith('pane:')) return;
-      if (addPaneOverlayIdentity && action.overlayId !== addPaneOverlayIdentity.overlayId) return;
-      const kind = action.id.slice('pane:'.length);
-      if (kind !== 'browser' && kind !== 'terminal') return;
-      void closeDesktopAddPaneOverlay().then(() => chooseAddPane(kind));
-    });
-    const unsubscribeOverlayClosed = window.magiDesktop?.onOverlayClosed((event) => {
-      if (addPaneOverlayIdentity && event.overlayId !== addPaneOverlayIdentity.overlayId) return;
-      addPaneOverlayIdentity = null;
-      addPaneMenuLayout = null;
-      domAddPaneMenuOpen = false;
-    });
     const handleOpenUrlInBrowser = (event: Event) => {
       const request = (event as CustomEvent<OpenUrlInBrowserRequest>).detail;
       if (!request?.url) return;
@@ -278,25 +164,11 @@
         addToast('error', i18n.t('browser.error.openExternal'), undefined, { forceVisible: true });
       });
     };
-    window.addEventListener('pointerdown', handleOutsidePointer, true);
-    window.addEventListener('keydown', handleEscape, true);
-    window.addEventListener('resize', windowResize);
     window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
-      window.removeEventListener('pointerdown', handleOutsidePointer, true);
-      window.removeEventListener('keydown', handleEscape, true);
-      window.removeEventListener('resize', windowResize);
-      menuGeometryObserver?.disconnect();
-      if (addPaneMenuReflowFrame !== null) {
-        cancelAnimationFrame(addPaneMenuReflowFrame);
-        addPaneMenuReflowFrame = null;
-      }
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
-      unsubscribeOverlayAction?.();
-      unsubscribeOverlayClosed?.();
       domAddPaneMenuOpen = false;
-      void closeDesktopAddPaneOverlay();
     };
   });
 
@@ -489,18 +361,12 @@
   const canOpenAddPaneMenu = $derived(addablePaneKinds.some((item) => item.enabled));
 
   function toggleAddPaneMenu(): void {
-    // 浏览器 Surface 创建是异步的，但新增面板选择器属于右栏通用能力。
-    // 菜单本身只改变主 Renderer 的局部状态，不等待浏览器连接或原生 View。
     if (!canOpenAddPaneMenu) return;
-    if (window.magiDesktop) {
-      if (addPaneOverlayIdentity) {
-        void closeDesktopAddPaneOverlay();
-        return;
-      }
-      openDesktopAddPaneMenu();
-      return;
-    }
     domAddPaneMenuOpen = !domAddPaneMenuOpen;
+  }
+
+  function handleAddPaneMenuToggle(event: ToggleEvent): void {
+    domAddPaneMenuOpen = event.newState === 'open';
   }
 
   async function chooseAddPane(kind: RightPaneCreationKind): Promise<void> {
@@ -1252,7 +1118,6 @@
         <button
         type="button"
         class="right-pane-add-tab"
-        bind:this={addPaneMenuButton}
         data-open-tab-count={openTabs.length}
           onclick={toggleAddPaneMenu}
           disabled={!canOpenAddPaneMenu}
@@ -1268,8 +1133,13 @@
     {/if}
   </header>
 
-  {#if addPaneMenuOpen && !desktopSurface}
-    <div bind:this={addPaneMenuElement} class="right-pane-add-menu-row">
+  <div
+    bind:this={addPaneMenuElement}
+    class="right-pane-add-menu-row"
+    popover="auto"
+    ontoggle={handleAddPaneMenuToggle}
+    aria-hidden={!addPaneMenuOpen}
+  >
       <div class="right-pane-add-menu" role="menu" aria-label={i18n.t('rightPane.addPanel')}>
         {#each addablePaneKinds as item (item.kind)}
           <button
@@ -1284,8 +1154,7 @@
           </button>
         {/each}
       </div>
-    </div>
-  {/if}
+  </div>
 
   <!-- 当前 code tab 的副标题：路径 + 文档预览操作 -->
   {#if activeTab && activeTab.kind === 'code'}
@@ -1323,13 +1192,37 @@
     </div>
   {/if}
 
-  <!-- Body：按 activeTab 路由 -->
+  <!-- Body：浏览器 guest 始终保留在右栏内容槽中，只切换显示状态。
+       切换代码、图片、终端或 Agent 时不销毁 Chromium 文档和会话。 -->
   <div
     class="right-pane-body"
     class:right-pane-body--code={codeMode}
     class:right-pane-body--browser={activeTab?.kind === 'browser'}
     class:right-pane-body--terminal={activeTab?.kind === 'terminal'}
   >
+    {#each openTabs as tab (tab.id)}
+      {#if tab.kind === 'browser'}
+        {@const browserPayload = tab.payload as BrowserTabPayload}
+        <div
+          class="right-pane-browser-tab-host"
+          class:active={tab.id === paneState.activeTabId && activeTab?.kind === 'browser'}
+          hidden={tab.id !== paneState.activeTabId || activeTab?.kind !== 'browser'}
+          aria-hidden={tab.id !== paneState.activeTabId || activeTab?.kind !== 'browser'}
+        >
+          <BrowserTabContent
+            browserSessionId={browserPayload.browserSessionId}
+            tabId={browserPayload.tabId}
+            lifecycle={browserPayload.lifecycle}
+            workspaceId={browserPayload.workspaceId}
+            workspacePath={browserPayload.workspacePath}
+            sessionId={browserPayload.sessionId}
+            desktopSurface={desktopSurface}
+            onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, tab.id, label)}
+          />
+        </div>
+      {/if}
+    {/each}
+
     {#if !activeTab}
       <div class="right-pane-state">
         <Icon name="sidebar-toggle" size={22} />
@@ -1344,18 +1237,6 @@
         workspacePath={agentPayload.workspacePath}
         sessionId={agentPayload.sessionId}
       />
-    {:else if activeTab.kind === 'browser'}
-      {@const browserPayload = activeTab.payload as BrowserTabPayload}
-      <BrowserTabContent
-        browserSessionId={browserPayload.browserSessionId}
-        tabId={browserPayload.tabId}
-        lifecycle={browserPayload.lifecycle}
-        workspaceId={browserPayload.workspaceId}
-        workspacePath={browserPayload.workspacePath}
-        sessionId={browserPayload.sessionId}
-        desktopSurface={desktopSurface}
-        onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, activeTab.id, label)}
-      />
     {:else if activeTab.kind === 'terminal'}
       {@const terminalPayload = activeTab.payload as TerminalTabPayload}
       <TerminalTabContent
@@ -1364,6 +1245,8 @@
         workspacePath={terminalPayload.workspacePath}
         sessionId={terminalPayload.sessionId}
       />
+    {:else if activeTab.kind === 'browser'}
+      <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
     {:else if previewError}
@@ -1503,6 +1386,16 @@
     overflow: hidden;
   }
 
+  .right-pane-browser-tab-host {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .right-pane-browser-tab-host[hidden] { display: none; }
+
   /* ============ Tab 条 ============ */
   .right-pane-tabbar {
     position: relative;
@@ -1537,6 +1430,7 @@
   }
 
   .right-pane-add-tab {
+    anchor-name: --right-pane-add-anchor;
     flex: 0 0 auto;
     align-self: center;
     width: 28px;
@@ -1561,16 +1455,19 @@
   }
 
   .right-pane-add-menu-row {
-    position: absolute;
-    top: 42px;
-    right: 6px;
-    z-index: 5;
+    position: fixed;
+    position-anchor: --right-pane-add-anchor;
+    top: calc(anchor(bottom) + 4px);
+    right: calc(100vw - anchor(right) + 6px);
+    z-index: 1200;
     display: block;
     box-sizing: border-box;
     width: min(240px, calc(100% - 12px));
     min-width: 0;
+    margin: 0;
     pointer-events: auto;
   }
+  .right-pane-add-menu-row:not(:popover-open) { display: none; }
 
   .right-pane-add-menu {
     width: min(240px, 100%);
@@ -1818,6 +1715,7 @@
 
   /* ============ Body ============ */
   .right-pane-body {
+    position: relative;
     min-width: 0;
     min-height: 0;
     flex: 1;
@@ -1834,7 +1732,6 @@
 
   .right-pane-body--browser {
     position: relative;
-    z-index: 2;
     display: flex;
     flex-direction: column;
     width: 100%;

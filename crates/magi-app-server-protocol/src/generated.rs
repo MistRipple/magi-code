@@ -1106,10 +1106,6 @@ pub struct BrowserToolParams {
     pub access_profile: Option<BrowserAccessProfile>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "browserCapabilityRevision")]
-    pub browser_capability_revision: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "browserExecutionId")]
     pub browser_execution_id: Option<String>,
     #[serde(default)]

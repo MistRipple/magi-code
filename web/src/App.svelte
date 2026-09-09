@@ -18,7 +18,6 @@
     synchronizeBrowserTabs,
   } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
-  import { setDesktopBlockingOverlay } from './shared/desktop-overlay-contract';
   import {
     RUNTIME_CONNECTION_EVENT,
     BROWSER_AUTHORITY_CHANGED_EVENT,
@@ -130,12 +129,7 @@
   }
 
   // Settings 是 App Renderer 的全局阻塞层。它不靠 z-index 压过原生
-  // WebContentsView，而是通过统一契约让当前 Browser Surface 先退出内容槽。
-  $effect(() => {
-    setDesktopBlockingOverlay('app-settings', settingsOpen);
-    return () => setDesktopBlockingOverlay('app-settings', false);
-  });
-
+  // 原生窗口外壳，而是通过统一契约让当前 Browser Tab 先退出内容槽。
   onMount(() => {
     const focusAppRenderer = () => {
       if (window.magiDesktop?.focusApp) {

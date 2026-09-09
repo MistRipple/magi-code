@@ -428,7 +428,7 @@ fn current_turn_to_canonical_turn(
         .iter()
         .map(|item| current_turn_item_to_canonical_item(session_id, turn, item))
         .collect::<DomainResult<Vec<_>>>()?;
-    let metadata = turn
+    let mut metadata = turn
         .items
         .iter()
         .find(|item| item.kind == "user_message")
@@ -441,6 +441,9 @@ fn current_turn_to_canonical_turn(
             )])
         })
         .unwrap_or_default();
+    if let Some(request_id) = crate::models::active_execution_turn_request_id(turn) {
+        metadata.insert("requestId".to_string(), Value::String(request_id));
+    }
     let mut canonical_turn = CanonicalTurn {
         session_id: session_id.clone(),
         turn_id: turn.turn_id.clone(),
@@ -1324,8 +1327,12 @@ fn canonical_item_to_active(item: &CanonicalTurnItem) -> ActiveExecutionTurnItem
     }
 }
 
-/// event 游标领先 projection 时，只允许用权威事件结果单向推进 sidecar 缓存。
-pub(super) fn advance_sidecar_projection_from_canonical(
+/// sidecar 只是执行恢复缓存，canonical turn 才是唯一会话事实。
+///
+/// projection 的 canonical event 游标只能说明 durable 快照已经覆盖到哪条事件，
+/// 不能证明同一文件里的 sidecar 已同步。恢复时必须始终从权威 canonical turn
+/// 重建 sidecar，避免 daemon 在终态事件已落盘、sidecar 仍停在旧活动快照时拒绝启动。
+pub(super) fn rebuild_sidecar_projection_from_canonical(
     sidecar: &mut SessionRuntimeSidecar,
     canonical_turns: &[CanonicalTurn],
 ) -> DomainResult<()> {
@@ -3129,16 +3136,7 @@ impl SessionStore {
         turn.completed_at.get_or_insert(occurred_at);
         turn.normalize();
 
-        let request_id = turn.items.iter().find_map(|item| {
-            item.request_id
-                .as_deref()
-                .or_else(|| {
-                    item.metadata
-                        .get("requestId")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .filter(|value| !value.trim().is_empty())
-        });
+        let request_id = crate::models::active_execution_turn_request_id(&turn);
         let item_id = turn
             .items
             .iter()
@@ -3155,16 +3153,22 @@ impl SessionStore {
                 {
                     return Err(DomainError::NotFound { entity: "session" });
                 }
-                if let Some(request_id) = request_id
+                if let Some(request_id) = request_id.as_deref()
                     && state.canonical_turns.iter().any(|existing| {
                         existing.session_id == session_id
-                            && existing.items.iter().any(|item| {
-                                item.metadata
-                                    .get("requestId")
-                                    .or_else(|| item.metadata.get("request_id"))
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some(request_id)
-                            })
+                            && (existing
+                                .metadata
+                                .get("requestId")
+                                .or_else(|| existing.metadata.get("request_id"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some(request_id)
+                                || existing.items.iter().any(|item| {
+                                    item.metadata
+                                        .get("requestId")
+                                        .or_else(|| item.metadata.get("request_id"))
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(request_id)
+                                }))
                     })
                 {
                     return Ok(CanonicalCommitPlan {

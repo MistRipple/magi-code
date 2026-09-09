@@ -94,6 +94,7 @@ export interface BrowserAuthoritySessionProjection {
   browserSessionId: string;
   revision: number;
   agentOccupied: boolean;
+  activeTabId: string | null;
   tabs: BrowserAuthorityTabProjection[];
 }
 
@@ -796,7 +797,8 @@ export function openBrowserTab(
 export function synchronizeBrowserSessionSnapshot(
   snapshot: Pick<
     BrowserSessionSnapshot,
-    'browserSessionId' | 'workspaceId' | 'sessionId' | 'revision' | 'agentOccupied' | 'tabs'
+    'browserSessionId' | 'workspaceId' | 'sessionId' | 'revision'
+    | 'activeTabId' | 'agentOccupied' | 'tabs'
   >,
   workspacePath?: string | null,
   options?: {
@@ -814,6 +816,7 @@ export function synchronizeBrowserSessionSnapshot(
       browserSessionId: snapshot.browserSessionId,
       revision: snapshot.revision,
       agentOccupied: snapshot.agentOccupied,
+      activeTabId: snapshot.activeTabId,
       tabs: snapshot.tabs.map((tab) => ({
         tabId: tab.tabId,
         lifecycle: tab.lifecycle,
@@ -998,21 +1001,54 @@ export function synchronizeBrowserTabs(
     pane.activeTabId = requestedPaneId;
     pane.collapsed = false;
     const active = pane.openTabs.find((tab) => tab.id === requestedPaneId);
-    if (active) active.lastActivatedAt = now();
+    if (active) {
+      active.lastActivatedAt = now();
+      // 权威事件携带 revealTabId 时，表示一次跨进程的明确激活意图。
+      // 必须和用户点击 Tab 走同一条 Desktop intent 记录，否则旧的
+      // Main snapshot 会在真实内容槽注册期间把目标 Tab 写回旧项。
+      rememberDesktopPanelIntent(scopeKey, active);
+    }
     return;
   }
-  const previousActiveStillExists = Boolean(
-    previousActiveTabId
-      && pane.openTabs.some((tab) => tab.id === previousActiveTabId),
-  );
+  const authorityActivePaneId = snapshot?.activeTabId?.trim()
+    ? `browser:${browserSessionId}:${snapshot.activeTabId.trim()}`
+    : null;
+  const previousActiveTab = previousActiveTabId
+    ? pane.openTabs.find((tab) => tab.id === previousActiveTabId) ?? null
+    : null;
+  const previousActiveStillExists = previousActiveTab !== null;
+  const pendingIntent = pendingDesktopPanelIntent;
+  const pendingBrowserIntent = pendingIntent?.scopeKey === scopeKey
+    && pendingIntent.kind === 'browser'
+    && pane.openTabs.some((tab) => tab.id === `browser:${browserSessionId}:${pendingIntent.tabId}`);
+
+  // 浏览器快照的 activeTabId 是物理 Chromium Surface 正在展示的页面。
+  // 只有用户尚未发出新的 Browser 激活意图时，才允许它收敛当前 Browser
+  // Tab；Code/Terminal 等非浏览器一级 Tab 仍由 RightPane 自己保持。
+  if (
+    previousActiveStillExists
+      && (previousActiveTab.kind !== 'browser' || pendingBrowserIntent || !authorityActivePaneId)
+  ) {
+    pane.activeTabId = previousActiveTabId;
+    return;
+  }
+
+  if (
+    authorityActivePaneId
+      && pane.openTabs.some((tab) => tab.id === authorityActivePaneId)
+  ) {
+    pane.activeTabId = authorityActivePaneId;
+    if (!hadBrowserProjection) pane.collapsed = false;
+    return;
+  }
 
   if (previousActiveStillExists) {
     pane.activeTabId = previousActiveTabId;
     return;
   }
 
-  // BrowserAuthority 不持有窗口级选中项。首次投影按持久 Tab 顺序选择第一个；
-  // Desktop Renderer 随后使用当前窗口的 Main snapshot 恢复该窗口自己的选择。
+  // Authority 没有活动 Tab 时才按稳定顺序选择第一个。正常恢复会优先使用
+  // snapshot.activeTabId，不能把物理 Surface 正在展示的页面错投影成第一个 Tab。
   const firstAuthorityPaneId = authorityTabs[0]
     ? `browser:${browserSessionId}:${authorityTabs[0].tabId.trim()}`
     : null;

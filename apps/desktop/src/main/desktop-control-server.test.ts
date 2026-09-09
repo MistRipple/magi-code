@@ -62,6 +62,78 @@ test("并发 start/close 通过单一生命周期队列收口为一个控制端�
   assert.equal(existsSync(socketPath), false);
 });
 
+test("只有 Control WebSocket 建立后才发布 Host 可执行状态", async () => {
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const states: boolean[] = [];
+  const { server, socketPath } = createControlServer(worker, {
+    onConnectionState: (connected) => states.push(connected),
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    assert.deepEqual(states, [true]);
+  } finally {
+    await closeSocket(client);
+    await waitUntil(() => states.length === 2);
+    assert.deepEqual(states, [true, false]);
+    await server.close();
+  }
+});
+
+test("控制连接断开只释放浏览器自动化控制态，不关闭逻辑 Tab", async () => {
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  let releaseCount = 0;
+  const { server, socketPath } = createControlServer(worker, {
+    onHostControlReleased: () => { releaseCount += 1; },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    await closeSocket(client);
+    await waitUntil(() => releaseCount === 1);
+    assert.equal(releaseCount, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("primary_changed 未完成 Worker 重绑前，同一 Tab 的命令不得执行", async () => {
+  const rebind = deferred<void>();
+  const calls: BrowserHostCommand[] = [];
+  const worker = {
+    execute: async (_binding: BrowserSurfaceBinding, command: BrowserHostCommand) => {
+      calls.push(command);
+      return failedOutcome("unused");
+    },
+    forwardSurfaceEvent: (event: BrowserSurfaceEvent) => (
+      event.type === "primary_changed" ? rebind.promise : Promise.resolve()
+    ),
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker);
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    server.handleSurfaceEvent({ type: "primary_changed", binding });
+    const responsePromise = nextJsonMatching(client, (message) => message.request_id === "rebind-gated");
+    client.send(JSON.stringify(request("rebind-gated", snapshotCommand())));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls.length, 0);
+
+    rebind.resolve();
+    await responsePromise;
+    assert.equal(calls.length, 1);
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("连接断开后同一资源队列等待旧底层操作收口", async () => {
   const firstOperation = deferred<{ outcome: BrowserCommandOutcome }>();
   const calls: BrowserHostCommand[] = [];
@@ -304,6 +376,55 @@ test("新建 Browser Page 只物化 WebContents，不等待可见内容槽", asy
     assert.equal(response.outcome?.status, "succeeded");
     assert.equal(materializeCalled, true);
     assert.equal(ensureCalled, false);
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
+test("ensure_surface 在逻辑 Surface 尚未绑定 guest 时等待并返回真实 binding", async () => {
+  const surface = bindingForTab("tab-await-surface");
+  let bindingReady = false;
+  let ensureInput: unknown = null;
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    bindings: [surface],
+    primaryTabId: surface.tab_id,
+    bindingAvailable: () => bindingReady,
+    ensureBrowserSurface: async (input) => {
+      ensureInput = input;
+      bindingReady = true;
+    },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(
+      client,
+      (message) => message.request_id === "ensure-surface",
+    );
+    client.send(JSON.stringify(request("ensure-surface", {
+      type: "ensure_surface",
+      payload: { tab_id: surface.tab_id },
+    })));
+    const response = await responsePromise;
+    assert.equal(response.outcome?.status, "succeeded");
+    const outcome = response.outcome as { status: string; payload?: unknown } | undefined;
+    assert.deepEqual(outcome?.payload, {
+      type: "surface_binding",
+      payload: surface,
+    });
+    assert.deepEqual(ensureInput, {
+      windowId: surface.window_id,
+      tabId: surface.tab_id,
+      browserSessionId: surface.browser_context_id,
+      url: "https://example.test/",
+      navigationRevision: surface.navigation_revision,
+      viewport: { mode: "auto" },
+    });
   } finally {
     await closeSocket(client);
     await server.close();
@@ -570,6 +691,73 @@ test("标记投影执行缓慢时不占用普通浏览器命令队列", async ()
   }
 });
 
+test("停止导航绕过同一 Tab 的长导航队列并立即进入 SurfaceManager", async () => {
+  const navigation = deferred<{ tab_id: string; url: string; origin: string; title: string; navigation_revision: number }>();
+  let navigateStarted = false;
+  let stopCalled = false;
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    navigate: async () => {
+      navigateStarted = true;
+      return navigation.promise;
+    },
+    stopNavigation: async () => {
+      stopCalled = true;
+      return {
+        tab_id: binding.tab_id,
+        url: "https://example.test/previous",
+        origin: "https://example.test",
+        title: "Previous",
+        navigation_revision: binding.navigation_revision + 1,
+      };
+    },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    client.send(JSON.stringify(request("navigate-long", {
+      type: "navigate",
+      payload: {
+        tab_id: binding.tab_id,
+        control: { mode: "user", fence: 0 },
+        navigation: { action: "url", url: "https://example.test/slow" },
+      },
+    })));
+    await waitUntil(() => navigateStarted);
+    const stopResponsePromise = nextJsonMatching(client, (message) => message.request_id === "stop-fast");
+    client.send(JSON.stringify(request("stop-fast", {
+      type: "stop_navigation",
+      payload: { tab_id: binding.tab_id },
+    })));
+    const stopResponse = await stopResponsePromise;
+    assert.equal(stopResponse.outcome?.status, "succeeded");
+    assert.equal(stopCalled, true, "Stop 必须在长导航完成前进入 SurfaceManager");
+
+    navigation.resolve({
+      tab_id: binding.tab_id,
+      url: "https://example.test/slow",
+      origin: "https://example.test",
+      title: "Slow",
+      navigation_revision: binding.navigation_revision + 1,
+    });
+    const navigateResponse = await nextJsonMatching(client, (message) => message.request_id === "navigate-long");
+    assert.equal(navigateResponse.outcome?.status, "succeeded");
+  } finally {
+    navigation.resolve({
+      tab_id: binding.tab_id,
+      url: "https://example.test/slow",
+      origin: "https://example.test",
+      title: "Slow",
+      navigation_revision: binding.navigation_revision + 1,
+    });
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("规范化后的 Chromium DOM.nodeId=null 可以完整进入节点选择消息", async () => {
   const worker = {
     execute: async () => failedOutcome("unused"),
@@ -621,9 +809,14 @@ function createControlServer(
   options: {
     bindings?: BrowserSurfaceBinding[];
     primaryTabId?: string;
+    bindingAvailable?: () => boolean;
     materialize?: (input: unknown) => Promise<BrowserSurfaceBinding>;
     recordForBinding?: () => { getURL: () => string; getTitle: () => string };
+    navigate?: (binding: BrowserSurfaceBinding, navigation: unknown) => Promise<unknown>;
+    stopNavigation?: (binding: BrowserSurfaceBinding) => Promise<unknown>;
     ensureBrowserSurface?: (input: unknown) => Promise<void>;
+    onConnectionState?: (connected: boolean) => void;
+    onHostControlReleased?: () => void;
   } = {},
 ): { server: DesktopControlServer; socketPath: string } {
   // macOS limits Unix-domain socket paths to a little over 100 bytes. The
@@ -635,7 +828,9 @@ function createControlServer(
   let primaryTabId = options.primaryTabId ?? binding.tab_id;
   const surfaceManager = {
     primaryBindingForTab: (tabId: string) => (
-      bindings.find((candidate) => candidate.tab_id === tabId && candidate.tab_id === primaryTabId) ?? null
+      options.bindingAvailable?.() !== false
+        ? bindings.find((candidate) => candidate.tab_id === tabId && candidate.tab_id === primaryTabId) ?? null
+        : null
     ),
     activationInputForTab: (tabId: string) => {
       const candidate = bindings.find((item) => item.tab_id === tabId);
@@ -649,13 +844,30 @@ function createControlServer(
         viewport: { mode: "auto" as const },
       };
     },
-    isRenderableBinding: (candidate: BrowserSurfaceBinding) => candidate.tab_id === primaryTabId,
+    isContentSlotBoundBinding: (candidate: BrowserSurfaceBinding) => (
+      options.bindingAvailable?.() !== false && candidate.tab_id === primaryTabId
+    ),
     bindings: () => bindings,
     isPrimary: (candidate: BrowserSurfaceBinding) => candidate.tab_id === primaryTabId,
+    releaseDisconnectedHostControl: () => options.onHostControlReleased?.(),
     materialize: options.materialize ?? (async () => binding),
     recordForBinding: options.recordForBinding ?? (() => ({
       getURL: () => "https://example.test/",
       getTitle: () => "Example",
+    })),
+    navigate: options.navigate ?? (async () => ({
+      tab_id: binding.tab_id,
+      url: "https://example.test/",
+      origin: "https://example.test",
+      title: "Example",
+      navigation_revision: binding.navigation_revision,
+    })),
+    stopNavigation: options.stopNavigation ?? (async () => ({
+      tab_id: binding.tab_id,
+      url: "https://example.test/",
+      origin: "https://example.test",
+      title: "Example",
+      navigation_revision: binding.navigation_revision,
     })),
   } as unknown as BrowserSurfaceManager;
   const server = new DesktopControlServer({
@@ -663,7 +875,7 @@ function createControlServer(
     token: "desktop-test-token",
     surfaceManager,
     worker,
-    activeWindowId: () => binding.window_id,
+    waitForActiveWindow: async () => binding.window_id,
     ensureBrowserSurface: async (input) => {
       if (options.ensureBrowserSurface) {
         await options.ensureBrowserSurface(input);
@@ -672,6 +884,7 @@ function createControlServer(
       primaryTabId = input.tabId;
     },
     handshake: () => handshake,
+    ...(options.onConnectionState ? { onConnectionState: options.onConnectionState } : {}),
   });
   return { server, socketPath };
 }

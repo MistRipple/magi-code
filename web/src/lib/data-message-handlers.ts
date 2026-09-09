@@ -418,7 +418,6 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
 
 function handleStateUpdate(
   message: ClientBridgeMessage,
-  options: { preserveLocalProcessing?: boolean } = {},
 ) {
   const state = message.state as AppState;
   if (!state) return;
@@ -472,9 +471,6 @@ function handleStateUpdate(
   };
 
   setAppState(mergedState);
-  if (!options.preserveLocalProcessing) {
-    applyAuthoritativeProcessingState(state.processingState ?? null);
-  }
   // currentSessionId 属于显式 bootstrap / switch 的会话锚定语义，
   // 不能由常规 stateUpdate 反向覆盖当前浏览器查看的会话。
   // 否则会出现侧边栏 active、URL、主内容三者分裂，破坏 live/restore 单一真相源。
@@ -1471,7 +1467,7 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
           currentWorkspaceId: workspaceId,
           sessions,
         },
-      }, { preserveLocalProcessing: preserveLocalTurnDuringStaleSnapshot });
+      });
 
       if (!preserveLocalTurnDuringStaleSnapshot && shouldApplyCanonicalSnapshot) {
         replaceOrchestratorRuntimeState(

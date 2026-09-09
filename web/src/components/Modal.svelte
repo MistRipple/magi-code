@@ -3,9 +3,6 @@
   import { onMount, tick } from 'svelte';
   import type { Snippet } from 'svelte';
   import Icon from './Icon.svelte';
-  import { setDesktopBlockingOverlay } from '../shared/desktop-overlay-contract';
-
-  let modalSequence = 0;
 
   interface Props {
     title?: string;
@@ -38,7 +35,6 @@
   let dialogEl: HTMLDivElement | undefined = $state();
   let overlayEl: HTMLDivElement | undefined = $state();
   let previouslyFocused: HTMLElement | null = null;
-  const overlayId = `modal-${++modalSequence}`;
 
   function handleBackdropClick(e: MouseEvent) {
     if (e.target === overlayEl && closeOnBackdrop && onClose) {
@@ -75,7 +71,6 @@
   }
 
   onMount(() => {
-    setDesktopBlockingOverlay(overlayId, true);
     previouslyFocused = document.activeElement as HTMLElement;
     tick().then(() => {
       if (dialogEl) {
@@ -92,7 +87,6 @@
     });
 
     return () => {
-      setDesktopBlockingOverlay(overlayId, false);
       // Restore focus when modal unmounts
       if (previouslyFocused && typeof previouslyFocused.focus === 'function') {
         previouslyFocused.focus();
@@ -107,7 +101,6 @@
   bind:this={overlayEl}
   class="modal-overlay {modalClass}"
   role="presentation"
-  data-desktop-blocking-overlay="true"
   onclick={handleBackdropClick}
   onkeydown={handleKeydown}
   transition:fade={{ duration: 150 }}

@@ -4,6 +4,7 @@ import {
   getCurrentBrowserSession,
   setActiveBrowserTab,
   type BrowserSessionSnapshot,
+  type BrowserTabSnapshot,
 } from './agent-api';
 
 export interface BrowserAuthorityContext {
@@ -20,6 +21,11 @@ export interface BrowserAuthorityActivationTarget {
 
 type CurrentSessionSnapshotConsumer = (snapshot: BrowserSessionSnapshot | null) => void;
 type SessionSnapshotConsumer = (snapshot: BrowserSessionSnapshot) => void;
+
+export interface BrowserAuthorityTabResolution {
+  snapshot: BrowserSessionSnapshot;
+  tab: BrowserTabSnapshot | null;
+}
 
 // BrowserAuthority 的读写共享同一条 promise lane。Renderer、右栏组件和事件恢复
 // 可以同时提出意图，但不会再让旧快照或旧激活请求穿插覆盖新的权威状态。
@@ -56,10 +62,15 @@ export function synchronizeBrowserAuthority(
 export function prepareBrowserAuthorityForDesktop(
   target: BrowserAuthorityActivationTarget,
   consumer: SessionSnapshotConsumer,
+  options: { forceRestore?: boolean } = {},
 ): Promise<BrowserSessionSnapshot> {
   return enqueue(async () => {
     let snapshot: BrowserSessionSnapshot;
-    if (target.lifecycle === 'suspended' || target.lifecycle === 'crashed') {
+    if (
+      options.forceRestore === true
+      || target.lifecycle === 'suspended'
+      || target.lifecycle === 'crashed'
+    ) {
       snapshot = await activateBrowserTab(target.tabId);
     }
     snapshot = await setActiveBrowserTab(target.browserSessionId, target.tabId);
@@ -76,5 +87,26 @@ export function loadBrowserAuthoritySession(
     const snapshot = await getBrowserSession(browserSessionId);
     consumer(snapshot);
     return snapshot;
+  });
+}
+
+/**
+ * 读取当前 Browser Tab 的权威恢复资料。
+ *
+ * Renderer 的右栏投影只负责表达用户意图，不能把旧的 about:blank 或旧
+ * navigation revision 传给 Electron。激活前必须从 Authority 读取同一 Tab
+ * 的持久化快照；读取与后续恢复命令共用 authority lane，避免重启期间旧
+ * 投影与新快照交错覆盖。
+ */
+export function loadBrowserAuthorityTab(
+  browserSessionId: string,
+  tabId: string,
+): Promise<BrowserAuthorityTabResolution> {
+  return enqueue(async () => {
+    const snapshot = await getBrowserSession(browserSessionId);
+    return {
+      snapshot,
+      tab: snapshot.tabs.find((candidate) => candidate.tabId === tabId) ?? null,
+    };
   });
 }

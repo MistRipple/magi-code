@@ -128,6 +128,27 @@ struct StateLayoutMigration {
     target_version: u32,
 }
 
+/// 旧版在删除会话时没有把同一会话的 canonical event 目录纳入删除事务。
+///
+/// v2 已提交状态里，这类目录不再代表可恢复会话，但也不能静默删除：迁移修复会把
+/// 原目录整体移到 `migrations/legacy-v1/orphan-session-events`，并以这份记录说明
+/// 为什么它不参与当前会话恢复。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyOrphanEventQuarantineRecord {
+    schema_version: u32,
+    session_id: magi_core::SessionId,
+    reason: String,
+    archived_at: magi_core::UtcMillis,
+    source_event_root: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyOrphanEventQuarantineMarker {
+    schema_version: u32,
+}
+
 /// 迁移阶段的完整输入快照。它在删除任何旧布局或未标记布局前先原子写入，
 /// 因此进程可以在迁移任意一步退出后从同一份快照继续，不会再次猜测数据来源。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -377,13 +398,26 @@ impl StateRepository {
         &self,
         workspace_roots: &[(String, PathBuf)],
     ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
+        self.load_session_projections_inner(workspace_roots, true)
+    }
+
+    /// 仅供已识别到旧布局重写的恢复事务读取 v2 projection。
+    ///
+    /// 该阶段允许 current 指针暂时引用尚待导入的旧 session；调用方必须在
+    /// 写入任何新状态前通过 `merge_current_session_id` 把它收敛为真实存在的
+    /// session。普通启动永远走公开入口并保持严格校验。
+    fn load_session_projections_inner(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+        validate_current: bool,
+    ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
         self.recover_session_projection_transaction(workspace_roots)?;
         let mut durable = SessionDurableState::default();
         let mut sidecars = SessionExecutionSidecarStoreState::default();
         let mut cache = SessionProjectionCache::default();
         let mut event_cache = HashMap::new();
         let mut event_accepted_submissions = Vec::new();
-        let mut loaded_snapshots = HashMap::<magi_core::SessionId, serde_json::Value>::new();
+        let mut loaded_snapshots = HashMap::<magi_core::SessionId, String>::new();
         let workspace_root_by_id = workspace_roots.iter().cloned().collect::<HashMap<_, _>>();
         let mut roots = vec![(String::new(), self.state_root.clone())];
         roots.extend(workspace_roots.iter().cloned());
@@ -410,26 +444,40 @@ impl StateRepository {
                             ))
                         })?;
                     let session_id = Self::validate_session_projection(&snapshot, &path)?;
-                    let value =
-                        serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
-                            DaemonError::internal(format!(
-                                "解析 session projection 失败 {}: {error}",
-                                path.display()
-                            ))
-                        })?;
-                    if let Some(previous_value) = loaded_snapshots.get(&session_id) {
-                        if previous_value != &value {
-                            let previous_path = cache
-                                .snapshots
-                                .get(&session_id)
-                                .map(|(path, _)| path.display().to_string())
-                                .unwrap_or_else(|| "<unknown>".to_string());
-                            return Err(DaemonError::internal(format!(
-                                "session {} 存在冲突的重复 projection: {} 与 {}",
-                                session_id,
-                                previous_path,
-                                path.display()
-                            )));
+                    if let Some(previous_content) = loaded_snapshots.get(&session_id) {
+                        let same_snapshot = previous_content == &content;
+                        if !same_snapshot {
+                            let previous_value: serde_json::Value =
+                                serde_json::from_str(previous_content).map_err(|error| {
+                                    DaemonError::internal(format!(
+                                        "解析重复 session projection 失败 {}: {error}",
+                                        cache
+                                            .snapshots
+                                            .get(&session_id)
+                                            .map(|(path, _)| path.display().to_string())
+                                            .unwrap_or_else(|| "<unknown>".to_string())
+                                    ))
+                                })?;
+                            let value: serde_json::Value =
+                                serde_json::from_str(&content).map_err(|error| {
+                                    DaemonError::internal(format!(
+                                        "解析重复 session projection 失败 {}: {error}",
+                                        path.display()
+                                    ))
+                                })?;
+                            if previous_value != value {
+                                let previous_path = cache
+                                    .snapshots
+                                    .get(&session_id)
+                                    .map(|(path, _)| path.display().to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string());
+                                return Err(DaemonError::internal(format!(
+                                    "session {} 存在冲突的重复 projection: {} 与 {}",
+                                    session_id,
+                                    previous_path,
+                                    path.display()
+                                )));
+                            }
                         }
                         let session = snapshot
                             .durable
@@ -485,16 +533,17 @@ impl StateRepository {
                         &path,
                     )?;
                     snapshot.durable.canonical_turns = event_projection.canonical_turns().to_vec();
-                    if snapshot.canonical_event_seq < event_projection.last_event_seq()
-                        && let Some(sidecar) = snapshot.sidecar.as_mut()
-                    {
-                        SessionStore::advance_sidecar_projection_from_canonical(
+                    // canonical event 是唯一事实源；sidecar 只是执行恢复缓存。
+                    // event 游标相等只说明 durable canonical 已同步，不能证明 sidecar
+                    // 没有停留在较早的活动快照，因此每次恢复都从事件结果重建它。
+                    if let Some(sidecar) = snapshot.sidecar.as_mut() {
+                        SessionStore::rebuild_sidecar_projection_from_canonical(
                             sidecar,
                             event_projection.canonical_turns(),
                         )
                         .map_err(|error| {
                             DaemonError::internal(format!(
-                                "canonical event 无法推进 sidecar projection {}: {error}",
+                                "canonical event 无法重建 sidecar projection {}: {error}",
                                 path.display()
                             ))
                         })?;
@@ -510,7 +559,7 @@ impl StateRepository {
                             record,
                         );
                     }
-                    loaded_snapshots.insert(session_id.clone(), value);
+                    loaded_snapshots.insert(session_id.clone(), content.clone());
                     event_cache.insert(session_id.clone(), event_projection);
                     cache.snapshots.insert(session_id, (path, content));
                 }
@@ -547,13 +596,8 @@ impl StateRepository {
                         event_root.display()
                     )));
                 }
-                let event_projection = SessionConversationProjection::load_from_root(&event_root)?;
-                let session_id = event_projection.session_id().cloned().ok_or_else(|| {
-                    DaemonError::internal(format!(
-                        "canonical event projection 缺少 session 归属: {}",
-                        event_root.display()
-                    ))
-                })?;
+                let session_id =
+                    SessionConversationProjection::read_session_id_from_root(&event_root)?;
                 if self.session_event_root(&session_id) != event_root {
                     return Err(DaemonError::internal(format!(
                         "canonical event 目录与 session 归属不一致: {}",
@@ -563,9 +607,12 @@ impl StateRepository {
                 if event_cache.contains_key(&session_id) {
                     continue;
                 }
+                let event_projection =
+                    SessionConversationProjection::load(&event_root, &session_id)?;
                 if event_projection.accepted_submissions().is_empty() {
                     // 没有 accepted 事实时无法从事件本身重建 session 元数据；最终由
                     // coverage 校验报告该目录确实是损坏的孤立事件日志。
+                    event_cache.insert(session_id, event_projection);
                     continue;
                 }
                 for record in event_projection.accepted_submissions() {
@@ -620,7 +667,8 @@ impl StateRepository {
             cache.app_meta = Some((app_meta_path, content));
         }
 
-        if let Some(current_session_id) = durable.current_session_id.as_ref()
+        if validate_current
+            && let Some(current_session_id) = durable.current_session_id.as_ref()
             && !durable
                 .sessions
                 .iter()
@@ -698,6 +746,10 @@ impl StateRepository {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let event_cache = self
+            .session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned");
         for entry in fs::read_dir(&event_parent)? {
             let entry = entry?;
             let path = entry.path();
@@ -713,7 +765,12 @@ impl StateRepository {
                     path.display()
                 ))
             })?;
-            SessionConversationProjection::load(&path, session_id)?;
+            if !event_cache.contains_key(session_id) {
+                return Err(DaemonError::internal(format!(
+                    "canonical event 目录未包含在本次恢复结果中: {}",
+                    path.display()
+                )));
+            }
         }
         Ok(())
     }
@@ -760,15 +817,9 @@ impl StateRepository {
                 return Ok(());
             }
             if !legacy_paths.is_empty() {
-                return Err(DaemonError::internal(format!(
-                    "state layout v2 已提交，但仍发现旧布局文件: {}",
-                    legacy_paths
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
+                self.reconcile_reintroduced_legacy_state(workspace_roots, &legacy)?;
             }
+            self.quarantine_legacy_orphan_event_logs(workspace_roots)?;
             return Ok(());
         }
 
@@ -906,6 +957,420 @@ impl StateRepository {
         self.remove_legacy_sources(&legacy)?;
         self.remove_file_if_exists(&migration_path)?;
         self.remove_file_if_exists(&staging_path)?;
+        Ok(())
+    }
+
+    /// 修复 2026-09-01 之前已提交 v2 状态中遗留的 canonical event 目录。
+    ///
+    /// 旧删除实现会移除 projection 却保留 event 目录。不能仅按目录名复活这些会话，
+    /// 否则用户已删除的历史会重新出现在列表中；也不能直接删除，避免丢失可诊断事实。
+    /// 只有同时满足以下条件才隔离：
+    ///
+    /// - 当前任一 projection 都不拥有该 session；
+    /// - event 中没有 accepted 恢复事实（这类日志可能是发送崩溃窗口，必须恢复）；
+    /// - 旧布局归档明确包含该 session，证明它来自迁移前的历史数据。
+    ///
+    /// 其他组合均按未知状态损坏拒绝启动，防止该修复掩盖真实数据丢失。
+    fn quarantine_legacy_orphan_event_logs(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+    ) -> Result<(), DaemonError> {
+        let marker_path = self.legacy_orphan_event_quarantine_marker_path();
+        if marker_path.exists() {
+            let marker: LegacyOrphanEventQuarantineMarker = self.read_json_strict(&marker_path)?;
+            if marker.schema_version != 1 {
+                return Err(DaemonError::internal(format!(
+                    "legacy orphan event 隔离标记版本不支持: {}",
+                    marker.schema_version
+                )));
+            }
+            return Ok(());
+        }
+
+        let event_parent = self.state_root.join("session-events");
+        if !event_parent.exists() {
+            self.write_json_atomically(
+                marker_path,
+                &LegacyOrphanEventQuarantineMarker { schema_version: 1 },
+            )?;
+            return Ok(());
+        }
+
+        let live_session_ids = self.read_committed_session_projection_ids(workspace_roots)?;
+        let archived_legacy_session_ids = self.archived_legacy_session_ids()?;
+        let quarantine_root = self
+            .state_root
+            .join("migrations")
+            .join("legacy-v1")
+            .join("orphan-session-events");
+
+        let mut event_roots = fs::read_dir(&event_parent)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        event_roots.sort();
+        for event_root in event_roots {
+            if !event_root.is_dir() {
+                return Err(DaemonError::internal(format!(
+                    "canonical event 根目录包含非 session 目录: {}",
+                    event_root.display()
+                )));
+            }
+            let session_id = SessionConversationProjection::read_session_id_from_root(&event_root)?;
+            if self.session_event_root(&session_id) != event_root {
+                return Err(DaemonError::internal(format!(
+                    "canonical event 目录与 session 归属不一致: {}",
+                    event_root.display()
+                )));
+            }
+            if live_session_ids.contains(&session_id) {
+                continue;
+            }
+            let event_projection = SessionConversationProjection::load(&event_root, &session_id)?;
+            if !event_projection.accepted_submissions().is_empty() {
+                // accepted 事实就是 projection 缺失时的恢复依据，交由常规恢复流程处理。
+                continue;
+            }
+            if !archived_legacy_session_ids.contains(&session_id) {
+                return Err(DaemonError::internal(format!(
+                    "canonical event 目录没有当前 session、accepted WAL 或旧布局归档归属: {}",
+                    event_root.display()
+                )));
+            }
+
+            fs::create_dir_all(&quarantine_root)?;
+            let encoded = Self::session_projection_file_name(&session_id)
+                .trim_end_matches(".json")
+                .to_string();
+            let target = quarantine_root.join(format!("{encoded}.events"));
+            if target.exists() {
+                return Err(DaemonError::internal(format!(
+                    "canonical event 隔离目录已存在，拒绝覆盖: {}",
+                    target.display()
+                )));
+            }
+            let record = LegacyOrphanEventQuarantineRecord {
+                schema_version: 1,
+                session_id: session_id.clone(),
+                reason: "legacy_session_deletion_left_unowned_canonical_events".to_string(),
+                archived_at: magi_core::UtcMillis::now(),
+                source_event_root: format!("session-events/{encoded}"),
+            };
+            // 先落盘隔离说明，再原子移动目录。若进程在移动前退出，下次会重试同一
+            // session；若已移动，原始 event 数据仍完整保留在确定的目标目录中。
+            self.write_json_atomically(quarantine_root.join(format!("{encoded}.json")), &record)?;
+            fs::rename(&event_root, &target)?;
+            Self::sync_parent_directory(&event_root);
+            Self::sync_parent_directory(&target);
+        }
+        self.write_json_atomically(
+            marker_path,
+            &LegacyOrphanEventQuarantineMarker { schema_version: 1 },
+        )?;
+        Ok(())
+    }
+
+    fn read_committed_session_projection_ids(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+    ) -> Result<HashSet<SessionId>, DaemonError> {
+        // 这里只需要已提交 projection 的身份集合，不能重新调用完整恢复入口。
+        // 完整恢复会重放全部 canonical event；迁移清理和运行时恢复随后还会再次
+        // 读取同一批数据，正是启动阻塞的根因。
+        #[derive(serde::Deserialize)]
+        struct ProjectionIdentity {
+            durable: DurableIdentity,
+        }
+        #[derive(serde::Deserialize)]
+        struct DurableIdentity {
+            sessions: Vec<SessionIdentity>,
+        }
+        #[derive(serde::Deserialize)]
+        struct SessionIdentity {
+            #[serde(rename = "sessionId")]
+            session_id: SessionId,
+        }
+
+        let mut roots = vec![(String::new(), self.state_root.clone())];
+        roots.extend(workspace_roots.iter().cloned());
+        let mut paths_by_session = HashMap::<SessionId, PathBuf>::new();
+        let mut session_ids = HashSet::new();
+        for (workspace_id, workspace_root) in roots {
+            let projection_root = if workspace_id.is_empty() {
+                self.session_projection_root()
+            } else {
+                workspace_root.join(".magi").join("session-projections")
+            };
+            if !projection_root.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(&projection_root)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let content = fs::read_to_string(&path)?;
+                let identity: ProjectionIdentity =
+                    serde_json::from_str(&content).map_err(|error| {
+                        DaemonError::internal(format!(
+                            "解析 session projection 身份失败 {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                if identity.durable.sessions.len() != 1 {
+                    return Err(DaemonError::internal(format!(
+                        "session projection 身份必须只包含一个 session: {}",
+                        path.display()
+                    )));
+                }
+                let session_id = identity.durable.sessions[0].session_id.clone();
+                if let Some(previous_path) = paths_by_session.get(&session_id) {
+                    let previous_content = fs::read_to_string(previous_path)?;
+                    let previous_value: serde_json::Value = serde_json::from_str(&previous_content)
+                        .map_err(|error| {
+                            DaemonError::internal(format!(
+                                "解析重复 session projection 失败 {}: {error}",
+                                previous_path.display()
+                            ))
+                        })?;
+                    let value: serde_json::Value =
+                        serde_json::from_str(&content).map_err(|error| {
+                            DaemonError::internal(format!(
+                                "解析重复 session projection 失败 {}: {error}",
+                                path.display()
+                            ))
+                        })?;
+                    if previous_value != value {
+                        return Err(DaemonError::internal(format!(
+                            "session {} 存在冲突的重复 projection: {} 与 {}",
+                            session_id,
+                            previous_path.display(),
+                            path.display()
+                        )));
+                    }
+                    continue;
+                }
+                paths_by_session.insert(session_id.clone(), path);
+                session_ids.insert(session_id);
+            }
+        }
+        Ok(session_ids)
+    }
+
+    fn archived_legacy_session_ids(&self) -> Result<HashSet<SessionId>, DaemonError> {
+        let archive_root = self
+            .state_root
+            .join("migrations")
+            .join("legacy-v1")
+            .join("archive");
+        if !archive_root.exists() {
+            return Ok(HashSet::new());
+        }
+        let mut paths = vec![archive_root.join("sessions.json")];
+        let workspace_root = archive_root.join("workspaces");
+        if workspace_root.exists() {
+            for entry in fs::read_dir(workspace_root)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    paths.push(entry.path().join("sessions.json"));
+                }
+            }
+        }
+        let mut session_ids = HashSet::new();
+        for path in paths {
+            if !path.exists() {
+                continue;
+            }
+            let state = self.read_legacy_session_file(&path)?;
+            session_ids.extend(state.sessions.into_iter().map(|session| session.session_id));
+        }
+        Ok(session_ids)
+    }
+
+    fn legacy_orphan_event_quarantine_marker_path(&self) -> PathBuf {
+        self.state_root
+            .join("migrations")
+            .join("legacy-v1")
+            .join("orphan-event-quarantine.json")
+    }
+
+    /// v2 已提交后，旧版本进程仍可能在退出前把最后一次快照写回旧路径。
+    ///
+    /// 这些文件不能直接删除：空快照可以安全清理，新的 session 事实必须并入
+    /// canonical projection，已有 session 的冲突则必须停止启动并保留原文件，
+    /// 不能用旧布局覆盖 v2 的事件权威。该路径是一次性状态恢复，不是运行期
+    /// 双写或兼容存储。
+    fn reconcile_reintroduced_legacy_state(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+        legacy: &LegacyStatePaths,
+    ) -> Result<(), DaemonError> {
+        // v2 current 可能暂时指向仍停留在旧快照中的 session。先读取 projection
+        // 事实，再由本恢复事务在导入后统一校正 current；常规启动仍使用严格入口。
+        let (mut durable, mut sidecars) =
+            self.load_session_projections_inner(workspace_roots, false)?;
+        let legacy_durable = self.load_legacy_session_state(legacy)?;
+        let legacy_sidecars = if legacy.session_sidecars.exists() {
+            self.read_json_strict(&legacy.session_sidecars)?
+        } else {
+            SessionExecutionSidecarStoreState::default()
+        };
+        let legacy_store =
+            SessionStore::convert_v1_persisted_parts(legacy_durable, legacy_sidecars).map_err(
+                |error| DaemonError::internal(format!("恢复旧 session 状态失败: {error}")),
+            )?;
+        let normalized_durable = legacy_store.durable_state();
+        let normalized_sidecars = legacy_store.execution_sidecar_store_state();
+        let canonical_ids = durable
+            .sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<HashSet<_>>();
+        let mut imported = SessionDurableState::default();
+
+        for session in &normalized_durable.sessions {
+            let session_id = session.session_id.clone();
+            let candidate = normalized_durable.durable_state_for_session(&session_id);
+            if canonical_ids.contains(&session_id) {
+                let existing = durable.durable_state_for_session(&session_id);
+                let same = serde_json::to_value(&existing).map_err(DaemonError::from)?
+                    == serde_json::to_value(&candidate).map_err(DaemonError::from)?;
+                if !same {
+                    return Err(DaemonError::internal(format!(
+                        "state layout v2 与旧布局存在冲突 session，保留旧文件待处理: {session_id}"
+                    )));
+                }
+            } else {
+                imported.append_state_without_current(candidate);
+            }
+        }
+
+        let imported_ids = imported
+            .sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<HashSet<_>>();
+        for candidate in normalized_sidecars.runtime_sidecars {
+            let session_id = candidate.session_id.clone();
+            let existing = sidecars.runtime_sidecar(&session_id);
+            if !canonical_ids.contains(&session_id) && !imported_ids.contains(&session_id) {
+                return Err(DaemonError::internal(format!(
+                    "旧布局 sidecar 没有 session 归属，保留旧文件待处理: {session_id}"
+                )));
+            }
+            match existing {
+                None => sidecars.upsert_runtime_sidecar(candidate),
+                Some(existing) => {
+                    let same = serde_json::to_value(&existing).map_err(DaemonError::from)?
+                        == serde_json::to_value(&candidate).map_err(DaemonError::from)?;
+                    if same {
+                        continue;
+                    }
+                    if candidate.updated_at.0 > existing.updated_at.0 {
+                        sidecars.upsert_runtime_sidecar(candidate);
+                    } else if candidate.updated_at.0 == existing.updated_at.0 {
+                        return Err(DaemonError::internal(format!(
+                            "state layout v2 与旧布局存在冲突 sidecar，保留旧文件待处理: {session_id}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if !imported.sessions.is_empty() {
+            self.initialize_session_events(&imported)?;
+            durable.append_state_without_current(imported);
+        }
+        self.merge_current_session_id(&mut durable, normalized_durable.current_session_id)?;
+        self.merge_unmarked_notifications(
+            &mut durable,
+            normalized_durable
+                .notifications
+                .into_iter()
+                .filter(|notification| notification.session_id.is_none())
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DaemonError::from)?,
+        )?;
+        self.save_session_projection_parts(
+            &durable,
+            &sidecars,
+            &workspace_roots.iter().cloned().collect::<HashMap<_, _>>(),
+            false,
+        )?;
+
+        if legacy.task_store.exists() {
+            let legacy_snapshot =
+                TaskStore::restore_legacy_checkpoint(&self.read_json_strict(&legacy.task_store)?)?
+                    .snapshot();
+            let merged_snapshot = match TaskStore::restore_from_projection_directory(
+                &self.task_store_projection_path(),
+            )? {
+                Some(current) => self.merge_task_snapshots(current.snapshot(), legacy_snapshot)?,
+                None => legacy_snapshot,
+            };
+            self.checkpoint_task_store_snapshot_inner(&merged_snapshot, false)?;
+        }
+
+        self.archive_reintroduced_legacy_sources(legacy)?;
+        self.remove_legacy_sources(legacy)?;
+        Ok(())
+    }
+
+    fn archive_reintroduced_legacy_sources(
+        &self,
+        legacy: &LegacyStatePaths,
+    ) -> Result<(), DaemonError> {
+        let parent = self
+            .state_root
+            .join("migrations")
+            .join("legacy-v1")
+            .join("reintroduced");
+        fs::create_dir_all(&parent)?;
+        let mut index = 0_u32;
+        let archive_root = loop {
+            let suffix = if index == 0 {
+                String::new()
+            } else {
+                format!("-{index}")
+            };
+            let path = parent.join(format!("{}{}", magi_core::UtcMillis::now().0, suffix));
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    index = index.saturating_add(1);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        for (source, relative) in [
+            (&legacy.global_sessions, PathBuf::from("sessions.json")),
+            (
+                &legacy.session_sidecars,
+                PathBuf::from("session-sidecars.json"),
+            ),
+            (&legacy.task_store, PathBuf::from("task-store.json")),
+        ] {
+            if source.exists() {
+                Self::archive_legacy_source(source, &archive_root.join(relative))?;
+            }
+        }
+        for (workspace_id, source) in &legacy.workspace_sessions {
+            if !source.exists() {
+                continue;
+            }
+            let workspace_dir =
+                Self::session_projection_file_name(&magi_core::SessionId::new(workspace_id))
+                    .trim_end_matches(".json")
+                    .to_string();
+            Self::archive_legacy_source(
+                source,
+                &archive_root
+                    .join("workspaces")
+                    .join(workspace_dir)
+                    .join("sessions.json"),
+            )?;
+        }
         Ok(())
     }
 
@@ -2990,9 +3455,10 @@ mod tests {
     };
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
-        CanonicalTurnEventWriter, CanonicalTurnMutation, ExecutionThread, ExecutionThreadStatus,
-        NotificationRecord, NotificationScope, SessionDurableState, SessionPlan, SessionRecord,
-        ThreadChatMessage, ThreadContextCheckpoint, TimelineEntry, TimelineEntryKind,
+        ActiveExecutionTurnItem, CanonicalTurnEventWriter, CanonicalTurnMutation, ExecutionThread,
+        ExecutionThreadStatus, NotificationRecord, NotificationScope, SessionDurableState,
+        SessionPlan, SessionRecord, ThreadChatMessage, ThreadContextCheckpoint, TimelineEntry,
+        TimelineEntryKind,
     };
     use std::{collections::HashMap, thread};
 
@@ -3415,6 +3881,14 @@ mod tests {
         .expect("duplicate projection directory should create");
         fs::copy(&canonical_path, &duplicate_path).expect("matching duplicate should copy");
 
+        let committed_ids = repository
+            .read_committed_session_projection_ids(&[(
+                "duplicate-root".to_string(),
+                duplicate_root.clone(),
+            )])
+            .expect("identical duplicate projection should use canonical recovery semantics");
+        assert_eq!(committed_ids, HashSet::from([session_id.clone()]));
+
         let (durable, sidecars) = repository
             .load_session_projections(&[("duplicate-root".to_string(), duplicate_root.clone())])
             .expect("identical duplicate projection should deduplicate");
@@ -3436,6 +3910,13 @@ mod tests {
         repository
             .write_json_atomically(duplicate_path.clone(), &conflicting)
             .expect("conflicting duplicate should write");
+        let error = repository
+            .read_committed_session_projection_ids(&[(
+                "duplicate-root".to_string(),
+                duplicate_root.clone(),
+            )])
+            .expect_err("conflicting duplicate projection must reject orphan reconciliation");
+        assert!(error.to_string().contains("冲突的重复 projection"));
         let error = repository
             .load_session_projections(&[("duplicate-root".to_string(), duplicate_root.clone())])
             .expect_err("conflicting duplicate projection must reject recovery");
@@ -3949,6 +4430,109 @@ mod tests {
     }
 
     #[test]
+    fn canonical_event_log_rebuilds_stale_sidecar_even_when_event_cursor_matches() {
+        let state_root = unique_temp_dir("magi-canonical-sidecar-authority");
+        let repository = StateRepository::new(state_root.clone());
+        let (session_store, turn_id, _) =
+            accepted_session_store("canonical-sidecar-authority", None, 51);
+        let session_id = SessionId::new("canonical-sidecar-authority");
+        install_test_event_authority(&repository, &session_store);
+
+        // 先持久化仅含 accepted turn 的 sidecar。随后 canonical 事件新增 item 并收口
+        // turn；模拟进程在 sidecar flush 前退出。此时 snapshot 的 canonical 游标可以
+        // 已经最新，但 sidecar 仍是更早的执行缓存。
+        let stale_sidecar = session_store
+            .execution_sidecar_store_state()
+            .runtime_sidecar(&session_id)
+            .expect("accepted turn should have a sidecar");
+        session_store
+            .append_current_turn_item_for_turn(
+                &session_id,
+                Some(turn_id.as_str()),
+                ActiveExecutionTurnItem {
+                    item_id: "turn-item-after-sidecar-checkpoint".to_string(),
+                    item_seq: 1,
+                    kind: "assistant_stream".to_string(),
+                    status: "running".to_string(),
+                    source: "orchestrator".to_string(),
+                    title: None,
+                    content: Some("canonical event is authoritative".to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_status: None,
+                    tool_arguments: None,
+                    tool_result: None,
+                    tool_error: None,
+                    request_id: None,
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    metadata: HashMap::new(),
+                    timeline_entry_id: None,
+                    source_thread_id: ThreadId::new(format!("thread-orchestrator-{session_id}")),
+                },
+            )
+            .expect("canonical item should append");
+        session_store
+            .update_current_turn_status_for_turn(&session_id, Some(turn_id.as_str()), "completed")
+            .expect("turn should complete");
+        repository
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("terminal canonical projection should persist");
+
+        let projection_path = repository
+            .session_projection_root()
+            .join(StateRepository::session_projection_file_name(&session_id));
+        let mut snapshot: SessionProjectionSnapshot =
+            serde_json::from_slice(&fs::read(&projection_path).expect("projection should read"))
+                .expect("projection should parse");
+        assert_eq!(
+            snapshot.canonical_event_seq,
+            SessionConversationProjection::load(
+                &repository.session_event_root(&session_id),
+                &session_id
+            )
+            .expect("event projection should load")
+            .last_event_seq(),
+            "fixture must prove that the durable event cursor is already current"
+        );
+        snapshot.sidecar = Some(stale_sidecar);
+        repository
+            .write_json_atomically(projection_path, &snapshot)
+            .expect("stale sidecar fixture should persist");
+
+        let (durable, sidecars) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .expect("canonical event must rebuild a stale sidecar regardless of cursor equality");
+        let canonical = durable
+            .canonical_turns
+            .iter()
+            .find(|turn| turn.session_id == session_id && turn.turn_id == turn_id)
+            .expect("canonical turn should restore");
+        assert_eq!(
+            canonical.status,
+            magi_session_store::CanonicalTurnStatus::Completed
+        );
+        let recovered_turn = sidecars
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("rebuilt sidecar turn should restore");
+        assert_eq!(recovered_turn.status, "completed");
+        assert_eq!(recovered_turn.items.len(), canonical.items.len());
+        assert_eq!(
+            recovered_turn.items[0].item_id,
+            "turn-item-after-sidecar-checkpoint"
+        );
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn canonical_projection_cannot_recreate_a_missing_event_log() {
         let state_root = unique_temp_dir("magi-canonical-event-required");
         let repository = StateRepository::new(state_root.clone());
@@ -4069,6 +4653,140 @@ mod tests {
         repository
             .validate_session_event_log_coverage(&SessionDurableState::default())
             .expect_err("unknown orphan event log must fail recovery");
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn committed_v2_layout_quarantines_proven_legacy_orphan_event_log() {
+        let state_root = unique_temp_dir("magi-layout-legacy-event-quarantine");
+        let repository = StateRepository::new(state_root.clone());
+        let (legacy_store, _, _) = accepted_session_store("legacy-orphan-event", None, 58);
+        let session_id = SessionId::new("legacy-orphan-event");
+
+        // 模拟旧迁移已将历史 turn 转成 canonical event，随后旧删除路径只删除了
+        // projection。archive 是该 session 来自旧布局且已经不在当前索引中的证据。
+        repository
+            .initialize_session_events(&legacy_store.durable_state())
+            .expect("legacy canonical event should initialize");
+        repository
+            .write_json_atomically(
+                state_root.join("migrations/legacy-v1/archive/sessions.json"),
+                &legacy_store.durable_state(),
+            )
+            .expect("legacy source archive should persist");
+        repository
+            .write_json_atomically(
+                state_root.join("state-layout.json"),
+                &StateLayoutMarker {
+                    version: STATE_LAYOUT_VERSION,
+                },
+            )
+            .expect("committed v2 marker should persist");
+
+        repository
+            .migrate_legacy_state_layout(&[])
+            .expect("proven legacy orphan should be quarantined without resurrection");
+
+        let encoded = StateRepository::session_projection_file_name(&session_id)
+            .trim_end_matches(".json")
+            .to_string();
+        let quarantine_root = state_root.join("migrations/legacy-v1/orphan-session-events");
+        assert!(!repository.session_event_root(&session_id).exists());
+        assert!(quarantine_root.join(format!("{encoded}.events")).exists());
+        let record: LegacyOrphanEventQuarantineRecord = repository
+            .read_json_strict(&quarantine_root.join(format!("{encoded}.json")))
+            .expect("quarantine record should be readable");
+        assert_eq!(record.session_id, session_id);
+        assert_eq!(
+            record.reason,
+            "legacy_session_deletion_left_unowned_canonical_events"
+        );
+
+        let (restored, _) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .expect("quarantined event must not recreate deleted session");
+        assert!(restored.sessions.is_empty());
+        repository
+            .validate_session_event_log_coverage(&restored)
+            .expect("remaining event roots should all have live ownership");
+
+        repository
+            .migrate_legacy_state_layout(&[])
+            .expect("legacy orphan cleanup should be idempotent");
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn committed_v2_layout_rejects_unproven_orphan_event_log() {
+        let state_root = unique_temp_dir("magi-layout-unknown-event-orphan");
+        let repository = StateRepository::new(state_root.clone());
+        let (session_store, _, _) = accepted_session_store("unknown-event-orphan", None, 59);
+        let session_id = SessionId::new("unknown-event-orphan");
+        repository
+            .initialize_session_events(&session_store.durable_state())
+            .expect("event fixture should initialize");
+        repository
+            .write_json_atomically(
+                state_root.join("state-layout.json"),
+                &StateLayoutMarker {
+                    version: STATE_LAYOUT_VERSION,
+                },
+            )
+            .expect("committed v2 marker should persist");
+
+        let error = repository
+            .migrate_legacy_state_layout(&[])
+            .expect_err("unproven event orphan must remain a startup error");
+        assert!(
+            error
+                .to_string()
+                .contains("没有当前 session、accepted WAL 或旧布局归档归属")
+        );
+        assert!(repository.session_event_root(&session_id).exists());
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn committed_v2_layout_preserves_accepted_event_only_recovery() {
+        let state_root = unique_temp_dir("magi-layout-accepted-event-recovery");
+        let repository = StateRepository::new(state_root.clone());
+        let (session_store, turn_id, task_id) =
+            accepted_session_store("accepted-event-recovery", None, 60);
+        let session_id = SessionId::new("accepted-event-recovery");
+        let acceptance = session_store
+            .session_acceptance_record(&session_id, &turn_id)
+            .expect("accepted session should provide recovery record");
+        repository
+            .append_canonical_turn_transaction_with_acceptance(
+                &session_id,
+                &[CanonicalTurnMutation {
+                    previous: None,
+                    next: acceptance.canonical_turn.clone(),
+                }],
+                &acceptance,
+                &accepted_task(task_id, 60),
+            )
+            .expect("accepted event transaction should persist");
+        repository
+            .write_json_atomically(
+                state_root.join("state-layout.json"),
+                &StateLayoutMarker {
+                    version: STATE_LAYOUT_VERSION,
+                },
+            )
+            .expect("committed v2 marker should persist");
+
+        repository
+            .migrate_legacy_state_layout(&[])
+            .expect("accepted event-only crash window must remain recoverable");
+        assert!(repository.session_event_root(&session_id).exists());
+        let (restored, _) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .expect("accepted event should restore the missing session projection");
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].session_id, session_id);
 
         let _ = fs::remove_dir_all(state_root);
     }
@@ -4329,8 +5047,8 @@ mod tests {
     }
 
     #[test]
-    fn committed_v2_layout_rejects_reintroduced_legacy_files() {
-        let state_root = unique_temp_dir("magi-layout-v2-rejects-legacy");
+    fn committed_v2_layout_cleans_empty_reintroduced_legacy_files() {
+        let state_root = unique_temp_dir("magi-layout-v2-cleans-empty-legacy");
         let repository = StateRepository::new(state_root.clone());
         repository
             .write_json_atomically(
@@ -4345,8 +5063,118 @@ mod tests {
 
         repository
             .migrate_legacy_state_layout(&[])
-            .expect_err("committed v2 must not read or remove reintroduced legacy state");
+            .expect("empty legacy snapshot should be reconciled after v2 commit");
+        assert!(!state_root.join("sessions.json").exists());
+        assert!(
+            state_root
+                .join("migrations/legacy-v1/reintroduced")
+                .read_dir()
+                .expect("reintroduced archive directory should exist")
+                .next()
+                .is_some()
+        );
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn committed_v2_layout_imports_reintroduced_session_once() {
+        let state_root = unique_temp_dir("magi-layout-v2-imports-legacy-session");
+        let repository = StateRepository::new(state_root.clone());
+        repository
+            .write_json_atomically(
+                state_root.join("state-layout.json"),
+                &StateLayoutMarker {
+                    version: STATE_LAYOUT_VERSION,
+                },
+            )
+            .expect("v2 marker should persist");
+        let (legacy_store, _, _) = accepted_session_store("reintroduced-session", None, 90);
+        repository
+            .write_json_atomically(
+                state_root.join("sessions.json"),
+                &legacy_store.durable_state(),
+            )
+            .expect("reintroduced legacy session should write");
+        repository
+            .write_json_atomically(
+                state_root.join("session-sidecars.json"),
+                &legacy_store.execution_sidecar_store_state(),
+            )
+            .expect("reintroduced legacy sidecar should write");
+
+        repository
+            .migrate_legacy_state_layout(&[])
+            .expect("new legacy session should be imported into v2");
+        let (restored, sidecars) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .expect("imported v2 session should restore");
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(
+            restored.canonical_turns.len(),
+            legacy_store.durable_state().canonical_turns.len() + 1,
+            "v1 converter must preserve the unlinked timeline fact exactly once"
+        );
+        assert_eq!(sidecars.runtime_sidecars.len(), 1);
+        assert!(!state_root.join("sessions.json").exists());
+        assert!(
+            state_root
+                .join("migrations/legacy-v1/reintroduced")
+                .read_dir()
+                .expect("reintroduced archive directory should exist")
+                .next()
+                .is_some()
+        );
+
+        repository
+            .migrate_legacy_state_layout(&[])
+            .expect("reconciled layout should be idempotent");
+        let (restored_again, _) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .expect("idempotent v2 session should restore");
+        assert_eq!(restored_again.sessions.len(), 1);
+        assert_eq!(restored_again.canonical_turns.len(), 2);
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn committed_v2_layout_preserves_conflicting_reintroduced_session() {
+        let state_root = unique_temp_dir("magi-layout-v2-preserves-conflict");
+        let repository = StateRepository::new(state_root.clone());
+        let (canonical_store, _, _) = accepted_session_store("conflicting-session", None, 91);
+        install_test_event_authority(&repository, &canonical_store);
+        repository
+            .save_session_projection_state(
+                &canonical_store.durable_state(),
+                &canonical_store.execution_sidecar_store_state(),
+            )
+            .expect("canonical v2 session should persist");
+        repository
+            .write_json_atomically(
+                state_root.join("state-layout.json"),
+                &StateLayoutMarker {
+                    version: STATE_LAYOUT_VERSION,
+                },
+            )
+            .expect("v2 marker should persist");
+
+        let (legacy_store, _, _) = accepted_session_store("conflicting-session", None, 91);
+        let mut conflicting = legacy_store.durable_state();
+        conflicting.sessions[0].title = "different legacy fact".to_string();
+        repository
+            .write_json_atomically(state_root.join("sessions.json"), &conflicting)
+            .expect("conflicting legacy session should write");
+
+        let error = repository
+            .migrate_legacy_state_layout(&[])
+            .expect_err("conflicting reintroduced session must stop recovery");
+        assert!(error.to_string().contains("存在冲突 session"));
         assert!(state_root.join("sessions.json").exists());
+        let (restored, _) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .expect("canonical v2 state must remain readable");
+        assert_eq!(restored.sessions[0].title, "accepted journal test");
 
         let _ = fs::remove_dir_all(state_root);
     }

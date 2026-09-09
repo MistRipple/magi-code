@@ -91,6 +91,12 @@ export class BrowserAutomationRuntime {
   }
 
   rebind(bindings: BrowserSurfaceBinding[]): void {
+    const activeSurfaceIds = new Set(bindings.map((binding) => binding.surface_id));
+    for (const [surfaceId, current] of this.#pages) {
+      if (activeSurfaceIds.has(surfaceId)) continue;
+      this.wakeDialogWaiters(current);
+      this.#pages.delete(surfaceId);
+    }
     for (const binding of bindings) {
       const current = this.currentPage(binding.surface_id);
       if (current && !samePhysicalBinding(current.binding, binding)) {
@@ -223,7 +229,11 @@ export class BrowserAutomationRuntime {
         return {
           result: {
             type: "hit_test",
-            payload: await this.hitTest(binding, command.payload.x, command.payload.y),
+            payload: await this.hitTest(
+              binding,
+              command.payload.normalized_x,
+              command.payload.normalized_y,
+            ),
           },
         };
       case "devtools":
@@ -586,7 +596,7 @@ export class BrowserAutomationRuntime {
     if (this.navigationAdvanced(binding)) return;
     if (!await this.pointerOrHandleDialog(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 })) return;
     if (this.navigationAdvanced(binding)) return;
-    // 某些 Electron WebContentsView 的后台/非激活 Surface 会接受 CDP
+    // 某些 Electron Chromium guest 的后台/非激活 Surface 会接受 CDP
     // Input.dispatchMouseEvent 并更新焦点，但不把完整鼠标序列转成 DOM
     // click。等待一个事件循环后检查捕获监听器；只有确认页面没有观察到
     // click 时才排队一次异步 HTMLElement.click()，避免原生鼠标成功时
@@ -699,7 +709,7 @@ export class BrowserAutomationRuntime {
       && viewport.width > 0 && viewport.height > 0) {
       return viewport;
     }
-    // WebContentsView 在尚未获得宿主布局尺寸时，页面脚本的 innerWidth/innerHeight
+    // Chromium guest 在尚未获得宿主布局尺寸时，页面脚本的 innerWidth/innerHeight
     // 可能暂时为 0；此时 Chromium 自己的布局视口仍是截图和归一化裁剪的权威尺寸。
     const metrics = await this.#cdp.send<{
       layoutViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number };
@@ -844,7 +854,12 @@ export class BrowserAutomationRuntime {
     return { bounds };
   }
 
-  private async hitTest(binding: BrowserSurfaceBinding, x: number, y: number) {
+  private async hitTest(binding: BrowserSurfaceBinding, normalizedX: number, normalizedY: number) {
+    const x = finiteNumber(normalizedX, "normalized_x");
+    const y = finiteNumber(normalizedY, "normalized_y");
+    if (x < 0 || x > 1 || y < 0 || y > 1) {
+      throw protocolFailure("browser_hit_test_coordinates_invalid", "normalized hit-test coordinates must be within [0, 1]");
+    }
     const result = await this.evaluate<Record<string, unknown>>(
       binding,
       `globalThis.__magiBrowserAutomation.hitTest(${Number(x)}, ${Number(y)})`,

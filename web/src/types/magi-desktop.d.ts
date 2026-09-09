@@ -5,56 +5,7 @@ interface MagiDesktopRectangle {
   height: number;
 }
 
-type MagiDesktopPanelKind = 'agent' | 'browser' | 'code' | 'terminal' | null;
-
-interface MagiDesktopOverlayField {
-  id: string;
-  label: string;
-  type: 'number' | 'text';
-  value: string;
-  min: number | null;
-  max: number | null;
-}
-
-interface MagiDesktopOverlayItem {
-  id: string;
-  label: string;
-  icon: string | null;
-  selected: boolean;
-  disabled: boolean;
-}
-
-interface MagiDesktopOverlayState {
-  overlayId: string;
-  kind: 'menu' | 'annotation';
-  phase: 'menu' | 'select' | 'comment';
-  ownerId: string;
-  placement: 'right-pane-add' | 'browser-viewport' | 'browser-annotations';
-  popupBounds: MagiDesktopRectangle | null;
-  title: string;
-  items: MagiDesktopOverlayItem[];
-  fields: MagiDesktopOverlayField[];
-}
-
-interface MagiDesktopOverlayAction {
-  overlayId: string;
-  kind: 'menu' | 'annotation';
-  ownerId: string;
-  interaction: 'select' | 'input';
-  id: string;
-  value: string | null;
-}
-
-interface MagiDesktopOverlayClosedEvent {
-  overlayId: string;
-  kind: MagiDesktopOverlayState['kind'];
-  ownerId: string;
-  reason: 'closed' | 'replaced';
-  replacement: {
-    overlayId: string;
-    ownerId: string;
-  } | null;
-}
+type MagiDesktopPanelKind = "agent" | "browser" | "code" | "terminal" | null;
 
 interface MagiDesktopWindowLayoutSnapshot {
   desktopEpoch: string;
@@ -64,26 +15,14 @@ interface MagiDesktopWindowLayoutSnapshot {
   displayScaleFactor: number;
   fullscreen: boolean;
   rightPaneVisible: boolean;
-  rightPaneMode: 'side-by-side' | 'overlay';
+  rightPaneMode: "side-by-side" | "overlay";
   rightPaneWidth: number;
   activePanelKind: MagiDesktopPanelKind;
   activeTabId: string | null;
   activeSurfaceId: string | null;
-  rendererGeometry: MagiDesktopRendererGeometryFrame | null;
   appBounds: MagiDesktopRectangle;
   dividerBounds: MagiDesktopRectangle | null;
   rightPaneBounds: MagiDesktopRectangle | null;
-}
-
-interface MagiDesktopRendererGeometryFrame {
-  revision: number;
-  layoutRevision: number;
-  coordinateSpace: 'window-content-css-px';
-  rightPaneBounds: MagiDesktopRectangle | null;
-  browserContentSlot: {
-    tabId: string;
-    bounds: MagiDesktopRectangle;
-  } | null;
 }
 
 interface MagiDesktopWindowSnapshot {
@@ -92,6 +31,17 @@ interface MagiDesktopWindowSnapshot {
   snapshotRevision: number;
   layout: MagiDesktopWindowLayoutSnapshot;
   activeBrowserViewport: MagiDesktopLogicalViewport | null;
+  activeBrowserNavigationRevision: number | null;
+  activeBrowserDownloads: MagiDesktopBrowserDownloadSnapshot[];
+}
+
+interface MagiDesktopBrowserDownloadSnapshot {
+  downloadId: string;
+  tabId: string;
+  suggestedFilename: string;
+  state: "started" | "progressing" | "completed" | "cancelled" | "interrupted";
+  receivedBytes: number;
+  totalBytes: number | null;
 }
 
 interface MagiDesktopContextSnapshot {
@@ -103,32 +53,40 @@ interface MagiDesktopContextSnapshot {
 }
 
 type MagiDesktopLayoutIntent =
-  | { type: 'right_pane_width'; width: number }
-  | { type: 'right_pane_reset_width' }
-  | { type: 'right_pane_visibility'; visible: boolean }
   | {
-      type: 'renderer_geometry';
-      frame: MagiDesktopRendererGeometryFrame;
+      type: "client_bounds";
+      bounds: MagiDesktopRectangle;
+      displayScaleFactor: number;
+      fullscreen: boolean;
+    }
+  | { type: "right_pane_width"; width: number }
+  | { type: "right_pane_reset_width" }
+  | { type: "right_pane_visibility"; visible: boolean }
+  | {
+      type: "active_panel";
+      kind: MagiDesktopPanelKind;
+      tabId: string | null;
+      surfaceId: string | null;
     };
 
 type MagiDesktopLogicalViewport =
-  | { mode: 'auto' }
+  | { mode: "auto" }
   | {
-      mode: 'fixed';
+      mode: "fixed";
       width: number;
       height: number;
       device_scale_factor_millis: number;
-      device_type: 'desktop' | 'mobile';
+      device_type: "desktop" | "mobile";
     };
 
 type MagiDesktopViewportIntent =
-  | { mode: 'auto' }
+  | { mode: "auto" }
   | {
-      mode: 'fixed';
+      mode: "fixed";
       width: number;
       height: number;
       deviceScaleFactorMillis: number;
-      deviceType: 'desktop' | 'mobile';
+      deviceType: "desktop" | "mobile";
     };
 
 interface MagiDesktopBrowserActivationRequest {
@@ -139,6 +97,16 @@ interface MagiDesktopBrowserActivationRequest {
   viewport: MagiDesktopViewportIntent;
 }
 
+interface MagiDesktopEmbeddedBrowserWebviewRequest {
+  tabId: string;
+  browserSessionId: string;
+  navigationRevision: number;
+  webContentsId: number;
+}
+
+type MagiDesktopReleasedBrowserWebviewRequest =
+  MagiDesktopEmbeddedBrowserWebviewRequest;
+
 interface MagiDesktopBrowserInspectRequest {
   tabId: string;
   surfaceId: string;
@@ -146,7 +114,14 @@ interface MagiDesktopBrowserInspectRequest {
 }
 
 interface MagiDesktopUpdateSnapshot {
-  status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'failed' | 'unsupported';
+  status:
+    | "idle"
+    | "checking"
+    | "available"
+    | "downloading"
+    | "downloaded"
+    | "failed"
+    | "unsupported";
   currentVersion: string;
   availableVersion: string | null;
   downloadedBytes: number;
@@ -156,11 +131,13 @@ interface MagiDesktopUpdateSnapshot {
   installable: boolean;
 }
 
-type MagiDesktopBrowserComponentStatus = 'starting' | 'ready' | 'restarting' | 'failed' | 'stopped';
-type MagiDesktopBrowserProtocolStatus = MagiDesktopBrowserComponentStatus | 'incompatible';
+type MagiDesktopBrowserComponentStatus =
+  "starting" | "ready" | "restarting" | "failed" | "stopped";
+type MagiDesktopBrowserProtocolStatus =
+  MagiDesktopBrowserComponentStatus | "incompatible";
 
 interface MagiDesktopBrowserComponentError {
-  target: 'daemon' | 'worker' | 'protocol' | 'version';
+  target: "daemon" | "worker" | "protocol" | "version";
   code: string;
   message: string;
 }
@@ -196,22 +173,23 @@ interface MagiDesktopBrowserComponentSnapshot {
   error: MagiDesktopBrowserComponentError | null;
 }
 
-type MagiDesktopContextMenuRole = 'undo' | 'redo' | 'cut' | 'copy' | 'paste' | 'selectAll';
+type MagiDesktopContextMenuRole =
+  "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll";
 
 type MagiDesktopContextMenuItem =
-  | { type: 'role'; role: MagiDesktopContextMenuRole }
-  | { type: 'separator' }
-  | { type: 'action'; id: string; label: string; enabled?: boolean };
+  | { type: "role"; role: MagiDesktopContextMenuRole }
+  | { type: "separator" }
+  | { type: "action"; id: string; label: string; enabled?: boolean };
 
 type MagiDesktopFileDropEvent =
-  | { type: 'enter'; paths: string[]; position: { x: number; y: number } }
-  | { type: 'over'; position: { x: number; y: number } }
-  | { type: 'drop'; paths: string[]; position: { x: number; y: number } }
-  | { type: 'leave' };
+  | { type: "enter"; paths: string[]; position: { x: number; y: number } }
+  | { type: "over"; position: { x: number; y: number } }
+  | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+  | { type: "leave" };
 
 interface MagiDesktopBridge {
-  readonly runtime: 'electron';
-  readonly surface: 'app' | 'overlay' | null;
+  readonly runtime: "electron";
+  readonly surface: "app" | null;
   readonly windowId: string | null;
   getSnapshot(): Promise<MagiDesktopWindowSnapshot>;
   setContext(context: {
@@ -219,24 +197,45 @@ interface MagiDesktopBridge {
     workspacePath: string;
     sessionId: string;
   }): Promise<MagiDesktopContextSnapshot>;
-  submitLayoutIntent(intent: MagiDesktopLayoutIntent): Promise<MagiDesktopWindowSnapshot>;
-  activateBrowser(request: MagiDesktopBrowserActivationRequest): Promise<MagiDesktopWindowSnapshot>;
-  activatePanel(request: { kind: MagiDesktopPanelKind; tabId: string | null }): Promise<MagiDesktopWindowSnapshot>;
+  submitLayoutIntent(
+    intent: MagiDesktopLayoutIntent,
+  ): Promise<MagiDesktopWindowSnapshot>;
+  activateBrowser(
+    request: MagiDesktopBrowserActivationRequest,
+  ): Promise<MagiDesktopWindowSnapshot>;
+  registerBrowserWebview(
+    request: MagiDesktopEmbeddedBrowserWebviewRequest,
+  ): Promise<MagiDesktopWindowSnapshot>;
+  releaseBrowserWebview(
+    request: MagiDesktopReleasedBrowserWebviewRequest,
+  ): Promise<MagiDesktopWindowSnapshot>;
+  waitForBrowserSurface(request: {
+    tabId: string;
+  }): Promise<MagiDesktopWindowSnapshot>;
+  activatePanel(request: {
+    kind: MagiDesktopPanelKind;
+    tabId: string | null;
+  }): Promise<MagiDesktopWindowSnapshot>;
   setBrowserViewport(request: {
     tabId: string;
     viewport: MagiDesktopViewportIntent;
   }): Promise<MagiDesktopWindowSnapshot>;
-  startBrowserInspect(request: MagiDesktopBrowserInspectRequest): Promise<MagiDesktopWindowSnapshot>;
-  stopBrowserInspect(request: MagiDesktopBrowserInspectRequest): Promise<MagiDesktopWindowSnapshot>;
+  cancelBrowserDownload(request: {
+    tabId: string;
+    downloadId: string;
+  }): Promise<MagiDesktopWindowSnapshot>;
+  startBrowserInspect(
+    request: MagiDesktopBrowserInspectRequest,
+  ): Promise<MagiDesktopWindowSnapshot>;
+  stopBrowserInspect(
+    request: MagiDesktopBrowserInspectRequest,
+  ): Promise<MagiDesktopWindowSnapshot>;
   focusApp(): Promise<void>;
   readyRightPane(): Promise<void>;
-  openOverlay(state: Omit<MagiDesktopOverlayState, 'overlayId' | 'phase'> & { overlayId?: string; phase?: MagiDesktopOverlayState['phase'] }): Promise<void>;
-  closeOverlay(request: { overlayId: string; ownerId: string }): Promise<MagiDesktopOverlayClosedEvent | null>;
-  setBlockingOverlay(request: { active: boolean }): Promise<MagiDesktopWindowSnapshot>;
-  readyOverlay(): Promise<void>;
-  submitOverlayAction(action: MagiDesktopOverlayAction): Promise<void>;
   openExternal(url: string): Promise<void>;
-  showContextMenu(request: { items: MagiDesktopContextMenuItem[] }): Promise<string | null>;
+  showContextMenu(request: {
+    items: MagiDesktopContextMenuItem[];
+  }): Promise<string | null>;
   openWorkspaceFolder(workspaceRootPathRef: string): Promise<void>;
   revealWorkspaceFile(request: {
     targetPathRef: string;
@@ -245,8 +244,8 @@ interface MagiDesktopBridge {
   setAppearance(appearance: {
     backgroundColor: string;
     accentColor: string;
-    material: 'clear' | 'translucent' | 'immersive';
-    mode: 'light' | 'dark';
+    material: "clear" | "translucent" | "immersive";
+    mode: "light" | "dark";
   }): Promise<void>;
   getAppVersion(): Promise<string>;
   getBrowserComponentInfo(): Promise<MagiDesktopBrowserComponentSnapshot>;
@@ -255,13 +254,19 @@ interface MagiDesktopBridge {
   checkForUpdates(): Promise<MagiDesktopUpdateSnapshot>;
   downloadUpdate(): Promise<MagiDesktopUpdateSnapshot>;
   installUpdate(): Promise<never>;
-  onSnapshot(listener: (snapshot: MagiDesktopWindowSnapshot) => void): () => void;
-  onContext(listener: (context: MagiDesktopContextSnapshot) => void): () => void;
+  onSnapshot(
+    listener: (snapshot: MagiDesktopWindowSnapshot) => void,
+  ): () => void;
+  onBrowserRuntimeReady(
+    listener: (event: { revision: number }) => void,
+  ): () => void;
+  onContext(
+    listener: (context: MagiDesktopContextSnapshot) => void,
+  ): () => void;
   onBrowserEvent(listener: (event: unknown) => void): () => void;
-  onBrowserComponent(listener: (snapshot: MagiDesktopBrowserComponentSnapshot) => void): () => void;
-  onOverlayState(listener: (state: MagiDesktopOverlayState) => void): () => void;
-  onOverlayClosed(listener: (event: MagiDesktopOverlayClosedEvent) => void): () => void;
-  onOverlayAction(listener: (action: MagiDesktopOverlayAction) => void): () => void;
+  onBrowserComponent(
+    listener: (snapshot: MagiDesktopBrowserComponentSnapshot) => void,
+  ): () => void;
   onUpdate(listener: (snapshot: MagiDesktopUpdateSnapshot) => void): () => void;
   onFileDrop(listener: (event: MagiDesktopFileDropEvent) => void): () => void;
 }

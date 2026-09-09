@@ -13,6 +13,7 @@ export interface PanelLayoutInput {
   viewportWidth: number;
   sidebarWidth: number;
   previewPanelWidth: number;
+  sidebarVisible?: boolean;
   desktopSurface?: boolean;
 }
 
@@ -51,11 +52,15 @@ export function resolvePanelLayout(input: PanelLayoutInput): PanelLayoutResoluti
     PANEL_LAYOUT.minContentWidth
     + PANEL_LAYOUT.previewHandleWidth
     + previewPanelWidth;
-  const previewOverlay = sidebarDrawer || contentFrameWidth < previewSplitWidth;
-  const sideBySideWidth =
-    sidebarWidth
-    + shellGap
-    + previewSplitWidth;
+  // 右栏位于 sidebar 之后的 workbench-content 内，能否并排必须以该
+  // 内容轨道的真实可用宽度判断。此前使用整个窗口宽度，造成 CSS 轨道
+  // 实际溢出后再隐藏左栏掩盖问题；右栏变宽不应改变左栏的用户状态。
+  const sidebarTakenWidth = input.sidebarVisible === false || sidebarDrawer
+    ? 0
+    : sidebarWidth + shellGap;
+  const workbenchWidth = Math.max(0, contentFrameWidth - sidebarTakenWidth);
+  const previewOverlay = sidebarDrawer || workbenchWidth < previewSplitWidth;
+  const sideBySideWidth = sidebarTakenWidth + previewSplitWidth;
   const panelsCanCoexist = !previewOverlay && contentFrameWidth >= sideBySideWidth;
 
   return {
@@ -78,14 +83,9 @@ export function resolvePreviewPanelWidthBounds(
     : 0;
   const currentWorkbenchWidth = Math.max(0, shellWidth - sidebarTakenWidth);
 
-  // 展开右栏时，左栏可以按 panelsCanCoexist 的结果自动让出空间。
-  // 这里预留完整工作区，避免拖拽逻辑继续扣除已经隐藏的左栏宽度。
-  const focusWorkbenchWidth = input.rightPaneOpen && !input.previewOverlay
-    ? shellWidth
-    : currentWorkbenchWidth;
   const maxByConversation = Math.max(
     PANEL_LAYOUT.minPreviewWidth,
-    focusWorkbenchWidth
+    currentWorkbenchWidth
       - PANEL_LAYOUT.previewHandleWidth
       - PANEL_LAYOUT.minContentWidth,
   );
@@ -104,7 +104,6 @@ export function resolvePreviewPanelWidthBounds(
 
 export interface PanelVisibilityInput {
   sidebarDrawer: boolean;
-  panelsCanCoexist: boolean;
   sidebarPreferredOpen: boolean;
   sidebarDrawerOpen: boolean;
   rightPaneOpen: boolean;
@@ -115,9 +114,7 @@ export function resolvePanelVisibility(
 ): { sidebarVisible: boolean; rightPaneVisible: boolean } {
   const sidebarVisible = input.sidebarDrawer
     ? input.sidebarDrawerOpen && !input.rightPaneOpen
-    : input.sidebarPreferredOpen && (
-      input.panelsCanCoexist || !input.rightPaneOpen
-    );
+    : input.sidebarPreferredOpen;
 
   return {
     sidebarVisible,

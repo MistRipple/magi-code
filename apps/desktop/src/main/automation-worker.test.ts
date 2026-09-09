@@ -27,6 +27,8 @@ class FakeUtilityProcess extends EventEmitter {
   readonly stdout = null;
   readonly stderr = null;
   killed = false;
+  holdRebindAck = false;
+  #pendingRebindAck: MainToWorkerMessage | null = null;
 
   constructor(private readonly failOnRebind = false) {
     super();
@@ -45,6 +47,10 @@ class FakeUtilityProcess extends EventEmitter {
     }
     this.messages.push(typedMessage);
     if (typedMessage.type === "worker_rebind") {
+      if (this.holdRebindAck) {
+        this.#pendingRebindAck = typedMessage;
+        return;
+      }
       queueMicrotask(() => this.emit("message", {
         type: "worker_rebind_ack",
         worker_epoch: typedMessage.worker_epoch,
@@ -52,6 +58,18 @@ class FakeUtilityProcess extends EventEmitter {
         binding_count: typedMessage.bindings.length,
       }));
     }
+  }
+
+  releaseRebindAck(): void {
+    const message = this.#pendingRebindAck;
+    this.#pendingRebindAck = null;
+    if (!message || message.type !== "worker_rebind") return;
+    queueMicrotask(() => this.emit("message", {
+      type: "worker_rebind_ack",
+      worker_epoch: message.worker_epoch,
+      rebind_id: message.rebind_id,
+      binding_count: message.bindings.length,
+    }));
   }
 
   emitReady(workerEpoch: string): void {
@@ -62,11 +80,11 @@ class FakeUtilityProcess extends EventEmitter {
     });
   }
 
-  emitResult(callId: string): void {
+  emitResult(callId: string, resultBinding: BrowserSurfaceBinding = binding): void {
     this.emit("message", {
       type: "worker_result",
       call_id: callId,
-      binding,
+      binding: resultBinding,
       outcome: { status: "succeeded", payload: { type: "empty" } },
     });
   }
@@ -121,6 +139,37 @@ test("恢复注册只会在新 Worker 完成 Surface 重绑后执行", async () 
   await starting;
 
   assert.equal(rebindVisibleWhenReady, true);
+  await worker.stop();
+});
+
+test("运行期 primary_changed 会等待 Worker 重绑 ACK，命令不会越过换代边界", async () => {
+  const child = new FakeUtilityProcess();
+  const nextBinding = {
+    ...binding,
+    surface_id: "surface-test-next",
+    surface_revision: 2,
+    web_contents_id: 2,
+    target_id: "target-test-next",
+    navigation_revision: 2,
+  };
+  const worker = createWorker(() => child, undefined, () => [nextBinding]);
+  const starting = worker.start();
+  child.emitReady(worker.workerEpoch);
+  await starting;
+
+  child.holdRebindAck = true;
+  const rebind = worker.forwardSurfaceEvent({ type: "primary_changed", binding: nextBinding });
+  const execution = worker.execute(nextBinding, { type: "ping" });
+  await waitFor(() => child.messages.filter((message) => message.type === "worker_rebind").length === 2);
+  assert.equal(child.messages.some((message) => message.type === "worker_command"), false);
+
+  child.releaseRebindAck();
+  await rebind;
+  await waitFor(() => child.messages.some((message) => message.type === "worker_command"));
+  const command = child.messages.find((message) => message.type === "worker_command");
+  assert.ok(command && command.type === "worker_command");
+  child.emitResult(command.call_id, nextBinding);
+  assert.equal((await execution).outcome.status, "succeeded");
   await worker.stop();
 });
 
@@ -204,9 +253,10 @@ test("连续恢复失败后进入 failed 且不遗留可用性错误的 Worker �
 function createWorker(
   fork: () => FakeUtilityProcess,
   onReady?: () => Promise<void>,
+  bindings: () => BrowserSurfaceBinding[] = () => [],
 ): AutomationWorker {
   const surfaceManager = {
-    bindings: () => [],
+    bindings,
     updateControl: async () => undefined,
   } as unknown as BrowserSurfaceManager;
   return new AutomationWorker({

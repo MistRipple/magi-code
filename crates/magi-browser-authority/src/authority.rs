@@ -843,7 +843,6 @@ impl BrowserAuthority {
             tab.lifecycle = lifecycle;
             tab.updated_at = now;
             if lifecycle == BrowserTabLifecycle::Suspended {
-                tab.navigation_revision = tab.navigation_revision.saturating_add(1);
                 tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
             }
         }
@@ -1551,7 +1550,6 @@ impl BrowserAuthority {
                         )
                     {
                         tab.lifecycle = BrowserTabLifecycle::Suspended;
-                        tab.navigation_revision = tab.navigation_revision.saturating_add(1);
                         tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
                         tab.updated_at = now;
                     }
@@ -1674,7 +1672,6 @@ impl BrowserAuthority {
                 )
             {
                 tab.lifecycle = BrowserTabLifecycle::Suspended;
-                tab.navigation_revision = tab.navigation_revision.saturating_add(1);
                 tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
                 tab.updated_at = now;
             }

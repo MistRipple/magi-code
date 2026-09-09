@@ -74,7 +74,7 @@ fn file_read_uses_schema_path_and_directory_listing() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -104,7 +104,7 @@ fn file_read_uses_schema_path_and_directory_listing() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -139,8 +139,9 @@ fn file_read_accepts_host_path_ref_without_reconstructing_native_path() {
             risk_level: RiskLevel::Low,
         },
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -237,7 +238,7 @@ fn search_text_filesystem_failure_uses_public_error_message() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -272,7 +273,7 @@ fn builtin_execution_emits_usage_event_and_updates_ledger() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -322,7 +323,7 @@ fn search_text_supports_json_input() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -405,7 +406,7 @@ fn shell_exec_runs_and_reports_failure_semantics() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -429,7 +430,7 @@ fn shell_exec_runs_and_reports_failure_semantics() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -447,7 +448,7 @@ fn shell_exec_runs_and_reports_failure_semantics() {
             approval_requirement: ApprovalRequirement::Required,
             risk_level: RiskLevel::High,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
     assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
@@ -464,7 +465,7 @@ fn shell_exec_silent_command_completes_without_being_treated_as_timeout() {
             BuiltinToolName::ShellExec.as_str(),
             serde_json::json!({ "command": "sleep 1" }).to_string(),
         ),
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -496,7 +497,7 @@ fn shell_exec_explicit_timeout_is_reported_as_timeout_not_cancellation() {
             })
             .to_string(),
         ),
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -535,7 +536,7 @@ fn shell_exec_publishes_output_before_process_completion() {
             })
             .to_string(),
         ),
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
         &on_progress,
     );
@@ -583,7 +584,7 @@ fn shell_exec_spawn_failure_uses_public_error_message() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -620,7 +621,7 @@ fn shell_exec_reports_missing_executable_in_compound_command() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -652,7 +653,7 @@ fn shell_exec_detects_missing_pipeline_dependency_even_when_stderr_is_suppressed
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -701,8 +702,9 @@ fn shell_exec_accepts_shell_program_with_arguments() {
             risk_level: RiskLevel::Low,
         },
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(workspace),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -739,8 +741,9 @@ fn shell_exec_reports_unavailable_workspace_before_starting_shell() {
             risk_level: RiskLevel::Low,
         },
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(missing_workspace),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -779,8 +782,9 @@ fn shell_exec_reclassifies_read_only_mode_with_write_redirection() {
             risk_level: RiskLevel::Low,
         },
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -815,7 +819,7 @@ fn shell_exec_read_only_allows_dev_null_probe_redirection() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -876,7 +880,7 @@ fn shell_exec_rejects_writes_to_policy_read_only_paths_in_full_access() {
             },
             ToolExecutionContext {
                 working_directory: Some(root.clone()),
-                browser_capability_revision: None,
+                browser_capability_snapshot: None,
                 browser_execution_id: None,
                 ..ToolExecutionContext::default()
             },
@@ -936,8 +940,9 @@ fn shell_exec_allows_reading_or_copying_from_policy_read_only_paths() {
             risk_level: RiskLevel::Low,
         },
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(workspace_dir.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -959,8 +964,9 @@ fn shell_exec_allows_reading_or_copying_from_policy_read_only_paths() {
             risk_level: RiskLevel::Low,
         },
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(workspace_dir),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -990,7 +996,7 @@ fn shell_exec_background_process_can_be_controlled_through_shell_surface() {
         session_id: Some(SessionId::new("session-shell-background-control")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-background-control")),
         working_directory: Some(root),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -1106,7 +1112,7 @@ fn shell_exec_read_only_git_status_in_non_git_workspace_is_stable_probe() {
         session_id: Some(SessionId::new("session-shell-non-git")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-non-git")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -1147,7 +1153,7 @@ fn shell_exec_read_only_compound_git_status_in_non_git_workspace_is_stable_probe
         session_id: Some(SessionId::new("session-shell-compound-non-git")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-compound-non-git")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -1221,7 +1227,7 @@ fn shell_exec_records_git_worktree_changed_paths() {
         session_id: Some(SessionId::new("session-shell-change-capture")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-change-capture")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -1268,7 +1274,7 @@ fn shell_exec_records_non_git_filesystem_changed_paths() {
         session_id: Some(SessionId::new("session-shell-non-git-change")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-non-git-change")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -1312,7 +1318,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
         workspace_id: Some(WorkspaceId::new("workspace-shell-cancel")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let runner_registry = registry.clone();
@@ -1367,7 +1373,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
         workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-workspace-scope")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let runner_registry = registry.clone();
@@ -1422,7 +1428,7 @@ fn session_cancellation_stops_background_processes_in_the_same_scope() {
         workspace_id: Some(WorkspaceId::new("workspace-background-cancel")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let launch = registry.execute_with_policy(
@@ -1488,7 +1494,7 @@ fn shell_exec_rejects_blank_json_command() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -1525,7 +1531,7 @@ fn builtin_required_fields_reject_empty_json_objects() {
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
-            ToolExecutionContext::default(),
+            test_workspace_context(),
             &ToolExecutionPolicy::default(),
         );
 
@@ -1551,8 +1557,9 @@ fn builtins_use_context_working_directory_for_relative_inputs() {
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
+        workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -1641,7 +1648,7 @@ fn shell_exec_blocks_conflicting_write_scope_until_guard_drops() {
         workspace_id: Some(WorkspaceId::new("workspace-write")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let guarded_input = ToolExecutionInput {
@@ -1724,7 +1731,7 @@ fn write_guard_tracks_file_copy_destination_path() {
         workspace_id: Some(WorkspaceId::new("workspace-copy-guard")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let blocked_context = ToolExecutionContext {
@@ -1801,7 +1808,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
         workspace_id: Some(WorkspaceId::new("workspace-a")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let other_context = ToolExecutionContext {
@@ -1811,7 +1818,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
         workspace_id: Some(WorkspaceId::new("workspace-b")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let guarded_input = ToolExecutionInput {
@@ -1892,7 +1899,7 @@ fn process_inspect_reports_current_process() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -1928,7 +1935,7 @@ fn process_launch_does_not_block_followup_shell_in_same_session() {
         workspace_id: Some(WorkspaceId::new("workspace-process-launch")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -2012,7 +2019,7 @@ fn process_launch_rejects_blank_json_command() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &full_access_policy(),
     );
 
@@ -2032,7 +2039,7 @@ fn process_launch_spawn_failure_uses_public_error_message() {
         workspace_id: Some(WorkspaceId::new("workspace-process-spawn-error")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -2082,7 +2089,7 @@ fn process_write_failure_uses_public_error_message() {
         workspace_id: Some(WorkspaceId::new("workspace-process-write-error")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -2142,7 +2149,7 @@ fn process_write_failure_uses_public_error_message() {
 }
 
 #[test]
-fn process_tools_reject_missing_session_or_workspace_context() {
+fn process_tools_reject_missing_workspace_context_before_execution() {
     let root = unique_temp_dir("magi-tool-process-context");
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
@@ -2165,8 +2172,9 @@ fn process_tools_reject_missing_session_or_workspace_context() {
         ToolExecutionContext::default(),
         &full_access_policy(),
     );
-    assert_eq!(output.status, ExecutionResultStatus::Failed);
-    assert!(output.payload.contains("需要 session 或 workspace 上下文"));
+    assert_eq!(output.status, ExecutionResultStatus::Rejected);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["error_code"], "workspace_required");
 
     let context = ToolExecutionContext {
         worker_id: None,
@@ -2175,7 +2183,7 @@ fn process_tools_reject_missing_session_or_workspace_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-context")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let launch = tool_registry.execute_internal_builtin_with_policy(
@@ -2210,12 +2218,10 @@ fn process_tools_reject_missing_session_or_workspace_context() {
         ToolExecutionContext::default(),
         &ToolExecutionPolicy::default(),
     );
-    assert_eq!(read_without_context.status, ExecutionResultStatus::Failed);
-    assert!(
-        read_without_context
-            .payload
-            .contains("需要 session 或 workspace 上下文")
-    );
+    assert_eq!(read_without_context.status, ExecutionResultStatus::Rejected);
+    let read_payload: Value =
+        serde_json::from_str(&read_without_context.payload).expect("read payload json");
+    assert_eq!(read_payload["error_code"], "workspace_required");
 
     let kill = tool_registry.execute_internal_builtin_with_policy(
         ToolExecutionInput {
@@ -2247,7 +2253,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let workspace_only_context = ToolExecutionContext {
@@ -2257,7 +2263,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let other_session_context = ToolExecutionContext {
@@ -2267,7 +2273,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -2386,7 +2392,7 @@ fn diff_preview_reports_text_deltas() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -2430,7 +2436,7 @@ fn diff_preview_prefers_inline_text_when_path_labels_are_present() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -2452,8 +2458,9 @@ fn diff_preview_resolves_relative_paths_from_tool_working_directory() {
     fs::write(root.join("after.txt"), "alpha\nnew\n").expect("write after");
     let registry = make_registry();
     let context = ToolExecutionContext {
+        workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -2533,7 +2540,7 @@ fn builtin_invocation_emits_usage_event_and_updates_ledger() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -2573,7 +2580,7 @@ fn governance_blocked_invocations_appear_in_summary_and_events() {
         workspace_id: Some(WorkspaceId::new("workspace-gov")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -2686,7 +2693,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
         workspace_id: None,
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let input_a = ToolExecutionInput {
@@ -2716,7 +2723,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
         workspace_id: None,
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let input_b = ToolExecutionInput {
@@ -2778,7 +2785,7 @@ fn summary_for_query_filters_by_context_fields() {
         workspace_id: Some(WorkspaceId::new("ws1")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let ctx_w2 = ToolExecutionContext {
@@ -2788,7 +2795,7 @@ fn summary_for_query_filters_by_context_fields() {
         workspace_id: Some(WorkspaceId::new("ws1")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -2873,7 +2880,7 @@ fn policy_rejection_reflected_in_summary_and_events() {
     let file = root.join("p.txt");
     fs::write(&file, "policy").expect("write");
 
-    let ctx = ToolExecutionContext::default();
+    let ctx = test_workspace_context();
 
     // Policy that explicitly denies file.read
     let deny_policy = ToolExecutionPolicy {
@@ -3002,7 +3009,7 @@ fn full_chain_invocations_events_summary_consistent() {
         workspace_id: Some(WorkspaceId::new("ws-chain")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -3156,7 +3163,7 @@ fn full_access_policy_skips_regular_tool_approval() {
             approval_requirement: ApprovalRequirement::Required,
             risk_level: RiskLevel::High,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy {
             access_profile: magi_core::AccessProfile::FullAccess,
             ..ToolExecutionPolicy::default()
@@ -3247,8 +3254,9 @@ fn registry_enforces_effective_read_only_profile_default_path_scope() {
             .to_string(),
         ),
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(workspace),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -3282,7 +3290,7 @@ fn registry_does_not_skip_approval_when_command_mode_downgrades_full_access() {
             approval_requirement: ApprovalRequirement::Required,
             risk_level: RiskLevel::High,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy {
             access_profile: magi_core::AccessProfile::FullAccess,
             command_mode: "read_only".to_string(),
@@ -3370,6 +3378,74 @@ fn make_registry() -> ToolRegistry {
     r
 }
 
+fn test_workspace_context() -> ToolExecutionContext {
+    ToolExecutionContext {
+        workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
+        ..ToolExecutionContext::default()
+    }
+}
+
+#[test]
+fn registry_enforces_workspace_boundary_and_keeps_browser_available_without_workspace() {
+    let registry = make_registry();
+
+    for tool in [
+        BuiltinToolName::FileRead,
+        BuiltinToolName::ShellExec,
+        BuiltinToolName::GitStatus,
+    ] {
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("workspace-boundary-{}", tool.as_str())),
+                tool.as_str(),
+                "{}",
+            ),
+            ToolExecutionContext::default(),
+            &full_access_policy(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected, "{tool:?}");
+        let payload: Value = serde_json::from_str(&output.payload).expect("rejection payload");
+        assert_eq!(payload["error_code"], "workspace_required", "{tool:?}");
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_executor = Arc::clone(&calls);
+    let registry = make_registry().with_browser_automation(
+        Arc::new(move |_, tool, _, context| {
+            assert!(context.workspace_id.is_none());
+            calls_for_executor.fetch_add(1, Ordering::SeqCst);
+            (
+                serde_json::json!({ "tool": tool, "status": "succeeded" }).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }),
+        Arc::new(|_| magi_browser_authority::BrowserCapabilitySnapshot {
+            revision: 1,
+            in_app_browser_enabled: true,
+            browser_use_enabled: true,
+            host_status: magi_browser_authority::BrowserHostStatus::Ready,
+            host_protocol_compatible: true,
+            access_profile: magi_core::AccessProfile::FullAccess,
+        }),
+    );
+
+    let browser_output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("workspace-boundary-browser-tabs"),
+            BuiltinToolName::BrowserTabs.as_str(),
+            "{}",
+        ),
+        ToolExecutionContext::default(),
+        &full_access_policy(),
+    );
+
+    assert_eq!(browser_output.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let payload: Value = serde_json::from_str(&browser_output.payload).expect("browser payload");
+    assert_eq!(payload["tool"], BuiltinToolName::BrowserTabs.as_str());
+}
+
 fn full_access_policy() -> ToolExecutionPolicy {
     ToolExecutionPolicy {
         access_profile: magi_core::AccessProfile::FullAccess,
@@ -3399,7 +3475,7 @@ fn structured_git_builtins_delegate_through_runtime_resource() {
         workspace_id: Some(WorkspaceId::new("workspace-git-builtin")),
         access_profile: magi_core::AccessProfile::FullAccess,
         working_directory: Some(PathBuf::from("/tmp/git-builtin")),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -3444,7 +3520,7 @@ fn registry_enforces_read_only_profile_for_write_tools() {
             })
             .to_string(),
         ),
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy {
             access_profile: magi_core::AccessProfile::ReadOnly,
             ..ToolExecutionPolicy::default()
@@ -3472,7 +3548,7 @@ fn registry_requires_approval_for_restricted_write_shell() {
             })
             .to_string(),
         ),
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -3497,7 +3573,7 @@ fn registry_allows_restricted_read_only_shell() {
             })
             .to_string(),
         ),
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
 
@@ -3524,8 +3600,9 @@ fn registry_reclassifies_misdeclared_shell_without_blocking_full_access() {
             .to_string(),
         ),
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -3557,8 +3634,9 @@ fn registry_requires_approval_for_misdeclared_shell_in_restricted_access() {
             .to_string(),
         ),
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -3581,7 +3659,7 @@ fn registry_rejects_process_side_effects_in_read_only_access() {
             BuiltinToolName::ProcessLaunch.as_str(),
             serde_json::json!({ "command": "printf blocked" }).to_string(),
         ),
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy {
             access_profile: magi_core::AccessProfile::ReadOnly,
             ..ToolExecutionPolicy::default()
@@ -3616,7 +3694,7 @@ fn registry_rejects_background_shell_declared_read_only_in_read_only_access() {
                 "workspace-read-only-background",
             )),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -3649,6 +3727,14 @@ fn exec_tool_with_context_and_policy(
     context: ToolExecutionContext,
     policy: ToolExecutionPolicy,
 ) -> ToolExecutionOutput {
+    let context = if context.workspace_id.is_some() {
+        context
+    } else {
+        ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
+            ..context
+        }
+    };
     registry.execute_with_policy(
         ToolExecutionInput {
             tool_call_id: ToolCallId::new(format!("tc-{}", tool.as_str())),
@@ -3671,7 +3757,7 @@ fn registry_rejects_restricted_file_write_outside_workspace_root() {
     let registry = make_registry();
     let context = ToolExecutionContext {
         working_directory: Some(workspace.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -3732,7 +3818,7 @@ fn referenced_external_paths_are_readable_but_never_writable() {
     let registry = make_registry();
     let context = ToolExecutionContext {
         working_directory: Some(workspace.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -3790,8 +3876,9 @@ fn registry_rejects_outside_shell_path_before_approval() {
             .to_string(),
         ),
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(workspace),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -3829,8 +3916,9 @@ fn registry_applies_path_policy_to_code_symbols_path() {
             .to_string(),
         ),
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(workspace),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -4337,8 +4425,9 @@ fn apply_patch_tool_applies_patch_envelope_through_registry() {
             risk_level: RiskLevel::Medium,
         },
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -4404,7 +4493,7 @@ fn file_remove_rejects_workspace_root_even_in_full_access() {
         &serde_json::json!({ "path": ".", "recursive": true }).to_string(),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -4435,7 +4524,7 @@ fn file_remove_rejects_absolute_working_directory_even_in_full_access() {
         &serde_json::json!({ "path": root.to_string_lossy(), "recursive": true }).to_string(),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -4465,7 +4554,7 @@ fn file_read_reports_missing_path_without_mislabeling_it_as_permission_failure()
         &serde_json::json!({ "path": "missing.txt" }).to_string(),
         ToolExecutionContext {
             working_directory: Some(root),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -5306,7 +5395,7 @@ fn knowledge_graph_query_returns_scoped_candidates_and_requires_focus() {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
-        ToolExecutionContext::default(),
+        test_workspace_context(),
         &ToolExecutionPolicy::default(),
     );
     assert_eq!(missing_focus.status, ExecutionResultStatus::Failed);
@@ -6278,7 +6367,7 @@ fn registry_rejects_internal_process_tools_as_public_builtin_calls() {
         workspace_id: Some(WorkspaceId::new("workspace-internal-process")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -6337,7 +6426,7 @@ fn shell_exec_background_keeps_shell_public_payload() {
         workspace_id: Some(WorkspaceId::new("workspace-shell-background")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
 
@@ -6377,7 +6466,7 @@ fn file_write_execution_respects_active_write_guard() {
         workspace_id: Some(WorkspaceId::new("workspace-file-write-guard")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
     };
     let held_input = ToolExecutionInput {
@@ -6521,7 +6610,7 @@ fn search_semantic_uses_workspace_local_index() {
     let context = ToolExecutionContext {
         workspace_id: Some(workspace_id),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -6595,7 +6684,7 @@ fn search_semantic_lazily_builds_missing_workspace_index() {
         ToolExecutionContext {
             workspace_id: Some(workspace_id.clone()),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -6637,7 +6726,7 @@ fn search_semantic_returns_empty_success_for_empty_workspace() {
         ToolExecutionContext {
             workspace_id: Some(workspace_id.clone()),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -6928,7 +7017,7 @@ fn search_semantic_uses_context_workspace_when_multiple_indexes_are_ready() {
         ToolExecutionContext {
             workspace_id: Some(workspace_a),
             working_directory: Some(root_a.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -6964,7 +7053,7 @@ fn search_semantic_uses_context_workspace_when_multiple_indexes_are_ready() {
         ToolExecutionContext {
             workspace_id: Some(workspace_b),
             working_directory: Some(root_b.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -7014,7 +7103,7 @@ fn search_semantic_does_not_fallback_to_text_scan() {
     let context = ToolExecutionContext {
         workspace_id: Some(workspace_id),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -7070,7 +7159,7 @@ fn code_symbols_definition_and_file_symbols() {
     let context = ToolExecutionContext {
         workspace_id: Some(workspace_id),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
@@ -7283,7 +7372,7 @@ fn image_generate_writes_provider_bytes_to_workspace_without_persisting_base64()
             session_id: Some(magi_core::SessionId::new("session-image-generate")),
             workspace_id: Some(magi_core::WorkspaceId::new("workspace-image-generate")),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             access_profile: magi_core::AccessProfile::FullAccess,
             ..ToolExecutionContext::default()
@@ -7329,7 +7418,7 @@ fn image_generate_is_unavailable_in_read_only_access_profile() {
         ),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             ..ToolExecutionContext::default()
         },
@@ -7360,8 +7449,9 @@ fn image_generate_rejects_unconfigured_runtime_before_provider_call() {
         .with_image_generation_runtime(executor, Arc::new(|| false));
     registry.register_default_builtins();
     let context = ToolExecutionContext {
+        workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         access_profile: magi_core::AccessProfile::FullAccess,
         ..ToolExecutionContext::default()
@@ -7422,8 +7512,9 @@ fn image_generate_rejects_workspace_escape_before_calling_provider() {
             .to_string(),
         ),
         ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
             working_directory: Some(root.clone()),
-            browser_capability_revision: None,
+            browser_capability_snapshot: None,
             browser_execution_id: None,
             access_profile: magi_core::AccessProfile::FullAccess,
             ..ToolExecutionContext::default()
@@ -7462,8 +7553,9 @@ fn image_generate_normalizes_extension_and_avoids_overwriting_existing_image() {
         .with_image_generation_runtime(executor, Arc::new(|| true));
     registry.register_default_builtins();
     let context = ToolExecutionContext {
+        workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
         working_directory: Some(root.clone()),
-        browser_capability_revision: None,
+        browser_capability_snapshot: None,
         browser_execution_id: None,
         access_profile: magi_core::AccessProfile::FullAccess,
         ..ToolExecutionContext::default()

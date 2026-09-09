@@ -1351,6 +1351,79 @@ test("持久化浏览器标记通过 Host 同步到当前 Chromium 文档", asyn
   );
 });
 
+test("标记命中检测把内容槽归一化坐标转换为当前 Chromium CSS 视口坐标", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      if (expression.includes("__magiBrowserAutomation.hitTest(0.5, 0.25)")) {
+        return {
+          result: {
+            value: {
+              navigation_revision: 0,
+              viewport_width: 1280,
+              viewport_height: 720,
+              scroll_x: 0,
+              scroll_y: 0,
+              element_ref: "e:1:1",
+              tag_name: "button",
+              test_id: null,
+              stable_id: "save",
+              aria_role: "button",
+              aria_name: "Save",
+              text_excerpt: "Save",
+              css_path: "#save",
+              ancestor_fingerprint: "ancestor",
+              dom_fingerprint: "dom",
+              bounds: { x: 640, y: 180, width: 120, height: 40 },
+            },
+          },
+        };
+      }
+    }
+    return { result: { value: null } };
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("hit-test-call", binding, {
+    type: "hit_test",
+    payload: {
+      tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
+      normalized_x: 0.5,
+      normalized_y: 0.25,
+    },
+  });
+
+  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(
+    port.requests.some((request) => request.method === "Runtime.evaluate"
+      && String(request.params.expression).includes("__magiBrowserAutomation.hitTest(0.5, 0.25)")),
+    true,
+  );
+  assert.match(INSTALL_PAGE_RUNTIME, /normalizedX \* innerWidth/u);
+  assert.match(INSTALL_PAGE_RUNTIME, /normalizedY \* innerHeight/u);
+});
+
+test("标记命中检测拒绝超出 [0, 1] 的归一化坐标", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("invalid-hit-test-call", binding, {
+    type: "hit_test",
+    payload: {
+      tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
+      normalized_x: 1.01,
+      normalized_y: 0.5,
+    },
+  });
+
+  assert.equal(result.outcome.status, "failed");
+  if (result.outcome.status === "failed") {
+    assert.equal(result.outcome.payload.code, "browser_hit_test_coordinates_invalid");
+  }
+});
+
 test("同一 Surface 的并发工具调用按资源串行，运行时安装不会暴露半初始化状态", async () => {
   let isolatedWorlds = 0;
   const port = new ScriptedPort((method, params) => {
@@ -1455,11 +1528,15 @@ test("Runtime.evaluate 竞态遇到失效 context 时只重试一次并重建 is
   assert.deepEqual(annotationEvaluations.map((request) => request.params.contextId), [1, 2]);
 });
 
-test("浏览器标记层的 MutationObserver 不会观察自身 Shadow DOM 重绘", () => {
-  assert.match(
+test("浏览器标记层只观察目标布局相关节点，不监听整个页面属性", () => {
+  assert.match(INSTALL_PAGE_RUNTIME, /annotationResizeObserver/u);
+  assert.match(INSTALL_PAGE_RUNTIME, /attributeFilter:.*class.*style.*hidden.*open/u);
+  assert.match(INSTALL_PAGE_RUNTIME, /childList: options\.childList/u);
+  assert.doesNotMatch(
     INSTALL_PAGE_RUNTIME,
-    /target === state\.annotationShadow[\s\S]*?state\.annotationShadow\?\.contains\(target\)/u,
+    /observe\(root,\s*\{\s*childList:\s*true,\s*subtree:\s*true,\s*attributes:\s*true/u,
   );
+  assert.doesNotMatch(INSTALL_PAGE_RUNTIME, /while \(shadow\.firstChild\)/u);
 });
 
 test("Accessibility 节点引用使用 Worker isolated world 的执行上下文", async () => {

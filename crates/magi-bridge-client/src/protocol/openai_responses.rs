@@ -30,8 +30,17 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         model: &str,
     ) -> Result<AdaptedRequest, String> {
         let mut input = Vec::new();
+        let response_call_history = ResponseCallHistory::from_messages(&params.messages);
+        let mut emitted_call_ids = std::collections::HashSet::new();
+        let mut emitted_output_ids = std::collections::HashSet::new();
         for message in &params.messages {
-            append_response_input_items(&mut input, message)?;
+            append_response_input_items(
+                &mut input,
+                message,
+                &response_call_history,
+                &mut emitted_call_ids,
+                &mut emitted_output_ids,
+            )?;
         }
 
         let mut body = json!({
@@ -98,7 +107,58 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
     }
 }
 
-fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> Result<(), String> {
+#[derive(Default)]
+struct ResponseCallHistory {
+    call_ids: std::collections::HashSet<String>,
+    result_ids: std::collections::HashSet<String>,
+}
+
+impl ResponseCallHistory {
+    fn from_messages(messages: &[LlmMessage]) -> Self {
+        let mut history = Self::default();
+        for message in messages {
+            let LlmMessageContent::Blocks(blocks) = &message.content else {
+                continue;
+            };
+            for block in blocks {
+                match block {
+                    LlmContentBlock::ToolUse { id, .. } => {
+                        if !id.trim().is_empty() {
+                            history.call_ids.insert(id.clone());
+                        }
+                    }
+                    LlmContentBlock::ToolResult { tool_use_id, .. } => {
+                        if !tool_use_id.trim().is_empty() {
+                            history.result_ids.insert(tool_use_id.clone());
+                        }
+                    }
+                    LlmContentBlock::ProviderContext { context }
+                        if response_output_item_from_context_block(block)
+                            .is_some_and(|item| item["type"].as_str() == Some("function_call")) =>
+                    {
+                        if let Some(call_id) = response_call_id_from_context(context) {
+                            history.call_ids.insert(call_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        history
+    }
+
+    fn is_complete_call(&self, call_id: &str) -> bool {
+        self.call_ids.contains(call_id) && self.result_ids.contains(call_id)
+    }
+}
+
+fn append_response_input_items(
+    input: &mut Vec<Value>,
+    message: &LlmMessage,
+    response_call_history: &ResponseCallHistory,
+    emitted_call_ids: &mut std::collections::HashSet<String>,
+    emitted_output_ids: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
     match &message.content {
         LlmMessageContent::Text(text) => {
             if text != PROMPT_CACHE_BOUNDARY {
@@ -120,12 +180,8 @@ fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> 
                 .iter()
                 .filter_map(response_output_item_from_context_block)
                 .filter(|item| item["type"].as_str() == Some("function_call"))
-                .filter_map(|item| {
-                    item["call_id"]
-                        .as_str()
-                        .or_else(|| item["id"].as_str())
-                        .map(str::to_string)
-                })
+                .filter_map(|item| response_call_id_from_item(item))
+                .filter(|call_id| response_call_history.is_complete_call(call_id))
                 .collect::<std::collections::HashSet<_>>();
             let mut message_parts = Vec::new();
             for block in blocks {
@@ -148,7 +204,10 @@ fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> 
                         name,
                         input: args,
                     } => {
-                        if raw_function_call_ids.contains(id) {
+                        if !response_call_history.is_complete_call(id)
+                            || raw_function_call_ids.contains(id)
+                            || !emitted_call_ids.insert(id.clone())
+                        {
                             continue;
                         }
                         flush_response_message(input, &message.role, &mut message_parts);
@@ -165,6 +224,11 @@ fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> 
                         is_error,
                         images,
                     } => {
+                        if !response_call_history.is_complete_call(tool_use_id)
+                            || !emitted_output_ids.insert(tool_use_id.clone())
+                        {
+                            continue;
+                        }
                         flush_response_message(input, &message.role, &mut message_parts);
                         input.push(response_tool_output_item(
                             tool_use_id,
@@ -176,6 +240,17 @@ fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> 
                     LlmContentBlock::ProviderContext { context }
                         if replayable_response_output_item(context).is_some() =>
                     {
+                        let item = &context.data;
+                        if item["type"].as_str() == Some("function_call") {
+                            let Some(call_id) = response_call_id_from_item(item) else {
+                                continue;
+                            };
+                            if !response_call_history.is_complete_call(&call_id)
+                                || !emitted_call_ids.insert(call_id)
+                            {
+                                continue;
+                            }
+                        }
                         flush_response_message(input, &message.role, &mut message_parts);
                         input.push(context.data.clone());
                     }
@@ -193,6 +268,18 @@ fn response_output_item_from_context_block(block: &LlmContentBlock) -> Option<&V
         return None;
     };
     replayable_response_output_item(context)
+}
+
+fn response_call_id_from_context(context: &ModelProviderContext) -> Option<String> {
+    response_call_id_from_item(&context.data)
+}
+
+fn response_call_id_from_item(item: &Value) -> Option<String> {
+    item["call_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|call_id| !call_id.is_empty())
+        .map(str::to_string)
 }
 
 fn replayable_response_output_item(context: &ModelProviderContext) -> Option<&Value> {
@@ -360,7 +447,6 @@ fn parse_responses_envelope(envelope: &Value) -> Result<AdaptedResponse, String>
                 let (arguments, argument_parse_error) = parse_tool_arguments(&raw_arguments);
                 let call_id = item["call_id"]
                     .as_str()
-                    .or_else(|| item["id"].as_str())
                     .filter(|value| !value.trim().is_empty())
                     .ok_or("function_call missing call_id")?;
                 tool_calls.push(ToolCall {
@@ -628,6 +714,192 @@ mod tests {
         assert_eq!(input[2]["call_id"], "call_123");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_123");
+    }
+
+    #[test]
+    fn drops_unpaired_raw_function_calls_and_orphan_results() {
+        let request = OpenAiResponsesAdapter
+            .build_request(
+                &params(vec![
+                    LlmMessage {
+                        role: "assistant".to_string(),
+                        content: LlmMessageContent::Blocks(vec![
+                            LlmContentBlock::ProviderContext {
+                                context: ModelProviderContext {
+                                    provider: "openai_responses".to_string(),
+                                    kind: RESPONSE_OUTPUT_ITEM_CONTEXT_KIND.to_string(),
+                                    data: json!({
+                                        "type": "function_call",
+                                        "id": "fc_unpaired",
+                                        "call_id": "call_unpaired",
+                                        "name": "shell_exec",
+                                        "arguments": "{}"
+                                    }),
+                                },
+                            },
+                            LlmContentBlock::ToolUse {
+                                id: "call_unpaired".to_string(),
+                                name: "shell_exec".to_string(),
+                                input: json!({}),
+                            },
+                        ]),
+                    },
+                    LlmMessage {
+                        role: "user".to_string(),
+                        content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
+                            tool_use_id: "call_orphan_result".to_string(),
+                            content: "不应发送".to_string(),
+                            is_error: false,
+                            images: Vec::new(),
+                        }]),
+                    },
+                ]),
+                "gpt-5",
+            )
+            .expect("request should build");
+
+        let input = request.body["input"].as_array().expect("input array");
+        assert!(input.iter().all(|item| {
+            item["type"].as_str() != Some("function_call")
+                && item["type"].as_str() != Some("function_call_output")
+        }));
+    }
+
+    #[test]
+    fn does_not_replay_raw_function_call_without_call_id() {
+        let request = OpenAiResponsesAdapter
+            .build_request(
+                &params(vec![
+                    LlmMessage {
+                        role: "assistant".to_string(),
+                        content: LlmMessageContent::Blocks(vec![
+                            LlmContentBlock::ProviderContext {
+                                context: ModelProviderContext {
+                                    provider: "openai_responses".to_string(),
+                                    kind: RESPONSE_OUTPUT_ITEM_CONTEXT_KIND.to_string(),
+                                    data: json!({
+                                        "type": "function_call",
+                                        "id": "fc_cancelled_without_call_id",
+                                        "name": "shell_exec",
+                                        "arguments": "{}"
+                                    }),
+                                },
+                            },
+                            LlmContentBlock::ToolUse {
+                                id: "call_current".to_string(),
+                                name: "shell_exec".to_string(),
+                                input: json!({}),
+                            },
+                        ]),
+                    },
+                    LlmMessage {
+                        role: "user".to_string(),
+                        content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
+                            tool_use_id: "call_current".to_string(),
+                            content: "完成".to_string(),
+                            is_error: false,
+                            images: Vec::new(),
+                        }]),
+                    },
+                ]),
+                "gpt-5",
+            )
+            .expect("request should build");
+
+        let input = request.body["input"].as_array().expect("input array");
+        assert!(
+            input
+                .iter()
+                .all(|item| { item["id"].as_str() != Some("fc_cancelled_without_call_id") })
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .count(),
+            1
+        );
+        assert_eq!(input[0]["call_id"], "call_current");
+    }
+
+    #[test]
+    fn rejects_response_function_call_with_item_id_only() {
+        let error = OpenAiResponsesAdapter
+            .parse_response(
+                200,
+                &json!({
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "id": "fc_item_id_is_not_call_id",
+                        "name": "shell_exec",
+                        "arguments": "{}"
+                    }]
+                })
+                .to_string(),
+            )
+            .expect_err("function_call 缺少 call_id 时必须拒绝响应");
+        assert!(error.contains("function_call missing call_id"));
+    }
+
+    #[test]
+    fn emits_one_raw_call_and_one_output_for_a_paired_history() {
+        let raw_call = ModelProviderContext {
+            provider: "openai_responses".to_string(),
+            kind: RESPONSE_OUTPUT_ITEM_CONTEXT_KIND.to_string(),
+            data: json!({
+                "type": "function_call",
+                "id": "fc_paired",
+                "call_id": "call_paired",
+                "name": "shell_exec",
+                "arguments": "{\"command\":\"pwd\"}"
+            }),
+        };
+        let request = OpenAiResponsesAdapter
+            .build_request(
+                &params(vec![
+                    LlmMessage {
+                        role: "assistant".to_string(),
+                        content: LlmMessageContent::Blocks(vec![
+                            LlmContentBlock::ProviderContext { context: raw_call },
+                            LlmContentBlock::ToolUse {
+                                id: "call_paired".to_string(),
+                                name: "shell_exec".to_string(),
+                                input: json!({"command": "pwd"}),
+                            },
+                        ]),
+                    },
+                    LlmMessage {
+                        role: "user".to_string(),
+                        content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
+                            tool_use_id: "call_paired".to_string(),
+                            content: "/workspace".to_string(),
+                            is_error: false,
+                            images: Vec::new(),
+                        }]),
+                    },
+                ]),
+                "gpt-5",
+            )
+            .expect("request should build");
+
+        let input = request.body["input"].as_array().expect("input array");
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .count(),
+            1
+        );
+        assert_eq!(input[0]["call_id"], "call_paired");
+        assert_eq!(input[1]["call_id"], "call_paired");
     }
 
     #[test]

@@ -64,10 +64,12 @@
     removeAgentWorkspace,
     renameAgentSession,
     resolveAgentBaseUrl,
+    BROWSER_AUTHORITY_CHANGED_EVENT,
     type AgentConnectionEventDetail,
     type AgentWorkspaceSummary,
   } from './agent-api';
   import {
+    loadBrowserAuthorityTab,
     loadBrowserAuthoritySession,
     prepareBrowserAuthorityForDesktop,
   } from './browser-authority-coordinator';
@@ -77,7 +79,11 @@
     resolveAgentBindingContext,
     type AgentBindingOverride,
   } from './agent-binding-context';
-  import { navigateSession, sessionNavigationState } from '../shared/session-navigation.svelte';
+import {
+  navigateSession,
+  sessionNavigationState,
+  waitForSessionNavigation,
+} from '../shared/session-navigation.svelte';
   import {
     rightPaneState,
     getRightPaneState,
@@ -144,7 +150,6 @@
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
   let workspaceActionPending = $state(false);
-  let pendingWorkspaceRegistrationDisplayPath = '';
   let showRemoveWorkspaceDialog = $state(false);
   let pendingRemoveWorkspace = $state<AgentWorkspaceSummary | null>(null);
   let workspaceDialogError = $state('');
@@ -172,17 +177,7 @@
   let workbenchElement = $state<HTMLElement | null>(null);
   let pendingDesktopRightPaneWidth: number | null = null;
   let desktopRightPaneResizeFrame: number | null = null;
-  let desktopGeometryMounted = false;
-  let desktopGeometrySchedulePending = false;
-  let desktopGeometryRevision = 0;
-  let desktopGeometryLastKey = '';
-  type DesktopGeometryReport = {
-    key: string;
-    desktopEpoch: string;
-    frame: MagiDesktopRendererGeometryFrame;
-  };
-  let desktopGeometryInFlight: DesktopGeometryReport | null = null;
-  let desktopGeometryPending: DesktopGeometryReport | null = null;
+  let desktopRightPaneResizeCancel: (() => void) | null = null;
   let desktopSnapshotEpoch = '';
   let desktopSnapshotRevision = -1;
   type DesktopVisibilityTarget = {
@@ -206,6 +201,7 @@
   type DesktopPanelActivationRequest = DesktopPanelTarget & {
     key: string;
     requestId: number;
+    recoveryRevision: number;
   };
   // 右栏可见性只允许一条 IPC 请求在途。这个状态不是 UI 状态：
   // - target 来自当前 Renderer 的 rightPaneState；
@@ -217,12 +213,14 @@
   let desktopVisibilitySyncEpoch = $state(0);
   // 非浏览器右栏面板的 Main 激活必须由这里唯一串行化。RightPane 只更新
   // 用户意图；只有 Main 快照确认后，才能认为原生 Browser Surface 已撤下。
-  // 这避免 Renderer 已渲染终端/代码、而旧 WebContentsView 仍保留在命中树。
+  // 这避免 Renderer 已渲染终端/代码、而旧 Chromium guest 仍保留在命中树。
   let desktopPanelActivationRequest: DesktopPanelActivationRequest | null = null;
   let desktopPanelActivationRequestId = 0;
-  let desktopPanelActivationAwaitingGeometryKey = '';
   let desktopPanelActivationFailureKey = '';
   let desktopPanelActivationEpoch = $state(0);
+  let desktopRuntimeRecoveryRevision = $state(0);
+  let desktopBrowserRuntimeReady = $state(false);
+  let desktopPanelActivationCompletedRecoveryRevision = $state(0);
   let sidebarElement = $state<HTMLElement | null>(null);
   let desktopDropIndicator = $state<{
     zone: DesktopDropZone;
@@ -378,6 +376,7 @@
     viewportWidth,
     sidebarWidth: effectiveSidebarWidth,
     previewPanelWidth: effectivePreviewPanelWidth,
+    sidebarVisible: viewportWidth > PANEL_LAYOUT.mobileBreakpoint && !sidebarCollapsed,
     desktopSurface: desktopAppSurface,
   }));
   const sidebarIsDrawer = $derived(panelLayout.sidebarDrawer);
@@ -423,11 +422,10 @@
   const desktopRightPaneOverlay = $derived(
     desktopAppSurface
       && rightPaneVisible
-      && desktopSnapshot?.layout.rightPaneMode === 'overlay',
+      && panelLayout.previewOverlay,
   );
   const panelVisibility = $derived(resolvePanelVisibility({
     sidebarDrawer: sidebarIsDrawer,
-    panelsCanCoexist: panelLayout.panelsCanCoexist,
     sidebarPreferredOpen: !sidebarCollapsed,
     sidebarDrawerOpen: sidebarOpen,
     rightPaneOpen: rightPaneVisible,
@@ -449,161 +447,6 @@
     // 当前目标；是否需要再次提交由下面的单向状态机重新判断。
     desktopVisibilitySyncFailure = null;
     return true;
-  }
-
-  function readDesktopRect(element: Element | null): MagiDesktopRectangle | null {
-    if (!(element instanceof HTMLElement)) return null;
-    const rect = element.getBoundingClientRect();
-    if (
-      !Number.isFinite(rect.left)
-      || !Number.isFinite(rect.top)
-      || !Number.isFinite(rect.width)
-      || !Number.isFinite(rect.height)
-      || rect.width <= 0
-      || rect.height <= 0
-    ) return null;
-    return {
-      x: rect.left,
-      y: rect.top,
-      width: rect.width,
-      height: rect.height,
-    };
-  }
-
-  function rectangleKey(rectangle: MagiDesktopRectangle | null): string {
-    return rectangle
-      ? `${rectangle.x}:${rectangle.y}:${rectangle.width}:${rectangle.height}`
-      : '';
-  }
-
-  function pumpDesktopGeometryReport(): void {
-    if (desktopGeometryInFlight || !desktopGeometryPending || !window.magiDesktop) return;
-    const pending = desktopGeometryPending;
-    desktopGeometryPending = null;
-    desktopGeometryInFlight = pending;
-    let retryAfterNonAck = false;
-    void window.magiDesktop.submitLayoutIntent({
-      type: 'renderer_geometry',
-      frame: pending.frame,
-    }).then((snapshot) => {
-      if (!desktopGeometryMounted) return;
-      const snapshotApplied = applyDesktopSnapshot(snapshot);
-      const rendererGeometry = snapshot.layout.rendererGeometry;
-      const acknowledged = snapshotApplied
-        && snapshot.desktopEpoch === pending.desktopEpoch
-        && snapshot.layout.layoutRevision === pending.frame.layoutRevision
-        && rendererGeometry?.revision === pending.frame.revision
-        && rendererGeometry.layoutRevision === pending.frame.layoutRevision
-        && rendererGeometry.coordinateSpace === pending.frame.coordinateSpace
-        && rendererGeometry.browserContentSlot?.tabId === pending.frame.browserContentSlot?.tabId;
-      if (acknowledged) {
-        // 只有 Main 返回同一 layoutRevision 且实际接受了 renderer revision，
-        // 才能把这次 DOM 读取记为完成。否则必须重新读取当前 DOM。
-        desktopGeometryLastKey = pending.key;
-        if (desktopGeometryPending?.key === pending.key) {
-          desktopGeometryPending = null;
-        }
-        return;
-      }
-      // Main 会用当前快照响应 stale layoutRevision，而不是 reject Promise。
-      // 该响应不是本次几何的 ack；丢弃同一旧 generation 的排队项，下一次
-      // tick 按最新 snapshot 重新读取，避免旧请求把队列锁死。
-      if (desktopGeometryPending?.frame.layoutRevision === pending.frame.layoutRevision) {
-        desktopGeometryPending = null;
-      }
-      // 在途标记清除后再调度。否则 tick 可能先执行并因仍在途而返回，
-      // 这次 stale 响应就会丢失下一次有效读取。
-      retryAfterNonAck = true;
-    }).catch((error) => {
-      console.warn('[WebWorkbenchShell] 上报桌面 DOM 布局失败:', error);
-    }).finally(() => {
-      desktopGeometryInFlight = null;
-      if (desktopGeometryMounted) {
-        if (retryAfterNonAck) scheduleDesktopGeometryReport();
-        pumpDesktopGeometryReport();
-      }
-    });
-  }
-
-  function reportDesktopGeometry(): void {
-    if (!desktopGeometryMounted || !desktopAppSurface || !desktopSnapshot || !workbenchElement) return;
-
-    const layout = desktopSnapshot.layout;
-    const browserPanelActive = layout.rightPaneVisible
-      && layout.activePanelKind === 'browser'
-      && Boolean(layout.activeTabId);
-    const rightPaneElement = workbenchElement.querySelector('.desktop-right-pane-column');
-    const rightPaneBounds = layout.rightPaneVisible ? readDesktopRect(rightPaneElement) : null;
-    // 右栏可见时，父容器是完整 geometry frame 的必要部分。DOM 重排的中间
-    // 状态不得提交给 Main，否则原生 View 会被解绑到一个不存在的槽位。
-    if (layout.rightPaneVisible && !rightPaneBounds) return;
-    let browserContentSlot: MagiDesktopRendererGeometryFrame['browserContentSlot'] = null;
-    if (browserPanelActive) {
-      const browserSlotElement = rightPaneElement?.querySelector('.browser-surface-slot') ?? null;
-      // 槽位身份必须来自实际参与排版的 BrowserTabContent DOM。Store 的 activeTab
-      // 是逻辑状态，和 Svelte 的组件切换存在一个异步提交窗口；如果从 Store
-      // 读取身份、从 DOM 读取矩形，两者可能来自不同一帧，Main 就会丢弃本次
-      // 绑定。data-browser-tab-id 与槽位矩形由同一个 DOM 节点产生，形成唯一
-      // 的“当前浏览器内容槽位”事实来源。
-      const browserTabId = browserSlotElement instanceof HTMLElement
-        ? browserSlotElement.dataset.browserTabId?.trim() ?? ''
-        : '';
-      const browserSlotBounds = browserTabId ? readDesktopRect(browserSlotElement) : null;
-      // 浏览器面板的内容槽也是完整 frame 的必要部分。槽位暂时不存在、
-      // 没有身份或尚未完成排版时，等待 Resize/MutationObserver 的下一帧。
-      if (
-        !browserSlotBounds
-        || !layout.activeTabId
-        || browserTabId !== layout.activeTabId
-      ) return;
-      browserContentSlot = {
-        tabId: browserTabId,
-        bounds: browserSlotBounds,
-      };
-    }
-    const revision = Math.max(
-      desktopGeometryRevision + 1,
-      (layout.rendererGeometry?.revision ?? -1) + 1,
-    );
-    const frame: MagiDesktopRendererGeometryFrame = {
-      revision,
-      layoutRevision: layout.layoutRevision,
-      coordinateSpace: 'window-content-css-px',
-      rightPaneBounds,
-      browserContentSlot,
-    };
-    const key = [
-      desktopSnapshotEpoch,
-      frame.layoutRevision,
-      frame.rightPaneBounds ? 'visible' : 'hidden',
-      frame.browserContentSlot?.tabId ?? '',
-      rectangleKey(frame.rightPaneBounds),
-      rectangleKey(frame.browserContentSlot?.bounds ?? null),
-    ].join('|');
-    if (
-      key === desktopGeometryLastKey
-      || desktopGeometryPending?.key === key
-      || desktopGeometryInFlight?.key === key
-    ) return;
-
-    desktopGeometryRevision = revision;
-    desktopGeometryPending = {
-      key,
-      desktopEpoch: desktopSnapshotEpoch,
-      frame,
-    };
-    pumpDesktopGeometryReport();
-  }
-
-  function scheduleDesktopGeometryReport(): void {
-    if (!desktopGeometryMounted || desktopGeometrySchedulePending) return;
-    // tick 只等待当前 Svelte 提交完成，不创建时间轮询；ResizeObserver/
-    // MutationObserver 负责触发，单飞队列负责合并连续尺寸变化。
-    desktopGeometrySchedulePending = true;
-    void tick().then(() => {
-      desktopGeometrySchedulePending = false;
-      if (desktopGeometryMounted) reportDesktopGeometry();
-    });
   }
 
   function sameDesktopVisibilityTarget(
@@ -674,11 +517,67 @@
           resyncAfterClosedBrowserTab(request);
           return;
         }
+        // Renderer 里的 BrowserTabPayload 只是右栏投影，重启或 Renderer
+        // 重建期间可能仍保留旧的 about:blank。激活真实 Chromium guest 前，
+        // 必须读取 Authority 的当前 URL 与 navigation revision，不能让投影
+        // 覆盖已持久化的页面事实。
+        const authorityResolution = await loadBrowserAuthorityTab(
+          browser.browserSessionId,
+          browser.tabId,
+        );
+        const authoritativeTab = authorityResolution.tab;
+        if (!authoritativeTab || authoritativeTab.lifecycle === 'closed') {
+          synchronizeBrowserSessionSnapshot(
+            authorityResolution.snapshot,
+            browser.workspacePath,
+            {
+              workspaceId: authorityResolution.snapshot.workspaceId,
+              sessionId: authorityResolution.snapshot.sessionId,
+            },
+          );
+          return;
+        }
+        synchronizeBrowserSessionSnapshot(
+          authorityResolution.snapshot,
+          browser.workspacePath,
+          {
+            workspaceId: authorityResolution.snapshot.workspaceId,
+            sessionId: authorityResolution.snapshot.sessionId,
+          },
+        );
+        const activatedSnapshot = await desktop.activateBrowser({
+          tabId: browser.tabId,
+          browserSessionId: browser.browserSessionId,
+          url: authoritativeTab.url,
+          navigationRevision: authoritativeTab.navigationRevision,
+          viewport: { mode: 'auto' },
+        });
+        applyDesktopSnapshot(activatedSnapshot);
+        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) {
+          if (desktopPanelActivationRequest?.requestId === request.requestId) {
+            desktopPanelActivationRequest = null;
+            desktopPanelActivationEpoch += 1;
+          }
+          return;
+        }
+        // activateBrowser 只建立逻辑 Surface 并把当前内容槽身份提交给
+        // Renderer。必须等对应 <webview> 完成注册后，才能恢复 Authority
+        // 页面；否则 RestorePage 会在没有真实 WebContents 的 Surface 上
+        // 等待，形成启动死锁。
+        const readySnapshot = await desktop.waitForBrowserSurface({ tabId: browser.tabId });
+        applyDesktopSnapshot(readySnapshot);
+        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) {
+          if (desktopPanelActivationRequest?.requestId === request.requestId) {
+            desktopPanelActivationRequest = null;
+            desktopPanelActivationEpoch += 1;
+          }
+          return;
+        }
         await prepareBrowserAuthorityForDesktop(
           {
             browserSessionId: browser.browserSessionId,
             tabId: browser.tabId,
-            lifecycle: browser.lifecycle,
+            lifecycle: authoritativeTab.lifecycle,
           },
           (authoritySnapshot) => {
             synchronizeBrowserSessionSnapshot(authoritySnapshot, browser.workspacePath, {
@@ -688,31 +587,42 @@
               newTabLabel: i18n.t('browser.tab.new'),
             });
           },
+          {
+            forceRestore: request.recoveryRevision > desktopPanelActivationCompletedRecoveryRevision,
+          },
         );
-        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) return;
+        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) {
+          if (desktopPanelActivationRequest?.requestId === request.requestId) {
+            desktopPanelActivationRequest = null;
+            desktopPanelActivationEpoch += 1;
+          }
+          return;
+        }
       }
       const snapshot = request.kind === 'browser' && request.browser
-        ? await desktop.activateBrowser({
-            tabId: request.browser.tabId,
-            browserSessionId: request.browser.browserSessionId,
-            url: request.browser.url || 'about:blank',
-            navigationRevision: request.browser.navigationRevision,
-            viewport: { mode: 'auto' },
-          })
+        ? desktopSnapshot ?? await desktop.getSnapshot()
         : await desktop.activatePanel({ kind: request.kind, tabId: request.tabId });
       applyDesktopSnapshot(snapshot);
       if (desktopPanelActivationRequest?.requestId !== request.requestId) return;
+      const recoveryIsObsolete = request.recoveryRevision < desktopRuntimeRecoveryRevision;
       desktopPanelActivationRequest = null;
+      if (recoveryIsObsolete) {
+        // 这条请求属于 daemon 重启前的旧运行时代次。它的结果只能收口
+        // 自身的 Promise，不能把旧 Surface 当作恢复完成；下一轮 effect
+        // 会用新的代次重新物化当前逻辑 Browser Tab。
+        desktopPanelActivationFailureKey = '';
+        desktopPanelActivationEpoch += 1;
+        return;
+      }
       const target = currentDesktopPanelTarget();
       if (sameDesktopPanelTarget(target, request)) {
         if (desktopPanelTargetAcknowledged(snapshot, target)) {
-          desktopPanelActivationAwaitingGeometryKey = '';
           desktopPanelActivationFailureKey = '';
           if (target.kind) {
             clearPendingDesktopPanelIntent(target.scopeKey, target.kind, target.tabId ?? '');
           }
+          desktopPanelActivationCompletedRecoveryRevision = request.recoveryRevision;
         } else if (target.kind === 'browser') {
-          desktopPanelActivationAwaitingGeometryKey = request.key;
         } else {
           desktopPanelActivationFailureKey = request.key;
         }
@@ -720,7 +630,13 @@
       desktopPanelActivationEpoch += 1;
     } catch (error) {
       if (desktopPanelActivationRequest?.requestId !== request.requestId) return;
+      const recoveryIsObsolete = request.recoveryRevision < desktopRuntimeRecoveryRevision;
       desktopPanelActivationRequest = null;
+      if (recoveryIsObsolete) {
+        desktopPanelActivationFailureKey = '';
+        desktopPanelActivationEpoch += 1;
+        return;
+      }
       const target = currentDesktopPanelTarget();
       if (sameDesktopPanelTarget(target, request)) {
         if (isClosedBrowserTabError(error)) {
@@ -794,11 +710,73 @@
 
   function workspacePathForId(workspaceId: string): string {
     const workspace = workspaces.find((candidate) => candidate.workspaceId === workspaceId);
-    return workspace ? workspaceBindingPath(workspace) : '';
+    return workspace ? workspaceNavigationPath(workspace) : '';
   }
 
-  function workspaceBindingPath(workspace: AgentWorkspaceSummary): string {
+  function workspaceNavigationPath(workspace: AgentWorkspaceSummary): string {
+    // 会话协议使用规范化后的真实工作区路径；rootPathRef 只用于文件系统引用。
+    return workspace.rootPath.trim();
+  }
+
+  function workspacePathRef(workspace: AgentWorkspaceSummary): string {
     return workspace.rootPathRef?.trim() || workspace.rootPath.trim();
+  }
+
+  type BrowserAuthorityEventDetail = {
+    eventType?: string;
+    workspaceId?: string | null;
+    sessionId?: string | null;
+    payload?: Record<string, unknown>;
+  };
+
+  function browserSessionIdsForAuthorityEvent(detail: BrowserAuthorityEventDetail): string[] {
+    const payload = detail.payload;
+    const ids = new Set<string>();
+    const directSessionId = payload?.browser_session_id ?? payload?.browserSessionId;
+    if (typeof directSessionId === 'string' && directSessionId.trim()) {
+      ids.add(directSessionId.trim());
+    }
+
+    // 页面更新事件来自 Chromium Surface，事件 payload 只携带 tab/binding，
+    // 不重复带 browser_session_id。此时从已经投影到右栏的 Browser Tab 反查
+    // 会话，保证非当前 Tab 的标题、生命周期和关闭状态也能收敛。
+    const binding = payload?.binding;
+    const bindingTabId = binding && typeof binding === 'object' && !Array.isArray(binding)
+      ? (binding as Record<string, unknown>).tab_id
+      : undefined;
+    const changedTabId = payload?.tab_id ?? bindingTabId;
+    if (typeof changedTabId === 'string' && changedTabId.trim()) {
+      for (const pane of Object.values(rightPaneState.perSession)) {
+        for (const tab of pane.openTabs) {
+          if (tab.kind !== 'browser') continue;
+          const browser = tab.payload as BrowserTabPayload;
+          if (browser.tabId === changedTabId && browser.browserSessionId.trim()) {
+            ids.add(browser.browserSessionId.trim());
+          }
+        }
+      }
+    }
+    return [...ids];
+  }
+
+  function synchronizeBrowserProjectionFromAuthorityEvent(event: Event): void {
+    const detail = (event as CustomEvent<BrowserAuthorityEventDetail>).detail;
+    if (!detail || typeof detail !== 'object') return;
+    const browserSessionIds = browserSessionIdsForAuthorityEvent(detail);
+    for (const browserSessionId of browserSessionIds) {
+      void loadBrowserAuthoritySession(browserSessionId, (snapshot) => {
+        const workspaceId = snapshot.workspaceId?.trim() || detail.workspaceId?.trim() || '';
+        const workspacePath = workspaceId ? workspacePathForId(workspaceId) : '';
+        synchronizeBrowserSessionSnapshot(snapshot, workspacePath, {
+          workspaceId,
+          sessionId: snapshot.sessionId,
+        });
+      }).catch((error) => {
+        // 浏览器事件可能在 Host 收口期间早于 HTTP 快照可读；事件流后续
+        // 仍会再次触发同步，单次快照失败不能让右栏投影永久停在旧 Tab。
+        console.warn('[WebWorkbenchShell] 同步浏览器权威投影失败:', error);
+      });
+    }
   }
 
   function resolveBackendWorkspaceSelection(nextWorkspaces: AgentWorkspaceSummary[]): string {
@@ -1534,7 +1512,7 @@
   function startDesktopRightPaneResize(event: PointerEvent): void {
     if (!desktopAppSurface) return;
     if (!window.magiDesktop) return;
-    if (desktopSnapshot?.layout.rightPaneMode === 'overlay') return;
+    if (desktopRightPaneOverlay) return;
     const handle = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
     if (!handle) return;
     const rightPaneElement = workbenchElement?.querySelector('.desktop-right-pane-column');
@@ -1557,6 +1535,7 @@
     );
     if (!initialWidth) return;
     event.preventDefault();
+    desktopRightPaneResizeCancel?.();
     isPreviewPanelResizing = true;
     const initialRight = rightPaneRect.right;
     const pointerId = event.pointerId;
@@ -1578,10 +1557,11 @@
         desktopRightPaneResizeFrame = requestAnimationFrame(submitPendingDesktopRightPaneWidth);
       }
     };
-    const stop = (stopEvent: PointerEvent) => {
-      if (stopEvent.pointerId !== pointerId) return;
+    const stop = (stopEvent?: PointerEvent) => {
+      if (stopEvent && stopEvent.pointerId !== pointerId) return;
       if (stopped) return;
       stopped = true;
+      if (desktopRightPaneResizeCancel) desktopRightPaneResizeCancel = null;
       isPreviewPanelResizing = false;
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', stop);
@@ -1596,6 +1576,7 @@
         // 捕获未建立时无需释放。
       }
     };
+    desktopRightPaneResizeCancel = () => stop();
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', stop);
     window.addEventListener('pointercancel', stop);
@@ -1631,7 +1612,7 @@
       imageDataUrl: metadata.imageDataUrl,
       currentBinding,
       selectedWorkspaceId: selectedWorkspace?.workspaceId || selectedWorkspaceId,
-      selectedWorkspacePath: selectedWorkspace ? workspaceBindingPath(selectedWorkspace) : '',
+      selectedWorkspacePath: selectedWorkspace ? workspaceNavigationPath(selectedWorkspace) : '',
       workspacePathForId,
       activeWorkspaceId: rightPaneState.activeWorkspaceId,
       activeSessionId: rightPaneState.activeSessionId,
@@ -1712,7 +1693,7 @@
     }
     const requestSeq = beginWorkspaceSessionRequest(requestedWorkspaceId);
     try {
-      const snapshot = await getWorkspaceSessions(requestedWorkspaceId, workspaceBindingPath(workspace));
+      const snapshot = await getWorkspaceSessions(requestedWorkspaceId, workspaceNavigationPath(workspace));
       if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) !== requestSeq) {
         return false;
       }
@@ -1784,36 +1765,33 @@
     }
   }
 
-  async function registerWorkspaceRoot(rootPath: string, openDraft: boolean): Promise<void> {
-    const expectedDisplayPath = pendingWorkspaceRegistrationDisplayPath || rootPath;
-    const next = await registerAgentWorkspace(rootPath);
-    const addedWorkspace = next.find((workspace) => workspace.rootPath === expectedDisplayPath) ?? null;
+  async function registerWorkspaceRoot(rootPath: string): Promise<void> {
+    const registration = await registerAgentWorkspace(rootPath);
+    const addedWorkspace = registration.workspaces.find(
+      (workspace) => workspace.workspaceId === registration.workspaceId,
+    ) ?? null;
     if (!addedWorkspace) {
-      throw new Error(`注册后未找到工作区: ${expectedDisplayPath}`);
+      throw new Error(`注册后未找到工作区: ${registration.workspaceId}`);
     }
 
-    workspaces = next;
+    workspaces = registration.workspaces;
     selectedWorkspaceId = addedWorkspace.workspaceId;
     expandedWorkspaceIds = {
       ...expandedWorkspaceIds,
       [addedWorkspace.workspaceId]: true,
     };
 
-    if (openDraft) {
-      navigateSession({
-        kind: 'draft',
-        scope: 'workspace',
-        workspaceId: addedWorkspace.workspaceId,
-        workspacePath: workspaceBindingPath(addedWorkspace),
-      });
-      if (sidebarIsDrawer) sidebarOpen = false;
-      return;
+    const navigation = navigateSession({
+      kind: 'draft',
+      scope: 'workspace',
+      workspaceId: addedWorkspace.workspaceId,
+      workspacePath: workspaceNavigationPath(addedWorkspace),
+    });
+    if (!navigation) {
+      throw new Error(`工作区导航目标无效: ${addedWorkspace.workspaceId}`);
     }
-
-    await refreshWorkspaceSessions(
-      addedWorkspace.workspaceId,
-      addedWorkspace.rootPath,
-    );
+    await waitForSessionNavigation(navigation);
+    if (sidebarIsDrawer) sidebarOpen = false;
   }
 
   async function handleFolderSelected(
@@ -1824,24 +1802,20 @@
     }
     workspaceDialogError = '';
     const normalizedRootPath = selection.pathRef.trim();
-    const displayPath = selection.displayPath.trim();
-    if (!normalizedRootPath || !displayPath) {
+    if (!normalizedRootPath) {
       return;
     }
-    const onboardingOrigin = workspaceOnboardingState.origin;
     closeAddWorkspaceDialog({ force: true });
     workspaceActionPending = true;
-    pendingWorkspaceRegistrationDisplayPath = displayPath;
     try {
       await runActionWithFeedback(
-        () => registerWorkspaceRoot(normalizedRootPath, onboardingOrigin === 'composer'),
+        () => registerWorkspaceRoot(normalizedRootPath),
         {
           actionLabel: i18n.t('web.action.addWorkspace'),
           successMessage: i18n.t('web.workspaceAdded'),
         },
       );
     } finally {
-      pendingWorkspaceRegistrationDisplayPath = '';
       workspaceActionPending = false;
     }
   }
@@ -1856,7 +1830,7 @@
         const result = await resolveAgentPath(path);
         const dropped = resolveDesktopDroppedPath(path, result);
         if (!dropped || dropped.kind !== 'directory') continue;
-        await registerWorkspaceRoot(dropped.path, true);
+        await registerWorkspaceRoot(dropped.path);
         return;
       }
       addToast('warning', i18n.t('web.desktopDropDirectoryOnly'));
@@ -1954,14 +1928,14 @@
                   kind: 'session',
                   scope: 'workspace',
                   workspaceId: selectedWorkspaceId,
-                  workspacePath: workspaceBindingPath(nextWorkspace),
+                  workspacePath: workspaceNavigationPath(nextWorkspace),
                   sessionId: nextSession.id,
                 }
               : {
                   kind: 'draft',
                   scope: 'workspace',
                   workspaceId: selectedWorkspaceId,
-                  workspacePath: workspaceBindingPath(nextWorkspace),
+                  workspacePath: workspaceNavigationPath(nextWorkspace),
                 });
           }
         } else {
@@ -1978,7 +1952,7 @@
       return;
     }
     const workspaceId = workspace.workspaceId.trim();
-    const workspacePath = workspaceBindingPath(workspace);
+    const workspacePath = workspaceNavigationPath(workspace);
     if (!workspaceId || !workspacePath || workspaceId === selectedWorkspaceId) {
       return;
     }
@@ -2047,7 +2021,7 @@
       return;
     }
     const workspaceId = workspace.workspaceId.trim();
-    const workspacePath = workspaceBindingPath(workspace);
+    const workspacePath = workspaceNavigationPath(workspace);
     if (!workspaceId || !workspacePath) {
       return;
     }
@@ -2090,7 +2064,7 @@
       kind: 'session',
       scope: 'workspace',
       workspaceId: workspace.workspaceId,
-      workspacePath: workspaceBindingPath(workspace),
+      workspacePath: workspaceNavigationPath(workspace),
       sessionId,
     });
     if (sidebarIsDrawer) {
@@ -2169,12 +2143,13 @@
 
     sessionRenameError = '';
     renamingSessionId = session.id;
+    let renameCommitted = false;
     try {
       const snapshot = await runActionWithFeedback(
         () => renameAgentSession(session.id, normalizedName, {
           scope: 'workspace',
           workspaceId: workspace.workspaceId,
-          workspacePath: workspaceBindingPath(workspace),
+          workspacePath: workspaceNavigationPath(workspace),
         }),
         {
           actionLabel: i18n.t('web.action.renameSession'),
@@ -2186,7 +2161,7 @@
       }
       const normalizedSnapshot = normalizeRustBootstrapPayload(snapshot, {
         workspaceId: workspace.workspaceId,
-        workspacePath: workspaceBindingPath(workspace),
+        workspacePath: workspaceNavigationPath(workspace),
       });
       const authoritativeWorkspaceId = normalizedSnapshot.workspace.workspaceId?.trim()
         || workspace.workspaceId;
@@ -2202,14 +2177,15 @@
         ...sessionsByWorkspace,
         [authoritativeWorkspaceId]: normalizedSnapshot.sessions,
       };
-      if (currentBootstrapWorkspaceId() === authoritativeWorkspaceId) {
-        replaceWorkspaceSessionProjection(authoritativeWorkspaceId, normalizedSnapshot.sessions, cursor);
-      }
-      editingSession = null;
-      sessionRenameDraft = '';
-      sessionRenameInput = null;
+        if (currentBootstrapWorkspaceId() === authoritativeWorkspaceId) {
+          replaceWorkspaceSessionProjection(authoritativeWorkspaceId, normalizedSnapshot.sessions, cursor);
+        }
+      renameCommitted = true;
     } finally {
       renamingSessionId = null;
+    }
+    if (renameCommitted) {
+      cancelSessionRename();
     }
   }
 
@@ -2251,12 +2227,16 @@
       return;
     }
     renamingSessionId = session.id;
+    let renameCommitted = false;
     try {
       await renameAgentSession(session.id, name, {});
       await refreshPersonalSessions();
-      cancelSessionRename();
+      renameCommitted = true;
     } finally {
       renamingSessionId = null;
+    }
+    if (renameCommitted) {
+      cancelSessionRename();
     }
   }
 
@@ -2289,7 +2269,7 @@
       sessionId: session.id,
       ...(workspace ? {
         workspaceId: workspace.workspaceId,
-        workspacePath: workspaceBindingPath(workspace),
+        workspacePath: workspaceNavigationPath(workspace),
       } : {}),
       requireConfirm: false,
     });
@@ -2338,9 +2318,6 @@
     }
     sidebarCollapsed = false;
     persistSidebarCollapsed(false);
-    if (rightPaneVisible && !panelLayout.panelsCanCoexist) {
-      requestRightPaneVisibility(false);
-    }
   }
 
   function toggleRightPaneFromHeader(): void {
@@ -2526,71 +2503,59 @@
   $effect(() => {
     if (!desktopAppSurface || !desktopSnapshot || !window.magiDesktop) return;
     void desktopPanelActivationEpoch;
+    const recoveryRevision = desktopRuntimeRecoveryRevision;
     const target = currentDesktopPanelTarget();
     const targetKey = desktopPanelTargetKey(target);
     const snapshot = desktopSnapshot;
 
     // 新打开的右栏必须先完成 Renderer 的可见性事务，随后才物化浏览器。
     // 不把 BrowserSurface 放到不可见右栏中，避免 Main 先挂载再撤下造成黑屏。
-    if (target.kind === 'browser' && !desktopRightPaneVisible) return;
+    if (target.kind === 'browser' && (!desktopRightPaneVisible || !desktopBrowserRuntimeReady)) return;
 
-    const activationDecision = decideDesktopPanelActivation(
-      snapshot,
-      target,
-      desktopPanelActivationRequest !== null,
-      desktopPanelActivationAwaitingGeometryKey === targetKey,
-    );
-    if (activationDecision === 'acknowledged') {
-      desktopPanelActivationAwaitingGeometryKey = '';
-      desktopPanelActivationFailureKey = '';
-      if (target.kind) {
-        clearPendingDesktopPanelIntent(target.scopeKey, target.kind, target.tabId ?? '');
+    const recoveryPending = desktopPanelActivationCompletedRecoveryRevision < recoveryRevision;
+    const inFlightRequest = desktopPanelActivationRequest;
+    if (inFlightRequest && inFlightRequest.recoveryRevision < recoveryRevision) {
+      // 运行时恢复事件不能打断旧 IPC。旧请求结束后会主动清空自身结果，
+      // 再由当前代次派发唯一一次新的激活。
+      return;
+    }
+    if (!recoveryPending) {
+      const activationDecision = decideDesktopPanelActivation(
+        snapshot,
+        target,
+        inFlightRequest !== null,
+        false,
+      );
+      if (activationDecision === 'acknowledged') {
+        desktopPanelActivationFailureKey = '';
+        if (target.kind) {
+          clearPendingDesktopPanelIntent(target.scopeKey, target.kind, target.tabId ?? '');
+        }
+        return;
       }
+
+      if (activationDecision === 'wait_for_in_flight') {
+        // Main 侧操作严格串行。当前 Renderer 意图只保留在 rightPaneState，
+        // 在途请求结束后由 epoch 再读取最新目标，绝不并发覆盖。
+        return;
+      }
+    } else if (inFlightRequest) {
       return;
     }
 
-    if (activationDecision === 'wait_for_in_flight') {
-      // Main 侧操作严格串行。当前 Renderer 意图只保留在 rightPaneState，
-      // 在途请求结束后由 epoch 再读取最新目标，绝不并发覆盖。
-      return;
-    }
-
-    if (desktopPanelActivationAwaitingGeometryKey && desktopPanelActivationAwaitingGeometryKey !== targetKey) {
-      desktopPanelActivationAwaitingGeometryKey = '';
-    }
     if (desktopPanelActivationFailureKey && desktopPanelActivationFailureKey !== targetKey) {
       desktopPanelActivationFailureKey = '';
     }
-    if (desktopPanelActivationAwaitingGeometryKey === targetKey) return;
     if (desktopPanelActivationFailureKey === targetKey) return;
 
     const request: DesktopPanelActivationRequest = {
       ...target,
       key: targetKey,
       requestId: ++desktopPanelActivationRequestId,
+      recoveryRevision,
     };
     desktopPanelActivationRequest = request;
     activateDesktopPanelTarget(request);
-  });
-
-  $effect(() => {
-    if (!desktopAppSurface || !desktopSnapshot || !workbenchElement) return;
-    // 这些依赖覆盖面板切换、右栏显隐、窗口尺寸和主进程确认的布局变化。
-    // 实际坐标统一延迟到当前 Svelte 提交完成后从 DOM 读取，避免在排版中间帧
-    // 把旧槽位提交给 Main。
-    void desktopSnapshot.layout.activePanelKind;
-    void desktopSnapshot.layout.activeTabId;
-    void desktopSnapshot.layout.rightPaneVisible;
-    void desktopSnapshot.layout.rightPaneMode;
-    void desktopSnapshot.layout.rightPaneWidth;
-    void desktopSnapshot.layout.rendererGeometry?.revision;
-    // 内容槽是 Surface 是否真正可见的确认状态。恢复时 activePanelKind/
-    // activeTabId 可能与上一份快照相同，只有 browserContentSlot 的变化能
-    // 触发再次读取并完成原生 View 的绑定。
-    void desktopSnapshot.layout.rendererGeometry?.browserContentSlot?.tabId;
-    void activeRightPaneState.activeTabId;
-    void activeRightPaneState.openTabs.length;
-    scheduleDesktopGeometryReport();
   });
 
   onMount(() => {
@@ -2606,44 +2571,34 @@
       if (!disposed) console.error('[WebWorkbenchShell] 获取桌面窗口快照失败:', error);
     });
     const stopSnapshot = desktop.onSnapshot(applyDesktopSnapshot);
-    desktopGeometryMounted = true;
-    const geometryResizeObserver = new ResizeObserver(() => {
-      scheduleDesktopGeometryReport();
-    });
-    const geometryMutationObserver = new MutationObserver(() => {
-      // Svelte 可能先替换内容槽或锚点，再在同一轮提交中更新身份与显示状态。
-      // 先重新收集目标，确保新节点从这一帧开始就由 ResizeObserver 负责跟踪。
-      observeGeometryTargets();
-      scheduleDesktopGeometryReport();
-    });
-    const observeGeometryTargets = () => {
-      geometryResizeObserver.disconnect();
-      geometryMutationObserver.disconnect();
-      if (!workbenchElement) return;
-
-      // 原生 View 的坐标事实来源必须覆盖所有会参与右栏排版的 DOM 节点。
-      // 只观察父节点无法捕获槽位自身的尺寸变化（例如 class/style 切换），
-      // 只观察当前槽位也无法捕获 Tab 切换后新槽位的第一帧尺寸。
-      geometryResizeObserver.observe(workbenchElement);
-      const rightPaneElement = workbenchElement.querySelector('.desktop-right-pane-column');
-      if (rightPaneElement) {
-        geometryResizeObserver.observe(rightPaneElement);
-        const browserSlotElement = rightPaneElement.querySelector('.browser-surface-slot');
-        if (browserSlotElement) geometryResizeObserver.observe(browserSlotElement);
-      }
-
-      // 一个统一的根观察器覆盖右栏和浏览器槽位的结构、身份、
-      // 显示及层级变化。这里不使用 attributeFilter：CSS class、inline style、
-      // hidden、ARIA 和 data-* 都可能改变可见性或参与定位，过滤其中任何一种
-      // 都会重新引入“原生视图仍在旧坐标”的漏报路径。
-      geometryMutationObserver.observe(workbenchElement, {
-        subtree: true,
-        childList: true,
-        attributes: true,
-      });
+    const applyBrowserComponent = (snapshot: MagiDesktopBrowserComponentSnapshot) => {
+      // 组件状态只能撤销当前运行时资格，不能授予资格。授予资格的唯一
+      // 来源是 Main 在同一代 Control WebSocket 完成 daemon ready 握手后
+      // 发布的 browser-runtime-ready 事件，避免旧 daemon 状态抢先放行激活。
+      if (snapshot.runtime.ready !== true) desktopBrowserRuntimeReady = false;
     };
-    if (workbenchElement) observeGeometryTargets();
-    scheduleDesktopGeometryReport();
+    const stopBrowserComponent = desktop.onBrowserComponent(applyBrowserComponent);
+    const stopBrowserRuntimeReady = desktop.onBrowserRuntimeReady((event) => {
+      const revision = event && typeof event === 'object' && 'revision' in event
+        && typeof event.revision === 'number' && Number.isFinite(event.revision)
+        ? Math.max(0, Math.floor(event.revision))
+        : 0;
+      if (revision <= desktopRuntimeRecoveryRevision) return;
+      desktopBrowserRuntimeReady = true;
+      desktopRuntimeRecoveryRevision = revision;
+      desktopPanelActivationFailureKey = '';
+      desktopPanelActivationEpoch += 1;
+      // 先读取 Main 的最新确认快照，再让唯一激活 effect 重新物化当前逻辑
+      // Tab。事件本身只表示运行时代次已切换，不携带旧的布局事实。
+      void desktop.getSnapshot().then((snapshot) => {
+        if (!disposed) {
+          applyDesktopSnapshot(snapshot);
+          desktopPanelActivationEpoch += 1;
+        }
+      }).catch((error) => {
+        if (!disposed) console.warn('[WebWorkbenchShell] 读取浏览器运行时恢复快照失败:', error);
+      });
+    });
     // 这只是 App Renderer 的首次绘制/窗口显示握手，不携带任何右栏 Tab
     // 或面板意图；右栏状态仍由本地 rightPaneState 唯一管理。
     void desktop.readyRightPane().catch((error) => {
@@ -2651,15 +2606,14 @@
     });
     return () => {
       disposed = true;
-      desktopGeometryMounted = false;
       stopSnapshot();
-      geometryResizeObserver.disconnect();
-      geometryMutationObserver.disconnect();
-      desktopGeometryPending = null;
+      stopBrowserComponent();
+      stopBrowserRuntimeReady();
       if (desktopRightPaneResizeFrame !== null) {
         cancelAnimationFrame(desktopRightPaneResizeFrame);
         desktopRightPaneResizeFrame = null;
       }
+      desktopRightPaneResizeCancel?.();
     };
   });
 
@@ -2760,6 +2714,7 @@
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
     window.addEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
+    window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, synchronizeBrowserProjectionFromAuthorityEvent);
     window.addEventListener('keydown', handlePanelEscape);
     void registerDesktopFileDropListener(handleDesktopDragDropEvent)
       .then((stop) => {
@@ -2782,6 +2737,7 @@
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
       window.removeEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
+      window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, synchronizeBrowserProjectionFromAuthorityEvent);
       window.removeEventListener('keydown', handlePanelEscape);
       if (resizeRaf !== null) {
         cancelAnimationFrame(resizeRaf);
@@ -2935,7 +2891,7 @@
                     class="workspace-header-btn"
                     use:desktopContextMenu={{
                       kind: 'workspace',
-                      workspacePathRef: workspaceBindingPath(workspace),
+                      workspacePathRef: workspacePathRef(workspace),
                     }}
                     class:active={workspace.workspaceId === selectedWorkspaceId}
                     aria-expanded={!!expandedWorkspaceIds[workspace.workspaceId]}
@@ -3417,9 +3373,7 @@
     z-index: var(--z-overlay-preview);
     grid-column: auto;
     width: min(var(--desktop-right-pane-width, 480px), 100%);
-    /* 用内阴影表达分界线，不占用内容轨道宽度。Main 的
-       browserContentBounds 与右栏 DOM 必须共享同一 x/width，否则原生
-       WebContentsView 会在 overlay 模式向左错一像素并遮住工具栏。 */
+    /* 用内阴影表达分界线，不占用内容轨道宽度。 */
     box-shadow: inset 1px 0 var(--border);
     background: transparent;
   }
@@ -3813,18 +3767,16 @@
   }
 
   .recent-session-new-btn {
-    opacity: 0;
-    pointer-events: none;
+    opacity: 0.72;
+    pointer-events: auto;
     transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
   }
 
-  .recent-sessions-header:hover .recent-session-new-btn,
   .recent-session-new-btn:focus-visible {
     opacity: 1;
-    pointer-events: auto;
   }
 
-  .recent-sessions-header:hover .recent-session-new-btn:disabled {
+  .recent-session-new-btn:disabled {
     opacity: 0.35;
     pointer-events: none;
   }

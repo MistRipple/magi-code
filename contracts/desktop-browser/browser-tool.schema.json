@@ -11,13 +11,14 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "action": {
-            "type": "string",
-            "enum": [
-              "url",
-              "back",
-              "forward",
-              "reload"
+            "action": {
+              "type": "string",
+              "enum": [
+                "url",
+                "back",
+                "forward",
+                "stop",
+                "reload"
             ],
             "description": "可选；提供 url 时默认执行 URL 导航，后退、前进或刷新时再显式填写"
           },
@@ -75,9 +76,41 @@
               "required": [
                 "ignore_cache"
               ]
+          }
+        },
+        {
+          "description": "停止当前页面的 Chromium 导航并保留当前已显示页面",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "enum": [
+                "stop"
+              ]
             }
           },
-          {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "url"
+                ]
+              },
+              {
+                "required": [
+                  "ignore_cache"
+                ]
+              },
+              {
+                "required": [
+                  "init_script"
+                ]
+              }
+            ]
+          }
+        },
+        {
             "description": "后退或前进",
             "required": [
               "action"
@@ -1304,13 +1337,6 @@
         "restricted",
         "full_access"
       ]
-    },
-    "browserCapabilityRevision": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "minimum": 0
     },
     "browserExecutionId": {
       "type": [

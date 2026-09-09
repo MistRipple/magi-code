@@ -43,6 +43,13 @@ pub(crate) fn spawn_new_session_title_refinement(
     first_message: &str,
     placeholder_title: &str,
 ) {
+    let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            session_id = %session_id,
+            "无法为会话标题精修获取 Tokio runtime，跳过异步精修"
+        );
+        return;
+    };
     let state = state.clone();
     let session_id = session_id.clone();
     let first_message = first_message.to_string();
@@ -51,12 +58,12 @@ pub(crate) fn spawn_new_session_title_refinement(
     let _ = std::thread::Builder::new()
         .name(format!("magi-session-title-{}", session_id))
         .spawn(move || {
-            refine_new_session_title_and_publish(
-                &state,
-                &thread_session_id,
-                &first_message,
-                &placeholder_title,
-            );
+            runtime_handle.block_on(refine_new_session_title_and_publish(
+                state,
+                thread_session_id,
+                first_message,
+                placeholder_title,
+            ));
         })
         .map_err(|error| {
             tracing::warn!(
@@ -67,11 +74,11 @@ pub(crate) fn spawn_new_session_title_refinement(
         });
 }
 
-pub(crate) fn refine_new_session_title_and_publish(
-    state: &ApiState,
-    session_id: &SessionId,
-    first_message: &str,
-    placeholder_title: &str,
+async fn refine_new_session_title_and_publish(
+    state: ApiState,
+    session_id: SessionId,
+    first_message: String,
+    placeholder_title: String,
 ) -> bool {
     let Some(client) =
         magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role(
@@ -91,7 +98,7 @@ pub(crate) fn refine_new_session_title_and_publish(
     };
     let workspace_id = state
         .session_store
-        .session(session_id)
+        .session(&session_id)
         .and_then(|session| state.session_workspace_id(&session));
     let usage_context = workspace_id
         .as_ref()
@@ -100,25 +107,43 @@ pub(crate) fn refine_new_session_title_and_publish(
             settings_store: &state.settings_store,
             workspace_id,
         });
-    let refined_title = refine_new_session_title_inner(
+    let refined_title = generate_new_session_title(
         client,
         state.session_store.clone(),
         session_id.clone(),
-        first_message.to_string(),
-        placeholder_title.to_string(),
+        first_message,
         usage_context,
     );
     let Some(title) = refined_title else {
         return false;
     };
-    if let Err(error) = state.persist_session_projection() {
-        tracing::warn!(
-            session_id = %session_id,
-            ?error,
-            "辅助模型会话标题持久化失败"
-        );
+
+    // 模型调用发生在锁外；只有提交生成结果时才进入完整生命周期临界区，
+    // 并在临界区内再次检查 placeholder，避免覆盖用户的手动重命名或删除。
+    let _lifecycle_guard = state.lock_session_lifecycle(&session_id).await;
+    let is_placeholder = state
+        .session_store
+        .session(&session_id)
+        .is_some_and(|session| session.title == placeholder_title);
+    if !is_placeholder {
+        return false;
     }
-    publish_session_title_updated(state, session_id, workspace_id, &title);
+    let renamed = match state.rename_session_with_persistence_for_api(&session_id, title) {
+        Ok(renamed) => renamed,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                ?error,
+                "辅助模型会话标题提交失败"
+            );
+            return false;
+        }
+    };
+    let workspace_id = state
+        .session_store
+        .session(&session_id)
+        .and_then(|session| state.session_workspace_id(&session));
+    publish_session_title_updated(&state, &session_id, workspace_id, &renamed.title);
     true
 }
 
@@ -177,6 +202,23 @@ fn refine_new_session_title_inner(
     session_id: SessionId,
     first_message: String,
     placeholder_title: String,
+    usage_context: Option<SessionTitleUsageContext<'_>>,
+) -> Option<String> {
+    let title = generate_new_session_title(
+        client,
+        session_store.clone(),
+        session_id.clone(),
+        first_message,
+        usage_context,
+    )?;
+    rename_session_if_placeholder(&session_store, &session_id, &placeholder_title, title)
+}
+
+fn generate_new_session_title(
+    client: Arc<dyn ModelBridgeClient>,
+    session_store: Arc<SessionStore>,
+    session_id: SessionId,
+    first_message: String,
     usage_context: Option<SessionTitleUsageContext<'_>>,
 ) -> Option<String> {
     let trimmed = first_message.trim();
@@ -240,38 +282,7 @@ fn refine_new_session_title_inner(
         );
         return None;
     };
-    match session_store
-        .session(&session_id)
-        .map(|record| record.title)
-    {
-        Some(ref current) if current == &placeholder_title => {}
-        Some(other) => {
-            tracing::debug!(
-                session_id = %session_id,
-                current = %other,
-                "会话标题已被改动，跳过辅助模型精修"
-            );
-            return None;
-        }
-        None => {
-            tracing::debug!(
-                session_id = %session_id,
-                "会话已不存在，跳过辅助模型精修"
-            );
-            return None;
-        }
-    }
-    match session_store.rename_session(&session_id, title.clone()) {
-        Ok(_) => Some(title),
-        Err(err) => {
-            tracing::warn!(
-                session_id = %session_id,
-                ?err,
-                "会话标题写回失败"
-            );
-            None
-        }
-    }
+    Some(title)
 }
 
 fn build_title_prompt(message: &str) -> String {
@@ -314,6 +325,43 @@ fn normalize_title(raw: &str) -> Option<String> {
         return None;
     }
     Some(title)
+}
+
+fn rename_session_if_placeholder(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    placeholder_title: &str,
+    title: String,
+) -> Option<String> {
+    match session_store.session(session_id).map(|record| record.title) {
+        Some(current) if current == placeholder_title => {}
+        Some(other) => {
+            tracing::debug!(
+                session_id = %session_id,
+                current = %other,
+                "会话标题已被改动，跳过辅助模型精修"
+            );
+            return None;
+        }
+        None => {
+            tracing::debug!(
+                session_id = %session_id,
+                "会话已不存在，跳过辅助模型精修"
+            );
+            return None;
+        }
+    }
+    match session_store.rename_session(session_id, title.clone()) {
+        Ok(_) => Some(title),
+        Err(err) => {
+            tracing::warn!(
+                session_id = %session_id,
+                ?err,
+                "会话标题写回失败"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

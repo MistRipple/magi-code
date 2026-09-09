@@ -243,6 +243,19 @@ impl SessionStore {
         })
     }
 
+    /// 返回当前导航指针本身，而不是解析后的会话记录。
+    ///
+    /// 生命周期回滚必须区分“没有 current”和“current 指向的记录暂时不可见”，
+    /// 不能用 `current_session()` 的 `None` 把两种状态合并，否则失败的新建会话
+    /// 可能把原导航状态恢复成错误的默认选择。
+    pub fn current_session_id(&self) -> Option<SessionId> {
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .current_session_id
+            .clone()
+    }
+
     pub fn session(&self, session_id: &SessionId) -> Option<SessionRecord> {
         let state = self.state.read().expect("session state read lock poisoned");
         state
@@ -352,13 +365,18 @@ impl SessionStore {
             .canonical_turns
             .iter()
             .find(|turn| {
-                turn.items.iter().any(|item| {
-                    item.metadata
-                        .get("requestId")
-                        .or_else(|| item.metadata.get("request_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(request_id)
-                })
+                turn.metadata
+                    .get("requestId")
+                    .or_else(|| turn.metadata.get("request_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request_id)
+                    || turn.items.iter().any(|item| {
+                        item.metadata
+                            .get("requestId")
+                            .or_else(|| item.metadata.get("request_id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(request_id)
+                    })
             })?
             .clone();
         turn.normalize();

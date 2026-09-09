@@ -37,11 +37,12 @@ pub(crate) struct SessionConversationProjection {
 }
 
 impl SessionConversationProjection {
-    /// 从事件目录中的首个 segment 读取归属，再按会话完整重放事件。
+    /// 只读取首个 event segment 的 session 归属，不重放整个事件目录。
     ///
-    /// 这条入口覆盖 accepted event 已落盘、session projection 尚未落盘的崩溃窗口，
-    /// 不依赖目录名反解会话 ID。
-    pub(crate) fn load_from_root(event_root: &Path) -> Result<Self, DaemonError> {
+    /// 启动阶段需要先判断 event 目录是否已经由 projection 拥有。这个判断不能为了
+    /// 读取一个身份字段而重放整段历史，否则每次 daemon 启动都会把同一批 event
+    /// 解析两次，历史越大，服务可用时间越长。
+    pub(crate) fn read_session_id_from_root(event_root: &Path) -> Result<SessionId, DaemonError> {
         let mut paths = fs::read_dir(event_root)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()?;
@@ -60,7 +61,7 @@ impl SessionConversationProjection {
                     path.display()
                 ))
             })?;
-        Self::load(event_root, &transaction.session_id)
+        Ok(transaction.session_id)
     }
 
     pub(crate) fn load(event_root: &Path, session_id: &SessionId) -> Result<Self, DaemonError> {
@@ -226,10 +227,6 @@ impl SessionConversationProjection {
 
     pub(crate) fn last_event_seq(&self) -> u64 {
         self.last_event_seq
-    }
-
-    pub(crate) fn session_id(&self) -> Option<&SessionId> {
-        self.session_id.as_ref()
     }
 
     pub(crate) fn canonical_turns(&self) -> &[CanonicalTurn] {
@@ -812,6 +809,25 @@ mod tests {
         let replayed = SessionConversationProjection::load(temp.path(), &session_id)
             .expect("events should replay");
         assert_eq!(replayed.canonical_turns(), &[completed]);
+    }
+
+    #[test]
+    fn terminal_turn_shell_keeps_request_identity_without_items() {
+        let session_id = SessionId::new("session-terminal-shell-request");
+        let mut completed = turn(&session_id, CanonicalTurnStatus::Completed);
+        completed.metadata.insert(
+            "requestId".to_string(),
+            serde_json::json!("request-terminal-shell"),
+        );
+
+        let shell = turn_shell(&completed);
+
+        assert!(shell.items.is_empty(), "终态事件仍应使用轻量 turn shell");
+        assert_eq!(
+            shell.metadata.get("requestId"),
+            Some(&serde_json::json!("request-terminal-shell")),
+            "shell 必须保留用于前端收敛处理态的 Turn 级 requestId"
+        );
     }
 
     #[test]

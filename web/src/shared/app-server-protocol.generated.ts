@@ -458,7 +458,6 @@ export interface BrowserToolParams {
   workspaceId?: string | null;
   callId?: string | null;
   accessProfile?: BrowserAccessProfile;
-  browserCapabilityRevision?: number | null;
   browserExecutionId?: string | null;
   taskId?: string | null;
   workerId?: string | null;

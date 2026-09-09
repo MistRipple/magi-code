@@ -346,6 +346,11 @@ impl ToolRegistry {
                 self.record_invocation(&input, &context, &output);
                 return output;
             }
+            if canonical_name.requires_workspace_context() && context.workspace_id.is_none() {
+                let output = self.build_workspace_required_rejection(&input, canonical_name);
+                self.record_invocation(&input, &context, &output);
+                return output;
+            }
         }
         if let Some(output) = self.enforce_execution_policy(&input, policy) {
             self.record_invocation(&input, &context, &output);
@@ -457,6 +462,36 @@ impl ToolRegistry {
             payload: serde_json::json!({
                 "tool": tool_name.as_str(),
                 "status": "rejected",
+                "error": reason.clone(),
+            })
+            .to_string(),
+            governance: GovernanceDecision {
+                outcome: GovernanceOutcome::Rejected,
+                allowed: false,
+                requires_approval: false,
+                phase: DecisionPhase::ToolPolicy,
+                threshold: input.risk_level,
+                reason: Some(reason),
+            },
+        }
+    }
+
+    fn build_workspace_required_rejection(
+        &self,
+        input: &ToolExecutionInput,
+        tool_name: BuiltinToolName,
+    ) -> ToolExecutionOutput {
+        let reason = format!(
+            "{} 需要当前会话绑定工作区；请先选择工作区后再执行该工具",
+            tool_name.as_str()
+        );
+        ToolExecutionOutput {
+            tool_call_id: input.tool_call_id.clone(),
+            status: ExecutionResultStatus::Rejected,
+            payload: serde_json::json!({
+                "tool": tool_name.as_str(),
+                "status": "rejected",
+                "error_code": "workspace_required",
                 "error": reason.clone(),
             })
             .to_string(),

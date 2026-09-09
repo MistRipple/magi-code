@@ -149,7 +149,8 @@ function canonicalTurnRequestId(turn: CanonicalTurn | undefined): string {
   if (!turn) {
     return '';
   }
-  const turnRequestId = readMetadataString(turn.metadata, 'requestId');
+  const turnRequestId = readMetadataString(turn.metadata, 'requestId')
+    || readMetadataString(turn.metadata, 'request_id');
   if (turnRequestId) {
     return turnRequestId;
   }
@@ -163,7 +164,9 @@ function canonicalTurnRequestId(turn: CanonicalTurn | undefined): string {
 }
 
 function canonicalItemRequestId(item: CanonicalTurnItem | undefined): string {
-  return item ? readMetadataString(item.metadata, 'requestId') : '';
+  return item
+    ? readMetadataString(item.metadata, 'requestId') || readMetadataString(item.metadata, 'request_id')
+    : '';
 }
 
 export function isLocalOptimisticTurn(turn: CanonicalTurn | undefined): boolean {

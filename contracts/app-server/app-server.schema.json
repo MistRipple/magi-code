@@ -720,7 +720,6 @@
         "workspaceId": { "type": ["string", "null"] },
         "callId": { "type": ["string", "null"] },
         "accessProfile": { "$ref": "#/$defs/BrowserAccessProfile" },
-        "browserCapabilityRevision": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
         "browserExecutionId": { "type": ["string", "null"] },
         "taskId": { "type": ["string", "null"] },
         "workerId": { "type": ["string", "null"] }

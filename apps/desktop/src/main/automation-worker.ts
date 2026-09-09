@@ -86,6 +86,10 @@ export class AutomationWorker {
   #failureNotification: Promise<void> | null = null;
   #readyHandshakeProcess: UtilityProcess | null = null;
   #rebindWaiter: RebindWaiter | null = null;
+  // 运行期 Primary Surface 换代必须先完成 Worker 重绑，再允许同一批
+  // 浏览器命令进入 Worker。Promise 保留失败状态，避免重绑失败时继续
+  // 使用旧物理 binding；下一次 primary_changed 才是新的恢复边界。
+  #surfaceRebindLane: Promise<void> = Promise.resolve();
   #processExitWaiters = new Map<UtilityProcess, { promise: Promise<void>; resolve: () => void }>();
   #lifecycle: Promise<void> = Promise.resolve();
   #lifecycleBusy = false;
@@ -146,6 +150,7 @@ export class AutomationWorker {
     this.#ready = false;
     this.#readyHandshakeProcess = null;
     this.#failureNotified = false;
+    this.#surfaceRebindLane = Promise.resolve();
     this.#workerEpoch = `worker-${randomUUID()}`;
     let child: UtilityProcess;
     try {
@@ -208,6 +213,7 @@ export class AutomationWorker {
     signal?: AbortSignal,
   ): Promise<{ outcome: BrowserCommandOutcome; binary?: Buffer }> {
     await this.start(signal);
+    await this.waitForSurfaceRebind(signal);
     const child = this.#process;
     if (!child) throw new Error("browser_worker_failed");
     if (signal?.aborted) throw new Error("browser_command_cancelled");
@@ -252,8 +258,17 @@ export class AutomationWorker {
     });
   }
 
-  forwardSurfaceEvent(event: BrowserSurfaceEvent): void {
-    if (event.type !== "cdp_event" || !this.#process || !this.#ready) return;
+  forwardSurfaceEvent(event: BrowserSurfaceEvent): Promise<void> {
+    if (event.type === "primary_changed") {
+      const rebind = this.#surfaceRebindLane
+        .catch(() => undefined)
+        .then(() => this.rebindCurrentSurfaces());
+      this.#surfaceRebindLane = rebind;
+      return rebind;
+    }
+    if (event.type !== "cdp_event" || !this.#process || !this.#ready) {
+      return Promise.resolve();
+    }
     const message: MainToWorkerMessage = {
       type: "cdp_event",
       binding: event.binding,
@@ -262,6 +277,7 @@ export class AutomationWorker {
       ...(event.sessionId ? { session_id: event.sessionId } : {}),
     };
     this.postMessage(this.#process, message);
+    return Promise.resolve();
   }
 
   async stop(): Promise<void> {
@@ -296,6 +312,7 @@ export class AutomationWorker {
     this.#lifecycleEpoch += 1;
     this.#ready = false;
     this.#readyHandshakeProcess = null;
+    this.#surfaceRebindLane = Promise.resolve();
     this.rejectRebindWaiter(new Error("browser_worker_stopped"));
     if (child) {
       try {
@@ -358,6 +375,43 @@ export class AutomationWorker {
     this.#rebindWaiter = null;
     clearTimeout(waiter.timer);
     waiter.reject(error);
+  }
+
+  private async rebindCurrentSurfaces(): Promise<void> {
+    const child = this.#process;
+    if (!child || !this.#ready) return;
+    const workerEpoch = this.#workerEpoch;
+    const rebindId = `rebind-${randomUUID()}`;
+    const ack = this.waitForRebindAck(child, workerEpoch, rebindId);
+    try {
+      this.postMessage(child, {
+        type: "worker_rebind",
+        worker_epoch: workerEpoch,
+        rebind_id: rebindId,
+        bindings: this.#surfaceManager.bindings(),
+      });
+    } catch (cause) {
+      this.rejectRebindWaiter(asError(cause, "browser_worker_rebind_failed"));
+    }
+    await ack;
+    if (this.#process !== child || this.#workerEpoch !== workerEpoch || !this.#ready) {
+      throw new Error("browser_worker_rebind_stale");
+    }
+  }
+
+  private async waitForSurfaceRebind(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new Error("browser_command_cancelled");
+    const rebind = this.#surfaceRebindLane;
+    if (!signal) {
+      await rebind;
+      return;
+    }
+    await Promise.race([
+      rebind,
+      waitForAbort(signal).then(() => {
+        throw new Error("browser_command_cancelled");
+      }),
+    ]);
   }
 
   private scheduleRecovery(cause: unknown): void {
@@ -747,5 +801,16 @@ function waitForProcessExit(exit: Promise<void>): Promise<void> {
     exit.then(finish, finish);
     timer = setTimeout(finish, PROCESS_EXIT_TIMEOUT_MS);
     timer.unref();
+  });
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }

@@ -309,7 +309,6 @@ await withGoldenViteServer(async (server) => {
       arguments: { url: 'https://www.baidu.com/' },
       workspaceId: null,
       callId: 'browser-call-golden',
-      browserCapabilityRevision: 7,
     };
     const toolPromise = client.request('browser/tool', toolParams);
     await Promise.resolve();

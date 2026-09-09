@@ -12,7 +12,7 @@ export interface PrimaryPromotion<T> {
 }
 
 /**
- * 维护 Browser WebContentsView 的 Surface 索引和逻辑 Tab 的单一 Primary。
+ * 维护 Browser Chromium guest 的 Surface 索引和逻辑 Tab 的单一 Primary。
  *
  * 一个逻辑 Tab 可以在多个桌面窗口各有一个 Surface，因此“窗口 + Tab”
  * 只能用于查找 Surface，不能用于判定 Primary。Primary 必须按逻辑 Tab

@@ -19,6 +19,7 @@ use magi_bridge_client::{
     ChatToolCall,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
+use magi_browser_authority::BrowserCapabilitySnapshot;
 use magi_core::{
     AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextPackage,
     AgentContextReference, AgentContextReferenceKind, AgentContextSupplement, EventId,
@@ -219,7 +220,7 @@ pub(crate) fn execute_task_tool_call_batch(
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
-    browser_capability_revision: Option<u64>,
+    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     tool_calls: &[ChatToolCall],
     tool_execution_ledger: &mut ToolExecutionLedger,
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
@@ -247,7 +248,7 @@ pub(crate) fn execute_task_tool_call_batch(
             workspace_id,
             workspace_root_path,
             worker_id,
-            browser_capability_revision,
+            browser_capability_snapshot.clone(),
             execution_calls,
             on_progress,
             snapshot_session.clone(),
@@ -277,7 +278,7 @@ fn execute_task_tool_call_batch_unchecked(
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
-    browser_capability_revision: Option<u64>,
+    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     tool_calls: &[ChatToolCall],
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
     snapshot_session: Option<Arc<SnapshotSession>>,
@@ -317,6 +318,7 @@ fn execute_task_tool_call_batch_unchecked(
                         snapshot.before_tool(&hook_ctx);
                     }
                     let tool_call = &tool_calls[tool_index];
+                    let browser_capability_snapshot = browser_capability_snapshot.clone();
                     let result = execute_task_tool_call_with_lifecycle(
                         TaskToolLifecycleContext {
                             event_bus,
@@ -348,7 +350,7 @@ fn execute_task_tool_call_batch_unchecked(
                                 workspace_id,
                                 workspace_root_path,
                                 worker_id,
-                                browser_capability_revision,
+                                browser_capability_snapshot.clone(),
                                 tool_call,
                                 on_progress,
                             )
@@ -372,6 +374,7 @@ fn execute_task_tool_call_batch_unchecked(
                             let mut hook_ctx = hook_contexts[tool_index].clone();
                             let snapshot_session = snapshot_session.clone();
                             let execution_group_id_for_lifecycle = execution_group_id.clone();
+                            let browser_capability_snapshot = browser_capability_snapshot.clone();
                             (
                                 tool_index,
                                 scope.spawn(move || {
@@ -410,7 +413,7 @@ fn execute_task_tool_call_batch_unchecked(
                                                 workspace_id,
                                                 workspace_root_path,
                                                 worker_id,
-                                                browser_capability_revision,
+                                                browser_capability_snapshot.clone(),
                                                 tool_call,
                                                 on_progress,
                                             )
@@ -2749,7 +2752,7 @@ fn execute_task_tool_call(
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
-    browser_capability_revision: Option<u64>,
+    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     tool_call: &ChatToolCall,
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
 ) -> (String, ExecutionResultStatus) {
@@ -2970,7 +2973,7 @@ fn execute_task_tool_call(
                     workspace_id: workspace_id.clone(),
                     access_profile: effective_access_profile,
                     working_directory: workspace_root_path.cloned(),
-                    browser_capability_revision,
+                    browser_capability_snapshot: browser_capability_snapshot.clone(),
                     browser_execution_id: Some(format!("task:{}", task.task_id)),
                 },
                 workspace_root_path
@@ -3007,7 +3010,7 @@ fn execute_task_tool_call(
             workspace_id: workspace_id.clone(),
             access_profile: tool_policy.access_profile,
             working_directory: workspace_root_path.cloned(),
-            browser_capability_revision,
+            browser_capability_snapshot: browser_capability_snapshot.clone(),
             browser_execution_id: Some(format!("task:{}", task.task_id)),
         };
         let output = match on_progress {

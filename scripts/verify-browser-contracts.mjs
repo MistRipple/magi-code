@@ -160,7 +160,11 @@ assert.deepEqual(
 );
 
 const desktopIndex = await read("apps/desktop/src/main/index.ts");
-const ipcChannels = sorted([...desktopIndex.matchAll(/handleIpc\("([^"]+)"/gu)].map((match) => match[1]));
+const ipcChannels = sorted(
+  [...desktopIndex.matchAll(/handleIpc\(\s*"([^"]+)"/gu)].map(
+    (match) => match[1],
+  ),
+);
 const schemaIpcChannels = sorted(schemas.get("desktop-ipc.schema.json").properties.channel.enum);
 assert.deepEqual(schemaIpcChannels, ipcChannels, "Desktop IPC Schema/实际 handler 通道集合不一致");
 
@@ -193,7 +197,7 @@ const tsCommands = sorted(
 const rustCommands = rustEnumVariants(rustHostProtocol, "BrowserHostCommand", "Rust BrowserHostCommand");
 assert.deepEqual(schemaCommands, tsCommands, "Schema/TypeScript 命令集合不一致");
 assert.deepEqual(schemaCommands, rustCommands, "Schema/Rust 命令集合不一致");
-assert.equal(schemaCommands.length, 21, "Desktop Browser 命令集合数量发生漂移");
+assert.equal(schemaCommands.length, 23, "Desktop Browser 命令集合数量发生漂移");
 
 for (const branch of controlSchema.$defs.command.oneOf) {
   const command = branch.properties.type.const;

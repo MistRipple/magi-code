@@ -1033,8 +1033,9 @@ impl LlmTaskDispatcher {
         task: Option<&magi_core::Task>,
         skill_name: Option<&str>,
         access_profile: AccessProfile,
+        workspace_id: Option<&WorkspaceId>,
     ) -> Vec<ChatToolDefinition> {
-        let cache_key = tool_definition_cache_key(task, skill_name, access_profile);
+        let cache_key = tool_definition_cache_key(task, skill_name, access_profile, workspace_id);
         let cached_definitions = self
             .tool_definition_cache
             .lock()
@@ -1044,7 +1045,8 @@ impl LlmTaskDispatcher {
         let definitions = if let Some(definitions) = cached_definitions {
             definitions
         } else {
-            let definitions = self.build_base_tool_definitions(task, skill_name, access_profile);
+            let definitions =
+                self.build_base_tool_definitions(task, skill_name, access_profile, workspace_id);
             self.tool_definition_cache
                 .lock()
                 .expect("tool definition cache lock poisoned")
@@ -1076,6 +1078,7 @@ impl LlmTaskDispatcher {
         task: Option<&magi_core::Task>,
         skill_name: Option<&str>,
         access_profile: AccessProfile,
+        workspace_id: Option<&WorkspaceId>,
     ) -> Vec<ChatToolDefinition> {
         let Some(ref registry) = self.tool_registry else {
             return Vec::new();
@@ -1110,6 +1113,7 @@ impl LlmTaskDispatcher {
                                 Some(self.agent_role_registry.as_ref()),
                                 tool,
                             ) && (task.is_some() || session_turn_can_execute_builtin_tool(tool))
+                                && (workspace_id.is_some() || !tool.requires_workspace_context())
                                 && builtin_tool_visible_in_access_profile(
                                     tool,
                                     tool_surface_access_profile,
@@ -1157,8 +1161,10 @@ impl LlmTaskDispatcher {
         skill_name: Option<&str>,
         access_profile: AccessProfile,
         goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode,
+        workspace_id: Option<&WorkspaceId>,
     ) -> Vec<ChatToolDefinition> {
-        let mut definitions = self.build_tool_definitions(None, skill_name, access_profile);
+        let mut definitions =
+            self.build_tool_definitions(None, skill_name, access_profile, workspace_id);
         if goal_turn_mode.is_goal_driven()
             && let Some(registry) = self.tool_registry.as_ref()
         {
@@ -1169,6 +1175,11 @@ impl LlmTaskDispatcher {
                         BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
                             |tool| {
                                 is_session_goal_tool(tool)
+                                    && task_can_see_builtin_tool(
+                                        None,
+                                        Some(self.agent_role_registry.as_ref()),
+                                        tool,
+                                    )
                                     && builtin_tool_visible_in_access_profile(tool, access_profile)
                             },
                         )
@@ -1211,6 +1222,7 @@ fn tool_definition_cache_key(
     task: Option<&magi_core::Task>,
     skill_name: Option<&str>,
     access_profile: AccessProfile,
+    workspace_id: Option<&WorkspaceId>,
 ) -> String {
     let (task_kind, role_id, allowed_tools, denied_tools, command_mode) = task
         .map(|task| {
@@ -1246,6 +1258,7 @@ fn tool_definition_cache_key(
         "command_mode": command_mode,
         "skill": skill_name,
         "access_profile": format!("{:?}", access_profile),
+        "workspace_bound": workspace_id.is_some(),
     })
     .to_string()
 }
@@ -2106,6 +2119,7 @@ impl LlmTaskDispatcher {
                 active_skill_name.as_deref(),
                 request.access_profile,
                 request.goal_turn_mode,
+                request.workspace_id.as_ref(),
             );
             (!tool_defs.is_empty()).then_some(tool_defs)
         } else {
@@ -2246,6 +2260,7 @@ impl LlmTaskDispatcher {
                 Some(&execution_task),
                 skill_name.as_deref(),
                 access_profile,
+                workspace_id.as_ref(),
             );
             if tool_defs.is_empty() {
                 None
@@ -3908,6 +3923,7 @@ mod tests {
                 Some(&ordinary_task),
                 None,
                 magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
             )
             .into_iter()
             .map(|definition| definition.function.name)
@@ -3944,7 +3960,12 @@ mod tests {
             .access_profile = magi_core::AccessProfile::ReadOnly;
 
         let names = dispatcher
-            .build_tool_definitions(Some(&task), None, magi_core::AccessProfile::Restricted)
+            .build_tool_definitions(
+                Some(&task),
+                None,
+                magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -3988,7 +4009,12 @@ mod tests {
         policy.denied_tools.clear();
 
         let names = dispatcher
-            .build_tool_definitions(Some(&task), None, magi_core::AccessProfile::FullAccess)
+            .build_tool_definitions(
+                Some(&task),
+                None,
+                magi_core::AccessProfile::FullAccess,
+                Some(&WorkspaceId::new("test-workspace")),
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -4006,6 +4032,7 @@ mod tests {
             Some(&task),
             None,
             magi_core::AccessProfile::Restricted,
+            Some(&WorkspaceId::new("test-workspace")),
         );
 
         for name in ["agent_spawn", "agent_send", "agent_wait"] {
@@ -4038,7 +4065,12 @@ mod tests {
                 .expect("coordinator policy")
                 .access_profile = access_profile;
             let coordinator_names = dispatcher
-                .build_tool_definitions(Some(&coordinator), None, access_profile)
+                .build_tool_definitions(
+                    Some(&coordinator),
+                    None,
+                    access_profile,
+                    Some(&WorkspaceId::new("test-workspace")),
+                )
                 .into_iter()
                 .map(|definition| definition.function.name)
                 .collect::<Vec<_>>();
@@ -4054,7 +4086,12 @@ mod tests {
                 .expect("worker policy")
                 .access_profile = access_profile;
             let worker_names = dispatcher
-                .build_tool_definitions(Some(&worker), None, access_profile)
+                .build_tool_definitions(
+                    Some(&worker),
+                    None,
+                    access_profile,
+                    Some(&WorkspaceId::new("test-workspace")),
+                )
                 .into_iter()
                 .map(|definition| definition.function.name)
                 .collect::<Vec<_>>();
@@ -4077,7 +4114,12 @@ mod tests {
         let dispatcher = dispatcher_with_ready_browser_tool_surface();
         let worker = task_with_role("executor", TaskTier::ExecutionChain);
         let names = dispatcher
-            .build_tool_definitions(Some(&worker), None, magi_core::AccessProfile::Restricted)
+            .build_tool_definitions(
+                Some(&worker),
+                None,
+                magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -4102,11 +4144,43 @@ mod tests {
     }
 
     #[test]
+    fn task_tool_surface_hides_workspace_tools_without_workspace() {
+        let dispatcher = dispatcher_with_ready_browser_tool_surface();
+        let task = task_with_role("executor", TaskTier::ExecutionChain);
+        let names = dispatcher
+            .build_tool_definitions(
+                Some(&task),
+                None,
+                magi_core::AccessProfile::Restricted,
+                None,
+            )
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        for hidden in ["file_read", "shell_exec", "git_status", "search_text"] {
+            assert!(
+                !names.iter().any(|name| name == hidden),
+                "无 workspace 的任务工具目录不能暴露 {hidden}: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "browser_navigate"),
+            "无 workspace 的任务工具目录必须保留浏览器工具: {names:?}"
+        );
+    }
+
+    #[test]
     fn read_only_session_tool_surface_hides_write_tools_without_task_policy() {
         let dispatcher = dispatcher_with_default_tool_surface();
 
         let names = dispatcher
-            .build_tool_definitions(None, None, magi_core::AccessProfile::ReadOnly)
+            .build_tool_definitions(
+                None,
+                None,
+                magi_core::AccessProfile::ReadOnly,
+                Some(&WorkspaceId::new("test-workspace")),
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -4129,7 +4203,12 @@ mod tests {
         let dispatcher = dispatcher_with_default_tool_surface();
 
         let names = dispatcher
-            .build_tool_definitions(None, None, magi_core::AccessProfile::Restricted)
+            .build_tool_definitions(
+                None,
+                None,
+                magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -4149,10 +4228,53 @@ mod tests {
     }
 
     #[test]
+    fn session_turn_surface_hides_workspace_tools_without_workspace() {
+        let dispatcher = dispatcher_with_ready_browser_tool_surface();
+
+        let names = dispatcher
+            .build_session_turn_tool_definitions(
+                None,
+                magi_core::AccessProfile::Restricted,
+                crate::session_turn_execution::SessionGoalTurnMode::None,
+                None,
+            )
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        for hidden in [
+            "file_read",
+            "shell_exec",
+            "git_status",
+            "search_text",
+            "process_inspect",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == hidden),
+                "无 workspace 的 session turn 不能暴露 {hidden}: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "browser_navigate"),
+            "无 workspace 的 session turn 必须保留 browser_navigate: {names:?}"
+        );
+        for expected in ["get_goal", "create_goal", "update_goal", "update_plan"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "无 workspace 的 session turn 必须保留会话内部工具 {expected}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
     fn goal_continuation_tool_surface_cannot_create_a_second_goal() {
         let dispatcher = dispatcher_with_default_tool_surface();
-        let definitions =
-            dispatcher.build_tool_definitions(None, None, magi_core::AccessProfile::Restricted);
+        let definitions = dispatcher.build_tool_definitions(
+            None,
+            None,
+            magi_core::AccessProfile::Restricted,
+            Some(&WorkspaceId::new("test-workspace")),
+        );
 
         let continuation_names = session_goal_tool_surface(
             definitions.clone(),
@@ -4185,7 +4307,12 @@ mod tests {
         policy.command_mode = "read_only".to_string();
 
         let names = dispatcher
-            .build_tool_definitions(Some(&task), None, magi_core::AccessProfile::FullAccess)
+            .build_tool_definitions(
+                Some(&task),
+                None,
+                magi_core::AccessProfile::FullAccess,
+                Some(&WorkspaceId::new("test-workspace")),
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -4228,6 +4355,7 @@ mod tests {
                 Some(&task),
                 Some("code-review"),
                 magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
             )
             .into_iter()
             .map(|definition| definition.function.name)
@@ -4275,6 +4403,7 @@ mod tests {
                 Some("goal-method"),
                 magi_core::AccessProfile::Restricted,
                 crate::session_turn_execution::SessionGoalTurnMode::Start,
+                None,
             )
             .into_iter()
             .map(|definition| definition.function.name)
@@ -4315,6 +4444,7 @@ mod tests {
                 None,
                 Some("direct-skill"),
                 magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
             )
             .into_iter()
             .map(|definition| definition.function.name)
@@ -4354,8 +4484,12 @@ mod tests {
             }));
         dispatcher.tool_registry = Some(registry);
 
-        let definitions =
-            dispatcher.build_tool_definitions(None, None, magi_core::AccessProfile::Restricted);
+        let definitions = dispatcher.build_tool_definitions(
+            None,
+            None,
+            magi_core::AccessProfile::Restricted,
+            Some(&WorkspaceId::new("test-workspace")),
+        );
         let mcp = definitions
             .iter()
             .find(|definition| definition.function.name == "mcp__repo-tools__inspect");
@@ -4411,6 +4545,7 @@ mod tests {
                 None,
                 Some("prompt-only"),
                 magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
             )
             .into_iter()
             .map(|definition| definition.function.name)
@@ -4494,6 +4629,7 @@ mod tests {
                 Some(&task),
                 Some("mixed-skill"),
                 magi_core::AccessProfile::ReadOnly,
+                Some(&WorkspaceId::new("test-workspace")),
             )
             .into_iter()
             .map(|definition| definition.function.name)
@@ -4539,6 +4675,7 @@ mod tests {
                 Some(&task),
                 Some("read-only-skill"),
                 magi_core::AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
             )
             .into_iter()
             .map(|definition| definition.function.name)

@@ -439,6 +439,52 @@ impl BuiltinToolName {
         magi_browser_authority::BrowserToolKind::from_name(self.as_str())
     }
 
+    /// 该工具是否要求会话绑定工作区。
+    ///
+    /// 工作区是本地文件、进程、搜索、Git、项目知识和图片产物的唯一执行根。
+    /// 没有工作区时，这些工具不能仅靠执行阶段再返回错误，必须从模型工具目录中
+    /// 完全隐藏；浏览器、网络和会话内部工具不依赖工作区。
+    pub fn requires_workspace_context(&self) -> bool {
+        matches!(
+            self,
+            Self::FileRead
+                | Self::ViewImage
+                | Self::FileWrite
+                | Self::FilePatch
+                | Self::ApplyPatch
+                | Self::FileRemove
+                | Self::FileMkdir
+                | Self::FileCopy
+                | Self::FileMove
+                | Self::SearchText
+                | Self::SearchSemantic
+                | Self::ShellExec
+                | Self::ProcessLaunch
+                | Self::ProcessRead
+                | Self::ProcessWrite
+                | Self::ProcessKill
+                | Self::ProcessList
+                | Self::ProcessInspect
+                | Self::DiffPreview
+                | Self::ImageGenerate
+                | Self::KnowledgeQuery
+                | Self::KnowledgeGraphQuery
+                | Self::CodeSymbols
+                | Self::GitStatus
+                | Self::GitBranchList
+                | Self::GitBranchCreate
+                | Self::GitBranchSwitch
+                | Self::GitPull
+                | Self::GitPush
+                | Self::GitMergePreview
+                | Self::GitMerge
+                | Self::GitBranchDelete
+                | Self::GitWorktreeList
+                | Self::GitWorktreeCreate
+                | Self::GitWorktreeRemove
+        )
+    }
+
     pub fn is_write_operation(&self) -> bool {
         matches!(
             self,

@@ -90,8 +90,10 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore);
   assertWorkspaceSessionCatalogRejectsLatePreAcceptanceSnapshot(messagesStore);
   assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
+  assertSameSessionBootstrapRestoresCompletedAssistant(dataHandlers, messagesStore);
   assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
+  assertStaleStateUpdateCannotResurrectTerminalTurn(dataHandlers, messagesStore);
   assertTerminalCanonicalTurnWithoutAssistantSettlesBoundRequest(dataHandlers, messagesStore);
   assertHistoricalTerminalReplayDoesNotClearCurrentTurn(dataHandlers, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
@@ -2110,6 +2112,109 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
   messagesStore.setCurrentSessionId(null);
 }
 
+function assertSameSessionBootstrapRestoresCompletedAssistant(dataHandlers, messagesStore) {
+  const workspaceId = 'workspace-golden-bootstrap-completed-assistant';
+  const workspacePath = '/tmp/workspace-golden-bootstrap-completed-assistant';
+  const c = baseCase(
+    'same-session-bootstrap-completed-assistant',
+    'session-golden-bootstrap-completed-assistant',
+    'turn-golden-bootstrap-completed-assistant',
+    12100,
+  );
+  const userItem = user(c, 1, '刷新后用户消息仍然存在。');
+  const assistantItem = assistantText(c, 2, 'assistant-bootstrap-completed', '刷新后助手回复仍然存在。', 'completed');
+  const canonicalTurn = turn(c, 'completed', [userItem, assistantItem], {
+    completedAt: c.turnSeq + 100,
+    responseDurationMs: 100,
+  });
+  const sessions = [{
+    id: c.sessionId,
+    sessionId: c.sessionId,
+    title: '刷新恢复完成回复',
+    createdAt: c.turnSeq,
+    updatedAt: c.turnSeq + 100,
+    messageCount: 1,
+  }];
+
+  messagesStore.messagesState.currentWorkspaceId = workspaceId;
+  messagesStore.messagesState.currentWorkspacePath = workspacePath;
+  messagesStore.messagesState.bootstrapped = false;
+  messagesStore.setCurrentSessionId(c.sessionId);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+  });
+  assert.equal(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    null,
+    'completed assistant bootstrap repro starts with an empty projection',
+  );
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-same-session-bootstrap-completed-assistant',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq + 100,
+    updatedAt: c.turnSeq + 100,
+    data: {
+      dataType: 'sessionBootstrapLoaded',
+      payload: {
+        scope: 'workspace',
+        agent: { runtimeEpoch: 'runtime-golden-bootstrap-completed-assistant' },
+        eventStreamNextSequence: 1,
+        sessionId: c.sessionId,
+        workspace: {
+          workspaceId,
+          rootPath: workspacePath,
+        },
+        sessions,
+        state: {
+          currentSessionId: c.sessionId,
+          currentWorkspaceId: workspaceId,
+          currentWorkspacePath: workspacePath,
+          sessions,
+          isProcessing: false,
+          processingState: null,
+          messages: [],
+          edits: [],
+          changedFiles: [],
+          pendingChanges: [],
+          pendingChangesState: null,
+        },
+        canonicalTurns: [canonicalTurn],
+        notifications: { notifications: [] },
+        orchestratorRuntimeState: null,
+        hasMoreBefore: false,
+        beforeCursor: null,
+      },
+    },
+  });
+
+  const projectionValue = messagesStore.messagesState.canonicalTimelineProjection;
+  const assistantArtifact = findArtifactByTurnItemId(projectionValue, assistantItem.itemId);
+  assert.equal(
+    assistantArtifact?.message.content,
+    assistantItem.content,
+    'same-session bootstrap must render completed assistant content after F5',
+  );
+  assert.deepEqual(
+    messagesStore.getState().threadMessages.map((message) => message.content),
+    [userItem.content, assistantItem.content],
+    'same-session bootstrap must expose both user and completed assistant messages to the thread',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'completed assistant bootstrap must leave the composer idle',
+  );
+  messagesStore.setCurrentSessionId(null);
+}
+
 function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore) {
   const workspaceId = 'workspace-golden-stale-idle-bootstrap';
   const workspacePath = '/tmp/workspace-golden-stale-idle-bootstrap';
@@ -2377,8 +2482,6 @@ function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(data
   userItem.metadata = requestMetadata;
   const runningAssistant = assistantPlaceholderText(c, 2, requestMetadata.placeholderMessageId, 'running');
   runningAssistant.metadata = requestMetadata;
-  const completedAssistant = assistantText(c, 2, requestMetadata.placeholderMessageId, '处理态已收敛。', 'completed');
-  completedAssistant.metadata = requestMetadata;
 
   messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-live-terminal-settle';
   messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-live-terminal-settle';
@@ -2443,11 +2546,13 @@ function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(data
       payload: {
         sessionId: c.sessionId,
         canonicalEvent: event(c, 2, 'turn_completed', {
-          turn: turn(c, 'completed', [userItem, completedAssistant], {
+          // 生产事件使用不携带 items 的 Turn shell；requestId 必须由 Turn metadata
+          // 提供，否则前端无法将终态关联到本地 submission。
+          turn: turn(c, 'completed', [], {
             completedAt: c.turnSeq + 100,
             responseDurationMs: 100,
+            metadata: { requestId: requestMetadata.requestId },
           }),
-          item: completedAssistant,
         }),
       },
     },
@@ -2462,6 +2567,111 @@ function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(data
     0,
     'terminal canonical event must clear pending request ids',
   );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertStaleStateUpdateCannotResurrectTerminalTurn(dataHandlers, messagesStore) {
+  const c = baseCase(
+    'stale-state-update-after-terminal',
+    'session-golden-stale-state-update',
+    'turn-golden-stale-state-update',
+    11925,
+  );
+  const requestId = 'request-stale-state-update';
+  const userItem = user(c, 1, '验证终态后的旧状态更新。');
+  userItem.metadata = { requestId };
+  const assistantItem = assistantText(c, 2, 'assistant-stale-state-update', '已完成。', 'completed');
+  assistantItem.metadata = { requestId };
+
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-stale-state-update';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-stale-state-update';
+  messagesStore.setCurrentSessionId(c.sessionId);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+  });
+  messagesStore.createRequestBinding({
+    requestId,
+    userMessageId: userItem.itemId,
+    placeholderMessageId: assistantItem.itemId,
+    createdAt: c.turnSeq,
+  });
+  beginGoldenLocalSubmission(messagesStore, {
+    requestId,
+    userMessageId: userItem.itemId,
+    placeholderMessageId: assistantItem.itemId,
+    startedAt: c.turnSeq,
+    content: userItem.content,
+  });
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-stale-state-update-terminal',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq,
+    updatedAt: c.turnSeq,
+    data: {
+      dataType: 'sessionTurnCanonicalEventUpdated',
+      payload: {
+        sessionId: c.sessionId,
+        canonicalEvent: event(c, 1, 'turn_completed', {
+          turn: turn(c, 'completed', [userItem, assistantItem], {
+            completedAt: c.turnSeq + 100,
+          }),
+          item: assistantItem,
+        }),
+      },
+    },
+  });
+  assert.equal(messagesStore.messagesState.isProcessing, false, 'terminal event must settle before stale state update');
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-stale-state-update',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq + 1,
+    updatedAt: c.turnSeq + 1,
+    data: {
+      dataType: 'stateUpdate',
+      payload: {
+        state: {
+          currentSessionId: c.sessionId,
+          currentWorkspaceId: 'workspace-golden-stale-state-update',
+          currentWorkspacePath: '/tmp/workspace-golden-stale-state-update',
+          stateUpdatedAt: c.turnSeq + 1,
+          isProcessing: true,
+          processingState: {
+            isProcessing: true,
+            source: 'orchestrator',
+            agent: 'orchestrator',
+            startedAt: c.turnSeq,
+            pendingRequestIds: [],
+            stage: 'streaming',
+          },
+          messages: [],
+          edits: [],
+          changedFiles: [],
+          pendingChanges: [],
+          pendingChangesState: null,
+        },
+      },
+    },
+  });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'a stale stateUpdate without request ids must not resurrect a terminal turn',
+  );
+  assert.equal(messagesStore.messagesState.backendProcessing, false);
   messagesStore.setCurrentSessionId(null);
 }
 

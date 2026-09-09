@@ -104,6 +104,11 @@ export interface AgentWorkspacePickResult {
   name: string | null;
 }
 
+export interface AgentWorkspaceRegistrationResult {
+  workspaceId: string;
+  workspaces: AgentWorkspaceSummary[];
+}
+
 interface RawAgentWorkspaceSummary {
   workspaceId?: string;
   rootPath?: string;
@@ -1240,7 +1245,7 @@ export async function closeBrowserTab(tabId: string): Promise<void> {
 
 export async function navigateBrowserTab(
   tabId: string,
-  action: 'url' | 'back' | 'forward' | 'reload',
+  action: 'url' | 'back' | 'forward' | 'stop' | 'reload',
   url?: string,
 ): Promise<BrowserTabSnapshot> {
   const response = await getTransport().request(
@@ -1262,8 +1267,8 @@ export type BrowserAnnotationSelection =
   | {
       kind: 'element';
       navigationRevision: number;
-      x: number;
-      y: number;
+      normalizedX: number;
+      normalizedY: number;
     }
   | {
       kind: 'region';
@@ -1543,7 +1548,7 @@ export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
   }
 }
 
-export async function registerAgentWorkspace(rootPath: string): Promise<AgentWorkspaceSummary[]> {
+export async function registerAgentWorkspace(rootPath: string): Promise<AgentWorkspaceRegistrationResult> {
   try {
     const response = await getTransport().request(agentUrl('/api/workspaces/register'), {
       method: 'POST',
@@ -1552,14 +1557,15 @@ export async function registerAgentWorkspace(rootPath: string): Promise<AgentWor
         path: rootPath,
       }),
     });
-    const payload = await parseAgentJson<{ workspaces?: RawAgentWorkspaceSummary[]; workspaceId?: string; registered?: boolean }>(response, 'register workspace');
-    if (Array.isArray(payload.workspaces)) {
-      return cacheWorkspaceSummaries(payload.workspaces.map((workspace) => normalizeWorkspaceSummary(workspace)));
+    const payload = await parseAgentJson<{ workspaceId?: string }>(response, 'register workspace');
+    const workspaceId = payload.workspaceId?.trim() || '';
+    if (!workspaceId) {
+      throw new Error('工作区注册响应缺少 workspaceId');
     }
-    if (payload.registered || payload.workspaceId) {
-      return await listAgentWorkspaces();
-    }
-    return [];
+    return {
+      workspaceId,
+      workspaces: await listAgentWorkspaces(),
+    };
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(i18n.t('bridge.agentUnreachable'));

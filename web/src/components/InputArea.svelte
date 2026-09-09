@@ -204,6 +204,9 @@
   // 提交与 Bridge 结果通过 requestId 成对收口。输入区只拥有草稿，Bridge 只拥有
   // 网络生命周期，不能由任一侧猜测另一个状态，避免失败时永久丢失用户上下文。
   const submittedComposerDrafts = new Map<string, ComposerSubmissionDraft>();
+  // 输入区组件在会话切换时不会销毁。草稿必须按会话隔离，否则新会话会继承
+  // 上一个会话尚未发送的图片、标记或文本，表现为内容串会话和“新会话自带附件”。
+  const scopedComposerDrafts = new Map<string, ComposerSubmissionDraft>();
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
   const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
@@ -284,7 +287,7 @@
   const persistedSessionId = $derived.by(() => (
     isPersistedSessionId(currentSessionId) ? currentSessionId?.trim() || '' : ''
   ));
-  let composerReferenceScopeKey = '';
+  let composerReferenceScopeKey = $state('');
   const composerWorkspace = $derived.by(() => (
     isPersonalSession
       ? null
@@ -294,23 +297,44 @@
   const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
 
   function currentComposerReferenceScopeKey(): string {
-    return `${currentWorkspaceId ?? ''}\u0000${currentSessionId ?? ''}`;
+    // 作用域必须由已提交的工作区绑定和会话共同决定。直接读取 messagesState，
+    // 避免把会话切换期间的派生值缓存成旧作用域；路径也参与键值，覆盖仅有路径的工作区。
+    return [
+      messagesState.currentWorkspaceId?.trim() || '',
+      messagesState.currentWorkspacePath?.trim() || '',
+      messagesState.currentSessionId?.trim() || '',
+    ].join('\u0000');
   }
 
   $effect(() => {
+    // 这些直接读取是作用域切换的唯一响应式依赖。InputArea 在导航时保持挂载，
+    // 不能依赖组件重建来清空 contenteditable 的旧 DOM。
+    void messagesState.currentWorkspaceId;
+    void messagesState.currentWorkspacePath;
+    void messagesState.currentSessionId;
     const nextScopeKey = currentComposerReferenceScopeKey();
     if (!composerReferenceScopeKey) {
       composerReferenceScopeKey = nextScopeKey;
       return;
     }
     if (nextScopeKey === composerReferenceScopeKey) return;
+
+    // InputArea 在会话切换时不会销毁。先归档旧作用域的草稿，再清空当前渲染状态，
+    // 避免新会话继承旧会话的图片、标记或文本，同时保留用户尚未发送的输入。
+    const previousScopeKey = composerReferenceScopeKey;
+    if (composerHasDraft()) {
+      scopedComposerDrafts.set(previousScopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
+    } else {
+      scopedComposerDrafts.delete(previousScopeKey);
+    }
+
     composerReferenceScopeKey = nextScopeKey;
+    clearComposerState({ preserveScopedDraft: true });
+    const scopedDraft = scopedComposerDrafts.get(nextScopeKey);
+    if (scopedDraft) {
+      restoreComposerSubmissionDraft(scopedDraft);
+    }
     invalidateEnhanceState();
-    selectedGoalMode = false;
-    selectedSkill = null;
-    selectedContextReferences = [];
-    selectedBrowserAnnotations = [];
-    selectedBrowserNodeSelections = [];
     addMenuOpen = false;
     contextPickerOpen = false;
     closeSlashMenu();
@@ -426,7 +450,10 @@
     });
   });
 
-  function clearComposerState() {
+  function clearComposerState(options: { preserveScopedDraft?: boolean } = {}) {
+    if (!options.preserveScopedDraft && composerReferenceScopeKey) {
+      scopedComposerDrafts.delete(composerReferenceScopeKey);
+    }
     inputValue = '';
     selectedImages = [];
     selectedContextReferences = [];
@@ -438,6 +465,18 @@
     contextPickerOpen = false;
     invalidateEnhanceState();
     closeSlashMenu();
+  }
+
+  function composerHasDraft(): boolean {
+    return Boolean(
+      inputValue.trim()
+      || selectedImages.length > 0
+      || selectedContextReferences.length > 0
+      || selectedBrowserAnnotations.length > 0
+      || selectedBrowserNodeSelections.length > 0
+      || selectedGoalMode
+      || selectedSkill,
+    );
   }
 
   function currentBrowserTabIdentity(): { browserSessionId: string; tabId: string } | null {
@@ -1162,8 +1201,9 @@
     writeStoredAccessProfile(profile);
   }
 
-  function workspaceBindingPath(workspace: ComposerWorkspaceOption): string {
-    return workspace.rootPathRef?.trim() || workspace.rootPath.trim();
+  function workspaceNavigationPath(workspace: ComposerWorkspaceOption): string {
+    // 会话和消息归属使用真实工作区路径，路径引用仅用于文件系统 API。
+    return workspace.rootPath.trim();
   }
 
   function composerWorkspaceLabel(workspace: ComposerWorkspaceOption | null): string {
@@ -1198,7 +1238,7 @@
       kind: 'draft',
       scope: 'workspace',
       workspaceId: workspace.workspaceId,
-      workspacePath: workspaceBindingPath(workspace),
+      workspacePath: workspaceNavigationPath(workspace),
     });
   }
 
@@ -1481,7 +1521,7 @@
         text: submissionText,
         requestId,
         workspaceId: targetWorkspace?.workspaceId || '',
-        workspacePath: targetWorkspace ? workspaceBindingPath(targetWorkspace) : '',
+        workspacePath: targetWorkspace ? workspaceNavigationPath(targetWorkspace) : '',
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,

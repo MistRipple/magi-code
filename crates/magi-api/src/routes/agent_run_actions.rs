@@ -374,10 +374,10 @@ async fn restart_task(
     let manager = state
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("重新执行失败", "runner_manager 未配置"))?;
-    // Restart 与 Continue 使用相同的锁顺序：session 生命周期锁 → root restart 锁。
-    // 旧 runner 必须在创建新执行链前完全退出，避免两条执行链并存。
-    let _session_turn_guard = state.lock_session_turn(&session_id).await;
-    let _session_lifecycle_guard = manager.lock_session_lifecycle(&session_id).await;
+    // Restart 与 Continue 使用相同的锁顺序：navigation -> session Turn -> Runner
+    // lifecycle -> root restart。旧 runner 必须在创建新执行链前完全退出，避免两条
+    // 执行链并存，也避免与删除/关闭形成锁反转。
+    let _session_lifecycle_guard = state.lock_session_lifecycle(&session_id).await;
     let _restart_guard = manager
         .lock_for_restart(requested_root_task.task_id.as_str())
         .await;

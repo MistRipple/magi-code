@@ -24,6 +24,16 @@ pub struct CanonicalTurnMutation {
     pub next: CanonicalTurn,
 }
 
+/// Session 生命周期 mutation 事务的失败类型。
+///
+/// durable projection 写入失败时，SessionStore 不提交候选状态，因此调用方可以安全地
+/// 保留原会话并向用户返回错误；只有 projection 成功后才会提交内存状态和生命周期事件。
+#[derive(Debug)]
+pub enum SessionMutationTransactionError<E> {
+    Domain(DomainError),
+    Persistence(E),
+}
+
 pub trait CanonicalTurnEventWriter: Send + Sync {
     fn append_canonical_turn_transaction(
         &self,
@@ -201,6 +211,104 @@ pub(crate) fn cmp_sessions_newest_first(
         .then_with(|| right.session_id.as_str().cmp(left.session_id.as_str()))
 }
 
+fn prepare_session_deletion(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    replacement_session_id: Option<&SessionId>,
+) -> DomainResult<bool> {
+    let target = state
+        .sessions
+        .iter()
+        .find(|session| &session.session_id == session_id)
+        .ok_or(DomainError::NotFound { entity: "session" })?
+        .clone();
+    let deleting_current = state.current_session_id.as_ref() == Some(session_id);
+
+    if !deleting_current && replacement_session_id.is_some() {
+        return Err(DomainError::InvalidState {
+            message: format!("删除非 current 会话时不能改写 current: {session_id}"),
+        });
+    }
+    if let Some(replacement_id) = replacement_session_id {
+        if replacement_id == session_id {
+            return Err(DomainError::InvalidState {
+                message: "删除会话的替代 current 不能指向被删除会话".to_string(),
+            });
+        }
+        let replacement = state
+            .sessions
+            .iter()
+            .find(|session| &session.session_id == replacement_id)
+            .ok_or(DomainError::NotFound {
+                entity: "replacement session",
+            })?;
+        if replacement.workspace_id != target.workspace_id {
+            return Err(DomainError::InvalidState {
+                message: "删除会话的替代 current 必须属于同一 workspace".to_string(),
+            });
+        }
+    }
+
+    state
+        .sessions
+        .retain(|session| &session.session_id != session_id);
+    state
+        .timeline
+        .retain(|entry| &entry.session_id != session_id);
+    state
+        .notifications
+        .retain(|notification| notification.session_id.as_ref() != Some(session_id));
+    state
+        .canonical_turns
+        .retain(|turn| &turn.session_id != session_id);
+    state.goals.retain(|goal| &goal.session_id != session_id);
+    state.plans.retain(|plan| &plan.session_id != session_id);
+    state
+        .thread_registry
+        .retain(|thread| &thread.session_id != session_id);
+    let removed_sidecar = state
+        .execution_sidecar_store
+        .runtime_sidecar(session_id)
+        .is_some();
+    state
+        .execution_sidecar_store
+        .remove_runtime_sidecar(session_id);
+    if deleting_current {
+        state.current_session_id = replacement_session_id.cloned();
+    }
+    Ok(removed_sidecar)
+}
+
+fn prepare_session_rename(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    new_title: &str,
+) -> DomainResult<Option<SessionRecord>> {
+    let session = state
+        .sessions
+        .iter_mut()
+        .find(|session| &session.session_id == session_id)
+        .ok_or(DomainError::NotFound { entity: "session" })?;
+    if session.title == new_title {
+        return Ok(None);
+    }
+    session.title = new_title.to_string();
+    session.updated_at = UtcMillis::now();
+    let updated = session.clone();
+    let entry_id = unique_timeline_entry_id(
+        &state.timeline,
+        format!("timeline-session-renamed-{session_id}"),
+    );
+    state.timeline.push(TimelineEntry {
+        entry_id,
+        session_id: session_id.clone(),
+        kind: TimelineEntryKind::SessionRenamed,
+        message: format!("会话已重命名: {new_title}"),
+        occurred_at: updated.updated_at,
+    });
+    Ok(Some(updated))
+}
+
 impl Default for SessionStore {
     fn default() -> Self {
         Self {
@@ -245,11 +353,11 @@ impl SessionStore {
         Ok(Self::from_state(state))
     }
 
-    pub fn advance_sidecar_projection_from_canonical(
+    pub fn rebuild_sidecar_projection_from_canonical(
         sidecar: &mut crate::models::SessionRuntimeSidecar,
         canonical_turns: &[CanonicalTurn],
     ) -> DomainResult<()> {
-        sidecar::advance_sidecar_projection_from_canonical(sidecar, canonical_turns)
+        sidecar::rebuild_sidecar_projection_from_canonical(sidecar, canonical_turns)
     }
 
     /// 一次性 v1 -> v2 转换。旧 timeline/sidecar 兼容只允许存在于此边界。
@@ -319,6 +427,12 @@ impl SessionStore {
         &self,
         records: impl IntoIterator<Item = SessionAcceptanceRecord>,
     ) -> DomainResult<usize> {
+        // 所有 canonical 事实提交都先取得这把锁，再取得 state 锁。
+        // 恢复也必须遵守同一顺序，避免 state -> canonical 与 canonical -> state 互相等待。
+        let _canonical_guard = self
+            .canonical_commit_lock
+            .lock()
+            .expect("canonical commit lock poisoned");
         let mut state = self
             .state
             .write()
@@ -490,6 +604,14 @@ impl SessionStore {
             .durable_persistence_lock
             .lock()
             .expect("session durable persistence lock poisoned");
+        // canonical event writer 会先更新事件缓存，再提交内存 projection。
+        // 如果只持有 state 读锁，写入事件与内存提交之间的窗口会让持久化回调
+        // 同时看到旧 canonical 和新 event，产生无法解释的投影冲突。把完整
+        // snapshot 事务置于 canonical commit lock 之下，保证两者使用同一代事实。
+        let _canonical_guard = self
+            .canonical_commit_lock
+            .lock()
+            .expect("session canonical commit lock poisoned");
         let mut persist = persist;
         let state = self.state.read().expect("session state read lock poisoned");
         let durable = state.durable_state();
@@ -663,32 +785,55 @@ impl SessionStore {
         title: impl Into<String>,
     ) -> DomainResult<SessionRecord> {
         let new_title = normalize_session_title(title.into())?;
+        self.rename_session_with_persistence(session_id, new_title, |_, _| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|error| match error {
+            SessionMutationTransactionError::Domain(error) => error,
+            SessionMutationTransactionError::Persistence(error) => match error {},
+        })
+    }
+
+    /// 在 durable projection 成功后提交 session 标题和重命名 timeline 事件。
+    ///
+    /// 候选状态在 state 写锁覆盖期间生成、持久化并提交，避免重命名后刷新时出现旧标题
+    /// 覆盖新标题，或事件已经发布但 durable projection 仍是旧版本。
+    pub fn rename_session_with_persistence<E>(
+        &self,
+        session_id: &SessionId,
+        title: impl Into<String>,
+        persist: impl FnOnce(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<(), E>,
+    ) -> Result<SessionRecord, SessionMutationTransactionError<E>> {
+        let new_title = normalize_session_title(title.into())
+            .map_err(SessionMutationTransactionError::Domain)?;
+        let _persistence_guard = self
+            .durable_persistence_lock
+            .lock()
+            .expect("session durable persistence lock poisoned");
+        let _canonical_guard = self
+            .canonical_commit_lock
+            .lock()
+            .expect("session canonical commit lock poisoned");
         let mut state = self
             .state
             .write()
             .expect("session state write lock poisoned");
-        let session = state
-            .sessions
-            .iter_mut()
-            .find(|session| &session.session_id == session_id)
-            .ok_or(DomainError::NotFound { entity: "session" })?;
-        if session.title == new_title {
-            return Ok(session.clone());
-        }
-        session.title = new_title.clone();
-        session.updated_at = UtcMillis::now();
-        let updated = session.clone();
-        let entry_id = unique_timeline_entry_id(
-            &state.timeline,
-            format!("timeline-session-renamed-{}", session_id),
-        );
-        state.timeline.push(TimelineEntry {
-            entry_id,
-            session_id: session_id.clone(),
-            kind: TimelineEntryKind::SessionRenamed,
-            message: format!("会话已重命名: {}", new_title),
-            occurred_at: updated.updated_at,
-        });
+        let mut candidate = state.clone();
+        let Some(updated) = prepare_session_rename(&mut candidate, session_id, &new_title)
+            .map_err(SessionMutationTransactionError::Domain)?
+        else {
+            return candidate
+                .sessions
+                .into_iter()
+                .find(|session| &session.session_id == session_id)
+                .ok_or(SessionMutationTransactionError::Domain(
+                    DomainError::NotFound { entity: "session" },
+                ));
+        };
+        let durable = candidate.durable_state();
+        let sidecars = candidate.execution_sidecar_store.clone();
+        persist(&durable, &sidecars).map_err(SessionMutationTransactionError::Persistence)?;
+        *state = candidate;
         Ok(updated)
     }
 
@@ -727,46 +872,38 @@ impl SessionStore {
         Ok(archived)
     }
 
-    pub fn delete_session(&self, session_id: &SessionId) -> DomainResult<()> {
+    /// 删除 session 的唯一状态提交入口。
+    ///
+    /// 调用方必须在生命周期锁内先完成运行资源的收口，再把预先确定的替代 current
+    /// 传入。这里持有 durable、canonical 和 state 写锁直到 projection 回调结束，
+    /// 所以回调失败时不会出现“磁盘已删、内存仍在”或“内存已删、磁盘仍在”的分歧。
+    pub fn delete_session_with_persistence<E>(
+        &self,
+        session_id: &SessionId,
+        replacement_session_id: Option<&SessionId>,
+        persist: impl FnOnce(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<(), E>,
+    ) -> Result<(), SessionMutationTransactionError<E>> {
+        let _persistence_guard = self
+            .durable_persistence_lock
+            .lock()
+            .expect("session durable persistence lock poisoned");
+        let _canonical_guard = self
+            .canonical_commit_lock
+            .lock()
+            .expect("session canonical commit lock poisoned");
         let mut state = self
             .state
             .write()
             .expect("session state write lock poisoned");
-        let before_len = state.sessions.len();
-        state
-            .sessions
-            .retain(|session| &session.session_id != session_id);
-        if state.sessions.len() == before_len {
-            return Err(DomainError::NotFound { entity: "session" });
-        }
-        state
-            .timeline
-            .retain(|entry| &entry.session_id != session_id);
-        state
-            .notifications
-            .retain(|notification| notification.session_id.as_ref() != Some(session_id));
-        state
-            .canonical_turns
-            .retain(|turn| &turn.session_id != session_id);
-        state.goals.retain(|goal| &goal.session_id != session_id);
-        state.plans.retain(|plan| &plan.session_id != session_id);
-        state
-            .thread_registry
-            .retain(|thread| &thread.session_id != session_id);
-        let removed_sidecar = state
-            .execution_sidecar_store
-            .runtime_sidecar(session_id)
-            .is_some();
-        state
-            .execution_sidecar_store
-            .remove_runtime_sidecar(session_id);
-        if state.current_session_id.as_ref() == Some(session_id) {
-            state.current_session_id = state
-                .sessions
-                .iter()
-                .map(|session| session.session_id.clone())
-                .min_by(|left, right| left.as_str().cmp(right.as_str()));
-        }
+        let mut candidate = state.clone();
+        let removed_sidecar =
+            prepare_session_deletion(&mut candidate, session_id, replacement_session_id)
+                .map_err(SessionMutationTransactionError::Domain)?;
+        let durable = candidate.durable_state();
+        let sidecars = candidate.execution_sidecar_store.clone();
+        persist(&durable, &sidecars).map_err(SessionMutationTransactionError::Persistence)?;
+
+        *state = candidate;
         drop(state);
         if removed_sidecar {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::DeleteSession);
@@ -775,6 +912,31 @@ impl SessionStore {
             observer.on_session_deleted(session_id);
         }
         Ok(())
+    }
+
+    /// 仅供不接入 durable repository 的领域级调用方使用。生产 API 删除路径必须调用
+    /// `delete_session_with_persistence`，并传入真正的 projection 持久化回调。
+    pub fn delete_session(&self, session_id: &SessionId) -> DomainResult<()> {
+        let replacement = {
+            let state = self.state.read().expect("session state read lock poisoned");
+            if state.current_session_id.as_ref() != Some(session_id) {
+                None
+            } else {
+                state
+                    .sessions
+                    .iter()
+                    .filter(|session| &session.session_id != session_id)
+                    .max_by(|left, right| cmp_sessions_newest_first(left, right))
+                    .map(|session| session.session_id.clone())
+            }
+        };
+        self.delete_session_with_persistence(session_id, replacement.as_ref(), |_, _| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|error| match error {
+            SessionMutationTransactionError::Domain(error) => error,
+            SessionMutationTransactionError::Persistence(error) => match error {},
+        })
     }
 
     pub fn upsert_plan(

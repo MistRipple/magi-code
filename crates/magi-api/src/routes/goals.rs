@@ -170,7 +170,7 @@ async fn update_current_goal(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let _session_turn_guard = state.lock_session_turn(&scope.session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
     let goal = state
         .session_store
         .update_goal_objective_if_revision(
@@ -204,7 +204,7 @@ async fn pause_current_goal(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let _session_turn_guard = state.lock_session_turn(&scope.session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
     let execution_to_interrupt = goal_execution_to_interrupt(
         &state,
         &scope.session_id,
@@ -294,7 +294,7 @@ async fn resume_current_goal(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let _session_turn_guard = state.lock_session_turn(&scope.session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
     let current = state
         .session_store
         .current_goal(&scope.session_id)
@@ -345,7 +345,7 @@ async fn resume_current_goal(
             .ensure_current_turn_acceptance_available(&scope.session_id)
             .is_ok();
     if can_start_now
-        && let Err(error) = super::sessions::resume_active_goal_continuation_turn(
+        && let Err(error) = super::sessions::resume_active_goal_continuation_turn_after_turn_commit(
             state.clone(),
             scope.session_id.clone(),
             scope.workspace_id(),
@@ -390,7 +390,7 @@ async fn clear_current_goal(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let _session_turn_guard = state.lock_session_turn(&scope.session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
     let (_cleared_goal, cleared_plan) = state
         .session_store
         .clear_goal_with_plan(
@@ -419,7 +419,7 @@ async fn clear_current_plan(
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let _session_turn_guard = state.lock_session_turn(&scope.session_id).await;
+    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
     let plan_store =
         magi_plan::PlanStore::new(state.session_store.clone(), scope.session_id.clone());
     let cleared_plan = plan_store.snapshot();
