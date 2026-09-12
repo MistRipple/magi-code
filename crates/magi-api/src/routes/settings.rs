@@ -1839,6 +1839,68 @@ async fn delete_role(
     })))
 }
 
+fn generated_role_id_seed(value: &str) -> String {
+    let mut slug = String::new();
+    let mut separator_pending = false;
+    for character in value.trim().chars() {
+        let character = character.to_ascii_lowercase();
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            if separator_pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            separator_pending = false;
+            slug.push(character);
+        } else {
+            separator_pending = true;
+        }
+    }
+    let slug = slug.chars().take(48).collect::<String>();
+    if slug.is_empty() {
+        "custom-role".to_string()
+    } else {
+        slug.trim_end_matches('-').to_string()
+    }
+}
+
+fn generated_import_role_id(
+    registry: &magi_agent_role::AgentRoleRegistry,
+    role: &magi_agent_role::AgentRole,
+) -> String {
+    let source = if magi_agent_role::validate_role_id(role.id.trim()).is_ok() {
+        role.id.trim()
+    } else {
+        role.display_name.trim()
+    };
+    let base = generated_role_id_seed(source);
+    let copy_suffix = "-copy";
+    let copy_prefix = base
+        .chars()
+        .take(64 - copy_suffix.len())
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+    let copy_base = format!("{copy_prefix}{copy_suffix}");
+    if !registry.contains(&copy_base) {
+        return copy_base;
+    }
+
+    let mut suffix = 2u64;
+    loop {
+        let suffix_text = format!("-{suffix}");
+        let prefix = copy_base
+            .chars()
+            .take(64 - suffix_text.len())
+            .collect::<String>()
+            .trim_end_matches('-')
+            .to_string();
+        let candidate = format!("{prefix}{suffix_text}");
+        if !registry.contains(&candidate) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
 async fn import_role(
     State(state): State<ApiState>,
     Json(request): Json<Value>,
@@ -1873,13 +1935,11 @@ async fn import_role(
             "conflict 只支持 reject、overwrite、rename".to_string(),
         ));
     }
-    let new_id =
-        strict_optional_string_field(&request, &["newId", "new_id"], "newId")?.unwrap_or_default();
+    let new_id = strict_optional_string_field(&request, &["newId", "new_id"], "newId")?;
     if conflict == "rename" {
-        if new_id.is_empty() {
-            return Err(ApiError::InvalidInput("另存为需要提供 newId".to_string()));
-        }
-        role.id = new_id;
+        role.id = new_id
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| generated_import_role_id(&state.agent_role_registry, &role));
         role.role_revision = 1;
     }
     let expected = if conflict == "overwrite" {
@@ -4121,6 +4181,21 @@ mod tests {
         .expect("另存为导入应成功");
         assert_eq!(renamed.0["role"]["templateId"], json!("round-trip-copy"));
         assert!(state.agent_role_registry.contains("round-trip-copy"));
+
+        let auto_renamed = import_role(
+            State(state.clone()),
+            Json(json!({
+                "content": content,
+                "conflict": "rename"
+            })),
+        )
+        .await
+        .expect("未指定 newId 时应自动另存为");
+        assert_eq!(
+            auto_renamed.0["role"]["templateId"],
+            json!("round-trip-copy-2")
+        );
+        assert!(state.agent_role_registry.contains("round-trip-copy-2"));
     }
 
     #[tokio::test]

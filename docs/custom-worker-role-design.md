@@ -41,7 +41,7 @@ Magi 是面向软件开发工作的本地多代理协作环境。主 Agent 负�
 
 继续使用现有 `RoleTemplate`/`AgentRole` 语义。实现中的 `AgentRole` 就是后端规范化角色对象，承担唯一角色定义真相源；没有再引入一套并行的 `RoleDefinition` 结构。内置 Markdown 资产和用户 Markdown 都解析为 `AgentRole`，API 从它生成展示 DTO，Worker 目录从它生成调度信息。规范对象至少包含：
 
-- `templateId`：API 使用的全局唯一稳定 ID；对象内部字段名为 `id`；
+- `templateId`：API 使用的全局唯一稳定 ID；对象内部字段名为 `id`。它是系统内部标识，不作为新建表单的用户输入项；创建时由显示名称自动生成，复制和冲突导入时由系统生成唯一副本 ID；
 - `displayName`、`description`；
 - `systemPrompt`；
 - `role`、`focus`、`constraints`、`output_preferences`；API DTO 映射为 `profile.role`、`profile.focus`、`profile.constraints`、`profile.outputPreferences`；
@@ -140,7 +140,9 @@ Worker 报告回传主 Agent
 - 用轻量来源标识区分“系统内置”和“我的角色”；
 - 内置角色可查看和绑定引擎，不可删除；
 - 用户角色可创建、编辑、复制、删除、导入和导出；
-- 创建时复用当前详情页字段，不要求用户填写底层 JSON；
+- 新建和编辑直接占用设置面板的角色工作区，不使用额外弹出层；表单提供返回角色列表的入口；
+- 创建时复用当前详情页字段，不要求用户填写底层 JSON 或角色 ID；显示名称保存时自动生成合法且唯一的内部 ID，中文或无法转写为 ASCII 的名称使用 `custom-role` 系列 ID；
+- 编辑已有角色时保持其内部 ID 不变，避免已有绑定、任务记录和导出文件失效；复制角色时自动生成 `-copy`、`-copy-2` 等唯一 ID；
 - 新建角色默认继承主模型、使用安全的可派发 Worker 设置；
 - 保存后立即出现在角色列表，并可被主 Agent 选择。
 
@@ -162,7 +164,7 @@ Worker 报告回传主 Agent
 
 ### 7.2 导入
 
-导入必须由后端完成解析和校验。当前 UI 先以 `reject` 策略提交，后端发现用户角色 ID 冲突后返回 409，设置页再让用户选择覆盖或另存为；无论从哪条入口提交，最终写盘前都必须再次经过同一套校验。
+导入必须由后端完成解析和校验。当前 UI 先以 `reject` 策略提交，后端发现用户角色 ID 冲突后返回 409，设置页再让用户选择覆盖或自动另存为；无论从哪条入口提交，最终写盘前都必须再次经过同一套校验。用户不需要填写新 ID；`rename` 未提供 `newId` 时，后端以原角色 ID 生成唯一的 `-copy`、`-copy-2` 等副本 ID。API 仍接受合法的显式 `newId`，用于脚本和已有集成。
 
 1. 读取 Markdown 并校验 schema 版本；
 2. 校验 ID、字段长度、枚举和必填字段；
@@ -206,7 +208,7 @@ API 不允许通过用户输入修改内置角色定义，也不允许导入凭�
 - 使用 API 返回的统一角色列表；
 - 展示来源和管理操作；
 - 创建/编辑表单提交角色定义；
-- 导入先提交后端校验，冲突返回 409 后展示覆盖或另存为选择；
+- 导入先提交后端校验，冲突返回 409 后展示覆盖或自动另存为选择；
 - 导出通过后端生成的 Markdown 文件下载；
 - 保存、导入、删除后刷新 bootstrap/registry 数据。
 
@@ -217,7 +219,7 @@ API 不允许通过用户输入修改内置角色定义，也不允许导入凭�
 | `GET` | `/settings/registry/role-templates` | 无 | `{ templates }`，只返回可派发的 builtin/user 角色；每项包含 `source`、`editable`、`deletable`、`roleRevision` |
 | `POST` | `/settings/registry/roles/upsert` | `{ role, expectedRoleRevision? }` | `{ role, registryRevision, agents }`；无 revision 表示创建，有 revision 表示基于当前版本编辑 |
 | `POST` | `/settings/registry/roles/delete` | `{ templateId, expectedRoleRevision }` | `{ deleted, registryRevision, templates, agents }`；删除前检查活动 Worker 并清理该角色 binding |
-| `POST` | `/settings/registry/roles/import` | `{ content, conflict: reject\|overwrite\|rename, newId? }` | 与 upsert 相同；`overwrite` 只允许用户角色，`rename` 必须给出合法 `newId` |
+| `POST` | `/settings/registry/roles/import` | `{ content, conflict: reject\|overwrite\|rename, newId? }` | 与 upsert 相同；`overwrite` 只允许覆盖已存在的用户角色；`rename` 默认自动生成唯一副本 ID，也可提供合法 `newId` |
 | `GET` | `/settings/registry/roles/export?templateId=<id>` | 角色 ID | `{ templateId, fileName, content, registryRevision }`；`content` 是 schema v1 Markdown |
 | `GET` | `/settings/registry/agents` | 无 | `{ agents }`；每个角色都有 binding，`engineId: ""` 表示继承编排模型 |
 | `POST` | `/settings/registry/agents/upsert` | 顶层 `{ templateId, engineId, ... }` | `{ agents }`；非空 `engineId` 必须已存在于 engines registry |
@@ -239,7 +241,7 @@ API 不允许通过用户输入修改内置角色定义，也不允许导入凭�
 
 - 角色写入采用原子替换；reload 失败时保留上一个有效快照并明确提示。
 - Worker 启动时固定角色快照，编辑不会影响运行中的 Worker。
-- 创建默认继承主模型，导入先由后端校验，冲突明确提供覆盖、另存为或取消。
+- 创建默认继承主模型，导入先由后端校验，冲突明确提供覆盖、自动另存为或取消。
 - 内置角色的 ID、提示词、能力、排序和默认行为保持不变。
 - 当前只接受 schema version `1`；未知版本明确拒绝并保留现有有效快照。未来升级必须提供一次性迁移后再提升 `CURRENT_ROLE_SCHEMA_VERSION`，运行时不长期保留双格式或双字段语义。
 - 常用操作不依赖手动改文件或重启 daemon。
@@ -252,6 +254,7 @@ API 不允许通过用户输入修改内置角色定义，也不允许导入凭�
 - 主 Agent 的可派发角色列表包含自定义角色；
 - 主 Agent 能把任务分配给自定义角色，Worker 能完成执行并回传报告；
 - 自定义角色可以编辑、删除和复制；
+- 新建角色不要求输入角色 ID，系统根据显示名称生成稳定且唯一的内部 ID；
 - 导出的文件可被另一实例导入；
 - 导入后角色的 prompt、能力和展示信息保持一致；
 - 导入不会写入或导出 API Key、工作区路径和运行记录；
@@ -299,7 +302,7 @@ API 不允许通过用户输入修改内置角色定义，也不允许导入凭�
 
 ### 13.6 产品验收场景
 
-必须验证：创建后无需重启即可出现在设置页和后续任务分配；绑定指定 Engine 后 Worker 按该 binding 解析模型；编辑只影响后续新建 Runner；导出后在干净目录导入仍可执行；同 ID 导入支持拒绝、覆盖和另存为；非法能力、非法 ID 和协调器角色被拒绝；活动 Worker 使用时删除被阻止；删除中途故障可由启动恢复；并发编辑不会互相覆盖；导出内容不含敏感信息。
+必须验证：创建后无需重启即可出现在设置页和后续任务分配；新建表单不显示角色 ID 输入项且保存后生成合法唯一 ID；绑定指定 Engine 后 Worker 按该 binding 解析模型；编辑只影响后续新建 Runner；导出后在干净目录导入仍可执行；同 ID 导入支持拒绝、覆盖和自动另存为；非法能力、非法 ID 和协调器角色被拒绝；活动 Worker 使用时删除被阻止；删除中途故障可由启动恢复；并发编辑不会互相覆盖；导出内容不含敏感信息。
 
 ### 13.7 热更新必须覆盖所有持有者
 

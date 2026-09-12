@@ -160,7 +160,9 @@
   let editorError = $state('');
   let editorBusy = $state(false);
   let draft = $state<RoleDraft>(emptyDraft());
-  let importInput: HTMLInputElement;
+  let importInput = $state<HTMLInputElement | undefined>(undefined);
+  let agentsScrollPanel = $state<HTMLDivElement | undefined>(undefined);
+  let roleEditorDisplayNameInput = $state<HTMLInputElement | undefined>(undefined);
 
   function emptyDraft(): RoleDraft {
     return {
@@ -183,9 +185,41 @@
     return values.join('\n');
   }
 
+  /**
+   * 角色 ID 是系统内部稳定标识，由显示名称或复制来源自动生成。
+   * 只保留后端允许的 ASCII 形式；中文名称等无法转写为 ASCII 时使用通用前缀。
+   */
+  function roleIdBase(value: string): string {
+    return value
+      .trim()
+      .normalize('NFKD')
+      .toLowerCase()
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .replace(/-{2,}/g, '-')
+      .slice(0, 48)
+      .replace(/-+$/g, '') || 'custom-role';
+  }
+
+  function uniqueRoleId(seed: string): string {
+    const base = roleIdBase(seed);
+    const occupied = new Set(roleTemplates.map((template: RoleTemplate) => template.templateId));
+    if (!occupied.has(base)) return base;
+
+    let suffix = 2;
+    while (true) {
+      const suffixText = `-${suffix}`;
+      const prefix = base.slice(0, Math.max(1, 64 - suffixText.length)).replace(/-+$/g, '') || 'role';
+      const candidate = `${prefix}${suffixText}`;
+      if (!occupied.has(candidate)) return candidate;
+      suffix += 1;
+    }
+  }
+
   function draftFromTemplate(template: RoleTemplate, copy = false): RoleDraft {
     return {
-      id: copy ? `${template.templateId}-copy` : template.templateId,
+      id: copy ? uniqueRoleId(`${template.templateId}-copy`) : template.templateId,
       displayName: copy ? `${template.displayName} 副本` : template.displayName,
       description: template.description,
       positioning: template.profile.role,
@@ -233,11 +267,24 @@
 
   async function submitRole() {
     editorError = '';
+    const displayName = draft.displayName.trim();
+    const systemPrompt = draft.systemPrompt.trim();
+    if (!displayName || !systemPrompt) {
+      editorError = '请填写显示名称和系统提示词';
+      return;
+    }
+    const roleId = editorMode === 'edit'
+      ? draft.id.trim()
+      : uniqueRoleId(draft.id || displayName);
+    if (!roleId) {
+      editorError = '角色配置无效，请返回后重试';
+      return;
+    }
     const payload: Record<string, unknown> = {
-      id: draft.id.trim(),
-      displayName: draft.displayName.trim(),
+      id: roleId,
+      displayName,
       description: draft.description.trim(),
-      systemPrompt: draft.systemPrompt.trim(),
+      systemPrompt,
       supportedKinds: ['local_agent'],
       parallelismLimit: draft.parallelismLimit.trim() ? Number(draft.parallelismLimit.trim()) : null,
       coordinatorMode: false,
@@ -251,12 +298,8 @@
       ownerships: splitLines(draft.ownerships),
       insightPreferences: draft.insights,
       capabilities: draft.capabilities,
-      defaultUI: { colorToken: `agent-${draft.id.trim()}`, icon: 'bot' },
+      defaultUI: { colorToken: `agent-${roleId}`, icon: 'bot' },
     };
-    if (!payload.id || !payload.displayName || !payload.systemPrompt) {
-      editorError = '请填写角色 ID、显示名称和系统提示词';
-      return;
-    }
     if (draft.parallelismLimit.trim()) {
       const parallelismLimit = Number(draft.parallelismLimit.trim());
       if (!Number.isSafeInteger(parallelismLimit) || parallelismLimit <= 0) {
@@ -307,9 +350,8 @@
       }
       const message = error instanceof Error ? error.message : '角色导入失败';
       try {
-        if (!window.confirm(`${message}\n\n点击“确定”覆盖已有用户角色，点击“取消”尝试另存为。`)) {
-          const newId = window.prompt('请输入新的角色 ID（小写字母、数字和连字符）：');
-          if (newId?.trim()) await importRole(content, 'rename', newId.trim());
+        if (!window.confirm(`${message}\n\n点击“确定”覆盖已有用户角色，点击“取消”自动另存为新角色。`)) {
+          await importRole(content, 'rename');
         } else {
           await importRole(content, 'overwrite');
         }
@@ -335,6 +377,14 @@
     if (selectedKey === null || !atoms.some((a: RoleAtom) => a.template.templateId === selectedKey)) {
       selectedKey = atoms[0].template.templateId;
     }
+  });
+
+  $effect(() => {
+    if (!editorOpen) return;
+    requestAnimationFrame(() => {
+      agentsScrollPanel?.scrollTo({ top: 0, behavior: 'auto' });
+      roleEditorDisplayNameInput?.focus();
+    });
   });
 
   const selected = $derived<RoleAtom | null>(
@@ -398,248 +448,262 @@
 </script>
 
 <div class="settings-tab-inner scroll-proxy">
-  <div class="agents-scroll-panel settings-scroll-panel">
-    <div class="agents-toolbar">
-      <div>
-        <div class="toolbar-title">子代理角色</div>
-        <div class="toolbar-description">内置角色和我的角色共用同一套 Worker 调度能力</div>
-      </div>
-      <div class="toolbar-actions">
-        <button type="button" class="toolbar-button" onclick={chooseImportFile}>导入角色</button>
-        <button type="button" class="toolbar-button primary" onclick={openCreateRole}>新建角色</button>
+  <div class="agents-scroll-panel settings-scroll-panel" bind:this={agentsScrollPanel}>
+    {#if !editorOpen}
+      <div class="agents-toolbar">
+        <div>
+          <div class="toolbar-title">子代理角色</div>
+          <div class="toolbar-description">内置角色和我的角色共用同一套 Worker 调度能力</div>
+        </div>
+        <div class="toolbar-actions">
+          <button type="button" class="toolbar-button" onclick={chooseImportFile}>导入角色</button>
+          <button type="button" class="toolbar-button primary" onclick={openCreateRole}>新建角色</button>
+        </div>
         <input bind:this={importInput} class="visually-hidden" type="file" accept=".md,text/markdown" onchange={handleImportFile} />
       </div>
-    </div>
-    <div class="agents-shell">
-      <div class="agents-tabbar" role="tablist" aria-label={i18n.t('settings.agents.listTitle')}>
-        <div class="tabbar-track">
-          {#each atoms as atom, idx (atom.template.templateId)}
-            {@const isSelected = atom.template.templateId === selectedKey}
-            <button
-              type="button"
-              class="role-tab"
-              class:active={isSelected}
-              role="tab"
-              id="agent-tab-{atom.template.templateId}"
-              aria-selected={isSelected}
-              aria-controls="agent-tabpanel"
-              tabindex={isSelected ? 0 : -1}
-              onclick={() => (selectedKey = atom.template.templateId)}
-              onkeydown={(e) => onTabKeydown(e, idx)}
-            >
-              <span class="role-tab-avatar" style="background: {atom.muted}; color: {atom.color}" aria-hidden="true">
-                <Icon name="bot" size={11} />
-              </span>
-              <span class="role-tab-copy">
-                <span class="role-tab-name">{atom.displayName}</span>
-                <span class="role-tab-subtitle">{statusTooltip(atom.status)}</span>
-              </span>
-              <span
-                class="role-tab-status status-{atom.status}"
-                title={statusTooltip(atom.status)}
-                aria-label={statusTooltip(atom.status)}
-              ></span>
-            </button>
-          {/each}
+    {/if}
+    <div class="agents-shell" class:editing={editorOpen}>
+      {#if !editorOpen}
+        <div class="agents-tabbar" role="tablist" aria-label={i18n.t('settings.agents.listTitle')}>
+          <div class="tabbar-track">
+            {#each atoms as atom, idx (atom.template.templateId)}
+              {@const isSelected = atom.template.templateId === selectedKey}
+              <button
+                type="button"
+                class="role-tab"
+                class:active={isSelected}
+                role="tab"
+                id="agent-tab-{atom.template.templateId}"
+                aria-selected={isSelected}
+                aria-controls="agent-tabpanel"
+                tabindex={isSelected ? 0 : -1}
+                onclick={() => (selectedKey = atom.template.templateId)}
+                onkeydown={(e) => onTabKeydown(e, idx)}
+              >
+                <span class="role-tab-avatar" style="background: {atom.muted}; color: {atom.color}" aria-hidden="true">
+                  <Icon name="bot" size={11} />
+                </span>
+                <span class="role-tab-copy">
+                  <span class="role-tab-name">{atom.displayName}</span>
+                  <span class="role-tab-subtitle">{statusTooltip(atom.status)}</span>
+                </span>
+                <span
+                  class="role-tab-status status-{atom.status}"
+                  title={statusTooltip(atom.status)}
+                  aria-label={statusTooltip(atom.status)}
+                ></span>
+              </button>
+            {/each}
+          </div>
         </div>
-      </div>
+      {/if}
 
       <div class="agents-content">
-        <div
-          id="agent-tabpanel"
-          class="agents-detail"
-          role="tabpanel"
-          aria-labelledby={selected ? `agent-tab-${selected.template.templateId}` : undefined}
-        >
-          {#if !selected}
-            <div class="detail-empty">{i18n.t('settings.agents.detailEmpty')}</div>
-          {:else}
-            {@const tmpl = selected.template}
-            {@const positioning = resolveLocalizedRolePositioning(tmpl)}
-
-            <div class="detail-layout">
-              <div class="detail-primary">
-                <header class="detail-header">
-                  <div class="detail-avatar" style="background: {selected.muted}; color: {selected.color}">
-                    <Icon name="bot" size={18} />
-                  </div>
-                  <div class="detail-title-stack">
-                    <div class="detail-title-row">
-                      <span class="detail-title">{selected.displayName}</span>
-                      <span class="source-badge source-{tmpl.source ?? 'builtin'}">{tmpl.source === 'user' ? '我的角色' : '系统内置'}</span>
-                      <span class="detail-status-pill status-{selected.status}">{statusTooltip(selected.status)}</span>
-                    </div>
-                    {#if positioning}
-                      <div class="detail-kicker">{positioning}</div>
-                    {/if}
-                    {#if selected.description}
-                      <p class="detail-description">{selected.description}</p>
-                    {/if}
-                    <div class="detail-actions">
-                      <button type="button" class="text-button" onclick={() => openCopyRole(tmpl)}>复制</button>
-                      <button type="button" class="text-button" onclick={() => exportSelectedRole(tmpl.templateId)}>导出</button>
-                      {#if tmpl.editable}
-                        <button type="button" class="text-button" onclick={() => openEditRole(tmpl)}>编辑</button>
-                      {/if}
-                      {#if tmpl.deletable}
-                        <button type="button" class="text-button danger" onclick={() => removeSelectedRole(tmpl)}>删除</button>
-                      {/if}
-                    </div>
-                  </div>
-                </header>
-
-                <section class="detail-section engine-row">
-                  <div class="section-title">{i18n.t('settings.agents.sectionEngine')}</div>
-                  <EnginePicker
-                    value={selected.engineId}
-                    engines={selectableEngines}
-                    inheritModelLabel={inheritModelLabel}
-                    getDisplayName={getWorkerDisplayName}
-                    modelStatuses={modelStatuses}
-                    error={selected.status === 'error'}
-                    onchange={(engineId: string) => updateRoleEngine(tmpl.templateId, engineId)}
-                  />
-                  {#if selected.status === 'error'}
-                    <div class="binding-hint err">{i18n.t('settings.agents.engineDisabledHint')}</div>
-                  {:else if selected.status === 'inherit'}
-                    <div class="binding-hint">{i18n.t('settings.agents.inheritOrchestratorHint')}</div>
-                  {/if}
-                </section>
+        {#if editorOpen}
+          <div id="agent-role-editor" class="role-editor-page" role="region" aria-labelledby="role-editor-title">
+            <form
+              class="role-editor"
+              onsubmit={(event) => {
+                event.preventDefault();
+                void submitRole();
+              }}
+            >
+              <div class="role-editor-back-row">
+                <button type="button" class="editor-back-button" onclick={closeEditor} disabled={editorBusy}>
+                  <span aria-hidden="true">←</span>
+                  返回角色列表
+                </button>
               </div>
-
-              <div class="detail-masonry">
-                {#if tmpl.profile.focus.length > 0}
-                  <section class="detail-section">
-                    <div class="section-title">{i18n.t('settings.agents.sectionSpecialties')}</div>
-                    <ul class="detail-list">
-                      {#each tmpl.profile.focus as item, i}
-                        <li>{resolveLocalizedListPhrase(tmpl, 'focus', i, item)}</li>
-                      {/each}
-                    </ul>
-                  </section>
-                {/if}
-
-                {#if tmpl.profile.constraints.length > 0}
-                  <section class="detail-section">
-                    <div class="section-title">{i18n.t('settings.agents.sectionConstraints')}</div>
-                    <ul class="detail-list">
-                      {#each tmpl.profile.constraints as item, i}
-                        <li>{resolveLocalizedListPhrase(tmpl, 'constraints', i, item)}</li>
-                      {/each}
-                    </ul>
-                  </section>
-                {/if}
-
-                {#if tmpl.profile.outputPreferences && tmpl.profile.outputPreferences.length > 0}
-                  <section class="detail-section">
-                    <div class="section-title">{i18n.t('settings.agents.sectionOutput')}</div>
-                    <ul class="detail-list">
-                      {#each tmpl.profile.outputPreferences as item, i}
-                        <li>{resolveLocalizedListPhrase(tmpl, 'outputPreferences', i, item)}</li>
-                      {/each}
-                    </ul>
-                  </section>
-                {/if}
-
-                {#if tmpl.ownerships.length > 0}
-                  <section class="detail-section">
-                    <div class="section-title">{i18n.t('settings.agents.sectionOwnerships')}</div>
-                    <div class="chip-row">
-                      {#each tmpl.ownerships as item, i}
-                        <span class="chip">{resolveLocalizedListPhrase(tmpl, 'ownerships', i, item)}</span>
-                      {/each}
-                    </div>
-                  </section>
-                {/if}
-
-                {#if tmpl.insightPreferences.length > 0}
-                  <section class="detail-section">
-                    <div class="section-title">{i18n.t('settings.agents.sectionInsights')}</div>
-                    <div class="chip-row">
-                      {#each tmpl.insightPreferences as kind}
-                        <span class="chip chip-insight chip-insight-{kind}">{insightLabel(kind)}</span>
-                      {/each}
-                    </div>
-                  </section>
-                {/if}
-              </div>
-            </div>
-          {/if}
-        </div>
-
-        {#if domainCapabilities.length > 0}
-          <section class="domain-library" aria-labelledby="agent-domain-library-title">
-            <div class="domain-library-heading">
-              <div>
-                <div id="agent-domain-library-title" class="section-title">
-                  {i18n.t('settings.agents.domainLibraryTitle')}
+              <header class="role-editor-header">
+                <div>
+                  <div class="role-editor-eyebrow">角色配置</div>
+                  <h2 id="role-editor-title">{editorMode === 'create' ? '新建子代理角色' : '编辑子代理角色'}</h2>
+                  <p>角色会注册到 Magi 的 Worker 目录，系统会自动生成内部标识，并默认继承主模型。</p>
                 </div>
-                <p class="domain-library-description">{i18n.t('settings.agents.domainLibraryDescription')}</p>
+              </header>
+              <div class="role-editor-grid">
+                <label>显示名称<input bind:this={roleEditorDisplayNameInput} bind:value={draft.displayName} placeholder="例如：数据分析师" /></label>
+                <label class="wide">角色描述<input bind:value={draft.description} placeholder="说明这个角色解决什么问题" /></label>
+                <label class="wide">角色定位<input bind:value={draft.positioning} placeholder="例如：数据分析与验证" /></label>
+                <label>专长（每行一项）<textarea bind:value={draft.focus} rows="4"></textarea></label>
+                <label>约束（每行一项）<textarea bind:value={draft.constraints} rows="4"></textarea></label>
+                <label>输出偏好（每行一项）<textarea bind:value={draft.outputPreferences} rows="4"></textarea></label>
+                <label>核心职责（每行一项）<textarea bind:value={draft.ownerships} rows="4"></textarea></label>
+                <label class="wide">系统提示词<textarea bind:value={draft.systemPrompt} rows="8" placeholder="描述该 Worker 的职责、工作边界和输出要求"></textarea></label>
+                <label>并发上限（可选）<input bind:value={draft.parallelismLimit} inputmode="numeric" placeholder="不填表示不限" /></label>
+                <fieldset class="wide">
+                  <legend>信号偏好</legend>
+                  <div class="checkbox-grid">
+                    {#each ['decision', 'contract', 'risk', 'constraint'] as insight}
+                      <label class="checkbox-label"><input type="checkbox" checked={draft.insights.includes(insight)} onchange={() => (draft.insights = draft.insights.includes(insight) ? draft.insights.filter((item) => item !== insight) : [...draft.insights, insight])} />{insightLabel(insight as 'decision' | 'contract' | 'risk' | 'constraint')}</label>
+                    {/each}
+                  </div>
+                </fieldset>
+                <fieldset class="wide">
+                  <legend>可用专业能力</legend>
+                  <div class="checkbox-grid capability-editor-grid">
+                    {#each domainCapabilities as capability (capability.id)}
+                      <label class="checkbox-label" title={capabilityDescription(capability)}><input type="checkbox" checked={draft.capabilities.includes(capability.id)} onchange={() => (draft.capabilities = draft.capabilities.includes(capability.id) ? draft.capabilities.filter((item) => item !== capability.id) : [...draft.capabilities, capability.id])} />{capabilityName(capability)}</label>
+                    {/each}
+                  </div>
+                </fieldset>
               </div>
-              <span class="domain-library-count" aria-label={i18n.t('settings.agents.domainLibraryCount', { count: domainCapabilities.length })}>
-                {domainCapabilities.length}
-              </span>
-            </div>
-            <div class="chip-row capability-list">
-              {#each domainCapabilities as capability (capability.id)}
-                <span class="chip" title={domainCapabilityDescription(capability)}>
-                  {capabilityName(capability)}
+              {#if editorError}<div class="role-editor-error" role="alert">{editorError}</div>{/if}
+              <footer class="role-editor-footer">
+                <button type="submit" class="toolbar-button primary" disabled={editorBusy}>{editorBusy ? '保存中…' : '保存角色'}</button>
+              </footer>
+            </form>
+          </div>
+        {:else}
+          <div
+            id="agent-tabpanel"
+            class="agents-detail"
+            role="tabpanel"
+            aria-labelledby={selected ? `agent-tab-${selected.template.templateId}` : undefined}
+          >
+            {#if !selected}
+              <div class="detail-empty">{i18n.t('settings.agents.detailEmpty')}</div>
+            {:else}
+              {@const tmpl = selected.template}
+              {@const positioning = resolveLocalizedRolePositioning(tmpl)}
+
+              <div class="detail-layout">
+                <div class="detail-primary">
+                  <header class="detail-header">
+                    <div class="detail-avatar" style="background: {selected.muted}; color: {selected.color}">
+                      <Icon name="bot" size={18} />
+                    </div>
+                    <div class="detail-title-stack">
+                      <div class="detail-title-row">
+                        <span class="detail-title">{selected.displayName}</span>
+                        <span class="source-badge source-{tmpl.source ?? 'builtin'}">{tmpl.source === 'user' ? '我的角色' : '系统内置'}</span>
+                        <span class="detail-status-pill status-{selected.status}">{statusTooltip(selected.status)}</span>
+                      </div>
+                      {#if positioning}
+                        <div class="detail-kicker">{positioning}</div>
+                      {/if}
+                      {#if selected.description}
+                        <p class="detail-description">{selected.description}</p>
+                      {/if}
+                      <div class="detail-actions">
+                        <button type="button" class="text-button" onclick={() => openCopyRole(tmpl)}>复制</button>
+                        <button type="button" class="text-button" onclick={() => exportSelectedRole(tmpl.templateId)}>导出</button>
+                        {#if tmpl.editable}
+                          <button type="button" class="text-button" onclick={() => openEditRole(tmpl)}>编辑</button>
+                        {/if}
+                        {#if tmpl.deletable}
+                          <button type="button" class="text-button danger" onclick={() => removeSelectedRole(tmpl)}>删除</button>
+                        {/if}
+                      </div>
+                    </div>
+                  </header>
+
+                  <section class="detail-section engine-row">
+                    <div class="section-title">{i18n.t('settings.agents.sectionEngine')}</div>
+                    <EnginePicker
+                      value={selected.engineId}
+                      engines={selectableEngines}
+                      inheritModelLabel={inheritModelLabel}
+                      getDisplayName={getWorkerDisplayName}
+                      modelStatuses={modelStatuses}
+                      error={selected.status === 'error'}
+                      onchange={(engineId: string) => updateRoleEngine(tmpl.templateId, engineId)}
+                    />
+                    {#if selected.status === 'error'}
+                      <div class="binding-hint err">{i18n.t('settings.agents.engineDisabledHint')}</div>
+                    {:else if selected.status === 'inherit'}
+                      <div class="binding-hint">{i18n.t('settings.agents.inheritOrchestratorHint')}</div>
+                    {/if}
+                  </section>
+                </div>
+
+                <div class="detail-masonry">
+                  {#if tmpl.profile.focus.length > 0}
+                    <section class="detail-section">
+                      <div class="section-title">{i18n.t('settings.agents.sectionSpecialties')}</div>
+                      <ul class="detail-list">
+                        {#each tmpl.profile.focus as item, i}
+                          <li>{resolveLocalizedListPhrase(tmpl, 'focus', i, item)}</li>
+                        {/each}
+                      </ul>
+                    </section>
+                  {/if}
+
+                  {#if tmpl.profile.constraints.length > 0}
+                    <section class="detail-section">
+                      <div class="section-title">{i18n.t('settings.agents.sectionConstraints')}</div>
+                      <ul class="detail-list">
+                        {#each tmpl.profile.constraints as item, i}
+                          <li>{resolveLocalizedListPhrase(tmpl, 'constraints', i, item)}</li>
+                        {/each}
+                      </ul>
+                    </section>
+                  {/if}
+
+                  {#if tmpl.profile.outputPreferences && tmpl.profile.outputPreferences.length > 0}
+                    <section class="detail-section">
+                      <div class="section-title">{i18n.t('settings.agents.sectionOutput')}</div>
+                      <ul class="detail-list">
+                        {#each tmpl.profile.outputPreferences as item, i}
+                          <li>{resolveLocalizedListPhrase(tmpl, 'outputPreferences', i, item)}</li>
+                        {/each}
+                      </ul>
+                    </section>
+                  {/if}
+
+                  {#if tmpl.ownerships.length > 0}
+                    <section class="detail-section">
+                      <div class="section-title">{i18n.t('settings.agents.sectionOwnerships')}</div>
+                      <div class="chip-row">
+                        {#each tmpl.ownerships as item, i}
+                          <span class="chip">{resolveLocalizedListPhrase(tmpl, 'ownerships', i, item)}</span>
+                        {/each}
+                      </div>
+                    </section>
+                  {/if}
+
+                  {#if tmpl.insightPreferences.length > 0}
+                    <section class="detail-section">
+                      <div class="section-title">{i18n.t('settings.agents.sectionInsights')}</div>
+                      <div class="chip-row">
+                        {#each tmpl.insightPreferences as kind}
+                          <span class="chip chip-insight chip-insight-{kind}">{insightLabel(kind)}</span>
+                        {/each}
+                      </div>
+                    </section>
+                  {/if}
+                </div>
+              </div>
+            {/if}
+          </div>
+
+          {#if domainCapabilities.length > 0}
+            <section class="domain-library" aria-labelledby="agent-domain-library-title">
+              <div class="domain-library-heading">
+                <div>
+                  <div id="agent-domain-library-title" class="section-title">
+                    {i18n.t('settings.agents.domainLibraryTitle')}
+                  </div>
+                  <p class="domain-library-description">{i18n.t('settings.agents.domainLibraryDescription')}</p>
+                </div>
+                <span class="domain-library-count" aria-label={i18n.t('settings.agents.domainLibraryCount', { count: domainCapabilities.length })}>
+                  {domainCapabilities.length}
                 </span>
-              {/each}
-            </div>
-          </section>
+              </div>
+              <div class="chip-row capability-list">
+                {#each domainCapabilities as capability (capability.id)}
+                  <span class="chip" title={domainCapabilityDescription(capability)}>
+                    {capabilityName(capability)}
+                  </span>
+                {/each}
+              </div>
+            </section>
+          {/if}
         {/if}
       </div>
     </div>
   </div>
 </div>
-
-{#if editorOpen}
-  <div class="role-editor-backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && closeEditor()}>
-    <div class="role-editor" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="role-editor-title">
-      <header class="role-editor-header">
-        <div>
-          <h2 id="role-editor-title">{editorMode === 'create' ? '新建子代理角色' : '编辑子代理角色'}</h2>
-          <p>角色会立即注册到 Magi 的 Worker 目录，并默认继承主模型。</p>
-        </div>
-        <button type="button" class="text-button" onclick={closeEditor}>关闭</button>
-      </header>
-      <div class="role-editor-grid">
-        <label>角色 ID<input bind:value={draft.id} disabled={editorMode === 'edit'} placeholder="例如：data-analyst" /></label>
-        <label>显示名称<input bind:value={draft.displayName} placeholder="例如：数据分析师" /></label>
-        <label class="wide">角色描述<input bind:value={draft.description} placeholder="说明这个角色解决什么问题" /></label>
-        <label class="wide">角色定位<input bind:value={draft.positioning} placeholder="例如：数据分析与验证" /></label>
-        <label>专长（每行一项）<textarea bind:value={draft.focus} rows="4"></textarea></label>
-        <label>约束（每行一项）<textarea bind:value={draft.constraints} rows="4"></textarea></label>
-        <label>输出偏好（每行一项）<textarea bind:value={draft.outputPreferences} rows="4"></textarea></label>
-        <label>核心职责（每行一项）<textarea bind:value={draft.ownerships} rows="4"></textarea></label>
-        <label class="wide">系统提示词<textarea bind:value={draft.systemPrompt} rows="8" placeholder="描述该 Worker 的职责、工作边界和输出要求"></textarea></label>
-        <label>并发上限（可选）<input bind:value={draft.parallelismLimit} inputmode="numeric" placeholder="不填表示不限" /></label>
-        <fieldset class="wide">
-          <legend>信号偏好</legend>
-          <div class="checkbox-grid">
-            {#each ['decision', 'contract', 'risk', 'constraint'] as insight}
-              <label class="checkbox-label"><input type="checkbox" checked={draft.insights.includes(insight)} onchange={() => (draft.insights = draft.insights.includes(insight) ? draft.insights.filter((item) => item !== insight) : [...draft.insights, insight])} />{insightLabel(insight as 'decision' | 'contract' | 'risk' | 'constraint')}</label>
-            {/each}
-          </div>
-        </fieldset>
-        <fieldset class="wide">
-          <legend>可用专业能力</legend>
-          <div class="checkbox-grid capability-editor-grid">
-            {#each domainCapabilities as capability (capability.id)}
-              <label class="checkbox-label" title={capabilityDescription(capability)}><input type="checkbox" checked={draft.capabilities.includes(capability.id)} onchange={() => (draft.capabilities = draft.capabilities.includes(capability.id) ? draft.capabilities.filter((item) => item !== capability.id) : [...draft.capabilities, capability.id])} />{capabilityName(capability)}</label>
-            {/each}
-          </div>
-        </fieldset>
-      </div>
-      {#if editorError}<div class="role-editor-error">{editorError}</div>{/if}
-      <footer class="role-editor-footer">
-        <button type="button" class="toolbar-button" onclick={closeEditor} disabled={editorBusy}>取消</button>
-        <button type="button" class="toolbar-button primary" onclick={() => void submitRole()} disabled={editorBusy}>{editorBusy ? '保存中…' : '保存角色'}</button>
-      </footer>
-    </div>
-  </div>
-{/if}
 
 <style>
   .settings-tab-inner {
@@ -711,40 +775,69 @@
   .detail-actions { margin-top: 10px; }
   .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
-  .role-editor-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-    background: color-mix(in srgb, #000 42%, transparent);
+  .role-editor-page {
+    min-width: 0;
+    padding: 8px 0 24px;
   }
   .role-editor {
-    width: min(760px, 100%);
-    max-height: min(820px, 94vh);
-    overflow: auto;
-    border: 1px solid var(--ind-border-separator);
-    border-radius: 12px;
-    background: var(--ind-bg-primary, #fff);
-    box-shadow: 0 24px 70px rgb(0 0 0 / 22%);
-    padding: 22px;
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--ind-border-card-strong);
+    border-radius: var(--radius-lg);
+    background: color-mix(in srgb, var(--ind-bg-card-elevated) 92%, transparent);
+    color: var(--ind-foreground);
+    box-shadow: var(--ind-shadow-sm, 0 1px 2px rgb(0 0 0 / 8%));
+    padding: 20px 22px 22px;
   }
-  .role-editor-header, .role-editor-footer { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+  .role-editor-back-row { margin-bottom: 16px; }
+  .editor-back-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 0;
+    padding: 4px 0;
+    background: transparent;
+    color: var(--ind-foreground-muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .editor-back-button:hover { color: var(--ind-tab-accent); }
+  .editor-back-button:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--ind-tab-accent) 52%, transparent);
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+  .editor-back-button:disabled { opacity: .55; cursor: default; }
+  .role-editor-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--ind-border-separator);
+  }
+  .role-editor-eyebrow {
+    margin-bottom: 5px;
+    color: var(--ind-tab-accent);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .04em;
+  }
   .role-editor-header h2 { margin: 0; font-size: 18px; color: var(--ind-foreground); }
-  .role-editor-header p { margin: 7px 0 0; color: var(--ind-foreground-soft); font-size: 12px; }
-  .role-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 20px; }
-  .role-editor-grid label, .role-editor-grid legend { color: var(--ind-foreground-secondary); font-size: 12px; font-weight: 600; }
-  .role-editor-grid input, .role-editor-grid textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 6px; border: 1px solid var(--ind-border-separator); border-radius: 7px; background: var(--ind-bg-control); color: var(--ind-foreground); padding: 8px 9px; font: inherit; font-size: 13px; resize: vertical; }
+  .role-editor-header p { margin: 7px 0 0; color: var(--ind-foreground-soft); font-size: 12px; line-height: 1.5; }
+  .role-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 20px; align-items: start; }
+  .role-editor-grid label, .role-editor-grid legend { color: var(--ind-foreground-secondary); font-size: 12px; font-weight: 600; line-height: 1.35; }
+  .role-editor-grid input:not([type='checkbox']), .role-editor-grid textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 7px; border: 1px solid var(--ind-border-control); border-radius: var(--radius-md); background: var(--ind-bg-control); color: var(--ind-foreground); padding: 9px 10px; font: inherit; font-size: 13px; line-height: 1.45; resize: vertical; }
+  .role-editor-grid input:not([type='checkbox'])::placeholder, .role-editor-grid textarea::placeholder { color: var(--ind-foreground-soft); opacity: 1; }
+  .role-editor-grid input:not([type='checkbox']):disabled { opacity: .65; cursor: not-allowed; }
   .role-editor-grid input:focus, .role-editor-grid textarea:focus { outline: 2px solid color-mix(in srgb, var(--ind-tab-accent) 34%, transparent); outline-offset: 1px; }
   .role-editor-grid .wide { grid-column: 1 / -1; }
-  .role-editor-grid fieldset { min-width: 0; border: 1px solid var(--ind-border-separator); border-radius: 8px; padding: 12px; }
+  .role-editor-grid fieldset { min-width: 0; border: 1px solid var(--ind-border-control); border-radius: var(--radius-lg); padding: 12px 14px 14px; }
   .checkbox-grid { display: flex; flex-wrap: wrap; gap: 9px 16px; margin-top: 8px; }
   .checkbox-label { display: inline-flex !important; align-items: center; gap: 6px; font-weight: 500 !important; cursor: pointer; }
-  .checkbox-label input { width: auto; margin: 0; }
+  .checkbox-label input { width: auto; margin: 0; accent-color: var(--ind-tab-accent); }
   .role-editor-error { margin-top: 14px; padding: 9px 11px; border-radius: 7px; color: var(--error, #ff3b30); background: color-mix(in srgb, var(--error, #ff3b30) 9%, transparent); font-size: 12px; }
-  .role-editor-footer { align-items: center; justify-content: flex-end; margin-top: 18px; }
+  .role-editor-footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--ind-border-separator); }
 
   .agents-shell {
     display: grid;
@@ -752,6 +845,10 @@
     gap: 22px;
     min-height: 100%;
     align-items: stretch;
+  }
+  .agents-shell.editing {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
   }
 
   .agents-tabbar {
