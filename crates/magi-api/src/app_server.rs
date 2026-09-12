@@ -10,6 +10,7 @@ use axum::{
         State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
+    http::HeaderMap,
     response::Response,
     routing::get,
 };
@@ -228,8 +229,14 @@ pub fn routes() -> Router<ApiState> {
     Router::new().route("/app-server", get(connect))
 }
 
-async fn connect(State(state): State<ApiState>, websocket: WebSocketUpgrade) -> Response {
-    websocket.on_upgrade(move |socket| run_connection(socket, state))
+async fn connect(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let trusted_desktop_surface =
+        crate::routes::is_trusted_desktop_renderer_request(&state, &headers);
+    websocket.on_upgrade(move |socket| run_connection(socket, state, trusted_desktop_surface))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -242,6 +249,7 @@ struct EventSubscription {
 
 #[derive(Clone, Debug, Default)]
 struct ConnectionState {
+    trusted_desktop_surface: bool,
     initialize_seen: bool,
     initialized: bool,
     client_info: Option<ClientInfo>,
@@ -312,7 +320,7 @@ impl OutgoingChannels {
     }
 }
 
-async fn run_connection(socket: WebSocket, state: ApiState) {
+async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surface: bool) {
     let (mut sink, mut stream) = socket.split();
     let (control_tx, mut control_rx) = mpsc::channel::<SequencedMessage>(CONTROL_QUEUE_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel::<SequencedMessage>(EVENT_QUEUE_CAPACITY);
@@ -377,7 +385,10 @@ async fn run_connection(socket: WebSocket, state: ApiState) {
 
     // 在连接建立瞬间执行 snapshot + subscribe，后续发送 snapshot 时不会丢掉并发事件。
     let (initial_snapshot, mut event_rx) = state.event_bus.snapshot_and_subscribe();
-    let connection_state = Arc::new(Mutex::new(ConnectionState::default()));
+    let connection_state = Arc::new(Mutex::new(ConnectionState {
+        trusted_desktop_surface,
+        ..ConnectionState::default()
+    }));
     let request_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
     let pending_requests = Arc::new(Mutex::new(HashMap::<RequestId, RequestControl>::new()));
     let pending_server_requests = Arc::new(Mutex::new(HashMap::<
@@ -803,6 +814,9 @@ async fn initialize_connection(
             ErrorObject::new(ERROR_INVALID_PARAMS, "clientInfo.name 不能为空"),
         );
     }
+    let browser_tools_available = guard.trusted_desktop_surface
+        && params.capabilities.desktop_browser_surface
+        && params.capabilities.browser_tools;
     guard.initialize_seen = true;
     guard.client_info = Some(params.client_info);
     guard.capabilities = params.capabilities;
@@ -821,10 +835,9 @@ async fn initialize_connection(
                 turns: true,
                 events: true,
                 approvals: true,
-                // App Server 已提供 browser/tools/list 与 browser/tool。实际是否可执行
-                // 由 browser capability snapshot 在请求边界再次校验，而不是通过握手
-                // 静态伪装成“没有浏览器能力”。
-                browser_tools: true,
+                // 方法存在不代表当前连接有权调用。只有可信 Desktop 传输且客户端
+                // 显式协商两项浏览器能力时才广告；执行时还会再次校验运行快照。
+                browser_tools: browser_tools_available,
             },
         },
     )
@@ -954,13 +967,27 @@ async fn dispatch_request(
             read_session(state, request.id, request.params).await
         }
         Some(AppServerRequestMethod::TurnStart) => {
-            start_turn(state, request.id, request.params).await
+            start_turn(state, connection_state, request.id, request.params).await
         }
         Some(AppServerRequestMethod::BrowserToolsList) => {
-            list_browser_tools(state, request.id, request.params).await
+            if !browser_tools_authorized(connection_state).await {
+                error_response(
+                    request.id,
+                    ErrorObject::new(ERROR_INVALID_REQUEST, "当前连接没有 Desktop 浏览器工具能力"),
+                )
+            } else {
+                list_browser_tools(state, request.id, request.params).await
+            }
         }
         Some(AppServerRequestMethod::BrowserTool) => {
-            execute_browser_tool(state, request.id, request.params, control).await
+            if !browser_tools_authorized(connection_state).await {
+                error_response(
+                    request.id,
+                    ErrorObject::new(ERROR_INVALID_REQUEST, "当前连接没有 Desktop 浏览器工具能力"),
+                )
+            } else {
+                execute_browser_tool(state, request.id, request.params, control).await
+            }
         }
         Some(AppServerRequestMethod::ApprovalRequest) => {
             request_approval(
@@ -987,6 +1014,13 @@ async fn dispatch_request(
             ),
         ),
     }
+}
+
+async fn browser_tools_authorized(connection_state: &Arc<Mutex<ConnectionState>>) -> bool {
+    let state = connection_state.lock().await;
+    state.trusted_desktop_surface
+        && state.capabilities.desktop_browser_surface
+        && state.capabilities.browser_tools
 }
 
 async fn finish_browser_request_after_termination(
@@ -1776,6 +1810,7 @@ async fn read_session(
 
 async fn start_turn(
     state: &ApiState,
+    connection_state: &Arc<Mutex<ConnectionState>>,
     request_id: RequestId,
     params: Value,
 ) -> magi_app_server_protocol::ServerResponse {
@@ -1788,7 +1823,7 @@ async fn start_turn(
             );
         }
     };
-    let request = match serde_json::to_value(protocol_params)
+    let mut request = match serde_json::to_value(protocol_params)
         .map_err(|error| error.to_string())
         .and_then(|value| {
             serde_json::from_value::<crate::dto::SessionTurnRequestDto>(value)
@@ -1802,6 +1837,7 @@ async fn start_turn(
             );
         }
     };
+    request.desktop_browser_tools_allowed = browser_tools_authorized(connection_state).await;
     let business_request_id = request.request_id();
     if let Some(business_request_id) = business_request_id.as_deref() {
         let _request_lock = state.lock_app_server_request(business_request_id).await;
@@ -1904,7 +1940,7 @@ async fn start_turn_once(
         )
     } else {
         let business_request_id = request.request_id();
-        match sessions::submit_session_turn(
+        match sessions::submit_session_turn_authorized(
             axum::extract::State(state.clone()),
             axum::Json(request),
         )
@@ -2305,6 +2341,7 @@ fn send_protocol_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header::USER_AGENT;
     use futures_util::{SinkExt, StreamExt};
     use magi_core::{EventId, TaskCompletionContract, TaskTier, ThreadId, UtcMillis};
     use magi_event_bus::EventCategory;
@@ -2320,7 +2357,10 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
-    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Message as ClientMessage, client::IntoClientRequest},
+    };
 
     fn event(sequence: u64, session_id: Option<&str>, workspace_id: Option<&str>) -> EventEnvelope {
         EventEnvelope {
@@ -2743,6 +2783,13 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         );
+        state.set_browser_host_connection_config(Some(crate::state::BrowserHostConnectionConfig {
+            socket_path: "/tmp/magi-app-server-test.sock".to_string(),
+            auth_token: "desktop-renderer-test-token".to_string(),
+            desktop_epoch: "desktop-app-server-test".to_string(),
+            parent_pid: 1,
+            generation: 1,
+        }));
         let event_state = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2758,7 +2805,22 @@ mod tests {
                 .expect("测试路由应正常退出");
         });
 
-        let (mut socket, _) = connect_async(format!("ws://{address}/api/app-server"))
+        let mut desktop_request = format!("ws://{address}/api/app-server")
+            .into_client_request()
+            .expect("desktop websocket request should build");
+        desktop_request.headers_mut().insert(
+            USER_AGENT,
+            "Mozilla/5.0 @magi/desktop/3.0.51 Electron/43.4.0"
+                .parse()
+                .expect("desktop user agent should parse"),
+        );
+        desktop_request.headers_mut().insert(
+            "x-magi-desktop-renderer-token",
+            "desktop-renderer-test-token"
+                .parse()
+                .expect("desktop renderer token should parse"),
+        );
+        let (mut socket, _) = connect_async(desktop_request)
             .await
             .expect("应成功连接 App Server WebSocket");
         let before_initialized = send_request(
@@ -2784,7 +2846,12 @@ mod tests {
                 "params": {
                     "clientInfo": {"name": "integration-test"},
                     "protocol": {"major": 1, "minor": 0},
-                    "capabilities": {"streaming": true, "approvals": true}
+                    "capabilities": {
+                        "streaming": true,
+                        "approvals": true,
+                        "desktopBrowserSurface": true,
+                        "browserTools": true
+                    }
                 }
             }),
             "1",
@@ -2963,6 +3030,7 @@ mod tests {
         )
         .await;
         assert_eq!(initialize["result"]["capabilities"]["events"], true);
+        assert_eq!(initialize["result"]["capabilities"]["browserTools"], false);
         socket
             .send(ClientMessage::Text(
                 serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})
@@ -2971,6 +3039,22 @@ mod tests {
             ))
             .await
             .expect("initialized 通知应发送");
+        let browser_tools = send_request(
+            &mut socket,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "untrusted-browser-tools",
+                "method": "browser/tools/list",
+                "params": {}
+            }),
+            "untrusted-browser-tools",
+        )
+        .await;
+        assert_eq!(browser_tools["error"]["code"], ERROR_INVALID_REQUEST);
+        assert_eq!(
+            browser_tools["error"]["message"],
+            "当前连接没有 Desktop 浏览器工具能力"
+        );
 
         socket
             .send(ClientMessage::Text(

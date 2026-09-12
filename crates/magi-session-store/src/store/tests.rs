@@ -868,6 +868,82 @@ fn persistence_waits_for_canonical_commit_before_capturing_projection() {
 }
 
 #[test]
+fn sidecar_flush_waits_for_canonical_commit_before_capturing_projection() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-sidecar-canonical-order");
+    let turn_id = "turn-sidecar-canonical-order";
+    store
+        .create_session(session_id.clone(), "Sidecar canonical order")
+        .expect("session should create");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
+        .expect("initial turn should be stored");
+    store.bind_execution_ownership(
+        session_id.clone(),
+        ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(WorkspaceId::new("workspace-sidecar-canonical-order")),
+            execution_chain_ref: Some("chain-sidecar-canonical-order".to_string()),
+            ..ExecutionOwnership::default()
+        },
+    );
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    store.install_canonical_event_writer(Arc::new(BlockingCanonicalWriter {
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+    }));
+
+    let mutation_store = store.clone();
+    let mutation_session_id = session_id.clone();
+    let mutation = thread::spawn(move || {
+        mutation_store
+            .update_current_turn_status_for_turn(&mutation_session_id, Some(turn_id), "completed")
+            .expect("canonical mutation should complete");
+    });
+    entered_rx
+        .recv()
+        .expect("canonical writer should be entered");
+
+    let (flush_entered_tx, flush_entered_rx) = std::sync::mpsc::channel();
+    let flush_store = store.clone();
+    let flush = thread::spawn(move || {
+        flush_store
+            .flush_execution_sidecars_with(|durable, _| {
+                let turn = durable
+                    .canonical_turns
+                    .iter()
+                    .find(|turn| turn.turn_id == turn_id)
+                    .expect("canonical turn should exist in flush snapshot");
+                flush_entered_tx
+                    .send(turn.status)
+                    .expect("sidecar flush callback should signal entry");
+                Ok::<(), ()>(())
+            })
+            .expect("sidecar flush should succeed")
+    });
+    assert!(
+        flush_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "sidecar flush callback must wait for the canonical event commit"
+    );
+
+    release_tx
+        .send(())
+        .expect("canonical writer should be released");
+    mutation.join().expect("canonical mutation should join");
+    assert!(flush.join().expect("sidecar flush should join"));
+    assert_eq!(
+        flush_entered_rx
+            .try_recv()
+            .expect("sidecar flush should capture post-commit state"),
+        CanonicalTurnStatus::Completed
+    );
+}
+
+#[test]
 fn persistence_returns_stable_callback_error_without_retrying() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-persistence-stable-error");

@@ -461,6 +461,30 @@ test("Host 重新连接时重放当前 Primary Surface，重启后自动化仍�
   }
 });
 
+test("最后一个 Primary Surface 关闭会发送独立关闭事件", async () => {
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => Promise.resolve(),
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker);
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const eventPromise = nextJsonMatching(client, (message) => (
+      (message.event as { type?: string } | undefined)?.type === "primary_surface_closed"
+    ));
+    server.handleSurfaceEvent({ type: "primary_closed", binding });
+    const event = await eventPromise;
+    assert.deepEqual(
+      (event.event as { payload?: { binding?: BrowserSurfaceBinding } }).payload?.binding,
+      binding,
+    );
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("持久化标记在页面刷新后按最后一次 Authority 投影重放", async () => {
   const calls: Array<{ binding: BrowserSurfaceBinding; command: BrowserHostCommand }> = [];
   const worker = {
@@ -560,9 +584,15 @@ test("文档就绪信号会重放刷新后尚未落地的标记投影", async ()
 test("标记投影按 Tab 合并最新 revision，不取消正在执行的 Chromium 请求", async () => {
   const firstOperation = deferred<{ outcome: BrowserCommandOutcome }>();
   const calls: BrowserHostCommand[] = [];
+  const signals: AbortSignal[] = [];
   const worker = {
-    execute: async (_binding: BrowserSurfaceBinding, command: BrowserHostCommand) => {
+    execute: async (
+      _binding: BrowserSurfaceBinding,
+      command: BrowserHostCommand,
+      signal?: AbortSignal,
+    ) => {
       calls.push(command);
+      if (signal) signals.push(signal);
       if (calls.length === 1) return firstOperation.promise;
       return {
         outcome: {
@@ -610,6 +640,7 @@ test("标记投影按 Tab 合并最新 revision，不取消正在执行的 Chrom
         ],
       },
     })));
+    assert.equal(signals[0]?.aborted, false, "新 revision 不能取消正在执行的投影 CDP");
     firstOperation.resolve({
       outcome: {
         status: "succeeded",
@@ -641,10 +672,18 @@ test("标记投影按 Tab 合并最新 revision，不取消正在执行的 Chrom
 test("标记投影执行缓慢时不占用普通浏览器命令队列", async () => {
   const annotationOperation = deferred<{ outcome: BrowserCommandOutcome }>();
   const calls: BrowserHostCommand[] = [];
+  let annotationSignal: AbortSignal | undefined;
   const worker = {
-    execute: async (_binding: BrowserSurfaceBinding, command: BrowserHostCommand) => {
+    execute: async (
+      _binding: BrowserSurfaceBinding,
+      command: BrowserHostCommand,
+      signal?: AbortSignal,
+    ) => {
       calls.push(command);
-      if (command.type === "set_annotations") return annotationOperation.promise;
+      if (command.type === "set_annotations") {
+        annotationSignal = signal;
+        return annotationOperation.promise;
+      }
       return {
         outcome: {
           status: "succeeded" as const,
@@ -672,6 +711,11 @@ test("标记投影执行缓慢时不占用普通浏览器命令队列", async ()
     const response = await commandResponse;
     assert.equal(response.outcome?.status, "succeeded");
     assert.equal(calls.filter((command) => command.type === "snapshot").length, 1);
+    assert.equal(
+      annotationSignal?.aborted,
+      false,
+      "普通命令不能通过取消投影来抢占 CDP session",
+    );
 
     annotationOperation.resolve({
       outcome: {

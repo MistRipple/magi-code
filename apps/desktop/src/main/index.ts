@@ -1,14 +1,15 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   app,
-  BaseWindow,
+  BrowserWindow,
   ipcMain,
   Menu,
   nativeTheme,
+  session,
   shell,
   type MenuItemConstructorOptions,
   type Rectangle,
@@ -22,19 +23,22 @@ import { assertDesktopIpcMessage } from "@magi/desktop-browser-contracts/validat
 import { AutomationWorker } from "./automation-worker.js";
 import {
   BrowserSurfaceManager,
+  type BrowserDisplaySizeInput,
   type BrowserSurfaceEvent,
   type EmbeddedBrowserWebviewInput,
+  type ReleasedBrowserWebviewInput,
 } from "./browser-surface-manager.js";
 import { DesktopControlServer } from "./desktop-control-server.js";
 import { openWorkspaceFolder, revealWorkspaceFile } from "./desktop-files.js";
 import { ProcessSupervisor } from "./process-supervisor.js";
 import { DesktopRuntimeRecoveryCoordinator } from "./desktop-runtime-recovery.js";
+import { defaultStateRoot } from "./state-root.js";
 import { UpdateManager } from "./update-manager.js";
 import { WindowManager } from "./window-manager.js";
 import type { PanelKind, WindowLayoutIntent } from "./window-layout.js";
 
 const stateRoot =
-  process.env.MAGI_STATE_ROOT?.trim() || join(homedir(), ".magi");
+  process.env.MAGI_STATE_ROOT?.trim() || defaultStateRoot();
 app.setPath("userData", join(stateRoot, "desktop"));
 app.commandLine.appendSwitch("use-mock-keychain");
 if (process.platform === "linux")
@@ -51,6 +55,7 @@ app.commandLine.appendSwitch(
 );
 
 const AGENT_ORIGIN = "http://127.0.0.1:38123";
+const DESKTOP_RENDERER_AUTH_HEADER = "X-Magi-Desktop-Renderer-Token";
 const MAGI_DAEMON_SERVICE_NAME = "magi-rust-backend";
 const DESKTOP_HOST_READY_POLL_INTERVAL_MS = 50;
 const DESKTOP_HOST_READY_TIMEOUT_MS = 65_000;
@@ -73,7 +78,7 @@ const controlSocket =
   process.platform === "win32"
     ? `\\\\.\\pipe\\magi-${process.pid}`
     : join(tmpdir(), `magi-${process.pid}.sock`);
-const windows = new Map<string, BaseWindow>();
+const windows = new Map<string, BrowserWindow>();
 
 let windowManager: WindowManager | null = null;
 let surfaceManager: BrowserSurfaceManager | null = null;
@@ -135,6 +140,7 @@ if (singleInstance) {
     .whenReady()
     .then(async () => {
       const paths = resolveRuntimePaths();
+      configureAppRendererAuthentication(controlToken);
       let control: DesktopControlServer | null = null;
       let worker: AutomationWorker | null = null;
       const surfaces = new BrowserSurfaceManager({
@@ -300,6 +306,26 @@ if (singleInstance) {
     });
 }
 
+function configureAppRendererAuthentication(token: string): void {
+  const appSession = session.fromPartition("persist:magi-app");
+  appSession.webRequest.onBeforeSendHeaders(
+    {
+      urls: [
+        `${AGENT_ORIGIN}/*`,
+        `${AGENT_ORIGIN.replace("http://", "ws://")}/*`,
+      ],
+    },
+    (details, callback) => {
+      callback({
+        requestHeaders: {
+          ...details.requestHeaders,
+          [DESKTOP_RENDERER_AUTH_HEADER]: token,
+        },
+      });
+    },
+  );
+}
+
 app.on("window-all-closed", () => app.quit());
 app.on("before-quit", (event) => {
   if (shuttingDown) return;
@@ -341,6 +367,14 @@ function registerIpc(): void {
       const { manager, windowId } = trustedAppSender(event.sender.id);
       const request = parseEmbeddedBrowserWebview(value);
       return manager.registerEmbeddedWebview(windowId, request);
+    },
+  );
+  handleIpc(
+    "magi-desktop:update-browser-display-size",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = parseBrowserDisplaySize(value);
+      return manager.updateEmbeddedWebviewDisplaySize(windowId, request);
     },
   );
   handleIpc(
@@ -429,6 +463,26 @@ function registerIpc(): void {
     async (event, value: unknown) => {
       const { manager, windowId } = trustedAppSender(event.sender.id);
       return manager.stopBrowserInspect(
+        windowId,
+        parseBrowserInspectRequest(value),
+      );
+    },
+  );
+  handleIpc(
+    "magi-desktop:start-browser-annotation-capture",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      return manager.startBrowserAnnotationCapture(
+        windowId,
+        parseBrowserInspectRequest(value),
+      );
+    },
+  );
+  handleIpc(
+    "magi-desktop:stop-browser-annotation-capture",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      return manager.stopBrowserAnnotationCapture(
         windowId,
         parseBrowserInspectRequest(value),
       );
@@ -1364,7 +1418,13 @@ function parseEmbeddedBrowserWebview(
 ): EmbeddedBrowserWebviewInput {
   const input = rejectUnknownFields(
     object(value),
-    ["tabId", "browserSessionId", "navigationRevision", "webContentsId"],
+    [
+      "tabId",
+      "browserSessionId",
+      "navigationRevision",
+      "webContentsId",
+      "displaySize",
+    ],
     "embeddedBrowserWebview",
   );
   return {
@@ -1380,12 +1440,57 @@ function parseEmbeddedBrowserWebview(
       1,
       2_147_483_647,
     ),
+    displaySize: parseBrowserDisplayDimensions(input.displaySize),
+  };
+}
+
+function parseBrowserDisplaySize(value: unknown): BrowserDisplaySizeInput {
+  const input = rejectUnknownFields(
+    object(value),
+    [
+      "tabId",
+      "browserSessionId",
+      "navigationRevision",
+      "webContentsId",
+      "displaySize",
+    ],
+    "browserDisplaySize",
+  );
+  return {
+    tabId: text(input.tabId, "tabId"),
+    browserSessionId: text(input.browserSessionId, "browserSessionId"),
+    navigationRevision: nonNegativeInteger(
+      input.navigationRevision,
+      "navigationRevision",
+    ),
+    webContentsId: integerInRange(
+      input.webContentsId,
+      "webContentsId",
+      1,
+      2_147_483_647,
+    ),
+    displaySize: parseBrowserDisplayDimensions(input.displaySize),
+  };
+}
+
+function parseBrowserDisplayDimensions(value: unknown): {
+  width: number;
+  height: number;
+} {
+  const input = rejectUnknownFields(
+    object(value),
+    ["width", "height"],
+    "browserDisplaySize.dimensions",
+  );
+  return {
+    width: integerInRange(input.width, "displaySize.width", 1, 100_000),
+    height: integerInRange(input.height, "displaySize.height", 1, 100_000),
   };
 }
 
 function parseReleasedBrowserWebview(
   value: unknown,
-): EmbeddedBrowserWebviewInput {
+): ReleasedBrowserWebviewInput {
   const input = rejectUnknownFields(
     object(value),
     ["tabId", "browserSessionId", "navigationRevision", "webContentsId"],

@@ -4,7 +4,6 @@ import {
   WINDOW_LAYOUT,
   createWindowLayoutState,
   reduceWindowLayout,
-  resolveRightPaneMode,
   snapshotWindowLayout,
 } from "./window-layout.js";
 
@@ -47,15 +46,26 @@ test("右栏拖动只改变父容器宽度并保持工作区最小宽度", () =>
   assert.deepEqual(snapshot.rightPaneBounds, { x: 456, y: 0, width: 544, height: 800 });
 });
 
-test("窄窗口使用整窗右栏模式，不创建伪造的浏览器内容坐标", () => {
+test("窄窗口仍保持并排右栏，不覆盖中间内容", () => {
   let state = baseState(720, 600);
   state = reduceWindowLayout(state, { type: "right_pane_visibility", visible: true });
   const snapshot = snapshotWindowLayout(state);
 
-  assert.equal(resolveRightPaneMode(720), "overlay");
-  assert.equal(snapshot.rightPaneMode, "overlay");
-  assert.deepEqual(snapshot.rightPaneBounds, { x: 0, y: 0, width: 720, height: 600 });
-  assert.equal(snapshot.dividerBounds, null);
+  assert.deepEqual(snapshot.rightPaneBounds, { x: 400, y: 0, width: 320, height: 600 });
+  assert.deepEqual(snapshot.dividerBounds, { x: 392, y: 0, width: 8, height: 600 });
+});
+
+test("窗口缩放到最小尺寸时三栏几何仍然互不重叠", () => {
+  let state = baseState(720, 520);
+  state = reduceWindowLayout(state, { type: "right_pane_visibility", visible: true });
+  const snapshot = snapshotWindowLayout(state);
+  const divider = snapshot.dividerBounds;
+  const rightPane = snapshot.rightPaneBounds;
+
+  assert.ok(divider);
+  assert.ok(rightPane);
+  assert.equal(divider.x + divider.width, rightPane.x);
+  assert.equal(rightPane.x + rightPane.width, snapshot.appBounds.width);
 });
 
 test("浏览器面板只保存逻辑 Surface 身份，非浏览器面板清除 Surface 身份", () => {

@@ -177,6 +177,10 @@ impl BrowserNodeSelectionDto {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTurnRequestDto {
+    /// 仅由 HTTP/App Server 入口根据可信 Desktop 传输设置，客户端 JSON
+    /// 不能声明或持久化该字段，避免 Web Turn 借用本机 Browser Host。
+    #[serde(skip)]
+    pub desktop_browser_tools_allowed: bool,
     pub session_id: Option<String>,
     pub scope: SessionScopeKindDto,
     pub workspace_id: Option<String>,
@@ -702,6 +706,7 @@ mod tests {
     #[test]
     fn timeline_message_uses_user_text_directly() {
         let request = SessionTurnRequestDto {
+            desktop_browser_tools_allowed: true,
             session_id: Some("session-a".to_string()),
             scope: SessionScopeKindDto::Workspace,
             workspace_id: Some("workspace-a".to_string()),
@@ -727,6 +732,19 @@ mod tests {
         assert_eq!(
             request.timeline_message(request.trimmed_text().as_deref()),
             "请分析项目"
+        );
+    }
+
+    #[test]
+    fn desktop_browser_tool_authority_cannot_be_supplied_by_client_json() {
+        let value = serde_json::json!({
+            "scope": "personal",
+            "text": "打开网页",
+            "desktopBrowserToolsAllowed": true
+        });
+        assert!(
+            serde_json::from_value::<SessionTurnRequestDto>(value).is_err(),
+            "Desktop 浏览器工具授权只能由服务端传输边界写入"
         );
     }
 

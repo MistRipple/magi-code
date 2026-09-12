@@ -537,6 +537,35 @@ impl BrowserAuthority {
         Ok(revoked)
     }
 
+    pub fn clear_primary_surface(
+        &mut self,
+        binding: &BrowserSurfaceBinding,
+        now: UtcMillis,
+    ) -> Result<(bool, BrowserTab, Vec<BrowserControlLease>), BrowserAuthorityError> {
+        let tab = self.require_tab(&binding.tab_id)?.clone();
+        let Some(current) = self.primary_surfaces.get(&binding.tab_id) else {
+            return Ok((false, tab, Vec::new()));
+        };
+        if current != binding {
+            return Ok((false, tab, Vec::new()));
+        }
+        let revoked = self.revoke_surface_leases(
+            &binding.tab_id,
+            &binding.surface_id,
+            BrowserLeaseEndReason::RuntimeUnavailable,
+            now,
+        );
+        self.primary_surfaces.remove(&binding.tab_id);
+        let tab = if tab.lifecycle == BrowserTabLifecycle::Ready {
+            self.transition_tab(&binding.tab_id, BrowserTabLifecycle::Suspended, now)?
+        } else {
+            self.bump_session_revision(&tab.browser_session_id, now);
+            self.bump_revision();
+            tab
+        };
+        Ok((true, tab, revoked))
+    }
+
     /// 接受 Electron 当前的 Primary Surface，并在同一 Authority 事务中恢复
     /// 逻辑 Tab。Surface 绑定和 Tab lifecycle 必须原子收敛，不能先让 UI 看见
     /// 一个可见的 Chromium Page，再等待另一个 API 请求把 Tab 从 Suspended

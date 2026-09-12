@@ -35,6 +35,14 @@ import {
   resolveBrowserPageTitle,
   resolveMaterializedPageUrl,
 } from "./browser-surface-url.js";
+import {
+  decideBrowserPopup,
+  type BrowserPopupBlockReason,
+} from "./browser-popup-policy.js";
+import {
+  fitBrowserViewportScale,
+  type BrowserDisplaySize,
+} from "./browser-viewport-scale.js";
 
 export interface BrowserInspectedNodeContext {
   browser_session_id: string;
@@ -66,6 +74,7 @@ export interface BrowserDownloadRuntimeSnapshot {
 
 export type BrowserSurfaceEvent =
   | { type: "primary_changed"; binding: BrowserSurfaceBinding }
+  | { type: "primary_closed"; binding: BrowserSurfaceBinding }
   | {
       type: "page_updated";
       binding: BrowserSurfaceBinding;
@@ -78,7 +87,12 @@ export type BrowserSurfaceEvent =
       binding: BrowserSurfaceBinding;
       loading: boolean;
     }
-  | { type: "popup_blocked"; binding: BrowserSurfaceBinding; url: string }
+  | {
+      type: "popup_blocked";
+      binding: BrowserSurfaceBinding;
+      url: string;
+      reason: BrowserPopupBlockReason;
+    }
   | {
       type: "download";
       binding: BrowserSurfaceBinding;
@@ -111,6 +125,22 @@ export type BrowserSurfaceEvent =
       type: "node_inspected";
       binding: BrowserSurfaceBinding;
       node: BrowserInspectedNodeContext;
+    }
+  | {
+      type: "annotation_selection";
+      binding: BrowserSurfaceBinding;
+      selection:
+        | {
+            kind: "element";
+            navigation_revision: number;
+            normalized_x: number;
+            normalized_y: number;
+          }
+        | {
+            kind: "region";
+            navigation_revision: number;
+            rect: { x: number; y: number; width: number; height: number };
+          };
     };
 
 export interface MaterializeSurfaceInput {
@@ -144,6 +174,8 @@ interface BrowserSurfaceRecord {
   partitionId: string;
   /** 由 App Renderer 的 <webview> 注册；Main 不创建显示用的原生 View。 */
   contents: WebContents | null;
+  /** 当前 Renderer 内容槽的 CSS 像素尺寸，只用于 Chromium fixed scale。 */
+  displaySize: BrowserDisplaySize | null;
   pageUrl: string;
   pageTitle: string;
   activationGeneration: number | null;
@@ -195,6 +227,14 @@ interface BrowserSurfaceRecord {
   inspectResourcesEnabled: boolean;
   inspectHoverPoint: { x: number; y: number } | null;
   inspectHoverPromise: Promise<void> | null;
+  annotationCaptureGeneration: number;
+  annotationCaptureActive: boolean;
+  annotationCaptureGestureActive: boolean;
+  annotationCaptureStart: { x: number; y: number } | null;
+  annotationCaptureCurrent: { x: number; y: number } | null;
+  annotationCapturePoint: { x: number; y: number } | null;
+  annotationCaptureRenderPromise: Promise<void> | null;
+  annotationCaptureExecutionContextId: number | null;
   /**
    * Chromium 会先通过 updated 报告可恢复的 interrupted，再在 done 中
    * 报告最终状态。保存状态而不是只保存 DownloadItem，避免快照把真实
@@ -280,8 +320,11 @@ type ViewportCommitState =
 interface ViewportCommit {
   revision: number;
   viewport: BrowserLogicalViewport;
+  displaySize: BrowserDisplaySize | null;
   navigationGeneration: number;
   debuggerSessionGeneration: number;
+  /** 显式用户/工具提交必须重新写入 Chromium，不能由宿主缓存短路。 */
+  force: boolean;
   state: ViewportCommitState;
   abort: AbortController;
   promise: Promise<void>;
@@ -294,14 +337,17 @@ interface ViewportCommitLifecycle {
   current: ViewportCommit | null;
   running: Promise<void> | null;
   /**
-   * Chromium 的设备指标覆盖属于 WebContents 文档状态，不属于某一次
-   * debugger session。即使 debugger detach 后 `applied` 被清空，也必须
-   * 记住目标仍可能处于 fixed override，下一次 Auto 提交要明确清理。
+   * 设备指标覆盖只允许由当前 Surface 的持久 debugger session 写入。
+   * debugger session 失效后本状态同时失效，重新握手后按目标视口重放。
    */
   deviceMetricsOverrideActive: boolean;
   applied: {
     viewport: BrowserLogicalViewport;
     scale: number | null;
+    /** 应用结果属于具体文档和 debugger session，不能跨导航复用。 */
+    navigationGeneration: number;
+    debuggerSessionGeneration: number;
+    displaySize: BrowserDisplaySize | null;
   } | null;
 }
 
@@ -345,6 +391,7 @@ export interface EmbeddedBrowserWebviewInput {
   browserSessionId: string;
   navigationRevision: number;
   webContentsId: number;
+  displaySize: BrowserDisplaySize;
 }
 
 export interface ReleasedBrowserWebviewInput {
@@ -352,6 +399,10 @@ export interface ReleasedBrowserWebviewInput {
   browserSessionId: string;
   navigationRevision: number;
   webContentsId: number;
+}
+
+export interface BrowserDisplaySizeInput extends ReleasedBrowserWebviewInput {
+  displaySize: BrowserDisplaySize;
 }
 
 // 固定资产只用于隔离世界中的可视化指针，不读取或修改页面的光标样式。
@@ -446,7 +497,6 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Emulation.setScriptExecutionDisabled",
   "Storage.getCookies",
   "Emulation.clearGeolocationOverride",
-  "Emulation.clearDeviceMetricsOverride",
   "Emulation.setCPUThrottlingRate",
   "Emulation.setTouchEmulationEnabled",
   "Emulation.setEmulatedMedia",
@@ -550,6 +600,55 @@ const DIALOG_BRIDGE_SCRIPT = String.raw`(() => {
   };
   globalThis.__magiBrowserDialogInstalled = true;
 })();`;
+
+function annotationCaptureOverlayExpression(input: {
+  visible: boolean;
+  x: number | null;
+  y: number | null;
+  width: number | null;
+  height: number | null;
+}): string {
+  return `(() => {
+    const state = ${JSON.stringify(input)};
+    const selector = '[data-magi-browser-annotation-capture="true"]';
+    if (!state.visible) {
+      document.querySelector(selector)?.remove();
+      return true;
+    }
+    let host = document.querySelector(selector);
+    if (!(host instanceof HTMLElement) || !host.isConnected) {
+      host = document.createElement('div');
+      host.dataset.magiBrowserAnnotationCapture = 'true';
+      host.setAttribute('aria-hidden', 'true');
+      (document.documentElement || document.body)?.append(host);
+    }
+    if (!(host instanceof HTMLElement)) return false;
+    host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;overflow:hidden;';
+    let selection = host.querySelector('[data-magi-browser-annotation-selection="true"]');
+    if (!(selection instanceof HTMLElement)) {
+      selection = document.createElement('div');
+      selection.dataset.magiBrowserAnnotationSelection = 'true';
+      host.append(selection);
+    }
+    selection.style.cssText = 'position:absolute;box-sizing:border-box;border:2px solid #e8590c;background:rgba(255,146,43,.16);box-shadow:0 0 0 1px rgba(255,255,255,.75),0 2px 8px rgba(0,0,0,.24);pointer-events:none;display:none;';
+    const hasRect = [state.x, state.y, state.width, state.height].every((value) => typeof value === 'number' && Number.isFinite(value));
+    if (!hasRect || state.width <= 0 || state.height <= 0) return true;
+    const left = Math.max(0, Math.min(innerWidth, Math.min(state.x, state.x + state.width)));
+    const top = Math.max(0, Math.min(innerHeight, Math.min(state.y, state.y + state.height)));
+    const right = Math.max(0, Math.min(innerWidth, Math.max(state.x, state.x + state.width)));
+    const bottom = Math.max(0, Math.min(innerHeight, Math.max(state.y, state.y + state.height)));
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 || height <= 0) return true;
+    selection.style.display = 'block';
+    selection.style.left = left + 'px';
+    selection.style.top = top + 'px';
+    selection.style.width = width + 'px';
+    selection.style.height = height + 'px';
+    return true;
+  })()`;
+}
+
 export class BrowserSurfaceManager {
   readonly #desktopEpoch: string;
   readonly #surfaces = new BrowserSurfaceRegistry<BrowserSurfaceRecord>();
@@ -691,6 +790,7 @@ export class BrowserSurfaceManager {
       browserSessionId: input.browserSessionId,
       partitionId,
       contents: null,
+      displaySize: null,
       pageUrl: normalizeNavigableUrl(input.initialUrl),
       pageTitle: "",
       activationGeneration: input.activationGeneration ?? null,
@@ -740,6 +840,14 @@ export class BrowserSurfaceManager {
       inspectResourcesEnabled: false,
       inspectHoverPoint: null,
       inspectHoverPromise: null,
+      annotationCaptureGeneration: 0,
+      annotationCaptureActive: false,
+      annotationCaptureGestureActive: false,
+      annotationCaptureStart: null,
+      annotationCaptureCurrent: null,
+      annotationCapturePoint: null,
+      annotationCaptureRenderPromise: null,
+      annotationCaptureExecutionContextId: null,
       downloads: new Map(),
       lifecycleEpoch: 0,
       lifecycleAbort: new AbortController(),
@@ -779,15 +887,21 @@ export class BrowserSurfaceManager {
       !record.contents.isDestroyed() &&
       record.contents !== guest
     ) {
-      this.resetDebuggerSession(record);
       // Renderer owns the <webview> guest. The old element is removed by the
       // Renderer lifecycle; Main must not close its WebContents while the old
       // element can still be present in the compositor tree.
-      this.trackPendingGuestRelease(record.contents);
-      record.contents = null;
+      this.detachEmbeddedGuest(record);
     }
-    if (record.contents === guest) return this.binding(record);
+    if (record.contents === guest) {
+      this.updateDisplaySize(record, input.displaySize);
+      return this.binding(record);
+    }
     record.contents = guest;
+    // 内置浏览器自动化在右栏隐藏、应用失焦和 Renderer 重建后仍需读取
+    // Chromium 合成帧。Electron 会把 backgroundThrottling 传播到宿主
+    // compositor；对受管 guest 关闭节流，避免新 guest 的首帧永久挂起。
+    guest.setBackgroundThrottling(false);
+    record.displaySize = structuredClone(input.displaySize);
     record.targetId = `webcontents-${guest.id}`;
     record.priming = true;
     guest.once("destroyed", () => {
@@ -834,6 +948,29 @@ export class BrowserSurfaceManager {
       this.publishRestoredErrorPage(record);
     }
     return this.binding(record);
+  }
+
+  updateEmbeddedWebviewDisplaySize(
+    windowId: string,
+    input: BrowserDisplaySizeInput,
+  ): void {
+    const record = this.surfaceForTab(input.tabId, windowId);
+    if (!record) throw staleSurfaceError("browser_surface_not_found");
+    if (record.browserSessionId !== input.browserSessionId) {
+      throw staleSurfaceError("browser_browser_session_stale");
+    }
+    if (record.navigationRevision !== input.navigationRevision) {
+      throw staleSurfaceError("browser_navigation_revision_stale");
+    }
+    const contents = record.contents;
+    if (
+      !contents ||
+      contents.isDestroyed() ||
+      contents.id !== input.webContentsId
+    ) {
+      throw staleSurfaceError("browser_surface_content_unavailable");
+    }
+    this.updateDisplaySize(record, input.displaySize);
   }
 
   /**
@@ -941,7 +1078,7 @@ export class BrowserSurfaceManager {
     return Boolean(record && !record.closed);
   }
 
-  focusTab(windowId: string, tabId: string): boolean {
+  activateTabSurface(windowId: string, tabId: string): boolean {
     const record = this.#surfaces.forWindowTab(windowId, tabId);
     const contents = record?.contents;
     if (
@@ -952,7 +1089,6 @@ export class BrowserSurfaceManager {
     )
       return false;
     this.promote(record.surfaceId);
-    contents.focus();
     return true;
   }
 
@@ -1028,6 +1164,24 @@ export class BrowserSurfaceManager {
 
   viewportForSurface(surfaceId: string | null): BrowserLogicalViewport | null {
     return this.viewportStateForSurface(surfaceId)?.viewport ?? null;
+  }
+
+  displayMetricsForSurface(surfaceId: string | null): {
+    width: number;
+    height: number;
+    scale: number;
+  } | null {
+    if (!surfaceId) return null;
+    const record = this.#surfaces.get(surfaceId);
+    const displaySize = record?.displaySize;
+    if (!record || record.closed || !displaySize) return null;
+    const scale = record.viewport.mode === "fixed"
+      ? fitBrowserViewportScale(
+          { width: record.viewport.width, height: record.viewport.height },
+          displaySize,
+        )
+      : 1;
+    return { ...structuredClone(displaySize), scale };
   }
 
   navigationRevisionForSurface(surfaceId: string | null): number | null {
@@ -1162,7 +1316,7 @@ export class BrowserSurfaceManager {
     try {
       inputCommand = this.enqueueCdp(
         record,
-        async ({ track }) => {
+        async ({ track, debuggerLease }) => {
           // 只在当前输入真正取得 Surface lane 后注册 waiter，避免排队中的
           // 后续输入被同一次 dialog opening 错误地当成已执行。
           const nativeDialogOpening = injectsInput
@@ -1175,6 +1329,16 @@ export class BrowserSurfaceManager {
             // 与 lane 外的校验保持一致：排队期间文档已经换代时，旧命令必须
             // 失败并交给上层使用新的 binding 重试，不能把旧 DOM 操作投递到新页。
             this.recordForBinding(binding);
+            const lease = debuggerLease(sessionId);
+            if (method === "Page.captureScreenshot") {
+              await this.waitForCompositorFrame(
+                record,
+                lease,
+                track,
+                options.signal,
+              );
+              this.recordForBinding(binding);
+            }
             const command = this.sendSurfaceCdpCommand(
               record,
               method,
@@ -1184,7 +1348,7 @@ export class BrowserSurfaceManager {
               method === "Page.captureScreenshot"
                 ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS
                 : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-              this.createDebuggerSessionLease(record, sessionId),
+              lease,
               track,
               options.signal,
             );
@@ -1275,19 +1439,26 @@ export class BrowserSurfaceManager {
               this.createDebuggerSessionLease(record, sessionId),
           });
         } catch (error) {
-          if (isBrowserTargetClosedError(error)) {
+          // CDP lane 属于捕获时的物理 guest。Renderer F5 或 webview 重绑后，
+          // 旧命令可能迟到失败，但它不能再 detach/reset 当前的新 guest。
+          // lifecycle epoch 是这条跨异步边界的唯一所有权栅栏。
+          const lifecycleCurrent =
+            !record.closed && record.lifecycleEpoch === lifecycleEpoch;
+          if (lifecycleCurrent && isBrowserTargetClosedError(error)) {
             // Chromium Target 已经终止时，任何仍在 lane 中的命令都必须把
             // Surface 转为“等待新 guest”状态；否则 rejected CDP promise 会
             // 被 reconnectDebugger 当作暂时断线而无限重试。
             this.detachEmbeddedGuest(record);
-          }
-          if (isCdpTimeoutError(error)) {
+          } else if (lifecycleCurrent && isCdpTimeoutError(error)) {
             // Electron 的 debugger.sendCommand 没有可取消句柄。超时后必须
             // 废弃整个 debugger session 并让 Chromium 结束旧请求，否则迟到
             // 的响应会继续污染同一 Surface 的后续命令队列。
             this.invalidateDebuggerSession(record, "cdp-timeout");
-          }
-          if (operationStarted && isBrowserCommandCancelledError(error)) {
+          } else if (
+            lifecycleCurrent &&
+            operationStarted &&
+            isBrowserCommandCancelledError(error)
+          ) {
             // Electron 的 debugger.sendCommand 没有取消句柄。取消已经发给
             // Main 的 CDP 请求时，直接废弃当前 debugger session，让迟到的
             // Chromium Promise 只能落在旧 lease 上；Surface lane 则立即释放
@@ -1398,6 +1569,60 @@ export class BrowserSurfaceManager {
     );
   }
 
+  private async waitForCompositorFrame(
+    record: BrowserSurfaceRecord,
+    lease: DebuggerSessionLease,
+    track: (promise: Promise<unknown>) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const frameTree = (await this.sendSurfaceCdpCommand(
+      record,
+      "Page.getFrameTree",
+      {},
+      SCREENSHOT_READINESS_TIMEOUT_MS,
+      lease,
+      track,
+      signal,
+    )) as { frameTree?: { frame?: { id?: string } } };
+    const frameId = frameTree.frameTree?.frame?.id;
+    if (!frameId) throw new Error("browser_screenshot_frame_unavailable");
+    const world = (await this.sendSurfaceCdpCommand(
+      record,
+      "Page.createIsolatedWorld",
+      {
+        frameId,
+        worldName: "magi-screenshot-readiness",
+        grantUniveralAccess: false,
+      },
+      SCREENSHOT_READINESS_TIMEOUT_MS,
+      lease,
+      track,
+      signal,
+    )) as { executionContextId?: number };
+    if (!world.executionContextId) {
+      throw new Error("browser_screenshot_context_unavailable");
+    }
+    // did-finish-load 与 viewport commit 不代表 compositor 已提交首帧。
+    // 在独立 world 等待两个真实渲染帧，防止 F5 后过早截图把 Chromium
+    // capture 管线卡在尚未建立的 Surface 上。这里没有固定成功等待；
+    // 只有真实帧事件或明确超时能够结束前置条件。
+    await this.sendSurfaceCdpCommand(
+      record,
+      "Runtime.evaluate",
+      {
+        contextId: world.executionContextId,
+        awaitPromise: true,
+        returnByValue: true,
+        expression:
+          "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))",
+      },
+      SCREENSHOT_READINESS_TIMEOUT_MS,
+      lease,
+      track,
+      signal,
+    );
+  }
+
   private async waitForViewportCommit(
     record: BrowserSurfaceRecord,
   ): Promise<void> {
@@ -1431,8 +1656,9 @@ export class BrowserSurfaceManager {
 
   private scheduleViewportCommit(
     record: BrowserSurfaceRecord,
+    force = false,
   ): ViewportCommit | null {
-    const commit = this.requestViewportCommit(record);
+    const commit = this.requestViewportCommit(record, force);
     if (!commit || record.viewportLifecycle.running) return commit;
 
     const running = this.flushViewportCommits(record);
@@ -1461,19 +1687,19 @@ export class BrowserSurfaceManager {
 
   private requestViewportCommit(
     record: BrowserSurfaceRecord,
+    force: boolean,
   ): ViewportCommit | null {
     if (record.closed || !record.contents || record.contents.isDestroyed())
       return null;
     const current = record.viewportLifecycle.current;
-    const debuggerGenerationMatches =
-      record.viewport.mode === "auto" ||
-      current?.debuggerSessionGeneration === record.debuggerSessionGeneration;
     if (
+      !force &&
       current &&
       ["requested", "applying", "ready"].includes(current.state) &&
       current.navigationGeneration === record.navigationGeneration &&
-      debuggerGenerationMatches &&
-      sameLogicalViewport(current.viewport, record.viewport)
+      current.debuggerSessionGeneration === record.debuggerSessionGeneration &&
+      sameLogicalViewport(current.viewport, record.viewport) &&
+      sameDisplaySize(current.displaySize, record.displaySize)
     )
       return current;
     if (
@@ -1493,8 +1719,12 @@ export class BrowserSurfaceManager {
     const commit: ViewportCommit = {
       revision: ++record.viewportLifecycle.nextRevision,
       viewport: structuredClone(record.viewport),
+      displaySize: record.displaySize
+        ? structuredClone(record.displaySize)
+        : null,
       navigationGeneration: record.navigationGeneration,
       debuggerSessionGeneration: record.debuggerSessionGeneration,
+      force,
       state: "requested",
       abort: new AbortController(),
       promise,
@@ -1538,13 +1768,26 @@ export class BrowserSurfaceManager {
         return;
       if (!this.isViewportCommitInputCurrent(record, commit)) return;
       // 导航期间不向 Chromium 写固定设备指标；真实 guest 自己保留文档
-      // 加载态和 compositor 帧，避免刷新/跳转期间由宿主制造黑屏。
+      // 加载态和 compositor 帧，避免刷新/跳转期间由宿主制造黑屏。导航是否
+      // 已完成只由 BrowserSurface 的事务状态机决定；isLoadingMainFrame() 在
+      // did-finish-load/did-stop-loading 回调阶段仍可能暂时为 true，且变为 false
+      // 时不会产生新的提交唤醒事件，不能作为第二个生命周期事实源。
       const contents = record.contents;
       if (!contents || contents.isDestroyed()) return;
-      if (record.priming || contents.isLoadingMainFrame()) return;
+      if (record.priming) return;
+      if (
+        !record.debuggerSessionInitialized ||
+        !contents.debugger.isAttached()
+      )
+        return;
       commit.state = "applying";
       try {
-        await this.enqueueCdp(record, () => this.applyViewport(record, commit));
+        await this.enqueueCdp(
+          record,
+          ({ debuggerLease, track }) =>
+            this.applyViewport(record, commit, debuggerLease(), track),
+          commit.abort.signal,
+        );
         if (!this.isViewportCommitInputCurrent(record, commit)) continue;
         // `applyViewport` 已通过同一条 Surface CDP lane 完成，DOM 的
         // <webview> 尺寸由右栏自然布局负责，不需要向 Main 回报 ready。
@@ -1581,8 +1824,8 @@ export class BrowserSurfaceManager {
       Boolean(contents) &&
       !contents?.isDestroyed() &&
       record.navigationGeneration === commit.navigationGeneration &&
-      (commit.viewport.mode === "auto" ||
-        record.debuggerSessionGeneration === commit.debuggerSessionGeneration)
+      record.debuggerSessionGeneration === commit.debuggerSessionGeneration &&
+      sameDisplaySize(record.displaySize, commit.displaySize)
     );
   }
 
@@ -1739,7 +1982,10 @@ export class BrowserSurfaceManager {
     record.viewport = viewport;
     const contents = this.requireContents(record);
     if (contents.isLoadingMainFrame()) return;
-    this.scheduleViewportCommit(record);
+    // 显式提交即使与宿主记录相同，也必须重新写入当前 Chromium session。
+    // 这使调用方可以校正外部调试动作造成的实际状态漂移，宿主缓存只用于
+    // 合并内部重复生命周期事件，不能替代浏览器事实。
+    this.scheduleViewportCommit(record, true);
     await this.waitForViewportCommit(record);
     this.assertRenderableBinding(binding);
   }
@@ -1886,6 +2132,392 @@ export class BrowserSurfaceManager {
     this.assertRenderableBinding(binding);
     await this.stopInspectRecord(record);
     this.assertRenderableBinding(binding);
+  }
+
+  /**
+   * 区域标记必须消费 guest 的原生输入事件。主 Renderer 的 DOM 无法可靠
+   * 覆盖 Electron webview 合成层，继续在这里放一个 pointer-events 覆盖层
+   * 会把拖拽变成网页文本选择。捕获状态属于当前物理 Surface，不属于
+   * 逻辑 Browser Tab，也不会参与右栏布局。
+   */
+  async startAnnotationCapture(binding: BrowserSurfaceBinding): Promise<void> {
+    const record = this.requireRecord(binding.surface_id);
+    this.assertRenderableBinding(binding);
+    const generation = ++record.annotationCaptureGeneration;
+    record.annotationCaptureActive = true;
+    record.annotationCaptureGestureActive = false;
+    record.annotationCaptureStart = null;
+    record.annotationCaptureCurrent = null;
+    record.annotationCapturePoint = null;
+    try {
+      await this.waitForDebugger(record);
+      this.assertRenderableBinding(binding);
+      await this.enqueueCdp(record, async ({ track, debuggerLease }) => {
+        if (!this.isAnnotationCaptureGenerationActive(record, generation))
+          return;
+        const lease = debuggerLease();
+        const contextId = await this.ensureAnnotationCaptureContext(
+          record,
+          lease,
+          track,
+        );
+        if (!this.isAnnotationCaptureGenerationActive(record, generation))
+          return;
+        await this.sendSurfaceCdpCommand(
+          record,
+          "Runtime.evaluate",
+          {
+            contextId,
+            returnByValue: true,
+            awaitPromise: false,
+            expression: annotationCaptureOverlayExpression({
+              visible: true,
+              x: null,
+              y: null,
+              width: null,
+              height: null,
+            }),
+          },
+          CURSOR_CDP_COMMAND_TIMEOUT_MS,
+          lease,
+          track,
+        );
+      });
+      this.assertRenderableBinding(binding);
+      if (!record.annotationCaptureActive) {
+        throw staleSurfaceError("browser_annotation_capture_inactive");
+      }
+      if (record.annotationCapturePoint) {
+        this.scheduleAnnotationCaptureRender(record);
+      }
+    } catch (error) {
+      if (record.annotationCaptureGeneration === generation) {
+        record.annotationCaptureActive = false;
+        record.annotationCaptureGestureActive = false;
+        record.annotationCaptureStart = null;
+        record.annotationCaptureCurrent = null;
+        record.annotationCapturePoint = null;
+      }
+      await this.stopAnnotationCaptureRecord(record).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async stopAnnotationCapture(binding: BrowserSurfaceBinding): Promise<void> {
+    const record = this.requireRecord(binding.surface_id);
+    this.assertRenderableBinding(binding);
+    await this.stopAnnotationCaptureRecord(record);
+    this.assertRenderableBinding(binding);
+  }
+
+  private isAnnotationCaptureGenerationActive(
+    record: BrowserSurfaceRecord,
+    generation: number,
+  ): boolean {
+    const contents = record.contents;
+    return (
+      !record.closed &&
+      Boolean(contents) &&
+      !contents?.isDestroyed() &&
+      this.isContentSlotBound(record) &&
+      record.primary &&
+      this.#surfaces.isPrimary(record) &&
+      record.annotationCaptureActive &&
+      record.annotationCaptureGeneration === generation &&
+      Boolean(contents?.debugger.isAttached())
+    );
+  }
+
+  private async ensureAnnotationCaptureContext(
+    record: BrowserSurfaceRecord,
+    lease: DebuggerSessionLease,
+    track: (promise: Promise<unknown>) => void,
+  ): Promise<number> {
+    if (record.annotationCaptureExecutionContextId !== null) {
+      return record.annotationCaptureExecutionContextId;
+    }
+    const frameTree = (await this.sendSurfaceCdpCommand(
+      record,
+      "Page.getFrameTree",
+      {},
+      CURSOR_CDP_COMMAND_TIMEOUT_MS,
+      lease,
+      track,
+    )) as { frameTree?: { frame?: { id?: string } } };
+    const frameId = frameTree.frameTree?.frame?.id;
+    if (!frameId) throw new Error("browser_annotation_capture_context_unavailable");
+    const world = (await this.sendSurfaceCdpCommand(
+      record,
+      "Page.createIsolatedWorld",
+      {
+        frameId,
+        worldName: "magi-browser-annotation-capture",
+        grantUniveralAccess: false,
+      },
+      CURSOR_CDP_COMMAND_TIMEOUT_MS,
+      lease,
+      track,
+    )) as { executionContextId?: number };
+    if (!world.executionContextId) {
+      throw new Error("browser_annotation_capture_context_unavailable");
+    }
+    record.annotationCaptureExecutionContextId = world.executionContextId;
+    return world.executionContextId;
+  }
+
+  private scheduleAnnotationCaptureRender(record: BrowserSurfaceRecord): void {
+    if (
+      !record.annotationCaptureActive ||
+      !record.annotationCaptureGestureActive ||
+      !record.annotationCapturePoint ||
+      record.annotationCaptureRenderPromise
+    )
+      return;
+    const generation = record.annotationCaptureGeneration;
+    const render = (async () => {
+      while (this.isAnnotationCaptureGenerationActive(record, generation)) {
+        const point = record.annotationCapturePoint;
+        if (!point) return;
+        record.annotationCapturePoint = null;
+        const contextId = record.annotationCaptureExecutionContextId;
+        if (contextId === null) return;
+        await this.enqueueCdp(record, async ({ track, debuggerLease }) => {
+          if (!this.isAnnotationCaptureGenerationActive(record, generation))
+            return;
+          await this.sendSurfaceCdpCommand(
+            record,
+            "Runtime.evaluate",
+            {
+              contextId,
+              returnByValue: true,
+              awaitPromise: false,
+              expression: annotationCaptureOverlayExpression({
+                visible: true,
+                x: record.annotationCaptureStart?.x ?? point.x,
+                y: record.annotationCaptureStart?.y ?? point.y,
+                width: Math.abs(
+                  point.x - (record.annotationCaptureStart?.x ?? point.x),
+                ),
+                height: Math.abs(
+                  point.y - (record.annotationCaptureStart?.y ?? point.y),
+                ),
+              }),
+            },
+            CURSOR_CDP_COMMAND_TIMEOUT_MS,
+            debuggerLease(),
+            track,
+          );
+        });
+      }
+    })();
+    record.annotationCaptureRenderPromise = render;
+    void render
+      .catch((error) => {
+        if (!record.closed && record.annotationCaptureActive) {
+          console.warn("[BrowserSurfaceManager] 区域标记选区渲染失败", {
+            surfaceId: record.surfaceId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })
+      .finally(() => {
+        if (record.annotationCaptureRenderPromise === render) {
+          record.annotationCaptureRenderPromise = null;
+        }
+        if (
+          record.annotationCaptureActive &&
+          record.annotationCaptureGestureActive &&
+          record.annotationCapturePoint
+        ) {
+          this.scheduleAnnotationCaptureRender(record);
+        }
+      });
+  }
+
+  private stopAnnotationCaptureForLifecycle(
+    record: BrowserSurfaceRecord,
+    reason: string,
+  ): void {
+    if (
+      !record.annotationCaptureActive &&
+      !record.annotationCaptureGestureActive &&
+      record.annotationCaptureExecutionContextId === null
+    )
+      return;
+    void this.stopAnnotationCaptureRecord(record).catch((error) => {
+      if (!record.closed) {
+        console.warn("[BrowserSurfaceManager] 区域标记清理失败", {
+          surfaceId: record.surfaceId,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  private stopAnnotationCaptureRecord(
+    record: BrowserSurfaceRecord,
+  ): Promise<void> {
+    const contextId = record.annotationCaptureExecutionContextId;
+    const hasWork =
+      record.annotationCaptureActive ||
+      record.annotationCaptureGestureActive ||
+      contextId !== null;
+    ++record.annotationCaptureGeneration;
+    record.annotationCaptureActive = false;
+    record.annotationCaptureGestureActive = false;
+    record.annotationCaptureStart = null;
+    record.annotationCaptureCurrent = null;
+    record.annotationCapturePoint = null;
+    record.annotationCaptureExecutionContextId = null;
+    if (!hasWork || contextId === null) return Promise.resolve();
+    const contents = record.contents;
+    if (!contents || contents.isDestroyed() || !contents.debugger.isAttached())
+      return Promise.resolve();
+    return this.enqueueCdp(record, async ({ track, debuggerLease }) => {
+      await this.sendSurfaceCdpCommand(
+        record,
+        "Runtime.evaluate",
+        {
+          contextId,
+          returnByValue: true,
+          awaitPromise: false,
+          expression: annotationCaptureOverlayExpression({
+            visible: false,
+            x: null,
+            y: null,
+            width: null,
+            height: null,
+          }),
+        },
+        CURSOR_CDP_COMMAND_TIMEOUT_MS,
+        debuggerLease(),
+        track,
+      );
+    });
+  }
+
+  private handleAnnotationCapturePointRequested(
+    record: BrowserSurfaceRecord,
+    x: number,
+    y: number,
+  ): void {
+    const start = record.annotationCaptureStart;
+    if (!start || !record.annotationCaptureActive) return;
+    const generation = record.annotationCaptureGeneration;
+    const end = {
+      x: Math.max(0, x),
+      y: Math.max(0, y),
+    };
+    record.annotationCaptureCurrent = end;
+    record.annotationCapturePoint = end;
+    const contents = record.contents;
+    if (
+      !contents ||
+      contents.isDestroyed() ||
+      !contents.debugger.isAttached() ||
+      !this.isAnnotationCaptureGenerationActive(record, generation)
+    )
+      return;
+    void this.enqueueCdp(record, async ({ track, debuggerLease }) => {
+      if (!this.isAnnotationCaptureGenerationActive(record, generation)) return;
+      const viewport = (await this.sendSurfaceCdpCommand(
+        record,
+        "Runtime.evaluate",
+        {
+          returnByValue: true,
+          awaitPromise: false,
+          expression: "({ width: innerWidth, height: innerHeight })",
+        },
+        CURSOR_CDP_COMMAND_TIMEOUT_MS,
+        debuggerLease(),
+        track,
+      )) as { result?: { value?: { width?: unknown; height?: unknown } } };
+      const width = viewport.result?.value?.width;
+      const height = viewport.result?.value?.height;
+      if (
+        typeof width !== "number" ||
+        !Number.isFinite(width) ||
+        width <= 0 ||
+        typeof height !== "number" ||
+        !Number.isFinite(height) ||
+        height <= 0 ||
+        !this.isAnnotationCaptureGenerationActive(record, generation)
+      )
+        return;
+      const clampedStart = {
+        x: Math.max(0, Math.min(width, start.x)),
+        y: Math.max(0, Math.min(height, start.y)),
+      };
+      const clampedEnd = {
+        x: Math.max(0, Math.min(width, end.x)),
+        y: Math.max(0, Math.min(height, end.y)),
+      };
+      const normalizedStart = {
+        x: clampedStart.x / width,
+        y: clampedStart.y / height,
+      };
+      const normalizedEnd = {
+        x: clampedEnd.x / width,
+        y: clampedEnd.y / height,
+      };
+      const normalizedWidth = Math.abs(normalizedEnd.x - normalizedStart.x);
+      const normalizedHeight = Math.abs(normalizedEnd.y - normalizedStart.y);
+      const selection =
+        normalizedWidth < 0.012 && normalizedHeight < 0.012
+          ? {
+              kind: "element" as const,
+              navigation_revision: record.navigationRevision,
+              normalized_x: normalizedEnd.x,
+              normalized_y: normalizedEnd.y,
+            }
+          : {
+              kind: "region" as const,
+              navigation_revision: record.navigationRevision,
+              rect: {
+                x: Math.min(normalizedStart.x, normalizedEnd.x),
+                y: Math.min(normalizedStart.y, normalizedEnd.y),
+                width: normalizedWidth,
+                height: normalizedHeight,
+              },
+            };
+      this.#onEvent({
+        type: "annotation_selection",
+        binding: this.binding(record),
+        selection,
+      });
+    }).catch((error) => {
+      if (!record.closed && record.annotationCaptureActive) {
+        console.warn("[BrowserSurfaceManager] 区域标记选择采集失败", {
+          surfaceId: record.surfaceId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  private annotationCapturePagePoint(
+    record: BrowserSurfaceRecord,
+    x: number,
+    y: number,
+  ): { x: number; y: number } {
+    if (record.viewport.mode !== "fixed" || !record.displaySize) {
+      return { x: Math.max(0, x), y: Math.max(0, y) };
+    }
+    const scale = fitBrowserViewportScale(
+      { width: record.viewport.width, height: record.viewport.height },
+      record.displaySize,
+    );
+    if (!Number.isFinite(scale) || scale <= 0) {
+      return { x: Math.max(0, x), y: Math.max(0, y) };
+    }
+    // before-mouse-event 使用内容槽坐标，而 CDP 设备仿真页面使用 CSS
+    // 视口坐标。固定设备画布缩放时必须在同一边界完成逆缩放，否则选区
+    // 会把内容槽坐标误当作页面坐标，最终出现区域偏移或被压到右下角。
+    return {
+      x: Math.max(0, x / scale),
+      y: Math.max(0, y / scale),
+    };
   }
 
   private isInspectGenerationActive(
@@ -2410,6 +3042,7 @@ export class BrowserSurfaceManager {
     record.cursorExecutionContextId = null;
     this.invalidateViewportCommit(record, "navigation");
     this.stopInspectForLifecycle(record, "navigation");
+    this.stopAnnotationCaptureForLifecycle(record, "navigation");
     if (operation.loadingEmitted) {
       this.#onEvent({
         type: "loading_changed",
@@ -3214,7 +3847,10 @@ export class BrowserSurfaceManager {
               x: point.x,
               y: point.y,
               includeUserAgentShadowDOM: true,
-              ignorePointerEventsNone: true,
+              // Inspect 必须遵循用户实际看到的指针命中语义。标记和虚拟
+              // 鼠标等 Magi 页面层均为 pointer-events:none，不能成为用户
+              // 选择结果，也不能遮住其下方真实网页节点。
+              ignorePointerEventsNone: false,
             },
             DEFAULT_CDP_COMMAND_TIMEOUT_MS,
             lease,
@@ -3297,7 +3933,7 @@ export class BrowserSurfaceManager {
           x: Math.max(0, Math.floor(x)),
           y: Math.max(0, Math.floor(y)),
           includeUserAgentShadowDOM: true,
-          ignorePointerEventsNone: true,
+          ignorePointerEventsNone: false,
         },
         DEFAULT_CDP_COMMAND_TIMEOUT_MS,
         lease,
@@ -3672,11 +4308,11 @@ export class BrowserSurfaceManager {
     });
     webContents.setWindowOpenHandler((details) => {
       // 这是 Chromium 创建新 WebContents 前的唯一边界。右栏 Browser Tab
-      // 只有一个顶层页面：合法的网页弹窗请求转成当前页导航，禁止创建
-      // 第二个 WebContents、BrowserWindow 或 Magi 子 Tab。
-      try {
-        if (!isCurrentGuest()) return { action: "deny" };
-        const url = normalizePopupNavigationUrl(details.url);
+      // 只有一个顶层页面：产品决策函数只允许可证明不依赖独立窗口的请求
+      // 转成当前页导航，其他请求携带稳定原因拒绝。
+      if (!isCurrentGuest()) return { action: "deny" };
+      const decision = decideBrowserPopup(details);
+      if (decision.action === "navigate_current_page") {
         // Electron 仍在处理 window-open 回调时不能对同一个 WebContents
         // 立即启动顶层导航，否则新文档已经加载但原生视图的 compositor
         // 不会重新提交首帧，表现为 API 截图正常而右栏黑屏。把导航放到
@@ -3684,7 +4320,7 @@ export class BrowserSurfaceManager {
         // 不创建第二个 WebContents，也不增加任何子 Tab。
         setImmediate(() => {
           if (!isCurrentGuest()) return;
-          void this.loadPopupInCurrentPage(record, url, details).catch(
+          void this.loadPopupInCurrentPage(record, decision.url, details).catch(
             (error) => {
               if (isCurrentGuest()) {
                 console.warn(
@@ -3692,7 +4328,7 @@ export class BrowserSurfaceManager {
                   {
                     tabId: record.tabId,
                     surfaceId: record.surfaceId,
-                    url,
+                    url: decision.url,
                     error:
                       error instanceof Error ? error.message : String(error),
                   },
@@ -3701,13 +4337,12 @@ export class BrowserSurfaceManager {
             },
           );
         });
-      } catch {
-        if (!isCurrentGuest()) return { action: "deny" };
-        // about:blank、脚本协议和其他不受信任的 popup 不能转移到当前页。
+      } else {
         this.#onEvent({
           type: "popup_blocked",
           binding: this.binding(record),
           url: details.url,
+          reason: decision.reason,
         });
       }
       return { action: "deny" };
@@ -4102,6 +4737,49 @@ export class BrowserSurfaceManager {
     });
     webContents.on("before-mouse-event", (event, input) => {
       if (!isCurrentGuest() || record.automationInputDepth > 0) return;
+
+      // 区域标记消费 guest 的原生鼠标手势。选区反馈绘制在 guest 自己的
+      // isolated world 中，因此拖动不会触发网页文本选择，也不会依赖主
+      // Renderer 覆盖层的坐标和 z-index。
+      if (
+        record.annotationCaptureActive ||
+        record.annotationCaptureGestureActive
+      ) {
+        if (
+          record.annotationCaptureActive &&
+          input.type === "mouseDown" &&
+          (input.button === undefined || input.button === "left")
+        ) {
+          event.preventDefault();
+          record.annotationCaptureGestureActive = true;
+          record.annotationCaptureStart = this.annotationCapturePagePoint(
+            record,
+            input.x,
+            input.y,
+          );
+          record.annotationCaptureCurrent = record.annotationCaptureStart;
+          record.annotationCapturePoint = record.annotationCaptureStart;
+          this.scheduleAnnotationCaptureRender(record);
+        } else if (
+          record.annotationCaptureGestureActive &&
+          input.type === "mouseMove"
+        ) {
+          event.preventDefault();
+          const point = this.annotationCapturePagePoint(record, input.x, input.y);
+          record.annotationCaptureCurrent = point;
+          record.annotationCapturePoint = point;
+          this.scheduleAnnotationCaptureRender(record);
+        } else if (
+          record.annotationCaptureGestureActive &&
+          input.type === "mouseUp"
+        ) {
+          event.preventDefault();
+          record.annotationCaptureGestureActive = false;
+          const point = this.annotationCapturePagePoint(record, input.x, input.y);
+          this.handleAnnotationCapturePointRequested(record, point.x, point.y);
+        }
+        return;
+      }
 
       // 节点选择在 guest 的真实输入事件上完成；右栏拖动属于 App Renderer
       // 的 DOM 事件，不再跨进程转换坐标。
@@ -4531,6 +5209,7 @@ export class BrowserSurfaceManager {
     // stopInspectForLifecycle 必须先读取并排队清理 Overlay 资源；下面的
     // 状态清零只负责阻止新请求，不能覆盖这次清理已经捕获的事实。
     this.stopInspectForLifecycle(record, "debugger-detached");
+    this.stopAnnotationCaptureForLifecycle(record, "debugger-detached");
     this.invalidateViewportCommit(record, "debugger-session");
     this.removeDebuggerListeners(record);
     record.debuggerSessionGeneration += 1;
@@ -4548,6 +5227,7 @@ export class BrowserSurfaceManager {
     record.cdpSessionIds.clear();
     record.blockedCdpSessionIds.clear();
     record.cursorExecutionContextId = null;
+    record.viewportLifecycle.deviceMetricsOverrideActive = false;
     record.viewportLifecycle.applied = null;
   }
 
@@ -4791,10 +5471,14 @@ export class BrowserSurfaceManager {
   private async applyViewport(
     record: BrowserSurfaceRecord,
     commit: ViewportCommit,
+    lease: DebuggerSessionLease,
+    track: (promise: Promise<unknown>) => void,
   ): Promise<void> {
     const contents = this.requireContents(record);
     if (record.closed || contents.isDestroyed()) return;
-    if (contents.isLoadingMainFrame()) return;
+    // flush 进入 CDP lane 后可能有新导航抢先开始；继续使用同一个权威
+    // navigation gate 二次校验，不能重新引入 Electron 查询态作为并行事实源。
+    if (record.priming) return;
     const lifecycle = record.viewportLifecycle;
     const applied = lifecycle.applied;
     if (commit.viewport.mode === "auto") {
@@ -4802,16 +5486,29 @@ export class BrowserSurfaceManager {
       // viewport，Chromium 会自行触发 resize、media query 和 flex/grid 重排。
       // 这条路径不能把右栏尺寸再次转成 CDP override，否则每次拖动都会
       // 让页面经历第二套 viewport 变更，产生闪烁、跳动或状态不同步。
-      // 只有从 fixed 切换回来时才需要清理旧的 CDP override；清理动作也
-      // 必须允许在 Surface 暂时隐藏时执行，避免隐藏期间残留固定视口。
-      if (!lifecycle.deviceMetricsOverrideActive) {
+      // 只有从 fixed 切换回来或显式要求校正时才清理。生命周期内部产生的
+      // 重复 auto 事件可由缓存合并，但显式提交不能把缓存当作浏览器事实。
+      if (!commit.force && !lifecycle.deviceMetricsOverrideActive) {
         lifecycle.applied = {
           viewport: structuredClone(commit.viewport),
           scale: null,
+          navigationGeneration: commit.navigationGeneration,
+          debuggerSessionGeneration: commit.debuggerSessionGeneration,
+          displaySize: commit.displaySize
+            ? structuredClone(commit.displaySize)
+            : null,
         };
         return;
       }
-      contents.disableDeviceEmulation();
+      await this.sendSurfaceCdpCommand(
+        record,
+        "Emulation.clearDeviceMetricsOverride",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        lease,
+        track,
+        commit.abort.signal,
+      );
       if (record.viewportLifecycle.current !== commit) {
         throw staleSurfaceError("browser_viewport_commit_stale");
       }
@@ -4819,6 +5516,11 @@ export class BrowserSurfaceManager {
       lifecycle.applied = {
         viewport: structuredClone(commit.viewport),
         scale: null,
+        navigationGeneration: commit.navigationGeneration,
+        debuggerSessionGeneration: commit.debuggerSessionGeneration,
+        displaySize: commit.displaySize
+          ? structuredClone(commit.displaySize)
+          : null,
       };
       return;
     }
@@ -4827,29 +5529,62 @@ export class BrowserSurfaceManager {
     const width = Math.max(320, Math.round(viewport.width));
     const height = Math.max(240, Math.round(viewport.height));
     const mobile = viewport.device_type === "mobile";
-    // 固定视口由 Chromium 设备仿真负责。显示槽位的尺寸属于 Renderer
-    // DOM 布局，Main 不读取它，也不以它推导缩放比例。
-    const scale = 1;
+    const displaySize = commit.displaySize;
+    if (!displaySize) {
+      throw new Error("browser_display_size_unavailable");
+    }
+    // Renderer 只上报当前内容槽的瞬时 CSS 尺寸；Main 不读取窗口坐标，
+    // 也不设置原生 bounds。完整容纳设备画布只由 Chromium scale 完成。
+    const scale = fitBrowserViewportScale(
+      { width, height },
+      displaySize,
+    );
     if (
+      !commit.force &&
       applied &&
       applied.scale !== null &&
+      applied.navigationGeneration === commit.navigationGeneration &&
+      applied.debuggerSessionGeneration === commit.debuggerSessionGeneration &&
+      sameDisplaySize(applied.displaySize, commit.displaySize) &&
       sameLogicalViewport(applied.viewport, viewport) &&
       applied.scale === scale
     )
       return;
-    contents.enableDeviceEmulation({
-      screenPosition: mobile ? "mobile" : "desktop",
-      screenSize: { width, height },
-      viewPosition: { x: 0, y: 0 },
-      deviceScaleFactor: viewport.device_scale_factor_millis / 1_000,
-      viewSize: { width, height },
-      scale,
-    });
+    await this.sendSurfaceCdpCommand(
+      record,
+      "Emulation.setDeviceMetricsOverride",
+      {
+        width,
+        height,
+        deviceScaleFactor: viewport.device_scale_factor_millis / 1_000,
+        mobile,
+        scale,
+        screenWidth: width,
+        screenHeight: height,
+        positionX: 0,
+        positionY: 0,
+        // `<webview>` 的物理可见尺寸只由 Renderer 内容槽决定。Chromium
+        // DevTools Device Mode 也固定使用该参数，防止设备指标覆盖反向改写
+        // guest compositor surface；否则固定视口下 Page.captureScreenshot 会
+        // 等待一个与嵌入容器冲突的可见尺寸并最终超时。
+        dontSetVisibleSize: true,
+      },
+      DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+      lease,
+      track,
+      commit.abort.signal,
+    );
     if (record.viewportLifecycle.current !== commit) {
       throw staleSurfaceError("browser_viewport_commit_stale");
     }
     lifecycle.deviceMetricsOverrideActive = true;
-    lifecycle.applied = { viewport: structuredClone(viewport), scale };
+    lifecycle.applied = {
+      viewport: structuredClone(viewport),
+      scale,
+      navigationGeneration: commit.navigationGeneration,
+      debuggerSessionGeneration: commit.debuggerSessionGeneration,
+      displaySize: structuredClone(displaySize),
+    };
   }
 
   private async setAgentCursor(
@@ -5011,6 +5746,13 @@ export class BrowserSurfaceManager {
       // mounted in another window, so terminate its Overlay/DOM domains
       // before allowing the new surface to receive inspect events.
       this.stopInspectForLifecycle(previous, "surface-not-primary");
+      this.stopAnnotationCaptureForLifecycle(previous, "surface-not-primary");
+      if (previous.agentControlled) {
+        previous.agentControlled = false;
+        void this.setAgentCursor(previous, false, null, null, null).catch(
+          () => undefined,
+        );
+      }
     }
     record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);
     // 逻辑 Primary 可以先于 Renderer 创建 guest WebContents。此时只更新
@@ -5019,13 +5761,14 @@ export class BrowserSurfaceManager {
     this.publishPrimaryChanged(record);
   }
 
-  private promoteReplacement(tabId: string): void {
+  private promoteReplacement(tabId: string): BrowserSurfaceRecord | null {
     const replacement = this.#surfaces.promoteReplacement(tabId);
-    if (!replacement) return;
+    if (!replacement) return null;
     replacement.surfaceRevision = this.#surfaces.nextRevision(
       replacement.tabId,
     );
     this.publishPrimaryChanged(replacement);
+    return replacement;
   }
 
   private publishPrimaryChanged(record: BrowserSurfaceRecord): void {
@@ -5133,6 +5876,13 @@ export class BrowserSurfaceManager {
     promoteReplacement = true,
   ): void {
     if (record.closed) return;
+    const closingPrimaryBinding =
+      promoteReplacement &&
+      this.#surfaces.isPrimary(record) &&
+      record.contents &&
+      !record.contents.isDestroyed()
+        ? this.binding(record)
+        : null;
     record.closed = true;
     record.lifecycleEpoch += 1;
     record.lifecycleAbort.abort();
@@ -5143,7 +5893,12 @@ export class BrowserSurfaceManager {
     this.cancelDownloadsForRecord(record);
     this.resetDebuggerSession(record);
     this.removeRecordIndexes(record);
-    if (promoteReplacement) this.promoteReplacement(record.tabId);
+    const replacement = promoteReplacement
+      ? this.promoteReplacement(record.tabId)
+      : null;
+    if (closingPrimaryBinding && !replacement) {
+      this.#onEvent({ type: "primary_closed", binding: closingPrimaryBinding });
+    }
     if (record.contents && !record.contents.isDestroyed()) {
       this.#closingSurfaces.add(record);
     } else {
@@ -5157,18 +5912,40 @@ export class BrowserSurfaceManager {
 
   private detachEmbeddedGuest(record: BrowserSurfaceRecord): void {
     if (record.closed || !record.contents) return;
-    this.trackPendingGuestRelease(record.contents);
+    const guest = record.contents;
+    // debugger/Overlay 清理必须仍绑定旧 guest；随后再推进生命周期 epoch，
+    // 使已经排队的清理和命令全部失效，绝不能落到下一代 WebContents。
+    this.resetDebuggerSession(record);
+    this.trackPendingGuestRelease(guest);
     record.lifecycleEpoch += 1;
     record.lifecycleAbort.abort();
     record.lifecycleAbort = new AbortController();
+    // CDP lane、viewport flush 和 crash recovery 都是物理 guest 资源，不是
+    // 逻辑 Browser Tab 状态。Renderer F5 会复用 Surface/URL/viewport，但
+    // 新 guest 必须从独立空队列开始初始化；旧 Promise 的迟到结算由 epoch
+    // 栅栏丢弃，不能阻塞或重置新 guest。
+    record.cdpLane = Promise.resolve();
+    record.viewportLifecycle.running = null;
+    record.recoveryPromise = null;
+    record.automationInputDepth = 0;
     this.rejectNavigationWaiters(
       record,
       staleSurfaceError("browser_surface_content_unavailable"),
     );
-    this.resetDebuggerSession(record);
-    this.removeDebuggerListeners(record);
     record.contents = null;
+    record.displaySize = null;
     record.priming = true;
+  }
+
+  private updateDisplaySize(
+    record: BrowserSurfaceRecord,
+    displaySize: BrowserDisplaySize,
+  ): void {
+    if (sameDisplaySize(record.displaySize, displaySize)) return;
+    record.displaySize = structuredClone(displaySize);
+    if (record.viewport.mode === "fixed") {
+      this.scheduleViewportCommit(record, true);
+    }
   }
 
   private trackPendingGuestRelease(guest: WebContents): void {
@@ -5213,13 +5990,6 @@ interface CdpNodeDescription {
 
 interface CdpBoxModelResponse {
   model?: { border?: unknown };
-}
-
-function normalizePopupNavigationUrl(value: string): string {
-  const url = normalizeNavigableUrl(value);
-  if (url === "about:blank")
-    throw new Error("browser_popup_about_blank_rejected");
-  return url;
 }
 
 function safeOrigin(value: string): string | null {
@@ -5383,6 +6153,21 @@ function sameLogicalViewport(
     left.height === right.height &&
     left.device_scale_factor_millis === right.device_scale_factor_millis &&
     left.device_type === right.device_type
+  );
+}
+
+function sameDisplaySize(
+  left: BrowserDisplaySize | null,
+  right: BrowserDisplaySize | null,
+): boolean {
+  return (
+    left === right ||
+    Boolean(
+      left &&
+        right &&
+        left.width === right.width &&
+        left.height === right.height,
+    )
   );
 }
 

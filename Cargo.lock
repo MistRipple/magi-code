@@ -1138,6 +1138,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "getrandom 0.3.4",
+ "image",
  "magi-agent-role",
  "magi-app-server-protocol",
  "magi-appearance",
@@ -1154,6 +1155,7 @@ dependencies = [
  "magi-orchestrator",
  "magi-plan",
  "magi-process",
+ "magi-runtime-state",
  "magi-safety-gate",
  "magi-session-store",
  "magi-settings-store",
@@ -1326,6 +1328,7 @@ dependencies = [
  "magi-orchestrator",
  "magi-plan",
  "magi-process",
+ "magi-runtime-state",
  "magi-session-store",
  "magi-settings-store",
  "magi-skill-runtime",
@@ -1351,7 +1354,6 @@ dependencies = [
 name = "magi-daemon-app"
 version = "3.0.51"
 dependencies = [
- "dirs",
  "magi-daemon",
  "magi-process",
  "magi-runtime-state",
@@ -1500,9 +1502,11 @@ dependencies = [
 name = "magi-runtime-state"
 version = "3.0.51"
 dependencies = [
+ "dirs",
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
 ]
 
 [[package]]
@@ -1628,6 +1632,7 @@ dependencies = [
  "magi-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

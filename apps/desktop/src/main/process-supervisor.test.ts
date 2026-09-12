@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
+import type { ChildProcess, spawn } from "node:child_process";
 import { test } from "node:test";
 import { ProcessSupervisor } from "./process-supervisor.js";
 
@@ -256,8 +258,98 @@ test("external daemon identity mismatch is never re-registered and recovers only
   }
 });
 
-async function waitUntil(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 5_000;
+test("managed daemon restarts after an unexpected exit even when ready flag is transiently false", async () => {
+  let startupNonce = "";
+  let runtimeSequence = 0;
+  let readyCalls = 0;
+  let releaseInitialRegistration!: () => void;
+  const initialRegistration = new Promise<void>((resolve) => {
+    releaseInitialRegistration = resolve;
+  });
+  const children: FakeChildProcess[] = [];
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(healthPayload({
+      runtimeEpoch: `runtime-managed-${runtimeSequence}`,
+      startupNonce,
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const fakeSpawn = ((_command: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+      runtimeSequence += 1;
+      startupNonce = options.env?.MAGI_DAEMON_START_NONCE ?? "";
+      const child = new FakeChildProcess(10_000 + runtimeSequence);
+      children.push(child);
+      return child as unknown as ChildProcess;
+    }) as typeof spawn;
+    const supervisor = new ProcessSupervisor({
+      daemonPath: process.execPath,
+      agentOrigin: `http://127.0.0.1:${address.port}`,
+      environment: {},
+      daemonIdentity: DAEMON_IDENTITY,
+      spawnDaemon: fakeSpawn,
+      onReady: async () => {
+        readyCalls += 1;
+        if (readyCalls === 1) await initialRegistration;
+      },
+    });
+
+    const start = supervisor.start();
+    await waitUntil(() => readyCalls === 1);
+    assert.equal(children.length, 1);
+    const firstChild = children.at(0);
+    assert.ok(firstChild);
+    firstChild.exitUnexpectedly(1);
+    releaseInitialRegistration();
+    await start;
+
+    await waitUntil(() => children.length === 2, 8_000);
+    await waitUntil(() => supervisor.status === "ready", 8_000);
+    const recoveredChild = children.at(1);
+    assert.ok(recoveredChild);
+    assert.equal(supervisor.processId, recoveredChild.pid);
+    await supervisor.stop();
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+class FakeChildProcess extends EventEmitter {
+  readonly pid: number;
+  readonly stdout = null;
+  readonly stderr = null;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+
+  constructor(pid: number) {
+    super();
+    this.pid = pid;
+  }
+
+  kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
+    if (this.exitCode !== null || this.signalCode !== null) return false;
+    this.signalCode = signal;
+    queueMicrotask(() => this.emit("exit", null, signal));
+    return true;
+  }
+
+  exitUnexpectedly(code: number): void {
+    this.exitCode = code;
+    this.emit("exit", code, null);
+  }
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 25));

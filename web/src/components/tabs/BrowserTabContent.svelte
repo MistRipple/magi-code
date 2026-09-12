@@ -7,6 +7,7 @@
     browserScreenshotUrl,
     browserClientPlatform,
     getBrowserSession,
+    isReferenceableBrowserAnnotation,
     navigateBrowserTab,
     type BrowserAnnotationSnapshot,
     type BrowserAnnotationSelection,
@@ -60,6 +61,7 @@
     page?: { url?: string; title?: string };
     loading?: boolean;
     reason?: string;
+    url?: string;
     diagnostic?: string;
     node?: DesktopInspectedNode;
     payload?: Record<string, unknown>;
@@ -69,6 +71,13 @@
     receivedBytes?: number;
     totalBytes?: number | null;
     error?: string;
+    selection?: {
+      kind?: string;
+      navigation_revision?: number;
+      normalized_x?: number;
+      normalized_y?: number;
+      rect?: { x?: number; y?: number; width?: number; height?: number };
+    };
   }
 
   interface DesktopInspectedNode {
@@ -111,12 +120,17 @@
   const desktopRuntime = $derived(desktopSurface);
   let desktopSnapshot = $state<MagiDesktopWindowSnapshot | null>(null);
   let browserWebview = $state<EmbeddedBrowserWebviewElement | undefined>();
+  let browserSurfaceSlot = $state<HTMLDivElement | undefined>();
   let browserToolbar = $state<HTMLDivElement | undefined>();
   let registeredWebviewKey = '';
-  let registeredWebviewRelease: MagiDesktopEmbeddedBrowserWebviewRequest | null = null;
+  let registeredWebviewRelease: MagiDesktopReleasedBrowserWebviewRequest | null = null;
   let webviewRegistered = $state(false);
   let webviewRegistrationTimer: number | null = null;
   let webviewRegistrationAttempts = 0;
+  let displaySizeObserver: ResizeObserver | null = null;
+  let displaySizeAnimationFrame: number | null = null;
+  let displaySizeSyncGeneration = 0;
+  let lastDisplaySizeKey = '';
   let snapshot = $state<BrowserSessionSnapshot | null>(null);
   let address = $state('');
   let addressEditing = $state(false);
@@ -129,11 +143,14 @@
   let annotationMenuElement = $state<TopLayerPopoverElement | undefined>();
   let viewportMenuButton = $state<HTMLButtonElement | undefined>();
   let annotationHistoryButton = $state<HTMLButtonElement | undefined>();
-  let annotationCaptureElement = $state<TopLayerPopoverElement | undefined>();
+  let annotationCreateButton = $state<HTMLButtonElement | undefined>();
   let annotationEditorElement = $state<TopLayerPopoverElement | undefined>();
   let pageErrorElement = $state<TopLayerPopoverElement | undefined>();
+  let actionErrorElement = $state<TopLayerPopoverElement | undefined>();
   let tooltipElement = $state<TopLayerPopoverElement | undefined>();
   let tooltipAnchorElement = $state<HTMLElement | undefined>();
+  let tooltipAnchorPreviousValue = '';
+  let tooltipAnchorPreviousPriority = '';
   let tooltipText = $state('');
   let viewportMenuOpen = $state(false);
   let annotationMenuOpen = $state(false);
@@ -153,6 +170,8 @@
   let annotationSelection = $state<BrowserAnnotationSelection | null>(null);
   let annotationComment = $state('');
   let annotationPhase = $state<'select' | 'comment' | null>(null);
+  let annotationCaptureIdentity = $state<BrowserInspectIdentity | null>(null);
+  let annotationCaptureGeneration = 0;
   let annotationEditor = $state<HTMLTextAreaElement | undefined>();
   let pageError = $state('');
   let nodeInspectActive = $state(false);
@@ -164,11 +183,30 @@
   let desktopSurfaceSyncGeneration = 0;
   let activeBrowserIdentityKey = '';
   let activeDownloads = $state<MagiDesktopBrowserDownloadSnapshot[]>([]);
+  const anchorToken = $derived(tabId.replace(/[^A-Za-z0-9_-]/gu, '_'));
+  const toolbarAnchorName = $derived(`--magi-browser-toolbar-${anchorToken}`);
+  const surfaceAnchorName = $derived(`--magi-browser-surface-${anchorToken}`);
+  const viewportAnchorName = $derived(`--magi-browser-viewport-${anchorToken}`);
+  const annotationHistoryAnchorName = $derived(`--magi-browser-annotations-${anchorToken}`);
+  const tooltipAnchorName = $derived(`--magi-browser-tooltip-${anchorToken}`);
 
   $effect(() => {
     if (annotationPhase !== 'comment') return;
     void tick().then(() => {
       if (annotationPhase === 'comment') annotationEditor?.focus();
+    });
+  });
+
+  $effect(() => {
+    if (browserSurfaceAvailable) return;
+    untrack(() => {
+      viewportMenuOpen = false;
+      annotationMenuOpen = false;
+      annotationPhase = null;
+      annotationSelection = null;
+      annotationComment = '';
+      stopDesktopAnnotationCapture(annotationCaptureIdentity);
+      clearToolbarTooltip();
     });
   });
 
@@ -179,9 +217,9 @@
     const popovers: Array<[TopLayerPopoverElement | undefined, boolean]> = [
       [viewportMenuElement, viewportMenuOpen],
       [annotationMenuElement, annotationMenuOpen],
-      [annotationCaptureElement, annotationPhase === 'select'],
       [annotationEditorElement, annotationPhase === 'comment' && Boolean(annotationSelection)],
       [pageErrorElement, Boolean(pageError && browserReady && !browserLoading)],
+      [actionErrorElement, Boolean(actionError && browserReady)],
       [tooltipElement, Boolean(tooltipText)],
     ];
     for (const [element, open] of popovers) {
@@ -194,7 +232,11 @@
   const activeTab = $derived.by<BrowserTabSnapshot | null>(() => (
     snapshot?.tabs.find((tab) => tab.tabId === tabId && tab.lifecycle !== 'closed') ?? null
   ));
-  const savedAnnotations = $derived((activeTab?.annotations ?? []).filter((annotation) => annotation.status !== 'deleted'));
+  const savedAnnotations = $derived(
+    (activeTab?.annotations ?? []).filter((annotation) => (
+      isReferenceableBrowserAnnotation(annotation.status)
+    )),
+  );
   const activeDownload = $derived.by<MagiDesktopBrowserDownloadSnapshot | null>(() => {
     if (!desktopRuntime) return null;
     const downloads = activeDownloads.filter((download) => download.tabId === tabId);
@@ -261,6 +303,59 @@
     return `magi-browser-${id.replace(/[^A-Za-z0-9._-]/gu, '_')}`;
   }
 
+  function currentBrowserDisplaySize(): MagiDesktopBrowserDisplaySize | null {
+    const slot = browserSurfaceSlot;
+    if (!slot) return null;
+    const rect = slot.getBoundingClientRect();
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
+    if (width < 1 || height < 1) return null;
+    return { width, height };
+  }
+
+  function browserDisplaySizeKey(
+    webContentsId: number,
+    displaySize: MagiDesktopBrowserDisplaySize,
+  ): string {
+    return `${webContentsId}\u0000${displaySize.width}\u0000${displaySize.height}`;
+  }
+
+  function scheduleBrowserDisplaySizeSync(): void {
+    if (displaySizeAnimationFrame !== null) return;
+    displaySizeAnimationFrame = window.requestAnimationFrame(() => {
+      displaySizeAnimationFrame = null;
+      synchronizeBrowserDisplaySize();
+    });
+  }
+
+  function synchronizeBrowserDisplaySize(): void {
+    const desktop = window.magiDesktop;
+    const release = registeredWebviewRelease;
+    const displaySize = currentBrowserDisplaySize();
+    if (!desktop || !release || !webviewRegistered || !displaySize) return;
+    const key = browserDisplaySizeKey(release.webContentsId, displaySize);
+    if (key === lastDisplaySizeKey) return;
+    const generation = ++displaySizeSyncGeneration;
+    lastDisplaySizeKey = key;
+    void desktop.updateBrowserDisplaySize({
+      ...release,
+      displaySize,
+    }).then((next) => {
+      if (
+        generation !== displaySizeSyncGeneration
+        || registeredWebviewRelease?.webContentsId !== release.webContentsId
+      ) return;
+      applyDesktopViewport(next);
+    }).catch((cause) => {
+      if (
+        generation !== displaySizeSyncGeneration
+        || registeredWebviewRelease?.webContentsId !== release.webContentsId
+      ) return;
+      lastDisplaySizeKey = '';
+      actionError = errorMessage(cause);
+    });
+  }
+
   function scheduleWebviewRegistration(delay = 0): void {
     if (webviewRegistrationTimer !== null || webviewRegistrationAttempts >= 40) return;
     const run = () => {
@@ -289,6 +384,12 @@
       scheduleWebviewRegistration(Math.min(250, 40 + webviewRegistrationAttempts * 5));
       return;
     }
+    const displaySize = currentBrowserDisplaySize();
+    if (!displaySize) {
+      webviewRegistrationAttempts += 1;
+      scheduleWebviewRegistration(Math.min(250, 40 + webviewRegistrationAttempts * 5));
+      return;
+    }
     const key = [identity.tabId, identity.surfaceId, identity.navigationRevision, webContentsId].join('\u0000');
     if (registeredWebviewKey === key) return;
     if (registeredWebviewRelease && registeredWebviewRelease.webContentsId !== webContentsId) {
@@ -304,6 +405,7 @@
       browserSessionId,
       navigationRevision: identity.navigationRevision,
       webContentsId,
+      displaySize,
     }).then((next) => {
       if (registeredWebviewKey !== key) return;
       applyDesktopViewport(next);
@@ -314,9 +416,12 @@
         navigationRevision: identity.navigationRevision,
         webContentsId,
       };
+      lastDisplaySizeKey = browserDisplaySizeKey(webContentsId, displaySize);
+      scheduleBrowserDisplaySizeSync();
     }).catch((cause) => {
       if (registeredWebviewKey !== key) return;
       registeredWebviewKey = '';
+      lastDisplaySizeKey = '';
       webviewRegistered = false;
       actionError = errorMessage(cause);
       scheduleWebviewRegistration(250);
@@ -378,6 +483,15 @@
     );
   }
 
+  function stopDesktopAnnotationCapture(
+    identity: BrowserInspectIdentity | null,
+  ): void {
+    ++annotationCaptureGeneration;
+    annotationCaptureIdentity = null;
+    if (!identity) return;
+    void window.magiDesktop?.stopBrowserAnnotationCapture(identity).catch(() => undefined);
+  }
+
   function notifyNodeSelectionInvalidated(selection: BrowserNodeSelectionContext | null): void {
     if (!selection) return;
     window.dispatchEvent(new CustomEvent('magi:browserNodeSelectionInvalidated', {
@@ -414,6 +528,14 @@
     // 这里 fire-and-forget 是有意的：清理是旧生命周期的副作用，不能成为
     // 新生命周期的 UI 前置条件。
     void desktop.stopBrowserInspect(identity).catch(() => undefined);
+  }
+
+  function stopNodeInspectionForAnnotation(): void {
+    const identity = nodeInspectIdentity;
+    const shouldStop = nodeInspectActive || nodeInspectBusy;
+    clearNodeInspection(true);
+    if (!shouldStop || !identity) return;
+    void window.magiDesktop?.stopBrowserInspect(identity).catch(() => undefined);
   }
 
   function toggleNodeInspection(): void {
@@ -768,6 +890,7 @@
 
   function toggleViewportMenu(): void {
     if (!activeTab || busy || !browserReady) return;
+    clearToolbarTooltip();
     annotationMenuOpen = false;
     viewportMenuOpen = !viewportMenuOpen;
   }
@@ -780,8 +903,20 @@
   }
 
   function clearToolbarTooltip(): void {
-    tooltipAnchorElement?.style.removeProperty('anchor-name');
+    if (tooltipAnchorElement) {
+      if (tooltipAnchorPreviousValue) {
+        tooltipAnchorElement.style.setProperty(
+          'anchor-name',
+          tooltipAnchorPreviousValue,
+          tooltipAnchorPreviousPriority,
+        );
+      } else {
+        tooltipAnchorElement.style.removeProperty('anchor-name');
+      }
+    }
     tooltipAnchorElement = undefined;
+    tooltipAnchorPreviousValue = '';
+    tooltipAnchorPreviousPriority = '';
     tooltipText = '';
   }
 
@@ -793,8 +928,13 @@
       return;
     }
     if (tooltipAnchorElement !== target) {
-      tooltipAnchorElement?.style.removeProperty('anchor-name');
-      target.style.setProperty('anchor-name', '--browser-tooltip-anchor');
+      clearToolbarTooltip();
+      tooltipAnchorPreviousValue = target.style.getPropertyValue('anchor-name').trim();
+      tooltipAnchorPreviousPriority = target.style.getPropertyPriority('anchor-name');
+      const anchorNames = tooltipAnchorPreviousValue
+        ? `${tooltipAnchorPreviousValue}, ${tooltipAnchorName}`
+        : tooltipAnchorName;
+      target.style.setProperty('anchor-name', anchorNames, tooltipAnchorPreviousPriority);
       tooltipAnchorElement = target;
     }
     tooltipText = text;
@@ -808,23 +948,63 @@
     clearToolbarTooltip();
   }
 
+  function restoreOverlayTriggerFocus(
+    target: HTMLButtonElement | undefined,
+  ): void {
+    void tick().then(() => target?.focus());
+  }
+
   function handleToolbarFocusOut(event: FocusEvent): void {
     const related = event.relatedTarget;
     if (related instanceof Node && browserToolbar?.contains(related)) return;
     clearToolbarTooltip();
   }
 
-  function openDesktopAnnotationCreation(): void {
-    if (!activeTab || !browserReady || annotationPhase) return;
+  async function openDesktopAnnotationCreation(): Promise<void> {
+    const tab = activeTab;
+    const desktop = window.magiDesktop;
+    const identity = activeBrowserIdentity;
+    if (!tab || !desktop || !identity || !browserReady || annotationPhase) return;
+    clearToolbarTooltip();
+    stopNodeInspectionForAnnotation();
     annotationSelection = null;
     annotationComment = '';
     annotationPhase = 'select';
     viewportMenuOpen = false;
     annotationMenuOpen = false;
+    const generation = ++annotationCaptureGeneration;
+    annotationCaptureIdentity = identity;
+    actionError = '';
+    try {
+      await desktop.startBrowserAnnotationCapture(identity);
+      if (
+        generation !== annotationCaptureGeneration
+        || !sameBrowserIdentity(annotationCaptureIdentity, identity)
+        || !sameBrowserIdentity(activeBrowserIdentity, identity)
+        || annotationPhase !== 'select'
+      ) {
+        void desktop.stopBrowserAnnotationCapture(identity).catch(() => undefined);
+      }
+    } catch (cause) {
+      if (generation !== annotationCaptureGeneration) return;
+      annotationCaptureIdentity = null;
+      annotationPhase = null;
+      annotationSelection = null;
+      annotationComment = '';
+      actionError = errorMessage(cause);
+    }
   }
 
-  function clampUnit(value: number): number {
-    return Math.max(0, Math.min(1, value));
+  function cancelAnnotationCreation(): void {
+    ++annotationCaptureGeneration;
+    const identity = annotationCaptureIdentity;
+    annotationCaptureIdentity = null;
+    annotationPhase = null;
+    annotationSelection = null;
+    annotationComment = '';
+    if (identity) {
+      void window.magiDesktop?.stopBrowserAnnotationCapture(identity).catch(() => undefined);
+    }
   }
 
   function submitCreatedAnnotation(): void {
@@ -844,6 +1024,7 @@
 
   function toggleAnnotationMenu(): void {
     if (!activeTab || busy || !browserReady || annotationPhase) return;
+    clearToolbarTooltip();
     viewportMenuOpen = false;
     annotationMenuOpen = !annotationMenuOpen;
   }
@@ -964,79 +1145,8 @@
 
   function selectSavedAnnotation(annotation: BrowserAnnotationSnapshot): void {
     annotationMenuOpen = false;
+    restoreOverlayTriggerFocus(annotationHistoryButton);
     window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: annotation }));
-  }
-
-  function normalizedAnnotationPoint(event: PointerEvent | MouseEvent): { x: number; y: number } | null {
-    const target = event.currentTarget;
-    if (!(target instanceof HTMLElement)) return null;
-    const rect = target.getBoundingClientRect();
-    if (!rect.width || !rect.height) return null;
-    return {
-      x: clampUnit((event.clientX - rect.left) / rect.width),
-      y: clampUnit((event.clientY - rect.top) / rect.height),
-    };
-  }
-
-  let annotationDragStart = $state<{ x: number; y: number } | null>(null);
-  let annotationDragCurrent = $state<{ x: number; y: number } | null>(null);
-
-  function finishAnnotationSelection(event: PointerEvent | MouseEvent): void {
-    if (annotationPhase !== 'select' || !annotationDragStart) return;
-    event.preventDefault();
-    const start = annotationDragStart;
-    const end = normalizedAnnotationPoint(event) ?? annotationDragCurrent ?? start;
-    annotationDragStart = null;
-    annotationDragCurrent = null;
-    const width = Math.abs(end.x - start.x);
-    const height = Math.abs(end.y - start.y);
-        annotationSelection = width < 0.012 && height < 0.012
-      ? {
-          kind: 'element',
-          navigationRevision: activeBrowserIdentity?.navigationRevision ?? 0,
-          normalizedX: end.x,
-          normalizedY: end.y,
-        }
-      : {
-          kind: 'region',
-          navigationRevision: activeBrowserIdentity?.navigationRevision ?? 0,
-          rect: {
-            x: Math.min(start.x, end.x),
-            y: Math.min(start.y, end.y),
-            width,
-            height,
-          },
-        };
-    annotationComment = '';
-    annotationPhase = 'comment';
-  }
-
-  function handleAnnotationPointerDown(event: PointerEvent): void {
-    if (annotationPhase !== 'select' || !browserReady) return;
-    event.preventDefault();
-    const point = normalizedAnnotationPoint(event);
-    if (!point) return;
-    const target = event.currentTarget as HTMLElement;
-    target.setPointerCapture?.(event.pointerId);
-    annotationDragStart = point;
-    annotationDragCurrent = point;
-  }
-
-  function handleAnnotationPointerMove(event: PointerEvent): void {
-    if (annotationPhase !== 'select' || !annotationDragStart) return;
-    const point = normalizedAnnotationPoint(event);
-    if (point) annotationDragCurrent = point;
-  }
-
-  function handleAnnotationPointerUp(event: PointerEvent): void {
-    finishAnnotationSelection(event);
-    const target = event.currentTarget as HTMLElement;
-    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
-  }
-
-  function annotationSelectionStyle(): string {
-    if (!annotationDragStart || !annotationDragCurrent) return '';
-    return `left:${Math.min(annotationDragStart.x, annotationDragCurrent.x) * 100}%;top:${Math.min(annotationDragStart.y, annotationDragCurrent.y) * 100}%;width:${Math.abs(annotationDragCurrent.x - annotationDragStart.x) * 100}%;height:${Math.abs(annotationDragCurrent.y - annotationDragStart.y) * 100}%;`;
   }
 
   function browserEventBinding(event: DesktopBrowserEvent): BrowserInspectIdentity | null {
@@ -1063,6 +1173,48 @@
     };
   }
 
+  function annotationSelectionFromEvent(
+    event: DesktopBrowserEvent,
+    binding: BrowserInspectIdentity,
+  ): BrowserAnnotationSelection | null {
+    const raw = event.selection;
+    if (!raw || raw.navigation_revision !== binding.navigationRevision) return null;
+    const isNormalized = (value: unknown): value is number => (
+      typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
+    );
+    if (raw.kind === 'element' && isNormalized(raw.normalized_x) && isNormalized(raw.normalized_y)) {
+      return {
+        kind: 'element',
+        navigationRevision: binding.navigationRevision,
+        normalizedX: raw.normalized_x,
+        normalizedY: raw.normalized_y,
+      };
+    }
+    const rect = raw.rect;
+    if (
+      raw.kind !== 'region'
+      || !rect
+      || !isNormalized(rect.x)
+      || !isNormalized(rect.y)
+      || !isNormalized(rect.width)
+      || !isNormalized(rect.height)
+      || rect.width <= 0
+      || rect.height <= 0
+      || rect.x + rect.width > 1
+      || rect.y + rect.height > 1
+    ) return null;
+    return {
+      kind: 'region',
+      navigationRevision: binding.navigationRevision,
+      rect: {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      },
+    };
+  }
+
   function handleDesktopBrowserEvent(value: unknown): void {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return;
     const event = value as DesktopBrowserEvent;
@@ -1085,6 +1237,7 @@
       || event.type === 'page_crashed'
     ) {
       clearNodeInspection();
+      cancelAnnotationCreation();
       if (event.type === 'page_crashed') {
         pageError = event.reason?.trim() || event.diagnostic?.trim() || i18n.t('browser.error.pageLoadFailed');
         browserLoading = false;
@@ -1093,6 +1246,33 @@
     }
 
     if (!currentIdentity || !tab || binding.surfaceId !== currentIdentity.surfaceId) return;
+
+    if (event.type === 'annotation_selection') {
+      if (
+        !sameBrowserIdentity(annotationCaptureIdentity, binding)
+        || !sameBrowserIdentity(currentIdentity, binding)
+      ) return;
+      const selection = annotationSelectionFromEvent(event, binding);
+      if (!selection) {
+        actionError = i18n.t('browser.annotation.failed');
+        stopDesktopAnnotationCapture(binding);
+        annotationPhase = null;
+        annotationSelection = null;
+        annotationComment = '';
+        return;
+      }
+      stopDesktopAnnotationCapture(binding);
+      annotationSelection = selection;
+      annotationComment = '';
+      annotationPhase = 'comment';
+      actionError = '';
+      return;
+    }
+
+    if (event.type === 'popup_blocked') {
+      actionError = popupBlockedMessage(event.reason);
+      return;
+    }
 
     if (event.type === 'node_inspected' || event.type === 'node_selection') {
       // 节点上下文必须精确匹配启动检查时的三元身份。页面事件允许
@@ -1144,15 +1324,12 @@
     if (event.type === 'loading_changed') {
       browserLoading = event.loading === true;
       if (browserLoading) {
+        actionError = '';
         pageError = '';
         clearNodeInspection();
         // 页面导航会使未提交选择失去语义；已保存的标记仍由 Authority
         // 持久化并在新文档就绪后重放。
-        annotationPhase = null;
-        annotationSelection = null;
-        annotationComment = '';
-        annotationDragStart = null;
-        annotationDragCurrent = null;
+        cancelAnnotationCreation();
         viewportMenuOpen = false;
         annotationMenuOpen = false;
       }
@@ -1161,6 +1338,7 @@
     }
     if (event.type === 'page_failed') {
       clearNodeInspection();
+      cancelAnnotationCreation();
       pageError = event.reason?.trim() || i18n.t('browser.error.pageLoadFailed');
       browserLoading = false;
       if (pageEventIsNewerThanSnapshot) void refreshSession();
@@ -1172,6 +1350,23 @@
     }
     if (event.page.title?.trim()) onTitleChange?.(event.page.title);
     if (pageEventIsNewerThanSnapshot) void refreshSession();
+  }
+
+  function popupBlockedMessage(reason: string | undefined): string {
+    switch (reason) {
+      case 'unsupported_protocol':
+        return i18n.t('browser.popup.unsupportedProtocol');
+      case 'script_blank_window':
+        return i18n.t('browser.popup.scriptBlankWindow');
+      case 'named_window':
+        return i18n.t('browser.popup.namedWindow');
+      case 'opener_required':
+        return i18n.t('browser.popup.openerRequired');
+      case 'separate_window_features':
+        return i18n.t('browser.popup.separateWindowFeatures');
+      default:
+        return i18n.t('browser.popup.invalidUrl');
+    }
   }
 
   function applyDownloadEvent(event: DesktopBrowserEvent): void {
@@ -1223,6 +1418,8 @@
   $effect(() => {
     const identity = activeBrowserIdentity;
     if (!identity) {
+      ++displaySizeSyncGeneration;
+      lastDisplaySizeKey = '';
       registeredWebviewKey = '';
       webviewRegistered = false;
       webviewRegistrationAttempts = 0;
@@ -1253,6 +1450,14 @@
   });
 
   $effect(() => {
+    const currentIdentity = activeBrowserIdentity;
+    const captureIdentity = annotationCaptureIdentity;
+    if (captureIdentity && !sameBrowserIdentity(captureIdentity, currentIdentity)) {
+      untrack(cancelAnnotationCreation);
+    }
+  });
+
+  $effect(() => {
     const expectedSessionId = browserSessionId.trim();
     const expectedTabId = tabId.trim();
     const identityKey = `${expectedSessionId}\u0000${expectedTabId}`;
@@ -1262,6 +1467,8 @@
       clearNodeInspection();
       cancelPendingCustomViewport();
       ++viewportMutationGeneration;
+      ++displaySizeSyncGeneration;
+      lastDisplaySizeKey = '';
       customViewportWidthEditing = false;
       customViewportHeightEditing = false;
       customViewportInputDirty = false;
@@ -1272,11 +1479,7 @@
       actionError = '';
       pageError = '';
       browserLoading = false;
-      annotationPhase = null;
-      annotationSelection = null;
-      annotationComment = '';
-      annotationDragStart = null;
-      annotationDragCurrent = null;
+      cancelAnnotationCreation();
       viewportMenuOpen = false;
       annotationMenuOpen = false;
       activeDownloads = [];
@@ -1295,6 +1498,12 @@
     view?.addEventListener('did-attach', handleWebviewAttached);
     view?.addEventListener('dom-ready', handleWebviewReady);
     scheduleWebviewRegistration();
+    displaySizeObserver = browserSurfaceSlot
+      ? new ResizeObserver(scheduleBrowserDisplaySizeSync)
+      : null;
+    if (browserSurfaceSlot && displaySizeObserver) {
+      displaySizeObserver.observe(browserSurfaceSlot);
+    }
     const pointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
@@ -1305,15 +1514,17 @@
       if (event.key !== 'Escape') return;
       const hasOpenOverlay = Boolean(annotationPhase || viewportMenuOpen || annotationMenuOpen);
       if (!hasOpenOverlay) return;
+      const focusTarget = annotationPhase
+        ? annotationCreateButton
+        : annotationMenuOpen
+          ? annotationHistoryButton
+          : viewportMenuButton;
       event.preventDefault();
       event.stopPropagation();
       viewportMenuOpen = false;
       annotationMenuOpen = false;
-      annotationPhase = null;
-      annotationSelection = null;
-      annotationComment = '';
-      annotationDragStart = null;
-      annotationDragCurrent = null;
+      if (annotationPhase) cancelAnnotationCreation();
+      restoreOverlayTriggerFocus(focusTarget);
     };
     const browserAuthorityChanged = (event: Event) => {
       const detail = (event as CustomEvent<{
@@ -1334,6 +1545,8 @@
     return () => {
       const release = registeredWebviewRelease;
       registeredWebviewRelease = null;
+      ++displaySizeSyncGeneration;
+      lastDisplaySizeKey = '';
       if (desktop && release) {
         void desktop.releaseBrowserWebview(release).catch(() => undefined);
       }
@@ -1341,9 +1554,17 @@
       unsubscribeDesktopSnapshot?.();
       window.removeEventListener('pointerdown', pointerDown);
       window.removeEventListener('keydown', keyboard, true);
+      clearToolbarTooltip();
       clearNodeInspection();
+      stopDesktopAnnotationCapture(annotationCaptureIdentity);
       view?.removeEventListener('did-attach', handleWebviewAttached);
       view?.removeEventListener('dom-ready', handleWebviewReady);
+      displaySizeObserver?.disconnect();
+      displaySizeObserver = null;
+      if (displaySizeAnimationFrame !== null) {
+        window.cancelAnimationFrame(displaySizeAnimationFrame);
+        displaySizeAnimationFrame = null;
+      }
       if (webviewRegistrationTimer !== null) {
         window.clearTimeout(webviewRegistrationTimer);
         webviewRegistrationTimer = null;
@@ -1364,6 +1585,7 @@
   <div
     bind:this={browserToolbar}
     class="browser-toolbar"
+    style:anchor-name={toolbarAnchorName}
     role="toolbar"
     tabindex="-1"
     onpointerover={updateToolbarTooltip}
@@ -1392,7 +1614,7 @@
         <button type="submit" class="address-submit" disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}><Icon name="chevron-right" size={12} /></button>
       </form>
       <div class="menu-wrap">
-      <button bind:this={viewportMenuButton} type="button" class="icon-button" class:active={localViewportMode === 'fixed'} onclick={toggleViewportMenu} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')} aria-expanded={viewportMenuOpen}><Icon name="monitor" size={13} /></button>
+      <button bind:this={viewportMenuButton} type="button" class="icon-button" class:active={localViewportMode === 'fixed'} style:anchor-name={viewportAnchorName} onclick={toggleViewportMenu} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')} aria-expanded={viewportMenuOpen}><Icon name="monitor" size={13} /></button>
       </div>
       <button
         type="button"
@@ -1416,10 +1638,10 @@
     {/if}
     <div class="menu-wrap">
       {#if desktopRuntime}
-        <button type="button" class="icon-button toolbar-edge-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(annotationPhase)} data-tooltip={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
+        <button bind:this={annotationCreateButton} type="button" class="icon-button toolbar-edge-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(annotationPhase)} data-tooltip={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
       {/if}
       {#if savedAnnotations.length > 0}
-        <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button toolbar-edge-button" class:active={annotationMenuOpen} onclick={toggleAnnotationMenu} data-tooltip={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')} aria-expanded={annotationMenuOpen}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
+        <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button toolbar-edge-button" class:active={annotationMenuOpen} style:anchor-name={annotationHistoryAnchorName} onclick={toggleAnnotationMenu} data-tooltip={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')} aria-expanded={annotationMenuOpen}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
       {/if}
     </div>
     {#if desktopRuntime}
@@ -1433,6 +1655,7 @@
     <div
       bind:this={tooltipElement}
       class="browser-toolbar-tooltip"
+      style:position-anchor={tooltipAnchorName}
       popover="manual"
       role="tooltip"
     >{tooltipText}</div>
@@ -1441,6 +1664,7 @@
   {#if activeDownload && (activeDownload.state === 'started' || activeDownload.state === 'progressing' || activeDownload.state === 'completed' || activeDownload.state === 'cancelled' || activeDownload.state === 'interrupted')}
     <div
       class="browser-download-panel"
+      style:position-anchor={surfaceAnchorName}
       role="status"
       aria-label={i18n.t('browser.download.status')}
     >
@@ -1463,7 +1687,7 @@
   {/if}
 
   {#if viewportMenuOpen}
-    <div bind:this={viewportMenuElement} class="viewport-popover" data-menu="viewport" popover="manual">
+    <div bind:this={viewportMenuElement} class="viewport-popover" style:position-anchor={viewportAnchorName} data-menu="viewport" popover="manual">
       <div class="viewport-menu" role="menu" aria-label={i18n.t('browser.viewport.control')}>
         <button type="button" class:selected={localViewportMode === 'auto'} role="menuitem" onclick={() => { viewportMenuOpen = false; useAutomaticViewport(); }}>
           <Icon name="monitor" size={14} />
@@ -1484,9 +1708,11 @@
           <label>
             <span>{i18n.t('browser.viewport.width')}</span>
             <input
-              type="number"
-              min={VIEWPORT_DIMENSION_LIMITS.width.min}
-              max={VIEWPORT_DIMENSION_LIMITS.width.max}
+              type="text"
+              inputmode="numeric"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label={i18n.t('browser.viewport.width')}
               value={customViewportWidthInput}
               onfocus={() => { customViewportWidthEditing = true; }}
               oninput={(event) => handleCustomViewportInput('width', event)}
@@ -1496,9 +1722,11 @@
           <label>
             <span>{i18n.t('browser.viewport.height')}</span>
             <input
-              type="number"
-              min={VIEWPORT_DIMENSION_LIMITS.height.min}
-              max={VIEWPORT_DIMENSION_LIMITS.height.max}
+              type="text"
+              inputmode="numeric"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label={i18n.t('browser.viewport.height')}
               value={customViewportHeightInput}
               onfocus={() => { customViewportHeightEditing = true; }}
               oninput={(event) => handleCustomViewportInput('height', event)}
@@ -1511,7 +1739,7 @@
   {/if}
 
   {#if annotationMenuOpen}
-    <div bind:this={annotationMenuElement} class="annotation-history-popover" data-menu="annotations" popover="manual">
+    <div bind:this={annotationMenuElement} class="annotation-history-popover" style:position-anchor={annotationHistoryAnchorName} data-menu="annotations" popover="manual">
       <div class="annotation-menu" role="menu" aria-label={i18n.t('browser.annotation.history')}>
         {#each savedAnnotations as annotation (annotation.annotationId)}
           <button type="button" onclick={() => selectSavedAnnotation(annotation)} title={annotation.comment}><span class="annotation-menu-number">{annotation.sequence}</span><span>{annotation.comment}</span></button>
@@ -1521,7 +1749,9 @@
   {/if}
 
   <div
+    bind:this={browserSurfaceSlot}
     class="browser-surface-slot"
+    style:anchor-name={surfaceAnchorName}
     data-browser-tab-id={tabId}
     aria-label={i18n.t('browser.viewport.label')}
   >
@@ -1538,8 +1768,15 @@
       {#if !browserReady}
         <div class="browser-placeholder browser-placeholder-overlay" class:error={connectionState === 'error'} aria-live="polite">{connectionStatusText}</div>
       {/if}
+      {#if actionError && browserReady}
+        <div bind:this={actionErrorElement} class="browser-action-error" style:position-anchor={surfaceAnchorName} popover="manual" role="alert">
+          <Icon name="alert-circle" size={14} />
+          <span>{actionError}</span>
+          <button type="button" onclick={() => { actionError = ''; }} aria-label={i18n.t('common.close')}><Icon name="close" size={12} /></button>
+        </div>
+      {/if}
       {#if pageError && browserReady && !browserLoading}
-        <div bind:this={pageErrorElement} class="browser-page-error" popover="manual" role="alert" aria-live="assertive">
+        <div bind:this={pageErrorElement} class="browser-page-error" style:position-anchor={surfaceAnchorName} popover="manual" role="alert" aria-live="assertive">
           <Icon name="alert-circle" size={28} />
           <strong>{i18n.t('browser.error.pageLoadFailed')}</strong>
           <span>{pageError}</span>
@@ -1549,23 +1786,8 @@
           </button>
         </div>
       {/if}
-      {#if annotationPhase === 'select'}
-        <!-- 标记选择层属于当前 Browser Tab 内容槽，不能成为窗口级原生视图。 -->
-        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-        <div
-          bind:this={annotationCaptureElement}
-          class="annotation-capture"
-          popover="manual"
-          role="application"
-          aria-label={i18n.t('browser.annotation.title')}
-          onpointerdown={handleAnnotationPointerDown}
-          onpointermove={handleAnnotationPointerMove}
-          onpointerup={handleAnnotationPointerUp}
-        >
-          <div class="annotation-selection" style={annotationSelectionStyle()}></div>
-        </div>
-      {:else if annotationPhase === 'comment' && annotationSelection}
-        <div bind:this={annotationEditorElement} class="annotation-editor" popover="manual" role="dialog" aria-label={i18n.t('browser.annotation.title')}>
+      {#if annotationPhase === 'comment' && annotationSelection}
+        <div bind:this={annotationEditorElement} class="annotation-editor" style:position-anchor={surfaceAnchorName} popover="manual" role="dialog" aria-label={i18n.t('browser.annotation.title')}>
           <textarea
             bind:this={annotationEditor}
             bind:value={annotationComment}
@@ -1573,7 +1795,7 @@
             maxlength="4000"
           ></textarea>
           <div class="annotation-editor-actions">
-            <button type="button" onclick={() => { annotationPhase = null; annotationSelection = null; annotationComment = ''; }}>{i18n.t('common.cancel')}</button>
+            <button type="button" onclick={cancelAnnotationCreation}>{i18n.t('common.cancel')}</button>
             <button type="button" class="primary" disabled={!annotationComment.trim()} onclick={submitCreatedAnnotation}>{i18n.t('common.save')}</button>
           </div>
         </div>
@@ -1616,7 +1838,7 @@
 <style>
   .browser-pane { position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: var(--background); }
   /* 工具栏固定在右栏内容区内，边框不改变内容槽的有效尺寸。 */
-  .browser-toolbar { position: relative; z-index: 10; isolation: isolate; anchor-name: --browser-toolbar-anchor; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
+  .browser-toolbar { position: relative; z-index: 10; isolation: isolate; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
   .icon-button, .address-submit { position: relative; }
   .icon-button { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; }
   .icon-button:hover:not(:disabled) { background: var(--surface-2); color: var(--foreground); }
@@ -1625,7 +1847,7 @@
   .flip :global(svg) { transform: scaleX(-1); }
   /* 原生 title 和普通伪元素都会落在 <webview> 后面；工具提示通过
      Popover Top Layer 从当前工具栏向下展示，仍由 Renderer DOM 管理。 */
-  .browser-toolbar-tooltip { position: fixed; position-anchor: --browser-tooltip-anchor; top: calc(anchor(bottom) + 5px); left: anchor(center); z-index: var(--z-tooltip, 1200); max-width: min(240px, calc(100vw - 16px)); padding: 4px 7px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--glass-bg, var(--dropdown-bg)); box-shadow: var(--shadow-sm); color: var(--foreground); font-size: var(--text-xs); font-weight: var(--font-medium, 500); line-height: 1.25; white-space: nowrap; pointer-events: none; transform: translateX(-50%); }
+  .browser-toolbar-tooltip { position: fixed; top: calc(anchor(bottom) + 5px); left: anchor(right); z-index: var(--z-tooltip, 1200); max-width: min(240px, calc(100vw - 16px)); padding: 4px 7px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--glass-bg, var(--dropdown-bg)); box-shadow: var(--shadow-sm); color: var(--foreground); font-size: var(--text-xs); font-weight: var(--font-medium, 500); line-height: 1.25; white-space: nowrap; pointer-events: none; transform: translateX(-100%); }
   .address-form { display: flex; flex: 1 1 0; min-width: 0; }
   .address-form input { box-sizing: border-box; width: 100%; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-right: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); background: var(--surface-1); color: var(--foreground); font: inherit; }
   .address-submit { display: grid; place-items: center; width: 27px; height: 27px; flex: 0 0 27px; padding: 0; border: 1px solid var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--surface-1); color: var(--foreground-muted); cursor: pointer; }
@@ -1636,7 +1858,7 @@
      CSS Anchor Positioning 让它跟随真实工具栏位置，Popover Top Layer 解决
      Electron webview 原生合成层的遮挡，不需要任何浏览器内容坐标映射。 */
   .viewport-popover,
-  .annotation-history-popover { position: fixed; position-anchor: --browser-toolbar-anchor; top: calc(anchor(bottom) + 4px); right: calc(100vw - anchor(right) + 6px); z-index: 20; box-sizing: border-box; width: min(300px, calc(100vw - 12px)); pointer-events: auto; }
+  .annotation-history-popover { position: fixed; top: calc(anchor(bottom) + 4px); left: anchor(right); z-index: 20; box-sizing: border-box; width: min(300px, calc(100vw - 12px)); pointer-events: auto; transform: translateX(-100%); }
   .viewport-menu, .annotation-menu { box-sizing: border-box; width: min(300px, 100%); overflow: hidden; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
   .annotation-history-popover .annotation-menu { width: 100%; max-height: min(420px, calc(100vh - 48px)); overflow-y: auto; scrollbar-width: none; }
   .annotation-history-popover .annotation-menu::-webkit-scrollbar { display: none; }
@@ -1658,31 +1880,34 @@
   .status-light.loading { background: var(--warning); }
   .status-light.error { background: var(--error); }
   .record-status { min-width: 0; max-width: 180px; overflow: hidden; color: var(--foreground-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-  .browser-download-panel { position: fixed; position-anchor: --browser-surface-anchor; bottom: calc(100vh - anchor(bottom) + 10px); left: calc(anchor(left) + 10px); z-index: 5; box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 30px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); pointer-events: auto; }
+  .browser-download-panel { position: fixed; top: calc(anchor(bottom) - 10px); left: calc(anchor(left) + 10px); z-index: 5; box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 30px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); pointer-events: auto; transform: translateY(-100%); }
   .browser-download-name { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--foreground); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
   .browser-download-state { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; white-space: nowrap; }
   .browser-download-bytes { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .browser-download-panel button { flex: 0 0 auto; height: 22px; padding: 0 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: 10px; cursor: pointer; }
   .browser-download-panel button:hover { background: var(--surface-hover); }
-  .browser-surface-slot { position: relative; z-index: 0; anchor-name: --browser-surface-anchor; display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
+  .browser-surface-slot { position: relative; z-index: 0; display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
   /* Electron 的 webview 自定义元素依赖自身的 flex 内部布局把 guest
      视口同步到内容槽。覆盖为 block 会让 guest 退回默认 150px 高度，
      从而出现页面被截断、滚动条异常和截图范围错误。 */
   .browser-webview { display: flex; flex: 1 1 auto; width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: #fff; }
   .browser-placeholder-overlay { position: absolute; inset: 0; pointer-events: none; background: var(--surface-1); }
+  .browser-action-error { position: fixed; top: calc(anchor(top) + 10px); left: calc(anchor(left) + 10px); z-index: 6; box-sizing: border-box; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 34px; margin: 0; padding: 5px 6px 5px 8px; border: 1px solid color-mix(in srgb, var(--error) 45%, var(--border)); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); color: var(--foreground); pointer-events: auto; }
+  .browser-action-error > :global(svg) { color: var(--error); }
+  .browser-action-error span { min-width: 0; overflow-wrap: anywhere; font-size: var(--text-xs); line-height: 1.35; }
+  .browser-action-error button { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--foreground-muted); cursor: pointer; }
+  .browser-action-error button:hover { background: var(--surface-hover); color: var(--foreground); }
   /* 失败页仍由 Chromium guest 负责导航，但 guest 的 chrome-error 页面在
      Electron webview 中不保证有可见错误文案。使用当前内容槽的 Top Layer
      呈现同一失败事实，避免普通 DOM 被原生 guest 合成层覆盖。 */
-  .browser-page-error { position: fixed; position-anchor: --browser-surface-anchor; top: anchor(top); left: anchor(left); width: anchor-size(width); height: anchor-size(height); box-sizing: border-box; display: grid; place-content: center; justify-items: center; gap: 9px; margin: 0; padding: 24px; border: 0; background: var(--surface-1); color: var(--foreground-muted); text-align: center; }
+  .browser-page-error { position: fixed; top: anchor(top); left: anchor(left); width: anchor-size(width); height: anchor-size(height); box-sizing: border-box; display: grid; place-content: center; justify-items: center; gap: 9px; margin: 0; padding: 24px; border: 0; background: var(--surface-1); color: var(--foreground-muted); text-align: center; }
   .browser-page-error :global(svg) { color: var(--error); }
   .browser-page-error strong { color: var(--foreground); font-size: var(--text-md); font-weight: 600; }
   .browser-page-error span { max-width: min(520px, 100%); overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-xs); }
   .browser-page-error button { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; margin-top: 4px; padding: 0 10px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .browser-page-error button:hover:not(:disabled) { background: var(--surface-hover); }
   .browser-page-error button:disabled { cursor: default; opacity: .5; }
-  .annotation-capture { position: fixed; position-anchor: --browser-surface-anchor; top: anchor(top); left: anchor(left); width: anchor-size(width); height: anchor-size(height); z-index: 3; cursor: crosshair; pointer-events: auto; touch-action: none; user-select: none; background: rgba(0, 0, 0, 0.001); }
-  .annotation-selection { position: absolute; border: 1px solid var(--primary); background: color-mix(in srgb, var(--primary) 18%, transparent); pointer-events: none; }
-  .annotation-editor { position: fixed; position-anchor: --browser-surface-anchor; left: anchor(left); bottom: calc(100vh - anchor(bottom) + 12px); width: min(360px, calc(anchor-size(width) - 24px)); z-index: 4; box-sizing: border-box; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
+  .annotation-editor { position: fixed; top: calc(anchor(bottom) - 12px); left: anchor(left); width: min(360px, calc(anchor-size(width) - 24px)); z-index: 4; box-sizing: border-box; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); transform: translateY(-100%); }
   .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; resize: vertical; padding: 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
   .annotation-editor-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
   .annotation-editor-actions button { min-width: 58px; height: 28px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); cursor: pointer; }

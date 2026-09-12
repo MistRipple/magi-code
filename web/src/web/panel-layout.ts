@@ -14,6 +14,7 @@ export interface PanelLayoutInput {
   sidebarWidth: number;
   previewPanelWidth: number;
   sidebarVisible?: boolean;
+  rightPaneOpen?: boolean;
   desktopSurface?: boolean;
 }
 
@@ -43,7 +44,22 @@ export function resolvePanelLayout(input: PanelLayoutInput): PanelLayoutResoluti
   const previewPanelWidth = Math.max(PANEL_LAYOUT.minPreviewWidth, input.previewPanelWidth);
   const shellPadding = input.desktopSurface ? 0 : PANEL_LAYOUT.shellPadding;
   const shellGap = input.desktopSurface ? 0 : PANEL_LAYOUT.shellGap;
-  const sidebarDrawer = viewportWidth <= PANEL_LAYOUT.mobileBreakpoint;
+  const sidebarPreferredVisible = input.sidebarVisible !== false;
+  const rightPaneOpen = input.rightPaneOpen !== false;
+  const desktopThreePaneWidth =
+    sidebarWidth
+    + shellGap
+    + PANEL_LAYOUT.minContentWidth
+    + PANEL_LAYOUT.previewHandleWidth
+    + previewPanelWidth;
+  // Desktop 的右栏不能在中栏不足时切成 overlay。三栏无法同时容纳时，
+  // 只将左栏收为可重新打开的抽屉，让中栏和右栏继续留在同一个父级
+  // Grid 中；右栏始终是内容轨道，不会覆盖对话区。
+  const sidebarDrawer = input.desktopSurface
+    ? rightPaneOpen
+      && sidebarPreferredVisible
+      && viewportWidth < desktopThreePaneWidth
+    : viewportWidth <= PANEL_LAYOUT.mobileBreakpoint;
   const contentFrameWidth = Math.max(
     0,
     viewportWidth - shellPadding * 2,
@@ -55,11 +71,16 @@ export function resolvePanelLayout(input: PanelLayoutInput): PanelLayoutResoluti
   // 右栏位于 sidebar 之后的 workbench-content 内，能否并排必须以该
   // 内容轨道的真实可用宽度判断。此前使用整个窗口宽度，造成 CSS 轨道
   // 实际溢出后再隐藏左栏掩盖问题；右栏变宽不应改变左栏的用户状态。
-  const sidebarTakenWidth = input.sidebarVisible === false || sidebarDrawer
+  const sidebarTakenWidth = !sidebarPreferredVisible || sidebarDrawer
     ? 0
     : sidebarWidth + shellGap;
   const workbenchWidth = Math.max(0, contentFrameWidth - sidebarTakenWidth);
-  const previewOverlay = sidebarDrawer || workbenchWidth < previewSplitWidth;
+  // 桌面端右栏永远是 workbench-body 的第三个 Grid 轨道。把它改成
+  // absolute overlay 会让右栏在窗口缩小时盖住中间对话区；移动 Web
+  // 没有原生桌面三栏约束，才继续使用覆盖模式。
+  const previewOverlay = input.desktopSurface
+    ? false
+    : sidebarDrawer || workbenchWidth < previewSplitWidth;
   const sideBySideWidth = sidebarTakenWidth + previewSplitWidth;
   const panelsCanCoexist = !previewOverlay && contentFrameWidth >= sideBySideWidth;
 

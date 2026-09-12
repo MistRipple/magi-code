@@ -437,6 +437,50 @@ fn surface_replacement_revokes_only_that_surface() {
 }
 
 #[test]
+fn closing_current_primary_suspends_tab_and_rejects_stale_close_events() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    let first = binding(&tab_id, &surface_id(), 1);
+    authority
+        .set_primary_surface(first.clone(), at(6))
+        .expect("surface should bind");
+    let lease = authority
+        .acquire_lease(AcquireBrowserLease {
+            lease_id: BrowserLeaseId::new("lease-primary-close"),
+            tab_id: tab_id.clone(),
+            surface_id: surface_id(),
+            owner: owner(),
+            turn_id: "turn-primary-close".to_string(),
+            goal_binding: None,
+            acquired_at: at(7),
+            expires_at: at(100),
+        })
+        .expect("lease should acquire");
+    let (accepted, tab, revoked) = authority
+        .clear_primary_surface(&first, at(8))
+        .expect("current primary close should succeed");
+    assert!(accepted);
+    assert_eq!(tab.lifecycle, BrowserTabLifecycle::Suspended);
+    assert!(authority.primary_surface(&tab_id).is_none());
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].lease_id, lease.lease_id);
+    assert_eq!(revoked[0].lifecycle, BrowserLeaseLifecycle::Revoked);
+
+    let second = binding(&tab_id, "surface-2", 2);
+    authority
+        .set_primary_surface(second.clone(), at(9))
+        .expect("replacement should bind");
+    let (accepted, _, revoked) = authority
+        .clear_primary_surface(&first, at(10))
+        .expect("stale close should be ignored");
+    assert!(!accepted);
+    assert!(revoked.is_empty());
+    assert_eq!(authority.primary_surface(&tab_id), Some(&second));
+}
+
+#[test]
 fn stale_primary_surface_events_cannot_rewind_the_binding() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);
@@ -678,8 +722,8 @@ fn durable_restore_suspends_tabs_without_changing_navigation_revision() {
         )
         .expect("页面状态应推进导航代次");
 
-    let restored = BrowserAuthority::restore(authority.snapshot(), at(7))
-        .expect("持久化恢复应成功");
+    let restored =
+        BrowserAuthority::restore(authority.snapshot(), at(7)).expect("持久化恢复应成功");
     let tab = restored.tab(&tab_id).expect("恢复后 Tab 应存在");
     assert_eq!(tab.lifecycle, BrowserTabLifecycle::Suspended);
     assert_eq!(tab.navigation_revision, 1);

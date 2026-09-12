@@ -1,4 +1,4 @@
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
 use magi_core::{EventId, SessionId, TaskId, TaskStatus, TaskTier, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
 use serde::{Deserialize, Serialize};
@@ -207,6 +207,7 @@ struct TaskIdRequest {
 }
 
 async fn perform_task_action(
+    headers: HeaderMap,
     State(state): State<ApiState>,
     Json(request): Json<TaskIdRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -215,7 +216,11 @@ async fn perform_task_action(
     }
     match request.action {
         AgentRunActionKind::Continue => continue_task(state, request).await,
-        AgentRunActionKind::Restart => restart_task(state, request).await,
+        AgentRunActionKind::Restart => {
+            let desktop_browser_tools_allowed =
+                super::is_trusted_desktop_renderer_request(&state, &headers);
+            restart_task(state, request, desktop_browser_tools_allowed).await
+        }
         AgentRunActionKind::Archive => archive_task(state, request).await,
     }
 }
@@ -355,6 +360,7 @@ async fn continue_task(
 async fn restart_task(
     state: ApiState,
     request: TaskIdRequest,
+    desktop_browser_tools_allowed: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let now = UtcMillis::now();
     let task_id = request.task_id.trim();
@@ -398,6 +404,7 @@ async fn restart_task(
         root_task.goal.trim().to_string()
     };
     let restart_request = SessionTurnRequestDto {
+        desktop_browser_tools_allowed,
         session_id: Some(session_id.to_string()),
         scope: request.scope,
         workspace_id: scope.workspace_id().map(|id| id.to_string()),

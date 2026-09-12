@@ -9,7 +9,7 @@
  *   因为当前暂时没有浏览器 Tab 就覆盖用户显式打开的空面板。
  * - togglePane() 仅切 collapsed；openTab*() 触发自动展开
  * - 同 kind 同 key（agent: agentRunId / code: filepath / browser: BrowserTabId）幂等：复用现有 tab 并激活
- * - 浏览器 Tab 的存在性只由 BrowserAuthority 决定，前端 localStorage 只保存布局，不保存浏览器 Tab 实体
+ * - 浏览器 Tab 的存在性只由 BrowserAuthority 决定，前端存储只保存布局，不保存浏览器 Tab 实体
  * - terminal 以 terminalTabId 作为唯一键；每次新建都是独立命令终端，不共享输出历史
  */
 
@@ -58,7 +58,7 @@ export interface CodeTabPayload {
   headSummary?: string;
   /** large_text 尾部摘要 */
   tailSummary?: string;
-  /** 工具输出携带的瞬时图片数据；不得写入 localStorage。 */
+  /** 工具输出携带的瞬时图片数据；不得写入右栏状态存储。 */
   imageDataUrl?: string;
 }
 
@@ -137,7 +137,7 @@ const EMPTY_SESSION_STATE: SessionPaneState = {
   browserAuthoritySynchronized: false,
 };
 
-/** localStorage 持久化 key，带 schema 版本号方便后续演化 */
+/** 右栏状态 key，带 schema 版本号方便后续演化。 */
 const STORAGE_KEY = 'magi-right-pane-state.v3';
 /** 持久化 session 总数硬上限：超过后按 lastActivatedAt 倒序保留最近 N 个，防止长期使用膨胀 */
 const MAX_PERSISTED_SESSIONS = 50;
@@ -164,6 +164,14 @@ function isDesktopRenderer(): boolean {
   const surface = window.magiDesktop?.surface
     ?? new URLSearchParams(window.location.search).get('desktopSurface');
   return surface === 'app';
+}
+
+function rightPaneStorage(): Storage | null {
+  if (typeof window === 'undefined') return null;
+  // Desktop 的每个 BrowserWindow 使用独立 sessionStorage：Renderer F5
+  // 可以恢复 Terminal/Code/Agent 身份，但不同窗口不会争用同一份活动 Tab，
+  // 完整应用重启也不会伪造已经终止的本地终端进程。
+  return isDesktopRenderer() ? window.sessionStorage : window.localStorage;
 }
 
 function normalizeWorkspaceId(workspaceId: string | null | undefined): string {
@@ -222,7 +230,7 @@ function normalizeStoredScopeKey(scopeKeyOrSessionId: string | null | undefined)
 /**
  * 序列化前裁剪 code tab payload —— content / diff / headSummary / tailSummary / imageDataUrl
  * 单条可达 100KB+，恢复后由 RightPane.svelte 的 fetchedContents $effect 重新拉取，
- * 不需要进 localStorage。元数据（filepath / contentKind / size / mime / symlinkTarget / language）
+ * 不需要进右栏状态存储。元数据（filepath / contentKind / size / mime / symlinkTarget / language）
  * 全部保留，刷新后能立即识别 tab kind 与文件信息。
  */
 function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
@@ -248,7 +256,7 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
 
 function tabsForPersist(tabs: RightPaneTab[]): RightPaneTab[] {
   // BrowserAuthority 在 daemon 重启和运行组件升级时负责恢复浏览器 Tab。
-  // 不把浏览器实体复制到 localStorage，避免前端先挂载已经失效的 Host 引用。
+  // 不把浏览器实体复制到前端存储，避免先挂载已经失效的 Host 引用。
   return tabs.filter((tab) => tab.kind !== 'browser').map(sanitizeTabForPersist);
 }
 
@@ -274,11 +282,12 @@ function isRestorableTab(tab: RightPaneTab): boolean {
   return false;
 }
 
-/** 从 localStorage 恢复 perSession + activeSessionId；解析/版本不符则静默回退到空状态 */
+/** 从当前端的窗口级存储恢复；解析/版本不符则静默回退到空状态。 */
 function loadPersisted(): void {
-  if (typeof window === 'undefined' || isDesktopRenderer()) return;
+  const storage = rightPaneStorage();
+  if (!storage) return;
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = storage.getItem(STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as PersistedShape;
     if (!parsed || (parsed.version !== 3 && parsed.version !== 4)) return;
@@ -315,9 +324,10 @@ function loadPersisted(): void {
   }
 }
 
-/** 把当前 perSession 序列化写入 localStorage；mutation 末尾同步调用 */
+/** 把当前 perSession 序列化写入当前端的窗口级存储。 */
 function persistState(): void {
-  if (typeof window === 'undefined' || isDesktopRenderer()) return;
+  const storage = rightPaneStorage();
+  if (!storage) return;
   try {
     const entries = Object.entries(rightPaneState.perSession);
     let kept: [string, SessionPaneState][] = entries;
@@ -346,7 +356,7 @@ function persistState(): void {
         ]),
       ),
     };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+    storage.setItem(STORAGE_KEY, JSON.stringify(slim));
   } catch {
     // QuotaExceededError / SecurityError 等 → 静默忽略，不影响主流程
   }
@@ -423,10 +433,10 @@ export function clearBrowserTabClosePending(
 loadPersisted();
 
 // 自动持久化：$state proxy 是深度 reactive 的，任何 perSession / activeSessionId / tab 字段
-// 的变化都会被 persistState 内部的遍历"读取"触发，从而重新写入 localStorage。
+// 的变化都会被 persistState 内部的遍历"读取"触发，从而重新写入对应存储。
 // 用 $effect.root 创建与模块寿命同生命周期的 reactive scope；页面 unload 时浏览器自动 GC。
 // 这个收敛实现避免在每个 mutation 末尾手写一次 persist——新增 mutation 函数也不会漏。
-if (typeof window !== 'undefined' && !isDesktopRenderer()) {
+if (typeof window !== 'undefined') {
   $effect.root(() => {
     $effect(() => {
       persistState();
@@ -1058,7 +1068,7 @@ export function synchronizeBrowserTabs(
     && pane.openTabs.some((tab) => tab.id === firstAuthorityPaneId)
   ) {
     pane.activeTabId = firstAuthorityPaneId;
-    // Browser Tab 不写入 localStorage。首次从 BrowserAuthority 恢复时，
+    // Browser Tab 不写入前端存储。首次从 BrowserAuthority 恢复时，
     // 右栏状态仍是空面板的 collapsed=true，必须把权威存在的 Browser
     // Tab 投影为可见面板；已有本地 active Tab 或用户手动折叠时不抢占。
     if (!hadBrowserProjection) pane.collapsed = false;

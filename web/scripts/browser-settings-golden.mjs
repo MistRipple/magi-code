@@ -38,6 +38,10 @@ assert.match(agentApiSource, /clientPlatform/);
 assert.match(agentApiSource, /'desktop' \| 'web' \| 'mobile-web'/);
 assert.match(source, /inAppBrowserEnabled/);
 assert.match(source, /browserUseEnabled/);
+assert.match(source, /if \(!isDesktop \|\| !capabilitySnapshot \|\| savingSetting\) return/);
+assert.match(source, /disabled=\{!isDesktop \|\| !capabilitySnapshot \|\| capabilityLoading/);
+assert.match(source, /if \(!isDesktop \|\| resourceReclaiming \|\| selected\.length === 0\) return/);
+assert.match(source, /disabled=\{!isDesktop \|\| !tab\.canReclaim/);
 
 assert.match(source, /const desktop = window\.magiDesktop;[\s\S]*?desktop\?\.runtime === 'electron'/);
 assert.match(source, /desktop\.getBrowserComponentInfo\(\)/);

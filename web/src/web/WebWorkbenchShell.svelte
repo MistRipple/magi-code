@@ -172,6 +172,15 @@ import {
   let sidebarCollapsed = $state(false);
   let previewPanelWidth = $state<number | null>(null);
   let isPreviewPanelResizing = $state(false);
+  type SidebarTooltipState = {
+    text: string;
+    left: number;
+    top: number;
+    placement: 'above' | 'below';
+  };
+  let sidebarTooltip = $state<SidebarTooltipState | null>(null);
+  let sidebarTooltipTarget = $state<HTMLElement | null>(null);
+  let sidebarTooltipFrame: number | null = null;
   let desktopRightPaneVisible = $state(false);
   let desktopSnapshot = $state<MagiDesktopWindowSnapshot | null>(null);
   let workbenchElement = $state<HTMLElement | null>(null);
@@ -252,6 +261,9 @@ import {
   type HtmlBrowserOpenRequest = {
     requestId: number;
     filepath: string;
+    workspaceId: string;
+    workspacePath: string;
+    sessionId: string;
   };
   type WebFolderPickerProps = {
     title?: string;
@@ -372,11 +384,19 @@ import {
       ? (desktopSnapshot?.layout.rightPaneWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH)
       : (previewPanelWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH),
   );
+  const rightPaneOpenForLayout = $derived(
+    desktopAppSurface
+      ? desktopRightPaneVisible
+      : !getRightPaneState(rightPaneState.activeScopeKey).collapsed,
+  );
   const panelLayout = $derived(resolvePanelLayout({
     viewportWidth,
     sidebarWidth: effectiveSidebarWidth,
     previewPanelWidth: effectivePreviewPanelWidth,
-    sidebarVisible: viewportWidth > PANEL_LAYOUT.mobileBreakpoint && !sidebarCollapsed,
+    sidebarVisible: desktopAppSurface
+      ? !sidebarCollapsed
+      : viewportWidth > PANEL_LAYOUT.mobileBreakpoint && !sidebarCollapsed,
+    rightPaneOpen: rightPaneOpenForLayout,
     desktopSurface: desktopAppSurface,
   }));
   const sidebarIsDrawer = $derived(panelLayout.sidebarDrawer);
@@ -416,14 +436,9 @@ import {
   });
   /** Desktop 的窗口布局以 Main snapshot 为准；Web 客户端仍使用本地面板状态。 */
   const rightPaneVisible = $derived(
-    desktopAppSurface ? desktopRightPaneVisible : !activeRightPaneState.collapsed,
+    rightPaneOpenForLayout,
   );
   const inlineRightPaneVisible = $derived(!desktopAppSurface && rightPaneVisible);
-  const desktopRightPaneOverlay = $derived(
-    desktopAppSurface
-      && rightPaneVisible
-      && panelLayout.previewOverlay,
-  );
   const panelVisibility = $derived(resolvePanelVisibility({
     sidebarDrawer: sidebarIsDrawer,
     sidebarPreferredOpen: !sidebarCollapsed,
@@ -507,6 +522,22 @@ import {
       });
   }
 
+  /**
+   * 激活请求跨越 HTTP、IPC 和 Surface 就绪边界后，必须重新核对当前用户
+   * 意图。旧请求只负责结束自己的单飞槽，不能继续改写 RightPane、
+   * BrowserAuthority 或 Main 的活动 Surface。
+   */
+  function abandonSupersededDesktopPanelActivation(
+    request: DesktopPanelActivationRequest,
+  ): boolean {
+    if (sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) return false;
+    if (desktopPanelActivationRequest?.requestId === request.requestId) {
+      desktopPanelActivationRequest = null;
+      desktopPanelActivationEpoch += 1;
+    }
+    return true;
+  }
+
   async function activateDesktopPanelTarget(request: DesktopPanelActivationRequest): Promise<void> {
     const desktop = window.magiDesktop;
     if (!desktop) return;
@@ -525,6 +556,7 @@ import {
           browser.browserSessionId,
           browser.tabId,
         );
+        if (abandonSupersededDesktopPanelActivation(request)) return;
         const authoritativeTab = authorityResolution.tab;
         if (!authoritativeTab || authoritativeTab.lifecycle === 'closed') {
           synchronizeBrowserSessionSnapshot(
@@ -553,26 +585,14 @@ import {
           viewport: { mode: 'auto' },
         });
         applyDesktopSnapshot(activatedSnapshot);
-        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) {
-          if (desktopPanelActivationRequest?.requestId === request.requestId) {
-            desktopPanelActivationRequest = null;
-            desktopPanelActivationEpoch += 1;
-          }
-          return;
-        }
+        if (abandonSupersededDesktopPanelActivation(request)) return;
         // activateBrowser 只建立逻辑 Surface 并把当前内容槽身份提交给
         // Renderer。必须等对应 <webview> 完成注册后，才能恢复 Authority
         // 页面；否则 RestorePage 会在没有真实 WebContents 的 Surface 上
         // 等待，形成启动死锁。
         const readySnapshot = await desktop.waitForBrowserSurface({ tabId: browser.tabId });
         applyDesktopSnapshot(readySnapshot);
-        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) {
-          if (desktopPanelActivationRequest?.requestId === request.requestId) {
-            desktopPanelActivationRequest = null;
-            desktopPanelActivationEpoch += 1;
-          }
-          return;
-        }
+        if (abandonSupersededDesktopPanelActivation(request)) return;
         await prepareBrowserAuthorityForDesktop(
           {
             browserSessionId: browser.browserSessionId,
@@ -580,6 +600,9 @@ import {
             lifecycle: authoritativeTab.lifecycle,
           },
           (authoritySnapshot) => {
+            // setActiveBrowserTab 已经进入 Authority lane，但用户可能在请求
+            // 返回前选择了新 Tab。过期结果不得用 revealTabId 复活旧意图。
+            if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) return;
             synchronizeBrowserSessionSnapshot(authoritySnapshot, browser.workspacePath, {
               workspaceId: browser.workspaceId,
               sessionId: browser.sessionId,
@@ -591,13 +614,7 @@ import {
             forceRestore: request.recoveryRevision > desktopPanelActivationCompletedRecoveryRevision,
           },
         );
-        if (!sameDesktopPanelTarget(currentDesktopPanelTarget(), request)) {
-          if (desktopPanelActivationRequest?.requestId === request.requestId) {
-            desktopPanelActivationRequest = null;
-            desktopPanelActivationEpoch += 1;
-          }
-          return;
-        }
+        if (abandonSupersededDesktopPanelActivation(request)) return;
       }
       const snapshot = request.kind === 'browser' && request.browser
         ? desktopSnapshot ?? await desktop.getSnapshot()
@@ -1512,7 +1529,6 @@ import {
   function startDesktopRightPaneResize(event: PointerEvent): void {
     if (!desktopAppSurface) return;
     if (!window.magiDesktop) return;
-    if (desktopRightPaneOverlay) return;
     const handle = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
     if (!handle) return;
     const rightPaneElement = workbenchElement?.querySelector('.desktop-right-pane-column');
@@ -1631,30 +1647,33 @@ import {
     if (!normalizedFilePath) {
       return false;
     }
-    openCodeTab(sessionId, normalizedFilePath, {
-      displayPath: metadata.displayPath,
-      label: metadata.label,
-      workspaceId,
-      workspacePath,
-      sessionId,
-      contentKind: metadata.contentKind,
-      size: metadata.size,
-      mime: metadata.mime,
-      symlinkTarget: metadata.symlinkTarget,
-      headSummary: metadata.headSummary,
-      tailSummary: metadata.tailSummary,
-      imageDataUrl: imageDataUrl || undefined,
-    });
     if (desktopAppSurface && isHtmlFile(metadata.displayPath || normalizedFilePath)) {
       // HTML 文件在桌面端代表可运行的网页入口。请求放在 Shell 状态中，
       // 由右栏组件消费，避免右栏懒加载或主 Renderer 切换布局时丢事件。
       htmlBrowserOpenRequest = {
         requestId: ++htmlBrowserOpenRequestId,
         filepath: normalizedFilePath,
+        workspaceId,
+        workspacePath,
+        sessionId,
       };
       requestRightPaneVisibility(true);
     } else {
       htmlBrowserOpenRequest = null;
+      openCodeTab(sessionId, normalizedFilePath, {
+        displayPath: metadata.displayPath,
+        label: metadata.label,
+        workspaceId,
+        workspacePath,
+        sessionId,
+        contentKind: metadata.contentKind,
+        size: metadata.size,
+        mime: metadata.mime,
+        symlinkTarget: metadata.symlinkTarget,
+        headSummary: metadata.headSummary,
+        tailSummary: metadata.tailSummary,
+        imageDataUrl: imageDataUrl || undefined,
+      });
     }
     if (sidebarIsDrawer) {
       sidebarOpen = false;
@@ -2344,6 +2363,104 @@ import {
     }
   }
 
+  function sidebarTooltipTargetFromEvent(event: Event): HTMLElement | null {
+    const eventTarget = event.target instanceof Element
+      ? event.target.closest<HTMLElement>('[data-tooltip]')
+      : null;
+    if (!eventTarget || !sidebarElement?.contains(eventTarget)) {
+      return null;
+    }
+    return eventTarget;
+  }
+
+  function clearSidebarTooltip(): void {
+    if (sidebarTooltipFrame !== null && typeof window !== 'undefined') {
+      window.cancelAnimationFrame(sidebarTooltipFrame);
+      sidebarTooltipFrame = null;
+    }
+    sidebarTooltipTarget = null;
+    sidebarTooltip = null;
+  }
+
+  function positionSidebarTooltip(target: HTMLElement | null = sidebarTooltipTarget): void {
+    if (!target || !target.isConnected || !sidebarElement?.contains(target)) {
+      clearSidebarTooltip();
+      return;
+    }
+    const text = target.dataset.tooltip?.trim() || '';
+    const rect = target.getBoundingClientRect();
+    if (!text || rect.width <= 0 || rect.height <= 0) {
+      clearSidebarTooltip();
+      return;
+    }
+
+    const viewportPadding = 8;
+    const tooltipGap = 6;
+    const placement = rect.bottom + 40 <= window.innerHeight || rect.top < 40 ? 'below' : 'above';
+    const top = placement === 'below' ? rect.bottom + tooltipGap : rect.top - tooltipGap;
+    const left = Math.min(
+      Math.max(rect.right, viewportPadding),
+      Math.max(viewportPadding, window.innerWidth - viewportPadding),
+    );
+    sidebarTooltip = { text, left, top, placement };
+  }
+
+  function scheduleSidebarTooltipPosition(): void {
+    if (!sidebarTooltipTarget || sidebarTooltipFrame !== null || typeof window === 'undefined') {
+      return;
+    }
+    sidebarTooltipFrame = window.requestAnimationFrame(() => {
+      sidebarTooltipFrame = null;
+      positionSidebarTooltip();
+    });
+  }
+
+  function showSidebarTooltip(event: Event): void {
+    const target = sidebarTooltipTargetFromEvent(event);
+    if (!target) return;
+    const text = target.dataset.tooltip?.trim() || '';
+    if (!text) return;
+    sidebarTooltipTarget = target;
+    positionSidebarTooltip(target);
+  }
+
+  function handleSidebarTooltipPointerOver(event: PointerEvent): void {
+    const target = sidebarTooltipTargetFromEvent(event);
+    const relatedTarget = event.relatedTarget;
+    if (!target || (relatedTarget instanceof Node && target.contains(relatedTarget))) {
+      return;
+    }
+    showSidebarTooltip(event);
+  }
+
+  function handleSidebarTooltipPointerOut(event: PointerEvent): void {
+    const target = sidebarTooltipTargetFromEvent(event);
+    const relatedTarget = event.relatedTarget;
+    if (target && relatedTarget instanceof Node && target.contains(relatedTarget)) {
+      return;
+    }
+    if (!relatedTarget || target === sidebarTooltipTarget) {
+      clearSidebarTooltip();
+    }
+  }
+
+  function handleSidebarTooltipFocusIn(event: FocusEvent): void {
+    showSidebarTooltip(event);
+  }
+
+  function handleSidebarTooltipFocusOut(event: FocusEvent): void {
+    const target = sidebarTooltipTargetFromEvent(event);
+    const relatedTarget = event.relatedTarget;
+    if (target && relatedTarget instanceof Node && target.contains(relatedTarget)) {
+      return;
+    }
+    clearSidebarTooltip();
+  }
+
+  function handleSidebarTooltipViewportChange(): void {
+    scheduleSidebarTooltipPosition();
+  }
+
   $effect(() => {
     if (typeof document === 'undefined') {
       return;
@@ -2671,9 +2788,14 @@ import {
       const detail = (event as CustomEvent<OpenHtmlFileInBrowserRequest>).detail;
       const filepath = detail?.filepath?.trim() || '';
       if (!filepath || !isHtmlFile(filepath)) return;
+      const binding = currentWorkspaceBinding();
+      if (binding.scope !== 'workspace' || !binding.workspaceId || !binding.workspacePath || !binding.sessionId) return;
       htmlBrowserOpenRequest = {
         requestId: ++htmlBrowserOpenRequestId,
         filepath,
+        workspaceId: binding.workspaceId,
+        workspacePath: binding.workspacePath,
+        sessionId: binding.sessionId,
       };
       requestRightPaneVisibility(true);
     };
@@ -2711,6 +2833,7 @@ import {
       }
     };
     window.addEventListener('resize', handleResize);
+    window.addEventListener('scroll', handleSidebarTooltipViewportChange, true);
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
     window.addEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
@@ -2734,6 +2857,7 @@ import {
       stopDesktopFileDrop?.();
       desktopDropIndicator = null;
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('scroll', handleSidebarTooltipViewportChange, true);
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
       window.removeEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
@@ -2742,6 +2866,7 @@ import {
       if (resizeRaf !== null) {
         cancelAnimationFrame(resizeRaf);
       }
+      clearSidebarTooltip();
     };
   });
 
@@ -2762,7 +2887,6 @@ import {
   class:web-workbench-shell--preview-overlay={previewIsOverlay}
   class:web-workbench-shell--has-preview={inlineRightPaneVisible}
   class:web-workbench-shell--desktop-right-pane-visible={desktopAppSurface && desktopRightPaneVisible}
-  class:web-workbench-shell--desktop-preview-overlay={desktopRightPaneOverlay}
   class:web-workbench-shell--resizing={isSidebarResizing || isPreviewPanelResizing}
   class:web-workbench-shell--sidebar-resizing={isSidebarResizing}
   class:web-workbench-shell--preview-resizing={isPreviewPanelResizing}
@@ -2798,7 +2922,15 @@ import {
   {/if}
 
   {#if !sidebarHidden}
-  <aside bind:this={sidebarElement} class="sidebar" class:sidebar--open={sidebarIsDrawer && sidebarOpen}>
+  <aside
+    bind:this={sidebarElement}
+    class="sidebar"
+    class:sidebar--open={sidebarIsDrawer && sidebarOpen}
+    onpointerover={handleSidebarTooltipPointerOver}
+    onpointerout={handleSidebarTooltipPointerOut}
+    onfocusin={handleSidebarTooltipFocusIn}
+    onfocusout={handleSidebarTooltipFocusOut}
+  >
     <div class="sidebar-header">
       <div class="sidebar-toolbar">
         <MagiWordmark />
@@ -2835,10 +2967,14 @@ import {
       </div>
     </div>
 
-    <div class="sidebar-navigation-scroll">
+    <div
+      class="sidebar-navigation-scroll"
+      class:sidebar-navigation-scroll--projects={sidebarMode === 'projects'}
+      class:sidebar-navigation-scroll--files={sidebarMode === 'files'}
+    >
       {#if sidebarMode === 'projects'}
         <section class="sidebar-section sidebar-section--workspaces">
-        <div class="section-title-row">
+        <div class="section-title-row section-title-row--sticky">
           <button
             type="button"
             class="section-title-toggle"
@@ -2912,6 +3048,7 @@ import {
                   <button
                     type="button"
                     class="workspace-new-session-btn"
+                    data-tooltip={i18n.t('web.newWorkspaceSessionTitle')}
                     title={i18n.t('web.newWorkspaceSessionTitle')}
                     aria-label={i18n.t('web.newWorkspaceSessionAria', { name: workspace.name })}
                     disabled={workspaceActionPending || messagesState.sessionHydrating}
@@ -3063,7 +3200,7 @@ import {
         </section>
       {:else}
         <section class="sidebar-section sidebar-section--file-tree-mode">
-        <div class="file-tree-mode-header">
+        <div class="file-tree-mode-header section-title-row--sticky">
           <button
             type="button"
             class="file-tree-back-btn"
@@ -3095,8 +3232,9 @@ import {
         </section>
       {/if}
 
-      <div class="recent-sessions-section">
-        <div class="section-title-row recent-sessions-header">
+      {#if sidebarMode === 'projects'}
+      <section class="recent-sessions-section">
+        <div class="section-title-row recent-sessions-header section-title-row--sticky">
           <button
             type="button"
             class="section-title-toggle"
@@ -3159,7 +3297,8 @@ import {
             {/if}
           </div>
         {/if}
-      </div>
+      </section>
+      {/if}
     </div>
 
     <div
@@ -3171,6 +3310,15 @@ import {
       ondblclick={resetSidebarWidth}
     ></div>
   </aside>
+  {/if}
+
+  {#if sidebarTooltip}
+    <div
+      class="sidebar-tooltip"
+      class:sidebar-tooltip--above={sidebarTooltip.placement === 'above'}
+      style={`left:${sidebarTooltip.left}px;top:${sidebarTooltip.top}px;`}
+      role="tooltip"
+    >{sidebarTooltip.text}</div>
   {/if}
 
   <main
@@ -3208,23 +3356,19 @@ import {
           }}
         />
       {:else if desktopAppSurface && desktopRightPaneVisible && RightPaneComponent}
-        {#if !desktopRightPaneOverlay}
-          <div
-            class="desktop-right-pane-resize-handle"
-            role="separator"
-            aria-orientation="vertical"
-            title={i18n.t('web.filePreviewResizeReset')}
-            onpointerdown={startDesktopRightPaneResize}
-            ondblclick={resetDesktopRightPaneWidth}
-          ></div>
-        {/if}
+        <div
+          class="desktop-right-pane-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          title={i18n.t('web.filePreviewResizeReset')}
+          onpointerdown={startDesktopRightPaneResize}
+          ondblclick={resetDesktopRightPaneWidth}
+        ></div>
         <div
           class="desktop-right-pane-column"
-          class:desktop-right-pane-column--overlay={desktopRightPaneOverlay}
         >
           <RightPaneComponent
             workspaceRoot={selectedWorkspace?.rootPath || ''}
-            overlay={desktopRightPaneOverlay}
             desktopSurface={true}
             htmlBrowserOpenRequest={htmlBrowserOpenRequest}
             onHtmlBrowserOpenHandled={(requestId) => {
@@ -3318,13 +3462,9 @@ import {
 
   .web-workbench-shell--desktop-right-pane-visible .workbench-body {
     grid-template-columns:
-      minmax(var(--workbench-min-content-width, 448px), 1fr)
+      minmax(0, 1fr)
       var(--desktop-right-pane-divider-width, 8px)
       minmax(var(--preview-min-width, 320px), var(--desktop-right-pane-width, 480px));
-  }
-
-  .web-workbench-shell--desktop-preview-overlay .workbench-body {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .web-workbench-shell--desktop-right-pane-visible .workbench-app-pane {
@@ -3365,18 +3505,6 @@ import {
     min-height: 0;
   }
 
-  .desktop-right-pane-column--overlay {
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    z-index: var(--z-overlay-preview);
-    grid-column: auto;
-    width: min(var(--desktop-right-pane-width, 480px), 100%);
-    /* 用内阴影表达分界线，不占用内容轨道宽度。 */
-    box-shadow: inset 1px 0 var(--border);
-    background: transparent;
-  }
 
   .desktop-right-pane-column :global(.right-pane) {
     box-sizing: border-box;
@@ -3504,37 +3632,28 @@ import {
     border-radius: var(--radius-sm);
   }
 
-  /* 自定义 tooltip（图标按钮通用） */
-  .sidebar-icon-btn::after,
-  .theme-toggle-btn::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 50%;
-    transform: translateX(-50%);
+  /* Tooltip 挂载在 Shell 顶层，不能再由 sidebar-navigation-scroll 的
+     overflow 或中间面板的绘制顺序裁剪。 */
+  .sidebar-tooltip {
+    position: fixed;
+    z-index: var(--z-tooltip, 1200);
+    max-width: min(260px, calc(100vw - 16px));
     padding: 4px 8px;
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
-    background: var(--glass-bg);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
+    background: var(--magi-surface-popover, var(--dropdown-bg));
+    box-shadow: var(--shadow-md);
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    line-height: 1.3;
     white-space: nowrap;
     pointer-events: none;
-    opacity: 0;
-    transition: opacity var(--transition-fast);
-    z-index: var(--z-tooltip);
+    transform: translateX(-100%);
   }
 
-  .sidebar-icon-btn:hover::after,
-  .theme-toggle-btn:hover::after {
-    opacity: 1;
-  }
-
-  .sidebar-icon-btn:disabled::after {
-    display: none;
+  .sidebar-tooltip--above {
+    transform: translate(-100%, -100%);
   }
 
   .session-meta,
@@ -3608,6 +3727,10 @@ import {
     scrollbar-color: var(--scrollbar-thumb) transparent;
   }
 
+  .sidebar-navigation-scroll--files {
+    overflow: hidden;
+  }
+
   .sidebar-section--workspaces {
     flex: 0 0 auto;
     overflow: visible;
@@ -3624,6 +3747,18 @@ import {
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
+  }
+
+  .section-title-row--sticky {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    min-height: 28px;
+    padding: 2px 0;
+    /* 标题是滚动内容的遮挡层，使用主题基色而不是半透明面板材质，
+       避免下方工作区/会话行透出来造成文字串层。 */
+    background: var(--magi-canvas, var(--background));
+    box-shadow: 0 1px 0 var(--border-subtle);
   }
 
   .section-title {
@@ -3753,17 +3888,6 @@ import {
     flex: 0 0 auto;
     padding-top: var(--space-2);
     border-top: 1px solid color-mix(in srgb, var(--border-subtle) 70%, transparent);
-  }
-
-  .recent-sessions-header {
-    position: sticky;
-    top: 0;
-    z-index: 3;
-    min-height: 28px;
-    padding: 2px 0;
-    /* 侧栏自身已经承担皮肤背景；这里不能再次铺半透明背景，否则在
-       壁纸/透明主题下会产生明显的矩形叠色。 */
-    background: transparent;
   }
 
   .recent-session-new-btn {

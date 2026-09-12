@@ -1,8 +1,10 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
+    http::HeaderMap,
     routing::{get, post},
 };
+use magi_browser_authority::BrowserToolKind;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
     PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
@@ -518,7 +520,17 @@ async fn guide_session_turn_queue_item(
     Ok(Json(session_turn_queue_response(&state, &session_id)))
 }
 
-pub(crate) async fn submit_session_turn(
+async fn submit_session_turn(
+    headers: HeaderMap,
+    state: State<ApiState>,
+    Json(mut request): Json<SessionTurnRequestDto>,
+) -> Result<Json<SessionTurnResponseDto>, ApiError> {
+    request.desktop_browser_tools_allowed =
+        super::is_trusted_desktop_renderer_request(&state.0, &headers);
+    submit_session_turn_authorized(state, Json(request)).await
+}
+
+pub(crate) async fn submit_session_turn_authorized(
     State(state): State<ApiState>,
     Json(mut request): Json<SessionTurnRequestDto>,
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {
@@ -2233,6 +2245,13 @@ fn session_turn_denied_tools(request: &SessionTurnRequestDto) -> Vec<String> {
     }
     if !explicitly_requests_goal && !explicitly_requests_plan {
         denied.push("update_plan".to_string());
+    }
+    if !request.desktop_browser_tools_allowed {
+        denied.extend(
+            BrowserToolKind::ALL
+                .into_iter()
+                .map(|tool| tool.name().to_string()),
+        );
     }
     denied
 }
@@ -5142,6 +5161,7 @@ mod tests {
 
     fn session_turn_request(text: &str) -> SessionTurnRequestDto {
         SessionTurnRequestDto {
+            desktop_browser_tools_allowed: true,
             session_id: None,
             scope: crate::dto::SessionScopeKindDto::Personal,
             workspace_id: None,
@@ -7530,6 +7550,21 @@ mod tests {
     }
 
     #[test]
+    fn web_turn_denies_every_browser_tool_without_affecting_other_tools() {
+        let mut request = session_turn_request("检查网页");
+        request.desktop_browser_tools_allowed = false;
+        let denied = session_turn_denied_tools(&request);
+        for tool in BrowserToolKind::ALL {
+            assert!(
+                denied.iter().any(|name| name == tool.name()),
+                "Web Turn 必须隐藏浏览器工具 {}",
+                tool.name()
+            );
+        }
+        assert!(!denied.iter().any(|name| name == "shell"));
+    }
+
+    #[test]
     fn complete_workspace_analysis_routes_to_execute_without_collaboration() {
         for text in [
             "完整分析当前项目",
@@ -9459,17 +9494,20 @@ mod tests {
             .expect("action task should exist");
         assert_eq!(task.required_tool_chain(), ["update_plan"]);
         let policy = task.policy_snapshot.expect("task policy should exist");
-        assert_eq!(
-            policy.denied_tools,
-            [
-                "agent_spawn",
-                "agent_send",
-                "agent_wait",
-                "get_goal",
-                "create_goal",
-                "update_goal",
-            ]
+        let mut expected_denied_tools = vec![
+            "agent_spawn".to_string(),
+            "agent_send".to_string(),
+            "agent_wait".to_string(),
+            "get_goal".to_string(),
+            "create_goal".to_string(),
+            "update_goal".to_string(),
+        ];
+        expected_denied_tools.extend(
+            BrowserToolKind::ALL
+                .into_iter()
+                .map(|tool| tool.name().to_string()),
         );
+        assert_eq!(policy.denied_tools, expected_denied_tools);
     }
 
     #[tokio::test]

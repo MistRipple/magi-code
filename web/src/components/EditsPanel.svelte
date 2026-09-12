@@ -229,6 +229,9 @@
     }
     const scope = editScope(edit);
     const detail = await loadChangeDetail(edit, scope);
+    if (requestOpenHtmlFileInBrowser(detail.filePath)) {
+      return;
+    }
     const diff = synthesizeDiff(detail);
     openCodeTab(scope.sessionId, detail.filePath, {
       ...scope,
@@ -251,7 +254,6 @@
       headSummary: detail.headSummary,
       tailSummary: detail.tailSummary,
     });
-    requestOpenHtmlFileInBrowser(detail.filePath);
   }
 
 </script>

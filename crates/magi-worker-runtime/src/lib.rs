@@ -1019,7 +1019,7 @@ mod tests {
             worker_id: worker_id.clone(),
             task_id: task_id.clone(),
             session_id: None,
-            workspace_id: None,
+            workspace_id: Some(WorkspaceId::new("workspace-loopback-policy")),
             execution_profile: WorkerExecutionProfile::default(),
             tool_policy: ToolExecutionPolicy {
                 access_profile: magi_core::AccessProfile::FullAccess,

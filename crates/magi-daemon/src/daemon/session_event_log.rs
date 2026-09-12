@@ -27,6 +27,13 @@ struct CanonicalEventTransaction {
     acceptance: Option<AcceptedSubmissionRecord>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedCanonicalEventWrite {
+    pub(crate) path: PathBuf,
+    pub(crate) content: String,
+    pub(crate) projection: SessionConversationProjection,
+}
+
 /// canonical 对话事实的重放结果。projection 文件只缓存该结果；events 目录才是权威源。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SessionConversationProjection {
@@ -143,6 +150,81 @@ impl SessionConversationProjection {
         mutations: &[CanonicalTurnMutation],
         acceptance: Option<AcceptedSubmissionRecord>,
     ) -> Result<Self, DaemonError> {
+        let (next, transaction) =
+            self.plan_transaction_inner(event_root, session_id, mutations, acceptance)?;
+        let Some(transaction) = transaction else {
+            return Ok(next);
+        };
+        fs::create_dir_all(event_root)?;
+        let path = event_root.join(transaction_file_name(
+            transaction.first_event_seq,
+            transaction.last_event_seq,
+        ));
+        if path.exists() {
+            let existing: CanonicalEventTransaction = serde_json::from_slice(&fs::read(&path)?)
+                .map_err(|error| {
+                    DaemonError::internal(format!(
+                        "解析已存在 canonical event transaction 失败 {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            if existing != transaction {
+                return Err(DaemonError::internal(format!(
+                    "canonical event transaction 序号冲突: {}",
+                    path.display()
+                )));
+            }
+        } else {
+            magi_core::fs_atomic::write_atomic(
+                &path,
+                serde_json::to_vec_pretty(&transaction).map_err(DaemonError::from)?,
+            )?;
+        }
+        Ok(next)
+    }
+
+    /// 只规划 canonical event segment，不直接写盘。
+    ///
+    /// workspace projection 首次接入新的 daemon 状态根时，调用方必须把该 segment
+    /// 与 projection 游标更新放入同一个可恢复事务，不能在两个目录分别提交。
+    pub(crate) fn prepare_transaction_write(
+        &self,
+        event_root: &Path,
+        session_id: &SessionId,
+        mutations: &[CanonicalTurnMutation],
+    ) -> Result<PreparedCanonicalEventWrite, DaemonError> {
+        let (projection, transaction) =
+            self.plan_transaction_inner(event_root, session_id, mutations, None)?;
+        let transaction = transaction.ok_or_else(|| {
+            DaemonError::internal("canonical event 导入没有产生可提交事件".to_string())
+        })?;
+        let path = event_root.join(transaction_file_name(
+            transaction.first_event_seq,
+            transaction.last_event_seq,
+        ));
+        let content = serde_json::to_vec_pretty(&transaction)
+            .map_err(DaemonError::from)
+            .and_then(|content| {
+                String::from_utf8(content).map_err(|error| {
+                    DaemonError::internal(format!(
+                        "canonical event transaction 不是 UTF-8: {error}"
+                    ))
+                })
+            })?;
+        Ok(PreparedCanonicalEventWrite {
+            path,
+            content,
+            projection,
+        })
+    }
+
+    fn plan_transaction_inner(
+        &self,
+        event_root: &Path,
+        session_id: &SessionId,
+        mutations: &[CanonicalTurnMutation],
+        acceptance: Option<AcceptedSubmissionRecord>,
+    ) -> Result<(Self, Option<CanonicalEventTransaction>), DaemonError> {
         if mutations.is_empty() {
             return Err(DaemonError::internal(
                 "canonical event transaction 不能为空".to_string(),
@@ -175,7 +257,7 @@ impl SessionConversationProjection {
                     "accepted canonical event transaction 没有产生事件".to_string(),
                 ));
             }
-            return Ok(next);
+            return Ok((next, None));
         }
 
         if let Some(acceptance) = acceptance.as_ref() {
@@ -200,29 +282,7 @@ impl SessionConversationProjection {
             events,
             acceptance,
         };
-        fs::create_dir_all(event_root)?;
-        let path = event_root.join(transaction_file_name(first_event_seq, last_event_seq));
-        if path.exists() {
-            let existing: CanonicalEventTransaction = serde_json::from_slice(&fs::read(&path)?)
-                .map_err(|error| {
-                    DaemonError::internal(format!(
-                        "解析已存在 canonical event transaction 失败 {}: {error}",
-                        path.display()
-                    ))
-                })?;
-            if existing != transaction {
-                return Err(DaemonError::internal(format!(
-                    "canonical event transaction 序号冲突: {}",
-                    path.display()
-                )));
-            }
-        } else {
-            magi_core::fs_atomic::write_atomic(
-                &path,
-                serde_json::to_vec_pretty(&transaction).map_err(DaemonError::from)?,
-            )?;
-        }
-        Ok(next)
+        Ok((next, Some(transaction)))
     }
 
     pub(crate) fn last_event_seq(&self) -> u64 {

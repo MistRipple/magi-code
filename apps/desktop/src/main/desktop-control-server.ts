@@ -228,6 +228,7 @@ export class DesktopControlServer {
     // 会覆盖当前 Surface，表现为地址、状态和工具结果来回跳变。
     if (
       event.type !== "primary_changed" &&
+      event.type !== "primary_closed" &&
       event.type !== "cdp_event" &&
       !this.#surfaceManager.isPrimary(event.binding)
     ) {
@@ -240,6 +241,14 @@ export class DesktopControlServer {
           payload: { binding: event.binding },
         });
         this.scheduleAnnotationProjection(event.binding.tab_id);
+        break;
+      case "primary_closed":
+        this.#surfaceRebinds.delete(event.binding.tab_id);
+        this.#appliedAnnotationProjections.delete(event.binding.tab_id);
+        this.emit({
+          type: "primary_surface_closed",
+          payload: { binding: event.binding },
+        });
         break;
       case "page_updated":
         if (this.#surfaceManager.isPrimary(event.binding)) {
@@ -262,7 +271,11 @@ export class DesktopControlServer {
       case "popup_blocked":
         this.emit({
           type: "popup_blocked",
-          payload: { binding: event.binding, url: event.url },
+          payload: {
+            binding: event.binding,
+            url: event.url,
+            reason: event.reason,
+          },
         });
         break;
       case "user_takeover":
@@ -767,13 +780,6 @@ export class DesktopControlServer {
     outcome: BrowserCommandOutcome;
     binary?: Buffer;
   }> {
-    const tabId = commandTabId(command);
-    if (tabId && command.type !== "set_annotations") {
-      // 普通浏览器命令优先于页面标记重放。标记事实已经由 Authority
-      // 持久化，当前页面换代或用户开始操作时，旧投影没有继续占用资源的
-      // 价值；重新绑定后会按最新快照再次投影。
-      this.cancelAnnotationProjection(tabId);
-    }
     switch (command.type) {
       case "ping":
         return succeeded({
@@ -957,7 +963,6 @@ export class DesktopControlServer {
     tabId: string,
     annotations: unknown[],
   ): void {
-    this.cancelAnnotationProjection(tabId);
     const previous = this.#annotationProjections.get(tabId);
     this.#annotationProjections.set(tabId, {
       revision: (previous?.revision ?? 0) + 1,

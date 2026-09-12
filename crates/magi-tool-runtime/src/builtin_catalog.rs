@@ -2209,11 +2209,26 @@ mod tests {
         let required = schema["required"]
             .as_array()
             .expect("browser_navigate required should be an array");
+        let variants = schema["oneOf"]
+            .as_array()
+            .expect("browser_navigate oneOf should be an array");
 
         assert!(required.is_empty());
         assert_eq!(schema["properties"]["url"]["type"], "string");
         assert_eq!(schema["properties"]["include_snapshot"]["type"], "boolean");
-        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(3));
+        assert_eq!(variants.len(), 4);
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant["properties"]["action"]["enum"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                serde_json::json!(["url"]),
+                serde_json::json!(["stop"]),
+                serde_json::json!(["back", "forward"]),
+                serde_json::json!(["reload"]),
+            ]
+        );
     }
 
     #[test]

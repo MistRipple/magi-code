@@ -5282,6 +5282,13 @@ impl SessionStore {
             .durable_persistence_lock
             .lock()
             .expect("session durable persistence lock poisoned");
+        // sidecar checkpoint 同样会携带完整 durable canonical projection。必须与
+        // persist_projection_with 遵守同一锁顺序，禁止在 event writer 已提交、
+        // 内存 canonical 尚未 apply 的窗口捕获跨代快照。
+        let _canonical_guard = self
+            .canonical_commit_lock
+            .lock()
+            .expect("session canonical commit lock poisoned");
         let mut persist = persist;
         let persisted_version = {
             let state = self.state.read().expect("session state read lock poisoned");

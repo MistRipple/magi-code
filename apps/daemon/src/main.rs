@@ -6,17 +6,11 @@
 use std::{env, path::PathBuf, process};
 
 use magi_daemon::{Daemon, DaemonConfig};
-use magi_runtime_state::RuntimeStateManager;
+use magi_runtime_state::{RuntimeStateManager, default_state_root};
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 38123;
 const DEFAULT_SERVICE_NAME: &str = "magi-rust-backend";
-
-fn default_state_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".magi")
-}
 
 fn read_env(name: &str) -> Option<String> {
     let value = env::var(name).ok()?;

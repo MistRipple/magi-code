@@ -97,6 +97,7 @@
 
   function previewInRightPane(filepath: string) {
     if (!filepath) return;
+    if (requestOpenHtmlFileInBrowser(filepath)) return;
     const sessionId = filePreviewScope?.sessionId ?? change?.sessionId;
     const workspaceId = filePreviewScope?.workspaceId ?? change?.workspaceId;
     const workspacePath = filePreviewScope?.workspacePath ?? change?.workspacePath;
@@ -113,7 +114,6 @@
       headSummary: change?.headSummary,
       tailSummary: change?.tailSummary,
     });
-    requestOpenHtmlFileInBrowser(filepath);
   }
 </script>
 

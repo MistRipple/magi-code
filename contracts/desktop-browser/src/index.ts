@@ -1,4 +1,4 @@
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 4 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 5 } as const;
 
 /**
  * Browser Surface 允许自动化附着的页面内部 Target 类型。
@@ -97,6 +97,14 @@ export interface DesktopBrowserHandshake {
 }
 
 export type BrowserDeviceType = "desktop" | "mobile";
+
+export type BrowserPopupBlockReason =
+  | "invalid_url"
+  | "unsupported_protocol"
+  | "script_blank_window"
+  | "named_window"
+  | "opener_required"
+  | "separate_window_features";
 
 export type BrowserLogicalViewport =
   | { mode: "auto" }
@@ -251,6 +259,7 @@ export type BrowserHostCommand =
       type: "screenshot";
       payload: {
         tab_id: BrowserTabId;
+        navigation_revision: number;
         target?: BrowserSnapshotTarget | null;
         clip?: BrowserNormalizedRect | null;
         full_page: boolean;
@@ -377,6 +386,7 @@ export interface BrowserHitTest {
   navigation_revision: number;
   viewport_width: number;
   viewport_height: number;
+  device_scale_factor_millis: number;
   scroll_x: number;
   scroll_y: number;
   element_ref: string;
@@ -396,6 +406,10 @@ export type BrowserHostEvent =
   | { type: "ready"; payload: DesktopBrowserHandshake }
   | {
       type: "primary_surface_changed";
+      payload: { binding: BrowserSurfaceBinding };
+    }
+  | {
+      type: "primary_surface_closed";
       payload: { binding: BrowserSurfaceBinding };
     }
   | { type: "user_takeover"; payload: { binding: BrowserSurfaceBinding } }
@@ -447,7 +461,11 @@ export type BrowserHostEvent =
     }
   | {
       type: "popup_blocked";
-      payload: { binding: BrowserSurfaceBinding; url: string };
+      payload: {
+        binding: BrowserSurfaceBinding;
+        url: string;
+        reason: BrowserPopupBlockReason;
+      };
     }
   | { type: "node_selection"; payload: BrowserNodeSelection }
   | {

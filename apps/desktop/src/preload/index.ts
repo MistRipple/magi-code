@@ -110,6 +110,8 @@ contextBridge.exposeInMainWorld("magiDesktop", {
     ipcRenderer.invoke("magi-desktop:activate-browser", request),
   registerBrowserWebview: (request: unknown) =>
     ipcRenderer.invoke("magi-desktop:register-browser-webview", request),
+  updateBrowserDisplaySize: (request: unknown) =>
+    ipcRenderer.invoke("magi-desktop:update-browser-display-size", request),
   releaseBrowserWebview: (request: unknown) =>
     ipcRenderer.invoke("magi-desktop:release-browser-webview", request),
   waitForBrowserSurface: (request: unknown) =>
@@ -124,6 +126,10 @@ contextBridge.exposeInMainWorld("magiDesktop", {
     ipcRenderer.invoke("magi-desktop:start-browser-inspect", request),
   stopBrowserInspect: (request: unknown) =>
     ipcRenderer.invoke("magi-desktop:stop-browser-inspect", request),
+  startBrowserAnnotationCapture: (request: unknown) =>
+    ipcRenderer.invoke("magi-desktop:start-browser-annotation-capture", request),
+  stopBrowserAnnotationCapture: (request: unknown) =>
+    ipcRenderer.invoke("magi-desktop:stop-browser-annotation-capture", request),
   focusApp: () => ipcRenderer.invoke("magi-desktop:focus-app"),
   readyRightPane: () => ipcRenderer.invoke("magi-desktop:right-pane-ready"),
   openExternal: (url: string) =>

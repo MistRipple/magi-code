@@ -718,6 +718,56 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 ),
             }
         }
+        BrowserHostEvent::PrimarySurfaceClosed { binding } => {
+            let context = browser_tab_context(state, &binding.tab_id);
+            match state.mutate_browser_authority(|authority| {
+                authority.clear_primary_surface(&binding, UtcMillis::now())
+            }) {
+                Ok((true, tab, revoked)) => {
+                    publish_tab_event(
+                        state,
+                        "browser.tab.status_changed",
+                        context.clone(),
+                        serde_json::json!({
+                            "tab_id": tab.tab_id,
+                            "lifecycle": tab.lifecycle,
+                            "surface_id": null,
+                            "surface_revision": binding.surface_revision,
+                            "navigation_revision": tab.navigation_revision,
+                        }),
+                    );
+                    publish_tab_event(
+                        state,
+                        "browser.surface.primary_closed",
+                        context,
+                        serde_json::json!({ "binding": binding }),
+                    );
+                    if !revoked.is_empty() {
+                        publish_tab_event(
+                            state,
+                            "browser.control.revoked",
+                            browser_tab_context(state, &binding.tab_id),
+                            serde_json::json!({
+                                "tab_id": binding.tab_id,
+                                "reason": "primary_surface_closed",
+                                "revoked_lease_count": revoked.len(),
+                            }),
+                        );
+                    }
+                }
+                Ok((false, _, _)) => tracing::debug!(
+                    tab_id = %binding.tab_id,
+                    surface_id = %binding.surface_id,
+                    "忽略非当前 Primary Surface 的关闭事件"
+                ),
+                Err(error) => tracing::warn!(
+                    tab_id = %binding.tab_id,
+                    surface_id = %binding.surface_id,
+                    ?error,
+                    "处理 Primary Surface 关闭事件失败"
+                ),
+            }
+        }
         BrowserHostEvent::UserTakeover { binding } => {
             revoke_surface_control(
                 state,
@@ -940,7 +990,11 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 }),
             );
         }
-        BrowserHostEvent::PopupBlocked { binding, url } => {
+        BrowserHostEvent::PopupBlocked {
+            binding,
+            url,
+            reason,
+        } => {
             if !is_current_or_advanced_primary_binding(state, &binding) {
                 tracing::debug!(
                     tab_id = %binding.tab_id,
@@ -954,7 +1008,12 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 state,
                 "browser.popup.blocked",
                 browser_tab_context(state, &binding.tab_id),
-                serde_json::json!({ "tab_id": binding.tab_id, "binding": binding, "url": url }),
+                serde_json::json!({
+                    "tab_id": binding.tab_id,
+                    "binding": binding,
+                    "url": url,
+                    "reason": reason,
+                }),
             );
         }
         BrowserHostEvent::NodeSelection(selection) => {

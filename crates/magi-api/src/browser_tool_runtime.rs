@@ -26,7 +26,10 @@ use magi_session_store::SessionStore;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{RuntimeStatePersistence, state::BrowserHostStatusSnapshot};
+use crate::{
+    RuntimeStatePersistence, browser_image::crop_browser_screenshot,
+    state::BrowserHostStatusSnapshot,
+};
 
 const DEFAULT_BROWSER_PROFILE_ID: &str = "browser-profile-default";
 const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -596,8 +599,11 @@ impl BrowserToolRuntimeDependencies {
                 let reply = client
                     .request(BrowserHostCommand::Screenshot {
                         tab_id: tab.tab_id.clone(),
+                        navigation_revision: tab.navigation_revision,
                         target,
-                        clip,
+                        // 归一化 clip 先捕获当前真实 viewport，再在 daemon
+                        // 内存中裁剪，避免 Chromium clipped capture 改变滚动。
+                        clip: if clip.is_some() { None } else { clip },
                         full_page,
                         format,
                         quality,
@@ -612,17 +618,25 @@ impl BrowserToolRuntimeDependencies {
                         "浏览器截图结果无效",
                     ));
                 };
-                let bytes = reply.binary.ok_or_else(|| {
+                let host_bytes = reply.binary.ok_or_else(|| {
                     BrowserToolError::new("browser_binary_missing", "浏览器截图缺少二进制内容")
                 })?;
-                validate_screenshot_binary(&format, &metadata, &bytes)?;
+                validate_screenshot_binary(&format, &metadata, &host_bytes)?;
+                let bytes = match clip {
+                    Some(clip) => crop_browser_screenshot(&host_bytes, format, clip, quality)
+                        .map_err(|error| {
+                            BrowserToolError::new("browser_screenshot_crop_failed", error)
+                        })?,
+                    None => host_bytes,
+                };
                 let extension = match format {
                     magi_browser_authority::BrowserScreenshotFormat::Png => "png",
                     magi_browser_authority::BrowserScreenshotFormat::Jpeg => "jpg",
                     magi_browser_authority::BrowserScreenshotFormat::Webp => "webp",
                 };
                 let path = self.persist_artifact(session_id, call_id, &bytes, extension)?;
-                Ok(json!({ "tool": tool_name, "status": "succeeded", "path": path, "mime": metadata.mime_type, "bytes": bytes.len(), "sha256": metadata.sha256 }).to_string())
+                let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                Ok(json!({ "tool": tool_name, "status": "succeeded", "path": path, "mime": metadata.mime_type, "bytes": bytes.len(), "sha256": sha256 }).to_string())
             }
             _ => Err(BrowserToolError::new(
                 "unknown_browser_tool",

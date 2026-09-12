@@ -21,7 +21,10 @@ mod workspaces;
 use axum::{
     Json, Router,
     extract::{Query, Request, State},
-    http::{HeaderMap, HeaderName, StatusCode, Uri, header::HOST},
+    http::{
+        HeaderMap, HeaderName, StatusCode, Uri,
+        header::{HOST, USER_AGENT},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -186,6 +189,30 @@ pub(crate) fn is_public_tunnel_request(headers: &HeaderMap) -> bool {
             .and_then(|value| value.to_str().ok())
             .and_then(|host| host.split(':').next())
             .is_some_and(|host| host.ends_with(".trycloudflare.com"))
+}
+
+pub(crate) fn is_trusted_desktop_renderer_request(state: &ApiState, headers: &HeaderMap) -> bool {
+    if is_public_tunnel_request(headers) {
+        return false;
+    }
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !user_agent.contains("@magi/desktop/") || !user_agent.contains("Electron/") {
+        return false;
+    }
+    let Some(request_token) = headers
+        .get("x-magi-desktop-renderer-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    state
+        .browser_host_connection_config()
+        .is_some_and(|config| config.auth_token == request_token)
 }
 
 fn is_protected_remote_path(path: &str) -> bool {

@@ -60,6 +60,9 @@
   type HtmlBrowserOpenRequest = {
     requestId: number;
     filepath: string;
+    workspaceId: string;
+    workspacePath: string;
+    sessionId: string;
   };
 
   interface Props {
@@ -777,7 +780,7 @@
   }
 
   let openingHtmlInBrowser = $state(false);
-  async function openHtmlInMagiBrowser(): Promise<void> {
+  async function openHtmlInMagiBrowser(request?: HtmlBrowserOpenRequest): Promise<void> {
     if (!canCreateBrowserPane) {
       const message = desktopSurface
         ? i18n.t('browser.error.internalUnavailable')
@@ -785,11 +788,13 @@
       addToast('warning', message, undefined, { forceVisible: true });
       return;
     }
-    const filePath = activeFilePath.trim();
-    const workspaceId = activeCodePayload?.workspaceId?.trim() || '';
-    const workspacePath = activeCodePayload?.workspacePath?.trim() || workspaceRoot.trim();
-    const sessionHint = activeCodePayload?.sessionId?.trim() || '';
-    if (!htmlFile || !filePath || !workspaceId || !workspacePath || openingHtmlInBrowser || creatingBrowserPane) return;
+    const filePath = request?.filepath.trim() || activeFilePath.trim();
+    const workspaceId = request?.workspaceId.trim() || activeCodePayload?.workspaceId?.trim() || '';
+    const workspacePath = request?.workspacePath.trim()
+      || activeCodePayload?.workspacePath?.trim()
+      || workspaceRoot.trim();
+    const sessionHint = request?.sessionId.trim() || activeCodePayload?.sessionId?.trim() || '';
+    if (!isHtmlFile(filePath) || !workspaceId || !workspacePath || !sessionHint || openingHtmlInBrowser || creatingBrowserPane) return;
     openingHtmlInBrowser = true;
     try {
       const sitePreviewQuery = buildFilePreviewQuery(filePath, {
@@ -825,8 +830,6 @@
   let handledHtmlBrowserOpenRequestId = 0;
   $effect(() => {
     const request = htmlBrowserOpenRequest;
-    const currentFilePath = activeFilePath.trim();
-    void htmlFile;
     void browserCapabilities;
     void creatingBrowserPane;
     void openingHtmlInBrowser;
@@ -836,11 +839,9 @@
       !browserCapabilities
       || creatingBrowserPane
       || openingHtmlInBrowser
-      || currentFilePath !== request.filepath
-      || !htmlFile
     ) return;
     handledHtmlBrowserOpenRequestId = request.requestId;
-    void openHtmlInMagiBrowser().finally(() => {
+    void openHtmlInMagiBrowser(request).finally(() => {
       onHtmlBrowserOpenHandled?.(request.requestId);
     });
   });
@@ -1458,7 +1459,7 @@
     position: fixed;
     position-anchor: --right-pane-add-anchor;
     top: calc(anchor(bottom) + 4px);
-    right: calc(100vw - anchor(right) + 6px);
+    left: calc(anchor(right) - 6px);
     z-index: 1200;
     display: block;
     box-sizing: border-box;
@@ -1466,6 +1467,7 @@
     min-width: 0;
     margin: 0;
     pointer-events: auto;
+    transform: translateX(-100%);
   }
   .right-pane-add-menu-row:not(:popover-open) { display: none; }
 

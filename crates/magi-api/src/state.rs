@@ -4703,6 +4703,7 @@ mod tests {
     ) -> QueuedRegularSessionTurn {
         QueuedRegularSessionTurn {
             request: SessionTurnRequestDto {
+                desktop_browser_tools_allowed: false,
                 session_id: Some(session_id.to_string()),
                 scope: crate::dto::SessionScopeKindDto::Workspace,
                 workspace_id: Some(workspace_id.to_string()),

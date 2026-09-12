@@ -15,7 +15,6 @@ interface MagiDesktopWindowLayoutSnapshot {
   displayScaleFactor: number;
   fullscreen: boolean;
   rightPaneVisible: boolean;
-  rightPaneMode: "side-by-side" | "overlay";
   rightPaneWidth: number;
   activePanelKind: MagiDesktopPanelKind;
   activeTabId: string | null;
@@ -31,8 +30,15 @@ interface MagiDesktopWindowSnapshot {
   snapshotRevision: number;
   layout: MagiDesktopWindowLayoutSnapshot;
   activeBrowserViewport: MagiDesktopLogicalViewport | null;
+  activeBrowserDisplayMetrics: MagiDesktopBrowserDisplayMetrics | null;
   activeBrowserNavigationRevision: number | null;
   activeBrowserDownloads: MagiDesktopBrowserDownloadSnapshot[];
+}
+
+interface MagiDesktopBrowserDisplayMetrics {
+  width: number;
+  height: number;
+  scale: number;
 }
 
 interface MagiDesktopBrowserDownloadSnapshot {
@@ -97,15 +103,30 @@ interface MagiDesktopBrowserActivationRequest {
   viewport: MagiDesktopViewportIntent;
 }
 
+interface MagiDesktopBrowserDisplaySize {
+  width: number;
+  height: number;
+}
+
 interface MagiDesktopEmbeddedBrowserWebviewRequest {
+  tabId: string;
+  browserSessionId: string;
+  navigationRevision: number;
+  webContentsId: number;
+  displaySize: MagiDesktopBrowserDisplaySize;
+}
+
+interface MagiDesktopReleasedBrowserWebviewRequest {
   tabId: string;
   browserSessionId: string;
   navigationRevision: number;
   webContentsId: number;
 }
 
-type MagiDesktopReleasedBrowserWebviewRequest =
-  MagiDesktopEmbeddedBrowserWebviewRequest;
+interface MagiDesktopBrowserDisplaySizeRequest
+  extends MagiDesktopReleasedBrowserWebviewRequest {
+  displaySize: MagiDesktopBrowserDisplaySize;
+}
 
 interface MagiDesktopBrowserInspectRequest {
   tabId: string;
@@ -206,6 +227,9 @@ interface MagiDesktopBridge {
   registerBrowserWebview(
     request: MagiDesktopEmbeddedBrowserWebviewRequest,
   ): Promise<MagiDesktopWindowSnapshot>;
+  updateBrowserDisplaySize(
+    request: MagiDesktopBrowserDisplaySizeRequest,
+  ): Promise<MagiDesktopWindowSnapshot>;
   releaseBrowserWebview(
     request: MagiDesktopReleasedBrowserWebviewRequest,
   ): Promise<MagiDesktopWindowSnapshot>;
@@ -230,6 +254,12 @@ interface MagiDesktopBridge {
   stopBrowserInspect(
     request: MagiDesktopBrowserInspectRequest,
   ): Promise<MagiDesktopWindowSnapshot>;
+  startBrowserAnnotationCapture(
+    request: MagiDesktopBrowserInspectRequest,
+  ): Promise<void>;
+  stopBrowserAnnotationCapture(
+    request: MagiDesktopBrowserInspectRequest,
+  ): Promise<void>;
   focusApp(): Promise<void>;
   readyRightPane(): Promise<void>;
   openExternal(url: string): Promise<void>;

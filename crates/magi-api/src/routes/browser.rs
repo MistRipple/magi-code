@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    browser_image::crop_browser_screenshot,
     errors::ApiError,
     routes::session_scope::{self, SessionScope},
     session_activity::session_running_task_count,
@@ -391,17 +392,15 @@ impl BrowserClientPlatform {
 }
 
 fn request_client_platform(
+    state: &ApiState,
     headers: &HeaderMap,
     declared: Option<BrowserClientPlatform>,
 ) -> BrowserClientPlatform {
-    if let Some(platform) = declared {
-        return platform;
-    }
     let user_agent = headers
         .get(USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if user_agent.contains("Electron/") {
+    let observed = if super::is_trusted_desktop_renderer_request(state, headers) {
         BrowserClientPlatform::Desktop
     } else if user_agent
         .as_bytes()
@@ -411,14 +410,22 @@ fn request_client_platform(
         BrowserClientPlatform::MobileWeb
     } else {
         BrowserClientPlatform::Web
+    };
+    match (observed, declared) {
+        // 客户端可以主动降级能力，但不能把服务端观测到的 Web 提升为 Desktop。
+        (BrowserClientPlatform::Desktop, Some(declared)) => declared,
+        (_, Some(BrowserClientPlatform::Desktop)) => observed,
+        (_, Some(declared)) => declared,
+        (_, None) => observed,
     }
 }
 
 fn require_desktop_browser_capability(
+    state: &ApiState,
     headers: &HeaderMap,
     declared: Option<BrowserClientPlatform>,
 ) -> Result<(), ApiError> {
-    let platform = request_client_platform(headers, declared);
+    let platform = request_client_platform(state, headers, declared);
     if platform.is_desktop() {
         return Ok(());
     }
@@ -456,13 +463,14 @@ struct BrowserCapabilitiesResponse {
 
 async fn capabilities(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(query): Query<BrowserCapabilitiesQuery>,
 ) -> Json<BrowserCapabilitiesResponse> {
     let session_id = query.session_id.as_deref().map(SessionId::new);
     Json(browser_capabilities_response(
         &state,
         session_id.as_ref(),
-        query.client_platform.unwrap_or_default(),
+        request_client_platform(&state, &headers, query.client_platform),
     ))
 }
 
@@ -511,14 +519,19 @@ struct UpdateBrowserSettingsRequest {
 
 async fn update_browser_settings(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<UpdateBrowserSettingsRequest>,
 ) -> Result<Json<BrowserCapabilitiesResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     state.update_browser_capability_settings(
         request.in_app_browser_enabled,
         request.browser_use_enabled,
     )?;
-    let response =
-        browser_capabilities_response(&state, None, request.client_platform.unwrap_or_default());
+    let response = browser_capabilities_response(
+        &state,
+        None,
+        request_client_platform(&state, &headers, request.client_platform),
+    );
     state.event_bus.publish(EventEnvelope::system(
         EventId::new(format!(
             "event-browser-settings-updated-{}",
@@ -551,8 +564,10 @@ async fn browser_resources(
 
 async fn reclaim_browser_resources(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<ReclaimBrowserResourcesRequest>,
 ) -> Result<Json<ReclaimBrowserResourcesResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let requested_ids = request
         .tab_ids
         .into_iter()
@@ -1096,7 +1111,7 @@ async fn create_session(
     headers: HeaderMap,
     Json(request): Json<CreateBrowserSessionRequest>,
 ) -> Result<(StatusCode, Json<BrowserSessionResponse>), ApiError> {
-    require_desktop_browser_capability(&headers, request.client_platform)?;
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let (scope, session_id) = validate_session_scope(
         &state,
         request.scope,
@@ -1224,8 +1239,10 @@ async fn get_current_session(
 
 async fn close_session(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(browser_session_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let browser_session_id = BrowserSessionId::new(browser_session_id);
     let session = state
         .browser_authority
@@ -1334,7 +1351,7 @@ async fn create_tab(
     headers: HeaderMap,
     Json(request): Json<CreateBrowserTabRequest>,
 ) -> Result<(StatusCode, Json<BrowserTabResponse>), ApiError> {
-    require_desktop_browser_capability(&headers, request.client_platform)?;
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let browser_session_id = BrowserSessionId::new(browser_session_id);
     let session = wait_for_browser_session_ready(&state, &browser_session_id).await?;
     validate_navigation_url(&request.initial_url)?;
@@ -1505,9 +1522,11 @@ async fn create_tab(
 /// 浏览器工具在没有显式 tab_id 时使用该运行态焦点作为默认目标。
 async fn set_active_tab(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(browser_session_id): Path<String>,
     Json(request): Json<SetActiveBrowserTabRequest>,
 ) -> Result<Json<BrowserSessionResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let browser_session_id = BrowserSessionId::new(browser_session_id);
     wait_for_browser_session_ready(&state, &browser_session_id).await?;
     let tab_id = BrowserTabId::new(request.tab_id);
@@ -1604,9 +1623,11 @@ async fn list_annotations(
 
 async fn create_annotation(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(tab_id): Path<String>,
     Json(request): Json<CreateBrowserAnnotationRequest>,
 ) -> Result<(StatusCode, Json<BrowserAnnotationResponse>), ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_tab_before_lock, session) = browser_tab_scope(&state, &tab_id)?;
     let comment = request.comment.trim().to_string();
@@ -1663,7 +1684,7 @@ async fn create_annotation(
     let hit_viewport = BrowserViewport {
         width: hit.viewport_width,
         height: hit.viewport_height,
-        device_scale_factor_millis: 1_000,
+        device_scale_factor_millis: hit.device_scale_factor_millis,
         device_type: magi_browser_authority::BrowserDeviceType::for_dimensions(hit.viewport_width),
     };
     let anchor = match region {
@@ -1710,6 +1731,7 @@ async fn create_annotation(
         &tab.tab_id,
         screenshot_clip,
         &tab_id,
+        hit.navigation_revision,
     )
     .await?;
     let artifact_id_for_cleanup = screenshot_artifact_id.clone();
@@ -1769,12 +1791,16 @@ async fn persist_browser_annotation_screenshot(
     tab_id: &BrowserTabId,
     clip: BrowserNormalizedRect,
     host_tab_id: &BrowserTabId,
+    navigation_revision: u64,
 ) -> Result<String, ApiError> {
     let reply = require_browser_host(state)?
         .request(BrowserHostCommand::Screenshot {
             tab_id: host_tab_id.clone(),
+            navigation_revision,
             target: None,
-            clip: Some(clip),
+            // Chromium clipped capture 会改写 fixed viewport 的滚动位置。
+            // 先捕获同一真实可见 viewport，再在内存中只做无损裁剪。
+            clip: None,
             full_page: false,
             format: magi_browser_authority::BrowserScreenshotFormat::Png,
             quality: None,
@@ -1793,9 +1819,16 @@ async fn persist_browser_annotation_screenshot(
         },
         outcome => return Err(host_outcome_error("保存浏览器标记截图失败", outcome)),
     };
-    let bytes = reply.binary.ok_or_else(|| {
+    let viewport_bytes = reply.binary.ok_or_else(|| {
         ApiError::InternalAssemblyError("浏览器标记截图缺少二进制内容".to_string())
     })?;
+    let bytes = crop_browser_screenshot(
+        &viewport_bytes,
+        magi_browser_authority::BrowserScreenshotFormat::Png,
+        clip,
+        None,
+    )
+    .map_err(|error| ApiError::InternalAssemblyError(error.to_string()))?;
     let Some(persistence) = state.runtime_persistence() else {
         return Err(ApiError::Conflict("浏览器标记截图存储不可用".to_string()));
     };
@@ -1816,7 +1849,7 @@ async fn persist_browser_annotation_screenshot(
         std::fs::create_dir_all(parent)
             .map_err(|error| ApiError::internal_assembly("创建浏览器标记截图目录失败", error))?;
     }
-    magi_core::fs_atomic::write_atomic(&path, bytes)
+    magi_core::fs_atomic::write_atomic(&path, &bytes)
         .map_err(|error| ApiError::internal_assembly("写入浏览器标记截图失败", error))?;
     tracing::debug!(
         session_id = %session_id,
@@ -1929,9 +1962,11 @@ fn normalize_hit_bounds(
 
 async fn update_annotation_status(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(annotation_id): Path<String>,
     Json(request): Json<UpdateBrowserAnnotationStatusRequest>,
 ) -> Result<Json<BrowserAnnotationResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let annotation_id = BrowserAnnotationId::new(annotation_id);
     let annotation = state
         .browser_authority
@@ -1963,9 +1998,11 @@ async fn update_annotation_status(
 
 async fn update_annotation_comment(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(annotation_id): Path<String>,
     Json(request): Json<UpdateBrowserAnnotationCommentRequest>,
 ) -> Result<Json<BrowserAnnotationResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let annotation_id = BrowserAnnotationId::new(annotation_id);
     let comment = request.comment.trim().to_string();
     if comment.is_empty() || comment.chars().count() > 4_000 {
@@ -2050,8 +2087,10 @@ async fn annotation_artifact(
 
 async fn activate_tab(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(tab_id): Path<String>,
 ) -> Result<Json<BrowserSessionResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
     ensure_browser_ui_ready(&state, &session.session_id)?;
@@ -2116,8 +2155,10 @@ async fn activate_tab(
 
 async fn close_tab(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(tab_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
     if state.browser_host_client().is_some()
@@ -2180,7 +2221,7 @@ async fn navigate_tab(
     headers: HeaderMap,
     Json(request): Json<NavigateBrowserTabRequest>,
 ) -> Result<Json<BrowserTabResponse>, ApiError> {
-    require_desktop_browser_capability(&headers, request.client_platform)?;
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_, session) = browser_tab_scope(&state, &tab_id)?;
     ensure_browser_ui_ready(&state, &session.session_id)?;
@@ -2305,13 +2346,14 @@ async fn screenshot_tab(
     headers: HeaderMap,
     Json(request): Json<ScreenshotBrowserTabRequest>,
 ) -> Result<Response, ApiError> {
-    require_desktop_browser_capability(&headers, request.client_platform)?;
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
-    let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
+    let (tab, session) = browser_tab_scope(&state, &tab_id)?;
     ensure_browser_ui_ready(&state, &session.session_id)?;
     let reply = require_browser_host(&state)?
         .request(BrowserHostCommand::Screenshot {
             tab_id,
+            navigation_revision: tab.navigation_revision,
             target: None,
             clip: None,
             full_page: request.full_page,
@@ -2841,6 +2883,36 @@ mod tests {
         errors::ApiError,
         state::{ApiState, BrowserHostConnectionConfig, RuntimeStatePersistence},
     };
+
+    fn capability_test_state(label: &str) -> ApiState {
+        ApiState::new(
+            label,
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    fn desktop_request_headers(state: &ApiState) -> HeaderMap {
+        let token = "desktop-renderer-test-token";
+        state.set_browser_host_connection_config(Some(BrowserHostConnectionConfig {
+            socket_path: "/tmp/magi-browser-test.sock".to_string(),
+            auth_token: token.to_string(),
+            desktop_epoch: "desktop-renderer-test".to_string(),
+            parent_pid: 1,
+            generation: 1,
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            "Mozilla/5.0 @magi/desktop/3.0.51 Electron/43.4.0"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-magi-desktop-renderer-token", token.parse().unwrap());
+        headers
+    }
 
     fn annotation_fixture() -> (ApiState, SessionId, SessionId, BrowserAnnotationId) {
         let state = ApiState::new(
@@ -3545,24 +3617,68 @@ mod tests {
 
     #[test]
     fn real_browser_operations_are_unavailable_to_web_clients() {
+        let state = capability_test_state("browser-client-platform-test");
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, "Mozilla/5.0".parse().unwrap());
-        let error = require_desktop_browser_capability(&headers, None)
+        let error = require_desktop_browser_capability(&state, &headers, None)
             .expect_err("web clients must not operate the Desktop browser host");
         assert!(matches!(error, ApiError::CapabilityUnavailable { .. }));
 
-        headers.insert(USER_AGENT, "Mozilla/5.0 Electron/40.0".parse().unwrap());
-        require_desktop_browser_capability(&headers, None)
+        headers.insert(
+            USER_AGENT,
+            "Mozilla/5.0 @magi/desktop/3.0.51 Electron/43.4.0"
+                .parse()
+                .unwrap(),
+        );
+        let guest_error = require_desktop_browser_capability(&state, &headers, None)
+            .expect_err("Electron guest without the App Renderer token must remain untrusted");
+        assert!(matches!(
+            guest_error,
+            ApiError::CapabilityUnavailable { .. }
+        ));
+
+        headers = desktop_request_headers(&state);
+        require_desktop_browser_capability(&state, &headers, None)
             .expect("Electron clients should be able to operate the Desktop browser host");
     }
 
     #[test]
+    fn declared_desktop_platform_cannot_elevate_web_or_tunnel_requests() {
+        let state = capability_test_state("browser-client-elevation-test");
+        let mut web_headers = HeaderMap::new();
+        web_headers.insert(USER_AGENT, "Mozilla/5.0".parse().unwrap());
+        let web_error = require_desktop_browser_capability(
+            &state,
+            &web_headers,
+            Some(BrowserClientPlatform::Desktop),
+        )
+        .expect_err("clientPlatform must not elevate a web request");
+        assert!(matches!(web_error, ApiError::CapabilityUnavailable { .. }));
+
+        let mut tunnel_headers = desktop_request_headers(&state);
+        tunnel_headers.insert("cf-ray", "test".parse().unwrap());
+        let tunnel_error = require_desktop_browser_capability(
+            &state,
+            &tunnel_headers,
+            Some(BrowserClientPlatform::Desktop),
+        )
+        .expect_err("public tunnel requests must remain record-only");
+        assert!(matches!(
+            tunnel_error,
+            ApiError::CapabilityUnavailable { .. }
+        ));
+    }
+
+    #[test]
     fn explicit_non_desktop_platform_cannot_be_overridden_by_a_desktop_user_agent() {
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, "Mozilla/5.0 Electron/40.0".parse().unwrap());
-        let error =
-            require_desktop_browser_capability(&headers, Some(BrowserClientPlatform::MobileWeb))
-                .expect_err("explicit mobile platform must remain record-only");
+        let state = capability_test_state("browser-client-downgrade-test");
+        let headers = desktop_request_headers(&state);
+        let error = require_desktop_browser_capability(
+            &state,
+            &headers,
+            Some(BrowserClientPlatform::MobileWeb),
+        )
+        .expect_err("explicit mobile platform must remain record-only");
         assert!(matches!(error, ApiError::CapabilityUnavailable { .. }));
     }
 
@@ -3847,6 +3963,7 @@ mod tests {
 
         let response = reclaim_browser_resources(
             axum::extract::State(state.clone()),
+            desktop_request_headers(&state),
             axum::Json(ReclaimBrowserResourcesRequest {
                 tab_ids: vec![tab_id.to_string()],
             }),

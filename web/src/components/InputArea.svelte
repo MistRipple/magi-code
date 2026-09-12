@@ -15,6 +15,7 @@
     enhanceAgentPrompt,
     fetchAgentModelList,
     getAgentSettingsBootstrap,
+    isReferenceableBrowserAnnotation,
     saveAgentModelContextWindow,
     saveAgentOrchestratorSessionConfig,
     resolveAgentPath,
@@ -1276,7 +1277,10 @@
     }
     function handleBrowserAnnotationCreated(event: Event) {
       const annotation = (event as CustomEvent<BrowserAnnotationSnapshot>).detail;
-      if (!annotation?.annotationId || annotation.status !== 'active') return;
+      if (
+        !annotation?.annotationId
+        || !isReferenceableBrowserAnnotation(annotation.status)
+      ) return;
       if (selectedBrowserAnnotations.some((item) => item.annotationId === annotation.annotationId)) return;
       if (selectedBrowserAnnotations.length >= 20) {
         addToast('warning', i18n.t('browser.annotation.limit'));

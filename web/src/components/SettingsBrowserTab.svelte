@@ -92,7 +92,7 @@
       const snapshot = await getBrowserResources();
       browserResources = snapshot;
       const availableIds = new Set(snapshot.tabs.filter((tab) => tab.canReclaim).map((tab) => tab.tabId));
-      selectedResourceTabIds = options.selectDefaults === true
+      selectedResourceTabIds = options.selectDefaults === true && isDesktop
         ? defaultResourceSelection(snapshot)
         : selectedResourceTabIds.filter((tabId) => availableIds.has(tabId));
     } catch (error) {
@@ -111,6 +111,7 @@
   }
 
   function toggleResourceTab(tabId: string, selected: boolean): void {
+    if (!isDesktop) return;
     if (selected) {
       if (!selectedResourceTabIds.includes(tabId)) {
         selectedResourceTabIds = [...selectedResourceTabIds, tabId];
@@ -121,6 +122,7 @@
   }
 
   function selectAllReclaimableResources(): void {
+    if (!isDesktop) return;
     selectedResourceTabIds = browserResources?.tabs
       .filter((tab) => tab.canReclaim)
       .map((tab) => tab.tabId) ?? [];
@@ -128,7 +130,7 @@
 
   async function reclaimSelectedResources(): Promise<void> {
     const selected = selectedResourceTabIds;
-    if (resourceReclaiming || selected.length === 0) return;
+    if (!isDesktop || resourceReclaiming || selected.length === 0) return;
     if (!window.confirm(i18n.t('settings.browser.resourcesReclaimConfirm', { count: selected.length }))) return;
     resourceReclaiming = true;
     resourceError = '';
@@ -192,7 +194,7 @@
     key: 'inAppBrowserEnabled' | 'browserUseEnabled',
     enabled: boolean,
   ): Promise<void> {
-    if (!capabilitySnapshot || savingSetting) return;
+    if (!isDesktop || !capabilitySnapshot || savingSetting) return;
     savingSetting = key;
     capabilityError = '';
     try {
@@ -394,7 +396,7 @@
           </div>
           <Toggle
             checked={capabilitySnapshot?.inAppBrowserEnabled ?? false}
-            disabled={!capabilitySnapshot || capabilityLoading || Boolean(savingSetting)}
+            disabled={!isDesktop || !capabilitySnapshot || capabilityLoading || Boolean(savingSetting)}
             ariaLabel={i18n.t('settings.browser.inAppBrowser')}
             onchange={(enabled) => void saveCapabilitySetting('inAppBrowserEnabled', enabled)}
           />
@@ -406,7 +408,7 @@
           </div>
           <Toggle
             checked={capabilitySnapshot?.browserUseEnabled ?? false}
-            disabled={!capabilitySnapshot || capabilityLoading || Boolean(savingSetting)}
+            disabled={!isDesktop || !capabilitySnapshot || capabilityLoading || Boolean(savingSetting)}
             ariaLabel={i18n.t('settings.browser.browserUse')}
             onchange={(enabled) => void saveCapabilitySetting('browserUseEnabled', enabled)}
           />
@@ -489,7 +491,7 @@
                   <input
                     type="checkbox"
                     checked={selectedResourceTabIds.includes(tab.tabId)}
-                    disabled={!tab.canReclaim || resourceLoading || resourceReclaiming}
+                    disabled={!isDesktop || !tab.canReclaim || resourceLoading || resourceReclaiming}
                     onchange={(event) => toggleResourceTab(tab.tabId, (event.currentTarget as HTMLInputElement).checked)}
                   />
                   <span class="resource-row-copy">
@@ -517,7 +519,7 @@
               type="button"
               class="danger resource-reclaim-button"
               onclick={() => void reclaimSelectedResources()}
-              disabled={resourceLoading || resourceReclaiming || selectedResourceTabIds.length === 0}
+              disabled={!isDesktop || resourceLoading || resourceReclaiming || selectedResourceTabIds.length === 0}
               aria-busy={resourceReclaiming}
             >
               <Icon name="trash" size={13} />

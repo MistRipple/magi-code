@@ -1,10 +1,46 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 38123;
 const CLIENT_LEASE_STALE_MS: u64 = 60_000;
+/// 返回 Desktop 与独立 daemon 共用的唯一应用状态根。
+///
+/// `~/.magi` 是当前产品已经使用的全局状态事实源，开发 daemon、正式
+/// Electron 和历史客户端必须解析到同一个目录。workspace 自身的状态仍位于
+/// 项目目录下的 `.magi` 子目录，不能把两者混成同一份 workspace 状态。
+pub fn default_state_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".magi")
+}
+
+/// 判断 daemon 全局状态根与 workspace 自身状态根是否发生物理重叠。
+///
+/// 两类状态由不同所有者管理。只要一个根是另一个根的祖先，就会让状态扫描
+/// 把 personal 与 workspace 数据混在一起，因此不能只判断路径是否完全相等。
+pub fn state_roots_overlap(state_root: &Path, workspace_root: &Path) -> io::Result<bool> {
+    let normalized_state_root = normalize_path(state_root)?;
+    let normalized_workspace_state_root = normalize_path(&workspace_root.join(".magi"))?;
+    Ok(normalized_state_root == normalized_workspace_state_root
+        || normalized_state_root.starts_with(&normalized_workspace_state_root)
+        || normalized_workspace_state_root.starts_with(&normalized_state_root))
+}
+
+fn normalize_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    match std::fs::canonicalize(&absolute) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(absolute),
+        Err(error) => Err(error),
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -279,6 +315,15 @@ mod tests {
         assert!(manager.read_runtime_state().is_none());
         assert!(manager.read_pid().is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_state_root_is_the_shared_user_state_root() {
+        let root = default_state_root();
+        assert_eq!(
+            root.file_name().and_then(|value| value.to_str()),
+            Some(".magi")
+        );
     }
 
     #[test]

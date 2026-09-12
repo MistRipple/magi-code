@@ -532,6 +532,14 @@ mod tests {
         path
     }
 
+    fn workspace_tool_context(name: &str) -> ToolExecutionContext {
+        ToolExecutionContext {
+            workspace_id: Some(magi_core::WorkspaceId::new(format!("workspace-{name}"))),
+            working_directory: Some(unique_temp_dir(name)),
+            ..ToolExecutionContext::default()
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct EchoTool;
 
@@ -733,7 +741,7 @@ mod tests {
                 payload: "hello".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
-                context: ToolExecutionContext::default(),
+                context: workspace_tool_context("skill-policy-rejected"),
                 working_directory: None,
             },
         );
@@ -782,7 +790,7 @@ mod tests {
                 payload: "hello".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
-                context: ToolExecutionContext::default(),
+                context: workspace_tool_context("skill-policy-allowed"),
                 working_directory: None,
             },
         );
@@ -838,7 +846,13 @@ mod tests {
                 ),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
-                context: ToolExecutionContext::default(),
+                context: ToolExecutionContext {
+                    workspace_id: Some(magi_core::WorkspaceId::new(
+                        "workspace-skill-runtime-policy",
+                    )),
+                    working_directory: Some(root.clone()),
+                    ..ToolExecutionContext::default()
+                },
                 working_directory: None,
             },
         );
@@ -1779,7 +1793,7 @@ mod tests {
                 payload: "builtin-payload".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
-                context: ToolExecutionContext::default(),
+                context: workspace_tool_context("skill-mixed-builtin"),
                 working_directory: None,
             },
         );

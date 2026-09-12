@@ -14,6 +14,7 @@
         "magi-desktop:layout-intent",
         "magi-desktop:activate-browser",
         "magi-desktop:register-browser-webview",
+        "magi-desktop:update-browser-display-size",
         "magi-desktop:release-browser-webview",
         "magi-desktop:wait-for-browser-surface",
         "magi-desktop:activate-panel",
@@ -21,6 +22,8 @@
         "magi-desktop:cancel-browser-download",
         "magi-desktop:start-browser-inspect",
         "magi-desktop:stop-browser-inspect",
+        "magi-desktop:start-browser-annotation-capture",
+        "magi-desktop:stop-browser-annotation-capture",
         "magi-desktop:right-pane-ready",
         "magi-desktop:focus-app",
         "magi-desktop:open-external",
@@ -45,6 +48,7 @@
     { "$ref": "#/$defs/layoutIntentChannel" },
     { "$ref": "#/$defs/activateBrowser" },
     { "$ref": "#/$defs/registerBrowserWebview" },
+    { "$ref": "#/$defs/updateBrowserDisplaySize" },
     { "$ref": "#/$defs/releaseBrowserWebview" },
     { "$ref": "#/$defs/waitForBrowserSurface" },
     { "$ref": "#/$defs/activatePanel" },
@@ -52,6 +56,8 @@
     { "$ref": "#/$defs/cancelBrowserDownload" },
     { "$ref": "#/$defs/startBrowserInspect" },
     { "$ref": "#/$defs/stopBrowserInspect" },
+    { "$ref": "#/$defs/startBrowserAnnotationCapture" },
+    { "$ref": "#/$defs/stopBrowserAnnotationCapture" },
     { "$ref": "#/$defs/rightPaneReady" },
     { "$ref": "#/$defs/focusApp" },
     { "$ref": "#/$defs/openExternal" },
@@ -80,6 +86,15 @@
         "y": { "type": "number" },
         "width": { "type": "number", "exclusiveMinimum": 0 },
         "height": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "browserDisplaySize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 100000 }
       }
     },
     "viewport": {
@@ -173,13 +188,41 @@
             "tabId",
             "browserSessionId",
             "navigationRevision",
-            "webContentsId"
+            "webContentsId",
+            "displaySize"
           ],
           "properties": {
             "tabId": { "$ref": "#/$defs/id" },
             "browserSessionId": { "$ref": "#/$defs/id" },
             "navigationRevision": { "type": "integer", "minimum": 0 },
-            "webContentsId": { "type": "integer", "minimum": 1 }
+            "webContentsId": { "type": "integer", "minimum": 1 },
+            "displaySize": { "$ref": "#/$defs/browserDisplaySize" }
+          }
+        }
+      }
+    },
+    "updateBrowserDisplaySize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "payload"],
+      "properties": {
+        "channel": { "const": "magi-desktop:update-browser-display-size" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tabId",
+            "browserSessionId",
+            "navigationRevision",
+            "webContentsId",
+            "displaySize"
+          ],
+          "properties": {
+            "tabId": { "$ref": "#/$defs/id" },
+            "browserSessionId": { "$ref": "#/$defs/id" },
+            "navigationRevision": { "type": "integer", "minimum": 0 },
+            "webContentsId": { "type": "integer", "minimum": 1 },
+            "displaySize": { "$ref": "#/$defs/browserDisplaySize" }
           }
         }
       }
@@ -415,6 +458,24 @@
       "required": ["channel", "payload"],
       "properties": {
         "channel": { "const": "magi-desktop:stop-browser-inspect" },
+        "payload": { "$ref": "#/$defs/browserInspectPayload" }
+      }
+    },
+    "startBrowserAnnotationCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "payload"],
+      "properties": {
+        "channel": { "const": "magi-desktop:start-browser-annotation-capture" },
+        "payload": { "$ref": "#/$defs/browserInspectPayload" }
+      }
+    },
+    "stopBrowserAnnotationCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "payload"],
+      "properties": {
+        "channel": { "const": "magi-desktop:stop-browser-annotation-capture" },
         "payload": { "$ref": "#/$defs/browserInspectPayload" }
       }
     },

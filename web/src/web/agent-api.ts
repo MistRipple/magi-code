@@ -877,6 +877,13 @@ export interface BrowserViewport {
 
 export type BrowserAnnotationStatus = 'active' | 'resolved' | 'stale' | 'deleted';
 
+/** 历史 artifact 仍可引用；只有明确删除的标记退出消息上下文。 */
+export function isReferenceableBrowserAnnotation(
+  status: BrowserAnnotationStatus,
+): boolean {
+  return status !== 'deleted';
+}
+
 export interface BrowserNormalizedRect {
   x: number;
   y: number;

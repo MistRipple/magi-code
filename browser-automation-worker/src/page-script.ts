@@ -230,12 +230,14 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     const sourceHeight = Number(field(viewport, 'height', 'height')) || innerHeight;
     const scrollXAtCapture = Number(field(anchor, 'scroll_x', 'scrollX')) || 0;
     const scrollYAtCapture = Number(field(anchor, 'scroll_y', 'scrollY')) || 0;
-    const width = Number(rect.width) * sourceWidth;
-    const height = Number(rect.height) * sourceHeight;
+    const scaleX = innerWidth / sourceWidth;
+    const scaleY = innerHeight / sourceHeight;
+    const width = Number(rect.width) * sourceWidth * scaleX;
+    const height = Number(rect.height) * sourceHeight * scaleY;
     if (!(width > 0 && height > 0)) return null;
     return {
-      x: Number(rect.x) * sourceWidth + scrollXAtCapture - scrollX,
-      y: Number(rect.y) * sourceHeight + scrollYAtCapture - scrollY,
+      x: (Number(rect.x) * sourceWidth + scrollXAtCapture) * scaleX - scrollX,
+      y: (Number(rect.y) * sourceHeight + scrollYAtCapture) * scaleY - scrollY,
       width,
       height,
     };
@@ -371,7 +373,13 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
   globalThis.__magiBrowserAutomation = {
     runtime_epoch: runtimeEpoch,
     viewport() {
-      return { width: innerWidth, height: innerHeight };
+      return {
+        width: innerWidth,
+        height: innerHeight,
+        scrollX,
+        scrollY,
+        deviceScaleFactorMillis: Math.round(devicePixelRatio * 1000),
+      };
     },
     snapshot(maxNodes, maxTextBytes, revision) {
       if (!Number.isSafeInteger(revision) || revision <= 0) {
@@ -480,6 +488,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
         navigation_revision: 0,
         viewport_width: innerWidth,
         viewport_height: innerHeight,
+        device_scale_factor_millis: Math.round(devicePixelRatio * 1000),
         scroll_x: scrollX,
         scroll_y: scrollY,
         element_ref: ref,

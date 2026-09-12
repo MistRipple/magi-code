@@ -3,7 +3,7 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 4;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 5;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
 
@@ -217,6 +217,7 @@ pub enum BrowserHostCommand {
     },
     Screenshot {
         tab_id: BrowserTabId,
+        navigation_revision: u64,
         target: Option<BrowserSnapshotTarget>,
         clip: Option<BrowserNormalizedRect>,
         full_page: bool,
@@ -470,6 +471,7 @@ pub struct BrowserHostHitTest {
     pub navigation_revision: u64,
     pub viewport_width: u32,
     pub viewport_height: u32,
+    pub device_scale_factor_millis: u32,
     pub scroll_x: f64,
     pub scroll_y: f64,
     pub element_ref: String,
@@ -513,6 +515,9 @@ pub struct BrowserHostEventEnvelope {
 pub enum BrowserHostEvent {
     Ready(BrowserHostHandshake),
     PrimarySurfaceChanged {
+        binding: BrowserSurfaceBinding,
+    },
+    PrimarySurfaceClosed {
         binding: BrowserSurfaceBinding,
     },
     UserTakeover {
@@ -564,6 +569,7 @@ pub enum BrowserHostEvent {
     PopupBlocked {
         binding: BrowserSurfaceBinding,
         url: String,
+        reason: BrowserPopupBlockReason,
     },
     NodeSelection(BrowserNodeSelection),
     AgentCursor(BrowserAgentCursor),
@@ -571,6 +577,17 @@ pub enum BrowserHostEvent {
     Heartbeat {
         monotonic_millis: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserPopupBlockReason {
+    InvalidUrl,
+    UnsupportedProtocol,
+    ScriptBlankWindow,
+    NamedWindow,
+    OpenerRequired,
+    SeparateWindowFeatures,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -612,7 +629,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(handshake).expect("serialize desktop handshake"),
             serde_json::json!({
-                "protocol_version": { "major": 3, "minor": 4 },
+                "protocol_version": { "major": 3, "minor": 5 },
                 "desktop_version": "desktop-test",
                 "electron_version": "electron-test",
                 "chromium_version": "chromium-test",
@@ -1090,6 +1107,32 @@ mod tests {
                     "reason": "user_takeover"
                 }
             })
+        );
+        let popup_blocked = serde_json::to_value(BrowserHostEvent::PopupBlocked {
+            binding: binding.clone(),
+            url: "about:blank".to_string(),
+            reason: BrowserPopupBlockReason::ScriptBlankWindow,
+        })
+        .expect("serialize popup blocked event");
+        assert_eq!(
+            popup_blocked,
+            serde_json::json!({
+                "type": "popup_blocked",
+                "payload": {
+                    "binding": binding,
+                    "url": "about:blank",
+                    "reason": "script_blank_window"
+                }
+            })
+        );
+        let mut missing_popup_reason = popup_blocked;
+        missing_popup_reason["payload"]
+            .as_object_mut()
+            .expect("popup payload")
+            .remove("reason");
+        assert!(
+            serde_json::from_value::<BrowserHostEvent>(missing_popup_reason).is_err(),
+            "popup_blocked must carry a stable reason"
         );
         assert_eq!(
             serde_json::to_value(BrowserHostEvent::PageCrashed {

@@ -700,23 +700,49 @@ export class BrowserAutomationRuntime {
     await this.evaluate(binding, expression);
   }
 
-  private async pageViewport(binding: BrowserSurfaceBinding): Promise<{ width: number; height: number }> {
-    const viewport = await this.evaluate<{ width: number; height: number }>(
+  private async pageViewport(binding: BrowserSurfaceBinding): Promise<{
+    width: number;
+    height: number;
+    scrollX: number;
+    scrollY: number;
+  }> {
+    const viewport = await this.evaluate<{
+      width: number;
+      height: number;
+      scrollX?: number;
+      scrollY?: number;
+    }>(
       binding,
       "globalThis.__magiBrowserAutomation.viewport()",
     );
     if (Number.isFinite(viewport?.width) && Number.isFinite(viewport?.height)
       && viewport.width > 0 && viewport.height > 0) {
-      return viewport;
+      return {
+        width: viewport.width,
+        height: viewport.height,
+        scrollX: Number.isFinite(viewport.scrollX) ? viewport.scrollX! : 0,
+        scrollY: Number.isFinite(viewport.scrollY) ? viewport.scrollY! : 0,
+      };
     }
     // Chromium guest 在尚未获得宿主布局尺寸时，页面脚本的 innerWidth/innerHeight
     // 可能暂时为 0；此时 Chromium 自己的布局视口仍是截图和归一化裁剪的权威尺寸。
     const metrics = await this.#cdp.send<{
       layoutViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number };
       visualViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number };
-      cssVisualViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number };
+      cssVisualViewport?: { clientWidth?: number; clientHeight?: number; width?: number; height?: number; pageX?: number; pageY?: number };
     }>(binding, "Page.getLayoutMetrics");
-    const candidates = [metrics.cssVisualViewport, metrics.visualViewport, metrics.layoutViewport];
+    const candidates: Array<{
+      clientWidth?: number;
+      clientHeight?: number;
+      width?: number;
+      height?: number;
+      pageX?: number;
+      pageY?: number;
+    } | undefined> = [
+      metrics.cssVisualViewport,
+      metrics.visualViewport,
+      metrics.layoutViewport,
+    ];
     const positiveDimension = (primary: unknown, fallback: unknown): number | null => {
       const primaryValue = Number(primary);
       if (Number.isFinite(primaryValue) && primaryValue > 0) return primaryValue;
@@ -730,6 +756,8 @@ export class BrowserAutomationRuntime {
       return {
         width,
         height,
+        scrollX: Number.isFinite(candidate?.pageX) ? candidate!.pageX! : 0,
+        scrollY: Number.isFinite(candidate?.pageY) ? candidate!.pageY! : 0,
       };
     }
     // 页面尚未拥有有效的 Chromium 布局视口时，不能伪造一个固定尺寸继续
@@ -777,6 +805,12 @@ export class BrowserAutomationRuntime {
     binding: BrowserSurfaceBinding,
     input: Extract<BrowserHostCommand, { type: "screenshot" }>["payload"],
   ): Promise<{ result: BrowserCommandResult; binary: Buffer }> {
+    if (input.navigation_revision !== binding.navigation_revision) {
+      throw protocolFailure(
+        "browser_navigation_revision_stale",
+        "截图请求不属于当前 Chromium 文档",
+      );
+    }
     const hasElementTarget = Boolean(input.target && input.target.element_ref !== "root");
     // root 代表整页范围，与未传 target 的截图语义相同；只有具体元素
     // 才会与 clip/full_page 互斥。否则模型或上层调用在 full_page 请求中
@@ -796,8 +830,8 @@ export class BrowserAutomationRuntime {
     } else if (input.clip) {
       const viewport = await this.pageViewport(binding);
       clip = {
-        x: input.clip.x * viewport.width,
-        y: input.clip.y * viewport.height,
+        x: viewport.scrollX + input.clip.x * viewport.width,
+        y: viewport.scrollY + input.clip.y * viewport.height,
         width: input.clip.width * viewport.width,
         height: input.clip.height * viewport.height,
         scale: 1,
@@ -845,7 +879,7 @@ export class BrowserAutomationRuntime {
     );
     const resolved = await this.evaluate<{ bounds: { x: number; y: number; width: number; height: number } }>(
       binding,
-      `(() => { const e = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)}); const r = e.getBoundingClientRect(); return { bounds: { x: r.x, y: r.y, width: r.width, height: r.height } }; })()`,
+      `(() => { const e = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)}); const r = e.getBoundingClientRect(); return { bounds: { x: scrollX + r.x, y: scrollY + r.y, width: r.width, height: r.height } }; })()`,
     );
     const bounds = resolved?.bounds;
     if (!bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) {

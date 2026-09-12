@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import WebSocket from "ws";
 
 const baseUrl = (process.env.MAGI_ACCEPTANCE_BASE_URL || "http://127.0.0.1:38123").replace(/\/$/u, "");
 const args = new Map();
@@ -21,8 +22,10 @@ const scope = String(args.get("scope") || process.env.MAGI_ACCEPTANCE_SCOPE || "
 const workspaceId = String(args.get("workspace-id") || process.env.MAGI_ACCEPTANCE_WORKSPACE_ID || "").trim();
 const writeAnnotation = args.has("write-annotation");
 const lifecycleRegression = args.has("lifecycle-regression");
+const useAppRenderer = args.has("app-renderer") || process.env.MAGI_ACCEPTANCE_APP_RENDERER === "1";
 const checks = [];
 const failures = [];
+const appRendererTransport = useAppRenderer ? await createAppRendererTransport() : null;
 
 function record(name, passed, detail = "") {
   const line = `${passed ? "通过" : "失败"} ${name}${detail ? `: ${detail}` : ""}`;
@@ -31,6 +34,7 @@ function record(name, passed, detail = "") {
 }
 
 async function readResponse(path, init = {}) {
+  if (appRendererTransport) return appRendererTransport.read(path, init);
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
     headers: {
@@ -40,6 +44,96 @@ async function readResponse(path, init = {}) {
   });
   const bytes = Buffer.from(await response.arrayBuffer());
   return { response, bytes };
+}
+
+async function createAppRendererTransport() {
+  const cdpBaseUrl = (process.env.MAGI_ACCEPTANCE_CDP_URL || "http://127.0.0.1:9225").replace(/\/$/u, "");
+  const targets = await (await fetch(`${cdpBaseUrl}/json/list`)).json();
+  const expectedOrigin = new URL(baseUrl).origin;
+  const target = targets.find((candidate) => {
+    try {
+      const url = new URL(candidate.url);
+      return candidate.type === "page" && url.origin === expectedOrigin && url.pathname === "/web.html";
+    } catch {
+      return false;
+    }
+  });
+  if (!target?.webSocketDebuggerUrl) {
+    throw new Error(`未找到冻结 Electron 的 App Renderer：${expectedOrigin}/web.html`);
+  }
+
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  const pending = new Map();
+  let nextRequestId = 1;
+  socket.on("message", (raw) => {
+    const message = JSON.parse(raw.toString());
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    clearTimeout(request.timer);
+    if (message.error) request.reject(new Error(message.error.message || "App Renderer CDP 请求失败"));
+    else request.resolve(message);
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+
+  const send = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = nextRequestId++;
+    const timer = setTimeout(() => {
+      if (pending.delete(id)) reject(new Error(`App Renderer CDP 超时: ${method}`));
+    }, 10000);
+    pending.set(id, { resolve, reject, timer });
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+
+  return {
+    async read(path, init = {}) {
+      const method = init.method || "GET";
+      const body = init.body ?? null;
+      const expression = `(${async function request(relativePath, requestMethod, requestBody) {
+        const response = await fetch(relativePath, {
+          method: requestMethod,
+          headers: { "content-type": "application/json" },
+          ...(requestBody === null ? {} : { body: requestBody }),
+        });
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        let binary = "";
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        return {
+          status: response.status,
+          headers: [...response.headers.entries()],
+          body: btoa(binary),
+        };
+      }.toString()})(${JSON.stringify(path)}, ${JSON.stringify(method)}, ${JSON.stringify(body)})`;
+      const result = await send("Runtime.evaluate", {
+        expression,
+        awaitPromise: true,
+        returnByValue: true,
+      });
+      const remote = result.result?.result;
+      if (!remote?.value) {
+        throw new Error(remote?.description || "App Renderer 未返回 HTTP 响应");
+      }
+      return {
+        response: {
+          ok: remote.value.status >= 200 && remote.value.status < 300,
+          status: remote.value.status,
+          headers: new Map(remote.value.headers.map(([name, value]) => [name.toLowerCase(), value])),
+        },
+        bytes: Buffer.from(remote.value.body, "base64"),
+      };
+    },
+    async close() {
+      for (const request of pending.values()) {
+        clearTimeout(request.timer);
+        request.reject(new Error("App Renderer transport closed"));
+      }
+      pending.clear();
+      socket.close();
+    },
+  };
 }
 
 async function readJson(path, init = {}) {
@@ -315,6 +409,7 @@ try {
   }
 }
 
+if (appRendererTransport) await appRendererTransport.close();
 for (const check of checks) process.stdout.write(`${check}\n`);
 if (failures.length) {
   process.stderr.write(`\n浏览器核心 live 验收失败 ${failures.length} 项。\n`);

@@ -10,4 +10,3 @@ tracing-subscriber.workspace = true
 magi-runtime-state = { path = "../../crates/magi-runtime-state" }
 magi-daemon = { path = "../../crates/magi-daemon" }
 magi-process = { path = "../../crates/magi-process" }
-dirs = "6"

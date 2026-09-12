@@ -8,6 +8,7 @@ arboard = { version = "3.6.1", default-features = false }
 axum.workspace = true
 base64.workspace = true
 futures-util.workspace = true
+image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -39,6 +40,7 @@ magi-snapshot = { path = "../magi-snapshot" }
 magi-plan = { path = "../magi-plan" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-usage-authority = { path = "../magi-usage-authority" }
+magi-runtime-state = { path = "../magi-runtime-state" }
 magi-workspace = { path = "../magi-workspace" }
 magi-skill-runtime = { version = "3.0.0", path = "../magi-skill-runtime" }
 dirs = "6"

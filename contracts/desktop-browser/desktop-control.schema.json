@@ -408,9 +408,10 @@
     "screenshotPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tab_id", "full_page", "format"],
+      "required": ["tab_id", "navigation_revision", "full_page", "format"],
       "properties": {
         "tab_id": { "$ref": "#/$defs/id" },
+        "navigation_revision": { "type": "integer", "minimum": 0 },
         "target": {
           "oneOf": [{ "$ref": "#/$defs/snapshotTarget" }, { "type": "null" }]
         },
@@ -609,6 +610,7 @@
         "navigation_revision",
         "viewport_width",
         "viewport_height",
+        "device_scale_factor_millis",
         "scroll_x",
         "scroll_y",
         "element_ref",
@@ -627,6 +629,7 @@
         "navigation_revision": { "type": "integer", "minimum": 0 },
         "viewport_width": { "type": "integer", "minimum": 0 },
         "viewport_height": { "type": "integer", "minimum": 0 },
+        "device_scale_factor_millis": { "type": "integer", "minimum": 1, "maximum": 8000 },
         "scroll_x": { "type": "number" },
         "scroll_y": { "type": "number" },
         "element_ref": { "$ref": "#/$defs/id" },
@@ -822,6 +825,20 @@
           "additionalProperties": false,
           "required": ["type", "payload"],
           "properties": {
+            "type": { "const": "primary_surface_closed" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["binding"],
+              "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" } }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
             "type": { "const": "user_takeover" },
             "payload": {
               "type": "object",
@@ -992,10 +1009,20 @@
             "payload": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["binding", "url"],
+              "required": ["binding", "url", "reason"],
               "properties": {
                 "binding": { "$ref": "#/$defs/surfaceBinding" },
-                "url": { "type": "string" }
+                "url": { "type": "string" },
+                "reason": {
+                  "enum": [
+                    "invalid_url",
+                    "unsupported_protocol",
+                    "script_blank_window",
+                    "named_window",
+                    "opener_required",
+                    "separate_window_features"
+                  ]
+                }
               }
             }
           }

@@ -8,6 +8,19 @@ await withGoldenViteServer(async (server) => {
   const binding = await server.ssrLoadModule('/src/web/agent-binding-context.ts');
   const agentApi = await server.ssrLoadModule('/src/web/agent-api.ts');
 
+  for (const status of ['active', 'stale', 'resolved']) {
+    assert.equal(
+      agentApi.isReferenceableBrowserAnnotation(status),
+      true,
+      `${status} browser annotation artifact must remain referenceable`,
+    );
+  }
+  assert.equal(
+    agentApi.isReferenceableBrowserAnnotation('deleted'),
+    false,
+    'deleted browser annotation must not enter message context',
+  );
+
   binding.setAgentBindingContext({
     scope: 'workspace',
     workspaceId: 'workspace-query-golden',

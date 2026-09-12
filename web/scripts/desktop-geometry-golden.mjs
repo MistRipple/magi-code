@@ -15,14 +15,14 @@ assert.doesNotMatch(layout, removedGeometryProtocol, '窗口布局不得保存�
 assert.doesNotMatch(rightPane, removedGeometryProtocol, '右栏路由不得依赖浏览器几何协议');
 assert.doesNotMatch(browserTab, removedGeometryProtocol, 'Browser Tab 不得发布或消费浏览器几何协议');
 
-assert.match(shell, /grid-template-columns:[\s\S]*minmax\(var\(--workbench-min-content-width/u);
+assert.match(shell, /web-workbench-shell--desktop-right-pane-visible \.workbench-body[\s\S]*minmax\(0, 1fr\)/u);
 assert.match(shell, /var\(--desktop-right-pane-divider-width[\s\S]*var\(--desktop-right-pane-width/u);
 assert.match(shell, /\.desktop-right-pane-column \{[\s\S]*width: 100%;[\s\S]*min-width: 0;[\s\S]*min-height: 0;/u);
 assert.match(shell, /\.desktop-right-pane-column :global\(\.right-pane\) \{[\s\S]*width: 100%;[\s\S]*height: 100%;/u);
 
 assert.match(layout, /rightPaneWidth: clampRightPaneWidth/u);
 assert.match(layout, /rightPaneBounds = state\.rightPaneVisible/u);
-assert.match(layout, /dividerBounds: state\.rightPaneVisible && sideBySide/u);
+assert.match(layout, /dividerBounds: state\.rightPaneVisible && rightPaneBounds/u);
 assert.match(rightPane, /class="right-pane-body"/u);
 assert.match(rightPane, /class="right-pane-browser-tab-host"[\s\S]*hidden=\{/u);
 assert.match(browserTab, /class="browser-surface-slot"[\s\S]*class="browser-webview"/u);

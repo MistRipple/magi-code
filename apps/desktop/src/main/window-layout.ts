@@ -2,9 +2,11 @@ export const WINDOW_LAYOUT = {
   minRightPaneWidth: 320,
   defaultRightPaneWidth: 480,
   maxRightPaneRatio: 2 / 3,
-  overlayBreakpoint: 840,
   minWorkbenchContentWidth: 448,
   rightPaneResizeHandleWidth: 8,
+  // 窄桌面端会自动把左栏收为抽屉；窗口仍需为中栏和最小右栏
+  // 留出稳定的内容宽度，不能进入会产生轨道溢出的无效几何状态。
+  minDesktopWindowWidth: 800,
 } as const;
 
 export interface Rectangle {
@@ -14,7 +16,6 @@ export interface Rectangle {
   height: number;
 }
 
-export type RightPaneMode = "side-by-side" | "overlay";
 export type PanelKind = "agent" | "browser" | "code" | "terminal" | null;
 
 /** 主进程只保存窗口布局意图；浏览器内容由 Renderer 的 webview 自然布局。 */
@@ -26,7 +27,6 @@ export interface WindowLayoutState {
   displayScaleFactor: number;
   fullscreen: boolean;
   rightPaneVisible: boolean;
-  rightPaneMode: RightPaneMode;
   rightPaneWidth: number;
   activePanelKind: PanelKind;
   activeTabId: string | null;
@@ -53,7 +53,6 @@ export function createWindowLayoutState(input: {
   clientBounds: Rectangle;
   displayScaleFactor?: number;
 }): WindowLayoutState {
-  const mode = resolveRightPaneMode(input.clientBounds.width);
   return {
     desktopEpoch: input.desktopEpoch,
     windowId: input.windowId,
@@ -62,8 +61,7 @@ export function createWindowLayoutState(input: {
     displayScaleFactor: finitePositive(input.displayScaleFactor, 1),
     fullscreen: false,
     rightPaneVisible: false,
-    rightPaneMode: mode,
-    rightPaneWidth: clampRightPaneWidth(WINDOW_LAYOUT.defaultRightPaneWidth, input.clientBounds.width, mode),
+    rightPaneWidth: clampRightPaneWidth(WINDOW_LAYOUT.defaultRightPaneWidth, input.clientBounds.width),
     activePanelKind: null,
     activeTabId: null,
     activeSurfaceId: null,
@@ -78,24 +76,22 @@ export function reduceWindowLayout(
   switch (intent.type) {
     case "client_bounds": {
       const bounds = normalizeRectangle(intent.bounds);
-      const mode = resolveRightPaneMode(bounds.width);
       next = {
         ...state,
         clientBounds: bounds,
         displayScaleFactor: finitePositive(intent.displayScaleFactor, 1),
         fullscreen: intent.fullscreen,
-        rightPaneMode: mode,
-        rightPaneWidth: clampRightPaneWidth(state.rightPaneWidth, bounds.width, mode),
+        rightPaneWidth: clampRightPaneWidth(state.rightPaneWidth, bounds.width),
       };
       break;
     }
     case "right_pane_width":
-      next = { ...state, rightPaneWidth: clampRightPaneWidth(intent.width, state.clientBounds.width, state.rightPaneMode) };
+      next = { ...state, rightPaneWidth: clampRightPaneWidth(intent.width, state.clientBounds.width) };
       break;
     case "right_pane_reset_width":
       next = {
         ...state,
-        rightPaneWidth: clampRightPaneWidth(WINDOW_LAYOUT.defaultRightPaneWidth, state.clientBounds.width, state.rightPaneMode),
+        rightPaneWidth: clampRightPaneWidth(WINDOW_LAYOUT.defaultRightPaneWidth, state.clientBounds.width),
       };
       break;
     case "right_pane_visibility":
@@ -116,34 +112,27 @@ export function reduceWindowLayout(
 export function snapshotWindowLayout(state: WindowLayoutState): WindowLayoutSnapshot {
   const { width, height } = state.clientBounds;
   const fullBounds = { x: 0, y: 0, width, height };
-  const rightPaneWidth = clampRightPaneWidth(state.rightPaneWidth, width, state.rightPaneMode);
-  const sideBySide = state.rightPaneMode === "side-by-side";
+  const rightPaneWidth = clampRightPaneWidth(state.rightPaneWidth, width);
   const rightPaneBounds = state.rightPaneVisible
-    ? sideBySide
-      ? { x: width - rightPaneWidth, y: 0, width: rightPaneWidth, height }
-      : { x: 0, y: 0, width, height }
+    ? { x: width - rightPaneWidth, y: 0, width: rightPaneWidth, height }
     : null;
   return {
     ...state,
     rightPaneWidth,
     appBounds: fullBounds,
-    dividerBounds: state.rightPaneVisible && sideBySide && rightPaneBounds
+    dividerBounds: state.rightPaneVisible && rightPaneBounds
       ? { x: Math.max(0, rightPaneBounds.x - WINDOW_LAYOUT.rightPaneResizeHandleWidth), y: 0, width: WINDOW_LAYOUT.rightPaneResizeHandleWidth, height }
       : null,
     rightPaneBounds,
   };
 }
 
-export function resolveRightPaneMode(windowWidth: number): RightPaneMode {
-  return windowWidth < WINDOW_LAYOUT.overlayBreakpoint ? "overlay" : "side-by-side";
-}
-
-export function clampRightPaneWidth(requestedWidth: number, windowWidth: number, mode: RightPaneMode): number {
+export function clampRightPaneWidth(requestedWidth: number, windowWidth: number): number {
   const available = Math.max(1, Math.round(windowWidth));
   const maxByRatio = Math.floor(available * WINDOW_LAYOUT.maxRightPaneRatio);
-  const maxByWorkbench = mode === "side-by-side"
-    ? available - WINDOW_LAYOUT.rightPaneResizeHandleWidth - WINDOW_LAYOUT.minWorkbenchContentWidth
-    : available;
+  const maxByWorkbench = available
+    - WINDOW_LAYOUT.rightPaneResizeHandleWidth
+    - WINDOW_LAYOUT.minWorkbenchContentWidth;
   const maximum = Math.max(
     Math.min(WINDOW_LAYOUT.minRightPaneWidth, available),
     Math.min(maxByRatio, maxByWorkbench),

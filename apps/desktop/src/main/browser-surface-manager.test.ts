@@ -19,6 +19,10 @@ const windowManagerSource = readFileSync(
   new URL("./window-manager.ts", import.meta.url),
   "utf8",
 );
+const webviewSecuritySource = readFileSync(
+  new URL("./browser-webview-security.ts", import.meta.url),
+  "utf8",
+);
 const indexSource = readFileSync(
   new URL("./index.ts", import.meta.url),
   "utf8",
@@ -129,10 +133,62 @@ test("真实 URL 下的 about:blank 标题不能覆盖已确认的页面标题",
   );
 });
 
-test("浏览器显示由 Renderer webview 承载，Main 不创建或调整浏览器 View", () => {
+test("DOM Inspect 的悬停与点击都忽略 pointer-events:none 内部覆盖层", () => {
+  const inspectStart = source.indexOf("private scheduleInspectHighlight(");
+  const inspectEnd = source.indexOf("private async readInspectNodeText(");
+  assert.ok(inspectStart >= 0 && inspectEnd > inspectStart);
+  const inspectSource = source.slice(inspectStart, inspectEnd);
+  assert.equal(
+    inspectSource.match(/ignorePointerEventsNone:\s*false/gu)?.length,
+    2,
+  );
+  assert.doesNotMatch(inspectSource, /ignorePointerEventsNone:\s*true/u);
+});
+
+test("截图等待新 guest 首个合成帧且后台不节流", () => {
+  const registerStart = source.indexOf("registerEmbeddedWebview(");
+  const registerEnd = source.indexOf("updateEmbeddedWebviewDisplaySize(");
+  assert.ok(registerStart >= 0 && registerEnd > registerStart);
+  const registerSource = source.slice(registerStart, registerEnd);
+  assert.match(registerSource, /guest\.setBackgroundThrottling\(false\)/u);
+
+  const readinessStart = source.indexOf(
+    "private async waitForCompositorFrame(",
+  );
+  const readinessEnd = source.indexOf(
+    "private async waitForViewportCommit(",
+    readinessStart,
+  );
+  const executeStart = source.indexOf("async sendCdp(");
+  const executeEnd = source.indexOf("private enqueueCdp<", executeStart);
+  assert.ok(
+    readinessStart >= 0 &&
+      readinessEnd > readinessStart &&
+      executeStart >= 0 &&
+      executeEnd > executeStart,
+  );
+  const readinessSource = source.slice(readinessStart, readinessEnd);
+  const executeSource = source.slice(executeStart, executeEnd);
+  assert.match(readinessSource, /Page\.createIsolatedWorld/u);
+  assert.match(
+    readinessSource,
+    /requestAnimationFrame\(\(\) => requestAnimationFrame\(\(\) => resolve\(true\)\)\)/u,
+  );
+  assert.match(
+    executeSource,
+    /if \(method === "Page\.captureScreenshot"\) \{[\s\S]*?await this\.waitForCompositorFrame\([\s\S]*?const command = this\.sendSurfaceCdpCommand/u,
+  );
+});
+
+test("Desktop 只保留 BrowserWindow 壳层，浏览器显示由 Renderer webview 承载", () => {
   assert.match(browserTabSource, /<webview[\s\S]*class="browser-webview"/u);
   assert.match(browserTabSource, /getWebContentsId\(\)/u);
   assert.match(browserTabSource, /registerBrowserWebview\(/u);
+  assert.match(windowManagerSource, /new\s+BrowserWindow\(/u);
+  assert.doesNotMatch(windowManagerSource, /\bBaseWindow\b/u);
+  assert.doesNotMatch(windowManagerSource, /\bWebContentsView\b/u);
+  assert.doesNotMatch(windowManagerSource, /\bappView\b/u);
+  assert.doesNotMatch(windowManagerSource, /\.addChildView\(/u);
   assert.doesNotMatch(source, /new\s+WebContentsView\(/u);
   assert.doesNotMatch(source, /\.setBounds\(/u);
   assert.doesNotMatch(source, /\.addChildView\(/u);
@@ -147,7 +203,25 @@ test("浏览器显示由 Renderer webview 承载，Main 不创建或调整浏览
   assert.match(browserTabSource, /\.browser-webview\s*\{[^}]*display:\s*flex/u);
 });
 
+test("只有 App Renderer partition 为 daemon 请求注入桌面认证令牌", () => {
+  assert.match(indexSource, /session\.fromPartition\("persist:magi-app"\)/u);
+  assert.match(indexSource, /webRequest\.onBeforeSendHeaders/u);
+  assert.match(indexSource, /X-Magi-Desktop-Renderer-Token/u);
+  assert.match(indexSource, /configureAppRendererAuthentication\(controlToken\)/u);
+  assert.doesNotMatch(preloadSource, /Desktop-Renderer-Token|controlToken/u);
+  assert.doesNotMatch(browserTabSource, /Desktop-Renderer-Token|controlToken/u);
+});
+
 test("Webview 注册严格绑定当前窗口、Browser Session、导航代次和 partition", () => {
+  assert.match(windowManagerSource, /"will-attach-webview"/u);
+  assert.match(windowManagerSource, /secureBrowserWebviewAttachment/u);
+  assert.match(webviewSecuritySource, /params\.src !== "about:blank"/u);
+  assert.match(webviewSecuritySource, /BROWSER_PARTITION_PATTERN/u);
+  assert.match(webviewSecuritySource, /delete webPreferences\.preload/u);
+  assert.match(webviewSecuritySource, /webPreferences\.nodeIntegration = false/u);
+  assert.match(webviewSecuritySource, /webPreferences\.contextIsolation = true/u);
+  assert.match(webviewSecuritySource, /webPreferences\.sandbox = true/u);
+  assert.match(webviewSecuritySource, /webPreferences\.webviewTag = false/u);
   assert.match(indexSource, /parseEmbeddedBrowserWebview\(value\)/u);
   assert.match(
     indexSource,
@@ -162,23 +236,18 @@ test("Webview 注册严格绑定当前窗口、Browser Session、导航代次和
   );
   assert.match(source, /record\.contents === guest/u);
   assert.match(source, /record\.contents !== guest/u);
+  assert.match(source, /updateEmbeddedWebviewDisplaySize/u);
+  assert.match(source, /record\.displaySize/u);
   assert.match(
     normalizedPreloadSource,
     /registerBrowserWebview:.*magi-desktop:register-browser-webview/u,
   );
+  assert.match(
+    normalizedPreloadSource,
+    /updateBrowserDisplaySize:.*magi-desktop:update-browser-display-size/u,
+  );
   assert.match(schemaSource, /magi-desktop:register-browser-webview/u);
-  assert.doesNotMatch(
-    source,
-    /contentSize|updateEmbeddedWebviewContentSize|contentWidth|contentHeight/u,
-  );
-  assert.doesNotMatch(
-    preloadSource,
-    /updateBrowserContentSize|update-browser-content-size/u,
-  );
-  assert.doesNotMatch(
-    schemaSource,
-    /updateBrowserContentSize|update-browser-content-size/u,
-  );
+  assert.match(schemaSource, /magi-desktop:update-browser-display-size/u);
   assert.doesNotMatch(
     schemaSource,
     /renderer_geometry|begin-right-pane-resize|end-right-pane-resize/u,
@@ -205,6 +274,17 @@ test("重新激活 Browser Tab 使用 Main Surface 的当前导航代次", () =>
     identity,
     /navigationRevision:\s*tab\.navigationRevision/u,
   );
+});
+
+test("活动 Browser Tab 注册时提升当前窗口 Surface，并清理旧 Primary 控制态", () => {
+  assert.match(windowManagerSource, /registerEmbeddedWebview[\s\S]*?activePanelKind === "browser"[\s\S]*?activateTabSurface\(windowId, input\.tabId\)/u);
+  const promotion = source.slice(
+    source.indexOf("private promote(surfaceId: string)"),
+    source.indexOf("private promoteReplacement", source.indexOf("private promote(surfaceId: string)")),
+  );
+  assert.match(promotion, /previous\.agentControlled = false/u);
+  assert.match(promotion, /setAgentCursor\(previous, false, null, null, null\)/u);
+  assert.doesNotMatch(promotion, /contents\.focus\(\)/u);
 });
 
 test("重绑已有 guest 后重新发布真实页面标题，不能保留 about:blank 元数据", () => {
@@ -465,6 +545,18 @@ test("关闭 Surface 等待 Renderer release ACK，物理 guest 由 webview DOM 
   );
 });
 
+test("关闭窗口最后一个 Primary 会通知 Authority，全局关闭 Tab 不重复通知", () => {
+  const closeRecord = source.slice(
+    source.indexOf("private closeRecord("),
+    source.indexOf("private removeRecordIndexes", source.indexOf("private closeRecord(")),
+  );
+  assert.match(closeRecord, /closingPrimaryBinding/u);
+  assert.match(closeRecord, /promoteReplacement\(record\.tabId\)/u);
+  assert.match(closeRecord, /closingPrimaryBinding && !replacement/u);
+  assert.match(closeRecord, /type: "primary_closed"/u);
+  assert.match(source, /closeTab\(tabId: string\)[\s\S]*?closeRecord\(record, false\)/u);
+});
+
 test("物理 guest 终止后只解除绑定，不进入调试器无限重连", () => {
   const destroyedStart = source.indexOf(
     'guest.once("destroyed"',
@@ -500,11 +592,46 @@ test("物理 guest 终止后只解除绑定，不进入调试器无限重连", (
   );
   assert.match(
     normalizedSource.slice(laneStart, laneEnd),
-    /this\.detachEmbeddedGuest\(record\)/u,
+    /record\.lifecycleEpoch === lifecycleEpoch[\s\S]*?this\.detachEmbeddedGuest\(record\)/u,
   );
   assert.match(
     source,
     /function isBrowserTargetClosedError\(value: unknown\)/u,
+  );
+});
+
+test("Renderer 重建时物理 guest 独占 CDP 队列和视口提交生命周期", () => {
+  const registerStart = source.indexOf("registerEmbeddedWebview(");
+  const registerEnd = source.indexOf("releaseEmbeddedWebview(", registerStart);
+  const registerSection = source.slice(registerStart, registerEnd);
+  assert.match(
+    registerSection,
+    /record\.contents !== guest[\s\S]*?this\.detachEmbeddedGuest\(record\)/u,
+  );
+  assert.doesNotMatch(
+    registerSection,
+    /record\.contents = null/u,
+    "guest 换代必须统一进入 detachEmbeddedGuest，不能保留第二套局部清理",
+  );
+
+  const detachStart = source.indexOf(
+    "private detachEmbeddedGuest(record: BrowserSurfaceRecord)",
+  );
+  const detachEnd = source.indexOf(
+    "private trackPendingGuestRelease",
+    detachStart,
+  );
+  assert.ok(detachStart >= 0 && detachEnd > detachStart);
+  const detachSection = source.slice(detachStart, detachEnd);
+  assert.match(detachSection, /this\.resetDebuggerSession\(record\)/u);
+  assert.match(detachSection, /record\.lifecycleEpoch \+= 1/u);
+  assert.match(detachSection, /record\.cdpLane = Promise\.resolve\(\)/u);
+  assert.match(detachSection, /record\.viewportLifecycle\.running = null/u);
+  assert.match(detachSection, /record\.recoveryPromise = null/u);
+  assert.ok(
+    detachSection.indexOf("this.resetDebuggerSession(record)") <
+      detachSection.indexOf("record.lifecycleEpoch += 1"),
+    "旧 debugger/Overlay 清理必须先捕获旧 guest，再推进物理生命周期代次",
   );
 });
 
@@ -527,11 +654,13 @@ test("右栏切换只隐藏非活动 Browser Tab，不卸载其 Chromium guest",
   );
 });
 
-test("浏览器 popup 永远复用当前一级 Browser Tab", () => {
+test("浏览器 popup 按单页支持矩阵导航或返回明确原因", () => {
   const policy = source.slice(source.indexOf("private installSurfacePolicy("));
   assert.match(policy, /setWindowOpenHandler\(\(details\) => \{/u);
+  assert.match(policy, /const decision = decideBrowserPopup\(details\)/u);
+  assert.match(policy, /decision\.action === "navigate_current_page"/u);
   assert.match(policy, /return \{ action: "deny" \};/u);
-  assert.match(policy, /type: "popup_blocked"/u);
+  assert.match(policy, /type: "popup_blocked"[\s\S]*reason: decision\.reason/u);
   assert.doesNotMatch(policy, /new\s+(BrowserWindow|WebContentsView)\(/u);
 });
 
@@ -543,13 +672,13 @@ test("失败导航由当前 Browser 内容槽的 Top Layer 呈现，不让 webvi
   );
   assert.match(
     browserTabSource,
-    /class="browser-page-error"[\s\S]*popover="manual"/u,
+    /class="browser-page-error"[\s\S]*style:position-anchor=\{surfaceAnchorName\}[\s\S]*popover="manual"/u,
   );
   assert.match(browserTabSource, /browser\.error\.pageLoadFailed/u);
   assert.match(browserTabSource, /navigate\('reload'\)/u);
   assert.match(
     browserTabSource,
-    /\.browser-page-error\s*\{[^}]*position:\s*fixed;[^}]*position-anchor:\s*--browser-surface-anchor/u,
+    /\.browser-page-error\s*\{[^}]*position:\s*fixed;[^}]*top:\s*anchor\(top\);[^}]*left:\s*anchor\(left\);[^}]*width:\s*anchor-size\(width\);[^}]*height:\s*anchor-size\(height\)/u,
   );
   assert.match(source, /type: "page_failed"[\s\S]*reason/u);
   const failureHandlerStart = normalizedSource.indexOf(
@@ -722,22 +851,100 @@ test("失败导航由当前 Browser 内容槽的 Top Layer 呈现，不让 webvi
 });
 
 test("Auto 视口使用 webview 自然尺寸，固定视口只使用 Chromium 设备指标", () => {
+  const flushViewportSection = source.slice(
+    source.indexOf("private async flushViewportCommits"),
+    source.indexOf("private isViewportCommitInputCurrent"),
+  );
+  const applyViewportSection = source.slice(
+    source.indexOf("private async applyViewport"),
+    source.indexOf("private async setAgentCursor"),
+  );
+  assert.match(flushViewportSection, /record\.priming/u);
+  assert.match(applyViewportSection, /record\.priming/u);
+  assert.doesNotMatch(flushViewportSection, /contents\.isLoadingMainFrame/u);
+  assert.doesNotMatch(applyViewportSection, /contents\.isLoadingMainFrame/u);
   const autoSection = source.slice(
     source.indexOf('if (commit.viewport.mode === "auto")'),
   );
-  assert.match(autoSection, /contents\.disableDeviceEmulation\(\)/u);
+  assert.match(autoSection, /"Emulation\.clearDeviceMetricsOverride"/u);
   assert.match(autoSection, /<webview> 的真实 DOM bounds 就是页面/u);
-  assert.match(autoSection, /contents\.enableDeviceEmulation\(\{/u);
-  assert.match(autoSection, /const scale = 1/u);
+  assert.match(autoSection, /"Emulation\.setDeviceMetricsOverride"/u);
+  assert.match(
+    autoSection,
+    /"Emulation\.setDeviceMetricsOverride"[\s\S]*?dontSetVisibleSize:\s*true/u,
+    "固定视口只能覆盖 Chromium 逻辑设备指标，不能改写 webview 的物理可见尺寸",
+  );
+  assert.match(autoSection, /fitBrowserViewportScale/u);
+  assert.match(autoSection, /browser_display_size_unavailable/u);
+  assert.doesNotMatch(source, /\.enableDeviceEmulation\(|\.disableDeviceEmulation\(/u);
+  assert.doesNotMatch(
+    source.slice(source.indexOf("const ALLOWED_WORKER_CDP_METHODS"), source.indexOf("const DEFAULT_CDP_COMMAND_TIMEOUT_MS")),
+    /Emulation\.clearDeviceMetricsOverride/u,
+  );
+  assert.match(source, /this\.scheduleViewportCommit\(record, true\)/u);
+  assert.match(source, /record\.viewportLifecycle\.deviceMetricsOverrideActive = false/u);
   assert.doesNotMatch(
     source,
     /contentSize|contentWidth|contentHeight|browserDeviceEmulationScale/u,
   );
   assert.match(browserTabSource, /mode === 'auto'[\s\S]*?\{ mode: 'auto' \}/u);
+  assert.match(browserTabSource, /new ResizeObserver\(scheduleBrowserDisplaySizeSync\)/u);
+  assert.match(browserTabSource, /updateBrowserDisplaySize\(/u);
+  assert.doesNotMatch(browserTabSource, /browserDeviceEmulationScale/u);
+  assert.match(windowManagerSource, /activeBrowserDisplayMetrics/u);
+  assert.match(source, /displayMetricsForSurface/u);
+  assert.doesNotMatch(browserTabSource, /annotationContentRect|annotation-capture|annotationDragStart/u);
   assert.doesNotMatch(
     browserTabSource,
-    /updateBrowserContentSize|new ResizeObserver\(/u,
+    /x:\s*clampUnit\(\(event\.clientX - rect\.left\) \/ rect\.width\)/u,
   );
+});
+
+test("固定视口提交缓存不会跨导航代次短路", () => {
+  const applyViewportSection = source.slice(
+    source.indexOf("private async applyViewport"),
+    source.indexOf("private async setAgentCursor"),
+  );
+  assert.match(
+    applyViewportSection,
+    /applied\.navigationGeneration === commit\.navigationGeneration/u,
+  );
+  assert.match(
+    applyViewportSection,
+    /applied\.debuggerSessionGeneration === commit\.debuggerSessionGeneration/u,
+  );
+  assert.match(
+    applyViewportSection,
+    /sameDisplaySize\(applied\.displaySize, commit\.displaySize\)/u,
+  );
+  const lifecycleStart = source.indexOf("interface ViewportCommitLifecycle");
+  const lifecycleEnd = source.indexOf("interface NavigationEventClaim", lifecycleStart);
+  assert.ok(lifecycleStart >= 0 && lifecycleEnd > lifecycleStart);
+  assert.match(
+    source.slice(lifecycleStart, lifecycleEnd),
+    /navigationGeneration:\s*number[\s\S]*debuggerSessionGeneration:\s*number[\s\S]*displaySize:\s*BrowserDisplaySize \| null/u,
+  );
+});
+
+test("区域标记完全由真实 guest 原生输入驱动，不依赖 Renderer 覆盖层", () => {
+  const mouseEventStart = source.indexOf('webContents.on("before-mouse-event"');
+  const mouseEventEnd = source.indexOf('webContents.on("render-process-gone"', mouseEventStart);
+  assert.ok(mouseEventStart >= 0 && mouseEventEnd > mouseEventStart);
+  const mouseEventSource = source.slice(mouseEventStart, mouseEventEnd);
+  assert.match(mouseEventSource, /record\.annotationCaptureActive/u);
+  assert.match(mouseEventSource, /input\.type === "mouseDown"/u);
+  assert.match(mouseEventSource, /input\.type === "mouseMove"/u);
+  assert.match(mouseEventSource, /input\.type === "mouseUp"/u);
+  assert.match(mouseEventSource, /event\.preventDefault\(\)/u);
+  assert.match(source, /annotationCaptureOverlayExpression/u);
+  assert.match(source, /annotationCapturePagePoint/u);
+  assert.match(source, /x \/ scale/u);
+  assert.match(source, /y \/ scale/u);
+  assert.match(source, /type: "annotation_selection"/u);
+  assert.match(browserTabSource, /startBrowserAnnotationCapture\(/u);
+  assert.match(browserTabSource, /stopBrowserAnnotationCapture\(/u);
+  assert.match(browserTabSource, /annotationSelectionFromEvent\(/u);
+  assert.doesNotMatch(browserTabSource, /onpointerdown=\{handleAnnotation|onpointermove=\{handleAnnotation|onpointerup=\{handleAnnotation/u);
 });
 
 test("截图和 DOM 选择都来自同一真实 Chromium WebContents", () => {

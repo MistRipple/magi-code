@@ -410,6 +410,7 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
     let repository = StateRepository::new(state_root);
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
+    let workspace_root = temp_workspace_absolute_path("runtime-sidecar-flush-workspace");
     let persistence = test_sidecar_persistence(
         repository.clone(),
         session_store.clone(),
@@ -420,10 +421,7 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
         .create_session(SessionId::new("session-flush"), "flush session")
         .expect("session should be creatable");
     workspace_store
-        .register(
-            WorkspaceId::new("workspace-flush"),
-            temp_workspace_absolute_path("runtime-sidecar-flush-workspace"),
-        )
+        .register(WorkspaceId::new("workspace-flush"), workspace_root.clone())
         .expect("workspace should be registrable");
 
     assert_eq!(
@@ -476,7 +474,11 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
             worker_runtime_snapshot_flushed: false,
         }
     );
-    assert!(repository.session_projection_root().exists());
+    assert!(
+        PathBuf::from(workspace_root.as_str())
+            .join(".magi/session-projections")
+            .exists()
+    );
     assert!(repository.workspace_recovery_sidecars_path().exists());
     assert_eq!(
         persistence
@@ -565,7 +567,7 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
     assert!(report.session_sidecars_flushed);
 
     let (session_durable, _) = repository
-        .load_session_projections(&[])
+        .load_session_projections(&[(workspace_id.to_string(), workspace_root)])
         .expect("workspace sessions should reload");
     assert_eq!(session_durable.canonical_turns.len(), 1);
     assert_eq!(
@@ -702,6 +704,7 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
     let repository = StateRepository::new(state_root);
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
+    let workspace_root = temp_workspace_absolute_path("recovery-sidecar-incremental-workspace");
     let persistence = test_sidecar_persistence(
         repository.clone(),
         session_store.clone(),
@@ -714,10 +717,7 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
         .create_session(session_id.clone(), "recovery session")
         .expect("session should be creatable");
     workspace_store
-        .register(
-            workspace_id.clone(),
-            temp_workspace_absolute_path("recovery-sidecar-incremental-workspace"),
-        )
+        .register(workspace_id.clone(), workspace_root.clone())
         .expect("workspace should be registrable");
 
     session_store.bind_execution_ownership(
@@ -784,7 +784,10 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
     );
 
     let (_, reloaded_session_sidecars) = repository
-        .load_session_projections(&[])
+        .load_session_projections(&[(
+            workspace_id.to_string(),
+            PathBuf::from(workspace_root.as_str()),
+        )])
         .expect("session sidecars should reload");
     let reloaded_workspace_sidecars = repository
         .load_workspace_recovery_sidecars()
@@ -1484,6 +1487,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
+    let workspace_root = temp_workspace_absolute_path("runtime-maintenance-workspace");
     let blocking_parent = state_root.join("blocking-parent");
     fs::write(&blocking_parent, b"blocker").expect("blocking parent file should be writable");
     let invalid_ledger_path = blocking_parent.join("audit-usage-ledger.json");
@@ -1496,7 +1500,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     workspace_store
         .register(
             WorkspaceId::new("workspace-maintenance"),
-            temp_workspace_absolute_path("runtime-maintenance-workspace"),
+            workspace_root.clone(),
         )
         .expect("workspace should be registrable");
     session_store.bind_execution_ownership(
@@ -1567,7 +1571,11 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     assert!(ledger.is_persist_healthy);
     assert!(ledger.last_persisted_at.is_some());
     assert!(!ledger.pending_flush);
-    assert!(repository.session_projection_root().exists());
+    assert!(
+        PathBuf::from(workspace_root.as_str())
+            .join(".magi/session-projections")
+            .exists()
+    );
     assert!(repository.workspace_recovery_sidecars_path().exists());
     assert!(repository.audit_usage_ledger_path().exists());
 }
@@ -1846,16 +1854,16 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
         .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
         .expect("recovery ref should be attachable");
 
-    // Persist session projection and workspace state
+    // workspace 注册事实必须先于引用它的 session projection。
+    repository
+        .save_workspace_durable_state(&workspace_store.durable_state())
+        .expect("workspace durable state should save");
     repository
         .save_session_projection_state(
             &session_store.durable_state(),
             &session_store.execution_sidecar_store_state(),
         )
         .expect("session projection should save");
-    repository
-        .save_workspace_durable_state(&workspace_store.durable_state())
-        .expect("workspace durable state should save");
 
     // ── Phase 2: Flush sidecars ──
     let persistence = test_sidecar_persistence(
@@ -2034,14 +2042,14 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
         );
 
         repository
+            .save_workspace_durable_state(&workspace_store.durable_state())
+            .expect("durable workspace save should succeed");
+        repository
             .save_session_projection_state(
                 &session_store.durable_state(),
                 &session_store.execution_sidecar_store_state(),
             )
             .expect("session projection save should succeed");
-        repository
-            .save_workspace_durable_state(&workspace_store.durable_state())
-            .expect("durable workspace save should succeed");
 
         let persistence =
             test_sidecar_persistence(repository.clone(), session_store, workspace_store);
@@ -2207,16 +2215,16 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
         Some("maintenance diagnostic".to_string()),
     );
 
-    // Persist durable state
+    // workspace 注册事实必须先于引用它的 session projection。
+    repository
+        .save_workspace_durable_state(&workspace_store.durable_state())
+        .expect("durable save should succeed");
     repository
         .save_session_projection_state(
             &session_store.durable_state(),
             &session_store.execution_sidecar_store_state(),
         )
         .expect("session projection save should succeed");
-    repository
-        .save_workspace_durable_state(&workspace_store.durable_state())
-        .expect("durable save should succeed");
 
     // Emit a usage event so ledger has something to persist.
     // NOTE: set_audit_usage_ledger_persistence is called AFTER publish so that

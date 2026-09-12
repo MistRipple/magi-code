@@ -46,6 +46,8 @@ assert.match(
 assert.match(sources.surface, /primaryBindingForTab\(/u);
 assert.match(sources.surface, /setWindowOpenHandler\(\(details\) =>/u);
 assert.match(sources.surface, /type: "popup_blocked"/u);
+assert.match(sources.surface, /decideBrowserPopup\(details\)/u);
+assert.match(sources.surface, /reason: decision\.reason/u);
 assert.doesNotMatch(sources.surface, /new\s+WebContentsView\(/u);
 assert.doesNotMatch(sources.surface, /\.setBounds\(/u);
 assert.doesNotMatch(sources.surface, /\.addChildView\(/u);
@@ -53,24 +55,33 @@ assert.doesNotMatch(sources.surface, /\.addChildView\(/u);
 assert.match(sources.surface, /Page\.captureScreenshot/u);
 assert.match(sources.surface, /DOM\.getNodeForLocation/u);
 assert.match(sources.surface, /Overlay\.highlightNode/u);
-assert.match(sources.surface, /contents\.disableDeviceEmulation\(\)/u);
-assert.match(sources.surface, /contents\.enableDeviceEmulation\(\{/u);
+assert.match(sources.surface, /"Emulation\.clearDeviceMetricsOverride"/u);
+assert.match(sources.surface, /"Emulation\.setDeviceMetricsOverride"/u);
+assert.doesNotMatch(sources.surface, /\.enableDeviceEmulation\(|\.disableDeviceEmulation\(/u);
 assert.match(sources.worker, /case\s+['"]screenshot['"][\s\S]*Page\.captureScreenshot/u);
 assert.match(sources.worker, /DOM\.getDocument|Accessibility\.getFullAXTree/u);
 
-assert.match(sources.window, /attachWindow\(windowId, appView\.webContents\)/u);
-assert.match(sources.window, /setViewBounds\(record\.appView, layout\.appBounds/u);
+assert.match(sources.window, /new\s+BrowserWindow\(/u);
+assert.match(sources.window, /attachWindow\(windowId, window\.webContents\)/u);
+assert.doesNotMatch(sources.window, /\bBaseWindow\b|\bWebContentsView\b|\bappView\b|\.addChildView\(/u);
 assert.doesNotMatch(sources.window, /bindContentSurface|browserContentBounds|browserContentSlot|rendererGeometry/u);
 assert.match(sources.main, /handleIpc\(\s*"magi-desktop:register-browser-webview"/u);
+assert.match(sources.main, /handleIpc\(\s*"magi-desktop:update-browser-display-size"/u);
+assert.match(sources.main, /configureAppRendererAuthentication\(controlToken\)/u);
+assert.match(sources.main, /X-Magi-Desktop-Renderer-Token/u);
+assert.doesNotMatch(sources.preload, /Desktop-Renderer-Token|controlToken/u);
 assert.match(
   sources.preload,
   /registerBrowserWebview:\s*\([^)]*\)\s*=>[\s\S]*?magi-desktop:register-browser-webview/u,
 );
 assert.match(sources.schema, /magi-desktop:register-browser-webview/u);
+assert.match(sources.schema, /magi-desktop:update-browser-display-size/u);
 
 assert.match(sources.browserTab, /VIEWPORT_DEVICE_MODES[\s\S]*id: 'wide'[\s\S]*id: 'narrow'/u);
 assert.match(sources.browserTab, /useAutomaticViewport\(\)/u);
 assert.match(sources.browserTab, /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS/u);
+assert.match(sources.browserTab, /new ResizeObserver\(scheduleBrowserDisplaySizeSync\)/u);
+assert.match(sources.browserTab, /updateBrowserDisplaySize\(/u);
 assert.match(sources.browserTab, /webpreferences="focusOnNavigation=no"/u);
 assert.match(sources.browserTab, /magi:browserScreenshotCaptured/u);
 assert.match(sources.browserTab, /magi:browserNodeSelected/u);

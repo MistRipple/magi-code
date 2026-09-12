@@ -61,7 +61,7 @@ use magi_workspace::WorkspaceStore;
 use std::{
     collections::{HashMap, HashSet},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock, Weak},
 };
 use tracing::{info, warn};
@@ -914,17 +914,35 @@ impl DaemonRuntime {
         let state_repository = StateRepository::new(config.state_root.clone());
 
         // 先加载工作区注册表（需要工作区路径来定位会话文件）
+        let workspace_durable_state = state_repository.load_workspace_durable_state()?;
+        let workspace_roots: Vec<(String, PathBuf)> = workspace_durable_state
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    workspace.workspace_id.to_string(),
+                    workspace.native_root_path(),
+                )
+            })
+            .collect();
+        Self::validate_workspace_state_separation(&config.state_root, &workspace_roots)?;
+        for workspace in &workspace_durable_state.workspaces {
+            magi_workspace::verify_or_create_workspace_identity(
+                &workspace.native_root_path(),
+                &workspace.workspace_id,
+            )
+            .map_err(|error| {
+                DaemonError::internal(format!(
+                    "校验工作区稳定身份失败 {}: {error}",
+                    workspace.native_root_path().display()
+                ))
+            })?;
+        }
         let workspace_store = Arc::new(WorkspaceStore::from_persisted_parts(
-            state_repository.load_workspace_durable_state()?,
+            workspace_durable_state,
             state_repository.load_workspace_recovery_sidecars()?,
         ));
 
-        // 收集所有工作区的 (workspace_id, root_path)
-        let workspace_roots: Vec<(String, std::path::PathBuf)> = workspace_store
-            .workspaces()
-            .into_iter()
-            .map(|w| (w.workspace_id.to_string(), w.native_root_path()))
-            .collect();
         state_repository.migrate_legacy_state_layout(&workspace_roots)?;
         let (session_durable, session_sidecars) =
             state_repository.load_session_projections(&workspace_roots)?;
@@ -989,6 +1007,33 @@ impl DaemonRuntime {
             managed_process_group: ManagedProcessGroup::new(),
             browser_host_controller_lifecycle: BrowserHostControllerLifecycle::new(),
         })
+    }
+
+    /// 校验全局状态根与项目 workspace 状态根的物理边界。
+    ///
+    /// 全局状态和 workspace 状态由不同的所有者管理：前者属于 daemon，后者
+    /// 属于项目目录。二者一旦指向同一个 `.magi`，projection 扫描就无法区分
+    /// personal 与 workspace session，恢复只能靠猜测。该配置直接拒绝，不能
+    /// 通过迁移、补字段或自动合并掩盖边界错误。
+    fn validate_workspace_state_separation(
+        state_root: &Path,
+        workspace_roots: &[(String, PathBuf)],
+    ) -> Result<(), DaemonError> {
+        for (workspace_id, workspace_root) in workspace_roots {
+            let overlaps = magi_runtime_state::state_roots_overlap(state_root, workspace_root)
+                .map_err(|error| {
+                    DaemonError::internal(format!("解析 daemon 与 workspace 状态边界失败: {error}"))
+                })?;
+            if overlaps {
+                return Err(DaemonError::internal(format!(
+                    "daemon 状态根与 workspace 状态根重合，拒绝启动: state_root={} workspace_id={} workspace_state_root={}",
+                    state_root.display(),
+                    workspace_id,
+                    workspace_root.join(".magi").display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2514,6 +2559,24 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_state_root_that_is_workspace_magi_directory() {
+        let root = temp_state_root("overlapping-state-root");
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(workspace_root.join(".magi")).unwrap();
+        let workspace_id = "workspace-overlapping".to_string();
+
+        let error = DaemonRuntime::validate_workspace_state_separation(
+            &workspace_root.join(".magi"),
+            &[(workspace_id.clone(), workspace_root.clone())],
+        )
+        .expect_err("global and workspace state roots must not overlap");
+
+        assert!(error.to_string().contains("状态根与 workspace 状态根重合"));
+        assert!(error.to_string().contains(&workspace_id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn external_mcp_catalog_uses_live_tool_list_instead_of_saved_count() {
         let script = r#"
 while IFS= read -r line; do
@@ -3321,15 +3384,19 @@ done
             .expect("test fixture should create a persisted session");
         drop(fixture);
 
-        let projection_path = fs::read_dir(state_root.join("session-projections"))
-            .expect("session projection directory should exist")
-            .map(|entry| {
-                entry
-                    .expect("session projection entry should be readable")
-                    .path()
-            })
-            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
-            .expect("fixture should persist a session projection");
+        let projection_path = fs::read_dir(
+            test_workspace_root(&config)
+                .join(".magi")
+                .join("session-projections"),
+        )
+        .expect("session projection directory should exist")
+        .map(|entry| {
+            entry
+                .expect("session projection entry should be readable")
+                .path()
+        })
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("fixture should persist a session projection");
         let ledger_path = state_root.join("audit-usage-ledger.json");
         let projection_modified = fs::metadata(&projection_path)
             .expect("session projection metadata should exist")

@@ -141,6 +141,17 @@ async fn register_workspace(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let canonical_path = canonical_workspace_path(&request.path)?;
 
+    if let Some(state_root) = state
+        .runtime_persistence()
+        .and_then(|persistence| persistence.state_root())
+        && magi_runtime_state::state_roots_overlap(state_root, &canonical_path)
+            .map_err(|error| ApiError::internal_assembly("校验 workspace 状态边界失败", error))?
+    {
+        return Err(ApiError::InvalidInput(
+            "工作区路径不能包含 Magi 全局状态目录".to_string(),
+        ));
+    }
+
     // 已注册过的 workspace：复用已有记录，仍异步刷新索引。
     if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
         let workspace_id = workspace.workspace_id.clone();
@@ -153,7 +164,9 @@ async fn register_workspace(
     }
 
     // 新 workspace：先同步完成注册（快），再异步构建索引。
-    let workspace_id = new_workspace_id();
+    let workspace_id =
+        magi_workspace::resolve_or_create_workspace_identity(&canonical_path, new_workspace_id())
+            .map_err(|error| ApiError::internal_assembly("工作区身份初始化失败", error))?;
     match state
         .workspace_registry
         .register_native_path(workspace_id.clone(), canonical_path.clone())
@@ -540,6 +553,58 @@ mod tests {
         assert_eq!(second_payload["reused"], true);
         assert_eq!(second_payload["workspaceId"], first_payload["workspaceId"]);
         assert_eq!(state.workspace_registry.workspaces().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_workspace_adopts_existing_project_identity() {
+        let state = test_state();
+        let root = tempfile::tempdir().expect("workspace dir");
+        let projection_root = root.path().join(".magi").join("session-projections");
+        fs::create_dir_all(&projection_root).expect("projection root");
+        fs::write(
+            projection_root.join("session-existing.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "canonical_event_seq": 0,
+                "durable": {
+                    "sessions": [{
+                        "sessionId": "session-existing",
+                        "workspaceId": "workspace-existing"
+                    }]
+                }
+            }))
+            .expect("projection json"),
+        )
+        .expect("projection write");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "path": root.path().to_string_lossy() }).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["workspaceId"], "workspace-existing");
+        assert_eq!(
+            state.workspace_registry.workspaces()[0]
+                .workspace_id
+                .as_str(),
+            "workspace-existing"
+        );
+        let identity: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join(".magi/workspace-identity.json"))
+                .expect("identity manifest"),
+        )
+        .expect("identity json");
+        assert_eq!(identity["workspaceId"], "workspace-existing");
     }
 
     #[tokio::test]

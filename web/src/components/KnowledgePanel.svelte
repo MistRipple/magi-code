@@ -191,19 +191,15 @@
     closeEditor();
   }
 
-  /**
-   * 知识库入口文件点击 → 推到右侧 RightPane 的 code tab。
-   * 这里只携带 filepath；RightPane 会异步拉取文件源码进行渲染，
-   * 文件为空时显示空态 + "在编辑器中打开" 按钮。
-   */
+  /** Electron 中 HTML 入口进入 Browser；其他文件和 Web 端进入文件视图。 */
   function previewEntryPoint(filepath: string) {
     if (!filepath) return;
+    if (requestOpenHtmlFileInBrowser(filepath)) return;
     openCodeTab(null, filepath, {
       sessionId: '',
       workspaceId: messagesState.currentWorkspaceId ?? undefined,
       workspacePath: messagesState.currentWorkspacePath || undefined,
     });
-    requestOpenHtmlFileInBrowser(filepath);
   }
 
   function openKnowledgeRecord(knowledgeId: string): void {

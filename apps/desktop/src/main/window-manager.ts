@@ -1,10 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
-  BaseWindow,
+  BrowserWindow,
   screen,
-  View,
-  WebContentsView,
-  type Rectangle,
 } from "electron";
 import type {
   BrowserLogicalViewport,
@@ -14,13 +11,16 @@ import type {
 import type {
   BrowserSurfaceActivationInput,
   BrowserDownloadRuntimeSnapshot,
+  BrowserDisplaySizeInput,
   BrowserSurfaceManager,
 } from "./browser-surface-manager.js";
+import { secureBrowserWebviewAttachment } from "./browser-webview-security.js";
 import { DesktopWindowReadiness } from "./desktop-window-readiness.js";
 import {
   createWindowLayoutState,
   reduceWindowLayout,
   snapshotWindowLayout,
+  WINDOW_LAYOUT,
   type PanelKind,
   type WindowLayoutIntent,
   type WindowLayoutSnapshot,
@@ -29,8 +29,7 @@ import {
 
 interface DesktopWindowRecord {
   windowId: string;
-  window: BaseWindow;
-  appView: WebContentsView;
+  window: BrowserWindow;
   layout: WindowLayoutState;
   context: DesktopRendererContext;
   browserActivationRevision: number;
@@ -70,6 +69,11 @@ export interface DesktopWindowSnapshot {
   snapshotRevision: number;
   layout: WindowLayoutSnapshot;
   activeBrowserViewport: BrowserLogicalViewport | null;
+  activeBrowserDisplayMetrics: {
+    width: number;
+    height: number;
+    scale: number;
+  } | null;
   activeBrowserNavigationRevision: number | null;
   activeBrowserDownloads: BrowserDownloadRuntimeSnapshot[];
 }
@@ -79,7 +83,7 @@ export class WindowManager {
   readonly #preloadPath: string;
   readonly #agentOrigin: string;
   readonly #surfaceManager: BrowserSurfaceManager;
-  readonly #windows: Map<string, BaseWindow>;
+  readonly #windows: Map<string, BrowserWindow>;
   readonly #records = new Map<string, DesktopWindowRecord>();
   readonly #browserSurfaceReadiness = new Map<
     string,
@@ -101,7 +105,7 @@ export class WindowManager {
     preloadPath: string;
     agentOrigin: string;
     surfaceManager: BrowserSurfaceManager;
-    windows: Map<string, BaseWindow>;
+    windows: Map<string, BrowserWindow>;
     onSnapshot: (snapshot: DesktopWindowSnapshot) => void;
   }) {
     this.#desktopEpoch = input.desktopEpoch;
@@ -123,32 +127,36 @@ export class WindowManager {
       960,
       Math.max(680, display.workAreaSize.height - 80),
     );
-    const window = new BaseWindow({
+    const window = new BrowserWindow({
       width,
       height,
-      minWidth: 720,
+      minWidth: WINDOW_LAYOUT.minDesktopWindowWidth,
       minHeight: 520,
       title: "Magi",
       // App Renderer 完成主题握手前窗口保持隐藏；这里的背景只是 native
       // view 的首帧兜底，并始终使用最近一次已同步的主题材质。
       backgroundColor: this.#appearance.backgroundColor,
       show: false,
+      webPreferences: {
+        preload: this.#preloadPath,
+        additionalArguments: [
+          "--magi-desktop-surface=app",
+          `--magi-desktop-window-id=${windowId}`,
+        ],
+        partition: "persist:magi-app",
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+        webviewTag: true,
+      },
     });
     this.applyNativeAppearance(window, this.#appearance);
     const contentBounds = window.getContentBounds();
-    // BaseWindow 的 contentView 需要先绑定到真实内容区，确保唯一的 App
-    // Renderer 从首帧开始使用窗口的实际尺寸。
-    setViewBounds(window.contentView, {
-      x: 0,
-      y: 0,
-      width: contentBounds.width,
-      height: contentBounds.height,
-    });
-    const appView = this.createTrustedView("app", windowId);
-    // contentView 是唯一的原生合成根，App Renderer 负责全部右栏 DOM。
-    // Browser guest 由 App Renderer 内的 <webview> 承载。
-    window.contentView.addChildView(appView, 0);
-    this.#surfaceManager.attachWindow(windowId, appView.webContents);
+    // BrowserWindow 的直属 Renderer 是唯一应用壳层。Browser guest 只由
+    // 右栏当前 Browser Tab 的 <webview> 内容槽承载，避免在 guest 外再套
+    // 一层原生合成容器，造成 Chromium compositor surface 不可截图。
+    this.#surfaceManager.attachWindow(windowId, window.webContents);
     const layout = createWindowLayoutState({
       desktopEpoch: this.#desktopEpoch,
       windowId,
@@ -163,7 +171,6 @@ export class WindowManager {
     const record: DesktopWindowRecord = {
       windowId,
       window,
-      appView,
       layout,
       context: {
         contextRevision: 0,
@@ -220,7 +227,7 @@ export class WindowManager {
       (record) =>
         !record.closed &&
         record.rendererLoadFailed &&
-        !record.appView.webContents.isDestroyed(),
+        !record.window.webContents.isDestroyed(),
     );
     await Promise.all(
       failed.map((record) =>
@@ -274,6 +281,8 @@ export class WindowManager {
       activeBrowserViewport: this.#surfaceManager.viewportForSurface(
         layout.activeSurfaceId,
       ),
+      activeBrowserDisplayMetrics:
+        this.#surfaceManager.displayMetricsForSurface(layout.activeSurfaceId),
       activeBrowserNavigationRevision:
         this.#surfaceManager.navigationRevisionForSurface(
           layout.activeSurfaceId,
@@ -357,8 +366,24 @@ export class WindowManager {
   ): DesktopWindowSnapshot {
     const record = this.requireWindow(windowId);
     this.#surfaceManager.registerEmbeddedWebview(windowId, input);
+    if (
+      record.layout.rightPaneVisible &&
+      record.layout.activePanelKind === "browser" &&
+      record.layout.activeTabId === input.tabId
+    ) {
+      this.#surfaceManager.activateTabSurface(windowId, input.tabId);
+    }
     this.resolveBrowserSurfaceReadiness(record);
     return this.snapshot(windowId);
+  }
+
+  updateEmbeddedWebviewDisplaySize(
+    windowId: string,
+    input: BrowserDisplaySizeInput,
+  ): DesktopWindowSnapshot {
+    const record = this.requireWindow(windowId);
+    this.#surfaceManager.updateEmbeddedWebviewDisplaySize(windowId, input);
+    return this.snapshot(record.windowId);
   }
 
   releaseEmbeddedWebview(
@@ -434,8 +459,8 @@ export class WindowManager {
     // 面板身份已经在 Main 事务中完成切换。非浏览器面板的键盘和后续
     // DOM 交互必须回到 App Renderer，不能由 Renderer 在 pointerdown/focusin
     // 中再次抢焦点，否则原生 WebContents 切换会打断当前 click 事件。
-    if (kind !== "browser" && !record.appView.webContents.isDestroyed()) {
-      record.appView.webContents.focus();
+    if (kind !== "browser" && !record.window.webContents.isDestroyed()) {
+      record.window.webContents.focus();
     }
     return snapshot;
   }
@@ -443,28 +468,22 @@ export class WindowManager {
   handleRightPaneReady(windowId: string): void {
     const record = this.requireWindow(windowId);
     record.appRendererReady = true;
-    if (!record.appView.webContents.isDestroyed()) {
-      record.appView.webContents.send("magi-desktop:context", record.context);
+    if (!record.window.webContents.isDestroyed()) {
+      record.window.webContents.send("magi-desktop:context", record.context);
       this.publishBrowserRuntimeReady(record);
     }
     // Web Renderer 只有在权威主题应用完成后才会发送该握手。延迟到这里
     // 首次显示，保证 native 外壳与 App Renderer 不会出现主题闪烁或错色。
     if (!record.window.isDestroyed() && !record.window.isVisible()) {
-      // BaseWindow 创建时虽然已经带有目标窗口尺寸，但隐藏状态下首次
-      // 挂载 App Renderer 不一定会让 Chromium 的 RenderWidget 收到
-      // 内容区 resize。通过 Electron 原生内容尺寸 API 在显示前提交同一
-      // 个真实 client size，建立一次完整的窗口 -> contentView -> App
-      // Renderer 尺寸链，避免首帧落回默认 800x600。
+      // 隐藏窗口中的 Renderer 可能先以默认尺寸完成首帧。显示前通过
+      // BrowserWindow 的内容尺寸 API 重放当前 client size，使 Chromium
+      // 从唯一原生窗口直接得到真实布局尺寸。
       record.window.setContentSize(
         record.layout.clientBounds.width,
         record.layout.clientBounds.height,
         false,
       );
       record.window.show();
-      // 首次显示前无条件重放一次 App Renderer bounds，确保隐藏期间创建的
-      // Renderer 不会以默认尺寸完成首帧排版。
-      setViewBounds(record.window.contentView, record.layout.clientBounds);
-      record.appView.setBounds(record.layout.clientBounds);
       this.applyLayout(record);
     }
   }
@@ -479,23 +498,22 @@ export class WindowManager {
       windowId,
       ...input,
     };
-    if (!record.appView.webContents.isDestroyed()) {
-      record.appView.webContents.send("magi-desktop:context", record.context);
+    if (!record.window.webContents.isDestroyed()) {
+      record.window.webContents.send("magi-desktop:context", record.context);
     }
     return record.context;
   }
 
   focusApp(windowId: string): void {
     const record = this.requireWindow(windowId);
-    if (record.window.isDestroyed() || record.appView.webContents.isDestroyed())
+    if (record.window.isDestroyed() || record.window.webContents.isDestroyed())
       return;
     // Browser Surface 只覆盖真实浏览器内容槽，工具栏、Tab 栏和其他右栏
-    // 面板仍由 appView 命中。切换 App 焦点不需要隐藏或卸载 Browser
+    // 面板仍由主 Renderer 命中。切换 App 焦点不需要隐藏或卸载 Browser
     // Surface；隐藏再 setImmediate 恢复会在每次 pointerdown/focusin 时
     // 产生可见闪烁，并使同一点击后续的截图、标记等 IPC 命中失效。
     record.window.focus();
-    record.appView.setVisible(true);
-    record.appView.webContents.focus();
+    record.window.webContents.focus();
   }
 
   async setBrowserViewport(
@@ -550,6 +568,30 @@ export class WindowManager {
     return this.snapshot(record.windowId);
   }
 
+  async startBrowserAnnotationCapture(
+    windowId: string,
+    request: { tabId: string; surfaceId: string; navigationRevision: number },
+  ): Promise<void> {
+    const { binding } = this.requireActiveBrowserBinding(windowId, {
+      tab_id: request.tabId,
+      surface_id: request.surfaceId,
+      navigation_revision: request.navigationRevision,
+    });
+    await this.#surfaceManager.startAnnotationCapture(binding);
+  }
+
+  async stopBrowserAnnotationCapture(
+    windowId: string,
+    request: { tabId: string; surfaceId: string; navigationRevision: number },
+  ): Promise<void> {
+    const { binding } = this.requireActiveBrowserBinding(windowId, {
+      tab_id: request.tabId,
+      surface_id: request.surfaceId,
+      navigation_revision: request.navigationRevision,
+    });
+    await this.#surfaceManager.stopAnnotationCapture(binding);
+  }
+
   private requireActiveBrowserBinding(
     windowId: string,
     request: BrowserSurfaceIdentity,
@@ -587,12 +629,11 @@ export class WindowManager {
     for (const record of this.#records.values()) {
       if (record.closed || record.window.isDestroyed()) continue;
       this.applyNativeAppearance(record.window, appearance);
-      record.appView.setBackgroundColor(appearance.backgroundColor);
     }
   }
 
   private applyNativeAppearance(
-    window: BaseWindow,
+    window: BrowserWindow,
     appearance: DesktopAppearance,
   ): void {
     window.setBackgroundColor(appearance.backgroundColor);
@@ -627,13 +668,13 @@ export class WindowManager {
 
   broadcast(windowId: string, channel: string, value: unknown): void {
     const record = this.requireWindow(windowId);
-    if (!record.appView.webContents.isDestroyed())
-      record.appView.webContents.send(channel, value);
+    if (!record.window.webContents.isDestroyed())
+      record.window.webContents.send(channel, value);
   }
 
   windowIdForWebContents(webContentsId: number): string | null {
     for (const record of this.#records.values()) {
-      if (record.appView.webContents.id === webContentsId) {
+      if (record.window.webContents.id === webContentsId) {
         return record.windowId;
       }
     }
@@ -642,28 +683,9 @@ export class WindowManager {
 
   rendererRoleForWebContents(webContentsId: number): "app" | null {
     for (const record of this.#records.values()) {
-      if (record.appView.webContents.id === webContentsId) return "app";
+      if (record.window.webContents.id === webContentsId) return "app";
     }
     return null;
-  }
-
-  private createTrustedView(surface: "app", windowId: string): WebContentsView {
-    const view = new WebContentsView({
-      webPreferences: {
-        preload: this.#preloadPath,
-        additionalArguments: [
-          `--magi-desktop-surface=${surface}`,
-          `--magi-desktop-window-id=${windowId}`,
-        ],
-        partition: "persist:magi-app",
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        webSecurity: true,
-        webviewTag: surface === "app",
-      },
-    });
-    return view;
   }
 
   private rendererUrl(windowId: string): string {
@@ -684,12 +706,6 @@ export class WindowManager {
     const updateBounds = () => {
       if (record.closed || window.isDestroyed()) return;
       const bounds = window.getContentBounds();
-      setViewBounds(window.contentView, {
-        x: 0,
-        y: 0,
-        width: bounds.width,
-        height: bounds.height,
-      });
       const display = screen.getDisplayMatching(window.getBounds());
       const previous = record.layout;
       const next = reduceWindowLayout(previous, {
@@ -717,9 +733,8 @@ export class WindowManager {
         changedMetrics.includes("bounds") ||
         changedMetrics.includes("workArea")
       ) {
-        // Native View 使用 DIP 坐标，Renderer 使用 CSS 像素。
         // 跨显示器或系统缩放变化时，即使窗口尺寸没有变化，也必须重新
-        // 提交同一布局事务，避免原生 Surface 继续使用旧 DPI 的坐标。
+        // 提交同一布局事务，使 Renderer 的窗口状态与真实显示器一致。
         updateBounds();
       }
     };
@@ -728,76 +743,83 @@ export class WindowManager {
     window.once("closed", () =>
       screen.off("display-metrics-changed", handleDisplayMetricsChanged),
     );
-    for (const view of [record.appView]) {
-      const surface = "app";
-      view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-      view.webContents.on("will-navigate", (event, url) => {
-        if (!this.isTrustedAppRendererUrl(url, record.windowId))
-          event.preventDefault();
+    const contents = window.webContents;
+    contents.on("will-attach-webview", (event, webPreferences, params) => {
+      const decision = secureBrowserWebviewAttachment(webPreferences, params);
+      if (decision.allowed) return;
+      event.preventDefault();
+      console.warn("[WindowManager] 拒绝未授权的 Browser guest", {
+        windowId: record.windowId,
+        reason: decision.reason,
       });
-      view.webContents.on("did-finish-load", () => {
-        if (record.closed || view.webContents.isDestroyed()) return;
-        if (record.rendererLoadFailed) return;
-        console.info("[WindowManager] 可信 Renderer 加载完成", {
-          windowId: record.windowId,
-          surface,
-          url: view.webContents.getURL(),
-        });
+    });
+    contents.setWindowOpenHandler(() => ({ action: "deny" }));
+    contents.on("will-navigate", (event, url) => {
+      if (!this.isTrustedAppRendererUrl(url, record.windowId))
+        event.preventDefault();
+    });
+    contents.on("did-finish-load", () => {
+      if (record.closed || contents.isDestroyed()) return;
+      if (record.rendererLoadFailed) return;
+      console.info("[WindowManager] 可信 Renderer 加载完成", {
+        windowId: record.windowId,
+        surface: "app",
+        url: contents.getURL(),
       });
-      view.webContents.on(
-        "did-fail-load",
-        (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-          if (record.closed || !isMainFrame) return;
-          record.appRendererReady = false;
-          record.rendererLoadFailed = true;
-          record.rendererRecoveryUrl = this.trustedRendererUrl(
-            record.windowId,
-            validatedURL,
-          );
-          console.error("[WindowManager] 可信 Renderer 加载失败", {
-            windowId: record.windowId,
-            surface,
-            errorCode,
-            errorDescription,
-            validatedURL,
-          });
-        },
-      );
-      view.webContents.on(
-        "console-message",
-        (_event, level, message, line, sourceId) => {
-          if (record.closed || level < 2) return;
-          console.error("[WindowManager] 可信 Renderer 控制台错误", {
-            windowId: record.windowId,
-            surface,
-            level,
-            message,
-            line,
-            sourceId,
-          });
-        },
-      );
-      view.webContents.on("render-process-gone", (_event, details) => {
-        if (record.closed) return;
+    });
+    contents.on(
+      "did-fail-load",
+      (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (record.closed || !isMainFrame) return;
         record.appRendererReady = false;
         record.rendererLoadFailed = true;
         record.rendererRecoveryUrl = this.trustedRendererUrl(
           record.windowId,
-          view.webContents.getURL(),
+          validatedURL,
         );
-        console.error("[WindowManager] 可信 Renderer 进程退出", {
+        console.error("[WindowManager] 可信 Renderer 加载失败", {
           windowId: record.windowId,
-          reason: details.reason,
-          exitCode: details.exitCode,
+          surface: "app",
+          errorCode,
+          errorDescription,
+          validatedURL,
         });
-        // Renderer 已经丢失旧 DOM，恢复唯一的 App Renderer；浏览器 guest
-        // 由右栏在新 DOM 挂载后重新注册并复用自己的逻辑 Tab。
-        void this.loadAppRenderer(
-          record,
-          record.rendererRecoveryUrl ?? this.rendererUrl(record.windowId),
-        );
+      },
+    );
+    contents.on(
+      "console-message",
+      (_event, level, message, line, sourceId) => {
+        if (record.closed || level < 2) return;
+        console.error("[WindowManager] 可信 Renderer 控制台错误", {
+          windowId: record.windowId,
+          surface: "app",
+          level,
+          message,
+          line,
+          sourceId,
+        });
+      },
+    );
+    contents.on("render-process-gone", (_event, details) => {
+      if (record.closed) return;
+      record.appRendererReady = false;
+      record.rendererLoadFailed = true;
+      record.rendererRecoveryUrl = this.trustedRendererUrl(
+        record.windowId,
+        contents.getURL(),
+      );
+      console.error("[WindowManager] 可信 Renderer 进程退出", {
+        windowId: record.windowId,
+        reason: details.reason,
+        exitCode: details.exitCode,
       });
-    }
+      // Renderer 已经丢失旧 DOM，恢复唯一的 App Renderer；浏览器 guest
+      // 由右栏在新 DOM 挂载后重新注册并复用自己的逻辑 Tab。
+      void this.loadAppRenderer(
+        record,
+        record.rendererRecoveryUrl ?? this.rendererUrl(record.windowId),
+      );
+    });
   }
 
   private loadAppRenderer(
@@ -819,18 +841,18 @@ export class WindowManager {
     record: DesktopWindowRecord,
     url: string,
   ): Promise<void> {
-    if (record.closed || record.appView.webContents.isDestroyed()) return;
+    if (record.closed || record.window.webContents.isDestroyed()) return;
     record.appRendererReady = false;
     record.rendererLoadFailed = false;
     record.rendererRecoveryUrl = null;
     try {
-      await record.appView.webContents.loadURL(url);
-      if (record.closed || record.appView.webContents.isDestroyed()) return;
+      await record.window.webContents.loadURL(url);
+      if (record.closed || record.window.webContents.isDestroyed()) return;
       record.rendererLoadFailed = false;
       record.rendererRecoveryUrl = null;
       this.applyLayout(record);
     } catch (error) {
-      if (record.closed || record.appView.webContents.isDestroyed()) return;
+      if (record.closed || record.window.webContents.isDestroyed()) return;
       record.rendererLoadFailed = true;
       record.rendererRecoveryUrl ??= this.trustedRendererUrl(
         record.windowId,
@@ -848,11 +870,11 @@ export class WindowManager {
     if (
       !record.appRendererReady ||
       record.closed ||
-      record.appView.webContents.isDestroyed() ||
+      record.window.webContents.isDestroyed() ||
       this.#browserRuntimeReadyRevision <= 0
     )
       return;
-    record.appView.webContents.send("magi-desktop:browser-runtime-ready", {
+    record.window.webContents.send("magi-desktop:browser-runtime-ready", {
       revision: this.#browserRuntimeReadyRevision,
     });
   }
@@ -890,12 +912,8 @@ export class WindowManager {
 
   private applyLayout(record: DesktopWindowRecord): DesktopWindowSnapshot {
     const snapshot = this.snapshot(record.windowId);
-    const { layout } = snapshot;
-    // BaseWindow 只承载唯一的 App Renderer。真实 Chromium guest 是右栏
-    // DOM 的子节点，窗口布局事务不读取、不计算也不更新浏览器几何。
-    setViewBounds(record.window.contentView, layout.clientBounds as Rectangle);
-    setViewBounds(record.appView, layout.appBounds as Rectangle);
-    record.appView.setVisible(true);
+    // BrowserWindow 的直属 Renderer 自动填满客户区。真实 Chromium guest
+    // 是右栏 DOM 的子节点，窗口布局事务不再维护任何原生子 View 几何。
     this.resolveBrowserSurfaceReadiness(record);
     this.#onSnapshot(snapshot);
     return snapshot;
@@ -1034,29 +1052,11 @@ export class WindowManager {
         waiter.reject(new Error("desktop_window_closed"));
     }
     this.#surfaceManager.closeWindow(record.windowId);
-    if (!record.window.isDestroyed()) {
-      record.window.contentView.removeChildView(record.appView);
-    }
-    if (!record.appView.webContents.isDestroyed())
-      record.appView.webContents.close();
     this.#records.delete(record.windowId);
     this.#windows.delete(record.windowId);
     if (this.#records.size === 0) this.#windowReadiness.markClosed();
     if (!record.window.isDestroyed()) record.window.destroy();
   }
-}
-
-function setViewBounds(view: View, bounds: Rectangle): void {
-  if (!sameBounds(view.getBounds(), bounds)) view.setBounds(bounds);
-}
-
-function sameBounds(left: Rectangle, right: Rectangle): boolean {
-  return (
-    left.x === right.x &&
-    left.y === right.y &&
-    left.width === right.width &&
-    left.height === right.height
-  );
 }
 
 function browserSurfaceReadinessKey(windowId: string, tabId: string): string {

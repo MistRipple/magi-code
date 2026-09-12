@@ -445,7 +445,7 @@ test("性能 Trace 停止时等待 tracingComplete 并返回采集事件", async
   assert.deepEqual(value?.events, [{ name: "firstContentfulPaint" }]);
 });
 
-test("浏览器截图的归一化区域必须转换为当前布局视口的真实裁剪区域", async () => {
+test("浏览器截图的归一化区域必须转换为当前滚动页面的绝对裁剪区域", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") {
       return { frameTree: { frame: { id: "frame-1" } } };
@@ -460,7 +460,7 @@ test("浏览器截图的归一化区域必须转换为当前布局视口的真�
       return {
         result: {
           value: String(params.expression).trim().endsWith("globalThis.__magiBrowserAutomation.viewport()")
-            ? { width: 1200, height: 800 }
+            ? { width: 1200, height: 800, scrollX: 40, scrollY: 600 }
             : null,
         },
       };
@@ -476,6 +476,7 @@ test("浏览器截图的归一化区域必须转换为当前布局视口的真�
     type: "screenshot",
     payload: {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       clip: { x: 0.25, y: 0.1, width: 0.5, height: 0.25 },
       full_page: false,
       format: "png",
@@ -487,10 +488,32 @@ test("浏览器截图的归一化区域必须转换为当前布局视口的真�
   const capture = port.requests.find((request) => request.method === "Page.captureScreenshot");
   assert.deepEqual(capture?.params, {
     format: "png",
-    clip: { x: 300, y: 80, width: 600, height: 200, scale: 1 },
+    clip: { x: 340, y: 680, width: 600, height: 200, scale: 1 },
     captureBeyondViewport: false,
     fromSurface: true,
   });
+});
+
+test("浏览器截图拒绝跨导航代次复用旧请求", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("stale-screenshot", binding, {
+    type: "screenshot",
+    payload: {
+      tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision + 1,
+      full_page: false,
+      format: "png",
+    },
+  });
+  assert.equal(result.outcome.status, "failed");
+  if (result.outcome.status === "failed") {
+    assert.equal(result.outcome.payload.code, "browser_navigation_revision_stale");
+  }
+  assert.equal(
+    port.requests.some((request) => request.method === "Page.captureScreenshot"),
+    false,
+  );
 });
 
 test("截图使用页面脚本视口坐标，滚动直接在当前文档执行", async () => {
@@ -524,6 +547,7 @@ test("截图使用页面脚本视口坐标，滚动直接在当前文档执行",
     type: "screenshot",
     payload: {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       clip: { x: 0.1, y: 0.1, width: 0.2, height: 0.2 },
       full_page: false,
       format: "png",
@@ -593,6 +617,7 @@ test("页面脚本视口失效时兼容 CDP 仅返回 clientWidth/clientHeight �
     type: "screenshot",
     payload: {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       clip: { x: 0, y: 0, width: 0.5, height: 0.5 },
       full_page: false,
       format: "png",
@@ -1140,6 +1165,7 @@ test("浏览器截图收到快照根节点时必须捕获整页范围而不是�
     type: "screenshot",
     payload: {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       target: { snapshot_revision: 1, element_ref: "root" },
       full_page: false,
       format: "png",
@@ -1164,6 +1190,7 @@ test("浏览器截图必须拒绝互斥范围组合，并校验图片文件头",
     type: "screenshot",
     payload: {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       target: { snapshot_revision: 1, element_ref: "e:1:1" },
       clip: { x: 0, y: 0, width: 1, height: 1 },
       full_page: false,
@@ -1178,6 +1205,7 @@ test("浏览器截图必须拒绝互斥范围组合，并校验图片文件头",
     type: "screenshot",
     payload: {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       full_page: false,
       format: "webp",
     },
@@ -1203,7 +1231,12 @@ test("浏览器截图必须拒绝互斥范围组合，并校验图片文件头",
   ] as const) {
     const captured = await formatRuntime.execute(`format-${format}`, binding, {
       type: "screenshot",
-      payload: { tab_id: binding.tab_id, full_page: false, format },
+      payload: {
+        tab_id: binding.tab_id,
+        navigation_revision: binding.navigation_revision,
+        full_page: false,
+        format,
+      },
     });
     assert.equal(captured.outcome.status, "succeeded");
     assert.equal(captured.binary_base64, bytes.toString("base64"));
@@ -1214,9 +1247,32 @@ test("浏览器截图必须拒绝互斥范围组合，并校验图片文件头",
 });
 
 test("整页截图使用 Chromium contentSize 和 captureBeyondViewport", async () => {
-  const port = new ScriptedPort((method) => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") {
+      return { frameTree: { frame: { id: "frame-1" } } };
+    }
+    if (method === "Page.createIsolatedWorld") {
+      return { executionContextId: 1 };
+    }
+    if (method === "Runtime.evaluate") {
+      return {
+        result: {
+          value: String(params.expression).trim().endsWith("globalThis.__magiBrowserAutomation.viewport()")
+            ? { width: 1200, height: 800, scrollX: 0, scrollY: 400 }
+            : null,
+        },
+      };
+    }
     if (method === "Page.getLayoutMetrics") {
-      return { contentSize: { x: 0, y: 0, width: 1400, height: 3000 } };
+      return {
+        contentSize: { x: 0, y: 0, width: 1400, height: 3000 },
+        cssVisualViewport: {
+          clientWidth: 1200,
+          clientHeight: 800,
+          pageX: 0,
+          pageY: 400,
+        },
+      };
     }
     if (method === "Page.captureScreenshot") return { data: PNG_BYTES.toString("base64") };
     return {};
@@ -1224,7 +1280,12 @@ test("整页截图使用 Chromium contentSize 和 captureBeyondViewport", async 
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
   const result = await runtime.execute("full-page", binding, {
     type: "screenshot",
-    payload: { tab_id: binding.tab_id, full_page: true, format: "png" },
+    payload: {
+      tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
+      full_page: true,
+      format: "png",
+    },
   });
   assert.equal(result.outcome.status, "succeeded");
   assert.deepEqual(
@@ -1244,6 +1305,9 @@ test("元素截图先滚动到元素并重新读取最终 bounds", async () => {
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
     if (method === "Runtime.evaluate") {
       const expression = String(params.expression);
+      if (expression.trim().endsWith("globalThis.__magiBrowserAutomation.viewport()")) {
+        return { result: { value: { width: 1200, height: 800, scrollX: 0, scrollY: 400 } } };
+      }
       if (expression.includes("getBoundingClientRect")) {
         return { result: { value: { bounds: { x: 20, y: 30, width: 400, height: 200 } } } };
       }
@@ -1257,6 +1321,7 @@ test("元素截图先滚动到元素并重新读取最终 bounds", async () => {
     type: "screenshot",
     payload: {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       target: { snapshot_revision: 1, element_ref: "e:1:1" },
       full_page: false,
       format: "png",
@@ -1364,6 +1429,7 @@ test("标记命中检测把内容槽归一化坐标转换为当前 Chromium CSS 
               navigation_revision: 0,
               viewport_width: 1280,
               viewport_height: 720,
+              device_scale_factor_millis: 2000,
               scroll_x: 0,
               scroll_y: 0,
               element_ref: "e:1:1",
@@ -1537,6 +1603,19 @@ test("浏览器标记层只观察目标布局相关节点，不监听整个页�
     /observe\(root,\s*\{\s*childList:\s*true,\s*subtree:\s*true,\s*attributes:\s*true/u,
   );
   assert.doesNotMatch(INSTALL_PAGE_RUNTIME, /while \(shadow\.firstChild\)/u);
+});
+
+test("区域标记按创建视口归一化到当前 Chromium 视口", () => {
+  assert.match(INSTALL_PAGE_RUNTIME, /const scaleX = innerWidth \/ sourceWidth/u);
+  assert.match(INSTALL_PAGE_RUNTIME, /const scaleY = innerHeight \/ sourceHeight/u);
+  assert.match(
+    INSTALL_PAGE_RUNTIME,
+    /Number\(rect\.width\) \* sourceWidth \* scaleX/u,
+  );
+  assert.match(
+    INSTALL_PAGE_RUNTIME,
+    /\(Number\(rect\.x\) \* sourceWidth \+ scrollXAtCapture\) \* scaleX - scrollX/u,
+  );
 });
 
 test("Accessibility 节点引用使用 Worker isolated world 的执行上下文", async () => {

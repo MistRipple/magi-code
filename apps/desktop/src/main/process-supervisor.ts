@@ -37,6 +37,7 @@ export class ProcessSupervisor {
   readonly #daemonIdentity: DaemonIdentityExpectation;
   readonly #reuseExistingDaemon: boolean;
   readonly #onReady: (() => Promise<void>) | undefined;
+  readonly #spawnDaemon: typeof spawn;
   #daemon: ChildProcess | null = null;
   #stopping = false;
   #ready = false;
@@ -67,6 +68,7 @@ export class ProcessSupervisor {
     environment: NodeJS.ProcessEnv;
     daemonIdentity: DaemonIdentityExpectation;
     onReady?: () => Promise<void>;
+    spawnDaemon?: typeof spawn;
   }) {
     this.#daemonPath = input.daemonPath;
     this.#agentOrigin = input.agentOrigin;
@@ -74,6 +76,7 @@ export class ProcessSupervisor {
     this.#daemonIdentity = input.daemonIdentity;
     this.#reuseExistingDaemon = input.environment.MAGI_DESKTOP_REUSE_DAEMON === "1";
     this.#onReady = input.onReady;
+    this.#spawnDaemon = input.spawnDaemon ?? spawn;
   }
 
   start(): Promise<void> {
@@ -204,7 +207,7 @@ export class ProcessSupervisor {
 
   private async startAttempt(generation: number, signal: AbortSignal): Promise<string> {
     const startupNonce = randomUUID();
-    const child = spawn(this.#daemonPath, [], {
+    const child = this.#spawnDaemon(this.#daemonPath, [], {
       env: {
         ...this.#environment,
         MAGI_DAEMON_START_NONCE: startupNonce,
@@ -220,7 +223,10 @@ export class ProcessSupervisor {
         const owned = this.#daemon === child && generation === this.#lifecycleGeneration;
         if (this.#daemon === child) this.#daemon = null;
         reject(new Error(`magi_daemon_exited:${code ?? signal ?? "unknown"}`));
-        if (owned && this.#ready && !this.#stopping) {
+        // 任意受管子进程的非主动退出都必须进入同一恢复队列。不能依赖 #ready：
+        // health 已通过而桌面连接仍在注册时它为 false，此时退出若被忽略，启动
+        // Promise 仍可能成功收口成一个没有 daemon 的假 ready 状态。
+        if (owned && !this.#stopping) {
           this.#ready = false;
           this.#status = "restarting";
           this.scheduleRecovery(generation);
@@ -266,6 +272,9 @@ export class ProcessSupervisor {
     let lastError: unknown;
     for (let attempt = 1; attempt <= MAX_RECOVERY_ATTEMPTS; attempt += 1) {
       if (this.#stopping || generation !== this.#lifecycleGeneration) return;
+      // 初始启动路径可能已经在同一生命周期内完成下一次尝试。恢复任务排到
+      // lifecycle queue 后必须复用该受管进程，不能再并行拉起第二个 daemon。
+      if (this.#daemon && !hasExited(this.#daemon)) return;
       await delay(attempt * 500, signal);
       try {
         this.#runtimeEpoch = await this.startAttempt(generation, signal);

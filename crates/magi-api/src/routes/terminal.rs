@@ -178,17 +178,19 @@ async fn run_terminal_channel(socket: WebSocket, terminal: std::sync::Arc<Termin
     let snapshot_sequence = snapshot.sequence;
     let (mut sink, mut source) = socket.split();
 
-    if send_lifecycle(&mut sink, &snapshot.lifecycle)
-        .await
-        .is_err()
-    {
-        return;
-    }
     if !snapshot.output.is_empty()
         && sink
             .send(Message::Binary(snapshot.output.into()))
             .await
             .is_err()
+    {
+        return;
+    }
+    // 重连快照必须先重放历史输出，再发布当前生命周期。终态若先到达，
+    // xterm 会先显示“进程已退出”再补旧输出，破坏真实时间顺序。
+    if send_lifecycle(&mut sink, &snapshot.lifecycle)
+        .await
+        .is_err()
     {
         return;
     }

@@ -416,10 +416,10 @@ assert.match(
   /web-workbench-shell--desktop-right-pane-visible \.workbench-body[\s\S]*?minmax\(var\(--preview-min-width, 320px\), var\(--desktop-right-pane-width, 480px\)\)/,
   '桌面右栏必须直接消费权威宽度，并与中间区域共享同一 grid 坐标系',
 );
-assert.match(
+assert.doesNotMatch(
   workbenchShellSource,
-  /web-workbench-shell--desktop-preview-overlay \.workbench-body[\s\S]*?desktop-right-pane-column--overlay/,
-  '窄窗口必须由同一套布局切换到右栏覆盖模式，不能继续强行三栏挤压',
+  /web-workbench-shell--desktop-preview-overlay|desktop-right-pane-column--overlay/,
+  '桌面右栏不得通过绝对定位覆盖中间对话区',
 );
 assert.doesNotMatch(
   rightPaneSource,
@@ -548,6 +548,39 @@ await withGoldenViteServer(async (server) => {
       panelsCanCoexist: false,
     },
     'narrow tablet should use a workbench-local browser overlay without suppressing the sidebar',
+  );
+
+  assert.deepEqual(
+    panelLayout.resolvePanelLayout({
+      viewportWidth: 720,
+      sidebarWidth: 240,
+      previewPanelWidth: 480,
+      sidebarVisible: true,
+      desktopSurface: true,
+    }),
+    {
+      sidebarDrawer: true,
+      previewOverlay: false,
+      panelsCanCoexist: false,
+    },
+    'desktop must keep the right pane in the same Grid even when the window is narrow',
+  );
+
+  assert.deepEqual(
+    panelLayout.resolvePanelLayout({
+      viewportWidth: 930,
+      sidebarWidth: 240,
+      previewPanelWidth: 320,
+      sidebarVisible: true,
+      rightPaneOpen: true,
+      desktopSurface: true,
+    }),
+    {
+      sidebarDrawer: true,
+      previewOverlay: false,
+      panelsCanCoexist: true,
+    },
+    'desktop should move only the left sidebar to a drawer before the right pane can overlap the conversation',
   );
 
   assert.deepEqual(
