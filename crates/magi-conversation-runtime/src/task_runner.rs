@@ -27,7 +27,11 @@ const DEFAULT_LEASE_DURATION_MS: u64 = 60_000;
 
 pub struct TaskRunner {
     store: Arc<TaskStore>,
+    /// 兼容直接构造 Runner 的调用方所提供的初始目录。生产 Runner 通过
+    /// `worker_catalog_provider` 在每次匹配时读取最新角色目录；已经派发的任务仍持有
+    /// 当次匹配复制出的 WorkerInfo，因此角色编辑不会改变运行中的 Worker 快照。
     workers: Vec<WorkerInfo>,
+    worker_catalog_provider: Option<Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>>,
     dispatcher: Arc<dyn TaskDispatcher>,
     result_receiver: Arc<dyn TaskResultReceiver>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
@@ -48,6 +52,7 @@ impl TaskRunner {
         Self {
             store,
             workers,
+            worker_catalog_provider: None,
             dispatcher,
             result_receiver,
             dispatch_gate: None,
@@ -61,6 +66,16 @@ impl TaskRunner {
 
     pub fn with_agent_role_registry(mut self, registry: AgentRoleRegistry) -> Self {
         self.agent_role_registry = registry;
+        self
+    }
+
+    /// 注入动态 Worker 目录。目录只用于尚未派发任务的匹配，WorkerInfo 在成功匹配
+    /// 后会被复制并随派发请求传递下去，确保角色热更新不改写运行中的任务。
+    pub fn with_worker_catalog_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
+    ) -> Self {
+        self.worker_catalog_provider = Some(provider);
         self
     }
 
@@ -480,7 +495,12 @@ impl TaskRunner {
         if explicitly_bound_role.is_some() && role.is_none() {
             return None;
         }
-        self.workers
+        let workers = self
+            .worker_catalog_provider
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_else(|| self.workers.clone());
+        workers
             .iter()
             .find(|worker| {
                 worker.supported_kinds.contains(&task.kind)
@@ -740,6 +760,56 @@ mod tests {
                 .status,
             TaskStatus::Pending
         );
+    }
+
+    #[test]
+    fn dynamic_worker_catalog_provider_sees_role_added_after_runner_creation() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task("task-dynamic-role", "task-dynamic-role", None);
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("dynamic-role"));
+        store.insert_task(root.clone()).expect("任务应插入");
+
+        let role_dir = tempfile::tempdir().expect("角色目录应创建");
+        let registry = AgentRoleRegistry::builtin().with_user_role_dir(role_dir.path());
+        let provider_registry = registry.clone();
+        let provider = Arc::new(move || {
+            let role_ids = provider_registry.spawnable_agent_role_ids();
+            magi_orchestrator::task_worker_catalog::build_worker_catalog_for_roles(
+                &provider_registry,
+                role_ids,
+            )
+        });
+        let dispatcher = Arc::new(HoldingDispatcher {
+            permits: Mutex::new(Vec::new()),
+        });
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            Vec::new(),
+            dispatcher,
+            Arc::new(EventBasedResultReceiver::new()),
+        )
+        .with_agent_role_registry(registry.clone())
+        .with_worker_catalog_provider(provider);
+
+        let mut role = registry.get("executor").expect("内置 executor 应存在");
+        role.id = "dynamic-role".to_string();
+        role.display_name = "动态角色".to_string();
+        role.role = "动态角色".to_string();
+        role.system_prompt = "你是动态加载的角色。".to_string();
+        registry
+            .save_user_role(role, None)
+            .expect("运行中新增角色应保存成功");
+
+        assert_eq!(
+            runner.run_cycle(&root.task_id),
+            RunCycleOutcome::Continue,
+            "Runner 创建后新增的用户角色应能匹配后续任务"
+        );
+        let lease = store
+            .get_active_lease(&root.task_id)
+            .expect("任务应获得动态角色的活跃租约");
+        assert_eq!(lease.role, "dynamic-role");
+        assert_eq!(lease.worker_id.as_str(), "task-worker-dynamic-role");
     }
 
     #[test]

@@ -391,7 +391,8 @@ impl RunnerManager {
             workers,
             Arc::clone(dispatcher),
             Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
-        );
+        )
+        .with_worker_catalog_provider(Arc::clone(&self.worker_catalog));
         runner = runner.with_agent_role_registry((*self.agent_role_registry).clone());
         runner = runner.with_execution_admission(Arc::clone(&self.execution_admission), session_id);
         if let Some(gate) = &self.dispatch_gate {

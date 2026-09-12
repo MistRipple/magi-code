@@ -48,7 +48,7 @@
 
 验证命令：`cargo test -p magi-agent-role --lib`
 
-验证结果：通过（32 passed）。
+验证结果：通过（33 passed）。
 
 ## 阶段 1：统一角色注册与持久化
 
@@ -84,7 +84,7 @@
 
 验证命令：`cargo test -p magi-agent-role --lib`、`cargo test -p magi-api --lib`
 
-验证结果：通过（分别 32 passed、617 passed）。
+验证结果：通过（分别 33 passed、618 passed）。
 
 ## 阶段 2：后端角色管理 API
 
@@ -116,7 +116,7 @@
 
 验证命令：`cargo test -p magi-api --lib`
 
-验证结果：通过（617 passed，包含角色 CRUD、revision、导入导出、冲突策略、活动 Worker 删除保护和事务恢复测试）。
+验证结果：通过（618 passed，包含角色 CRUD、revision、导入导出、冲突策略、活动 Worker 删除保护和事务恢复测试）。
 
 ## 阶段 3：前端角色管理体验
 
@@ -177,7 +177,7 @@
 
 验证命令：`cargo test -p magi-conversation-runtime --lib`、`cargo test -p magi-orchestrator --lib`、`cargo check -p magi-daemon`
 
-验证结果：通过（分别 479 passed、77 passed，daemon check 通过）。
+验证结果：通过（分别 481 passed、77 passed，daemon check 通过）。
 
 ## 阶段 5：完整验证与提交
 
@@ -203,7 +203,7 @@
 
 完成时间：2026-09-12
 
-完成内容：完成角色功能的发布前闭环验证，并清理全部手工验收数据。测试夹具同时修正为将 workspace 放在 daemon 状态根之外，保持生产状态隔离规则有效且使 daemon 全量测试覆盖真实边界。导入冲突提示明确为“角色已存在，请选择编辑、覆盖或另存为”；复制角色的默认中文名称为“副本”。
+完成内容：完成角色功能的发布前闭环验证，并清理全部手工验收数据。测试夹具同时修正为将 workspace 放在 daemon 状态根之外，保持生产状态隔离规则有效且使 daemon 全量测试覆盖真实边界。导入冲突提示明确为“角色已存在，请选择编辑、覆盖或另存为”；复制角色的默认中文名称为“副本”。本轮审计补强了四个边界：角色文件名必须与 front matter `id` 一致；`overwrite` 只允许覆盖已存在的用户角色；运行中 Runner 每次匹配读取最新 Worker catalog；`parallelismLimit` 按角色配置生效，省略时不套用固定角色上限。
 
 手工验收步骤与结果：
 
@@ -222,9 +222,9 @@
 |---|---|
 | `cargo fmt --all -- --check` | 通过 |
 | `git diff --check` | 通过 |
-| `cargo test -p magi-agent-role --lib` | 通过，32 passed |
-| `cargo test -p magi-api --lib` | 通过，617 passed |
-| `cargo test -p magi-conversation-runtime --lib` | 通过，479 passed |
+| `cargo test -p magi-agent-role --lib` | 通过，33 passed |
+| `cargo test -p magi-api --lib` | 通过，618 passed |
+| `cargo test -p magi-conversation-runtime --lib` | 通过，481 passed |
 | `cargo test -p magi-orchestrator --lib` | 通过，77 passed |
 | `cargo test -p magi-daemon --lib` | 通过，126 passed |
 | `cargo check -p magi-daemon` | 通过 |
@@ -232,9 +232,12 @@
 | `npm --prefix web run build` | 通过，产物生成成功；仅有既有 Rollup `@__PURE__` 注释提示 |
 | `curl -fsS http://127.0.0.1:38123/health` | 通过，HTTP 200，`status=ok` |
 
+本轮最终补充验证：`curl -fsS -I http://127.0.0.1:38123/web.html` 返回 HTTP 200；通过 daemon 托管入口打开设置页“代理”面板，确认内置角色来源标识、导入/新建入口和角色详情操作可见，打开新建表单后正常取消且未产生临时角色。
+
 提交记录：
 
 - 功能实现提交：`543ff2b224566d2abb9c2aa2ca1fcbe568ee70db`（包含代码、方案文档和开发计划）。
+- 本轮审计收敛提交：待本次代码提交完成后写入实际 SHA；包含文件名/ID 一致性、导入覆盖边界、动态 Worker catalog 和角色并发限制修复及其测试。
 - 工作区验收临时角色和绑定：已全部删除。
 
 ## 每阶段状态更新格式

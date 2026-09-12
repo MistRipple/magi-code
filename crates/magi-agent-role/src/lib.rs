@@ -741,12 +741,12 @@ fn load_file(path: &Path) -> Result<AgentRole, AgentRoleError> {
         path: path.to_path_buf(),
         message,
     })?;
+    let file_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     if role.id.trim().is_empty() {
-        let file_stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
         if file_stem.is_empty() {
             return Err(AgentRoleError::InvalidId {
                 path: path.to_path_buf(),
@@ -754,6 +754,11 @@ fn load_file(path: &Path) -> Result<AgentRole, AgentRoleError> {
             });
         }
         role.id = file_stem;
+    } else if role.id != file_stem {
+        return Err(AgentRoleError::InvalidDefinition(format!(
+            "角色 id `{}` 必须与文件名 `{}` 一致",
+            role.id, file_stem
+        )));
     }
     Ok(role)
 }
@@ -1494,6 +1499,24 @@ mod tests {
     }
 
     #[test]
+    fn load_file_rejects_id_that_does_not_match_filename() {
+        let dir = tempdir();
+        let path = dir.join("file-name.md");
+        fs::write(
+            &path,
+            "---\nid: another-name\nsupported_kinds: [local_agent]\n---\n你是 file-name\n",
+        )
+        .unwrap();
+
+        let error = load_file(&path).expect_err("角色 id 与文件名不一致时必须拒绝");
+        assert!(matches!(
+            error,
+            AgentRoleError::InvalidDefinition(message)
+                if message.contains("another-name") && message.contains("file-name")
+        ));
+    }
+
+    #[test]
     fn user_role_round_trip_and_reload_are_atomic() {
         let dir = tempdir();
         let registry = AgentRoleRegistry::builtin().with_user_role_dir(&dir);
@@ -1598,24 +1621,26 @@ mod tests {
     }
 
     #[test]
-    fn reload_rejects_duplicate_user_role_ids_across_different_files() {
+    fn reload_rejects_user_role_files_with_mismatched_ids() {
         let dir = tempdir();
-        let content = |prompt: &str| {
+        let content = |id: &str, prompt: &str| {
             format!(
-                "---\nid: duplicate-role\ndisplay_name: 角色\nsupported_kinds: [local_agent]\ncapabilities: [general_engineering]\n---\n{prompt}\n"
+                "---\nid: {id}\ndisplay_name: 角色\nsupported_kinds: [local_agent]\ncapabilities: [general_engineering]\n---\n{prompt}\n"
             )
         };
-        fs::write(dir.join("first.md"), content("第一份定义")).expect("第一份角色应写入");
-        fs::write(dir.join("second.md"), content("第二份定义")).expect("第二份角色应写入");
+        fs::write(dir.join("first.md"), content("first-role", "第一份定义"))
+            .expect("第一份角色应写入");
+        fs::write(dir.join("second.md"), content("second-role", "第二份定义"))
+            .expect("第二份角色应写入");
 
         let registry = AgentRoleRegistry::builtin().with_user_role_dir(&dir);
         registry
             .reload_from_disk()
-            .expect("重复角色文件不应阻塞 reload");
+            .expect("文件名不一致不应阻塞 reload");
 
         assert!(
-            !registry.contains("duplicate-role"),
-            "相同 ID 的多个用户定义必须全部拒绝，不能按文件名随机选一个"
+            !registry.contains("first-role") && !registry.contains("second-role"),
+            "文件名与 id 不一致的用户角色定义必须全部拒绝"
         );
     }
 

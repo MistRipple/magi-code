@@ -70,6 +70,9 @@ pub struct SpawnedChildExecutionRequest<'a> {
     pub session_id: &'a SessionId,
     pub workspace_id: &'a Option<WorkspaceId>,
     pub role: &'a str,
+    /// 角色定义中的并发上限。`None` 表示该角色不设置角色级上限；全局和会话级
+    /// 执行准入仍然继续生效。调用方必须从同一份 AgentRoleRegistry 读取该值。
+    pub role_parallelism_limit: Option<u32>,
     pub now: UtcMillis,
 }
 
@@ -252,6 +255,7 @@ impl TaskExecutionRegistry {
             session_id,
             workspace_id,
             role,
+            role_parallelism_limit,
             now,
         } = request;
         let mut chain = session_store
@@ -292,19 +296,22 @@ impl TaskExecutionRegistry {
             )));
         }
 
-        let active_role_agent_count = active_execution_agent_count_for_role(
-            task_store,
-            session_store,
-            session_id,
-            &chain,
-            role,
-        );
-        if active_role_agent_count >= DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE {
-            return Err(SpawnedChildExecutionError::RoleCapacityExceeded {
-                role: role.to_string(),
-                active: active_role_agent_count,
-                limit: DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE,
-            });
+        if let Some(limit) = role_parallelism_limit {
+            let limit = limit as usize;
+            let active_role_agent_count = active_execution_agent_count_for_role(
+                task_store,
+                session_store,
+                session_id,
+                &chain,
+                role,
+            );
+            if active_role_agent_count >= limit {
+                return Err(SpawnedChildExecutionError::RoleCapacityExceeded {
+                    role: role.to_string(),
+                    active: active_role_agent_count,
+                    limit,
+                });
+            }
         }
 
         let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
@@ -745,6 +752,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                role_parallelism_limit: None,
                 now,
             })
             .expect("spawned child runtime registration should succeed");
@@ -837,6 +845,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                role_parallelism_limit: None,
                 now,
             })
             .expect_err("重复注册子任务必须被拒绝");
@@ -902,6 +911,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                role_parallelism_limit: None,
                 now,
             })
             .expect_err("仅执行注册表中已有的任务也必须被拒绝");
@@ -978,6 +988,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                role_parallelism_limit: None,
                 now,
             })
             .expect_err("SpawnGraph 冲突必须拒绝注册");
@@ -1145,6 +1156,7 @@ mod tests {
                         session_id: &session_id,
                         workspace_id: &workspace_id,
                         role,
+                        role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
                         now: UtcMillis(now.0 + (role_index * 5 + instance_index) as u64 + 1),
                     })
                     .expect("默认容量应允许每个角色同时运行五个代理实例");
@@ -1165,6 +1177,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
                 now: UtcMillis(now.0 + 10),
             })
             .expect_err("同一角色的第六个并发代理应被角色实例上限拒绝");
@@ -1213,8 +1226,202 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
                 now: UtcMillis(now.0 + 11),
             })
             .expect("同角色已有实例完成后，第六个代理应能占用释放的名额");
+    }
+
+    fn spawn_fixture(
+        label: &str,
+    ) -> (
+        TaskStore,
+        Mutex<SpawnGraph>,
+        SessionStore,
+        TaskExecutionRegistry,
+        SessionId,
+        Option<WorkspaceId>,
+        MissionId,
+        TaskId,
+        UtcMillis,
+    ) {
+        let task_store = TaskStore::new();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_store = SessionStore::new();
+        let registry = TaskExecutionRegistry::default();
+        let session_id = SessionId::new(format!("session-{label}"));
+        let workspace_id = Some(WorkspaceId::new(format!("workspace-{label}")));
+        let mission_id = MissionId::new(format!("mission-{label}"));
+        let root_task_id = TaskId::new(format!("task-root-{label}"));
+        let parent_worker_id = WorkerId::new(format!("worker-parent-{label}"));
+        let now = UtcMillis(30_000);
+        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: format!("chain-{label}"),
+                    workspace_id: workspace_id.clone(),
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: vec![parent_worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: root_task_id.clone(),
+                        worker_id: parent_worker_id,
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("stage-restart".to_string()),
+                        resume_token: None,
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                        thread_id: ThreadId::new(format!("thread-{label}-parent")),
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: format!("timeline-{label}"),
+                        trimmed_text: Some("spawn children".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: format!("turn-{label}"),
+                        turn_seq: 1,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "running".to_string(),
+                        user_message: Some("spawn children".to_string()),
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("测试执行链应创建");
+        (
+            task_store,
+            spawn_graph,
+            session_store,
+            registry,
+            session_id,
+            workspace_id,
+            mission_id,
+            root_task_id,
+            now,
+        )
+    }
+
+    #[test]
+    fn spawned_local_agent_child_registration_uses_role_parallelism_limit() {
+        let (
+            task_store,
+            spawn_graph,
+            session_store,
+            registry,
+            session_id,
+            workspace_id,
+            mission_id,
+            root_task_id,
+            now,
+        ) = spawn_fixture("role-limit");
+
+        let limited_first = test_task(
+            "task-child-role-limit-0",
+            root_task_id.as_str(),
+            &mission_id,
+        );
+        registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &limited_first,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "limited-role",
+                role_parallelism_limit: Some(1),
+                now: UtcMillis(now.0 + 1),
+            })
+            .expect("并发上限为 1 时应允许第一个实例");
+
+        let limited_second = test_task(
+            "task-child-role-limit-1",
+            root_task_id.as_str(),
+            &mission_id,
+        );
+        let limited_error = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &limited_second,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "limited-role",
+                role_parallelism_limit: Some(1),
+                now: UtcMillis(now.0 + 2),
+            })
+            .expect_err("并发上限为 1 时不应允许第二个活跃实例");
+        assert_eq!(
+            limited_error,
+            SpawnedChildExecutionError::RoleCapacityExceeded {
+                role: "limited-role".to_string(),
+                active: 1,
+                limit: 1,
+            }
+        );
+
+        task_store
+            .update_status_checked(&limited_first.task_id, TaskStatus::Running)
+            .expect("受限角色实例应进入运行态");
+        task_store
+            .complete_task(
+                &limited_first.task_id,
+                magi_core::TaskCompletionAttempt {
+                    output_refs: vec!["limited done".to_string()],
+                    final_response: Some("limited done".to_string()),
+                    evidence: Vec::new(),
+                },
+            )
+            .expect("完成受限角色实例后应释放容量");
+        registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &limited_second,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "limited-role",
+                role_parallelism_limit: Some(1),
+                now: UtcMillis(now.0 + 3),
+            })
+            .expect("前一个受限实例完成后应允许下一个实例");
+
+        for index in 0..=DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE {
+            let unlimited_child = test_task(
+                &format!("task-child-role-unlimited-{index}"),
+                root_task_id.as_str(),
+                &mission_id,
+            );
+            registry
+                .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                    task_store: &task_store,
+                    spawn_graph: &spawn_graph,
+                    session_store: &session_store,
+                    child_task: &unlimited_child,
+                    session_id: &session_id,
+                    workspace_id: &workspace_id,
+                    role: "unlimited-role",
+                    role_parallelism_limit: None,
+                    now: UtcMillis(now.0 + 4 + index as u64),
+                })
+                .expect("None 应表示不设置角色级并发上限");
+        }
     }
 }

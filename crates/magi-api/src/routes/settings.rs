@@ -1883,11 +1883,23 @@ async fn import_role(
         role.role_revision = 1;
     }
     let expected = if conflict == "overwrite" {
-        state
-            .agent_role_registry
-            .get(&role.id)
-            .filter(|_| state.agent_role_registry.is_user_defined(&role.id))
-            .map(|existing| existing.role_revision)
+        match state.agent_role_registry.get(&role.id) {
+            Some(existing) if state.agent_role_registry.is_user_defined(&role.id) => {
+                Some(existing.role_revision)
+            }
+            Some(_) => {
+                return Err(ApiError::Conflict(format!(
+                    "角色 {} 是系统内置角色，不能覆盖",
+                    role.id
+                )));
+            }
+            None => {
+                return Err(ApiError::Conflict(format!(
+                    "角色 {} 不存在，不能使用覆盖导入；请选择拒绝或另存为",
+                    role.id
+                )));
+            }
+        }
     } else {
         None
     };
@@ -2367,6 +2379,14 @@ mod tests {
                 "defaultUI": {"colorToken": "agent-data-analyst", "icon": "bar-chart"}
             }
         })
+    }
+
+    fn role_export_content(state: &ApiState, role_id: &str) -> String {
+        let role = state
+            .agent_role_registry
+            .get(role_id)
+            .expect("测试角色应存在");
+        magi_agent_role::serialize_role_markdown(&role)
     }
 
     #[test]
@@ -4101,6 +4121,49 @@ mod tests {
         .expect("另存为导入应成功");
         assert_eq!(renamed.0["role"]["templateId"], json!("round-trip-copy"));
         assert!(state.agent_role_registry.contains("round-trip-copy"));
+    }
+
+    #[tokio::test]
+    async fn role_import_overwrite_requires_existing_user_role() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+        let content = role_export_content(&state, "executor").replacen(
+            "id: executor",
+            "id: missing-overwrite-target",
+            1,
+        );
+
+        let missing = import_role(
+            State(state.clone()),
+            Json(json!({
+                "content": content,
+                "conflict": "overwrite",
+                "newId": "missing-overwrite-target"
+            })),
+        )
+        .await;
+        assert!(matches!(
+            missing,
+            Err(ApiError::Conflict(message)) if message.contains("不存在") && message.contains("覆盖导入")
+        ));
+        assert!(
+            !state
+                .agent_role_registry
+                .contains("missing-overwrite-target")
+        );
+
+        let builtin = import_role(
+            State(state.clone()),
+            Json(json!({
+                "content": role_export_content(&state, "executor"),
+                "conflict": "overwrite"
+            })),
+        )
+        .await;
+        assert!(matches!(
+            builtin,
+            Err(ApiError::Conflict(message)) if message.contains("系统内置") && message.contains("覆盖")
+        ));
     }
 
     #[tokio::test]

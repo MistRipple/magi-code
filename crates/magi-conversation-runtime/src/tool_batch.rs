@@ -901,6 +901,9 @@ fn execute_coordinator_tool(
                     session_id,
                     workspace_id,
                     role: &role,
+                    role_parallelism_limit: agent_role_registry
+                        .get(&role)
+                        .and_then(|definition| definition.parallelism_limit),
                     now,
                 },
             ) {
