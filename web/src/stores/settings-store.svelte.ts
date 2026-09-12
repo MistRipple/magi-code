@@ -1746,10 +1746,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     try {
       await upsertAgentRole(role, expectedRoleRevision);
       await loadRegistryData();
-      notifySettingsSuccess('角色已保存');
+      notifySettingsSuccess(i18n.t('settings.toast.roleSaved'));
     } catch (e) {
       console.error('[SettingsPanel] 保存角色失败:', e);
-      notifySettingsError('保存角色失败', e);
+      notifySettingsError(i18n.t('settings.toast.action.saveRole'), e);
       throw e;
     }
   }
@@ -1758,10 +1758,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     try {
       await deleteAgentRole(templateId, roleRevision);
       await loadRegistryData();
-      notifySettingsSuccess('角色已删除');
+      notifySettingsSuccess(i18n.t('settings.toast.roleDeleted'));
     } catch (e) {
       console.error('[SettingsPanel] 删除角色失败:', e);
-      notifySettingsError('删除角色失败', e);
+      notifySettingsError(i18n.t('settings.toast.action.deleteRole'), e);
       throw e;
     }
   }
@@ -1770,10 +1770,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     try {
       await importAgentRoleFile(content, conflict, newId);
       await loadRegistryData();
-      notifySettingsSuccess('角色已导入');
+      notifySettingsSuccess(i18n.t('settings.toast.roleImported'));
     } catch (e) {
       console.error('[SettingsPanel] 导入角色失败:', e);
-      notifySettingsError('导入角色失败', e);
+      notifySettingsError(i18n.t('settings.toast.action.importRole'), e);
       throw e;
     }
   }

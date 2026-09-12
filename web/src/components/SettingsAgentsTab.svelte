@@ -218,9 +218,10 @@
   }
 
   function draftFromTemplate(template: RoleTemplate, copy = false): RoleDraft {
+    const displayName = resolveLocalizedTemplateDisplayName(template);
     return {
       id: copy ? uniqueRoleId(`${template.templateId}-copy`) : template.templateId,
-      displayName: copy ? `${template.displayName} 副本` : template.displayName,
+      displayName: copy ? i18n.t('settings.agents.copyName', { name: displayName }) : displayName,
       description: template.description,
       positioning: template.profile.role,
       focus: listText(template.profile.focus),
@@ -270,14 +271,14 @@
     const displayName = draft.displayName.trim();
     const systemPrompt = draft.systemPrompt.trim();
     if (!displayName || !systemPrompt) {
-      editorError = '请填写显示名称和系统提示词';
+      editorError = i18n.t('settings.agents.validation.required');
       return;
     }
     const roleId = editorMode === 'edit'
       ? draft.id.trim()
       : uniqueRoleId(draft.id || displayName);
     if (!roleId) {
-      editorError = '角色配置无效，请返回后重试';
+      editorError = i18n.t('settings.agents.validation.invalid');
       return;
     }
     const payload: Record<string, unknown> = {
@@ -303,7 +304,7 @@
     if (draft.parallelismLimit.trim()) {
       const parallelismLimit = Number(draft.parallelismLimit.trim());
       if (!Number.isSafeInteger(parallelismLimit) || parallelismLimit <= 0) {
-        editorError = '并发上限必须是正整数';
+        editorError = i18n.t('settings.agents.validation.parallelismPositive');
         return;
       }
       payload.parallelismLimit = parallelismLimit;
@@ -313,7 +314,7 @@
       await saveRole(payload, draft.roleRevision);
       editorOpen = false;
     } catch (error) {
-      editorError = error instanceof Error ? error.message : '角色保存失败';
+      editorError = error instanceof Error ? error.message : i18n.t('settings.agents.error.saveFallback');
     } finally {
       editorBusy = false;
     }
@@ -321,7 +322,9 @@
 
   async function removeSelectedRole(template: RoleTemplate) {
     if (!template.deletable || template.roleRevision === undefined) return;
-    if (!window.confirm(`确定删除角色“${template.displayName}”吗？`)) return;
+    if (!window.confirm(i18n.t('settings.agents.confirmDelete', {
+      name: resolveLocalizedTemplateDisplayName(template),
+    }))) return;
     try {
       await deleteRole(template.templateId, template.roleRevision);
       selectedKey = null;
@@ -345,12 +348,12 @@
       await importRole(content, 'reject');
     } catch (error) {
       if (!(error instanceof AgentApiError) || error.status !== 409) {
-        editorError = error instanceof Error ? error.message : '角色导入失败';
+        editorError = error instanceof Error ? error.message : i18n.t('settings.agents.error.importFallback');
         return;
       }
-      const message = error instanceof Error ? error.message : '角色导入失败';
+      const message = error instanceof Error ? error.message : i18n.t('settings.agents.error.importFallback');
       try {
-        if (!window.confirm(`${message}\n\n点击“确定”覆盖已有用户角色，点击“取消”自动另存为新角色。`)) {
+        if (!window.confirm(`${message}\n\n${i18n.t('settings.agents.importConflictInstruction')}`)) {
           await importRole(content, 'rename');
         } else {
           await importRole(content, 'overwrite');
@@ -452,12 +455,12 @@
     {#if !editorOpen}
       <div class="agents-toolbar">
         <div>
-          <div class="toolbar-title">子代理角色</div>
-          <div class="toolbar-description">内置角色和我的角色共用同一套 Worker 调度能力</div>
+          <div class="toolbar-title">{i18n.t('settings.agents.toolbarTitle')}</div>
+          <div class="toolbar-description">{i18n.t('settings.agents.toolbarDescription')}</div>
         </div>
         <div class="toolbar-actions">
-          <button type="button" class="toolbar-button" onclick={chooseImportFile}>导入角色</button>
-          <button type="button" class="toolbar-button primary" onclick={openCreateRole}>新建角色</button>
+          <button type="button" class="toolbar-button" onclick={chooseImportFile}>{i18n.t('settings.agents.importRole')}</button>
+          <button type="button" class="toolbar-button primary" onclick={openCreateRole}>{i18n.t('settings.agents.createRole')}</button>
         </div>
         <input bind:this={importInput} class="visually-hidden" type="file" accept=".md,text/markdown" onchange={handleImportFile} />
       </div>
@@ -511,28 +514,28 @@
               <div class="role-editor-back-row">
                 <button type="button" class="editor-back-button" onclick={closeEditor} disabled={editorBusy}>
                   <span aria-hidden="true">←</span>
-                  返回角色列表
+                  {i18n.t('settings.agents.editor.back')}
                 </button>
               </div>
               <header class="role-editor-header">
                 <div>
-                  <div class="role-editor-eyebrow">角色配置</div>
-                  <h2 id="role-editor-title">{editorMode === 'create' ? '新建子代理角色' : '编辑子代理角色'}</h2>
-                  <p>角色会注册到 Magi 的 Worker 目录，系统会自动生成内部标识，并默认继承主模型。</p>
+                  <div class="role-editor-eyebrow">{i18n.t('settings.agents.editor.eyebrow')}</div>
+                  <h2 id="role-editor-title">{i18n.t(editorMode === 'create' ? 'settings.agents.editor.createTitle' : 'settings.agents.editor.editTitle')}</h2>
+                  <p>{i18n.t('settings.agents.editor.description')}</p>
                 </div>
               </header>
               <div class="role-editor-grid">
-                <label>显示名称<input bind:this={roleEditorDisplayNameInput} bind:value={draft.displayName} placeholder="例如：数据分析师" /></label>
-                <label class="wide">角色描述<input bind:value={draft.description} placeholder="说明这个角色解决什么问题" /></label>
-                <label class="wide">角色定位<input bind:value={draft.positioning} placeholder="例如：数据分析与验证" /></label>
-                <label>专长（每行一项）<textarea bind:value={draft.focus} rows="4"></textarea></label>
-                <label>约束（每行一项）<textarea bind:value={draft.constraints} rows="4"></textarea></label>
-                <label>输出偏好（每行一项）<textarea bind:value={draft.outputPreferences} rows="4"></textarea></label>
-                <label>核心职责（每行一项）<textarea bind:value={draft.ownerships} rows="4"></textarea></label>
-                <label class="wide">系统提示词<textarea bind:value={draft.systemPrompt} rows="8" placeholder="描述该 Worker 的职责、工作边界和输出要求"></textarea></label>
-                <label>并发上限（可选）<input bind:value={draft.parallelismLimit} inputmode="numeric" placeholder="不填表示不限" /></label>
+                <label>{i18n.t('settings.agents.editor.displayName')}<input bind:this={roleEditorDisplayNameInput} bind:value={draft.displayName} placeholder={i18n.t('settings.agents.editor.displayNamePlaceholder')} /></label>
+                <label class="wide">{i18n.t('settings.agents.editor.roleDescription')}<input bind:value={draft.description} placeholder={i18n.t('settings.agents.editor.roleDescriptionPlaceholder')} /></label>
+                <label class="wide">{i18n.t('settings.agents.editor.positioning')}<input bind:value={draft.positioning} placeholder={i18n.t('settings.agents.editor.positioningPlaceholder')} /></label>
+                <label>{i18n.t('settings.agents.editor.specialties')}<textarea bind:value={draft.focus} rows="4"></textarea></label>
+                <label>{i18n.t('settings.agents.editor.constraints')}<textarea bind:value={draft.constraints} rows="4"></textarea></label>
+                <label>{i18n.t('settings.agents.editor.outputPreferences')}<textarea bind:value={draft.outputPreferences} rows="4"></textarea></label>
+                <label>{i18n.t('settings.agents.editor.ownerships')}<textarea bind:value={draft.ownerships} rows="4"></textarea></label>
+                <label class="wide">{i18n.t('settings.agents.editor.systemPrompt')}<textarea bind:value={draft.systemPrompt} rows="8" placeholder={i18n.t('settings.agents.editor.systemPromptPlaceholder')}></textarea></label>
+                <label>{i18n.t('settings.agents.editor.parallelismLimit')}<input bind:value={draft.parallelismLimit} inputmode="numeric" placeholder={i18n.t('settings.agents.editor.parallelismLimitPlaceholder')} /></label>
                 <fieldset class="wide">
-                  <legend>信号偏好</legend>
+                  <legend>{i18n.t('settings.agents.editor.insights')}</legend>
                   <div class="checkbox-grid">
                     {#each ['decision', 'contract', 'risk', 'constraint'] as insight}
                       <label class="checkbox-label"><input type="checkbox" checked={draft.insights.includes(insight)} onchange={() => (draft.insights = draft.insights.includes(insight) ? draft.insights.filter((item) => item !== insight) : [...draft.insights, insight])} />{insightLabel(insight as 'decision' | 'contract' | 'risk' | 'constraint')}</label>
@@ -540,7 +543,7 @@
                   </div>
                 </fieldset>
                 <fieldset class="wide">
-                  <legend>可用专业能力</legend>
+                  <legend>{i18n.t('settings.agents.editor.capabilities')}</legend>
                   <div class="checkbox-grid capability-editor-grid">
                     {#each domainCapabilities as capability (capability.id)}
                       <label class="checkbox-label" title={capabilityDescription(capability)}><input type="checkbox" checked={draft.capabilities.includes(capability.id)} onchange={() => (draft.capabilities = draft.capabilities.includes(capability.id) ? draft.capabilities.filter((item) => item !== capability.id) : [...draft.capabilities, capability.id])} />{capabilityName(capability)}</label>
@@ -550,7 +553,7 @@
               </div>
               {#if editorError}<div class="role-editor-error" role="alert">{editorError}</div>{/if}
               <footer class="role-editor-footer">
-                <button type="submit" class="toolbar-button primary" disabled={editorBusy}>{editorBusy ? '保存中…' : '保存角色'}</button>
+                <button type="submit" class="toolbar-button primary" disabled={editorBusy}>{editorBusy ? i18n.t('settings.agents.editor.saving') : i18n.t('settings.agents.editor.save')}</button>
               </footer>
             </form>
           </div>
@@ -576,7 +579,7 @@
                     <div class="detail-title-stack">
                       <div class="detail-title-row">
                         <span class="detail-title">{selected.displayName}</span>
-                        <span class="source-badge source-{tmpl.source ?? 'builtin'}">{tmpl.source === 'user' ? '我的角色' : '系统内置'}</span>
+                        <span class="source-badge source-{tmpl.source ?? 'builtin'}">{i18n.t(tmpl.source === 'user' ? 'settings.agents.source.user' : 'settings.agents.source.builtin')}</span>
                         <span class="detail-status-pill status-{selected.status}">{statusTooltip(selected.status)}</span>
                       </div>
                       {#if positioning}
@@ -586,13 +589,13 @@
                         <p class="detail-description">{selected.description}</p>
                       {/if}
                       <div class="detail-actions">
-                        <button type="button" class="text-button" onclick={() => openCopyRole(tmpl)}>复制</button>
-                        <button type="button" class="text-button" onclick={() => exportSelectedRole(tmpl.templateId)}>导出</button>
+                        <button type="button" class="text-button" onclick={() => openCopyRole(tmpl)}>{i18n.t('settings.agents.action.copy')}</button>
+                        <button type="button" class="text-button" onclick={() => exportSelectedRole(tmpl.templateId)}>{i18n.t('settings.agents.action.export')}</button>
                         {#if tmpl.editable}
-                          <button type="button" class="text-button" onclick={() => openEditRole(tmpl)}>编辑</button>
+                          <button type="button" class="text-button" onclick={() => openEditRole(tmpl)}>{i18n.t('settings.agents.action.edit')}</button>
                         {/if}
                         {#if tmpl.deletable}
-                          <button type="button" class="text-button danger" onclick={() => removeSelectedRole(tmpl)}>删除</button>
+                          <button type="button" class="text-button danger" onclick={() => removeSelectedRole(tmpl)}>{i18n.t('settings.agents.action.delete')}</button>
                         {/if}
                       </div>
                     </div>

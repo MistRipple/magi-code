@@ -2758,7 +2758,7 @@ export async function upsertAgentRole(role: Record<string, unknown>, expectedRol
     },
     'upsert agent role',
   );
-  if (!payload.role) throw new Error('角色保存响应缺少 role');
+  if (!payload.role) throw new Error(i18n.t('settings.agents.error.saveResponse'));
   return payload.role;
 }
 
@@ -2776,14 +2776,16 @@ export async function importAgentRole(content: string, conflict: 'reject' | 'ove
     { content, conflict, ...(newId ? { newId } : {}) },
     'import agent role',
   );
-  if (!payload.role) throw new Error('角色导入响应缺少 role');
+  if (!payload.role) throw new Error(i18n.t('settings.agents.error.importResponse'));
   return payload.role;
 }
 
 export async function exportAgentRole(templateId: string): Promise<{ fileName: string; content: string }> {
   const response = await getTransport().request(agentUrl(`/api/settings/registry/roles/export?templateId=${encodeURIComponent(templateId)}`));
   const payload = await parseAgentJson<{ fileName?: string; content?: string }>(response, 'export agent role');
-  if (!payload.fileName || payload.content === undefined) throw new Error('角色导出响应不完整');
+  if (!payload.fileName || payload.content === undefined) {
+    throw new Error(i18n.t('settings.agents.error.exportResponse'));
+  }
   return { fileName: payload.fileName, content: payload.content };
 }
 
