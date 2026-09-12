@@ -1325,8 +1325,10 @@ pub struct ApiState {
     pub conversation_registry: Arc<ConversationRegistry>,
     pub(crate) terminal_sessions: crate::terminal_runtime::TerminalSessionManager,
     /// 任务系统：AgentRole 注册表（替代 task_worker_catalog 硬编码 prompt）。
-    /// 加载策略：`~/.magi/roles/*.json` 优先，回落到 crate 内置 builtin 集。
+    /// 加载策略：`~/.magi/roles/*.md` 与 crate 内置 builtin 集合并加载。
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
+    /// 角色定义与绑定共享同一把进程内事务锁，避免删除角色时并发写入悬空绑定。
+    pub(crate) role_configuration_lock: Arc<Mutex<()>>,
     /// 任务系统 — L5：父子任务关系图，作为 task_dispatch 中
     /// "parent_task_id 散落查询"的统一上层。同一进程共享。
     pub spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
@@ -1351,6 +1353,127 @@ const WORKSPACE_PERSISTENCE_PUBLIC_ERROR: &str = "工作区状态暂不可保存
 const KNOWLEDGE_PERSISTENCE_PUBLIC_ERROR: &str = "知识库状态暂不可保存，请稍后重试";
 const BROWSER_PERSISTENCE_PUBLIC_ERROR: &str = "浏览器状态暂不可保存，请稍后重试";
 const DEFAULT_BROWSER_PROFILE_ID: &str = "browser-profile-default";
+const ROLE_DELETE_JOURNAL_FILE: &str = "role-delete-transaction.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RoleDeleteTransaction {
+    role_id: String,
+    role_file_contents: Option<String>,
+    agents_section: Option<serde_json::Value>,
+    phase: RoleDeleteTransactionPhase,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RoleDeleteTransactionPhase {
+    Prepared,
+    Committed,
+}
+
+fn role_delete_journal_path(state_root: &Path) -> PathBuf {
+    state_root.join(ROLE_DELETE_JOURNAL_FILE)
+}
+
+fn role_delete_role_path(state_root: &Path, role_id: &str) -> Result<PathBuf, String> {
+    magi_agent_role::validate_role_id(role_id)
+        .map_err(|error| format!("角色删除事务中的 role_id 无效: {error}"))?;
+    Ok(state_root.join("roles").join(format!("{role_id}.md")))
+}
+
+pub(crate) fn prepare_role_delete_transaction(
+    state_root: &Path,
+    role_id: &str,
+    role_file_contents: Option<String>,
+    agents_section: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let _ = role_delete_role_path(state_root, role_id)?;
+    fs::create_dir_all(state_root).map_err(|error| format!("创建角色删除事务目录失败: {error}"))?;
+    let journal = RoleDeleteTransaction {
+        role_id: role_id.to_string(),
+        role_file_contents,
+        agents_section,
+        phase: RoleDeleteTransactionPhase::Prepared,
+    };
+    let content =
+        serde_json::to_vec(&journal).map_err(|error| format!("序列化角色删除事务失败: {error}"))?;
+    magi_core::fs_atomic::write_atomic(&role_delete_journal_path(state_root), content)
+        .map_err(|error| format!("写入角色删除事务失败: {error}"))
+}
+
+pub(crate) fn mark_role_delete_transaction_committed(state_root: &Path) -> Result<(), String> {
+    let path = role_delete_journal_path(state_root);
+    let content = fs::read(&path).map_err(|error| format!("读取角色删除事务失败: {error}"))?;
+    let mut journal: RoleDeleteTransaction = serde_json::from_slice(&content)
+        .map_err(|error| format!("解析角色删除事务失败: {error}"))?;
+    journal.phase = RoleDeleteTransactionPhase::Committed;
+    let content =
+        serde_json::to_vec(&journal).map_err(|error| format!("序列化角色删除事务失败: {error}"))?;
+    magi_core::fs_atomic::write_atomic(&path, content)
+        .map_err(|error| format!("提交角色删除事务失败: {error}"))
+}
+
+pub(crate) fn clear_role_delete_transaction(state_root: &Path) -> Result<(), String> {
+    let path = role_delete_journal_path(state_root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("清理角色删除事务失败: {error}")),
+    }
+}
+
+fn restore_role_delete_transaction(
+    state_root: &Path,
+    settings_store: &SettingsStore,
+    journal: &RoleDeleteTransaction,
+) -> Result<(), String> {
+    let role_path = role_delete_role_path(state_root, &journal.role_id)?;
+    match &journal.role_file_contents {
+        Some(contents) => {
+            let parent = role_path
+                .parent()
+                .ok_or_else(|| "角色文件缺少父目录".to_string())?;
+            fs::create_dir_all(parent).map_err(|error| format!("恢复角色目录失败: {error}"))?;
+            magi_core::fs_atomic::write_atomic(&role_path, contents.as_bytes())
+                .map_err(|error| format!("恢复角色文件失败: {error}"))?;
+        }
+        None => match fs::remove_file(&role_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("清理角色文件失败: {error}")),
+        },
+    }
+    match &journal.agents_section {
+        Some(value) => settings_store
+            .set_section("agents", value.clone())
+            .map_err(|error| format!("恢复角色绑定失败: {error}"))?,
+        None => settings_store
+            .remove_section("agents")
+            .map_err(|error| format!("清理角色绑定失败: {error}"))?,
+    }
+    Ok(())
+}
+
+/// 在 daemon 启动时恢复未完成的角色删除事务。
+///
+/// `prepared` 表示删除尚未形成可恢复的提交点，必须完整恢复删除前像；
+/// `committed` 表示角色文件与绑定都已删除，只需清理事务记录。
+pub fn recover_role_delete_transaction(
+    state_root: &Path,
+    settings_store: &SettingsStore,
+) -> Result<(), String> {
+    let path = role_delete_journal_path(state_root);
+    let content = match fs::read(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("读取角色删除事务失败: {error}")),
+    };
+    let journal: RoleDeleteTransaction = serde_json::from_slice(&content)
+        .map_err(|error| format!("解析角色删除事务失败: {error}"))?;
+    if journal.phase == RoleDeleteTransactionPhase::Prepared {
+        restore_role_delete_transaction(state_root, settings_store, &journal)?;
+    }
+    clear_role_delete_transaction(state_root)
+}
 
 impl RuntimeStatePersistence {
     pub fn new(
@@ -1728,6 +1851,7 @@ impl ApiState {
             conversation_registry: Arc::new(ConversationRegistry::new()),
             terminal_sessions: crate::terminal_runtime::TerminalSessionManager::default(),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
+            role_configuration_lock: Arc::new(Mutex::new(())),
             spawn_graph: Arc::new(Mutex::new(magi_spawn_graph::SpawnGraph::new())),
             session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
             session_turn_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -2038,10 +2162,15 @@ impl ApiState {
     }
 
     pub fn task_worker_catalog(&self) -> Vec<WorkerInfo> {
-        build_worker_catalog_for_roles(
-            &self.agent_role_registry,
-            registered_role_template_ids(self),
-        )
+        // Runner 同时承接主线 coordinator task 和 agent_spawn 创建的 Worker task。
+        // registry 对外的 role template 列表只包含可被 agent_spawn 派发的角色，
+        // 因此这里必须显式补入唯一的内部 coordinator，不能依赖 TaskRunner 的
+        // 角色不匹配回退，否则目标续跑会被错误标记为不可运行。
+        let mut role_ids = registered_role_template_ids(self);
+        if let Some(coordinator) = self.agent_role_registry.default_coordinator() {
+            role_ids.push(coordinator.id);
+        }
+        build_worker_catalog_for_roles(&self.agent_role_registry, role_ids)
     }
 
     pub fn with_bridge_probe(
@@ -4680,6 +4809,98 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    #[test]
+    fn prepared_role_delete_transaction_restores_role_and_binding_snapshot() {
+        let state_root = tempfile::tempdir().expect("状态根应创建");
+        let role_path = state_root.path().join("roles/restore-me.md");
+        let role_contents = "---\nid: restore-me\nsupported_kinds: [local_agent]\n---\n恢复角色\n";
+        std::fs::create_dir_all(role_path.parent().expect("角色目录应存在"))
+            .expect("角色目录应创建");
+        std::fs::write(&role_path, role_contents).expect("角色文件应写入");
+
+        let settings = SettingsStore::new();
+        let previous_agents = serde_json::json!([{
+            "templateId": "restore-me",
+            "engineId": "engine-a",
+            "bindingRevision": 3,
+        }]);
+        settings
+            .set_section("agents", previous_agents.clone())
+            .expect("绑定快照应写入");
+        prepare_role_delete_transaction(
+            state_root.path(),
+            "restore-me",
+            Some(role_contents.to_string()),
+            Some(previous_agents.clone()),
+        )
+        .expect("删除事务应准备");
+
+        std::fs::remove_file(&role_path).expect("应模拟角色文件删除");
+        settings
+            .set_section("agents", serde_json::json!([]))
+            .expect("应模拟绑定删除");
+
+        recover_role_delete_transaction(state_root.path(), &settings).expect("事务应恢复");
+        assert_eq!(
+            std::fs::read_to_string(&role_path).expect("角色文件应恢复"),
+            role_contents
+        );
+        assert_eq!(settings.get_section("agents"), previous_agents);
+        assert!(!role_delete_journal_path(state_root.path()).exists());
+    }
+
+    #[test]
+    fn committed_role_delete_transaction_keeps_deletion_and_only_clears_journal() {
+        let state_root = tempfile::tempdir().expect("状态根应创建");
+        let role_path = state_root.path().join("roles/committed.md");
+        let role_contents = "---\nid: committed\nsupported_kinds: [local_agent]\n---\n已提交\n";
+        std::fs::create_dir_all(role_path.parent().expect("角色目录应存在"))
+            .expect("角色目录应创建");
+        std::fs::write(&role_path, role_contents).expect("角色文件应写入");
+
+        let settings = SettingsStore::new();
+        settings
+            .set_section("agents", serde_json::json!([{"templateId": "committed"}]))
+            .expect("绑定快照应写入");
+        prepare_role_delete_transaction(
+            state_root.path(),
+            "committed",
+            Some(role_contents.to_string()),
+            Some(settings.get_section("agents")),
+        )
+        .expect("删除事务应准备");
+        std::fs::remove_file(&role_path).expect("应模拟角色文件删除");
+        settings.remove_section("agents").expect("应模拟绑定删除");
+        mark_role_delete_transaction_committed(state_root.path()).expect("事务应提交");
+
+        recover_role_delete_transaction(state_root.path(), &settings).expect("提交事务应收敛");
+        assert!(!role_path.exists());
+        assert!(settings.get_section("agents").is_null());
+        assert!(!role_delete_journal_path(state_root.path()).exists());
+    }
+
+    #[test]
+    fn role_delete_transaction_rejects_invalid_role_id_before_touching_files() {
+        let state_root = tempfile::tempdir().expect("状态根应创建");
+        let journal = serde_json::json!({
+            "role_id": "../outside",
+            "role_file_contents": null,
+            "agents_section": null,
+            "phase": "prepared",
+        });
+        std::fs::write(
+            role_delete_journal_path(state_root.path()),
+            serde_json::to_vec(&journal).expect("事务应序列化"),
+        )
+        .expect("非法事务应写入测试文件");
+
+        let error = recover_role_delete_transaction(state_root.path(), &SettingsStore::new())
+            .expect_err("非法 role_id 必须拒绝恢复");
+        assert!(error.contains("role_id"));
+        assert!(role_delete_journal_path(state_root.path()).exists());
+        assert!(!state_root.path().join("outside.md").exists());
+    }
+
     fn git_fixture(path: &Path, args: &[&str]) {
         let output = magi_process::std_command("git")
             .arg("-C")
@@ -5192,10 +5413,22 @@ mod tests {
         AgentRole {
             id: id.to_string(),
             system_prompt: format!("{id} prompt"),
+            display_name: id.to_string(),
+            description: String::new(),
             supported_kinds: vec![TaskKindLabel::LocalAgent],
             parallelism_limit: None,
             coordinator_mode: false,
             version: 1,
+            role_revision: 1,
+            role: id.to_string(),
+            focus: Vec::new(),
+            constraints: Vec::new(),
+            output_preferences: Vec::new(),
+            ownerships: Vec::new(),
+            insight_preferences: Vec::new(),
+            capabilities: vec!["general_engineering".to_string()],
+            color_token: format!("agent-{id}"),
+            icon: "bot".to_string(),
         }
     }
 
@@ -5251,6 +5484,31 @@ mod tests {
                 .as_deref(),
             Some("auditor")
         );
+    }
+
+    #[test]
+    fn task_worker_catalog_includes_custom_roles_and_internal_coordinator() {
+        let role_dir = tempfile::tempdir().expect("角色目录应创建");
+        let custom_registry =
+            Arc::new(AgentRoleRegistry::builtin().with_user_role_dir(role_dir.path()));
+        let mut custom_role = test_agent_role("data-analyst");
+        custom_role.display_name = "数据分析师".to_string();
+        custom_registry
+            .save_user_role(custom_role, None)
+            .expect("自定义角色应保存");
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_agent_role_registry(custom_registry);
+
+        let catalog = state.task_worker_catalog();
+        assert!(catalog.iter().any(|worker| worker.role == "data-analyst"));
+        assert!(catalog.iter().any(|worker| worker.role == "executor"));
+        assert!(catalog.iter().any(|worker| worker.role == "coordinator"));
     }
 
     #[test]

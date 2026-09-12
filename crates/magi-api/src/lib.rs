@@ -38,4 +38,5 @@ pub use state::{
     ExecutionResourceCancellationReport, ExecutionResourceCoordinator, RunnerManager,
     RunnerStartError, RunnerStopError, RuntimeStatePersistence, SessionProjectionPersistMode,
     TaskCheckpointPersist, build_runtime_capability_dependency_provider,
+    recover_role_delete_transaction,
 };

@@ -342,18 +342,7 @@ fn parse_capability_markdown(raw: &str) -> Result<ProfessionalCapability, String
 }
 
 fn parse_string_list(value: &str, line: usize, field: &str) -> Result<Vec<String>, String> {
-    let inner = value
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .ok_or_else(|| format!("第 {line} 行 {field} 期望 [a, b] 格式"))?;
-    let mut values = Vec::new();
-    for item in inner.split(',') {
-        let item = super::strip_inline_quotes(item.trim());
-        if !item.is_empty() && !values.iter().any(|value| value == item) {
-            values.push(item.to_string());
-        }
-    }
-    Ok(values)
+    super::parse_bracket_string_list(value, line, field)
 }
 
 #[cfg(test)]

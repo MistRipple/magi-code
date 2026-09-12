@@ -232,6 +232,8 @@ import { getAgentColor } from '../lib/agent-colors';
         <SettingsAgentsTab roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} registryEngines={store.registryEngines}
           inheritModelLabel={store.orchConfig.model ?? ''} modelStatuses={store.modelStatuses}
           {getAgentColor} getWorkerDisplayName={store.getWorkerDisplayName} updateRoleEngine={store.updateRoleEngine}
+          saveRole={store.saveAgentRoleDefinition} deleteRole={store.removeAgentRoleDefinition}
+          importRole={store.importAgentRoleDefinition} exportRole={store.exportAgentRoleDefinition}
         />
       {:else if store.activeTab === 'rules'}
         <!-- 规则 Tab -->

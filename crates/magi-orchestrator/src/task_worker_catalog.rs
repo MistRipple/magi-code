@@ -31,10 +31,12 @@ pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
 }
 
 pub fn resolve_task_role<'a>(task: &'a Task, registry: &AgentRoleRegistry) -> Option<&'a str> {
-    if let Some(role) = task.executor_binding_target_role()
-        && registry.role_supports_task_kind(role, task.kind)
-    {
-        return Some(role);
+    if let Some(role) = task.executor_binding_target_role() {
+        // 任务已经显式绑定角色时，非法或不支持当前 TaskKind 的角色必须让
+        // 调度层明确返回“无匹配”，不能静默改派到 executor 掩盖配置错误。
+        return registry
+            .role_supports_task_kind(role, task.kind)
+            .then_some(role);
     }
     default_task_role_for_kind(task.kind)
 }
@@ -156,6 +158,9 @@ impl DynamicWorkerCatalog {
 
     pub fn find_for_task(&self, task: &Task, registry: &AgentRoleRegistry) -> Vec<WorkerInfo> {
         let required_role = resolve_task_role(task, registry);
+        if task.executor_binding_target_role().is_some() && required_role.is_none() {
+            return Vec::new();
+        }
         let workers = self.workers.read().expect("catalog read lock poisoned");
         workers
             .values()

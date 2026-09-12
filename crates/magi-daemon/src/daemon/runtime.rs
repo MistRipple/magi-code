@@ -69,6 +69,32 @@ use tracing::{info, warn};
 #[cfg(test)]
 struct StaticTestModelBridgeClient;
 
+/// 测试夹具的 workspace 必须与 daemon 全局状态根保持物理分离。
+///
+/// 生产启动会拒绝两类状态根重叠；测试不能通过把 workspace 放进 state_root
+/// 来绕过这条边界，否则所有重启恢复测试都会失去真实覆盖价值。
+#[cfg(test)]
+fn test_fixture_sibling_root(state_root: &Path, suffix: &str) -> PathBuf {
+    let name = state_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("magi-daemon-test-state");
+    state_root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{name}-{suffix}"))
+}
+
+#[cfg(test)]
+fn test_fixture_workspace_root(state_root: &Path) -> PathBuf {
+    test_fixture_sibling_root(state_root, "workspace")
+}
+
+#[cfg(test)]
+fn test_fixture_worktree_root(state_root: &Path) -> PathBuf {
+    test_fixture_sibling_root(state_root, "worktrees")
+}
+
 fn build_external_tool_catalog_provider(
     settings_store: Arc<SettingsStore>,
     skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
@@ -233,6 +259,7 @@ fn build_agent_role_catalog_provider(
     Arc::new(move || {
         let mut roles = registry
             .all()
+            .into_iter()
             .map(|role| {
                 let spawnable = registry.is_spawnable_agent_role(&role.id);
                 let status = if spawnable {
@@ -1045,8 +1072,9 @@ impl DaemonRuntime {
 
         let session_id = SessionId::new("test-session-001");
         let workspace_id = magi_core::WorkspaceId::new("test-workspace-001");
-        let workspace_root = config.state_root.join("test-workspace");
-        let worktree_root = config.state_root.join("test-worktrees/test-worktree-001");
+        let workspace_root = test_fixture_workspace_root(&config.state_root);
+        let worktree_root =
+            test_fixture_worktree_root(&config.state_root).join("test-worktree-001");
         std::fs::create_dir_all(&workspace_root)?;
 
         runtime
@@ -1223,13 +1251,18 @@ impl DaemonRuntime {
         settings_store
             .load_from_disk()
             .map_err(|error| DaemonError::internal(format!("加载设置文件失败: {error}")))?;
+        magi_api::recover_role_delete_transaction(&self.state_root, &settings_store)
+            .map_err(|error| DaemonError::internal(format!("恢复代理角色删除事务失败: {error}")))?;
         let appearance_library = Arc::new(
             magi_appearance::AppearanceLibrary::open(self.state_root.join("appearance"))
                 .map_err(|error| DaemonError::internal(format!("加载外观主题失败: {error}")))?,
         );
         Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env)
             .map_err(|error| DaemonError::internal(format!("保存环境模型设置失败: {error}")))?;
-        let agent_role_registry = Arc::new(magi_agent_role::AgentRoleRegistry::load_default());
+        let agent_role_registry = Arc::new(
+            magi_agent_role::AgentRoleRegistry::load_from_state_root(&self.state_root)
+                .map_err(|error| DaemonError::internal(format!("加载代理角色失败: {error}")))?,
+        );
         let app_skill_runtime = Arc::new(
             magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store).map_err(
                 |error| DaemonError::internal(format!("规范化 Skill 设置失败: {error}")),
@@ -2498,6 +2531,7 @@ mod tests {
         DaemonRuntime, SettingsBackedMcpBridgeClient, build_agent_role_catalog_provider,
         external_mcp_server_catalog_entry, fail_orphan_session_root_tasks,
         publish_task_status_changed_event, reconcile_terminal_task_execution_threads,
+        test_fixture_sibling_root,
     };
     use crate::daemon::{config::DaemonConfig, persistence::StateRepository};
     use axum::{
@@ -2684,7 +2718,7 @@ done
     }
 
     fn test_workspace_root(config: &DaemonConfig) -> PathBuf {
-        config.state_root.join("test-workspace")
+        super::test_fixture_workspace_root(&config.state_root)
     }
 
     fn seed_registered_test_workspace(config: &DaemonConfig, session_id: Option<&str>) {
@@ -3562,7 +3596,7 @@ done
     async fn restore_defers_code_index_rebuild_for_registered_workspaces() {
         let state_root = temp_state_root("multi-workspace-code-index");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-        let secondary_root = state_root.join("secondary-workspace");
+        let secondary_root = test_fixture_sibling_root(&state_root, "secondary-workspace");
         fs::create_dir_all(secondary_root.join("src")).unwrap();
         fs::write(
             secondary_root.join("src/lib.rs"),

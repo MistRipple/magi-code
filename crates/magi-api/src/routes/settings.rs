@@ -559,6 +559,10 @@ pub fn routes() -> Router<ApiState> {
             "/settings/registry/role-templates",
             get(list_role_templates),
         )
+        .route("/settings/registry/roles/upsert", post(upsert_role))
+        .route("/settings/registry/roles/delete", post(delete_role))
+        .route("/settings/registry/roles/import", post(import_role))
+        .route("/settings/registry/roles/export", get(export_role))
         .route("/settings/registry/engines", get(list_engines))
         .route("/settings/registry/engines/upsert", post(upsert_engine))
         .route("/settings/registry/engines/remove", post(remove_engine))
@@ -570,142 +574,65 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/stats/reset", post(reset_stats))
 }
 
-pub(crate) fn builtin_role_templates() -> Vec<Value> {
-    // 这里只暴露可被 agent_spawn 派发的代理角色。
-    // coordinator 是主线编排的内部身份，由主模型承接，不进入用户可配置角色列表。
-    vec![
-        json!({
-            "templateId": "executor",
-            "displayName": "Executor",
-            "description": "负责从根因落地边界清晰的实现，并完成清理与验证",
-            "i18n": {
-                "displayNameKey": "roleTemplate.executor.displayName",
-                "descriptionKey": "roleTemplate.executor.description",
-            },
-            "defaultUI": { "colorToken": "agent-executor", "icon": "tool" },
-            "profile": {
-                "role": "executor",
-                "focus": ["implementation", "integration", "cleanup", "verification"],
-                "constraints": ["fix-at-source", "preserve-authoritative-state"],
-                "outputPreferences": ["changes", "validation", "remaining-risk"],
-            },
-            "ownerships": ["implementation"],
-            "insightPreferences": ["decision", "contract", "risk"],
-        }),
-        json!({
-            "templateId": "explorer",
-            "displayName": "Explorer",
-            "description": "负责只读搜索、复现、证据收集与根因定位",
-            "i18n": {
-                "displayNameKey": "roleTemplate.explorer.displayName",
-                "descriptionKey": "roleTemplate.explorer.description",
-            },
-            "defaultUI": { "colorToken": "agent-explorer", "icon": "bug" },
-            "profile": {
-                "role": "explorer",
-                "focus": ["reproduction", "root-cause", "evidence", "data-flow"],
-                "constraints": ["read-only", "no-assumption-without-evidence"],
-                "outputPreferences": ["scope", "evidence", "next-step"],
-            },
-            "ownerships": ["investigation"],
-            "insightPreferences": ["decision", "risk", "constraint"],
-        }),
-        json!({
-            "templateId": "reviewer",
-            "displayName": "Reviewer",
-            "description": "负责独立审查行为回归、状态冲突与交付风险",
-            "i18n": {
-                "displayNameKey": "roleTemplate.reviewer.displayName",
-                "descriptionKey": "roleTemplate.reviewer.description",
-            },
-            "defaultUI": { "colorToken": "agent-reviewer", "icon": "shield" },
-            "profile": {
-                "role": "reviewer",
-                "focus": ["regression", "state-consistency", "security", "maintainability"],
-                "constraints": ["read-only", "evidence-before-finding"],
-                "outputPreferences": ["findings", "severity", "test-gaps"],
-            },
-            "ownerships": ["quality"],
-            "insightPreferences": ["risk", "constraint", "decision"],
-        }),
-        json!({
-            "templateId": "tester",
-            "displayName": "Tester",
-            "description": "负责测试矩阵、故障注入、真实场景与恢复验证",
-            "i18n": {
-                "displayNameKey": "roleTemplate.tester.displayName",
-                "descriptionKey": "roleTemplate.tester.description",
-            },
-            "defaultUI": { "colorToken": "agent-tester", "icon": "check-circle" },
-            "profile": {
-                "role": "tester",
-                "focus": ["test-matrix", "fault-injection", "recovery", "real-workflow"],
-                "constraints": ["evidence-before-pass", "report-uncovered-scope"],
-                "outputPreferences": ["matrix", "results", "uncovered-scope"],
-            },
-            "ownerships": ["verification"],
-            "insightPreferences": ["risk", "constraint"],
-        }),
-        json!({
-            "templateId": "architect",
-            "displayName": "Architect",
-            "description": "负责产品目标、用户工作流、系统边界与长期演进裁决",
-            "i18n": {
-                "displayNameKey": "roleTemplate.architect.displayName",
-                "descriptionKey": "roleTemplate.architect.description",
-            },
-            "defaultUI": { "colorToken": "agent-architect", "icon": "grid" },
-            "profile": {
-                "role": "architect",
-                "focus": ["product-intent", "user-workflow", "architecture", "boundaries"],
-                "constraints": ["single-source-of-truth", "design-for-evolution"],
-                "outputPreferences": ["decision", "data-flow", "acceptance-criteria"],
-            },
-            "ownerships": ["architecture"],
-            "insightPreferences": ["decision", "constraint", "risk"],
-        }),
-    ]
-}
-
+/// 生成前端角色 DTO 的唯一入口。内置和用户角色都从同一个规范 AgentRole 生成，
+/// API 不再维护一份独立的角色模板数组。
 pub(crate) fn role_templates_for_registry(
     registry: &magi_agent_role::AgentRoleRegistry,
 ) -> Vec<Value> {
-    builtin_role_templates()
+    registry
+        .all()
         .into_iter()
-        .map(|mut template| {
-            let template_id = template["templateId"]
-                .as_str()
-                .expect("内置角色模板必须包含 templateId");
+        .filter(|role| registry.is_spawnable_agent_role(&role.id))
+        .map(|role| {
             let capabilities = registry
-                .capability_summaries_for_role(template_id)
+                .capability_summaries_for_role(&role.id)
                 .into_iter()
-                .map(|capability| {
-                    serde_json::to_value(capability).expect("专业能力摘要必须可以序列化")
-                })
+                .map(|capability| serde_json::to_value(capability).expect("能力摘要必须可序列化"))
                 .collect::<Vec<_>>();
-            template
-                .as_object_mut()
-                .expect("内置角色模板必须是对象")
-                .insert("capabilities".to_string(), Value::Array(capabilities));
-            template
+            json!({
+                "templateId": role.id,
+                "displayName": role.display_name,
+                "description": role.description,
+                "i18n": {
+                    "displayNameKey": format!("roleTemplate.{}.displayName", role.id),
+                    "descriptionKey": format!("roleTemplate.{}.description", role.id),
+                },
+                "source": if registry.is_builtin(&role.id) { "builtin" } else { "user" },
+                "editable": !registry.is_builtin(&role.id),
+                "deletable": !registry.is_builtin(&role.id),
+                "version": role.version,
+                "roleRevision": role.role_revision,
+                "supportedKinds": role.supported_kinds,
+                "parallelismLimit": role.parallelism_limit,
+                "coordinatorMode": role.coordinator_mode,
+                "systemPrompt": role.system_prompt,
+                "defaultUI": { "colorToken": role.color_token, "icon": role.icon },
+                "profile": {
+                    "role": role.role,
+                    "focus": role.focus,
+                    "constraints": role.constraints,
+                    "outputPreferences": role.output_preferences,
+                },
+                "ownerships": role.ownerships,
+                "insightPreferences": role.insight_preferences,
+                "capabilities": capabilities,
+            })
         })
         .collect()
 }
 
-fn builtin_template_ids() -> HashSet<String> {
-    builtin_role_templates()
+fn template_ids_for_registry(registry: &magi_agent_role::AgentRoleRegistry) -> HashSet<String> {
+    role_templates_for_registry(registry)
         .iter()
-        .filter_map(|template| {
-            template
-                .get("templateId")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
+        .filter_map(|template| template.get("templateId").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
         .collect()
 }
 
-fn builtin_template_order_map() -> HashMap<String, usize> {
-    builtin_role_templates()
+fn template_order_map_for_registry(
+    registry: &magi_agent_role::AgentRoleRegistry,
+) -> HashMap<String, usize> {
+    role_templates_for_registry(registry)
         .into_iter()
         .enumerate()
         .filter_map(|(index, template)| {
@@ -921,9 +848,9 @@ fn load_agent_overrides(
 }
 
 pub(crate) fn resolve_registry_agents(state: &ApiState) -> Vec<Value> {
-    let templates = builtin_role_templates();
-    let template_ids = builtin_template_ids();
-    let order_map = builtin_template_order_map();
+    let templates = role_templates_for_registry(state.agent_role_registry.as_ref());
+    let template_ids = template_ids_for_registry(state.agent_role_registry.as_ref());
+    let order_map = template_order_map_for_registry(state.agent_role_registry.as_ref());
     let overrides = load_agent_overrides(state, &template_ids, &order_map);
     let override_map: HashMap<String, Value> = overrides
         .into_iter()
@@ -1506,6 +1433,493 @@ async fn list_role_templates(
     }))
 }
 
+fn role_error(error: magi_agent_role::AgentRoleError) -> ApiError {
+    match error {
+        magi_agent_role::AgentRoleError::Conflict(message) => ApiError::Conflict(message),
+        magi_agent_role::AgentRoleError::InvalidDefinition(message)
+        | magi_agent_role::AgentRoleError::Parse { message, .. } => ApiError::InvalidInput(message),
+        magi_agent_role::AgentRoleError::Io { path, source } => ApiError::InternalAssemblyError(
+            format!("角色文件持久化失败: {}: {source}", path.display()),
+        ),
+        magi_agent_role::AgentRoleError::InvalidId { path, file_stem } => {
+            ApiError::InvalidInput(format!(
+                "角色文件 {} 的 ID 无效（文件名 {}）",
+                path.display(),
+                file_stem
+            ))
+        }
+    }
+}
+
+fn strict_string_field(value: &Value, names: &[&str], label: &str) -> Result<String, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(String::new());
+    };
+    let Some(raw) = raw.as_str() else {
+        return Err(ApiError::InvalidInput(format!("{label} 必须是字符串")));
+    };
+    Ok(raw.trim().to_string())
+}
+
+fn strict_string_list_field(
+    value: &Value,
+    names: &[&str],
+    label: &str,
+) -> Result<Vec<String>, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(ApiError::InvalidInput(format!("{label} 必须是字符串数组")));
+    };
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let value = if let Some(value) = item.as_str() {
+            value.trim().to_string()
+        } else if let Some(value) = item.get("id").and_then(Value::as_str) {
+            value.trim().to_string()
+        } else {
+            return Err(ApiError::InvalidInput(format!(
+                "{label} 的每个元素必须是字符串或带 id 的能力对象"
+            )));
+        };
+        if !value.is_empty() {
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+fn strict_object_field(value: &Value, names: &[&str], label: &str) -> Result<Value, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(json!({}));
+    };
+    if !raw.is_object() {
+        return Err(ApiError::InvalidInput(format!("{label} 必须是对象")));
+    }
+    Ok(raw.clone())
+}
+
+fn strict_optional_u32_field(
+    value: &Value,
+    names: &[&str],
+    label: &str,
+) -> Result<Option<u32>, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(number) = raw.as_u64() else {
+        return Err(ApiError::InvalidInput(format!(
+            "{label} 必须是非负整数或 null"
+        )));
+    };
+    let number = u32::try_from(number)
+        .map_err(|_| ApiError::InvalidInput(format!("{label} 超出允许范围")))?;
+    Ok(Some(number))
+}
+
+fn strict_u32_field(
+    value: &Value,
+    names: &[&str],
+    default: u32,
+    label: &str,
+) -> Result<u32, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(default);
+    };
+    let Some(number) = raw.as_u64() else {
+        return Err(ApiError::InvalidInput(format!("{label} 必须是非负整数")));
+    };
+    u32::try_from(number).map_err(|_| ApiError::InvalidInput(format!("{label} 超出允许范围")))
+}
+
+fn strict_u64_field(
+    value: &Value,
+    names: &[&str],
+    default: u64,
+    label: &str,
+) -> Result<u64, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(default);
+    };
+    raw.as_u64()
+        .ok_or_else(|| ApiError::InvalidInput(format!("{label} 必须是非负整数")))
+}
+
+fn strict_optional_u64_field(
+    value: &Value,
+    names: &[&str],
+    label: &str,
+) -> Result<Option<u64>, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    raw.as_u64()
+        .map(Some)
+        .ok_or_else(|| ApiError::InvalidInput(format!("{label} 必须是非负整数或 null")))
+}
+
+fn strict_optional_string_field(
+    value: &Value,
+    names: &[&str],
+    label: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    raw.as_str()
+        .map(|value| value.trim().to_string())
+        .map(Some)
+        .ok_or_else(|| ApiError::InvalidInput(format!("{label} 必须是字符串或 null")))
+}
+
+fn strict_bool_field(
+    value: &Value,
+    names: &[&str],
+    default: bool,
+    label: &str,
+) -> Result<bool, ApiError> {
+    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(default);
+    };
+    raw.as_bool()
+        .ok_or_else(|| ApiError::InvalidInput(format!("{label} 必须是布尔值")))
+}
+
+fn role_from_value(value: &Value) -> Result<magi_agent_role::AgentRole, ApiError> {
+    let id = strict_string_field(value, &["id", "templateId", "template_id"], "角色 id")?;
+    let supported_kinds_value = value
+        .get("supportedKinds")
+        .or_else(|| value.get("supported_kinds"))
+        .cloned()
+        .unwrap_or_else(|| json!(["local_agent"]));
+    let supported_kinds = serde_json::from_value(supported_kinds_value)
+        .map_err(|error| ApiError::InvalidInput(format!("supportedKinds 无效: {error}")))?;
+    let profile = strict_object_field(value, &["profile"], "profile")?;
+    let default_ui = strict_object_field(value, &["defaultUI", "default_ui"], "defaultUI")?;
+    let parallelism_limit = strict_optional_u32_field(
+        value,
+        &["parallelismLimit", "parallelism_limit"],
+        "parallelismLimit",
+    )?;
+    let coordinator_mode = strict_bool_field(
+        value,
+        &["coordinatorMode", "coordinator_mode"],
+        false,
+        "coordinatorMode",
+    )?;
+    let version = strict_u32_field(value, &["version"], 1, "version")?;
+    let role_revision =
+        strict_u64_field(value, &["roleRevision", "role_revision"], 1, "roleRevision")?;
+    magi_agent_role::normalize_role(magi_agent_role::AgentRole {
+        id,
+        system_prompt: strict_string_field(
+            value,
+            &["systemPrompt", "system_prompt"],
+            "systemPrompt",
+        )?,
+        display_name: strict_string_field(value, &["displayName", "display_name"], "displayName")?,
+        description: strict_string_field(value, &["description"], "description")?,
+        supported_kinds,
+        parallelism_limit,
+        coordinator_mode,
+        version,
+        role_revision,
+        role: strict_string_field(&profile, &["role"], "profile.role")?,
+        focus: strict_string_list_field(&profile, &["focus"], "profile.focus")?,
+        constraints: strict_string_list_field(&profile, &["constraints"], "profile.constraints")?,
+        output_preferences: strict_string_list_field(
+            &profile,
+            &["outputPreferences", "output_preferences"],
+            "profile.outputPreferences",
+        )?,
+        ownerships: strict_string_list_field(value, &["ownerships"], "ownerships")?,
+        insight_preferences: strict_string_list_field(
+            value,
+            &["insightPreferences", "insight_preferences"],
+            "insightPreferences",
+        )?,
+        capabilities: strict_string_list_field(value, &["capabilities"], "capabilities")?,
+        color_token: strict_string_field(
+            &default_ui,
+            &["colorToken", "color_token"],
+            "defaultUI.colorToken",
+        )?,
+        icon: strict_string_field(&default_ui, &["icon"], "defaultUI.icon")?,
+    })
+    .map_err(ApiError::InvalidInput)
+}
+
+fn role_response(state: &ApiState, role: magi_agent_role::AgentRole) -> Value {
+    let template = role_templates_for_registry(state.agent_role_registry.as_ref())
+        .into_iter()
+        .find(|template| {
+            template.get("templateId").and_then(Value::as_str) == Some(role.id.as_str())
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "role": template,
+        "registryRevision": state.agent_role_registry.registry_revision(),
+        "agents": resolve_registry_agents(state),
+    })
+}
+
+async fn upsert_role(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let _configuration_guard = state
+        .role_configuration_lock
+        .lock()
+        .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
+    let role_value = request.get("role").unwrap_or(&request);
+    let role = role_from_value(role_value)?;
+    let expected = strict_optional_u64_field(
+        &request,
+        &["expectedRoleRevision", "expected_role_revision"],
+        "expectedRoleRevision",
+    )?;
+    let saved = state
+        .agent_role_registry
+        .save_user_role(role, expected)
+        .map_err(role_error)?;
+    Ok(Json(role_response(&state, saved)))
+}
+
+async fn delete_role(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let _configuration_guard = state
+        .role_configuration_lock
+        .lock()
+        .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
+    let role_id = strict_string_field(&request, &["templateId", "id"], "角色 ID")?;
+    magi_agent_role::validate_role_id(&role_id).map_err(ApiError::InvalidInput)?;
+    let role = state
+        .agent_role_registry
+        .get(&role_id)
+        .ok_or_else(|| ApiError::not_found("角色不存在", &role_id))?;
+    if state.agent_role_registry.is_builtin(&role_id) {
+        return Err(ApiError::Conflict(format!(
+            "角色 {} 是系统内置角色，不能删除",
+            role_id
+        )));
+    }
+    let expected = strict_optional_u64_field(
+        &request,
+        &["expectedRoleRevision", "expected_role_revision"],
+        "expectedRoleRevision",
+    )?;
+    if expected != Some(role.role_revision) {
+        return Err(ApiError::Conflict(format!(
+            "角色 {} 已被其他窗口修改，请刷新后重试",
+            role_id
+        )));
+    }
+    if let Some(task_store) = state.task_store()
+        && let Some((_, lease_id)) =
+            task_store
+                .collect_all_active_leases()
+                .into_iter()
+                .find(|(_, lease_id)| {
+                    task_store
+                        .get_lease(lease_id)
+                        .is_some_and(|lease| lease.role == role_id)
+                })
+    {
+        return Err(ApiError::Conflict(format!(
+            "角色 {} 正在被运行中的 Worker 使用（租约 {}），请等待任务结束后再删除",
+            role_id, lease_id
+        )));
+    }
+    // 先把删除前像写入状态根事务日志，再把绑定和角色文件作为一个可恢复操作提交。
+    // daemon 崩溃在任一中间点时，启动恢复会按日志恢复完整删除前像。
+    let previous_agents = state.settings_store.get("agents");
+    let role_file_path = state
+        .agent_role_registry
+        .user_role_dir()
+        .join(format!("{role_id}.md"));
+    let previous_role_file = match std::fs::read_to_string(&role_file_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ApiError::InternalAssemblyError(format!(
+                "读取角色删除前像失败: {}: {error}",
+                role_file_path.display()
+            )));
+        }
+    };
+    let state_root = state.runtime_persistence().map(|persistence| {
+        persistence
+            .state_root()
+            .expect("runtime persistence 必须包含 state root")
+    });
+    if let Some(state_root) = state_root {
+        crate::state::prepare_role_delete_transaction(
+            state_root,
+            &role_id,
+            previous_role_file,
+            previous_agents.clone(),
+        )
+        .map_err(ApiError::InternalAssemblyError)?;
+    }
+
+    let template_ids = template_ids_for_registry(state.agent_role_registry.as_ref());
+    let order_map = template_order_map_for_registry(state.agent_role_registry.as_ref());
+    let mut overrides = load_agent_overrides(&state, &template_ids, &order_map);
+    overrides
+        .retain(|entry| entry.get("templateId").and_then(Value::as_str) != Some(role_id.as_str()));
+    if let Err(error) = state
+        .settings_store
+        .set_section("agents", Value::Array(overrides))
+    {
+        if let Some(state_root) = state_root {
+            let _ =
+                crate::state::recover_role_delete_transaction(state_root, &state.settings_store);
+        }
+        return Err(settings_persistence_error(error));
+    }
+    if let Err(error) = state
+        .agent_role_registry
+        .delete_user_role(&role_id, expected)
+    {
+        let restore_result = if let Some(state_root) = state_root {
+            crate::state::recover_role_delete_transaction(state_root, &state.settings_store)
+        } else {
+            match previous_agents {
+                Some(previous_agents) => state
+                    .settings_store
+                    .set_section("agents", previous_agents)
+                    .map_err(|error| error.to_string()),
+                None => state
+                    .settings_store
+                    .remove_section("agents")
+                    .map_err(|error| error.to_string()),
+            }
+        };
+        if let Err(restore_error) = restore_result {
+            return Err(ApiError::InternalAssemblyError(format!(
+                "角色删除失败且绑定恢复失败: {}; 请重新加载设置后处理角色 {}（恢复错误: {restore_error}）",
+                error, role_id
+            )));
+        }
+        return Err(role_error(error));
+    }
+    if let Some(state_root) = state_root {
+        if let Err(error) = crate::state::mark_role_delete_transaction_committed(state_root) {
+            let recovery =
+                crate::state::recover_role_delete_transaction(state_root, &state.settings_store);
+            let reload = state.agent_role_registry.reload_from_disk();
+            return Err(ApiError::InternalAssemblyError(match (recovery, reload) {
+                (Ok(()), Ok(_)) => format!("角色删除提交记录失败，已恢复删除前状态: {error}"),
+                (recovery, reload) => format!(
+                    "角色删除提交记录失败，且恢复失败: {error}; recovery={recovery:?}; reload={reload:?}"
+                ),
+            }));
+        }
+        if let Err(error) = crate::state::clear_role_delete_transaction(state_root) {
+            tracing::warn!(%error, role_id = %role_id, "角色删除已提交，但事务日志清理失败，将在下次启动清理");
+        }
+    }
+    Ok(Json(json!({
+        "deleted": role_id,
+        "registryRevision": state.agent_role_registry.registry_revision(),
+        "templates": role_templates_for_registry(state.agent_role_registry.as_ref()),
+        "agents": resolve_registry_agents(&state),
+    })))
+}
+
+async fn import_role(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let _configuration_guard = state
+        .role_configuration_lock
+        .lock()
+        .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
+    let content = request
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::InvalidInput("导入内容不能为空".to_string()))?;
+    if content.chars().count() > 100_000 {
+        return Err(ApiError::InvalidInput(
+            "导入文件不能超过 100000 个字符".to_string(),
+        ));
+    }
+    let mut role = magi_agent_role::parse_role_markdown(content)
+        .map_err(ApiError::InvalidInput)
+        .and_then(|role| magi_agent_role::normalize_role(role).map_err(ApiError::InvalidInput))?;
+    let conflict = request
+        .get("conflict")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| ApiError::InvalidInput("conflict 必须是字符串".to_string()))
+        })
+        .transpose()?
+        .unwrap_or("reject");
+    if !matches!(conflict, "reject" | "overwrite" | "rename") {
+        return Err(ApiError::InvalidInput(
+            "conflict 只支持 reject、overwrite、rename".to_string(),
+        ));
+    }
+    let new_id =
+        strict_optional_string_field(&request, &["newId", "new_id"], "newId")?.unwrap_or_default();
+    if conflict == "rename" {
+        if new_id.is_empty() {
+            return Err(ApiError::InvalidInput("另存为需要提供 newId".to_string()));
+        }
+        role.id = new_id;
+        role.role_revision = 1;
+    }
+    let expected = if conflict == "overwrite" {
+        state
+            .agent_role_registry
+            .get(&role.id)
+            .filter(|_| state.agent_role_registry.is_user_defined(&role.id))
+            .map(|existing| existing.role_revision)
+    } else {
+        None
+    };
+    let saved = state
+        .agent_role_registry
+        .save_user_role(role, expected)
+        .map_err(role_error)?;
+    Ok(Json(role_response(&state, saved)))
+}
+
+async fn export_role(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let role_id = query
+        .get("templateId")
+        .or_else(|| query.get("id"))
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    let role = state
+        .agent_role_registry
+        .get(role_id)
+        .ok_or_else(|| ApiError::not_found("角色不存在", role_id))?;
+    Ok(Json(json!({
+        "templateId": role.id,
+        "fileName": format!("{}.md", role.id),
+        "content": magi_agent_role::serialize_role_markdown(&role),
+        "registryRevision": state.agent_role_registry.registry_revision(),
+    })))
+}
+
 async fn list_engines(
     State(state): State<ApiState>,
     Query(_query): Query<HashMap<String, String>>,
@@ -1586,13 +2000,17 @@ async fn upsert_agent(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _configuration_guard = state
+        .role_configuration_lock
+        .lock()
+        .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
     if request.get("agent").is_some() || request.get("modelSource").is_some() {
         return Err(ApiError::InvalidInput(
             "角色绑定必须使用顶层 templateId/engineId 字段".to_string(),
         ));
     }
-    let template_ids = builtin_template_ids();
-    let order_map = builtin_template_order_map();
+    let template_ids = template_ids_for_registry(state.agent_role_registry.as_ref());
+    let order_map = template_order_map_for_registry(state.agent_role_registry.as_ref());
     let normalized = normalize_agent_override_entry(&request, &template_ids, &order_map)
         .ok_or_else(|| ApiError::InvalidInput("角色绑定缺少有效的 templateId".to_string()))?;
     let template_id = normalized
@@ -1642,12 +2060,16 @@ async fn remove_agent(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _configuration_guard = state
+        .role_configuration_lock
+        .lock()
+        .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
     let template_id = request
         .get("templateId")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let template_ids = builtin_template_ids();
-    let order_map = builtin_template_order_map();
+    let template_ids = template_ids_for_registry(state.agent_role_registry.as_ref());
+    let order_map = template_order_map_for_registry(state.agent_role_registry.as_ref());
     let mut overrides = load_agent_overrides(&state, &template_ids, &order_map);
     overrides.retain(|entry| {
         entry
@@ -1916,12 +2338,46 @@ mod tests {
         test_state_with_external_catalog_snapshot(None)
     }
 
+    fn role_test_state(role_dir: &std::path::Path) -> ApiState {
+        test_state().with_agent_role_registry(Arc::new(
+            magi_agent_role::AgentRoleRegistry::builtin().with_user_role_dir(role_dir),
+        ))
+    }
+
+    fn role_payload(id: &str) -> Value {
+        json!({
+            "role": {
+                "id": id,
+                "displayName": "数据分析师",
+                "description": "负责清洗、分析和验证数据",
+                "systemPrompt": "你是数据分析师，先核对数据契约，再输出可复现结论。",
+                "supportedKinds": ["local_agent"],
+                "parallelismLimit": 2,
+                "coordinatorMode": false,
+                "version": 1,
+                "profile": {
+                    "role": "数据分析与验证",
+                    "focus": ["读取,清洗", "指标核对"],
+                    "constraints": ["保留证据"],
+                    "outputPreferences": ["数据口径", "验证结果"]
+                },
+                "ownerships": ["分析结论"],
+                "insightPreferences": ["decision", "risk"],
+                "capabilities": ["general_engineering", "data_engineering"],
+                "defaultUI": {"colorToken": "agent-data-analyst", "icon": "bar-chart"}
+            }
+        })
+    }
+
     #[test]
     fn role_templates_publish_non_empty_professional_capabilities() {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let templates = role_templates_for_registry(&registry);
 
-        assert_eq!(templates.len(), builtin_role_templates().len());
+        assert_eq!(
+            templates.len(),
+            role_templates_for_registry(&magi_agent_role::AgentRoleRegistry::builtin()).len()
+        );
         for template in templates {
             let template_id = template["templateId"]
                 .as_str()
@@ -3505,6 +3961,420 @@ mod tests {
             }
             other => panic!("expected invalid input, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn role_upsert_lists_user_role_and_persists_markdown() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+
+        let response = upsert_role(State(state.clone()), Json(role_payload("data-analyst")))
+            .await
+            .expect("角色创建应成功")
+            .0;
+        assert_eq!(response["role"]["templateId"], json!("data-analyst"));
+        assert_eq!(response["role"]["source"], json!("user"));
+        assert_eq!(response["role"]["editable"], json!(true));
+        assert_eq!(response["role"]["roleRevision"], json!(1));
+        assert!(state.agent_role_registry.is_user_defined("data-analyst"));
+        assert!(directory.path().join("data-analyst.md").is_file());
+
+        let templates = list_role_templates(State(state), Query(HashMap::new()))
+            .await
+            .0;
+        assert!(
+            templates["templates"]
+                .as_array()
+                .expect("templates 应为数组")
+                .iter()
+                .any(|template| template["templateId"] == json!("data-analyst"))
+        );
+    }
+
+    #[tokio::test]
+    async fn role_edit_requires_current_revision_and_increments_it() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+        let _ = upsert_role(State(state.clone()), Json(role_payload("revision-role")))
+            .await
+            .expect("角色创建应成功");
+
+        let mut update = role_payload("revision-role");
+        update["role"]["description"] = json!("第一次编辑");
+        update["expectedRoleRevision"] = json!(1);
+        let response = upsert_role(State(state.clone()), Json(update))
+            .await
+            .expect("角色编辑应成功")
+            .0;
+        assert_eq!(response["role"]["roleRevision"], json!(2));
+
+        let mut stale = role_payload("revision-role");
+        stale["role"]["description"] = json!("过期编辑");
+        stale["expectedRoleRevision"] = json!(1);
+        assert!(matches!(
+            upsert_role(State(state.clone()), Json(stale)).await,
+            Err(ApiError::Conflict(_))
+        ));
+        assert_eq!(
+            state
+                .agent_role_registry
+                .get("revision-role")
+                .unwrap()
+                .description,
+            "第一次编辑"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_export_import_round_trip_supports_conflict_strategies() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+        let _ = upsert_role(State(state.clone()), Json(role_payload("round-trip")))
+            .await
+            .expect("角色创建应成功");
+
+        let exported = export_role(
+            State(state.clone()),
+            Query(HashMap::from([(
+                String::from("templateId"),
+                String::from("round-trip"),
+            )])),
+        )
+        .await
+        .expect("角色导出应成功")
+        .0;
+        let content = exported["content"].as_str().expect("导出内容应为字符串");
+        assert!(!content.contains("role_revision:"));
+        assert!(!content.contains("api_key"));
+        assert!(!content.contains("workspace"));
+
+        let _ = delete_role(
+            State(state.clone()),
+            Json(json!({"templateId": "round-trip", "expectedRoleRevision": 1})),
+        )
+        .await
+        .expect("角色删除应成功");
+        assert!(!state.agent_role_registry.contains("round-trip"));
+
+        let _ = import_role(
+            State(state.clone()),
+            Json(json!({"content": content, "conflict": "reject"})),
+        )
+        .await
+        .expect("角色重新导入应成功");
+        assert_eq!(
+            state
+                .agent_role_registry
+                .get("round-trip")
+                .unwrap()
+                .system_prompt,
+            "你是数据分析师，先核对数据契约，再输出可复现结论。"
+        );
+
+        let reject = import_role(
+            State(state.clone()),
+            Json(json!({"content": content, "conflict": "reject"})),
+        )
+        .await;
+        assert!(matches!(
+            reject,
+            Err(ApiError::Conflict(message)) if message.contains("已存在")
+        ));
+
+        let overwrite = import_role(
+            State(state.clone()),
+            Json(json!({"content": content, "conflict": "overwrite"})),
+        )
+        .await
+        .expect("覆盖导入应成功");
+        assert_eq!(overwrite.0["role"]["templateId"], json!("round-trip"));
+
+        let renamed = import_role(
+            State(state.clone()),
+            Json(json!({
+                "content": content,
+                "conflict": "rename",
+                "newId": "round-trip-copy"
+            })),
+        )
+        .await
+        .expect("另存为导入应成功");
+        assert_eq!(renamed.0["role"]["templateId"], json!("round-trip-copy"));
+        assert!(state.agent_role_registry.contains("round-trip-copy"));
+    }
+
+    #[tokio::test]
+    async fn role_delete_removes_binding_and_stale_revision_preserves_it() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+        let _ = upsert_role(State(state.clone()), Json(role_payload("bound-role")))
+            .await
+            .expect("角色创建应成功");
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                json!([{"id": "engine-a", "displayName": "引擎 A", "llm": {}}]),
+            )
+            .expect("引擎配置应写入");
+        let _ = upsert_agent(
+            State(state.clone()),
+            Json(json!({"templateId": "bound-role", "engineId": "engine-a"})),
+        )
+        .await
+        .expect("角色绑定应成功");
+        assert!(
+            resolve_registry_agents(&state)
+                .iter()
+                .any(|agent| agent["templateId"] == json!("bound-role")
+                    && agent["engineId"] == json!("engine-a"))
+        );
+
+        let stale = delete_role(
+            State(state.clone()),
+            Json(json!({"templateId": "bound-role", "expectedRoleRevision": 99})),
+        )
+        .await;
+        assert!(matches!(stale, Err(ApiError::Conflict(_))));
+        assert!(state.agent_role_registry.contains("bound-role"));
+        assert!(
+            resolve_registry_agents(&state)
+                .iter()
+                .any(|agent| agent["templateId"] == json!("bound-role")
+                    && agent["engineId"] == json!("engine-a"))
+        );
+
+        let _ = delete_role(
+            State(state.clone()),
+            Json(json!({"templateId": "bound-role", "expectedRoleRevision": 1})),
+        )
+        .await
+        .expect("角色删除应成功");
+        assert!(!state.agent_role_registry.contains("bound-role"));
+        assert!(
+            !resolve_registry_agents(&state)
+                .iter()
+                .any(|agent| agent["templateId"] == json!("bound-role"))
+        );
+    }
+
+    #[tokio::test]
+    async fn role_mutations_reject_builtin_and_invalid_definitions() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+
+        let mut builtin = role_payload("executor");
+        builtin["role"]["displayName"] = json!("覆盖内置");
+        assert!(matches!(
+            upsert_role(State(state.clone()), Json(builtin)).await,
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            delete_role(
+                State(state.clone()),
+                Json(json!({"templateId": "executor", "expectedRoleRevision": 1}))
+            )
+            .await,
+            Err(ApiError::Conflict(_))
+        ));
+
+        let mut unknown_capability = role_payload("bad-capability");
+        unknown_capability["role"]["capabilities"] = json!(["does-not-exist"]);
+        assert!(matches!(
+            upsert_role(State(state.clone()), Json(unknown_capability)).await,
+            Err(ApiError::InvalidInput(message)) if message.contains("专业能力不存在")
+        ));
+
+        let mut coordinator = role_payload("bad-coordinator");
+        coordinator["role"]["coordinatorMode"] = json!(true);
+        assert!(matches!(
+            upsert_role(State(state.clone()), Json(coordinator)).await,
+            Err(ApiError::InvalidInput(message)) if message.contains("coordinator_mode")
+        ));
+
+        let mut missing_local_agent = role_payload("bad-kind");
+        missing_local_agent["role"]["supportedKinds"] = json!(["local_workflow"]);
+        assert!(matches!(
+            upsert_role(State(state.clone()), Json(missing_local_agent)).await,
+            Err(ApiError::InvalidInput(message)) if message.contains("local_agent")
+        ));
+
+        let mut malformed_number = role_payload("bad-number");
+        malformed_number["role"]["parallelismLimit"] = json!(-1);
+        assert!(matches!(
+            upsert_role(State(state), Json(malformed_number)).await,
+            Err(ApiError::InvalidInput(message)) if message.contains("parallelismLimit")
+        ));
+    }
+
+    #[tokio::test]
+    async fn role_delete_rejects_active_worker_lease_and_preserves_role_and_binding() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let task_store = Arc::new(magi_orchestrator::task_store::TaskStore::new());
+        let state = role_test_state(directory.path()).with_task_store(Arc::clone(&task_store));
+        let _ = upsert_role(State(state.clone()), Json(role_payload("active-role")))
+            .await
+            .expect("角色创建应成功");
+        state
+            .settings_store
+            .set_section(
+                "agents",
+                json!([{"templateId": "active-role", "engineId": "engine-a"}]),
+            )
+            .expect("绑定应写入");
+
+        let now = magi_core::UtcMillis::now();
+        let root_task_id = magi_core::TaskId::new("root-active-role");
+        let task_id = magi_core::TaskId::new("task-active-role");
+        let mission_id = magi_core::MissionId::new("mission-active-role");
+        task_store
+            .insert_task(magi_core::Task {
+                task_id: root_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: magi_core::TaskKind::LocalAgent,
+                title: "root".to_string(),
+                goal: "root".to_string(),
+                status: magi_core::TaskStatus::Running,
+                dependency_ids: Vec::new(),
+                required_children: vec![task_id.clone()],
+                policy_snapshot: None,
+                executor_binding: None,
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("根任务应写入");
+        task_store
+            .insert_task(magi_core::Task {
+                task_id: task_id.clone(),
+                mission_id,
+                root_task_id: root_task_id.clone(),
+                parent_task_id: Some(root_task_id.clone()),
+                kind: magi_core::TaskKind::LocalAgent,
+                title: "active worker".to_string(),
+                goal: "active worker".to_string(),
+                status: magi_core::TaskStatus::Pending,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: Some(magi_core::TaskExecutorBinding::for_role("active-role")),
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("子任务应写入");
+        task_store
+            .grant_lease_and_start_task(
+                &task_id,
+                &root_task_id,
+                &magi_core::WorkerId::new("worker-active-role"),
+                "active-role",
+                60_000,
+            )
+            .expect("租约应授予")
+            .expect("任务应获得活跃租约");
+
+        let result = delete_role(
+            State(state.clone()),
+            Json(json!({"templateId": "active-role", "expectedRoleRevision": 1})),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::Conflict(message)) if message.contains("运行中的 Worker"))
+        );
+        assert!(state.agent_role_registry.contains("active-role"));
+        assert_eq!(
+            state.settings_store.get_section("agents"),
+            json!([{"templateId": "active-role", "engineId": "engine-a"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn role_import_rejects_oversized_and_unknown_conflict_requests() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+        let oversized = "x".repeat(100_001);
+        assert!(matches!(
+            import_role(
+                State(state.clone()),
+                Json(json!({"content": oversized, "conflict": "reject"}))
+            )
+            .await,
+            Err(ApiError::InvalidInput(message)) if message.contains("100000")
+        ));
+        assert!(matches!(
+            import_role(
+                State(state),
+                Json(json!({"content": "---\nid: bad\n---\n提示词", "conflict": "merge"}))
+            )
+            .await,
+            Err(ApiError::InvalidInput(message)) if message.contains("reject")
+        ));
+    }
+
+    #[tokio::test]
+    async fn role_mutations_reject_malformed_revision_and_conflict_fields() {
+        let directory = tempfile::tempdir().expect("角色目录应创建");
+        let state = role_test_state(directory.path());
+
+        let mut role = role_payload("strict-input");
+        role["expectedRoleRevision"] = json!("1");
+        assert!(matches!(
+            upsert_role(State(state.clone()), Json(role)).await,
+            Err(ApiError::InvalidInput(message)) if message.contains("expectedRoleRevision")
+        ));
+
+        let mut role = role_payload("strict-input");
+        role["expectedRoleRevision"] = json!(-1);
+        assert!(matches!(
+            upsert_role(State(state.clone()), Json(role)).await,
+            Err(ApiError::InvalidInput(message)) if message.contains("expectedRoleRevision")
+        ));
+
+        assert!(matches!(
+            import_role(
+                State(state.clone()),
+                Json(json!({
+                    "content": "---\nid: strict-input\nsupported_kinds: [local_agent]\ncapabilities: [general_engineering]\n---\n提示词",
+                    "conflict": 1
+                }))
+            )
+            .await,
+            Err(ApiError::InvalidInput(message)) if message.contains("conflict")
+        ));
+
+        assert!(matches!(
+            import_role(
+                State(state),
+                Json(json!({
+                    "content": "---\nid: strict-input\nsupported_kinds: [local_agent]\ncapabilities: [general_engineering]\n---\n提示词",
+                    "conflict": "rename",
+                    "newId": 7
+                }))
+            )
+            .await,
+            Err(ApiError::InvalidInput(message)) if message.contains("newId")
+        ));
     }
 
     #[tokio::test]

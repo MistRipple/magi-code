@@ -57,6 +57,8 @@ npm run desktop:dev
 - [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：面向 Luna 后续开发的 token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
 - [知识图谱开发与验收计划](./knowledge-graph-plan.md)：知识、代码文件、符号和 Agent 图谱能力的分阶段实现边界与验收标准。
 - [Magi 对话响应链路性能开发与验收计划](./conversation-response-performance-plan.md)：发送接纳、后台准备、模型连接复用、流式增量写回、前端渲染和桌面端性能验收基线。
+- [用户自定义子代理角色设计方案](./custom-worker-role-design.md)：在现有 Worker 体系中统一支持用户角色的创建、注册、调度、导入和导出。
+- [用户自定义子代理角色开发计划](./custom-worker-role-development-plan.md)：按阶段记录实现、验证和最终提交状态。
 
 ## 用户场景与产品要求
 

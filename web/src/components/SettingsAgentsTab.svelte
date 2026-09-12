@@ -3,6 +3,7 @@
   import type { ProfessionalCapabilitySummary, RoleTemplate } from '../shared/types/role-templates';
   import { isAgentBindingOperational, resolveSelectableRegistryEngines } from '../shared/model-governance';
   import { i18n } from '../stores/i18n.svelte';
+  import { AgentApiError } from '../web/agent-api';
   import Icon from './Icon.svelte';
   import EnginePicker from './EnginePicker.svelte';
 
@@ -15,6 +16,10 @@
     getAgentColor,
     getWorkerDisplayName,
     updateRoleEngine,
+    saveRole,
+    deleteRole,
+    importRole,
+    exportRole,
   } = $props<{
     roleTemplates: RoleTemplate[];
     registryAgents: AgentBinding[];
@@ -24,6 +29,10 @@
     getAgentColor: (templateId: string, colorToken?: string) => { color: string; muted: string };
     getWorkerDisplayName: (workerId: string) => string;
     updateRoleEngine: (templateId: string, engineId: string) => void;
+    saveRole: (role: Record<string, unknown>, expectedRoleRevision?: number) => Promise<void>;
+    deleteRole: (templateId: string, roleRevision: number) => Promise<void>;
+    importRole: (content: string, conflict: 'reject' | 'overwrite' | 'rename', newId?: string) => Promise<void>;
+    exportRole: (templateId: string) => Promise<void>;
   }>();
 
   type RoleStatus = 'bound' | 'inherit' | 'error';
@@ -131,6 +140,193 @@
 
   let selectedKey = $state<string | null>(null);
 
+  type RoleDraft = {
+    id: string;
+    displayName: string;
+    description: string;
+    positioning: string;
+    focus: string;
+    constraints: string;
+    outputPreferences: string;
+    ownerships: string;
+    insights: string[];
+    capabilities: string[];
+    systemPrompt: string;
+    parallelismLimit: string;
+    roleRevision?: number;
+  };
+  let editorOpen = $state(false);
+  let editorMode = $state<'create' | 'edit'>('create');
+  let editorError = $state('');
+  let editorBusy = $state(false);
+  let draft = $state<RoleDraft>(emptyDraft());
+  let importInput: HTMLInputElement;
+
+  function emptyDraft(): RoleDraft {
+    return {
+      id: '',
+      displayName: '',
+      description: '',
+      positioning: '',
+      focus: '',
+      constraints: '',
+      outputPreferences: '',
+      ownerships: '',
+      insights: ['decision', 'risk'],
+      capabilities: ['general_engineering'],
+      systemPrompt: '',
+      parallelismLimit: '',
+    };
+  }
+
+  function listText(values: string[]): string {
+    return values.join('\n');
+  }
+
+  function draftFromTemplate(template: RoleTemplate, copy = false): RoleDraft {
+    return {
+      id: copy ? `${template.templateId}-copy` : template.templateId,
+      displayName: copy ? `${template.displayName} 副本` : template.displayName,
+      description: template.description,
+      positioning: template.profile.role,
+      focus: listText(template.profile.focus),
+      constraints: listText(template.profile.constraints),
+      outputPreferences: listText(template.profile.outputPreferences ?? []),
+      ownerships: listText(template.ownerships),
+      insights: [...template.insightPreferences],
+      capabilities: template.capabilities.map((capability) => capability.id),
+      systemPrompt: template.systemPrompt ?? '',
+      parallelismLimit: template.parallelismLimit ? String(template.parallelismLimit) : '',
+      roleRevision: copy ? undefined : template.roleRevision,
+    };
+  }
+
+  function splitLines(value: string): string[] {
+    return value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+  }
+
+  function openCreateRole() {
+    editorMode = 'create';
+    editorError = '';
+    draft = emptyDraft();
+    editorOpen = true;
+  }
+
+  function openEditRole(template: RoleTemplate) {
+    if (!template.editable) return;
+    editorMode = 'edit';
+    editorError = '';
+    draft = draftFromTemplate(template);
+    editorOpen = true;
+  }
+
+  function openCopyRole(template: RoleTemplate) {
+    editorMode = 'create';
+    editorError = '';
+    draft = draftFromTemplate(template, true);
+    editorOpen = true;
+  }
+
+  function closeEditor() {
+    if (!editorBusy) editorOpen = false;
+  }
+
+  async function submitRole() {
+    editorError = '';
+    const payload: Record<string, unknown> = {
+      id: draft.id.trim(),
+      displayName: draft.displayName.trim(),
+      description: draft.description.trim(),
+      systemPrompt: draft.systemPrompt.trim(),
+      supportedKinds: ['local_agent'],
+      parallelismLimit: draft.parallelismLimit.trim() ? Number(draft.parallelismLimit.trim()) : null,
+      coordinatorMode: false,
+      ...(draft.roleRevision === undefined ? {} : { roleRevision: draft.roleRevision }),
+      profile: {
+        role: draft.positioning.trim(),
+        focus: splitLines(draft.focus),
+        constraints: splitLines(draft.constraints),
+        outputPreferences: splitLines(draft.outputPreferences),
+      },
+      ownerships: splitLines(draft.ownerships),
+      insightPreferences: draft.insights,
+      capabilities: draft.capabilities,
+      defaultUI: { colorToken: `agent-${draft.id.trim()}`, icon: 'bot' },
+    };
+    if (!payload.id || !payload.displayName || !payload.systemPrompt) {
+      editorError = '请填写角色 ID、显示名称和系统提示词';
+      return;
+    }
+    if (draft.parallelismLimit.trim()) {
+      const parallelismLimit = Number(draft.parallelismLimit.trim());
+      if (!Number.isSafeInteger(parallelismLimit) || parallelismLimit <= 0) {
+        editorError = '并发上限必须是正整数';
+        return;
+      }
+      payload.parallelismLimit = parallelismLimit;
+    }
+    editorBusy = true;
+    try {
+      await saveRole(payload, draft.roleRevision);
+      editorOpen = false;
+    } catch (error) {
+      editorError = error instanceof Error ? error.message : '角色保存失败';
+    } finally {
+      editorBusy = false;
+    }
+  }
+
+  async function removeSelectedRole(template: RoleTemplate) {
+    if (!template.deletable || template.roleRevision === undefined) return;
+    if (!window.confirm(`确定删除角色“${template.displayName}”吗？`)) return;
+    try {
+      await deleteRole(template.templateId, template.roleRevision);
+      selectedKey = null;
+    } catch {
+      // store 层已显示具体错误；事件处理器消费 Promise，避免未处理拒绝。
+    }
+  }
+
+  function chooseImportFile() {
+    importInput?.click();
+  }
+
+  async function handleImportFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    let content = '';
+    try {
+      content = await file.text();
+      await importRole(content, 'reject');
+    } catch (error) {
+      if (!(error instanceof AgentApiError) || error.status !== 409) {
+        editorError = error instanceof Error ? error.message : '角色导入失败';
+        return;
+      }
+      const message = error instanceof Error ? error.message : '角色导入失败';
+      try {
+        if (!window.confirm(`${message}\n\n点击“确定”覆盖已有用户角色，点击“取消”尝试另存为。`)) {
+          const newId = window.prompt('请输入新的角色 ID（小写字母、数字和连字符）：');
+          if (newId?.trim()) await importRole(content, 'rename', newId.trim());
+        } else {
+          await importRole(content, 'overwrite');
+        }
+      } catch {
+        // store 层已显示具体错误；导入流程在这里消费后续冲突操作的拒绝。
+      }
+    }
+  }
+
+  async function exportSelectedRole(templateId: string) {
+    try {
+      await exportRole(templateId);
+    } catch {
+      // store 层已显示具体错误；避免导出失败形成未处理 Promise。
+    }
+  }
+
   $effect(() => {
     if (atoms.length === 0) {
       if (selectedKey !== null) selectedKey = null;
@@ -203,6 +399,17 @@
 
 <div class="settings-tab-inner scroll-proxy">
   <div class="agents-scroll-panel settings-scroll-panel">
+    <div class="agents-toolbar">
+      <div>
+        <div class="toolbar-title">子代理角色</div>
+        <div class="toolbar-description">内置角色和我的角色共用同一套 Worker 调度能力</div>
+      </div>
+      <div class="toolbar-actions">
+        <button type="button" class="toolbar-button" onclick={chooseImportFile}>导入角色</button>
+        <button type="button" class="toolbar-button primary" onclick={openCreateRole}>新建角色</button>
+        <input bind:this={importInput} class="visually-hidden" type="file" accept=".md,text/markdown" onchange={handleImportFile} />
+      </div>
+    </div>
     <div class="agents-shell">
       <div class="agents-tabbar" role="tablist" aria-label={i18n.t('settings.agents.listTitle')}>
         <div class="tabbar-track">
@@ -259,6 +466,7 @@
                   <div class="detail-title-stack">
                     <div class="detail-title-row">
                       <span class="detail-title">{selected.displayName}</span>
+                      <span class="source-badge source-{tmpl.source ?? 'builtin'}">{tmpl.source === 'user' ? '我的角色' : '系统内置'}</span>
                       <span class="detail-status-pill status-{selected.status}">{statusTooltip(selected.status)}</span>
                     </div>
                     {#if positioning}
@@ -267,6 +475,16 @@
                     {#if selected.description}
                       <p class="detail-description">{selected.description}</p>
                     {/if}
+                    <div class="detail-actions">
+                      <button type="button" class="text-button" onclick={() => openCopyRole(tmpl)}>复制</button>
+                      <button type="button" class="text-button" onclick={() => exportSelectedRole(tmpl.templateId)}>导出</button>
+                      {#if tmpl.editable}
+                        <button type="button" class="text-button" onclick={() => openEditRole(tmpl)}>编辑</button>
+                      {/if}
+                      {#if tmpl.deletable}
+                        <button type="button" class="text-button danger" onclick={() => removeSelectedRole(tmpl)}>删除</button>
+                      {/if}
+                    </div>
                   </div>
                 </header>
 
@@ -376,6 +594,53 @@
   </div>
 </div>
 
+{#if editorOpen}
+  <div class="role-editor-backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && closeEditor()}>
+    <div class="role-editor" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="role-editor-title">
+      <header class="role-editor-header">
+        <div>
+          <h2 id="role-editor-title">{editorMode === 'create' ? '新建子代理角色' : '编辑子代理角色'}</h2>
+          <p>角色会立即注册到 Magi 的 Worker 目录，并默认继承主模型。</p>
+        </div>
+        <button type="button" class="text-button" onclick={closeEditor}>关闭</button>
+      </header>
+      <div class="role-editor-grid">
+        <label>角色 ID<input bind:value={draft.id} disabled={editorMode === 'edit'} placeholder="例如：data-analyst" /></label>
+        <label>显示名称<input bind:value={draft.displayName} placeholder="例如：数据分析师" /></label>
+        <label class="wide">角色描述<input bind:value={draft.description} placeholder="说明这个角色解决什么问题" /></label>
+        <label class="wide">角色定位<input bind:value={draft.positioning} placeholder="例如：数据分析与验证" /></label>
+        <label>专长（每行一项）<textarea bind:value={draft.focus} rows="4"></textarea></label>
+        <label>约束（每行一项）<textarea bind:value={draft.constraints} rows="4"></textarea></label>
+        <label>输出偏好（每行一项）<textarea bind:value={draft.outputPreferences} rows="4"></textarea></label>
+        <label>核心职责（每行一项）<textarea bind:value={draft.ownerships} rows="4"></textarea></label>
+        <label class="wide">系统提示词<textarea bind:value={draft.systemPrompt} rows="8" placeholder="描述该 Worker 的职责、工作边界和输出要求"></textarea></label>
+        <label>并发上限（可选）<input bind:value={draft.parallelismLimit} inputmode="numeric" placeholder="不填表示不限" /></label>
+        <fieldset class="wide">
+          <legend>信号偏好</legend>
+          <div class="checkbox-grid">
+            {#each ['decision', 'contract', 'risk', 'constraint'] as insight}
+              <label class="checkbox-label"><input type="checkbox" checked={draft.insights.includes(insight)} onchange={() => (draft.insights = draft.insights.includes(insight) ? draft.insights.filter((item) => item !== insight) : [...draft.insights, insight])} />{insightLabel(insight as 'decision' | 'contract' | 'risk' | 'constraint')}</label>
+            {/each}
+          </div>
+        </fieldset>
+        <fieldset class="wide">
+          <legend>可用专业能力</legend>
+          <div class="checkbox-grid capability-editor-grid">
+            {#each domainCapabilities as capability (capability.id)}
+              <label class="checkbox-label" title={capabilityDescription(capability)}><input type="checkbox" checked={draft.capabilities.includes(capability.id)} onchange={() => (draft.capabilities = draft.capabilities.includes(capability.id) ? draft.capabilities.filter((item) => item !== capability.id) : [...draft.capabilities, capability.id])} />{capabilityName(capability)}</label>
+            {/each}
+          </div>
+        </fieldset>
+      </div>
+      {#if editorError}<div class="role-editor-error">{editorError}</div>{/if}
+      <footer class="role-editor-footer">
+        <button type="button" class="toolbar-button" onclick={closeEditor} disabled={editorBusy}>取消</button>
+        <button type="button" class="toolbar-button primary" onclick={() => void submitRole()} disabled={editorBusy}>{editorBusy ? '保存中…' : '保存角色'}</button>
+      </footer>
+    </div>
+  </div>
+{/if}
+
 <style>
   .settings-tab-inner {
     container-type: inline-size;
@@ -397,6 +662,89 @@
     flex-direction: column;
   }
   .settings-scroll-panel::-webkit-scrollbar { width: 0; }
+
+  .agents-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 0 12px;
+    border-bottom: 1px solid var(--ind-border-separator);
+    margin-bottom: 2px;
+  }
+  .toolbar-title { font-size: 14px; font-weight: 650; color: var(--ind-foreground); }
+  .toolbar-description { margin-top: 4px; color: var(--ind-foreground-soft); font-size: 12px; }
+  .toolbar-actions, .detail-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .toolbar-button {
+    border: 1px solid var(--ind-border-separator);
+    background: var(--ind-bg-control);
+    color: var(--ind-foreground-secondary);
+    border-radius: 7px;
+    padding: 7px 12px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .toolbar-button:hover { background: var(--ind-bg-control-hover); color: var(--ind-foreground); }
+  .toolbar-button.primary { background: var(--ind-tab-accent); border-color: var(--ind-tab-accent); color: white; }
+  .toolbar-button:disabled { opacity: .55; cursor: default; }
+  .text-button {
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--ind-tab-accent);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .text-button.danger { color: var(--error, #ff3b30); }
+  .source-badge {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    padding: 3px 7px;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .source-badge.source-builtin { color: var(--ind-foreground-soft); background: color-mix(in srgb, var(--ind-foreground) 7%, transparent); }
+  .source-badge.source-user { color: var(--ind-tab-accent); background: color-mix(in srgb, var(--ind-tab-accent) 10%, transparent); }
+  .detail-actions { margin-top: 10px; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+  .role-editor-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: color-mix(in srgb, #000 42%, transparent);
+  }
+  .role-editor {
+    width: min(760px, 100%);
+    max-height: min(820px, 94vh);
+    overflow: auto;
+    border: 1px solid var(--ind-border-separator);
+    border-radius: 12px;
+    background: var(--ind-bg-primary, #fff);
+    box-shadow: 0 24px 70px rgb(0 0 0 / 22%);
+    padding: 22px;
+  }
+  .role-editor-header, .role-editor-footer { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+  .role-editor-header h2 { margin: 0; font-size: 18px; color: var(--ind-foreground); }
+  .role-editor-header p { margin: 7px 0 0; color: var(--ind-foreground-soft); font-size: 12px; }
+  .role-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 20px; }
+  .role-editor-grid label, .role-editor-grid legend { color: var(--ind-foreground-secondary); font-size: 12px; font-weight: 600; }
+  .role-editor-grid input, .role-editor-grid textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 6px; border: 1px solid var(--ind-border-separator); border-radius: 7px; background: var(--ind-bg-control); color: var(--ind-foreground); padding: 8px 9px; font: inherit; font-size: 13px; resize: vertical; }
+  .role-editor-grid input:focus, .role-editor-grid textarea:focus { outline: 2px solid color-mix(in srgb, var(--ind-tab-accent) 34%, transparent); outline-offset: 1px; }
+  .role-editor-grid .wide { grid-column: 1 / -1; }
+  .role-editor-grid fieldset { min-width: 0; border: 1px solid var(--ind-border-separator); border-radius: 8px; padding: 12px; }
+  .checkbox-grid { display: flex; flex-wrap: wrap; gap: 9px 16px; margin-top: 8px; }
+  .checkbox-label { display: inline-flex !important; align-items: center; gap: 6px; font-weight: 500 !important; cursor: pointer; }
+  .checkbox-label input { width: auto; margin: 0; }
+  .role-editor-error { margin-top: 14px; padding: 9px 11px; border-radius: 7px; color: var(--error, #ff3b30); background: color-mix(in srgb, var(--error, #ff3b30) 9%, transparent); font-size: 12px; }
+  .role-editor-footer { align-items: center; justify-content: flex-end; margin-top: 18px; }
 
   .agents-shell {
     display: grid;
@@ -845,6 +1193,11 @@
   }
 
   @container agents-tab (max-width: 560px) {
+    .agents-toolbar { align-items: flex-start; flex-direction: column; }
+    .toolbar-actions { width: 100%; }
+    .toolbar-button { flex: 1; }
+    .role-editor-grid { grid-template-columns: 1fr; }
+    .role-editor-grid .wide { grid-column: auto; }
     .detail-masonry {
       grid-template-columns: 1fr;
     }

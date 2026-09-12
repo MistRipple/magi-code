@@ -29,6 +29,15 @@ export interface RoleTemplate {
   ownerships: string[];
   insightPreferences: ('decision' | 'contract' | 'risk' | 'constraint')[];
   capabilities: ProfessionalCapabilitySummary[];
+  source?: 'builtin' | 'user';
+  editable?: boolean;
+  deletable?: boolean;
+  version?: number;
+  roleRevision?: number;
+  supportedKinds?: string[];
+  parallelismLimit?: number | null;
+  coordinatorMode?: boolean;
+  systemPrompt?: string;
 }
 
 export interface ProfessionalCapabilitySummary {

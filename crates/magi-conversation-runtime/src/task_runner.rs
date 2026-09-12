@@ -473,7 +473,13 @@ impl TaskRunner {
     }
 
     fn match_worker(&self, task: &Task) -> Option<WorkerInfo> {
+        let explicitly_bound_role = task.executor_binding_target_role();
         let role = resolve_task_role(task, &self.agent_role_registry);
+        // 显式角色一旦无法在当前 registry 中解析，必须保持不可运行状态；
+        // 不能把用户明确要求的角色静默改派给 executor 或其他 worker。
+        if explicitly_bound_role.is_some() && role.is_none() {
+            return None;
+        }
         self.workers
             .iter()
             .find(|worker| {
@@ -481,12 +487,6 @@ impl TaskRunner {
                     && role.map(|role| worker.role == role).unwrap_or(true)
             })
             .cloned()
-            .or_else(|| {
-                self.workers
-                    .iter()
-                    .find(|worker| worker.supported_kinds.contains(&task.kind))
-                    .cloned()
-            })
     }
 
     fn terminal_state(&self, root_task_id: &TaskId) -> TerminalState {
@@ -700,6 +700,43 @@ mod tests {
             store
                 .get_task(&root.task_id)
                 .expect("task should remain available for failure reporting")
+                .status,
+            TaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn explicit_unknown_role_is_not_silently_fallback_to_executor() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task(
+            "task-explicit-unknown-role",
+            "task-explicit-unknown-role",
+            None,
+        );
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("missing-role"));
+        store.insert_task(root.clone()).expect("根任务应插入");
+        let executor = WorkerInfo {
+            worker_id: WorkerId::new("worker-executor-fallback-check"),
+            role: "executor".to_string(),
+            supported_kinds: vec![TaskKind::LocalAgent],
+            parallelism_limit: None,
+            system_prompt_template: None,
+        };
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            vec![executor],
+            Arc::new(RejectingDispatcher),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+
+        assert_eq!(
+            runner.run_cycle(&root.task_id),
+            RunCycleOutcome::Unrunnable(vec![root.task_id.clone()])
+        );
+        assert_eq!(
+            store
+                .get_task(&root.task_id)
+                .expect("task should remain pending")
                 .status,
             TaskStatus::Pending
         );

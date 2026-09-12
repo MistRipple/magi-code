@@ -32,6 +32,10 @@ import {
   listAgentRegistryAgents,
   listAgentRegistryEngines,
   listAgentRoleTemplates,
+  upsertAgentRole,
+  deleteAgentRole,
+  importAgentRole as importAgentRoleFile,
+  exportAgentRole as exportAgentRoleFile,
   loadAgentToolCatalogDiagnostics,
   loadAgentSkillLibrary,
   refreshAgentMcpTools,
@@ -1736,6 +1740,54 @@ function createSettingsStore(props: { onClose?: () => void }) {
       console.error("[SettingsPanel] 更新角色引擎失败:", e);
       notifySettingsError(i18n.t("settings.toast.action.updateRoleBinding"), e);
     }
+  }
+
+  async function saveAgentRoleDefinition(role: Record<string, unknown>, expectedRoleRevision?: number) {
+    try {
+      await upsertAgentRole(role, expectedRoleRevision);
+      await loadRegistryData();
+      notifySettingsSuccess('角色已保存');
+    } catch (e) {
+      console.error('[SettingsPanel] 保存角色失败:', e);
+      notifySettingsError('保存角色失败', e);
+      throw e;
+    }
+  }
+
+  async function removeAgentRoleDefinition(templateId: string, roleRevision: number) {
+    try {
+      await deleteAgentRole(templateId, roleRevision);
+      await loadRegistryData();
+      notifySettingsSuccess('角色已删除');
+    } catch (e) {
+      console.error('[SettingsPanel] 删除角色失败:', e);
+      notifySettingsError('删除角色失败', e);
+      throw e;
+    }
+  }
+
+  async function importAgentRoleDefinition(content: string, conflict: 'reject' | 'overwrite' | 'rename', newId?: string) {
+    try {
+      await importAgentRoleFile(content, conflict, newId);
+      await loadRegistryData();
+      notifySettingsSuccess('角色已导入');
+    } catch (e) {
+      console.error('[SettingsPanel] 导入角色失败:', e);
+      notifySettingsError('导入角色失败', e);
+      throw e;
+    }
+  }
+
+  async function exportAgentRoleDefinition(templateId: string) {
+    const result = await exportAgentRoleFile(templateId);
+    const blob = new Blob([result.content], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = result.fileName;
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   // 获取 worker/引擎的展示名称
@@ -4174,6 +4226,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     deleteEngine,
     renameEngineDisplay,
     updateRoleEngine,
+    saveAgentRoleDefinition,
+    removeAgentRoleDefinition,
+    importAgentRoleDefinition,
+    exportAgentRoleDefinition,
     getWorkerDisplayName,
     refreshConnections,
     showResetConfirmDialog,

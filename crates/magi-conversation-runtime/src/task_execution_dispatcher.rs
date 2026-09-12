@@ -2432,7 +2432,7 @@ impl LlmTaskDispatcher {
                     system_prompt: match worker.system_prompt_template.as_deref() {
                         Some(role_prompt) => Some(
                             self.agent_role_registry
-                                .compose_system_prompt(
+                                .compose_system_prompt_for_worker_snapshot(
                                     &worker.role,
                                     role_prompt,
                                     task.executor_binding_capability_ids(),
