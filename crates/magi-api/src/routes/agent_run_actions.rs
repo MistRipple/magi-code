@@ -581,6 +581,7 @@ mod tests {
             policy_snapshot: Some(TaskPolicy {
                 autonomy_level: "Autonomous".to_string(),
                 access_profile: AccessProfile::Restricted,
+                collaboration_mode: Default::default(),
                 allowed_tools: Vec::new(),
                 denied_tools: Vec::new(),
                 allowed_paths: Vec::new(),

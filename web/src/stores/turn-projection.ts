@@ -23,6 +23,7 @@ import type { CanonicalTurnReducerState } from './turn-reducer';
 import { coerceToolArgumentsRecord } from '../lib/tool-call-display';
 import { buildCanonicalToolFileChangeBlocks } from '../lib/canonical-tool-file-change';
 import { mapStandardBlocks } from '../lib/message-utils';
+import { parseToolPayloadRecord } from '../lib/tool-error-payload';
 import {
   inferConversationPresentationRole,
   isPromotedSidechainMessage,
@@ -48,6 +49,79 @@ interface TurnPresentation {
   readonly presentationSeq: ReadonlyMap<string, number>;
   /** 预计算的「总耗时」锚点 itemId；turn 未终态或无 responseDurationMs 时为 undefined。 */
   readonly responseDurationAnchorItemId: string | undefined;
+  /** 当前 turn 中已知的子代理终态，供主线历史代理卡片复用权威事实。 */
+  readonly agentChildStatuses: ReadonlyMap<string, AgentChildStatus>;
+}
+
+type AgentChildStatus = 'queued' | 'running' | 'completed' | 'failed' | 'killed' | 'degraded';
+
+function canonicalToolName(name: string): string {
+  const segments = name.trim().toLowerCase().split(/[.:/]/u).filter(Boolean);
+  return segments.at(-1) || name.trim().toLowerCase();
+}
+
+function normalizeAgentChildStatus(value: unknown): AgentChildStatus | undefined {
+  if (typeof value !== 'string') return undefined;
+  switch (value.trim().toLowerCase()) {
+    case 'pending':
+    case 'queued':
+      return 'queued';
+    case 'running':
+    case 'started':
+      return 'running';
+    case 'completed':
+    case 'succeeded':
+    case 'success':
+      return 'completed';
+    case 'failed':
+    case 'missing':
+      return 'failed';
+    case 'killed':
+    case 'cancelled':
+    case 'canceled':
+      return 'killed';
+    case 'degraded':
+    case 'blocked':
+      return 'degraded';
+    default:
+      return undefined;
+  }
+}
+
+function collectAgentChildStatuses(turn: CanonicalTurn): ReadonlyMap<string, AgentChildStatus> {
+  const taskStatuses = new Map<string, AgentChildStatus>();
+  const waitStatuses = new Map<string, AgentChildStatus>();
+
+  for (const item of turn.items) {
+    const taskId = normalizeCanonicalTaskId(item);
+    if (item.kind === 'task_status' && taskId) {
+      const status = normalizeAgentChildStatus(item.status);
+      if (status) taskStatuses.set(taskId, status);
+      continue;
+    }
+    if (item.kind !== 'tool_call' || canonicalToolName(item.tool?.name || '') !== 'agent_wait') {
+      continue;
+    }
+    const payload = parseToolPayloadRecord(item.tool?.result);
+    const results = payload?.results;
+    if (!Array.isArray(results)) continue;
+    for (const result of results) {
+      if (!result || typeof result !== 'object' || Array.isArray(result)) continue;
+      const record = result as Record<string, unknown>;
+      const childTaskId = typeof record.child_task_id === 'string'
+        ? record.child_task_id.trim()
+        : '';
+      if (!childTaskId) continue;
+      const status = normalizeAgentChildStatus(record.child_status) || normalizeAgentChildStatus(record.status);
+      if (status) waitStatuses.set(childTaskId, status);
+    }
+  }
+
+  // task_status 是本地 TaskStore 的事实；agent_wait 仅作为历史数据或尚未写入
+  // task_status 时的补充来源。两者合并后，主线代理卡片不再依赖当前 root projection。
+  const merged = new Map<string, AgentChildStatus>(waitStatuses);
+  for (const [taskId, status] of taskStatuses) merged.set(taskId, status);
+  return merged;
 }
 
 function normalizeSessionId(value: string | null | undefined): string {
@@ -511,6 +585,17 @@ function buildMessage(
   const roleId = isAgentTaskSidechain ? normalizeCanonicalRoleId(item) : undefined;
   const taskId = normalizeCanonicalTaskId(item);
   const blocks = buildMessageBlocks(item, content, artifactId);
+  const agentChildTaskId = item.kind === 'tool_call'
+    && canonicalToolName(item.tool?.name || '') === 'agent_spawn'
+    ? (() => {
+        const payload = parseToolPayloadRecord(item.tool?.result);
+        const value = payload?.child_task_id;
+        return typeof value === 'string' ? value.trim() : '';
+      })()
+    : '';
+  const agentChildStatus = agentChildTaskId
+    ? presentation.agentChildStatuses.get(agentChildTaskId)
+    : undefined;
   // 流式态对 assistant 的 text 与 thinking 都成立：
   //   - assistant_text：边推 token 边渲染正文；
   //   - assistant_thinking：边推 thinking delta 边在卡片头亮起"思考中..."。
@@ -585,6 +670,7 @@ function buildMessage(
       ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
       // metadata.taskId 是 RightPane agent run tab 按代理过滤 timeline 的唯一信号。
       ...(taskId ? { taskId } : {}),
+      ...(agentChildStatus ? { agentChildStatus } : {}),
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
       renderRevision: [
@@ -737,7 +823,12 @@ function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
     }
   }
 
-  return { orderedItems: ordered, presentationSeq, responseDurationAnchorItemId };
+  return {
+    orderedItems: ordered,
+    presentationSeq,
+    responseDurationAnchorItemId,
+    agentChildStatuses: collectAgentChildStatuses(turn),
+  };
 }
 
 function buildArtifact(

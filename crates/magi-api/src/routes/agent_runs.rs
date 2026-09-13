@@ -5,7 +5,8 @@ use axum::{
 };
 use magi_core::{
     AccessProfile, AgentRunProjection, MissionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task, TaskId,
-    TaskKind, TaskStatus, TaskTier, public_task_output_refs,
+    TaskKind, TaskStatus, TaskTier, classify_public_task_failure, public_task_failure_is_degraded,
+    public_task_output_refs,
 };
 use magi_session_store::{ActiveExecutionChain, ExecutionThread, ORCHESTRATOR_ROLE_ID};
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,11 @@ struct AgentProjectionDto {
     status_label: String,
     lifecycle: String,
     access_profile: String,
+    failure_stage: Option<String>,
+    failure_code: Option<String>,
+    failure_message: Option<String>,
+    queue_reason: Option<String>,
+    fallback_mode: Option<String>,
     parallelism_group: Option<String>,
     worker_id: Option<String>,
     thread_id: Option<String>,
@@ -90,7 +96,6 @@ struct AgentProjectionDto {
     response_duration_ms: Option<u64>,
     updated_at: magi_core::UtcMillis,
     result: Option<AgentProjectionResultDto>,
-    failure_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +217,7 @@ fn agent_read_model_for_projection(
     chain: Option<&ActiveExecutionChain>,
     session_threads: &[ExecutionThread],
     model_bindings: &HashMap<String, AgentModelBinding>,
+    queue_reasons: &HashMap<String, String>,
 ) -> Vec<AgentProjectionDto> {
     let branches_by_task = chain
         .map(|chain| {
@@ -251,6 +257,7 @@ fn agent_read_model_for_projection(
                 Some(thread),
                 execution_chain_ref.as_deref(),
                 model_bindings,
+                queue_reasons,
             ));
         }
     }
@@ -266,6 +273,7 @@ fn agent_read_model_for_projection(
             None,
             execution_chain_ref.as_deref(),
             model_bindings,
+            queue_reasons,
         ));
     }
 
@@ -289,6 +297,7 @@ fn agent_projection_from_task(
     thread: Option<&ExecutionThread>,
     execution_chain_ref: Option<&str>,
     model_bindings: &HashMap<String, AgentModelBinding>,
+    queue_reasons: &HashMap<String, String>,
 ) -> AgentProjectionDto {
     let role = thread
         .map(|thread| thread.role_id.as_str())
@@ -303,6 +312,8 @@ fn agent_projection_from_task(
             ..AgentModelBinding::default()
         });
     let (status, lifecycle) = agent_runtime_status(task);
+    let (failure_stage, failure_code, failure_message, fallback_mode) =
+        agent_failure_details(task, lifecycle);
     let completed_at = matches!(
         task.status,
         TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
@@ -334,6 +345,11 @@ fn agent_projection_from_task(
             .map(|policy| policy.access_profile.as_str())
             .unwrap_or(AccessProfile::Restricted.as_str())
             .to_string(),
+        failure_stage,
+        failure_code,
+        failure_message,
+        queue_reason: queue_reasons.get(task.task_id.as_str()).cloned(),
+        fallback_mode,
         parallelism_group: task
             .executor_binding_parallelism_group()
             .map(ToString::to_string),
@@ -351,10 +367,71 @@ fn agent_projection_from_task(
             .map(|thread| thread.last_used_at)
             .unwrap_or(task.updated_at),
         result: agent_projection_result(task, thread),
-        failure_message: (task.status == TaskStatus::Failed)
-            .then(|| task.output_refs.first().cloned())
-            .flatten(),
     }
+}
+
+fn agent_failure_details(
+    task: &Task,
+    lifecycle: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    if lifecycle == "queued" || lifecycle == "running" || task.status == TaskStatus::Completed {
+        return (None, None, None, None);
+    }
+    if task.status == TaskStatus::Killed {
+        return (
+            Some("cancellation".to_string()),
+            Some("agent_killed".to_string()),
+            Some("代理任务被终止".to_string()),
+            Some("mainline_or_reassign".to_string()),
+        );
+    }
+
+    let public_refs = public_task_output_refs(TaskStatus::Failed, &task.output_refs);
+    let raw_message = public_refs
+        .first()
+        .map(String::as_str)
+        .unwrap_or("代理任务执行失败");
+    if lifecycle == "degraded" || public_task_failure_is_degraded(raw_message) {
+        return (
+            Some("dispatch".to_string()),
+            Some("agent_unavailable".to_string()),
+            Some("代理当前不可用，主线需要改派或接管。".to_string()),
+            Some("mainline_or_reassign".to_string()),
+        );
+    }
+    let failure = classify_public_task_failure(raw_message);
+    (
+        Some(failure.failure_stage.to_string()),
+        Some(failure.error_code.to_string()),
+        Some(sanitize_public_failure_message(raw_message)),
+        Some(failure.fallback_mode.to_string()),
+    )
+}
+
+fn sanitize_public_failure_message(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("http://")
+        || trimmed.contains("https://")
+        || trimmed.to_ascii_lowercase().contains("api key")
+        || trimmed.to_ascii_lowercase().contains("token")
+        || trimmed.to_ascii_lowercase().contains("secret")
+        || trimmed.contains("/Users/")
+        || trimmed.contains("/home/")
+        || trimmed.contains("\\Users\\")
+    {
+        return TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT.to_string();
+    }
+    let mut output = trimmed.chars().take(600).collect::<String>();
+    if trimmed.chars().count() > 600 {
+        output.push('…');
+    }
+    output
 }
 
 fn agent_runtime_status(task: &Task) -> (&'static str, &'static str) {
@@ -399,7 +476,7 @@ fn agent_model_bindings_for_state(state: &ApiState) -> HashMap<String, AgentMode
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string);
             let model_source = if engine_id.is_some() {
-                "engine".to_string()
+                "role_engine".to_string()
             } else {
                 "inherited_orchestrator".to_string()
             };
@@ -447,10 +524,9 @@ fn agent_lifecycle(task: &Task) -> &'static str {
         TaskStatus::Completed => "completed",
         TaskStatus::Killed => "killed",
         TaskStatus::Failed
-            if task
-                .output_refs
+            if public_task_output_refs(TaskStatus::Failed, &task.output_refs)
                 .iter()
-                .any(|output| output == TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT) =>
+                .any(|output| public_task_failure_is_degraded(output)) =>
         {
             "degraded"
         }
@@ -592,11 +668,22 @@ async fn get_agent_run_projection(
     let session_threads = state
         .session_store
         .thread_registry_snapshot(&scope.execution.session_id);
+    let queue_reasons = state
+        .execution_admission_snapshot()
+        .map(|snapshot| {
+            snapshot
+                .queued
+                .into_iter()
+                .map(|entry| (entry.task_id, entry.reason))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let agents = agent_read_model_for_projection(
         &projection,
         active_chain.as_ref(),
         &session_threads,
         &agent_model_bindings,
+        &queue_reasons,
     );
     Ok(Json(agent_run_projection_response(
         projection, &scope, agents,
@@ -660,6 +747,7 @@ fn agent_run_failure_summary(projection: &AgentRunProjection) -> Option<AgentRun
                 .find(|task| task.parent_task_id.is_some() && task.status == TaskStatus::Failed)
                 .and_then(|task| task.output_refs.first().cloned())
         });
+    let message = message.map(|message| sanitize_public_failure_message(&message));
     Some(AgentRunFailureSummaryDto {
         root_failed,
         failed_agent_count,
@@ -738,10 +826,8 @@ mod tests {
     use super::*;
     use crate::routes::session_scope::{RegisteredWorkspaceBinding, SessionScope};
     use crate::state::ApiState;
-    use magi_core::{
-        AbsolutePath, ExecutionOwnership, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, UtcMillis,
-        WorkspaceId,
-    };
+    use magi_core::task::public_task_failure_output;
+    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
@@ -806,7 +892,12 @@ mod tests {
 
         assert_eq!(
             public_task.output_refs,
-            vec![TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT.to_string()]
+            vec![
+                public_task_failure_output(
+                    "LLM invocation failed: provider transport failed: timed out"
+                )
+                .to_string()
+            ]
         );
     }
 
@@ -922,8 +1013,14 @@ mod tests {
             handled_task_ids: vec![task.task_id.clone()],
             message_history: Vec::new(),
         };
-        let projection =
-            agent_projection_from_task(&task, None, Some(&thread), None, &HashMap::new());
+        let projection = agent_projection_from_task(
+            &task,
+            None,
+            Some(&thread),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(projection.status, "completed");
         assert_eq!(projection.lifecycle, "completed");
@@ -950,6 +1047,7 @@ mod tests {
         child.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "guided".to_string(),
             access_profile: AccessProfile::ReadOnly,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -1051,7 +1149,7 @@ mod tests {
             AgentModelBinding {
                 engine_id: Some("engine-reviewer".to_string()),
                 model: Some("gpt-reviewer".to_string()),
-                model_source: "engine".to_string(),
+                model_source: "role_engine".to_string(),
             },
         );
 
@@ -1060,6 +1158,7 @@ mod tests {
             Some(&chain),
             &session_threads,
             &model_bindings,
+            &HashMap::new(),
         );
 
         assert_eq!(agents.len(), 1);
@@ -1069,7 +1168,7 @@ mod tests {
         assert_eq!(agent.role, "reviewer");
         assert_eq!(agent.engine_id.as_deref(), Some("engine-reviewer"));
         assert_eq!(agent.model.as_deref(), Some("gpt-reviewer"));
-        assert_eq!(agent.model_source, "engine");
+        assert_eq!(agent.model_source, "role_engine");
         assert_eq!(agent.lifecycle, "completed");
         assert_eq!(agent.started_at, UtcMillis(10));
         assert_eq!(agent.completed_at, Some(UtcMillis(20)));
@@ -1138,6 +1237,11 @@ mod tests {
             status_label: "运行中".to_string(),
             lifecycle: "running".to_string(),
             access_profile: "read_only".to_string(),
+            failure_stage: None,
+            failure_code: None,
+            failure_message: None,
+            queue_reason: None,
+            fallback_mode: None,
             parallelism_group: None,
             worker_id: Some("worker-response".to_string()),
             thread_id: Some("thread-response".to_string()),
@@ -1147,7 +1251,6 @@ mod tests {
             response_duration_ms: None,
             updated_at: UtcMillis(2),
             result: None,
-            failure_message: None,
         }];
 
         let value = serde_json::to_value(agent_run_projection_response(projection, &scope, agents))
@@ -1263,7 +1366,7 @@ mod tests {
 
         assert_eq!(explorer.engine_id.as_deref(), Some("glm-5-1"));
         assert_eq!(explorer.model.as_deref(), Some("glm-5.1"));
-        assert_eq!(explorer.model_source, "engine");
+        assert_eq!(explorer.model_source, "role_engine");
     }
 
     #[test]

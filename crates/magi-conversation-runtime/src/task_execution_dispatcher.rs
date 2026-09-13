@@ -64,6 +64,7 @@ use std::{
     collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -138,6 +139,9 @@ pub struct LlmTaskDispatcher {
     /// 内置工具和 skill schema 在 daemon 生命周期内稳定；MCP 与浏览器能力仍在
     /// 每轮通过 live refresh 更新，不进入该缓存。
     tool_definition_cache: Arc<Mutex<HashMap<String, Vec<ChatToolDefinition>>>>,
+    /// 按 root task 统计尚未退出的异步 dispatch。Runner 重启必须等待这里的计数
+    /// 归零，不能只等待 Runner 自身循环结束。
+    dispatch_quiesce: Arc<DispatchQuiesceState>,
     knowledge_store: Option<Arc<KnowledgeStore>>,
     knowledge_persist_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     session_state_persist_callback: Option<Arc<SessionStatePersistCallback>>,
@@ -182,6 +186,71 @@ pub struct LlmTaskDispatcherDependencies {
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
 }
 
+#[derive(Default)]
+struct DispatchQuiesceState {
+    in_flight: Mutex<HashMap<TaskId, usize>>,
+    notify: tokio::sync::Notify,
+}
+
+impl DispatchQuiesceState {
+    fn begin(self: &Arc<Self>, root_task_id: TaskId) -> InFlightDispatchGuard {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .expect("dispatch quiesce lock poisoned");
+        *in_flight.entry(root_task_id.clone()).or_default() += 1;
+        InFlightDispatchGuard {
+            state: Arc::clone(self),
+            root_task_id,
+        }
+    }
+
+    async fn wait_for_root(&self, root_task_id: &TaskId) {
+        loop {
+            // 先创建 notified future，再检查计数，避免检查与 notify 之间丢失唤醒。
+            let notified = self.notify.notified();
+            let active = self
+                .in_flight
+                .lock()
+                .expect("dispatch quiesce lock poisoned")
+                .get(root_task_id)
+                .copied()
+                .unwrap_or(0);
+            if active == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn finish(&self, root_task_id: &TaskId) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .expect("dispatch quiesce lock poisoned");
+        if let Some(count) = in_flight.get_mut(root_task_id) {
+            if *count <= 1 {
+                in_flight.remove(root_task_id);
+            } else {
+                *count -= 1;
+            }
+        }
+        drop(in_flight);
+        self.notify.notify_waiters();
+    }
+}
+
+struct InFlightDispatchGuard {
+    state: Arc<DispatchQuiesceState>,
+    root_task_id: TaskId,
+}
+
+impl Drop for InFlightDispatchGuard {
+    fn drop(&mut self) {
+        self.state.finish(&self.root_task_id);
+    }
+}
+
 struct ExecutionPlanCleanup<'a> {
     registry: &'a TaskExecutionRegistry,
     task_id: &'a TaskId,
@@ -193,6 +262,51 @@ impl Drop for ExecutionPlanCleanup<'_> {
         let _ = self
             .registry
             .remove_if_turn_matches(self.task_id, &self.turn_id);
+    }
+}
+
+/// 代理执行代际的 worktree 清理守卫。
+///
+/// `invoke_llm_with_tools` 可能因为模型桥、工具执行或 Git runtime panic 而提前
+/// 退出。清理必须和执行代际绑定，并由同一个 RAII 守卫覆盖成功、失败、取消和
+/// panic 四条路径，避免迟到的旧 dispatch 释放新一轮 worktree。
+struct AgentWorktreeCleanup {
+    dispatcher: LlmTaskDispatcher,
+    task: magi_core::Task,
+    lease_id: LeaseId,
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
+    is_sidechain: bool,
+}
+
+impl Drop for AgentWorktreeCleanup {
+    fn drop(&mut self) {
+        if !self.is_sidechain {
+            return;
+        }
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.dispatcher.finalize_agent_worktree(
+                &self.task,
+                &self.lease_id,
+                &self.session_id,
+                &self.workspace_id,
+                true,
+            );
+        }));
+        if cleanup.is_err() {
+            tracing::error!(
+                task_id = %self.task.task_id,
+                lease_id = %self.lease_id,
+                "代理 worktree 清理发生 panic，至少标记该执行代际为 inactive"
+            );
+            if let Some(registry) = self.dispatcher.session_code_contexts.as_ref() {
+                let _ = registry.release_agent_worktree_for_lease(
+                    self.session_id.as_str(),
+                    self.task.task_id.as_str(),
+                    self.lease_id.as_str(),
+                );
+            }
+        }
     }
 }
 
@@ -359,6 +473,7 @@ impl LlmTaskDispatcher {
             model_bridge_client: None,
             model_client_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_definition_cache: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_quiesce: Arc::new(DispatchQuiesceState::default()),
             knowledge_store: None,
             knowledge_persist_callback: None,
             session_state_persist_callback: None,
@@ -573,6 +688,14 @@ impl LlmTaskDispatcher {
             execution_settings_snapshot,
         } = input;
         let task_id = &task.task_id;
+        let _worktree_cleanup = AgentWorktreeCleanup {
+            dispatcher: self.clone(),
+            task: task.clone(),
+            lease_id: lease_id.clone(),
+            session_id: session_id.clone(),
+            workspace_id: workspace_id.clone(),
+            is_sidechain,
+        };
         let streaming_entry_id = task_streaming_entry_id(task);
         let (outcome, context_summary) = self.invoke_llm_with_tools(TaskLlmInvocationInput {
             task,
@@ -599,7 +722,6 @@ impl LlmTaskDispatcher {
             writebacks.apply(&self.pipeline.memory_store);
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
             self.push_result(task_id, lease_id, outcome.clone());
-            self.finalize_agent_worktree(task, &session_id, &workspace_id, is_sidechain);
             if should_enrich_session {
                 self.schedule_post_completion_enrichment(
                     session_id,
@@ -612,7 +734,6 @@ impl LlmTaskDispatcher {
             return;
         }
         self.push_result(task_id, lease_id, outcome);
-        self.finalize_agent_worktree(task, &session_id, &workspace_id, is_sidechain);
     }
 
     fn schedule_post_completion_enrichment(
@@ -1370,6 +1491,7 @@ impl LlmTaskDispatcher {
     fn resolve_task_execution_root(
         &self,
         task: &magi_core::Task,
+        lease_id: &LeaseId,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
         execution_root: Option<&PathBuf>,
@@ -1400,13 +1522,18 @@ impl LlmTaskDispatcher {
             // 非 Git workspace 没有 SessionGitContext，只能沿用普通 workspace 语义。
             return Ok(main_root);
         };
-        if let Some(existing) = context
-            .agent_worktrees
-            .iter()
-            .find(|worktree| worktree.task_id == task.task_id.as_str() && worktree.active)
-            && existing.path.is_dir()
-        {
-            return Ok(Some(existing.path.clone()));
+        if let Some(existing) = context.agent_worktrees.iter().find(|worktree| {
+            worktree.task_id == task.task_id.as_str()
+                && worktree.active
+                && worktree.lease_id.as_deref() == Some(lease_id.as_str())
+        }) {
+            if existing.path.is_dir() {
+                return Ok(Some(existing.path.clone()));
+            }
+            return Err(format!(
+                "执行租约 {} 对应的 agent worktree 不可用",
+                lease_id
+            ));
         }
         if context.has_external_drift() {
             return Err(format!(
@@ -1466,6 +1593,7 @@ impl LlmTaskDispatcher {
                 session_id.as_str(),
                 magi_git::AgentWorktreeContext {
                     task_id: task.task_id.to_string(),
+                    lease_id: Some(lease_id.to_string()),
                     worker_id: worker_id.map(ToString::to_string).unwrap_or_default(),
                     path: created.path.clone(),
                     mode,
@@ -1553,6 +1681,7 @@ impl LlmTaskDispatcher {
     fn finalize_agent_worktree(
         &self,
         task: &magi_core::Task,
+        lease_id: &LeaseId,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
         is_sidechain: bool,
@@ -1572,7 +1701,11 @@ impl LlmTaskDispatcher {
         let Some(allocation) = context
             .agent_worktrees
             .iter()
-            .find(|worktree| worktree.task_id == task.task_id.as_str() && worktree.active)
+            .find(|worktree| {
+                worktree.task_id == task.task_id.as_str()
+                    && worktree.active
+                    && worktree.lease_id.as_deref() == Some(lease_id.as_str())
+            })
             .cloned()
         else {
             return;
@@ -1609,9 +1742,11 @@ impl LlmTaskDispatcher {
             }
         };
 
-        if let Err(error) =
-            registry.release_agent_worktree(session_id.as_str(), task.task_id.as_str())
-        {
+        if let Err(error) = registry.release_agent_worktree_for_lease(
+            session_id.as_str(),
+            task.task_id.as_str(),
+            lease_id.as_str(),
+        ) {
             tracing::warn!(
                 session_id = %session_id,
                 task_id = %task.task_id,
@@ -1652,6 +1787,7 @@ impl LlmTaskDispatcher {
                     "session_id": session_id,
                     "workspace_id": workspace_id,
                     "task_id": task.task_id,
+                    "lease_id": lease_id,
                     "worker_id": allocation.worker_id,
                     "mode": allocation.mode,
                     "base_head": allocation.base_head,
@@ -1732,17 +1868,12 @@ impl LlmTaskDispatcher {
         }
         let registry = Some(self.agent_role_registry.as_ref());
         if task_is_coordinator(Some(task), registry) {
-            let collaboration_disabled = task
+            let collaboration_mode = task
                 .policy_snapshot
                 .as_ref()
-                .is_some_and(|policy| policy.denied_tools.iter().any(|tool| tool == "agent_spawn"));
-            if collaboration_disabled {
-                return Some(
-                    "多代理模式（当前模式：disabled）：当前任务不允许创建或派发代理；任何历史中的 proactive/explicit_request_only 规则均已撤销，不得调用 agent_spawn，也不得用主线口头总结冒充代理执行。"
-                        .to_string(),
-                );
-            }
-            return Some(root_multi_agent_mode_prompt());
+                .map(|policy| policy.collaboration_mode)
+                .unwrap_or_default();
+            return Some(root_multi_agent_mode_prompt(collaboration_mode));
         }
         Some(subagent_multi_agent_mode_prompt())
     }
@@ -2227,6 +2358,7 @@ impl LlmTaskDispatcher {
             .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id));
         let workspace_root_path = match self.resolve_task_execution_root(
             task,
+            lease_id,
             session_id,
             workspace_id,
             execution_root,
@@ -2832,7 +2964,9 @@ impl TaskDispatcher for LlmTaskDispatcher {
             let task_id = task.task_id.clone();
             let lease_id = lease.lease_id.clone();
             let join_observer = self.clone();
+            let _dispatch_quiesce = self.dispatch_quiesce.begin(task.root_task_id.clone());
             let join = handle.spawn_blocking(move || {
+                let _dispatch_quiesce = _dispatch_quiesce;
                 let _admission_permit = admission_permit;
                 if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
                     tracing::error!("dispatch_inner failed: {}", err);
@@ -2851,9 +2985,21 @@ impl TaskDispatcher for LlmTaskDispatcher {
             Ok(())
         } else {
             // 不在 tokio 运行时中（例如同步测试环境），直接同步执行。
+            let _dispatch_quiesce = self.dispatch_quiesce.begin(task.root_task_id.clone());
             let _admission_permit = admission_permit;
             self.dispatch_inner(&task, &worker, &lease)
         }
+    }
+
+    fn wait_for_quiesce<'a>(
+        &'a self,
+        root_task_id: &'a TaskId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        let state = Arc::clone(&self.dispatch_quiesce);
+        let root_task_id = root_task_id.clone();
+        Box::pin(async move {
+            state.wait_for_root(&root_task_id).await;
+        })
     }
 }
 
@@ -2919,10 +3065,11 @@ mod tests {
     fn task_with_role(role: &str, task_tier: TaskTier) -> Task {
         let now = UtcMillis(1_000);
         let background_allowed = false;
+        let task_id = TaskId::new(format!("task-{role}"));
         Task {
-            task_id: TaskId::new(format!("task-{role}")),
+            task_id: task_id.clone(),
             mission_id: MissionId::new("mission-tool-scope"),
-            root_task_id: TaskId::new("task-root"),
+            root_task_id: task_id,
             parent_task_id: None,
             kind: TaskKind::LocalAgent,
             title: format!("task {role}"),
@@ -2933,6 +3080,7 @@ mod tests {
             policy_snapshot: Some(TaskPolicy {
                 autonomy_level: "Autonomous".to_string(),
                 access_profile: magi_core::AccessProfile::Restricted,
+                collaboration_mode: Default::default(),
                 allowed_tools: Vec::new(),
                 denied_tools: Vec::new(),
                 allowed_paths: Vec::new(),
@@ -3223,9 +3371,11 @@ mod tests {
             .with_git_context_runtime(git_service, contexts.clone());
         dispatcher.agent_worktree_root = fixture.path().join("agent-worktrees");
         let task = task_with_role("executor", TaskTier::ExecutionChain);
+        let lease_id = LeaseId::new("lease-git-agent");
         let execution_root = dispatcher
             .resolve_task_execution_root(
                 &task,
+                &lease_id,
                 &SessionId::new("session-git-agent"),
                 &Some(WorkspaceId::new("workspace-git-agent")),
                 None,
@@ -3264,6 +3414,7 @@ mod tests {
 
         dispatcher.finalize_agent_worktree(
             &task,
+            &lease_id,
             &SessionId::new("session-git-agent"),
             &Some(WorkspaceId::new("workspace-git-agent")),
             true,
@@ -3316,9 +3467,11 @@ mod tests {
             .with_git_context_runtime(git_service, contexts.clone());
         dispatcher.agent_worktree_root = fixture.path().join("agent-worktrees");
         let task = task_with_role("executor", TaskTier::ExecutionChain);
+        let lease_id = LeaseId::new("lease-git-agent-dirty");
         let execution_root = dispatcher
             .resolve_task_execution_root(
                 &task,
+                &lease_id,
                 &SessionId::new("session-git-agent-dirty"),
                 &Some(WorkspaceId::new("workspace-git-agent-dirty")),
                 None,
@@ -3332,6 +3485,7 @@ mod tests {
 
         dispatcher.finalize_agent_worktree(
             &task,
+            &lease_id,
             &SessionId::new("session-git-agent-dirty"),
             &Some(WorkspaceId::new("workspace-git-agent-dirty")),
             true,
@@ -3838,6 +3992,21 @@ mod tests {
             Some(&registry),
             BuiltinToolName::CreateGoal
         ));
+        let mut nested_coordinator = coordinator_task.clone();
+        nested_coordinator.parent_task_id = Some(TaskId::new("task-parent"));
+        nested_coordinator.root_task_id = coordinator_task.task_id.clone();
+        assert!(!task_can_see_builtin_tool(
+            Some(&nested_coordinator),
+            Some(&registry),
+            BuiltinToolName::AgentSpawn
+        ));
+        let mut detached_coordinator = coordinator_task.clone();
+        detached_coordinator.root_task_id = TaskId::new("task-other-root");
+        assert!(!task_can_see_builtin_tool(
+            Some(&detached_coordinator),
+            Some(&registry),
+            BuiltinToolName::AgentWait
+        ));
         assert!(!task_can_see_builtin_tool(
             Some(&worker_task),
             Some(&registry),
@@ -3879,6 +4048,47 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn dispatch_quiesce_waits_for_every_in_flight_dispatch_of_root() {
+        let state = Arc::new(DispatchQuiesceState::default());
+        let root_task_id = TaskId::new("root-dispatch-quiesce");
+        let first = state.begin(root_task_id.clone());
+        let second = state.begin(root_task_id.clone());
+
+        let waiting = tokio::spawn({
+            let state = Arc::clone(&state);
+            let root_task_id = root_task_id.clone();
+            async move { state.wait_for_root(&root_task_id).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), waiting)
+                .await
+                .is_err(),
+            "仍有 dispatch 时 quiesce 不应提前返回"
+        );
+
+        drop(first);
+        let waiting = tokio::spawn({
+            let state = Arc::clone(&state);
+            let root_task_id = root_task_id.clone();
+            async move { state.wait_for_root(&root_task_id).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), waiting)
+                .await
+                .is_err(),
+            "仍有第二个 dispatch 时 quiesce 不应提前返回"
+        );
+
+        drop(second);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.wait_for_root(&root_task_id),
+        )
+        .await
+        .expect("全部 dispatch 退出后 quiesce 应返回");
+    }
+
     #[test]
     fn assemble_prompt_injects_codex_style_multi_agent_mode_by_role() {
         let dispatcher = dispatcher_with_default_tool_surface();
@@ -3889,8 +4099,8 @@ mod tests {
         let (coordinator_prompt, _) =
             dispatcher.assemble_prompt(None, &coordinator_task, &session_id, &workspace_id);
         assert!(
-            coordinator_prompt.contains("多代理模式（当前模式：proactive"),
-            "root coordinator prompt 必须包含多代理触发策略: {coordinator_prompt}"
+            coordinator_prompt.contains("多代理模式（当前模式：auto"),
+            "root coordinator prompt 必须包含 auto 多代理策略: {coordinator_prompt}"
         );
         assert!(
             coordinator_prompt.contains("用户明确要求 subagent")
@@ -3908,16 +4118,10 @@ mod tests {
             .policy_snapshot
             .as_mut()
             .expect("policy")
-            .denied_tools = ["agent_spawn", "agent_send", "agent_wait"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+            .collaboration_mode = magi_core::CollaborationMode::Disabled;
         let (ordinary_prompt, _) =
             dispatcher.assemble_prompt(None, &ordinary_task, &session_id, &workspace_id);
-        assert!(
-            ordinary_prompt.contains("多代理模式（当前模式：disabled"),
-            "普通主线请求禁用协作工具后必须显式撤销旧协作规则"
-        );
+        assert!(ordinary_prompt.contains("多代理模式（当前模式：disabled"));
         let ordinary_tools = dispatcher
             .build_tool_definitions(
                 Some(&ordinary_task),
@@ -3928,10 +4132,10 @@ mod tests {
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
-        for hidden in ["agent_spawn", "agent_send", "agent_wait"] {
+        for visible in ["agent_spawn", "agent_send", "agent_wait"] {
             assert!(
-                !ordinary_tools.iter().any(|name| name == hidden),
-                "普通主线请求不能暴露协作工具 {hidden}: {ordinary_tools:?}"
+                ordinary_tools.iter().any(|name| name == visible),
+                "disabled 模式仍需保留协作工具定义，由运行时统一拒绝 {visible}: {ordinary_tools:?}"
             );
         }
 
@@ -3939,8 +4143,7 @@ mod tests {
         let (worker_prompt, _) =
             dispatcher.assemble_prompt(None, &worker_task, &session_id, &workspace_id);
         assert!(
-            worker_prompt
-                .contains("子代理模式（当前模式：explicit_request_only；worker 必须遵守）")
+            worker_prompt.contains("子代理模式（当前模式：worker；worker 必须遵守）")
                 && worker_prompt.contains("不要继续创建代理"),
             "worker prompt 必须说明自身不能继续分派"
         );

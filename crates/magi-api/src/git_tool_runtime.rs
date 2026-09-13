@@ -985,6 +985,7 @@ mod tests {
                 "session-git-tool",
                 magi_git::AgentWorktreeContext {
                     task_id: "task-running-agent".to_string(),
+                    lease_id: None,
                     worker_id: "worker-running-agent".to_string(),
                     path: temp.path().join("running-agent-worktree"),
                     mode: magi_git::AgentWorktreeMode::Writable,

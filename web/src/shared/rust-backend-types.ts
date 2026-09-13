@@ -1733,11 +1733,16 @@ export interface AgentProjectionDto {
   capabilityIds: string[];
   engineId?: string | null;
   model?: string | null;
-  modelSource: 'engine' | 'inherited_orchestrator' | 'unconfigured' | string;
+  modelSource: 'role_engine' | 'inherited_orchestrator' | 'unconfigured' | string;
   status: TaskStatus;
   statusLabel: string;
   lifecycle: 'queued' | 'running' | 'completed' | 'failed' | 'killed' | 'degraded' | string;
   accessProfile: 'read_only' | 'restricted' | 'full_access' | string;
+  failureStage?: string | null;
+  failureCode?: string | null;
+  failureMessage?: string | null;
+  queueReason?: string | null;
+  fallbackMode?: 'mainline_or_reassign' | string | null;
   parallelismGroup?: string | null;
   workerId?: string | null;
   threadId?: string | null;
@@ -1750,7 +1755,6 @@ export interface AgentProjectionDto {
   responseDurationMs?: number | null;
   updatedAt: number;
   result?: AgentProjectionResultDto | null;
-  failureMessage?: string | null;
 }
 
 export type AgentRunOutcome =

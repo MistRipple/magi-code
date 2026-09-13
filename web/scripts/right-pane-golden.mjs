@@ -95,6 +95,7 @@ await withGoldenViteServer(async (server) => {
     editsSource,
     fileChangeSource,
     knowledgeSource,
+    globalStyles,
   ] = await Promise.all([
     read('../src/stores/right-pane.svelte.ts'),
     read('../src/web/WebWorkbenchShell.svelte'),
@@ -104,6 +105,7 @@ await withGoldenViteServer(async (server) => {
     read('../src/components/EditsPanel.svelte'),
     read('../src/components/blocks/FileChangeCard.svelte'),
     read('../src/components/KnowledgePanel.svelte'),
+    read('../src/styles/global.css'),
   ]);
 
   const removedGeometry = /browserContentSlot|rendererGeometry|renderer_geometry|bindContentSurface|browserContentBounds/u;
@@ -204,6 +206,11 @@ await withGoldenViteServer(async (server) => {
   assert.match(browserSource, /magi:browserNodeSelected/u);
   assert.match(browserSource, /event\.type === 'popup_blocked'[\s\S]*popupBlockedMessage\(event\.reason\)/u);
   assert.match(browserSource, /class="browser-action-error"[\s\S]*style:position-anchor=\{surfaceAnchorName\}[\s\S]*popover="manual"/u);
+  assert.match(
+    globalStyles,
+    /:where\(\[popover\]\)\s*\{[\s\S]*?inset:\s*auto;[\s\S]*?margin:\s*0;[\s\S]*?border:\s*0;[\s\S]*?padding:\s*0;[\s\S]*?background:\s*transparent;/u,
+    '所有原生 popover 必须清除 Chromium 默认 dialog 外壳，避免额外黑边和内边距',
+  );
   assert.doesNotMatch(browserSource, /transform:\s*scale\(|object-fit:\s*(?:fill|cover)/u);
 
   console.log('right pane golden replay passed');

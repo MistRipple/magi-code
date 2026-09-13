@@ -1538,19 +1538,27 @@ mod tests {
                 vec![
                     crate::AgentRoleCatalogEntry {
                         role_id: "coordinator".to_string(),
+                        display_name: "协调器".to_string(),
+                        description: "主线任务编排角色".to_string(),
                         spawnable: false,
                         coordinator_mode: true,
                         supported_kinds: vec!["local_agent".to_string()],
+                        capability_ids: vec!["general_engineering".to_string()],
                         parallelism_limit: None,
                         status: "coordinator_only".to_string(),
+                        model_binding_status: "inherited_orchestrator".to_string(),
                     },
                     crate::AgentRoleCatalogEntry {
                         role_id: "executor".to_string(),
+                        display_name: "执行器".to_string(),
+                        description: "执行具体工作单元".to_string(),
                         spawnable: true,
                         coordinator_mode: false,
                         supported_kinds: vec!["local_agent".to_string()],
+                        capability_ids: vec!["general_engineering".to_string()],
                         parallelism_limit: Some(2),
                         status: "spawnable".to_string(),
+                        model_binding_status: "unconfigured".to_string(),
                     },
                 ]
             })),

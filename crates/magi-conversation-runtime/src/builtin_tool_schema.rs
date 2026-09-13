@@ -20,13 +20,12 @@ pub(crate) fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefin
 }
 
 fn apply_runtime_schema(
-    mut definition: ChatToolDefinition,
-    agent_role_registry: &AgentRoleRegistry,
+    definition: ChatToolDefinition,
+    _agent_role_registry: &AgentRoleRegistry,
 ) -> ChatToolDefinition {
-    if definition.function.name == BuiltinToolName::AgentSpawn.as_str() {
-        definition.function.parameters["properties"]["capabilities"]["items"]["enum"] =
-            serde_json::json!(agent_role_registry.capability_ids());
-    }
+    // 角色能力是运行时注册表的事实源，不能把全局能力集合写入工具 Schema。
+    // agent_spawn 缺省 capabilities 时由服务端按目标角色补齐；显式值仍由
+    // preflight 严格校验，避免模型依据一个跨角色的 enum 生成必然会被拒绝的参数。
     definition
 }
 
@@ -101,18 +100,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawn_schema_uses_capability_registry_as_source() {
+    fn agent_spawn_schema_keeps_capabilities_optional_and_role_scoped() {
         let definition = apply_runtime_schema(
             public_builtin_tool_definition("agent_spawn").expect("public agent_spawn"),
             &AgentRoleRegistry::load_default(),
         );
 
-        assert_eq!(
-            definition.function.parameters["properties"]["capabilities"]["items"]["enum"],
-            serde_json::json!(AgentRoleRegistry::load_default().capability_ids())
+        assert!(
+            definition.function.parameters["properties"]["capabilities"]
+                .get("minItems")
+                .is_some()
         );
         assert!(
-            definition.function.parameters["required"]
+            definition.function.parameters["properties"]["capabilities"]["items"]
+                .get("enum")
+                .is_none()
+        );
+        assert!(
+            !definition.function.parameters["required"]
                 .as_array()
                 .expect("required")
                 .iter()

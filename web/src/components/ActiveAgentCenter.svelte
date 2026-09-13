@@ -243,6 +243,18 @@
     return labels[agent.status];
   }
 
+  function failureStageLabel(stage: string | null | undefined): string {
+    if (!stage) return '';
+    const translated = i18n.t(`activeAgentCenter.failureStage.${stage}`);
+    return translated === `activeAgentCenter.failureStage.${stage}` ? stage : translated;
+  }
+
+  function failureCodeLabel(code: string | null | undefined): string {
+    if (!code) return '';
+    const translated = i18n.t(`activeAgentCenter.failureCode.${code}`);
+    return translated === `activeAgentCenter.failureCode.${code}` ? code : translated;
+  }
+
   function durationLabel(agent: AgentProjectionDto): string {
     return formatAgentDuration(agentDurationSeconds(agent, nowMs));
   }
@@ -257,6 +269,15 @@
         active: summary.activeCount,
         attention: summary.attentionCount,
       });
+    }
+    if (summary.queuedCount > 0 && summary.activeCount > 0) {
+      return i18n.t('activeAgentCenter.summaryQueuedRunning', {
+        queued: summary.queuedCount,
+        active: summary.activeCount,
+      });
+    }
+    if (summary.queuedCount > 0) {
+      return i18n.t('activeAgentCenter.summaryQueued', { count: summary.queuedCount });
     }
     if (summary.activeCount > 0) {
       return i18n.t('activeAgentCenter.summaryRunning', { count: summary.activeCount });
@@ -403,6 +424,15 @@
         <span>{agentRoleLabel(agent)}</span>
       </span>
       <span class="agent-goal">{agent.goal}</span>
+      {#if agent.queueReason}
+        <span class="agent-diagnostic">{agent.queueReason}</span>
+      {:else if agent.failureCode || agent.failureStage}
+        <span class="agent-diagnostic">
+          {failureCodeLabel(agent.failureCode) || i18n.t('activeAgentCenter.status.failed')}
+          {#if agent.failureStage} · {failureStageLabel(agent.failureStage)}{/if}
+          {#if agent.failureMessage} · {agent.failureMessage}{/if}
+        </span>
+      {/if}
     </span>
     <span class="agent-status agent-status--{statusTone(agent)}">
       <Icon name={icon.name} size={12} class={icon.spinning ? 'spinning' : ''} />
@@ -513,6 +543,18 @@
                 <small>{agentGroups.running.length}</small>
               </div>
               {#each agentGroups.running as agent (agent.agentRunId)}
+                {@render agentRow(agent)}
+              {/each}
+            </section>
+          {/if}
+
+          {#if agentGroups.queued.length > 0}
+            <section class="agent-group agent-group--queued">
+              <div class="group-heading">
+                <span>{i18n.t('activeAgentCenter.queued')}</span>
+                <small>{agentGroups.queued.length}</small>
+              </div>
+              {#each agentGroups.queued as agent (agent.agentRunId)}
                 {@render agentRow(agent)}
               {/each}
             </section>
@@ -1012,6 +1054,14 @@
 
   .agent-goal {
     overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .agent-diagnostic {
+    overflow: hidden;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
     text-overflow: ellipsis;
     white-space: nowrap;
   }

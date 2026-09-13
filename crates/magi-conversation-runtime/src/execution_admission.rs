@@ -159,6 +159,20 @@ impl ExecutionAdmissionController {
         })
     }
 
+    /// 在不改变排队或活跃状态的前提下检查当前角色是否能够立即取得执行槽位。
+    ///
+    /// `agent_spawn` 预检只能读取这份结果；真正的占用仍由 Runner 在取得任务租约
+    /// 后调用 [`Self::acquire`] 完成。这样预检不会产生没有对应 Task 的 queued 记录，
+    /// 同时 dispatcher 与 Runner 可以共享同一个准入控制器。
+    pub fn preview(&self, session_id: Option<&SessionId>, role: &str) -> Option<String> {
+        let resources = self.resource_snapshot();
+        let state = self
+            .state
+            .lock()
+            .expect("execution admission lock poisoned");
+        self.block_reason(&state, session_id, role, &resources)
+    }
+
     pub fn snapshot(&self) -> ExecutionAdmissionSnapshot {
         let resources = self.resource_snapshot();
         let state = self
@@ -391,6 +405,24 @@ mod tests {
 
         drop(permit);
         assert_eq!(controller.snapshot().active_task_count, 0);
+    }
+
+    #[test]
+    fn preview_is_read_only_and_does_not_create_queued_entry() {
+        let controller = controller();
+        let session = SessionId::new("session-preview");
+        let _permit = controller
+            .acquire(
+                TaskId::new("task-preview-active"),
+                Some(session.clone()),
+                "executor",
+            )
+            .expect("active task should acquire capacity");
+        let reason = controller
+            .preview(Some(&session), "reviewer")
+            .expect("preview should report the session limit");
+        assert!(reason.contains("当前会话执行容量已满"));
+        assert_eq!(controller.snapshot().queued_task_count, 0);
     }
 
     #[test]

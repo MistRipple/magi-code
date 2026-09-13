@@ -406,6 +406,20 @@ body::after {
   --magi-surface-overlay: var(--magi-critical-overlay);
 }
 
+/* Chromium 为 popover 属性提供了独立于应用设计系统的默认 dialog chrome，
+   包括黑色边框、内边距和全屏 inset。统一清除这层 UA 外壳，具体弹窗只负责
+   自己的定位与主题材质，避免浏览器工具弹窗出现额外黑边或尺寸漂移。 */
+:where([popover]) {
+  box-sizing: border-box;
+  inset: auto;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  overflow: visible;
+}
+
 /* 根治：确保系统原生光标选中时，具备高对比度可见底色 */
 ::selection {
   background-color: var(--vscode-editor-selectionBackground, rgba(59, 130, 246, 0.4));

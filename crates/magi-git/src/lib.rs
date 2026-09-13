@@ -157,6 +157,10 @@ pub enum AgentWorktreeMode {
 #[serde(rename_all = "camelCase")]
 pub struct AgentWorktreeContext {
     pub task_id: String,
+    /// 创建该 worktree 时持有的执行租约。租约是一次执行代际的唯一标识，
+    /// 用于防止旧 dispatch 在任务恢复后误清理新一轮 worktree。
+    #[serde(default)]
+    pub lease_id: Option<String>,
     pub worker_id: String,
     pub path: PathBuf,
     pub mode: AgentWorktreeMode,
@@ -299,9 +303,10 @@ impl SessionCodeContextRegistry {
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
-        context
-            .agent_worktrees
-            .retain(|existing| existing.task_id != agent_worktree.task_id);
+        context.agent_worktrees.retain(|existing| {
+            !(existing.task_id == agent_worktree.task_id
+                && existing.lease_id == agent_worktree.lease_id)
+        });
         context
             .runtime_workspace_roots
             .push(agent_worktree.path.clone());
@@ -335,6 +340,42 @@ impl SessionCodeContextRegistry {
             .find(|worktree| worktree.task_id == task_id)
             .ok_or_else(|| SessionContextError::MissingAgentWorktree {
                 task_id: task_id.to_string(),
+            })?;
+        agent_worktree.active = false;
+        context
+            .runtime_workspace_roots
+            .retain(|root| !same_path(root, &agent_worktree.path));
+        context.context_revision = context.context_revision.saturating_add(1);
+        Ok(context.clone())
+    }
+
+    /// 只释放指定执行租约对应的 worktree。旧 dispatch 到达时如果任务已经
+    /// 获得新租约，必须保持新一轮 worktree 的 active 状态。
+    pub fn release_agent_worktree_for_lease(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        lease_id: &str,
+    ) -> Result<SessionCodeContext, SessionContextError> {
+        let mut contexts = self
+            .contexts
+            .write()
+            .expect("session code context write lock poisoned");
+        let context = contexts
+            .get_mut(session_id)
+            .ok_or_else(|| SessionContextError::Missing {
+                session_id: session_id.to_string(),
+            })?;
+        let agent_worktree = context
+            .agent_worktrees
+            .iter_mut()
+            .find(|worktree| {
+                worktree.task_id == task_id
+                    && worktree.active
+                    && worktree.lease_id.as_deref() == Some(lease_id)
+            })
+            .ok_or_else(|| SessionContextError::MissingAgentWorktree {
+                task_id: format!("{task_id} (lease {lease_id})"),
             })?;
         agent_worktree.active = false;
         context
@@ -1879,6 +1920,61 @@ mod tests {
             expected_head: observation.head.clone(),
             expected_worktree_path: Some(observation.worktree_path.clone()),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_worktrees_are_scoped_by_execution_lease() {
+        let repo = repository();
+        let service = GitService::new();
+        let observation = service.observe(repo.path()).await.expect("observe");
+        let registry = SessionCodeContextRegistry::default();
+        registry.accept(
+            "session-lease-scope",
+            "workspace-lease-scope",
+            vec![],
+            &observation,
+        );
+
+        for (lease_id, path_suffix) in [("lease-old", "old"), ("lease-current", "current")] {
+            registry
+                .register_agent_worktree(
+                    "session-lease-scope",
+                    AgentWorktreeContext {
+                        task_id: "task-recovered".to_string(),
+                        lease_id: Some(lease_id.to_string()),
+                        worker_id: "worker-executor".to_string(),
+                        path: repo.path().join(path_suffix),
+                        mode: AgentWorktreeMode::ReadOnly,
+                        base_head: observation.head.clone().expect("base head"),
+                        branch: None,
+                        active: true,
+                    },
+                )
+                .expect("register worktree");
+        }
+
+        let before = registry.get("session-lease-scope").expect("context");
+        assert_eq!(before.agent_worktrees.len(), 2);
+        registry
+            .release_agent_worktree_for_lease("session-lease-scope", "task-recovered", "lease-old")
+            .expect("release stale lease");
+        let after = registry.get("session-lease-scope").expect("context");
+        assert!(
+            !after
+                .agent_worktrees
+                .iter()
+                .find(|worktree| worktree.lease_id.as_deref() == Some("lease-old"))
+                .expect("stale worktree")
+                .active
+        );
+        assert!(
+            after
+                .agent_worktrees
+                .iter()
+                .find(|worktree| worktree.lease_id.as_deref() == Some("lease-current"))
+                .expect("current worktree")
+                .active
+        );
     }
 
     #[tokio::test]

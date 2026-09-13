@@ -124,10 +124,19 @@ pub(crate) fn task_is_coordinator(
     task: Option<&Task>,
     registry: Option<&magi_agent_role::AgentRoleRegistry>,
 ) -> bool {
+    let Some(task) = task else {
+        return false;
+    };
+    // 编排工具只能由任务树根节点的 coordinator 使用。仅检查角色的
+    // coordinator_mode 会让任意 Worker 伪造角色绑定后再次创建子代理，
+    // 从而破坏“单根协调器”拓扑约束。
+    if task.parent_task_id.is_some() || task.root_task_id != task.task_id {
+        return false;
+    }
     let Some(registry) = registry else {
         return false;
     };
-    task_role_id(task)
+    task_role_id(Some(task))
         .and_then(|role_id| registry.get(role_id))
         .is_some_and(|role| role.coordinator_mode)
 }

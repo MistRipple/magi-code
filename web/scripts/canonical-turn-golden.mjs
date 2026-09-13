@@ -118,6 +118,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertUserImageMetadataProjectsToMessage(reducer, projection, timelineRenderItems);
   assertViewImageToolResultProjectsAsPreview(reducer, projection, viewImagePreview);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
+  assertHistoricalAgentSpawnStatusUsesCanonicalChildStatus(reducer, projection);
   assertSidechainApprovalAndArtifactArePromoted(reducer, projection, timelineRenderItems);
   assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
@@ -1226,6 +1227,45 @@ function assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reduce
       .map((entry) => entry.message.metadata?.turnItemId),
     childTaskItems.map((entry) => entry.message.metadata?.turnItemId),
     'task transcript should survive snapshot reload by taskId without role-tab state',
+  );
+}
+
+function assertHistoricalAgentSpawnStatusUsesCanonicalChildStatus(reducer, projection) {
+  const c = baseCase('historical-agent-status', 'session-golden-historical-agent-status', 'turn-golden-historical-agent-status', 9520);
+  const userItem = user(c, 1, '请启动代理并等待其完成。');
+  const spawnItem = agentSpawnTool(c, 2, 'spawn-started', 'call-spawn-started', 'executor', '历史验证代理', 'task-historical-child', 'running');
+  // agent_spawn 在派发时只返回 started；后续 task_status 才是历史终态的权威事实。
+  spawnItem.tool.result = {
+    tool: 'agent_spawn',
+    status: 'started',
+    child_task_id: 'task-historical-child',
+    role: 'executor',
+    title: '历史验证代理',
+  };
+  spawnItem.worker = { taskId: 'task-historical-root', title: 'agent_spawn' };
+  const childStatus = item(c, 3, 'child-status', 'task_status', 'completed', {
+    content: '历史验证代理：completed',
+    title: '历史验证代理',
+    worker: {
+      taskId: 'task-historical-child',
+      workerId: 'worker-historical-child',
+      roleId: 'executor',
+      title: '历史验证代理',
+    },
+  });
+  const rootFinal = assistantText(c, 4, 'root-final', '已收到历史代理结果。', 'completed');
+  rootFinal.worker = { taskId: 'task-historical-root', title: '最终回复' };
+
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [userItem, spawnItem, childStatus, rootFinal], { completedAt: 9600, responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.ok(projectionValue, 'historical agent status projection should exist');
+  const spawnArtifact = findArtifactByTurnItemId(projectionValue, 'spawn-started');
+  assert.equal(
+    spawnArtifact?.message.metadata?.agentChildStatus,
+    'completed',
+    '历史主线代理卡片必须从同一 turn 的 child task_status 恢复终态，不能回退显示 started/running',
   );
 }
 

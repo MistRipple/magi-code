@@ -197,6 +197,8 @@ pub(crate) struct QueuedRegularSessionTurn {
     pub task_title: Option<String>,
     pub execution_goal: Option<String>,
     pub task_tier: TaskTier,
+    #[serde(default)]
+    pub collaboration_mode: magi_core::CollaborationMode,
     pub tool_intent: Option<String>,
     pub forced_tool_name: Option<String>,
     #[serde(default)]
@@ -771,6 +773,7 @@ impl RunnerManager {
     }
 
     pub async fn quiesce_for_restart(&self, root_task_id: &str) {
+        let dispatcher = self.dispatcher.clone();
         let existing = {
             self.runners
                 .lock()
@@ -779,6 +782,11 @@ impl RunnerManager {
                 .cloned()
         };
         let Some(handle) = existing else {
+            if let Some(dispatcher) = dispatcher.as_ref() {
+                dispatcher
+                    .wait_for_quiesce(&TaskId::new(root_task_id))
+                    .await;
+            }
             return;
         };
 
@@ -802,6 +810,11 @@ impl RunnerManager {
                 ?error,
                 "旧 runner join 异常，已完成生命周期清理"
             );
+        }
+        if let Some(dispatcher) = dispatcher.as_ref() {
+            dispatcher
+                .wait_for_quiesce(&TaskId::new(root_task_id))
+                .await;
         }
         handle.active.store(false, Ordering::Relaxed);
 
@@ -4531,11 +4544,15 @@ fn normalize_public_mcp_tool_catalog_json(raw: &serde_json::Value) -> serde_json
 fn normalize_public_agent_role_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "roleId": raw.get("role_id").cloned().unwrap_or(serde_json::Value::Null),
+        "displayName": raw.get("display_name").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "description": raw.get("description").cloned().unwrap_or(serde_json::Value::String(String::new())),
         "spawnable": raw.get("spawnable").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "coordinatorMode": raw.get("coordinator_mode").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "supportedKinds": raw.get("supported_kinds").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "capabilityIds": raw.get("capability_ids").cloned().unwrap_or_else(|| serde_json::json!([])),
         "parallelismLimit": raw.get("parallelism_limit").cloned().unwrap_or(serde_json::Value::Null),
         "status": raw.get("status").cloned().unwrap_or(serde_json::Value::String("unknown".to_string())),
+        "modelBindingStatus": raw.get("model_binding_status").cloned().unwrap_or(serde_json::Value::String("unconfigured".to_string())),
     })
 }
 
@@ -4954,6 +4971,7 @@ mod tests {
             task_title: None,
             execution_goal: None,
             task_tier: TaskTier::ExecutionChain,
+            collaboration_mode: magi_core::CollaborationMode::Auto,
             tool_intent: None,
             forced_tool_name: None,
             goal_mode: false,
@@ -5320,6 +5338,7 @@ mod tests {
                 session_id.as_str(),
                 magi_git::AgentWorktreeContext {
                     task_id: "task-dirty-agent-cleanup".to_string(),
+                    lease_id: None,
                     worker_id: "worker-dirty-agent-cleanup".to_string(),
                     path: created.path,
                     mode: magi_git::AgentWorktreeMode::Writable,

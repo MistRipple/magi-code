@@ -12,18 +12,34 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
+use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
-    ExecutionOwnership, SessionId, Task, TaskExecutionTarget, TaskId, ThreadId, UtcMillis,
-    WorkerId, WorkspaceId,
+    ExecutionOwnership, PlanItemId, SessionId, Task, TaskExecutionTarget, TaskId, ThreadId,
+    UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
-use magi_session_store::{ActiveExecutionBranch, SessionStore};
+use magi_session_store::{ActiveExecutionBranch, ExecutionThread, SessionPlan, SessionStore};
 use magi_settings_store::SettingsStore;
 use magi_spawn_graph::SpawnGraph;
 
+use crate::execution_admission::ExecutionAdmissionController;
 use crate::{session_images::SessionTurnImage, session_thread};
 
 pub const DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE: usize = 5;
+
+/// `agent_spawn` 创建前预检需要的进程级运行时事实。
+///
+/// 该配置只保存可共享的句柄，不在预检阶段执行任何持久化或 Git mutation。测试和
+/// 轻量运行时可以不注入它，此时预检仍会执行参数、角色、作用域和准入检查；daemon
+/// 生产装配时必须注入真实 settings、模型客户端和 Git/workspace 事实源。
+#[derive(Clone, Default)]
+pub struct AgentSpawnPreflightRuntime {
+    pub settings_store: Option<Arc<SettingsStore>>,
+    pub default_model_client: Option<Arc<dyn ModelBridgeClient>>,
+    pub workspace_registry: Option<Arc<magi_workspace::WorkspaceStore>>,
+    pub session_code_contexts: Option<magi_git::SessionCodeContextRegistry>,
+    pub git_service_configured: bool,
+}
 
 #[derive(Clone, Debug)]
 pub enum TaskExecutionPlan {
@@ -73,6 +89,12 @@ pub struct SpawnedChildExecutionRequest<'a> {
     /// 角色定义中的并发上限。`None` 表示该角色不设置角色级上限；全局和会话级
     /// 执行准入仍然继续生效。调用方必须从同一份 AgentRoleRegistry 读取该值。
     pub role_parallelism_limit: Option<u32>,
+    /// 可选的当前会话计划。传入时，子任务与 `plan_item_id` 的绑定和回滚都在
+    /// 同一个注册事务内完成；预检阶段已经确认该 item 存在且处于可执行状态。
+    pub plan_store: Option<&'a magi_plan::PlanStore>,
+    pub plan_item_id: Option<PlanItemId>,
+    /// 可选的已通过预检的执行目录。为空时继承父任务计划中的目录。
+    pub execution_root: Option<PathBuf>,
     pub now: UtcMillis,
 }
 
@@ -81,6 +103,8 @@ pub struct SpawnedChildExecution {
     pub worker_id: WorkerId,
     pub thread_id: ThreadId,
     pub execution_chain_ref: String,
+    /// 计划绑定在同一注册事务内完成后的新快照。调用方只负责发布事件，不再重复绑定。
+    pub plan: Option<SessionPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,12 +135,64 @@ impl std::fmt::Display for SpawnedChildExecutionError {
 
 impl std::error::Error for SpawnedChildExecutionError {}
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TaskExecutionRegistry {
     plans: Arc<RwLock<HashMap<TaskId, TaskExecutionPlan>>>,
+    execution_admission: Arc<ExecutionAdmissionController>,
+    agent_spawn_preflight: Arc<RwLock<AgentSpawnPreflightRuntime>>,
+    /// 序列化跨 `TaskStore`、`SpawnGraph`、`SessionStore` 和执行计划的子任务注册。
+    ///
+    /// 预检发生在该锁之外，因此注册入口必须再次检查所有依赖唯一性的事实；
+    /// 这样并发的两个 `agent_spawn` 即使同时通过预检，也不会产生重复的
+    /// canonical task name 或交错的 active execution chain。
+    registration_lock: Arc<Mutex<()>>,
+}
+
+impl Default for TaskExecutionRegistry {
+    fn default() -> Self {
+        Self {
+            plans: Arc::new(RwLock::new(HashMap::new())),
+            execution_admission: Arc::new(ExecutionAdmissionController::default()),
+            agent_spawn_preflight: Arc::new(RwLock::new(AgentSpawnPreflightRuntime::default())),
+            registration_lock: Arc::new(Mutex::new(())),
+        }
+    }
 }
 
 impl TaskExecutionRegistry {
+    /// 返回与 Dispatcher/Runner 共用的执行准入控制器。
+    pub fn execution_admission(&self) -> Arc<ExecutionAdmissionController> {
+        Arc::clone(&self.execution_admission)
+    }
+
+    pub fn with_execution_admission(
+        mut self,
+        execution_admission: Arc<ExecutionAdmissionController>,
+    ) -> Self {
+        self.execution_admission = execution_admission;
+        self
+    }
+
+    /// 注入 `agent_spawn` 唯一预检使用的运行时事实源。
+    pub fn with_agent_spawn_preflight_runtime(self, runtime: AgentSpawnPreflightRuntime) -> Self {
+        *self
+            .agent_spawn_preflight
+            .write()
+            .expect("agent spawn preflight runtime lock poisoned") = runtime;
+        self
+    }
+
+    pub fn agent_spawn_preflight_runtime(&self) -> AgentSpawnPreflightRuntime {
+        self.agent_spawn_preflight
+            .read()
+            .expect("agent spawn preflight runtime lock poisoned")
+            .clone()
+    }
+
+    pub fn admission_preview(&self, session_id: Option<&SessionId>, role: &str) -> Option<String> {
+        self.execution_admission.preview(session_id, role)
+    }
+
     pub fn insert(
         &self,
         task_id: TaskId,
@@ -256,8 +332,14 @@ impl TaskExecutionRegistry {
             workspace_id,
             role,
             role_parallelism_limit,
+            plan_store,
+            plan_item_id,
+            execution_root,
             now,
         } = request;
+        let _registration_guard = self.registration_lock.lock().map_err(|error| {
+            SpawnedChildExecutionError::InvalidState(format!("agent_spawn 注册锁不可用: {error}"))
+        })?;
         let mut chain = session_store
             .active_execution_chain(session_id)
             .ok_or_else(|| {
@@ -296,6 +378,20 @@ impl TaskExecutionRegistry {
             )));
         }
 
+        // `preflight_agent_spawn` 已经检查过一次 task_name，但它与原子注册之间
+        // 可能存在并发窗口。这里用注册锁下的最新 TaskStore 快照再做一次唯一性
+        // 校验，确保同一父任务不会出现两个相同的 canonical task name。
+        if let Some(canonical_task_name) = child_task.canonical_task_name()
+            && task_store
+                .get_children(&parent_task_id)
+                .iter()
+                .any(|child| child.canonical_task_name() == Some(canonical_task_name))
+        {
+            return Err(SpawnedChildExecutionError::InvalidState(format!(
+                "同一父任务下 canonical task name 已存在: {canonical_task_name}"
+            )));
+        }
+
         if let Some(limit) = role_parallelism_limit {
             let limit = limit as usize;
             let active_role_agent_count = active_execution_agent_count_for_role(
@@ -327,16 +423,24 @@ impl TaskExecutionRegistry {
                     "agent_spawn 父任务缺少所属 Turn，无法注册子任务".to_string(),
                 )
             })?;
-        let thread_id = ThreadId::new(format!(
-            "thread-{role}-{}-{}",
-            child_task.task_id.as_str(),
-            now.0
-        ));
+        // Thread ID 只在这里生成一次，并把同一个对象同时写入 active branch、
+        // execution plan 和 SessionStore，避免“计划指向 A、注册表指向 B”的分裂。
+        let thread = session_thread::build_thread_for_role(
+            session_id,
+            &chain.mission_id,
+            role,
+            &worker_id,
+            &child_task.task_id,
+            now,
+        );
+        let thread_id = thread.thread_id.clone();
         let inherited_skill_name = parent_plan.as_ref().and_then(|plan| match plan {
             TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
         });
-        let inherited_execution_root = parent_plan.as_ref().and_then(|plan| match plan {
-            TaskExecutionPlan::Dispatch { execution_root, .. } => execution_root.clone(),
+        let inherited_execution_root = execution_root.or_else(|| {
+            parent_plan.as_ref().and_then(|plan| match plan {
+                TaskExecutionPlan::Dispatch { execution_root, .. } => execution_root.clone(),
+            })
         });
         let branch = ActiveExecutionBranch {
             task_id: child_task.task_id.clone(),
@@ -410,9 +514,10 @@ impl TaskExecutionRegistry {
             execution_settings_snapshot,
         };
 
-        task_store
-            .insert_task(child_task.clone())
-            .map_err(|error| SpawnedChildExecutionError::InvalidState(error.to_string()))?;
+        if let Err(error) = task_store.insert_task(child_task.clone()) {
+            return Err(SpawnedChildExecutionError::InvalidState(error.to_string()));
+        }
+        let task_inserted = true;
 
         let graph_added = match spawn_graph.lock().map_err(|err| {
             SpawnedChildExecutionError::InvalidState(format!("SpawnGraph mutex poisoned: {err}"))
@@ -441,9 +546,12 @@ impl TaskExecutionRegistry {
                 session_id,
                 &child_task.task_id,
                 &original_chain,
+                task_inserted,
                 false,
                 false,
                 false,
+                None,
+                None,
                 error,
             ));
         }
@@ -459,9 +567,12 @@ impl TaskExecutionRegistry {
                 session_id,
                 &child_task.task_id,
                 &original_chain,
+                task_inserted,
                 true,
                 false,
                 false,
+                None,
+                None,
                 SpawnedChildExecutionError::InvalidState(error.to_string()),
             ));
         }
@@ -475,9 +586,12 @@ impl TaskExecutionRegistry {
                 session_id,
                 &child_task.task_id,
                 &original_chain,
+                task_inserted,
                 true,
                 true,
                 false,
+                None,
+                None,
                 SpawnedChildExecutionError::InvalidState(format!(
                     "agent_spawn 子任务 {} 已存在于执行注册表，拒绝重复注册",
                     child_task.task_id
@@ -485,17 +599,55 @@ impl TaskExecutionRegistry {
             ));
         }
 
-        let thread_id = match session_thread::ensure_thread_for_role(
-            session_store,
-            session_id,
-            &chain.mission_id,
-            role,
-            &worker_id,
-            &child_task.task_id,
-            now,
-        ) {
-            Ok(thread_id) => thread_id,
-            Err(error) => {
+        if let Err(error) = session_store.register_thread(thread.clone()) {
+            return Err(rollback_spawned_local_agent_child(
+                self,
+                task_store,
+                spawn_graph,
+                session_store,
+                session_id,
+                &child_task.task_id,
+                &original_chain,
+                task_inserted,
+                true,
+                true,
+                true,
+                None,
+                None,
+                SpawnedChildExecutionError::InvalidState(format!(
+                    "agent_spawn 注册执行 thread 失败: {error}"
+                )),
+            ));
+        }
+
+        let plan_binding = match (plan_store, plan_item_id) {
+            (Some(plan_store), Some(plan_item_id)) => match plan_store
+                .bind_task_for_materialization(child_task.task_id.clone(), plan_item_id)
+            {
+                Ok(binding) => binding,
+                Err(error) => {
+                    return Err(rollback_spawned_local_agent_child(
+                        self,
+                        task_store,
+                        spawn_graph,
+                        session_store,
+                        session_id,
+                        &child_task.task_id,
+                        &original_chain,
+                        task_inserted,
+                        true,
+                        true,
+                        true,
+                        Some(&thread),
+                        None,
+                        SpawnedChildExecutionError::InvalidState(format!(
+                            "agent_spawn 计划绑定失败: {error}"
+                        )),
+                    ));
+                }
+            },
+            (None, None) | (Some(_), None) => None,
+            (None, Some(_)) => {
                 return Err(rollback_spawned_local_agent_child(
                     self,
                     task_store,
@@ -504,12 +656,15 @@ impl TaskExecutionRegistry {
                     session_id,
                     &child_task.task_id,
                     &original_chain,
+                    task_inserted,
                     true,
                     true,
                     true,
-                    SpawnedChildExecutionError::InvalidState(format!(
-                        "agent_spawn 注册执行 thread 失败: {error}"
-                    )),
+                    Some(&thread),
+                    None,
+                    SpawnedChildExecutionError::InvalidState(
+                        "agent_spawn 计划绑定上下文不完整".to_string(),
+                    ),
                 ));
             }
         };
@@ -518,6 +673,7 @@ impl TaskExecutionRegistry {
             worker_id,
             thread_id,
             execution_chain_ref,
+            plan: plan_binding.map(|(_, updated)| updated),
         })
     }
 }
@@ -531,12 +687,30 @@ fn rollback_spawned_local_agent_child(
     session_id: &SessionId,
     child_task_id: &TaskId,
     original_chain: &magi_session_store::ActiveExecutionChain,
+    task_inserted: bool,
     graph_added: bool,
     session_chain_updated: bool,
     registry_inserted: bool,
+    registered_thread: Option<&ExecutionThread>,
+    plan_rollback: Option<(&SessionPlan, u64)>,
     primary_error: SpawnedChildExecutionError,
 ) -> SpawnedChildExecutionError {
     let mut rollback_errors = Vec::new();
+    if let Some(thread) = registered_thread
+        && let Err(error) =
+            session_store.remove_thread_if_current(session_id, &thread.thread_id, thread)
+    {
+        rollback_errors.push(format!("执行 thread 回滚失败: {error}"));
+    }
+    if let Some((original_plan, expected_revision)) = plan_rollback
+        && let Err(error) = session_store.restore_plan_if_current(
+            session_id,
+            expected_revision,
+            Some(original_plan.clone()),
+        )
+    {
+        rollback_errors.push(format!("计划绑定回滚失败: {error}"));
+    }
     if registry_inserted && registry.remove(child_task_id).is_none() {
         rollback_errors.push("执行注册表回滚时未找到子任务".to_string());
     }
@@ -556,10 +730,12 @@ fn rollback_spawned_local_agent_child(
     {
         rollback_errors.push(format!("session active chain 回滚失败: {error}"));
     }
-    match task_store.remove_task(child_task_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => rollback_errors.push("TaskStore 回滚时未找到子任务".to_string()),
-        Err(error) => rollback_errors.push(format!("TaskStore 回滚失败: {error}")),
+    if task_inserted {
+        match task_store.remove_task(child_task_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => rollback_errors.push("TaskStore 回滚时未找到子任务".to_string()),
+            Err(error) => rollback_errors.push(format!("TaskStore 回滚失败: {error}")),
+        }
     }
 
     if rollback_errors.is_empty() {
@@ -753,6 +929,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "executor",
                 role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now,
             })
             .expect("spawned child runtime registration should succeed");
@@ -846,6 +1025,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "executor",
                 role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now,
             })
             .expect_err("重复注册子任务必须被拒绝");
@@ -912,6 +1094,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "executor",
                 role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now,
             })
             .expect_err("仅执行注册表中已有的任务也必须被拒绝");
@@ -989,6 +1174,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "executor",
                 role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now,
             })
             .expect_err("SpawnGraph 冲突必须拒绝注册");
@@ -1157,6 +1345,9 @@ mod tests {
                         workspace_id: &workspace_id,
                         role,
                         role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
+                        plan_store: None,
+                        plan_item_id: None,
+                        execution_root: None,
                         now: UtcMillis(now.0 + (role_index * 5 + instance_index) as u64 + 1),
                     })
                     .expect("默认容量应允许每个角色同时运行五个代理实例");
@@ -1178,6 +1369,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "executor",
                 role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now: UtcMillis(now.0 + 10),
             })
             .expect_err("同一角色的第六个并发代理应被角色实例上限拒绝");
@@ -1227,9 +1421,187 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "executor",
                 role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now: UtcMillis(now.0 + 11),
             })
             .expect("同角色已有实例完成后，第六个代理应能占用释放的名额");
+    }
+
+    #[test]
+    fn spawned_local_agent_child_registration_rolls_back_when_plan_binding_fails() {
+        let (
+            task_store,
+            spawn_graph,
+            session_store,
+            registry,
+            session_id,
+            workspace_id,
+            mission_id,
+            root_task_id,
+            now,
+        ) = spawn_fixture("plan-binding-rollback");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        session_store
+            .create_session(session_id.clone(), "计划绑定回滚测试")
+            .expect("计划绑定测试会话应创建");
+        session_store
+            .upsert_plan(
+                &session_id,
+                magi_session_store::SessionPlan {
+                    plan_id: magi_core::PlanId::new("plan-binding-rollback"),
+                    session_id: session_id.clone(),
+                    goal_id: None,
+                    revision: 1,
+                    language: "zh-CN".to_string(),
+                    state: magi_core::PlanState::Active,
+                    items: vec![magi_core::PlanItem::new(
+                        magi_core::PlanItemId::new("active-item"),
+                        "绑定代理",
+                        magi_core::PlanItemStatus::InProgress,
+                    )],
+                    task_bindings: HashMap::new(),
+                    task_statuses: HashMap::new(),
+                    updated_at: now,
+                },
+                Some(0),
+            )
+            .expect("测试计划应创建");
+
+        let child = test_task(
+            "task-child-plan-binding-rollback",
+            root_task_id.as_str(),
+            &mission_id,
+        );
+        let chain_before = session_store
+            .active_execution_chain(&session_id)
+            .expect("测试执行链应存在");
+        let threads_before = session_store.thread_registry_snapshot(&session_id);
+        let graph_before = spawn_graph.lock().expect("SpawnGraph 锁应可用").all_edges();
+        let plan_before = plan_store.snapshot().expect("测试计划应存在");
+
+        let error = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                role_parallelism_limit: None,
+                plan_store: Some(&plan_store),
+                plan_item_id: Some(magi_core::PlanItemId::new("missing-item")),
+                execution_root: None,
+                now,
+            })
+            .expect_err("计划绑定失败时必须回滚整次注册");
+
+        assert!(
+            matches!(error, SpawnedChildExecutionError::InvalidState(message) if message.contains("计划绑定失败"))
+        );
+        assert!(task_store.get_task(&child.task_id).is_none());
+        assert!(registry.get(&child.task_id).is_none());
+        assert_eq!(
+            format!(
+                "{:?}",
+                session_store
+                    .active_execution_chain(&session_id)
+                    .expect("执行链应保留")
+            ),
+            format!("{:?}", chain_before),
+            "计划绑定失败后必须恢复完整 active execution chain"
+        );
+        assert_eq!(
+            session_store.thread_registry_snapshot(&session_id),
+            threads_before,
+            "计划绑定失败后不得残留执行 thread"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                spawn_graph.lock().expect("SpawnGraph 锁应可用").all_edges()
+            ),
+            format!("{:?}", graph_before),
+            "计划绑定失败后不得残留 SpawnGraph 边"
+        );
+        let plan_after = plan_store.snapshot().expect("计划应保留");
+        assert_eq!(plan_after.task_bindings, plan_before.task_bindings);
+        assert_eq!(plan_after.task_statuses, plan_before.task_statuses);
+    }
+
+    #[test]
+    fn spawned_local_agent_child_registration_rejects_duplicate_canonical_name() {
+        let (
+            task_store,
+            spawn_graph,
+            session_store,
+            registry,
+            session_id,
+            workspace_id,
+            mission_id,
+            root_task_id,
+            now,
+        ) = spawn_fixture("canonical-name");
+        let canonical_name = "/root/canonical-name";
+        let mut first = test_task(
+            "task-child-canonical-first",
+            root_task_id.as_str(),
+            &mission_id,
+        );
+        first.executor_binding = Some(
+            magi_core::TaskExecutorBinding::for_role("executor")
+                .with_canonical_task_name(canonical_name),
+        );
+        registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &first,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
+                now,
+            })
+            .expect("第一个 canonical task name 应注册成功");
+
+        let mut duplicate = test_task(
+            "task-child-canonical-duplicate",
+            root_task_id.as_str(),
+            &mission_id,
+        );
+        duplicate.executor_binding = Some(
+            magi_core::TaskExecutorBinding::for_role("executor")
+                .with_canonical_task_name(canonical_name),
+        );
+        let error = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &duplicate,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
+                now: UtcMillis(now.0 + 1),
+            })
+            .expect_err("重复 canonical task name 必须被拒绝");
+
+        assert!(
+            matches!(error, SpawnedChildExecutionError::InvalidState(message) if message.contains("canonical task name"))
+        );
+        assert!(task_store.get_task(&duplicate.task_id).is_none());
+        assert!(registry.get(&duplicate.task_id).is_none());
     }
 
     fn spawn_fixture(
@@ -1345,6 +1717,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "limited-role",
                 role_parallelism_limit: Some(1),
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now: UtcMillis(now.0 + 1),
             })
             .expect("并发上限为 1 时应允许第一个实例");
@@ -1364,6 +1739,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "limited-role",
                 role_parallelism_limit: Some(1),
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now: UtcMillis(now.0 + 2),
             })
             .expect_err("并发上限为 1 时不应允许第二个活跃实例");
@@ -1399,6 +1777,9 @@ mod tests {
                 workspace_id: &workspace_id,
                 role: "limited-role",
                 role_parallelism_limit: Some(1),
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
                 now: UtcMillis(now.0 + 3),
             })
             .expect("前一个受限实例完成后应允许下一个实例");
@@ -1419,6 +1800,9 @@ mod tests {
                     workspace_id: &workspace_id,
                     role: "unlimited-role",
                     role_parallelism_limit: None,
+                    plan_store: None,
+                    plan_item_id: None,
+                    execution_root: None,
                     now: UtcMillis(now.0 + 4 + index as u64),
                 })
                 .expect("None 应表示不设置角色级并发上限");

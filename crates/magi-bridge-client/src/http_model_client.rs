@@ -939,13 +939,17 @@ fn provider_stream_event_error(
     event: &crate::protocol::streaming::SseEvent,
 ) -> Option<BridgeClientError> {
     let payload = serde_json::from_str::<Value>(&event.data).ok()?;
+    // OpenAI Responses 兼容网关可能省略 SSE `event:` 行，仅在 data JSON
+    // 的 `type` 字段中携带事件名。错误事件也必须使用同一事实源，否则
+    // response.failed 会被误当成普通数据继续解析。
+    let response_event_type = event
+        .event_type
+        .as_deref()
+        .or_else(|| payload["type"].as_str());
     let is_error_event = match provider_family {
         ProviderFamily::OpenAiChat => true,
         ProviderFamily::OpenAiResponses => {
-            matches!(
-                event.event_type.as_deref(),
-                Some("error" | "response.failed")
-            )
+            matches!(response_event_type, Some("error" | "response.failed"))
         }
         ProviderFamily::Anthropic => event.event_type.as_deref() == Some("error"),
     };
@@ -3236,6 +3240,53 @@ mod tests {
             http_request.headers[0],
             ("Authorization".to_string(), "Bearer test-key".to_string())
         );
+    }
+
+    #[test]
+    fn responses_stream_without_event_headers_completes_through_http_client() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Responses OK\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Responses OK\"}]}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n",
+            )
+            .to_string(),
+        );
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-5.6-luna".to_string(),
+            HttpModelBridgeProtocol::Responses,
+            None,
+        );
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-responses".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect("Responses data.type events should complete the HTTP stream");
+
+        assert_eq!(response.content.as_deref(), Some("Responses OK"));
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(response.usage.as_ref().unwrap()["inputTokens"], 4);
+        assert_eq!(response.usage.as_ref().unwrap()["outputTokens"], 2);
+        assert_eq!(response.provider_context.len(), 1);
+
+        let recorded = server
+            .request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock server should receive the Responses request");
+        assert_eq!(recorded.path, "/v1/responses");
     }
 
     #[test]

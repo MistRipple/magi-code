@@ -1073,7 +1073,7 @@ impl BuiltinToolName {
                 "更新当前会话 Goal 的终态。调用前必须用 get_goal 取得 goal_id、control_revision 与绑定计划 revision；没有绑定计划时 expected_plan_revision 传 null。complete 必须提供完成摘要；blocked 必须提供稳定 blocker_key 与原因，服务端只在同一阻塞连续三个 Goal Turn 出现后进入 blocked。"
             }
             Self::AgentSpawn => {
-                "【模型可直接调用，但仅限任务执行链中的 root coordinator】向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。必须明确提供角色本次激活的 capabilities，并同时提供结构化 context_package；它必须是 function arguments 内的 JSON 对象，不能把对象二次编码成字符串。子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
+                "【模型可直接调用，但仅限任务执行链中的 root coordinator】向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。capabilities 可省略，省略时由服务端按目标角色的能力集合自动补齐；显式提供时必须属于该角色。必须同时提供结构化 context_package；它必须是 function arguments 内的 JSON 对象，不能把对象二次编码成字符串。子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
                 - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\
@@ -1084,8 +1084,8 @@ impl BuiltinToolName {
                 - 代理适合处理边界清晰、可并行、不阻塞主线下一步的专项任务\n\
                 - 代理运行中，主线应继续推进不重叠工作；不要空等，也不要重复做已经委派的同一件事\n\n\
                 # 专业能力\n\
-                - capabilities 必填且至少一项，运行时只注入目标角色拥有且本次显式激活的专业能力\n\
-                - 可用 id：general_engineering / product_design / frontend / backend / desktop / mobile / database / security / devops / data_engineering / ai_model_integration / quality_engineering / performance\n\
+                - capabilities 可省略；省略时运行时自动激活目标角色的默认能力集合；显式传入时至少一项且只能使用目标角色拥有的能力\n\
+                - 能力 id 以 tool_catalog 返回的目标角色 capability_ids 为准，不要使用其他角色或全局清单推测\n\
                 - 能识别专业领域时必须选择对应能力；跨领域任务可以同时激活多项\n\
                 - general_engineering 只用于确实无法归类的通用工程工作，不能替代明确的专业能力\n\n\
                 # 并发上限\n\
@@ -1785,7 +1785,7 @@ impl BuiltinToolName {
                             "type": "string",
                             "minLength": 1
                         },
-                        "description": "本次任务从目标角色拥有的专业能力中激活的能力 id。能够识别领域时必须选择对应能力；跨领域可多选；general_engineering 仅用于无法明确归类的通用任务。"
+                        "description": "可选。本次任务从目标角色拥有的专业能力中激活的能力 id；省略时由服务端使用该角色默认能力集合。显式传入时只能使用 tool_catalog 返回的目标角色 capability_ids。"
                     },
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
@@ -1821,7 +1821,7 @@ impl BuiltinToolName {
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
-                "required": ["task_name", "role", "capabilities", "display_name", "goal", "context_package"]
+                "required": ["task_name", "role", "display_name", "goal", "context_package"]
             }),
             Self::AgentSend => serde_json::json!({
                 "type": "object",

@@ -2453,11 +2453,21 @@ mod tests {
     fn role_templates_publish_non_empty_professional_capabilities() {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let templates = role_templates_for_registry(&registry);
+        let builtin_templates =
+            role_templates_for_registry(&magi_agent_role::AgentRoleRegistry::builtin());
 
-        assert_eq!(
-            templates.len(),
-            role_templates_for_registry(&magi_agent_role::AgentRoleRegistry::builtin()).len()
-        );
+        // 默认注册表会加载用户自定义角色，数量可以多于内置角色；这里只要求
+        // 所有内置模板仍然发布，避免测试依赖本机 ~/.magi 中是否存在用户角色。
+        let template_ids = templates
+            .iter()
+            .filter_map(|template| template["templateId"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for builtin_template in &builtin_templates {
+            assert!(
+                template_ids.contains(builtin_template["templateId"].as_str().unwrap()),
+                "内置角色模板必须保留"
+            );
+        }
         for template in templates {
             let template_id = template["templateId"]
                 .as_str()

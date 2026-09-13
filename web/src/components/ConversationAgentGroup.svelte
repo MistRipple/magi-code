@@ -36,6 +36,26 @@
     return '';
   }
 
+  function metadataAgentStatus(item: TimelineRenderItem): string {
+    const value = item.message.metadata?.agentChildStatus;
+    if (typeof value !== 'string') return '';
+    switch (value.trim().toLowerCase()) {
+      case 'queued':
+        return 'queued';
+      case 'running':
+        return 'running';
+      case 'completed':
+        return 'success';
+      case 'failed':
+      case 'killed':
+        return 'error';
+      case 'degraded':
+        return 'degraded';
+      default:
+        return '';
+    }
+  }
+
   function toolStatus(item: TimelineRenderItem): string {
     const taskId = childTaskId(item);
     if (taskId) {
@@ -43,13 +63,24 @@
       const projection = getAgentRunState(scope.sessionId, scope.workspaceId).projection;
       const status = projection?.agents.find((agent) => agent.agentRunId === taskId)?.status
         || projection?.tasks.find((task) => task.task_id === taskId)?.status;
+      const lifecycle = projection?.agents.find((agent) => agent.agentRunId === taskId)?.lifecycle;
+      if (lifecycle === 'degraded') return 'degraded';
       if (status === 'completed') return 'success';
       if (status === 'failed' || status === 'killed') return 'error';
       if (status === 'running' || status === 'pending') return status;
     }
+    const persistedStatus = metadataAgentStatus(item);
+    if (persistedStatus) return persistedStatus;
     for (const block of item.message.blocks || []) {
       if (!block || typeof block !== 'object') continue;
       if (block.toolCall?.name && block.toolCall.name.toLowerCase().includes('agent_spawn')) {
+        const payload = parseToolPayloadRecord(block.toolCall.result);
+        const payloadStatus = typeof payload?.status === 'string' ? payload.status.trim().toLowerCase() : '';
+        if (payloadStatus === 'rejected') return 'rejected';
+        if (payloadStatus === 'degraded') return 'degraded';
+        if (payloadStatus === 'queued') return 'queued';
+        if (payloadStatus === 'started') return 'running';
+        if (payloadStatus === 'completed' || payloadStatus === 'succeeded') return 'success';
         return block.toolCall.status || 'pending';
       }
     }
@@ -58,21 +89,30 @@
 
   const statusCounts = $derived.by(() => {
     let running = 0;
+    let queued = 0;
     let completed = 0;
     let failed = 0;
+    let degraded = 0;
+    let rejected = 0;
     for (const item of items) {
       const status = toolStatus(item);
       if (status === 'success') completed += 1;
-      else if (status === 'error') failed += 1;
+      else if (status === 'error' || status === 'failed') failed += 1;
+      else if (status === 'degraded') degraded += 1;
+      else if (status === 'rejected') rejected += 1;
+      else if (status === 'queued' || status === 'pending') queued += 1;
       else running += 1;
     }
-    return { running, completed, failed };
+    return { running, queued, completed, failed, degraded, rejected };
   });
   const contentId = $derived(`conversation-agent-group-${(items[0]?.key || 'empty').replace(/[^a-zA-Z0-9_-]/gu, '-')}`);
   const summary = $derived([
     statusCounts.completed > 0 ? i18n.t('messageList.agentGroup.completed', { count: statusCounts.completed }) : '',
+    statusCounts.queued > 0 ? i18n.t('messageList.agentGroup.queued', { count: statusCounts.queued }) : '',
     statusCounts.running > 0 ? i18n.t('messageList.agentGroup.running', { count: statusCounts.running }) : '',
     statusCounts.failed > 0 ? i18n.t('messageList.agentGroup.failed', { count: statusCounts.failed }) : '',
+    statusCounts.degraded > 0 ? i18n.t('messageList.agentGroup.degraded', { count: statusCounts.degraded }) : '',
+    statusCounts.rejected > 0 ? i18n.t('messageList.agentGroup.rejected', { count: statusCounts.rejected }) : '',
   ].filter(Boolean).join(' · '));
 </script>
 

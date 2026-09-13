@@ -241,6 +241,67 @@ impl PlanItem {
 
 pub const TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT: &str = "任务运行失败，详情已记录在日志中。";
 
+/// 运行期失败对外展示的脱敏文案。
+///
+/// 任务输出可能包含 provider、URL、工作目录或线程错误等内部信息。公开投影不能
+/// 直接暴露这些内容，但必须保留足够的失败类别，供 `agent_wait`、API 和前端使用
+/// 同一套生命周期语义。文案刻意不包含内部标识、连接地址或敏感配置。
+const TASK_MODEL_INVOCATION_FAILURE_PUBLIC_OUTPUT: &str = "子代理模型调用失败，请改派或接管。";
+const TASK_GIT_PREFLIGHT_FAILURE_PUBLIC_OUTPUT: &str = "子代理 Git 工作区准备失败，请改派或接管。";
+const TASK_EXECUTION_ADMISSION_FAILURE_PUBLIC_OUTPUT: &str = "子代理执行租约已过期，请改派或接管。";
+const TASK_DISPATCH_FAILURE_PUBLIC_OUTPUT: &str = "子代理派发失败，请改派或接管。";
+const TASK_EXECUTION_FAILURE_PUBLIC_OUTPUT: &str = "子代理执行失败，请改派或接管。";
+
+/// 对外暴露的任务失败分类。分类只依赖已经脱敏的公开文本，供运行时、API 和
+/// 前端共同使用，避免每一层各自维护一套错误码映射。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicTaskFailureMetadata {
+    pub failure_stage: &'static str,
+    pub error_code: &'static str,
+    pub fallback_mode: &'static str,
+}
+
+pub fn classify_public_task_failure(error: &str) -> PublicTaskFailureMetadata {
+    let normalized = error.trim().to_ascii_lowercase();
+    if normalized.contains("模型")
+        || normalized.contains("model")
+        || normalized.contains("llm")
+        || normalized.contains("provider")
+    {
+        return PublicTaskFailureMetadata {
+            failure_stage: "model_invocation",
+            error_code: "model_invocation_failed",
+            fallback_mode: "mainline_or_reassign",
+        };
+    }
+    if normalized.contains("git") || normalized.contains("worktree") {
+        return PublicTaskFailureMetadata {
+            failure_stage: "git_preflight",
+            error_code: "git_preflight_failed",
+            fallback_mode: "mainline_or_reassign",
+        };
+    }
+    if normalized.contains("lease") || normalized.contains("租约") {
+        return PublicTaskFailureMetadata {
+            failure_stage: "execution_admission",
+            error_code: "lease_expired",
+            fallback_mode: "mainline_or_reassign",
+        };
+    }
+    if normalized.contains("dispatch") || normalized.contains("派发") {
+        return PublicTaskFailureMetadata {
+            failure_stage: "dispatch",
+            error_code: "dispatch_failed",
+            fallback_mode: "mainline_or_reassign",
+        };
+    }
+    PublicTaskFailureMetadata {
+        failure_stage: "task_execution",
+        error_code: "task_execution_failed",
+        fallback_mode: "mainline_or_reassign",
+    }
+}
+
 pub fn task_output_ref_is_internal_runtime_failure(output_ref: &str) -> bool {
     let normalized = output_ref.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -286,23 +347,65 @@ pub fn public_task_output_refs(status: TaskStatus, output_refs: &[String]) -> Ve
         return output_refs.to_vec();
     }
 
-    let mut redacted = false;
-    let visible_refs = output_refs
-        .iter()
-        .filter_map(|output_ref| {
-            if task_output_ref_is_internal_runtime_failure(output_ref) {
-                redacted = true;
-                None
-            } else {
-                Some(output_ref.clone())
+    let mut visible_refs = Vec::new();
+    let mut internal_refs = Vec::new();
+    for output_ref in output_refs {
+        if task_output_ref_is_internal_runtime_failure(output_ref) {
+            internal_refs.push(output_ref);
+        } else {
+            let public_ref = output_ref.clone();
+            if !visible_refs.iter().any(|existing| existing == &public_ref) {
+                visible_refs.push(public_ref);
             }
-        })
-        .collect::<Vec<_>>();
-
-    if redacted && visible_refs.is_empty() {
+        }
+    }
+    // 用户可读的失败结果优先保留；运行期诊断只在没有任何可读结果时转换为
+    // 稳定的失败类别，避免把同一失败的内部 transport 信息伪装成最终结论。
+    if !visible_refs.is_empty() {
+        return visible_refs;
+    }
+    for output_ref in internal_refs {
+        let public_ref = public_task_failure_output(output_ref).to_string();
+        if !visible_refs.iter().any(|existing| existing == &public_ref) {
+            visible_refs.push(public_ref);
+        }
+    }
+    if visible_refs.is_empty() {
         vec![TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT.to_string()]
     } else {
         visible_refs
+    }
+}
+
+/// 判断公开失败信息是否表示代理不可用，需要由主线接管或改派。
+pub fn public_task_failure_is_degraded(error: &str) -> bool {
+    let normalized = error.trim().to_ascii_lowercase();
+    [
+        "模型配置不可用",
+        "代理当前不可用",
+        "代理不可用",
+        "没有匹配角色",
+        "没有匹配",
+        "agent_unavailable",
+        "agent unavailable",
+        "no matching role",
+        "no matching worker",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
+}
+
+/// 把内部运行错误转换成稳定、可公开的失败类别文案。
+///
+/// 该函数只在失败输出被投影到 API、工具结果或前端前调用；原始错误仍保留在服务端
+/// 日志中用于诊断。调用方不得自行按字符串维护另一套脱敏分类。
+pub fn public_task_failure_output(error: &str) -> &'static str {
+    match classify_public_task_failure(error).error_code {
+        "model_invocation_failed" => TASK_MODEL_INVOCATION_FAILURE_PUBLIC_OUTPUT,
+        "git_preflight_failed" => TASK_GIT_PREFLIGHT_FAILURE_PUBLIC_OUTPUT,
+        "lease_expired" => TASK_EXECUTION_ADMISSION_FAILURE_PUBLIC_OUTPUT,
+        "dispatch_failed" => TASK_DISPATCH_FAILURE_PUBLIC_OUTPUT,
+        _ => TASK_EXECUTION_FAILURE_PUBLIC_OUTPUT,
     }
 }
 
@@ -334,6 +437,30 @@ pub enum AccessProfile {
     Restricted,
     /// 完全授权：跳过常规风险拦截；产品级硬阻断和任务/角色约束仍然生效。
     FullAccess,
+}
+
+/// Root coordinator 的协作策略。
+///
+/// 该字段只表达是否允许当前任务使用子代理，不能再通过 `denied_tools` 或
+/// 用户输入关键词间接推断。`auto` 由 coordinator 根据任务需要自主决定，
+/// `required` 表示用户明确要求真实协作，`disabled` 表示用户明确要求单线执行。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationMode {
+    #[default]
+    Auto,
+    Required,
+    Disabled,
+}
+
+impl CollaborationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 impl AccessProfile {
@@ -371,6 +498,8 @@ pub struct TaskPolicy {
     pub autonomy_level: String,
     #[serde(default)]
     pub access_profile: AccessProfile,
+    #[serde(default)]
+    pub collaboration_mode: CollaborationMode,
     pub allowed_tools: Vec<String>,
     pub denied_tools: Vec<String>,
     pub allowed_paths: Vec<String>,
@@ -970,15 +1099,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_task_output_refs_redacts_internal_failed_details() {
+    fn public_task_output_refs_preserves_failure_category_without_internal_details() {
         let output_refs = vec![
             "LLM invocation failed (round 0): provider transport failed: timed out".to_string(),
         ];
 
         assert_eq!(
             public_task_output_refs(TaskStatus::Failed, &output_refs),
-            vec![TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT.to_string()]
+            vec!["子代理模型调用失败，请改派或接管。".to_string()]
         );
+    }
+
+    #[test]
+    fn public_task_failure_categories_are_not_treated_as_agent_unavailable() {
+        let model_failure = public_task_output_refs(
+            TaskStatus::Failed,
+            &["model bridge client 未配置".to_string()],
+        );
+        assert_eq!(
+            model_failure,
+            vec!["子代理模型调用失败，请改派或接管。".to_string()]
+        );
+        assert!(!public_task_failure_is_degraded(&model_failure[0]));
+
+        let unavailable = "代理当前不可用，主线需要改派或接管。";
+        assert!(public_task_failure_is_degraded(unavailable));
     }
 
     #[test]

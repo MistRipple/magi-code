@@ -3354,6 +3354,7 @@ fn test_task_policy(
     magi_core::TaskPolicy {
         autonomy_level: "assisted".to_string(),
         access_profile,
+        collaboration_mode: Default::default(),
         allowed_tools,
         denied_tools,
         allowed_paths: vec!["/tmp/allowed".to_string()],

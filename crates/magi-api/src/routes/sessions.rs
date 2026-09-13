@@ -11,7 +11,7 @@ use magi_conversation_runtime::{
     UserSignal, requested_public_builtin_tool_chain, requested_required_tool_chain,
 };
 use magi_core::{
-    AccessProfile, DomainError, EventId, SessionId, TaskCompletionContract,
+    AccessProfile, CollaborationMode, DomainError, EventId, SessionId, TaskCompletionContract,
     TaskEvidenceRequirement, TaskRecoveryCheckpoint, TaskTier, UtcMillis, WorkerId, WorkspaceId,
     public_runtime_excerpt,
 };
@@ -814,6 +814,7 @@ struct SessionTurnIntentDecision {
     task_title: Option<String>,
     execution_goal: Option<String>,
     task_tier: TaskTier,
+    collaboration_mode: CollaborationMode,
     tool_intent: Option<String>,
     forced_tool_name: Option<String>,
     required_tool_chain: Vec<String>,
@@ -871,6 +872,7 @@ fn enqueue_session_turn_response(
         task_title: decision.task_title.clone(),
         execution_goal: decision.execution_goal.clone(),
         task_tier: decision.task_tier,
+        collaboration_mode: decision.collaboration_mode,
         tool_intent: decision.tool_intent.clone(),
         forced_tool_name: decision.forced_tool_name.clone(),
         goal_mode: decision.reason_code.as_deref() == Some("goal_mode_request"),
@@ -1147,6 +1149,7 @@ fn decide_session_turn_with_task_planner(
                 request.trimmed_text().as_deref().unwrap_or("继续"),
             )),
             task_tier: TaskTier::ExecutionChain,
+            collaboration_mode: CollaborationMode::Auto,
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: resume.required_tool_chain,
@@ -1171,6 +1174,7 @@ fn decide_session_turn_with_task_planner(
             task_title: None,
             execution_goal: None,
             task_tier: TaskTier::ExecutionChain,
+            collaboration_mode: requested_collaboration_mode(request),
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
@@ -1376,13 +1380,18 @@ fn local_session_turn_intent_decision(
     let requests_explicit_task_or_agent =
         session_turn_requests_explicit_task_or_agent_mode(request);
     let requests_explicit_plan = session_turn_requests_explicit_plan(request);
+    let requests_complex_workspace_analysis =
+        session_turn_requests_complex_workspace_analysis_by_local_rules(request);
     let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
         || session_turn_requested_public_builtin_tools(request).is_some();
     let route = if requests_goal_mode {
         SessionTurnRouteDto::Chat
     } else if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
         SessionTurnRouteDto::Continue
-    } else if requests_explicit_task_or_agent || requests_explicit_plan {
+    } else if requests_explicit_task_or_agent
+        || requests_explicit_plan
+        || requests_complex_workspace_analysis
+    {
         SessionTurnRouteDto::Task
     } else if requests_simple_execution
         || session_turn_requests_execute_by_local_rules(request)
@@ -1393,7 +1402,13 @@ fn local_session_turn_intent_decision(
         SessionTurnRouteDto::Chat
     };
     let task_tier = TaskTier::ExecutionChain;
-    let task_evidence = if matches!(route, SessionTurnRouteDto::Task) {
+    let collaboration_mode = requested_collaboration_mode(request);
+    let task_evidence = if requests_complex_workspace_analysis
+        && !requests_explicit_task_or_agent
+        && !requests_explicit_plan
+    {
+        vec!["复杂工作区分析需要结构化执行记录，协作由 root coordinator 自主判断".to_string()]
+    } else if matches!(route, SessionTurnRouteDto::Task) {
         vec!["用户明确要求任务模式或执行计划".to_string()]
     } else {
         Vec::new()
@@ -1404,6 +1419,7 @@ fn local_session_turn_intent_decision(
             .then(|| request.mission_title(Some(&task_text))),
         execution_goal: matches!(route, SessionTurnRouteDto::Task).then_some(task_text.clone()),
         task_tier,
+        collaboration_mode,
         tool_intent: matches!(route, SessionTurnRouteDto::Execute).then_some(task_text),
         forced_tool_name: None,
         required_tool_chain: Vec::new(),
@@ -1413,6 +1429,9 @@ fn local_session_turn_intent_decision(
         reason_code: Some(
             match route {
                 SessionTurnRouteDto::Continue => "continue_requested",
+                SessionTurnRouteDto::Task if requests_complex_workspace_analysis => {
+                    "proactive_collaboration_candidate"
+                }
                 SessionTurnRouteDto::Task => "explicit_task_request",
                 SessionTurnRouteDto::Execute => "tool_request",
                 SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
@@ -1428,6 +1447,9 @@ fn local_session_turn_intent_decision(
         route_reason: Some(
             match route {
                 SessionTurnRouteDto::Continue => "用户要求继续且存在可恢复链",
+                SessionTurnRouteDto::Task if requests_complex_workspace_analysis => {
+                    "复杂工作区分析需要结构化执行记录，协作由 root coordinator 自主判断"
+                }
                 SessionTurnRouteDto::Task => "用户明确要求任务模式或执行计划",
                 SessionTurnRouteDto::Execute => "用户请求需要工具执行但不需要代理运行记录",
                 SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
@@ -1448,6 +1470,7 @@ fn normalize_session_turn_decision(
     mut decision: SessionTurnIntentDecision,
     request: &SessionTurnRequestDto,
 ) -> SessionTurnIntentDecision {
+    decision.collaboration_mode = requested_collaboration_mode(request);
     let requested_completion_tool_chain = request
         .trimmed_text()
         .as_deref()
@@ -1460,6 +1483,7 @@ fn normalize_session_turn_decision(
         decision.task_title = None;
         decision.execution_goal = None;
         decision.task_tier = TaskTier::ExecutionChain;
+        decision.collaboration_mode = CollaborationMode::Auto;
         decision.tool_intent = Some(goal_mode_tool_intent(request));
         decision.forced_tool_name = None;
         decision.required_tool_chain = vec!["update_plan".to_string()];
@@ -2083,6 +2107,42 @@ fn session_turn_requests_workspace_inspection_by_local_rules(normalized: &str) -
     .any(|marker| normalized.contains(marker))
 }
 
+/// 仅把明确表达“完整/全面/系统性”且目标为当前工作区的分析请求升级为
+/// 结构化 root coordinator 任务。普通的“查看/分析一个文件”仍走直接执行，
+/// 避免为了自动协作把所有读取请求都创建成任务。
+fn session_turn_requests_complex_workspace_analysis_by_local_rules(
+    request: &SessionTurnRequestDto,
+) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    if !session_turn_requests_workspace_inspection_by_local_rules(&normalized) {
+        return false;
+    }
+    let complexity_markers = [
+        "完整",
+        "全面",
+        "系统性",
+        "深入",
+        "详细",
+        "综合",
+        "逐项",
+        "端到端",
+        "全量",
+        "thorough",
+        "comprehensive",
+        "deep",
+        "in-depth",
+        "end-to-end",
+        "entire codebase",
+        "whole repository",
+    ];
+    complexity_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
 fn session_turn_requests_continue_existing_task(request: &SessionTurnRequestDto) -> bool {
     let Some(text) = request.trimmed_text() else {
         return false;
@@ -2231,15 +2291,26 @@ fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
         .any(|term| normalized.contains(term))
 }
 
+fn requested_collaboration_mode(request: &SessionTurnRequestDto) -> CollaborationMode {
+    let normalized = request
+        .trimmed_text()
+        .map(|text| text.to_ascii_lowercase())
+        .unwrap_or_default();
+    if session_turn_explicitly_rejects_collaboration(&normalized) {
+        CollaborationMode::Disabled
+    } else if session_turn_requests_explicit_agent_collaboration(request) {
+        CollaborationMode::Required
+    } else {
+        CollaborationMode::Auto
+    }
+}
+
 fn session_turn_denied_tools(request: &SessionTurnRequestDto) -> Vec<String> {
-    let explicitly_requests_collaboration =
-        session_turn_requests_explicit_agent_collaboration(request);
     let explicitly_requests_goal = session_turn_requests_explicit_goal_mode(request);
     let explicitly_requests_plan = session_turn_requests_explicit_plan(request);
     let mut denied = Vec::new();
-    if !explicitly_requests_collaboration {
-        denied.extend(["agent_spawn", "agent_send", "agent_wait"].map(str::to_string));
-    }
+    // 协作模式由 TaskPolicy::collaboration_mode 表达；工具目录保持一致，
+    // disabled 模式由运行时拒绝调用，不能再通过关键词裁剪工具。
     if !explicitly_requests_goal {
         denied.extend(["get_goal", "create_goal", "update_goal"].map(str::to_string));
     }
@@ -2469,6 +2540,7 @@ async fn submit_mainline_session_turn(
                     .or_else(|| Some(request.mission_title(Some(&user_text)))),
                 execution_goal: Some(execution_goal),
                 task_tier: decision.task_tier,
+                collaboration_mode: decision.collaboration_mode,
                 accepted_at,
                 required_tool_chain,
                 completion_contract: decision.completion_contract.clone(),
@@ -2803,6 +2875,7 @@ async fn drain_next_queued_regular_session_turn(
         task_title: queued.task_title.clone(),
         execution_goal: queued.execution_goal.clone(),
         task_tier: queued.task_tier,
+        collaboration_mode: queued.collaboration_mode,
         tool_intent: queued.tool_intent.clone(),
         forced_tool_name: queued.forced_tool_name.clone(),
         required_tool_chain: queued.required_tool_chain.clone(),
@@ -5207,6 +5280,7 @@ mod tests {
             task_title: None,
             execution_goal: None,
             task_tier: TaskTier::ExecutionChain,
+            collaboration_mode: CollaborationMode::Auto,
             tool_intent: None,
             forced_tool_name: None,
             goal_mode: false,
@@ -5297,6 +5371,7 @@ mod tests {
             task_title: None,
             execution_goal: None,
             task_tier: TaskTier::ExecutionChain,
+            collaboration_mode: CollaborationMode::Auto,
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
@@ -7537,15 +7612,7 @@ mod tests {
         assert!(decision.task_evidence.is_empty());
         assert_eq!(
             session_turn_denied_tools(&request),
-            [
-                "agent_spawn",
-                "agent_send",
-                "agent_wait",
-                "get_goal",
-                "create_goal",
-                "update_goal",
-                "update_plan",
-            ]
+            ["get_goal", "create_goal", "update_goal", "update_plan",]
         );
     }
 
@@ -7565,7 +7632,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_workspace_analysis_routes_to_execute_without_collaboration() {
+    fn complete_workspace_analysis_enters_auto_coordinator_without_agent_keyword() {
         for text in [
             "完整分析当前项目",
             "完整检查当前仓库",
@@ -7578,24 +7645,19 @@ mod tests {
             );
 
             assert!(
-                matches!(decision.route, SessionTurnRouteDto::Execute),
-                "工作区检查不应因为复杂度修饰词升级成 Task: {text}"
+                matches!(decision.route, SessionTurnRouteDto::Task),
+                "完整工作区分析应进入结构化 root coordinator 任务: {text}"
             );
             assert_eq!(
                 decision.reason_code.as_deref(),
-                Some("workspace_inspection_request")
+                Some("proactive_collaboration_candidate")
             );
+            assert_eq!(decision.collaboration_mode, CollaborationMode::Auto);
+            assert!(decision.required_tool_chain.is_empty());
+            assert!(!decision.task_evidence.is_empty());
             assert_eq!(
                 session_turn_denied_tools(&request),
-                [
-                    "agent_spawn",
-                    "agent_send",
-                    "agent_wait",
-                    "get_goal",
-                    "create_goal",
-                    "update_goal",
-                    "update_plan",
-                ]
+                ["get_goal", "create_goal", "update_goal", "update_plan",]
             );
         }
     }
@@ -7908,15 +7970,7 @@ mod tests {
         assert!(decision.execution_goal.is_none());
         assert_eq!(
             session_turn_denied_tools(&request),
-            [
-                "agent_spawn",
-                "agent_send",
-                "agent_wait",
-                "get_goal",
-                "create_goal",
-                "update_goal",
-                "update_plan",
-            ]
+            ["get_goal", "create_goal", "update_goal", "update_plan",]
         );
     }
 
@@ -9495,9 +9549,6 @@ mod tests {
         assert_eq!(task.required_tool_chain(), ["update_plan"]);
         let policy = task.policy_snapshot.expect("task policy should exist");
         let mut expected_denied_tools = vec![
-            "agent_spawn".to_string(),
-            "agent_send".to_string(),
-            "agent_wait".to_string(),
             "get_goal".to_string(),
             "create_goal".to_string(),
             "update_goal".to_string(),
@@ -9508,6 +9559,7 @@ mod tests {
                 .map(|tool| tool.name().to_string()),
         );
         assert_eq!(policy.denied_tools, expected_denied_tools);
+        assert_eq!(policy.collaboration_mode, CollaborationMode::Disabled);
     }
 
     #[tokio::test]
@@ -9867,6 +9919,7 @@ mod tests {
                 task_title: None,
                 execution_goal: None,
                 task_tier: TaskTier::ExecutionChain,
+                collaboration_mode: CollaborationMode::Auto,
                 tool_intent: None,
                 forced_tool_name: None,
                 goal_mode: false,

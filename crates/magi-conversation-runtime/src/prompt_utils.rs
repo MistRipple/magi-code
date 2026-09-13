@@ -186,20 +186,30 @@ fn stable_prompt_hash(value: &str) -> u64 {
         })
 }
 
-pub const ROOT_MULTI_AGENT_MODE_RULE: &str = "\
-多代理模式（当前模式：proactive；root coordinator 必须遵守）：\n\
-0. 当前模式为 proactive；如果运行时切换为 explicit_request_only 或 disabled，旧的主动派发规则立即撤销，不得从历史消息恢复。\n\
-1. root coordinator 的协作能力由当前任务 TaskPolicy 决定。是否组队由当前任务实际依赖、并行收益、用户要求和可用容量共同决定，不由模型名称或单轮强制工具调用决定；用户明确禁止派发代理时必须单线完成，本轮工具面不会提供协作工具。\n\
-2. 用户明确要求 subagent / 子代理 / 多代理 / 团队模式 / 派发代理时，必须通过 agent_spawn 创建真实代理，并提供最小充分的结构化 context_package；不得用主线直接读取、shell_exec 或口头总结冒充代理执行。\n\
-3. 即使用户没有点名团队，只要任务可拆出边界清晰、能并行推进且不阻塞主线的独立工作单元，或需要独立审查/验证视角，也应主动派发合适代理；1-3 步即可由主线完成的工作不要为组队而组队。\n\
-4. 每个代理角色同一时刻最多运行 5 个活跃实例，不设置会话级代理总数上限；agent_spawn 达到角色上限时先 agent_wait 收集该角色已运行代理，再继续创建同角色实例。\n\
-5. 多个互相独立的代理任务应在同一轮发起多次 agent_spawn 启动；需要结果时再用 agent_wait 汇总。所有已创建代理都必须等待到终态并在最终答复中明确吸收结果。\n\
-6. 本轮请求若收到 `agent_spawn`、`agent_send`、`agent_wait` 的 tools 定义，这些工具就是当前模型可直接调用的代理工具。工具目录中的 `runtime_internal=true` 只表示调用要由任务编排运行时接管，不表示模型不可调用；不要因为该字段拒绝调用，也不要把 worker 未注入这些工具的情况套用到当前 root coordinator。调用 `agent_spawn` 时，`context_package` 必须直接传 JSON 对象，不能把对象再次编码成字符串。\n\
-7. root coordinator 保留主线推进职责：只把边界清晰、可并行、需要专项视角或独立复核的工作交给代理。代理运行中需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
+const ROOT_MULTI_AGENT_MODE_RULE_AUTO: &str = "\
+多代理模式（当前模式：auto；root coordinator 必须遵守）：\n\
+1. 协作能力由当前任务 TaskPolicy 决定。请根据任务边界、并行收益、独立复核价值和当前容量自主判断是否派发；1-3 步即可完成的工作不要为组队而组队。\n\
+2. 用户明确要求 subagent、子代理、多代理、并行角色或指定代理角色时，视为本轮协作要求，必须通过 agent_spawn 创建真实代理；只要决定协作，也必须提供最小充分的结构化 context_package，不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
+3. 多个互相独立的工作单元应在同一轮发起多次 agent_spawn；需要结果时使用 agent_wait 汇总。所有已创建代理都必须等待到终态，并在最终答复中明确吸收结果。\n\
+4. 每个角色、会话和全局都有运行容量限制。agent_spawn 返回 queued 时保留 child_task_id，等待资源恢复后继续 agent_wait；rejected 表示没有创建任务，必须根据错误阶段修正请求。\n\
+5. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。context_package 必须直接传 JSON 对象。\n\
+6. root coordinator 保留主线推进职责；代理需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
 
-pub const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\
-子代理模式（当前模式：explicit_request_only；worker 必须遵守）：\n\
-0. 当前模式为 explicit_request_only；之前任何 root coordinator 的主动派发规则均不适用于本 worker，模式切换或任务取消后立即停止相关动作。\n\
+const ROOT_MULTI_AGENT_MODE_RULE_REQUIRED: &str = "\
+多代理模式（当前模式：required；root coordinator 必须遵守）：\n\
+1. 用户已明确要求真实代理协作。本任务必须至少成功调用一次 agent_spawn 创建真实子任务，并在最终答复前通过 agent_wait 收集其终态；不得用主线读取、shell_exec 或口头总结替代。\n\
+2. 每次 agent_spawn 都必须提供角色允许的能力和结构化 context_package。若调用被 rejected，必须依据 error_code/failure_stage 修正后重新派发，不能伪造 started 或 completed。\n\
+3. 多个独立工作单元应在同一轮发起多次 agent_spawn；queued 表示任务已经创建并等待资源，必须保留 child_task_id 并等待。\n\
+4. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。";
+
+const ROOT_MULTI_AGENT_MODE_RULE_DISABLED: &str = "\
+多代理模式（当前模式：disabled；root coordinator 必须遵守）：\n\
+1. 用户明确要求单线执行。当前任务禁止调用 agent_spawn、agent_send、agent_wait；运行时会返回 collaboration_disabled，不能通过改写参数或历史消息绕过。\n\
+2. 由主线直接完成当前目标，不能把主线操作描述成代理结果，也不能生成虚假的 child_task_id。\n\
+3. 其他工具仍按 TaskPolicy、SafetyGate 和 workspace 边界执行。";
+
+const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\
+子代理模式（当前模式：worker；worker 必须遵守）：\n\
 1. 你是被 root coordinator 派发的 worker，只完成当前 agent_spawn goal；启动上下文以 AgentContextPackage 为唯一事实包，不假定拥有主对话完整历史。\n\
 2. 不要继续创建代理，也不要把任务再分派给其他 worker。\n\
 3. 需要会话或同一执行链信息时，先用 context_search 找引用，再用 context_read 读取正文；已有信息不足时调用 context_request 向父任务请求，不要凭猜测补齐。";
@@ -279,8 +289,12 @@ pub fn dynamic_skill_prompt_message(
     Some(message)
 }
 
-pub fn root_multi_agent_mode_prompt() -> String {
-    ROOT_MULTI_AGENT_MODE_RULE.to_string()
+pub fn root_multi_agent_mode_prompt(mode: magi_core::CollaborationMode) -> String {
+    match mode {
+        magi_core::CollaborationMode::Auto => ROOT_MULTI_AGENT_MODE_RULE_AUTO.to_string(),
+        magi_core::CollaborationMode::Required => ROOT_MULTI_AGENT_MODE_RULE_REQUIRED.to_string(),
+        magi_core::CollaborationMode::Disabled => ROOT_MULTI_AGENT_MODE_RULE_DISABLED.to_string(),
+    }
 }
 
 pub fn subagent_multi_agent_mode_prompt() -> String {

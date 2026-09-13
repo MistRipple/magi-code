@@ -22,12 +22,16 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
 };
 use magi_conversation_runtime::{
-    model_config::NormalizedModelConfig,
+    execution_admission::ExecutionAdmissionController,
+    model_config::{
+        NormalizedModelConfig, configured_role_engine_model_config,
+        resolve_orchestrator_model_config,
+    },
     session_turn_finalize::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
     task_execution_dispatcher::{LlmTaskDispatcher, LlmTaskDispatcherDependencies},
-    task_execution_registry::TaskExecutionRegistry,
+    task_execution_registry::{AgentSpawnPreflightRuntime, TaskExecutionRegistry},
     task_runner_bridge::EventBasedResultReceiver,
     usage_recording::{
         ModelUsageRecordInput, image_generation_model_usage_binding,
@@ -255,6 +259,8 @@ fn bridge_dispatch_action_label(action: magi_bridge_client::BridgeDispatchAction
 
 fn build_agent_role_catalog_provider(
     registry: Arc<magi_agent_role::AgentRoleRegistry>,
+    settings_store: Arc<SettingsStore>,
+    default_model_available: bool,
 ) -> AgentRoleCatalogProvider {
     Arc::new(move || {
         let mut roles = registry
@@ -269,8 +275,29 @@ fn build_agent_role_catalog_provider(
                 } else {
                     "unsupported"
                 };
+                let model_binding_status = agent_role_model_binding_status(
+                    settings_store.as_ref(),
+                    &role.id,
+                    default_model_available,
+                );
+                let display_name = if role.display_name.trim().is_empty() {
+                    role.id.clone()
+                } else {
+                    role.display_name.clone()
+                };
+                let description = if role.description.trim().is_empty() {
+                    if role.coordinator_mode {
+                        "主线任务编排角色".to_string()
+                    } else {
+                        "可派发的专业代理角色".to_string()
+                    }
+                } else {
+                    role.description.clone()
+                };
                 AgentRoleCatalogEntry {
                     role_id: role.id.clone(),
+                    display_name,
+                    description,
                     spawnable,
                     coordinator_mode: role.coordinator_mode,
                     supported_kinds: role
@@ -278,14 +305,41 @@ fn build_agent_role_catalog_provider(
                         .into_iter()
                         .map(task_kind_label)
                         .collect(),
+                    capability_ids: registry.capability_ids_for_role(&role.id),
                     parallelism_limit: role.parallelism_limit,
                     status: status.to_string(),
+                    model_binding_status,
                 }
             })
             .collect::<Vec<_>>();
         roles.sort_by(|left, right| left.role_id.cmp(&right.role_id));
         roles
     })
+}
+
+fn agent_role_model_binding_status(
+    settings_store: &SettingsStore,
+    role_id: &str,
+    default_model_available: bool,
+) -> String {
+    match configured_role_engine_model_config(settings_store, role_id) {
+        Ok(Some(_)) => "role_engine".to_string(),
+        Err(error) => {
+            tracing::debug!(role_id, %error, "agent role model binding is invalid");
+            "invalid".to_string()
+        }
+        Ok(None) => {
+            let orchestrator_ready = resolve_orchestrator_model_config(settings_store, None)
+                .ok()
+                .and_then(|config| config.to_http_model_client())
+                .is_some();
+            if orchestrator_ready || default_model_available {
+                "inherited_orchestrator".to_string()
+            } else {
+                "unconfigured".to_string()
+            }
+        }
+    }
 }
 
 fn task_kind_label(kind: magi_core::TaskKind) -> String {
@@ -1259,6 +1313,13 @@ impl DaemonRuntime {
         );
         Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env)
             .map_err(|error| DaemonError::internal(format!("保存环境模型设置失败: {error}")))?;
+        let direct_http_probe_result = if model_bridge_override.is_some() {
+            None
+        } else {
+            Self::try_build_http_model_client(bridge_env)
+        };
+        let default_model_available =
+            model_bridge_override.is_some() || direct_http_probe_result.is_some();
         let agent_role_registry = Arc::new(
             magi_agent_role::AgentRoleRegistry::load_from_state_root(&self.state_root)
                 .map_err(|error| DaemonError::internal(format!("加载代理角色失败: {error}")))?,
@@ -1275,8 +1336,11 @@ impl DaemonRuntime {
         );
         let external_mcp_tool_executor =
             build_external_mcp_tool_executor(settings_store.clone(), mcp_connections.clone());
-        let agent_role_catalog_provider =
-            build_agent_role_catalog_provider(agent_role_registry.clone());
+        let agent_role_catalog_provider = build_agent_role_catalog_provider(
+            agent_role_registry.clone(),
+            settings_store.clone(),
+            default_model_available,
+        );
         let snapshot_manager = Arc::new(SnapshotManager::new());
         let memory_store = MemoryStore::new();
         let context_runtime = ContextRuntime::with_runtime_sources(
@@ -1453,11 +1517,6 @@ impl DaemonRuntime {
         //
         // settings.json 的 `auxiliary` 段不参与业务派发，只服务于会话标题、知识抽取、
         // 会话记忆、Prompt 增强等辅助任务（通过 RoleTarget::Auxiliary 分支独立解析）。
-        let direct_http_probe_result = if model_bridge_override.is_some() {
-            None
-        } else {
-            Self::try_build_http_model_client(bridge_env)
-        };
         let direct_http_probe_config = direct_http_probe_result
             .as_ref()
             .map(|(_, config)| config.clone());
@@ -1512,7 +1571,21 @@ impl DaemonRuntime {
         let event_bus_for_task_store = self.event_bus.clone();
         let session_store_for_task_status = self.session_store.clone();
         let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
-        let task_execution_registry = TaskExecutionRegistry::default();
+        // `agent_spawn` 创建前预检与 Runner 必须共享同一个执行准入控制器，否则
+        // 预检看到的容量和真正派发时的容量可能不一致，导致“已创建后才排队/失败”。
+        let execution_admission = Arc::new(ExecutionAdmissionController::default());
+        let task_execution_registry = TaskExecutionRegistry::default()
+            .with_execution_admission(Arc::clone(&execution_admission))
+            .with_agent_spawn_preflight_runtime(AgentSpawnPreflightRuntime {
+                settings_store: Some(settings_store.clone()),
+                // UnavailableBusinessModelBridgeClient 不能作为有效预检客户端；
+                // settings/orchestrator 的有效配置仍由 resolver 单独解析。
+                default_model_client: default_model_available
+                    .then(|| business_model_client.clone()),
+                workspace_registry: Some(self.workspace_store.clone()),
+                session_code_contexts: Some(session_code_contexts.clone()),
+                git_service_configured: true,
+            });
         let accepted_submission_repository = self.state_repository.clone();
         let accepted_submission_repository_for_checkpoint = accepted_submission_repository.clone();
         let task_checkpoint_persist: TaskCheckpointPersist = Arc::new(move |snapshot| {
@@ -1819,6 +1892,7 @@ impl DaemonRuntime {
             runner_result_receiver,
         )
         .with_agent_role_registry(state.agent_role_registry.clone())
+        .with_execution_admission(Arc::clone(&execution_admission))
         .with_checkpoint_persist(task_checkpoint_persist)
         .with_terminal_observer(move |root_task_id, session_id, status, turn_id| {
             let Some(session_id) = session_id else {
@@ -2798,7 +2872,8 @@ done
     #[test]
     fn agent_role_catalog_provider_exports_spawnable_roles() {
         let registry = std::sync::Arc::new(magi_agent_role::AgentRoleRegistry::load_default());
-        let provider = build_agent_role_catalog_provider(registry);
+        let provider =
+            build_agent_role_catalog_provider(registry, Arc::new(SettingsStore::new()), false);
         let roles = provider();
 
         assert!(
@@ -2819,6 +2894,19 @@ done
                 .iter()
                 .any(|kind| kind == "local_agent")),
             "代理角色目录应暴露 supported_kinds，便于 tool_catalog 诊断"
+        );
+        assert!(
+            roles.iter().any(|role| role
+                .capability_ids
+                .iter()
+                .any(|capability| capability == "general_engineering")),
+            "代理角色目录应暴露 capability_ids，供 agent_spawn 选择默认能力"
+        );
+        assert!(
+            roles
+                .iter()
+                .all(|role| !role.display_name.trim().is_empty()),
+            "代理角色目录必须返回用户可见 display_name"
         );
     }
 

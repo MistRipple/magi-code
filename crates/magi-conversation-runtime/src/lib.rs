@@ -6,6 +6,7 @@
 
 #![recursion_limit = "256"]
 
+mod agent_spawn_preflight;
 mod builtin_tool_schema;
 mod context_authority;
 pub mod context_reference;

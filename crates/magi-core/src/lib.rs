@@ -33,10 +33,12 @@ pub use status::{
 pub use task::{
     AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextPackage,
     AgentContextReference, AgentContextReferenceKind, AgentContextSupplement, AgentRunProjection,
-    PlanItem, PlanItemStatus, PlanState, ProgressSummary, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task,
-    TaskCompletionAttempt, TaskCompletionContract, TaskCompletionEvidence, TaskEvidenceRequirement,
-    TaskExecutorBinding, TaskKind, TaskPolicy, TaskRecoveryCheckpoint, TaskRuntimePayload,
-    TaskStatus, TaskTier, public_task_output_refs, task_output_ref_is_internal_runtime_failure,
+    CollaborationMode, PlanItem, PlanItemStatus, PlanState, ProgressSummary,
+    PublicTaskFailureMetadata, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task, TaskCompletionAttempt,
+    TaskCompletionContract, TaskCompletionEvidence, TaskEvidenceRequirement, TaskExecutorBinding,
+    TaskKind, TaskPolicy, TaskRecoveryCheckpoint, TaskRuntimePayload, TaskStatus, TaskTier,
+    classify_public_task_failure, public_task_failure_is_degraded, public_task_output_refs,
+    task_output_ref_is_internal_runtime_failure,
 };
 pub use token_estimate::estimate_text_tokens;
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

@@ -129,6 +129,7 @@ fn task_serialization_roundtrip() {
         policy_snapshot: Some(TaskPolicy {
             autonomy_level: "full".to_string(),
             access_profile: crate::AccessProfile::Restricted,
+            collaboration_mode: Default::default(),
             allowed_tools: vec!["search".to_string()],
             denied_tools: Vec::new(),
             allowed_paths: vec!["/src".to_string()],

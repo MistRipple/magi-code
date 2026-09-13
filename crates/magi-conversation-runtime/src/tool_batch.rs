@@ -21,13 +21,14 @@ use magi_bridge_client::{
 };
 use magi_browser_authority::BrowserCapabilitySnapshot;
 use magi_core::{
-    AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextPackage,
-    AgentContextReference, AgentContextReferenceKind, AgentContextSupplement, EventId,
-    ExecutionResultStatus, GoalId, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT,
-    TaskExecutorBinding, TaskId, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier,
-    ToolCallId, UtcMillis, WorkspaceId, estimate_text_tokens, public_task_output_refs,
-    task_output_ref_is_internal_runtime_failure,
+    AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextReference,
+    AgentContextReferenceKind, AgentContextSupplement, EventId, ExecutionResultStatus, GoalId,
+    SessionId, TaskExecutorBinding, TaskId, TaskPolicy, TaskRuntimePayload, TaskStatus, ToolCallId,
+    UtcMillis, WorkspaceId, classify_public_task_failure, estimate_text_tokens,
+    public_task_failure_is_degraded, public_task_output_refs,
 };
+#[cfg(test)]
+use magi_core::{AgentContextPackage, TaskTier};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
@@ -41,6 +42,10 @@ use magi_tool_runtime::{
     effective_tool_policy_allowed_paths, normalize_tool_policy_paths, tool_path_access_requests,
 };
 
+use crate::agent_spawn_preflight::{
+    AGENT_CONTEXT_PREVIEW_MAX_CHARS, AGENT_CONTEXT_SUMMARY_MAX_CHARS, AgentSpawnPreflightInput,
+    parse_agent_context_references, preflight_agent_spawn, required_bounded_context_text,
+};
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
 use crate::task_execution_registry::SpawnedChildExecutionError;
@@ -70,11 +75,6 @@ const MIN_CREATE_GOAL_TOKEN_BUDGET: u64 = 16_000;
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
 const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
-const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 4_000;
-const AGENT_CONTEXT_EXPECTED_OUTPUT_MAX_CHARS: usize = 2_000;
-const AGENT_CONTEXT_CONSTRAINT_MAX_CHARS: usize = 600;
-const AGENT_CONTEXT_PREVIEW_MAX_CHARS: usize = 600;
-const AGENT_CONTEXT_REFERENCE_LIMIT: usize = 16;
 const AGENT_CONTEXT_ACCESS_LIMIT: usize = 8;
 const AGENT_UNAVAILABLE_PUBLIC_TEXT: &str = "代理当前不可用，主线需要改派或接管。";
 const AGENT_SPAWN_STARTED_INSTRUCTION: &str = "代理已异步启动。若后续结论依赖该代理结果，必须调用 agent_wait，并传入 task_ids=[child_task_id] 收集终态结果；不要在未等待必要代理结果时直接给最终答复。";
@@ -599,458 +599,24 @@ fn execute_coordinator_tool(
     };
 
     match tool {
-        magi_tool_runtime::BuiltinToolName::AgentSpawn => {
-            let task_name = parsed
-                .get("task_name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !valid_agent_task_name(&task_name) {
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "failed",
-                        "invalid_task_name",
-                        "input_validation",
-                        "agent_spawn task_name 只允许小写字母、数字和下划线，长度必须为 1-48",
-                        "请生成一个唯一的小写 task_name 后重新调用 agent_spawn。",
-                    ),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            let parent_canonical_name = task.canonical_task_name().unwrap_or("/root");
-            let canonical_task_name = child_canonical_task_name(parent_canonical_name, &task_name);
-            if task_store
-                .get_children(&task.task_id)
-                .iter()
-                .any(|child| child.canonical_task_name() == Some(canonical_task_name.as_str()))
-            {
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "failed",
-                        "duplicate_task_name",
-                        "input_validation",
-                        format!("同一父任务下 task_name 已存在: {task_name}"),
-                        "请生成一个未使用的 task_name 后重新调用 agent_spawn。",
-                    ),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            let plan_item_id = parsed
-                .get("plan_item_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(magi_core::PlanItemId::new);
-            if let Some(plan_item_id) = plan_item_id.as_ref()
-                && !plan_store.has_item(plan_item_id)
-            {
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "failed",
-                        "plan_item_not_found",
-                        "input_validation",
-                        format!("agent_spawn plan_item_id 不存在: {plan_item_id}"),
-                        "请使用当前 update_plan 返回的顶层计划项 ID，或省略 plan_item_id 后重新派发。",
-                    ),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            let spawnable_role_ids = agent_role_registry.spawnable_agent_role_ids();
-            let requested_role = parsed
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let requested_goal = parsed
-                .get("goal")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if requested_role.is_empty() || requested_goal.is_empty() {
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "failed",
-                        "missing_required_fields",
-                        "input_validation",
-                        "agent_spawn 缺少必需字段 role 或 goal",
-                        "请补齐 role 和 goal，并保持其为非空字符串后重新调用 agent_spawn。",
-                    ),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            // display_name 是 LLM 提供的代理展示名，作为 Task.title 直接面向用户。
-            // 长度限制 3-30 个 Unicode 字符：下限 3 既能拒绝『x』『ab』之类的占位符，
-            // 又允许典型 4 字中文短语（如『探索目录』『统计行数』）这一最自然的命名密度；
-            // 上限 30 防止破坏前端代理卡片版式。
-            let requested_display_name = parsed
-                .get("display_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let role = requested_role;
-            let goal = requested_goal;
-            let display_name = requested_display_name;
-            let display_name_chars = display_name.chars().count();
-            if display_name.is_empty() {
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "failed",
-                        "missing_display_name",
-                        "input_validation",
-                        "agent_spawn 缺少必需字段 display_name",
-                        "请提供 3-30 个字符的 display_name 后重新调用 agent_spawn。",
-                    ),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            if !agent_role_registry.is_spawnable_agent_role(&role) {
-                let role_hint = spawnable_role_ids.join(" / ");
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "degraded",
-                        "agent_role_not_spawnable",
-                        "input_validation",
-                        "该 role 不是可派发代理角色。coordinator 是主线编排身份，不能通过 agent_spawn 派发。",
-                        format!(
-                            "请改派 {role_hint} 等可用专业代理；如果无需继续派发，则由主线基于已有上下文直接推进并给出结果。"
-                        ),
-                    ),
-                    ExecutionResultStatus::Succeeded,
-                );
-            }
-            let requested_capability_ids = match parse_agent_spawn_capabilities(&parsed) {
-                Ok(capability_ids) => capability_ids,
-                Err(error) => {
-                    let available = agent_role_registry
-                        .capability_ids_for_role(&role)
-                        .join(" / ");
-                    return (
-                        agent_spawn_failure_payload(
-                            tool_call,
-                            "failed",
-                            "invalid_capabilities",
-                            "input_validation",
-                            error,
-                            format!(
-                                "请从角色 {role} 拥有的专业能力中至少选择一项：{available}。能够识别专业领域时不要只选择 general_engineering。"
-                            ),
-                        ),
-                        ExecutionResultStatus::Failed,
-                    );
-                }
-            };
-            let requested_capability_ids = match agent_role_registry
-                .validate_capability_ids_for_role(&role, &requested_capability_ids)
-            {
-                Ok(capability_ids) => capability_ids,
-                Err(error) => {
-                    let available = agent_role_registry
-                        .capability_ids_for_role(&role)
-                        .join(" / ");
-                    return (
-                        agent_spawn_failure_payload(
-                            tool_call,
-                            "failed",
-                            "unsupported_capability",
-                            "input_validation",
-                            error,
-                            format!("请改用角色 {role} 拥有的专业能力：{available}"),
-                        ),
-                        ExecutionResultStatus::Failed,
-                    );
-                }
-            };
-            if !(3..=30).contains(&display_name_chars) {
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "failed",
-                        "invalid_display_name",
-                        "input_validation",
-                        format!(
-                            "agent_spawn display_name 长度必须在 3-30 个字符之间，实际 {display_name_chars}",
-                        ),
-                        "请提供长度为 3-30 个字符的 display_name 后重新调用 agent_spawn。",
-                    ),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            if parsed.get("context").is_some() {
-                return (
-                    agent_spawn_failure_payload(
-                        tool_call,
-                        "failed",
-                        "legacy_context_rejected",
-                        "input_validation",
-                        "agent_spawn 不再接受 context 字符串，请使用结构化 context_package",
-                        "请移除 context，并按 Schema 传入 context_package 对象后重新调用 agent_spawn。",
-                    ),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            let task_kind = parsed
-                .get("task_kind")
-                .and_then(|v| v.as_str())
-                .and_then(|s| match s.to_ascii_lowercase().as_str() {
-                    "action" => Some(TaskKind::LocalAgent),
-                    "validation" => Some(TaskKind::LocalAgent),
-                    "repair" => Some(TaskKind::LocalAgent),
-                    "decision" => Some(TaskKind::LocalAgent),
-                    "work_package" | "workpackage" => Some(TaskKind::LocalAgent),
-                    "phase" => Some(TaskKind::LocalAgent),
-                    "objective" => Some(TaskKind::LocalAgent),
-                    _ => None,
-                })
-                .unwrap_or(TaskKind::LocalAgent);
-            let now = UtcMillis::now();
-            // 单调序号 + 毫秒时间戳一起拼接，避免同一毫秒内多次并行 agent_spawn
-            // 生成同名 child_id（会击穿 SpawnGraph 边唯一性约束）。
-            let seq = AGENT_SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
-            let child_id = TaskId::new(format!(
-                "task-spawn-{}-{}-{}",
-                task.task_id.as_str(),
-                now.0,
-                seq
-            ));
-            let context_package = match parse_agent_context_package(
-                &parsed,
-                &task.task_id,
-                now,
-                seq,
-            ) {
-                Ok(package) => package,
-                Err(error) => {
-                    return (
-                        agent_spawn_failure_payload(
-                            tool_call,
-                            "failed",
-                            "invalid_context_package",
-                            "input_validation",
-                            error,
-                            "请按 agent_spawn Schema 重新提供 context_package：summary、expected_output、constraints 必须为规定类型；references 中每条引用的 kind、source_ref 必须为字符串，若提供 title 也必须为字符串。",
-                        ),
-                        ExecutionResultStatus::Failed,
-                    );
-                }
-            };
-            let child_policy_snapshot =
-                agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref());
-            let child_access_profile = child_policy_snapshot.effective_access_profile();
-            let child_dependency_ids = agent_spawn_child_dependency_ids(task);
-            let child_input_refs = context_package
-                .references
-                .iter()
-                .map(|reference| reference.source_ref.clone())
-                .collect();
-            let child = magi_core::Task {
-                task_id: child_id.clone(),
-                mission_id: task.mission_id.clone(),
-                root_task_id: task.root_task_id.clone(),
-                parent_task_id: Some(task.task_id.clone()),
-                kind: task_kind,
-                title: display_name,
-                goal: goal.clone(),
-                status: TaskStatus::Pending,
-                dependency_ids: child_dependency_ids,
-                required_children: Vec::new(),
-                policy_snapshot: Some(child_policy_snapshot),
-                executor_binding: Some(
-                    TaskExecutorBinding::for_role(&role)
-                        .with_capability_ids(requested_capability_ids.clone())
-                        .with_parallelism_group(
-                            parsed
-                                .get("parallelism_group")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_string),
-                        )
-                        .with_canonical_task_name(canonical_task_name.clone())
-                        .with_plan_item_id(plan_item_id.clone()),
-                ),
-                completion_contract: magi_core::TaskCompletionContract::default(),
-                recovery_checkpoint: None,
-                knowledge_refs: Vec::new(),
-                workspace_scope: task.workspace_scope.clone(),
-                write_scope: task.write_scope.clone(),
-                input_refs: child_input_refs,
-                output_refs: Vec::new(),
-                evidence_refs: Vec::new(),
-                retry_count: 0,
-                runtime_payload: TaskRuntimePayload::AgentContext {
-                    package: Box::new(context_package.clone()),
-                    accesses: Vec::new(),
-                },
-                created_at: now,
-                updated_at: now,
-            };
-            let registered_execution = match execution_registry.register_spawned_local_agent_child(
-                SpawnedChildExecutionRequest {
-                    task_store,
-                    spawn_graph,
-                    session_store,
-                    child_task: &child,
-                    session_id,
-                    workspace_id,
-                    role: &role,
-                    role_parallelism_limit: agent_role_registry
-                        .get(&role)
-                        .and_then(|definition| definition.parallelism_limit),
-                    now,
-                },
-            ) {
-                Ok(registered) => registered,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        parent_task_id = %task.task_id,
-                        child_task_id = %child_id,
-                        "agent_spawn child execution registration failed"
-                    );
-                    if let SpawnedChildExecutionError::RoleCapacityExceeded {
-                        role,
-                        active,
-                        limit,
-                    } = error
-                    {
-                        return (
-                            agent_spawn_failure_payload(
-                                tool_call,
-                                "rejected",
-                                "agent_spawn_capacity_exceeded",
-                                "registration",
-                                format!(
-                                    "角色 {role} 已达到代理实例上限：最多 {limit} 个活跃实例，当前 {active} 个"
-                                ),
-                                "请先用 agent_wait 收集该角色已启动代理的结果；有实例退出活跃状态后再继续创建同角色代理。其他角色不受该角色容量占用影响。",
-                            ),
-                            ExecutionResultStatus::Rejected,
-                        );
-                    }
-                    return (
-                        agent_spawn_failure_payload(
-                            tool_call,
-                            "failed",
-                            "agent_spawn_registration_failed",
-                            "registration",
-                            "代理启动失败，请由主线继续或改派其他角色",
-                            "请根据当前任务继续推进，或改派其他可用角色；如需排查，请使用本次诊断引用定位工具调用。",
-                        ),
-                        ExecutionResultStatus::Failed,
-                    );
-                }
-            };
-            conversation_registry.open_task_signal_channel(session_id, &child_id);
-            if let Some(plan_item_id) = plan_item_id.clone() {
-                match plan_store.bind_task(child_id.clone(), plan_item_id) {
-                    Ok(plan) => magi_plan::publish_plan_event(
-                        event_bus,
-                        magi_plan::plan_event_type(&plan),
-                        &plan,
-                        workspace_id.as_ref(),
-                        Some(&child_id),
-                        Some(&task.mission_id),
-                    ),
-                    Err(error) => {
-                        tracing::error!(
-                            error = %error,
-                            child_task_id = %child_id,
-                            canonical_task_name,
-                            "agent_spawn 计划绑定失败"
-                        );
-                        if let Err(terminal_error) = task_store.revoke_lease_and_set_task_terminal(
-                            &child_id,
-                            &child.root_task_id,
-                            None,
-                            TaskStatus::Killed,
-                            vec!["代理计划绑定失败，执行已终止".to_string()],
-                        ) {
-                            tracing::error!(
-                                error = %terminal_error,
-                                child_task_id = %child_id,
-                                "agent_spawn 计划绑定失败后的终止事实提交失败"
-                            );
-                        }
-                        return (
-                            agent_spawn_failure_payload_for_child(
-                                tool_call,
-                                "failed",
-                                "agent_spawn_plan_binding_failed",
-                                "plan_binding",
-                                "代理已创建但计划绑定失败，运行已终止",
-                                "请修正或省略 plan_item_id 后重新派发；本次创建的代理已终止，可打开详情查看其执行记录。",
-                                Some(&child_id),
-                            ),
-                            ExecutionResultStatus::Failed,
-                        );
-                    }
-                }
-            }
-            publish_event(
-                "task.coordinator.agent_spawn",
-                serde_json::json!({
-                    "parent_task_id": task.task_id.to_string(),
-                    "child_task_id": child_id.to_string(),
-                    "canonical_task_name": canonical_task_name,
-                    "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
-                    "role": role,
-                    "capabilities": requested_capability_ids,
-                    "access_profile": child_access_profile.as_str(),
-                    "goal": goal,
-                    "context_package_id": context_package.package_id,
-                    "context_revision": context_package.revision,
-                    "task_kind": format!("{:?}", task_kind),
-                    "worker_id": registered_execution.worker_id.to_string(),
-                    "thread_id": registered_execution.thread_id.to_string(),
-                    "execution_chain_ref": registered_execution.execution_chain_ref,
-                }),
-            );
-            enqueue_agent_assignment_message(
+        magi_tool_runtime::BuiltinToolName::AgentSpawn => execute_agent_spawn(
+            CoordinatorToolContext {
+                event_bus,
+                agent_role_registry,
+                task_store,
+                session_store,
+                execution_registry,
                 conversation_registry,
-                session_id,
+                spawn_graph,
+                plan_store,
                 task,
-                &child,
-                &role,
-                now,
-            );
-
-            (
-                serde_json::json!({
-                    "tool": tool.as_str(),
-                    "status": "started",
-                    "child_task_id": child_id.to_string(),
-                    "canonical_task_name": canonical_task_name,
-                    "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
-                    "role": role,
-                    "capabilities": requested_capability_ids,
-                    "access_profile": child_access_profile.as_str(),
-                    "title": child.title,
-                    "assignment": {
-                        "title": child.title,
-                        "goal": child.goal,
-                        "role": role,
-                        "capabilities": requested_capability_ids,
-                        "access_profile": child_access_profile.as_str(),
-                        "context_package_id": context_package.package_id,
-                        "context_revision": context_package.revision,
-                    },
-                    "worker_id": registered_execution.worker_id.to_string(),
-                    "thread_id": registered_execution.thread_id.to_string(),
-                    "execution_chain_ref": registered_execution.execution_chain_ref,
-                    "instruction": AGENT_SPAWN_STARTED_INSTRUCTION,
-                })
-                .to_string(),
-                ExecutionResultStatus::Succeeded,
-            )
-        }
+                session_id,
+                workspace_id,
+            },
+            tool_call,
+            &parsed,
+            &publish_event,
+        ),
         magi_tool_runtime::BuiltinToolName::AgentWait => {
             let session_threads = session_store.thread_registry_snapshot(session_id);
             execute_agent_wait_with_runtime(
@@ -1068,6 +634,7 @@ fn execute_coordinator_tool(
         }
         magi_tool_runtime::BuiltinToolName::AgentSend => execute_agent_send(
             task_store,
+            spawn_graph,
             conversation_registry,
             task,
             session_id,
@@ -1079,6 +646,260 @@ fn execute_coordinator_tool(
     }
 }
 
+fn execute_agent_spawn(
+    context: CoordinatorToolContext<'_>,
+    tool_call: &ChatToolCall,
+    parsed: &serde_json::Value,
+    publish_event: &impl Fn(&str, serde_json::Value),
+) -> (String, ExecutionResultStatus) {
+    let CoordinatorToolContext {
+        event_bus,
+        agent_role_registry,
+        task_store,
+        session_store,
+        execution_registry,
+        conversation_registry,
+        spawn_graph,
+        plan_store,
+        task,
+        session_id,
+        workspace_id,
+    } = context;
+
+    // 预检只读事实；直到它成功后才生成 child_task_id 或写入任何任务状态。
+    let now = UtcMillis::now();
+    let sequence = AGENT_SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let preflight = match preflight_agent_spawn(AgentSpawnPreflightInput {
+        parsed,
+        parent_task: task,
+        task_store,
+        session_store,
+        execution_registry,
+        agent_role_registry,
+        plan_store,
+        session_id,
+        workspace_id,
+        now,
+        sequence,
+    }) {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            tracing::info!(
+                error_code = %error.error_code,
+                failure_stage = %error.failure_stage,
+                parent_task_id = %task.task_id,
+                "agent_spawn 创建前预检拒绝"
+            );
+            return (
+                agent_spawn_failure_payload(
+                    tool_call,
+                    "rejected",
+                    &error.error_code,
+                    &error.failure_stage,
+                    error.message,
+                    error.instruction,
+                ),
+                ExecutionResultStatus::Rejected,
+            );
+        }
+    };
+
+    let child_task_id = TaskId::new(format!(
+        "task-spawn-{}-{}-{}",
+        task.task_id.as_str(),
+        now.0,
+        sequence
+    ));
+    let context_package_id = preflight.context_package.package_id.clone();
+    let context_revision = preflight.context_package.revision;
+    let plan_item_id = preflight.plan_item_id.clone();
+    let child = magi_core::Task {
+        task_id: child_task_id.clone(),
+        mission_id: task.mission_id.clone(),
+        root_task_id: task.root_task_id.clone(),
+        parent_task_id: Some(task.task_id.clone()),
+        kind: preflight.task_kind,
+        title: preflight.display_name.clone(),
+        goal: preflight.goal.clone(),
+        status: TaskStatus::Pending,
+        dependency_ids: preflight.child_dependency_ids.clone(),
+        required_children: Vec::new(),
+        policy_snapshot: Some(preflight.child_policy_snapshot.clone()),
+        executor_binding: Some(
+            TaskExecutorBinding::for_role(&preflight.role)
+                .with_capability_ids(preflight.capability_ids.clone())
+                .with_parallelism_group(preflight.parallelism_group.clone())
+                .with_canonical_task_name(preflight.canonical_task_name.clone())
+                .with_plan_item_id(plan_item_id.clone()),
+        ),
+        completion_contract: magi_core::TaskCompletionContract::default(),
+        recovery_checkpoint: None,
+        knowledge_refs: Vec::new(),
+        workspace_scope: task.workspace_scope.clone(),
+        write_scope: task.write_scope.clone(),
+        input_refs: preflight.child_input_refs.clone(),
+        output_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        retry_count: 0,
+        runtime_payload: TaskRuntimePayload::AgentContext {
+            package: Box::new(preflight.context_package.clone()),
+            accesses: Vec::new(),
+        },
+        created_at: now,
+        updated_at: now,
+    };
+
+    let registered_execution = match execution_registry.register_spawned_local_agent_child(
+        SpawnedChildExecutionRequest {
+            task_store,
+            spawn_graph,
+            session_store,
+            child_task: &child,
+            session_id,
+            workspace_id,
+            role: &preflight.role,
+            role_parallelism_limit: agent_role_registry
+                .get(&preflight.role)
+                .and_then(|definition| definition.parallelism_limit),
+            plan_store: preflight.plan_item_id.as_ref().map(|_| plan_store),
+            plan_item_id: plan_item_id.clone(),
+            execution_root: preflight.working_dir.clone(),
+            now,
+        },
+    ) {
+        Ok(registered) => registered,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                parent_task_id = %task.task_id,
+                child_task_id = %child_task_id,
+                "agent_spawn 子任务原子注册失败"
+            );
+            let (error_code, failure_stage, status, execution_status, message, instruction) =
+                match error {
+                    SpawnedChildExecutionError::RoleCapacityExceeded {
+                        role,
+                        active,
+                        limit,
+                    } => (
+                        "agent_capacity_exceeded",
+                        "registration",
+                        "rejected",
+                        ExecutionResultStatus::Rejected,
+                        format!(
+                            "角色 {role} 已达到代理实例上限：最多 {limit} 个活跃实例，当前 {active} 个"
+                        ),
+                        "请先用 agent_wait 收集该角色已启动代理的结果；有实例退出活跃状态后再继续创建同角色代理。",
+                    ),
+                    SpawnedChildExecutionError::InvalidState(_) => (
+                        "agent_spawn_registration_failed",
+                        "registration",
+                        "failed",
+                        ExecutionResultStatus::Failed,
+                        "代理启动失败，请由主线继续或改派其他角色".to_string(),
+                        "请根据当前任务继续推进，或改派其他可用角色；如需排查，请使用本次诊断引用定位工具调用。",
+                    ),
+                };
+            return (
+                agent_spawn_failure_payload(
+                    tool_call,
+                    status,
+                    error_code,
+                    failure_stage,
+                    message,
+                    instruction,
+                ),
+                execution_status,
+            );
+        }
+    };
+
+    conversation_registry.open_task_signal_channel(session_id, &child_task_id);
+    if let Some(plan) = registered_execution.plan.as_ref() {
+        magi_plan::publish_plan_event(
+            event_bus,
+            magi_plan::plan_event_type(plan),
+            plan,
+            workspace_id.as_ref(),
+            Some(&child_task_id),
+            Some(&task.mission_id),
+        );
+    }
+    publish_event(
+        "task.coordinator.agent_spawn",
+        serde_json::json!({
+            "parent_task_id": task.task_id.to_string(),
+            "child_task_id": child_task_id.to_string(),
+            "task_name": preflight.task_name.clone(),
+            "canonical_task_name": preflight.canonical_task_name,
+            "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
+            "role": preflight.role,
+            "capabilities": preflight.capability_ids,
+            "access_profile": preflight.child_access_profile.as_str(),
+            "goal": preflight.goal,
+            "context_package_id": context_package_id,
+            "context_revision": context_revision,
+            "task_kind": "local_agent",
+            "worker_id": registered_execution.worker_id.to_string(),
+            "thread_id": registered_execution.thread_id.to_string(),
+            "execution_chain_ref": registered_execution.execution_chain_ref,
+            "model_source": preflight.model_source,
+            "queue_reason": preflight.queue_reason,
+        }),
+    );
+    enqueue_agent_assignment_message(
+        conversation_registry,
+        session_id,
+        task,
+        &child,
+        &preflight.role,
+        now,
+    );
+
+    let queue_reason = preflight.queue_reason.clone();
+    let status = if queue_reason.is_some() {
+        "queued"
+    } else {
+        "started"
+    };
+    let instruction = queue_reason
+        .as_ref()
+        .map(|_| "代理已创建并排队等待执行资源。资源可用后会自动启动；若后续结论依赖该代理，必须调用 agent_wait 收集终态结果。".to_string())
+        .unwrap_or_else(|| AGENT_SPAWN_STARTED_INSTRUCTION.to_string());
+    (
+        serde_json::json!({
+            "tool": BuiltinToolName::AgentSpawn.as_str(),
+            "status": status,
+            "child_task_id": child_task_id.to_string(),
+            "task_name": preflight.task_name,
+            "canonical_task_name": preflight.canonical_task_name,
+            "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
+            "role": preflight.role,
+            "capabilities": preflight.capability_ids,
+            "access_profile": preflight.child_access_profile.as_str(),
+            "title": child.title,
+            "assignment": {
+                "title": child.title,
+                "goal": child.goal,
+                "role": preflight.role,
+                "capabilities": preflight.capability_ids,
+                "access_profile": preflight.child_access_profile.as_str(),
+                "context_package_id": context_package_id,
+                "context_revision": context_revision,
+            },
+            "worker_id": registered_execution.worker_id.to_string(),
+            "thread_id": registered_execution.thread_id.to_string(),
+            "execution_chain_ref": registered_execution.execution_chain_ref,
+            "model_source": preflight.model_source.unwrap_or_else(|| "unconfigured".to_string()),
+            "queue_reason": queue_reason,
+            "instruction": instruction,
+        })
+        .to_string(),
+        ExecutionResultStatus::Succeeded,
+    )
+}
+
+#[cfg(test)]
 fn parse_agent_spawn_capabilities(parsed: &serde_json::Value) -> Result<Vec<String>, String> {
     let capabilities = parsed
         .get("capabilities")
@@ -1101,15 +922,9 @@ fn parse_agent_spawn_capabilities(parsed: &serde_json::Value) -> Result<Vec<Stri
         .collect()
 }
 
-fn valid_agent_task_name(task_name: &str) -> bool {
-    (1..=48).contains(&task_name.len())
-        && task_name.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
-        })
-}
-
 fn execute_agent_send(
     task_store: &TaskStore,
+    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     conversation_registry: &ConversationRegistry,
     parent_task: &magi_core::Task,
     session_id: &SessionId,
@@ -1117,13 +932,33 @@ fn execute_agent_send(
     parsed: &serde_json::Value,
     publish_event: &impl Fn(&str, serde_json::Value),
 ) -> (String, ExecutionResultStatus) {
-    let target_task_id = TaskId::new(
-        parsed
-            .get("task_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .trim(),
-    );
+    let Some(object) = parsed.as_object() else {
+        return context_tool_failure(tool, "invalid_arguments", "agent_send 参数必须是 JSON 对象");
+    };
+    for key in object.keys() {
+        if !matches!(key.as_str(), "task_id" | "message" | "references") {
+            return context_tool_failure(
+                tool,
+                "invalid_arguments",
+                format!("agent_send 不支持字段 {key}"),
+            );
+        }
+    }
+    let target_task_id = match object
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(task_id) => TaskId::new(task_id),
+        None => {
+            return context_tool_failure(
+                tool,
+                "invalid_arguments",
+                "agent_send.task_id 必须是非空字符串",
+            );
+        }
+    };
     let message = match required_bounded_context_text(
         parsed.get("message"),
         "agent_send.message",
@@ -1135,11 +970,27 @@ fn execute_agent_send(
     let Some(target_task) = task_store.get_task(&target_task_id) else {
         return context_tool_failure(tool, "target_not_found", "目标代理任务不存在");
     };
-    if target_task.root_task_id != parent_task.root_task_id
+    let graph_scope_matches = spawn_graph
+        .lock()
+        .map(|graph| {
+            graph
+                .parent_of(&target_task_id)
+                .map(|graph_parent| graph_parent == &parent_task.task_id)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false);
+    if target_task.parent_task_id.as_ref() != Some(&parent_task.task_id)
+        || !graph_scope_matches
+        || target_task.root_task_id != parent_task.root_task_id
         || target_task.mission_id != parent_task.mission_id
-        || target_task.task_id == parent_task.task_id
+        || target_task.workspace_scope != parent_task.workspace_scope
+        || target_task.write_scope != parent_task.write_scope
     {
-        return context_tool_failure(tool, "target_out_of_scope", "目标代理不属于当前执行链");
+        return context_tool_failure(
+            tool,
+            "target_out_of_scope",
+            "agent_send 只能向当前任务直接派发且作用域一致的子代理发送上下文",
+        );
     }
     if !matches!(
         target_task.status,
@@ -1740,16 +1591,6 @@ fn record_agent_context_access(
     )
 }
 
-fn child_canonical_task_name(parent_name: &str, task_name: &str) -> String {
-    let parent_name = parent_name.trim().trim_end_matches('/');
-    let parent_name = if parent_name.is_empty() {
-        "/root"
-    } else {
-        parent_name
-    };
-    format!("{parent_name}/{task_name}")
-}
-
 pub(crate) fn execute_goal_tool(
     session_store: &SessionStore,
     session_id: &SessionId,
@@ -2070,210 +1911,12 @@ fn objective_text_explicitly_allows_goal_budget(objective: &str, token_budget: u
     normalized.contains(&token_budget.to_string())
 }
 
-fn agent_spawn_child_policy_snapshot(parent_policy: Option<&TaskPolicy>) -> TaskPolicy {
-    parent_policy
-        .cloned()
-        .unwrap_or_else(default_agent_spawn_policy)
-}
-
-fn agent_spawn_child_dependency_ids(parent: &magi_core::Task) -> Vec<TaskId> {
-    parent.dependency_ids.clone()
-}
-
-fn parse_agent_context_package(
-    parsed: &serde_json::Value,
-    parent_task_id: &TaskId,
-    now: UtcMillis,
-    sequence: u64,
-) -> Result<AgentContextPackage, String> {
-    // 部分 OpenAI-compatible 模型会把嵌套 object 二次序列化为 JSON 字符串。
-    // 这里统一在 tool 参数边界还原一次，后续仍只接受同一份结构化合同，避免
-    // DeepSeek 等模型因合法内容的表示差异被错误拒绝。
-    let context_package = match parsed.get("context_package") {
-        Some(serde_json::Value::Object(_)) => parsed
-            .get("context_package")
-            .cloned()
-            .expect("context_package object should remain present"),
-        Some(serde_json::Value::String(encoded)) => {
-            serde_json::from_str(encoded).map_err(|_| {
-                "agent_spawn 的 context_package 必须是对象或可解析为对象的 JSON 字符串".to_string()
-            })?
-        }
-        _ => return Err("agent_spawn 缺少结构化 context_package".to_string()),
-    };
-    let value = context_package
-        .as_object()
-        .ok_or_else(|| "agent_spawn 的 context_package 必须是结构化对象".to_string())?;
-    let summary = required_bounded_context_text(
-        value.get("summary"),
-        "context_package.summary",
-        AGENT_CONTEXT_SUMMARY_MAX_CHARS,
-    )?;
-    let expected_output = required_bounded_context_text(
-        value.get("expected_output"),
-        "context_package.expected_output",
-        AGENT_CONTEXT_EXPECTED_OUTPUT_MAX_CHARS,
-    )?;
-    let constraints = value
-        .get("constraints")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "context_package.constraints 必须是数组".to_string())?
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            required_bounded_context_text(
-                Some(item),
-                &format!("context_package.constraints[{index}]"),
-                AGENT_CONTEXT_CONSTRAINT_MAX_CHARS,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    // 空引用列表不承载额外事实，兼容模型省略该字段时等同于 []。
-    // 显式传入非数组值仍由解析器拒绝，避免放宽结构校验。
-    let references =
-        parse_agent_context_references(value.get("references"), now, sequence, "spawn")?;
-    Ok(AgentContextPackage {
-        package_id: format!(
-            "agent-context-{}-{}-{sequence}",
-            parent_task_id.as_str(),
-            now.0
-        ),
-        revision: 1,
-        parent_task_id: parent_task_id.clone(),
-        summary,
-        constraints,
-        expected_output,
-        references,
-        supplements: Vec::new(),
-        created_at: now,
-        updated_at: now,
-    })
-}
-
-fn parse_agent_context_references(
-    value: Option<&serde_json::Value>,
-    now: UtcMillis,
-    sequence: u64,
-    scope: &str,
-) -> Result<Vec<AgentContextReference>, String> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let values = value
-        .as_array()
-        .ok_or_else(|| format!("{scope}.references 必须是数组"))?;
-    if values.len() > AGENT_CONTEXT_REFERENCE_LIMIT {
-        return Err(format!(
-            "{scope}.references 最多允许 {AGENT_CONTEXT_REFERENCE_LIMIT} 条"
-        ));
-    }
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let object = value
-                .as_object()
-                .ok_or_else(|| format!("{scope}.references[{index}] 必须是对象"))?;
-            let kind = parse_agent_context_reference_kind(
-                object
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-            )?;
-            let source_ref = required_bounded_context_text(
-                object.get("source_ref"),
-                &format!("{scope}.references[{index}].source_ref"),
-                1_000,
-            )?;
-            let title = optional_bounded_context_text(
-                object.get("title"),
-                &format!("{scope}.references[{index}].title"),
-                200,
-            )?
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| default_agent_context_reference_title(&source_ref));
-            let preview = optional_bounded_context_text(
-                object.get("preview"),
-                &format!("{scope}.references[{index}].preview"),
-                AGENT_CONTEXT_PREVIEW_MAX_CHARS,
-            )?
-            .unwrap_or_default();
-            Ok(AgentContextReference {
-                reference_id: format!("ctxref-{scope}-{}-{sequence}-{index}", now.0),
-                kind,
-                title,
-                source_ref,
-                estimated_tokens: estimate_text_tokens(&preview),
-                preview,
-            })
-        })
-        .collect()
-}
-
-fn parse_agent_context_reference_kind(value: &str) -> Result<AgentContextReferenceKind, String> {
-    match value.trim() {
-        "conversation_turn" => Ok(AgentContextReferenceKind::ConversationTurn),
-        "task_output" => Ok(AgentContextReferenceKind::TaskOutput),
-        "task_evidence" => Ok(AgentContextReferenceKind::TaskEvidence),
-        "file" => Ok(AgentContextReferenceKind::File),
-        "knowledge" => Ok(AgentContextReferenceKind::Knowledge),
-        "other" => Ok(AgentContextReferenceKind::Other),
-        _ => Err(format!("未知上下文引用类型: {value}")),
-    }
-}
-
-fn required_bounded_context_text(
-    value: Option<&serde_json::Value>,
-    field: &str,
-    max_chars: usize,
-) -> Result<String, String> {
-    let text = bounded_context_text(value, field, max_chars)?;
-    if text.is_empty() {
-        Err(format!("{field} 不能为空"))
-    } else {
-        Ok(text)
-    }
-}
-
-fn optional_bounded_context_text(
-    value: Option<&serde_json::Value>,
-    field: &str,
-    max_chars: usize,
-) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    bounded_context_text(Some(value), field, max_chars).map(Some)
-}
-
-fn default_agent_context_reference_title(source_ref: &str) -> String {
-    let mut title = source_ref.trim().chars().take(200).collect::<String>();
-    if source_ref.trim().chars().count() > 200 {
-        title.push('…');
-    }
-    title
-}
-
-fn bounded_context_text(
-    value: Option<&serde_json::Value>,
-    field: &str,
-    max_chars: usize,
-) -> Result<String, String> {
-    let text = value
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("{field} 必须是字符串"))?
-        .trim()
-        .to_string();
-    if text.chars().count() > max_chars {
-        return Err(format!("{field} 最多允许 {max_chars} 个字符"));
-    }
-    Ok(text)
-}
-
+#[cfg(test)]
 fn default_agent_spawn_policy() -> TaskPolicy {
     TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
         access_profile: magi_core::AccessProfile::Restricted,
+        collaboration_mode: Default::default(),
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
         allowed_paths: Vec::new(),
@@ -2337,6 +1980,12 @@ struct AgentWaitRuntime<'a> {
     session_threads: &'a [ExecutionThread],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentWaitRequest {
+    task_ids: Vec<TaskId>,
+    timeout_ms: u64,
+}
+
 fn execute_agent_wait_with_runtime(
     runtime: AgentWaitRuntime<'_>,
     parent_task: &magi_core::Task,
@@ -2350,16 +1999,38 @@ fn execute_agent_wait_with_runtime(
         session_id,
         session_threads,
     } = runtime;
-    let task_ids = parse_agent_wait_task_ids(parsed);
+    let request = match parse_agent_wait_request(parsed) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "rejected",
+                    "error_code": "invalid_arguments",
+                    "failure_stage": "input_validation",
+                    "child_task_id": serde_json::Value::Null,
+                    "error": error,
+                    "instruction": "请传入不含未知字段的对象；task_ids 必须是至少一个不重复的 child_task_id，timeout_ms 可省略或使用 1000-1800000 的整数。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Rejected,
+            );
+        }
+    };
+    let task_ids = request.task_ids;
     if task_ids.is_empty() {
         return (
             serde_json::json!({
                 "tool": tool.as_str(),
-                "status": "failed",
+                "status": "rejected",
+                "error_code": "invalid_arguments",
+                "failure_stage": "input_validation",
+                "child_task_id": serde_json::Value::Null,
                 "error": "agent_wait 缺少必需字段 task_ids",
+                "instruction": "请传入至少一个由当前任务通过 agent_spawn 创建的 task_ids。",
             })
             .to_string(),
-            ExecutionResultStatus::Failed,
+            ExecutionResultStatus::Rejected,
         );
     }
     if let Some(task_id) = task_ids.iter().find(|task_id| {
@@ -2369,15 +2040,17 @@ fn execute_agent_wait_with_runtime(
             serde_json::json!({
                 "tool": tool.as_str(),
                 "status": "rejected",
-                "error_code": "agent_wait_scope_mismatch",
+                "error_code": "scope_mismatch",
+                "failure_stage": "scope_validation",
                 "child_task_id": task_id.to_string(),
                 "error": "agent_wait 只能等待当前任务派发的代理",
+                "instruction": "请使用最近一次 agent_spawn 返回的 child_task_id，且只能等待当前任务直接派发的代理。",
             })
             .to_string(),
             ExecutionResultStatus::Rejected,
         );
     }
-    let timeout_ms = parse_agent_wait_timeout_ms(parsed);
+    let timeout_ms = request.timeout_ms;
     let started_at = std::time::Instant::now();
     let mut observed_status_version = task_store.status_change_version();
     loop {
@@ -2411,8 +2084,11 @@ fn execute_agent_wait_with_runtime(
                     "child_task_id": task_id.to_string(),
                     "status": "failed",
                     "child_status": "missing",
+                    "failure_stage": "runtime_lookup",
                     "error_code": "agent_task_unavailable",
+                    "fallback_mode": "mainline_or_reassign",
                     "error": "代理任务不可用",
+                    "instruction": "该代理任务不存在或已不可用。请改派可用角色，或由主线继续推进。",
                 }));
                 continue;
             };
@@ -2428,7 +2104,7 @@ fn execute_agent_wait_with_runtime(
             return (
                 serde_json::json!({
                     "tool": tool.as_str(),
-                    "status": "succeeded",
+                    "status": "completed",
                     "timed_out": false,
                     "results": results,
                     "merge_requirements": {
@@ -2527,25 +2203,54 @@ fn agent_wait_child_execution_scope_matches(
         && child.write_scope == parent_task.write_scope
 }
 
-fn parse_agent_wait_task_ids(parsed: &serde_json::Value) -> Vec<TaskId> {
-    parsed
+fn parse_agent_wait_request(parsed: &serde_json::Value) -> Result<AgentWaitRequest, String> {
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| "agent_wait 参数必须是 JSON 对象".to_string())?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "task_ids" | "timeout_ms") {
+            return Err(format!("agent_wait 不支持字段 {key}"));
+        }
+    }
+    let values = object
         .get("task_ids")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(TaskId::new)
-        .collect()
-}
-
-fn parse_agent_wait_timeout_ms(parsed: &serde_json::Value) -> u64 {
-    parsed
-        .get("timeout_ms")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(AGENT_WAIT_DEFAULT_TIMEOUT_MS)
-        .clamp(AGENT_WAIT_MIN_TIMEOUT_MS, AGENT_WAIT_MAX_TIMEOUT_MS)
+        .ok_or_else(|| "agent_wait 缺少必需字段 task_ids".to_string())?
+        .as_array()
+        .ok_or_else(|| "agent_wait task_ids 必须是数组".to_string())?;
+    if values.is_empty() {
+        return Err("agent_wait task_ids 至少需要一个任务 ID".to_string());
+    }
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    let mut task_ids = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let task_id = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("agent_wait task_ids[{index}] 必须是非空字符串"))?;
+        if !seen.insert(task_id.to_string()) {
+            return Err(format!("agent_wait task_ids 不能重复: {task_id}"));
+        }
+        task_ids.push(TaskId::new(task_id));
+    }
+    let timeout_ms = match object.get("timeout_ms") {
+        None => AGENT_WAIT_DEFAULT_TIMEOUT_MS,
+        Some(value) => {
+            let timeout_ms = value
+                .as_u64()
+                .ok_or_else(|| "agent_wait timeout_ms 必须是整数".to_string())?;
+            if !(AGENT_WAIT_MIN_TIMEOUT_MS..=AGENT_WAIT_MAX_TIMEOUT_MS).contains(&timeout_ms) {
+                return Err(format!(
+                    "agent_wait timeout_ms 必须在 {AGENT_WAIT_MIN_TIMEOUT_MS}-{AGENT_WAIT_MAX_TIMEOUT_MS} 之间"
+                ));
+            }
+            timeout_ms
+        }
+    };
+    Ok(AgentWaitRequest {
+        task_ids,
+        timeout_ms,
+    })
 }
 
 fn agent_thread_for_task<'a>(
@@ -2584,7 +2289,7 @@ fn child_agent_terminal_payload(
         TaskStatus::Completed => {
             let output =
                 transcript_output.unwrap_or_else(|| child_agent_output(&child.output_refs));
-            let mut payload = base("succeeded", "completed");
+            let mut payload = base("completed", "completed");
             payload["result"] = serde_json::json!({
                 "final_text": output.final_text,
                 "truncated": output.truncated,
@@ -2603,12 +2308,10 @@ fn child_agent_terminal_payload(
                 .unwrap_or_else(|| "代理任务执行失败".to_string());
             let unavailable = public_output_refs
                 .iter()
-                .any(|output| agent_unavailable_failure(output))
-                || public_output_refs
-                    .first()
-                    .is_some_and(|output| output == TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT);
+                .any(|output| agent_unavailable_failure(output));
             if unavailable {
                 let mut payload = base("degraded", "failed");
+                payload["failure_stage"] = serde_json::Value::String("dispatch".to_string());
                 payload["fallback_mode"] =
                     serde_json::Value::String("mainline_or_reassign".to_string());
                 payload["error_code"] = serde_json::Value::String("agent_unavailable".to_string());
@@ -2628,6 +2331,10 @@ fn child_agent_terminal_payload(
             }
             let output = child_agent_output(&public_output_refs);
             let mut payload = base("failed", "failed");
+            let failure = classify_public_task_failure(&error);
+            payload["failure_stage"] = serde_json::Value::String(failure.failure_stage.to_string());
+            payload["error_code"] = serde_json::Value::String(failure.error_code.to_string());
+            payload["fallback_mode"] = serde_json::Value::String(failure.fallback_mode.to_string());
             payload["result"] = serde_json::json!({
                 "final_text": output.final_text,
                 "truncated": output.truncated,
@@ -2640,7 +2347,10 @@ fn child_agent_terminal_payload(
         }
         TaskStatus::Killed => {
             let mut payload = base("failed", "killed");
+            payload["failure_stage"] = serde_json::Value::String("cancellation".to_string());
             payload["error_code"] = serde_json::Value::String("agent_killed".to_string());
+            payload["fallback_mode"] =
+                serde_json::Value::String("mainline_or_reassign".to_string());
             payload["error"] = serde_json::Value::String("代理任务被终止".to_string());
             payload
         }
@@ -2725,13 +2435,7 @@ fn truncate_for_agent_spawn_text(value: &str, max_chars: usize) -> (String, bool
 }
 
 fn agent_unavailable_failure(error: &str) -> bool {
-    if task_output_ref_is_internal_runtime_failure(error) {
-        return true;
-    }
-    let normalized = error.trim().to_ascii_lowercase();
-    ["模型配置不可用", "代理不可用", "没有匹配角色", "没有匹配"]
-        .iter()
-        .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
+    public_task_failure_is_degraded(error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2769,6 +2473,37 @@ fn execute_task_tool_call(
     {
         let decision = task_tool_visibility_decision_payload(canonical.as_str(), task);
         return (decision.payload, decision.status);
+    }
+
+    // 协作模式是当前 root task 的结构化策略。工具定义即使仍然可见，
+    // `disabled` 也必须在统一入口拒绝 agent_spawn/agent_send/agent_wait，
+    // 避免被普通安全策略或工具目录过滤改写成其它错误。
+    if let Some(canonical) =
+        magi_tool_runtime::BuiltinToolName::from_name(tool_call.function.name.as_str())
+        && matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::AgentSpawn
+                | magi_tool_runtime::BuiltinToolName::AgentSend
+                | magi_tool_runtime::BuiltinToolName::AgentWait
+        )
+        && task.policy_snapshot.as_ref().is_some_and(|policy| {
+            policy.collaboration_mode == magi_core::CollaborationMode::Disabled
+        })
+    {
+        return (
+            serde_json::json!({
+                "tool": canonical.as_str(),
+                "status": "rejected",
+                "error_code": "collaboration_disabled",
+                "failure_stage": "policy",
+                "error": "当前任务已明确禁止子代理协作",
+                "instruction": "请由主线直接完成当前任务，不要改写参数或重复调用协作工具。",
+                "child_task_id": null,
+                "diagnostic_ref": format!("tool_call:{}", tool_call.id),
+            })
+            .to_string(),
+            ExecutionResultStatus::Rejected,
+        );
     }
 
     if let Some(gate) = safety_gate {
@@ -3826,8 +3561,12 @@ fn safety_gate_decision_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_spawn_preflight::{
+        agent_spawn_child_policy_snapshot, child_canonical_task_name, parse_agent_context_package,
+        valid_agent_task_name,
+    };
     use magi_bridge_client::ChatToolFunction;
-    use magi_core::{MissionId, Task, TaskRuntimePayload};
+    use magi_core::{MissionId, Task, TaskKind, TaskRuntimePayload};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -6322,7 +6061,7 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Succeeded);
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("agent_wait result should be json");
-        assert_eq!(parsed["status"].as_str(), Some("succeeded"));
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
         assert_eq!(parsed["timed_out"].as_bool(), Some(false));
         assert_eq!(
             parsed["results"][0]["child_status"].as_str(),
@@ -6335,6 +6074,188 @@ mod tests {
         assert_eq!(
             parsed["results"][0]["result"]["final_text"].as_str(),
             Some("已完成目录探索，发现 README.md。")
+        );
+    }
+
+    #[test]
+    fn agent_wait_rejects_missing_task_ids() {
+        let task_store = TaskStore::new();
+        let parent = test_task(
+            "task-agent-wait-missing-ids",
+            "task-agent-wait-missing-ids",
+            None,
+        );
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            &spawn_graph,
+            &parent,
+            &[],
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({}),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait rejection should be json");
+        assert_eq!(parsed["status"].as_str(), Some("rejected"));
+        assert_eq!(parsed["error_code"].as_str(), Some("invalid_arguments"));
+        assert_eq!(parsed["failure_stage"].as_str(), Some("input_validation"));
+        assert!(parsed["child_task_id"].is_null());
+    }
+
+    #[test]
+    fn agent_wait_rejects_malformed_task_ids_instead_of_silently_filtering() {
+        for arguments in [
+            serde_json::json!({"task_ids": ["valid-child", 123]}),
+            serde_json::json!({"task_ids": ["valid-child", null]}),
+            serde_json::json!({"task_ids": ["valid-child", "valid-child"]}),
+            serde_json::json!({"task_ids": ["valid-child"], "unexpected": true}),
+            serde_json::json!({"task_ids": ["valid-child"], "timeout_ms": 999}),
+        ] {
+            let error = parse_agent_wait_request(&arguments)
+                .expect_err("malformed agent_wait request must be rejected");
+            assert!(!error.is_empty());
+        }
+    }
+
+    #[test]
+    fn agent_wait_reports_missing_direct_child_without_exposing_other_tasks() {
+        let task_store = TaskStore::new();
+        let parent = test_task(
+            "task-agent-wait-missing-child-root",
+            "task-agent-wait-missing-child-root",
+            None,
+        );
+        let missing_child_id = TaskId::new("task-agent-wait-missing-child");
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        spawn_graph
+            .lock()
+            .expect("SpawnGraph 锁应可用")
+            .add_edge(
+                parent.task_id.clone(),
+                missing_child_id.clone(),
+                TaskKind::LocalAgent,
+                std::time::SystemTime::now(),
+            )
+            .expect("缺失子任务的直接边应可建立用于测试");
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            &spawn_graph,
+            &parent,
+            &[],
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": [missing_child_id.as_str()],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait missing result should be json");
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(
+            parsed["results"][0]["child_status"].as_str(),
+            Some("missing")
+        );
+        assert_eq!(
+            parsed["results"][0]["error_code"].as_str(),
+            Some("agent_task_unavailable")
+        );
+        assert!(!payload.contains("foreign"));
+    }
+
+    #[test]
+    fn agent_wait_returns_timeout_with_pending_task_ids() {
+        let task_store = TaskStore::new();
+        let parent = test_task(
+            "task-agent-wait-timeout-root",
+            "task-agent-wait-timeout-root",
+            None,
+        );
+        let mut child = test_task(
+            "task-agent-wait-timeout-child",
+            parent.task_id.as_str(),
+            Some(parent.task_id.clone()),
+        );
+        child.status = TaskStatus::Pending;
+        task_store
+            .insert_task(child.clone())
+            .expect("待等待子任务应插入");
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+
+        let started = std::time::Instant::now();
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            &spawn_graph,
+            &parent,
+            &[],
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": [child.task_id.as_str()],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait timeout should be json");
+        assert_eq!(parsed["status"].as_str(), Some("timeout"));
+        assert_eq!(parsed["timed_out"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["pending_task_ids"],
+            serde_json::json!([child.task_id.as_str()])
+        );
+    }
+
+    #[test]
+    fn agent_wait_reports_killed_child_as_failed_recovery_result() {
+        let task_store = TaskStore::new();
+        let parent = test_task(
+            "task-agent-wait-killed-root",
+            "task-agent-wait-killed-root",
+            None,
+        );
+        let mut child = test_task(
+            "task-agent-wait-killed-child",
+            parent.task_id.as_str(),
+            Some(parent.task_id.clone()),
+        );
+        child.status = TaskStatus::Killed;
+        task_store
+            .insert_task(child.clone())
+            .expect("已终止子任务应插入");
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            &spawn_graph,
+            &parent,
+            &[],
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({"task_ids": [child.task_id.as_str()]}),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait killed result should be json");
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["results"][0]["status"].as_str(), Some("failed"));
+        assert_eq!(
+            parsed["results"][0]["child_status"].as_str(),
+            Some("killed")
+        );
+        assert_eq!(
+            parsed["results"][0]["error_code"].as_str(),
+            Some("agent_killed")
+        );
+        assert_eq!(
+            parsed["results"][0]["failure_stage"].as_str(),
+            Some("cancellation")
         );
     }
 
@@ -6460,10 +6381,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("agent_wait rejection should be json");
         assert_eq!(parsed["status"].as_str(), Some("rejected"));
-        assert_eq!(
-            parsed["error_code"].as_str(),
-            Some("agent_wait_scope_mismatch")
-        );
+        assert_eq!(parsed["error_code"].as_str(), Some("scope_mismatch"));
         assert!(!payload.contains("foreign result"));
     }
 
@@ -6499,10 +6417,7 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Rejected);
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("agent_wait rejection should be json");
-        assert_eq!(
-            parsed["error_code"].as_str(),
-            Some("agent_wait_scope_mismatch")
-        );
+        assert_eq!(parsed["error_code"].as_str(), Some("scope_mismatch"));
         assert!(!payload.contains("foreign scoped result"));
     }
 
@@ -6549,15 +6464,12 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Rejected);
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("agent_wait rejection should be json");
-        assert_eq!(
-            parsed["error_code"].as_str(),
-            Some("agent_wait_scope_mismatch")
-        );
+        assert_eq!(parsed["error_code"].as_str(), Some("scope_mismatch"));
         assert!(!payload.contains("workspace mismatched result"));
     }
 
     #[test]
-    fn agent_wait_marks_unavailable_agent_as_degradable() {
+    fn agent_wait_classifies_model_invocation_failure_without_degrading() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
@@ -6589,27 +6501,28 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("agent_wait result should be json");
         let result = &parsed["results"][0];
-        assert_eq!(result["status"].as_str(), Some("degraded"));
+        assert_eq!(result["status"].as_str(), Some("failed"));
         assert_eq!(result["child_status"].as_str(), Some("failed"));
         assert_eq!(
             result["fallback_mode"].as_str(),
             Some("mainline_or_reassign")
         );
-        assert!(
-            result["instruction"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("不要停止任务")
+        assert_eq!(result["failure_stage"].as_str(), Some("model_invocation"));
+        assert_eq!(
+            result["error_code"].as_str(),
+            Some("model_invocation_failed")
         );
-        assert_eq!(result["error_code"].as_str(), Some("agent_unavailable"));
-        assert_eq!(result["error"].as_str(), Some("代理当前不可用"));
+        assert_eq!(
+            result["error"].as_str(),
+            Some("子代理模型调用失败，请改派或接管。")
+        );
         assert_eq!(
             result["result"]["final_text"].as_str(),
-            Some(AGENT_UNAVAILABLE_PUBLIC_TEXT)
+            Some("子代理模型调用失败，请改派或接管。")
         );
         assert!(
             !result.to_string().contains("provider transport failed"),
-            "agent_wait degraded payload should not expose provider transport detail"
+            "agent_wait failed payload should not expose provider transport detail"
         );
     }
 
@@ -6648,7 +6561,12 @@ mod tests {
         let result = &parsed["results"][0];
         assert_eq!(result["status"].as_str(), Some("failed"));
         assert_eq!(result["child_status"].as_str(), Some("failed"));
-        assert!(result.get("fallback_mode").is_none());
+        assert_eq!(result["failure_stage"].as_str(), Some("task_execution"));
+        assert_eq!(result["error_code"].as_str(), Some("task_execution_failed"));
+        assert_eq!(
+            result["fallback_mode"].as_str(),
+            Some("mainline_or_reassign")
+        );
         assert_eq!(
             result["result"]["final_text"].as_str(),
             Some("测试失败：断言不匹配")
@@ -6848,6 +6766,7 @@ mod tests {
     #[test]
     fn agent_send_updates_package_revision_and_reaches_running_child() {
         let task_store = TaskStore::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-agent-send");
         let parent = coordinator_task(test_task(
@@ -6883,6 +6802,7 @@ mod tests {
 
         let (payload, status) = execute_agent_send(
             &task_store,
+            &spawn_graph,
             &registry,
             &parent,
             &session_id,
@@ -6902,6 +6822,78 @@ mod tests {
         let signals = registry.drain_task_signals(&session_id, &child.task_id);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].payload["revision"], 2);
+    }
+
+    #[test]
+    fn agent_send_rejects_non_direct_child_and_scope_mismatch() {
+        let task_store = TaskStore::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-agent-send-scope");
+        let parent = coordinator_task(test_task(
+            "task-agent-send-scope-parent",
+            "task-agent-send-scope-parent",
+            None,
+        ));
+        let child = test_task(
+            "task-agent-send-scope-child",
+            "task-agent-send-scope-parent",
+            Some(parent.task_id.clone()),
+        );
+        let grandchild = test_task(
+            "task-agent-send-scope-grandchild",
+            "task-agent-send-scope-parent",
+            Some(child.task_id.clone()),
+        );
+        task_store
+            .insert_task(parent.clone())
+            .expect("父任务应插入");
+        task_store.insert_task(child).expect("子任务应插入");
+        task_store
+            .insert_task(grandchild.clone())
+            .expect("孙任务应插入");
+        {
+            let mut graph = spawn_graph.lock().expect("SpawnGraph 锁应可用");
+            graph
+                .add_edge(
+                    parent.task_id.clone(),
+                    TaskId::new("task-agent-send-scope-child"),
+                    TaskKind::LocalAgent,
+                    std::time::SystemTime::now(),
+                )
+                .expect("子边应插入");
+            graph
+                .add_edge(
+                    TaskId::new("task-agent-send-scope-child"),
+                    grandchild.task_id.clone(),
+                    TaskKind::LocalAgent,
+                    std::time::SystemTime::now(),
+                )
+                .expect("孙边应插入");
+        }
+        registry.open_task_signal_channel(&session_id, &grandchild.task_id);
+
+        let (payload, status) = execute_agent_send(
+            &task_store,
+            &spawn_graph,
+            &registry,
+            &parent,
+            &session_id,
+            BuiltinToolName::AgentSend,
+            &serde_json::json!({
+                "task_id": grandchild.task_id,
+                "message": "不应越级发送",
+            }),
+            &|_, _| {},
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["error_code"], "target_out_of_scope");
+        assert!(
+            registry
+                .drain_task_signals(&session_id, &grandchild.task_id)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6981,6 +6973,7 @@ mod tests {
 
             let (send_payload, send_status) = execute_agent_send(
                 &task_store,
+                &spawn_graph,
                 &registry,
                 &parent,
                 &session_id,
@@ -7085,13 +7078,19 @@ mod tests {
     #[test]
     fn agent_unavailable_failure_is_degradable() {
         assert!(agent_unavailable_failure(
-            "LLM invocation failed (round 0): provider transport failed: timed out"
+            "代理当前不可用，主线需要改派或接管。"
         ));
         assert!(agent_unavailable_failure(
-            "dispatch spawn_blocking panicked: runtime worker crashed"
+            "agent_unavailable: no matching worker"
         ));
         assert!(agent_unavailable_failure(
             "模型配置不可用: model bridge client 未配置"
+        ));
+        assert!(!agent_unavailable_failure(
+            "LLM invocation failed (round 0): provider transport failed: timed out"
+        ));
+        assert!(!agent_unavailable_failure(
+            "dispatch spawn_blocking panicked: runtime worker crashed"
         ));
         assert!(!agent_unavailable_failure(
             "工具执行失败，任务不能标记完成：file_write: denied"

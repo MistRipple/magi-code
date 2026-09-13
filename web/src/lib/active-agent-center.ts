@@ -5,12 +5,14 @@ import type {
 } from '../shared/rust-backend-types';
 
 export interface ActiveAgentGroups {
+  queued: AgentProjectionDto[];
   running: AgentProjectionDto[];
   attention: AgentProjectionDto[];
   completed: AgentProjectionDto[];
 }
 
 export interface ActiveAgentSummary {
+  queuedCount: number;
   activeCount: number;
   attentionCount: number;
   completedCount: number;
@@ -63,13 +65,18 @@ function requiresAttention(agent: AgentProjectionDto): boolean {
 }
 
 function isRunning(agent: AgentProjectionDto): boolean {
-  return isAgentRuntimeActive(agent);
+  return isAgentRuntimeActive(agent) && !isQueued(agent);
+}
+
+function isQueued(agent: AgentProjectionDto): boolean {
+  return agent.status === 'pending' || agent.lifecycle === 'queued';
 }
 
 export function groupActiveAgents(
   agents: ReadonlyArray<AgentProjectionDto>,
 ): ActiveAgentGroups {
   const groups: ActiveAgentGroups = {
+    queued: [],
     running: [],
     attention: [],
     completed: [],
@@ -78,6 +85,8 @@ export function groupActiveAgents(
   for (const agent of agents) {
     if (requiresAttention(agent)) {
       groups.attention.push(agent);
+    } else if (isQueued(agent)) {
+      groups.queued.push(agent);
     } else if (isRunning(agent)) {
       groups.running.push(agent);
     } else {
@@ -100,20 +109,23 @@ export function shouldShowActiveAgentCenter(
   outcome?: AgentRunOutcome | null,
 ): boolean {
   return groups.running.length > 0
+    || groups.queued.length > 0
     || groups.attention.length > 0
     || groups.completed.length > 0
     || outcomeRequiresAgentCenter(outcome);
 }
 
 export function buildActiveAgentSummary(groups: ActiveAgentGroups): ActiveAgentSummary {
+  const queuedCount = groups.queued.length;
   const activeCount = groups.running.length;
   const attentionCount = groups.attention.length;
   const completedCount = groups.completed.length;
   return {
+    queuedCount,
     activeCount,
     attentionCount,
     completedCount,
-    triggerCount: activeCount + attentionCount + completedCount,
+    triggerCount: queuedCount + activeCount + attentionCount + completedCount,
   };
 }
 

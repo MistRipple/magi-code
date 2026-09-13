@@ -10,7 +10,7 @@ function agent(overrides = {}) {
     displayName: '架构代理',
     goal: '检查架构边界',
     role: 'architect',
-    modelSource: 'engine',
+    modelSource: 'role_engine',
     status: 'running',
     statusLabel: '执行中',
     lifecycle: 'running',
@@ -35,8 +35,13 @@ await withGoldenViteServer(async (server) => {
 
   assert.deepEqual(
     grouped.running.map((item) => item.agentRunId),
-    ['running', 'pending'],
-    '运行中与排队代理必须进入正在运行分组',
+    ['running'],
+    '运行中代理必须进入正在运行分组',
+  );
+  assert.deepEqual(
+    grouped.queued.map((item) => item.agentRunId),
+    ['pending'],
+    '排队代理必须单独进入排队分组',
   );
   assert.deepEqual(
     grouped.attention.map((item) => item.agentRunId),
@@ -85,7 +90,7 @@ await withGoldenViteServer(async (server) => {
 
   assert.deepEqual(
     center.buildActiveAgentSummary(grouped),
-    { activeCount: 2, attentionCount: 2, completedCount: 2, triggerCount: 6 },
+    { queuedCount: 1, activeCount: 1, attentionCount: 2, completedCount: 2, triggerCount: 6 },
     '入口数量必须统计当前固定列表中的全部代理',
   );
 

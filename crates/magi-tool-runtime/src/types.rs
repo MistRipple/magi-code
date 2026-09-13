@@ -339,11 +339,19 @@ pub struct ExternalMcpServerCatalogEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRoleCatalogEntry {
     pub role_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
     pub spawnable: bool,
     pub coordinator_mode: bool,
     pub supported_kinds: Vec<String>,
+    #[serde(default)]
+    pub capability_ids: Vec<String>,
     pub parallelism_limit: Option<u32>,
     pub status: String,
+    #[serde(default)]
+    pub model_binding_status: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -5559,6 +5559,7 @@ mod tests {
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -5732,6 +5733,7 @@ mod tests {
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::FullAccess,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -5760,6 +5762,7 @@ mod tests {
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -5801,6 +5804,7 @@ mod tests {
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -5830,6 +5834,7 @@ mod tests {
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -6581,6 +6586,7 @@ mod tests {
         planning.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -7082,6 +7088,7 @@ mod tests {
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
+            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),

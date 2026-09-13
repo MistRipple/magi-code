@@ -47,7 +47,15 @@ pub fn parse_stream_provider_context(
         ) {
             return None;
         }
-        if event.event_type.as_deref() == Some("response.output_item.done") {
+        // OpenAI Responses 兼容网关有两种合法的 SSE 表达：既可以用
+        // `event:` 行标记事件，也可以只在 `data` JSON 的 `type` 字段中标记。
+        // 两种形式必须进入同一条解析链，不能因为缺少 event 行而丢失
+        // 下一轮请求必须回放的 provider context。
+        let event_type = event
+            .event_type
+            .as_deref()
+            .or_else(|| envelope["type"].as_str());
+        if event_type == Some("response.output_item.done") {
             return Some(ProviderContextStreamDelta::Start {
                 // `done` 才携带可重放的完整原始 item；`added` 中的函数参数和
                 // reasoning 加密上下文通常尚未齐全，不能提前持久化。
@@ -201,6 +209,9 @@ fn parse_openai_responses_stream_event(
     let Ok(envelope) = serde_json::from_str::<Value>(data) else {
         return Vec::new();
     };
+    // Responses SSE 的事件类型既可能位于 SSE `event:` 行，也可能只存在于
+    // data JSON 的 `type` 字段。优先使用显式 event 行，兼容两种上游实现。
+    let event_type = event_type.or_else(|| envelope["type"].as_str());
     let empty = || LlmStreamChunk {
         kind: LlmStreamChunkType::ContentDelta,
         content: None,
@@ -1588,6 +1599,37 @@ mod tests {
         assert_eq!(input[1]["id"], "fc_1");
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn responses_stream_uses_data_type_when_event_header_is_omitted() {
+        // 部分 OpenAI Responses 兼容网关只输出 `data: {"type": ...}`，不输出
+        // SSE 的 `event:` 行。解析器仍必须保留正文和终止状态。
+        let sse_payload = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"兼容网关\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"兼容网关\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        );
+
+        let mut parser = SseLineParser::new();
+        let mut accumulator = StreamAccumulator::new();
+        for event in parser.feed(sse_payload) {
+            if let Some(context) =
+                parse_stream_provider_context(ProviderFamily::OpenAiResponses, &event)
+            {
+                accumulator.apply_provider_context(context);
+            }
+            accumulator.apply_all(&parse_stream_event(ProviderFamily::OpenAiResponses, &event));
+        }
+
+        let result = accumulator.finalize();
+        assert_eq!(result.content, "兼容网关");
+        assert_eq!(result.stop_reason, "stop");
+        assert_eq!(result.usage.input_tokens, 3);
+        assert_eq!(result.usage.output_tokens, 2);
+        assert_eq!(result.provider_context.len(), 1);
+        assert_eq!(result.provider_context[0].data["id"], "msg_1");
     }
 
     #[test]

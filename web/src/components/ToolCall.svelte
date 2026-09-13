@@ -216,7 +216,7 @@
     return 'tool';
   }
 
-  type VisualToolStatus = 'pending' | 'running' | 'success' | 'error' | 'cancelled';
+  type VisualToolStatus = 'pending' | 'running' | 'success' | 'error' | 'degraded' | 'cancelled';
 
   function visualStatusInfo(value: VisualToolStatus): { class: string } {
     const map: Record<string, { class: string }> = {
@@ -224,6 +224,7 @@
       running: { class: 'running' },
       success: { class: 'success' },
       error: { class: 'error' },
+      degraded: { class: 'degraded' },
       cancelled: { class: 'cancelled' },
     };
     return map[value] || { class: 'success' };
@@ -257,7 +258,7 @@
     /** 代理 TaskId，作为 RightPane tab 去重 key；未就绪时为 undefined */
     childTaskId: string | undefined;
     /** 代理创建或运行终态，未终态为 undefined */
-    outcome: 'succeeded' | 'degraded' | 'rejected' | 'failed' | 'killed' | undefined;
+    outcome: 'started' | 'queued' | 'completed' | 'succeeded' | 'degraded' | 'rejected' | 'failed' | 'killed' | undefined;
     /** 失败原因摘要，若有 */
     error: string | undefined;
     errorCode: string | undefined;
@@ -295,7 +296,7 @@
       : '';
 
     const outcome: AgentSpawnDisplay['outcome'] =
-      outputStatus === 'succeeded' || outputStatus === 'degraded' || outputStatus === 'rejected' || outputStatus === 'failed' || outputStatus === 'killed'
+      outputStatus === 'started' || outputStatus === 'queued' || outputStatus === 'completed' || outputStatus === 'succeeded' || outputStatus === 'degraded' || outputStatus === 'rejected' || outputStatus === 'failed' || outputStatus === 'killed'
         ? outputStatus
         : undefined;
 
@@ -334,12 +335,17 @@
 
   const agentSpawnVisualStatus = $derived.by((): VisualToolStatus => {
     const projectionStatus = agentProjectionTask?.agent?.status || agentProjectionTask?.task?.status;
+    const projectionLifecycle = agentProjectionTask?.agent?.lifecycle;
+    if (projectionLifecycle === 'degraded') return 'degraded';
     if (projectionStatus === 'pending') return 'pending';
     if (projectionStatus === 'running') return 'running';
     if (projectionStatus === 'failed' || projectionStatus === 'killed') return 'error';
     if (projectionStatus === 'completed') return 'success';
+    if (agentSpawnDisplay?.outcome === 'queued') return 'pending';
     if (agentSpawnDisplay?.outcome === 'rejected' || agentSpawnDisplay?.outcome === 'failed' || agentSpawnDisplay?.outcome === 'killed') return 'error';
-    if (agentSpawnDisplay?.outcome === 'succeeded' || agentSpawnDisplay?.outcome === 'degraded') return 'success';
+    if (agentSpawnDisplay?.outcome === 'degraded') return 'degraded';
+    if (agentSpawnDisplay?.outcome === 'started') return 'running';
+    if (agentSpawnDisplay?.outcome === 'succeeded' || agentSpawnDisplay?.outcome === 'completed') return 'success';
     return status;
   });
 
@@ -350,6 +356,7 @@
     || agentSpawnDisplay?.outcome === 'failed'
     || agentSpawnDisplay?.outcome === 'killed'
   );
+  const agentSpawnDegraded = $derived(agentSpawnVisualStatus === 'degraded');
   const agentSpawnRunning = $derived(agentSpawnVisualStatus === 'running' || agentSpawnVisualStatus === 'pending');
   const agentSpawnCreationFailed = $derived(agentSpawnFailed && !agentSpawnDisplay?.childTaskId);
 
@@ -357,6 +364,14 @@
     if (stage === 'input_validation') return i18n.t('toolCall.agentSpawn.stageInputValidation');
     if (stage === 'registration') return i18n.t('toolCall.agentSpawn.stageRegistration');
     if (stage === 'plan_binding') return i18n.t('toolCall.agentSpawn.stagePlanBinding');
+    if (stage === 'dispatch') return i18n.t('toolCall.agentSpawn.stageDispatch');
+    if (stage === 'model_invocation') return i18n.t('toolCall.agentSpawn.stageModelInvocation');
+    if (stage === 'git_preflight') return i18n.t('toolCall.agentSpawn.stageGitPreflight');
+    if (stage === 'execution_admission') return i18n.t('toolCall.agentSpawn.stageExecutionAdmission');
+    if (stage === 'task_execution') return i18n.t('toolCall.agentSpawn.stageTaskExecution');
+    if (stage === 'cancellation') return i18n.t('toolCall.agentSpawn.stageCancellation');
+    if (stage === 'runtime_lookup') return i18n.t('toolCall.agentSpawn.stageRuntimeLookup');
+    if (stage === 'scope_validation') return i18n.t('toolCall.agentSpawn.stageScopeValidation');
     return stage || '';
   }
 
@@ -801,6 +816,7 @@
 
   function toolStatusLabel(value: VisualToolStatus): string {
     if (value === 'cancelled') return i18n.t('terminalSession.status.cancelled');
+    if (value === 'degraded') return i18n.t('toolCall.agentSpawn.degraded');
     return i18n.t(`terminalSession.status.${value}`);
   }
 
@@ -946,9 +962,11 @@
           </span>
         {/if}
       </span>
-      {#if agentSpawnFailed}
+      {#if agentSpawnFailed || agentSpawnDegraded}
         <span class="agent-spawn-error">
-          {agentSpawnCreationFailed
+          {agentSpawnDegraded
+            ? i18n.t('toolCall.agentSpawn.degraded')
+            : agentSpawnCreationFailed
             ? i18n.t('toolCall.agentSpawn.creationFailed')
             : i18n.t('toolCall.agentSpawn.runtimeFailed')}
           {#if display.error}
@@ -990,6 +1008,8 @@
           {i18n.t('toolCall.agentSpawn.viewDetails')}
           <Icon name="chevron-right" size={12} />
         </span>
+      {:else if agentSpawnDegraded}
+        <span class="agent-spawn-cta agent-spawn-cta-degraded">{i18n.t('toolCall.agentSpawn.mainlineHandling')}</span>
       {:else if agentSpawnRunning}
         <span class="agent-spawn-cta agent-spawn-cta-pending">{i18n.t('toolCall.agentSpawn.dispatching')}</span>
       {:else if agentSpawnCreationFailed}
@@ -1559,6 +1579,11 @@
     border-color: var(--error);
   }
 
+  .agent-spawn-card.status-degraded {
+    border-color: color-mix(in srgb, var(--warning) 48%, var(--border));
+    background: color-mix(in srgb, var(--warning) 6%, var(--surface-1));
+  }
+
   .agent-spawn-icon {
     display: flex;
     align-items: center;
@@ -1655,5 +1680,9 @@
 
   .agent-spawn-cta-failed {
     color: var(--error);
+  }
+
+  .agent-spawn-cta-degraded {
+    color: var(--warning);
   }
 </style>
