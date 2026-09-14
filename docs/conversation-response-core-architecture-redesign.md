@@ -1,0 +1,997 @@
+# Magi 消息响应核心架构重设计
+
+> 文档类型：产品级架构设计与实现基线  
+> 文档状态：设计完成，待实现  
+> 编写日期：2026-09-14  
+> 适用范围：主对话消息发送、普通 Chat、工具执行、Goal、子代理、流式响应、任务恢复、Web/Desktop 通知  
+> 实现约束：只收敛到本文定义的一套正式架构，不保留旧链路与新链路长期并行，不通过延迟参数、前端假状态或兼容分支掩盖生命周期问题
+
+## 1. 设计结论
+
+Magi 当前的消息响应问题不是某一个函数慢，而是产品对象和执行对象没有分开：普通对话被包装成任务，任务状态参与主对话终态判断，流式输出直接驱动同步持久化，Session、Task、Conversation、Runner 和前端 Projection 同时持有部分状态。
+
+目标架构必须改成：
+
+```text
+Session
+  └── Turn
+        ├── Conversation Execution（普通文本 Chat）
+        └── Task Run（工具、代码、Goal、子代理）
+
+Turn Event Log
+  ├── Session Read Model
+  ├── Conversation History Read Model
+  ├── Task Read Model
+  ├── Agent Read Model
+  └── SSE / App Server Notification
+```
+
+核心规则：
+
+1. 每个 Session 只有一个 `SessionTurnCoordinator`，负责当前 Turn 的生命周期、输入队列、取消和终态。
+2. 普通 Chat 不创建 TaskStore 根任务；只有确实需要工程执行时才创建 Task Run。
+3. 所有 Turn 状态、消息内容和完成通知都经过同一个 `TurnEventSink`，前端和其他模块只消费投影。
+4. TaskStore 只管理任务树、租约和任务恢复，不决定主对话 Turn 是否完成。
+
+这套设计保留 Magi 的工程工作能力，同时把普通对话从任务调度、租约、Git 准备和终态观察链中解耦。它解决的是执行模型本身，不是在现有链路上继续增加补丁。
+
+## 2. 产品定位与边界
+
+Magi 是本地优先的 AI 工程工作空间。主对话既可以回答问题，也可以发起工程工作。因此“对话”和“任务”必须在产品体验上统一，在内部执行上分层。
+
+### 2.1 产品对象
+
+| 对象 | 产品含义 | 生命周期所有者 |
+|---|---|---|
+| Session | 用户看到的会话和消息时间线 | Session Read Model / Coordinator |
+| Turn | 用户发起的一轮交互 | SessionTurnCoordinator |
+| Task Run | 一轮需要工程执行的运行实例 | TaskRunSupervisor |
+| Task | Task Run 中的一个可调度工作节点 | TaskStore / TaskScheduler |
+| Agent Role | 子代理的角色、能力、模型绑定和提示配置 | AgentRoleRegistry |
+| Turn Event | Turn 的持久事实和实时通知 | TurnEventSink / Event Log |
+| Projection | 从事件事实生成的读取模型 | Projection Builder |
+
+### 2.2 Turn 执行级别
+
+`Turn` 在创建时必须确定唯一的 `execution_profile`：
+
+```text
+conversation
+task
+```
+
+| Profile | 用途 | 是否创建 Task Run | 是否允许工程工具 |
+|---|---|---:|---:|
+| `conversation` | 普通问答、解释、文本生成 | 否 | 否 |
+| `task` | 文件、代码、Git、Goal、计划、工具、子代理 | 是 | 是 |
+
+普通 Chat 不因为内部需要记录历史，就伪造一个 `LocalAgent` 任务。需要工具的请求在接纳时进入 `task` profile，不能执行到一半再隐式升级。
+
+Goal 自动推进、Continue、子代理等待和恢复都属于 Task Run 的内部行为；它们不再创建独立的普通 Chat 链路。
+
+### 2.3 产品体验原则
+
+- 用户只面对一套主对话和统一消息时间线。
+- 内部执行 profile 不要求用户理解 TaskStore、lease、Runner 或 canonical event。
+- “已接纳”“准备中”“运行中”“等待用户”“受阻”“失败”“完成”必须有稳定、可解释的产品语义。
+- 子代理状态是主 Turn 的执行详情，不是另一套主对话状态。
+- 普通 Chat 与工程任务共享同一套 Turn ID、事件协议、取消、恢复和前端 reducer。
+
+## 3. 当前架构问题与根因
+
+### 3.1 普通 Chat 被任务化
+
+当前主线入口 [sessions.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-api/src/routes/sessions.rs:2461) 仍把 Chat/Execute 统一交给任务派发。即使 `use_tools=false`，主线仍然会创建 TaskStore 记录、执行链和 Runner；只是不执行部分 workspace 准备。
+
+在 [dispatch_submission.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-conversation-runtime/src/dispatch_submission.rs:685) 中，主线任务固定使用 `TaskKind::LocalAgent`。这让普通文本回复暴露在任务租约、Runner 调度、checkpoint 和终态观察的额外失败面中。
+
+### 3.2 一轮 Turn 有多个部分权威
+
+当前一轮交互同时存在于：
+
+- `SessionStore.current_turn`；
+- canonical turn；
+- TaskStore task status 和 lease；
+- ExecutionRegistry；
+- ConversationRegistry 的 session 输入通道；
+- ConversationRegistry 的 task Conversation；
+- RunnerManager handle；
+- terminal observer；
+- `ThreadChatMessage` 模型历史。
+
+[registry.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-conversation-runtime/src/registry.rs:19) 同时维护 session Conversation 和 task Conversation。主线执行使用 task Conversation，而用户引导输入又使用 session turn input 通道，同一轮 Turn 没有一个统一的活动所有者。
+
+### 3.3 流式输出绑定同步完整写回
+
+[session_turn_execution.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-conversation-runtime/src/session_turn_execution.rs:2153) 的 Provider delta 回调会直接触发 SessionStore item 写回。canonical 事务在 [sidecar.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-session-store/src/store/sidecar.rs:551) 使用全局提交锁，底层写入还可能执行同步磁盘操作。
+
+因此 Provider 已经有首个 delta 时，UI 仍可能等待 canonical 完整重建和文件同步。一个 Session 的高频输出也可能阻塞其他 Session。
+
+### 3.4 任务完成依赖轮询和二次收口
+
+`EventBasedResultReceiver` 的接口仍然是 `poll_results`，Runner 在下一轮 cycle 才消费任务结果。任务终态之后又要通过 terminal observer 和 session finalizer 收口。
+
+这会造成：
+
+- 固定调度延迟；
+- 任务已完成但 Turn 尚未完成；
+- 结果已到但 Runner 尚未消费；
+- 重启、取消和迟到结果之间出现竞态；
+- 同一终态需要多个模块重复判断。
+
+### 3.5 App Server 和 HTTP 业务入口重复
+
+当前 Desktop 的 App Server `turn/start` 会转调 HTTP session turn 路径，见 [app_server.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-api/src/app_server.rs:1943)。这使协议层和业务层互相调用，无法保证 Desktop 和 Web 使用完全一致的接纳语义。
+
+目标是让两种传输适配器都直接调用同一个 `TurnService`。
+
+### 3.6 模型历史存在双写
+
+canonical Turn 与 `ThreadChatMessage` 分别承载界面事实和模型历史。用户消息、assistant 内容和工具结果从不同回调写入两套结构，重启、取消和工具失败时可能产生内容或顺序差异。
+
+目标架构中，模型历史必须是 Turn Event Log 的投影，不再拥有独立写入口。
+
+## 4. 唯一目标架构
+
+```mermaid
+flowchart TD
+    Client[Web / Desktop Client]
+    API[TurnService]
+    Coordinator[SessionTurnCoordinator<br/>每个 Session 一个]
+    Chat[ConversationExecutor<br/>普通文本 Chat]
+    TaskRun[TaskRunSupervisor<br/>工具 / Goal / 子代理]
+    Scheduler[TaskScheduler]
+    Agent[AgentOrchestrator]
+    Transport[ProviderTransportPool]
+    Sink[TurnEventSink]
+    Log[Durable Turn Event Log]
+    Projection[Session / Task / Agent Read Models]
+    Stream[SSE / App Server Notification]
+
+    Client --> API
+    API --> Coordinator
+    Coordinator --> Chat
+    Coordinator --> TaskRun
+    TaskRun --> Scheduler
+    Scheduler --> Agent
+    Chat --> Transport
+    TaskRun --> Transport
+    Chat --> Sink
+    TaskRun --> Sink
+    Agent --> Sink
+    Sink --> Log
+    Sink --> Projection
+    Sink --> Stream
+    Stream --> Client
+    Log --> Projection
+```
+
+建议的长期模块结构：
+
+```text
+crates/
+  magi-turn-runtime/
+    turn_service.rs
+    session_turn_coordinator.rs
+    turn_command.rs
+    turn_event.rs
+    turn_event_sink.rs
+    turn_recovery.rs
+    turn_stream_buffer.rs
+    conversation_executor.rs
+    task_run_supervisor.rs
+  magi-task-runtime/
+    task_scheduler.rs
+    task_completion_notifier.rs
+    agent_orchestrator.rs
+  magi-model-runtime/
+    provider_transport_pool.rs
+    provider_stream.rs
+    context_service.rs
+  magi-session-store/
+    turn_event_log.rs
+    projections/
+  magi-api/
+    routes/sessions.rs
+    app_server.rs
+```
+
+实际开发时可以先在现有 crate 内收敛模块，再根据依赖关系拆 crate。不能为了目录美观先搬文件，却保留原有职责关系。
+
+## 5. 核心模块职责
+
+### 5.1 `TurnService`
+
+统一的业务接纳入口。HTTP 和 App Server 都调用它。
+
+只负责：
+
+- 解析和基础校验；
+- session/workspace 范围校验；
+- request ID 幂等；
+- 判断 start、steer、continue、cancel 或 queue；
+- 向 SessionTurnCoordinator 发送命令；
+- 返回 accepted receipt。
+
+禁止等待：
+
+- 模型采样；
+- Git 扫描；
+- Snapshot 创建；
+- 工具定义完整构建；
+- 辅助模型压缩；
+- Task Run 完成。
+
+### 5.2 `SessionTurnCoordinator`
+
+每个 Session 一个实例，采用 Actor 或单写者模型。它是当前 Turn 的唯一运行时所有者。
+
+它拥有：
+
+- `active_turn`；
+- durable queued turns；
+- Turn command mailbox；
+- 当前 execution attempt 句柄；
+- steer/continue 输入队列；
+- 取消令牌；
+- Turn 终态；
+- 下一条 Turn 的启动边界。
+
+它不持有状态锁执行外部 IO。模型、Git、工具和子代理完成后都通过 command 或 event 回到 Coordinator。
+
+Coordinator 的唯一性由 `session_id` 建立，不能同时存在 SessionStore current turn、ConversationRegistry active input 和 Runner handle 三个独立生命周期所有者。
+
+### 5.3 `ConversationExecutor`
+
+处理 `conversation` profile：
+
+- 从 Conversation History Read Model 读取上下文；
+- 调用共享 ProviderTransport；
+- 产生 assistant item delta；
+- 处理取消和 Provider 错误；
+- 将最终内容交给 TurnEventSink。
+
+它不创建 TaskStore、lease、Runner、Snapshot 或 Git execution context。
+
+### 5.4 `TaskRunSupervisor`
+
+处理 `task` profile：
+
+- 创建 Task Run 和 root task；
+- 执行 Snapshot、Git、权限、上下文和工具准备；
+- 将任务提交给 TaskScheduler；
+- 接收 Task/Agent 完成事件；
+- 将 Task Run 的阶段结果反馈给 Coordinator。
+
+它不能直接关闭 Turn。Turn 终态由 Coordinator 统一产生。
+
+### 5.5 `TaskStore` 与 `TaskScheduler`
+
+TaskStore 只保存任务树、租约、状态、checkpoint 和恢复数据。TaskScheduler 负责资源调度和 Worker 分配。
+
+任务状态回调必须在 TaskStore 事务提交完成后异步发布，禁止在 task mutation 临界区内直接执行 SessionStore 写入、磁盘同步或跨模块回调。
+
+### 5.6 `TurnEventSink`
+
+所有 Turn 事实经过唯一的 Event Sink：
+
+```text
+TurnCommand / ProviderDelta / TaskEvent
+  -> TurnEventSink
+  -> Event Log
+  -> Read Model Projection
+  -> SSE / App Server Notification
+```
+
+职责：
+
+- 校验事件顺序和状态转移；
+- 分配 Session 内连续事件序号；
+- 合并流式内容；
+- 发布实时事件；
+- 按策略批量持久化；
+- 在终态时持久化完整快照；
+- 触发 Session、Conversation、Task、Agent 投影更新。
+
+### 5.7 `ModelTransportRuntime`
+
+进程级共享模型传输运行时：
+
+```text
+ModelTransportRuntime
+  -> ProviderClientPool
+  -> ProviderConcurrencyGate
+  -> TurnTransportSession
+```
+
+它负责连接池、HTTP Client、Tokio Runtime、取消、重试、空流、超时和 Provider streaming。每轮请求不能重新创建 OS 线程、Tokio Runtime 和 HTTP Client。
+
+## 6. 领域数据模型
+
+以下是目标模型的最小字段集合。具体 Rust 类型可以按现有 `magi-core` ID 类型实现，但字段语义必须保持一致。
+
+```text
+TurnRecord {
+    turn_id: TurnId,
+    session_id: SessionId,
+    turn_seq: u64,
+    request_id: String,
+    request_fingerprint: String,
+    execution_profile: Conversation | Task,
+    status: Accepted | Preparing | Running | Streaming |
+            WaitingInput | Blocked | Finalizing | Completed |
+            Failed | Cancelled,
+    execution_phase: Ready | Queued | Preparing | Executing |
+                     Waiting | Finalizing | Terminal,
+    execution_attempt_id: Option<ExecutionAttemptId>,
+    task_run_id: Option<TaskRunId>,
+    root_task_id: Option<TaskId>,
+    user_item_id: ItemId,
+    active_item_ids: Vec<ItemId>,
+    accepted_at: UtcMillis,
+    completed_at: Option<UtcMillis>,
+    failure: Option<TurnFailure>,
+}
+```
+
+```text
+TaskRunRecord {
+    task_run_id: TaskRunId,
+    turn_id: TurnId,
+    root_task_id: TaskId,
+    status: Preparing | Running | Waiting | Blocked |
+            Completed | Failed | Cancelled,
+    execution_snapshot_id: String,
+}
+```
+
+```text
+TurnEventEnvelope {
+    schema_version: String,
+    event_id: EventId,
+    session_id: SessionId,
+    turn_id: TurnId,
+    event_seq: u64,
+    turn_seq: u64,
+    event_kind: TurnEventKind,
+    occurred_at: UtcMillis,
+    causation_id: Option<String>,
+    correlation_id: String,
+    payload: JsonValue,
+}
+```
+
+### 6.1 不可违反的模型约束
+
+1. 同一 `session_id` 内 `event_seq` 单调递增且不重复。
+2. 同一 `turn_id` 只能有一个终态事件。
+3. 终态事件之后不能出现该 Turn 的 delta、task 或 phase 事件。
+4. `task_run_id` 和 `root_task_id` 只在 `execution_profile=task` 时存在。
+5. `request_id` 相同且 fingerprint 相同必须返回原 Turn receipt。
+6. `request_id` 相同但 fingerprint 不同必须返回幂等冲突，不得创建第二个 Turn。
+7. `ThreadChatMessage` 是事件投影，不能作为独立事实源写入。
+8. execution attempt 必须绑定不可变的 context snapshot，迟到结果只能关联原 attempt。
+9. Task 终态不能直接覆盖 Turn 终态。
+10. Coordinator 不得根据多个投影表反推事实；投影只能由事件重建。
+
+## 7. Turn 状态机和命令语义
+
+### 7.1 状态转移
+
+```text
+accepted
+  -> preparing
+  -> running
+  -> streaming
+  -> waiting_input
+  -> finalizing
+  -> completed
+
+preparing/running/streaming/waiting_input
+  -> blocked
+  -> failed
+  -> cancelled
+
+blocked -> preparing | waiting_input | failed | cancelled
+```
+
+状态含义：
+
+| 状态 | 语义 |
+|---|---|
+| `accepted` | 已通过基础校验并可靠持久化，可以在重启后恢复 |
+| `preparing` | 正在准备执行所需上下文、Git、Snapshot、工具或 Task Run |
+| `running` | 执行器已启动，尚未产生可见模型内容 |
+| `streaming` | 已收到至少一个可见模型 delta |
+| `waiting_input` | 等待用户 steer、continue 或恢复输入 |
+| `blocked` | 等待权限、Git 冲突、资源或其他外部处理 |
+| `finalizing` | 正在写入最终 item、使用量和终态事件 |
+| `completed` | 当前 Turn 完整结束 |
+| `failed` | 无法继续的执行失败 |
+| `cancelled` | 用户或系统取消 |
+
+队列不再使用模糊的 Turn 状态表示。请求只要持久化成功就是 `accepted`，是否等待资源由 `execution_phase=queued` 和 queue projection 表达。
+
+### 7.2 命令定义
+
+```text
+StartTurn { request, execution_profile }
+SteerTurn { turn_id, input }
+ContinueTurn { turn_id, input }
+CancelTurn { turn_id, reason }
+RecoverTurn { turn_id }
+ProviderDelta { attempt_id, item_id, delta }
+ProviderCompleted { attempt_id, usage }
+ProviderFailed { attempt_id, failure }
+TaskEvent { task_id, task_event }
+ExecutionFinished { turn_id, result }
+```
+
+命令规则：
+
+- 空闲 Session 收到 `StartTurn`，创建新的 Turn；
+- active Turn 收到显式 steer，输入进入当前 Turn mailbox；
+- active Turn 收到普通新消息，创建新的 durable queued Turn；
+- blocked Turn 收到 continue，恢复同一个 Turn 的新 execution attempt；
+- 已完成 Turn 不能接收迟到 steer；
+- Cancel 只由 Coordinator 产生最终取消事件，外部 API 不直接改写 Turn 状态；
+- 所有 execution 回调都必须带 attempt ID，过期 attempt 的迟到结果被明确拒绝。
+
+## 8. 消息执行时序
+
+### 8.1 普通 Chat
+
+```text
+Client
+  -> TurnService.start
+  -> SessionTurnCoordinator.admit
+  -> TurnEventSink.append(turn.accepted + user item)
+  -> 返回 accepted receipt
+  -> 后台 ConversationExecutor
+  -> ContextService 获取冻结上下文
+  -> ProviderTransportPool 发起流式请求
+  -> TurnEventSink 发布 assistant item delta
+  -> ProviderCompleted
+  -> TurnEventSink 持久化完整内容
+  -> Coordinator 产生 turn.completed
+  -> 客户端收到 completed notification
+```
+
+HTTP 返回 accepted 时不得等待 Provider、模型上下文压缩或正文生成。
+
+### 8.2 Task、Goal 与子代理
+
+```text
+Client
+  -> TurnService.start
+  -> Coordinator 写入 accepted
+  -> TaskRunSupervisor 创建 Task Run
+  -> preparing：权限 / Snapshot / Git / context / tool catalog
+  -> TaskScheduler 创建并调度 root task
+  -> AgentOrchestrator 按需创建 child task
+  -> TaskEvent 回到 Coordinator
+  -> Provider / Tool / Agent 事件进入 TurnEventSink
+  -> Task Run 完成或阻塞
+  -> Coordinator 生成最终响应
+  -> TurnEventSink 产生 turn.completed / blocked / failed
+```
+
+子代理不是独立的普通对话，也不创建第二套消息协议。子代理 item 通过 `turn_id + task_id + worker_id + role_id` 关联到主 Turn。
+
+### 8.3 Steer
+
+```text
+Client -> TurnService.steer(expected_turn_id)
+       -> Coordinator 校验 active turn
+       -> 持久化 user steer item
+       -> 写入 active attempt mailbox
+       -> 当前模型/工具边界读取 steer
+       -> 继续同一 Turn
+```
+
+steer 接纳和 user item 持久化必须在同一 Coordinator 命令中完成，避免输入已显示但执行器未收到，或执行器收到但历史未保存。
+
+## 9. 事件协议
+
+### 9.1 事件类型
+
+```text
+turn.accepted
+turn.phase_changed
+turn.item_started
+turn.item_delta
+turn.item_completed
+task.created
+task.queued
+task.running
+task.blocked
+task.completed
+task.failed
+turn.completed
+turn.failed
+turn.cancelled
+```
+
+### 9.2 `turn.item_delta`
+
+```json
+{
+  "eventKind": "turn.item_delta",
+  "sessionId": "session-1",
+  "turnId": "turn-1",
+  "eventSeq": 18,
+  "itemId": "item-assistant-1",
+  "itemVersion": 7,
+  "baseContentLength": 128,
+  "contentLength": 152,
+  "delta": "新增内容"
+}
+```
+
+前端按照 `itemId + itemVersion + baseContentLength` 应用增量。版本不连续或 base length 不匹配时，客户端请求当前 Turn 快照，不自行拼接猜测内容。
+
+长度单位必须在协议中固定为 Unicode scalar count 或 UTF-8 byte length，并由 Rust 与 TypeScript 共用契约测试；不能让 Rust `chars().count()` 与 JavaScript UTF-16 length 混用。
+
+### 9.3 终态事件
+
+`turn.completed`、`turn.failed` 和 `turn.cancelled` 必须携带：
+
+```text
+turn_id
+final_status
+completed_at
+final_item_snapshot
+usage（可选）
+failure（失败时）
+execution_attempt_id
+```
+
+终态事件写盘成功后才向外发布完成通知。正常路径不需要 terminal observer 再次收口。
+
+### 9.4 错误合同
+
+执行失败和阻塞统一使用：
+
+```text
+TurnFailure {
+    phase: Admission | Preparation | Context | Provider |
+           Tool | Agent | Git | Persistence | Recovery,
+    error_code: String,
+    retryable: bool,
+    user_action: Option<String>,
+    public_message: String,
+}
+```
+
+API Key、完整 Provider URL、堆栈和内部路径只进入受控日志，不进入用户可见事件。
+
+## 10. 持久化、流式写回与恢复
+
+### 10.1 事实和投影
+
+事件日志是 Turn 的持久事实源。Session、Conversation History、Task Center 和 Agent Center 都是投影。
+
+```text
+Turn Event Log
+  -> Session Projection
+  -> Conversation History Projection
+  -> Task Projection
+  -> Agent Projection
+```
+
+读取模型可以使用现有 SessionStore 和 TaskStore 的数据结构，但必须明确它们是 projection 或 task domain store，不能再独立生成互相冲突的 Turn 事实。
+
+### 10.2 增量持久化策略
+
+- accepted、phase 边界和终态必须可靠写入；
+- 普通 delta 先进入 `TurnStreamBuffer` 和事件发送队列；
+- 事件日志 writer 按短周期或字节阈值批量写入；
+- 批量写入使用 Session/分区级 writer，不使用全局 canonical 锁；
+- 终态强制 flush，并保存完整最终 item；
+- 事件发送和磁盘 flush 不能阻塞 Provider delta 消费；
+- EventBus 只负责实时传输，不能作为恢复依据。
+
+如果实时事件队列满，只允许合并同一 item 的连续 delta；不得丢失 phase、task 状态和终态事件。客户端发现 event sequence 缺口时，必须通过快照和事件尾部恢复。
+
+### 10.3 持久级别
+
+| 事件 | 持久要求 | 对外发布条件 |
+|---|---|---|
+| turn accepted | 同步 durable | 持久化成功后 |
+| phase changed | durable，可合并无语义变化的重复阶段 | 顺序分配完成后 |
+| item delta | 批量持久化 | 可先实时发布 |
+| item completed | durable，包含完整 item | 持久化成功后 |
+| task terminal | TaskStore durable + Turn event | 两者提交成功后 |
+| turn terminal | 同步 durable + 完整最终快照 | 持久化成功后 |
+
+### 10.4 daemon 重启
+
+启动时按以下顺序恢复：
+
+1. 读取 Turn Event Log；
+2. 构建 Session 和 Turn projection；
+3. 为存在未完成 Turn 的 Session 重建 Coordinator；
+4. 检查 execution attempt 是否已经向 Provider 发出请求；
+5. 未发出请求的 Turn 可以继续 preparation；
+6. Provider 请求状态不确定的 Turn 进入 `recovery_required`，不得无条件重放；
+7. Task Run 由 TaskStore 恢复，child task lease 单独校验；
+8. Coordinator 根据恢复结果产生继续、失败或需要用户操作的事件。
+
+恢复不能通过再次扫描多个状态表猜测 Turn 是否完成。事件日志必须能回答：请求是否接纳、执行是否开始、当前 item 内容是什么、是否已经产生终态。
+
+## 11. 模型上下文和历史一致性
+
+模型上下文只允许来自 Conversation History Projection：
+
+```text
+Turn Event Log
+  -> Conversation History Projection
+  -> ContextService
+  -> Provider Request
+```
+
+`ThreadChatMessage` 可以继续作为历史读取模型，但不能在 Provider 回调、工具回调和 SessionStore 路径中分别写入。
+
+每次执行在开始时绑定一个 `context_snapshot_id`。该快照包含：
+
+- 会话历史版本；
+- 模型身份和配置 revision；
+- 工具目录 revision；
+- 技能和 MCP revision；
+- 知识上下文 revision；
+- 权限和 Git context revision。
+
+模型切换、工具变化、权限变化、知识变化或历史变化时，旧快照不能继续用于新的 execution attempt。
+
+## 12. 子代理和角色配置
+
+子代理只属于 Task Run。`AgentOrchestrator` 必须使用现有角色注册表，不为用户角色建立第二套注册或执行逻辑。
+
+创建 child task 的正式顺序：
+
+```text
+解析请求
+  -> 角色存在且可派发
+  -> 能力属于角色允许集合
+  -> 模型绑定可用
+  -> 当前父 Task 和 Task Run 有效
+  -> 容量和资源检查
+  -> Git / workspace 前置检查
+  -> 固化角色配置快照
+  -> 原子创建 child task
+  -> 发布 task.created
+```
+
+预检失败时不得创建 Task、lease、Thread 或 SpawnGraph 边。角色配置在 child task 创建时固化快照，后续用户修改角色不会改变正在运行的任务。
+
+子代理完成使用 `TaskEvent` 通知父 Coordinator。`agent_wait` 等待明确的 child task 状态，不再通过 Runner 的周期轮询发现结果。
+
+子代理状态合同继续使用：
+
+```text
+queued
+running
+blocked
+completed
+failed
+cancelled
+rejected（创建前拒绝，不产生 child task）
+```
+
+## 13. API 与 Desktop/Web 传输
+
+### 13.1 统一业务入口
+
+```text
+HTTP POST /api/session/turn
+App Server turn/start
+        ↓
+     TurnService
+```
+
+App Server 不得再通过 HTTP 调用 session 路由。两个适配器可以有不同的序列化形式，但不得有不同的接纳、幂等和状态判断。
+
+### 13.2 `turn/start` 返回合同
+
+```json
+{
+  "accepted": true,
+  "status": "accepted",
+  "turnId": "turn-1",
+  "requestId": "request-1",
+  "executionProfile": "conversation",
+  "eventSequence": 42,
+  "queue": null,
+  "canonicalTurn": {}
+}
+```
+
+Task profile 只增加 `taskRunId` 和 `rootTaskId`，不改变 accepted 语义。
+
+`accepted` 表示请求已可靠接纳，不表示 Provider 已开始，也不表示任务已经成功。
+
+### 13.3 通知与重连
+
+Desktop 在同一条 App Server 长连接上接收：
+
+- turn accepted；
+- phase changed；
+- item delta；
+- task/agent 状态；
+- turn completed/failed/cancelled。
+
+Web 可以继续使用 SSE，但通过 `afterSequence` 重放事件。事件订阅晚于发送也不能造成数据丢失，因为事件已经进入持久日志。
+
+## 14. 前端产品行为
+
+前端只消费 Turn Projection 和 Turn Event：
+
+- accepted：立即显示用户消息和“准备中”状态；
+- preparing：显示具体准备阶段；
+- streaming：增量更新当前 item；
+- blocked：显示阻塞原因和可执行动作；
+- failed：显示失败阶段和是否可以重试；
+- completed：以终态事件为唯一完成依据。
+
+前端禁止：
+
+- 根据 child task 是否存在猜测 Turn 状态；
+- 通过定时器轮询判断完成；
+- 在 canonical event 缺失时自行创建错误消息；
+- 为原始模式和摘要模式维护两套消息事实；
+- 用 bootstrap 刷新代替正常完成事件；
+- 用 loading 动画掩盖接纳或首 delta 延迟。
+
+摘要模式、原始模式、主线消息和子代理详情都从同一 Projection 读取，只在呈现层决定折叠和布局。
+
+## 15. 取消、失败和恢复语义
+
+### 15.1 取消
+
+取消由 Coordinator 发起，并传播到：
+
+```text
+Coordinator
+  -> ModelTransport cancellation
+  -> TaskScheduler cancellation
+  -> Tool process cancellation
+  -> Browser/Git resource release
+```
+
+取消成功后由 Coordinator 产生唯一 `turn.cancelled`。外部中断 API 不直接修改多个 store。
+
+### 15.2 接纳失败与执行失败
+
+- 接纳失败：没有创建 Turn，API 返回错误。
+- 执行失败：Turn 已经存在，沿原 Turn 发布 `turn.failed`。
+- 阻塞：Turn 仍存在，发布 `blocked` 和明确用户动作。
+- Provider 状态不确定：进入 `recovery_required`，禁止自动重复请求。
+- 任务失败：先产生 task failure，再由 Coordinator 决定主 Turn 是改派、主线接管、blocked 还是 failed。
+
+### 15.3 迟到结果
+
+所有 Provider、Tool 和 Task 回调必须携带 `execution_attempt_id`。Coordinator 只接受当前 attempt 的事件。迟到结果可记录到审计日志，但不得修改当前 Turn、下一轮 Turn 或前端可见消息。
+
+## 16. 必须删除的旧职责
+
+| 当前职责 | 目标处理方式 |
+|---|---|
+| 普通 Chat 创建 LocalAgent 根任务 | 删除，改为 ConversationExecutor |
+| Runner 决定主 Turn 完成 | 删除，Coordinator 决定 |
+| terminal observer 二次收口 | 删除，终态直接从 Coordinator 产生 |
+| EventBasedResultReceiver 轮询结果 | 改为 TaskCompletionNotifier |
+| ConversationRegistry 同时维护 session/task Conversation | 收敛为 Session Coordinator 和 Task Runtime |
+| 每个 delta 完整 canonical upsert | 改为 TurnStreamBuffer + TurnEventSink |
+| 全局 canonical commit lock | 改为 Session/分区级 writer |
+| TaskStore 回调中直接写 SessionStore | 改为提交后异步事件 |
+| App Server 调用 HTTP 路由 | 改为共享 TurnService |
+| ThreadChatMessage 独立写入 | 改为事件日志投影 |
+| bootstrap 参与正常终态发现 | 删除，bootstrap 只用于初始化和恢复 |
+
+这部分必须做真正的职责迁移，并删除旧实现。不能长期保留“旧 TaskRunner 路径 + 新 Chat 路径”的双轨兼容模式，也不能在新路径失败时回退到旧路径。
+
+## 17. 实现顺序
+
+以下是实现依赖顺序，不是产品双轨分期。每完成一个边界，应立即更新本文状态并删除旧职责。
+
+### 17.1 领域合同
+
+- [ ] 建立 TurnRecord、TaskRunRecord、TurnEventEnvelope。
+- [ ] 固定 Turn 和 Task 两套状态机。
+- [ ] 固定 request ID 幂等规则。
+- [ ] 固定事件序号、attempt 和终态规则。
+- [ ] 更新 App Server Schema 和 Web 类型生成源。
+
+退出条件：Rust、TypeScript 和 JSON Schema 使用同一字段与枚举，非法状态转移有合同测试。
+
+### 17.2 事件事实源
+
+- [ ] 实现 TurnEventLog。
+- [ ] 实现 TurnEventSink。
+- [ ] 实现 Session/Conversation/Task/Agent projection。
+- [ ] accepted 和终态均可可靠恢复。
+- [ ] 建立 event sequence gap recovery。
+
+退出条件：只依赖事件日志即可重建完整会话 Turn 和最终正文。
+
+### 17.3 Coordinator
+
+- [ ] 实现每 Session 一个 Coordinator。
+- [ ] 将 start、steer、continue、cancel、recover 统一为 command。
+- [ ] 将 Session 当前 Turn 的修改收敛到 Coordinator。
+- [ ] 删除外部模块直接修改当前 Turn 的路径。
+- [ ] 实现 attempt ID 和迟到结果拒绝。
+
+退出条件：并发提交、steer、cancel、终态和下一轮启动均由一个单写者完成。
+
+### 17.4 Conversation 与 Task 执行分离
+
+- [ ] 普通 Chat 接入 ConversationExecutor。
+- [ ] 工具、Goal、代码和子代理接入 TaskRunSupervisor。
+- [ ] 删除普通 Chat 的 LocalAgent 根任务创建。
+- [ ] TaskStore 只保留真正的 Task Run 数据。
+- [ ] 固定 execution profile，不允许运行期隐式升级。
+
+退出条件：普通 Chat 全流程中不存在 Task、lease、Runner 或 Git/Snapshot 准备。
+
+### 17.5 模型流与任务通知
+
+- [ ] ModelTransportRuntime 进程级复用 Provider client 和 Tokio runtime。
+- [ ] Provider delta 接入 TurnStreamBuffer。
+- [ ] TaskScheduler 通过 TaskCompletionNotifier 发布完成。
+- [ ] 删除 `poll_results` 作为完成主路径。
+- [ ] 删除 terminal observer 的 Turn 终态职责。
+- [ ] TaskStore callback 移出任务 mutation 临界区。
+
+退出条件：Provider 首 delta 可以直接到达 Turn notification，Task terminal 可以主动唤醒 Task Run。
+
+### 17.6 前端和 Desktop 收敛
+
+- [ ] HTTP 与 App Server 直接调用 TurnService。
+- [ ] Desktop 使用同一条连接接收 Turn notification。
+- [ ] Web SSE 使用事件序号恢复。
+- [ ] 前端 reducer 只更新对应 item。
+- [ ] 删除正常路径上的终态 bootstrap 刷新和重复状态推导。
+- [ ] 原始与摘要模式共享同一事实投影。
+
+退出条件：冷启动、重连、流式输出和终态在 Web/Desktop 行为一致。
+
+### 17.7 旧实现清理与最终验收
+
+- [ ] 删除旧同步提交与旧 Task 化 Chat。
+- [ ] 删除旧双 Conversation 生命周期。
+- [ ] 删除旧结果轮询与二次 finalizer。
+- [ ] 删除旧完整 stream upsert。
+- [ ] 删除失效的兼容字段、分支、注释和测试夹具。
+- [ ] 完成 Rust、Web、daemon、Electron、真实 Provider 验证。
+- [ ] 更新本文全部状态并记录最终提交。
+
+## 18. MagiTurnHarness 验证设计
+
+Codex 的 harness 值得借鉴的是完整链路验证方式，不是把测试 harness 复制到生产路径。
+
+Magi 必须新增真实入口 harness：
+
+```text
+MagiTurnHarness
+  -> 调用 TurnService / turn/start
+  -> Mock Provider Streaming
+  -> 捕获实际 Provider Request
+  -> 消费 Turn Event
+  -> 检查 Event Log 和 Projection
+  -> 模拟断线、重启和重复请求
+```
+
+必须覆盖：
+
+1. 新 Session 普通 Chat；
+2. 长历史普通 Chat；
+3. Task/Goal 工具执行；
+4. 单个和多个子代理；
+5. 自定义 Agent Role 快照；
+6. accepted 后立即断开和重连；
+7. Provider 空流、失败、超时和重试；
+8. steer、continue、cancel；
+9. 权限阻塞、Git 阻塞和资源排队；
+10. daemon 重启恢复；
+11. 重复 request ID 和 fingerprint 冲突；
+12. 事件序号缺口和快照重放；
+13. 终态只产生一次；
+14. 前端首次可见 delta 和最终 DOM 内容。
+
+Harness 必须通过真实 `TurnService` 和真实事件投递路径验证，不能只调用 `TurnEventSink` 或某个内部函数后宣称链路正常。
+
+## 19. 性能与可靠性目标
+
+| 指标 | 目标 |
+|---|---:|
+| 本地 accepted P95 | ≤ 100ms |
+| Provider 首 delta 到 Magi 首通知额外开销 P95 | ≤ 50ms |
+| 实时 delta 到前端 DOM 绘制 P95 | ≤ 50ms |
+| 正常 Turn 终态重复次数 | 0 |
+| 一个 Session 的输出阻塞其他 Session | 不允许 |
+| 普通 Chat 创建 TaskStore 根任务 | 0 |
+| 同 request ID 重试产生重复 Turn | 0 |
+| 事件断线恢复后的内容重复或丢失 | 0 |
+
+性能测量必须至少记录：
+
+```text
+submit_received
+accepted_persisted
+accepted_response_sent
+coordinator_started
+preparation_completed
+provider_request_started
+provider_headers_received
+provider_first_delta
+turn_event_published
+frontend_event_received
+frontend_dom_painted
+turn_completed
+```
+
+Provider 自身 TTFT 必须与 Magi 内部开销分开统计。严格对照时使用相同的 prompt、历史、模型、工具面和请求参数。
+
+## 20. 验证矩阵
+
+| 维度 | 场景 |
+|---|---|
+| 会话 | 新建、短历史、长历史、压缩后历史 |
+| Profile | conversation、task |
+| 输入 | 文本、图片、文件引用、浏览器节点 |
+| 工具 | 无工具、只读工具、写工具、审批工具 |
+| 代理 | 无子代理、单代理、多代理、自定义角色 |
+| 状态 | 正常、排队、blocked、failed、cancelled |
+| 控制 | steer、continue、编辑重试、中断 |
+| Provider | 正常流、空流、超时、断线、重试 |
+| 恢复 | SSE 重连、WebSocket 重连、daemon 重启、Desktop 重启 |
+| Git | 非 Git、clean、dirty、conflict、branch 漂移 |
+| 呈现 | 原始模式、摘要模式、主线、Agent drawer |
+| 载体 | daemon 托管 Web、Electron 本地包 |
+
+最终验证至少包括：
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --all-targets
+npm --prefix web run check
+npm --prefix web run build
+npm test
+```
+
+还必须从本地 Electron 发行包启动真实 daemon，使用真实 Provider 验证普通 Chat、工具、子代理、取消、重连和恢复。只验证 `/health` 和 `/web.html` 不能证明核心消息链路完成。
+
+## 21. 完成定义
+
+只有同时满足以下条件，才算完成架构重构：
+
+- 普通 Chat 不再创建任务、lease 或 Runner；
+- 每个 Session 只有一个 active Turn Coordinator；
+- HTTP 和 App Server 使用同一 TurnService；
+- Turn Event Log 成为唯一 Turn 事实源；
+- Session、Conversation、Task、Agent 都由事件投影生成；
+- 流式 delta 不执行同步完整 canonical 写回；
+- Task 完成通过事件通知，不依赖周期轮询；
+- Turn 终态只由 Coordinator 产生一次；
+- 子代理挂载在 Task Run 下，角色快照和任务事件完整可追溯；
+- cancel、steer、continue、断线和重启都有明确状态和恢复语义；
+- 没有旧同步提交、旧双 Conversation、旧终态 observer 和旧兼容分支残留；
+- Rust、Web、daemon、Electron 和真实 Provider 的 Harness 验证全部通过；
+- 性能指标、事件一致性和权限/Git 安全同时达标。
+
+## 22. 工作量和风险判断
+
+这是中大型架构重构，预计约 18～28 个工程人日，另需桌面包、真实 Provider 和故障恢复验收时间。主要风险不是代码量，而是现有 SessionStore、TaskStore、ConversationRegistry 和前端 projection 之间存在大量隐式依赖。
+
+风险控制原则：
+
+- 先冻结领域合同和事件顺序，再迁移实现；
+- 每迁移一个职责立即删除旧写入点；
+- 不在 accepted 阶段跳过权限、Git 和恢复安全，只把重型准备移入明确的 preparing 状态；
+- 不用提高事件频率替代事件模型重构；
+- 不用前端 loading 或 bootstrap 刷新掩盖后端终态延迟；
+- 所有恢复场景必须验证最终正文、任务状态和审计记录一致。
+
+本文档定义的是 Magi 消息响应的正式目标架构。后续实现应以本文的对象边界、状态机、事件协议和删除清单为准，不再围绕当前 TaskRunner 全链路继续增加局部兼容逻辑。
+
