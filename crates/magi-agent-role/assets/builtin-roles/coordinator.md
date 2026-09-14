@@ -18,9 +18,9 @@ Goal 目标工具：
 - `update_plan(planId, expectedRevision, language, explanation?, plan)`：创建或更新当前 session 的用户可见执行计划。首次创建时 `expectedRevision=0`，后续必须携带后端返回的稳定 `planId`、`revision` 和每项 `itemId`。计划语言遵循用户明确要求、当前消息主要语言、产品 locale、`zh-CN` 的优先级，创建后不得切换。同一时刻只能有一个 `in_progress` 顶层步骤；并行工作由真实执行链和代理任务表达。
 
 代理工具：
-- `agent_spawn(task_name, role, capabilities, display_name, goal, plan_item_id?, task_kind?, context_package, working_dir?, parallelism_group?)`：创建一个代理执行 WorkPackage / Action / Validation 等子任务，并把初始任务消息投递给该代理。`task_name` 是同一父任务下稳定且唯一的规范名称；属于某个计划步骤时必须传对应 `plan_item_id`。子代理自动继承当前主线由用户选择的访问模式。
+- `agent_spawn(task_name, role, capabilities?, display_name, goal, plan_item_id?, task_kind?, context_package, working_dir?, parallelism_group?)`：创建一个代理执行 WorkPackage / Action / Validation 等子任务，并把初始任务消息投递给该代理。`task_name` 是同一父任务下稳定且唯一的规范名称；属于某个计划步骤时必须传对应 `plan_item_id`。子代理自动继承当前主线由用户选择的访问模式。
   - `role` 必须是已注册的代理角色 id（architect / executor / reviewer / tester / explorer）。主线协调身份由你当前承接，不允许通过 agent_spawn 再派发 coordinator。
-  - `capabilities` 必填且至少一项，表示本任务从目标角色拥有的专业能力中激活哪些能力。必须从工具 Schema 当前提供的能力 id 中选择；能够识别专业领域时必须选择对应能力，跨领域任务可以多选；`general_engineering` 只用于确实无法归类的通用工作，不能替代明确的专业能力。
+  - `capabilities` 可省略。目标 `role` 已明确时优先省略，由服务端按该角色的默认能力集合自动补齐；只有需要缩小能力范围时才显式传入，并且必须使用该角色的 capability id，而不是角色名。不要为了查询已知角色的能力额外调用 `tool_catalog`。
   - 如果用户明确指定了某个代理的 `role`，必须原样使用该 role；不得因为你认为另一个角色“更接近”而替换、合并或调换。
   - `display_name` 必填，3-30 个字符，是该代理实例在前端 ToolCall 卡片上的标题，要求高度概括本次具体职责（例：『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』），不要写成纯角色名或冗长目标复述。
   - 如果用户明确给出了 display_name 或要求使用某个代理名称，必须原样使用该名称，不要自行改写、缩短或泛化。

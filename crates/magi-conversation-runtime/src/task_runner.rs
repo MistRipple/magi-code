@@ -21,6 +21,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 const DEFAULT_LEASE_DURATION_MS: u64 = 60_000;
@@ -39,6 +40,7 @@ pub struct TaskRunner {
     session_id: Option<SessionId>,
     event_bus: Option<Arc<InMemoryEventBus>>,
     checkpoint_signal: AtomicBool,
+    first_dispatch_reported: AtomicBool,
     agent_role_registry: AgentRoleRegistry,
 }
 
@@ -60,6 +62,7 @@ impl TaskRunner {
             session_id: None,
             event_bus: None,
             checkpoint_signal: AtomicBool::new(false),
+            first_dispatch_reported: AtomicBool::new(false),
             agent_role_registry: AgentRoleRegistry::load_default(),
         }
     }
@@ -108,6 +111,7 @@ impl TaskRunner {
     }
 
     pub fn run_cycle(&self, root_task_id: &TaskId) -> RunCycleOutcome {
+        let cycle_started_at = Instant::now();
         if let Err(error) = self.apply_results() {
             return RunCycleOutcome::Error(error);
         }
@@ -181,6 +185,8 @@ impl TaskRunner {
                     continue;
                 }
             };
+            let report_first_dispatch_timing =
+                !self.first_dispatch_reported.load(Ordering::Relaxed);
             let lease = match self.store.grant_lease_and_start_task(
                 &task.task_id,
                 root_task_id,
@@ -201,6 +207,17 @@ impl TaskRunner {
                     ));
                 }
             };
+            if report_first_dispatch_timing {
+                tracing::info!(
+                    target: "magi.performance",
+                    root_task_id = %root_task_id,
+                    task_id = %task.task_id,
+                    worker_id = %worker.worker_id,
+                    elapsed_ms = cycle_started_at.elapsed().as_millis() as u64,
+                    stage = "task_runner_lease_granted",
+                    "conversation response timing"
+                );
+            }
             if let Err(error) = self
                 .dispatcher
                 .dispatch(&task, &worker, &lease, admission_permit)
@@ -227,6 +244,17 @@ impl TaskRunner {
                 }
                 self.set_checkpoint_signal();
                 return RunCycleOutcome::Error(failure_message);
+            }
+            if !self.first_dispatch_reported.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    target: "magi.performance",
+                    root_task_id = %root_task_id,
+                    task_id = %task.task_id,
+                    worker_id = %worker.worker_id,
+                    elapsed_ms = cycle_started_at.elapsed().as_millis() as u64,
+                    stage = "task_runner_first_dispatch_completed",
+                    "conversation response timing"
+                );
             }
             dispatched += 1;
         }

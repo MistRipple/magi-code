@@ -60,6 +60,7 @@ pub(super) async fn accept_session_task_submission(
             execution_goal,
             task_tier,
             collaboration_mode: CollaborationMode::Auto,
+            use_tools: true,
             accepted_at: monotonic_accepted_at(),
             required_tool_chain: Vec::new(),
             completion_contract: TaskCompletionContract::default(),
@@ -79,6 +80,7 @@ pub(super) struct SessionTaskSubmissionInput {
     pub execution_goal: Option<String>,
     pub task_tier: TaskTier,
     pub collaboration_mode: CollaborationMode,
+    pub use_tools: bool,
     pub accepted_at: UtcMillis,
     pub required_tool_chain: Vec<String>,
     pub completion_contract: TaskCompletionContract,
@@ -100,6 +102,7 @@ pub(super) async fn accept_session_task_submission_at(
         execution_goal,
         task_tier,
         collaboration_mode,
+        use_tools,
         accepted_at,
         required_tool_chain,
         completion_contract,
@@ -143,6 +146,7 @@ pub(super) async fn accept_session_task_submission_at(
             execution_goal,
             task_tier,
             collaboration_mode,
+            use_tools,
             skill_name: request.skill_name.clone(),
             target_role: None,
             images,
@@ -202,6 +206,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         access_profile: goal.access_profile,
         skill_name: None,
         goal_mode: true,
+        use_tools: true,
         target_role: None,
         request_id: None,
         user_message_id: None,
@@ -227,6 +232,7 @@ struct ExecuteDispatchSubmissionInput<'a> {
     execution_goal: Option<String>,
     task_tier: TaskTier,
     collaboration_mode: CollaborationMode,
+    use_tools: bool,
     skill_name: Option<String>,
     target_role: Option<String>,
     images: Vec<SessionTurnImage>,
@@ -285,6 +291,7 @@ async fn execute_dispatch_submission(
         execution_goal,
         task_tier,
         collaboration_mode,
+        use_tools,
         skill_name,
         target_role,
         images,
@@ -388,6 +395,7 @@ async fn execute_dispatch_submission(
         access_profile: request.requested_access_profile(),
         skill_name,
         goal_mode: request.goal_mode,
+        use_tools,
         target_role,
         request_id: request.request_id(),
         user_message_id: request.user_message_id(),
@@ -606,6 +614,12 @@ async fn prepare_session_task_dispatch(
         )
         .map_err(|error| ApiError::internal_assembly("更新任务准备状态失败", error))?
         .ok_or_else(|| ApiError::Conflict("当前任务 Turn 已被新的操作取代".to_string()))?;
+    trace.mark(
+        "preparation_turn_status_written",
+        accepted.session_id.as_str(),
+        Some(&accepted.turn_id),
+        None,
+    );
     if let Some(item_id) = accepted.user_message_item_id.as_deref() {
         publish_current_session_turn_item_event(
             &state.event_bus,
@@ -620,6 +634,12 @@ async fn prepare_session_task_dispatch(
         )
         .map_err(|error| ApiError::internal_assembly("发布任务用户消息事实失败", error))?;
     }
+    trace.mark(
+        "preparation_user_message_published",
+        accepted.session_id.as_str(),
+        Some(&accepted.turn_id),
+        None,
+    );
 
     if let Some(config) = initial_session_orchestrator_config(
         state,
@@ -633,6 +653,12 @@ async fn prepare_session_task_dispatch(
         )?;
         super::settings::require_orchestrator_session_model(state, &accepted.session_id)?;
     }
+    trace.mark(
+        "preparation_model_configured",
+        accepted.session_id.as_str(),
+        Some(&accepted.turn_id),
+        None,
+    );
     if accepted.request.workspace_id.is_none() {
         state.personal_session_execution_root(&accepted.session_id)?;
     }
@@ -656,26 +682,56 @@ async fn prepare_session_task_dispatch(
             None,
         );
     }
+    trace.mark(
+        "preparation_goal_state_updated",
+        accepted.session_id.as_str(),
+        Some(&accepted.turn_id),
+        None,
+    );
 
-    state
-        .ensure_snapshot_session_for_workspace_id(
-            &accepted.session_id,
-            &state
-                .session_store
-                .execution_ownership(&accepted.session_id)
-                .and_then(|ownership| ownership.workspace_id),
-        )
-        .await?;
-    state
-        .ensure_session_code_context(
-            &accepted.session_id,
-            &state
-                .session_store
-                .execution_ownership(&accepted.session_id)
-                .and_then(|ownership| ownership.workspace_id),
-        )
-        .await?;
+    // 普通 Chat 只需要文本模型调用，不会执行文件/Git 工具。SnapshotSession 的首次
+    // 建立会同步扫描整个 workspace，Git context 也会触发一次仓库观测；把这两项
+    // 放在 Chat 接受后的准备链上会让模型首包被无关的磁盘工作阻塞数秒。工具轮次
+    // 仍在这里初始化，确保所有可能写入 workspace 的工具继续共享同一变更账本和
+    // Git context，保持执行隔离与变更审计语义不变。
+    if accepted.request.use_tools {
+        let execution_workspace_id = state
+            .session_store
+            .execution_ownership(&accepted.session_id)
+            .and_then(|ownership| ownership.workspace_id);
+        state
+            .ensure_snapshot_session_for_workspace_id(&accepted.session_id, &execution_workspace_id)
+            .await?;
+        trace.mark(
+            "preparation_snapshot_ready",
+            accepted.session_id.as_str(),
+            Some(&accepted.turn_id),
+            None,
+        );
+        state
+            .ensure_session_code_context(&accepted.session_id, &execution_workspace_id)
+            .await?;
+        trace.mark(
+            "preparation_code_context_ready",
+            accepted.session_id.as_str(),
+            Some(&accepted.turn_id),
+            None,
+        );
+    } else {
+        trace.mark(
+            "preparation_workspace_context_skipped",
+            accepted.session_id.as_str(),
+            Some(&accepted.turn_id),
+            None,
+        );
+    }
     materialize_dispatch_submission_after_acceptance(state, accepted)?;
+    trace.mark(
+        "preparation_execution_materialized",
+        accepted.session_id.as_str(),
+        Some(&accepted.turn_id),
+        None,
+    );
     state.persist_session_state_checkpoint("session_task_turn_prepared")?;
     trace.mark(
         "preparation_completed",
@@ -1220,6 +1276,7 @@ mod tests {
                 access_profile: magi_core::AccessProfile::Restricted,
                 skill_name: None,
                 goal_mode: false,
+                use_tools: true,
                 target_role: None,
                 request_id: None,
                 user_message_id: None,

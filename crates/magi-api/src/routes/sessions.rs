@@ -2541,6 +2541,11 @@ async fn submit_mainline_session_turn(
                 execution_goal: Some(execution_goal),
                 task_tier: decision.task_tier,
                 collaboration_mode: decision.collaboration_mode,
+                // Goal mode stays on the mainline Chat route for UX continuity, but its
+                // lifecycle contract requires Goal/Plan tools. Plain Chat alone disables the
+                // tool surface so workspace preparation and tool schemas do not delay text
+                // replies.
+                use_tools: goal_mode || !matches!(route, SessionTurnRouteDto::Chat),
                 accepted_at,
                 required_tool_chain,
                 completion_contract: decision.completion_contract.clone(),

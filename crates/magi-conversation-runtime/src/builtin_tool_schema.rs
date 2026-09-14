@@ -12,11 +12,34 @@ pub(crate) fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefin
         kind: "function".to_string(),
         function: ChatToolFunctionDefinition {
             name: name.to_string(),
-            description: tool_name.description().to_string(),
+            // 模型每一轮都会收到工具定义；使用首段短描述，避免把面向文档的
+            // 长篇使用说明重复塞进 prompt。完整说明仍由 tool_catalog 保留。
+            description: model_tool_description(tool_name),
             parameters: tool_name.parameters_schema(),
         },
         origin: ChatToolOrigin::Builtin,
     })
+}
+
+fn model_tool_description(tool: BuiltinToolName) -> String {
+    if tool == BuiltinToolName::AgentSpawn {
+        return "模型调用此工具创建一个子代理任务并立即返回 child_task_id；role 已知时 capabilities 可省略，由服务端按角色默认能力补齐；需要结果时使用 agent_wait。必须传入结构化 context_package。".to_string();
+    }
+    const MAX_MODEL_TOOL_DESCRIPTION_CHARS: usize = 800;
+    let description = tool
+        .description()
+        .split("\n\n")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let mut compact = description
+        .chars()
+        .take(MAX_MODEL_TOOL_DESCRIPTION_CHARS)
+        .collect::<String>();
+    if description.chars().count() > MAX_MODEL_TOOL_DESCRIPTION_CHARS {
+        compact.push('…');
+    }
+    compact
 }
 
 fn apply_runtime_schema(
@@ -89,14 +112,30 @@ mod tests {
 
         assert_eq!(definition.kind, "function");
         assert_eq!(definition.function.name, "file_read");
-        assert_eq!(
-            definition.function.description,
-            BuiltinToolName::FileRead.description()
+        assert!(
+            definition
+                .function
+                .description
+                .starts_with("读取指定路径文件的内容")
         );
+        assert!(definition.function.description.chars().count() < 800);
         assert_eq!(
             definition.function.parameters["required"],
             serde_json::json!(["path"])
         );
+    }
+
+    #[test]
+    fn model_tool_descriptions_are_compact_and_keep_agent_spawn_contract() {
+        let definition = public_builtin_tool_definition("agent_spawn").expect("public agent_spawn");
+        assert!(
+            definition
+                .function
+                .description
+                .contains("capabilities 可省略")
+        );
+        assert!(definition.function.description.contains("context_package"));
+        assert!(definition.function.description.chars().count() < 800);
     }
 
     #[test]
@@ -284,7 +323,10 @@ mod tests {
                 format!("magi_builtin_{}", definition.function.name).len() <= 64,
                 "{name:?} 的协议工具名不得触发不透明哈希"
             );
-            assert_eq!(definition.function.description, name.description());
+            assert_eq!(
+                definition.function.description,
+                model_tool_description(name)
+            );
             assert_eq!(definition.function.parameters, name.parameters_schema());
             assert_eq!(definition.function.parameters["type"], "object", "{name:?}");
             assert!(

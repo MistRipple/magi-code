@@ -12,6 +12,7 @@ use crate::models::{
     SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, Task, UtcMillis};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// canonical 写模型在一次 SessionStore mutation 中准备的原子变更。
@@ -72,6 +73,9 @@ struct SidecarFlushState {
     last_dirty_reason: Option<SessionSidecarFlushReason>,
     last_flush_at: Option<UtcMillis>,
     next_flush_hint: Option<UtcMillis>,
+    /// 每个 session 最近一次变更对应的版本。保留版本而不是只保留集合，
+    /// 这样 checkpoint 期间发生的新变更不会被上一轮 flush 误清理。
+    dirty_session_versions: HashMap<SessionId, u64>,
 }
 
 fn normalize_session_title(title: String) -> DomainResult<String> {
@@ -438,6 +442,7 @@ impl SessionStore {
             .write()
             .expect("session state write lock poisoned");
         let mut restored = 0;
+        let mut dirty_session_ids = Vec::new();
         for record in records {
             let SessionAcceptanceRecord {
                 session,
@@ -554,11 +559,12 @@ impl SessionStore {
                 }
             }
             if state.current_session_id.is_none() {
-                state.current_session_id = Some(session_id);
+                state.current_session_id = Some(session_id.clone());
                 changed = true;
             }
             if changed {
                 restored += 1;
+                dirty_session_ids.push(session_id);
             }
         }
         if restored > 0 {
@@ -571,7 +577,12 @@ impl SessionStore {
                     .cmp(&right.turn_seq)
                     .then_with(|| left.turn_id.cmp(&right.turn_id))
             });
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
+            for session_id in dirty_session_ids {
+                self.mark_sidecar_dirty_for_session(
+                    Some(&session_id),
+                    SessionSidecarFlushReason::UpsertActiveExecutionChain,
+                );
+            }
         }
         Ok(restored)
     }
@@ -635,16 +646,44 @@ impl SessionStore {
             .clone()
     }
 
-    fn mark_sidecar_dirty(&self, reason: SessionSidecarFlushReason) {
+    fn mark_sidecar_dirty_for_session(
+        &self,
+        session_id: Option<&SessionId>,
+        reason: SessionSidecarFlushReason,
+    ) {
         let mut flush_state = self
             .sidecar_flush_state
             .write()
             .expect("session sidecar flush state write lock poisoned");
         flush_state.current_version = flush_state.current_version.saturating_add(1);
+        let version = flush_state.current_version;
+        if let Some(session_id) = session_id {
+            flush_state
+                .dirty_session_versions
+                .insert(session_id.clone(), version);
+        }
         let now = UtcMillis::now();
         flush_state.last_dirty_at = Some(now);
         flush_state.last_dirty_reason = Some(reason);
         flush_state.next_flush_hint = Some(now);
+    }
+
+    /// 返回尚未纳入成功 checkpoint 的会话集合。
+    ///
+    /// 该集合只用于持久化选择，调用方仍必须从同一份完整 durable snapshot
+    /// 中构建目标 session projection。集合在 flush 成功后按版本安全收敛。
+    pub fn pending_execution_sidecar_session_ids(&self) -> Vec<SessionId> {
+        let flush_state = self
+            .sidecar_flush_state
+            .read()
+            .expect("session sidecar flush state read lock poisoned");
+        let mut session_ids = flush_state
+            .dirty_session_versions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        session_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        session_ids
     }
 
     pub fn create_session(
@@ -906,7 +945,10 @@ impl SessionStore {
         *state = candidate;
         drop(state);
         if removed_sidecar {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::DeleteSession);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::DeleteSession,
+            );
         }
         if let Some(observer) = self.lifecycle_observer() {
             observer.on_session_deleted(session_id);
@@ -1112,7 +1154,10 @@ impl SessionStore {
             session.updated_at = now;
         }
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdatePlan);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::UpdatePlan,
+        );
         Ok(plan)
     }
 
@@ -1151,7 +1196,10 @@ impl SessionStore {
         let changed = state.plans.len() != before;
         drop(state);
         if changed {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::ClearPlan);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::ClearPlan,
+            );
         }
         Ok(changed)
     }
@@ -1204,7 +1252,10 @@ impl SessionStore {
             }
         }
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdatePlan);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::UpdatePlan,
+        );
         Ok(())
     }
 

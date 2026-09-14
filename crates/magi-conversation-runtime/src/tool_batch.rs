@@ -899,29 +899,6 @@ fn execute_agent_spawn(
     )
 }
 
-#[cfg(test)]
-fn parse_agent_spawn_capabilities(parsed: &serde_json::Value) -> Result<Vec<String>, String> {
-    let capabilities = parsed
-        .get("capabilities")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "agent_spawn 缺少 capabilities 数组".to_string())?;
-    if capabilities.is_empty() {
-        return Err("agent_spawn capabilities 至少需要一项专业能力".to_string());
-    }
-    capabilities
-        .iter()
-        .enumerate()
-        .map(|(index, capability)| {
-            capability
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| format!("agent_spawn capabilities[{index}] 必须是非空字符串"))
-        })
-        .collect()
-}
-
 fn execute_agent_send(
     task_store: &TaskStore,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
@@ -4153,32 +4130,6 @@ mod tests {
             "tool_call:call-agent-spawn-invalid-context"
         );
         assert_eq!(payload["child_task_id"], serde_json::Value::Null);
-    }
-
-    #[test]
-    fn agent_spawn_capabilities_are_required_and_structured() {
-        assert_eq!(
-            parse_agent_spawn_capabilities(&serde_json::json!({})),
-            Err("agent_spawn 缺少 capabilities 数组".to_string())
-        );
-        assert_eq!(
-            parse_agent_spawn_capabilities(&serde_json::json!({ "capabilities": [] })),
-            Err("agent_spawn capabilities 至少需要一项专业能力".to_string())
-        );
-        assert!(
-            parse_agent_spawn_capabilities(&serde_json::json!({
-                "capabilities": ["frontend", { "id": "security" }]
-            }))
-            .expect_err("非字符串能力必须被拒绝")
-            .contains("capabilities[1]")
-        );
-        assert_eq!(
-            parse_agent_spawn_capabilities(&serde_json::json!({
-                "capabilities": [" frontend ", "security"]
-            }))
-            .expect("合法能力应解析成功"),
-            ["frontend", "security"]
-        );
     }
 
     #[test]

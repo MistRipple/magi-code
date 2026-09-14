@@ -81,7 +81,9 @@ pub fn publish_task_status_turn_item_for_active_sessions(
     task: &Task,
     new_status: TaskStatus,
 ) -> Result<(), String> {
-    for sidecar in session_store.active_execution_sidecars() {
+    for sidecar in
+        session_store.active_execution_sidecars_for_task(&task.task_id, &task.root_task_id)
+    {
         let Some(turn) = sidecar.current_turn.as_ref() else {
             continue;
         };

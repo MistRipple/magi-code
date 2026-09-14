@@ -221,7 +221,48 @@ impl StateRepository {
         sidecars: &SessionExecutionSidecarStoreState,
     ) -> Result<(), DaemonError> {
         let workspace_roots = self.workspace_projection_roots()?;
-        self.save_session_projection_parts(durable, sidecars, &workspace_roots, true)
+        self.save_session_projection_parts(durable, sidecars, &workspace_roots, true, None, false)
+    }
+
+    /// 只提交指定 session 的 durable projection。
+    ///
+    /// canonical event 已经按 session 独立落盘；sidecar flush 只需更新发生过
+    /// 运行态变更的 session 文件，并维护全局 current/meta 文件。完整 snapshot
+    /// 仍由 `save_session_projection_state` 保留给启动迁移、关机和显式一致性操作。
+    pub(crate) fn save_session_projection_state_for_sessions(
+        &self,
+        durable: &SessionDurableState,
+        sidecars: &SessionExecutionSidecarStoreState,
+        session_ids: &[SessionId],
+    ) -> Result<(), DaemonError> {
+        let workspace_roots = self.workspace_projection_roots()?;
+        let changed = session_ids.iter().cloned().collect::<HashSet<_>>();
+        self.save_session_projection_parts(
+            durable,
+            sidecars,
+            &workspace_roots,
+            true,
+            Some(&changed),
+            false,
+        )
+    }
+
+    pub(crate) fn save_session_projection_partial_state_with_roots(
+        &self,
+        durable: &SessionDurableState,
+        sidecars: &SessionExecutionSidecarStoreState,
+        session_ids: &[SessionId],
+        workspace_roots: &HashMap<String, PathBuf>,
+    ) -> Result<(), DaemonError> {
+        let changed = session_ids.iter().cloned().collect::<HashSet<_>>();
+        self.save_session_projection_parts(
+            durable,
+            sidecars,
+            workspace_roots,
+            true,
+            Some(&changed),
+            true,
+        )
     }
 
     /// 持久化导航状态时只提交当前指针，以及缺失的目标会话 projection。
@@ -290,6 +331,7 @@ impl StateRepository {
                     &workspace_roots,
                     session_id,
                     &mut next_event_cache,
+                    false,
                 )?;
                 writes.push(SessionProjectionWrite {
                     path: path.clone(),
@@ -1055,6 +1097,8 @@ impl StateRepository {
             &staging.sidecars,
             &workspace_root_map,
             false,
+            None,
+            false,
         )?;
 
         if let Some(value) = staging.task_checkpoint.as_ref() {
@@ -1418,6 +1462,8 @@ impl StateRepository {
             &durable,
             &sidecars,
             &workspace_roots.iter().cloned().collect::<HashMap<_, _>>(),
+            false,
+            None,
             false,
         )?;
 
@@ -1927,6 +1973,7 @@ impl StateRepository {
                 leases.sort_by(|left, right| left.lease_id.as_str().cmp(right.lease_id.as_str()));
                 leases
             },
+            changed_root_ids: Vec::new(),
         })
     }
 
@@ -2523,6 +2570,7 @@ impl StateRepository {
         workspace_roots: &HashMap<String, PathBuf>,
         session_id: &SessionId,
         event_cache: &mut HashMap<SessionId, SessionConversationProjection>,
+        allow_canonical_event_advance: bool,
     ) -> Result<(PathBuf, String), DaemonError> {
         let path = self.session_projection_path(
             session_id,
@@ -2542,7 +2590,9 @@ impl StateRepository {
             serde_json::to_value(&next_durable.canonical_turns).map_err(DaemonError::from)?;
         let authoritative =
             serde_json::to_value(event_projection.canonical_turns()).map_err(DaemonError::from)?;
-        if !json_values_semantically_equal(&memory_canonical, &authoritative) {
+        if !allow_canonical_event_advance
+            && !json_values_semantically_equal(&memory_canonical, &authoritative)
+        {
             return Err(DaemonError::internal(format!(
                 "session projection 不能反向生成 canonical 事实: {session_id}"
             )));
@@ -2568,6 +2618,8 @@ impl StateRepository {
         sidecars: &SessionExecutionSidecarStoreState,
         workspace_roots: &HashMap<String, PathBuf>,
         mark_layout: bool,
+        changed_session_ids: Option<&HashSet<SessionId>>,
+        partial_snapshot: bool,
     ) -> Result<(), DaemonError> {
         let _write_guard = self
             .write_lock
@@ -2581,12 +2633,53 @@ impl StateRepository {
             .session_event_cache
             .lock()
             .expect("session event cache lock poisoned");
-        let mut next_cache = cache.clone();
-        let mut next_event_cache = event_cache.clone();
+        let mut next_cache = if partial_snapshot {
+            let snapshots = changed_session_ids
+                .into_iter()
+                .flat_map(|session_ids| session_ids.iter())
+                .filter_map(|session_id| {
+                    cache
+                        .snapshots
+                        .get(session_id)
+                        .cloned()
+                        .map(|snapshot| (session_id.clone(), snapshot))
+                })
+                .collect();
+            SessionProjectionCache {
+                snapshots,
+                pending_removals: cache.pending_removals.clone(),
+                pending_event_removals: cache.pending_event_removals.clone(),
+                global: cache.global.clone(),
+                app_meta: cache.app_meta.clone(),
+                workspace_meta: cache.workspace_meta.clone(),
+            }
+        } else {
+            cache.clone()
+        };
+        let mut next_event_cache = if partial_snapshot {
+            changed_session_ids
+                .into_iter()
+                .flat_map(|session_ids| session_ids.iter())
+                .filter_map(|session_id| {
+                    event_cache
+                        .get(session_id)
+                        .cloned()
+                        .map(|projection| (session_id.clone(), projection))
+                })
+                .collect()
+        } else {
+            event_cache.clone()
+        };
         let mut writes = Vec::<SessionProjectionWrite>::new();
         let mut removals = Vec::<SessionProjectionRemoval>::new();
         let mut sidecar_by_session = HashMap::new();
         for sidecar in &sidecars.runtime_sidecars {
+            if partial_snapshot
+                && changed_session_ids
+                    .is_some_and(|session_ids| !session_ids.contains(&sidecar.session_id))
+            {
+                continue;
+            }
             if sidecar_by_session
                 .insert(sidecar.session_id.clone(), sidecar.clone())
                 .is_some()
@@ -2606,16 +2699,18 @@ impl StateRepository {
                 )));
             }
         }
-        if let Some(orphan_sidecar_id) = sidecar_by_session
-            .keys()
-            .find(|session_id| !retained_ids.contains(*session_id))
+        if !partial_snapshot
+            && let Some(orphan_sidecar_id) = sidecar_by_session
+                .keys()
+                .find(|session_id| !retained_ids.contains(*session_id))
         {
             return Err(DaemonError::internal(format!(
                 "拒绝持久化无 session 归属的 sidecar: {orphan_sidecar_id}"
             )));
         }
 
-        if let Some(current_session_id) = durable.current_session_id.as_ref()
+        if !partial_snapshot
+            && let Some(current_session_id) = durable.current_session_id.as_ref()
             && !retained_ids.contains(current_session_id)
         {
             return Err(DaemonError::internal(format!(
@@ -2624,6 +2719,11 @@ impl StateRepository {
         }
 
         for session in &durable.sessions {
+            if changed_session_ids
+                .is_some_and(|session_ids| !session_ids.contains(&session.session_id))
+            {
+                continue;
+            }
             let session_id = session.session_id.clone();
             let path = self.session_projection_path(
                 &session_id,
@@ -2642,6 +2742,7 @@ impl StateRepository {
                 workspace_roots,
                 &session_id,
                 &mut next_event_cache,
+                partial_snapshot,
             )?;
             debug_assert_eq!(built_path, path);
             if previous.as_deref() != Some(content.as_str()) {
@@ -2664,20 +2765,22 @@ impl StateRepository {
                 .insert(session_id, (path.clone(), content));
         }
 
-        let stale_ids = next_cache
-            .snapshots
-            .iter()
-            .filter(|(session_id, _)| !retained_ids.contains(session_id))
-            .map(|(session_id, _)| session_id.clone())
-            .collect::<Vec<_>>();
-        for session_id in stale_ids {
-            if let Some((path, _)) = next_cache.snapshots.remove(&session_id) {
-                next_cache.pending_removals.insert(path);
+        if !partial_snapshot {
+            let stale_ids = next_cache
+                .snapshots
+                .iter()
+                .filter(|(session_id, _)| !retained_ids.contains(session_id))
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            for session_id in stale_ids {
+                if let Some((path, _)) = next_cache.snapshots.remove(&session_id) {
+                    next_cache.pending_removals.insert(path);
+                }
+                next_event_cache.remove(&session_id);
+                next_cache
+                    .pending_event_removals
+                    .insert(self.session_event_root(&session_id));
             }
-            next_event_cache.remove(&session_id);
-            next_cache
-                .pending_event_removals
-                .insert(self.session_event_root(&session_id));
         }
 
         let current_path = self.state_root.join("session-current.json");
@@ -2699,73 +2802,78 @@ impl StateRepository {
         }
         next_cache.global = Some((current_path, current_content));
 
-        let app_meta = SessionDurableState {
-            notifications: durable
-                .notifications
-                .iter()
-                .filter(|notification| {
-                    matches!(
-                        notification.scope,
-                        magi_session_store::NotificationScope::App
-                    )
-                })
-                .cloned()
-                .collect(),
-            ..SessionDurableState::default()
-        };
-        let app_meta_path = self.state_root.join("session-app-meta.json");
-        let app_meta_content = serde_json::to_vec_pretty(&app_meta).map_err(DaemonError::from)?;
-        let app_meta_content = String::from_utf8(app_meta_content).map_err(|error| {
-            DaemonError::internal(format!("session app meta 不是 UTF-8: {error}"))
-        })?;
-        if next_cache
-            .app_meta
-            .as_ref()
-            .map(|(_, previous)| previous != &app_meta_content)
-            .unwrap_or(true)
-        {
-            writes.push(SessionProjectionWrite {
-                path: app_meta_path.clone(),
-                content: app_meta_content.clone(),
-            });
-        }
-        next_cache.app_meta = Some((app_meta_path, app_meta_content));
-
-        for (workspace_id, root) in workspace_roots {
-            let meta = SessionDurableState {
+        if !partial_snapshot {
+            let app_meta = SessionDurableState {
                 notifications: durable
                     .notifications
                     .iter()
                     .filter(|notification| {
-                        notification.workspace_id.as_deref() == Some(workspace_id.as_str())
-                            && matches!(
-                                notification.scope,
-                                magi_session_store::NotificationScope::Workspace
-                            )
+                        matches!(
+                            notification.scope,
+                            magi_session_store::NotificationScope::App
+                        )
                     })
                     .cloned()
                     .collect(),
                 ..SessionDurableState::default()
             };
-            let path = root.join(".magi").join("session-workspace-meta.json");
-            let content = serde_json::to_vec_pretty(&meta).map_err(DaemonError::from)?;
-            let content = String::from_utf8(content).map_err(|error| {
-                DaemonError::internal(format!("workspace meta 不是 UTF-8: {error}"))
+            let app_meta_path = self.state_root.join("session-app-meta.json");
+            let app_meta_content =
+                serde_json::to_vec_pretty(&app_meta).map_err(DaemonError::from)?;
+            let app_meta_content = String::from_utf8(app_meta_content).map_err(|error| {
+                DaemonError::internal(format!("session app meta 不是 UTF-8: {error}"))
             })?;
             if next_cache
-                .workspace_meta
-                .get(workspace_id)
-                .map(|(_, previous)| previous != &content)
+                .app_meta
+                .as_ref()
+                .map(|(_, previous)| previous != &app_meta_content)
                 .unwrap_or(true)
             {
                 writes.push(SessionProjectionWrite {
-                    path: path.clone(),
-                    content: content.clone(),
+                    path: app_meta_path.clone(),
+                    content: app_meta_content.clone(),
                 });
             }
-            next_cache
-                .workspace_meta
-                .insert(workspace_id.clone(), (path, content));
+            next_cache.app_meta = Some((app_meta_path, app_meta_content));
+        }
+
+        if !partial_snapshot {
+            for (workspace_id, root) in workspace_roots {
+                let meta = SessionDurableState {
+                    notifications: durable
+                        .notifications
+                        .iter()
+                        .filter(|notification| {
+                            notification.workspace_id.as_deref() == Some(workspace_id.as_str())
+                                && matches!(
+                                    notification.scope,
+                                    magi_session_store::NotificationScope::Workspace
+                                )
+                        })
+                        .cloned()
+                        .collect(),
+                    ..SessionDurableState::default()
+                };
+                let path = root.join(".magi").join("session-workspace-meta.json");
+                let content = serde_json::to_vec_pretty(&meta).map_err(DaemonError::from)?;
+                let content = String::from_utf8(content).map_err(|error| {
+                    DaemonError::internal(format!("workspace meta 不是 UTF-8: {error}"))
+                })?;
+                if next_cache
+                    .workspace_meta
+                    .get(workspace_id)
+                    .map(|(_, previous)| previous != &content)
+                    .unwrap_or(true)
+                {
+                    writes.push(SessionProjectionWrite {
+                        path: path.clone(),
+                        content: content.clone(),
+                    });
+                }
+                next_cache
+                    .workspace_meta
+                    .insert(workspace_id.clone(), (path, content));
+            }
         }
 
         let pending_removals = next_cache
@@ -2797,7 +2905,13 @@ impl StateRepository {
         let accepted_path = self.accepted_submissions_path();
         let mut accepted = self.read_accepted_submission_journal_strict(&accepted_path)?;
         for record in &mut accepted.records {
-            record.session_checkpointed = true;
+            record.session_checkpointed = if partial_snapshot {
+                changed_session_ids.is_some_and(|session_ids| {
+                    session_ids.contains(&record.session.session.session_id)
+                })
+            } else {
+                true
+            };
         }
         accepted
             .records
@@ -2830,8 +2944,20 @@ impl StateRepository {
 
         next_cache.pending_removals.clear();
         next_cache.pending_event_removals.clear();
-        *cache = next_cache;
-        *event_cache = next_event_cache;
+        if partial_snapshot {
+            for (session_id, snapshot) in next_cache.snapshots {
+                cache.snapshots.insert(session_id, snapshot);
+            }
+            cache.pending_removals = next_cache.pending_removals;
+            cache.pending_event_removals = next_cache.pending_event_removals;
+            cache.global = next_cache.global;
+            for (session_id, projection) in next_event_cache {
+                event_cache.insert(session_id, projection);
+            }
+        } else {
+            *cache = next_cache;
+            *event_cache = next_event_cache;
+        }
 
         Ok(())
     }
@@ -3447,21 +3573,74 @@ impl RuntimeSidecarPersistence {
         &self,
         durable: &SessionDurableState,
         sidecars: &SessionExecutionSidecarStoreState,
+        changed_session_ids: Option<&[SessionId]>,
     ) -> Result<(), DaemonError> {
         // workspace 注册事实必须先于引用它的 session projection 落盘。进程若在两步之间
         // 退出，最多留下一个尚未被会话引用的 workspace；反向顺序会产生无法恢复的悬空归属。
         self.state_repository
             .save_workspace_durable_state(&self.workspace_store.durable_state())?;
-        self.state_repository
-            .save_session_projection_state(durable, sidecars)?;
+        match changed_session_ids {
+            Some(session_ids) => self
+                .state_repository
+                .save_session_projection_state_for_sessions(durable, sidecars, session_ids)?,
+            None => self
+                .state_repository
+                .save_session_projection_state(durable, sidecars)?,
+        }
         Ok(())
     }
 
-    fn save_session_projection(&self) -> Result<(), DaemonError> {
-        self.session_store
-            .persist_projection_with(|durable, sidecars| {
-                self.persist_session_snapshot(durable, sidecars)
+    fn persist_session_snapshot_incremental(
+        &self,
+        durable: &SessionDurableState,
+        sidecars: &SessionExecutionSidecarStoreState,
+        session_ids: &[SessionId],
+    ) -> Result<(), DaemonError> {
+        let started_at = std::time::Instant::now();
+        if session_ids.is_empty() {
+            // 理论上每个运行态 mutation 都携带 session 归属；若遇到旧调用方
+            // 或未归属的全局 dirty 标记，宁可执行一次完整快照，也不能丢失事实。
+            let result = self.persist_session_snapshot(durable, sidecars, None);
+            tracing::info!(
+                target: "magi.performance",
+                session_count = session_ids.len(),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                stage = "session_projection_full_fallback_completed",
+                "conversation response timing"
+            );
+            return result;
+        }
+        // workspace 注册/删除本身已经在 workspace mutation 事务中持久化；session
+        // 运行态 checkpoint 不再重复写入并 fsync 整个 workspaces.json。
+        let workspace_roots = self
+            .workspace_store
+            .workspaces()
+            .into_iter()
+            .map(|workspace| {
+                (
+                    workspace.workspace_id.to_string(),
+                    workspace.native_root_path(),
+                )
             })
+            .collect::<HashMap<_, _>>();
+        let result = self
+            .state_repository
+            .save_session_projection_partial_state_with_roots(
+                durable,
+                sidecars,
+                session_ids,
+                &workspace_roots,
+            );
+        if result.is_ok() {
+            tracing::info!(
+                target: "magi.performance",
+                session_count = session_ids.len(),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                stage = "session_projection_incremental_completed",
+                "conversation response timing"
+            );
+        }
+        result
     }
 
     pub(crate) fn flush_runtime_sidecars(&self) -> Result<RuntimeSidecarFlushReport, DaemonError> {
@@ -3470,11 +3649,11 @@ impl RuntimeSidecarPersistence {
                 .flush_durable_snapshot_with(|snapshot| {
                     self.state_repository.save_worker_runtime_snapshot(snapshot)
                 })?;
-        let session_sidecars_flushed =
-            self.session_store
-                .flush_execution_sidecars_with(|durable, sidecars| {
-                    self.persist_session_snapshot(durable, sidecars)
-                })?;
+        let session_sidecars_flushed = self.session_store.flush_execution_sidecar_snapshot_with(
+            |durable, sidecars, session_ids| {
+                self.persist_session_snapshot_incremental(durable, sidecars, session_ids)
+            },
+        )?;
         if let Err(error) = self.state_repository.prune_accepted_submissions() {
             warn!(?error, "刷新运行时 sidecar 后清理 accepted journal 失败");
         }
@@ -3491,15 +3670,14 @@ impl RuntimeSidecarPersistence {
     }
 
     pub(crate) fn persist_session_checkpoint(&self) -> Result<bool, DaemonError> {
-        let sidecars_flushed =
-            self.session_store
-                .flush_execution_sidecars_with(|durable, state| {
-                    self.persist_session_snapshot(durable, state)
-                })?;
-        if !sidecars_flushed {
-            self.save_session_projection()?;
-        }
-        Ok(sidecars_flushed)
+        self.session_store.flush_execution_sidecar_snapshot_with(
+            |durable, sidecars, session_ids| {
+                self.persist_session_snapshot_incremental(durable, sidecars, session_ids)
+            },
+        )?;
+        // false 表示本轮没有新的 sidecar dirty 事实；canonical event 已经是 durable
+        // 提交点，不应因此触发一次全量 session projection 重写。
+        Ok(true)
     }
 }
 
@@ -4173,6 +4351,60 @@ mod tests {
 
         let _ = fs::remove_dir_all(state_root);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn partial_session_projection_checkpoint_only_rewrites_target_session() {
+        let state_root = unique_temp_dir("magi-session-projection-partial");
+        let repository = StateRepository::new(state_root.clone());
+        let session_store = SessionStore::new();
+        let first = SessionId::new("session-partial-first");
+        let second = SessionId::new("session-partial-second");
+        session_store
+            .create_session(first.clone(), "partial first")
+            .expect("first session should create");
+        session_store
+            .create_session(second.clone(), "partial second")
+            .expect("second session should create");
+        repository
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("initial full projection should save");
+
+        let first_path = state_root
+            .join("session-projections")
+            .join(StateRepository::session_projection_file_name(&first));
+        let second_path = state_root
+            .join("session-projections")
+            .join(StateRepository::session_projection_file_name(&second));
+        let second_before = fs::read(&second_path).expect("second projection should exist");
+        session_store.append_timeline_entry(
+            first.clone(),
+            TimelineEntryKind::AssistantMessage,
+            "partial update",
+        );
+        let state = session_store.export_state();
+        let sidecars = session_store.execution_sidecar_store_state();
+        repository
+            .save_session_projection_partial_state_with_roots(
+                &state.durable_state_for_session(&first),
+                &sidecars,
+                std::slice::from_ref(&first),
+                &HashMap::new(),
+            )
+            .expect("partial projection should save");
+
+        let first_after = fs::read_to_string(&first_path).expect("first projection should exist");
+        assert!(first_after.contains("partial update"));
+        assert_eq!(
+            fs::read(&second_path).expect("second projection should remain"),
+            second_before,
+            "未变化 session 的 projection 不应被重写"
+        );
+
+        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]

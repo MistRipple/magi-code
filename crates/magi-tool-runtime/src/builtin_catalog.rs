@@ -1776,7 +1776,7 @@ impl BuiltinToolName {
                 "properties": {
                     "task_name": { "type": "string", "description": "稳定的机器任务名，只允许小写字母、数字和下划线；同一父任务下必须唯一。" },
                     "plan_item_id": { "type": "string", "description": "可选：绑定 update_plan 返回的顶层 itemId。绑定后代理状态会自动同步该计划项。" },
-                    "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。" },
+                    "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。role 已知时可直接调用 agent_spawn，capabilities 省略即可由服务端按角色默认能力补齐。" },
                     "capabilities": {
                         "type": "array",
                         "minItems": 1,
@@ -1785,7 +1785,7 @@ impl BuiltinToolName {
                             "type": "string",
                             "minLength": 1
                         },
-                        "description": "可选。本次任务从目标角色拥有的专业能力中激活的能力 id；省略时由服务端使用该角色默认能力集合。显式传入时只能使用 tool_catalog 返回的目标角色 capability_ids。"
+                        "description": "可选。本次任务从目标角色拥有的专业能力中激活的能力 id；省略时由服务端使用该角色默认能力集合。目标 role 已明确时优先省略，不要为了查询能力额外调用 tool_catalog。显式传入时只能使用目标角色的 capability_ids，不能把 role 名称当作 capability id。"
                     },
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },

@@ -1129,6 +1129,75 @@ pub struct SessionDurableState {
     pub thread_context_checkpoints: Vec<ThreadContextCheckpoint>,
 }
 
+fn durable_state_for_session_parts(
+    session_id: &SessionId,
+    sessions: &[SessionRecord],
+    timeline: &[TimelineEntry],
+    canonical_turns: &[CanonicalTurn],
+    notifications: &[NotificationRecord],
+    goals: &[SessionGoal],
+    plans: &[SessionPlan],
+    thread_registry: &[ExecutionThread],
+    thread_context_checkpoints: &[ThreadContextCheckpoint],
+) -> SessionDurableState {
+    let thread_session_ids = thread_registry
+        .iter()
+        .map(|thread| (thread.thread_id.clone(), thread.session_id.clone()))
+        .collect::<HashMap<_, _>>();
+    SessionDurableState {
+        current_session_id: None,
+        sessions: sessions
+            .iter()
+            .filter(|session| &session.session_id == session_id)
+            .cloned()
+            .collect(),
+        timeline: timeline
+            .iter()
+            .filter(|entry| &entry.session_id == session_id)
+            .cloned()
+            .collect(),
+        canonical_turns: canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+            .cloned()
+            .collect(),
+        notifications: notifications
+            .iter()
+            .filter(|notification| {
+                notification
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|notification_session| notification_session == session_id)
+            })
+            .cloned()
+            .collect(),
+        goals: goals
+            .iter()
+            .filter(|goal| &goal.session_id == session_id)
+            .cloned()
+            .collect(),
+        plans: plans
+            .iter()
+            .filter(|plan| &plan.session_id == session_id)
+            .cloned()
+            .collect(),
+        thread_registry: thread_registry
+            .iter()
+            .filter(|thread| &thread.session_id == session_id)
+            .cloned()
+            .collect(),
+        thread_context_checkpoints: thread_context_checkpoints
+            .iter()
+            .filter(|checkpoint| {
+                thread_session_ids
+                    .get(&checkpoint.thread_id)
+                    .is_some_and(|checkpoint_session| checkpoint_session == session_id)
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
 impl SessionDurableState {
     pub fn is_empty(&self) -> bool {
         self.current_session_id.is_none()
@@ -1166,75 +1235,35 @@ impl SessionDurableState {
     /// 这是新投影存储的归属边界：一个会话的所有 durable 事实都必须能从该会话
     /// 的 projection 文件恢复，daemon 级 `current_session_id` 单独保存在全局文件。
     pub fn durable_state_for_session(&self, session_id: &SessionId) -> SessionDurableState {
-        let thread_session_ids = self
-            .thread_registry
-            .iter()
-            .map(|thread| (thread.thread_id.clone(), thread.session_id.clone()))
-            .collect::<HashMap<_, _>>();
-        SessionDurableState {
-            current_session_id: None,
-            sessions: self
-                .sessions
-                .iter()
-                .filter(|session| &session.session_id == session_id)
-                .cloned()
-                .collect(),
-            timeline: self
-                .timeline
-                .iter()
-                .filter(|entry| &entry.session_id == session_id)
-                .cloned()
-                .collect(),
-            canonical_turns: self
-                .canonical_turns
-                .iter()
-                .filter(|turn| &turn.session_id == session_id)
-                .cloned()
-                .collect(),
-            notifications: self
-                .notifications
-                .iter()
-                .filter(|notification| {
-                    notification
-                        .session_id
-                        .as_ref()
-                        .is_some_and(|notification_session| notification_session == session_id)
-                })
-                .cloned()
-                .collect(),
-            goals: self
-                .goals
-                .iter()
-                .filter(|goal| &goal.session_id == session_id)
-                .cloned()
-                .collect(),
-            plans: self
-                .plans
-                .iter()
-                .filter(|plan| &plan.session_id == session_id)
-                .cloned()
-                .collect(),
-            thread_registry: self
-                .thread_registry
-                .iter()
-                .filter(|thread| &thread.session_id == session_id)
-                .cloned()
-                .collect(),
-            thread_context_checkpoints: self
-                .thread_context_checkpoints
-                .iter()
-                .filter(|checkpoint| {
-                    thread_session_ids
-                        .get(&checkpoint.thread_id)
-                        .is_some_and(|checkpoint_session| checkpoint_session == session_id)
-                })
-                .cloned()
-                .collect(),
-        }
+        durable_state_for_session_parts(
+            session_id,
+            &self.sessions,
+            &self.timeline,
+            &self.canonical_turns,
+            &self.notifications,
+            &self.goals,
+            &self.plans,
+            &self.thread_registry,
+            &self.thread_context_checkpoints,
+        )
     }
 }
 
 impl SessionStoreState {
+    /// 在持有 store 读锁时提取单个 session 的 durable 投影，避免先复制全局历史。
+    pub fn durable_state_for_session(&self, session_id: &SessionId) -> SessionDurableState {
+        durable_state_for_session_parts(
+            session_id,
+            &self.sessions,
+            &self.timeline,
+            &self.canonical_turns,
+            &self.notifications,
+            &self.goals,
+            &self.plans,
+            &self.thread_registry,
+            &self.thread_context_checkpoints,
+        )
+    }
     fn normalize_timeline_entry_ids(timeline: &mut [TimelineEntry]) {
         let mut seen = HashMap::<String, usize>::new();
         for entry in timeline.iter_mut() {

@@ -304,6 +304,10 @@ impl DispatchTurnOrigin {
     }
 }
 
+fn default_use_tools() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchSubmissionRequest {
     pub accepted_at: UtcMillis,
@@ -334,6 +338,10 @@ pub struct DispatchSubmissionRequest {
     pub access_profile: AccessProfile,
     pub skill_name: Option<String>,
     pub goal_mode: bool,
+    /// 是否向本轮模型暴露工具面。普通 Chat Turn 默认关闭，避免把完整工具
+    /// Schema 重复发送给只需要文本回答的模型；历史 accepted 请求缺省为 true。
+    #[serde(default = "default_use_tools")]
+    pub use_tools: bool,
     pub target_role: Option<String>,
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
@@ -1223,7 +1231,7 @@ fn materialize_execution(
                 skill_name: request.skill_name.as_deref(),
             },
         ),
-        use_tools: true,
+        use_tools: request.use_tools,
         skill_name: request.skill_name.clone(),
         images: request.images.clone(),
         execution_settings_snapshot: runtime
@@ -1795,6 +1803,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: Some(target_role.to_string()),
             request_id: None,
             user_message_id: None,
@@ -1912,6 +1921,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: Some("executor".to_string()),
             request_id: None,
             user_message_id: None,
@@ -2004,6 +2014,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -2099,6 +2110,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -2314,6 +2326,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -2471,6 +2484,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -2576,6 +2590,7 @@ mod tests {
             access_profile: AccessProfile::FullAccess,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: Some("executor".to_string()),
             request_id: None,
             user_message_id: None,
@@ -2688,6 +2703,7 @@ mod tests {
             access_profile: AccessProfile::FullAccess,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -2760,6 +2776,7 @@ mod tests {
             access_profile: AccessProfile::FullAccess,
             skill_name: Some("stellarlinkco/myclaude/skills/browser".to_string()),
             goal_mode: false,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -2838,6 +2855,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: Some("code-review".to_string()),
             goal_mode: false,
+            use_tools: true,
             target_role: Some("reviewer".to_string()),
             request_id: None,
             user_message_id: None,
@@ -2922,6 +2940,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: false,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -3029,6 +3048,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: true,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,
@@ -3156,6 +3176,7 @@ mod tests {
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             goal_mode: true,
+            use_tools: true,
             target_role: None,
             request_id: None,
             user_message_id: None,

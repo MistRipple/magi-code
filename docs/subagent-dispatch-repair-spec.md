@@ -1,6 +1,6 @@
 # Magi 子代理分配稳定性产品级修复方案
 
-- 文档状态：已完成；阶段 0-6 已完成（最后验证：2026-09-14）
+- 文档状态：已完成；阶段 0-7 已完成（最后验证：2026-09-14）
 - 适用范围：Magi 主对话中的 `agent_spawn`、`agent_send`、`agent_wait` 以及子代理 Worker 执行链
 - 目标读者：负责 Rust daemon、conversation runtime、Web 前端和桌面验收的实现 Agent
 - 约束：本方案只收敛到一条正式实现路径，不保留旧关键词开关、旧参数合同或临时兜底实现
@@ -469,7 +469,7 @@ model_binding_status
 
 ### 阶段 6：真实验证和发布前检查
 
-- [x] Rust 相关测试全部通过：`cargo test --workspace --all-targets`（2580 项通过、0 失败、1 项忽略），并通过 `cargo fmt --all -- --check`、`git diff --check`
+- [x] Rust 相关测试全部通过：`cargo test --workspace --all-targets`（2583 项通过、0 失败、1 项忽略），并通过 `cargo fmt --all -- --check`、`git diff --check`
 - [x] `npm --prefix web run check`
 - [x] `npm --prefix web run build`
 - [x] 使用 daemon 入口完成真实主对话派发、等待、运行失败归类和改派/主线接管指令验证
@@ -481,7 +481,7 @@ model_binding_status
 
 #### 代码与构建
 
-- `cargo test --workspace --all-targets`：2580 项通过、0 失败、1 项忽略。
+- `cargo test --workspace --all-targets`：2583 项通过、0 失败、1 项忽略。
 - `cargo fmt --all -- --check`：通过。
 - `git diff --check`：通过。
 - `npm --prefix web run check`：通过。
@@ -504,9 +504,41 @@ model_binding_status
 - 角色闭环：创建用户角色 `stage6-desktop-role`，导出 Markdown，再以 `stage6-desktop-role-imported` 导入；注册表同时识别两个用户角色，并验证自定义角色默认能力补齐、主对话任务识别和子代理执行。
 - 验证结束后已删除上述临时角色及 `stage6-failing-engine`，注册表无残留测试绑定。
 
-## 9. 必须覆盖的验收场景
+## 9. 阶段 7：主对话响应时延收敛
 
-### 9.1 正常路径
+本阶段针对“上游模型接口已经返回，但用户界面长时间没有收到主线回复”的真实链路问题，沿用同一条 Session Turn → TaskRunner → ConversationLoop → canonical event 派发链，不增加旁路执行器。
+
+- [x] 普通 Chat Turn 明确关闭工具面后，跳过首次 `SnapshotSession` 全工作区扫描和 Git context 初始化
+- [x] Goal mode 虽然继续使用主线 Chat 路由，但显式保留 Goal/Plan 工具面，避免工具收敛优化破坏目标模式合同
+- [x] TaskStore 已配置增量 checkpoint callback 时，Runner 消费状态变化信号但不在 `AllComplete` 再次写全量任务投影
+- [x] 保留无 TaskStore checkpoint callback 的嵌入/测试运行时的 Runner checkpoint 兜底
+- [x] 恢复路径先持久化 workspace 注册事实，再写引用 workspace 的 session projection，避免失败回滚误判悬空 workspace
+- [x] 增加 Runner 去重回归测试和终态阶段性能观测
+- [x] 使用 daemon 入口完成普通 workspace Chat 实测，确认接受、准备和终态收口不再被内部全量扫描或重复 checkpoint 阻塞
+- [x] 重新执行 `npm run desktop:package -- --dir`，并直接启动发行物内 daemon 做健康检查和静态入口检查
+
+阶段状态：已完成（2026-09-14）。
+
+真实 daemon 观测记录（本机、`http://127.0.0.1:38123/web.html`）：
+
+| 阶段 | 优化前观测 | 优化后观测 |
+|---|---:|---:|
+| HTTP `/api/session/turn` 接受 | 约 20～120 ms | 约 40～60 ms |
+| 普通 workspace Chat 准备 | `SnapshotSession` 首次扫描约 5.7 s，Git context 约 1.5 s | 约 60～180 ms，记录 `preparation_workspace_context_skipped` |
+| Runner 首次租约/派发 | 约 0.3～0.5 s | 约 0.3～0.7 s |
+| 模型请求准备 | 约 0.2～0.3 s | 约 0.18～0.24 s |
+| 模型首 token | 由上游模型与 prompt 长度决定 | 真实样本约 2.4～11.9 s，属于 provider 处理时间，不是 Magi 内部锁等待 |
+| 根任务完成到 `turn_completed` | 额外约 5 s 的全量 task projection | 终态观察约 10～150 ms，直接发布 canonical 终态事件 |
+
+最后一次 fresh workspace Chat 样本中，HTTP 接受耗时 38 ms，准备完成耗时 116 ms，模型请求准备耗时 206 ms；provider 首 token 在 8.9 s 到达，模型完整响应在 27.1 s 返回，随后 Magi 在约 150 ms 内完成根任务和 `turn_completed` 收口。该样本中的模型等待来自 provider 与 prompt 负载，未再出现 Magi 内部全量扫描或重复 task checkpoint 阻塞。
+
+本轮重新构建了 `/Users/xie/code/magi-rust-rewrite/target/electron-dist/mac-arm64/Magi.app`，直接启动其中的 `Contents/Resources/daemon/magi-daemon-app` 使用独立状态根和静态前端资源验证：`/health` 返回 `status=ok`，`/web.html` 返回 HTTP 200。桌面包中的 daemon、静态资源和本轮性能修复已进入同一发行物。
+
+普通 Chat 仍保留会话、线程、canonical event 和 durable 恢复记录；只延迟工具执行专属的 workspace 变更账本与 Git 观测。只要本轮真正需要工具，阶段 3 的快照、Git 隔离和审计流程仍按原合同执行。
+
+## 10. 必须覆盖的验收场景
+
+### 10.1 正常路径
 
 1. 普通复杂请求，未出现“代理”关键词，模式为 auto，coordinator 能自主派发 explorer。
 2. 用户明确要求两个不同角色并行，两个 `agent_spawn` 都返回 started，随后 `agent_wait` 返回两个 completed。
@@ -514,7 +546,7 @@ model_binding_status
 4. 用户自定义角色绑定独立 engine，模型来源显示 `role_engine`。
 5. 非 Git workspace 中的只读子代理可以正常执行。
 
-### 9.2 预检拒绝
+### 10.2 预检拒绝
 
 1. role 不存在或为 coordinator：返回 rejected，无 child_task_id，无 TaskStore 记录。
 2. 能力不属于角色：返回 unsupported_capability，无副作用。
@@ -523,7 +555,7 @@ model_binding_status
 5. Git session 没有 base HEAD 或发生外部漂移：返回 git_preflight_failed，无子任务。
 6. 用户明确禁止协作：返回 collaboration_disabled，不创建子任务。
 
-### 9.3 排队和运行失败
+### 10.3 排队和运行失败
 
 1. 会话容量满：新代理显示 queued，显示具体原因；已有代理完成后自动进入 running。
 2. 子代理模型请求超时：agent_wait 返回 failed 和 model_invocation_failed，主线可改派或接管。
@@ -531,14 +563,14 @@ model_binding_status
 4. 子代理 worktree 有未提交改动：任务完成但 worktree 正确进入 retained/inactive，后续任务不复用。
 5. agent_wait 使用非直接子任务 ID：返回 scope_mismatch，不泄露其他任务结果。
 
-### 9.4 用户体验
+### 10.4 用户体验
 
 1. 主线卡片不会出现“已成功”但没有 child_task_id 的状态。
 2. 排队、拒绝、运行失败、降级接管在中文和英文界面均有明确文案。
 3. 错误文案不暴露 API Key、完整 URL、堆栈和内部路径。
 4. 代理最终结果必须在主线明确引用并吸收；未等待或未吸收时不得结束主线答复。
 
-## 10. 完成定义
+## 11. 完成定义
 
 只有同时满足以下条件，才可以将本方案标记为完成：
 

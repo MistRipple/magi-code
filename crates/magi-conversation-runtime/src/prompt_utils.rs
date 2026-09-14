@@ -189,7 +189,7 @@ fn stable_prompt_hash(value: &str) -> u64 {
 const ROOT_MULTI_AGENT_MODE_RULE_AUTO: &str = "\
 多代理模式（当前模式：auto；root coordinator 必须遵守）：\n\
 1. 协作能力由当前任务 TaskPolicy 决定。请根据任务边界、并行收益、独立复核价值和当前容量自主判断是否派发；1-3 步即可完成的工作不要为组队而组队。\n\
-2. 用户明确要求 subagent、子代理、多代理、并行角色或指定代理角色时，视为本轮协作要求，必须通过 agent_spawn 创建真实代理；只要决定协作，也必须提供最小充分的结构化 context_package，不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
+2. 用户明确要求 subagent、子代理、多代理、并行角色或指定代理角色时，视为本轮协作要求，必须通过 agent_spawn 创建真实代理；只要决定协作，也必须提供最小充分的结构化 context_package。capabilities 可省略，目标 role 已知时优先省略，由服务端按角色默认能力补齐；不要为了查询已知角色能力先调用 tool_catalog，不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
 3. 多个互相独立的工作单元应在同一轮发起多次 agent_spawn；需要结果时使用 agent_wait 汇总。所有已创建代理都必须等待到终态，并在最终答复中明确吸收结果。\n\
 4. 每个角色、会话和全局都有运行容量限制。agent_spawn 返回 queued 时保留 child_task_id，等待资源恢复后继续 agent_wait；rejected 表示没有创建任务，必须根据错误阶段修正请求。\n\
 5. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。context_package 必须直接传 JSON 对象。\n\
@@ -198,7 +198,7 @@ const ROOT_MULTI_AGENT_MODE_RULE_AUTO: &str = "\
 const ROOT_MULTI_AGENT_MODE_RULE_REQUIRED: &str = "\
 多代理模式（当前模式：required；root coordinator 必须遵守）：\n\
 1. 用户已明确要求真实代理协作。本任务必须至少成功调用一次 agent_spawn 创建真实子任务，并在最终答复前通过 agent_wait 收集其终态；不得用主线读取、shell_exec 或口头总结替代。\n\
-2. 每次 agent_spawn 都必须提供角色允许的能力和结构化 context_package。若调用被 rejected，必须依据 error_code/failure_stage 修正后重新派发，不能伪造 started 或 completed。\n\
+2. 每次 agent_spawn 都必须提供有效 role 和结构化 context_package；capabilities 可省略，省略时由服务端按目标角色默认能力补齐。目标 role 已知时不要先调用 tool_catalog 查询能力。若调用被 rejected，必须依据 error_code/failure_stage 修正后重新派发，不能伪造 started 或 completed。\n\
 3. 多个独立工作单元应在同一轮发起多次 agent_spawn；queued 表示任务已经创建并等待资源，必须保留 child_task_id 并等待。\n\
 4. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。";
 

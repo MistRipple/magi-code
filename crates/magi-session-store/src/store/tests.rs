@@ -4595,6 +4595,10 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
     );
     assert!(bound_metadata.last_dirty_at.is_some());
     assert_eq!(bound_metadata.next_flush_hint, bound_metadata.last_dirty_at);
+    assert_eq!(
+        store.pending_execution_sidecar_session_ids(),
+        vec![session_id.clone()]
+    );
 
     store
         .apply_recovery_resume_input(
@@ -4651,6 +4655,10 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
         resume_metadata.next_flush_hint,
         resume_metadata.last_dirty_at
     );
+    assert_eq!(
+        store.pending_execution_sidecar_session_ids(),
+        vec![session_id.clone()]
+    );
 
     let mut flushes = Vec::new();
     assert!(
@@ -4669,6 +4677,7 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
     );
     assert!(flushed_metadata.last_flush_at.is_some());
     assert_eq!(flushed_metadata.next_flush_hint, None);
+    assert!(store.pending_execution_sidecar_session_ids().is_empty());
 }
 
 #[test]

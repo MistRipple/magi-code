@@ -93,6 +93,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
+    time::Instant,
 };
 
 const DISCOVERY_WRAP_UP_ROUNDS: usize = 8;
@@ -1542,6 +1543,7 @@ fn run_conversation_loop_inner(
         }
         context_budget_recheck_required = false;
         bound_model_visible_chat_tool_results(&mut messages);
+        let model_round_wall_started_at = Instant::now();
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
@@ -1584,6 +1586,18 @@ fn run_conversation_loop_inner(
         let invocation_request_template = invocation_request.clone();
         let non_stream_fallback_template = invocation_request.clone();
         let invocation_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
+        tracing::info!(
+            target: "magi.performance",
+            session_id = %session_id,
+            task_id = %task_id,
+            turn_id = expected_turn_id.as_deref().unwrap_or_default(),
+            round,
+            message_count = messages.len(),
+            tool_count = round_tools.as_ref().map_or(0, Vec::len),
+            elapsed_ms = model_round_wall_started_at.elapsed().as_millis() as u64,
+            stage = "task_model_request_ready",
+            "conversation response timing"
+        );
 
         let response = if streaming_entry_id.is_some() {
             let on_delta = |delta: &ModelStreamingDelta| {
@@ -2138,6 +2152,16 @@ fn run_conversation_loop_inner(
                 }
             }
         };
+        tracing::info!(
+            target: "magi.performance",
+            session_id = %session_id,
+            task_id = %task_id,
+            turn_id = expected_turn_id.as_deref().unwrap_or_default(),
+            round,
+            elapsed_ms = model_round_wall_started_at.elapsed().as_millis() as u64,
+            stage = "task_model_response_received",
+            "conversation response timing"
+        );
 
         if let Some(writeback_error) = take_task_writeback_error(turn_writeback_context) {
             let error_text = format!("模型流式响应写回失败：{writeback_error}");

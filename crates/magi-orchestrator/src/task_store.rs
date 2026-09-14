@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TASK_PROJECTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -82,6 +82,13 @@ struct TaskProjectionManifest {
 struct TaskProjectionManifestRoot {
     root_task_id: TaskId,
     file_name: String,
+    /// 该 root 文件实际来自哪个 generation。新的 generation 可以通过硬链接
+    /// 复用内容不变的 root，因此它不一定等于 manifest 的 generation。
+    #[serde(default)]
+    generation: u64,
+    /// 不包含 generation 字段的 root 业务事实指纹，用于 checkpoint 增量复用。
+    #[serde(default)]
+    content_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,6 +116,9 @@ pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, TaskStatus, Task
 pub struct TaskStoreSnapshot {
     pub tasks: Vec<Task>,
     pub leases: Vec<TaskLease>,
+    /// 本次 checkpoint 之前发生变化的 root。为空表示调用方要求完整快照。
+    /// 该字段只用于增量持久化决策，不改变任务事实本身。
+    pub changed_root_ids: Vec<TaskId>,
 }
 
 pub type CheckpointCallback = Box<dyn Fn(&TaskStoreSnapshot) -> DomainResult<()> + Send + Sync>;
@@ -247,6 +257,19 @@ impl TaskStore {
         *guard = Some(callback);
     }
 
+    /// 判断状态变更是否已经接入 durable checkpoint 回调。
+    ///
+    /// Runner 的调度循环会收到“状态已变化”的信号，但生产 TaskStore 在每次
+    /// 变更提交前已经通过该回调完成增量 checkpoint。暴露这个只读事实让 Runner
+    /// 避免在终态再次写一份全量快照；未配置回调的轻量测试/嵌入场景仍保留原有
+    /// `with_checkpoint_persist` 兜底。
+    pub fn has_checkpoint_callback(&self) -> bool {
+        self.on_checkpoint
+            .lock()
+            .expect("on_checkpoint lock poisoned")
+            .is_some()
+    }
+
     fn fire_checkpoint(&self, snapshot: &TaskStoreSnapshot) -> DomainResult<()> {
         let guard = self
             .on_checkpoint
@@ -266,12 +289,31 @@ impl TaskStore {
         let mut leases = leases.values().cloned().collect::<Vec<_>>();
         tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
         leases.sort_by(|left, right| left.lease_id.as_str().cmp(right.lease_id.as_str()));
-        TaskStoreSnapshot { tasks, leases }
+        TaskStoreSnapshot {
+            tasks,
+            leases,
+            changed_root_ids: Vec::new(),
+        }
+    }
+
+    fn snapshot_from_maps_with_dirty_roots(
+        tasks: &HashMap<TaskId, Task>,
+        leases: &HashMap<LeaseId, TaskLease>,
+        dirty_roots: impl IntoIterator<Item = TaskId>,
+    ) -> TaskStoreSnapshot {
+        let mut snapshot = Self::snapshot_from_maps(tasks, leases);
+        snapshot.changed_root_ids = dirty_roots.into_iter().collect();
+        snapshot
+            .changed_root_ids
+            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        snapshot.changed_root_ids.dedup();
+        snapshot
     }
 
     fn snapshot_locked(&self) -> TaskStoreSnapshot {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
         let leases = self.leases.read().expect("leases read lock poisoned");
+        // 空 changed_root_ids 明确表示完整快照，供周期性 checkpoint 和恢复写入使用。
         Self::snapshot_from_maps(&tasks, &leases)
     }
 
@@ -446,6 +488,7 @@ impl TaskStore {
             .lock()
             .expect("task mutation lock poisoned");
         let task_id = task.task_id.clone();
+        let root_task_id = task.root_task_id.clone();
         let mission_id = task.mission_id.clone();
         if !checkpoint {
             let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
@@ -484,7 +527,11 @@ impl TaskStore {
             .push(task_id.clone());
         if checkpoint {
             let leases = self.leases.read().expect("leases read lock poisoned");
-            let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+            let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+                &tasks,
+                &leases,
+                vec![root_task_id.clone()],
+            );
             self.fire_checkpoint(&snapshot)?;
         }
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
@@ -594,7 +641,11 @@ impl TaskStore {
         task.updated_at = UtcMillis::now();
         let cloned_task = task.clone();
         let leases = self.leases.read().expect("leases read lock poisoned");
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![cloned_task.root_task_id.clone()],
+        );
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         self.emit_status_change(task_id, old_status, new_status, cloned_task);
@@ -653,7 +704,11 @@ impl TaskStore {
             .read()
             .expect("mission_index read lock poisoned")
             .clone();
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![cloned_task.root_task_id.clone()],
+        );
         self.fire_checkpoint(&snapshot)?;
         self.commit_maps(tasks, leases, mission_index);
         self.emit_status_change(task_id, expected_status, new_status, cloned_task);
@@ -754,7 +809,11 @@ impl TaskStore {
         let old_status = task.status;
         Self::apply_completion(task, attempt)?;
         let cloned_task = task.clone();
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![cloned_task.root_task_id.clone()],
+        );
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         self.emit_status_change(task_id, old_status, TaskStatus::Completed, cloned_task);
@@ -805,6 +864,7 @@ impl TaskStore {
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let dirty_root_id = task.root_task_id.clone();
         let accesses = match &mut task.runtime_payload {
             TaskRuntimePayload::AgentContext { accesses, .. } => std::mem::take(accesses),
             TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => Vec::new(),
@@ -815,7 +875,8 @@ impl TaskStore {
         };
         task.updated_at = UtcMillis::now();
         let leases = self.leases.read().expect("leases read lock poisoned");
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot =
+            Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![dirty_root_id]);
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         self.notify_status_change();
@@ -835,6 +896,7 @@ impl TaskStore {
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let dirty_root_id = task.root_task_id.clone();
         let TaskRuntimePayload::AgentContext { accesses, .. } = &mut task.runtime_payload else {
             return Err(DomainError::InvalidState {
                 message: format!("任务 {task_id} 没有 agent context package"),
@@ -843,7 +905,8 @@ impl TaskStore {
         accesses.push(record);
         task.updated_at = UtcMillis::now();
         let leases = self.leases.read().expect("leases read lock poisoned");
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot =
+            Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![dirty_root_id]);
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         Ok(())
@@ -863,6 +926,7 @@ impl TaskStore {
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let dirty_root_id = task.root_task_id.clone();
         let TaskRuntimePayload::AgentContext { package, .. } = &mut task.runtime_payload else {
             return Err(DomainError::InvalidState {
                 message: format!("任务 {task_id} 没有 agent context package"),
@@ -874,7 +938,8 @@ impl TaskStore {
         task.updated_at = package.updated_at;
         let package = package.as_ref().clone();
         let leases = self.leases.read().expect("leases read lock poisoned");
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot =
+            Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![dirty_root_id]);
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         Ok(package)
@@ -1483,6 +1548,7 @@ impl TaskStore {
         role: &str,
         duration_ms: u64,
     ) -> DomainResult<Option<TaskLease>> {
+        let transaction_started_at = Instant::now();
         let _mutation_guard = self
             .mutation_lock
             .lock()
@@ -1537,10 +1603,30 @@ impl TaskStore {
             .read()
             .expect("mission_index read lock poisoned")
             .clone();
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![cloned_task.root_task_id.clone()],
+        );
         self.fire_checkpoint(&snapshot)?;
+        tracing::info!(
+            target: "magi.performance",
+            task_id = %task_id,
+            root_task_id = %root_task_id,
+            elapsed_ms = transaction_started_at.elapsed().as_millis() as u64,
+            stage = "task_lease_checkpoint_returned",
+            "conversation response timing"
+        );
         self.commit_maps(tasks, leases, mission_index);
         self.emit_status_change(task_id, old_status, TaskStatus::Running, cloned_task);
+        tracing::info!(
+            target: "magi.performance",
+            task_id = %task_id,
+            root_task_id = %root_task_id,
+            elapsed_ms = transaction_started_at.elapsed().as_millis() as u64,
+            stage = "task_lease_transaction_completed",
+            "conversation response timing"
+        );
         Ok(Some(lease))
     }
 
@@ -1640,7 +1726,11 @@ impl TaskStore {
             .read()
             .expect("mission_index read lock poisoned")
             .clone();
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![cloned_task.root_task_id.clone()],
+        );
         self.fire_checkpoint(&snapshot)?;
         self.commit_maps(tasks, leases, mission_index);
         self.emit_status_change(task_id, old_status, TaskStatus::Completed, cloned_task);
@@ -1784,7 +1874,11 @@ impl TaskStore {
             .read()
             .expect("mission_index read lock poisoned")
             .clone();
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![cloned_task.root_task_id.clone()],
+        );
         self.fire_checkpoint(&snapshot)?;
         self.commit_maps(tasks, leases, mission_index);
         self.emit_status_change(task_id, old_status, status, cloned_task);
@@ -1933,7 +2027,7 @@ impl TaskStore {
 
         let now = UtcMillis::now();
         let mut failed_count = 0usize;
-        for root_task_id in affected_roots {
+        for root_task_id in &affected_roots {
             for task_id in collect_subtree_ids_from_tasks(&tasks, &root_task_id) {
                 if let Some(task) = tasks.get_mut(&task_id)
                     && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
@@ -1950,7 +2044,7 @@ impl TaskStore {
             .read()
             .expect("mission_index read lock poisoned")
             .clone();
-        let snapshot = Self::snapshot_from_maps(&tasks, &leases);
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, affected_roots);
         self.fire_checkpoint(&snapshot)?;
         self.commit_maps(tasks, leases, mission_index);
         self.notify_status_change();
@@ -2111,6 +2205,8 @@ impl TaskStore {
         snapshot: &TaskStoreSnapshot,
         dir: &Path,
     ) -> io::Result<usize> {
+        let checkpoint_started_at = Instant::now();
+        let changed_root_count = snapshot.changed_root_ids.len();
         Self::validate_snapshot(snapshot)?;
         let _writer = TASK_PROJECTION_WRITE_LOCK
             .lock()
@@ -2180,7 +2276,23 @@ impl TaskStore {
             .collect::<Vec<_>>();
         projections
             .sort_by(|left, right| left.root_task_id.as_str().cmp(right.root_task_id.as_str()));
-        Self::validate_projection_set(&projections)?;
+        let dirty_roots = (!snapshot.changed_root_ids.is_empty()).then(|| {
+            snapshot
+                .changed_root_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        });
+        if let Some(dirty_roots) = dirty_roots.as_ref() {
+            let dirty_projections = projections
+                .iter()
+                .filter(|projection| dirty_roots.contains(&projection.root_task_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            Self::validate_projection_set(&dirty_projections)?;
+        } else {
+            Self::validate_projection_set(&projections)?;
+        }
 
         let sequence = TASK_PROJECTION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temporary_generation_dir = generations_dir.join(format!(
@@ -2188,15 +2300,63 @@ impl TaskStore {
             std::process::id()
         ));
         fs::create_dir(&temporary_generation_dir)?;
+        // 每次任务状态变更都会产生一个新 generation，但绝大多数 root projection
+        // 并没有变化。复用上一 generation 的不变文件，只为变化的 root 重新序列化并
+        // 写入新文件；最后仍通过 manifest 原子切换，保留崩溃恢复和完整快照语义。
+        let previous_generation_dir = previous_manifest.as_ref().and_then(|manifest| {
+            let path = generations_dir.join(Self::generation_directory_name(manifest.generation));
+            path.is_dir().then_some(path)
+        });
         let write_result = (|| -> io::Result<Vec<TaskProjectionManifestRoot>> {
             let mut manifest_roots = Vec::with_capacity(projections.len());
             for projection in &projections {
                 let file_name = Self::projection_file_name(projection.root_task_id.as_str());
+                let destination = temporary_generation_dir.join(&file_name);
+                let source = previous_generation_dir
+                    .as_ref()
+                    .map(|directory| directory.join(&file_name));
+                let previous_root = previous_manifest.as_ref().and_then(|manifest| {
+                    manifest
+                        .roots
+                        .iter()
+                        .find(|root| root.file_name == file_name)
+                });
+                let is_dirty = dirty_roots
+                    .as_ref()
+                    .is_none_or(|roots| roots.contains(&projection.root_task_id));
+                if !is_dirty
+                    && let Some(previous_root) = previous_root
+                    && let Some(source) = source.as_deref()
+                    && fs::hard_link(source, &destination).is_ok()
+                {
+                    manifest_roots.push(TaskProjectionManifestRoot {
+                        root_task_id: projection.root_task_id.clone(),
+                        file_name,
+                        generation: previous_root.generation,
+                        content_hash: previous_root.content_hash.clone(),
+                    });
+                    continue;
+                }
+
                 let content = serde_json::to_vec_pretty(projection).map_err(io::Error::other)?;
-                Self::write_new_file_synced(&temporary_generation_dir.join(&file_name), &content)?;
+                let content_hash = Self::projection_content_hash(projection)?;
+                let source_identity = Self::reuse_projection_file_if_unchanged(
+                    source.as_deref(),
+                    &destination,
+                    projection,
+                    previous_root,
+                    &content_hash,
+                )?;
+                if source_identity.is_none() {
+                    Self::write_new_file_synced(&destination, &content)?;
+                }
+                let (root_generation, root_hash) =
+                    source_identity.unwrap_or((generation, content_hash));
                 manifest_roots.push(TaskProjectionManifestRoot {
                     root_task_id: projection.root_task_id.clone(),
                     file_name,
+                    generation: root_generation,
+                    content_hash: root_hash,
                 });
             }
             Self::sync_directory(&temporary_generation_dir)?;
@@ -2227,7 +2387,79 @@ impl TaskStore {
         Self::sync_directory(dir)?;
 
         Self::cleanup_stale_generations(&generations_dir, &generation_dir)?;
+        if changed_root_count > 0 {
+            tracing::info!(
+                target: "magi.performance",
+                changed_root_count,
+                task_count = snapshot.tasks.len(),
+                lease_count = snapshot.leases.len(),
+                projection_count = projections.len(),
+                elapsed_ms = checkpoint_started_at.elapsed().as_millis() as u64,
+                stage = "task_projection_checkpoint_completed",
+                "conversation response timing"
+            );
+        }
         Ok(projections.len())
+    }
+
+    /// 复用上一 generation 中内容完全相同的 root projection。
+    ///
+    /// generation 目录只读且最终会整体重命名，因此可以安全建立硬链接；硬链接不
+    /// 可用时退回到普通写入，由调用方继续执行原子目录提交。返回 root 文件的来源
+    /// generation 和业务事实指纹，供 manifest 精确记录。
+    fn reuse_projection_file_if_unchanged(
+        source: Option<&Path>,
+        destination: &Path,
+        projection: &TaskRootProjection,
+        previous_root: Option<&TaskProjectionManifestRoot>,
+        content_hash: &str,
+    ) -> io::Result<Option<(u64, String)>> {
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let expected_hash = previous_root
+            .map(|root| root.content_hash.trim())
+            .filter(|hash| !hash.is_empty());
+        if expected_hash == Some(content_hash) {
+            if fs::hard_link(source, destination).is_ok() {
+                return Ok(Some((
+                    previous_root
+                        .map(|root| root.generation)
+                        .unwrap_or(projection.generation),
+                    content_hash.to_string(),
+                )));
+            }
+            return Ok(None);
+        }
+
+        // 旧 manifest 尚未带 content_hash 时只做一次兼容性比较；后续 checkpoint
+        // 会写入指纹，避免每次状态变更都重新解析所有历史 root 文件。
+        let existing = match fs::read(source) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let previous: TaskRootProjection = Self::deserialize_projection_strict(&existing)?;
+        let same_content = previous.schema_version == projection.schema_version
+            && previous.root_task_id == projection.root_task_id
+            && serde_json::to_value(&previous.tasks).map_err(io::Error::other)?
+                == serde_json::to_value(&projection.tasks).map_err(io::Error::other)?
+            && serde_json::to_value(&previous.leases).map_err(io::Error::other)?
+                == serde_json::to_value(&projection.leases).map_err(io::Error::other)?;
+        if !same_content || fs::hard_link(source, destination).is_err() {
+            return Ok(None);
+        }
+        Ok(Some((previous.generation, content_hash.to_string())))
+    }
+
+    fn projection_content_hash(projection: &TaskRootProjection) -> io::Result<String> {
+        let mut normalized = projection.clone();
+        normalized.generation = 0;
+        let content = serde_json::to_vec(&normalized).map_err(io::Error::other)?;
+        let hash = content.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+        Ok(format!("{hash:016x}"))
     }
 
     /// Restore a TaskStore from a root-task projection directory.
@@ -2271,9 +2503,13 @@ impl TaskStore {
             }
             let content = fs::read(generation_dir.join(&root.file_name))?;
             let projection = Self::deserialize_projection_strict(&content)?;
+            let content_hash_matches = root.content_hash.trim().is_empty()
+                || Self::projection_content_hash(&projection)? == root.content_hash;
             if projection.schema_version != TASK_PROJECTION_SCHEMA_VERSION
-                || projection.generation != manifest.generation
+                || root.generation == 0
+                || projection.generation != root.generation
                 || projection.root_task_id != root.root_task_id
+                || !content_hash_matches
             {
                 return Err(Self::invalid_projection(format!(
                     "task projection 元数据与 manifest 不一致: {}",
@@ -2651,9 +2887,29 @@ impl TaskStore {
     }
 
     fn validate_snapshot(snapshot: &TaskStoreSnapshot) -> io::Result<()> {
+        if snapshot.changed_root_ids.is_empty() {
+            return Self::validate_checkpoint(&TaskStoreCheckpoint {
+                tasks: snapshot.tasks.clone(),
+                leases: snapshot.leases.clone(),
+            });
+        }
+        // 状态变更已经在 TaskStore mutation lock 下完成结构校验；增量 checkpoint
+        // 只需验证受影响 root 的完整子树和租约，不能因为无关历史任务数量增长而
+        // 阻塞当前 Turn。恢复入口仍会对完整 projection 做全量校验。
+        let dirty_roots = snapshot.changed_root_ids.iter().collect::<HashSet<_>>();
         Self::validate_checkpoint(&TaskStoreCheckpoint {
-            tasks: snapshot.tasks.clone(),
-            leases: snapshot.leases.clone(),
+            tasks: snapshot
+                .tasks
+                .iter()
+                .filter(|task| dirty_roots.contains(&task.root_task_id))
+                .cloned()
+                .collect(),
+            leases: snapshot
+                .leases
+                .iter()
+                .filter(|lease| dirty_roots.contains(&lease.root_task_id))
+                .cloned()
+                .collect(),
         })
     }
 
@@ -2689,6 +2945,14 @@ impl TaskStore {
             return Err(Self::invalid_projection(
                 "task projection manifest 版本或 generation 不合法",
             ));
+        }
+        let mut manifest = manifest;
+        // 兼容 generation manifest 引入前已经写入的 root 条目：旧 manifest 没有
+        // root generation，旧文件本身使用顶层 generation。
+        for root in &mut manifest.roots {
+            if root.generation == 0 {
+                root.generation = manifest.generation;
+            }
         }
         Ok(manifest)
     }
@@ -3556,6 +3820,9 @@ mod tests {
                 TaskProjectionManifestRoot {
                     root_task_id: projection.root_task_id.clone(),
                     file_name,
+                    generation,
+                    content_hash: TaskStore::projection_content_hash(projection)
+                        .expect("fixture projection hash should compute"),
                 }
             })
             .collect();
@@ -3757,6 +4024,66 @@ mod tests {
         assert_eq!(generations.len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_reuses_unchanged_root_projection_files() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().expect("projection root");
+        let projection_dir = dir.path().join("tasks");
+        let store = TaskStore::new();
+        store
+            .insert_task(rooted_task("root-a", "root-a"))
+            .expect("root a should insert");
+        store
+            .insert_task(rooted_task("root-b", "root-b"))
+            .expect("root b should insert");
+        store
+            .checkpoint_to_projection_directory(&projection_dir)
+            .expect("first generation should commit");
+
+        let first_manifest = TaskStore::read_projection_manifest_if_present(&projection_dir)
+            .expect("manifest should read")
+            .expect("first manifest should exist");
+        let first_generation_dir = projection_dir.join(TASK_PROJECTION_GENERATIONS_DIR).join(
+            TaskStore::generation_directory_name(first_manifest.generation),
+        );
+        let root_a_file = first_generation_dir.join(TaskStore::projection_file_name("root-a"));
+        let root_b_file = first_generation_dir.join(TaskStore::projection_file_name("root-b"));
+        let root_a_inode = fs::metadata(&root_a_file)
+            .expect("root a projection should exist")
+            .ino();
+        let root_b_inode = fs::metadata(&root_b_file)
+            .expect("root b projection should exist")
+            .ino();
+
+        store
+            .update_task_goal(&TaskId::new("root-a"), "updated root a".to_string())
+            .expect("root a goal should update");
+        let mut snapshot = store.snapshot();
+        snapshot.changed_root_ids = vec![TaskId::new("root-a")];
+        TaskStore::checkpoint_snapshot_to_projection_directory(&snapshot, &projection_dir)
+            .expect("second generation should commit");
+
+        let second_manifest = TaskStore::read_projection_manifest_if_present(&projection_dir)
+            .expect("manifest should read")
+            .expect("second manifest should exist");
+        let second_generation_dir = projection_dir.join(TASK_PROJECTION_GENERATIONS_DIR).join(
+            TaskStore::generation_directory_name(second_manifest.generation),
+        );
+        let second_root_a_inode =
+            fs::metadata(second_generation_dir.join(TaskStore::projection_file_name("root-a")))
+                .expect("updated root a projection should exist")
+                .ino();
+        let second_root_b_inode =
+            fs::metadata(second_generation_dir.join(TaskStore::projection_file_name("root-b")))
+                .expect("unchanged root b projection should exist")
+                .ino();
+
+        assert_ne!(second_root_a_inode, root_a_inode);
+        assert_eq!(second_root_b_inode, root_b_inode);
+    }
+
     #[test]
     fn projection_restore_rejects_duplicate_tasks_and_invalid_leases() {
         let duplicate_dir = tempfile::tempdir().expect("duplicate fixture");
@@ -3935,6 +4262,7 @@ mod tests {
                     heartbeat_at: now,
                     lease_status: TaskLeaseState::Active,
                 }],
+                changed_root_ids: Vec::new(),
             };
             let checkpoint_dir = tempfile::tempdir().expect("checkpoint directory");
             let projection_dir = checkpoint_dir.path().join("projection");
@@ -4000,6 +4328,7 @@ mod tests {
         let snapshot = TaskStoreSnapshot {
             tasks: vec![task],
             leases,
+            changed_root_ids: Vec::new(),
         };
         let checkpoint_dir = tempfile::tempdir().expect("checkpoint directory");
         let projection_dir = checkpoint_dir.path().join("projection");
@@ -4128,6 +4457,8 @@ mod tests {
                 roots: vec![TaskProjectionManifestRoot {
                     root_task_id: TaskId::new("root-schema"),
                     file_name: "root-schema.json".to_string(),
+                    generation: 1,
+                    content_hash: String::new(),
                 }],
             })
             .expect("manifest should encode"),

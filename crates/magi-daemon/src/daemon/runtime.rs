@@ -67,6 +67,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock, Weak},
+    time::Instant,
 };
 use tracing::{info, warn};
 
@@ -1628,6 +1629,7 @@ impl DaemonRuntime {
         let task_execution_registry_for_status = task_execution_registry.clone();
         task_store.set_status_change_callback(Box::new(
             move |task_id, old_status, new_status, task: magi_core::Task| {
+                let callback_started_at = Instant::now();
                 if matches!(
                     new_status,
                     TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
@@ -1635,6 +1637,13 @@ impl DaemonRuntime {
                     task_execution_registry_for_status.remove(task_id);
                 }
                 sync_task_plan_status(eb.as_ref(), session_store.as_ref(), &task, new_status);
+                tracing::info!(
+                    target: "magi.performance",
+                    task_id = %task_id,
+                    stage = "task_status_callback_plan_synced",
+                    elapsed_ms = callback_started_at.elapsed().as_millis() as u64,
+                    "conversation response timing"
+                );
                 settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
                 publish_task_status_changed_event(
                     eb.as_ref(),
@@ -1643,6 +1652,13 @@ impl DaemonRuntime {
                     old_status,
                     new_status,
                     &task,
+                );
+                tracing::info!(
+                    target: "magi.performance",
+                    task_id = %task_id,
+                    stage = "task_status_callback_event_published",
+                    elapsed_ms = callback_started_at.elapsed().as_millis() as u64,
+                    "conversation response timing"
                 );
                 if let Err(error) = publish_task_status_turn_item_for_active_sessions(
                     &eb,
@@ -1657,6 +1673,13 @@ impl DaemonRuntime {
                         "任务状态事实写回会话 Turn 失败"
                     );
                 }
+                tracing::info!(
+                    target: "magi.performance",
+                    task_id = %task_id,
+                    stage = "task_status_callback_completed",
+                    elapsed_ms = callback_started_at.elapsed().as_millis() as u64,
+                    "conversation response timing"
+                );
             },
         ));
         let task_store = Arc::new(task_store);

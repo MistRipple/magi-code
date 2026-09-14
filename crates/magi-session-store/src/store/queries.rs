@@ -4,7 +4,7 @@ use crate::models::{
     SessionDurableState, SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
     SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, TimelineEntry,
 };
-use magi_core::{ExecutionOwnership, SessionId};
+use magi_core::{ExecutionOwnership, SessionId, TaskId};
 use std::collections::HashSet;
 
 impl SessionStore {
@@ -564,6 +564,53 @@ impl SessionStore {
             .expect("session state read lock poisoned")
             .execution_sidecar_store
             .active_runtime_sidecars()
+    }
+
+    /// 只返回与指定任务直接相关的活动执行 sidecar。
+    ///
+    /// 任务状态回调是高频路径；全量克隆所有历史 sidecar 会把每个会话的完整
+    /// current turn / tool history 都复制一遍。先在读锁内按任务归属过滤，再只克隆
+    /// 命中的 sidecar，保持原有匹配语义并把复杂度降到活动任务数。
+    pub fn active_execution_sidecars_for_task(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+    ) -> Vec<SessionRuntimeSidecar> {
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .filter(|sidecar| {
+                let active = sidecar.ownership.execution_chain_ref.is_some()
+                    || sidecar.ownership.workspace_id.is_some()
+                    || sidecar.ownership.mission_id.is_some()
+                    || sidecar.ownership.task_id.is_some();
+                if !active {
+                    return false;
+                }
+                let active_chain_matches =
+                    sidecar
+                        .active_execution_chain
+                        .as_ref()
+                        .is_some_and(|chain| {
+                            chain.root_task_id == *root_task_id
+                                || chain.root_task_id == *task_id
+                                || chain
+                                    .active_branch_task_ids
+                                    .iter()
+                                    .any(|active_task_id| active_task_id == task_id)
+                        });
+                let turn_matches = sidecar.current_turn.as_ref().is_some_and(|turn| {
+                    turn.items
+                        .iter()
+                        .any(|item| item.task_id.as_ref() == Some(task_id))
+                });
+                active_chain_matches || turn_matches
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn execution_sidecar_exports(&self) -> Vec<SessionRuntimeSidecarExport> {

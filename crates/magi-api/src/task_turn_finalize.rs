@@ -4,7 +4,7 @@ use magi_conversation_runtime::session_writeback::SessionStatePersistCallback;
 use magi_core::{SessionId, TaskId, public_runtime_excerpt};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const INTERMEDIATE_PERSIST_DEBOUNCE: Duration = Duration::from_millis(100);
 
@@ -107,6 +107,7 @@ impl SessionStatePersistenceScheduler {
         checkpoint: &'static str,
         generation: u64,
     ) -> Result<(), String> {
+        let started_at = Instant::now();
         let _write_guard = self
             .write_lock
             .lock()
@@ -123,6 +124,14 @@ impl SessionStatePersistenceScheduler {
         if let Err(error) = (self.persist)(checkpoint) {
             return Err(format!("checkpoint {checkpoint} 持久化失败：{error}"));
         }
+        tracing::info!(
+            target: "magi.performance",
+            checkpoint,
+            generation,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            stage = "session_persistence_intermediate_completed",
+            "conversation response timing"
+        );
         Ok(())
     }
 
@@ -258,6 +267,16 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
     runner_status: &str,
     expected_turn_id: Option<&str>,
 ) -> Result<bool, String> {
+    let finalize_started_at = Instant::now();
+    tracing::info!(
+        target: "magi.performance",
+        session_id = %session_id,
+        root_task_id = %root_task_id,
+        runner_status,
+        expected_turn_id = expected_turn_id.unwrap_or_default(),
+        stage = "session_terminal_finalize_started",
+        "conversation response timing"
+    );
     let persist_session_state = session_state_persist_callback(state);
     let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
             magi_conversation_runtime::session_turn_finalize::FinalizeBackgroundSessionTaskTurnContext {
@@ -271,6 +290,15 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 persist_session_state: Some(persist_session_state.as_ref()),
             },
         )?;
+    tracing::info!(
+        target: "magi.performance",
+        session_id = %session_id,
+        root_task_id = %root_task_id,
+        finalized,
+        elapsed_ms = finalize_started_at.elapsed().as_millis() as u64,
+        stage = "session_terminal_finalize_core_completed",
+        "conversation response timing"
+    );
     if finalized {
         let owns_active_plan = state
             .session_store

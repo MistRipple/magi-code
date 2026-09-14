@@ -2058,13 +2058,14 @@ impl SessionStore {
         // 触发非法状态转换（例如 Failed→Completed），导致 panic 并毒化整个
         // session state RwLock。因此本函数绝不能从 sidecar.current_turn 反向
         // 重投影 canonical。
+        let session_id = sidecar.session_id.clone();
         let mut state = self
             .state
             .write()
             .expect("session state write lock poisoned");
         upsert_runtime_sidecar_in_state(&mut state, sidecar);
         drop(state);
-        self.mark_sidecar_dirty(reason);
+        self.mark_sidecar_dirty_for_session(Some(&session_id), reason);
     }
 
     fn derive_sidecar_status(
@@ -2179,6 +2180,7 @@ impl SessionStore {
 
     /// 注册新 thread；重复的 `thread_id` 表示恢复/装配状态冲突，必须显式失败。
     pub fn register_thread(&self, thread: ExecutionThread) -> DomainResult<()> {
+        let session_id = thread.session_id.clone();
         {
             let mut state = self
                 .state
@@ -2195,7 +2197,10 @@ impl SessionStore {
             }
             state.thread_registry.push(thread);
         }
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RegisterThread);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::RegisterThread,
+        );
         Ok(())
     }
 
@@ -2242,7 +2247,10 @@ impl SessionStore {
                 .retain(|checkpoint| &checkpoint.thread_id != thread_id);
             state.thread_registry.remove(index)
         };
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RemoveThread);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::RemoveThread,
+        );
         Ok(Some(removed))
     }
 
@@ -2282,7 +2290,10 @@ impl SessionStore {
                 .retain(|checkpoint| &checkpoint.thread_id != thread_id);
             state.thread_registry.remove(index)
         };
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RemoveThread);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::RemoveThread,
+        );
         Ok(Some(removed))
     }
 
@@ -2319,7 +2330,10 @@ impl SessionStore {
             }
             *thread = original;
         }
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RestoreThread);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::RestoreThread,
+        );
         Ok(())
     }
 
@@ -2329,6 +2343,11 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        let session_id = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.session_id.clone());
         if let Some(thread) = state
             .thread_registry
             .iter_mut()
@@ -2339,6 +2358,13 @@ impl SessionStore {
             if !thread.handled_task_ids.iter().any(|id| id == task_id) {
                 thread.handled_task_ids.push(task_id.clone());
             }
+        }
+        drop(state);
+        if let Some(session_id) = session_id {
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
         }
     }
 
@@ -2366,18 +2392,22 @@ impl SessionStore {
             }
             thread.clone()
         };
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RegisterThread);
+        self.mark_sidecar_dirty_for_session(
+            Some(&updated.session_id),
+            SessionSidecarFlushReason::RegisterThread,
+        );
         Ok(updated)
     }
 
     /// 将处理指定 task 且仍为 `Active` 的 thread 原子收口为 `Idle`。
     pub fn mark_task_threads_idle(&self, task_id: &TaskId, now: UtcMillis) -> usize {
-        let settled = {
+        let (settled, session_ids) = {
             let mut state = self
                 .state
                 .write()
                 .expect("session state write lock poisoned");
             let mut settled = 0;
+            let mut session_ids = Vec::new();
             for thread in state.thread_registry.iter_mut().filter(|thread| {
                 thread.status == ExecutionThreadStatus::Active
                     && thread
@@ -2388,11 +2418,19 @@ impl SessionStore {
                 thread.status = ExecutionThreadStatus::Idle;
                 thread.last_used_at = now;
                 settled += 1;
+                session_ids.push(thread.session_id.clone());
             }
-            settled
+            session_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            session_ids.dedup();
+            (settled, session_ids)
         };
         if settled > 0 {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::SettleThread);
+            for session_id in session_ids {
+                self.mark_sidecar_dirty_for_session(
+                    Some(&session_id),
+                    SessionSidecarFlushReason::SettleThread,
+                );
+            }
         }
         settled
     }
@@ -2409,6 +2447,11 @@ impl SessionStore {
                 thread.last_used_at = now;
             }
         }
+        drop(state);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::SettleThread,
+        );
     }
 
     /// 只读快照：用于测试与调试。
@@ -2499,7 +2542,10 @@ impl SessionStore {
             message_history: Vec::new(),
         });
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RegisterThread);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::RegisterThread,
+        );
         (mission_id, thread_id, true)
     }
 
@@ -2614,6 +2660,11 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        let session_id = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.session_id.clone());
         if let Some(thread) = state
             .thread_registry
             .iter_mut()
@@ -2621,6 +2672,13 @@ impl SessionStore {
         {
             thread.observed_context_window_tokens = Some(context_window_tokens);
             thread.last_used_at = now;
+        }
+        drop(state);
+        if let Some(session_id) = session_id {
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
         }
     }
 
@@ -2634,6 +2692,11 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        let session_id = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.session_id.clone());
         let Some(message_count) = state
             .thread_registry
             .iter()
@@ -2663,6 +2726,13 @@ impl SessionStore {
         {
             thread.last_used_at = now;
         }
+        drop(state);
+        if let Some(session_id) = session_id {
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
+        }
     }
 
     /// 安装上下文检查点并显式报告目标 thread 是否存在。
@@ -2676,6 +2746,11 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        let session_id = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.session_id.clone());
         let message_count = state
             .thread_registry
             .iter()
@@ -2704,7 +2779,12 @@ impl SessionStore {
             thread.last_used_at = now;
         }
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RegisterThread);
+        if let Some(session_id) = session_id {
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
+        }
         Ok(())
     }
 
@@ -2732,6 +2812,7 @@ impl SessionStore {
         else {
             return false;
         };
+        let session_id = thread.session_id.clone();
         if thread.message_history.len() != expected_message_count {
             return false;
         }
@@ -2766,6 +2847,11 @@ impl SessionStore {
         {
             thread.last_used_at = now;
         }
+        drop(state);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::RegisterThread,
+        );
         true
     }
 
@@ -2774,9 +2860,23 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        let session_id = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.session_id.clone());
+        let before = state.thread_context_checkpoints.len();
         state
             .thread_context_checkpoints
             .retain(|checkpoint| &checkpoint.thread_id != thread_id);
+        let changed = state.thread_context_checkpoints.len() != before;
+        drop(state);
+        if changed && let Some(session_id) = session_id {
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
+        }
     }
 
     /// P6b：将本轮 task 的 LLM 对话追加到当前 thread 的审计 / 恢复记录。
@@ -2793,6 +2893,11 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        let session_id = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.session_id.clone());
         if let Some(thread) = state
             .thread_registry
             .iter_mut()
@@ -2800,6 +2905,13 @@ impl SessionStore {
         {
             thread.message_history.extend(messages);
             thread.last_used_at = now;
+        }
+        drop(state);
+        if let Some(session_id) = session_id {
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
         }
     }
 
@@ -2816,6 +2928,11 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        let session_id = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.session_id.clone());
         if let Some(thread) = state
             .thread_registry
             .iter_mut()
@@ -2827,6 +2944,13 @@ impl SessionStore {
         state
             .thread_context_checkpoints
             .retain(|checkpoint| &checkpoint.thread_id != thread_id);
+        drop(state);
+        if let Some(session_id) = session_id {
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
+        }
     }
 
     /// 替换 thread transcript，并在目标不存在时显式失败。
@@ -2845,17 +2969,22 @@ impl SessionStore {
             .iter_mut()
             .find(|thread| &thread.thread_id == thread_id)
             .ok_or(DomainError::NotFound { entity: "thread" })?;
+        let session_id = thread.session_id.clone();
         thread.message_history = messages;
         thread.last_used_at = now;
         state
             .thread_context_checkpoints
             .retain(|checkpoint| &checkpoint.thread_id != thread_id);
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::RegisterThread);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::RegisterThread,
+        );
         Ok(())
     }
 
     pub fn bind_execution_ownership(&self, session_id: SessionId, ownership: ExecutionOwnership) {
+        let dirty_session_id = session_id.clone();
         let mut state = self
             .state
             .write()
@@ -2915,7 +3044,10 @@ impl SessionStore {
             },
         );
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::BindExecutionOwnership);
+        self.mark_sidecar_dirty_for_session(
+            Some(&dirty_session_id),
+            SessionSidecarFlushReason::BindExecutionOwnership,
+        );
     }
 
     pub fn accept_current_turn_with_timeline_entry(
@@ -3022,7 +3154,10 @@ impl SessionStore {
                 updated
             },
         )?;
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertCurrentTurn,
+        );
         Ok((entry_id, updated))
     }
 
@@ -3109,7 +3244,10 @@ impl SessionStore {
             .and_then(|sidecar| sidecar.current_turn.as_ref())
             .is_some_and(|turn| turn.status == "failed")
         {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::UpdateCurrentTurnStatus,
+            );
         }
         Ok(updated)
     }
@@ -3253,7 +3391,10 @@ impl SessionStore {
                 Some((item_id, updated))
             },
         )?;
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertCurrentTurn,
+        );
         Ok(updated)
     }
 
@@ -3342,7 +3483,10 @@ impl SessionStore {
                 (updated, superseded_turn)
             },
         )?;
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertCurrentTurn,
+        );
         Ok((entry_id, updated, superseded_turn))
     }
 
@@ -3552,7 +3696,10 @@ impl SessionStore {
                 (updated, canonical_turn)
             },
         )?;
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertActiveExecutionChain,
+        );
         Ok((entry_id, updated, canonical_turn))
     }
 
@@ -3711,7 +3858,10 @@ impl SessionStore {
                     (updated, superseded_turn, accepted_canonical_turn)
                 },
             )?;
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertActiveExecutionChain,
+        );
         Ok((entry_id, updated, superseded_turn, accepted_canonical_turn))
     }
 
@@ -3771,7 +3921,10 @@ impl SessionStore {
                 updated
             },
         )?;
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertActiveExecutionChain,
+        );
         Ok(updated)
     }
 
@@ -3851,7 +4004,10 @@ impl SessionStore {
             },
         );
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::ApplyRecoveryResumeInput);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::ApplyRecoveryResumeInput,
+        );
         Ok(())
     }
 
@@ -3937,7 +4093,10 @@ impl SessionStore {
         };
         upsert_runtime_sidecar_in_state(&mut state, updated.clone());
         drop(state);
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::ApplyResumeExecutionTarget);
+        self.mark_sidecar_dirty_for_session(
+            Some(session_id),
+            SessionSidecarFlushReason::ApplyResumeExecutionTarget,
+        );
         Ok(updated)
     }
 
@@ -4109,7 +4268,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateActiveExecutionBranchSnapshot);
+            self.mark_sidecar_dirty_for_session(
+                Some(&session_id),
+                SessionSidecarFlushReason::UpdateActiveExecutionBranchSnapshot,
+            );
         }
         Ok(updated)
     }
@@ -4175,7 +4337,10 @@ impl SessionStore {
                 updated
             },
         )?;
-        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertCurrentTurn,
+        );
         Ok(updated)
     }
 
@@ -4233,7 +4398,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::AppendCurrentTurnItem,
+            );
         }
         Ok(updated)
     }
@@ -4320,7 +4488,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::AppendCurrentTurnItem,
+            );
         }
         Ok(updated)
     }
@@ -4415,7 +4586,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::AppendCurrentTurnItem,
+            );
         }
         Ok(updated)
     }
@@ -4505,7 +4679,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::UpdateCurrentTurnStatus,
+            );
         }
         Ok(updated)
     }
@@ -4588,7 +4765,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::UpdateCurrentTurnStatus,
+            );
         }
         Ok(updated)
     }
@@ -4758,7 +4938,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::UpdateCurrentTurnStatus,
+            );
         }
         Ok(updated)
     }
@@ -5067,7 +5250,10 @@ impl SessionStore {
             },
         )?;
         if updated_turn_id.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::UpdateCurrentTurnStatus,
+            );
         }
         Ok(updated_turn_id)
     }
@@ -5178,7 +5364,10 @@ impl SessionStore {
             },
         )?;
         if updated.is_some() {
-            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+            self.mark_sidecar_dirty_for_session(
+                Some(session_id),
+                SessionSidecarFlushReason::UpdateCurrentTurnStatus,
+            );
         }
         Ok(updated)
     }
@@ -5290,22 +5479,128 @@ impl SessionStore {
             .lock()
             .expect("session canonical commit lock poisoned");
         let mut persist = persist;
-        let persisted_version = {
+        let (persisted_version, persisted_session_ids) = {
             let state = self.state.read().expect("session state read lock poisoned");
             let durable_snapshot = state.durable_state();
             let sidecar_snapshot = state.execution_sidecar_store.clone();
-            let persisted_version = self
+            let flush_state = self
                 .sidecar_flush_state
                 .read()
-                .expect("session sidecar flush state read lock poisoned")
-                .current_version;
+                .expect("session sidecar flush state read lock poisoned");
+            let persisted_version = flush_state.current_version;
+            let persisted_session_ids = flush_state
+                .dirty_session_versions
+                .iter()
+                .filter_map(|(session_id, version)| {
+                    (*version <= persisted_version).then_some(session_id.clone())
+                })
+                .collect::<Vec<_>>();
             persist(&durable_snapshot, &sidecar_snapshot)?;
-            persisted_version
+            (persisted_version, persisted_session_ids)
         };
         let mut flush_state = self
             .sidecar_flush_state
             .write()
             .expect("session sidecar flush state write lock poisoned");
+        for session_id in persisted_session_ids {
+            if flush_state
+                .dirty_session_versions
+                .get(&session_id)
+                .is_some_and(|version| *version <= persisted_version)
+            {
+                flush_state.dirty_session_versions.remove(&session_id);
+            }
+        }
+        flush_state.flushed_version = flush_state.flushed_version.max(persisted_version);
+        let now = UtcMillis::now();
+        flush_state.last_flush_at = Some(now);
+        if flush_state.current_version == flush_state.flushed_version {
+            flush_state.next_flush_hint = None;
+        } else if flush_state.next_flush_hint.is_none() {
+            flush_state.next_flush_hint = flush_state.last_dirty_at.or(Some(now));
+        }
+        Ok(true)
+    }
+
+    /// 捕获脏 session 的最小持久化快照后再执行写盘。
+    ///
+    /// canonical/persistence 锁只覆盖快照构造，不覆盖文件 fsync；因此后台中间态
+    /// 持久化不会阻塞模型流式写回。canonical event 是追加日志，快照写盘期间若有
+    /// 新事件提交，projection builder 会以日志最新事实重新对齐，下一轮继续收敛。
+    pub fn flush_execution_sidecar_snapshot_with<E, F>(&self, persist: F) -> Result<bool, E>
+    where
+        F: FnMut(
+            &SessionDurableState,
+            &SessionExecutionSidecarStoreState,
+            &[SessionId],
+        ) -> Result<(), E>,
+    {
+        let _flush_guard = self
+            .sidecar_flush_lock
+            .lock()
+            .expect("session sidecar flush lock poisoned");
+        let (persisted_version, dirty_session_ids, durable, sidecars) = {
+            let _persistence_guard = self
+                .durable_persistence_lock
+                .lock()
+                .expect("session durable persistence lock poisoned");
+            let _canonical_guard = self
+                .canonical_commit_lock
+                .lock()
+                .expect("canonical commit lock poisoned");
+            let state = self.state.read().expect("session state read lock poisoned");
+            let flush_state = self
+                .sidecar_flush_state
+                .read()
+                .expect("session sidecar flush state read lock poisoned");
+            if flush_state.current_version == flush_state.flushed_version {
+                return Ok(false);
+            }
+            let persisted_version = flush_state.current_version;
+            let mut dirty_session_ids = flush_state
+                .dirty_session_versions
+                .iter()
+                .filter_map(|(session_id, version)| {
+                    (*version <= persisted_version).then_some(session_id.clone())
+                })
+                .collect::<Vec<_>>();
+            dirty_session_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            let mut durable = SessionDurableState {
+                current_session_id: state.current_session_id.clone(),
+                ..SessionDurableState::default()
+            };
+            for session_id in &dirty_session_ids {
+                durable.append_state_without_current(state.durable_state_for_session(session_id));
+            }
+            let dirty_set = dirty_session_ids.iter().collect::<HashSet<_>>();
+            let sidecars = SessionExecutionSidecarStoreState {
+                runtime_sidecars: state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter()
+                    .filter(|sidecar| dirty_set.contains(&sidecar.session_id))
+                    .cloned()
+                    .collect(),
+            };
+            (persisted_version, dirty_session_ids, durable, sidecars)
+        };
+
+        let mut persist = persist;
+        persist(&durable, &sidecars, &dirty_session_ids)?;
+
+        let mut flush_state = self
+            .sidecar_flush_state
+            .write()
+            .expect("session sidecar flush state write lock poisoned");
+        for session_id in dirty_session_ids {
+            if flush_state
+                .dirty_session_versions
+                .get(&session_id)
+                .is_some_and(|version| *version <= persisted_version)
+            {
+                flush_state.dirty_session_versions.remove(&session_id);
+            }
+        }
         flush_state.flushed_version = flush_state.flushed_version.max(persisted_version);
         let now = UtcMillis::now();
         flush_state.last_flush_at = Some(now);

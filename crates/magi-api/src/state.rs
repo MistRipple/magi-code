@@ -301,6 +301,16 @@ pub struct RunnerManager {
 /// Number of runner cycles between periodic checkpoints.
 const CHECKPOINT_INTERVAL_CYCLES: u64 = 5;
 
+fn task_checkpoint_is_already_durable(task_store: &TaskStore, root_task_id: &TaskId) -> bool {
+    task_store.has_checkpoint_callback()
+        && task_store
+            .get_task(root_task_id)
+            .and_then(|task| task.policy_snapshot)
+            .is_some_and(|policy| {
+                matches!(policy.checkpoint_mode.as_str(), "turn" | "task_or_phase")
+            })
+}
+
 fn fail_runner_for_checkpoint_error(
     handle: &RunnerHandle,
     active: &AtomicBool,
@@ -551,22 +561,33 @@ impl RunnerManager {
 
                 // Checkpoint policy consumption (design 3.2).
                 if let Some(ref persist) = bg_checkpoint_persist {
-                    let should_checkpoint =
-                        if let Some(root_task) = bg_task_store.get_task(&root_id) {
-                            if let Some(ref policy) = root_task.policy_snapshot {
-                                match policy.checkpoint_mode.as_str() {
-                                    "turn" => true,
-                                    "task_or_phase" => task_runner.take_checkpoint_signal(),
-                                    _ => cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES),
-                                }
-                            } else {
-                                cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES)
+                    let should_checkpoint = if let Some(root_task) =
+                        bg_task_store.get_task(&root_id)
+                    {
+                        if let Some(ref policy) = root_task.policy_snapshot {
+                            match policy.checkpoint_mode.as_str() {
+                                // TaskStore 的每次状态变更已经在提交前触发 checkpoint；
+                                // Runner 只需消费变更信号，不能按 100ms 调度周期重复
+                                // 重写整个任务投影。
+                                "turn" | "task_or_phase" => task_runner.take_checkpoint_signal(),
+                                _ => cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES),
                             }
                         } else {
                             cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES)
-                        };
+                        }
+                    } else {
+                        cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES)
+                    };
                     if should_checkpoint {
-                        if let Err(error) = persist(&bg_task_store.snapshot()) {
+                        // TaskStore 的 turn/task_or_phase 变更已经在状态提交前通过
+                        // checkpoint callback 增量落盘。这里只消费 Runner 信号，避免
+                        // AllComplete 分支再次序列化全部历史 root；没有该 callback
+                        // 的嵌入/测试运行时继续使用 Runner checkpoint 兜底。
+                        let checkpoint_is_already_durable =
+                            task_checkpoint_is_already_durable(&bg_task_store, &root_id);
+                        if !checkpoint_is_already_durable
+                            && let Err(error) = persist(&bg_task_store.snapshot())
+                        {
                             fail_runner_for_checkpoint_error(
                                 bg_handle.as_ref(),
                                 bg_active.as_ref(),
@@ -601,6 +622,7 @@ impl RunnerManager {
                     }
                     RunCycleOutcome::AllComplete => {
                         if !checkpointed_this_cycle
+                            && !task_checkpoint_is_already_durable(&bg_task_store, &root_id)
                             && let Some(ref persist) = bg_checkpoint_persist
                             && let Err(error) = persist(&bg_task_store.snapshot())
                         {
@@ -3778,16 +3800,19 @@ impl ApiState {
     }
 
     pub fn persist_runtime_durable_state(&self) -> Result<(), ApiError> {
-        self.persist_session_projection()?;
+        // session projection 的 workspace 路径依赖已落盘的 workspace 注册事实；
+        // 先写 workspace 可避免恢复失败回滚时把刚注册的 workspace 误判为悬空引用。
         self.persist_workspace_durable_state()?;
+        self.persist_session_projection()?;
         self.persist_knowledge_state()?;
         self.persist_session_git_contexts()?;
         Ok(())
     }
 
     pub fn persist_runtime_durable_state_for_api(&self) -> Result<(), ApiError> {
-        self.persist_session_projection_for_api()?;
+        // 保持 workspace 注册事实先于引用它的 session projection 落盘。
         self.persist_workspace_durable_state_for_api()?;
+        self.persist_session_projection_for_api()?;
         self.persist_knowledge_state_for_api()?;
         Ok(())
     }
@@ -5415,6 +5440,40 @@ mod tests {
         }
     }
 
+    struct CompletingDispatcher {
+        result_receiver: Arc<EventBasedResultReceiver>,
+    }
+
+    impl TaskDispatcher for CompletingDispatcher {
+        fn dispatch(
+            &self,
+            task: &Task,
+            _worker: &WorkerInfo,
+            lease: &TaskLease,
+            _admission_permit: magi_conversation_runtime::execution_admission::ExecutionAdmissionPermit,
+        ) -> Result<(), String> {
+            self.result_receiver.push_result(
+                magi_conversation_runtime::task_runner_bridge::TaskResult {
+                    task_id: task.task_id.clone(),
+                    lease_id: lease.lease_id.clone(),
+                    outcome:
+                        magi_conversation_runtime::task_runner_bridge::TaskOutcome::Completed {
+                            attempt: magi_core::TaskCompletionAttempt {
+                                output_refs: vec![
+                                    "runner checkpoint deduplication verified".to_string(),
+                                ],
+                                final_response: Some(
+                                    "runner checkpoint deduplication verified".to_string(),
+                                ),
+                                evidence: Vec::new(),
+                            },
+                        },
+                },
+            );
+            Ok(())
+        }
+    }
+
     struct PanickingDispatcher;
 
     impl TaskDispatcher for PanickingDispatcher {
@@ -5868,6 +5927,88 @@ mod tests {
                 .expect("runner status should remain inspectable")
                 .status,
             "error"
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_does_not_repeat_full_checkpoint_after_task_store_checkpoint() {
+        let store = Arc::new(TaskStore::new());
+        let task_id = TaskId::new("task-runner-checkpoint-dedup");
+        let mut task = task_with_status(task_id.as_str(), TaskStatus::Pending);
+        task.root_task_id = task_id.clone();
+        store.insert_task(task).expect("pending root should insert");
+
+        let task_store_checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checkpoint_count_for_callback = task_store_checkpoint_count.clone();
+        store.set_checkpoint_callback(Box::new(move |_| {
+            checkpoint_count_for_callback.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        // 让 root 使用生产默认的 `turn` checkpoint 策略。
+        store
+            .update_status_checked(&task_id, TaskStatus::Pending)
+            .expect("pending policy should freeze");
+
+        let result_receiver = Arc::new(EventBasedResultReceiver::new());
+        let runner_checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner_checkpoint_count_for_callback = runner_checkpoint_count.clone();
+        let observed_terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_terminal_for_callback = observed_terminal.clone();
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store.clone(),
+            Arc::new(SessionStore::new()),
+            Arc::new(|| {
+                vec![WorkerInfo {
+                    worker_id: WorkerId::new("worker-runner-checkpoint-dedup"),
+                    role: "executor".to_string(),
+                    supported_kinds: vec![TaskKind::LocalAgent],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                }]
+            }),
+            Arc::new(CompletingDispatcher {
+                result_receiver: result_receiver.clone(),
+            }),
+            result_receiver,
+        )
+        .with_checkpoint_persist(Arc::new(move |_| {
+            runner_checkpoint_count_for_callback.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }))
+        .with_terminal_observer(move |_task_id, _session_id, status, _turn_id| {
+            if status == "completed" {
+                observed_terminal_for_callback.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let handle = manager
+            .start(task_id.as_str(), None)
+            .await
+            .expect("runner should start");
+        for _ in 0..100 {
+            if observed_terminal.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(observed_terminal.load(Ordering::SeqCst));
+        assert!(!handle.active.load(Ordering::SeqCst));
+        assert_eq!(
+            store
+                .get_task(&task_id)
+                .expect("completed root should remain")
+                .status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            runner_checkpoint_count.load(Ordering::SeqCst),
+            0,
+            "TaskStore callback 已完成 turn checkpoint，Runner 不应再写全量快照"
+        );
+        assert!(
+            task_store_checkpoint_count.load(Ordering::SeqCst) >= 3,
+            "租约和终态变更必须仍由 TaskStore callback 持久化"
         );
     }
 
