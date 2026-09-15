@@ -311,7 +311,7 @@ impl SessionTurnCoordinator {
             } => {
                 let turn_id = admission.turn_id.clone();
                 let profile = admission.profile;
-                self.restore_active(session_id, admission, attempt_id.clone(), status);
+                self.restore_active_internal(session_id, admission, attempt_id.clone(), status);
                 Ok(CoordinatorCommandResult::Attempt(TurnAttempt {
                     turn_id,
                     attempt_id,
@@ -726,7 +726,26 @@ impl SessionTurnCoordinator {
     }
 
     /// 将已恢复的 attempt 作为当前活动 Turn 注册。保留旧入口供恢复代码使用。
+    /// 兼容已有恢复调用方，但实际通过统一 Recover command 建立活动身份。
     pub fn restore_active(
+        &self,
+        session_id: &SessionId,
+        admission: TurnAdmission,
+        attempt_id: String,
+        status: CoordinatorTurnStatus,
+    ) {
+        self.execute_command(
+            session_id,
+            TurnCommand::Recover {
+                admission,
+                attempt_id,
+                status,
+            },
+        )
+        .expect("Coordinator Recover command must restore active Turn");
+    }
+
+    fn restore_active_internal(
         &self,
         session_id: &SessionId,
         admission: TurnAdmission,
@@ -965,6 +984,28 @@ mod tests {
             coordinator.terminal_status(&session, &previous),
             Some(CoordinatorTurnStatus::Failed)
         );
+    }
+
+    #[test]
+    fn recover_command_restores_active_attempt() {
+        let coordinator = SessionTurnCoordinator::new();
+        let session = SessionId::new("session-command-recover");
+        coordinator.restore_active(
+            &session,
+            TurnAdmission {
+                turn_id: "turn-command-recover".to_string(),
+                request_id: "request-command-recover".to_string(),
+                request_fingerprint: "fp-command-recover".to_string(),
+                profile: ExecutionProfile::Task,
+            },
+            "attempt-command-recover".to_string(),
+            CoordinatorTurnStatus::Running,
+        );
+        let attempt = coordinator
+            .current_attempt(&session, "turn-command-recover")
+            .expect("Recover command should restore active attempt");
+        assert_eq!(attempt.attempt_id, "attempt-command-recover");
+        assert_eq!(attempt.profile, ExecutionProfile::Task);
     }
 
     #[test]
