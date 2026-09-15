@@ -28,7 +28,7 @@ use magi_browser_authority::{
     BrowserSurfaceControlSnapshot,
 };
 use magi_conversation_runtime::{
-    ConversationRegistry,
+    ConversationRegistry, TaskCompletionNotifier,
     execution_admission::{ExecutionAdmissionController, ExecutionAdmissionSnapshot},
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
@@ -129,8 +129,6 @@ pub struct RunnerHandle {
     join_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-type RunnerTerminalObserver =
-    Arc<dyn Fn(TaskId, Option<SessionId>, String, Option<String>) + Send + Sync>;
 pub type TaskCheckpointPersist = Arc<dyn Fn(&TaskStoreSnapshot) -> DomainResult<()> + Send + Sync>;
 pub type CanonicalEventNextSequenceProvider =
     Arc<dyn Fn(&SessionId) -> Result<u64, String> + Send + Sync>;
@@ -295,7 +293,6 @@ pub struct RunnerManager {
     /// Maps a session to the root task IDs whose runners should be killed
     /// when the session is closed (design 1.5: Session-Runner linkage).
     session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
-    terminal_observer: Option<RunnerTerminalObserver>,
 }
 
 /// Number of runner cycles between periodic checkpoints.
@@ -314,10 +311,6 @@ fn task_checkpoint_is_already_durable(task_store: &TaskStore, root_task_id: &Tas
 fn fail_runner_for_checkpoint_error(
     handle: &RunnerHandle,
     active: &AtomicBool,
-    root_task_id: &TaskId,
-    session_id: &Option<SessionId>,
-    turn_id: &Option<String>,
-    terminal_observer: Option<&RunnerTerminalObserver>,
     error: &DomainError,
 ) {
     let message = format!("任务 checkpoint 持久化失败: {error}");
@@ -327,14 +320,6 @@ fn fail_runner_for_checkpoint_error(
         .lock()
         .expect("last_error lock should hold") = Some(message);
     active.store(false, Ordering::Relaxed);
-    if let Some(observer) = terminal_observer {
-        observer(
-            root_task_id.clone(),
-            session_id.clone(),
-            "error".to_string(),
-            turn_id.clone(),
-        );
-    }
 }
 
 impl RunnerManager {
@@ -359,7 +344,6 @@ impl RunnerManager {
             result_receiver,
             checkpoint_persist: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
-            terminal_observer: None,
         }
     }
 
@@ -419,14 +403,6 @@ impl RunnerManager {
         self
     }
 
-    pub fn with_terminal_observer(
-        mut self,
-        observer: impl Fn(TaskId, Option<SessionId>, String, Option<String>) + Send + Sync + 'static,
-    ) -> Self {
-        self.terminal_observer = Some(Arc::new(observer));
-        self
-    }
-
     /// Get a reference to the shared result receiver.
     ///
     /// This is used by the daemon to wire the TaskStore's status-change
@@ -470,15 +446,6 @@ impl RunnerManager {
             }
         }
 
-        // runner 的终态回调可能在用户停止并提交下一轮后才到达；回调必须携带
-        // 启动时绑定的 Turn，而不能在回调时重新读取 session 的 current_turn。
-        let observer_turn_id = session_id.as_ref().and_then(|session_id| {
-            self.session_store
-                .runtime_sidecar(session_id)
-                .and_then(|sidecar| sidecar.current_turn)
-                .map(|turn| turn.turn_id)
-        });
-
         let mut runners = self.runners.lock().expect("runners lock should hold");
         if let Some(existing) = runners.get(root_task_id)
             && existing.active.load(Ordering::Relaxed)
@@ -495,14 +462,12 @@ impl RunnerManager {
             join_handle: Mutex::new(None),
         });
 
-        let observer_session_id = session_id.clone();
         let task_runner = Arc::new(self.build_task_runner(session_id.clone()));
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
         let bg_active = Arc::clone(&handle.active);
         let bg_task_store = Arc::clone(&self.task_store);
         let bg_checkpoint_persist = self.checkpoint_persist.clone();
-        let terminal_observer = self.terminal_observer.clone();
         let join_handle = tokio::spawn(async move {
             let mut waiting_streak = 0u32;
             loop {
@@ -591,10 +556,6 @@ impl RunnerManager {
                             fail_runner_for_checkpoint_error(
                                 bg_handle.as_ref(),
                                 bg_active.as_ref(),
-                                &root_id,
-                                &observer_session_id,
-                                &observer_turn_id,
-                                terminal_observer.as_ref(),
                                 &error,
                             );
                             break;
@@ -629,10 +590,6 @@ impl RunnerManager {
                             fail_runner_for_checkpoint_error(
                                 bg_handle.as_ref(),
                                 bg_active.as_ref(),
-                                &root_id,
-                                &observer_session_id,
-                                &observer_turn_id,
-                                terminal_observer.as_ref(),
                                 &error,
                             );
                             break;
@@ -640,14 +597,6 @@ impl RunnerManager {
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "completed".to_string();
                         bg_active.store(false, Ordering::Relaxed);
-                        if let Some(observer) = terminal_observer.as_ref() {
-                            observer(
-                                root_id.clone(),
-                                observer_session_id.clone(),
-                                "completed".to_string(),
-                                observer_turn_id.clone(),
-                            );
-                        }
                         break;
                     }
                     RunCycleOutcome::Waiting => {
@@ -675,10 +624,6 @@ impl RunnerManager {
                             fail_runner_for_checkpoint_error(
                                 bg_handle.as_ref(),
                                 bg_active.as_ref(),
-                                &root_id,
-                                &observer_session_id,
-                                &observer_turn_id,
-                                terminal_observer.as_ref(),
                                 &error,
                             );
                             break;
@@ -686,14 +631,6 @@ impl RunnerManager {
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = runner_status.to_string();
                         bg_active.store(false, Ordering::Relaxed);
-                        if let Some(observer) = terminal_observer.as_ref() {
-                            observer(
-                                root_id.clone(),
-                                observer_session_id.clone(),
-                                runner_status.to_string(),
-                                observer_turn_id.clone(),
-                            );
-                        }
                         break;
                     }
                     RunCycleOutcome::Blocked { reason, .. } => {
@@ -713,6 +650,26 @@ impl RunnerManager {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     RunCycleOutcome::Error(err) => {
+                        // A cycle can stop because a child task failed or no
+                        // worker could proceed while the root itself is still
+                        // Pending/Running.  Persist that root failure through
+                        // TaskStore before notifying the Turn side; otherwise
+                        // removing Runner's terminal observer would leave a
+                        // non-terminal task with no durable completion fact.
+                        if bg_task_store.get_task(&root_id).is_some_and(|task| {
+                            matches!(
+                                task.status,
+                                magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+                            )
+                        }) && let Err(close_error) =
+                            task_runner.finalize_unexpected_failure(&root_id, &err)
+                        {
+                            tracing::error!(
+                                root_task_id = %root_id,
+                                %close_error,
+                                "Runner error 后根任务收口失败"
+                            );
+                        }
                         if !checkpointed_this_cycle
                             && let Some(ref persist) = bg_checkpoint_persist
                             && let Err(error) = persist(&bg_task_store.snapshot())
@@ -720,10 +677,6 @@ impl RunnerManager {
                             fail_runner_for_checkpoint_error(
                                 bg_handle.as_ref(),
                                 bg_active.as_ref(),
-                                &root_id,
-                                &observer_session_id,
-                                &observer_turn_id,
-                                terminal_observer.as_ref(),
                                 &error,
                             );
                             break;
@@ -736,14 +689,6 @@ impl RunnerManager {
                             .expect("last_error lock should hold");
                         *last_error = Some(err);
                         bg_active.store(false, Ordering::Relaxed);
-                        if let Some(observer) = terminal_observer.as_ref() {
-                            observer(
-                                root_id.clone(),
-                                observer_session_id.clone(),
-                                "error".to_string(),
-                                observer_turn_id.clone(),
-                            );
-                        }
                         break;
                     }
                 }
@@ -1335,6 +1280,10 @@ pub struct ApiState {
     execution_pipeline: Option<ExecutionPipeline>,
     task_execution_registry: TaskExecutionRegistry,
     task_store: Option<Arc<TaskStore>>,
+    /// TaskStore terminal transitions are routed through this notifier before
+    /// they reach the Turn finalizer.  It is optional for lightweight test
+    /// states that do not construct a task runtime.
+    task_completion_notifier: Option<Arc<TaskCompletionNotifier>>,
     runner_manager: Option<Arc<RunnerManager>>,
     session_turn_dispatcher: Option<Arc<LlmTaskDispatcher>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
@@ -1359,6 +1308,8 @@ pub struct ApiState {
     pub tunnel_manager: crate::tunnel::TunnelManager,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
+    /// Session Turn 的单一生命周期所有者。只保存轻量身份与 attempt，不复制正文。
+    pub turn_coordinator: Arc<magi_conversation_runtime::SessionTurnCoordinator>,
     pub(crate) terminal_sessions: crate::terminal_runtime::TerminalSessionManager,
     /// 任务系统：AgentRole 注册表（替代 task_worker_catalog 硬编码 prompt）。
     /// 加载策略：`~/.magi/roles/*.md` 与 crate 内置 builtin 集合并加载。
@@ -1861,6 +1812,7 @@ impl ApiState {
             execution_pipeline: None,
             task_execution_registry: TaskExecutionRegistry::default(),
             task_store: None,
+            task_completion_notifier: None,
             runner_manager: None,
             session_turn_dispatcher: None,
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
@@ -1885,6 +1837,7 @@ impl ApiState {
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry: Arc::new(ConversationRegistry::new()),
+            turn_coordinator: Arc::new(magi_conversation_runtime::SessionTurnCoordinator::new()),
             terminal_sessions: crate::terminal_runtime::TerminalSessionManager::default(),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             role_configuration_lock: Arc::new(Mutex::new(())),
@@ -3852,6 +3805,15 @@ impl ApiState {
         self
     }
 
+    pub fn with_task_completion_notifier(mut self, notifier: Arc<TaskCompletionNotifier>) -> Self {
+        self.task_completion_notifier = Some(notifier);
+        self
+    }
+
+    pub fn task_completion_notifier(&self) -> Option<&Arc<TaskCompletionNotifier>> {
+        self.task_completion_notifier.as_ref()
+    }
+
     pub fn with_task_execution_registry(mut self, registry: TaskExecutionRegistry) -> Self {
         self.task_execution_registry = registry;
         self
@@ -3883,6 +3845,41 @@ impl ApiState {
 
     pub fn session_turn_dispatcher(&self) -> Option<&Arc<LlmTaskDispatcher>> {
         self.session_turn_dispatcher.as_ref()
+    }
+
+    pub fn turn_coordinator(&self) -> &Arc<magi_conversation_runtime::SessionTurnCoordinator> {
+        &self.turn_coordinator
+    }
+
+    /// 从 SessionStore 的 canonical Turn projection 恢复 Coordinator 的轻量身份索引。
+    ///
+    /// canonical event 是重启后的唯一事实来源；这里只恢复 requestId、fingerprint、
+    /// profile、attempt 和生命周期状态，不复制 Turn 正文，也不会自动重新发起上游
+    /// Provider 请求。活动 Turn 的执行是否可继续由各 profile 的恢复调度器决定。
+    pub fn restore_turn_coordinator_from_session_store(&self) -> usize {
+        let mut restored = 0;
+        for session_id in self.session_store.session_index() {
+            let mut turns = self.session_store.canonical_turns_for_session(&session_id);
+            // 先恢复最新 Turn：Coordinator 只允许一个 active 槽位，旧的异常
+            // 非终态事实不能覆盖当前 canonical 轮次。终态 Turn 仍会全部进入
+            // request replay 索引，供重试返回原 receipt。
+            turns.sort_by(|left, right| {
+                right
+                    .turn_seq
+                    .cmp(&left.turn_seq)
+                    .then_with(|| right.accepted_at.0.cmp(&left.accepted_at.0))
+                    .then_with(|| right.turn_id.cmp(&left.turn_id))
+            });
+            for turn in turns {
+                if self
+                    .turn_coordinator
+                    .restore_canonical_turn(&session_id, &turn)
+                {
+                    restored += 1;
+                }
+            }
+        }
+        restored
     }
 
     pub(crate) async fn lock_session_turn(
@@ -5857,14 +5854,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_panic_fails_root_task_and_notifies_terminal_observer() {
+    async fn runner_panic_fails_root_task_and_stops_with_error() {
         let store = Arc::new(TaskStore::new());
         let root_task_id = "task-runner-cycle-panic";
         let mut root_task = task_with_status(root_task_id, TaskStatus::Pending);
         root_task.root_task_id = root_task.task_id.clone();
         store.insert_task(root_task).expect("根任务应插入");
-        let observed_status = Arc::new(Mutex::new(None));
-        let observed_status_for_observer = observed_status.clone();
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
             store.clone(),
             Arc::new(SessionStore::new()),
@@ -5879,34 +5874,19 @@ mod tests {
             }),
             Arc::new(PanickingDispatcher),
             Arc::new(EventBasedResultReceiver::new()),
-        )
-        .with_terminal_observer(move |_task_id, _session_id, status, _turn_id| {
-            *observed_status_for_observer
-                .lock()
-                .expect("observer status lock should not poison") = Some(status);
-        });
+        );
 
-        manager
+        let handle = manager
             .start_after_quiesce(root_task_id, None)
             .expect("runner should start");
         for _ in 0..20 {
-            if observed_status
-                .lock()
-                .expect("observer status lock should not poison")
-                .is_some()
-            {
+            if !handle.active.load(Ordering::Relaxed) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(
-            observed_status
-                .lock()
-                .expect("observer status lock should not poison")
-                .as_deref(),
-            Some("error")
-        );
+        assert!(!handle.active.load(Ordering::Relaxed));
         assert_eq!(
             store
                 .get_task(&TaskId::new(root_task_id))
@@ -5952,8 +5932,6 @@ mod tests {
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
         let runner_checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let runner_checkpoint_count_for_callback = runner_checkpoint_count.clone();
-        let observed_terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let observed_terminal_for_callback = observed_terminal.clone();
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
             store.clone(),
             Arc::new(SessionStore::new()),
@@ -5974,25 +5952,19 @@ mod tests {
         .with_checkpoint_persist(Arc::new(move |_| {
             runner_checkpoint_count_for_callback.fetch_add(1, Ordering::SeqCst);
             Ok(())
-        }))
-        .with_terminal_observer(move |_task_id, _session_id, status, _turn_id| {
-            if status == "completed" {
-                observed_terminal_for_callback.store(true, Ordering::SeqCst);
-            }
-        });
+        }));
 
         let handle = manager
             .start(task_id.as_str(), None)
             .await
             .expect("runner should start");
         for _ in 0..100 {
-            if observed_terminal.load(Ordering::SeqCst) {
+            if !handle.active.load(Ordering::SeqCst) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert!(observed_terminal.load(Ordering::SeqCst));
         assert!(!handle.active.load(Ordering::SeqCst));
         assert_eq!(
             store
@@ -6021,8 +5993,6 @@ mod tests {
         store
             .insert_task(root_task)
             .expect("completed root should insert before runner starts");
-        let observed_statuses = Arc::new(Mutex::new(Vec::<String>::new()));
-        let observed_statuses_for_observer = observed_statuses.clone();
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
             store,
             Arc::new(SessionStore::new()),
@@ -6036,13 +6006,7 @@ mod tests {
             Err(DomainError::Persistence {
                 message: "checkpoint unavailable".to_string(),
             })
-        }))
-        .with_terminal_observer(move |_task_id, _session_id, status, _turn_id| {
-            observed_statuses_for_observer
-                .lock()
-                .expect("observer statuses lock should not poison")
-                .push(status);
-        });
+        }));
 
         let handle = manager
             .start(root_task_id, None)
@@ -6067,13 +6031,6 @@ mod tests {
                 .expect("last error should lock")
                 .as_deref()
                 .is_some_and(|error| error.contains("checkpoint 持久化失败"))
-        );
-        assert_eq!(
-            observed_statuses
-                .lock()
-                .expect("observer statuses should lock")
-                .as_slice(),
-            ["error"]
         );
     }
 

@@ -849,6 +849,11 @@ pub struct TurnStartResult {
     #[serde(rename = "createdSession")]
     pub created_session: bool,
     pub route: Option<TurnStartRoute>,
+    #[serde(rename = "executionProfile")]
+    pub execution_profile: Option<String>,
+    pub status: Option<String>,
+    #[serde(rename = "eventSequence")]
+    pub event_sequence: Option<u64>,
     #[serde(rename = "sessionSummary")]
     pub session_summary: Option<SessionSummary>,
     #[serde(rename = "userMessageItemId")]

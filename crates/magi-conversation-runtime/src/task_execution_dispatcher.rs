@@ -21,11 +21,13 @@ use crate::{
     session_images::SessionTurnImage,
     session_turn_execution::{
         BUSINESS_MODEL_PROVIDER, SessionTurnExecutionError, SessionTurnExecutionOutput,
-        SessionTurnExecutionRequest, SessionTurnExecutionRuntime, run_session_turn_execution,
+        SessionTurnExecutionRequest, SessionTurnExecutionRuntime, TurnTerminalCommitPolicy,
+        run_session_turn_execution, run_session_turn_execution_without_terminal_commit,
     },
     session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
     session_writeback::SessionStatePersistCallback,
     skill_apply_tool_definition,
+    task_completion_notifier::TaskCompletionNotifier,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_role_id},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
@@ -132,6 +134,7 @@ pub struct LlmTaskDispatcher {
     session_store: Arc<SessionStore>,
     execution_registry: TaskExecutionRegistry,
     result_receiver: Arc<EventBasedResultReceiver>,
+    completion_notifier: Option<Arc<TaskCompletionNotifier>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     /// 按设置事实源代际复用角色模型客户端。HTTP 连接池由 bridge-client 继续统一持有，
     /// 这里只避免每个 Turn 重复解析配置和构造同一角色包装器。
@@ -470,6 +473,7 @@ impl LlmTaskDispatcher {
             session_store,
             execution_registry,
             result_receiver,
+            completion_notifier: None,
             model_bridge_client: None,
             model_client_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_definition_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -503,6 +507,13 @@ impl LlmTaskDispatcher {
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
         self.model_bridge_client = Some(client);
+        self
+    }
+
+    /// 配置主动 Task 完成通知。生产 daemon 在 Worker 结果到达时先提交 TaskStore，
+    /// 再由该通知器唤醒 Turn 侧；未配置时仅保留测试用的结果接收器。
+    pub fn with_completion_notifier(mut self, notifier: Arc<TaskCompletionNotifier>) -> Self {
+        self.completion_notifier = Some(notifier);
         self
     }
 
@@ -666,7 +677,7 @@ impl LlmTaskDispatcher {
         });
     }
 
-    fn execute_dispatch_plan(&self, input: DispatchPlanExecutionInput<'_>) {
+    fn execute_dispatch_plan(&self, input: DispatchPlanExecutionInput<'_>) -> TaskOutcome {
         let DispatchPlanExecutionInput {
             task,
             lease_id,
@@ -687,7 +698,6 @@ impl LlmTaskDispatcher {
             system_prompt,
             execution_settings_snapshot,
         } = input;
-        let task_id = &task.task_id;
         let _worktree_cleanup = AgentWorktreeCleanup {
             dispatcher: self.clone(),
             task: task.clone(),
@@ -721,19 +731,22 @@ impl LlmTaskDispatcher {
             let should_enrich_session = !writebacks.is_empty();
             writebacks.apply(&self.pipeline.memory_store);
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
-            self.push_result(task_id, lease_id, outcome.clone());
+            // 完成通知可能立即推进同一 Session 的队列，因此必须先释放
+            // 代理 worktree 与临时资源，再提交 TaskStore durable completion。
+            drop(_worktree_cleanup);
             if should_enrich_session {
                 self.schedule_post_completion_enrichment(
                     session_id,
                     turn_id,
                     workspace_id,
-                    outcome,
+                    outcome.clone(),
                     execution_settings_snapshot,
                 );
             }
-            return;
+            return outcome;
         }
-        self.push_result(task_id, lease_id, outcome);
+        drop(_worktree_cleanup);
+        outcome
     }
 
     fn schedule_post_completion_enrichment(
@@ -2177,6 +2190,25 @@ impl LlmTaskDispatcher {
         &self,
         request: SessionTurnExecutionRequest,
     ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
+        self.execute_session_turn_with_policy(request, TurnTerminalCommitPolicy::Executor)
+    }
+
+    /// 执行不创建 TaskStore 的 Conversation Turn。
+    ///
+    /// 上下文、Provider 和历史装配仍复用同一 dispatcher，但终态提交策略显式交给
+    /// SessionTurnCoordinator，避免普通对话同时由执行器和 API finalizer 收口。
+    pub fn execute_conversation_turn(
+        &self,
+        request: SessionTurnExecutionRequest,
+    ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
+        self.execute_session_turn_with_policy(request, TurnTerminalCommitPolicy::Coordinator)
+    }
+
+    fn execute_session_turn_with_policy(
+        &self,
+        request: SessionTurnExecutionRequest,
+        terminal_policy: TurnTerminalCommitPolicy,
+    ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
         let plan_store =
             magi_plan::PlanStore::new(self.session_store.clone(), request.session_id.clone());
         let execution_settings_snapshot = self.execution_settings_snapshot();
@@ -2272,7 +2304,13 @@ impl LlmTaskDispatcher {
             );
             selection.render_for_prompt()
         });
-        run_session_turn_execution(SessionTurnExecutionRuntime {
+        let run = match terminal_policy {
+            TurnTerminalCommitPolicy::Executor => run_session_turn_execution,
+            TurnTerminalCommitPolicy::Coordinator => {
+                run_session_turn_execution_without_terminal_commit
+            }
+        };
+        run(SessionTurnExecutionRuntime {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
@@ -2531,6 +2569,14 @@ impl LlmTaskDispatcher {
                 execution_settings_snapshot,
                 ..
             } => {
+                if let Some(notifier) = self.completion_notifier.as_ref() {
+                    notifier.bind_lease_context(
+                        &task.task_id,
+                        lease.lease_id.as_str(),
+                        Some(session_id.clone()),
+                        Some(turn_id.clone()),
+                    );
+                }
                 self.publish_task_dispatched_event(TaskDispatchedEventInput {
                     task_id: &task.task_id,
                     mission_id: &task.mission_id,
@@ -2540,7 +2586,7 @@ impl LlmTaskDispatcher {
                     session_id: Some(&session_id),
                     workspace_id: workspace_id.as_ref(),
                 });
-                self.execute_dispatch_plan(DispatchPlanExecutionInput {
+                let outcome = self.execute_dispatch_plan(DispatchPlanExecutionInput {
                     task,
                     lease_id: &lease.lease_id,
                     session_id,
@@ -2584,6 +2630,10 @@ impl LlmTaskDispatcher {
                     },
                     execution_settings_snapshot,
                 });
+                // 完成通知可能立即触发 session 队列出队。先释放当前任务的
+                // execution plan，再提交 TaskStore 终态，避免下一轮观察到旧计划。
+                drop(_plan_cleanup);
+                self.push_result(&task.task_id, &lease.lease_id, outcome);
             }
         }
 

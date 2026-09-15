@@ -71,7 +71,8 @@ use crate::{
 };
 use magi_bridge_client::{
     BridgeClientError, ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER,
-    ModelBridgeClient, ModelInvocationRequest, ModelResponseStatus, ModelStreamingDelta,
+    ModelBridgeClient, ModelInvocationRequest, ModelProviderContext, ModelResponseStatus,
+    ModelStreamingDelta,
 };
 use magi_core::{
     EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskCompletionAttempt,
@@ -265,14 +266,15 @@ pub(crate) fn chat_message_to_thread_chat_message(message: &ChatMessage) -> Thre
 pub(crate) fn append_thread_messages_checkpoint(
     session_store: &SessionStore,
     thread_id: &ThreadId,
-    messages: Vec<ThreadChatMessage>,
+    _messages: Vec<ThreadChatMessage>,
     persist_session_state: Option<&SessionStatePersistCallback>,
     checkpoint: &'static str,
 ) -> Result<(), String> {
-    if messages.is_empty() {
-        return Ok(());
-    }
-    session_store.append_thread_messages(thread_id, messages, UtcMillis::now());
+    // 参数只作为旧数据迁移输入；新 Turn 一旦存在 canonical item，provider/tool
+    // 回调提供的 messages 会被忽略，ThreadChatMessage 始终只是 projection。
+    session_store
+        .rebuild_thread_message_projection_with_legacy(thread_id, _messages, UtcMillis::now())
+        .map_err(|error| format!("从 canonical Turn 重建 thread projection 失败: {error}"))?;
     persist_session_state_checkpoint(persist_session_state, checkpoint)
 }
 
@@ -1810,6 +1812,7 @@ fn run_conversation_loop_inner(
                                     round,
                                     "completed",
                                     &partial_visible_content,
+                                    &[],
                                     None,
                                     &stream_publish_gate,
                                 ) {
@@ -2248,6 +2251,7 @@ fn run_conversation_loop_inner(
                 round,
                 "completed",
                 completed_stream_content,
+                &parsed.provider_context,
                 None,
                 &stream_publish_gate,
             )
@@ -2495,6 +2499,82 @@ fn run_conversation_loop_inner(
         }
 
         let assistant_tool_message = assistant_response_message;
+        let assistant_provider_context = assistant_tool_message.provider_context.clone();
+        // 模型返回的 assistant tool-call 是 canonical Turn 事实的一部分，即使某个
+        // call 随后因工具面校验失败也不能只留在本地 messages 向量里。复用流式 item
+        // 身份写入正文、工具调用和 provider context，ThreadChatMessage 再由 canonical
+        // projection 重建。
+        let mut assistant_tool_item = session_turn_item(
+            "assistant_stream",
+            "completed",
+            Some("生成回复".to_string()),
+            assistant_tool_message.content.clone(),
+            Some(stream_item_id.clone()),
+            thread_id.clone(),
+        );
+        apply_model_response_round(&mut assistant_tool_item, round);
+        apply_task_worker_detail_visibility(&mut assistant_tool_item, task, &turn_visibility);
+        if !assistant_provider_context.is_empty() {
+            assistant_tool_item.metadata.insert(
+                "providerContext".to_string(),
+                serde_json::to_value(&assistant_provider_context)
+                    .expect("模型提供方上下文必须能够序列化"),
+            );
+        }
+        if !assistant_tool_message.tool_calls.is_empty() {
+            assistant_tool_item.metadata.insert(
+                "toolCalls".to_string(),
+                serde_json::to_value(&assistant_tool_message.tool_calls)
+                    .expect("模型工具调用必须能够序列化"),
+            );
+        }
+        if assistant_tool_message.content.is_some()
+            || !assistant_tool_message.tool_calls.is_empty()
+            || !assistant_tool_message.provider_context.is_empty()
+        {
+            let published = match upsert_session_turn_item_for_turn(
+                session_store,
+                session_id,
+                expected_turn_id.as_deref(),
+                assistant_tool_item,
+                Some(task_store),
+            ) {
+                Ok(Some(published)) => published,
+                Ok(None) => {
+                    let error = task_failure_with_error_item(
+                        turn_writeback_context,
+                        "当前 Turn 已不可写，无法保存 assistant tool-call 事实",
+                        streaming_entry_id.or(last_stream_item_id.as_deref()),
+                        None,
+                        None,
+                    );
+                    return (TaskOutcome::Failed { error }, context_summary);
+                }
+                Err(error) => {
+                    let error = task_failure_with_error_item(
+                        turn_writeback_context,
+                        &format!("保存 assistant tool-call 事实失败：{error}"),
+                        streaming_entry_id.or(last_stream_item_id.as_deref()),
+                        None,
+                        None,
+                    );
+                    return (TaskOutcome::Failed { error }, context_summary);
+                }
+            };
+            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+            if let Err(error) =
+                session_store.rebuild_thread_message_projection(thread_id, UtcMillis::now())
+            {
+                let error = task_failure_with_error_item(
+                    turn_writeback_context,
+                    &format!("重建 assistant tool-call thread projection 失败: {error}"),
+                    streaming_entry_id.or(last_stream_item_id.as_deref()),
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
+        }
         if let Err(error) = append_thread_messages_checkpoint(
             session_store,
             thread_id,
@@ -2563,9 +2643,11 @@ fn run_conversation_loop_inner(
             return (TaskOutcome::Failed { error }, context_summary);
         }
         for tool_call in &valid_tool_calls {
-            if let Err(writeback_error) =
-                append_task_tool_call_started_turn_item(turn_writeback_context, tool_call)
-            {
+            if let Err(writeback_error) = append_task_tool_call_started_turn_item(
+                turn_writeback_context,
+                tool_call,
+                &assistant_provider_context,
+            ) {
                 let error_text = format!("工具开始事实写回失败：{writeback_error}");
                 let error = task_failure_with_error_item(
                     turn_writeback_context,
@@ -3802,6 +3884,7 @@ fn publish_task_content_delta(
         model_round,
         "running",
         &visible_content,
+        &[],
         stream_update.as_ref(),
         publish_gate,
     )
@@ -3813,6 +3896,7 @@ fn upsert_task_stream_turn_item(
     model_round: usize,
     status: &str,
     content: &str,
+    provider_context: &[ModelProviderContext],
     stream_update: Option<&SessionTurnStreamUpdate>,
     publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
 ) -> Result<(), String> {
@@ -3829,6 +3913,12 @@ fn upsert_task_stream_turn_item(
         context.turn_visibility.thread_id().clone(),
     );
     apply_model_response_round(&mut item, model_round);
+    if !provider_context.is_empty() {
+        item.metadata.insert(
+            "providerContext".to_string(),
+            serde_json::to_value(provider_context).expect("模型提供方上下文必须能够序列化"),
+        );
+    }
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
     let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
@@ -3862,12 +3952,17 @@ fn upsert_task_stream_turn_item(
             );
         }
     }
+    context
+        .session_store
+        .rebuild_thread_message_projection(context.turn_visibility.thread_id(), UtcMillis::now())
+        .map_err(|error| format!("重建任务回复 thread projection 失败: {error}"))?;
     Ok(())
 }
 
 fn append_task_tool_call_started_turn_item(
     context: TaskTurnWritebackContext<'_>,
     tool_call: &ChatToolCall,
+    provider_context: &[ModelProviderContext],
 ) -> Result<(), String> {
     let mut item = session_turn_item(
         "tool_call_started",
@@ -3882,6 +3977,12 @@ fn append_task_tool_call_started_turn_item(
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_status = Some("running".to_string());
     item.tool_arguments = Some(tool_call.function.arguments.clone());
+    if !provider_context.is_empty() {
+        item.metadata.insert(
+            "providerContext".to_string(),
+            serde_json::to_value(provider_context).expect("模型提供方上下文必须能够序列化"),
+        );
+    }
     let Some(published) = upsert_session_turn_item_for_turn(
         context.session_store,
         context.session_id,
@@ -3902,6 +4003,10 @@ fn append_task_tool_call_started_turn_item(
         context.workspace_id,
         &published,
     );
+    context
+        .session_store
+        .rebuild_thread_message_projection(context.turn_visibility.thread_id(), UtcMillis::now())
+        .map_err(|error| format!("重建工具调用 thread projection 失败: {error}"))?;
     Ok(())
 }
 
@@ -3954,6 +4059,10 @@ fn upsert_task_tool_call_result_turn_item(
         context.workspace_id,
         &published,
     );
+    context
+        .session_store
+        .rebuild_thread_message_projection(context.turn_visibility.thread_id(), UtcMillis::now())
+        .map_err(|error| format!("重建工具结果 thread projection 失败: {error}"))?;
     Ok(())
 }
 

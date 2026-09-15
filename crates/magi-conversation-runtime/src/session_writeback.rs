@@ -891,6 +891,13 @@ pub fn publish_session_turn_item_stream_event(
         "stream_delta": stream_update.delta,
         "stream_content_length": stream_update.content_length,
         "stream_reset": stream_update.reset,
+        // 对外协议使用 camelCase；保留现有 snake_case 字段供旧事件回放解析器读取，
+        // 两组字段在同一次事实事件中始终表达同一版本和长度。
+        "itemVersion": item_version,
+        "baseContentLength": stream_update.base_content_length,
+        "contentLength": stream_update.content_length,
+        "delta": stream_update.delta,
+        "reset": stream_update.reset,
     });
     if item_version == 1 {
         let mut canonical_item = canonical_item.clone();
@@ -971,6 +978,27 @@ pub fn append_session_turn_error_item(
     session_store: &SessionStore,
     input: SessionTurnErrorInput<'_>,
 ) -> Result<(), String> {
+    append_session_turn_error_item_with_terminal_commit(event_bus, session_store, input, true)
+}
+
+/// 写入失败 item，但把 Turn 终态留给 SessionTurnCoordinator 提交。
+///
+/// Conversation profile 使用这个入口，保证执行器只产生内容事实，Coordinator
+/// 才能在同一个生命周期边界提交 failed/cancelled/completed。
+pub fn append_session_turn_error_item_without_terminal_commit(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    input: SessionTurnErrorInput<'_>,
+) -> Result<(), String> {
+    append_session_turn_error_item_with_terminal_commit(event_bus, session_store, input, false)
+}
+
+fn append_session_turn_error_item_with_terminal_commit(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    input: SessionTurnErrorInput<'_>,
+    commit_terminal: bool,
+) -> Result<(), String> {
     let SessionTurnErrorInput {
         session_id,
         workspace_id,
@@ -1025,16 +1053,21 @@ pub fn append_session_turn_error_item(
             session_id
         )
     })?;
-    session_store
-        .update_current_turn_status_for_turn(session_id, expected_turn_id, "failed")
-        .map_err(|error| format!("更新会话 {} 的 Turn failed 状态失败: {error}", session_id))?
-        .ok_or_else(|| {
-            format!(
-                "会话 {} 没有可更新的当前 Turn，无法提交 failed 状态",
-                session_id
-            )
-        })?;
-    persist_session_state_checkpoint(persist_session_state, "session_turn_failed")?;
+    if commit_terminal {
+        session_store
+            .update_current_turn_status_for_turn(session_id, expected_turn_id, "failed")
+            .map_err(|error| format!("更新会话 {} 的 Turn failed 状态失败: {error}", session_id))?
+            .ok_or_else(|| {
+                format!(
+                    "会话 {} 没有可更新的当前 Turn，无法提交 failed 状态",
+                    session_id
+                )
+            })?;
+        persist_session_state_checkpoint(persist_session_state, "session_turn_failed")?;
+    } else {
+        // 失败 item 本身仍需可靠落盘，终态由 Coordinator 在随后同一执行边界提交。
+        persist_session_state_checkpoint(persist_session_state, "session_turn_error_item")?;
+    }
     let _ = item_published;
     publish_current_session_turn_item_event(
         event_bus,
@@ -2772,6 +2805,11 @@ mod tests {
             Value::from(1_u64)
         );
         assert_eq!(first_payload["canonical_item_version"], Value::from(1_u64));
+        assert_eq!(first_payload["itemVersion"], Value::from(1_u64));
+        assert_eq!(first_payload["baseContentLength"], Value::from(0_u64));
+        assert_eq!(first_payload["contentLength"], Value::from(1_u64));
+        assert_eq!(first_payload["delta"], Value::String("你".to_string()));
+        assert_eq!(first_payload["reset"], Value::Bool(false));
         assert_eq!(
             first_payload["stream_base_content_length"],
             Value::from(0_u64)
@@ -2790,6 +2828,14 @@ mod tests {
             Value::String(item_id.to_string())
         );
         assert_eq!(second_payload["canonical_item_version"], Value::from(2_u64));
+        assert_eq!(second_payload["itemVersion"], Value::from(2_u64));
+        assert_eq!(second_payload["baseContentLength"], Value::from(1_u64));
+        assert_eq!(
+            second_payload["contentLength"],
+            Value::from(second_content.chars().count() as u64)
+        );
+        assert_eq!(second_payload["delta"], second_payload["stream_delta"]);
+        assert_eq!(second_payload["reset"], Value::Bool(false));
         assert_eq!(
             second_payload["stream_base_content_length"],
             Value::from(1_u64)

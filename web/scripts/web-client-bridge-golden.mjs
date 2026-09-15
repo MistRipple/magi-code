@@ -1333,6 +1333,7 @@ await withGoldenViteServer(async (server) => {
   );
 
   const bootstrapRequestsBeforeTerminalEvent = bootstrapRequestCount;
+  const workspaceSessionRequestsBeforeTerminalEvent = workspaceSessionsRequestCount;
   summaryUpdatedAt = ACCEPTED_AT + 2_000;
   terminalPublished = true;
   recoveredStream.onmessage?.({ data: JSON.stringify(completedTurnItemEnvelope()) });
@@ -1361,12 +1362,17 @@ await withGoldenViteServer(async (server) => {
     'terminal session turn event must project the final assistant item as non-streaming',
   );
   await waitFor(
-    () => bootstrapRequestCount > bootstrapRequestsBeforeTerminalEvent,
-    'terminal session turn event must finish its authoritative bootstrap refresh',
+    () => workspaceSessionsRequestCount > workspaceSessionRequestsBeforeTerminalEvent,
+    'terminal session turn event must refresh the lightweight session summary',
+  );
+  assert.equal(
+    bootstrapRequestCount,
+    bootstrapRequestsBeforeTerminalEvent,
+    'canonical terminal event must not trigger a heavyweight bootstrap refresh',
   );
   await waitFor(
     () => currentSessionSummary(messagesStore)?.updatedAt === summaryUpdatedAt,
-    'terminal bootstrap refresh must finish applying before tunnel reconciliation starts',
+    'terminal session summary refresh must finish applying before tunnel reconciliation starts',
   );
   assert.equal(
     messagesStore.messagesState.orchestratorRuntimeState?.status,
@@ -1474,8 +1480,8 @@ await withGoldenViteServer(async (server) => {
       workspaceSessionRequestsBeforeTunnelSync + 2,
       'tunnel terminal sync must recheck the lightweight workspace session summary',
     );
-    assert.ok(
-      bootstrapRequestCount > bootstrapRequestsBeforeTunnelSync,
+    await waitFor(
+      () => bootstrapRequestCount > bootstrapRequestsBeforeTunnelSync,
       'request-scoped terminal event must trigger authoritative bootstrap recovery',
     );
   } finally {
@@ -2092,15 +2098,6 @@ await withGoldenViteServer(async (server) => {
     ),
   )));
   const terminalRefreshBootstrapRequests = [];
-  bootstrapInterceptors.push((parsed) => {
-    terminalRefreshBootstrapRequests.push(parsed);
-    return jsonResponse(scopedBootstrapPayload(
-      WORKSPACE_ID,
-      WORKSPACE_PATH,
-      NAVIGATION_BARRIER_SESSION_ID,
-      '导航屏障会话',
-    ));
-  });
   bridge.postMessage({
     type: 'navigateSession',
     target: 'session',
@@ -2126,16 +2123,12 @@ await withGoldenViteServer(async (server) => {
     () => messagesStore.messagesState.currentSessionId === NAVIGATION_BARRIER_SESSION_ID,
     '后台终态刷新并发发生时，首次用户导航仍必须提交到目标会话',
   );
-  await waitFor(
-    () => terminalRefreshBootstrapRequests.length === 1,
-    '导航提交后，排队的终态 bootstrap 必须按最新会话绑定执行',
-  );
-  assert.equal(
-    terminalRefreshBootstrapRequests[0].searchParams.get('sessionId'),
-    NAVIGATION_BARRIER_SESSION_ID,
-    '排队的终态 bootstrap 不得继续读取导航前的旧会话',
-  );
   await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(
+    terminalRefreshBootstrapRequests.length,
+    0,
+    'canonical 终态事件不应在导航提交后补发冗余 bootstrap',
+  );
   assert.equal(
     messagesStore.messagesState.currentSessionId,
     NAVIGATION_BARRIER_SESSION_ID,

@@ -25,6 +25,7 @@ mod task_dispatch;
 pub mod task_turn_finalize;
 mod terminal_runtime;
 pub mod tunnel;
+mod turn_service;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};

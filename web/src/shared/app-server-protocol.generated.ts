@@ -352,6 +352,9 @@ export interface TurnStartResult {
   eventStreamNextSequence: number;
   createdSession: boolean;
   route: TurnStartRoute | null;
+  executionProfile: "conversation" | "task" | null;
+  status: string | null;
+  eventSequence: number | null;
   sessionSummary: SessionSummary | null;
   userMessageItemId: string | null;
   canonicalTurn: CanonicalTurn | null;

@@ -772,6 +772,22 @@ fn resolve_session_mission(
     )
 }
 
+/// 根据 accepted 时间和来源生成稳定的 Task Turn 身份。
+///
+/// 该身份在 Coordinator、accepted journal、恢复请求和执行注册表之间共享；不能在
+/// 任一层重新随机生成，否则迟到回调无法证明自己属于原始 Turn。
+pub fn dispatch_turn_id(request: &DispatchSubmissionRequest) -> String {
+    match &request.turn_origin {
+        DispatchTurnOrigin::User => format!("turn-session-action-{}", request.accepted_at.0),
+        DispatchTurnOrigin::GoalContinuation(_) => {
+            format!(
+                "turn-goal-continuation-{}-{}",
+                request.session_id, request.accepted_at.0
+            )
+        }
+    }
+}
+
 fn validate_dispatch_request(
     runtime: &DispatchSubmissionRuntime<'_>,
     request: &DispatchSubmissionRequest,
@@ -850,15 +866,7 @@ fn validate_dispatch_request(
             action_task_id, accepted_at.0
         ))
     };
-    let turn_id = match &request.turn_origin {
-        DispatchTurnOrigin::User => format!("turn-session-action-{}", accepted_at.0),
-        DispatchTurnOrigin::GoalContinuation(_) => {
-            format!(
-                "turn-goal-continuation-{}-{}",
-                request.session_id, accepted_at.0
-            )
-        }
-    };
+    let turn_id = dispatch_turn_id(request);
     Ok(PreparedDispatchSubmission {
         task,
         mission_id,
@@ -975,7 +983,7 @@ fn build_active_execution_chain(
             .collect::<Result<Vec<_>, DispatchSubmissionRunError>>()?,
     };
     if !request.turn_origin.creates_user_message_item() {
-        let mut metadata = std::collections::HashMap::new();
+        let mut metadata = request.user_message_metadata.clone();
         metadata.insert("pendingDispatch".to_string(), pending_dispatch);
         metadata.insert("renderable".to_string(), serde_json::Value::Bool(false));
         current_turn.items.push(ActiveExecutionTurnItem {
@@ -1768,7 +1776,7 @@ mod tests {
             _session_id: &SessionId,
             _mutations: &[CanonicalTurnMutation],
             _acceptance: &SessionAcceptanceRecord,
-            _task: &magi_core::Task,
+            _task: Option<&magi_core::Task>,
         ) -> DomainResult<()> {
             Err(DomainError::Persistence {
                 message: "test acceptance write rejection".to_string(),

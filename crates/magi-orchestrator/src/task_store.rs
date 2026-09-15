@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -107,6 +107,7 @@ struct TaskRootProjection {
 /// after the status change. Implementations should be lightweight (e.g.
 /// publish an event).
 pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, TaskStatus, Task) + Send + Sync>;
+type SharedStatusChangeCallback = Arc<dyn Fn(&TaskId, TaskStatus, TaskStatus, Task) + Send + Sync>;
 
 /// 待提交的任务事实快照。
 ///
@@ -134,7 +135,7 @@ pub struct TaskStore {
     /// Wrapped in a `Mutex` so that `set_status_change_callback` can replace
     /// the callback through a `&self` reference (needed after restoring from
     /// a checkpoint).
-    on_status_change: Mutex<Option<StatusChangeCallback>>,
+    on_status_change: Mutex<Option<SharedStatusChangeCallback>>,
     /// Optional callback fired on every successful status change for checkpoint
     /// persistence (design 6.8).
     on_checkpoint: Mutex<Option<CheckpointCallback>>,
@@ -144,6 +145,9 @@ pub struct TaskStore {
     mutation_lock: Mutex<()>,
     status_change_version: Mutex<u64>,
     status_change_signal: Condvar,
+    /// 生产 daemon 设为 true，把可能触发跨模块 IO 的回调移出 mutation guard；
+    /// 默认 false 供同步嵌入测试保持确定的 callback 观察语义。
+    status_change_callback_async: AtomicBool,
 }
 
 fn default_frozen_policy() -> TaskPolicy {
@@ -218,6 +222,7 @@ impl TaskStore {
             mutation_lock: Mutex::new(()),
             status_change_version: Mutex::new(0),
             status_change_signal: Condvar::new(),
+            status_change_callback_async: AtomicBool::new(false),
         }
     }
 
@@ -228,11 +233,12 @@ impl TaskStore {
             tasks: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
             mission_index: RwLock::new(HashMap::new()),
-            on_status_change: Mutex::new(Some(callback)),
+            on_status_change: Mutex::new(Some(Arc::from(callback))),
             on_checkpoint: Mutex::new(None),
             mutation_lock: Mutex::new(()),
             status_change_version: Mutex::new(0),
             status_change_signal: Condvar::new(),
+            status_change_callback_async: AtomicBool::new(false),
         }
     }
 
@@ -245,7 +251,14 @@ impl TaskStore {
             .on_status_change
             .lock()
             .expect("on_status_change lock poisoned");
-        *guard = Some(callback);
+        *guard = Some(Arc::from(callback));
+    }
+
+    /// 生产路径启用异步状态通知，保证 callback 不会在 TaskStore mutation guard
+    /// 生命周期内执行。同步模式只用于不涉及外部 IO 的嵌入测试。
+    pub fn set_status_change_callback_async(&self, enabled: bool) {
+        self.status_change_callback_async
+            .store(enabled, Ordering::Release);
     }
 
     /// Set or replace the per-transition checkpoint callback (design 6.8).
@@ -421,14 +434,28 @@ impl TaskStore {
         new_status: TaskStatus,
         task: Task,
     ) {
+        // 状态事实已经通过 checkpoint 和 map 提交完成后才进入这里。回调可能触发
+        // SessionStore、事件总线或 Runner 收口，不能在 mutation_lock 生命周期内执行；
+        // 复制轻量句柄并异步投递，确保任务状态提交不会被跨模块 IO 反向阻塞。
         let callback = self
             .on_status_change
             .lock()
-            .expect("on_status_change lock poisoned");
-        if let Some(ref callback) = *callback {
-            callback(task_id, old_status, new_status, task);
+            .expect("on_status_change lock poisoned")
+            .clone();
+        if let Some(callback) = callback {
+            if self.status_change_callback_async.load(Ordering::Acquire) {
+                let callback_task_id = task_id.clone();
+                let log_task_id = callback_task_id.clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("magi-task-status-notify".to_string())
+                    .spawn(move || callback(&callback_task_id, old_status, new_status, task))
+                {
+                    tracing::warn!(?error, %log_task_id, "异步任务状态通知线程启动失败");
+                }
+            } else {
+                callback(task_id, old_status, new_status, task);
+            }
         }
-        drop(callback);
         self.notify_status_change();
     }
 
@@ -648,6 +675,7 @@ impl TaskStore {
         );
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
+        drop(_mutation_guard);
         self.emit_status_change(task_id, old_status, new_status, cloned_task);
         Ok(())
     }
@@ -711,6 +739,7 @@ impl TaskStore {
         );
         self.fire_checkpoint(&snapshot)?;
         self.commit_maps(tasks, leases, mission_index);
+        drop(_mutation_guard);
         self.emit_status_change(task_id, expected_status, new_status, cloned_task);
         Ok(())
     }
@@ -816,6 +845,7 @@ impl TaskStore {
         );
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
+        drop(_mutation_guard);
         self.emit_status_change(task_id, old_status, TaskStatus::Completed, cloned_task);
         Ok(())
     }
@@ -1618,6 +1648,7 @@ impl TaskStore {
             "conversation response timing"
         );
         self.commit_maps(tasks, leases, mission_index);
+        drop(_mutation_guard);
         self.emit_status_change(task_id, old_status, TaskStatus::Running, cloned_task);
         tracing::info!(
             target: "magi.performance",
@@ -1733,6 +1764,7 @@ impl TaskStore {
         );
         self.fire_checkpoint(&snapshot)?;
         self.commit_maps(tasks, leases, mission_index);
+        drop(_mutation_guard);
         self.emit_status_change(task_id, old_status, TaskStatus::Completed, cloned_task);
         Ok(true)
     }
@@ -1881,6 +1913,7 @@ impl TaskStore {
         );
         self.fire_checkpoint(&snapshot)?;
         self.commit_maps(tasks, leases, mission_index);
+        drop(_mutation_guard);
         self.emit_status_change(task_id, old_status, status, cloned_task);
         Ok(true)
     }

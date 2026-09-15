@@ -194,9 +194,6 @@ let currentInterruptTaskId = '';
 let currentBindingGeneration = 0;
 let continueRequestId = '';
 let currentRuntimeEpoch = '';
-let terminalBootstrapRefreshInFlight: Promise<void> | null = null;
-let terminalBootstrapRefreshPending = false;
-let terminalBootstrapRefreshReason = '';
 type SessionTurnSubmissionContext = {
   requestId: string;
   scope: 'personal' | 'workspace';
@@ -962,47 +959,6 @@ function settleProcessingRequestSnapshot(snapshot: ProcessingRequestSnapshot): v
   settlePendingRequestSnapshot(snapshot);
 }
 
-function refreshBootstrapAfterTerminalTurn(reason: string): void {
-  terminalBootstrapRefreshPending = true;
-  terminalBootstrapRefreshReason = reason;
-  if (terminalBootstrapRefreshInFlight) {
-    return;
-  }
-
-  const request = (async (): Promise<void> => {
-    while (terminalBootstrapRefreshPending) {
-      terminalBootstrapRefreshPending = false;
-      const refreshReason = terminalBootstrapRefreshReason || 'terminal_bootstrap_refresh';
-      terminalBootstrapRefreshReason = '';
-      try {
-        // 终态事件已经直接驱动 canonical reducer。bootstrap 只做后台权威校正，
-        // 失败时不得重新猜测或清除当前 UI 的 processing 状态。
-        await fetchBootstrap({
-          forceFresh: true,
-          refreshSettingsBootstrapOnBindingChange: false,
-          refreshSessionTurnQueueAfterBootstrap: false,
-          settleProcessingOnFailure: false,
-        });
-      } catch (error) {
-        reportExpectedRecoveryFailure(
-          i18n.t('bridge.action.syncTurnState'),
-          '[web-client-bridge] turn 终态后 bootstrap 同步失败:',
-          error,
-        );
-        scheduleRecovery(refreshReason, error, true);
-      }
-    }
-  })().finally(() => {
-    terminalBootstrapRefreshInFlight = null;
-    // 终态刷新期间可能发生新的 terminal event；finally 之后重新启动一轮，
-    // 确保会话切换或连续轮次不会被前一轮吞掉。
-    if (terminalBootstrapRefreshPending) {
-      refreshBootstrapAfterTerminalTurn(terminalBootstrapRefreshReason || 'terminal_bootstrap_refresh');
-    }
-  });
-  terminalBootstrapRefreshInFlight = request;
-}
-
 function emitRecoveringState(reason: string, error?: unknown): void {
   bridgeRecovering = true;
   if (error !== undefined) {
@@ -1351,6 +1307,10 @@ function emitSessionTurnAccepted(
     sessionId: string;
     workspaceId?: string;
     requestId?: string;
+    turnId?: string | null;
+    executionProfile?: 'conversation' | 'task' | null;
+    status?: string | null;
+    eventSequence?: number | null;
     runtimeEpoch?: string;
     eventStreamNextSequence?: number;
     acceptedAt?: number;
@@ -1372,6 +1332,10 @@ function emitSessionTurnAccepted(
     sessionId: payload.sessionId,
     workspaceId: payload.workspaceId || '',
     ...(payload.requestId ? { requestId: payload.requestId } : {}),
+    ...(payload.turnId ? { turnId: payload.turnId } : {}),
+    ...(payload.executionProfile ? { executionProfile: payload.executionProfile } : {}),
+    ...(payload.status ? { status: payload.status } : {}),
+    ...(typeof payload.eventSequence === 'number' ? { eventSequence: payload.eventSequence } : {}),
     ...(payload.runtimeEpoch ? { runtimeEpoch: payload.runtimeEpoch } : {}),
     ...(typeof payload.eventStreamNextSequence === 'number'
       ? { eventStreamNextSequence: payload.eventStreamNextSequence }
@@ -1455,9 +1419,7 @@ function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void
     if (requestId) {
       clearContinueRequestInFlight(requestId);
     }
-    // canonical 终态事件是会话执行结束的统一协议入口。增量 reducer 负责即时收敛，
-    // 权威 bootstrap 立即在后台校正任务、代理与运行态快照。
-    refreshBootstrapAfterTerminalTurn('canonical_turn_terminal');
+    // canonical 终态事件是会话执行结束的统一协议入口，增量 reducer 直接收敛 UI。
   }
   emitDataMessage('sessionTurnCanonicalEventUpdated', {
     sessionId: canonicalEvent.sessionId,
@@ -1501,6 +1463,11 @@ function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
     return false;
   }
   emitSessionTurnCanonicalEvent(canonicalEvent);
+  if (isCanonicalTerminalEvent(canonicalEvent)) {
+    if (canonicalEvent.sessionId || currentSessionId) {
+      scheduleSessionSummaryRefresh('canonical_turn_terminal');
+    }
+  }
   return true;
 }
 
@@ -2288,14 +2255,17 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
             ...(terminalPublicMessage ? { publicMessage: terminalPublicMessage } : {}),
           },
         });
+        // 缺少 canonical 终态事实时进入一次无重连的权威快照恢复；正常
+        // canonical 终态不再通过 bootstrap 二次发现终态。
+        refreshBootstrapForSilentEventStream(
+          `missing_canonical_${terminalReason}`,
+          new Error('终态事件缺少 canonical Turn 事实'),
+        );
       } else {
         console.warn('[web-client-bridge] turn 终态缺少精确 sessionId/requestId，等待权威快照收敛', {
           eventType,
         });
       }
-    }
-    if (!hasCanonicalTerminal) {
-      refreshBootstrapAfterTerminalTurn(terminalReason);
     }
   }
 
@@ -2327,10 +2297,6 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     } as ClientBridgeMessage);
 
     if (eventType === 'task.status.changed' && event.payload) {
-      const taskStatus = event.payload.new_status ?? event.payload.newStatus ?? event.payload.status;
-      if (isTerminalRuntimeTaskStatus(taskStatus)) {
-        refreshBootstrapAfterTerminalTurn('terminal_task_status_refresh');
-      }
       emitDataMessage('taskStatusChanged', {
         taskId: event.payload.task_id ?? event.payload.taskId ?? '',
         rootTaskId: event.payload.root_task_id ?? event.payload.rootTaskId ?? '',
@@ -4220,7 +4186,11 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       emitSessionTurnAccepted({
         sessionId: resolvedSessionId,
         workspaceId: targetWorkspaceId,
-        requestId,
+        requestId: turnResult.requestId || requestId,
+        turnId: turnResult.turnId,
+        executionProfile: turnResult.executionProfile,
+        status: turnResult.status,
+        eventSequence: turnResult.eventSequence,
         runtimeEpoch: turnResult.runtimeEpoch,
         eventStreamNextSequence: turnResult.eventStreamNextSequence,
         acceptedAt: turnResult.acceptedAt,

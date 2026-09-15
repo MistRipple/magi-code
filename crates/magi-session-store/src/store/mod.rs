@@ -51,7 +51,7 @@ pub trait CanonicalTurnEventWriter: Send + Sync {
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
         acceptance: &SessionAcceptanceRecord,
-        task: &Task,
+        task: Option<&Task>,
     ) -> DomainResult<()>;
 }
 
@@ -102,11 +102,12 @@ fn normalize_session_title(title: String) -> DomainResult<String> {
 pub struct SessionStore {
     state: Arc<RwLock<SessionStoreState>>,
     durable_persistence_lock: Arc<Mutex<()>>,
-    /// 串行化 canonical 事务的准备、事件写入和内存提交，但不占用 session state 写锁。
+    /// 允许不同 session 的 canonical 事务并行；完整 projection/恢复快照取得写屏障。
     ///
-    /// canonical event writer 可能执行 fsync；这把锁只阻止另一笔 canonical 事务进入，
-    /// 不阻止普通 session 读取或不相关的内存状态操作。
-    pub(crate) canonical_commit_lock: Arc<Mutex<()>>,
+    /// 单个 session 的 prepare → event writer → memory apply 仍由对应的 session lock
+    /// 串行化，避免一条会话内的 Turn 竞态，同时不让某个 session 的 fsync 阻塞其他会话。
+    pub(crate) canonical_commit_barrier: Arc<RwLock<()>>,
+    pub(crate) canonical_session_locks: Arc<Mutex<HashMap<SessionId, Arc<Mutex<()>>>>>,
     sidecar_flush_state: Arc<RwLock<SidecarFlushState>>,
     sidecar_flush_lock: Arc<Mutex<()>>,
     lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
@@ -318,7 +319,8 @@ impl Default for SessionStore {
         Self {
             state: Arc::new(RwLock::new(SessionStoreState::default())),
             durable_persistence_lock: Arc::new(Mutex::new(())),
-            canonical_commit_lock: Arc::new(Mutex::new(())),
+            canonical_commit_barrier: Arc::new(RwLock::new(())),
+            canonical_session_locks: Arc::new(Mutex::new(HashMap::new())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
@@ -336,7 +338,8 @@ impl SessionStore {
         Self {
             state: Arc::new(RwLock::new(state)),
             durable_persistence_lock: Arc::new(Mutex::new(())),
-            canonical_commit_lock: Arc::new(Mutex::new(())),
+            canonical_commit_barrier: Arc::new(RwLock::new(())),
+            canonical_session_locks: Arc::new(Mutex::new(HashMap::new())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
@@ -408,7 +411,7 @@ impl SessionStore {
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
         acceptance: &SessionAcceptanceRecord,
-        task: &Task,
+        task: Option<&Task>,
     ) -> DomainResult<()> {
         let writer = self
             .canonical_event_writer
@@ -423,6 +426,15 @@ impl SessionStore {
         Ok(())
     }
 
+    pub(crate) fn canonical_commit_lock_for(&self, session_id: &SessionId) -> Arc<Mutex<()>> {
+        self.canonical_session_locks
+            .lock()
+            .expect("canonical session lock registry poisoned")
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// 将旧版本 accepted journal 合并回内存状态。
     ///
     /// 旧 journal 只在完整 snapshot 成功后删除，因此这里必须允许它与旧 snapshot
@@ -434,9 +446,9 @@ impl SessionStore {
         // 所有 canonical 事实提交都先取得这把锁，再取得 state 锁。
         // 恢复也必须遵守同一顺序，避免 state -> canonical 与 canonical -> state 互相等待。
         let _canonical_guard = self
-            .canonical_commit_lock
-            .lock()
-            .expect("canonical commit lock poisoned");
+            .canonical_commit_barrier
+            .write()
+            .expect("canonical commit barrier poisoned");
         let mut state = self
             .state
             .write()
@@ -620,9 +632,9 @@ impl SessionStore {
         // 同时看到旧 canonical 和新 event，产生无法解释的投影冲突。把完整
         // snapshot 事务置于 canonical commit lock 之下，保证两者使用同一代事实。
         let _canonical_guard = self
-            .canonical_commit_lock
-            .lock()
-            .expect("session canonical commit lock poisoned");
+            .canonical_commit_barrier
+            .write()
+            .expect("session canonical commit barrier poisoned");
         let mut persist = persist;
         let state = self.state.read().expect("session state read lock poisoned");
         let durable = state.durable_state();
@@ -850,9 +862,9 @@ impl SessionStore {
             .lock()
             .expect("session durable persistence lock poisoned");
         let _canonical_guard = self
-            .canonical_commit_lock
-            .lock()
-            .expect("session canonical commit lock poisoned");
+            .canonical_commit_barrier
+            .write()
+            .expect("session canonical commit barrier poisoned");
         let mut state = self
             .state
             .write()
@@ -927,9 +939,9 @@ impl SessionStore {
             .lock()
             .expect("session durable persistence lock poisoned");
         let _canonical_guard = self
-            .canonical_commit_lock
-            .lock()
-            .expect("session canonical commit lock poisoned");
+            .canonical_commit_barrier
+            .write()
+            .expect("session canonical commit barrier poisoned");
         let mut state = self
             .state
             .write()

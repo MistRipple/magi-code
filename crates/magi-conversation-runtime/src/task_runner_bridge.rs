@@ -7,7 +7,7 @@ use crate::execution_admission::ExecutionAdmissionPermit;
 use magi_core::{LeaseId, Task, TaskCompletionAttempt, TaskId};
 use magi_orchestrator::task_store::TaskLease;
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::{collections::HashSet, future::Future, pin::Pin};
 
 /// The outcome of a single `run_cycle` iteration.
@@ -87,9 +87,23 @@ pub enum TaskOutcome {
 /// The Runner calls `poll_results` at the start of each cycle to collect
 /// any results that have arrived since the last cycle.
 pub trait TaskResultReceiver: Send + Sync {
+    /// 生产运行时若返回 true，Worker 结果已经由主动完成通知提交，Runner
+    /// 不应再通过周期轮询消费同一结果。
+    fn uses_active_completion_sink(&self) -> bool {
+        false
+    }
+
+    /// 仅保留给未装配主动通知目标的嵌入测试/兼容读取器。
     fn poll_results(&self) -> Vec<TaskResult>;
 }
 // --- Event-based result receiver
+
+/// Task 完成的主动通知目标。生产运行时把 Worker 结果直接交给该目标，
+/// 由目标先完成 TaskStore durable mutation，再唤醒 Turn Coordinator；测试和
+/// 未装配通知目标的嵌入场景仍可使用 poll_results。
+pub trait TaskCompletionSink: Send + Sync {
+    fn notify(&self, result: TaskResult);
+}
 
 /// A result receiver that collects results pushed externally (e.g. from a
 /// `StatusChangeCallback` on the TaskStore) and returns them when polled.
@@ -107,6 +121,7 @@ pub trait TaskResultReceiver: Send + Sync {
 pub struct EventBasedResultReceiver {
     results: Mutex<Vec<TaskResult>>,
     seen: Mutex<HashSet<(TaskId, LeaseId)>>,
+    completion_sink: Mutex<Option<Arc<dyn TaskCompletionSink>>>,
 }
 
 impl Default for EventBasedResultReceiver {
@@ -120,7 +135,17 @@ impl EventBasedResultReceiver {
         Self {
             results: Mutex::new(Vec::new()),
             seen: Mutex::new(HashSet::new()),
+            completion_sink: Mutex::new(None),
         }
+    }
+
+    /// 配置主动完成通知目标。配置后新结果直接进入 durable completion path，
+    /// 不再等待 Runner 的下一轮 `poll_results`。
+    pub fn set_completion_sink(&self, sink: Arc<dyn TaskCompletionSink>) {
+        *self
+            .completion_sink
+            .lock()
+            .expect("EventBasedResultReceiver completion sink lock poisoned") = Some(sink);
     }
 
     /// Push a result into the buffer.  Called from the TaskStore's
@@ -134,6 +159,16 @@ impl EventBasedResultReceiver {
             .lock()
             .expect("EventBasedResultReceiver seen lock poisoned");
         if !seen.insert((result.task_id.clone(), result.lease_id.clone())) {
+            return;
+        }
+        let sink = self
+            .completion_sink
+            .lock()
+            .expect("EventBasedResultReceiver completion sink lock poisoned")
+            .clone();
+        drop(seen);
+        if let Some(sink) = sink {
+            sink.notify(result);
             return;
         }
         self.results
@@ -159,6 +194,13 @@ impl EventBasedResultReceiver {
 }
 
 impl TaskResultReceiver for EventBasedResultReceiver {
+    fn uses_active_completion_sink(&self) -> bool {
+        self.completion_sink
+            .lock()
+            .expect("EventBasedResultReceiver completion sink lock poisoned")
+            .is_some()
+    }
+
     fn poll_results(&self) -> Vec<TaskResult> {
         let mut guard = self
             .results

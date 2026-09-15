@@ -502,7 +502,8 @@
       "required": [
         "kind", "replayed", "requestId", "sessionId", "turnId", "entryId", "eventId",
         "acceptedAt", "runtimeEpoch", "eventStreamNextSequence", "createdSession", "route",
-        "sessionSummary", "userMessageItemId", "canonicalTurn", "canonicalItem", "queue"
+        "sessionSummary", "userMessageItemId", "canonicalTurn", "canonicalItem", "queue",
+        "executionProfile", "status", "eventSequence"
       ],
       "properties": {
         "kind": { "$ref": "#/$defs/TurnStartKind" },
@@ -521,6 +522,21 @@
             { "$ref": "#/$defs/TurnStartRoute" },
             { "type": "null" }
           ]
+        },
+        "executionProfile": {
+          "type": ["string", "null"],
+          "x-rust-type": "Option<String>",
+          "x-ts-type": "\"conversation\" | \"task\" | null"
+        },
+        "status": {
+          "type": ["string", "null"],
+          "x-rust-type": "Option<String>",
+          "x-ts-type": "string | null"
+        },
+        "eventSequence": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
         },
         "sessionSummary": {
           "oneOf": [

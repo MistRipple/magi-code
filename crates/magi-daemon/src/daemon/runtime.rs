@@ -30,6 +30,7 @@ use magi_conversation_runtime::{
     session_turn_finalize::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
+    task_completion_notifier::TaskCompletionNotifier,
     task_execution_dispatcher::{LlmTaskDispatcher, LlmTaskDispatcherDependencies},
     task_execution_registry::{AgentSpawnPreflightRuntime, TaskExecutionRegistry},
     task_runner_bridge::EventBasedResultReceiver,
@@ -66,7 +67,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, RwLock, Weak},
+    sync::{Arc, OnceLock, RwLock},
     time::Instant,
 };
 use tracing::{info, warn};
@@ -1624,26 +1625,60 @@ impl DaemonRuntime {
         task_store.set_checkpoint_callback(Box::new(move |store| {
             task_checkpoint_persist_for_store(store)
         }));
+        // Worker 结果直接提交 TaskStore durable 终态，再由完成通知唤醒 Turn 侧；
+        // Runner 仍可在未装配该通知目标的嵌入测试中使用结果队列。
+        let task_store = Arc::new(task_store);
+        let completion_notifier = Arc::new(TaskCompletionNotifier::new(Arc::clone(&task_store)));
         let eb = event_bus_for_task_store.clone();
         let session_store = session_store_for_task_status.clone();
         let task_execution_registry_for_status = task_execution_registry.clone();
+        let completion_notifier_for_status = completion_notifier.clone();
         task_store.set_status_change_callback(Box::new(
             move |task_id, old_status, new_status, task: magi_core::Task| {
+                // TaskStore 在 production 模式下已经把 callback 放到 mutation guard
+                // 之外执行。终态事实提交后立即通知 Turn Coordinator，避免计划/事件等
+                // 投影工作把 Turn 终态延迟到不可观测的后台窗口；后续任务侧投影仍在
+                // 同一回调中继续完成。
                 let callback_started_at = Instant::now();
                 if matches!(
                     new_status,
                     TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
                 ) {
-                    task_execution_registry_for_status.remove(task_id);
+                    if let Some(plan) = task_execution_registry_for_status.get(task_id) {
+                        match plan {
+                            magi_conversation_runtime::task_execution_registry::TaskExecutionPlan::Dispatch {
+                                session_id,
+                                turn_id,
+                                ..
+                            } => completion_notifier_for_status.bind_task_context(
+                                task_id,
+                                Some(session_id),
+                                Some(turn_id),
+                            ),
+                        }
+                    }
+                    // kill、租约过期和恢复收敛可能没有仍在 registry 中的执行计划；
+                    // 从当前 session sidecar 读取绑定的 Turn，仍然把同一 durable
+                    // Task 终态路由到 Coordinator，而不是丢弃为无主通知。
+                    for sidecar in session_store
+                        .active_execution_sidecars_for_task(task_id, &task.root_task_id)
+                    {
+                        if let Some(turn) = sidecar.current_turn.as_ref() {
+                            completion_notifier_for_status.bind_task_context(
+                                task_id,
+                                Some(sidecar.session_id.clone()),
+                                Some(turn.turn_id.clone()),
+                            );
+                            break;
+                        }
+                    }
+                    completion_notifier_for_status.notify_terminal_status(
+                        task_id,
+                        new_status,
+                        &task,
+                    );
                 }
                 sync_task_plan_status(eb.as_ref(), session_store.as_ref(), &task, new_status);
-                tracing::info!(
-                    target: "magi.performance",
-                    task_id = %task_id,
-                    stage = "task_status_callback_plan_synced",
-                    elapsed_ms = callback_started_at.elapsed().as_millis() as u64,
-                    "conversation response timing"
-                );
                 settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
                 publish_task_status_changed_event(
                     eb.as_ref(),
@@ -1652,13 +1687,6 @@ impl DaemonRuntime {
                     old_status,
                     new_status,
                     &task,
-                );
-                tracing::info!(
-                    target: "magi.performance",
-                    task_id = %task_id,
-                    stage = "task_status_callback_event_published",
-                    elapsed_ms = callback_started_at.elapsed().as_millis() as u64,
-                    "conversation response timing"
                 );
                 if let Err(error) = publish_task_status_turn_item_for_active_sessions(
                     &eb,
@@ -1673,6 +1701,12 @@ impl DaemonRuntime {
                         "任务状态事实写回会话 Turn 失败"
                     );
                 }
+                if matches!(
+                    new_status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+                ) {
+                    task_execution_registry_for_status.remove(task_id);
+                }
                 tracing::info!(
                     target: "magi.performance",
                     task_id = %task_id,
@@ -1682,22 +1716,26 @@ impl DaemonRuntime {
                 );
             },
         ));
-        let task_store = Arc::new(task_store);
+        task_store.set_status_change_callback_async(true);
+        runner_result_receiver.set_completion_sink(completion_notifier.clone());
         let accepted_submissions = self.state_repository.load_accepted_submissions()?;
         let mut restored_accepted_task_count = 0;
         for record in accepted_submissions
             .iter()
             .filter(|record| !record.task_checkpointed)
         {
-            if task_store.get_task(&record.task.task_id).is_some() {
+            let Some(task) = record.task.as_ref() else {
+                continue;
+            };
+            if task_store.get_task(&task.task_id).is_some() {
                 continue;
             }
             task_store
-                .insert_task_without_checkpoint(record.task.clone())
+                .insert_task_without_checkpoint(task.clone())
                 .map_err(|error| {
                     DaemonError::internal(format!(
                         "恢复 accepted task {} 失败: {error}",
-                        record.task.task_id
+                        task.task_id
                     ))
                 })?;
             restored_accepted_task_count += 1;
@@ -1852,7 +1890,16 @@ impl DaemonRuntime {
             .map_err(|error| {
                 DaemonError::internal(format!("恢复 session turn 排队状态失败: {error:?}"))
             })?;
-        state = state.with_task_store(Arc::clone(&task_store));
+        state = state
+            .with_task_store(Arc::clone(&task_store))
+            .with_task_completion_notifier(completion_notifier.clone());
+        let restored_turn_coordinator_count = state.restore_turn_coordinator_from_session_store();
+        if restored_turn_coordinator_count > 0 {
+            tracing::info!(
+                restored_turn_coordinator_count,
+                "已从 canonical Turn 恢复 SessionTurnCoordinator 身份索引"
+            );
+        }
         if magi_api::task_turn_finalize::reconcile_terminal_session_task_turns(&state) > 0 {
             let _ = state.persist_session_projection();
         }
@@ -1884,6 +1931,7 @@ impl DaemonRuntime {
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())
+                .with_completion_notifier(completion_notifier.clone())
                 .with_knowledge_store(state.knowledge_store.clone())
                 .with_knowledge_persist_callback(knowledge_persist_callback)
                 .with_session_state_persist_callback(session_state_persist_callback)
@@ -1904,9 +1952,9 @@ impl DaemonRuntime {
         state = state
             .with_session_turn_dispatcher(session_turn_dispatcher)
             .with_model_bridge_client(business_model_client);
-        let state_for_runner_terminal = state.clone();
-        let terminal_runner_manager = Arc::new(OnceLock::<Weak<RunnerManager>>::new());
-        let terminal_runner_manager_for_observer = Arc::clone(&terminal_runner_manager);
+        // Runner 只负责调度与资源循环。任务终态由 TaskStore durable status
+        // callback 进入 TaskCompletionNotifier，再由 Turn finalizer 收口，避免
+        // Runner 只负责调度，Task completion notification 是唯一终态入口。
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
             state.session_store.clone(),
@@ -1916,64 +1964,43 @@ impl DaemonRuntime {
         )
         .with_agent_role_registry(state.agent_role_registry.clone())
         .with_execution_admission(Arc::clone(&execution_admission))
-        .with_checkpoint_persist(task_checkpoint_persist)
-        .with_terminal_observer(move |root_task_id, session_id, status, turn_id| {
-            let Some(session_id) = session_id else {
+        .with_checkpoint_persist(task_checkpoint_persist);
+        let runner_manager = Arc::new(runner_manager);
+        state = state.with_shared_runner_manager(runner_manager);
+
+        // 完成通知器必须捕获已经装配 RunnerManager 的最终 ApiState。若在
+        // with_shared_runner_manager 之前注册 observer，队列出队时会使用缺少
+        // runner manager 的旧快照，把合法的 queued Turn 错误收口为失败。
+        let completion_state = state.clone();
+        completion_notifier.set_observer(move |notification| {
+            let Some(session_id) = notification.session_id.as_ref() else {
                 return;
             };
-            if matches!(status.as_str(), "completed" | "failed" | "killed") {
-                let report = state_for_runner_terminal.cancel_execution_resources(
-                    Some(&session_id),
-                    None,
-                    Some(&root_task_id),
-                    magi_browser_authority::BrowserLeaseEndReason::TaskFinished,
-                );
-                if report.browser_lease_count > 0 {
-                    tracing::debug!(
-                        %session_id,
-                        %root_task_id,
-                        browser_lease_count = report.browser_lease_count,
-                        "任务进入终态，已释放 Browser Lease"
-                    );
-                }
-            }
-            let Some(runner_manager) = terminal_runner_manager_for_observer
-                .get()
-                .and_then(Weak::upgrade)
-            else {
-                tracing::error!(
-                    %session_id,
-                    %root_task_id,
-                    "runner 终态回调无法获取活动 runner manager"
-                );
+            let Some(turn_id) = notification.turn_id.as_deref() else {
                 return;
             };
-            let callback_state = state_for_runner_terminal
-                .clone()
-                .with_shared_runner_manager(runner_manager);
+            let runner_status = match notification.status {
+                TaskStatus::Completed => "completed",
+                TaskStatus::Failed => "failed",
+                TaskStatus::Killed => "killed",
+                _ => return,
+            };
             if let Err(error) = magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
-                &callback_state,
-                &session_id,
-                &root_task_id,
-                &status,
-                turn_id.as_deref(),
+                &completion_state,
+                session_id,
+                &notification.root_task_id,
+                runner_status,
+                Some(turn_id),
             ) {
                 tracing::error!(
                     %session_id,
-                    %root_task_id,
+                    turn_id,
+                    root_task_id = %notification.root_task_id,
                     %error,
-                    "runner 终态回调未能完成 session Turn 收敛"
+                    "主动 Task completion 通知未能收口 Session Turn"
                 );
             }
         });
-        let runner_manager = Arc::new(runner_manager);
-        if terminal_runner_manager
-            .set(Arc::downgrade(&runner_manager))
-            .is_err()
-        {
-            return Err(DaemonError::internal("重复装配 runner 终态回调状态"));
-        }
-        state = state.with_shared_runner_manager(runner_manager);
 
         if let Some(probe_config) = direct_http_probe_config {
             state = state.with_direct_http_model_probe(probe_config);
@@ -4180,6 +4207,7 @@ done
         .await;
         assert_completed_two_agent_run_projection(&first_projection);
 
+        let second_request_id = "request-router-session-action-followup";
         let (status, second_body) = post_json(
             app.clone(),
             "/api/session/turn",
@@ -4190,6 +4218,8 @@ done
                 "skillName": "refactor",
                 "images": [],
                 "workspaceId": active_workspace_id.to_string(),
+                "requestId": second_request_id,
+                "userMessageId": "user-router-session-action-followup",
             }),
         )
         .await;
@@ -4200,9 +4230,35 @@ done
             .expect("accepted_at should serialize as integer");
         // session 一生一 mission：第二次派发复用第一次派发创建的 mission_id
         let second_mission_id = format!("mission-session-action-{first_accepted_at}");
-        let second_root_task_id = second_body["rootTaskId"]
-            .as_str()
-            .expect("root_task_id should serialize as string");
+        let second_root_task_id = if let Some(root_task_id) = second_body["rootTaskId"].as_str() {
+            root_task_id.to_string()
+        } else {
+            assert_eq!(
+                second_body["queued"], true,
+                "忙碌 session 的 followup 应进入队列: {second_body:?}"
+            );
+            let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
+            loop {
+                if let Some(turn) = state
+                    .session_store
+                    .canonical_turn_for_request_id(second_request_id)
+                    && let Some(task_id) = turn
+                        .items
+                        .iter()
+                        .find(|item| {
+                            item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                        })
+                        .and_then(|item| item.worker.as_ref())
+                        .and_then(|worker| worker.task_id.as_ref())
+                {
+                    break task_id.to_string();
+                }
+                if Instant::now() >= deadline {
+                    panic!("queued followup was not accepted into canonical Turn before timeout");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
         let expected_extraction_id = format!(
             "extract-session-action-test-session-001-{first_accepted_at}-timeline-test-session-001-{first_accepted_at}"
         );
@@ -4210,6 +4266,8 @@ done
         let second_execution_group =
             wait_for_execution_group(app.clone(), &second_mission_id, |entry| {
                 entry["context_memory_extraction_refs"] == json!([expected_extraction_id])
+                    && entry["context_used_memory_count"] == 1
+                    && entry["context_extracted_memory_count"] == 1
             })
             .await;
         assert_eq!(second_execution_group["context_used_memory_count"], 1);
@@ -4220,7 +4278,7 @@ done
         );
         let second_projection = wait_for_agent_run_projection_completed(
             app,
-            second_root_task_id,
+            &second_root_task_id,
             "test-session-001",
             active_workspace_id.as_str(),
         )
@@ -4264,11 +4322,9 @@ done
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {body:?}");
         assert_eq!(body["route"], "chat");
-        // 统一执行链路后，chat 也通过 root coordinator 派发并返回 rootTaskId。
-        let root_task_id = body["rootTaskId"]
-            .as_str()
-            .expect("chat turn should return root task id")
-            .to_string();
+        // 普通 Chat 属于 Conversation profile，不创建 TaskStore root task。
+        assert!(body["rootTaskId"].is_null());
+        assert!(body["actionTaskId"].is_null());
 
         let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {
@@ -4302,19 +4358,6 @@ done
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-
-        // 统一链路后 chat 也有 root task，投影接口应能回看已完成的运行。
-        let projection = wait_for_agent_run_projection_completed(
-            app.clone(),
-            &root_task_id,
-            session_id.as_str(),
-            active_workspace_id.as_str(),
-        )
-        .await;
-        assert_eq!(
-            projection["root_task"]["status"], "completed",
-            "chat turn root task should complete: {projection:?}"
-        );
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use magi_conversation_runtime::context_reference::{
     SessionContextReference, SessionContextReferenceKind, sanitize_browser_node_selection,
 };
 use magi_conversation_runtime::session_images::SessionTurnImage;
+use magi_conversation_runtime::{CoordinatorTurnStatus, ExecutionProfile};
 use magi_core::{AccessProfile, EventId, SessionId, TaskId, UtcMillis};
 use magi_session_store::{
     CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem, SessionRecord,
@@ -540,6 +541,12 @@ pub struct SessionTurnResponseDto {
     pub event_stream_next_sequence: u64,
     pub created_session: bool,
     pub route: SessionTurnRouteDto,
+    /// Turn 生命周期合同的直接字段；canonicalTurn 仍保留完整事实投影。
+    pub turn_id: Option<String>,
+    pub request_id: Option<String>,
+    pub execution_profile: Option<ExecutionProfile>,
+    pub status: Option<CoordinatorTurnStatus>,
+    pub event_sequence: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_summary: Option<SessionDirectoryEntryDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -614,6 +621,17 @@ impl SessionTurnResponseDto {
             event_stream_next_sequence,
             created_session,
             route,
+            turn_id: None,
+            request_id: None,
+            execution_profile: Some(match route {
+                SessionTurnRouteDto::Chat => ExecutionProfile::Conversation,
+                SessionTurnRouteDto::Execute
+                | SessionTurnRouteDto::Task
+                | SessionTurnRouteDto::Continue
+                | SessionTurnRouteDto::Steer => ExecutionProfile::Task,
+            }),
+            status: Some(CoordinatorTurnStatus::Accepted),
+            event_sequence: Some(event_stream_next_sequence),
             session_summary: None,
             root_task_id: root_task_id.map(|task_id| task_id.to_string()),
             action_task_id: action_task_id.map(|task_id| task_id.to_string()),
@@ -640,6 +658,16 @@ impl SessionTurnResponseDto {
         self
     }
 
+    pub fn with_request_identity(
+        mut self,
+        request_id: Option<String>,
+        event_sequence: u64,
+    ) -> Self {
+        self.request_id = request_id;
+        self.event_sequence = Some(event_sequence);
+        self
+    }
+
     pub fn with_session_summary(
         mut self,
         session_summary: Option<SessionDirectoryEntryDto>,
@@ -659,6 +687,41 @@ impl SessionTurnResponseDto {
         turn: Option<CanonicalTurn>,
         item: Option<CanonicalTurnItem>,
     ) -> Self {
+        if let Some(canonical_turn) = turn.as_ref() {
+            self.turn_id = Some(canonical_turn.turn_id.clone());
+            self.status = Some(match canonical_turn.status {
+                magi_session_store::CanonicalTurnStatus::Pending => CoordinatorTurnStatus::Accepted,
+                magi_session_store::CanonicalTurnStatus::Running => CoordinatorTurnStatus::Running,
+                magi_session_store::CanonicalTurnStatus::Blocked => CoordinatorTurnStatus::Blocked,
+                magi_session_store::CanonicalTurnStatus::Completed => {
+                    CoordinatorTurnStatus::Completed
+                }
+                magi_session_store::CanonicalTurnStatus::Failed => CoordinatorTurnStatus::Failed,
+                magi_session_store::CanonicalTurnStatus::Interrupted
+                | magi_session_store::CanonicalTurnStatus::Cancelled
+                | magi_session_store::CanonicalTurnStatus::Superseded => {
+                    CoordinatorTurnStatus::Cancelled
+                }
+            });
+            if let Some(request_id) = canonical_turn
+                .metadata
+                .get("requestId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                self.request_id = Some(request_id.to_string());
+            }
+            if let Some(profile) = canonical_turn
+                .metadata
+                .get("executionProfile")
+                .and_then(Value::as_str)
+            {
+                self.execution_profile = Some(match profile {
+                    "task" => ExecutionProfile::Task,
+                    _ => ExecutionProfile::Conversation,
+                });
+            }
+        }
         if turn.is_some() || item.is_some() {
             self.canonical_schema_version = Some(CANONICAL_TURN_SCHEMA_VERSION);
             self.canonical_event_kind = Some(event_kind.to_string());
@@ -677,6 +740,7 @@ impl SessionTurnResponseDto {
         if self.canonical_turn.is_some() || self.canonical_item.is_some() {
             self.canonical_event_id = Some(event_id.to_string());
             self.canonical_event_seq = Some(event_seq);
+            self.event_sequence = Some(event_seq);
             self.canonical_occurred_at = Some(occurred_at);
         }
         self

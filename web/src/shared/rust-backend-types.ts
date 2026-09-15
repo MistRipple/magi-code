@@ -108,6 +108,12 @@ export interface SessionTurnResponseDto {
   eventStreamNextSequence: number;
   createdSession: boolean;
   route: SessionTurnRouteDto;
+  /** Turn 生命周期合同的直接字段。 */
+  turnId?: string | null;
+  requestId?: string | null;
+  executionProfile?: "conversation" | "task" | null;
+  status?: string | null;
+  eventSequence?: number | null;
   sessionSummary?: SessionDirectoryEntryDto | null;
   /** Root task ID when the backend created an agent run for this action. */
   rootTaskId?: string | null;
@@ -982,6 +988,10 @@ export interface SessionContinueResponseDto {
   runnerStarted: boolean;
   eventId: string;
   continuedAt: number;
+  turnId: string;
+  requestId: string;
+  executionProfile: "task";
+  eventSequence: number;
 }
 
 export type IncidentScopeDto = 'app' | 'workspace' | 'session';

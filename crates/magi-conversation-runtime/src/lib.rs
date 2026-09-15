@@ -24,11 +24,13 @@ pub mod prompt_utils;
 mod registry;
 pub mod session_images;
 pub mod session_thread;
+pub mod session_turn_coordinator;
 pub mod session_turn_execution;
 pub mod session_turn_finalize;
 pub mod session_writeback;
 mod skill_apply_tool;
 mod skill_custom_tool_surface;
+pub mod task_completion_notifier;
 pub mod task_execution_dispatcher;
 pub mod task_execution_registry;
 pub mod task_helpers;
@@ -42,6 +44,7 @@ mod tool_execution_ledger;
 pub mod tool_result_utils;
 mod tool_surface_state;
 mod turn;
+pub mod turn_stream_buffer;
 pub mod usage_recording;
 
 pub use builtin_tool_schema::{
@@ -54,6 +57,11 @@ pub use registry::{
     ConversationRegistry, SessionTurnInputBoundary, SessionTurnInputCommitError,
     SessionTurnInputError, TaskSignalBoundary, TaskSignalCommitError,
 };
+pub use session_turn_coordinator::{
+    CoordinatorAdmission, CoordinatorError, CoordinatorTurnStatus, ExecutionProfile,
+    SessionTurnCoordinator, TurnAdmission, TurnAttempt, request_fingerprint,
+};
+pub use session_turn_execution::SessionTurnExecutionRequest;
 pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,
 };
@@ -62,6 +70,7 @@ pub use skill_custom_tool_surface::{
     execute_skill_custom_tool, extract_skill_custom_tool_payload, parse_skill_custom_tool_name,
     tool_execution_policy_scope,
 };
+pub use task_completion_notifier::{TaskCompletionNotification, TaskCompletionNotifier};
 pub use task_helpers::{
     GoalModeLifecycleState, TaskTurnVisibility, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,

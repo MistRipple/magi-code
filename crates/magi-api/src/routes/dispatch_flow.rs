@@ -245,7 +245,7 @@ struct ExecuteDispatchSubmissionInput<'a> {
     user_message_metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
-fn initial_session_orchestrator_config(
+pub(super) fn initial_session_orchestrator_config(
     state: &ApiState,
     created_session: bool,
     config: Option<&serde_json::Value>,
@@ -537,6 +537,19 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
         .execution_ownership(&accepted.session_id)
         .and_then(|ownership| ownership.workspace_id);
     let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(accepted);
+    let metadata = canonical_turn.as_ref().map(|turn| &turn.metadata);
+    let request_id = metadata
+        .and_then(|metadata| metadata.get("requestId"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let request_fingerprint = metadata
+        .and_then(|metadata| metadata.get("requestFingerprint"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let attempt_id = metadata
+        .and_then(|metadata| metadata.get("attemptId"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let session_summary = accepted_session_directory_entry(state, accepted);
     let event_id = EventId::new(format!(
         "event-session-turn-task-{}",
@@ -552,9 +565,19 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
             "workspace_id": workspace_id.as_ref().map(ToString::to_string),
             "text": serde_json::Value::Null,
             "skill_name": serde_json::Value::Null,
-            "request_id": serde_json::Value::Null,
-            "user_message_id": serde_json::Value::Null,
-            "placeholder_message_id": serde_json::Value::Null,
+            "request_id": request_id,
+            "request_fingerprint": request_fingerprint,
+            "attempt_id": attempt_id,
+            "user_message_id": canonical_item
+                .as_ref()
+                .and_then(|item| item.metadata.get("userMessageId"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "placeholder_message_id": canonical_item
+                .as_ref()
+                .and_then(|item| item.metadata.get("placeholderMessageId"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             "image_count": 0,
             "created_session": false,
             "session_summary": session_summary,
@@ -605,6 +628,23 @@ async fn prepare_session_task_dispatch(
         Some(&accepted.turn_id),
         None,
     );
+    if !matches!(
+        state
+            .turn_coordinator()
+            .current_status(&accepted.session_id, &accepted.turn_id),
+        Ok(magi_conversation_runtime::CoordinatorTurnStatus::Running)
+    ) {
+        state
+            .turn_coordinator()
+            .set_status(
+                &accepted.session_id,
+                &accepted.turn_id,
+                magi_conversation_runtime::CoordinatorTurnStatus::Preparing,
+            )
+            .map_err(|error| {
+                ApiError::internal_assembly("更新任务 Coordinator 准备状态失败", error)
+            })?;
+    }
     state
         .session_store
         .update_current_turn_status_for_turn(
@@ -812,6 +852,20 @@ pub(super) async fn finalize_session_task_dispatch(
             fail_accepted_task_submission(&state, &accepted, &error.to_string());
             return;
         }
+    }
+    if let Err(error) = state.turn_coordinator().set_status(
+        &accepted.session_id,
+        &accepted.turn_id,
+        magi_conversation_runtime::CoordinatorTurnStatus::Running,
+    ) {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            turn_id = %accepted.turn_id,
+            %error,
+            "更新任务 Coordinator 运行状态失败"
+        );
+        fail_accepted_task_submission(&state, &accepted, &error.to_string());
+        return;
     }
     if let Err(error) =
         drive_dispatch_submission_after_lifecycle_and_restart_lock(&state, &mut accepted)
@@ -1096,7 +1150,7 @@ pub(super) fn resolve_dispatch_session(
     Ok((session_id, true, requested_workspace_id))
 }
 
-fn publish_session_user_message_event(
+pub(crate) fn publish_session_user_message_event(
     state: &ApiState,
     session_id: &SessionId,
     workspace_id: Option<WorkspaceId>,

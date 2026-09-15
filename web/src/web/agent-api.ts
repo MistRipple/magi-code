@@ -487,6 +487,11 @@ export interface AgentSessionTurnResult {
   eventStreamNextSequence: number;
   createdSession: boolean;
   route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
+  turnId?: string | null;
+  requestId?: string | null;
+  executionProfile?: 'conversation' | 'task' | null;
+  status?: string | null;
+  eventSequence?: number | null;
   sessionSummary?: AgentSessionSummary | null;
   /** Root task ID when the backend created an agent run for this action. */
   rootTaskId?: string | null;
@@ -2113,6 +2118,11 @@ export async function submitSessionTurn(
       eventStreamNextSequence: number;
       createdSession: boolean;
       route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
+      turnId?: string | null;
+      requestId?: string | null;
+      executionProfile?: 'conversation' | 'task' | null;
+      status?: string | null;
+      eventSequence?: number | null;
       sessionSummary?: RawAgentSessionSummary | null;
       rootTaskId?: string | null;
       actionTaskId?: string | null;
@@ -2147,6 +2157,15 @@ export async function submitSessionTurn(
       eventStreamNextSequence,
       createdSession: raw.createdSession,
       route: raw.route,
+      turnId: typeof raw.turnId === 'string' && raw.turnId.trim() ? raw.turnId.trim() : null,
+      requestId: typeof raw.requestId === 'string' && raw.requestId.trim() ? raw.requestId.trim() : null,
+      executionProfile: raw.executionProfile === 'task' || raw.executionProfile === 'conversation'
+        ? raw.executionProfile
+        : null,
+      status: typeof raw.status === 'string' && raw.status.trim() ? raw.status.trim() : null,
+      eventSequence: typeof raw.eventSequence === 'number' && Number.isFinite(raw.eventSequence)
+        ? Math.floor(raw.eventSequence)
+        : null,
       sessionSummary: raw.sessionSummary ? normalizeSessionSummary(raw.sessionSummary) : null,
       rootTaskId: typeof raw.rootTaskId === 'string' && raw.rootTaskId.trim() ? raw.rootTaskId.trim() : null,
       actionTaskId: typeof raw.actionTaskId === 'string' && raw.actionTaskId.trim()

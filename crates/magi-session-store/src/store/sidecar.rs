@@ -7,12 +7,13 @@ use crate::models::{
     GoalContinuationState, GoalStatus, InterruptedGoalResumeCheckpoint, SessionAcceptanceRecord,
     SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
     SessionPlan, SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState,
-    ThreadChatMessage, ThreadContextCheckpoint, ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint,
+    ThreadModelProviderContext, ThreadVisibility, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, GoalId, MissionId, PlanState,
     RecoveryResumeInput, SessionId, Task, TaskExecutionTarget, TaskId, ThreadId, UtcMillis,
-    WorkerId,
+    WorkerId, WorkspaceId,
 };
 use magi_tool_runtime::BuiltinToolName;
 use serde_json::Value;
@@ -405,7 +406,10 @@ fn current_turn_item_to_canonical_item(
         // 新 item 从版本 1 开始。版本号属于 canonical 事实，不应等到第一次更新
         // 后才出现，否则流式事件的版本 1 会与首次完整事实更新发生冲突。
         item_version: Some(1),
-        updated_at: UtcMillis::now(),
+        // accepted_at 来自全局单调序列，在并行请求下可能领先系统时钟数毫秒；
+        // canonical item 的更新时间必须始终不早于创建时间，否则 daemon 事件日志
+        // 会把合法的 accepted 事实判定为时间倒流。
+        updated_at: UtcMillis(UtcMillis::now().0.max(turn.accepted_at.0)),
         title: item.title.clone(),
         content: item.content.clone(),
         blocks: Vec::new(),
@@ -443,6 +447,23 @@ fn current_turn_to_canonical_turn(
         .unwrap_or_default();
     if let Some(request_id) = crate::models::active_execution_turn_request_id(turn) {
         metadata.insert("requestId".to_string(), Value::String(request_id));
+    }
+    // Turn 级协议元数据由首个 user item 携带，canonical Turn 也保留同一份
+    // 轻量身份，便于重启后按 requestId/fingerprint 恢复而无需重新解析请求。
+    if let Some(user_item) = turn.items.iter().find(|item| item.kind == "user_message") {
+        for key in [
+            "executionProfile",
+            "requestFingerprint",
+            "traceId",
+            "attemptId",
+            "userMessageId",
+            "placeholderMessageId",
+            "route",
+        ] {
+            if let Some(value) = user_item.metadata.get(key) {
+                metadata.insert(key.to_string(), value.clone());
+            }
+        }
     }
     let mut canonical_turn = CanonicalTurn {
         session_id: session_id.clone(),
@@ -545,14 +566,14 @@ fn apply_canonical_turn_in_state(state: &mut SessionStoreState, incoming: Canoni
 struct CanonicalCommitPlan<T> {
     mutations: Vec<super::CanonicalTurnMutation>,
     value: T,
-    acceptance: Option<(SessionAcceptanceRecord, Task)>,
+    acceptance: Option<(SessionAcceptanceRecord, Option<Task>)>,
 }
 
 impl SessionStore {
     /// 在不占用 session state 写锁的情况下完成一笔 canonical 事务。
     ///
     /// prepare 只读取并校验内存状态，事件写入完成后才重新取得 state 写锁提交
-    /// canonical projection。canonical_commit_lock 保证 prepare 到 apply 期间不会有
+    /// canonical projection。canonical session commit lock 保证 prepare 到 apply 期间不会有
     /// 另一笔 canonical 事务改变同一份事件 projection；普通 session 读取可以在 fsync
     /// 期间继续进行。
     fn commit_canonical_transaction<T, R>(
@@ -561,10 +582,14 @@ impl SessionStore {
         prepare: impl FnOnce(&SessionStoreState) -> DomainResult<CanonicalCommitPlan<T>>,
         apply: impl FnOnce(&mut SessionStoreState, T) -> R,
     ) -> DomainResult<R> {
-        let _canonical_guard = self
-            .canonical_commit_lock
+        let _canonical_barrier = self
+            .canonical_commit_barrier
+            .read()
+            .expect("canonical commit barrier poisoned");
+        let canonical_session_lock = self.canonical_commit_lock_for(session_id);
+        let _canonical_guard = canonical_session_lock
             .lock()
-            .expect("canonical commit lock poisoned");
+            .expect("canonical session commit lock poisoned");
         let plan = {
             let state = self.state.read().expect("session state read lock poisoned");
             prepare(&state)?
@@ -580,7 +605,7 @@ impl SessionStore {
                 session_id,
                 &plan.mutations,
                 acceptance,
-                task,
+                task.as_ref(),
             )?;
         } else if !plan.mutations.is_empty() {
             self.persist_canonical_mutations(session_id, &plan.mutations)?;
@@ -618,7 +643,7 @@ impl SessionStore {
         state: &SessionStoreState,
         session_id: &SessionId,
         turn: &ActiveExecutionTurn,
-        acceptance: Option<(SessionAcceptanceRecord, Task)>,
+        acceptance: Option<(SessionAcceptanceRecord, Option<Task>)>,
     ) -> DomainResult<CanonicalCommitPlan<CanonicalTurn>> {
         let incoming = prepare_canonical_turn_in_state(state, session_id, turn)?;
         let previous = state
@@ -647,7 +672,7 @@ impl SessionStore {
         state: &SessionStoreState,
         session_id: &SessionId,
         incoming: CanonicalTurn,
-        acceptance: Option<(SessionAcceptanceRecord, Task)>,
+        acceptance: Option<(SessionAcceptanceRecord, Option<Task>)>,
     ) -> CanonicalCommitPlan<CanonicalTurn> {
         let previous = state
             .canonical_turns
@@ -676,7 +701,7 @@ impl SessionStore {
         replaced_turn_index: usize,
         mut incoming: CanonicalTurn,
         superseded_at: UtcMillis,
-        acceptance: Option<(SessionAcceptanceRecord, Task)>,
+        acceptance: Option<(SessionAcceptanceRecord, Option<Task>)>,
     ) -> DomainResult<CanonicalCommitPlan<CanonicalTurn>> {
         apply_goal_response_duration_scope(state, &mut incoming);
         incoming.normalize();
@@ -2242,9 +2267,6 @@ impl SessionStore {
                     message: format!("thread {} 不属于本次恢复创建的任务 {}", thread_id, task_id),
                 });
             }
-            state
-                .thread_context_checkpoints
-                .retain(|checkpoint| &checkpoint.thread_id != thread_id);
             state.thread_registry.remove(index)
         };
         self.mark_sidecar_dirty_for_session(
@@ -2574,6 +2596,268 @@ impl SessionStore {
                 worker_id: thread.worker_instance_id.clone(),
             })
         }
+    }
+
+    /// 从 canonical Turn Log 重建 thread 对模型可见的历史投影。
+    ///
+    /// ThreadChatMessage 只是读取投影，不能再作为 Provider/工具路径的独立事实源。
+    /// 只有当当前 session 存在属于该 thread 的 canonical item 时才替换 transcript；
+    /// 没有 canonical 历史的旧 thread 保留原值，交由迁移/恢复路径处理。
+    pub fn rebuild_thread_message_projection(
+        &self,
+        thread_id: &ThreadId,
+        now: UtcMillis,
+    ) -> DomainResult<usize> {
+        fn value_text(value: &Value) -> String {
+            match value {
+                Value::String(text) => text.clone(),
+                _ => value.to_string(),
+            }
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let thread = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .cloned()
+            .ok_or(DomainError::NotFound { entity: "thread" })?;
+        let mut projected = Vec::new();
+        for turn in state
+            .canonical_turns
+            .iter()
+            .filter(|turn| turn.session_id == thread.session_id)
+        {
+            for item in turn.items.iter().filter(|item| {
+                item.source_thread_id == *thread_id
+                    || (thread.role_id != ORCHESTRATOR_ROLE_ID
+                        && item.kind == CanonicalTurnItemKind::UserMessage
+                        && item.metadata.get("route").and_then(Value::as_str) == Some("continue"))
+            }) {
+                match item.kind {
+                    CanonicalTurnItemKind::UserMessage => {
+                        if item
+                            .content
+                            .as_deref()
+                            .is_some_and(|content| !content.trim().is_empty())
+                        {
+                            projected.push(ThreadChatMessage {
+                                role: "user".to_string(),
+                                content: item.content.clone(),
+                                images: Vec::new(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                provider_context: Vec::new(),
+                            });
+                        }
+                    }
+                    CanonicalTurnItemKind::AssistantText => {
+                        if item
+                            .content
+                            .as_deref()
+                            .is_some_and(|content| !content.trim().is_empty())
+                        {
+                            let provider_context = item
+                                .metadata
+                                .get("providerContext")
+                                .and_then(|value| {
+                                    serde_json::from_value::<Vec<ThreadModelProviderContext>>(
+                                        value.clone(),
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or_default();
+                            let tool_calls = item
+                                .metadata
+                                .get("toolCalls")
+                                .and_then(|value| {
+                                    serde_json::from_value::<Vec<ThreadChatToolCall>>(value.clone())
+                                        .ok()
+                                })
+                                .unwrap_or_default();
+                            projected.push(ThreadChatMessage {
+                                role: "assistant".to_string(),
+                                content: item.content.clone(),
+                                images: Vec::new(),
+                                tool_calls,
+                                tool_call_id: None,
+                                provider_context,
+                            });
+                        }
+                    }
+                    CanonicalTurnItemKind::ToolCall => {
+                        let Some(tool) = item.tool.as_ref() else {
+                            continue;
+                        };
+                        projected.push(ThreadChatMessage {
+                            role: "assistant".to_string(),
+                            content: None,
+                            images: Vec::new(),
+                            tool_calls: vec![ThreadChatToolCall {
+                                id: tool.call_id.clone(),
+                                kind: "function".to_string(),
+                                function: ThreadChatToolFunction {
+                                    name: tool.name.clone(),
+                                    arguments: tool
+                                        .arguments
+                                        .as_ref()
+                                        .map(value_text)
+                                        .unwrap_or_else(|| "{}".to_string()),
+                                },
+                            }],
+                            tool_call_id: None,
+                            provider_context: Vec::new(),
+                        });
+                        let result = tool
+                            .result
+                            .as_ref()
+                            .map(value_text)
+                            .or_else(|| {
+                                tool.error.as_ref().map(|error| {
+                                    serde_json::json!({
+                                        "tool": tool.name,
+                                        "status": "failed",
+                                        "error": error,
+                                    })
+                                    .to_string()
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                let interrupted = matches!(
+                                    turn.status,
+                                    CanonicalTurnStatus::Cancelled
+                                        | CanonicalTurnStatus::Interrupted
+                                        | CanonicalTurnStatus::Superseded
+                                ) || matches!(
+                                    item.status,
+                                    CanonicalTurnItemStatus::Cancelled
+                                        | CanonicalTurnItemStatus::Failed
+                                );
+                                serde_json::json!({
+                                    "tool": tool.name,
+                                    "status": if interrupted { "interrupted" } else { "pending" },
+                                    "execution": if interrupted { "unknown" } else { "not_started" },
+                                    "reason": if interrupted {
+                                        "task_interrupted_before_tool_result_persisted"
+                                    } else {
+                                        "canonical_projection_missing_tool_result"
+                                    },
+                                })
+                                .to_string()
+                            });
+                        projected.push(ThreadChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(result),
+                            images: Vec::new(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: Some(tool.call_id.clone()),
+                            provider_context: Vec::new(),
+                        });
+                    }
+                    CanonicalTurnItemKind::AssistantThinking
+                    | CanonicalTurnItemKind::TaskStatus
+                    | CanonicalTurnItemKind::SystemNotice => {}
+                }
+            }
+        }
+        if projected.is_empty() {
+            return Ok(0);
+        }
+        // 迁移中的旧 thread 可能已经有一段没有 canonical 对应物的历史。保留
+        // 这段历史作为 prefix，并在 canonical projection 尚未成为 suffix 时追加
+        // 新事实；重复重建会命中 prefix/suffix 判断，不会不断复制消息。
+        let projected = if thread.message_history == projected
+            || projected.starts_with(&thread.message_history)
+        {
+            projected
+        } else if thread.message_history.ends_with(&projected) {
+            thread.message_history.clone()
+        } else {
+            let existing = &thread.message_history;
+            // canonical tool call 在工具执行前会先投影一个“结果未知”的 marker；
+            // 结果落盘后必须替换该 marker，而不是把同一个 call 再追加一遍。
+            let interrupted_marker_index = existing.iter().position(|message| {
+                message.content.as_deref().is_some_and(|content| {
+                    content.contains("canonical_projection_missing_tool_result")
+                })
+            });
+            if let Some(marker_index) = interrupted_marker_index {
+                let assistant_index = marker_index.saturating_sub(1);
+                let mut merged = existing[..assistant_index].to_vec();
+                merged.extend(projected);
+                merged
+            } else {
+                let overlap = (1..=existing.len().min(projected.len()))
+                    .rev()
+                    .find(|overlap| existing[existing.len() - overlap..] == projected[..*overlap])
+                    .unwrap_or(0);
+                let mut merged = existing.clone();
+                merged.extend(projected.into_iter().skip(overlap));
+                merged
+            }
+        };
+        let target = state
+            .thread_registry
+            .iter_mut()
+            .find(|candidate| &candidate.thread_id == thread_id)
+            .expect("thread was found while holding state lock");
+        let changed = target.message_history != projected;
+        if changed {
+            target.message_history = projected;
+            target.last_used_at = now;
+        }
+        drop(state);
+        if changed {
+            self.mark_sidecar_dirty_for_session(
+                Some(&thread.session_id),
+                SessionSidecarFlushReason::RegisterThread,
+            );
+        }
+        Ok(if changed { 1 } else { 0 })
+    }
+
+    /// 重建 projection；仅对没有任何 canonical item 的旧 thread 使用一次性迁移
+    /// 输入。新 Turn 一旦有 canonical 事实，传入的 legacy_messages 会被忽略，避免
+    /// Provider/工具回调重新建立第二份事实源。
+    pub fn rebuild_thread_message_projection_with_legacy(
+        &self,
+        thread_id: &ThreadId,
+        legacy_messages: Vec<ThreadChatMessage>,
+        now: UtcMillis,
+    ) -> DomainResult<usize> {
+        let projected = self.rebuild_thread_message_projection(thread_id, now)?;
+        if projected > 0 || legacy_messages.is_empty() {
+            return Ok(projected);
+        }
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let has_canonical_item = state.canonical_turns.iter().any(|turn| {
+            turn.items
+                .iter()
+                .any(|item| item.source_thread_id == *thread_id)
+        });
+        if has_canonical_item {
+            return Ok(0);
+        }
+        let thread = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+            .ok_or(DomainError::NotFound { entity: "thread" })?;
+        let session_id = thread.session_id.clone();
+        thread.message_history.extend(legacy_messages);
+        thread.last_used_at = now;
+        drop(state);
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::RegisterThread,
+        );
+        Ok(1)
     }
 
     /// P6b：读取指定 thread 内部的对话记录。代理 task thread 为单 task 独占，
@@ -3161,6 +3445,129 @@ impl SessionStore {
         Ok((entry_id, updated))
     }
 
+    /// 接受一个不属于 TaskStore 的 Conversation Turn。
+    ///
+    /// Conversation Turn 与任务 Turn 共用 canonical 写模型，但不会继承旧任务的
+    /// execution chain、lease 或 recovery ownership。该边界必须在同一笔 canonical
+    /// transaction 内完成，不能先清理旧 ownership 再调用通用 accepted 方法。
+    pub fn accept_conversation_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        workspace_id: Option<WorkspaceId>,
+        timeline_entry: TimelineEntryInput,
+        mut turn: ActiveExecutionTurn,
+    ) -> DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
+        let TimelineEntryInput {
+            entry_id,
+            kind,
+            message,
+            occurred_at,
+        } = timeline_entry;
+        turn.normalize();
+        let (updated, canonical_turn) = self.commit_canonical_transaction(
+            &session_id,
+            |state| {
+                if !state
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+                {
+                    return Err(DomainError::NotFound { entity: "session" });
+                }
+                let existing = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter()
+                    .find(|sidecar| sidecar.session_id == session_id)
+                    .cloned();
+                reject_conflicting_active_current_turn(
+                    &session_id,
+                    existing
+                        .as_ref()
+                        .and_then(|sidecar| sidecar.current_turn.as_ref()),
+                    Some(turn.turn_id.as_str()),
+                )?;
+                reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+
+                let workspace_id = workspace_id.clone().or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|sidecar| sidecar.ownership.workspace_id.clone())
+                });
+                let ownership = ExecutionOwnership {
+                    session_id: Some(session_id.clone()),
+                    workspace_id,
+                    ..ExecutionOwnership::default()
+                };
+                let updated = SessionRuntimeSidecar {
+                    session_id: session_id.clone(),
+                    ownership,
+                    // Conversation Turn 不应沿用任务恢复标记。
+                    recovery_id: None,
+                    current_turn: Some(turn.clone()),
+                    active_execution_chain: None,
+                    status: SessionExecutionSidecarStatus::Detached,
+                    updated_at: UtcMillis::now(),
+                };
+                let canonical_plan = Self::canonical_turn_commit_plan(
+                    state,
+                    &session_id,
+                    updated
+                        .current_turn
+                        .as_ref()
+                        .expect("conversation turn was set"),
+                    None,
+                )?;
+                let acceptance = SessionAcceptanceRecord {
+                    session: state
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_id == session_id)
+                        .expect("session existence was validated")
+                        .clone(),
+                    timeline_entry: TimelineEntry {
+                        entry_id: entry_id.clone(),
+                        session_id: session_id.clone(),
+                        kind: kind.clone(),
+                        message: message.clone(),
+                        occurred_at,
+                    },
+                    superseded_turn: None,
+                    canonical_turn: canonical_plan.value.clone(),
+                    sidecar: updated.clone(),
+                };
+                Ok(CanonicalCommitPlan {
+                    mutations: canonical_plan.mutations,
+                    value: (updated, canonical_plan.value),
+                    acceptance: Some((acceptance, None)),
+                })
+            },
+            |state, (updated, canonical_turn)| {
+                state.timeline.push(TimelineEntry {
+                    entry_id: entry_id.clone(),
+                    session_id: session_id.clone(),
+                    kind: kind.clone(),
+                    message: message.clone(),
+                    occurred_at,
+                });
+                if let Some(session) = state
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.session_id == session_id)
+                {
+                    session.updated_at = occurred_at;
+                }
+                upsert_runtime_sidecar_in_state(state, updated.clone());
+                (updated, canonical_turn)
+            },
+        )?;
+        self.mark_sidecar_dirty_for_session(
+            Some(&session_id),
+            SessionSidecarFlushReason::UpsertCurrentTurn,
+        );
+        Ok((entry_id, updated, canonical_turn))
+    }
+
     /// 在 Continue 创建新 Turn 前，将仍处于活动态的旧 current Turn 收口为失败。
     ///
     /// 某些恢复场景中根任务已经失败或 daemon 已经停止，但异步终态回调尚未把
@@ -3640,7 +4047,7 @@ impl SessionStore {
                                 canonical_turn: incoming.clone(),
                                 sidecar: updated.clone(),
                             },
-                            task.clone(),
+                            Some(task.clone()),
                         )
                     });
                     (Some(incoming), acceptance)
@@ -3816,7 +4223,7 @@ impl SessionStore {
                                 canonical_turn: incoming_canonical_turn.clone(),
                                 sidecar: updated.clone(),
                             },
-                            task.clone(),
+                            Some(task.clone()),
                         )
                     });
                     let plan = Self::canonical_replacement_commit_plan(
@@ -4594,12 +5001,16 @@ impl SessionStore {
         Ok(updated)
     }
 
-    pub fn update_current_turn_status_for_turn(
+    /// 更新当前 Turn 状态并返回本次是否真的产生了 canonical mutation。
+    ///
+    /// `changed` 是终态事件去重的边界：相同终态的重试仍返回当前 sidecar，
+    /// 但调用方只能在 `changed == true` 时发布事实事件。
+    pub fn update_current_turn_status_for_turn_with_change(
         &self,
         session_id: &SessionId,
         expected_turn_id: Option<&str>,
         status: impl Into<String>,
-    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+    ) -> DomainResult<Option<(SessionRuntimeSidecar, bool)>> {
         let next_status = normalize_stored_current_turn_status(status.into());
         let updated = self.commit_canonical_transaction(
             session_id,
@@ -4675,16 +5086,28 @@ impl SessionStore {
                         record_session_completion(state, session_id, completed_at);
                     }
                 }
-                Some(candidate)
+                Some((candidate, changed))
             },
         )?;
-        if updated.is_some() {
+        if updated.as_ref().is_some_and(|(_, changed)| *changed) {
             self.mark_sidecar_dirty_for_session(
                 Some(session_id),
                 SessionSidecarFlushReason::UpdateCurrentTurnStatus,
             );
         }
         Ok(updated)
+    }
+
+    /// 保留 SessionStore 的既有调用契约；需要区分重复提交时使用
+    /// `update_current_turn_status_for_turn_with_change`。
+    pub fn update_current_turn_status_for_turn(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        status: impl Into<String>,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        self.update_current_turn_status_for_turn_with_change(session_id, expected_turn_id, status)
+            .map(|updated| updated.map(|(sidecar, _)| sidecar))
     }
 
     pub fn complete_current_turn_from_completed_root_task_for_turn(
@@ -5475,9 +5898,9 @@ impl SessionStore {
         // persist_projection_with 遵守同一锁顺序，禁止在 event writer 已提交、
         // 内存 canonical 尚未 apply 的窗口捕获跨代快照。
         let _canonical_guard = self
-            .canonical_commit_lock
-            .lock()
-            .expect("session canonical commit lock poisoned");
+            .canonical_commit_barrier
+            .write()
+            .expect("session canonical commit barrier poisoned");
         let mut persist = persist;
         let (persisted_version, persisted_session_ids) = {
             let state = self.state.read().expect("session state read lock poisoned");
@@ -5545,9 +5968,9 @@ impl SessionStore {
                 .lock()
                 .expect("session durable persistence lock poisoned");
             let _canonical_guard = self
-                .canonical_commit_lock
-                .lock()
-                .expect("canonical commit lock poisoned");
+                .canonical_commit_barrier
+                .write()
+                .expect("canonical commit barrier poisoned");
             let state = self.state.read().expect("session state read lock poisoned");
             let flush_state = self
                 .sidecar_flush_state

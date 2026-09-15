@@ -1030,6 +1030,29 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         "resume parser after crash"
     );
 
+    let detach_deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+    loop {
+        let detached = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .is_some_and(|sidecar| {
+                matches!(sidecar.status, SessionExecutionSidecarStatus::Detached)
+                    && sidecar.active_execution_chain.is_none()
+                    && sidecar.current_turn.as_ref().is_some_and(|turn| {
+                        matches!(
+                            turn.status.trim().to_ascii_lowercase().as_str(),
+                            "failed" | "cancelled" | "completed"
+                        )
+                    })
+            });
+        if detached {
+            break;
+        }
+        if Instant::now() >= detach_deadline {
+            panic!("恢复任务终态通知未在超时前释放 session execution chain");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let first_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let recovery_summary = first_read_model["recovery"]["summaries"]
         .as_array()
@@ -1065,6 +1088,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         "recovery-router-recovery"
     );
 
+    let followup_request_id = "request-router-recovery-followup";
     let (status, followup_body) = post_json(
         app.clone(),
         "/api/session/turn",
@@ -1075,6 +1099,8 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
             "skillName": "resume",
             "images": [],
             "workspaceId": workspace_id.to_string(),
+            "requestId": followup_request_id,
+            "userMessageId": "user-router-recovery-followup",
         }),
     )
     .await;
@@ -1089,14 +1115,48 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .expect("accepted_at should serialize as integer");
     // session 一生一 mission：followup dispatch 复用 recovery 阶段已绑定的 mission_id
     let followup_mission_id = "mission-router-recovery".to_string();
-    let followup_root_task_id = followup_body["rootTaskId"]
-        .as_str()
-        .expect("root_task_id should serialize as string");
+    let followup_root_task_id = if let Some(root_task_id) = followup_body["rootTaskId"].as_str() {
+        root_task_id.to_string()
+    } else {
+        assert_eq!(
+            followup_body["queued"], true,
+            "忙碌 session 的 followup 应进入队列: {followup_body:?}"
+        );
+        let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+        loop {
+            if let Some(turn) = state
+                .session_store
+                .canonical_turn_for_request_id(followup_request_id)
+                && let Some(task_id) = turn
+                    .items
+                    .iter()
+                    .find(|item| {
+                        item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                    })
+                    .and_then(|item| item.worker.as_ref())
+                    .and_then(|worker| worker.task_id.as_ref())
+            {
+                break task_id.to_string();
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "queued recovery followup was not accepted into canonical Turn before timeout"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
     let followup_execution_group =
         wait_for_execution_group(app.clone(), &followup_mission_id, |entry| {
             entry["context_memory_extraction_refs"]
                 .as_array()
                 .is_some_and(|refs| refs.iter().any(|value| value == &expected_extraction_id))
+                && entry["context_used_memory_count"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1)
+                && entry["context_extracted_memory_count"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1)
         })
         .await;
     assert!(
@@ -1120,7 +1180,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
     );
     let followup_projection = wait_for_agent_run_projection_completed(
         app,
-        followup_root_task_id,
+        &followup_root_task_id,
         session_id.as_str(),
         workspace_id.as_str(),
     )
@@ -1188,6 +1248,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     .await;
     assert_completed_two_agent_run_projection(&first_projection);
 
+    let second_request_id = "request-bootstrap-context-summary-followup";
     let (status, second_body) = post_json(
         app.clone(),
         "/api/session/turn",
@@ -1198,6 +1259,8 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
             "skillName": "refactor",
             "images": [],
             "workspaceId": active_workspace_id.to_string(),
+            "requestId": second_request_id,
+            "userMessageId": "user-bootstrap-context-summary-followup",
         }),
     )
     .await;
@@ -1212,12 +1275,40 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         .expect("accepted_at should serialize as integer");
     // session 一生一 mission：第二次派发复用第一次派发创建的 mission_id
     let second_mission_id = format!("mission-session-action-{first_accepted_at}");
-    let second_root_task_id = second_body["rootTaskId"]
-        .as_str()
-        .expect("root_task_id should serialize as string");
+    let second_root_task_id = if let Some(root_task_id) = second_body["rootTaskId"].as_str() {
+        root_task_id.to_string()
+    } else {
+        assert_eq!(
+            second_body["queued"], true,
+            "忙碌 session 的 followup 应进入队列: {second_body:?}"
+        );
+        let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+        loop {
+            if let Some(turn) = state
+                .session_store
+                .canonical_turn_for_request_id(second_request_id)
+                && let Some(task_id) = turn
+                    .items
+                    .iter()
+                    .find(|item| {
+                        item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                    })
+                    .and_then(|item| item.worker.as_ref())
+                    .and_then(|worker| worker.task_id.as_ref())
+            {
+                break task_id.to_string();
+            }
+            if Instant::now() >= deadline {
+                panic!("queued followup was not accepted into canonical Turn before timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
     let second_execution_group =
         wait_for_execution_group(app.clone(), &second_mission_id, |entry| {
             entry["context_memory_extraction_refs"] == json!([expected_extraction_id])
+                && entry["context_used_memory_count"] == 1
+                && entry["context_extracted_memory_count"] == 1
         })
         .await;
     assert_eq!(
@@ -1226,7 +1317,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     );
     let second_projection = wait_for_agent_run_projection_completed(
         app.clone(),
-        second_root_task_id,
+        &second_root_task_id,
         session_id.as_str(),
         active_workspace_id.as_str(),
     )
@@ -1381,10 +1472,20 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
     )
     .await;
-    assert_eq!(
-        after_resume_bootstrap["runtimeReadModel"]["meta"], after_resume_read_model["meta"],
-        "bootstrap 应保留全局运行态元信息"
-    );
+    // bootstrap 与独立 read-model 请求之间可能有后台终态事件到达；动态的
+    // recent_event_count/latest_sequence 允许前进，但协议元数据必须保持一致。
+    for key in [
+        "contract_version",
+        "contract_sections",
+        "ordering_strategy",
+        "section_ordering_rules",
+    ] {
+        assert_eq!(
+            after_resume_bootstrap["runtimeReadModel"]["meta"][key],
+            after_resume_read_model["meta"][key],
+            "bootstrap 应保留稳定运行态元信息 {key}"
+        );
+    }
     assert!(
         after_resume_bootstrap["runtimeReadModel"]["details"]["sessions"]
             .as_array()
@@ -1405,6 +1506,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         "resume bootstrap route followup"
     );
 
+    let followup_request_id = "request-bootstrap-recovery-followup";
     let (status, followup_body) = post_json(
         app.clone(),
         "/api/session/turn",
@@ -1415,6 +1517,8 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             "skillName": "resume",
             "images": [],
             "workspaceId": workspace_id.to_string(),
+            "requestId": followup_request_id,
+            "userMessageId": "user-bootstrap-recovery-followup",
         }),
     )
     .await;
@@ -1428,14 +1532,46 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let followup_mission_id = format!("mission-session-action-{seed_accepted_at}");
-    let followup_root_task_id = followup_body["rootTaskId"]
-        .as_str()
-        .expect("root_task_id should serialize as string");
+    let followup_root_task_id = if let Some(root_task_id) = followup_body["rootTaskId"].as_str() {
+        root_task_id.to_string()
+    } else {
+        assert_eq!(
+            followup_body["queued"], true,
+            "忙碌 session 的 followup 应进入队列: {followup_body:?}"
+        );
+        let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+        loop {
+            if let Some(turn) = state
+                .session_store
+                .canonical_turn_for_request_id(followup_request_id)
+                && let Some(task_id) = turn
+                    .items
+                    .iter()
+                    .find(|item| {
+                        item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                    })
+                    .and_then(|item| item.worker.as_ref())
+                    .and_then(|worker| worker.task_id.as_ref())
+            {
+                break task_id.to_string();
+            }
+            if Instant::now() >= deadline {
+                panic!("queued followup was not accepted into canonical Turn before timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
     let followup_execution_group =
         wait_for_execution_group(app.clone(), &followup_mission_id, |entry| {
             entry["context_memory_extraction_refs"]
                 .as_array()
                 .is_some_and(|refs| refs.iter().any(|value| value == expected_extraction_id))
+                && entry["context_used_memory_count"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1)
+                && entry["context_extracted_memory_count"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1)
         })
         .await;
     assert!(
@@ -1455,7 +1591,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     );
     let followup_projection = wait_for_agent_run_projection_completed(
         app.clone(),
-        followup_root_task_id,
+        &followup_root_task_id,
         session_id.as_str(),
         workspace_id.as_str(),
     )
@@ -2459,18 +2595,18 @@ async fn session_turn_live_events_reach_multiple_subscribers() {
 
     let first_event = wait_for_event_matching(
         &mut first_receiver,
-        "first subscriber session.turn.task.accepted",
+        "first subscriber session.turn.conversation.accepted",
         |event| {
-            event.event_type == "session.turn.task.accepted"
+            event.event_type == "session.turn.conversation.accepted"
                 && event_payload_contains_request_id(event, "request-multi-subscriber-live")
         },
     )
     .await;
     let second_event = wait_for_event_matching(
         &mut second_receiver,
-        "second subscriber session.turn.task.accepted",
+        "second subscriber session.turn.conversation.accepted",
         |event| {
-            event.event_type == "session.turn.task.accepted"
+            event.event_type == "session.turn.conversation.accepted"
                 && event_payload_contains_request_id(event, "request-multi-subscriber-live")
         },
     )
@@ -3955,7 +4091,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
     let runtime = DaemonRuntime::restore_with_test_fixture(&config)
         .expect("runtime restore should load explicit test fixture");
-    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, first_body) = post_json(
         app.clone(),
@@ -3985,6 +4121,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     .await;
     assert_completed_two_agent_run_projection(&first_projection);
 
+    let second_request_id = "request-sequential-session-actions-followup";
     let (status, second_body) = post_json(
         app.clone(),
         "/api/session/turn",
@@ -3995,17 +4132,42 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
             "skillName": "refactor",
             "images": [],
             "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
+            "requestId": second_request_id,
+            "userMessageId": "user-sequential-session-actions-followup",
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!second_body["createdSession"].as_bool().unwrap_or(true));
-    let second_root_task_id = second_body["rootTaskId"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!("second root task id should serialize as string, body: {second_body}")
-        })
-        .to_string();
+    let second_root_task_id = if let Some(root_task_id) = second_body["rootTaskId"].as_str() {
+        root_task_id.to_string()
+    } else {
+        assert_eq!(
+            second_body["queued"], true,
+            "忙碌 session 的 followup 应进入队列: {second_body}"
+        );
+        let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+        loop {
+            if let Some(turn) = state
+                .session_store
+                .canonical_turn_for_request_id(second_request_id)
+                && let Some(task_id) = turn
+                    .items
+                    .iter()
+                    .find(|item| {
+                        item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                    })
+                    .and_then(|item| item.worker.as_ref())
+                    .and_then(|worker| worker.task_id.as_ref())
+            {
+                break task_id.to_string();
+            }
+            if Instant::now() >= deadline {
+                panic!("queued followup was not accepted into canonical Turn before timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
     let second_projection = wait_for_agent_run_projection_completed(
         app.clone(),
         &second_root_task_id,

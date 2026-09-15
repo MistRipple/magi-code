@@ -38,13 +38,13 @@ use crate::{
     session_writeback::{
         ContextCompactionWritebackContext, SessionStatePersistCallback,
         SessionTurnStreamPublishGate, append_session_tool_call_items_batch_with_context,
-        append_session_turn_error_item, append_session_turn_item_for_turn,
-        apply_model_response_round, new_context_compaction_item_id,
-        persist_session_state_checkpoint, publish_current_session_turn_item_event,
-        publish_model_retry_runtime_event, publish_session_turn_item_event,
-        publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
-        upsert_context_compaction_completed_notice, upsert_context_compaction_progress_notice,
-        upsert_session_turn_item_for_turn,
+        append_session_turn_error_item, append_session_turn_error_item_without_terminal_commit,
+        append_session_turn_item_for_turn, apply_model_response_round,
+        new_context_compaction_item_id, persist_session_state_checkpoint,
+        publish_current_session_turn_item_event, publish_model_retry_runtime_event,
+        publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
+        session_turn_stream_update, upsert_context_compaction_completed_notice,
+        upsert_context_compaction_progress_notice, upsert_session_turn_item_for_turn,
     },
     strict_goal_mode_tool_definitions_for_round,
     task_helpers::canonical_tool_call_name,
@@ -59,6 +59,7 @@ use crate::{
         activate_skill_tool_definitions, build_browser_tool_surface,
         refresh_live_mcp_tool_definitions_with_mode,
     },
+    turn_stream_buffer::TurnStreamBuffer,
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         account_active_goal_usage, publish_model_usage_record_for_turn,
@@ -119,6 +120,7 @@ impl SessionGoalTurnMode {
     }
 }
 
+#[derive(Clone)]
 pub struct SessionTurnExecutionRequest {
     pub session_id: SessionId,
     pub turn_id: String,
@@ -157,6 +159,23 @@ impl SessionTurnExecutionOutput {
             final_content: String::new(),
             interrupted: true,
         }
+    }
+}
+
+/// Turn 终态的唯一提交者。
+///
+/// 旧 Task 执行仍使用 `Executor` 以保持现有任务链兼容；普通 Conversation 使用
+/// `Coordinator`，执行器只写 item，最终状态由 SessionTurnCoordinator 收口。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TurnTerminalCommitPolicy {
+    #[default]
+    Executor,
+    Coordinator,
+}
+
+impl TurnTerminalCommitPolicy {
+    const fn commits_terminal(self) -> bool {
+        matches!(self, Self::Executor)
     }
 }
 
@@ -239,6 +258,11 @@ impl SessionTurnExecutionError {
             SessionTurnFailureReason::ToolPolicyRejected,
             failure.summary,
         )
+    }
+
+    /// 供 API 调度器在执行线程未能启动时写入统一的 canonical error item。
+    pub fn runtime_invalid_state_with_message(message: impl Into<String>) -> Self {
+        Self::new(SessionTurnFailureReason::RuntimeInvalidState, message)
     }
 
     fn runtime_invalid_state() -> Self {
@@ -402,6 +426,28 @@ fn normalize_interrupted_session_tool_history(
     thread_id: &magi_core::ThreadId,
     persist_session_state: Option<&SessionStatePersistCallback>,
 ) -> Result<usize, String> {
+    // 新路径的工具调用和结果都已经进入 canonical Turn；直接重建 thread
+    // projection 即可得到“结果未知”的 interrupted marker，不再单独修改 transcript。
+    let has_canonical_items = session_store
+        .canonical_turns_for_session(session_id)
+        .iter()
+        .any(|turn| {
+            turn.items
+                .iter()
+                .any(|item| item.source_thread_id == *thread_id)
+        });
+    if has_canonical_items {
+        let rebuilt = session_store
+            .rebuild_thread_message_projection(thread_id, UtcMillis::now())
+            .map_err(|error| format!("从 canonical Turn 重建中断工具历史失败: {error}"))?;
+        if rebuilt > 0 {
+            persist_session_state_checkpoint(
+                persist_session_state,
+                "session_turn_interrupted_tool_result",
+            )?;
+        }
+        return Ok(rebuilt);
+    }
     let mut history = session_store.thread_message_history(thread_id);
     let inserted = insert_interrupted_tool_result_messages(
         &mut history,
@@ -814,13 +860,27 @@ pub struct SessionTurnExecutionRuntime<'a> {
 pub fn run_session_turn_execution(
     runtime: SessionTurnExecutionRuntime<'_>,
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
+    run_session_turn_execution_with_policy(runtime, TurnTerminalCommitPolicy::Executor)
+}
+
+/// Conversation profile 的执行入口。所有失败/完成状态由 Coordinator 提交。
+pub fn run_session_turn_execution_without_terminal_commit(
+    runtime: SessionTurnExecutionRuntime<'_>,
+) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
+    run_session_turn_execution_with_policy(runtime, TurnTerminalCommitPolicy::Coordinator)
+}
+
+fn run_session_turn_execution_with_policy(
+    runtime: SessionTurnExecutionRuntime<'_>,
+    terminal_policy: TurnTerminalCommitPolicy,
+) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     let plan_store = runtime.plan_store;
     let session_store = runtime.session_store;
     let session_id = runtime.request.session_id.clone();
     let turn_id = runtime.request.turn_id.clone();
     let workspace_id = runtime.request.workspace_id.clone();
     let event_bus = runtime.event_bus;
-    let result = run_session_turn_execution_inner(runtime);
+    let result = run_session_turn_execution_inner(runtime, terminal_policy);
     if result.is_err() {
         let owns_active_plan = session_store
             .active_plan_for_execution_owner(&session_id, &turn_id)
@@ -865,6 +925,7 @@ pub fn run_session_turn_execution(
 
 fn run_session_turn_execution_inner(
     runtime: SessionTurnExecutionRuntime<'_>,
+    terminal_policy: TurnTerminalCommitPolicy,
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     let SessionTurnExecutionRuntime {
         client,
@@ -1059,20 +1120,27 @@ fn run_session_turn_execution_inner(
         );
     }
     if let Some(current_user_message) = messages.last() {
-        let mut persisted_user_message = chat_message_to_thread_chat_message(current_user_message);
-        // 原图由 canonical turn 负责审计与 UI 展示。thread 历史只保留文本语义，
-        // 避免后续纯文本回合把历史图片再次发送给主模型。
-        persisted_user_message.images.clear();
-        session_store.append_thread_messages(
-            &orchestrator_thread_id,
-            vec![persisted_user_message],
-            UtcMillis::now(),
-        );
+        // 当前用户消息已经在 Turn accepted 事务中写入 canonical；这里只更新
+        // ThreadChatMessage projection，不能在 Provider 执行路径追加第二份事实。
+        let mut legacy_message = chat_message_to_thread_chat_message(current_user_message);
+        legacy_message.images.clear();
+        session_store
+            .rebuild_thread_message_projection_with_legacy(
+                &orchestrator_thread_id,
+                vec![legacy_message],
+                UtcMillis::now(),
+            )
+            .map_err(|error| {
+                SessionTurnExecutionError::new(
+                    SessionTurnFailureReason::RuntimeInvalidState,
+                    format!("从 canonical Turn 重建用户消息 projection 失败：{error}"),
+                )
+            })?;
         persist_session_state_checkpoint(persist_session_state, "session_turn_thread_user")
             .map_err(|error| {
                 SessionTurnExecutionError::new(
                     SessionTurnFailureReason::RuntimeInvalidState,
-                    format!("用户消息持久化失败：{error}"),
+                    format!("用户消息 projection 持久化失败：{error}"),
                 )
             })?;
     }
@@ -1302,7 +1370,8 @@ fn run_session_turn_execution_inner(
                 }
                 let execution_error =
                     SessionTurnExecutionError::from_terminal_tool_failure(failure);
-                if let Err(writeback_error) = append_session_turn_error_item(
+                if let Err(writeback_error) = append_session_turn_error_for_policy(
+                    terminal_policy,
                     event_bus,
                     session_store,
                     crate::session_writeback::SessionTurnErrorInput {
@@ -1334,7 +1403,8 @@ fn run_session_turn_execution_inner(
                     SessionTurnFailureReason::ModelResponseInvalid,
                     *model_failure,
                 );
-                if let Err(writeback_error) = append_session_turn_error_item(
+                if let Err(writeback_error) = append_session_turn_error_for_policy(
+                    terminal_policy,
                     event_bus,
                     session_store,
                     crate::session_writeback::SessionTurnErrorInput {
@@ -1446,7 +1516,8 @@ fn run_session_turn_execution_inner(
                 } else {
                     session_turn_model_error(&request, &error, retry_attempts)
                 };
-                if let Err(writeback_error) = append_session_turn_error_item(
+                if let Err(writeback_error) = append_session_turn_error_for_policy(
+                    terminal_policy,
                     event_bus,
                     session_store,
                     crate::session_writeback::SessionTurnErrorInput {
@@ -1491,7 +1562,8 @@ fn run_session_turn_execution_inner(
         {
             let execution_error =
                 SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
-            if let Err(writeback_error) = append_session_turn_error_item(
+            if let Err(writeback_error) = append_session_turn_error_for_policy(
+                terminal_policy,
                 event_bus,
                 session_store,
                 crate::session_writeback::SessionTurnErrorInput {
@@ -1543,7 +1615,8 @@ fn run_session_turn_execution_inner(
         if let Some(tool_call_failure) = repeated_tool_call_failure {
             let execution_error =
                 SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
-            if let Err(writeback_error) = append_session_turn_error_item(
+            if let Err(writeback_error) = append_session_turn_error_for_policy(
+                terminal_policy,
                 event_bus,
                 session_store,
                 crate::session_writeback::SessionTurnErrorInput {
@@ -1765,7 +1838,8 @@ fn run_session_turn_execution_inner(
             empty_response_recovery_attempts,
             last_response_observation.as_deref(),
         );
-        if let Err(writeback_error) = append_session_turn_error_item(
+        if let Err(writeback_error) = append_session_turn_error_for_policy(
+            terminal_policy,
             event_bus,
             session_store,
             crate::session_writeback::SessionTurnErrorInput {
@@ -1796,6 +1870,7 @@ fn run_session_turn_execution_inner(
         return Ok(SessionTurnExecutionOutput::interrupted());
     }
     append_final_item(
+        terminal_policy,
         event_bus,
         session_store,
         &request,
@@ -2052,6 +2127,18 @@ fn required_tool_chain_recovery_prompt(
     )
 }
 
+fn apply_provider_context_metadata(
+    item: &mut magi_session_store::ActiveExecutionTurnItem,
+    provider_context: &[ModelProviderContext],
+) {
+    if !provider_context.is_empty() {
+        item.metadata.insert(
+            "providerContext".to_string(),
+            serde_json::to_value(provider_context).expect("模型提供方上下文必须能够序列化"),
+        );
+    }
+}
+
 fn stream_session_turn_round(
     runtime: SessionTurnRoundRuntime<'_>,
     tool_registry: Option<&ToolRegistry>,
@@ -2150,6 +2237,8 @@ fn stream_session_turn_round(
                 .unwrap_or_default(),
         })
     });
+    let content_buffer = std::cell::RefCell::new(TurnStreamBuffer::default());
+    let thinking_buffer = std::cell::RefCell::new(TurnStreamBuffer::default());
     let on_delta = |delta: &ModelStreamingDelta| {
         if writeback_error.borrow().is_some() || !request_turn_is_writable(session_store, request) {
             writeback_aborted.set(true);
@@ -2179,6 +2268,13 @@ fn stream_session_turn_round(
                 let mut thinking = streamed_thinking.borrow_mut();
                 thinking.clear();
                 thinking.push_str(accumulated_thinking);
+            }
+            if thinking_buffer
+                .borrow_mut()
+                .push_at(accumulated_thinking, UtcMillis::now())
+                .is_none()
+            {
+                return;
             }
             let mut item = session_turn_item(
                 "assistant_thinking",
@@ -2246,6 +2342,13 @@ fn stream_session_turn_round(
             current_visible.push_str(&visible_content);
         }
         if visible_content.trim().is_empty() {
+            return;
+        }
+        if content_buffer
+            .borrow_mut()
+            .push_at(&visible_content, UtcMillis::now())
+            .is_none()
+        {
             return;
         }
         let mut item = session_turn_item(
@@ -2734,6 +2837,7 @@ fn stream_session_turn_round(
         apply_request_aliases(&mut stream_item, request);
         apply_model_response_round(&mut stream_item, round);
         apply_goal_turn_intermediate_visibility(&mut stream_item, request);
+        apply_provider_context_metadata(&mut stream_item, &parsed.provider_context);
         let published = match upsert_session_turn_item_for_turn(
             session_store,
             &request.session_id,
@@ -3016,6 +3120,19 @@ fn forced_tool_choice_for_round(
     tool_is_available.then(|| ChatToolChoice::force_function(forced_tool_name))
 }
 
+fn append_session_turn_error_for_policy(
+    terminal_policy: TurnTerminalCommitPolicy,
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    input: crate::session_writeback::SessionTurnErrorInput<'_>,
+) -> Result<(), String> {
+    if terminal_policy.commits_terminal() {
+        append_session_turn_error_item(event_bus, session_store, input)
+    } else {
+        append_session_turn_error_item_without_terminal_commit(event_bus, session_store, input)
+    }
+}
+
 struct FinalItemInput<'a> {
     content: &'a str,
     item_id: Option<&'a str>,
@@ -3024,6 +3141,7 @@ struct FinalItemInput<'a> {
 }
 
 fn append_final_item(
+    terminal_policy: TurnTerminalCommitPolicy,
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
@@ -3084,24 +3202,26 @@ fn append_final_item(
             request.session_id
         )
     })?;
-    session_store
-        .update_current_turn_status_for_turn(
-            &request.session_id,
-            Some(&request.turn_id),
-            "completed",
-        )
-        .map_err(|error| {
-            format!(
-                "会话 {} 的 Turn completed 状态提交失败: {error}",
-                request.session_id
+    if terminal_policy.commits_terminal() {
+        session_store
+            .update_current_turn_status_for_turn(
+                &request.session_id,
+                Some(&request.turn_id),
+                "completed",
             )
-        })?
-        .ok_or_else(|| {
-            format!(
-                "会话 {} 的当前 Turn 已不可写，无法提交 completed 状态",
-                request.session_id
-            )
-        })?;
+            .map_err(|error| {
+                format!(
+                    "会话 {} 的 Turn completed 状态提交失败: {error}",
+                    request.session_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "会话 {} 的当前 Turn 已不可写，无法提交 completed 状态",
+                    request.session_id
+                )
+            })?;
+    }
     publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -3112,7 +3232,14 @@ fn append_final_item(
     )?;
     // 终态事件只代表执行生命周期结束，projection 快照随后合并写入一次；
     // 否则 UI 停止状态会被几十 MB 级 checkpoint 串行拖住。
-    persist_session_state_checkpoint(persist_session_state, "session_turn_completed")?;
+    persist_session_state_checkpoint(
+        persist_session_state,
+        if terminal_policy.commits_terminal() {
+            "session_turn_completed"
+        } else {
+            "session_turn_final_item"
+        },
+    )?;
     Ok(())
 }
 
@@ -6815,6 +6942,7 @@ mod tests {
         .expect("post-tool stream item should be stored");
 
         append_final_item(
+            TurnTerminalCommitPolicy::Executor,
             &event_bus,
             &store,
             &request,
@@ -7430,6 +7558,7 @@ mod tests {
         };
 
         append_final_item(
+            TurnTerminalCommitPolicy::Executor,
             &event_bus,
             &store,
             &request,

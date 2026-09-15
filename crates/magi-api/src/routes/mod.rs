@@ -95,7 +95,7 @@ use session_scope::{require_session_record_in_scope, resolve_explicit_session_sc
 
 #[cfg(test)]
 use conversation_bridge::begin_session_turn;
-use conversation_bridge::{finalize_session_turn, ingest_user_input_to_conversation};
+use conversation_bridge::ingest_user_input_to_conversation;
 pub(crate) use dispatch_flow::schedule_restored_session_task_dispatches;
 use dispatch_flow::{
     SessionTaskSubmissionInput, accept_goal_continuation_task_submission,

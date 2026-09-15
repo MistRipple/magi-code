@@ -36,7 +36,7 @@ impl crate::CanonicalTurnEventWriter for RejectingCanonicalWriter {
         _session_id: &SessionId,
         _mutations: &[crate::CanonicalTurnMutation],
         _acceptance: &SessionAcceptanceRecord,
-        _task: &magi_core::Task,
+        _task: Option<&magi_core::Task>,
     ) -> magi_core::DomainResult<()> {
         Err(DomainError::Persistence {
             message: "test canonical writer failure".to_string(),
@@ -71,7 +71,7 @@ impl crate::CanonicalTurnEventWriter for BlockingCanonicalWriter {
         session_id: &SessionId,
         mutations: &[crate::CanonicalTurnMutation],
         _acceptance: &SessionAcceptanceRecord,
-        _task: &magi_core::Task,
+        _task: Option<&magi_core::Task>,
     ) -> magi_core::DomainResult<()> {
         self.append_canonical_turn_transaction(session_id, mutations)
     }

@@ -282,11 +282,11 @@ function normalizeCanonicalTurnStreamUpdate(
   record: Record<string, unknown>,
 ): CanonicalTurnStreamUpdate | undefined {
   const itemId = readString(record, 'canonicalItemId', 'canonical_item_id');
-  const itemVersion = readNumber(record, 'canonicalItemVersion', 'canonical_item_version');
+  const itemVersion = readNumber(record, 'itemVersion', 'canonicalItemVersion', 'canonical_item_version');
   const itemStatus = readItemStatus(readString(record, 'canonicalItemStatus', 'canonical_item_status'));
-  const baseContentLength = readNumber(record, 'streamBaseContentLength', 'stream_base_content_length');
+  const baseContentLength = readNumber(record, 'baseContentLength', 'streamBaseContentLength', 'stream_base_content_length');
   const delta = readRawString(record, 'streamDelta', 'stream_delta');
-  const contentLength = readNumber(record, 'streamContentLength', 'stream_content_length');
+  const contentLength = readNumber(record, 'contentLength', 'streamContentLength', 'stream_content_length');
   if (!itemId || itemVersion === undefined || !itemStatus || baseContentLength === undefined || delta === undefined || contentLength === undefined) {
     return undefined;
   }

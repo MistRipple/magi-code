@@ -9,6 +9,8 @@ use crate::{
     state::{ApiState, RunnerStartError},
 };
 use magi_conversation_runtime::{
+    CoordinatorError, CoordinatorTurnStatus, ExecutionProfile, SessionTurnCoordinator,
+    TurnAdmission, TurnAttempt,
     execution_chain_recovery::{
         apply_chain_recovery_if_needed, commit_chain_recovery, fail_resumed_execution_paths,
         release_resumed_branch_path, sync_branch_checkpoint_to_worker_runtime,
@@ -24,7 +26,7 @@ use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, CanonicalTurn, CanonicalTurnItemKind,
     ExecutionThread, ExecutionThreadStatus, InterruptedGoalResumeCheckpoint, SessionStore,
-    ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
+    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
 };
 use magi_settings_store::SettingsStore;
 use std::sync::Arc;
@@ -173,6 +175,8 @@ struct ContinueRecoveryAttempt<'a> {
     chain: ActiveExecutionChain,
     branches: Vec<ActiveExecutionBranch>,
     resumed_turn_id: String,
+    coordinator: Option<&'a SessionTurnCoordinator>,
+    coordinator_attempt: Option<TurnAttempt>,
     registered_task_ids: Vec<magi_core::TaskId>,
     registered_threads: Vec<ExecutionThread>,
     committed: bool,
@@ -185,6 +189,7 @@ impl<'a> ContinueRecoveryAttempt<'a> {
         chain: &ActiveExecutionChain,
         branches: &[ActiveExecutionBranch],
         resumed_turn_id: &str,
+        coordinator: Option<&'a SessionTurnCoordinator>,
     ) -> Self {
         Self {
             state,
@@ -192,10 +197,16 @@ impl<'a> ContinueRecoveryAttempt<'a> {
             chain: chain.clone(),
             branches: branches.to_vec(),
             resumed_turn_id: resumed_turn_id.to_string(),
+            coordinator,
+            coordinator_attempt: None,
             registered_task_ids: Vec::new(),
             registered_threads: Vec::new(),
             committed: false,
         }
+    }
+
+    fn record_coordinator_attempt(&mut self, attempt: TurnAttempt) {
+        self.coordinator_attempt = Some(attempt);
     }
 
     fn record_registered_task(&mut self, task_id: magi_core::TaskId) {
@@ -277,6 +288,42 @@ impl Drop for ContinueRecoveryAttempt<'_> {
             }
         }
         fail_prepared_continue_turn(self.state, &self.session_id, &self.resumed_turn_id);
+        if let (Some(coordinator), Some(attempt)) =
+            (self.coordinator, self.coordinator_attempt.as_ref())
+        {
+            let terminal = self
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&self.session_id, &self.resumed_turn_id)
+                .and_then(|turn| match turn.status {
+                    magi_session_store::CanonicalTurnStatus::Completed => {
+                        Some(CoordinatorTurnStatus::Completed)
+                    }
+                    magi_session_store::CanonicalTurnStatus::Failed => {
+                        Some(CoordinatorTurnStatus::Failed)
+                    }
+                    magi_session_store::CanonicalTurnStatus::Interrupted
+                    | magi_session_store::CanonicalTurnStatus::Cancelled
+                    | magi_session_store::CanonicalTurnStatus::Superseded => {
+                        Some(CoordinatorTurnStatus::Cancelled)
+                    }
+                    _ => None,
+                });
+            let result = match terminal {
+                Some(status) => coordinator
+                    .finish(&self.session_id, attempt, status)
+                    .map(|_| ()),
+                None => coordinator.abort(&self.session_id, attempt).map(|_| ()),
+            };
+            if let Err(error) = result {
+                tracing::error!(
+                    ?error,
+                    session_id = %self.session_id,
+                    turn_id = %self.resumed_turn_id,
+                    "Continue 恢复失败后的 Coordinator 收口失败"
+                );
+            }
+        }
         if let Err(error) = self.state.persist_runtime_durable_state_for_api() {
             tracing::error!(
                 ?error,
@@ -638,53 +685,25 @@ pub(crate) fn persist_resumed_branch_user_input(
     state: &ApiState,
     session_id: &SessionId,
     branches: &[ActiveExecutionBranch],
-    prompt_text: Option<&str>,
-    images: &[SessionTurnImage],
-    accepted_at: UtcMillis,
+    _prompt_text: Option<&str>,
+    _images: &[SessionTurnImage],
+    _accepted_at: UtcMillis,
 ) -> Result<(), ApiError> {
-    if prompt_text.is_none() && images.is_empty() {
-        return Ok(());
-    }
-
-    let mut thread_ids = Vec::new();
+    // Continue 的用户输入事实由新的 canonical Turn 写入；这里仅在写入前确认所有
+    // branch thread 仍属于当前 session。写入后由 write_continue_user_message 重建
+    // 每个 branch 的 ThreadChatMessage projection，避免在 canonical 之外再 append 一份事实。
+    let registered_threads = state.session_store.thread_registry_snapshot(session_id);
     for branch in branches {
-        if !thread_ids.contains(&branch.thread_id) {
-            thread_ids.push(branch.thread_id.clone());
+        if !registered_threads
+            .iter()
+            .any(|thread| thread.thread_id == branch.thread_id)
+        {
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                format!("恢复分支 thread 不存在: {}", branch.thread_id),
+            ));
         }
     }
-    let registered_threads = state.session_store.thread_registry_snapshot(session_id);
-    if let Some(missing_thread_id) = thread_ids.iter().find(|thread_id| {
-        !registered_threads
-            .iter()
-            .any(|thread| thread.thread_id == **thread_id)
-    }) {
-        return Err(ApiError::internal_assembly(
-            "继续会话失败",
-            format!("恢复分支 thread 不存在: {missing_thread_id}"),
-        ));
-    }
-
-    let message = ThreadChatMessage {
-        role: "user".to_string(),
-        content: prompt_text.map(str::to_string),
-        images: images
-            .iter()
-            .map(|image| ThreadChatImageSource {
-                kind: image.source.kind.clone(),
-                media_type: image.source.media_type.clone(),
-                data: image.source.data.clone(),
-            })
-            .collect(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        provider_context: Vec::new(),
-    };
-    for thread_id in thread_ids {
-        state
-            .session_store
-            .append_thread_messages(&thread_id, vec![message.clone()], accepted_at);
-    }
-    state.persist_session_state_checkpoint("session_continue_task_input")?;
     Ok(())
 }
 
@@ -698,12 +717,19 @@ pub(crate) async fn continue_execution_chain_with_pre_resume<T, U, F, G>(
     requested_agent_ids: &[WorkerId],
     resumed_turn_id: &str,
     resumed_at: UtcMillis,
+    request_id: String,
+    request_fingerprint: String,
     prepare_input: F,
     prepare_turn: G,
 ) -> Result<(SessionContinueAccepted, T, U), ApiError>
 where
     F: FnOnce(&[ActiveExecutionBranch]) -> Result<T, ApiError>,
-    G: FnOnce(&ActiveExecutionChain, &ActiveExecutionBranch, &T) -> Result<U, ApiError>,
+    G: FnOnce(
+        &ActiveExecutionChain,
+        &ActiveExecutionBranch,
+        &T,
+        &TurnAttempt,
+    ) -> Result<U, ApiError>,
 {
     if state.session_store.session(session_id).is_none() {
         return Err(ApiError::session_not_found(session_id.as_str()));
@@ -917,6 +943,83 @@ where
         state.persist_session_state_checkpoint("session_continue_finalize_previous_turn")?;
     }
 
+    // 旧 current Turn 可能已经由 SessionStore 收口，但 daemon 恢复或异步终态回调
+    // 尚未释放 Coordinator active 槽位。先按 canonical 终态完成旧 attempt，再接纳
+    // Continue 的新 Turn，保证同一 session 永远只有一个活动 attempt。
+    if let Some(previous_turn_id) = chain
+        .current_turn
+        .as_ref()
+        .map(|turn| turn.turn_id.as_str())
+    {
+        let previous_turn = state
+            .session_store
+            .runtime_sidecar(session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .filter(|turn| turn.turn_id == previous_turn_id);
+        if let Some(previous_turn) = previous_turn {
+            let previous_status = match previous_turn.status.trim().to_ascii_lowercase().as_str() {
+                "completed" | "complete" | "succeeded" | "success" => {
+                    CoordinatorTurnStatus::Completed
+                }
+                "cancelled" | "canceled" | "interrupted" => CoordinatorTurnStatus::Cancelled,
+                "failed" | "error" => CoordinatorTurnStatus::Failed,
+                _ => CoordinatorTurnStatus::Failed,
+            };
+            match state
+                .turn_coordinator()
+                .current_attempt(session_id, previous_turn_id)
+            {
+                Ok(previous_attempt) => {
+                    state
+                        .turn_coordinator()
+                        .finish(session_id, &previous_attempt, previous_status)
+                        .map_err(|error| {
+                            ApiError::internal_assembly(
+                                "Continue 旧 Turn 收口失败",
+                                error.to_string(),
+                            )
+                        })?;
+                }
+                Err(CoordinatorError::NoActiveTurn) => {}
+                Err(error) => {
+                    return Err(ApiError::conflict(
+                        "Continue 旧 Turn 与 Coordinator 不一致",
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    let coordinator_admission = state
+        .turn_coordinator()
+        .accept(
+            session_id,
+            TurnAdmission {
+                turn_id: resumed_turn_id.to_string(),
+                request_id,
+                request_fingerprint,
+                profile: ExecutionProfile::Task,
+            },
+        )
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let coordinator_attempt = match coordinator_admission {
+        magi_conversation_runtime::CoordinatorAdmission::Accepted(attempt) => attempt,
+        magi_conversation_runtime::CoordinatorAdmission::Replay(attempt) => {
+            return Err(ApiError::Conflict(format!(
+                "Continue Turn {} 已经接纳（attempt {}），请重放原请求读取 canonical receipt",
+                attempt.turn_id, attempt.attempt_id
+            )));
+        }
+    };
+    if let Some(notifier) = state.task_completion_notifier() {
+        notifier.bind_coordinator_attempt(
+            &chain.root_task_id,
+            &coordinator_attempt.attempt_id,
+            Some(session_id.clone()),
+            Some(resumed_turn_id.to_string()),
+        );
+    }
+
     let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
     let mut recovery_attempt = ContinueRecoveryAttempt::new(
         state,
@@ -924,7 +1027,9 @@ where
         &chain,
         &branches_to_resume,
         resumed_turn_id,
+        Some(state.turn_coordinator()),
     );
+    recovery_attempt.record_coordinator_attempt(coordinator_attempt.clone());
     for thread in
         restore_missing_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)?
     {
@@ -1026,7 +1131,12 @@ where
 
     // 必须在启动 runner 前切换 current turn。旧 interrupted turn 仍保留在历史中，
     // 新 runner 的所有流式/工具写回都绑定到这个新 turn，避免首个事件落到旧轮次。
-    let prepared_turn = prepare_turn(&chain, primary_branch, &prepared_input)?;
+    let prepared_turn = prepare_turn(
+        &chain,
+        primary_branch,
+        &prepared_input,
+        &coordinator_attempt,
+    )?;
 
     // 旧 runner 已在恢复状态前完成退出；这里只允许启动一个全新的执行轮。
     match manager.start_after_quiesce(chain.root_task_id.as_str(), Some(session_id.clone())) {

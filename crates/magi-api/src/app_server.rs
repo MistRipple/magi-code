@@ -47,8 +47,8 @@ use std::sync::{
 use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 
 use crate::{
-    dto::SessionDirectoryEntryDto, errors::ApiError, routes::sessions,
-    session_activity::session_running_task_count, state::ApiState,
+    dto::SessionDirectoryEntryDto, errors::ApiError, session_activity::session_running_task_count,
+    state::ApiState, turn_service::TurnService,
 };
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
@@ -1846,6 +1846,48 @@ async fn start_turn(
     start_turn_once(state, request_id, request).await
 }
 
+fn canonical_turn_wire_status(status: magi_session_store::CanonicalTurnStatus) -> &'static str {
+    match status {
+        magi_session_store::CanonicalTurnStatus::Pending => "accepted",
+        magi_session_store::CanonicalTurnStatus::Running => "running",
+        magi_session_store::CanonicalTurnStatus::Blocked => "blocked",
+        magi_session_store::CanonicalTurnStatus::Completed => "completed",
+        magi_session_store::CanonicalTurnStatus::Failed => "failed",
+        magi_session_store::CanonicalTurnStatus::Interrupted
+        | magi_session_store::CanonicalTurnStatus::Cancelled => "cancelled",
+        magi_session_store::CanonicalTurnStatus::Superseded => "cancelled",
+    }
+}
+
+fn event_sequence_for_event_id(state: &ApiState, event_id: &str) -> u64 {
+    let snapshot = state.event_bus.snapshot();
+    snapshot
+        .recent_events
+        .iter()
+        .find(|event| event.event_id.to_string() == event_id)
+        .map(|event| event.sequence)
+        .unwrap_or(snapshot.next_sequence)
+}
+
+fn event_sequence_for_turn(state: &ApiState, turn: &magi_session_store::CanonicalTurn) -> u64 {
+    let snapshot = state.event_bus.snapshot();
+    snapshot
+        .recent_events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.payload.get("turn_id").and_then(Value::as_str) == Some(turn.turn_id.as_str())
+                || event
+                    .payload
+                    .get("canonical_turn")
+                    .and_then(|value| value.get("turnId"))
+                    .and_then(Value::as_str)
+                    == Some(turn.turn_id.as_str())
+        })
+        .map(|event| event.sequence)
+        .unwrap_or(snapshot.next_sequence)
+}
+
 async fn start_turn_once(
     state: &ApiState,
     request_id: RequestId,
@@ -1885,6 +1927,10 @@ async fn start_turn_once(
                     "route": user_message_item.and_then(|item| {
                         item.metadata.get("route").and_then(Value::as_str)
                     }),
+                    "executionProfile": existing_turn.metadata.get("executionProfile").and_then(Value::as_str)
+                        .or_else(|| user_message_item.and_then(|item| item.metadata.get("executionProfile").and_then(Value::as_str))),
+                    "status": canonical_turn_wire_status(existing_turn.status),
+                    "eventSequence": event_sequence_for_turn(state, &existing_turn),
                     "userMessageItemId": user_message_item.map(|item| item.item_id.clone()),
                     "runtimeEpoch": state.runtime_epoch(),
                     "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
@@ -1924,6 +1970,12 @@ async fn start_turn_once(
                     "turnId": null,
                     "acceptedAt": queued_turn.accepted_at,
                     "route": queued_turn.route,
+                    "executionProfile": if matches!(queued_turn.route, crate::dto::SessionTurnRouteDto::Chat) { "conversation" } else { "task" },
+                    "status": "accepted",
+                    "eventSequence": event_sequence_for_event_id(
+                        state,
+                        &format!("event-session-turn-queued-{}", queued_turn.accepted_at.0),
+                    ),
                     "createdSession": false,
                     "userMessageItemId": user_message_item_id,
                     "runtimeEpoch": state.runtime_epoch(),
@@ -1940,13 +1992,8 @@ async fn start_turn_once(
         )
     } else {
         let business_request_id = request.request_id();
-        match sessions::submit_session_turn_authorized(
-            axum::extract::State(state.clone()),
-            axum::Json(request),
-        )
-        .await
-        {
-            Ok(axum::Json(result)) => {
+        match TurnService::new(state.clone()).submit(request).await {
+            Ok(result) => {
                 let mut result = match serde_json::to_value(result) {
                     Ok(result) => result,
                     Err(error) => {
@@ -1985,7 +2032,9 @@ async fn start_turn_once(
                     json!(if queued { "queued" } else { "accepted" }),
                 );
                 object.insert("replayed".to_string(), json!(false));
-                object.insert("requestId".to_string(), json!(business_request_id));
+                if let Some(request_id) = business_request_id.as_ref() {
+                    object.insert("requestId".to_string(), json!(request_id));
+                }
                 let turn_id = object
                     .get("canonicalTurn")
                     .and_then(|turn| turn.get("turnId"))

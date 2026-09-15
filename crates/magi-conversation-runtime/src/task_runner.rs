@@ -6,7 +6,7 @@
 use crate::execution_admission::ExecutionAdmissionController;
 use crate::task_runner_bridge::{
     RunCycleOutcome, TaskDispatchGate, TaskDispatchGateDecision, TaskDispatcher, TaskOutcome,
-    TaskResultReceiver,
+    TaskResult, TaskResultReceiver,
 };
 use magi_agent_role::AgentRoleRegistry;
 use magi_core::{DomainError, SessionId, Task, TaskId, TaskStatus};
@@ -42,6 +42,80 @@ pub struct TaskRunner {
     checkpoint_signal: AtomicBool,
     first_dispatch_reported: AtomicBool,
     agent_role_registry: AgentRoleRegistry,
+}
+
+/// 将 Worker 结果提交到 TaskStore。该函数由主动完成通知和旧 Runner 测试入口共同使用，
+/// 但生产完成路径由 [`TaskCompletionNotifier`] 主动调用，不依赖 Runner 周期轮询。
+pub fn apply_task_result(store: &TaskStore, result: TaskResult) -> Result<bool, String> {
+    let Some(task) = store.get_task(&result.task_id) else {
+        tracing::warn!(
+            task_id = %result.task_id,
+            lease_id = %result.lease_id,
+            "忽略不存在任务的迟到结果"
+        );
+        return Ok(false);
+    };
+    let root_task_id = task.root_task_id.clone();
+    match result.outcome {
+        TaskOutcome::Completed { attempt } => match store.complete_lease_and_task(
+            &result.task_id,
+            &root_task_id,
+            &result.lease_id,
+            attempt,
+        ) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                tracing::warn!(
+                    task_id = %result.task_id,
+                    lease_id = %result.lease_id,
+                    "忽略非当前活跃租约的迟到任务结果"
+                );
+                Ok(false)
+            }
+            Err(DomainError::InvalidState { message }) => {
+                let failure_message =
+                    format!("任务 {} 完成合同验证失败: {message}", result.task_id);
+                let changed = store
+                    .revoke_lease_and_set_task_terminal(
+                        &result.task_id,
+                        &root_task_id,
+                        Some(&result.lease_id),
+                        TaskStatus::Failed,
+                        vec![failure_message.clone()],
+                    )
+                    .map_err(|error| format!("{failure_message}；失败状态持久化失败: {error}"))?;
+                if !changed {
+                    return Err(format!(
+                        "{failure_message}；当前任务租约已失效，未写入失败事实"
+                    ));
+                }
+                Err(failure_message)
+            }
+            Err(error) => Err(format!(
+                "任务 {} 完成事实持久化失败: {error}",
+                result.task_id
+            )),
+        },
+        TaskOutcome::Failed { error } => {
+            let changed = store
+                .revoke_lease_and_set_task_terminal(
+                    &result.task_id,
+                    &root_task_id,
+                    Some(&result.lease_id),
+                    TaskStatus::Failed,
+                    vec![error],
+                )
+                .map_err(|err| format!("任务 {} 失败状态持久化失败: {err}", result.task_id))?;
+            if !changed {
+                tracing::warn!(
+                    task_id = %result.task_id,
+                    lease_id = %result.lease_id,
+                    "忽略非当前活跃租约的迟到失败结果"
+                );
+            }
+            Ok(changed)
+        }
+    }
 }
 
 impl TaskRunner {
@@ -112,7 +186,9 @@ impl TaskRunner {
 
     pub fn run_cycle(&self, root_task_id: &TaskId) -> RunCycleOutcome {
         let cycle_started_at = Instant::now();
-        if let Err(error) = self.apply_results() {
+        if !self.result_receiver.uses_active_completion_sink()
+            && let Err(error) = self.apply_results()
+        {
             return RunCycleOutcome::Error(error);
         }
 
@@ -290,6 +366,20 @@ impl TaskRunner {
                 )?;
             }
         }
+        // A root can remain Pending when only an unmatched leaf was supplied in
+        // `task_ids`.  Close it in the same terminal transition so the Task
+        // fact and the Turn completion notifier cannot be left waiting for a
+        // Runner observer that no longer exists.
+        if let Some(root_task) = self.store.get_task(root_task_id)
+            && matches!(root_task.status, TaskStatus::Pending | TaskStatus::Running)
+        {
+            self.close_task(
+                root_task_id,
+                root_task_id,
+                TaskStatus::Failed,
+                vec![self.unrunnable_task_reason(&root_task)],
+            )?;
+        }
         self.set_checkpoint_signal();
         Ok(())
     }
@@ -385,85 +475,7 @@ impl TaskRunner {
 
     fn apply_results(&self) -> Result<(), String> {
         for result in self.result_receiver.poll_results() {
-            let Some(task) = self.store.get_task(&result.task_id) else {
-                tracing::warn!(
-                    task_id = %result.task_id,
-                    lease_id = %result.lease_id,
-                    "忽略不存在任务的迟到结果"
-                );
-                continue;
-            };
-            let root_task_id = task.root_task_id.clone();
-            match result.outcome {
-                TaskOutcome::Completed { attempt } => {
-                    match self.store.complete_lease_and_task(
-                        &result.task_id,
-                        &root_task_id,
-                        &result.lease_id,
-                        attempt,
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::warn!(
-                                task_id = %result.task_id,
-                                lease_id = %result.lease_id,
-                                "忽略非当前活跃租约的迟到任务结果"
-                            );
-                            continue;
-                        }
-                        Err(DomainError::InvalidState { message }) => {
-                            let failure_message =
-                                format!("任务 {} 完成合同验证失败: {message}", result.task_id);
-                            let changed = self
-                                .store
-                                .revoke_lease_and_set_task_terminal(
-                                    &result.task_id,
-                                    &root_task_id,
-                                    Some(&result.lease_id),
-                                    TaskStatus::Failed,
-                                    vec![failure_message.clone()],
-                                )
-                                .map_err(|error| {
-                                    format!("{failure_message}；失败状态持久化失败: {error}")
-                                })?;
-                            if !changed {
-                                return Err(format!(
-                                    "{failure_message}；当前任务租约已失效，未写入失败事实"
-                                ));
-                            }
-                            return Err(failure_message);
-                        }
-                        Err(error) => {
-                            return Err(format!(
-                                "任务 {} 完成事实持久化失败: {error}",
-                                result.task_id
-                            ));
-                        }
-                    }
-                }
-                TaskOutcome::Failed { error } => {
-                    let changed = self
-                        .store
-                        .revoke_lease_and_set_task_terminal(
-                            &result.task_id,
-                            &root_task_id,
-                            Some(&result.lease_id),
-                            TaskStatus::Failed,
-                            vec![error],
-                        )
-                        .map_err(|err| {
-                            format!("任务 {} 失败状态持久化失败: {err}", result.task_id)
-                        })?;
-                    if !changed {
-                        tracing::warn!(
-                            task_id = %result.task_id,
-                            lease_id = %result.lease_id,
-                            "忽略非当前活跃租约的迟到失败结果"
-                        );
-                        continue;
-                    }
-                }
-            }
+            let _ = apply_task_result(self.store.as_ref(), result)?;
             self.set_checkpoint_signal();
         }
         Ok(())

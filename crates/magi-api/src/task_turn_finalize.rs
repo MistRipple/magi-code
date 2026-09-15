@@ -220,10 +220,11 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     session_id: &SessionId,
     root_task_id: &TaskId,
 ) -> Result<bool, String> {
-    finalize_background_session_task_turn_if_root_completed_for_turn(
+    finalize_background_session_task_turn_if_root_terminal_for_turn(
         state,
         session_id,
         root_task_id,
+        "completed",
         None,
     )
 }
@@ -234,30 +235,13 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
     root_task_id: &TaskId,
     expected_turn_id: Option<&str>,
 ) -> Result<bool, String> {
-    let persist_session_state = session_state_persist_callback(state);
-    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed_for_turn(
-        state.session_store.as_ref(),
-        &state.event_bus,
-        state.task_store(),
+    finalize_background_session_task_turn_if_root_terminal_for_turn(
+        state,
         session_id,
         root_task_id,
+        "completed",
         expected_turn_id,
-        Some(persist_session_state.as_ref()),
-    )?;
-    if finalized {
-        release_terminal_browser_resources(state, session_id, root_task_id);
-        crate::routes::sessions::record_active_goal_turn_success(
-            state,
-            session_id,
-            root_task_id.as_str(),
-        );
-        state
-            .persist_session_state_checkpoint("session_task_turn_goal_updated")
-            .map_err(|error| format!("任务完成后的 Goal 状态持久化失败: {error:?}"))?;
-        state.release_session_git_execution_lease(session_id);
-        schedule_next_queued_session_turn(state, session_id);
-    }
-    Ok(finalized)
+    )
 }
 
 pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
@@ -287,6 +271,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 root_task_id,
                 runner_status,
                 expected_turn_id,
+                coordinator: Some(state.turn_coordinator()),
                 persist_session_state: Some(persist_session_state.as_ref()),
             },
         )?;
@@ -415,16 +400,18 @@ pub fn schedule_restored_session_turn_queues(state: &ApiState) -> usize {
 }
 
 pub fn reconcile_terminal_session_task_turns(state: &ApiState) -> usize {
-    magi_conversation_runtime::session_turn_finalize::reconcile_terminal_session_task_turns(
+    magi_conversation_runtime::session_turn_finalize::reconcile_terminal_session_task_turns_with_coordinator(
         state.session_store.as_ref(),
         &state.event_bus,
         state.task_store(),
+        Some(state.turn_coordinator()),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_conversation_runtime::{CoordinatorAdmission, ExecutionProfile, TurnAdmission};
     use magi_core::{
         AccessProfile, MissionId, Task, TaskKind, TaskRuntimePayload, TaskStatus, UtcMillis,
     };
@@ -653,6 +640,19 @@ mod tests {
             Arc::new(GovernanceService::default()),
         )
         .with_task_store(task_store);
+        let task_attempt = state
+            .turn_coordinator()
+            .accept(
+                &session_id,
+                TurnAdmission {
+                    turn_id: "turn-failed-task-plan-pause".to_string(),
+                    request_id: "request-failed-task-plan-pause".to_string(),
+                    request_fingerprint: "fp-failed-task-plan-pause".to_string(),
+                    profile: ExecutionProfile::Task,
+                },
+            )
+            .expect("Task Turn 应注册 Coordinator admission");
+        assert!(matches!(task_attempt, CoordinatorAdmission::Accepted(_)));
 
         assert!(
             finalize_background_session_task_turn_if_root_terminal_for_turn(
@@ -775,6 +775,19 @@ mod tests {
             Arc::new(GovernanceService::default()),
         )
         .with_task_store(task_store);
+        let task_attempt = state
+            .turn_coordinator()
+            .accept(
+                &session_id,
+                TurnAdmission {
+                    turn_id: "turn-fast-goal-completion".to_string(),
+                    request_id: "request-fast-goal-completion".to_string(),
+                    request_fingerprint: "fp-fast-goal-completion".to_string(),
+                    profile: ExecutionProfile::Task,
+                },
+            )
+            .expect("Task Turn 应注册 Coordinator admission");
+        assert!(matches!(task_attempt, CoordinatorAdmission::Accepted(_)));
 
         assert!(
             finalize_background_session_task_turn_if_root_completed(

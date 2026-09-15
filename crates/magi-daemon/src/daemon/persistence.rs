@@ -36,7 +36,8 @@ pub(crate) struct StateRepository {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AcceptedSubmissionRecord {
     pub session: SessionAcceptanceRecord,
-    pub task: Task,
+    #[serde(default)]
+    pub task: Option<Task>,
     pub session_checkpointed: bool,
     pub task_checkpointed: bool,
     pub task_projection_generation_at_acceptance: u64,
@@ -3037,11 +3038,20 @@ impl StateRepository {
         }
         let mut reconciled = false;
         for record in &mut records {
+            // Conversation acceptance 没有 Task projection；其 canonical event 本身
+            // 已经是完整 durable 事实，不能等待不存在的 task manifest。
+            let Some(task) = record.task.as_ref() else {
+                if !record.task_checkpointed {
+                    record.task_checkpointed = true;
+                    reconciled = true;
+                }
+                continue;
+            };
             if !record.task_checkpointed
                 && (committed_generation > record.task_projection_generation_at_acceptance
                     || TaskStore::committed_projection_contains_root(
                         &self.task_store_projection_path(),
-                        &record.task.root_task_id,
+                        &task.root_task_id,
                     )?)
             {
                 record.task_checkpointed = true;
@@ -3125,7 +3135,7 @@ impl StateRepository {
         });
         journal.records.push(AcceptedSubmissionRecord {
             session: session.clone(),
-            task: task.clone(),
+            task: Some(task.clone()),
             session_checkpointed: false,
             task_checkpointed: false,
             task_projection_generation_at_acceptance,
@@ -3441,7 +3451,7 @@ impl CanonicalTurnEventWriter for StateRepository {
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
         acceptance: &SessionAcceptanceRecord,
-        task: &Task,
+        task: Option<&Task>,
     ) -> DomainResult<()> {
         let _write_guard = self
             .write_lock
@@ -3474,11 +3484,13 @@ impl CanonicalTurnEventWriter for StateRepository {
                 .unwrap_or(0);
         let acceptance = AcceptedSubmissionRecord {
             session: acceptance.clone(),
-            task: task.clone(),
+            task: task.cloned(),
             // canonical event 已经包含 session、timeline 和 sidecar，事件 segment 本身
             // 就是 session accepted 事实的 durable 提交点。
             session_checkpointed: true,
-            task_checkpointed: false,
+            // Conversation acceptance 没有待 checkpoint 的 Task；Task acceptance
+            // 仍等待 task-store manifest 收敛。
+            task_checkpointed: task.is_none(),
             task_projection_generation_at_acceptance,
         };
         self.append_canonical_turn_transaction_locked(session_id, mutations, Some(acceptance))
@@ -4087,7 +4099,14 @@ mod tests {
             .expect("WAL should load");
         assert_eq!(recovered.len(), 1);
         assert!(!recovered[0].task_checkpointed);
-        assert_eq!(recovered[0].task.task_id, task_id);
+        assert_eq!(
+            recovered[0]
+                .task
+                .as_ref()
+                .expect("task acceptance should include task")
+                .task_id,
+            task_id
+        );
 
         let _ = fs::remove_dir_all(state_root);
     }
@@ -4116,7 +4135,14 @@ mod tests {
             .expect("late WAL should reconcile against persisted task membership");
         assert_eq!(recovered.len(), 1);
         assert!(recovered[0].task_checkpointed);
-        assert_eq!(recovered[0].task.task_id, task_id);
+        assert_eq!(
+            recovered[0]
+                .task
+                .as_ref()
+                .expect("task acceptance should include task")
+                .task_id,
+            task_id
+        );
 
         let _ = fs::remove_dir_all(state_root);
     }
@@ -5290,7 +5316,7 @@ mod tests {
                     next: acceptance.canonical_turn.clone(),
                 }],
                 &acceptance,
-                &task,
+                Some(&task),
             )
             .expect("accepted event transaction should commit");
         // accepted 事务之后继续追加 canonical item 并完成 Turn，模拟 projection 尚未
@@ -5377,7 +5403,14 @@ mod tests {
         assert_eq!(recovered_acceptance.len(), 1);
         assert!(recovered_acceptance[0].session_checkpointed);
         assert!(!recovered_acceptance[0].task_checkpointed);
-        assert_eq!(recovered_acceptance[0].task.task_id, task_id);
+        assert_eq!(
+            recovered_acceptance[0]
+                .task
+                .as_ref()
+                .expect("task acceptance should include task")
+                .task_id,
+            task_id
+        );
 
         restored_repository
             .save_session_projection_state(&durable, &sidecars)
@@ -5538,7 +5571,7 @@ mod tests {
                     next: acceptance.canonical_turn.clone(),
                 }],
                 &acceptance,
-                &accepted_task(task_id, 60),
+                Some(&accepted_task(task_id, 60)),
             )
             .expect("accepted event transaction should persist");
         repository

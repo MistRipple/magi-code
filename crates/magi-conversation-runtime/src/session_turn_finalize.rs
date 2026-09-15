@@ -10,6 +10,7 @@ use magi_event_bus::InMemoryEventBus;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{ActiveExecutionTurn, SessionStore};
 
+use crate::session_turn_coordinator::{CoordinatorTurnStatus, SessionTurnCoordinator};
 use crate::session_writeback::{
     SessionStatePersistCallback, append_session_turn_item_for_turn,
     persist_session_state_checkpoint, publish_current_session_turn_item_event,
@@ -35,6 +36,9 @@ pub struct FinalizeBackgroundSessionTaskTurnContext<'a> {
     pub root_task_id: &'a TaskId,
     pub runner_status: &'a str,
     pub expected_turn_id: Option<&'a str>,
+    /// 生产 Task 终态必须先由 SessionStore durable mutation 成功，再由 Coordinator
+    /// 收口 attempt；None 仅供不依赖 Coordinator 的纯 runtime 单元测试。
+    pub coordinator: Option<&'a SessionTurnCoordinator>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
 
@@ -526,7 +530,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     root_task_id: &TaskId,
     persist_session_state: Option<&SessionStatePersistCallback>,
 ) -> Result<bool, String> {
-    finalize_background_session_task_turn_if_root_completed_for_turn(
+    finalize_completed_root_task_turn_for_turn(
         session_store,
         event_bus,
         task_store,
@@ -537,7 +541,29 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     )
 }
 
+/// 仅供没有统一 Coordinator 的嵌入测试读取已完成 root；生产路径使用
+/// `finalize_background_session_task_turn_if_root_terminal`。
 pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
+    session_store: &SessionStore,
+    event_bus: &InMemoryEventBus,
+    task_store: Option<&TaskStore>,
+    session_id: &SessionId,
+    root_task_id: &TaskId,
+    expected_turn_id: Option<&str>,
+    persist_session_state: Option<&SessionStatePersistCallback>,
+) -> Result<bool, String> {
+    finalize_completed_root_task_turn_for_turn(
+        session_store,
+        event_bus,
+        task_store,
+        session_id,
+        root_task_id,
+        expected_turn_id,
+        persist_session_state,
+    )
+}
+
+fn finalize_completed_root_task_turn_for_turn(
     session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
     task_store: Option<&TaskStore>,
@@ -578,7 +604,7 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
         if archived {
             persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived")?;
         }
-        return Ok(current_turn_status_is_completed(&turn.status) || archived);
+        return Ok(archived);
     }
     let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
     else {
@@ -747,6 +773,59 @@ pub fn terminal_turn_event_anchor_item_id(
         .map(|item| item.item_id.clone())
 }
 
+fn finish_coordinator_after_durable_terminal(
+    coordinator: Option<&SessionTurnCoordinator>,
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    expected_turn_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(coordinator) = coordinator else {
+        return Ok(());
+    };
+    let sidecar = session_store
+        .runtime_sidecar(session_id)
+        .ok_or_else(|| format!("session {session_id} 终态后缺少 runtime sidecar"))?;
+    let turn = sidecar
+        .current_turn
+        .as_ref()
+        .ok_or_else(|| format!("session {session_id} 终态后缺少 current Turn"))?;
+    if expected_turn_id.is_some_and(|expected| expected != turn.turn_id) {
+        return Err(format!(
+            "session {session_id} 终态后 current Turn {} 与 expected Turn 不一致",
+            turn.turn_id
+        ));
+    }
+    let attempt = coordinator
+        .current_attempt(session_id, &turn.turn_id)
+        .map_err(|error| {
+            format!(
+                "Task Turn {} 缺少 Coordinator attempt: {error}",
+                turn.turn_id
+            )
+        })?;
+    if attempt.profile != crate::session_turn_coordinator::ExecutionProfile::Task {
+        return Err(format!(
+            "Task Turn {} 的 Coordinator profile 不是 task",
+            turn.turn_id
+        ));
+    }
+    let status = match turn.status.trim().to_ascii_lowercase().as_str() {
+        "completed" | "complete" | "succeeded" | "success" => CoordinatorTurnStatus::Completed,
+        "failed" | "error" => CoordinatorTurnStatus::Failed,
+        "cancelled" | "canceled" | "interrupted" => CoordinatorTurnStatus::Cancelled,
+        other => return Err(format!("Task Turn {} 终态非法: {other}", turn.turn_id)),
+    };
+    coordinator
+        .finish(session_id, &attempt, status)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Task Turn {} Coordinator 终态收口失败: {error}",
+                turn.turn_id
+            )
+        })
+}
+
 pub fn finalize_background_session_task_turn_if_root_terminal(
     context: FinalizeBackgroundSessionTaskTurnContext<'_>,
 ) -> Result<bool, String> {
@@ -758,9 +837,10 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         root_task_id,
         runner_status,
         expected_turn_id,
+        coordinator,
         persist_session_state,
     } = context;
-    match finalize_background_session_task_turn_if_root_completed_for_turn(
+    match finalize_completed_root_task_turn_for_turn(
         session_store,
         event_bus,
         task_store,
@@ -769,7 +849,15 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         expected_turn_id,
         persist_session_state,
     ) {
-        Ok(true) => return Ok(true),
+        Ok(true) => {
+            finish_coordinator_after_durable_terminal(
+                coordinator,
+                session_store,
+                session_id,
+                expected_turn_id,
+            )?;
+            return Ok(true);
+        }
         Ok(false) => {}
         Err(error) => return Err(error),
     }
@@ -898,6 +986,12 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     ) {
         return Err(format!("根任务失败时 Turn 终态事件发布失败: {error}"));
     }
+    finish_coordinator_after_durable_terminal(
+        coordinator,
+        session_store,
+        session_id,
+        expected_turn_id,
+    )?;
 
     Ok(true)
 }
@@ -906,6 +1000,22 @@ pub fn reconcile_terminal_session_task_turns(
     session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
     task_store: Option<&TaskStore>,
+) -> usize {
+    reconcile_terminal_session_task_turns_with_coordinator(
+        session_store,
+        event_bus,
+        task_store,
+        None,
+    )
+}
+
+/// daemon 恢复时使用 Coordinator 版本；终态任务只通过 canonical durable mutation
+/// 后的统一入口收口 Turn，避免启动 reconcile 又建立一条独立终态路径。
+pub fn reconcile_terminal_session_task_turns_with_coordinator(
+    session_store: &SessionStore,
+    event_bus: &InMemoryEventBus,
+    task_store: Option<&TaskStore>,
+    coordinator: Option<&SessionTurnCoordinator>,
 ) -> usize {
     let Some(task_store) = task_store else {
         return 0;
@@ -950,6 +1060,7 @@ pub fn reconcile_terminal_session_task_turns(
                     root_task_id,
                     runner_status,
                     expected_turn_id: Some(turn_id),
+                    coordinator,
                     persist_session_state: None,
                 },
             )

@@ -246,7 +246,22 @@ async fn pause_current_goal(
         state
             .conversation_registry
             .close_session_turn_input(&scope.session_id, &turn_id);
-        let _ = super::finalize_session_turn(&state, &scope.session_id, false);
+        if let Ok(attempt) = state
+            .turn_coordinator()
+            .current_attempt(&scope.session_id, &turn_id)
+            && let Err(error) = state.turn_coordinator().finish(
+                &scope.session_id,
+                &attempt,
+                magi_conversation_runtime::CoordinatorTurnStatus::Cancelled,
+            )
+        {
+            tracing::error!(
+                session_id = %scope.session_id,
+                turn_id = %turn_id,
+                %error,
+                "暂停 Goal 时 Coordinator 取消收口失败"
+            );
+        }
     }
     publish_goal_plan_if_present(&state, &scope, plan.as_ref());
     state.persist_session_state_checkpoint("goal_paused")?;
