@@ -878,7 +878,7 @@ Coordinator
 ### 17.3 Coordinator
 
 - [x] 每个 Session 建立唯一 `SessionTurnCoordinator`。
-- [ ] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command；本轮已把生产 start/status/finish/cancel/abort 接入命令入口，并把 steer 与 Continue 接入显式命令；recover 仍需把恢复边界改为显式 command。
+- [ ] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command；本轮已把生产 start/status/finish/cancel/abort 接入命令入口，并把 steer、Continue 与显式恢复 wrapper 接入 command；canonical 全量 restore 和断线恢复 harness 仍需继续收敛。
 - [ ] 删除所有外部模块直接修改 current Turn 的路径。
 - [x] 实现 attempt ID 校验、迟到结果拒绝和终态冲突。
 - [x] Continue 在接纳新 Turn 前收口旧 attempt，并在新 Turn 上注册 Task attempt。
