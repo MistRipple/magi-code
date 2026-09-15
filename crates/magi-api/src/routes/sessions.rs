@@ -613,6 +613,23 @@ pub(crate) async fn submit_session_turn_internal(
         }
         return canonical_turn_replay_response(&state, existing_turn);
     }
+    // 排队中的请求尚未拥有 canonical Turn，但 requestId 仍然必须保持幂等；
+    // 否则网络重试会把同一条用户消息复制到队列，并在队首 drain 时执行两次。
+    if let Some(request_id) = request.request_id()
+        && let Some((queued, queue_position)) =
+            state.queued_regular_session_turn_for_request_id(&request_id)
+    {
+        let stored_fingerprint = queued
+            .request_fingerprint
+            .clone()
+            .or_else(|| queued.request.request_fingerprint().ok());
+        if stored_fingerprint.as_deref() != Some(request_fingerprint.as_str()) {
+            return Err(ApiError::Conflict(
+                "requestId 已绑定另一条排队消息，请为新请求生成新的 requestId".to_string(),
+            ));
+        }
+        return queued_turn_replay_response(&state, &queued, queue_position);
+    }
     if request.steer_current_turn && session_turn_requests_explicit_goal_mode(&request) {
         return Err(ApiError::InvalidInput(
             "目标模式必须作为独立执行轮次提交，不能作为当前轮引导".to_string(),
@@ -2916,6 +2933,34 @@ fn canonical_turn_replay_response(
     })
     .with_canonical_event("turn_started", Some(canonical_turn), user_item)
     .with_canonical_event_metadata(event_id, event_seq, UtcMillis::now()))
+}
+
+fn queued_turn_replay_response(
+    state: &ApiState,
+    queued: &QueuedRegularSessionTurn,
+    queue_position: usize,
+) -> Result<SessionTurnResponseDto, ApiError> {
+    let event_id = EventId::new(format!(
+        "event-session-turn-queued-replay-{}",
+        queued.queue_id
+    ));
+    let event_sequence = state.event_bus.snapshot().next_sequence;
+    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
+        session_id: queued.session_id.clone(),
+        entry_id: queued.queue_id.clone(),
+        event_id: event_id.clone(),
+        accepted_at: queued.accepted_at,
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence: event_sequence,
+        created_session: false,
+        route: queued.route,
+        root_task_id: None,
+        action_task_id: None,
+        execution_chain_ref: None,
+        user_message_item_id: queued.request.user_message_id(),
+    })
+    .with_queued(queued.queue_id.clone(), queue_position)
+    .with_request_identity(queued.request.request_id(), event_sequence))
 }
 
 fn conversation_turn_replay_response(
