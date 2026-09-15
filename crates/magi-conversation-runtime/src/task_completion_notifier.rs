@@ -6,6 +6,7 @@
 
 use crate::task_runner::apply_task_result;
 use crate::task_runner_bridge::{TaskCompletionSink, TaskResult};
+use crate::turn_contract::TaskRunRecord;
 use magi_core::{SessionId, TaskId, TaskStatus};
 use magi_orchestrator::task_store::TaskStore;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,25 @@ pub struct TaskCompletionNotification {
     pub task_id: TaskId,
     pub attempt_id: String,
     pub status: TaskStatus,
+}
+
+impl TaskCompletionNotification {
+    /// 将 TaskStore 的终态通知映射为 Turn 侧关联记录。没有 session/turn
+    /// 绑定的后台任务不会被伪造为某个会话的 Turn。
+    pub fn task_run_record(&self, event_sequence: u64) -> Option<TaskRunRecord> {
+        Some(TaskRunRecord {
+            session_id: self.session_id.clone()?,
+            turn_id: self.turn_id.clone()?,
+            task_id: self.task_id.clone(),
+            root_task_id: self.root_task_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            status: format!("{:?}", self.status).to_ascii_lowercase(),
+            event_sequence,
+            lease_id: None,
+            causation_id: None,
+            trace_id: None,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -425,6 +445,11 @@ mod tests {
             Some(SessionId::new("session-notifier"))
         );
         assert_eq!(notification.turn_id.as_deref(), Some("turn-notifier"));
+        let task_run = notification
+            .task_run_record(7)
+            .expect("Turn-bound completion should produce a task run record");
+        assert_eq!(task_run.event_sequence, 7);
+        assert_eq!(task_run.task_id, task_id);
         assert_eq!(notification.root_task_id, task_id);
         assert_eq!(notification.status, TaskStatus::Failed);
         assert_eq!(

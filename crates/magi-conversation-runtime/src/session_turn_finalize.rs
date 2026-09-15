@@ -12,10 +12,11 @@ use magi_session_store::{ActiveExecutionTurn, SessionStore};
 
 use crate::session_turn_coordinator::{CoordinatorTurnStatus, SessionTurnCoordinator};
 use crate::session_writeback::{
-    SessionStatePersistCallback, append_session_turn_item_for_turn,
+    CanonicalTurnEventSink, SessionStatePersistCallback, append_session_turn_item_for_turn,
     persist_session_state_checkpoint, publish_current_session_turn_item_event,
     publish_session_turn_item_event, session_turn_item,
 };
+use crate::turn_contract::TurnCommand;
 
 const TASK_CONTEXT_MAX_CHARS: usize = 4000;
 const TASK_CONTEXT_MAX_REFS: usize = 8;
@@ -752,8 +753,8 @@ fn update_current_turn_completed_from_root(
     session_id: &SessionId,
     expected_turn_id: Option<&str>,
 ) -> Result<(), String> {
-    match session_store
-        .complete_current_turn_from_completed_root_task_for_turn(session_id, expected_turn_id)
+    match CanonicalTurnEventSink::for_store(session_store, None)
+        .complete_from_root_task(session_id, expected_turn_id)
         .map_err(|error| format!("完成当前 Turn 失败: {error}"))?
     {
         Some(_) => Ok(()),
@@ -816,7 +817,7 @@ fn finish_coordinator_after_durable_terminal(
         other => return Err(format!("Task Turn {} 终态非法: {other}", turn.turn_id)),
     };
     coordinator
-        .finish(session_id, &attempt, status)
+        .execute_command(session_id, TurnCommand::Finish { attempt, status })
         .map(|_| ())
         .map_err(|error| {
             format!(
@@ -966,8 +967,8 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         .item_id
     };
 
-    session_store
-        .update_current_turn_status_for_turn(session_id, expected_turn_id, turn_status)
+    CanonicalTurnEventSink::for_store(session_store, Some(task_store))
+        .set_status_domain(session_id, expected_turn_id, turn_status)
         .map_err(|error| format!("终态 Turn 失败状态提交失败: {error}"))?
         .ok_or_else(|| {
             format!("终态 Turn 没有可更新的失败状态: session={session_id}, task={root_task_id}")

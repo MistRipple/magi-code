@@ -22,6 +22,7 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
 };
 use magi_conversation_runtime::{
+    CanonicalTurnEventSink,
     execution_admission::ExecutionAdmissionController,
     model_config::{
         NormalizedModelConfig, configured_role_engine_model_config,
@@ -2080,7 +2081,8 @@ impl DaemonRuntime {
                 .current_turn
                 .as_ref()
                 .is_some_and(|turn| !current_turn_status_is_terminal(&turn.status))
-                && let Err(error) = self.session_store.cancel_current_turn(&session_id)
+                && let Err(error) = CanonicalTurnEventSink::for_store(&self.session_store, None)
+                    .cancel_turn(&session_id)
             {
                 warn!(
                     ?error,
@@ -2246,7 +2248,9 @@ impl DaemonRuntime {
 
         let orphan_count = orphan_sessions.len();
         for session_id in orphan_sessions {
-            if let Err(error) = self.session_store.cancel_current_turn(&session_id) {
+            if let Err(error) = CanonicalTurnEventSink::for_store(&self.session_store, None)
+                .cancel_turn(&session_id)
+            {
                 warn!(
                     ?error,
                     %session_id,

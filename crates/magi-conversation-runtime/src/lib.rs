@@ -44,6 +44,7 @@ mod tool_execution_ledger;
 pub mod tool_result_utils;
 mod tool_surface_state;
 mod turn;
+pub mod turn_contract;
 pub mod turn_stream_buffer;
 pub mod usage_recording;
 
@@ -58,10 +59,11 @@ pub use registry::{
     SessionTurnInputError, TaskSignalBoundary, TaskSignalCommitError,
 };
 pub use session_turn_coordinator::{
-    CoordinatorAdmission, CoordinatorError, CoordinatorTurnStatus, ExecutionProfile,
-    SessionTurnCoordinator, TurnAdmission, TurnAttempt, request_fingerprint,
+    CoordinatorAdmission, CoordinatorCommandResult, CoordinatorError, CoordinatorTurnStatus,
+    ExecutionProfile, SessionTurnCoordinator, TurnAdmission, TurnAttempt, request_fingerprint,
 };
 pub use session_turn_execution::SessionTurnExecutionRequest;
+pub use session_writeback::{CanonicalTurnEventSink, TurnEventSink};
 pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,
 };
@@ -92,6 +94,7 @@ pub use tool_approval::{
 };
 pub(crate) use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};
+pub use turn_contract::{TaskRunRecord, TurnCommand, TurnEventEnvelope, TurnRecord};
 
 #[cfg(test)]
 pub(crate) fn test_plan_store(name: &str) -> magi_plan::PlanStore {

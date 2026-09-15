@@ -7,8 +7,8 @@ use axum::{
 use magi_browser_authority::BrowserToolKind;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    CoordinatorAdmission, CoordinatorTurnStatus, ExecutionProfile, SessionTurnExecutionRequest,
-    TurnAdmission,
+    CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus, ExecutionProfile,
+    SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
 };
 use magi_conversation_runtime::{
     PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
@@ -1036,6 +1036,18 @@ async fn submit_steer_current_turn_after_turn_commit(
     let request_fingerprint = request
         .request_fingerprint()
         .map_err(ApiError::InvalidInput)?;
+    state
+        .turn_coordinator()
+        .execute_command(
+            &session_id,
+            TurnCommand::Steer {
+                attempt: coordinator_attempt.clone(),
+                request_id: request_id
+                    .clone()
+                    .expect("steer request id should be normalized"),
+            },
+        )
+        .map_err(|error| ApiError::Conflict(format!("steer Turn 命令校验失败: {error}")))?;
     let (user_message_item_id, mut user_message_item) =
         build_user_message_turn_item(UserMessageTurnItemInput {
             accepted_at,
@@ -1079,12 +1091,8 @@ async fn submit_steer_current_turn_after_turn_commit(
         .conversation_registry
         .try_steer_session_turn_with(&session_id, &expected_turn_id, signal, || {
             state
-                .session_store
-                .append_current_turn_item_for_turn(
-                    &session_id,
-                    Some(&expected_turn_id),
-                    user_message_item,
-                )
+                .turn_event_sink()
+                .append_item_sidecar(&session_id, Some(&expected_turn_id), user_message_item)
                 .and_then(|sidecar| {
                     sidecar.ok_or(magi_core::DomainError::InvalidState {
                         message: "当前会话没有可写入的活跃 Turn".to_string(),
@@ -2621,10 +2629,19 @@ async fn submit_conversation_session_turn(
         request_fingerprint: request_fingerprint.clone(),
         profile: ExecutionProfile::Conversation,
     };
-    let coordinator_admission = state
+    let coordinator_admission = match state
         .turn_coordinator()
-        .accept(&session_id, admission)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .execute_command(&session_id, TurnCommand::Start(admission))
+        .map_err(|error| ApiError::Conflict(error.to_string()))?
+    {
+        CoordinatorCommandResult::Admission(admission) => admission,
+        other => {
+            return Err(ApiError::internal_assembly(
+                "接纳 conversation Turn",
+                format!("Coordinator 返回了非法 Start 结果: {other:?}"),
+            ));
+        }
+    };
     let attempt = match coordinator_admission {
         CoordinatorAdmission::Accepted(attempt) => attempt,
         CoordinatorAdmission::Replay(attempt) => {
@@ -2952,7 +2969,13 @@ fn schedule_conversation_execution(
         let turn_id = request.turn_id.clone();
         let coordinator = state.turn_coordinator().clone();
         if coordinator
-            .set_status(&session_id, &turn_id, CoordinatorTurnStatus::Preparing)
+            .execute_command(
+                &session_id,
+                TurnCommand::SetStatus {
+                    turn_id: turn_id.clone(),
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            )
             .is_err()
         {
             return;
@@ -2970,9 +2993,13 @@ fn schedule_conversation_execution(
             );
             let changed = settle_conversation_turn(&state, &session_id, &turn_id, "failed");
             if changed {
-                if let Err(error) =
-                    coordinator.finish(&session_id, &attempt, CoordinatorTurnStatus::Failed)
-                {
+                if let Err(error) = coordinator.execute_command(
+                    &session_id,
+                    TurnCommand::Finish {
+                        attempt: attempt.clone(),
+                        status: CoordinatorTurnStatus::Failed,
+                    },
+                ) {
                     tracing::error!(
                         session_id = %session_id,
                         turn_id = %turn_id,
@@ -2988,7 +3015,13 @@ fn schedule_conversation_execution(
             return;
         };
         if coordinator
-            .set_status(&session_id, &turn_id, CoordinatorTurnStatus::Running)
+            .execute_command(
+                &session_id,
+                TurnCommand::SetStatus {
+                    turn_id: turn_id.clone(),
+                    status: CoordinatorTurnStatus::Running,
+                },
+            )
             .is_err()
         {
             return;
@@ -3057,7 +3090,13 @@ fn schedule_conversation_execution(
         // 当前 Turn，Coordinator 才收口同一 attempt。取消或新 Turn 先提交时，迟到
         // 的执行结果不会再次触碰 Coordinator。
         if canonical_changed {
-            if let Err(error) = coordinator.finish(&session_id, &attempt, terminal_status) {
+            if let Err(error) = coordinator.execute_command(
+                &session_id,
+                TurnCommand::Finish {
+                    attempt: attempt.clone(),
+                    status: terminal_status,
+                },
+            ) {
                 tracing::error!(
                     session_id = %session_id,
                     turn_id = %turn_id,
@@ -3089,8 +3128,8 @@ fn settle_conversation_turn(
     status: &str,
 ) -> bool {
     let updated = match state
-        .session_store
-        .update_current_turn_status_for_turn_with_change(session_id, Some(turn_id), status)
+        .turn_event_sink()
+        .set_status_domain(session_id, Some(turn_id), status)
     {
         Ok(updated) => updated,
         Err(error) => {
@@ -4473,10 +4512,12 @@ async fn interrupt_session_turn(
                 .conversation_registry
                 .close_session_turn_input(&session_id, turn_id);
             if let Some(attempt) = coordinator_attempt.as_ref() {
-                if let Err(error) = state.turn_coordinator().finish(
+                if let Err(error) = state.turn_coordinator().execute_command(
                     &session_id,
-                    attempt,
-                    CoordinatorTurnStatus::Cancelled,
+                    TurnCommand::Finish {
+                        attempt: attempt.clone(),
+                        status: CoordinatorTurnStatus::Cancelled,
+                    },
                 ) {
                     tracing::error!(
                         session_id = %session_id,
@@ -5158,7 +5199,7 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
         .session_store
         .active_plan_for_execution_owner(session_id, &current_turn.turn_id)
         .is_some();
-    match state.session_store.cancel_current_turn(session_id) {
+    match state.turn_event_sink().cancel_turn(session_id) {
         Ok(Some(_)) => {}
         Ok(None) => return cancelled_tool_process_count > 0,
         Err(error) => {
@@ -5174,10 +5215,13 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
         .conversation_registry
         .close_session_turn_input(session_id, &current_turn.turn_id);
     if let Some(attempt) = coordinator_attempt.as_ref()
-        && let Err(error) =
-            state
-                .turn_coordinator()
-                .finish(session_id, attempt, CoordinatorTurnStatus::Cancelled)
+        && let Err(error) = state.turn_coordinator().execute_command(
+            session_id,
+            TurnCommand::Finish {
+                attempt: attempt.clone(),
+                status: CoordinatorTurnStatus::Cancelled,
+            },
+        )
     {
         tracing::error!(
             %session_id,

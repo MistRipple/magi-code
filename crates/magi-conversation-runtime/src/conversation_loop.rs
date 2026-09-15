@@ -11,9 +11,9 @@ use crate::model_context_window::{
     conservative_context_limit_recovery_window, resolve_model_context_window_with_override,
 };
 use crate::session_writeback::{
-    ContextCompactionWritebackContext, SessionStatePersistCallback, SessionTurnStreamPublishGate,
-    SessionTurnStreamUpdate, append_session_turn_item_for_turn, apply_model_response_round,
-    new_context_compaction_item_id, persist_session_state_checkpoint,
+    CanonicalTurnEventSink, ContextCompactionWritebackContext, SessionStatePersistCallback,
+    SessionTurnStreamPublishGate, SessionTurnStreamUpdate, append_session_turn_item_for_turn,
+    apply_model_response_round, new_context_compaction_item_id, persist_session_state_checkpoint,
     publish_current_session_turn_item_event, publish_model_retry_runtime_event,
     publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
     session_turn_stream_update, upsert_context_compaction_completed_notice,
@@ -4200,13 +4200,8 @@ fn append_task_final_turn_item(
         .get_task(&context.task.root_task_id)
         .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
     if context.turn_visibility.is_mainline() && root_task_completed {
-        context
-            .session_store
-            .update_current_turn_status_for_turn(
-                context.session_id,
-                context.expected_turn_id,
-                "completed",
-            )
+        CanonicalTurnEventSink::for_store(context.session_store, Some(context.task_store))
+            .set_status_domain(context.session_id, context.expected_turn_id, "completed")
             .map_err(|error| {
                 format!(
                     "提交会话 {} 的 Turn completed 状态失败: {error}",
@@ -4282,13 +4277,8 @@ fn append_task_error_turn_item(
         &published,
     );
     if context.turn_visibility.is_mainline() {
-        context
-            .session_store
-            .update_current_turn_status_for_turn(
-                context.session_id,
-                context.expected_turn_id,
-                "failed",
-            )
+        CanonicalTurnEventSink::for_store(context.session_store, Some(context.task_store))
+            .set_status_domain(context.session_id, context.expected_turn_id, "failed")
             .map_err(|error| {
                 format!(
                     "提交会话 {} 的 Turn failed 状态失败: {error}",

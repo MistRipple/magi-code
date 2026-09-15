@@ -9,8 +9,8 @@ use crate::{
     state::{ApiState, RunnerStartError},
 };
 use magi_conversation_runtime::{
-    CoordinatorError, CoordinatorTurnStatus, ExecutionProfile, SessionTurnCoordinator,
-    TurnAdmission, TurnAttempt,
+    CoordinatorCommandResult, CoordinatorError, CoordinatorTurnStatus, ExecutionProfile,
+    SessionTurnCoordinator, TurnAdmission, TurnAttempt, TurnCommand,
     execution_chain_recovery::{
         apply_chain_recovery_if_needed, commit_chain_recovery, fail_resumed_execution_paths,
         release_resumed_branch_path, sync_branch_checkpoint_to_worker_runtime,
@@ -311,9 +311,22 @@ impl Drop for ContinueRecoveryAttempt<'_> {
                 });
             let result = match terminal {
                 Some(status) => coordinator
-                    .finish(&self.session_id, attempt, status)
+                    .execute_command(
+                        &self.session_id,
+                        TurnCommand::Finish {
+                            attempt: attempt.clone(),
+                            status,
+                        },
+                    )
                     .map(|_| ()),
-                None => coordinator.abort(&self.session_id, attempt).map(|_| ()),
+                None => coordinator
+                    .execute_command(
+                        &self.session_id,
+                        TurnCommand::Abort {
+                            attempt: attempt.clone(),
+                        },
+                    )
+                    .map(|_| ()),
             };
             if let Err(error) = result {
                 tracing::error!(
@@ -346,11 +359,10 @@ pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
 /// 任何失败都不能把这个 Turn 留在 running，否则下一次发送会继续看到一个永远不会
 /// 收口的“活动会话”，并再次触发旧执行链的恢复逻辑。
 fn fail_prepared_continue_turn(state: &ApiState, session_id: &SessionId, turn_id: &str) {
-    match state.session_store.update_current_turn_status_for_turn(
-        session_id,
-        Some(turn_id),
-        "failed",
-    ) {
+    match state
+        .turn_event_sink()
+        .set_status_domain(session_id, Some(turn_id), "failed")
+    {
         Ok(Some(_)) => {
             if let Err(error) =
                 state.persist_session_state_checkpoint("session_continue_start_failed")
@@ -944,8 +956,9 @@ where
     }
 
     // 旧 current Turn 可能已经由 SessionStore 收口，但 daemon 恢复或异步终态回调
-    // 尚未释放 Coordinator active 槽位。先按 canonical 终态完成旧 attempt，再接纳
-    // Continue 的新 Turn，保证同一 session 永远只有一个活动 attempt。
+    // 尚未释放 Coordinator active 槽位。先读取旧 attempt 和 canonical 终态，
+    // 最后通过同一个 Continue command 原子收口并接纳新 Turn。
+    let mut previous_coordinator = None;
     if let Some(previous_turn_id) = chain
         .current_turn
         .as_ref()
@@ -970,15 +983,7 @@ where
                 .current_attempt(session_id, previous_turn_id)
             {
                 Ok(previous_attempt) => {
-                    state
-                        .turn_coordinator()
-                        .finish(session_id, &previous_attempt, previous_status)
-                        .map_err(|error| {
-                            ApiError::internal_assembly(
-                                "Continue 旧 Turn 收口失败",
-                                error.to_string(),
-                            )
-                        })?;
+                    previous_coordinator = Some((previous_attempt, previous_status));
                 }
                 Err(CoordinatorError::NoActiveTurn) => {}
                 Err(error) => {
@@ -990,18 +995,33 @@ where
             }
         }
     }
-    let coordinator_admission = state
+    let next_admission = TurnAdmission {
+        turn_id: resumed_turn_id.to_string(),
+        request_id,
+        request_fingerprint,
+        profile: ExecutionProfile::Task,
+    };
+    let command = match previous_coordinator {
+        Some((previous, previous_status)) => TurnCommand::Continue {
+            previous,
+            previous_status,
+            next: next_admission,
+        },
+        None => TurnCommand::Start(next_admission),
+    };
+    let coordinator_admission = match state
         .turn_coordinator()
-        .accept(
-            session_id,
-            TurnAdmission {
-                turn_id: resumed_turn_id.to_string(),
-                request_id,
-                request_fingerprint,
-                profile: ExecutionProfile::Task,
-            },
-        )
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .execute_command(session_id, command)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?
+    {
+        CoordinatorCommandResult::Admission(admission) => admission,
+        other => {
+            return Err(ApiError::internal_assembly(
+                "接纳 Continue Turn",
+                format!("Coordinator 返回了非法 Continue 接纳结果: {other:?}"),
+            ));
+        }
+    };
     let coordinator_attempt = match coordinator_admission {
         magi_conversation_runtime::CoordinatorAdmission::Accepted(attempt) => attempt,
         magi_conversation_runtime::CoordinatorAdmission::Replay(attempt) => {

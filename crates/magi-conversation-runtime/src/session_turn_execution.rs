@@ -36,7 +36,7 @@ use crate::{
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
-        ContextCompactionWritebackContext, SessionStatePersistCallback,
+        CanonicalTurnEventSink, ContextCompactionWritebackContext, SessionStatePersistCallback,
         SessionTurnStreamPublishGate, append_session_tool_call_items_batch_with_context,
         append_session_turn_error_item, append_session_turn_error_item_without_terminal_commit,
         append_session_turn_item_for_turn, apply_model_response_round,
@@ -3203,12 +3203,8 @@ fn append_final_item(
         )
     })?;
     if terminal_policy.commits_terminal() {
-        session_store
-            .update_current_turn_status_for_turn(
-                &request.session_id,
-                Some(&request.turn_id),
-                "completed",
-            )
+        CanonicalTurnEventSink::for_store(session_store, None)
+            .set_status_domain(&request.session_id, Some(&request.turn_id), "completed")
             .map_err(|error| {
                 format!(
                     "会话 {} 的 Turn completed 状态提交失败: {error}",

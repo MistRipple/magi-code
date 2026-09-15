@@ -7,6 +7,7 @@ use crate::tool_result_utils::{
     tool_execution_failed_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::activated_skill_id_from_tool_result;
+use crate::turn_contract::{TurnEventEnvelope, TurnRecord};
 use crate::{
     SKILL_APPLY_TOOL_NAME, TaskTurnVisibility, active_skill_tool_execution_policy,
     apply_task_worker_detail_visibility, execute_skill_apply_from_runtime,
@@ -763,7 +764,293 @@ pub fn session_turn_item(
     }
 }
 
+/// Turn 事实写回的唯一边界。
+///
+/// `SessionStore` 负责 canonical durable mutation，`InMemoryEventBus` 只负责在
+/// mutation 成功后发布投影通知。这个对象不拥有任何业务状态，因此可以按一次
+/// command 创建，避免把 SessionStore 的可变事实复制到执行器中。
+pub struct CanonicalTurnEventSink<'a> {
+    session_store: Option<&'a SessionStore>,
+    event_bus: Option<&'a InMemoryEventBus>,
+    task_store: Option<&'a TaskStore>,
+}
+
+impl<'a> CanonicalTurnEventSink<'a> {
+    pub fn new(
+        session_store: &'a SessionStore,
+        event_bus: &'a InMemoryEventBus,
+        task_store: Option<&'a TaskStore>,
+    ) -> Self {
+        Self {
+            session_store: Some(session_store),
+            event_bus: Some(event_bus),
+            task_store,
+        }
+    }
+
+    pub fn for_store(session_store: &'a SessionStore, task_store: Option<&'a TaskStore>) -> Self {
+        Self {
+            session_store: Some(session_store),
+            event_bus: None,
+            task_store,
+        }
+    }
+
+    pub fn for_events(event_bus: &'a InMemoryEventBus) -> Self {
+        Self {
+            session_store: None,
+            event_bus: Some(event_bus),
+            task_store: None,
+        }
+    }
+
+    pub fn envelope_for_item(
+        &self,
+        published: &PublishedSessionTurnItem,
+        event_sequence: u64,
+    ) -> Option<TurnEventEnvelope> {
+        let turn = published
+            .canonical_turn
+            .as_ref()
+            .and_then(|turn| TurnRecord::from_canonical(turn, event_sequence));
+        let canonical_item = published.canonical_item.clone();
+        let turn_record = turn.as_ref()?;
+        Some(TurnEventEnvelope {
+            event_id: format!("session-turn-item-{}-{}", published.turn_id, event_sequence),
+            event_type: "session.turn.item".to_string(),
+            event_sequence,
+            session_id: turn_record.session_id.clone(),
+            turn_id: turn_record.turn_id.clone(),
+            turn_seq: turn_record.turn_seq,
+            occurred_at: UtcMillis::now(),
+            causation_id: turn_record.causation_id.clone(),
+            trace_id: turn_record.trace_id.clone(),
+            item_version: canonical_item.as_ref().and_then(|item| item.item_version),
+            base_content_length: None,
+            content_length: canonical_item
+                .as_ref()
+                .and_then(|item| item.content.as_deref())
+                .map(|content| content.chars().count()),
+            delta: None,
+            reset: None,
+            turn: Some(turn_record.clone()),
+            task_run: None,
+            item: canonical_item,
+        })
+    }
+}
+
+impl<'a> CanonicalTurnEventSink<'a> {
+    /// 需要保留 SessionStore 原始 DomainError 的边界（例如 API 要把
+    /// CurrentTurnConflict 映射为 409）时使用这些方法。它们仍通过同一个
+    /// sink 对象执行 canonical mutation。
+    pub fn append_item_sidecar(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .append_current_turn_item_for_turn(session_id, expected_turn_id, item)
+    }
+
+    pub fn upsert_item_sidecar(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .upsert_current_turn_item_for_turn(session_id, expected_turn_id, item)
+    }
+
+    pub fn set_status_domain(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        status: &str,
+    ) -> magi_core::DomainResult<Option<(SessionRuntimeSidecar, bool)>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .update_current_turn_status_for_turn_with_change(session_id, expected_turn_id, status)
+    }
+
+    pub fn cancel_turn(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .cancel_current_turn(session_id)
+    }
+
+    pub fn complete_from_root_task(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .complete_current_turn_from_completed_root_task_for_turn(session_id, expected_turn_id)
+    }
+}
+
+/// 统一 Turn 写回能力。实现只允许先 durable mutation，再发布事件。
+pub trait TurnEventSink {
+    fn append_item(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> Result<Option<PublishedSessionTurnItem>, String>;
+
+    fn upsert_item(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> Result<Option<PublishedSessionTurnItem>, String>;
+
+    fn set_status(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        status: &str,
+    ) -> Result<Option<(SessionRuntimeSidecar, bool)>, String>;
+
+    fn publish_item(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        published: &PublishedSessionTurnItem,
+    );
+
+    fn publish_stream(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        published: &PublishedSessionTurnItem,
+        stream_update: &SessionTurnStreamUpdate,
+        publish_gate: &mut SessionTurnStreamPublishGate,
+    );
+}
+
+impl<'a> TurnEventSink for CanonicalTurnEventSink<'a> {
+    fn append_item(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> Result<Option<PublishedSessionTurnItem>, String> {
+        append_session_turn_item_for_turn_raw(
+            self.session_store
+                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
+            session_id,
+            expected_turn_id,
+            item,
+            self.task_store,
+        )
+    }
+
+    fn upsert_item(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> Result<Option<PublishedSessionTurnItem>, String> {
+        upsert_session_turn_item_for_turn_raw(
+            self.session_store
+                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
+            session_id,
+            expected_turn_id,
+            item,
+            self.task_store,
+        )
+    }
+
+    fn set_status(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        status: &str,
+    ) -> Result<Option<(SessionRuntimeSidecar, bool)>, String> {
+        self.set_status_domain(session_id, expected_turn_id, status)
+            .map_err(|error| error.to_string())
+    }
+
+    fn publish_item(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        published: &PublishedSessionTurnItem,
+    ) {
+        if let Some(event_bus) = self.event_bus {
+            publish_session_turn_item_event_raw(event_bus, session_id, workspace_id, published);
+        }
+    }
+
+    fn publish_stream(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        published: &PublishedSessionTurnItem,
+        stream_update: &SessionTurnStreamUpdate,
+        publish_gate: &mut SessionTurnStreamPublishGate,
+    ) {
+        if let Some(event_bus) = self.event_bus {
+            publish_session_turn_item_stream_event_raw(
+                event_bus,
+                session_id,
+                workspace_id,
+                published,
+                stream_update,
+                publish_gate,
+            );
+        }
+    }
+}
+
 pub fn append_session_turn_item_for_turn(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    expected_turn_id: Option<&str>,
+    item: ActiveExecutionTurnItem,
+    task_store: Option<&TaskStore>,
+) -> Result<Option<PublishedSessionTurnItem>, String> {
+    CanonicalTurnEventSink::for_store(session_store, task_store).append_item(
+        session_id,
+        expected_turn_id,
+        item,
+    )
+}
+
+pub fn upsert_session_turn_item_for_turn(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    expected_turn_id: Option<&str>,
+    item: ActiveExecutionTurnItem,
+    task_store: Option<&TaskStore>,
+) -> Result<Option<PublishedSessionTurnItem>, String> {
+    CanonicalTurnEventSink::for_store(session_store, task_store).upsert_item(
+        session_id,
+        expected_turn_id,
+        item,
+    )
+}
+
+fn append_session_turn_item_for_turn_raw(
     session_store: &SessionStore,
     session_id: &SessionId,
     expected_turn_id: Option<&str>,
@@ -780,7 +1067,7 @@ pub fn append_session_turn_item_for_turn(
     published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
 }
 
-pub fn upsert_session_turn_item_for_turn(
+fn upsert_session_turn_item_for_turn_raw(
     session_store: &SessionStore,
     session_id: &SessionId,
     expected_turn_id: Option<&str>,
@@ -798,6 +1085,15 @@ pub fn upsert_session_turn_item_for_turn(
 }
 
 pub fn publish_session_turn_item_event(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    published: &PublishedSessionTurnItem,
+) {
+    CanonicalTurnEventSink::for_events(event_bus).publish_item(session_id, workspace_id, published);
+}
+
+fn publish_session_turn_item_event_raw(
     event_bus: &InMemoryEventBus,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -861,6 +1157,23 @@ pub fn publish_model_retry_runtime_event(
 }
 
 pub fn publish_session_turn_item_stream_event(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    published: &PublishedSessionTurnItem,
+    stream_update: &SessionTurnStreamUpdate,
+    publish_gate: &mut SessionTurnStreamPublishGate,
+) {
+    CanonicalTurnEventSink::for_events(event_bus).publish_stream(
+        session_id,
+        workspace_id,
+        published,
+        stream_update,
+        publish_gate,
+    );
+}
+
+fn publish_session_turn_item_stream_event_raw(
     event_bus: &InMemoryEventBus,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -1054,8 +1367,8 @@ fn append_session_turn_error_item_with_terminal_commit(
         )
     })?;
     if commit_terminal {
-        session_store
-            .update_current_turn_status_for_turn(session_id, expected_turn_id, "failed")
+        CanonicalTurnEventSink::for_store(session_store, None)
+            .set_status_domain(session_id, expected_turn_id, "failed")
             .map_err(|error| format!("更新会话 {} 的 Turn failed 状态失败: {error}", session_id))?
             .ok_or_else(|| {
                 format!(

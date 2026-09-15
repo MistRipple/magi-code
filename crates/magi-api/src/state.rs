@@ -28,7 +28,7 @@ use magi_browser_authority::{
     BrowserSurfaceControlSnapshot,
 };
 use magi_conversation_runtime::{
-    ConversationRegistry, TaskCompletionNotifier,
+    CanonicalTurnEventSink, ConversationRegistry, TaskCompletionNotifier,
     execution_admission::{ExecutionAdmissionController, ExecutionAdmissionSnapshot},
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
@@ -3826,6 +3826,16 @@ impl ApiState {
 
     pub fn task_store(&self) -> Option<&TaskStore> {
         self.task_store.as_deref()
+    }
+
+    /// 构造一次性 Turn 事实写回边界。SessionStore 的 canonical mutation 必须
+    /// 通过该 sink 完成，事件发布只能发生在 mutation 成功之后。
+    pub fn turn_event_sink(&self) -> CanonicalTurnEventSink<'_> {
+        CanonicalTurnEventSink::new(
+            self.session_store.as_ref(),
+            self.event_bus.as_ref(),
+            self.task_store(),
+        )
     }
 
     pub fn with_runner_manager(mut self, manager: RunnerManager) -> Self {

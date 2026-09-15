@@ -636,22 +636,20 @@ async fn prepare_session_task_dispatch(
     ) {
         state
             .turn_coordinator()
-            .set_status(
+            .execute_command(
                 &accepted.session_id,
-                &accepted.turn_id,
-                magi_conversation_runtime::CoordinatorTurnStatus::Preparing,
+                magi_conversation_runtime::TurnCommand::SetStatus {
+                    turn_id: accepted.turn_id.clone(),
+                    status: magi_conversation_runtime::CoordinatorTurnStatus::Preparing,
+                },
             )
             .map_err(|error| {
                 ApiError::internal_assembly("更新任务 Coordinator 准备状态失败", error)
             })?;
     }
     state
-        .session_store
-        .update_current_turn_status_for_turn(
-            &accepted.session_id,
-            Some(&accepted.turn_id),
-            "preparing",
-        )
+        .turn_event_sink()
+        .set_status_domain(&accepted.session_id, Some(&accepted.turn_id), "preparing")
         .map_err(|error| ApiError::internal_assembly("更新任务准备状态失败", error))?
         .ok_or_else(|| ApiError::Conflict("当前任务 Turn 已被新的操作取代".to_string()))?;
     trace.mark(
@@ -825,7 +823,7 @@ pub(super) async fn finalize_session_task_dispatch(
         fail_accepted_task_submission(&state, &accepted, error.message());
         return;
     }
-    match state.session_store.update_current_turn_status_for_turn(
+    match state.turn_event_sink().set_status_domain(
         &accepted.session_id,
         Some(&accepted.turn_id),
         "running",
@@ -853,10 +851,12 @@ pub(super) async fn finalize_session_task_dispatch(
             return;
         }
     }
-    if let Err(error) = state.turn_coordinator().set_status(
+    if let Err(error) = state.turn_coordinator().execute_command(
         &accepted.session_id,
-        &accepted.turn_id,
-        magi_conversation_runtime::CoordinatorTurnStatus::Running,
+        magi_conversation_runtime::TurnCommand::SetStatus {
+            turn_id: accepted.turn_id.clone(),
+            status: magi_conversation_runtime::CoordinatorTurnStatus::Running,
+        },
     ) {
         tracing::error!(
             session_id = %accepted.session_id,

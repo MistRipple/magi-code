@@ -13,6 +13,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::turn_contract::TurnCommand;
+
 /// Turn 接纳时确定的执行级别。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +86,17 @@ pub enum CoordinatorAdmission {
     Accepted(TurnAttempt),
     /// 相同 requestId + fingerprint 的重试，返回原 Turn。
     Replay(TurnAttempt),
+}
+
+/// Coordinator 命令的结果。命令执行只改变内存中的生命周期所有权，
+/// durable Turn 事实仍必须由调用方在命令成功后交给 TurnEventSink。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoordinatorCommandResult {
+    Admission(CoordinatorAdmission),
+    Status(CoordinatorTurnStatus),
+    Attempt(TurnAttempt),
+    Finished(bool),
+    Aborted(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,6 +244,108 @@ pub struct SessionTurnCoordinator {
 impl SessionTurnCoordinator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 执行统一生命周期命令。
+    ///
+    /// 这里不写 SessionStore，也不发布事件；这样命令验证和 durable mutation
+    /// 之间的边界始终显式，迟到的 provider/task 结果不能绕过 attempt 校验。
+    pub fn execute_command(
+        &self,
+        session_id: &SessionId,
+        command: TurnCommand,
+    ) -> Result<CoordinatorCommandResult, CoordinatorError> {
+        match command {
+            TurnCommand::Start(admission) => self
+                .accept(session_id, admission)
+                .map(CoordinatorCommandResult::Admission),
+            TurnCommand::SetStatus { turn_id, status } => {
+                self.set_status(session_id, &turn_id, status)?;
+                Ok(CoordinatorCommandResult::Status(status))
+            }
+            TurnCommand::Steer { attempt, .. } => {
+                self.validate_attempt(session_id, &attempt)?;
+                Ok(CoordinatorCommandResult::Attempt(attempt))
+            }
+            TurnCommand::Continue {
+                previous,
+                previous_status,
+                next,
+            } => {
+                // Continue 必须先按 canonical 已提交的旧状态收口执行代际，
+                // 才能把新的 admission 放入同一 session 槽位。
+                match self.current_attempt(session_id, &previous.turn_id) {
+                    Ok(current) => {
+                        if current.attempt_id != previous.attempt_id {
+                            return Err(CoordinatorError::AttemptMismatch {
+                                expected: current.attempt_id,
+                                actual: previous.attempt_id,
+                            });
+                        }
+                        self.finish(session_id, &previous, previous_status)?;
+                    }
+                    Err(CoordinatorError::NoActiveTurn) => {
+                        match self.terminal_status(session_id, &previous) {
+                            Some(actual) if actual == previous_status => {}
+                            Some(actual) => {
+                                return Err(CoordinatorError::TerminalConflict {
+                                    expected: actual,
+                                    actual: previous_status,
+                                });
+                            }
+                            None => return Err(CoordinatorError::NoActiveTurn),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+                self.accept(session_id, next)
+                    .map(CoordinatorCommandResult::Admission)
+            }
+            TurnCommand::Cancel { attempt } => self
+                .finish(session_id, &attempt, CoordinatorTurnStatus::Cancelled)
+                .map(CoordinatorCommandResult::Finished),
+            TurnCommand::Recover {
+                admission,
+                attempt_id,
+                status,
+            } => {
+                let turn_id = admission.turn_id.clone();
+                let profile = admission.profile;
+                self.restore_active(session_id, admission, attempt_id.clone(), status);
+                Ok(CoordinatorCommandResult::Attempt(TurnAttempt {
+                    turn_id,
+                    attempt_id,
+                    profile,
+                }))
+            }
+            TurnCommand::Finish { attempt, status } => self
+                .finish(session_id, &attempt, status)
+                .map(CoordinatorCommandResult::Finished),
+            TurnCommand::Abort { attempt } => self
+                .abort(session_id, &attempt)
+                .map(CoordinatorCommandResult::Aborted),
+        }
+    }
+
+    fn validate_attempt(
+        &self,
+        session_id: &SessionId,
+        attempt: &TurnAttempt,
+    ) -> Result<(), CoordinatorError> {
+        let current = self.current_attempt(session_id, &attempt.turn_id)?;
+        if current.attempt_id != attempt.attempt_id {
+            return Err(CoordinatorError::AttemptMismatch {
+                expected: current.attempt_id,
+                actual: attempt.attempt_id.clone(),
+            });
+        }
+        if current.profile != attempt.profile {
+            return Err(CoordinatorError::AttemptMismatch {
+                expected: current.profile.to_string(),
+                actual: attempt.profile.to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn accept(
@@ -763,6 +878,93 @@ mod tests {
             coordinator.accept(&session, admission("turn-replayed", "request-1", "fp-1")),
             Ok(CoordinatorAdmission::Replay(replayed)) if replayed.turn_id == "turn-1"
         ));
+    }
+
+    #[test]
+    fn execute_command_serializes_start_steer_cancel_and_replay() {
+        let coordinator = SessionTurnCoordinator::new();
+        let session = SessionId::new("session-command-contract");
+        let admission = TurnAdmission {
+            turn_id: "turn-command-1".to_string(),
+            request_id: "request-command-1".to_string(),
+            request_fingerprint: "fp-command-1".to_string(),
+            profile: ExecutionProfile::Conversation,
+        };
+        let attempt = match coordinator
+            .execute_command(&session, TurnCommand::Start(admission.clone()))
+            .expect("Start command should be accepted")
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected Start result: {other:?}"),
+        };
+        assert!(matches!(
+            coordinator.execute_command(
+                &session,
+                TurnCommand::Steer {
+                    attempt: attempt.clone(),
+                    request_id: "steer-command-1".to_string(),
+                },
+            ),
+            Ok(CoordinatorCommandResult::Attempt(_))
+        ));
+        assert!(matches!(
+            coordinator.execute_command(
+                &session,
+                TurnCommand::Cancel {
+                    attempt: attempt.clone(),
+                },
+            ),
+            Ok(CoordinatorCommandResult::Finished(true))
+        ));
+        assert!(matches!(
+            coordinator.execute_command(&session, TurnCommand::Start(admission)),
+            Ok(CoordinatorCommandResult::Admission(
+                CoordinatorAdmission::Replay(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn continue_command_closes_previous_attempt_with_its_canonical_status() {
+        let coordinator = SessionTurnCoordinator::new();
+        let session = SessionId::new("session-command-continue");
+        let first = TurnAdmission {
+            turn_id: "turn-command-old".to_string(),
+            request_id: "request-command-old".to_string(),
+            request_fingerprint: "fp-command-old".to_string(),
+            profile: ExecutionProfile::Task,
+        };
+        let previous = match coordinator
+            .execute_command(&session, TurnCommand::Start(first))
+            .unwrap()
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected previous admission: {other:?}"),
+        };
+        let next = TurnAdmission {
+            turn_id: "turn-command-next".to_string(),
+            request_id: "request-command-next".to_string(),
+            request_fingerprint: "fp-command-next".to_string(),
+            profile: ExecutionProfile::Task,
+        };
+        let result = coordinator
+            .execute_command(
+                &session,
+                TurnCommand::Continue {
+                    previous: previous.clone(),
+                    previous_status: CoordinatorTurnStatus::Failed,
+                    next,
+                },
+            )
+            .expect("Continue command should install the next attempt");
+        assert!(matches!(
+            result,
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(_))
+        ));
+        assert_eq!(
+            coordinator.terminal_status(&session, &previous),
+            Some(CoordinatorTurnStatus::Failed)
+        );
     }
 
     #[test]

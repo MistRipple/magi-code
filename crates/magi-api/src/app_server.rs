@@ -1232,7 +1232,7 @@ impl BrowserToolItemWriter {
             timeline_entry_id: None,
             source_thread_id: self.turn_context.source_thread_id.clone(),
         };
-        let updated = match self.state.session_store.upsert_current_turn_item_for_turn(
+        let updated = match self.state.turn_event_sink().upsert_item_sidecar(
             &self.turn_context.session_id,
             Some(&self.turn_context.turn_id),
             item,
@@ -1331,8 +1331,8 @@ fn browser_tool_turn_context(
         source_thread_id: source_thread_id.clone(),
     };
     let updated = state
-        .session_store
-        .upsert_current_turn_item_for_turn(session_id, Some(&turn.turn_id), item)
+        .turn_event_sink()
+        .upsert_item_sidecar(session_id, Some(&turn.turn_id), item)
         .map_err(|error| {
             ErrorObject::new(ERROR_INTERNAL, format!("浏览器工具 Item 写入失败: {error}"))
         })?;

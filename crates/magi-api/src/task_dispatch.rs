@@ -10,7 +10,9 @@ use magi_conversation_runtime::dispatch_submission::{
 pub(crate) use magi_conversation_runtime::dispatch_submission::{
     DispatchSubmissionAccepted, DispatchSubmissionRequest, DispatchTurnOrigin,
 };
-use magi_conversation_runtime::{CoordinatorAdmission, ExecutionProfile, TurnAdmission};
+use magi_conversation_runtime::{
+    CoordinatorAdmission, CoordinatorCommandResult, ExecutionProfile, TurnAdmission, TurnCommand,
+};
 use sha2::{Digest, Sha256};
 
 pub fn submit_dispatch_submission(
@@ -49,18 +51,27 @@ pub fn submit_dispatch_submission(
         "requestFingerprint".to_string(),
         serde_json::Value::String(request_fingerprint.clone()),
     );
-    let admission = state
+    let admission = match state
         .turn_coordinator()
-        .accept(
+        .execute_command(
             &request.session_id,
-            TurnAdmission {
+            TurnCommand::Start(TurnAdmission {
                 turn_id: turn_id.clone(),
                 request_id,
                 request_fingerprint,
                 profile: ExecutionProfile::Task,
-            },
+            }),
         )
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .map_err(|error| ApiError::Conflict(error.to_string()))?
+    {
+        CoordinatorCommandResult::Admission(admission) => admission,
+        other => {
+            return Err(ApiError::internal_assembly(
+                "接纳 task Turn",
+                format!("Coordinator 返回了非法 Start 结果: {other:?}"),
+            ));
+        }
+    };
     let coordinator_attempt = match admission {
         CoordinatorAdmission::Accepted(attempt) => attempt,
         CoordinatorAdmission::Replay(attempt) => {
@@ -79,9 +90,12 @@ pub fn submit_dispatch_submission(
     );
 
     let task_store = state.task_store().ok_or_else(|| {
-        let _ = state
-            .turn_coordinator()
-            .abort(&request.session_id, &coordinator_attempt);
+        let _ = state.turn_coordinator().execute_command(
+            &request.session_id,
+            TurnCommand::Abort {
+                attempt: coordinator_attempt.clone(),
+            },
+        );
         ApiError::internal_assembly("构建任务派发运行时", "task_store 未配置")
     })?;
     let workspace_root_path =

@@ -857,33 +857,33 @@ Coordinator
 
 ### 17.1 领域合同
 
-- [ ] 建立独立的 `TurnRecord`、`TaskRunRecord`、`TurnEventEnvelope` 类型。
+- [x] 建立独立的 `TurnRecord`、`TaskRunRecord`、`TurnEventEnvelope` 类型，并由 canonical restore、Task completion notification 和 Turn sink 使用。
 - [x] 固定 Coordinator、canonical Turn 和 TaskStore 的状态迁移合同。
 - [x] 固定 request ID + fingerprint 幂等规则。
 - [x] 固定事件序号、execution attempt 和终态冲突规则。
 - [x] 更新 App Server Schema 和 Web 类型生成源。
 
-本阶段已改文件：`crates/magi-conversation-runtime/src/session_turn_coordinator.rs`、`crates/magi-api/src/dto/session_turn.rs`、`contracts/app-server/app-server.schema.json`、`crates/magi-app-server-protocol/src/generated.rs`、`web/src/shared/app-server-protocol.generated.ts`。验证命令：`cargo test -p magi-conversation-runtime --lib session_turn_coordinator`、`npm run protocol:check`。结果：Coordinator 合同测试 10 项通过，协议生成检查通过。剩余工作是把文档模型字段收敛为正式 Rust 记录类型，并补齐 schema 级非法状态测试。
+本阶段已改文件：`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-conversation-runtime/src/session_turn_coordinator.rs`、`crates/magi-api/src/dto/session_turn.rs`、`contracts/app-server/app-server.schema.json`、`crates/magi-app-server-protocol/src/generated.rs`、`web/src/shared/app-server-protocol.generated.ts`。验证命令：`cargo test -p magi-conversation-runtime --lib session_turn_coordinator`、`cargo test -p magi-conversation-runtime --lib turn_contract`、`npm run protocol:check`。结果：正式记录类型可从 canonical Turn 恢复稳定身份，Coordinator command 具备 Start/SetStatus/Steer/Continue/Cancel/Recover/Finish/Abort 分支，协议生成检查通过。
 
 ### 17.2 事件事实源
 
 - [x] 扩展现有 canonical 持久化，补齐 Turn 序号、幂等、profile、attempt、item version 和恢复字段。
-- [ ] 建立独立的 `TurnEventSink` 结构并把所有写回入口收敛到它。
+- [x] 建立独立的 `CanonicalTurnEventSink`/`TurnEventSink` 结构；生产 Conversation、Task finalizer、steer、continue、App Server browser tool 和 dispatch 状态写回均通过该边界。
 - [x] Session/Conversation 与 Task/Agent 读取模型按单向事实源更新；`ThreadChatMessage` 只由 canonical projection 重建。
 - [x] accepted 和终态事实可在 daemon 启动时恢复。
 - [ ] 建立覆盖 SSE/WebSocket 的 Turn 快照断线恢复 harness。
 
-本阶段已改文件：`crates/magi-session-store/src/store/mod.rs`、`crates/magi-session-store/src/store/sidecar.rs`、`crates/magi-conversation-runtime/src/session_writeback.rs`、`crates/magi-conversation-runtime/src/task_completion_notifier.rs`、`crates/magi-api/src/state.rs`、`crates/magi-daemon/src/daemon/runtime.rs`。验证命令：`cargo test --workspace --all-targets`、`cargo test -p magi-conversation-runtime --lib`。结果：Rust workspace 测试通过；canonical projection 可从持久化 Turn 恢复 Coordinator 身份。剩余工作是抽出统一 Sink 和真实断线/重启 harness。
+本阶段已改文件：`crates/magi-session-store/src/store/mod.rs`、`crates/magi-session-store/src/store/sidecar.rs`、`crates/magi-conversation-runtime/src/session_writeback.rs`、`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-conversation-runtime/src/task_completion_notifier.rs`、`crates/magi-api/src/state.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/routes/dispatch_flow.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/app_server.rs`、`crates/magi-daemon/src/daemon/runtime.rs`。验证命令：`cargo test --workspace --all-targets`、`cargo test -p magi-conversation-runtime --lib`。结果：Rust workspace 测试通过；canonical projection 可从持久化 Turn 恢复 Coordinator 身份，生产写回先经 `CanonicalTurnEventSink` 再发布事件。剩余工作是补齐真实断线/重启 harness，并清理仅用于测试夹具的直接 SessionStore 写入。
 
 ### 17.3 Coordinator
 
 - [x] 每个 Session 建立唯一 `SessionTurnCoordinator`。
-- [ ] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command。
+- [ ] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command；本轮已把生产 start/status/finish/cancel/abort 接入命令入口，并把 steer 与 Continue 接入显式命令；recover 仍需把恢复边界改为显式 command。
 - [ ] 删除所有外部模块直接修改 current Turn 的路径。
 - [x] 实现 attempt ID 校验、迟到结果拒绝和终态冲突。
 - [x] Continue 在接纳新 Turn 前收口旧 attempt，并在新 Turn 上注册 Task attempt。
 
-本阶段已改文件：`crates/magi-conversation-runtime/src/session_turn_coordinator.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/task_turn_finalize.rs`。验证命令：`cargo test -p magi-conversation-runtime --lib session_turn_coordinator`、`cargo test -p magi-daemon --lib daemon::tests::daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dispatch`。结果：并发/迟到/恢复后队列推进测试通过。剩余工作是把 cancel、recover 和所有 steer 输入边界改成显式 command，并移除旧生命周期适配器。
+本阶段已改文件：`crates/magi-conversation-runtime/src/session_turn_coordinator.rs`、`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/routes/dispatch_flow.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/routes/goals.rs`、`crates/magi-api/src/task_turn_finalize.rs`。验证命令：`cargo test -p magi-conversation-runtime --lib session_turn_coordinator`、`cargo test -p magi-daemon --lib daemon::tests::daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dispatch`。结果：生产 start、preparing/running、finish、cancel 和 abort 已走 `TurnCommand`，并发/迟到/恢复后队列推进测试通过。剩余工作是把 steer、continue 和 recover 的外部输入边界也收进同一个 command。
 
 ### 17.4 Conversation 与 Task 执行分离
 
@@ -927,7 +927,7 @@ Coordinator
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 
-本阶段当前可验证结果：Rust workspace、Web 检查/构建、npm golden、Electron directory package 均已通过。真实 daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。仍未把 Goal、子代理、工具、取消和完整重连矩阵收敛为独立 `MagiTurnHarness`，因此该阶段保持未完成；本轮架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`。
+本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。仍未把 Goal、子代理、工具、取消和完整重连矩阵收敛为独立 `MagiTurnHarness`，因此该阶段保持未完成；既有架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`。
 
 ## 18. MagiTurnHarness 验证设计
 
