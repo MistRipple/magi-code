@@ -925,9 +925,9 @@ Coordinator
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
 - [ ] 清理失效兼容字段、分支、注释和测试夹具。
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 端到端验证。
-- [ ] 在验证全部完成后记录最终提交 SHA。
+- [x] 记录本轮架构实现提交 SHA。
 
-本阶段当前可验证结果：Rust workspace、Web 检查/构建、npm golden、Electron directory package 均已通过。真实 daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。仍未把 Goal、子代理、工具、取消和完整重连矩阵收敛为独立 `MagiTurnHarness`，因此该阶段保持未完成，最终提交 SHA 待提交后回写。
+本阶段当前可验证结果：Rust workspace、Web 检查/构建、npm golden、Electron directory package 均已通过。真实 daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。仍未把 Goal、子代理、工具、取消和完整重连矩阵收敛为独立 `MagiTurnHarness`，因此该阶段保持未完成；本轮架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`。
 
 ## 18. MagiTurnHarness 验证设计
 
