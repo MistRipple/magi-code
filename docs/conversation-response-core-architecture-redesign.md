@@ -927,7 +927,7 @@ Coordinator
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 
-本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。仍未把 Goal、子代理、工具、取消和完整重连矩阵收敛为独立 `MagiTurnHarness`，因此该阶段保持未完成；既有架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`。
+本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。仍未把 Goal、子代理、工具、取消和完整重连矩阵收敛为独立 `MagiTurnHarness`，因此该阶段保持未完成；前一阶段架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`；本轮正式领域合同、`CanonicalTurnEventSink` 与 Coordinator command 收敛提交 SHA 为 `d6dc40c129abbdf674b1830708276eaea9d09442`。
 
 ## 18. MagiTurnHarness 验证设计
 
