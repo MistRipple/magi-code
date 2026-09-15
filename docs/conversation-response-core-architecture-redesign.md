@@ -871,9 +871,9 @@ Coordinator
 - [x] 建立独立的 `CanonicalTurnEventSink`/`TurnEventSink` 结构；生产 Conversation、Task finalizer、steer、continue、App Server browser tool 和 dispatch 状态写回均通过该边界。
 - [x] Session/Conversation 与 Task/Agent 读取模型按单向事实源更新；`ThreadChatMessage` 只由 canonical projection 重建。
 - [x] accepted 和终态事实可在 daemon 启动时恢复。
-- [ ] 建立覆盖 SSE/WebSocket 的 Turn 快照断线恢复 harness。
+- [ ] 建立覆盖真实 SSE/WebSocket 载体的 Turn 快照断线恢复 harness；当前 `MagiTurnHarness` 已覆盖 EventBus 快照重放和 canonical restart replay。
 
-本阶段已改文件：`crates/magi-session-store/src/store/mod.rs`、`crates/magi-session-store/src/store/sidecar.rs`、`crates/magi-conversation-runtime/src/session_writeback.rs`、`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-conversation-runtime/src/task_completion_notifier.rs`、`crates/magi-api/src/state.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/routes/dispatch_flow.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/app_server.rs`、`crates/magi-daemon/src/daemon/runtime.rs`。验证命令：`cargo test --workspace --all-targets`、`cargo test -p magi-conversation-runtime --lib`。结果：Rust workspace 测试通过；canonical projection 可从持久化 Turn 恢复 Coordinator 身份，生产写回先经 `CanonicalTurnEventSink` 再发布事件。剩余工作是补齐真实断线/重启 harness，并清理仅用于测试夹具的直接 SessionStore 写入。
+本阶段已改文件：`crates/magi-session-store/src/store/mod.rs`、`crates/magi-session-store/src/store/sidecar.rs`、`crates/magi-conversation-runtime/src/session_writeback.rs`、`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-conversation-runtime/src/task_completion_notifier.rs`、`crates/magi-api/src/state.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/routes/dispatch_flow.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/app_server.rs`、`crates/magi-daemon/src/daemon/runtime.rs`、`crates/magi-api/src/turn_harness.rs`。验证命令：`cargo test --workspace --all-targets`、`cargo test -p magi-conversation-runtime --lib`、`cargo test -p magi-api --lib turn_harness`。结果：Rust workspace 测试通过；canonical projection 可从持久化 Turn 恢复 Coordinator 身份，生产写回先经 `CanonicalTurnEventSink` 再发布事件；`MagiTurnHarness` 已通过真实 `TurnService` 验证普通 Chat 流式 delta、canonical projection、无 TaskStore root task、EventBus 快照重放、Provider 空流/失败、Task profile 主链、Goal profile 的 Task 失败收口、request replay、fingerprint conflict 和重启后 replay。剩余工作是接入真实 SSE/WebSocket 载体，并清理仅用于测试夹具的直接 SessionStore 写入。
 
 ### 17.3 Coordinator
 
@@ -924,10 +924,10 @@ Coordinator
 - [x] 删除旧结果轮询与二次 finalizer 的生产职责。
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
 - [ ] 清理失效兼容字段、分支、注释和测试夹具。
-- [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 端到端验证。
+- [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 全矩阵端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 
-本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。仍未把 Goal、子代理、工具、取消和完整重连矩阵收敛为独立 `MagiTurnHarness`，因此该阶段保持未完成；前一阶段架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`；本轮正式领域合同、`CanonicalTurnEventSink` 与 Coordinator command 收敛提交 SHA 为 `d6dc40c129abbdf674b1830708276eaea9d09442`。
+本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。新增 `crates/magi-api/src/turn_harness.rs` 后，`MagiTurnHarness` 已通过真实 `TurnService` 覆盖普通 Chat 流式投影、Task profile 主链、Task 工具成功执行、Goal profile 的 Provider 失败收口、取消、EventBus 快照重放、Provider 空流/失败、request replay、fingerprint conflict 和 canonical restart replay；子代理、真实 SSE/WebSocket 载体和完整权限/Git 矩阵仍未完成，因此该阶段保持未完成；本阶段新增实现待提交。前一阶段架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`；正式领域合同、`CanonicalTurnEventSink` 与 Coordinator command 收敛提交 SHA 为 `d6dc40c129abbdf674b1830708276eaea9d09442`。
 
 ## 18. MagiTurnHarness 验证设计
 
@@ -963,6 +963,8 @@ MagiTurnHarness
 14. 前端首次可见 delta 和最终 DOM 内容。
 
 Harness 必须通过真实 `TurnService` 和真实事件投递路径验证，不能只调用 `TurnEventSink` 或某个内部函数后宣称链路正常。
+
+当前已落地的测试实现位于 `crates/magi-api/src/turn_harness.rs`：它装配真实 `ApiState`、`SessionStore`、`EventBus`、`SessionTurnCoordinator` 和 Conversation/Task dispatcher，通过 `TurnService::submit` 接纳请求；Provider 替身负责可观测累计 delta、工具调用轮次、空流、失败和可取消阻塞。现有测试覆盖普通 Chat、首 delta、最终 canonical projection、普通 Chat 不装配 TaskStore/Runner、Task profile 主链、Task 工具成功执行、Goal profile 的 Provider 失败收口、取消、EventBus 快照重放、request replay、fingerprint conflict、Provider 失败/空流以及重建状态后的 canonical replay。该实现仍是分阶段 harness，尚未覆盖子代理、真实 SSE/WebSocket 载体、权限/Git 阻塞、超时/重试和 Electron DOM 全矩阵。
 
 ## 19. 性能与可靠性目标
 
