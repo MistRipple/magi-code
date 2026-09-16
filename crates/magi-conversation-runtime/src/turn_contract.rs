@@ -179,7 +179,7 @@ pub struct TurnEventEnvelope {
 pub enum TurnCommand {
     Start(TurnAdmission),
     SetStatus {
-        turn_id: String,
+        attempt: TurnAttempt,
         status: CoordinatorTurnStatus,
     },
     Steer {

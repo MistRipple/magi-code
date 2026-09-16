@@ -779,6 +779,41 @@ impl MagiTurnHarness {
         self.submit(None, text, request_id, user_message_id).await
     }
 
+    pub async fn steer(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &str,
+        text: &str,
+        request_id: &str,
+        user_message_id: &str,
+    ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
+        TurnService::new(self.state.clone())
+            .submit(SessionTurnRequestDto {
+                desktop_browser_tools_allowed: false,
+                session_id: Some(session_id.to_string()),
+                scope: SessionScopeKindDto::Personal,
+                workspace_id: None,
+                workspace_path: None,
+                text: Some(text.to_string()),
+                skill_name: None,
+                locale: Some("zh-CN".to_string()),
+                goal_mode: false,
+                images: Vec::new(),
+                context_references: Vec::new(),
+                browser_annotation_refs: Vec::new(),
+                browser_node_selections: Vec::new(),
+                access_profile: None,
+                orchestrator_session_config: None,
+                request_id: Some(request_id.to_string()),
+                user_message_id: Some(user_message_id.to_string()),
+                placeholder_message_id: None,
+                steer_current_turn: true,
+                expected_turn_id: Some(expected_turn_id.to_string()),
+                replace_turn_id: None,
+            })
+            .await
+    }
+
     pub async fn cancel(&self, session_id: &SessionId) -> Result<(), crate::errors::ApiError> {
         crate::routes::sessions::interrupt_session_turn_for_browser_takeover(
             &self.state,
@@ -1607,6 +1642,64 @@ mod tests {
         drop(socket);
         shutdown_tx.send(()).expect("测试服务应收到停止信号");
         server.await.expect("测试服务任务应结束");
+    }
+
+    #[tokio::test]
+    async fn steer_routes_to_the_active_turn_and_keeps_the_same_turn_identity() {
+        let harness = MagiTurnHarness::new("不会先完成");
+        harness.provider.set_hold_for_cancellation();
+        let initial = harness
+            .submit(
+                None,
+                "请回复一句话并保持等待",
+                "harness-steer-root-request",
+                "harness-steer-root-user",
+            )
+            .await
+            .expect("可引导的 Turn 应先被接纳");
+        let session_id = SessionId::new(initial.session_id.clone());
+        let turn_id = initial.turn_id.clone().expect("初始 Turn 应有身份");
+        for _ in 0..100 {
+            if !harness.provider.requests().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !harness.provider.requests().is_empty(),
+            "steer 前 Provider 必须已经进入执行"
+        );
+        let steered = harness
+            .steer(
+                &session_id,
+                &turn_id,
+                "优先收口当前响应",
+                "harness-steer-request",
+                "harness-steer-user",
+            )
+            .await
+            .expect("steer 应通过真实 TurnService 接纳");
+        assert_eq!(steered.route, crate::dto::SessionTurnRouteDto::Steer);
+        assert_eq!(steered.steered_turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(steered.turn_id.as_deref(), Some(turn_id.as_str()));
+        let current = harness
+            .state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("steer 后仍应保留同一 current Turn");
+        assert_eq!(current.turn_id, turn_id);
+        assert!(current.items.iter().any(|item| {
+            item.kind == "user_message" && item.content.as_deref() == Some("优先收口当前响应")
+        }));
+        harness
+            .cancel(&session_id)
+            .await
+            .expect("steer 场景应可取消");
+        let terminal = harness
+            .wait_for_terminal(&session_id, &current.turn_id)
+            .await;
+        assert_eq!(terminal.status, CanonicalTurnStatus::Cancelled);
     }
 
     #[tokio::test]

@@ -3017,7 +3017,7 @@ fn schedule_conversation_execution(
             .execute_command(
                 &session_id,
                 TurnCommand::SetStatus {
-                    turn_id: turn_id.clone(),
+                    attempt: attempt.clone(),
                     status: CoordinatorTurnStatus::Preparing,
                 },
             )
@@ -3063,7 +3063,7 @@ fn schedule_conversation_execution(
             .execute_command(
                 &session_id,
                 TurnCommand::SetStatus {
-                    turn_id: turn_id.clone(),
+                    attempt: attempt.clone(),
                     status: CoordinatorTurnStatus::Running,
                 },
             )
@@ -4559,9 +4559,8 @@ async fn interrupt_session_turn(
             if let Some(attempt) = coordinator_attempt.as_ref() {
                 if let Err(error) = state.turn_coordinator().execute_command(
                     &session_id,
-                    TurnCommand::Finish {
+                    TurnCommand::Cancel {
                         attempt: attempt.clone(),
-                        status: CoordinatorTurnStatus::Cancelled,
                     },
                 ) {
                     tracing::error!(
@@ -5262,9 +5261,8 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
     if let Some(attempt) = coordinator_attempt.as_ref()
         && let Err(error) = state.turn_coordinator().execute_command(
             session_id,
-            TurnCommand::Finish {
+            TurnCommand::Cancel {
                 attempt: attempt.clone(),
-                status: CoordinatorTurnStatus::Cancelled,
             },
         )
     {
@@ -8240,14 +8238,14 @@ mod tests {
             .begin_session_turn_input(session_id.clone(), "turn-session-steer".to_string());
         state
             .turn_coordinator()
-            .accept(
+            .execute_command(
                 &session_id,
-                TurnAdmission {
+                TurnCommand::Start(TurnAdmission {
                     turn_id: "turn-session-steer".to_string(),
                     request_id: "request-session-steer-root".to_string(),
                     request_fingerprint: "fp-session-steer-root".to_string(),
                     profile: ExecutionProfile::Conversation,
-                },
+                }),
             )
             .expect("active Turn should register with Coordinator");
 
@@ -9689,14 +9687,14 @@ mod tests {
             .expect("active turn input should begin");
         state
             .turn_coordinator()
-            .accept(
+            .execute_command(
                 &session_id,
-                TurnAdmission {
+                TurnCommand::Start(TurnAdmission {
                     turn_id: "turn-queued-turn-guide".to_string(),
                     request_id: "request-queued-turn-guide-root".to_string(),
                     request_fingerprint: "fp-queued-turn-guide-root".to_string(),
                     profile: ExecutionProfile::Conversation,
-                },
+                }),
             )
             .expect("active Turn should register with Coordinator");
         let queued = queued_regular_turn(

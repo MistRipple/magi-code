@@ -122,9 +122,12 @@ pub fn submit_dispatch_submission(
     let pending = match prepare_pending_dispatch_submission(&runtime, &request) {
         Ok(pending) => pending,
         Err(error) => {
-            let _ = state
-                .turn_coordinator()
-                .abort(&request.session_id, &coordinator_attempt);
+            let _ = state.turn_coordinator().execute_command(
+                &request.session_id,
+                TurnCommand::Abort {
+                    attempt: coordinator_attempt.clone(),
+                },
+            );
             return Err(ApiError::internal_assembly(
                 "准备任务派发提交失败",
                 error.into_message(),
@@ -156,9 +159,12 @@ pub fn submit_dispatch_submission(
             Ok(accepted)
         }
         Err(error) => {
-            let _ = state
-                .turn_coordinator()
-                .abort(&accepted_session_id_for_abort, &coordinator_attempt);
+            let _ = state.turn_coordinator().execute_command(
+                &accepted_session_id_for_abort,
+                TurnCommand::Abort {
+                    attempt: coordinator_attempt.clone(),
+                },
+            );
             Err(dispatch_accept_error_to_api_error(error))
         }
     }

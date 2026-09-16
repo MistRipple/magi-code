@@ -259,8 +259,8 @@ impl SessionTurnCoordinator {
             TurnCommand::Start(admission) => self
                 .accept(session_id, admission)
                 .map(CoordinatorCommandResult::Admission),
-            TurnCommand::SetStatus { turn_id, status } => {
-                self.set_status(session_id, &turn_id, status)?;
+            TurnCommand::SetStatus { attempt, status } => {
+                self.set_status(session_id, &attempt, status)?;
                 Ok(CoordinatorCommandResult::Status(status))
             }
             TurnCommand::Steer { attempt, .. } => {
@@ -348,7 +348,7 @@ impl SessionTurnCoordinator {
         Ok(())
     }
 
-    pub fn accept(
+    fn accept(
         &self,
         session_id: &SessionId,
         admission: TurnAdmission,
@@ -403,10 +403,10 @@ impl SessionTurnCoordinator {
         Ok(CoordinatorAdmission::Accepted(attempt))
     }
 
-    pub fn set_status(
+    fn set_status(
         &self,
         session_id: &SessionId,
-        turn_id: &str,
+        attempt: &TurnAttempt,
         status: CoordinatorTurnStatus,
     ) -> Result<(), CoordinatorError> {
         let mut state = self.state.lock().expect("turn coordinator state poisoned");
@@ -415,10 +415,22 @@ impl SessionTurnCoordinator {
             .get_mut(session_id)
             .and_then(|session| session.active.as_mut())
             .ok_or(CoordinatorError::NoActiveTurn)?;
-        if active.admission.turn_id != turn_id {
+        if active.admission.turn_id != attempt.turn_id {
             return Err(CoordinatorError::TurnMismatch {
                 expected: active.admission.turn_id.clone(),
-                actual: turn_id.to_string(),
+                actual: attempt.turn_id.clone(),
+            });
+        }
+        if active.attempt_id != attempt.attempt_id {
+            return Err(CoordinatorError::AttemptMismatch {
+                expected: active.attempt_id.clone(),
+                actual: attempt.attempt_id.clone(),
+            });
+        }
+        if active.admission.profile != attempt.profile {
+            return Err(CoordinatorError::AttemptMismatch {
+                expected: active.admission.profile.to_string(),
+                actual: attempt.profile.to_string(),
             });
         }
         if active.status.is_terminal() {
@@ -444,8 +456,7 @@ impl SessionTurnCoordinator {
     }
 
     /// 只允许当前 attempt 提交结果，终态提交具有幂等性。
-    /// 只允许当前 attempt 提交结果，终态提交具有幂等性。
-    pub fn finish(
+    fn finish(
         &self,
         session_id: &SessionId,
         attempt: &TurnAttempt,
@@ -540,7 +551,7 @@ impl SessionTurnCoordinator {
 
     /// 在 accepted durable 事务失败时撤销尚未写入 canonical 的 admission。
     /// 只允许相同 attempt 清理当前活动槽位，避免误删并发 Turn。
-    pub fn abort(
+    fn abort(
         &self,
         session_id: &SessionId,
         attempt: &TurnAttempt,
@@ -725,9 +736,11 @@ impl SessionTurnCoordinator {
         true
     }
 
-    /// 将已恢复的 attempt 作为当前活动 Turn 注册。保留旧入口供恢复代码使用。
-    /// 兼容已有恢复调用方，但实际通过统一 Recover command 建立活动身份。
-    pub fn restore_active(
+    /// 将已恢复的 attempt 作为当前活动 Turn 注册。
+    ///
+    /// 仅供 Coordinator 单元测试构造状态；生产恢复必须通过 Recover command。
+    #[cfg(test)]
+    fn restore_active(
         &self,
         session_id: &SessionId,
         admission: TurnAdmission,
@@ -821,16 +834,6 @@ impl SessionTurnCoordinator {
             .get(session_id)
             .and_then(|session| session.active.as_ref())
             .map(|active| active.admission.profile)
-    }
-
-    /// 从已持久化的 accepted Turn 恢复轻量所有权；不会恢复正文。
-    pub fn restore(&self, session_id: &SessionId, admission: TurnAdmission, attempt_id: String) {
-        self.restore_active(
-            session_id,
-            admission,
-            attempt_id,
-            CoordinatorTurnStatus::Accepted,
-        );
     }
 
     pub fn clear_session(&self, session_id: &SessionId) {
@@ -1298,20 +1301,61 @@ mod tests {
             }
         );
         assert_eq!(
-            coordinator.set_status(&session, &attempt.turn_id, CoordinatorTurnStatus::Running,),
+            coordinator.execute_command(
+                &session,
+                TurnCommand::SetStatus {
+                    attempt: TurnAttempt {
+                        turn_id: attempt.turn_id.clone(),
+                        attempt_id: "attempt-stale".to_string(),
+                        profile: attempt.profile,
+                    },
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            ),
+            Err(CoordinatorError::AttemptMismatch {
+                expected: attempt.attempt_id.clone(),
+                actual: "attempt-stale".to_string(),
+            })
+        );
+        assert_eq!(
+            coordinator.execute_command(
+                &session,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Running,
+                },
+            ),
             Err(CoordinatorError::InvalidTransition {
                 from: CoordinatorTurnStatus::Accepted,
                 to: CoordinatorTurnStatus::Running,
             })
         );
         coordinator
-            .set_status(&session, &attempt.turn_id, CoordinatorTurnStatus::Preparing)
+            .execute_command(
+                &session,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            )
             .unwrap();
         coordinator
-            .set_status(&session, &attempt.turn_id, CoordinatorTurnStatus::Blocked)
+            .execute_command(
+                &session,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Blocked,
+                },
+            )
             .unwrap();
         coordinator
-            .set_status(&session, &attempt.turn_id, CoordinatorTurnStatus::Preparing)
+            .execute_command(
+                &session,
+                TurnCommand::SetStatus {
+                    attempt,
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            )
             .unwrap();
     }
 

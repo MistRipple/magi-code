@@ -3,7 +3,7 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_conversation_runtime::{CoordinatorTurnStatus, TurnCommand};
+use magi_conversation_runtime::TurnCommand;
 use magi_core::{AccessProfile, DomainError, GoalId, SessionId, UtcMillis};
 use magi_session_store::{GoalStatus, SessionGoal, SessionPlan};
 use serde::{Deserialize, Serialize};
@@ -252,9 +252,8 @@ async fn pause_current_goal(
             .current_attempt(&scope.session_id, &turn_id)
             && let Err(error) = state.turn_coordinator().execute_command(
                 &scope.session_id,
-                TurnCommand::Finish {
+                TurnCommand::Cancel {
                     attempt: attempt.clone(),
-                    status: CoordinatorTurnStatus::Cancelled,
                 },
             )
         {

@@ -878,12 +878,12 @@ Coordinator
 ### 17.3 Coordinator
 
 - [x] 每个 Session 建立唯一 `SessionTurnCoordinator`。
-- [ ] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command；本轮已把生产 start/status/finish/cancel/abort 接入命令入口，并把 steer、Continue 与显式恢复 wrapper 接入 command；canonical 全量 restore 和断线恢复 harness 仍需继续收敛。
-- [ ] 删除所有外部模块直接修改 current Turn 的路径。生产用户中断已统一经 `CanonicalTurnEventSink::interrupt_turn_by_user` 写入并保留 `interruptionSource=user`；剩余直接写入仅限测试 fixture 和 sink 内部。
+- [x] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command；生产 start、Steer、Continue、Recover、Cancel、Abort、Finish 以及 preparing/running 状态均通过携带并校验同一 `TurnAttempt` 的 command 入口，canonical restore 和断线恢复也复用 Recover command；Coordinator 内部的 mutation helper 已收为私有，仅由 command 分发。
+- [ ] 删除所有外部模块直接修改 current Turn 的路径。生产用户中断已统一经 `CanonicalTurnEventSink::interrupt_turn_by_user` 写入并保留 `interruptionSource=user`，生产会话关闭、Goal pause、daemon restart 和接受失败也经 sink 收口；剩余直接写入仅限测试 fixture 和 sink 内部。
 - [x] 实现 attempt ID 校验、迟到结果拒绝和终态冲突。
 - [x] Continue 在接纳新 Turn 前收口旧 attempt，并在新 Turn 上注册 Task attempt。
 
-本阶段已改文件：`crates/magi-conversation-runtime/src/session_turn_coordinator.rs`、`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/routes/dispatch_flow.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/routes/goals.rs`、`crates/magi-api/src/task_turn_finalize.rs`、`crates/magi-conversation-runtime/src/session_writeback.rs`。验证命令：`cargo test -p magi-conversation-runtime --lib session_turn_coordinator`、`cargo test -p magi-daemon --lib daemon::tests::daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dispatch`。结果：生产 start、preparing/running、finish、cancel 和 abort 已走 `TurnCommand`，用户中断的 canonical 写回经 `CanonicalTurnEventSink` 保留来源 metadata，并发/迟到/恢复后队列推进测试通过。剩余工作是把 steer、continue 和 recover 的外部输入边界也收进同一个 command。
+本阶段已改文件：`crates/magi-conversation-runtime/src/session_turn_coordinator.rs`、`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/routes/dispatch_flow.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/routes/goals.rs`、`crates/magi-api/src/task_turn_finalize.rs`、`crates/magi-conversation-runtime/src/session_writeback.rs`。验证命令：`cargo test -p magi-conversation-runtime --lib session_turn_coordinator`、`cargo test -p magi-api --lib`、`cargo test -p magi-daemon --lib`。结果：生产 start、preparing/running、steer、continue、recover、finish、cancel 和 abort 均走 `TurnCommand`；状态命令携带并校验 `TurnAttempt`，用户中断的 canonical 写回经 `CanonicalTurnEventSink` 保留来源 metadata，并发/迟到/恢复后队列推进测试通过。Coordinator 的 accept/set_status/finish/abort 仅保留为 command 内部私有实现，跨 crate fixture 也通过 `TurnCommand::Start` 接纳。剩余工作是清理测试 fixture 中直接构造 canonical Turn 的兼容写入口。
 
 ### 17.4 Conversation 与 Task 执行分离
 
@@ -927,7 +927,7 @@ Coordinator
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 全矩阵端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 
-本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。新增 `crates/magi-api/src/turn_harness.rs` 后，`MagiTurnHarness` 已通过真实 `TurnService` 覆盖普通 Chat 流式投影、Task profile 主链、Task 工具成功执行、单个和多个子代理、自定义 Agent Role 快照、Goal profile 的 Provider 失败收口、取消、真实 SSE/WebSocket 载体断线重连、EventBus 快照重放、Provider 空流/失败/超时/首帧前重试、request replay、fingerprint conflict 和 canonical restart replay；生产用户中断和 daemon 重启中断的 canonical 写回已统一经 `CanonicalTurnEventSink`，daemon 测试等待条件同时确认 Task terminal 与 canonical Turn terminal，降低并行执行时序误报；权限/Git 阻塞和 Electron DOM 全矩阵仍未完成；资源排队及其 requestId/fingerprint 幂等已由 `MagiTurnHarness` 覆盖，因此该阶段保持未完成；本阶段新增实现提交 SHA 为 `e37c91a97bbf5731bab1ba3b77b6086a17b94471`。前一阶段架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`；正式领域合同、`CanonicalTurnEventSink` 与 Coordinator command 收敛提交 SHA 为 `d6dc40c129abbdf674b1830708276eaea9d09442`。
+本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。新增 `crates/magi-api/src/turn_harness.rs` 后，`MagiTurnHarness` 已通过真实 `TurnService` 覆盖普通 Chat 流式投影、Task profile 主链、Task 工具成功执行、单个和多个子代理、自定义 Agent Role 快照、Goal profile 的 Provider 失败收口、steer、取消、真实 SSE/WebSocket 载体断线重连、EventBus 快照重放、Provider 空流/失败/超时/首帧前重试、request replay、fingerprint conflict 和 canonical restart replay；生产用户中断和 daemon 重启中断的 canonical 写回已统一经 `CanonicalTurnEventSink`，daemon 测试等待条件同时确认 Task terminal 与 canonical Turn terminal，降低并行执行时序误报；Coordinator 的 preparing/running 状态命令已改为 attempt-scoped，Task 接受失败的 Abort 也统一走 command；权限/Git 阻塞和 Electron DOM 全矩阵仍未完成；资源排队及其 requestId/fingerprint 幂等已由 `MagiTurnHarness` 覆盖，因此该阶段保持未完成；本阶段新增实现提交 SHA 为 `e37c91a97bbf5731bab1ba3b77b6086a17b94471`。前一阶段架构实现提交 SHA 为 `c297ce5a727cc6da7509998040a09a92c75270b1`；正式领域合同、`CanonicalTurnEventSink` 与 Coordinator command 收敛提交 SHA 为 `d6dc40c129abbdf674b1830708276eaea9d09442`。
 
 ## 18. MagiTurnHarness 验证设计
 
@@ -964,7 +964,7 @@ MagiTurnHarness
 
 Harness 必须通过真实 `TurnService` 和真实事件投递路径验证，不能只调用 `TurnEventSink` 或某个内部函数后宣称链路正常。
 
-当前已落地的测试实现位于 `crates/magi-api/src/turn_harness.rs`：它装配真实 `ApiState`、`SessionStore`、`EventBus`、`SessionTurnCoordinator` 和 Conversation/Task dispatcher，通过 `TurnService::submit` 接纳请求；Provider 替身负责可观测累计 delta、工具调用轮次、空流、失败、首帧前暂态重试和可取消阻塞。现有测试覆盖普通 Chat、首 delta、最终 canonical projection、普通 Chat 不装配 TaskStore/Runner、Task profile 主链、Task 工具成功执行、单个和多个子代理、自定义 Agent Role 快照、Goal profile 的 Provider 失败收口、取消、真实 SSE/WebSocket 载体断线重连、EventBus 快照重放、request replay、fingerprint conflict、Provider 失败/空流/超时/重试以及重建状态后的 canonical replay。该实现仍是分阶段 harness，尚未覆盖权限/Git 阻塞和 Electron DOM 全矩阵；忙碌 session 的资源排队、队列身份重放和 fingerprint 冲突已有测试。
+当前已落地的测试实现位于 `crates/magi-api/src/turn_harness.rs`：它装配真实 `ApiState`、`SessionStore`、`EventBus`、`SessionTurnCoordinator` 和 Conversation/Task dispatcher，通过 `TurnService::submit` 接纳请求；Provider 替身负责可观测累计 delta、工具调用轮次、空流、失败、首帧前暂态重试和可取消阻塞。现有测试覆盖普通 Chat、首 delta、最终 canonical projection、普通 Chat 不装配 TaskStore/Runner、Task profile 主链、Task 工具成功执行、单个和多个子代理、自定义 Agent Role 快照、Goal profile 的 Provider 失败收口、steer、取消、真实 SSE/WebSocket 载体断线重连、EventBus 快照重放、request replay、fingerprint conflict、Provider 失败/空流/超时/重试以及重建状态后的 canonical replay。该实现仍是分阶段 harness，尚未覆盖权限/Git 阻塞和 Electron DOM 全矩阵；忙碌 session 的资源排队、队列身份重放和 fingerprint 冲突已有测试。
 
 ## 19. 性能与可靠性目标
 

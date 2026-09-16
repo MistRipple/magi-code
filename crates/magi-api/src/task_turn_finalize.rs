@@ -411,7 +411,9 @@ pub fn reconcile_terminal_session_task_turns(state: &ApiState) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_conversation_runtime::{CoordinatorAdmission, ExecutionProfile, TurnAdmission};
+    use magi_conversation_runtime::{
+        CoordinatorAdmission, ExecutionProfile, TurnAdmission, TurnCommand,
+    };
     use magi_core::{
         AccessProfile, MissionId, Task, TaskKind, TaskRuntimePayload, TaskStatus, UtcMillis,
     };
@@ -642,16 +644,20 @@ mod tests {
         .with_task_store(task_store);
         let task_attempt = state
             .turn_coordinator()
-            .accept(
+            .execute_command(
                 &session_id,
-                TurnAdmission {
+                TurnCommand::Start(TurnAdmission {
                     turn_id: "turn-failed-task-plan-pause".to_string(),
                     request_id: "request-failed-task-plan-pause".to_string(),
                     request_fingerprint: "fp-failed-task-plan-pause".to_string(),
                     profile: ExecutionProfile::Task,
-                },
+                }),
             )
             .expect("Task Turn 应注册 Coordinator admission");
+        let task_attempt = match task_attempt {
+            magi_conversation_runtime::CoordinatorCommandResult::Admission(admission) => admission,
+            other => panic!("unexpected Coordinator command result: {other:?}"),
+        };
         assert!(matches!(task_attempt, CoordinatorAdmission::Accepted(_)));
 
         assert!(
@@ -777,16 +783,20 @@ mod tests {
         .with_task_store(task_store);
         let task_attempt = state
             .turn_coordinator()
-            .accept(
+            .execute_command(
                 &session_id,
-                TurnAdmission {
+                TurnCommand::Start(TurnAdmission {
                     turn_id: "turn-fast-goal-completion".to_string(),
                     request_id: "request-fast-goal-completion".to_string(),
                     request_fingerprint: "fp-fast-goal-completion".to_string(),
                     profile: ExecutionProfile::Task,
-                },
+                }),
             )
             .expect("Task Turn 应注册 Coordinator admission");
+        let task_attempt = match task_attempt {
+            magi_conversation_runtime::CoordinatorCommandResult::Admission(admission) => admission,
+            other => panic!("unexpected Coordinator command result: {other:?}"),
+        };
         assert!(matches!(task_attempt, CoordinatorAdmission::Accepted(_)));
 
         assert!(

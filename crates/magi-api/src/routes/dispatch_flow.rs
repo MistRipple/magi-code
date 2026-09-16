@@ -608,6 +608,7 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
 async fn prepare_session_task_dispatch(
     state: &ApiState,
     accepted: &DispatchSubmissionAccepted,
+    coordinator_attempt: &magi_conversation_runtime::TurnAttempt,
 ) -> Result<(), ApiError> {
     let trace_id = state
         .session_store
@@ -628,30 +629,31 @@ async fn prepare_session_task_dispatch(
         Some(&accepted.turn_id),
         None,
     );
-    if !matches!(
+    let coordinator_is_running = matches!(
         state
             .turn_coordinator()
             .current_status(&accepted.session_id, &accepted.turn_id),
         Ok(magi_conversation_runtime::CoordinatorTurnStatus::Running)
-    ) {
+    );
+    if !coordinator_is_running {
         state
             .turn_coordinator()
             .execute_command(
                 &accepted.session_id,
                 magi_conversation_runtime::TurnCommand::SetStatus {
-                    turn_id: accepted.turn_id.clone(),
+                    attempt: coordinator_attempt.clone(),
                     status: magi_conversation_runtime::CoordinatorTurnStatus::Preparing,
                 },
             )
             .map_err(|error| {
                 ApiError::internal_assembly("更新任务 Coordinator 准备状态失败", error)
             })?;
+        state
+            .turn_event_sink()
+            .set_status_domain(&accepted.session_id, Some(&accepted.turn_id), "preparing")
+            .map_err(|error| ApiError::internal_assembly("更新任务准备状态失败", error))?
+            .ok_or_else(|| ApiError::Conflict("当前任务 Turn 已被新的操作取代".to_string()))?;
     }
-    state
-        .turn_event_sink()
-        .set_status_domain(&accepted.session_id, Some(&accepted.turn_id), "preparing")
-        .map_err(|error| ApiError::internal_assembly("更新任务准备状态失败", error))?
-        .ok_or_else(|| ApiError::Conflict("当前任务 Turn 已被新的操作取代".to_string()))?;
     trace.mark(
         "preparation_turn_status_written",
         accepted.session_id.as_str(),
@@ -812,7 +814,24 @@ pub(super) async fn finalize_session_task_dispatch(
         );
         return;
     }
-    if let Err(error) = prepare_session_task_dispatch(&state, &accepted).await {
+    let coordinator_attempt = match state
+        .turn_coordinator()
+        .current_attempt(&accepted.session_id, &accepted.turn_id)
+    {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            tracing::error!(
+                session_id = %accepted.session_id,
+                turn_id = %accepted.turn_id,
+                %error,
+                "任务准备前读取 Coordinator attempt 失败"
+            );
+            fail_accepted_task_submission(&state, &accepted, &error.to_string());
+            return;
+        }
+    };
+    if let Err(error) = prepare_session_task_dispatch(&state, &accepted, &coordinator_attempt).await
+    {
         state.release_session_git_execution_lease(&accepted.session_id);
         tracing::error!(
             session_id = %accepted.session_id,
@@ -821,6 +840,22 @@ pub(super) async fn finalize_session_task_dispatch(
             "session turn preparation failed"
         );
         fail_accepted_task_submission(&state, &accepted, error.message());
+        return;
+    }
+    if let Err(error) = state.turn_coordinator().execute_command(
+        &accepted.session_id,
+        magi_conversation_runtime::TurnCommand::SetStatus {
+            attempt: coordinator_attempt.clone(),
+            status: magi_conversation_runtime::CoordinatorTurnStatus::Running,
+        },
+    ) {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            turn_id = %accepted.turn_id,
+            %error,
+            "更新任务 Coordinator 运行状态失败"
+        );
+        fail_accepted_task_submission(&state, &accepted, &error.to_string());
         return;
     }
     match state.turn_event_sink().set_status_domain(
@@ -850,22 +885,6 @@ pub(super) async fn finalize_session_task_dispatch(
             fail_accepted_task_submission(&state, &accepted, &error.to_string());
             return;
         }
-    }
-    if let Err(error) = state.turn_coordinator().execute_command(
-        &accepted.session_id,
-        magi_conversation_runtime::TurnCommand::SetStatus {
-            turn_id: accepted.turn_id.clone(),
-            status: magi_conversation_runtime::CoordinatorTurnStatus::Running,
-        },
-    ) {
-        tracing::error!(
-            session_id = %accepted.session_id,
-            turn_id = %accepted.turn_id,
-            %error,
-            "更新任务 Coordinator 运行状态失败"
-        );
-        fail_accepted_task_submission(&state, &accepted, &error.to_string());
-        return;
     }
     if let Err(error) =
         drive_dispatch_submission_after_lifecycle_and_restart_lock(&state, &mut accepted)
