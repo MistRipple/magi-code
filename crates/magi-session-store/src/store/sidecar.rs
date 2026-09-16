@@ -1460,6 +1460,14 @@ fn migration_status_rank(status: CanonicalTurnStatus) -> u8 {
     if status.is_terminal() { 2 } else { 1 }
 }
 
+fn canonical_turn_progress_rank(status: CanonicalTurnStatus) -> u8 {
+    match status {
+        CanonicalTurnStatus::Pending => 0,
+        CanonicalTurnStatus::Running => 1,
+        _ => 2,
+    }
+}
+
 fn migration_canonical_turn_key(turn: &CanonicalTurn) -> (u64, u8, usize) {
     let latest_item_update = turn
         .items
@@ -1560,8 +1568,8 @@ fn canonical_turn_is_ahead_of_active(
     let Ok(active_status) = canonical_current_turn_status(&active.status) else {
         return false;
     };
-    let canonical_rank = migration_status_rank(canonical.status);
-    let active_rank = migration_status_rank(active_status);
+    let canonical_rank = canonical_turn_progress_rank(canonical.status);
+    let active_rank = canonical_turn_progress_rank(active_status);
     if canonical_rank > active_rank
         || (canonical.status.is_terminal()
             && active_status.is_terminal()
