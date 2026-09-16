@@ -29,6 +29,7 @@ use magi_spawn_graph::SpawnGraph;
 use serde::{Deserialize, Serialize};
 
 use crate::session_thread;
+use crate::session_writeback::CanonicalTurnEventSink;
 
 use crate::context_reference::{
     SessionContextReference, browser_annotation_artifact_paths,
@@ -1626,7 +1627,7 @@ pub fn accept_dispatch_submission(
         })?;
     if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
         let accept_result = if let Some(goal_id) = request.turn_origin.continuation_goal_id() {
-            session_store
+            CanonicalTurnEventSink::for_store(session_store, Some(task_store))
                 .accept_goal_continuation_with_timeline_entry_and_task(
                     request.session_id.clone(),
                     goal_id,
@@ -1641,7 +1642,7 @@ pub fn accept_dispatch_submission(
                 )
                 .map(|(_, _, canonical_turn)| (None, canonical_turn))
         } else if let Some(replace_turn_id) = request.replace_turn_id.as_deref() {
-            session_store
+            CanonicalTurnEventSink::for_store(session_store, Some(task_store))
                 .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
                     request.session_id.clone(),
                     replace_turn_id,
@@ -1658,7 +1659,7 @@ pub fn accept_dispatch_submission(
                     (Some(superseded_turn), Some(canonical_turn))
                 })
         } else {
-            session_store
+            CanonicalTurnEventSink::for_store(session_store, Some(task_store))
                 .accept_active_execution_chain_with_timeline_entry_and_task(
                     request.session_id.clone(),
                     TimelineEntryInput::new(

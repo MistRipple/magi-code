@@ -1311,8 +1311,8 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
             );
         }
         match state
-            .session_store
-            .interrupt_current_turn_by_daemon_restart(&browser_session.session_id)
+            .turn_event_sink()
+            .interrupt_turn_by_daemon_restart(&browser_session.session_id)
         {
             Ok(Some(_)) => {
                 state

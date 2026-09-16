@@ -239,8 +239,8 @@ async fn pause_current_goal(
             );
         }
         state
-            .session_store
-            .interrupt_current_turn_by_user(&scope.session_id)
+            .turn_event_sink()
+            .interrupt_turn_by_user(&scope.session_id)
             .map_err(|error| {
                 ApiError::internal_assembly("暂停 Goal 时中断当前 Turn 失败", error)
             })?;

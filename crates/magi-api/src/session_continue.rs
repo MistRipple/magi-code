@@ -949,8 +949,8 @@ where
         .map(|turn| turn.turn_id.as_str())
     {
         state
-            .session_store
-            .finalize_current_turn_for_continue(session_id, previous_turn_id)
+            .turn_event_sink()
+            .finalize_turn_for_continue(session_id, previous_turn_id)
             .map_err(|error| ApiError::internal_assembly("收口 Continue 前置 Turn 失败", error))?;
         state.persist_session_state_checkpoint("session_continue_finalize_previous_turn")?;
     }

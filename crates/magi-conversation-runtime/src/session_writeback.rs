@@ -37,7 +37,7 @@ use magi_session_store::{
     CANONICAL_TURN_SCHEMA_VERSION, CanonicalToolCall, CanonicalTurn, CanonicalTurnEventKind,
     CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
     CanonicalTurnVisibility, CanonicalWorkerRef, SessionRuntimeSidecar, SessionStore,
-    active_execution_turn_request_id,
+    TimelineEntryInput, active_execution_turn_request_id,
 };
 use magi_skill_runtime::{SkillDispatchRuntime, SkillRuntime};
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
@@ -883,6 +883,118 @@ impl<'a> CanonicalTurnEventSink<'a> {
             .update_current_turn_status_for_turn_with_change(session_id, expected_turn_id, status)
     }
 
+    /// 接纳普通 Conversation Turn 的 canonical 事实。
+    pub fn accept_conversation_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        workspace_id: Option<WorkspaceId>,
+        timeline_entry: TimelineEntryInput,
+        turn: ActiveExecutionTurn,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .accept_conversation_turn_with_timeline_entry(
+                session_id,
+                workspace_id,
+                timeline_entry,
+                turn,
+            )
+    }
+
+    /// 接纳带有 Task execution chain 的 Turn，并把 Task 关联写进同一笔 canonical 事务。
+    pub fn accept_active_execution_chain_with_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .accept_active_execution_chain_with_timeline_entry_and_task(
+                session_id,
+                timeline_entry,
+                active_execution_chain,
+                task,
+            )
+    }
+
+    /// 接纳 Goal continuation Turn，并保留 Goal continuation 的 canonical 关联。
+    pub fn accept_goal_continuation_with_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        goal_id: &magi_core::GoalId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .accept_goal_continuation_with_timeline_entry_and_task(
+                session_id,
+                goal_id,
+                timeline_entry,
+                active_execution_chain,
+                task,
+            )
+    }
+
+    /// 原子替换旧 Turn 并接纳新的 Task execution chain。
+    pub fn replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        replace_turn_id: &str,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn, CanonicalTurn)>
+    {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+                session_id,
+                replace_turn_id,
+                timeline_entry,
+                active_execution_chain,
+                task,
+            )
+    }
+
+    /// Continue 创建新 Turn 前收口旧 current Turn，保持 replacement 归属校验集中在 sink。
+    pub fn finalize_turn_for_continue(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &str,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .finalize_current_turn_for_continue(session_id, expected_turn_id)
+    }
+
+    /// 接纳 Continue 的普通 canonical Turn。
+    pub fn accept_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        turn: ActiveExecutionTurn,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar)> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .accept_current_turn_with_timeline_entry(session_id, timeline_entry, turn)
+    }
+
     pub fn cancel_turn(
         &self,
         session_id: &SessionId,
@@ -892,6 +1004,33 @@ impl<'a> CanonicalTurnEventSink<'a> {
                 message: "TurnEventSink 缺少 SessionStore".to_string(),
             })?
             .cancel_current_turn(session_id)
+    }
+
+    /// 按用户来源中断当前 Turn，并保留 canonical interruption metadata。
+    ///
+    /// 用户取消和内部资源清理都结束 Turn，但前者还必须写入
+    /// `interruptionSource=user` 与时间戳，供恢复路由和审计区分来源。
+    pub fn interrupt_turn_by_user(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .interrupt_current_turn_by_user(session_id)
+    }
+
+    /// 将 daemon 重启遗留的执行 Turn 收口为可恢复的中断事实。
+    pub fn interrupt_turn_by_daemon_restart(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "TurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .interrupt_current_turn_by_daemon_restart(session_id)
     }
 
     pub fn complete_from_root_task(

@@ -2734,7 +2734,7 @@ async fn submit_conversation_session_turn(
     };
     turn.normalize();
     let (_entry_id, _sidecar, canonical_turn) = match state
-        .session_store
+        .turn_event_sink()
         .accept_conversation_turn_with_timeline_entry(
             session_id.clone(),
             workspace_id.clone(),
@@ -4407,8 +4407,8 @@ fn write_continue_user_message(
     };
     turn.normalize();
     state
-        .session_store
-        .accept_current_turn_with_timeline_entry(
+        .turn_event_sink()
+        .accept_turn_with_timeline_entry(
             accepted.session_id.clone(),
             TimelineEntryInput::new(
                 entry_id.clone(),
@@ -4515,8 +4515,8 @@ async fn interrupt_session_turn(
     let mut cancelled_tool_process_count = 0;
     if interrupted {
         let cancelled_item_id = state
-            .session_store
-            .interrupt_current_turn_by_user(&session_id)
+            .turn_event_sink()
+            .interrupt_turn_by_user(&session_id)
             .map_err(|error| ApiError::internal_assembly("中断 session turn 失败", error))?
             .and_then(|sidecar| sidecar.current_turn)
             .and_then(|turn| turn.items.last().map(|item| item.item_id.clone()));

@@ -2191,9 +2191,8 @@ impl DaemonRuntime {
                     }
                 }
             }
-            match self
-                .session_store
-                .interrupt_current_turn_by_daemon_restart(&session_id)
+            match CanonicalTurnEventSink::for_store(&self.session_store, None)
+                .interrupt_turn_by_daemon_restart(&session_id)
             {
                 Ok(Some(_)) => interrupted_turn_count += 1,
                 Ok(None) => {}
@@ -3914,7 +3913,38 @@ done
                 && completed_tasks == total_tasks
                 && projection["root_task"]["status"] == "completed"
             {
-                return projection;
+                // TaskStore 的 durable terminal 与 canonical Turn finalizer 由不同回调
+                // 顺序完成；只有 Turn 也已经进入终态，后续同一 session 的请求才不会
+                // 在这个等待窗口内被错误地判定为“已有活动 Turn”。
+                let canonical_terminal =
+                    get_json(app.clone(), "/runtime/read-model").await["details"]["sessions"]
+                        .as_array()
+                        .and_then(|sessions| {
+                            sessions
+                                .iter()
+                                .find(|entry| entry["session_id"] == session_id)
+                        })
+                        .and_then(|entry| entry["current_turn"]["status"].as_str())
+                        .is_some_and(|status| {
+                            matches!(
+                                status,
+                                "completed"
+                                    | "complete"
+                                    | "succeeded"
+                                    | "success"
+                                    | "failed"
+                                    | "error"
+                                    | "interrupted"
+                                    | "cancelled"
+                                    | "canceled"
+                                    | "blocked"
+                                    | "killed"
+                                    | "superseded"
+                            )
+                        });
+                if canonical_terminal {
+                    return projection;
+                }
             }
             if Instant::now() >= deadline {
                 return projection;
