@@ -600,8 +600,12 @@ fn finalize_completed_root_task_turn_for_turn(
         return Ok(false);
     }
     if current_turn_status_is_terminal(&turn.status) {
-        let archived =
-            archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?;
+        let archived = archive_terminal_active_execution_chain(
+            session_store,
+            Some(task_store),
+            session_id,
+            root_task_id,
+        )?;
         if archived {
             persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived")?;
         }
@@ -636,7 +640,12 @@ fn finalize_completed_root_task_turn_for_turn(
     {
         return Err(format!("根任务完成时 Turn completed 状态提交失败: {error}"));
     }
-    archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?;
+    archive_terminal_active_execution_chain(
+        session_store,
+        Some(task_store),
+        session_id,
+        root_task_id,
+    )?;
     persist_session_state_checkpoint(persist_session_state, "session_task_turn_completed")?;
     if let Err(error) = publish_current_session_turn_item_event(
         event_bus,
@@ -657,6 +666,7 @@ fn finalize_completed_root_task_turn_for_turn(
 /// 防止一个已经完成的任务长期把后续普通对话绑定到过期任务链。
 fn archive_terminal_active_execution_chain(
     session_store: &SessionStore,
+    task_store: Option<&TaskStore>,
     session_id: &SessionId,
     root_task_id: &TaskId,
 ) -> Result<bool, String> {
@@ -673,6 +683,20 @@ fn archive_terminal_active_execution_chain(
             .as_ref()
             .is_some_and(daemon_restart_recovery_is_pending)
     {
+        return Ok(false);
+    }
+    // Failed root 仍可能带有可继续的 branch checkpoint。保留这条 active
+    // execution chain，让 Continue 复用原 mission/root/chain；只有没有可恢复
+    // branch 时才释放 session ownership。Completed/Killed root 仍按原规则归档。
+    if task_store.is_some_and(|store| {
+        store
+            .get_task(root_task_id)
+            .is_some_and(|root| root.status == TaskStatus::Failed)
+    }) && chain.branches.iter().any(|branch| {
+        crate::execution_chain_recovery::active_execution_branch_is_continue_recoverable(
+            None, task_store, chain, branch,
+        )
+    }) {
         return Ok(false);
     }
     session_store
@@ -910,19 +934,29 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     }) {
         return Ok(false);
     }
-    let workspace_id = active_chain.workspace_id.clone();
-    let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
-    else {
-        return Ok(false);
-    };
     let Some(current_turn) = sidecar.current_turn.as_ref() else {
         return Ok(false);
     };
+    let workspace_id = active_chain.workspace_id.clone();
+    // Preparation can fail before materialize_dispatch_submission_after_acceptance
+    // creates the orchestrator thread.  The accepted canonical Turn already carries
+    // the deterministic source thread on its user item; use it as the failure item
+    // anchor and keep terminalization independent from a late thread projection.
+    let orchestrator_thread_id = session_store
+        .orchestrator_thread_for_session(session_id)
+        .map(|thread| thread.thread_id)
+        .or_else(|| {
+            current_turn
+                .items
+                .first()
+                .map(|item| item.source_thread_id.clone())
+        })
+        .unwrap_or_else(|| ThreadId::new(format!("thread-orchestrator-{session_id}")));
     let existing_error_item_id = current_turn
         .items
         .iter()
         .find(|item| {
-            item.kind == "assistant_error" && item.source_thread_id == orchestrator_thread.thread_id
+            item.kind == "assistant_error" && item.source_thread_id == orchestrator_thread_id
         })
         .map(|item| item.item_id.clone());
 
@@ -930,7 +964,12 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     // active chain 的历史终态需要在这里完成一次归档，归档成功后由调用方释放 lease。
     if current_turn_status_is_terminal(&current_turn.status) {
         let archived = if terminal_chain_requires_archival(root_task.status, &current_turn.status) {
-            archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?
+            archive_terminal_active_execution_chain(
+                session_store,
+                Some(task_store),
+                session_id,
+                root_task_id,
+            )?
         } else {
             false
         };
@@ -950,7 +989,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             Some(title.to_string()),
             Some(message),
             Some(item_id.clone()),
-            orchestrator_thread.thread_id.clone(),
+            orchestrator_thread_id.clone(),
         );
         error_item.task_id = Some(root_task_id.clone());
         append_session_turn_item_for_turn(
@@ -974,7 +1013,12 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             format!("终态 Turn 没有可更新的失败状态: session={session_id}, task={root_task_id}")
         })?;
     if terminal_chain_requires_archival(root_task.status, turn_status) {
-        archive_terminal_active_execution_chain(session_store, session_id, root_task_id)?;
+        archive_terminal_active_execution_chain(
+            session_store,
+            Some(task_store),
+            session_id,
+            root_task_id,
+        )?;
     }
     persist_session_state_checkpoint(persist_session_state, "session_task_turn_failed")?;
     if let Err(error) = publish_current_session_turn_item_event(

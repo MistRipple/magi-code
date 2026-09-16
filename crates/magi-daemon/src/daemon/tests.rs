@@ -3376,59 +3376,188 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     let runtime = DaemonRuntime::restore_with_test_fixture(&config)
         .expect("first runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
-
-    let (status, body) = post_json(
-        app.clone(),
-        "/api/session/turn",
-        json!({
-            "scope": "workspace",
-            "text": "修复重启继续执行链路问题，完成后运行测试并汇总验证结果",
-            "skillName": "refactor",
-            "images": [],
-            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
-        }),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "session action should succeed: {body:?}"
-    );
-
-    let session_id_text = body["sessionId"]
-        .as_str()
-        .expect("session_id should serialize as string")
-        .to_string();
+    // 这里直接建立可恢复的活动链，避免用即时完成的测试模型制造“刚接纳就已
+    // 完成”的竞态。daemon 重启路径随后会真实处理 Running root 与当前 Turn。
+    let session_id_text = "session-continue-restart-chain".to_string();
     let session_id = SessionId::new(session_id_text.clone());
-    let mut chain = state
-        .session_store
-        .active_execution_chain(&session_id)
-        .expect("seed dispatch should create active execution chain");
-    let primary_branch = chain
-        .branches
-        .iter()
-        .find(|branch| branch.is_primary)
-        .cloned()
-        .or_else(|| chain.branches.first().cloned())
-        .expect("seed dispatch should contain at least one branch");
-    let mission_id = chain.mission_id.clone();
-    let root_task_id = chain.root_task_id.clone();
-    let execution_chain_ref = chain.execution_chain_ref.clone();
+    let workspace_id = WorkspaceId::new(DEFAULT_TEST_WORKSPACE_ID);
+    let mission_id = MissionId::new("mission-session-continue-restart-chain");
+    let root_task_id = TaskId::new("task-session-continue-restart-chain");
+    let root_worker_id = WorkerId::new("worker-session-continue-restart-chain");
+    let execution_chain_ref = "chain-session-continue-restart-chain".to_string();
     let task_store = state.task_store().expect("task store should be configured");
-
-    task_store
-        .revoke_lease_and_set_task_terminal(
-            &primary_branch.task_id,
-            &root_task_id,
-            None,
-            TaskStatus::Failed,
-            Vec::new(),
-        )
-        .expect("primary branch should become recoverable")
-        .then_some(())
-        .expect("primary branch should become recoverable");
-
     let now = UtcMillis::now();
+    state
+        .session_store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "重启继续执行链路验收",
+            Some(workspace_id.to_string()),
+        )
+        .expect("restart chain session should create");
+    let (_, orchestrator_thread_id) =
+        state
+            .session_store
+            .ensure_session_mission(&session_id, now, || mission_id.clone());
+    task_store
+        .insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "重启继续执行 root".to_string(),
+            goal: "验证 daemon 重启后可继续执行链".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: Some(workspace_id.to_string()),
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("restart chain root task should insert");
+    let request_id = "request-session-continue-restart-chain";
+    let user_message_id = "user-session-continue-restart-chain";
+    let user_item = ActiveExecutionTurnItem {
+        item_id: user_message_id.to_string(),
+        item_seq: 1,
+        kind: "user_message".to_string(),
+        status: "completed".to_string(),
+        source: "orchestrator".to_string(),
+        title: None,
+        content: Some("修复重启继续执行链路问题，完成后运行测试并汇总验证结果".to_string()),
+        task_id: None,
+        worker_id: None,
+        role_id: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_status: None,
+        tool_arguments: None,
+        tool_result: None,
+        tool_error: None,
+        request_id: Some(request_id.to_string()),
+        user_message_id: Some(user_message_id.to_string()),
+        placeholder_message_id: None,
+        metadata: std::collections::HashMap::from([
+            ("route".to_string(), json!("execute")),
+            ("executionProfile".to_string(), json!("task")),
+            ("requestId".to_string(), json!(request_id)),
+            (
+                "requestFingerprint".to_string(),
+                json!("fingerprint-session-continue-restart-chain"),
+            ),
+            ("userMessageId".to_string(), json!(user_message_id)),
+        ]),
+        timeline_entry_id: Some("timeline-session-continue-restart-chain".to_string()),
+        source_thread_id: orchestrator_thread_id,
+    };
+    let primary_branch = ActiveExecutionBranch {
+        task_id: root_task_id.clone(),
+        worker_id: root_worker_id.clone(),
+        stage: "execute".to_string(),
+        lease_id: None,
+        execution_intent_ref: Some("worker-intent-session-continue-restart-chain".to_string()),
+        binding_lifecycle: Some("requested".to_string()),
+        checkpoint_stage: Some("execute".to_string()),
+        next_step_index: Some(1),
+        checkpoint_at: Some(now),
+        resume_mode: Some("step-checkpoint".to_string()),
+        resume_token: None,
+        use_tools: true,
+        skill_name: Some("refactor".to_string()),
+        is_primary: true,
+        thread_id: ThreadId::new("thread-session-continue-restart-chain"),
+    };
+    state
+        .session_store
+        .register_thread(ExecutionThread {
+            thread_id: primary_branch.thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            role_id: "executor".to_string(),
+            worker_instance_id: primary_branch.worker_id.clone(),
+            status: ExecutionThreadStatus::Active,
+            created_at: now,
+            last_used_at: now,
+            observed_context_window_tokens: None,
+            handled_task_ids: vec![root_task_id.clone()],
+            message_history: Vec::new(),
+        })
+        .expect("restart chain root thread should register");
+    let mut chain = ActiveExecutionChain {
+        session_id: session_id.clone(),
+        mission_id: mission_id.clone(),
+        root_task_id: root_task_id.clone(),
+        execution_chain_ref: execution_chain_ref.clone(),
+        workspace_id: Some(workspace_id.clone()),
+        active_branch_task_ids: vec![root_task_id.clone()],
+        active_worker_bindings: vec![root_worker_id.clone()],
+        branches: vec![primary_branch.clone()],
+        recovery_ref: None,
+        dispatch_context: ActiveExecutionDispatchContext {
+            accepted_at: now,
+            entry_id: "timeline-session-continue-restart-chain".to_string(),
+            trimmed_text: Some(
+                "修复重启继续执行链路问题，完成后运行测试并汇总验证结果".to_string(),
+            ),
+            skill_name: Some("refactor".to_string()),
+        },
+        current_turn: Some(ActiveExecutionTurn {
+            turn_id: "turn-session-continue-restart-chain".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: Some(
+                "修复重启继续执行链路问题，完成后运行测试并汇总验证结果".to_string(),
+            ),
+            items: vec![user_item],
+        }),
+    };
+    state
+        .session_store
+        .accept_active_execution_chain_with_timeline_entry(
+            session_id.clone(),
+            magi_session_store::TimelineEntryInput::new(
+                "timeline-session-continue-restart-chain",
+                magi_session_store::TimelineEntryKind::UserMessage,
+                "修复重启继续执行链路问题，完成后运行测试并汇总验证结果",
+                now,
+            ),
+            chain.clone(),
+        )
+        .expect("restart chain should accept canonical turn");
+    let admission = state
+        .turn_coordinator()
+        .execute_command(
+            &session_id,
+            magi_conversation_runtime::TurnCommand::Start(
+                magi_conversation_runtime::TurnAdmission {
+                    turn_id: "turn-session-continue-restart-chain".to_string(),
+                    request_id: request_id.to_string(),
+                    request_fingerprint: "fingerprint-session-continue-restart-chain".to_string(),
+                    profile: magi_conversation_runtime::ExecutionProfile::Task,
+                },
+            ),
+        )
+        .expect("restart chain coordinator admission should succeed");
+    assert!(matches!(
+        admission,
+        magi_conversation_runtime::CoordinatorCommandResult::Admission(
+            magi_conversation_runtime::CoordinatorAdmission::Accepted(_)
+        )
+    ));
     let extra_branch_specs = [
         (
             "task-restart-branch-1",
@@ -3648,7 +3777,10 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     )
     .flush_runtime_sidecars()
     .expect("runtime sidecars should flush");
-    assert!(flush_report.session_sidecars_flushed);
+    // Task completion 的主动通知可能已经在本次显式 flush 前完成同一 session
+    // 的 checkpoint；此时 sidecar 已经是 clean，返回 false 只表示没有新增脏版本。
+    // 后续 restart 断言会验证这份最新 chain 确实已落盘。
+    let _ = flush_report.session_sidecars_flushed;
     assert!(flush_report.worker_runtime_snapshot_flushed);
 
     drop(app);

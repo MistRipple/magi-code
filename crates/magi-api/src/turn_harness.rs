@@ -32,8 +32,12 @@ use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicU64},
+};
 use tower::ServiceExt;
 
 #[derive(Clone, Debug)]
@@ -611,6 +615,14 @@ impl MagiTurnHarness {
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
         let completion_notifier = with_task_runtime
             .then(|| Arc::new(TaskCompletionNotifier::new(Arc::clone(&task_store))));
+        if let Some(notifier) = completion_notifier.as_ref() {
+            let notifier_for_status = notifier.clone();
+            task_store.set_status_change_callback(Box::new(
+                move |task_id, _old_status, new_status, task| {
+                    notifier_for_status.notify_terminal_status(task_id, new_status, &task);
+                },
+            ));
+        }
         let mut state = ApiState::new(
             "magi-turn-harness",
             Arc::clone(&event_bus),
@@ -779,6 +791,46 @@ impl MagiTurnHarness {
         self.submit(None, text, request_id, user_message_id).await
     }
 
+    /// 在已注册 workspace 中通过真实 TurnService 提交 Task profile 请求。
+    ///
+    /// 该入口只存在于测试 harness，用于把 workspace/Git 前置检查纳入真实
+    /// Turn 接纳链；生产代码仍由 HTTP/App Server 的同一份 DTO 合同接收请求。
+    pub async fn submit_workspace_task(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &magi_core::WorkspaceId,
+        workspace_path: &Path,
+        text: &str,
+        request_id: &str,
+        user_message_id: &str,
+    ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
+        TurnService::new(self.state.clone())
+            .submit(SessionTurnRequestDto {
+                desktop_browser_tools_allowed: false,
+                session_id: Some(session_id.to_string()),
+                scope: SessionScopeKindDto::Workspace,
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: Some(workspace_path.display().to_string()),
+                text: Some(text.to_string()),
+                skill_name: None,
+                locale: Some("zh-CN".to_string()),
+                goal_mode: false,
+                images: Vec::new(),
+                context_references: Vec::new(),
+                browser_annotation_refs: Vec::new(),
+                browser_node_selections: Vec::new(),
+                access_profile: None,
+                orchestrator_session_config: None,
+                request_id: Some(request_id.to_string()),
+                user_message_id: Some(user_message_id.to_string()),
+                placeholder_message_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
+                replace_turn_id: None,
+            })
+            .await
+    }
+
     pub async fn steer(
         &self,
         session_id: &SessionId,
@@ -869,6 +921,72 @@ impl MagiTurnHarness {
             .filter(|event| event.session_id.as_ref() == Some(session_id))
             .collect()
     }
+}
+
+#[cfg(test)]
+fn git_fixture_command(path: &Path, args: &[&str]) {
+    let output = magi_process::std_command("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .expect("Git harness fixture command should start");
+    assert!(
+        output.status.success(),
+        "Git harness fixture command {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(test)]
+fn git_fixture_command_expect_failure(path: &Path, args: &[&str]) {
+    let output = magi_process::std_command("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .expect("Git harness conflict command should start");
+    assert!(
+        !output.status.success(),
+        "Git harness conflict command {:?} should fail",
+        args
+    );
+}
+
+#[cfg(test)]
+fn register_git_workspace(harness: &MagiTurnHarness) -> (magi_core::WorkspaceId, PathBuf) {
+    static GIT_FIXTURE_SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+    let sequence = GIT_FIXTURE_SEQUENCE
+        .get_or_init(|| AtomicU64::new(0))
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "magi-turn-harness-git-{}-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0,
+        sequence
+    ));
+    fs::create_dir_all(&root).expect("Git harness workspace should create");
+    git_fixture_command(&root, &["init", "-b", "main"]);
+    git_fixture_command(&root, &["config", "user.name", "Magi Harness"]);
+    git_fixture_command(
+        &root,
+        &["config", "user.email", "magi-harness@example.test"],
+    );
+    fs::write(root.join("README.md"), "base\n").expect("Git harness fixture file should write");
+    git_fixture_command(&root, &["add", "README.md"]);
+    git_fixture_command(&root, &["commit", "-m", "base"]);
+    let workspace_id = magi_core::WorkspaceId::new(format!(
+        "workspace-turn-harness-git-{}-{}",
+        UtcMillis::now().0,
+        sequence
+    ));
+    harness
+        .state
+        .workspace_registry
+        .register_native_path(workspace_id.clone(), root.clone())
+        .expect("Git harness workspace should register");
+    (workspace_id, root)
 }
 
 #[cfg(test)]
@@ -1901,6 +2019,214 @@ mod tests {
             harness.state.queued_regular_session_turn_count(&session_id),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_task_with_external_git_branch_drift_fails_before_provider_dispatch() {
+        let harness = MagiTurnHarness::new_task("不会在漂移 workspace 中执行");
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        let session_id = SessionId::new("harness-git-drift-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Git 漂移阻塞验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("Git 漂移 harness session should create");
+
+        harness
+            .state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("Git 漂移场景应先建立稳定 context");
+        harness
+            .state
+            .release_session_git_execution_lease(&session_id);
+        git_fixture_command(&workspace_root, &["switch", "-c", "external/drift"]);
+
+        let response = harness
+            .submit_workspace_task(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "执行一个复杂任务：读取当前工作区并汇总结果",
+                "harness-git-drift-request",
+                "harness-git-drift-user",
+            )
+            .await
+            .expect("Git 漂移请求应先写入 accepted 事实");
+        assert_eq!(
+            response.execution_profile,
+            Some(magi_conversation_runtime::ExecutionProfile::Task)
+        );
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("Git 漂移 Task 应返回 Turn 身份");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 漂移 Task 应返回 root task 身份");
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(
+            task.output_refs
+                .iter()
+                .any(|message| message.contains("Git context")),
+            "Git 漂移必须保留可诊断的 task 阻塞事实: {task:?}"
+        );
+        assert!(
+            harness.provider.requests().is_empty(),
+            "Git 前置检查失败时不得向 Provider 派发请求"
+        );
+        let context = harness
+            .state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .expect("Git 漂移后 context 仍应可恢复");
+        assert!(context.has_external_drift());
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_task_preserves_dirty_git_context_and_can_complete() {
+        let harness = MagiTurnHarness::new_task("dirty workspace 完成");
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        let session_id = SessionId::new("harness-git-dirty-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Git dirty 验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("Git dirty harness session should create");
+        harness
+            .state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("Git dirty 场景应先建立稳定 context");
+        harness
+            .state
+            .release_session_git_execution_lease(&session_id);
+        fs::write(workspace_root.join("README.md"), "dirty change\n")
+            .expect("Git dirty file should write");
+
+        let response = harness
+            .submit_workspace_task(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "执行一个复杂任务：读取当前工作区并汇总结果",
+                "harness-git-dirty-request",
+                "harness-git-dirty-user",
+            )
+            .await
+            .expect("Git dirty 请求应进入执行链");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("Git dirty Task 应返回 Turn 身份");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert!(!harness.provider.requests().is_empty());
+        let context = harness
+            .state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .expect("Git dirty 完成后 context 应保留");
+        assert!(context.git.dirty.has_uncommitted);
+        assert!(!context.has_external_drift());
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_task_with_git_merge_conflict_fails_before_provider_dispatch() {
+        let harness = MagiTurnHarness::new_task("不会在冲突 workspace 中执行");
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        let session_id = SessionId::new("harness-git-conflict-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Git 冲突阻塞验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("Git 冲突 harness session should create");
+        harness
+            .state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("Git 冲突场景应先建立稳定 context");
+        harness
+            .state
+            .release_session_git_execution_lease(&session_id);
+
+        git_fixture_command(&workspace_root, &["switch", "-c", "conflicting"]);
+        fs::write(workspace_root.join("README.md"), "feature\n")
+            .expect("Git conflict feature file should write");
+        git_fixture_command(&workspace_root, &["add", "README.md"]);
+        git_fixture_command(&workspace_root, &["commit", "-m", "feature change"]);
+        git_fixture_command(&workspace_root, &["switch", "main"]);
+        fs::write(workspace_root.join("README.md"), "main change\n")
+            .expect("Git conflict main file should write");
+        git_fixture_command(&workspace_root, &["add", "README.md"]);
+        git_fixture_command(&workspace_root, &["commit", "-m", "main change"]);
+        git_fixture_command_expect_failure(&workspace_root, &["merge", "conflicting"]);
+
+        let response = harness
+            .submit_workspace_task(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "执行一个复杂任务：处理当前工作区冲突并汇总结果",
+                "harness-git-conflict-request",
+                "harness-git-conflict-user",
+            )
+            .await
+            .expect("Git 冲突请求应先写入 accepted 事实");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("Git 冲突 Task 应返回 Turn 身份");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 冲突 Task 应返回 root task 身份");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(
+            task.output_refs
+                .iter()
+                .any(|message| { message.contains("未解决的 Git merge conflict") })
+        );
+        assert!(
+            harness.provider.requests().is_empty(),
+            "Git 冲突前置检查失败时不得向 Provider 派发请求"
+        );
+        let context = harness
+            .state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .expect("Git 冲突后 context 仍应可恢复");
+        assert_eq!(context.git.dirty.conflicted_paths, vec!["README.md"]);
+
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

@@ -1546,6 +1546,66 @@ fn replace_active_turn_from_canonical(
     sidecar_turn.normalize();
 }
 
+/// 仅当 canonical 已经明确领先 incoming sidecar 时才回放 canonical。
+///
+/// `upsert_active_execution_chain` 同时承担运行时写回和重启/恢复快照回放。
+/// 同一 Turn 的普通写回可能携带 canonical 尚未见过的新 item 或 metadata，
+/// 不能因为 canonical 已存在就无条件覆盖，否则会吞掉合法 mutation，也会让
+/// canonical writer 的错误无法向 materialize 调用方传播。这里用终态/状态进度、
+/// 完成时间和 durable item 集合判断 incoming 是否只是迟到快照。
+fn canonical_turn_is_ahead_of_active(
+    canonical: &CanonicalTurn,
+    active: &ActiveExecutionTurn,
+) -> bool {
+    let Ok(active_status) = canonical_current_turn_status(&active.status) else {
+        return false;
+    };
+    let canonical_rank = migration_status_rank(canonical.status);
+    let active_rank = migration_status_rank(active_status);
+    if canonical_rank > active_rank
+        || (canonical.status.is_terminal()
+            && active_status.is_terminal()
+            && canonical.status != active_status)
+    {
+        return true;
+    }
+    if canonical
+        .completed_at
+        .is_some_and(|canonical_completed_at| {
+            active
+                .completed_at
+                .is_none_or(|active_completed_at| active_completed_at < canonical_completed_at)
+        })
+    {
+        return true;
+    }
+    let active_item_ids = active
+        .items
+        .iter()
+        .map(|item| item.item_id.as_str())
+        .collect::<HashSet<_>>();
+    if canonical
+        .items
+        .iter()
+        .any(|item| !active_item_ids.contains(item.item_id.as_str()))
+    {
+        return true;
+    }
+    canonical.items.iter().any(|canonical_item| {
+        let Some(active_item) = active
+            .items
+            .iter()
+            .find(|item| item.item_id == canonical_item.item_id)
+        else {
+            return true;
+        };
+        let Ok(active_item_status) = canonical_current_turn_item_status(&active_item.status) else {
+            return false;
+        };
+        canonical_item.status.is_terminal() && !active_item_status.is_terminal()
+    })
+}
+
 /// v1 -> v2 converter 专用入口。正常 v2 恢复不得从 timeline/sidecar 反向补事实。
 pub(super) fn convert_v1_conversation_facts(state: &mut SessionStoreState) -> DomainResult<()> {
     let mut legacy_turns = Vec::<(SessionId, ActiveExecutionTurn, UtcMillis)>::new();
@@ -4307,11 +4367,27 @@ impl SessionStore {
                     .iter()
                     .find(|sidecar| sidecar.session_id == session_id)
                     .cloned();
-                let updated = Self::build_active_execution_chain_sidecar(
+                let mut updated = Self::build_active_execution_chain_sidecar(
                     session_id.clone(),
                     active_execution_chain.clone(),
                     existing,
                 )?;
+                // `upsert_active_execution_chain` 也被恢复/分支快照路径调用；调用方
+                // 可能持有比 canonical Turn 更早的 sidecar 快照。canonical Turn 是
+                // 唯一事实源，若同一 Turn 已存在 canonical 事实，先从 canonical
+                // 重建 incoming sidecar，避免把迟到快照倒写成 Failed -> Pending，
+                // 或删除终态写回已经追加的 item。
+                if let Some(incoming_turn) = updated.current_turn.as_mut()
+                    && let Some(canonical) = state.canonical_turns.iter().find(|turn| {
+                        turn.session_id == session_id && turn.turn_id == incoming_turn.turn_id
+                    })
+                    && canonical_turn_is_ahead_of_active(canonical, incoming_turn)
+                {
+                    replace_active_turn_from_canonical(canonical, incoming_turn);
+                    if let Some(chain) = updated.active_execution_chain.as_mut() {
+                        chain.current_turn = Some(incoming_turn.clone());
+                    }
+                }
                 let mutations = if let Some(turn) = updated.current_turn.as_ref() {
                     Self::canonical_turn_commit_plan(state, &session_id, turn, None)?.mutations
                 } else {
