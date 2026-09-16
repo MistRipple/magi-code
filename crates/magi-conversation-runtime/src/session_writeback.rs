@@ -1069,6 +1069,76 @@ pub trait TurnEventSink {
         status: &str,
     ) -> Result<Option<(SessionRuntimeSidecar, bool)>, String>;
 
+    /// Turn 接纳、替换、继续和中断也属于 canonical 写回合同；业务边界不得绕过 sink
+    /// 直接调用 SessionStore 的 current Turn mutation。
+    fn accept_conversation_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        workspace_id: Option<WorkspaceId>,
+        timeline_entry: TimelineEntryInput,
+        turn: ActiveExecutionTurn,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)>;
+
+    fn accept_active_execution_chain_with_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)>;
+
+    fn accept_goal_continuation_with_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        goal_id: &magi_core::GoalId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)>;
+
+    fn replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        replace_turn_id: &str,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn, CanonicalTurn)>;
+
+    fn finalize_turn_for_continue(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &str,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>>;
+
+    fn accept_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        turn: ActiveExecutionTurn,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar)>;
+
+    fn cancel_turn(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>>;
+
+    fn interrupt_turn_by_user(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>>;
+
+    fn interrupt_turn_by_daemon_restart(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>>;
+
+    fn complete_from_root_task(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>>;
+
     fn publish_item(
         &self,
         session_id: &SessionId,
@@ -1127,6 +1197,126 @@ impl<'a> TurnEventSink for CanonicalTurnEventSink<'a> {
     ) -> Result<Option<(SessionRuntimeSidecar, bool)>, String> {
         self.set_status_domain(session_id, expected_turn_id, status)
             .map_err(|error| error.to_string())
+    }
+
+    fn accept_conversation_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        workspace_id: Option<WorkspaceId>,
+        timeline_entry: TimelineEntryInput,
+        turn: ActiveExecutionTurn,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
+        CanonicalTurnEventSink::accept_conversation_turn_with_timeline_entry(
+            self,
+            session_id,
+            workspace_id,
+            timeline_entry,
+            turn,
+        )
+    }
+
+    fn accept_active_execution_chain_with_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
+        CanonicalTurnEventSink::accept_active_execution_chain_with_timeline_entry_and_task(
+            self,
+            session_id,
+            timeline_entry,
+            active_execution_chain,
+            task,
+        )
+    }
+
+    fn accept_goal_continuation_with_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        goal_id: &magi_core::GoalId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
+        CanonicalTurnEventSink::accept_goal_continuation_with_timeline_entry_and_task(
+            self,
+            session_id,
+            goal_id,
+            timeline_entry,
+            active_execution_chain,
+            task,
+        )
+    }
+
+    fn replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+        &self,
+        session_id: SessionId,
+        replace_turn_id: &str,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        task: &magi_core::Task,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn, CanonicalTurn)>
+    {
+        CanonicalTurnEventSink::replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
+            self,
+            session_id,
+            replace_turn_id,
+            timeline_entry,
+            active_execution_chain,
+            task,
+        )
+    }
+
+    fn finalize_turn_for_continue(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &str,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        CanonicalTurnEventSink::finalize_turn_for_continue(self, session_id, expected_turn_id)
+    }
+
+    fn accept_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        turn: ActiveExecutionTurn,
+    ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar)> {
+        CanonicalTurnEventSink::accept_turn_with_timeline_entry(
+            self,
+            session_id,
+            timeline_entry,
+            turn,
+        )
+    }
+
+    fn cancel_turn(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        CanonicalTurnEventSink::cancel_turn(self, session_id)
+    }
+
+    fn interrupt_turn_by_user(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        CanonicalTurnEventSink::interrupt_turn_by_user(self, session_id)
+    }
+
+    fn interrupt_turn_by_daemon_restart(
+        &self,
+        session_id: &SessionId,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        CanonicalTurnEventSink::interrupt_turn_by_daemon_restart(self, session_id)
+    }
+
+    fn complete_from_root_task(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+    ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
+        CanonicalTurnEventSink::complete_from_root_task(self, session_id, expected_turn_id)
     }
 
     fn publish_item(
