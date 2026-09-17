@@ -398,7 +398,7 @@ impl RunnerManager {
         runner
     }
 
-    /// 设置 Runner 周期性及终态 task checkpoint 的唯一提交入口。
+    /// 设置 Runner 周期性 checkpoint 的唯一提交入口。
     pub fn with_checkpoint_persist(mut self, persist: TaskCheckpointPersist) -> Self {
         self.checkpoint_persist = Some(persist);
         self
@@ -406,9 +406,7 @@ impl RunnerManager {
 
     /// Get a reference to the shared result receiver.
     ///
-    /// This is used by the daemon to wire the TaskStore's status-change
-    /// callback so that terminal status transitions push results into the
-    /// receiver for the Runner to pick up.
+    /// 供 daemon 读取共享结果接收器并装配主动完成通知目标。
     pub fn result_receiver(&self) -> &Arc<EventBasedResultReceiver> {
         &self.result_receiver
     }

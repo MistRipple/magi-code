@@ -8,7 +8,11 @@ use magi_core::{LeaseId, Task, TaskCompletionAttempt, TaskId};
 use magi_orchestrator::task_store::TaskLease;
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use std::sync::{Arc, Mutex};
-use std::{collections::HashSet, future::Future, pin::Pin};
+use std::{
+    collections::{HashSet, VecDeque},
+    future::Future,
+    pin::Pin,
+};
 
 /// The outcome of a single `run_cycle` iteration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,10 +86,10 @@ pub enum TaskOutcome {
     Failed { error: String },
 }
 
-/// Trait for receiving execution results from workers.
+/// 接收 Worker 执行结果。
 ///
-/// The Runner calls `poll_results` at the start of each cycle to collect
-/// any results that have arrived since the last cycle.
+/// `poll_results` 仅供没有主动完成通知目标的嵌入式 Runner 使用。生产装配会安装
+/// completion sink，结果立即交付，不再等待下一轮调度循环。
 pub trait TaskResultReceiver: Send + Sync {
     /// 生产运行时若返回 true，Worker 结果已经由主动完成通知提交，Runner
     /// 不应再通过周期轮询消费同一结果。
@@ -105,23 +109,25 @@ pub trait TaskCompletionSink: Send + Sync {
     fn notify(&self, result: TaskResult);
 }
 
-/// A result receiver that collects results pushed externally (e.g. from a
-/// `StatusChangeCallback` on the TaskStore) and returns them when polled.
+#[derive(Default)]
+struct CompletionReceiverState {
+    results: Vec<TaskResult>,
+    sink: Option<Arc<dyn TaskCompletionSink>>,
+    seen: HashSet<(TaskId, LeaseId)>,
+    notifications: VecDeque<TaskResult>,
+    notifying: bool,
+}
+
+/// 接收外部推送结果（例如来自 TaskStore 的 `StatusChangeCallback`）。
 ///
-/// This is the production receiver wired through `RunnerManager`.  When a
-/// task transitions to a terminal state (Completed/Failed) the status-change
-/// callback pushes a `TaskResult` into this receiver so the Runner's
-/// `apply_results` step can process it on the next cycle.
+/// 没有主动 completion sink 时，结果会进入嵌入式 Runner 的兼容轮询队列；安装 sink
+/// 后，已经缓冲的结果会在返回前交给 sink，切换装配模式不会遗留终态结果。
 ///
-/// Results are deduplicated by task ID and lease ID. A recovered task may have
-/// an old execution result arrive after a new lease has started; the two results
-/// must remain distinguishable so the Runner can reject only the stale lease.
-/// Call `clear_task_result_state` when a task is reset to a non-terminal state
-/// so buffered terminal results from earlier execution rounds are removed.
+/// 结果按 task ID 和 lease ID 去重。恢复后的任务可能在新租约建立后收到旧执行结果；
+/// 两类结果保持可区分，以便 Runner 只拒绝旧租约。任务回到非终态时调用
+/// `clear_task_result_state` 清理此前执行轮次的缓冲终态结果。
 pub struct EventBasedResultReceiver {
-    results: Mutex<Vec<TaskResult>>,
-    seen: Mutex<HashSet<(TaskId, LeaseId)>>,
-    completion_sink: Mutex<Option<Arc<dyn TaskCompletionSink>>>,
+    state: Mutex<CompletionReceiverState>,
 }
 
 impl Default for EventBasedResultReceiver {
@@ -133,19 +139,31 @@ impl Default for EventBasedResultReceiver {
 impl EventBasedResultReceiver {
     pub fn new() -> Self {
         Self {
-            results: Mutex::new(Vec::new()),
-            seen: Mutex::new(HashSet::new()),
-            completion_sink: Mutex::new(None),
+            state: Mutex::new(CompletionReceiverState::default()),
         }
     }
 
     /// 配置主动完成通知目标。配置后新结果直接进入 durable completion path，
-    /// 不再等待 Runner 的下一轮 `poll_results`。
+    /// 不再等待 Runner 的下一轮 `poll_results`；已经缓冲的结果也会先交给该目标。
     pub fn set_completion_sink(&self, sink: Arc<dyn TaskCompletionSink>) {
-        *self
-            .completion_sink
-            .lock()
-            .expect("EventBasedResultReceiver completion sink lock poisoned") = Some(sink);
+        let should_notify = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("EventBasedResultReceiver state lock poisoned");
+            state.sink = Some(sink);
+            let pending = std::mem::take(&mut state.results);
+            state.notifications.extend(pending);
+            if state.notifications.is_empty() || state.notifying {
+                false
+            } else {
+                state.notifying = true;
+                true
+            }
+        };
+        if should_notify {
+            self.drain_notifications();
+        }
     }
 
     /// Push a result into the buffer.  Called from the TaskStore's
@@ -154,27 +172,58 @@ impl EventBasedResultReceiver {
     /// If a result for this `task_id` has already been pushed, the call is a
     /// no-op — this prevents feedback loops.
     pub fn push_result(&self, result: TaskResult) {
-        let mut seen = self
-            .seen
-            .lock()
-            .expect("EventBasedResultReceiver seen lock poisoned");
-        if !seen.insert((result.task_id.clone(), result.lease_id.clone())) {
-            return;
+        let should_notify = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("EventBasedResultReceiver state lock poisoned");
+            if !state
+                .seen
+                .insert((result.task_id.clone(), result.lease_id.clone()))
+            {
+                return;
+            }
+            if state.sink.is_some() {
+                state.notifications.push_back(result);
+                if state.notifying {
+                    false
+                } else {
+                    state.notifying = true;
+                    true
+                }
+            } else {
+                state.results.push(result);
+                false
+            }
+        };
+        if should_notify {
+            self.drain_notifications();
         }
-        let sink = self
-            .completion_sink
-            .lock()
-            .expect("EventBasedResultReceiver completion sink lock poisoned")
-            .clone();
-        drop(seen);
-        if let Some(sink) = sink {
+    }
+
+    /// 逐个交付已排队的结果。通知回调在状态锁外执行，因此允许回调重入
+    /// `push_result` 或 `set_completion_sink`；`notifying` 保证重入结果仍按入队顺序
+    /// 由当前 drain 循环继续交付。
+    fn drain_notifications(&self) {
+        loop {
+            let (sink, result) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("EventBasedResultReceiver state lock poisoned");
+                let Some(result) = state.notifications.pop_front() else {
+                    state.notifying = false;
+                    return;
+                };
+                let Some(sink) = state.sink.as_ref().cloned() else {
+                    state.results.push(result);
+                    state.notifying = false;
+                    return;
+                };
+                (sink, result)
+            };
             sink.notify(result);
-            return;
         }
-        self.results
-            .lock()
-            .expect("EventBasedResultReceiver results lock poisoned")
-            .push(result);
     }
 
     /// Clear all buffered terminal-result state for a task.
@@ -182,37 +231,154 @@ impl EventBasedResultReceiver {
     /// 恢复链路会把 Failed 任务重新放回非终态。如果这里只清 dedup 标记而不清
     /// 队列，Runner 下一轮会先消费旧 Failed 结果，把刚恢复的任务再次打失败。
     pub fn clear_task_result_state(&self, task_id: &TaskId) {
-        self.seen
+        let mut state = self
+            .state
             .lock()
-            .expect("EventBasedResultReceiver seen lock poisoned")
+            .expect("EventBasedResultReceiver state lock poisoned");
+        state
+            .seen
             .retain(|(seen_task_id, _)| seen_task_id != task_id);
-        self.results
-            .lock()
-            .expect("EventBasedResultReceiver results lock poisoned")
+        state.results.retain(|result| &result.task_id != task_id);
+        state
+            .notifications
             .retain(|result| &result.task_id != task_id);
     }
 }
 
 impl TaskResultReceiver for EventBasedResultReceiver {
     fn uses_active_completion_sink(&self) -> bool {
-        self.completion_sink
+        self.state
             .lock()
-            .expect("EventBasedResultReceiver completion sink lock poisoned")
+            .expect("EventBasedResultReceiver state lock poisoned")
+            .sink
             .is_some()
     }
 
     fn poll_results(&self) -> Vec<TaskResult> {
-        let mut guard = self
-            .results
+        let mut state = self
+            .state
             .lock()
-            .expect("EventBasedResultReceiver results lock poisoned");
-        std::mem::take(&mut *guard)
+            .expect("EventBasedResultReceiver state lock poisoned");
+        std::mem::take(&mut state.results)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingCompletionSink {
+        results: Mutex<Vec<TaskResult>>,
+    }
+
+    impl TaskCompletionSink for RecordingCompletionSink {
+        fn notify(&self, result: TaskResult) {
+            self.results
+                .lock()
+                .expect("recording completion sink lock poisoned")
+                .push(result);
+        }
+    }
+
+    struct ReentrantCompletionSink {
+        receiver: Mutex<Option<Arc<EventBasedResultReceiver>>>,
+        lease_ids: Mutex<Vec<String>>,
+    }
+
+    impl ReentrantCompletionSink {
+        fn new() -> Self {
+            Self {
+                receiver: Mutex::new(None),
+                lease_ids: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TaskCompletionSink for ReentrantCompletionSink {
+        fn notify(&self, result: TaskResult) {
+            if result.lease_id == LeaseId::new("lease-buffered-before-sink") {
+                let receiver = self
+                    .receiver
+                    .lock()
+                    .expect("reentrant receiver lock poisoned")
+                    .clone()
+                    .expect("reentrant receiver should be installed");
+                receiver.push_result(TaskResult {
+                    task_id: TaskId::new("task-reentrant"),
+                    lease_id: LeaseId::new("lease-reentrant"),
+                    outcome: TaskOutcome::Failed {
+                        error: "reentrant result".to_string(),
+                    },
+                });
+            }
+            self.lease_ids
+                .lock()
+                .expect("reentrant lease ids lock poisoned")
+                .push(result.lease_id.to_string());
+        }
+    }
+
+    #[test]
+    fn installing_active_sink_flushes_buffered_results_without_polling() {
+        let receiver = EventBasedResultReceiver::new();
+        let task_id = TaskId::new("task-buffered-before-sink");
+        receiver.push_result(TaskResult {
+            task_id: task_id.clone(),
+            lease_id: LeaseId::new("lease-buffered-before-sink"),
+            outcome: TaskOutcome::Failed {
+                error: "buffered failure".to_string(),
+            },
+        });
+
+        let sink = Arc::new(RecordingCompletionSink::default());
+        receiver.set_completion_sink(sink.clone());
+
+        assert!(receiver.poll_results().is_empty());
+        let results = sink
+            .results
+            .lock()
+            .expect("recording completion sink lock poisoned");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, task_id);
+        assert_eq!(
+            results[0].lease_id,
+            LeaseId::new("lease-buffered-before-sink")
+        );
+    }
+
+    #[test]
+    fn reentrant_sink_keeps_buffered_result_before_new_result() {
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        receiver.push_result(TaskResult {
+            task_id: TaskId::new("task-buffered-before-sink"),
+            lease_id: LeaseId::new("lease-buffered-before-sink"),
+            outcome: TaskOutcome::Failed {
+                error: "buffered failure".to_string(),
+            },
+        });
+
+        let sink = Arc::new(ReentrantCompletionSink::new());
+        *sink
+            .receiver
+            .lock()
+            .expect("reentrant receiver lock poisoned") = Some(Arc::clone(&receiver));
+        receiver.set_completion_sink(sink.clone());
+
+        let lease_ids = sink
+            .lease_ids
+            .lock()
+            .expect("reentrant lease ids lock poisoned")
+            .clone();
+        assert_eq!(
+            lease_ids,
+            vec![
+                "lease-buffered-before-sink".to_string(),
+                "lease-reentrant".to_string()
+            ]
+        );
+        assert!(receiver.poll_results().is_empty());
+    }
 
     #[test]
     fn clear_task_result_state_drops_stale_terminal_result() {
