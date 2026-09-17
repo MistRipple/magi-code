@@ -68,7 +68,8 @@ struct ProviderState {
     behavior: Option<ProviderBehavior>,
     requests: Vec<ModelInvocationRequest>,
     deltas: Vec<ModelStreamingDelta>,
-    tool_round_emitted: bool,
+    tool_round_emitted: usize,
+    tool_round_limit: usize,
     agent_spawn_emitted: usize,
     transient_failures_remaining: usize,
 }
@@ -196,7 +197,27 @@ impl HarnessModelClient {
             arguments: arguments.into(),
             response: response.into(),
         });
-        state.tool_round_emitted = false;
+        state.tool_round_emitted = 0;
+        state.tool_round_limit = 1;
+    }
+
+    pub fn set_tool_then_completed_twice(
+        &self,
+        tool_name: impl Into<String>,
+        arguments: impl Into<String>,
+        response: impl Into<String>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("harness provider state should hold");
+        state.behavior = Some(ProviderBehavior::ToolThenCompleted {
+            tool_name: tool_name.into(),
+            arguments: arguments.into(),
+            response: response.into(),
+        });
+        state.tool_round_emitted = 0;
+        state.tool_round_limit = 2;
     }
 
     pub fn requests(&self) -> Vec<ModelInvocationRequest> {
@@ -455,7 +476,7 @@ impl HarnessModelClient {
                 arguments,
                 response,
             } => {
-                let emit_tool_round = {
+                let tool_round_index = {
                     let mut state = self
                         .state
                         .lock()
@@ -464,20 +485,23 @@ impl HarnessModelClient {
                     let tool_surface_available = request.tools.as_ref().is_some_and(|tools| {
                         tools.iter().any(|tool| tool.function.name == tool_name)
                     });
-                    if !classifier_request && tool_surface_available && !state.tool_round_emitted {
-                        state.tool_round_emitted = true;
-                        true
+                    if !classifier_request
+                        && tool_surface_available
+                        && state.tool_round_emitted < state.tool_round_limit
+                    {
+                        state.tool_round_emitted += 1;
+                        Some(state.tool_round_emitted)
                     } else {
-                        false
+                        None
                     }
                 };
-                if emit_tool_round {
+                if let Some(tool_round_index) = tool_round_index {
                     return Ok(ModelResponse {
                         status: ModelResponseStatus::RequiresToolExecution,
                         content: None,
                         thinking: None,
                         tool_calls: vec![ChatToolCall {
-                            id: "harness-tool-call-1".to_string(),
+                            id: format!("harness-tool-call-{tool_round_index}"),
                             kind: "function".to_string(),
                             function: magi_bridge_client::ChatToolFunction {
                                 name: tool_name,
@@ -1346,6 +1370,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_access_profile_executes_write_tool_without_approval() {
+        let harness = MagiTurnHarness::new_task("完全授权写入完成");
+        let workspace_root = tempfile::tempdir().expect("full access workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-full-access-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("full access workspace should register");
+        let session_id = SessionId::new("harness-full-access-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "完全授权写入验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("full access session should create");
+        let target = workspace_root.path().join("full-access.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf full_access > {}", target.display())
+            })
+            .to_string(),
+            "完全授权后的任务已完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 执行一个完全授权的写入命令",
+                "harness-full-access-request",
+                "harness-full-access-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("full access task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("full access task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("full access task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("full access write should be readable"),
+            "full_access"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "完全授权写入不得产生 pending 审批"
+        );
+        assert!(
+            !harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "tool.approval.requested"),
+            "完全授权写入不得发布审批请求"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "shell_exec" && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "完全授权写入应执行工具轮并请求一次最终答复"
+        );
+    }
+
+    #[tokio::test]
     async fn restricted_profile_approval_allows_original_write_tool_once() {
         let harness = MagiTurnHarness::new_task("审批后完成");
         let workspace_root = tempfile::tempdir().expect("approval workspace should create");
@@ -1542,6 +1656,111 @@ mod tests {
                 .pending_for_session(&session_id)
                 .is_empty(),
             "审批拒绝后不得遗留 pending 请求"
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_allow_for_turn_reuses_write_tool_grant() {
+        let harness = MagiTurnHarness::new_task("按 Turn 授权完成");
+        let workspace_root = tempfile::tempdir().expect("turn grant workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-turn-grant-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("turn grant workspace should register");
+        let session_id = SessionId::new("harness-turn-grant-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "按 Turn 授权验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("turn grant session should create");
+        let target = workspace_root.path().join("turn-grant.txt");
+        harness.provider.set_tool_then_completed_twice(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf turn_grant > {}", target.display())
+            })
+            .to_string(),
+            "按 Turn 授权后的任务已完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 两次完成同一 Turn 内的写入操作",
+                "harness-turn-grant-request",
+                "harness-turn-grant-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("turn grant task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("turn grant task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("turn grant task should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "allow_for_turn",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("turn grant write should be readable"),
+            "turn_grant"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "按 Turn 授权完成后不得遗留 pending 请求"
+        );
+        let approval_requests = harness
+            .events_for(&session_id)
+            .into_iter()
+            .filter(|event| event.event_type == "tool.approval.requested")
+            .count();
+        assert_eq!(approval_requests, 1, "同一 Turn 的同名工具只需审批一次");
+        let tool_calls = turn
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind == CanonicalTurnItemKind::ToolCall
+                    && item
+                        .tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.name == "shell_exec")
+            })
+            .count();
+        assert_eq!(tool_calls, 2, "按 Turn 授权后应执行两次写工具调用");
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            3,
+            "两次工具轮后应仅请求一次最终答复"
         );
     }
 
