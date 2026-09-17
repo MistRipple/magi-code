@@ -111,10 +111,9 @@ pub trait TaskCompletionSink: Send + Sync {
 
 #[derive(Default)]
 struct CompletionReceiverState {
-    results: Vec<TaskResult>,
+    pending: VecDeque<TaskResult>,
     sink: Option<Arc<dyn TaskCompletionSink>>,
     seen: HashSet<(TaskId, LeaseId)>,
-    notifications: VecDeque<TaskResult>,
     notifying: bool,
 }
 
@@ -152,9 +151,7 @@ impl EventBasedResultReceiver {
                 .lock()
                 .expect("EventBasedResultReceiver state lock poisoned");
             state.sink = Some(sink);
-            let pending = std::mem::take(&mut state.results);
-            state.notifications.extend(pending);
-            if state.notifications.is_empty() || state.notifying {
+            if state.pending.is_empty() || state.notifying {
                 false
             } else {
                 state.notifying = true;
@@ -166,11 +163,9 @@ impl EventBasedResultReceiver {
         }
     }
 
-    /// Push a result into the buffer.  Called from the TaskStore's
-    /// `StatusChangeCallback` when a task reaches a terminal state.
+    /// 接收 TaskStore 在任务进入终态时通过 `StatusChangeCallback` 推送的结果。
     ///
-    /// If a result for this `task_id` has already been pushed, the call is a
-    /// no-op — this prevents feedback loops.
+    /// 同一 `task_id` 和 `lease_id` 的结果只接受一次，避免形成反馈循环。
     pub fn push_result(&self, result: TaskResult) {
         let should_notify = {
             let mut state = self
@@ -184,7 +179,7 @@ impl EventBasedResultReceiver {
                 return;
             }
             if state.sink.is_some() {
-                state.notifications.push_back(result);
+                state.pending.push_back(result);
                 if state.notifying {
                     false
                 } else {
@@ -192,7 +187,7 @@ impl EventBasedResultReceiver {
                     true
                 }
             } else {
-                state.results.push(result);
+                state.pending.push_back(result);
                 false
             }
         };
@@ -211,12 +206,12 @@ impl EventBasedResultReceiver {
                     .state
                     .lock()
                     .expect("EventBasedResultReceiver state lock poisoned");
-                let Some(result) = state.notifications.pop_front() else {
+                let Some(result) = state.pending.pop_front() else {
                     state.notifying = false;
                     return;
                 };
                 let Some(sink) = state.sink.as_ref().cloned() else {
-                    state.results.push(result);
+                    state.pending.push_front(result);
                     state.notifying = false;
                     return;
                 };
@@ -226,7 +221,7 @@ impl EventBasedResultReceiver {
         }
     }
 
-    /// Clear all buffered terminal-result state for a task.
+    /// 清理指定任务尚未交付的终态结果状态。
     ///
     /// 恢复链路会把 Failed 任务重新放回非终态。如果这里只清 dedup 标记而不清
     /// 队列，Runner 下一轮会先消费旧 Failed 结果，把刚恢复的任务再次打失败。
@@ -238,10 +233,7 @@ impl EventBasedResultReceiver {
         state
             .seen
             .retain(|(seen_task_id, _)| seen_task_id != task_id);
-        state.results.retain(|result| &result.task_id != task_id);
-        state
-            .notifications
-            .retain(|result| &result.task_id != task_id);
+        state.pending.retain(|result| &result.task_id != task_id);
     }
 }
 
@@ -259,7 +251,10 @@ impl TaskResultReceiver for EventBasedResultReceiver {
             .state
             .lock()
             .expect("EventBasedResultReceiver state lock poisoned");
-        std::mem::take(&mut state.results)
+        if state.sink.is_some() {
+            return Vec::new();
+        }
+        std::mem::take(&mut state.pending).into_iter().collect()
     }
 }
 
