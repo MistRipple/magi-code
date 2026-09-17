@@ -61,10 +61,6 @@ enum ProviderBehavior {
         error: String,
     },
     HoldForCancellation,
-    PermissionBlockedWriteTool {
-        tool_name: String,
-        arguments: String,
-    },
 }
 
 #[derive(Default)]
@@ -75,7 +71,6 @@ struct ProviderState {
     tool_round_emitted: bool,
     agent_spawn_emitted: usize,
     transient_failures_remaining: usize,
-    permission_blocked_write_calls: usize,
 }
 
 /// 可观测的真流式 Provider 替身。
@@ -184,22 +179,6 @@ impl HarnessModelClient {
             .lock()
             .expect("harness provider state should hold")
             .behavior = Some(ProviderBehavior::HoldForCancellation);
-    }
-
-    pub fn set_permission_blocked_write_tool(
-        &self,
-        tool_name: impl Into<String>,
-        arguments: impl Into<String>,
-    ) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("harness provider state should hold");
-        state.behavior = Some(ProviderBehavior::PermissionBlockedWriteTool {
-            tool_name: tool_name.into(),
-            arguments: arguments.into(),
-        });
-        state.permission_blocked_write_calls = 0;
     }
 
     pub fn set_tool_then_completed(
@@ -339,54 +318,6 @@ impl HarnessModelClient {
                 message,
             }),
             ProviderBehavior::HoldForCancellation => Ok(ModelResponse::completed("")),
-            ProviderBehavior::PermissionBlockedWriteTool {
-                tool_name,
-                arguments,
-            } => {
-                let classifier_request = request.prompt.contains("Session Turn 编排分类器");
-                let mut tool_surface_available = request
-                    .tools
-                    .as_ref()
-                    .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == tool_name));
-                if !tool_surface_available && !classifier_request {
-                    tool_surface_available = request.tools.as_ref().is_some_and(|tools| {
-                        tools.iter().any(|tool| tool.function.name == "file_write")
-                    });
-                }
-                if !classifier_request && tool_surface_available {
-                    let call_index = {
-                        let mut state = self
-                            .state
-                            .lock()
-                            .expect("harness provider state should hold");
-                        state.permission_blocked_write_calls =
-                            state.permission_blocked_write_calls.saturating_add(1);
-                        state.permission_blocked_write_calls
-                    };
-                    return Ok(ModelResponse {
-                        status: ModelResponseStatus::RequiresToolExecution,
-                        content: None,
-                        thinking: None,
-                        tool_calls: vec![ChatToolCall {
-                            id: format!("harness-permission-blocked-write-call-{call_index}"),
-                            kind: "function".to_string(),
-                            function: magi_bridge_client::ChatToolFunction {
-                                name: tool_name,
-                                arguments,
-                            },
-                        }],
-                        usage: None,
-                        finish_reason: Some("tool_calls".to_string()),
-                        provider_context: Vec::new(),
-                    });
-                }
-                let response = if classifier_request {
-                    "权限阻塞任务已停止"
-                } else {
-                    "权限阻塞任务已停止"
-                };
-                Ok(ModelResponse::completed(response))
-            }
             ProviderBehavior::AgentSpawnThenWait {
                 response,
                 child_count,
@@ -530,10 +461,9 @@ impl HarnessModelClient {
                         .lock()
                         .expect("harness provider state should hold");
                     let classifier_request = request.prompt.contains("Session Turn 编排分类器");
-                    let tool_surface_available = request
-                        .tools
-                        .as_ref()
-                        .is_some_and(|tools| !tools.is_empty());
+                    let tool_surface_available = request.tools.as_ref().is_some_and(|tools| {
+                        tools.iter().any(|tool| tool.function.name == tool_name)
+                    });
                     if !classifier_request && tool_surface_available && !state.tool_round_emitted {
                         state.tool_round_emitted = true;
                         true
@@ -1083,7 +1013,77 @@ fn register_git_workspace(harness: &MagiTurnHarness) -> (magi_core::WorkspaceId,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use magi_session_store::CanonicalTurnStatus;
+
+    async fn resolve_tool_approval_via_http(
+        harness: &MagiTurnHarness,
+        session_id: &SessionId,
+        workspace_id: &magi_core::WorkspaceId,
+        workspace_path: &Path,
+        approval_id: &str,
+        decision: &str,
+    ) {
+        let response = crate::routes::build_router(harness.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/tool-approval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "workspaceId": workspace_id,
+                            "workspacePath": workspace_path.display().to_string(),
+                            "approvalId": approval_id,
+                            "decision": decision,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("approval request should build"),
+            )
+            .await
+            .expect("approval route should respond");
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("approval error body should read");
+            panic!(
+                "approval route should respond 200, got {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    async fn wait_for_pending_tool_approval(
+        harness: &MagiTurnHarness,
+        session_id: &SessionId,
+    ) -> magi_conversation_runtime::PendingToolApproval {
+        for _ in 0..200 {
+            if let Some(pending) = harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(session_id)
+                .into_iter()
+                .next()
+            {
+                return pending;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Turn {session_id} 未在测试窗口内产生工具审批请求");
+    }
+
+    fn non_classifier_provider_request_count(harness: &MagiTurnHarness) -> usize {
+        harness
+            .provider
+            .requests()
+            .into_iter()
+            .filter(|request| !request.prompt.contains("Session Turn 编排分类器"))
+            .count()
+    }
 
     #[tokio::test]
     async fn real_turn_service_streams_and_projects_without_task() {
@@ -1300,12 +1300,13 @@ mod tests {
             )
             .expect("permission session should create");
         let target = workspace_root.path().join("should-not-write.txt");
-        harness.provider.set_permission_blocked_write_tool(
+        harness.provider.set_tool_then_completed(
             "shell_exec",
             serde_json::json!({
                 "command": format!("printf blocked > {}", target.display())
             })
             .to_string(),
+            "不会执行受限写入",
         );
         let response = harness
             .submit_workspace_task_with_access_profile(
@@ -1342,6 +1343,206 @@ mod tests {
                     .is_some_and(|tool| tool.name == "shell_exec")
         }));
         assert_eq!(harness.provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_approval_allows_original_write_tool_once() {
+        let harness = MagiTurnHarness::new_task("审批后完成");
+        let workspace_root = tempfile::tempdir().expect("approval workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-approval-allow-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("approval workspace should register");
+        let session_id = SessionId::new("harness-approval-allow-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "权限审批允许验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("approval session should create");
+        let target = workspace_root.path().join("approval-allowed.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf approved > {}", target.display())
+            })
+            .to_string(),
+            "权限审批后的任务已完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 执行一个命令并在审批后汇总结果",
+                "harness-approval-allow-request",
+                "harness-approval-allow-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("restricted approval task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("approval task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("approval task should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "shell_exec");
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "tool.approval.requested"),
+            "真实工具执行必须发布审批请求事件"
+        );
+
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("approved write should be readable"),
+            "approved"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "审批允许后不得遗留 pending 请求"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "tool.approval.resolved"),
+            "真实审批路由必须发布 resolved 事件"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "允许原始调用后只应有工具轮和一次最终答复轮"
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_approval_denial_fails_without_repeating_write_tool() {
+        let harness = MagiTurnHarness::new_task("不会执行被拒绝写入");
+        let workspace_root = tempfile::tempdir().expect("approval workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-approval-deny-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("approval workspace should register");
+        let session_id = SessionId::new("harness-approval-deny-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "权限审批拒绝验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("approval session should create");
+        let target = workspace_root.path().join("approval-denied.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf denied > {}", target.display())
+            })
+            .to_string(),
+            "不会执行被拒绝写入",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 执行一个命令但必须等待用户审批",
+                "harness-approval-deny-request",
+                "harness-approval-deny-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("restricted approval task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("approval task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("approval task should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "deny",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(!target.exists(), "用户拒绝后不得产生写入副作用");
+        assert!(
+            turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::ToolCall
+                    && item.tool.as_ref().is_some_and(|tool| {
+                        tool.name == "shell_exec"
+                            && tool
+                                .error
+                                .as_deref()
+                                .is_some_and(|error| error.contains("拒绝"))
+                    })
+            }),
+            "拒绝结果必须写入 canonical ToolCall"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            1,
+            "拒绝不可重试的写工具后不得再次请求 Provider"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "审批拒绝后不得遗留 pending 请求"
+        );
     }
 
     #[tokio::test]
