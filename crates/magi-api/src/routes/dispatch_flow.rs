@@ -6,8 +6,7 @@ use magi_event_bus::{EventContext, EventEnvelope};
 use serde_json::json;
 
 use super::{
-    browser::resolve_browser_annotation_context,
-    conversation_bridge::ingest_user_input_to_conversation, monotonic_accepted_at, new_session_id,
+    browser::resolve_browser_annotation_context, monotonic_accepted_at, new_session_id,
     session_scope::resolve_session_workspace_binding,
 };
 use crate::{
@@ -424,7 +423,6 @@ async fn execute_dispatch_submission(
             return Err(error);
         }
     };
-    ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     publish_session_user_message_event(
         state,
         &session_id,

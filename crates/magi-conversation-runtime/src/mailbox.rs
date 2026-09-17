@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use magi_core::UtcMillis;
 use serde::{Deserialize, Serialize};
 
-/// 用户信号载荷。独立 Turn 的入口由 routes 层注入 Conversation；当前活跃 Turn
-/// 的引导输入由 ConversationRegistry 的 session-turn input 通道单独承载。
+/// 用户信号载荷。普通 Session Turn 由 TurnService 直接接纳；当前活跃 Turn 的
+/// 引导输入由 SessionTurnCoordinator 的 turn-id 通道承载，不进入 Task mailbox。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserSignal {
     pub text: Option<String>,
@@ -18,7 +18,6 @@ pub struct UserSignal {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum MailboxAuthor {
-    User,
     Agent(String),
     System,
     Parent(String),
@@ -51,19 +50,14 @@ pub struct RuntimeSignal {
     pub enqueued_at: UtcMillis,
 }
 
-/// Mailbox 内的信号变体。
+/// Task Conversation mailbox 内的运行时信号。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MailboxItem {
-    User(UserSignal),
     Runtime(RuntimeSignal),
 }
 
 impl MailboxItem {
-    pub fn user(signal: UserSignal) -> Self {
-        Self::User(signal)
-    }
-
     pub fn runtime(signal: RuntimeSignal) -> Self {
         Self::Runtime(signal)
     }
@@ -85,24 +79,6 @@ impl Mailbox {
         self.items.push_back(item);
     }
 
-    /// 取出全部 user 信号，并保留非 user 运行时信号等待 Turn 边界消费。
-    pub fn drain_user_signals(&mut self) -> Vec<UserSignal> {
-        let mut signals = Vec::with_capacity(self.items.len());
-        let remainder: VecDeque<MailboxItem> = self
-            .items
-            .drain(..)
-            .filter_map(|item| match item {
-                MailboxItem::User(signal) => {
-                    signals.push(signal);
-                    None
-                }
-                other => Some(other),
-            })
-            .collect();
-        self.items = remainder;
-        signals
-    }
-
     /// Turn 边界唯一消费入口：按 FIFO 取出全部待处理信号。
     pub fn drain_all(&mut self) -> Vec<MailboxItem> {
         self.items.drain(..).collect()
@@ -113,54 +89,36 @@ impl Mailbox {
 mod tests {
     use super::*;
 
-    fn sample_signal(text: &str) -> UserSignal {
-        UserSignal {
-            text: Some(text.to_string()),
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            accepted_at: UtcMillis(0),
+    fn runtime_signal(text: &str, at: u64) -> RuntimeSignal {
+        RuntimeSignal {
+            author: MailboxAuthor::Parent("task-parent".to_string()),
+            kind: MailboxKind::Message,
+            trigger_turn: true,
+            payload: serde_json::json!({"text": text}),
+            enqueued_at: UtcMillis(at),
         }
     }
 
     #[test]
     fn push_and_drain_preserves_order() {
         let mut mailbox = Mailbox::new();
-        mailbox.push(MailboxItem::user(sample_signal("a")));
-        mailbox.push(MailboxItem::user(sample_signal("b")));
+        mailbox.push(MailboxItem::runtime(runtime_signal("a", 1)));
+        mailbox.push(MailboxItem::runtime(runtime_signal("b", 2)));
 
-        let signals = mailbox.drain_user_signals();
+        let signals = mailbox.drain_all();
         assert_eq!(signals.len(), 2);
-        assert_eq!(signals[0].text.as_deref(), Some("a"));
-        assert_eq!(signals[1].text.as_deref(), Some("b"));
-
-        // 再次 drain 应为空。
-        assert!(mailbox.drain_user_signals().is_empty());
+        assert!(
+            matches!(signals[0], MailboxItem::Runtime(ref signal) if signal.payload["text"] == "a")
+        );
+        assert!(
+            matches!(signals[1], MailboxItem::Runtime(ref signal) if signal.payload["text"] == "b")
+        );
+        assert!(mailbox.drain_all().is_empty());
     }
 
     #[test]
     fn drain_on_empty_returns_empty() {
         let mut mailbox = Mailbox::new();
-        assert!(mailbox.drain_user_signals().is_empty());
-    }
-
-    #[test]
-    fn drain_user_signals_preserves_runtime_items() {
-        let mut mailbox = Mailbox::new();
-        mailbox.push(MailboxItem::runtime(RuntimeSignal {
-            author: MailboxAuthor::Parent("task-parent".to_string()),
-            kind: MailboxKind::Message,
-            trigger_turn: true,
-            payload: serde_json::json!({"text": "继续执行"}),
-            enqueued_at: UtcMillis(10),
-        }));
-        mailbox.push(MailboxItem::user(sample_signal("user")));
-
-        let users = mailbox.drain_user_signals();
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].text.as_deref(), Some("user"));
-        let pending = mailbox.drain_all();
-        assert!(matches!(pending.as_slice(), [MailboxItem::Runtime(_)]));
         assert!(mailbox.drain_all().is_empty());
     }
 }

@@ -28,7 +28,7 @@ use magi_browser_authority::{
     BrowserSurfaceControlSnapshot,
 };
 use magi_conversation_runtime::{
-    CanonicalTurnEventSink, ConversationRegistry, TaskCompletionNotifier,
+    CanonicalTurnEventSink, ConversationRegistry, SessionTurnCoordinator, TaskCompletionNotifier,
     execution_admission::{ExecutionAdmissionController, ExecutionAdmissionSnapshot},
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
@@ -1779,6 +1779,10 @@ impl ApiState {
             Arc::clone(&event_bus),
         );
         let service_name = service_name.into();
+        let turn_coordinator = Arc::new(SessionTurnCoordinator::new());
+        let conversation_registry = Arc::new(ConversationRegistry::with_turn_coordinator(
+            Arc::clone(&turn_coordinator),
+        ));
         Self {
             service_info: ServiceInfo {
                 service_name,
@@ -1836,8 +1840,8 @@ impl ApiState {
             skill_dispatch_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             snapshot_manager: Arc::new(SnapshotManager::new()),
-            conversation_registry: Arc::new(ConversationRegistry::new()),
-            turn_coordinator: Arc::new(magi_conversation_runtime::SessionTurnCoordinator::new()),
+            conversation_registry,
+            turn_coordinator,
             terminal_sessions: crate::terminal_runtime::TerminalSessionManager::default(),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             role_configuration_lock: Arc::new(Mutex::new(())),

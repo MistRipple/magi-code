@@ -1722,6 +1722,7 @@ fn run_session_turn_execution_inner(
                     provider_context: Vec::new(),
                 });
                 let steers = conversation_registry
+                    .turn_coordinator()
                     .drain_session_turn_steers(&request.session_id, &request.turn_id);
                 append_session_turn_steers_to_messages(&mut messages, steers);
                 round = round.saturating_add(1);
@@ -1749,12 +1750,14 @@ fn run_session_turn_execution_inner(
                     provider_context: Vec::new(),
                 });
                 let steers = conversation_registry
+                    .turn_coordinator()
                     .drain_session_turn_steers(&request.session_id, &request.turn_id);
                 append_session_turn_steers_to_messages(&mut messages, steers);
                 round = round.saturating_add(1);
                 continue;
             }
             match conversation_registry
+                .turn_coordinator()
                 .take_session_turn_steers_or_close(&request.session_id, &request.turn_id)
             {
                 SessionTurnInputBoundary::Pending(steers) => {
@@ -1820,8 +1823,9 @@ fn run_session_turn_execution_inner(
             round = round.saturating_add(1);
             continue;
         }
-        let steers =
-            conversation_registry.drain_session_turn_steers(&request.session_id, &request.turn_id);
+        let steers = conversation_registry
+            .turn_coordinator()
+            .drain_session_turn_steers(&request.session_id, &request.turn_id);
         append_session_turn_steers_to_messages(&mut messages, steers);
         round = round.saturating_add(1);
     }
@@ -3743,6 +3747,7 @@ mod tests {
             .expect("current turn should be stored");
         let registry = ConversationRegistry::new();
         registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
             .expect("turn input should begin");
         let client = CancellingModelBridgeClient {
@@ -3881,6 +3886,7 @@ mod tests {
             .expect("识图模型配置必须可写入");
         let registry = ConversationRegistry::new();
         registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
             .expect("识图接管测试输入边界必须可创建");
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
@@ -3991,6 +3997,7 @@ mod tests {
             )
             .expect("识图后的纯文本轮次必须可写入");
         registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), follow_up_turn_id.clone())
             .expect("识图后的纯文本输入边界必须可创建");
         let follow_up_request = SessionTurnExecutionRequest {
@@ -4114,6 +4121,7 @@ mod tests {
                 .push(request);
             if call == 0 {
                 self.registry
+                    .turn_coordinator()
                     .try_steer_session_turn(
                         &self.session_id,
                         &self.turn_id,
@@ -4259,6 +4267,7 @@ mod tests {
             .expect("current turn should be stored");
         let registry = Arc::new(ConversationRegistry::new());
         registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
             .expect("turn input should begin");
         let client = SteeringModelBridgeClient {
@@ -4379,6 +4388,7 @@ mod tests {
             .expect("current turn should be stored");
         let registry = ConversationRegistry::new();
         registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
             .expect("turn input should begin");
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
@@ -4541,6 +4551,7 @@ mod tests {
             .expect("ordinary turn should be stored");
         let registry = ConversationRegistry::new();
         registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), ordinary_turn_id.clone())
             .expect("ordinary turn input should begin");
         let client = PlanFollowUpModelBridgeClient {

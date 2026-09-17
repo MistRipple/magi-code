@@ -6638,7 +6638,6 @@ mod tests {
                 );
                 assert_eq!(signal.payload["context_revision"], 1);
             }
-            other => panic!("expected runtime assignment message, got {other:?}"),
         }
     }
 

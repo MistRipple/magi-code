@@ -245,7 +245,7 @@ async fn pause_current_goal(
                 ApiError::internal_assembly("暂停 Goal 时中断当前 Turn 失败", error)
             })?;
         state
-            .conversation_registry
+            .turn_coordinator()
             .close_session_turn_input(&scope.session_id, &turn_id);
         if let Ok(attempt) = state
             .turn_coordinator()

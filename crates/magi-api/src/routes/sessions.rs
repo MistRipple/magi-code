@@ -804,12 +804,7 @@ pub(crate) async fn submit_session_turn_internal(
                 |branches| {
                     // S1：user 信号与恢复 runner 在同一个 session 临界区内串行提交，
                     // 下游一律读 signal.*，不再读 request.*。
-                    let signal = super::ingest_user_input_to_conversation(
-                        &state,
-                        &session_id,
-                        &request,
-                        accepted_at,
-                    );
+                    let signal = super::user_signal_from_request(&request, accepted_at);
                     persist_resumed_branch_user_input(
                         &state,
                         &session_id,
@@ -1105,7 +1100,7 @@ async fn submit_steer_current_turn_after_turn_commit(
         accepted_at,
     };
     state
-        .conversation_registry
+        .turn_coordinator()
         .try_steer_session_turn_with(&session_id, &expected_turn_id, signal, || {
             state
                 .turn_event_sink()
@@ -2761,7 +2756,7 @@ async fn submit_conversation_session_turn(
         }
     };
     if let Err(error) = state
-        .conversation_registry
+        .turn_coordinator()
         .begin_session_turn_input(session_id.clone(), turn_id.clone())
     {
         state.turn_coordinator().clear_session(&session_id);
@@ -3054,7 +3049,7 @@ fn schedule_conversation_execution(
                 }
             }
             state
-                .conversation_registry
+                .turn_coordinator()
                 .close_session_turn_input(&session_id, &turn_id);
             schedule_next_queued_regular_session_turn(state, session_id, None);
             return;
@@ -3129,7 +3124,7 @@ fn schedule_conversation_execution(
             }
         };
         state
-            .conversation_registry
+            .turn_coordinator()
             .close_session_turn_input(&session_id, &turn_id);
         // canonical mutation 已经在 terminal guard 内完成；只有本次执行真正写入了
         // 当前 Turn，Coordinator 才收口同一 attempt。取消或新 Turn 先提交时，迟到
@@ -4554,7 +4549,7 @@ async fn interrupt_session_turn(
         }
         if let Some(turn_id) = turn_id.as_deref() {
             state
-                .conversation_registry
+                .turn_coordinator()
                 .close_session_turn_input(&session_id, turn_id);
             if let Some(attempt) = coordinator_attempt.as_ref() {
                 if let Err(error) = state.turn_coordinator().execute_command(
@@ -5256,7 +5251,7 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
         }
     }
     state
-        .conversation_registry
+        .turn_coordinator()
         .close_session_turn_input(session_id, &current_turn.turn_id);
     if let Some(attempt) = coordinator_attempt.as_ref()
         && let Err(error) = state.turn_coordinator().execute_command(
@@ -7520,11 +7515,9 @@ mod tests {
             )
             .expect("current turn should persist");
         state
-            .conversation_registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-interrupt-canonical".to_string())
             .expect("turn input should begin");
-        crate::routes::begin_session_turn(&state, &session_id)
-            .expect("conversation turn should begin");
         let plan_store = seed_active_plan(
             &state.session_store,
             &session_id,
@@ -7582,11 +7575,15 @@ mod tests {
         let plan = plan_store.snapshot().expect("plan should remain visible");
         assert_eq!(plan.state, magi_core::PlanState::Paused);
         assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
-        assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
+        assert!(
+            !state
+                .turn_coordinator()
+                .close_session_turn_input(&session_id, "turn-interrupt-canonical")
+        );
     }
 
     #[tokio::test]
-    async fn close_session_cancels_active_turn_and_releases_conversation_slot() {
+    async fn close_session_cancels_active_turn_and_releases_turn_input() {
         let state = test_state();
         let workspace_id =
             register_workspace(&state, "workspace-close-active-turn", "close-active-turn");
@@ -7616,11 +7613,9 @@ mod tests {
             )
             .expect("current turn should persist");
         state
-            .conversation_registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id)
             .expect("turn input should begin");
-        crate::routes::begin_session_turn(&state, &session_id)
-            .expect("conversation turn should begin");
         let plan_store = seed_active_plan(
             &state.session_store,
             &session_id,
@@ -7659,7 +7654,11 @@ mod tests {
         let plan = plan_store.snapshot().expect("plan should remain visible");
         assert_eq!(plan.state, magi_core::PlanState::Paused);
         assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
-        assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
+        assert!(
+            !state
+                .turn_coordinator()
+                .close_session_turn_input(&session_id, "turn-close-active-turn")
+        );
     }
 
     #[tokio::test]
@@ -8234,7 +8233,7 @@ mod tests {
             )
             .expect("active turn should persist");
         let _active_input = state
-            .conversation_registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-session-steer".to_string());
         state
             .turn_coordinator()
@@ -8270,7 +8269,7 @@ mod tests {
         assert_eq!(body["steeredTurnId"], "turn-session-steer");
         assert_eq!(body["userMessageItemId"], "user-session-steer");
         let drained = state
-            .conversation_registry
+            .turn_coordinator()
             .drain_session_turn_steers(&session_id, "turn-session-steer");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].text.as_deref(), Some("优先收口，不要扩展"));
@@ -9682,7 +9681,7 @@ mod tests {
             )
             .expect("active turn should persist");
         state
-            .conversation_registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-queued-turn-guide".to_string())
             .expect("active turn input should begin");
         state
@@ -9717,7 +9716,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(body["queuedTurns"], json!([]));
         let steers = state
-            .conversation_registry
+            .turn_coordinator()
             .drain_session_turn_steers(&session_id, "turn-queued-turn-guide");
         assert_eq!(steers.len(), 1);
         assert_eq!(steers[0].text.as_deref(), Some("queued queue-guide-once"));
@@ -9744,7 +9743,7 @@ mod tests {
         assert_eq!(retry_body["queuedTurns"], json!([]));
         assert!(
             state
-                .conversation_registry
+                .turn_coordinator()
                 .drain_session_turn_steers(&session_id, "turn-queued-turn-guide")
                 .is_empty(),
             "恢复重试不得重复写入引导信号"
@@ -10940,7 +10939,6 @@ mod tests {
                 std::time::SystemTime::UNIX_EPOCH,
             )
             .expect("spawn edge should register");
-        state.conversation_registry.conversation_for(&session_id);
         state
             .conversation_registry
             .conversation_for_task(&session_id, &child_task.task_id);

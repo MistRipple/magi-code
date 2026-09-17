@@ -1,10 +1,10 @@
 use magi_core::SessionId;
 
 use crate::driver::{RoundOutcome, TurnDriver};
-use crate::mailbox::{Mailbox, MailboxItem, RuntimeSignal, UserSignal};
+use crate::mailbox::{Mailbox, MailboxItem, RuntimeSignal};
 use crate::turn::{Turn, TurnState, TurnTransitionError};
 
-/// 一个 Conversation 绑定一个 SessionId 与其 Mailbox + 当前 Turn 槽位。
+/// 一个 Task Conversation 绑定一个 SessionId 与其 Mailbox + 当前 Turn 槽位。
 ///
 /// S2 起 Conversation 持有"当前 Turn"槽位，并强制"同 Conversation 不并发"：
 /// 在已有未终态 Turn 时 `begin_turn` 会返回错误。
@@ -50,21 +50,10 @@ impl Conversation {
         &self.session_id
     }
 
-    /// 推入一个独立 Turn 的 user 信号。当前活跃 Turn 的引导输入不经过该
-    /// Mailbox，而由 ConversationRegistry 的 turn-id 绑定通道接收。
-    pub fn ingest_user_signal(&mut self, signal: UserSignal) {
-        self.mailbox.push(MailboxItem::user(signal));
-    }
-
     /// 推入运行时信号。代理回执、Coordinator 指令、系统 followup 等都通过
     /// Mailbox 进入下一次 Turn，而不是绕到事件总线里当作隐式业务通道。
     pub fn ingest_runtime_signal(&mut self, signal: RuntimeSignal) {
         self.mailbox.push(MailboxItem::runtime(signal));
-    }
-
-    /// 取出并消费 mailbox 中累积的 user 信号。
-    pub fn drain_user_signals(&mut self) -> Vec<UserSignal> {
-        self.mailbox.drain_user_signals()
     }
 
     /// Turn 边界的完整消费入口。driver 会把这批待处理信号注入下一轮 prompt。
@@ -220,39 +209,6 @@ impl std::error::Error for TurnAdvanceError {}
 mod tests {
     use super::*;
     use magi_core::UtcMillis;
-
-    fn sample_signal(text: &str) -> UserSignal {
-        UserSignal {
-            text: Some(text.to_string()),
-            request_id: Some(format!("req-{}", text)),
-            user_message_id: None,
-            placeholder_message_id: None,
-            accepted_at: UtcMillis(42),
-        }
-    }
-
-    #[test]
-    fn ingest_and_drain_yields_signal_in_order() {
-        let mut conv = Conversation::new(SessionId::new("session-1"));
-        conv.ingest_user_signal(sample_signal("hello"));
-        conv.ingest_user_signal(sample_signal("world"));
-
-        let signals = conv.drain_user_signals();
-        assert_eq!(signals.len(), 2);
-        assert_eq!(signals[0].text.as_deref(), Some("hello"));
-        assert_eq!(signals[1].text.as_deref(), Some("world"));
-        assert!(conv.drain_user_signals().is_empty());
-    }
-
-    #[test]
-    fn drain_again_yields_empty() {
-        let mut conv = Conversation::new(SessionId::new("session-2"));
-        conv.ingest_user_signal(sample_signal("once"));
-        let first = conv.drain_user_signals();
-        assert_eq!(first.len(), 1);
-        let second = conv.drain_user_signals();
-        assert!(second.is_empty());
-    }
 
     #[test]
     fn begin_turn_then_end_turn_releases_slot() {
@@ -435,7 +391,6 @@ mod tests {
         }
 
         let mut conv = Conversation::new(SessionId::new("s-mailbox"));
-        conv.ingest_user_signal(sample_signal("hello"));
         conv.ingest_runtime_signal(RuntimeSignal {
             author: crate::mailbox::MailboxAuthor::System,
             kind: crate::mailbox::MailboxKind::Followup,
@@ -447,7 +402,7 @@ mod tests {
         let outcome = conv
             .advance_turn(CapturingDriver { captured_len: 0 })
             .unwrap();
-        assert_eq!(outcome, 2);
+        assert_eq!(outcome, 1);
         assert!(conv.drain_mailbox_items().is_empty());
     }
 }

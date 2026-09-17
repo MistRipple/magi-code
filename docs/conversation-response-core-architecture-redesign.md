@@ -113,13 +113,13 @@ Profile 选择结果必须写入 Turn accepted 事件，后续执行器只能读
 - canonical turn；
 - TaskStore task status 和 lease；
 - ExecutionRegistry；
-- ConversationRegistry 的 session 输入通道；
+- SessionTurnCoordinator 的 steer 输入队列；
 - ConversationRegistry 的 task Conversation；
 - RunnerManager handle；
 - terminal observer；
 - `ThreadChatMessage` 模型历史。
 
-[registry.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-conversation-runtime/src/registry.rs:19) 同时维护 session Conversation 和 task Conversation。主线执行使用 task Conversation，而用户引导输入又使用 session turn input 通道，同一轮 Turn 没有一个统一的活动所有者。
+[registry.rs](/Users/xie/code/magi-rust-rewrite/crates/magi-conversation-runtime/src/registry.rs:19) 现在只为 task/worker 持有 Conversation；普通 Session Turn 由 SessionTurnCoordinator/TurnService 接纳，不再创建 session Conversation。steer 输入队列和工具授权已由 Coordinator 持有，Registry 仅提供窄转发以兼容 Task runtime 的依赖形态。
 
 ### 3.3 流式输出绑定同步完整写回
 
@@ -841,7 +841,7 @@ Coordinator
 | Runner 决定主 Turn 完成 | 删除，Coordinator 决定 |
 | terminal observer 二次收口 | 删除，终态直接从 Coordinator 产生 |
 | EventBasedResultReceiver 轮询结果 | 改为 TaskCompletionNotifier |
-| ConversationRegistry 同时维护 session/task Conversation | 收敛为 Session Coordinator 和 Task Runtime |
+| ConversationRegistry 同时维护 session/task Conversation | 已收敛为 task Conversation；session Turn 和 steer 队列由 Coordinator/TurnService 负责 |
 | 每个 delta 完整 canonical upsert | 改为 TurnStreamBuffer + TurnEventSink |
 | 全局 canonical commit lock | 改为 Session/分区级 writer |
 | TaskStore 回调中直接写 SessionStore | 改为提交后异步事件 |
@@ -920,7 +920,8 @@ Coordinator
 ### 17.7 旧实现清理与最终验收
 
 - [x] 普通 Chat 的旧 Task 化入口已删除。
-- [ ] 删除旧双 Conversation 生命周期和所有外部 current Turn 写入口。
+- [x] 删除 session Conversation 生命周期；`ConversationRegistry` 只保留 task/worker Conversation。
+- [ ] 删除所有外部 current Turn 写入口。
 - [x] 删除旧结果轮询与二次 finalizer 的生产职责。
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
 - [ ] 清理失效兼容字段、分支、注释和测试夹具。

@@ -3,7 +3,6 @@ mod agent_runs;
 mod appearance;
 mod browser;
 mod changes_files_tunnel;
-mod conversation_bridge;
 mod dispatch_flow;
 mod file_site;
 mod goals;
@@ -15,6 +14,7 @@ pub(crate) mod sessions;
 pub(crate) mod settings;
 mod terminal;
 mod tools;
+mod turn_input;
 mod workspace_vcs;
 mod workspaces;
 
@@ -93,15 +93,13 @@ use crate::{
 };
 use session_scope::{require_session_record_in_scope, resolve_explicit_session_scope};
 
-#[cfg(test)]
-use conversation_bridge::begin_session_turn;
-use conversation_bridge::ingest_user_input_to_conversation;
 pub(crate) use dispatch_flow::schedule_restored_session_task_dispatches;
 use dispatch_flow::{
     SessionTaskSubmissionInput, accept_goal_continuation_task_submission,
     accept_session_task_submission_at, dispatch_accepted_canonical_event,
     schedule_session_task_dispatch,
 };
+use turn_input::user_signal_from_request;
 
 pub fn build_router(state: ApiState) -> Router {
     let tunnel_manager = state.tunnel_manager.clone();

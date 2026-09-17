@@ -8,11 +8,13 @@ use magi_core::SessionId;
 use magi_session_store::{CanonicalTurn, CanonicalTurnStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::ToolApprovalRegistry;
+use crate::mailbox::UserSignal;
 use crate::turn_contract::TurnCommand;
 
 /// Turn 接纳时确定的执行级别。
@@ -173,10 +175,60 @@ struct FinishedTurn {
     turn_seq: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct SessionState {
     active: Option<ActiveTurn>,
     recent: HashMap<String, FinishedTurn>,
+}
+
+#[derive(Debug)]
+struct SessionTurnInputState {
+    turn_id: String,
+    pending: VecDeque<UserSignal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionTurnInputError {
+    AlreadyActive {
+        active_turn_id: String,
+    },
+    NoActiveTurn,
+    TurnMismatch {
+        active_turn_id: String,
+        expected_turn_id: String,
+    },
+}
+
+impl fmt::Display for SessionTurnInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive { active_turn_id } => {
+                write!(f, "session already has active input turn {active_turn_id}")
+            }
+            Self::NoActiveTurn => f.write_str("session has no active input turn"),
+            Self::TurnMismatch {
+                active_turn_id,
+                expected_turn_id,
+            } => write!(
+                f,
+                "active input turn {active_turn_id} does not match expected turn {expected_turn_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionTurnInputError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionTurnInputBoundary {
+    Pending(Vec<UserSignal>),
+    Closed,
+}
+
+#[derive(Debug)]
+pub enum SessionTurnInputCommitError<E> {
+    Input(SessionTurnInputError),
+    Commit(E),
 }
 
 fn status_transition_allowed(from: CoordinatorTurnStatus, to: CoordinatorTurnStatus) -> bool {
@@ -225,7 +277,7 @@ fn status_transition_allowed(from: CoordinatorTurnStatus, to: CoordinatorTurnSta
     )
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CoordinatorState {
     sessions: HashMap<SessionId, SessionState>,
 }
@@ -235,10 +287,14 @@ struct CoordinatorState {
 /// 每个 session 的命令在同一把状态锁内顺序执行；正文、事件和任务快照不在锁内写入，
 /// 因而不会把磁盘 IO 带进生命周期临界区。`recent` 只保存已完成 requestId 的轻量
 /// 身份，避免网络重试重新创建 Turn；正文仍从 SessionStore 读取。
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SessionTurnCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
     attempt_sequence: Arc<AtomicU64>,
+    /// 当前活跃 Turn 的 steer 输入由 Coordinator 持有，避免 ConversationRegistry
+    /// 同时成为 Session Turn 的第二个生命周期所有者。
+    session_turn_inputs: Arc<Mutex<HashMap<SessionId, SessionTurnInputState>>>,
+    tool_approvals: ToolApprovalRegistry,
 }
 
 impl SessionTurnCoordinator {
@@ -826,6 +882,150 @@ impl SessionTurnCoordinator {
             .ok_or(CoordinatorError::NoActiveTurn)
     }
 
+    pub fn tool_approvals(&self) -> &ToolApprovalRegistry {
+        &self.tool_approvals
+    }
+
+    /// 注册当前 Turn 的 steer 输入边界。Conversation profile 和 Task profile
+    /// 共用该边界，但 Task worker 的 mailbox 仍由 ConversationRegistry 按 task 持有。
+    pub fn begin_session_turn_input(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+    ) -> Result<(), SessionTurnInputError> {
+        let mut guard = self
+            .session_turn_inputs
+            .lock()
+            .expect("session turn input mutex poisoned");
+        if let Some(active) = guard.get(&session_id) {
+            return Err(SessionTurnInputError::AlreadyActive {
+                active_turn_id: active.turn_id.clone(),
+            });
+        }
+        self.tool_approvals.begin_turn(&session_id);
+        guard.insert(
+            session_id,
+            SessionTurnInputState {
+                turn_id,
+                pending: VecDeque::new(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn try_steer_session_turn(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &str,
+        signal: UserSignal,
+    ) -> Result<(), SessionTurnInputError> {
+        self.try_steer_session_turn_with(session_id, expected_turn_id, signal, || {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|error| match error {
+            SessionTurnInputCommitError::Input(error) => error,
+            SessionTurnInputCommitError::Commit(never) => match never {},
+        })
+    }
+
+    /// 在输入边界锁内先提交 canonical 用户项，再把 signal 放入 FIFO，保证 steer
+    /// 不会在写回和接收之间被另一轮 Turn 插入。
+    pub fn try_steer_session_turn_with<T, E, F>(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: &str,
+        signal: UserSignal,
+        commit: F,
+    ) -> Result<T, SessionTurnInputCommitError<E>>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        let mut guard = self
+            .session_turn_inputs
+            .lock()
+            .expect("session turn input mutex poisoned");
+        let active = guard
+            .get_mut(session_id)
+            .ok_or(SessionTurnInputCommitError::Input(
+                SessionTurnInputError::NoActiveTurn,
+            ))?;
+        if active.turn_id != expected_turn_id {
+            return Err(SessionTurnInputCommitError::Input(
+                SessionTurnInputError::TurnMismatch {
+                    active_turn_id: active.turn_id.clone(),
+                    expected_turn_id: expected_turn_id.to_string(),
+                },
+            ));
+        }
+        let committed = commit().map_err(SessionTurnInputCommitError::Commit)?;
+        active.pending.push_back(signal);
+        Ok(committed)
+    }
+
+    pub fn drain_session_turn_steers(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Vec<UserSignal> {
+        let mut guard = self
+            .session_turn_inputs
+            .lock()
+            .expect("session turn input mutex poisoned");
+        let Some(active) = guard.get_mut(session_id) else {
+            return Vec::new();
+        };
+        if active.turn_id != turn_id {
+            return Vec::new();
+        }
+        active.pending.drain(..).collect()
+    }
+
+    pub fn take_session_turn_steers_or_close(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> SessionTurnInputBoundary {
+        let mut guard = self
+            .session_turn_inputs
+            .lock()
+            .expect("session turn input mutex poisoned");
+        let Some(active) = guard.get_mut(session_id) else {
+            return SessionTurnInputBoundary::Closed;
+        };
+        if active.turn_id != turn_id {
+            return SessionTurnInputBoundary::Closed;
+        }
+        if active.pending.is_empty() {
+            guard.remove(session_id);
+            drop(guard);
+            self.tool_approvals.remove_turn(session_id, turn_id);
+            SessionTurnInputBoundary::Closed
+        } else {
+            SessionTurnInputBoundary::Pending(active.pending.drain(..).collect())
+        }
+    }
+
+    pub fn close_session_turn_input(&self, session_id: &SessionId, turn_id: &str) -> bool {
+        let mut guard = self
+            .session_turn_inputs
+            .lock()
+            .expect("session turn input mutex poisoned");
+        let removed = if guard
+            .get(session_id)
+            .is_some_and(|active| active.turn_id == turn_id)
+        {
+            guard.remove(session_id);
+            true
+        } else {
+            false
+        };
+        drop(guard);
+        if removed {
+            self.tool_approvals.remove_turn(session_id, turn_id);
+        }
+        removed
+    }
+
     pub fn active_profile(&self, session_id: &SessionId) -> Option<ExecutionProfile> {
         self.state
             .lock()
@@ -842,6 +1042,11 @@ impl SessionTurnCoordinator {
             .expect("turn coordinator state poisoned")
             .sessions
             .remove(session_id);
+        self.session_turn_inputs
+            .lock()
+            .expect("session turn input mutex poisoned")
+            .remove(session_id);
+        self.tool_approvals.remove_session(session_id);
     }
 }
 
@@ -1423,5 +1628,32 @@ mod tests {
             ),
             Ok(CoordinatorAdmission::Accepted(_))
         ));
+    }
+
+    #[test]
+    fn steer_input_is_cleared_with_coordinator_session_state() {
+        let coordinator = SessionTurnCoordinator::new();
+        let session = SessionId::new("session-coordinator-steer-input");
+        coordinator
+            .begin_session_turn_input(session.clone(), "turn-coordinator-steer".to_string())
+            .expect("Coordinator should own the steer input boundary");
+        coordinator
+            .try_steer_session_turn(
+                &session,
+                "turn-coordinator-steer",
+                UserSignal {
+                    text: Some("收口".to_string()),
+                    request_id: Some("request-coordinator-steer".to_string()),
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    accepted_at: magi_core::UtcMillis(1),
+                },
+            )
+            .expect("matching steer should be queued");
+        coordinator.clear_session(&session);
+        assert_eq!(
+            coordinator.take_session_turn_steers_or_close(&session, "turn-coordinator-steer"),
+            SessionTurnInputBoundary::Closed
+        );
     }
 }

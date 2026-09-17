@@ -5,71 +5,28 @@ use std::time::Duration;
 use magi_core::{SessionId, TaskId};
 
 use crate::conversation::Conversation;
-use crate::mailbox::{RuntimeSignal, UserSignal};
+use crate::mailbox::RuntimeSignal;
+use crate::session_turn_coordinator::SessionTurnCoordinator;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ConversationKey {
-    Session(SessionId),
     Task {
         session_id: SessionId,
         task_id: TaskId,
     },
 }
 
-/// 按 ConversationKey 持有 Conversation 实例。用户输入入口使用 session 级
-/// Conversation；任务执行入口使用 task 级 Conversation，确保不同 task 拥有独立
-/// Mailbox 与 Turn 并发边界。
+/// 按任务身份持有 Conversation 实例。Session 级 Turn 不再创建第二个
+/// Conversation 生命周期；只有 Task profile 的 worker 需要独立 mailbox 和
+/// TurnDriver 状态。
 #[derive(Debug, Default)]
 pub struct ConversationRegistry {
     inner: Mutex<HashMap<ConversationKey, Arc<Mutex<Conversation>>>>,
-    session_turn_inputs: Mutex<HashMap<SessionId, SessionTurnInputState>>,
+    /// Session Turn 的 steer 队列和工具授权由 Coordinator 持有；Registry 只管理
+    /// task/worker Conversation 与运行时信号通道。
+    turn_coordinator: Arc<SessionTurnCoordinator>,
     task_signal_channels: Mutex<HashMap<(SessionId, TaskId), VecDeque<RuntimeSignal>>>,
     task_signal_ready: Condvar,
-    tool_approvals: crate::ToolApprovalRegistry,
-}
-
-#[derive(Debug)]
-struct SessionTurnInputState {
-    turn_id: String,
-    pending: VecDeque<UserSignal>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SessionTurnInputError {
-    AlreadyActive {
-        active_turn_id: String,
-    },
-    NoActiveTurn,
-    TurnMismatch {
-        active_turn_id: String,
-        expected_turn_id: String,
-    },
-}
-
-impl std::fmt::Display for SessionTurnInputError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyActive { active_turn_id } => {
-                write!(f, "session already has active input turn {active_turn_id}")
-            }
-            Self::NoActiveTurn => f.write_str("session has no active input turn"),
-            Self::TurnMismatch {
-                active_turn_id,
-                expected_turn_id,
-            } => write!(
-                f,
-                "active input turn {active_turn_id} does not match expected turn {expected_turn_id}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SessionTurnInputError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SessionTurnInputBoundary {
-    Pending(Vec<UserSignal>),
-    Closed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,19 +41,18 @@ pub enum TaskSignalCommitError<E> {
     Commit(E),
 }
 
-#[derive(Debug)]
-pub enum SessionTurnInputCommitError<E> {
-    Input(SessionTurnInputError),
-    Commit(E),
-}
-
 impl ConversationRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn conversation_for(&self, session_id: &SessionId) -> Arc<Mutex<Conversation>> {
-        self.conversation_for_key(ConversationKey::Session(session_id.clone()), session_id)
+    pub fn with_turn_coordinator(turn_coordinator: Arc<SessionTurnCoordinator>) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            turn_coordinator,
+            task_signal_channels: Mutex::new(HashMap::new()),
+            task_signal_ready: Condvar::new(),
+        }
     }
 
     pub fn conversation_for_task(
@@ -140,150 +96,11 @@ impl ConversationRegistry {
     }
 
     pub fn tool_approvals(&self) -> &crate::ToolApprovalRegistry {
-        &self.tool_approvals
+        self.turn_coordinator.tool_approvals()
     }
 
-    /// 注册当前主会话 Turn 的引导输入通道。每个 session 同时只能有一个活跃
-    /// Turn，后续引导必须携带精确的 turn_id 才能进入该通道。
-    pub fn begin_session_turn_input(
-        &self,
-        session_id: SessionId,
-        turn_id: String,
-    ) -> Result<(), SessionTurnInputError> {
-        let mut guard = self
-            .session_turn_inputs
-            .lock()
-            .expect("session turn input mutex poisoned");
-        if let Some(active) = guard.get(&session_id) {
-            return Err(SessionTurnInputError::AlreadyActive {
-                active_turn_id: active.turn_id.clone(),
-            });
-        }
-        self.tool_approvals.begin_turn(&session_id);
-        guard.insert(
-            session_id,
-            SessionTurnInputState {
-                turn_id,
-                pending: VecDeque::new(),
-            },
-        );
-        Ok(())
-    }
-
-    /// 把引导输入追加到当前 Turn。expected_turn_id 是完成边界校验条件，禁止把
-    /// 已完成 Turn 的迟到输入串入下一轮。
-    pub fn try_steer_session_turn(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: &str,
-        signal: UserSignal,
-    ) -> Result<(), SessionTurnInputError> {
-        self.try_steer_session_turn_with(session_id, expected_turn_id, signal, || {
-            Ok::<(), std::convert::Infallible>(())
-        })
-        .map_err(|error| match error {
-            SessionTurnInputCommitError::Input(error) => error,
-            SessionTurnInputCommitError::Commit(never) => match never {},
-        })
-    }
-
-    /// 在持有 Turn 输入边界锁时先提交关联状态，再把信号加入 FIFO。该入口用于把
-    /// canonical 用户项写入与引导接收收敛为一次不可穿插的状态变更。
-    pub fn try_steer_session_turn_with<T, E, F>(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: &str,
-        signal: UserSignal,
-        commit: F,
-    ) -> Result<T, SessionTurnInputCommitError<E>>
-    where
-        F: FnOnce() -> Result<T, E>,
-    {
-        let mut guard = self
-            .session_turn_inputs
-            .lock()
-            .expect("session turn input mutex poisoned");
-        let active = guard
-            .get_mut(session_id)
-            .ok_or(SessionTurnInputCommitError::Input(
-                SessionTurnInputError::NoActiveTurn,
-            ))?;
-        if active.turn_id != expected_turn_id {
-            return Err(SessionTurnInputCommitError::Input(
-                SessionTurnInputError::TurnMismatch {
-                    active_turn_id: active.turn_id.clone(),
-                    expected_turn_id: expected_turn_id.to_string(),
-                },
-            ));
-        }
-        let committed = commit().map_err(SessionTurnInputCommitError::Commit)?;
-        active.pending.push_back(signal);
-        Ok(committed)
-    }
-
-    /// 在工具轮结束后读取当前已到达的引导，但保持 Turn 继续接收后续引导。
-    pub fn drain_session_turn_steers(
-        &self,
-        session_id: &SessionId,
-        turn_id: &str,
-    ) -> Vec<UserSignal> {
-        let mut guard = self
-            .session_turn_inputs
-            .lock()
-            .expect("session turn input mutex poisoned");
-        let Some(active) = guard.get_mut(session_id) else {
-            return Vec::new();
-        };
-        if active.turn_id != turn_id {
-            return Vec::new();
-        }
-        active.pending.drain(..).collect()
-    }
-
-    /// 模型准备结束当前 Turn 时的唯一边界操作：若已有引导则原子取出并继续；
-    /// 若没有引导则在同一把锁内关闭通道，使迟到引导明确失败而不是串入下一轮。
-    pub fn take_session_turn_steers_or_close(
-        &self,
-        session_id: &SessionId,
-        turn_id: &str,
-    ) -> SessionTurnInputBoundary {
-        let mut guard = self
-            .session_turn_inputs
-            .lock()
-            .expect("session turn input mutex poisoned");
-        let Some(active) = guard.get_mut(session_id) else {
-            return SessionTurnInputBoundary::Closed;
-        };
-        if active.turn_id != turn_id {
-            return SessionTurnInputBoundary::Closed;
-        }
-        if active.pending.is_empty() {
-            guard.remove(session_id);
-            SessionTurnInputBoundary::Closed
-        } else {
-            SessionTurnInputBoundary::Pending(active.pending.drain(..).collect())
-        }
-    }
-
-    pub fn close_session_turn_input(&self, session_id: &SessionId, turn_id: &str) -> bool {
-        let mut guard = self
-            .session_turn_inputs
-            .lock()
-            .expect("session turn input mutex poisoned");
-        let removed = if guard
-            .get(session_id)
-            .is_some_and(|active| active.turn_id == turn_id)
-        {
-            guard.remove(session_id);
-            true
-        } else {
-            false
-        };
-        drop(guard);
-        if removed {
-            self.tool_approvals.remove_turn(session_id, turn_id);
-        }
-        removed
+    pub fn turn_coordinator(&self) -> &SessionTurnCoordinator {
+        self.turn_coordinator.as_ref()
     }
 
     /// 注册任务级运行时信号通道。agent_spawn 可在子任务 runner 启动前调用，因此
@@ -396,7 +213,7 @@ impl ConversationRegistry {
         if channel.is_empty() {
             channels.remove(&key);
             drop(channels);
-            self.tool_approvals.remove_task(session_id, task_id);
+            self.tool_approvals().remove_task(session_id, task_id);
             TaskSignalBoundary::Closed
         } else {
             TaskSignalBoundary::Pending(channel.drain(..).collect())
@@ -411,7 +228,7 @@ impl ConversationRegistry {
             .remove(&(session_id.clone(), task_id.clone()))
             .is_some();
         if removed {
-            self.tool_approvals.remove_task(session_id, task_id);
+            self.tool_approvals().remove_task(session_id, task_id);
         }
         removed
     }
@@ -425,22 +242,18 @@ impl ConversationRegistry {
             .expect("ConversationRegistry mutex poisoned");
         let before = guard.len();
         guard.retain(|key, _| match key {
-            ConversationKey::Session(candidate) => candidate != session_id,
             ConversationKey::Task {
                 session_id: candidate,
                 ..
             } => candidate != session_id,
         });
         let removed = before.saturating_sub(guard.len());
-        self.session_turn_inputs
-            .lock()
-            .expect("session turn input mutex poisoned")
-            .remove(session_id);
+        drop(guard);
         self.task_signal_channels
             .lock()
             .expect("task signal channel mutex poisoned")
             .retain(|(candidate, _), _| candidate != session_id);
-        self.tool_approvals.remove_session(session_id);
+        self.turn_coordinator.clear_session(session_id);
         removed
     }
 }
@@ -449,62 +262,29 @@ impl ConversationRegistry {
 mod tests {
     use super::*;
     use crate::mailbox::UserSignal;
+    use crate::{SessionTurnInputBoundary, SessionTurnInputError};
     use magi_core::UtcMillis;
 
     #[test]
-    fn lazily_creates_then_reuses_same_conversation() {
+    fn task_conversations_are_isolated_by_task_identity() {
         let registry = ConversationRegistry::new();
-        let session = SessionId::new("session-a");
+        let session_id = SessionId::new("session-a");
+        let task_a = registry.conversation_for_task(&session_id, &TaskId::new("task-a"));
+        let task_b = registry.conversation_for_task(&session_id, &TaskId::new("task-b"));
 
-        let conv1 = registry.conversation_for(&session);
-        conv1.lock().unwrap().ingest_user_signal(UserSignal {
-            text: Some("first".to_string()),
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            accepted_at: UtcMillis(1),
-        });
-
-        let conv2 = registry.conversation_for(&session);
-        assert!(Arc::ptr_eq(&conv1, &conv2));
-
-        let drained = conv2.lock().unwrap().drain_user_signals();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].text.as_deref(), Some("first"));
-    }
-
-    #[test]
-    fn different_sessions_get_distinct_conversations() {
-        let registry = ConversationRegistry::new();
-        let a = registry.conversation_for(&SessionId::new("a"));
-        let b = registry.conversation_for(&SessionId::new("b"));
-        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&task_a, &task_b));
         assert_eq!(registry.len(), 2);
     }
 
     #[test]
-    fn task_conversations_are_isolated_from_session_conversation() {
-        let registry = ConversationRegistry::new();
-        let session_id = SessionId::new("session-a");
-        let root = registry.conversation_for(&session_id);
-        let task_a = registry.conversation_for_task(&session_id, &TaskId::new("task-a"));
-        let task_b = registry.conversation_for_task(&session_id, &TaskId::new("task-b"));
-
-        assert!(!Arc::ptr_eq(&root, &task_a));
-        assert!(!Arc::ptr_eq(&task_a, &task_b));
-        assert_eq!(registry.len(), 3);
-    }
-
-    #[test]
-    fn remove_session_drops_session_and_task_conversations() {
+    fn remove_session_drops_task_conversations() {
         let registry = ConversationRegistry::new();
         let session_a = SessionId::new("session-a");
         let session_b = SessionId::new("session-b");
-        registry.conversation_for(&session_a);
         registry.conversation_for_task(&session_a, &TaskId::new("task-a"));
-        registry.conversation_for(&session_b);
+        registry.conversation_for_task(&session_b, &TaskId::new("task-b"));
 
-        assert_eq!(registry.remove_session(&session_a), 2);
+        assert_eq!(registry.remove_session(&session_a), 1);
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.remove_session(&session_a), 0);
     }
@@ -513,10 +293,12 @@ mod tests {
     fn session_turn_steer_requires_matching_active_turn_and_drains_fifo() {
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-steer");
-        let _active =
-            registry.begin_session_turn_input(session_id.clone(), "turn-steer".to_string());
+        let _active = registry
+            .turn_coordinator()
+            .begin_session_turn_input(session_id.clone(), "turn-steer".to_string());
 
         registry
+            .turn_coordinator()
             .try_steer_session_turn(
                 &session_id,
                 "turn-steer",
@@ -530,6 +312,7 @@ mod tests {
             )
             .expect("matching active turn should accept steer");
         registry
+            .turn_coordinator()
             .try_steer_session_turn(
                 &session_id,
                 "turn-steer",
@@ -543,12 +326,15 @@ mod tests {
             )
             .expect("second steer should remain FIFO");
 
-        let drained = registry.drain_session_turn_steers(&session_id, "turn-steer");
+        let drained = registry
+            .turn_coordinator()
+            .drain_session_turn_steers(&session_id, "turn-steer");
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].text.as_deref(), Some("first"));
         assert_eq!(drained[1].text.as_deref(), Some("second"));
         assert!(
             registry
+                .turn_coordinator()
                 .try_steer_session_turn(
                     &session_id,
                     "turn-other",
@@ -570,15 +356,18 @@ mod tests {
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-steer-close");
         registry
+            .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-steer-close".to_string())
             .expect("active input turn should begin");
 
         assert_eq!(
-            registry.take_session_turn_steers_or_close(&session_id, "turn-steer-close"),
+            registry
+                .turn_coordinator()
+                .take_session_turn_steers_or_close(&session_id, "turn-steer-close"),
             SessionTurnInputBoundary::Closed
         );
         assert_eq!(
-            registry.try_steer_session_turn(
+            registry.turn_coordinator().try_steer_session_turn(
                 &session_id,
                 "turn-steer-close",
                 UserSignal {

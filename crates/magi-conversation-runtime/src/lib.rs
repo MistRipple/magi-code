@@ -1,8 +1,8 @@
 //! 任务系统 - Conversation Runtime
 //!
-//! 提供 Mailbox 作为 user 信号进入任务系统的单一通道，
-//! Conversation 绑定 SessionId、Mailbox 与当前 Turn 槽位，
-//! Turn 状态机刻画一轮 user → assistant 的推进契约。
+//! 提供 Task Conversation 的运行时 Mailbox、SessionTurnCoordinator 与 Turn 执行骨架。
+//! 普通 Session Turn 由 Coordinator/TurnService 接纳；Task worker 才绑定
+//! Conversation、Mailbox 与当前 Turn 槽位。
 
 #![recursion_limit = "256"]
 
@@ -54,13 +54,12 @@ pub use builtin_tool_schema::{
 pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
 pub use driver::{RoundOutcome, TurnDriver};
 pub use mailbox::{MailboxAuthor, MailboxItem, MailboxKind, RuntimeSignal, UserSignal};
-pub use registry::{
-    ConversationRegistry, SessionTurnInputBoundary, SessionTurnInputCommitError,
-    SessionTurnInputError, TaskSignalBoundary, TaskSignalCommitError,
-};
+pub use registry::{ConversationRegistry, TaskSignalBoundary, TaskSignalCommitError};
 pub use session_turn_coordinator::{
     CoordinatorAdmission, CoordinatorCommandResult, CoordinatorError, CoordinatorTurnStatus,
-    ExecutionProfile, SessionTurnCoordinator, TurnAdmission, TurnAttempt, request_fingerprint,
+    ExecutionProfile, SessionTurnCoordinator, SessionTurnInputBoundary,
+    SessionTurnInputCommitError, SessionTurnInputError, TurnAdmission, TurnAttempt,
+    request_fingerprint,
 };
 pub use session_turn_execution::SessionTurnExecutionRequest;
 pub use session_writeback::{CanonicalTurnEventSink, TurnEventSink};

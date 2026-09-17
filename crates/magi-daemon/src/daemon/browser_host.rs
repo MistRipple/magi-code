@@ -1316,7 +1316,7 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
         {
             Ok(Some(_)) => {
                 state
-                    .conversation_registry
+                    .turn_coordinator()
                     .close_session_turn_input(&browser_session.session_id, &current_turn.turn_id);
                 if owned_goal {
                     match state
