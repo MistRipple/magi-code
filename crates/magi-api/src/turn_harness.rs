@@ -22,7 +22,7 @@ use magi_conversation_runtime::{
     task_execution_registry::AgentSpawnPreflightRuntime,
     task_runner_bridge::EventBasedResultReceiver,
 };
-use magi_core::{SessionId, UtcMillis};
+use magi_core::{AccessProfile, SessionId, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_memory_store::MemoryStore;
@@ -61,6 +61,10 @@ enum ProviderBehavior {
         error: String,
     },
     HoldForCancellation,
+    PermissionBlockedWriteTool {
+        tool_name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Default)]
@@ -71,6 +75,7 @@ struct ProviderState {
     tool_round_emitted: bool,
     agent_spawn_emitted: usize,
     transient_failures_remaining: usize,
+    permission_blocked_write_calls: usize,
 }
 
 /// 可观测的真流式 Provider 替身。
@@ -179,6 +184,22 @@ impl HarnessModelClient {
             .lock()
             .expect("harness provider state should hold")
             .behavior = Some(ProviderBehavior::HoldForCancellation);
+    }
+
+    pub fn set_permission_blocked_write_tool(
+        &self,
+        tool_name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("harness provider state should hold");
+        state.behavior = Some(ProviderBehavior::PermissionBlockedWriteTool {
+            tool_name: tool_name.into(),
+            arguments: arguments.into(),
+        });
+        state.permission_blocked_write_calls = 0;
     }
 
     pub fn set_tool_then_completed(
@@ -318,6 +339,54 @@ impl HarnessModelClient {
                 message,
             }),
             ProviderBehavior::HoldForCancellation => Ok(ModelResponse::completed("")),
+            ProviderBehavior::PermissionBlockedWriteTool {
+                tool_name,
+                arguments,
+            } => {
+                let classifier_request = request.prompt.contains("Session Turn 编排分类器");
+                let mut tool_surface_available = request
+                    .tools
+                    .as_ref()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == tool_name));
+                if !tool_surface_available && !classifier_request {
+                    tool_surface_available = request.tools.as_ref().is_some_and(|tools| {
+                        tools.iter().any(|tool| tool.function.name == "file_write")
+                    });
+                }
+                if !classifier_request && tool_surface_available {
+                    let call_index = {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .expect("harness provider state should hold");
+                        state.permission_blocked_write_calls =
+                            state.permission_blocked_write_calls.saturating_add(1);
+                        state.permission_blocked_write_calls
+                    };
+                    return Ok(ModelResponse {
+                        status: ModelResponseStatus::RequiresToolExecution,
+                        content: None,
+                        thinking: None,
+                        tool_calls: vec![ChatToolCall {
+                            id: format!("harness-permission-blocked-write-call-{call_index}"),
+                            kind: "function".to_string(),
+                            function: magi_bridge_client::ChatToolFunction {
+                                name: tool_name,
+                                arguments,
+                            },
+                        }],
+                        usage: None,
+                        finish_reason: Some("tool_calls".to_string()),
+                        provider_context: Vec::new(),
+                    });
+                }
+                let response = if classifier_request {
+                    "权限阻塞任务已停止"
+                } else {
+                    "权限阻塞任务已停止"
+                };
+                Ok(ModelResponse::completed(response))
+            }
             ProviderBehavior::AgentSpawnThenWait {
                 response,
                 child_count,
@@ -804,6 +873,28 @@ impl MagiTurnHarness {
         request_id: &str,
         user_message_id: &str,
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
+        self.submit_workspace_task_with_access_profile(
+            session_id,
+            workspace_id,
+            workspace_path,
+            text,
+            request_id,
+            user_message_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn submit_workspace_task_with_access_profile(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &magi_core::WorkspaceId,
+        workspace_path: &Path,
+        text: &str,
+        request_id: &str,
+        user_message_id: &str,
+        access_profile: Option<AccessProfile>,
+    ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
         TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
                 desktop_browser_tools_allowed: false,
@@ -819,7 +910,7 @@ impl MagiTurnHarness {
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
                 browser_node_selections: Vec::new(),
-                access_profile: None,
+                access_profile,
                 orchestrator_session_config: None,
                 request_id: Some(request_id.to_string()),
                 user_message_id: Some(user_message_id.to_string()),
@@ -876,7 +967,7 @@ impl MagiTurnHarness {
     }
 
     pub async fn wait_for_terminal(&self, session_id: &SessionId, turn_id: &str) -> CanonicalTurn {
-        for _ in 0..200 {
+        for _ in 0..1_000 {
             if let Some(turn) = self
                 .state
                 .session_store
@@ -892,7 +983,7 @@ impl MagiTurnHarness {
     }
 
     pub async fn wait_for_task_terminal(&self, task_id: &magi_core::TaskId) -> magi_core::Task {
-        for _ in 0..200 {
+        for _ in 0..1_000 {
             if let Some(task) = self
                 .state
                 .task_store()
@@ -1186,6 +1277,71 @@ mod tests {
                 })
             })
         }));
+    }
+
+    #[tokio::test]
+    async fn task_profile_permission_block_stops_write_tool_without_provider_loop() {
+        let harness = MagiTurnHarness::new_task("不会执行受限写入");
+        let workspace_root = tempfile::tempdir().expect("permission workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-permission-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("permission workspace should register");
+        let session_id = SessionId::new("harness-permission-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "权限阻塞验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("permission session should create");
+        let target = workspace_root.path().join("should-not-write.txt");
+        harness.provider.set_permission_blocked_write_tool(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf blocked > {}", target.display())
+            })
+            .to_string(),
+        );
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：写入文件并汇总结果",
+                "harness-permission-request",
+                "harness-permission-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("permission-blocked task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("permission task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("permission task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(!target.exists(), "只读访问模式下写工具不得产生文件副作用");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "shell_exec")
+        }));
+        assert_eq!(harness.provider.requests().len(), 1);
     }
 
     #[tokio::test]
