@@ -879,7 +879,7 @@ Coordinator
 
 - [x] 每个 Session 建立唯一 `SessionTurnCoordinator`。
 - [x] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command；生产 start、Steer、Continue、Recover、Cancel、Abort、Finish 以及 preparing/running 状态均通过携带并校验同一 `TurnAttempt` 的 command 入口，canonical restore 和断线恢复也复用 Recover command；Coordinator 内部的 mutation helper 已收为私有，仅由 command 分发。
-- [ ] 删除所有外部模块直接修改 current Turn 的路径。生产用户中断已统一经 `CanonicalTurnEventSink::interrupt_turn_by_user` 写入并保留 `interruptionSource=user`，生产会话关闭、Goal pause、daemon restart 和接受失败也经 sink 收口；剩余直接写入仅限测试 fixture 和 sink 内部。
+- [ ] 删除所有外部模块直接修改 current Turn 的路径。生产用户中断已统一经 `CanonicalTurnEventSink::interrupt_turn_by_user` 写入并保留 `interruptionSource=user`，生产会话关闭、Goal pause、daemon restart 和接受失败也经 sink 收口；剩余直接写入仅限测试 fixture 和 sink 内部。当前进一步统一了 canonical 恢复与 `TurnRecord` 投影的身份读取及历史 profile 推断，避免恢复状态与事件投影分叉；测试夹具写入仍待清理。
 - [x] 实现 attempt ID 校验、迟到结果拒绝和终态冲突。
 - [x] Continue 在接纳新 Turn 前收口旧 attempt，并在新 Turn 上注册 Task attempt。
 
@@ -924,13 +924,13 @@ Coordinator
 - [ ] 删除所有外部 current Turn 写入口。
 - [x] 删除旧结果轮询与二次 finalizer 的生产职责。
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
-- [ ] 清理失效兼容字段、分支、注释和测试夹具。
+- [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 全矩阵端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 
 本阶段当前可验证结果：Rust workspace 全量测试、Web protocol/check/build、npm golden、Electron directory package 均已通过。重新启动 release daemon 后，daemon 托管入口返回 `/web.html` HTTP 200、`/health` `status=ok`；此前本地 OpenAI-compatible Provider 已实际收到 `stream=true` 请求并完成首 delta、canonical completed、request replay、fingerprint conflict 与 daemon 重启 replay；打包 Electron 已启动并加载同一 daemon 托管页面。新增 `crates/magi-api/src/turn_harness.rs` 后，`MagiTurnHarness` 已通过真实 `TurnService` 覆盖普通 Chat 流式投影、Task profile 主链、Task 工具成功执行、单个和多个子代理、自定义 Agent Role 快照、Goal profile 的 Provider 失败收口、steer、取消、真实 SSE/WebSocket 载体断线重连、EventBus 快照重放、Provider 空流/失败/超时/首帧前重试、request replay、fingerprint conflict、canonical restart replay，以及 workspace branch 漂移、merge conflict 和 ReadOnly profile 下写工具确定性权限阻塞；生产用户中断和 daemon 重启中断的 canonical 写回已统一经 `CanonicalTurnEventSink`，daemon 测试等待条件同时确认 Task terminal 与 canonical Turn terminal，降低并行执行时序误报；Coordinator 的 preparing/running 状态命令已改为 attempt-scoped，Task 接受失败的 Abort 也统一走 command；`upsert_active_execution_chain` 仅在 canonical 明确领先时修复迟到 sidecar，避免覆盖合法 mutation；Task preparation 在缺少 orchestrator thread 时仍能写入 canonical 失败终态；权限阻塞和 Electron DOM 全矩阵仍未完成；资源排队及其 requestId/fingerprint 幂等、Git branch 漂移和 merge conflict 已由 `MagiTurnHarness` 覆盖，因此该阶段保持未完成。
 
-已记录的相关提交包括：架构实现 `dbe4b5cd8c0908bbd91b30a4212d3b8620d07e36`（`收敛 Session Conversation 与 Turn 输入边界`），权限阻塞验收 `b398de2cb1f5fd7e76c4324b01b75fb5d1caf512`（`补充权限阻塞 Turn 验收`），Recover command 身份边界 `a5298ec44fb2ab64b983b47e0872d4025cd86e66`（`统一 Turn 恢复命令身份边界`），以及本轮序号/profile 边界收紧 `912360ec05998fd135ddab29f34af76bb6f76f97`（`收紧 Turn 恢复序号与 profile 边界`）。本轮明确拒绝未知显式 `executionProfile`，保持 `turn_seq` 不可变，仅允许进程内终态 replay 的零序号补齐一次，并验证恢复冲突不会清除活动 Turn；复验包括 Coordinator 24 项、Turn contract 3 项、workspace 全量测试、protocol check、Web check/build、npm golden 和 Electron directory package，均通过。权限审批完整矩阵、Electron DOM 全矩阵、测试夹具清理和性能指标仍未完成。
+已记录的相关提交包括：架构实现 `dbe4b5cd8c0908bbd91b30a4212d3b8620d07e36`（`收敛 Session Conversation 与 Turn 输入边界`），权限阻塞验收 `b398de2cb1f5fd7e76c4324b01b75fb5d1caf512`（`补充权限阻塞 Turn 验收`），Recover command 身份边界 `a5298ec44fb2ab64b983b47e0872d4025cd86e66`（`统一 Turn 恢复命令身份边界`），序号/profile 边界收紧 `912360ec05998fd135ddab29f34af76bb6f76f97`（`收紧 Turn 恢复序号与 profile 边界`），以及 canonical Turn 身份解析收敛 `d79bdf0eee060fd74eacdc291b3468ac2964d10e`（`统一 canonical Turn 身份解析边界`）。本轮进一步把 canonical 恢复和 `TurnRecord` 投影统一到同一身份读取与历史 profile 推断函数，明确拒绝未知显式 `executionProfile`；复验包括 Coordinator 24 项、Turn contract 4 项、workspace 全量测试、protocol check、Web check/build、npm golden 和 Electron directory package，均通过。权限审批完整矩阵、Electron DOM 全矩阵、测试夹具清理和性能指标仍未完成。
 
 ## 18. MagiTurnHarness 验证设计
 
