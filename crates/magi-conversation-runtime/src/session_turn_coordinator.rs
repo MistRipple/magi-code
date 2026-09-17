@@ -685,58 +685,24 @@ impl SessionTurnCoordinator {
             return None;
         }
 
-        fn metadata_string(turn: &CanonicalTurn, key: &str) -> Option<String> {
-            turn.metadata
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    turn.items.iter().find_map(|item| {
-                        item.metadata
-                            .get(key)
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string)
-                    })
-                })
-        }
-
-        let request_id =
-            metadata_string(turn, "requestId").or_else(|| metadata_string(turn, "request_id"));
+        let request_id = crate::turn_contract::canonical_turn_metadata_string(turn, "requestId")
+            .or_else(|| crate::turn_contract::canonical_turn_metadata_string(turn, "request_id"));
         let Some(request_id) = request_id else {
             // 历史 Turn 没有幂等身份时仍可由 SessionStore 展示，但不能被 Coordinator
             // 当作可安全恢复的请求。
             return None;
         };
-        let request_fingerprint = metadata_string(turn, "requestFingerprint")
-            .or_else(|| metadata_string(turn, "request_fingerprint"))?;
-        let profile = match metadata_string(turn, "executionProfile")
-            .or_else(|| metadata_string(turn, "execution_profile"))
-            .as_deref()
-        {
-            Some("task") => ExecutionProfile::Task,
-            Some("conversation") => ExecutionProfile::Conversation,
-            Some(_) => {
-                // executionProfile 是安全边界的一部分。未知值不能静默降级为
-                // Conversation，否则重启恢复会绕过 Task 的权限和资源准备。
-                return None;
-            }
-            None => {
-                let route = metadata_string(turn, "route");
-                if route.as_deref().is_some_and(|route| route != "chat")
-                    || turn.items.iter().any(|item| item.worker.is_some())
-                {
-                    ExecutionProfile::Task
-                } else {
-                    ExecutionProfile::Conversation
-                }
-            }
-        };
-        let attempt_id =
-            metadata_string(turn, "attemptId").or_else(|| metadata_string(turn, "attempt_id"))?;
+        let request_fingerprint =
+            crate::turn_contract::canonical_turn_metadata_string(turn, "requestFingerprint")
+                .or_else(|| {
+                    crate::turn_contract::canonical_turn_metadata_string(
+                        turn,
+                        "request_fingerprint",
+                    )
+                })?;
+        let profile = crate::turn_contract::canonical_execution_profile(turn)?;
+        let attempt_id = crate::turn_contract::canonical_turn_metadata_string(turn, "attemptId")
+            .or_else(|| crate::turn_contract::canonical_turn_metadata_string(turn, "attempt_id"))?;
         let admission = TurnAdmission {
             turn_id: turn.turn_id.clone(),
             request_id,

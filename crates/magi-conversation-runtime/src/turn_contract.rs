@@ -12,6 +12,54 @@ use magi_session_store::{CanonicalTurn, CanonicalTurnItem};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// 从 canonical Turn 读取非空字符串元数据。
+///
+/// 新写入路径会把身份复制到 Turn 级 metadata；历史 canonical 事实可能只在首个
+/// item 上保留，因此恢复和事件投影必须使用同一读取顺序。
+pub(crate) fn canonical_turn_metadata_string(turn: &CanonicalTurn, key: &str) -> Option<String> {
+    turn.metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            turn.items.iter().find_map(|item| {
+                item.metadata
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        })
+}
+
+/// 解析 canonical Turn 固化的执行 profile。
+///
+/// 显式 profile 是安全边界，未知值必须拒绝；缺失 profile 只允许按历史 route/worker
+/// 事实推断，避免恢复和 Turn 事件投影走出两套身份结果。
+pub(crate) fn canonical_execution_profile(turn: &CanonicalTurn) -> Option<ExecutionProfile> {
+    match canonical_turn_metadata_string(turn, "executionProfile")
+        .or_else(|| canonical_turn_metadata_string(turn, "execution_profile"))
+        .as_deref()
+    {
+        Some("task") => Some(ExecutionProfile::Task),
+        Some("conversation") => Some(ExecutionProfile::Conversation),
+        Some(_) => None,
+        None => {
+            let route = canonical_turn_metadata_string(turn, "route");
+            if route.as_deref().is_some_and(|route| route != "chat")
+                || turn.items.iter().any(|item| item.worker.is_some())
+            {
+                Some(ExecutionProfile::Task)
+            } else {
+                Some(ExecutionProfile::Conversation)
+            }
+        }
+    }
+}
+
 /// canonical Turn 的跨模块身份记录。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -59,27 +107,13 @@ impl TurnRecord {
     /// 从 canonical Turn 提取稳定身份。缺少 requestId/attemptId 的旧事实不会
     /// 被伪造为可重放身份，调用方必须在迁移边界补齐这些字段后再接纳。
     pub fn from_canonical(turn: &CanonicalTurn, event_sequence: u64) -> Option<Self> {
-        let string_metadata = |key: &str| {
-            turn.metadata
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        };
-        let request_id = string_metadata("requestId").or_else(|| string_metadata("request_id"))?;
-        let attempt_id = string_metadata("attemptId").or_else(|| string_metadata("attempt_id"))?;
-        let request_fingerprint = string_metadata("requestFingerprint")
-            .or_else(|| string_metadata("request_fingerprint"))?;
-        let execution_profile = match string_metadata("executionProfile")
-            .or_else(|| string_metadata("execution_profile"))
-            .as_deref()
-        {
-            Some("task") => ExecutionProfile::Task,
-            Some("conversation") => ExecutionProfile::Conversation,
-            Some(_) => return None,
-            None => ExecutionProfile::Conversation,
-        };
+        let request_id = canonical_turn_metadata_string(turn, "requestId")
+            .or_else(|| canonical_turn_metadata_string(turn, "request_id"))?;
+        let attempt_id = canonical_turn_metadata_string(turn, "attemptId")
+            .or_else(|| canonical_turn_metadata_string(turn, "attempt_id"))?;
+        let request_fingerprint = canonical_turn_metadata_string(turn, "requestFingerprint")
+            .or_else(|| canonical_turn_metadata_string(turn, "request_fingerprint"))?;
+        let execution_profile = canonical_execution_profile(turn)?;
         let status = match turn.status {
             magi_session_store::CanonicalTurnStatus::Pending => CoordinatorTurnStatus::Accepted,
             magi_session_store::CanonicalTurnStatus::Running => CoordinatorTurnStatus::Running,
@@ -117,8 +151,8 @@ impl TurnRecord {
             completed_at: turn.completed_at,
             task_id,
             root_task_id,
-            causation_id: string_metadata("causationId"),
-            trace_id: string_metadata("traceId"),
+            causation_id: canonical_turn_metadata_string(turn, "causationId"),
+            trace_id: canonical_turn_metadata_string(turn, "traceId"),
         })
     }
 }
@@ -215,6 +249,7 @@ pub enum TurnCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionTurnCoordinator;
     use magi_core::SessionId;
 
     fn canonical(status: magi_session_store::CanonicalTurnStatus) -> CanonicalTurn {
@@ -279,5 +314,24 @@ mod tests {
             Value::String("future-profile".to_string()),
         );
         assert!(TurnRecord::from_canonical(&turn, 1).is_none());
+    }
+
+    #[test]
+    fn canonical_turn_without_profile_uses_the_same_historical_route_inference_as_recovery() {
+        let mut turn = canonical(magi_session_store::CanonicalTurnStatus::Running);
+        turn.metadata.remove("executionProfile");
+        turn.metadata
+            .insert("route".to_string(), Value::String("task".to_string()));
+
+        let record =
+            TurnRecord::from_canonical(&turn, 1).expect("历史 task route 应能推断为 task profile");
+        assert_eq!(record.execution_profile, ExecutionProfile::Task);
+        let command =
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&turn.session_id, &turn)
+                .expect("同一 canonical Turn 应能生成恢复命令");
+        let TurnCommand::Recover { admission, .. } = command else {
+            panic!("canonical recovery must produce Recover command");
+        };
+        assert_eq!(admission.profile, record.execution_profile);
     }
 }

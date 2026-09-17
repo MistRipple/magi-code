@@ -997,7 +997,7 @@ async fn submit_steer_current_turn_after_turn_commit(
         .expected_turn_id()
         .ok_or_else(|| ApiError::InvalidInput("引导当前回复必须提供 expectedTurnId".to_string()))?;
     // steer 仍属于当前 Turn 的同一个 execution attempt；先由 Coordinator 校验
-    // 当前所有权，再在同一 session lock 内写入 canonical user item 和 mailbox。
+    // 当前所有权，再在同一 session lock 内写入 canonical user item 和 Coordinator FIFO。
     let coordinator_attempt = state
         .turn_coordinator()
         .current_attempt(&session_id, &expected_turn_id)
@@ -2590,7 +2590,7 @@ fn build_user_message_turn_item(
 
 /// 接受并启动普通 Conversation Turn。
 ///
-/// 该路径只写 canonical/session projection 和 session 级 Conversation 输入通道，
+/// 该路径只写 canonical/session projection，并把执行输入交给 Turn Coordinator；
 /// 不创建 TaskStore root task、lease、Runner、Snapshot 或 Git execution context。
 async fn submit_conversation_session_turn(
     state: ApiState,
