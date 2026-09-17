@@ -198,6 +198,8 @@ pub enum TurnCommand {
         admission: TurnAdmission,
         attempt_id: String,
         status: CoordinatorTurnStatus,
+        /// canonical Turn 的持久化顺序，用于恢复时拒绝迟到快照。
+        turn_seq: u64,
     },
     Finish {
         attempt: TurnAttempt,

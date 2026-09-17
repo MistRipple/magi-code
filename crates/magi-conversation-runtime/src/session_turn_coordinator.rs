@@ -97,6 +97,7 @@ pub enum CoordinatorCommandResult {
     Admission(CoordinatorAdmission),
     Status(CoordinatorTurnStatus),
     Attempt(TurnAttempt),
+    Recovered { attempt: TurnAttempt, changed: bool },
     Finished(bool),
     Aborted(bool),
 }
@@ -364,15 +365,25 @@ impl SessionTurnCoordinator {
                 admission,
                 attempt_id,
                 status,
+                turn_seq,
             } => {
                 let turn_id = admission.turn_id.clone();
                 let profile = admission.profile;
-                self.restore_active_internal(session_id, admission, attempt_id.clone(), status);
-                Ok(CoordinatorCommandResult::Attempt(TurnAttempt {
-                    turn_id,
-                    attempt_id,
-                    profile,
-                }))
+                let changed = self.apply_recover_command(
+                    session_id,
+                    admission,
+                    attempt_id.clone(),
+                    status,
+                    turn_seq,
+                );
+                Ok(CoordinatorCommandResult::Recovered {
+                    attempt: TurnAttempt {
+                        turn_id,
+                        attempt_id,
+                        profile,
+                    },
+                    changed,
+                })
             }
             TurnCommand::Finish { attempt, status } => self
                 .finish(session_id, &attempt, status)
@@ -659,12 +670,21 @@ impl SessionTurnCoordinator {
             .map(|finished| finished.status)
     }
 
-    /// 从 canonical Turn 恢复生命周期身份。
+    /// 从 canonical Turn 构造 Recover command。
     ///
-    /// accepted 事实已经写入 canonical event 后，Coordinator 可以在 daemon 重启时
-    /// 重新建立 requestId/fingerprint/profile/attempt 关联。正文不会被复制；终态 Turn
-    /// 只进入 replay 索引，活动 Turn 才恢复为当前所有权。
-    pub fn restore_canonical_turn(&self, session_id: &SessionId, turn: &CanonicalTurn) -> bool {
+    /// canonical event 是恢复输入，Coordinator 的状态变更仍必须经过统一命令分发，
+    /// 不允许恢复路径直接改写 Coordinator 内部状态。缺少完整幂等和 attempt 身份的
+    /// 历史事实不能被猜测为可恢复的请求。
+    pub fn recover_command_for_canonical_turn(
+        session_id: &SessionId,
+        turn: &CanonicalTurn,
+    ) -> Option<TurnCommand> {
+        if &turn.session_id != session_id {
+            // 恢复命令的 session 作用域必须与 canonical 事实一致，避免调用方把
+            // 一个 session 的 Turn 错装进另一个 Coordinator 槽位。
+            return None;
+        }
+
         fn metadata_string(turn: &CanonicalTurn, key: &str) -> Option<String> {
             turn.metadata
                 .get(key)
@@ -687,13 +707,12 @@ impl SessionTurnCoordinator {
         let request_id =
             metadata_string(turn, "requestId").or_else(|| metadata_string(turn, "request_id"));
         let Some(request_id) = request_id else {
-            // 老 Turn 没有幂等身份时不能猜 requestId；它仍可由 SessionStore 展示，
-            // 但不能被 Coordinator 当作可安全重放的请求。
-            return false;
+            // 历史 Turn 没有幂等身份时仍可由 SessionStore 展示，但不能被 Coordinator
+            // 当作可安全恢复的请求。
+            return None;
         };
         let request_fingerprint = metadata_string(turn, "requestFingerprint")
-            .or_else(|| metadata_string(turn, "request_fingerprint"))
-            .unwrap_or_else(|| format!("legacy-turn:{}", turn.turn_id));
+            .or_else(|| metadata_string(turn, "request_fingerprint"))?;
         let profile = metadata_string(turn, "executionProfile")
             .or_else(|| metadata_string(turn, "execution_profile"))
             .map(|value| match value.as_str() {
@@ -710,18 +729,12 @@ impl SessionTurnCoordinator {
                     ExecutionProfile::Conversation
                 }
             });
-        let attempt_id = metadata_string(turn, "attemptId")
-            .or_else(|| metadata_string(turn, "attempt_id"))
-            .unwrap_or_else(|| format!("attempt-restored-{}", turn.turn_id));
+        let attempt_id =
+            metadata_string(turn, "attemptId").or_else(|| metadata_string(turn, "attempt_id"))?;
         let admission = TurnAdmission {
             turn_id: turn.turn_id.clone(),
             request_id,
             request_fingerprint,
-            profile,
-        };
-        let attempt = TurnAttempt {
-            turn_id: turn.turn_id.clone(),
-            attempt_id,
             profile,
         };
         let status = match turn.status {
@@ -737,59 +750,12 @@ impl SessionTurnCoordinator {
             // 但不会重新占用 session 的活动槽位。
             CanonicalTurnStatus::Superseded => CoordinatorTurnStatus::Cancelled,
         };
-        let mut state = self.state.lock().expect("turn coordinator state poisoned");
-        let session = state.sessions.entry(session_id.clone()).or_default();
-        if status.is_terminal() {
-            // canonical terminal projection 可能在同一进程的执行回调之后才恢复；
-            // 同一 Turn 的 active 槽位必须一并释放，否则重启/重放后新请求会被
-            // 错误地拒绝为“已有活动 Turn”。更晚的不同 active Turn 保持不变。
-            if session.active.as_ref().is_some_and(|active| {
-                active.admission.turn_id == turn.turn_id && turn.turn_seq >= active.turn_seq
-            }) {
-                session.active = None;
-            }
-            if let Some(existing) = session.recent.get(&admission.request_id)
-                && existing.turn_seq >= turn.turn_seq
-            {
-                return false;
-            }
-            session.recent.insert(
-                admission.request_id.clone(),
-                FinishedTurn {
-                    admission,
-                    attempt,
-                    status,
-                    turn_seq: turn.turn_seq,
-                },
-            );
-            return true;
-        }
-        if let Some(active) = session.active.as_ref() {
-            if active.admission.turn_id == turn.turn_id {
-                return true;
-            }
-            // canonical turns 按 turnSeq 恢复时，较新的活动 Turn 优先；不要让旧
-            // snapshot 覆盖已经恢复的当前所有权。
-            if turn.turn_seq <= active.turn_seq {
-                return false;
-            }
-        }
-        // 如果已经先恢复了更晚的终态 Turn，则更早的非终态 Turn 只能是陈旧
-        // projection。恢复它会重新占用 active 槽位并阻塞后续 request，因此直接跳过。
-        if session
-            .recent
-            .values()
-            .any(|finished| finished.turn_seq > turn.turn_seq)
-        {
-            return false;
-        }
-        session.active = Some(ActiveTurn {
+        Some(TurnCommand::Recover {
             admission,
-            attempt_id: attempt.attempt_id,
+            attempt_id,
             status,
             turn_seq: turn.turn_seq,
-        });
-        true
+        })
     }
 
     /// 将已恢复的 attempt 作为当前活动 Turn 注册。
@@ -809,26 +775,74 @@ impl SessionTurnCoordinator {
                 admission,
                 attempt_id,
                 status,
+                turn_seq: 0,
             },
         )
         .expect("Coordinator Recover command must restore active Turn");
     }
 
-    fn restore_active_internal(
+    fn apply_recover_command(
         &self,
         session_id: &SessionId,
         admission: TurnAdmission,
         attempt_id: String,
         status: CoordinatorTurnStatus,
-    ) {
+        turn_seq: u64,
+    ) -> bool {
         let mut state = self.state.lock().expect("turn coordinator state poisoned");
         let session = state.sessions.entry(session_id.clone()).or_default();
+        if status.is_terminal() {
+            let finished_attempt = TurnAttempt {
+                turn_id: admission.turn_id.clone(),
+                attempt_id: attempt_id.clone(),
+                profile: admission.profile,
+            };
+            if session.active.as_ref().is_some_and(|active| {
+                active.admission.turn_id == admission.turn_id && turn_seq >= active.turn_seq
+            }) {
+                session.active = None;
+            }
+            if let Some(existing) = session.recent.get(&admission.request_id)
+                && existing.turn_seq >= turn_seq
+            {
+                return false;
+            }
+            session.recent.insert(
+                admission.request_id.clone(),
+                FinishedTurn {
+                    admission,
+                    attempt: finished_attempt,
+                    status,
+                    turn_seq,
+                },
+            );
+            return true;
+        }
+        if let Some(active) = session.active.as_ref() {
+            if active.admission.turn_id == admission.turn_id {
+                if active.attempt_id != attempt_id || active.admission != admission {
+                    return false;
+                }
+                return true;
+            }
+            if turn_seq <= active.turn_seq {
+                return false;
+            }
+        }
+        if session
+            .recent
+            .values()
+            .any(|finished| finished.turn_seq > turn_seq)
+        {
+            return false;
+        }
         session.active = Some(ActiveTurn {
             admission,
             attempt_id,
             status,
-            turn_seq: 0,
+            turn_seq,
         });
+        true
     }
 
     pub fn current_attempt(
@@ -1217,6 +1231,124 @@ mod tests {
     }
 
     #[test]
+    fn recover_command_rejects_cross_session_canonical_turn() {
+        let source_session = SessionId::new("session-recover-source");
+        let target_session = SessionId::new("session-recover-target");
+        let turn = CanonicalTurn {
+            session_id: source_session,
+            turn_id: "turn-cross-session".to_string(),
+            turn_seq: 1,
+            accepted_at: magi_core::UtcMillis(1),
+            completed_at: None,
+            status: CanonicalTurnStatus::Running,
+            response_duration_ms: None,
+            usage: None,
+            items: Vec::new(),
+            metadata: serde_json::json!({
+                "requestId": "request-cross-session",
+                "requestFingerprint": "fp-cross-session",
+                "executionProfile": "conversation",
+                "attemptId": "attempt-cross-session",
+            })
+            .as_object()
+            .cloned()
+            .unwrap()
+            .into_iter()
+            .collect(),
+        };
+
+        assert!(
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&target_session, &turn)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recover_command_requires_complete_replay_identity() {
+        let session = SessionId::new("session-recover-identity");
+        let mut turn = CanonicalTurn {
+            session_id: session.clone(),
+            turn_id: "turn-missing-attempt".to_string(),
+            turn_seq: 1,
+            accepted_at: magi_core::UtcMillis(1),
+            completed_at: Some(magi_core::UtcMillis(2)),
+            status: CanonicalTurnStatus::Completed,
+            response_duration_ms: None,
+            usage: None,
+            items: Vec::new(),
+            metadata: serde_json::json!({
+                "requestId": "request-missing-attempt",
+                "requestFingerprint": "fp-missing-attempt",
+            })
+            .as_object()
+            .cloned()
+            .unwrap()
+            .into_iter()
+            .collect(),
+        };
+        assert!(
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &turn).is_none()
+        );
+
+        turn.metadata.remove("requestFingerprint");
+        turn.metadata.insert(
+            "attemptId".to_string(),
+            serde_json::Value::String("attempt-missing-fingerprint".to_string()),
+        );
+        assert!(
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &turn).is_none()
+        );
+    }
+
+    #[test]
+    fn recover_command_same_turn_is_not_idempotent_for_different_attempt() {
+        let coordinator = SessionTurnCoordinator::new();
+        let session = SessionId::new("session-recover-attempt-conflict");
+        let admission = admission(
+            "turn-recover-attempt-conflict",
+            "request-recover-attempt-conflict",
+            "fp-recover-attempt-conflict",
+        );
+        let first = coordinator
+            .execute_command(
+                &session,
+                TurnCommand::Recover {
+                    admission: admission.clone(),
+                    attempt_id: "attempt-first".to_string(),
+                    status: CoordinatorTurnStatus::Running,
+                    turn_seq: 2,
+                },
+            )
+            .expect("first recover should be accepted");
+        assert!(matches!(
+            first,
+            CoordinatorCommandResult::Recovered { changed: true, .. }
+        ));
+        let second = coordinator
+            .execute_command(
+                &session,
+                TurnCommand::Recover {
+                    admission,
+                    attempt_id: "attempt-stale".to_string(),
+                    status: CoordinatorTurnStatus::Running,
+                    turn_seq: 2,
+                },
+            )
+            .expect("stale recover should be handled deterministically");
+        assert!(matches!(
+            second,
+            CoordinatorCommandResult::Recovered { changed: false, .. }
+        ));
+        assert_eq!(
+            coordinator
+                .current_attempt(&session, "turn-recover-attempt-conflict")
+                .expect("first recovered attempt should remain active")
+                .attempt_id,
+            "attempt-first"
+        );
+    }
+
+    #[test]
     fn one_session_cannot_start_two_different_turns() {
         let coordinator = SessionTurnCoordinator::new();
         let session = SessionId::new("session-serial");
@@ -1280,7 +1412,12 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        assert!(coordinator.restore_canonical_turn(&session, &turn));
+        let command = SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &turn)
+            .expect("canonical Turn should produce Recover command");
+        assert!(matches!(
+            coordinator.execute_command(&session, command),
+            Ok(CoordinatorCommandResult::Recovered { changed: true, .. })
+        ));
         let replay = coordinator
             .accept(
                 &session,
@@ -1323,7 +1460,12 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        assert!(coordinator.restore_canonical_turn(&session, &turn));
+        let command = SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &turn)
+            .expect("canonical Turn should produce Recover command");
+        assert!(matches!(
+            coordinator.execute_command(&session, command),
+            Ok(CoordinatorCommandResult::Recovered { changed: true, .. })
+        ));
         let attempt = coordinator
             .current_attempt(&session, "turn-active")
             .expect("active Turn should restore");
@@ -1388,12 +1530,18 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        assert!(
-            coordinator.restore_canonical_turn(&session, &make_turn("turn-old", 1, "request-old"))
-        );
-        assert!(
-            coordinator.restore_canonical_turn(&session, &make_turn("turn-new", 2, "request-new"))
-        );
+        for turn in [
+            make_turn("turn-old", 1, "request-old"),
+            make_turn("turn-new", 2, "request-new"),
+        ] {
+            let command =
+                SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &turn)
+                    .expect("canonical Turn should produce Recover command");
+            assert!(matches!(
+                coordinator.execute_command(&session, command),
+                Ok(CoordinatorCommandResult::Recovered { changed: true, .. })
+            ));
+        }
         assert_eq!(
             coordinator
                 .current_attempt(&session, "turn-new")
@@ -1455,8 +1603,20 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        assert!(coordinator.restore_canonical_turn(&session, &terminal));
-        assert!(!coordinator.restore_canonical_turn(&session, &stale_active));
+        let terminal_command =
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &terminal)
+                .expect("terminal Turn should produce Recover command");
+        assert!(matches!(
+            coordinator.execute_command(&session, terminal_command),
+            Ok(CoordinatorCommandResult::Recovered { changed: true, .. })
+        ));
+        let stale_command =
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &stale_active)
+                .expect("stale Turn should produce Recover command");
+        assert!(matches!(
+            coordinator.execute_command(&session, stale_command),
+            Ok(CoordinatorCommandResult::Recovered { changed: false, .. })
+        ));
         assert!(matches!(
             coordinator.current_attempt(&session, "turn-active-old"),
             Err(CoordinatorError::NoActiveTurn)
@@ -1602,8 +1762,14 @@ mod tests {
         let mut terminal = active.clone();
         terminal.status = CanonicalTurnStatus::Completed;
         terminal.completed_at = Some(magi_core::UtcMillis(11));
-        assert!(coordinator.restore_canonical_turn(&session, &active));
-        // restore_canonical_turn 的同 turn active 已经存在时视为幂等；模拟状态被
+        let active_command =
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &active)
+                .expect("active Turn should produce Recover command");
+        assert!(matches!(
+            coordinator.execute_command(&session, active_command),
+            Ok(CoordinatorCommandResult::Recovered { changed: true, .. })
+        ));
+        // 同一 Turn 的 active 恢复已经存在时视为幂等；模拟状态被
         // 重新装载到 active 后再提交 terminal projection。
         coordinator.restore_active(
             &session,
@@ -1611,7 +1777,13 @@ mod tests {
             attempt.attempt_id.clone(),
             CoordinatorTurnStatus::Running,
         );
-        assert!(coordinator.restore_canonical_turn(&session, &terminal));
+        let terminal_command =
+            SessionTurnCoordinator::recover_command_for_canonical_turn(&session, &terminal)
+                .expect("terminal Turn should produce Recover command");
+        assert!(matches!(
+            coordinator.execute_command(&session, terminal_command),
+            Ok(CoordinatorCommandResult::Recovered { changed: true, .. })
+        ));
         assert!(matches!(
             coordinator.current_attempt(&session, &terminal.turn_id),
             Err(CoordinatorError::NoActiveTurn)

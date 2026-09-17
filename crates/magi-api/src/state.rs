@@ -28,7 +28,8 @@ use magi_browser_authority::{
     BrowserSurfaceControlSnapshot,
 };
 use magi_conversation_runtime::{
-    CanonicalTurnEventSink, ConversationRegistry, SessionTurnCoordinator, TaskCompletionNotifier,
+    CanonicalTurnEventSink, ConversationRegistry, CoordinatorCommandResult, SessionTurnCoordinator,
+    TaskCompletionNotifier,
     execution_admission::{ExecutionAdmissionController, ExecutionAdmissionSnapshot},
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
@@ -3885,10 +3886,15 @@ impl ApiState {
                     .then_with(|| right.turn_id.cmp(&left.turn_id))
             });
             for turn in turns {
-                if self
-                    .turn_coordinator
-                    .restore_canonical_turn(&session_id, &turn)
-                {
+                let Some(command) =
+                    SessionTurnCoordinator::recover_command_for_canonical_turn(&session_id, &turn)
+                else {
+                    continue;
+                };
+                if matches!(
+                    self.turn_coordinator.execute_command(&session_id, command),
+                    Ok(CoordinatorCommandResult::Recovered { changed: true, .. })
+                ) {
                     restored += 1;
                 }
             }

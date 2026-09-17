@@ -2888,7 +2888,7 @@ impl SessionStore {
     }
 
     /// 重建 projection；仅对没有任何 canonical item 的旧 thread 使用一次性迁移
-    /// 输入。新 Turn 一旦有 canonical 事实，传入的 legacy_messages 会被忽略，避免
+    /// 输入。新 Turn 一旦有 canonical 事实，传入的迁移输入会被忽略，避免
     /// Provider/工具回调重新建立第二份事实源。
     pub fn rebuild_thread_message_projection_with_legacy(
         &self,

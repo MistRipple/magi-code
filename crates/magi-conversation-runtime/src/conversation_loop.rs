@@ -266,14 +266,14 @@ pub(crate) fn chat_message_to_thread_chat_message(message: &ChatMessage) -> Thre
 pub(crate) fn append_thread_messages_checkpoint(
     session_store: &SessionStore,
     thread_id: &ThreadId,
-    _messages: Vec<ThreadChatMessage>,
+    messages: Vec<ThreadChatMessage>,
     persist_session_state: Option<&SessionStatePersistCallback>,
     checkpoint: &'static str,
 ) -> Result<(), String> {
-    // 参数只作为旧数据迁移输入；新 Turn 一旦存在 canonical item，provider/tool
-    // 回调提供的 messages 会被忽略，ThreadChatMessage 始终只是 projection。
+    // 新 Turn 一旦存在 canonical item，provider/tool 回调只触发 projection 重建；
+    // 没有 canonical 历史的旧 thread 才允许一次性使用迁移输入。
     session_store
-        .rebuild_thread_message_projection_with_legacy(thread_id, _messages, UtcMillis::now())
+        .rebuild_thread_message_projection_with_legacy(thread_id, messages, UtcMillis::now())
         .map_err(|error| format!("从 canonical Turn 重建 thread projection 失败: {error}"))?;
     persist_session_state_checkpoint(persist_session_state, checkpoint)
 }
