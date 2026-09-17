@@ -217,7 +217,23 @@ impl EventBasedResultReceiver {
                 };
                 (sink, result)
             };
-            sink.notify(result);
+            // Sink 属于运行时装配边界，第三方实现即使意外 panic 也不能让当前
+            // receiver 永久停在 `notifying=true`，或丢失已经从 pending 取出的结果。
+            // 保留原结果并在恢复状态后继续向上传播 panic，调用方仍可按自身策略处理。
+            let retry_result = result.clone();
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.notify(result)))
+            {
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .expect("EventBasedResultReceiver state lock poisoned");
+                    state.pending.push_front(retry_result);
+                    state.notifying = false;
+                }
+                std::panic::resume_unwind(payload);
+            }
         }
     }
 
@@ -279,6 +295,14 @@ mod tests {
     struct ReentrantCompletionSink {
         receiver: Mutex<Option<Arc<EventBasedResultReceiver>>>,
         lease_ids: Mutex<Vec<String>>,
+    }
+
+    struct PanicCompletionSink;
+
+    impl TaskCompletionSink for PanicCompletionSink {
+        fn notify(&self, _result: TaskResult) {
+            panic!("completion sink panic");
+        }
     }
 
     impl ReentrantCompletionSink {
@@ -373,6 +397,34 @@ mod tests {
             ]
         );
         assert!(receiver.poll_results().is_empty());
+    }
+
+    #[test]
+    fn panicking_sink_preserves_result_for_recovery() {
+        let receiver = EventBasedResultReceiver::new();
+        let result = TaskResult {
+            task_id: TaskId::new("task-panic-sink"),
+            lease_id: LeaseId::new("lease-panic-sink"),
+            outcome: TaskOutcome::Failed {
+                error: "panic sink result".to_string(),
+            },
+        };
+        receiver.push_result(result.clone());
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            receiver.set_completion_sink(Arc::new(PanicCompletionSink));
+        }));
+        assert!(panic_result.is_err());
+
+        let sink = Arc::new(RecordingCompletionSink::default());
+        receiver.set_completion_sink(sink.clone());
+        let results = sink
+            .results
+            .lock()
+            .expect("recording completion sink lock poisoned");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, result.task_id);
+        assert_eq!(results[0].lease_id, result.lease_id);
     }
 
     #[test]
