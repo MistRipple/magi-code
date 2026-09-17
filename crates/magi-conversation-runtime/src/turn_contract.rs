@@ -76,7 +76,9 @@ impl TurnRecord {
             .as_deref()
         {
             Some("task") => ExecutionProfile::Task,
-            _ => ExecutionProfile::Conversation,
+            Some("conversation") => ExecutionProfile::Conversation,
+            Some(_) => return None,
+            None => ExecutionProfile::Conversation,
         };
         let status = match turn.status {
             magi_session_store::CanonicalTurnStatus::Pending => CoordinatorTurnStatus::Accepted,
@@ -266,6 +268,16 @@ mod tests {
     fn legacy_canonical_turn_without_request_identity_is_not_replayable() {
         let mut turn = canonical(magi_session_store::CanonicalTurnStatus::Running);
         turn.metadata.clear();
+        assert!(TurnRecord::from_canonical(&turn, 1).is_none());
+    }
+
+    #[test]
+    fn canonical_turn_with_unknown_execution_profile_is_not_projected() {
+        let mut turn = canonical(magi_session_store::CanonicalTurnStatus::Running);
+        turn.metadata.insert(
+            "executionProfile".to_string(),
+            Value::String("future-profile".to_string()),
+        );
         assert!(TurnRecord::from_canonical(&turn, 1).is_none());
     }
 }
