@@ -8,6 +8,11 @@ use crate::tool_result_utils::{
 };
 use crate::tool_surface_state::activated_skill_id_from_tool_result;
 use crate::turn_contract::{TurnEventEnvelope, TurnRecord};
+#[cfg(test)]
+use crate::{
+    CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus, ExecutionProfile,
+    SessionTurnCoordinator, TurnAdmission, TurnCommand,
+};
 use crate::{
     SKILL_APPLY_TOOL_NAME, TaskTurnVisibility, active_skill_tool_execution_policy,
     apply_task_worker_detail_visibility, execute_skill_apply_from_runtime,
@@ -2347,7 +2352,11 @@ struct SessionToolCallTestContext<'a> {
 }
 
 #[cfg(test)]
-fn ensure_test_session_turn(session_store: &SessionStore, session_id: &SessionId) {
+fn ensure_test_session_turn(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    coordinator: &SessionTurnCoordinator,
+) {
     if session_store.session(session_id).is_none() {
         session_store
             .create_session(session_id.clone(), "session tool test")
@@ -2358,21 +2367,133 @@ fn ensure_test_session_turn(session_store: &SessionStore, session_id: &SessionId
         .and_then(|sidecar| sidecar.current_turn)
         .is_none()
     {
-        session_store
-            .upsert_current_turn(
+        let turn_id = format!("turn-{session_id}");
+        let accepted_at = UtcMillis::now();
+        let attempt = match coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::Start(TurnAdmission {
+                    turn_id: turn_id.clone(),
+                    request_id: format!("request-{turn_id}"),
+                    request_fingerprint: format!("fingerprint-{turn_id}"),
+                    profile: ExecutionProfile::Conversation,
+                }),
+            )
+            .expect("session tool test Turn should be admitted")
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected session tool test admission: {other:?}"),
+        };
+        CanonicalTurnEventSink::for_store(session_store, None)
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                None,
+                TimelineEntryInput::new(
+                    format!("timeline-{turn_id}"),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    "session tool test",
+                    accepted_at,
+                ),
                 ActiveExecutionTurn {
-                    turn_id: format!("turn-{session_id}"),
+                    turn_id: turn_id.clone(),
                     turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
+                    accepted_at,
+                    status: "accepted".to_string(),
                     user_message: Some("session tool test".to_string()),
                     items: Vec::new(),
                     completed_at: None,
                 },
             )
-            .expect("session tool test turn should be creatable");
+            .expect("session tool test Turn should be persisted through sink");
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("session tool test Turn should enter preparing");
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt,
+                    status: CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("session tool test Turn should enter running");
+        CanonicalTurnEventSink::for_store(session_store, None)
+            .set_status_domain(session_id, Some(turn_id.as_str()), "running")
+            .expect("session tool test running status should persist");
     }
+}
+
+#[cfg(test)]
+fn seed_test_conversation_turn(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    mut turn: ActiveExecutionTurn,
+) {
+    let coordinator = SessionTurnCoordinator::new();
+    let turn_id = turn.turn_id.clone();
+    let accepted_at = turn.accepted_at;
+    let request_id = format!("request-{turn_id}");
+    let request_fingerprint = format!("fingerprint-{turn_id}");
+    let attempt = match coordinator
+        .execute_command(
+            session_id,
+            TurnCommand::Start(TurnAdmission {
+                turn_id: turn_id.clone(),
+                request_id,
+                request_fingerprint,
+                profile: ExecutionProfile::Conversation,
+            }),
+        )
+        .expect("session writeback test Turn should be admitted")
+    {
+        CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+        other => panic!("unexpected session writeback test admission: {other:?}"),
+    };
+    let workspace_id = session_store
+        .execution_ownership(session_id)
+        .and_then(|ownership| ownership.workspace_id);
+    let message = turn.user_message.clone().unwrap_or_default();
+    turn.status = "accepted".to_string();
+    CanonicalTurnEventSink::for_store(session_store, None)
+        .accept_conversation_turn_with_timeline_entry(
+            session_id.clone(),
+            workspace_id,
+            TimelineEntryInput::new(
+                format!("timeline-{turn_id}"),
+                magi_session_store::TimelineEntryKind::UserMessage,
+                message,
+                accepted_at,
+            ),
+            turn,
+        )
+        .expect("session writeback test Turn should be persisted through sink");
+    coordinator
+        .execute_command(
+            session_id,
+            TurnCommand::SetStatus {
+                attempt: attempt.clone(),
+                status: CoordinatorTurnStatus::Preparing,
+            },
+        )
+        .expect("session writeback test Turn should enter preparing");
+    coordinator
+        .execute_command(
+            session_id,
+            TurnCommand::SetStatus {
+                attempt,
+                status: CoordinatorTurnStatus::Running,
+            },
+        )
+        .expect("session writeback test Turn should enter running");
+    CanonicalTurnEventSink::for_store(session_store, None)
+        .set_status_domain(session_id, Some(turn_id.as_str()), "running")
+        .expect("session writeback test running status should persist");
 }
 
 #[cfg(test)]
@@ -2393,7 +2514,8 @@ fn execute_session_turn_tool_call(
         workspace_root_path,
         access_profile,
     } = context;
-    ensure_test_session_turn(session_store, session_id);
+    let coordinator = SessionTurnCoordinator::new();
+    ensure_test_session_turn(session_store, session_id, &coordinator);
     let plan_store = crate::test_plan_store("test-plan");
     let tool_approval_registry = crate::ToolApprovalRegistry::default();
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
@@ -2447,7 +2569,8 @@ fn execute_session_turn_tool_call_with_approval(
         workspace_root_path,
         access_profile,
     } = context;
-    ensure_test_session_turn(session_store, session_id);
+    let coordinator = SessionTurnCoordinator::new();
+    ensure_test_session_turn(session_store, session_id, &coordinator);
     let plan_store = crate::test_plan_store("test-plan-approval");
     let tool_approval_registry = crate::ToolApprovalRegistry::default();
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
@@ -3353,20 +3476,19 @@ mod tests {
             .create_session(session_id.clone(), "stream delta payload")
             .expect("session should be creatable");
         let now = UtcMillis::now();
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-stream-delta-payload".to_string(),
-                    turn_seq: 1,
-                    accepted_at: now,
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: None,
-                    items: Vec::new(),
-                },
-            )
-            .expect("running turn should be stored");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-stream-delta-payload".to_string(),
+                turn_seq: 1,
+                accepted_at: now,
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: None,
+                items: Vec::new(),
+            },
+        );
 
         let event_bus = InMemoryEventBus::new(8);
         let workspace_id = None;
@@ -4708,20 +4830,19 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-shell-batch".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("并发执行 shell".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-shell-batch".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("并发执行 shell".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
 
         let probe = Arc::new(ConcurrentToolProbe::new(Duration::from_millis(180)));
         let mut tool_registry = ToolRegistry::new(
@@ -4914,20 +5035,19 @@ mod tests {
             session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
                 MissionId::new("mission-goal-tool-writeback")
             });
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-goal-tool-writeback".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("创建并完成目标".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-goal-tool-writeback".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("创建并完成目标".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
         let checkpoints = Arc::new(Mutex::new(Vec::<String>::new()));
         let checkpoints_for_callback = Arc::clone(&checkpoints);
         let persist = move |checkpoint: &str| {
@@ -5077,20 +5197,19 @@ mod tests {
             session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
                 MissionId::new("mission-mainline-plan-update")
             });
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-mainline-plan-update".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("更新执行计划".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-mainline-plan-update".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("更新执行计划".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         let mut messages = Vec::new();
         let mut tool_execution_ledger = ToolExecutionLedger::default();
@@ -5229,20 +5348,19 @@ mod tests {
             session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
                 MissionId::new("mission-skill-activation")
             });
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-skill-activation".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("使用 code-review".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-skill-activation".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("使用 code-review".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
         let skill_registry = SkillRegistry::new();
         skill_registry.register(SkillDefinition {
             skill_id: "owner/repo/skills/code-review".to_string(),
@@ -5327,20 +5445,19 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-approval-tool".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("受限模式执行写入 shell".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-approval-tool".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("受限模式执行写入 shell".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
 
         let mut tool_registry = ToolRegistry::new(
             Arc::new(GovernanceService::default()),
@@ -5487,20 +5604,19 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-expired-approval".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("等待审批过期".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-expired-approval".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("等待审批过期".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
 
         let mut tool_registry = ToolRegistry::new(
             Arc::new(GovernanceService::default()),
@@ -5606,20 +5722,19 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "session approval disconnect")
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-approval-disconnect".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("等待审批通道断开".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be active");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-approval-disconnect".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("等待审批通道断开".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
         let registry = crate::ToolApprovalRegistry::default();
         let mission_id = MissionId::new("mission-approval-disconnect");
         let source_thread_id = ThreadId::new("thread-approval-disconnect");
@@ -5694,20 +5809,19 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-panic-tool".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("执行会 panic 的串行工具".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-panic-tool".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("执行会 panic 的串行工具".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
 
         let mut tool_registry = ToolRegistry::new(
             Arc::new(GovernanceService::default()),
@@ -5819,20 +5933,19 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-concurrent-snapshot".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("并发工具快照归因".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-concurrent-snapshot".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("并发工具快照归因".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
 
         let mut tool_registry = ToolRegistry::new(
             Arc::new(GovernanceService::default()),
@@ -5969,27 +6082,22 @@ mod tests {
             Some("turn-item-plain-final".to_string()),
             orchestrator_thread_id.clone(),
         );
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-session-plain".to_string(),
-                    turn_seq: 2,
-                    accepted_at: now,
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("普通流式验证".to_string()),
-                    items: vec![final_item],
-                },
-            )
-            .expect("plain turn should be stored");
-        session_store
-            .update_current_turn_status_for_turn(
-                &session_id,
-                Some("turn-session-plain"),
-                "completed",
-            )
-            .expect("plain turn should complete");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-session-plain".to_string(),
+                turn_seq: 2,
+                accepted_at: now,
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("普通流式验证".to_string()),
+                items: vec![final_item],
+            },
+        );
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some("turn-session-plain"), "completed")
+            .expect("plain turn should complete through sink");
 
         let sidecar = session_store
             .runtime_sidecar(&session_id)

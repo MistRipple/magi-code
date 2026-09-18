@@ -2300,6 +2300,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_auto_allows_file_patch_and_file_mkdir() {
+        let patch_harness = MagiTurnHarness::new_task("file_patch 自动允许后完成");
+        let patch_workspace_root = tempfile::tempdir().expect("file patch workspace should create");
+        let patch_workspace_id = magi_core::WorkspaceId::new("harness-file-patch-workspace");
+        patch_harness
+            .state
+            .workspace_registry
+            .register_native_path(
+                patch_workspace_id.clone(),
+                patch_workspace_root.path().to_path_buf(),
+            )
+            .expect("file patch workspace should register");
+        let patch_session_id = SessionId::new("harness-file-patch-session");
+        patch_harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                patch_session_id.clone(),
+                "file_patch 自动允许验收",
+                Some(patch_workspace_id.to_string()),
+            )
+            .expect("file patch session should create");
+        let patch_target = patch_workspace_root.path().join("patch-target.txt");
+        fs::write(&patch_target, "before\n").expect("file patch fixture should write");
+        patch_harness.provider.set_tool_then_completed(
+            "file_patch",
+            serde_json::json!({
+                "path": patch_target.display().to_string(),
+                "old_string": "before",
+                "new_string": "after"
+            })
+            .to_string(),
+            "file_patch 自动允许后完成",
+        );
+
+        let patch_response = patch_harness
+            .submit_workspace_task_with_access_profile(
+                &patch_session_id,
+                &patch_workspace_id,
+                patch_workspace_root.path(),
+                "调用 file_patch 修改工作区内文件",
+                "harness-file-patch-request",
+                "harness-file-patch-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("file patch task should be accepted");
+        let patch_turn_id = patch_response
+            .turn_id
+            .clone()
+            .expect("file patch task should have turn");
+        let patch_root_task_id = patch_response
+            .root_task_id
+            .clone()
+            .expect("file patch task should have root task");
+        let patch_turn = patch_harness
+            .wait_for_terminal(&patch_session_id, &patch_turn_id)
+            .await;
+        let patch_task = patch_harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(patch_root_task_id))
+            .await;
+        assert_eq!(patch_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(patch_task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(fs::read_to_string(&patch_target).unwrap(), "after\n");
+        assert_eq!(
+            patch_harness
+                .events_for(&patch_session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            0,
+            "Restricted 下工作区内 file_patch 应自动允许"
+        );
+        assert_eq!(
+            patch_harness
+                .events_for(&patch_session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            0,
+            "自动允许的 file_patch 不应伪造审批收口"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&patch_harness),
+            2,
+            "file_patch 允许后应执行工具轮和一次最终答复轮"
+        );
+
+        let mkdir_harness = MagiTurnHarness::new_task("file_mkdir 自动允许后完成");
+        let mkdir_workspace_root = tempfile::tempdir().expect("file mkdir workspace should create");
+        let mkdir_workspace_id = magi_core::WorkspaceId::new("harness-file-mkdir-workspace");
+        mkdir_harness
+            .state
+            .workspace_registry
+            .register_native_path(
+                mkdir_workspace_id.clone(),
+                mkdir_workspace_root.path().to_path_buf(),
+            )
+            .expect("file mkdir workspace should register");
+        let mkdir_session_id = SessionId::new("harness-file-mkdir-session");
+        mkdir_harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                mkdir_session_id.clone(),
+                "file_mkdir 自动允许验收",
+                Some(mkdir_workspace_id.to_string()),
+            )
+            .expect("file mkdir session should create");
+        let mkdir_target = mkdir_workspace_root.path().join("nested").join("created");
+        mkdir_harness.provider.set_tool_then_completed(
+            "file_mkdir",
+            serde_json::json!({"path": mkdir_target.display().to_string()}).to_string(),
+            "file_mkdir 自动允许后完成",
+        );
+
+        let mkdir_response = mkdir_harness
+            .submit_workspace_task_with_access_profile(
+                &mkdir_session_id,
+                &mkdir_workspace_id,
+                mkdir_workspace_root.path(),
+                "调用 file_mkdir 创建工作区内目录",
+                "harness-file-mkdir-request",
+                "harness-file-mkdir-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("file mkdir task should be accepted");
+        let mkdir_turn_id = mkdir_response
+            .turn_id
+            .clone()
+            .expect("file mkdir task should have turn");
+        let mkdir_root_task_id = mkdir_response
+            .root_task_id
+            .clone()
+            .expect("file mkdir task should have root task");
+        let mkdir_turn = mkdir_harness
+            .wait_for_terminal(&mkdir_session_id, &mkdir_turn_id)
+            .await;
+        let mkdir_task = mkdir_harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(mkdir_root_task_id))
+            .await;
+        assert_eq!(mkdir_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(mkdir_task.status, magi_core::TaskStatus::Completed);
+        assert!(
+            mkdir_target.is_dir(),
+            "Restricted 下工作区内 file_mkdir 应创建目录"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&mkdir_harness),
+            2,
+            "file_mkdir 自动允许后应执行工具轮和一次最终答复轮"
+        );
+        assert!(mkdir_turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "file_mkdir" && tool.error.is_none() && tool.result.is_some()
+                })
+        }));
+        assert_eq!(
+            mkdir_harness
+                .events_for(&mkdir_session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            0,
+            "Restricted 下工作区内 file_mkdir 应自动允许"
+        );
+    }
+
+    #[tokio::test]
     async fn restricted_profile_rejects_write_outside_workspace_without_approval() {
         let harness = MagiTurnHarness::new_task("越界写入被拒绝");
         let workspace_root = tempfile::tempdir().expect("workspace should create");
