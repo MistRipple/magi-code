@@ -901,7 +901,7 @@ Coordinator
 - [x] Provider delta 接入 `TurnStreamBuffer`，首帧、窗口、reset 和 terminal flush 有测试。
 - [x] 增加 `TaskCompletionNotifier`，生产 Worker 结果先 durable 提交 TaskStore，再主动通知 Turn 侧。
 - [x] 生产 Task 完成路径不再依赖 Runner 的 `poll_results` 周期消费；轮询接口仅保留未装配通知器的嵌入测试入口。
-- [x] 结果接收器在主动通知目标安装前缓冲的结果会按原顺序一次性交付；通知回调可重入，结果去重、兼容轮询队列和主动通知队列由同一状态锁收口。
+- [x] 结果接收器在主动通知目标安装前缓冲的结果会按原顺序一次性交付；通知回调可重入，结果去重、兼容轮询队列和主动通知队列由同一状态锁收口；Sink panic 会恢复 pending 和通知状态，回调内替换 Sink 后由新 Sink 继续排空。
 - [x] 删除 terminal observer 对 Turn 终态的二次职责。
 - [x] 生产 TaskStore 状态 callback 从 mutation guard 中移出，并在提交后异步执行。
 - [x] 主动完成通知 Sink 的 panic 边界已收口：回调异常时恢复 pending 结果和通知状态；若回调期间已替换 Sink，则由新 Sink 继续排空队列，避免结果遗留。
