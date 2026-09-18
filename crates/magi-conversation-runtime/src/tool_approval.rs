@@ -580,6 +580,29 @@ mod tests {
     }
 
     #[test]
+    fn removing_session_clears_expired_approval_metadata() {
+        let registry = ToolApprovalRegistry::default();
+        let stale = request("approval-expired-session-cleanup");
+        let requested_at = stale.requested_at;
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request(stale.clone())
+            .expect("approval should become pending")
+        else {
+            panic!("approval must initially wait");
+        };
+        assert_eq!(
+            registry.expire_stale(UtcMillis(requested_at.0 + TOOL_APPROVAL_TTL_MILLIS + 1,)),
+            1
+        );
+        assert!(waiter.decision_rx.recv().is_err());
+        assert!(registry.is_expired(&stale.session_id, &stale.approval_id));
+
+        registry.remove_session(&stale.session_id);
+
+        assert!(!registry.is_expired(&stale.session_id, &stale.approval_id));
+    }
+
+    #[test]
     fn allow_for_turn_reuses_only_matching_turn_tool_scope() {
         let registry = ToolApprovalRegistry::default();
         let ToolApprovalRequestOutcome::Pending(waiter) = registry
