@@ -93,12 +93,18 @@ struct PendingApprovalEntry {
     decision_tx: mpsc::Sender<ToolApprovalDecision>,
 }
 
+#[derive(Debug)]
+struct ExpiredToolApproval {
+    task_id: TaskId,
+    turn_id: String,
+}
+
 #[derive(Debug, Default)]
 struct ToolApprovalState {
     pending: HashMap<String, PendingApprovalEntry>,
     turn_tool_grants: HashSet<TurnToolGrant>,
     denied_session_tool_calls: HashSet<SessionToolCallFingerprint>,
-    expired: HashSet<(SessionId, String)>,
+    expired: HashMap<(SessionId, String), ExpiredToolApproval>,
 }
 
 pub struct ToolApprovalWaiter {
@@ -159,8 +165,15 @@ impl ToolApprovalRegistry {
             .map(|(approval_id, entry)| (approval_id.clone(), entry.request.session_id.clone()))
             .collect::<Vec<_>>();
         for (approval_id, session_id) in expired {
-            state.pending.remove(&approval_id);
-            state.expired.insert((session_id, approval_id));
+            if let Some(entry) = state.pending.remove(&approval_id) {
+                state.expired.insert(
+                    (session_id, approval_id),
+                    ExpiredToolApproval {
+                        task_id: entry.request.task_id,
+                        turn_id: entry.request.turn_id,
+                    },
+                );
+            }
         }
     }
 
@@ -182,7 +195,7 @@ impl ToolApprovalRegistry {
         Self::expire_stale_locked(&mut state, UtcMillis::now());
         state
             .expired
-            .contains(&(session_id.clone(), approval_id.to_string()))
+            .contains_key(&(session_id.clone(), approval_id.to_string()))
     }
 
     pub fn request(
@@ -204,7 +217,7 @@ impl ToolApprovalRegistry {
             .lock()
             .map_err(|_| "工具授权状态锁已损坏".to_string())?;
         Self::expire_stale_locked(&mut state, UtcMillis::now());
-        state.expired.retain(|(session_id, approval_id)| {
+        state.expired.retain(|(session_id, approval_id), _| {
             session_id != &request.session_id || approval_id != &request.approval_id
         });
         state.turn_tool_grants.retain(|existing| {
@@ -248,7 +261,7 @@ impl ToolApprovalRegistry {
         let Some(entry) = state.pending.remove(approval_id) else {
             if state
                 .expired
-                .contains(&(session_id.clone(), approval_id.to_string()))
+                .contains_key(&(session_id.clone(), approval_id.to_string()))
             {
                 return Err("工具授权请求已过期".to_string());
             }
@@ -316,9 +329,9 @@ impl ToolApprovalRegistry {
             state.denied_session_tool_calls.retain(|fingerprint| {
                 fingerprint.session_id != *session_id || fingerprint.turn_id != turn_id
             });
-            state
-                .expired
-                .retain(|(expired_session, _)| expired_session != session_id);
+            state.expired.retain(|(expired_session, _), entry| {
+                expired_session != session_id || entry.turn_id != turn_id
+            });
         }
     }
 
@@ -339,7 +352,7 @@ impl ToolApprovalRegistry {
                 .retain(|fingerprint| fingerprint.session_id != *session_id);
             state
                 .expired
-                .retain(|(expired_session, _)| expired_session != session_id);
+                .retain(|(expired_session, _), _| expired_session != session_id);
         }
     }
 
@@ -347,6 +360,9 @@ impl ToolApprovalRegistry {
         if let Ok(mut state) = self.state.lock() {
             state.pending.retain(|_, entry| {
                 entry.request.session_id != *session_id || entry.request.task_id != *task_id
+            });
+            state.expired.retain(|(expired_session, _), entry| {
+                expired_session != session_id || entry.task_id != *task_id
             });
         }
     }
@@ -364,7 +380,7 @@ impl ToolApprovalRegistry {
                 .retain(|fingerprint| fingerprint.session_id != *session_id);
             state
                 .expired
-                .retain(|(expired_session, _)| expired_session != session_id);
+                .retain(|(expired_session, _), _| expired_session != session_id);
         }
     }
 }
@@ -514,6 +530,53 @@ mod tests {
                 .expect("expiry must not be remembered as denial"),
             ToolApprovalRequestOutcome::Pending(_)
         ));
+    }
+
+    #[test]
+    fn removing_task_clears_expired_approval_metadata() {
+        let registry = ToolApprovalRegistry::default();
+        let stale = request("approval-expired-task-cleanup");
+        let requested_at = stale.requested_at;
+        let task_id = stale.task_id.clone();
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request(stale.clone())
+            .expect("approval should become pending")
+        else {
+            panic!("approval must initially wait");
+        };
+        assert_eq!(
+            registry.expire_stale(UtcMillis(requested_at.0 + TOOL_APPROVAL_TTL_MILLIS + 1,)),
+            1
+        );
+        assert!(waiter.decision_rx.recv().is_err());
+        assert!(registry.is_expired(&stale.session_id, &stale.approval_id));
+
+        registry.remove_task(&stale.session_id, &task_id);
+
+        assert!(!registry.is_expired(&stale.session_id, &stale.approval_id));
+    }
+
+    #[test]
+    fn removing_other_turn_keeps_expired_approval_for_original_turn() {
+        let registry = ToolApprovalRegistry::default();
+        let mut stale = request("approval-expired-turn-cleanup");
+        stale.turn_id = "turn-expired".to_string();
+        let requested_at = stale.requested_at;
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request(stale.clone())
+            .expect("approval should become pending")
+        else {
+            panic!("approval must initially wait");
+        };
+        assert_eq!(
+            registry.expire_stale(UtcMillis(requested_at.0 + TOOL_APPROVAL_TTL_MILLIS + 1,)),
+            1
+        );
+        assert!(waiter.decision_rx.recv().is_err());
+
+        registry.remove_turn(&stale.session_id, "turn-other");
+
+        assert!(registry.is_expired(&stale.session_id, &stale.approval_id));
     }
 
     #[test]
