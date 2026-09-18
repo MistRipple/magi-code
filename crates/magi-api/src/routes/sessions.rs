@@ -7,8 +7,8 @@ use axum::{
 use magi_browser_authority::BrowserToolKind;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    CanonicalTurnEventSink, CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus,
-    ExecutionProfile, SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
+    CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus, ExecutionProfile,
+    SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
 };
 use magi_conversation_runtime::{
     PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
@@ -5697,6 +5697,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use magi_conversation_runtime::{
+        CanonicalTurnEventSink,
         execution_admission::ExecutionAdmissionPermit,
         task_execution_registry::TaskExecutionPlan,
         task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher},
