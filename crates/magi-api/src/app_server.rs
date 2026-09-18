@@ -2392,6 +2392,7 @@ mod tests {
     use super::*;
     use axum::http::header::USER_AGENT;
     use futures_util::{SinkExt, StreamExt};
+    use magi_conversation_runtime::CanonicalTurnEventSink;
     use magi_core::{EventId, TaskCompletionContract, TaskTier, ThreadId, UtcMillis};
     use magi_event_bus::EventCategory;
     use magi_governance::GovernanceService;
@@ -2650,9 +2651,10 @@ mod tests {
             timeline_entry_id: Some("timeline-canonical-replay".to_string()),
             source_thread_id: ThreadId::new("thread-canonical-replay"),
         };
-        session_store
-            .accept_current_turn_with_timeline_entry(
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                None,
                 TimelineEntryInput::new(
                     "timeline-canonical-replay",
                     TimelineEntryKind::UserMessage,

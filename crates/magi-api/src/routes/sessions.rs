@@ -7,8 +7,8 @@ use axum::{
 use magi_browser_authority::BrowserToolKind;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus, ExecutionProfile,
-    SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
+    CanonicalTurnEventSink, CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus,
+    ExecutionProfile, SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
 };
 use magi_conversation_runtime::{
     PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
@@ -6941,10 +6941,16 @@ mod tests {
             .expect("task store should exist")
             .insert_task(task)
             .expect("任务应插入");
-        state
-            .session_store
-            .upsert_current_turn(
+        CanonicalTurnEventSink::for_store(&state.session_store, None)
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                None,
+                TimelineEntryInput::new(
+                    "timeline-legacy-continue-thread",
+                    TimelineEntryKind::UserMessage,
+                    "检查项目",
+                    now,
+                ),
                 ActiveExecutionTurn {
                     turn_id: "turn-legacy-continue-thread".to_string(),
                     turn_seq: now.0,
