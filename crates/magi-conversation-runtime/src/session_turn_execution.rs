@@ -5938,20 +5938,21 @@ mod tests {
             orchestrator_thread_id.clone(),
         );
         user_item.item_seq = 1;
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-placeholder-reuse".to_string(),
-                    turn_seq: 1000,
-                    accepted_at: ts(1000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请只回复一句话".to_string()),
-                    items: vec![user_item],
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = ConversationRegistry::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-placeholder-reuse".to_string(),
+                turn_seq: 1000,
+                accepted_at: ts(1000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请只回复一句话".to_string()),
+                items: vec![user_item],
+            },
+        );
         let event_bus = InMemoryEventBus::new(16);
         let client = StreamingTextModelBridgeClient {
             delta_content: "你好".to_string(),
@@ -6072,27 +6073,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(900), || {
                 magi_core::MissionId::new("mission-model-retry-runtime")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-model-retry-runtime".to_string(),
-                    turn_seq: 1_000,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请继续".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("请继续".to_string()),
-                        Some("user-model-retry-runtime".to_string()),
-                        orchestrator_thread_id.clone(),
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = ConversationRegistry::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-model-retry-runtime".to_string(),
+                turn_seq: 1_000,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请继续".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("请继续".to_string()),
+                    Some("user-model-retry-runtime".to_string()),
+                    orchestrator_thread_id.clone(),
+                )],
+            },
+        );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
