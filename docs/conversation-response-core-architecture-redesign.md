@@ -889,6 +889,8 @@ Coordinator
 
 随后将 `routes/messages.rs`、`routes/workspaces.rs`、`routes/goals.rs` 以及 `routes/sessions.rs` 中可迁移的普通 Conversation/排队/查看/中断测试夹具统一改为共享的 `#[cfg(test)]` Coordinator + `CanonicalTurnEventSink` 构造器；`dispatch_submission` 的中断恢复夹具也改为显式 Start/SetStatus + sink 中断，保留 Task checkpoint 和独占 Thread 语义。随后又将 Browser Host 断线、daemon recovery route、session turn cancellation mock 和 dispatcher model configuration failure fixture 收敛到对应的 Coordinator/Sink 写回边界。需要完整 Task execution chain、旧 thread projection、daemon restart recovery 或持久化重建的其他夹具仍保留在各自的迁移/恢复测试边界内。新增 fixture 不改变生产代码路径，相关定向测试与 workspace 全量 Rust 测试均通过。17.3 和 17.7 仍未完成，剩余直接写入主要限于尚未迁移的复杂执行/恢复夹具、存储 canonical mutation 和 Sink 内部实现。
 
+排队与审批测试 harness 也已改为先用 Coordinator 接纳、再由 `CanonicalTurnEventSink` 写入 running Turn；审批等待辅助函数同时等待 pending 状态和 `tool.approval.requested` 事件，避免异步事件发布窗口导致偶发误报。该修复只改变测试同步边界，不改变生产审批状态机。
+
 ### 17.4 Conversation 与 Task 执行分离
 
 - [x] 普通 Chat 接入独立 Conversation 执行路径。

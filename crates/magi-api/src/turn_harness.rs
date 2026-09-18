@@ -1262,7 +1262,15 @@ mod tests {
                 .into_iter()
                 .next()
             {
-                return pending;
+                // Pending 状态先于事件总线发布；等待两者同时可见，避免测试在
+                // 审批注册完成但 `tool.approval.requested` 尚未发布的窄窗口读取。
+                if harness
+                    .events_for(session_id)
+                    .iter()
+                    .any(|event| event.event_type == "tool.approval.requested")
+                {
+                    return pending;
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
