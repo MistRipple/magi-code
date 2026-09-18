@@ -895,6 +895,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 随后将 `conversation_loop` 的共享 Task 测试夹具改为显式 `TurnCommand::Start`、Task execution-chain canonical acceptance、`SetStatus(Preparing/Running)` 和 Sink 状态写回；模型取消测试也改为通过同一 Coordinator 关联的 `CanonicalTurnEventSink` 取消 Turn。该批迁移保持 Task 的主线 thread、任务 execution chain 和取消回调语义，定向 `conversation_loop` 与 cancellation 测试通过。daemon persistence 中用于 stale projection、workspace import 和 event-only recovery 的状态更新也统一经 Sink 的 sidecar 边界，迁移/恢复断言保持不变。
 
+继续将 `session_turn_execution` 中的 vision takeover、steer、plan follow-up 和普通 Turn 隔离夹具改为对应 profile 的 Coordinator + canonical sink 接纳；steer 与 follow-up fixture 复用同一个 registry Coordinator，vision follow-up 使用独立 Turn 的输入边界。相关 session execution 定向测试和 workspace Rust 全量测试通过，仍保留未迁移的上下文恢复、历史投影及存储单元测试边界。
+
 ### 17.4 Conversation 与 Task 执行分离
 
 - [x] 普通 Chat 接入独立 Conversation 执行路径。

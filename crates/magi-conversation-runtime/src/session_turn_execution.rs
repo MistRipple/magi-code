@@ -3427,6 +3427,90 @@ mod tests {
         attempt
     }
 
+    fn seed_conversation_turn(
+        store: &SessionStore,
+        session_id: &SessionId,
+        coordinator: &SessionTurnCoordinator,
+        mut turn: ActiveExecutionTurn,
+    ) {
+        let turn_id = turn.turn_id.clone();
+        let request_id = format!("request-{turn_id}");
+        let request_fingerprint = format!("fingerprint-{turn_id}");
+        let attempt = match coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::Start(TurnAdmission {
+                    turn_id: turn_id.clone(),
+                    request_id: request_id.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    profile: ExecutionProfile::Conversation,
+                }),
+            )
+            .expect("会话 Turn 应先经过 Coordinator 接纳")
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected conversation fixture admission: {other:?}"),
+        };
+        if let Some(item) = turn
+            .items
+            .iter_mut()
+            .find(|item| item.kind == "user_message")
+        {
+            item.request_id = Some(request_id.clone());
+            item.metadata.insert(
+                "executionProfile".to_string(),
+                serde_json::json!("conversation"),
+            );
+            item.metadata
+                .insert("requestId".to_string(), serde_json::json!(request_id));
+            item.metadata.insert(
+                "requestFingerprint".to_string(),
+                serde_json::json!(request_fingerprint),
+            );
+            item.metadata.insert(
+                "attemptId".to_string(),
+                serde_json::json!(attempt.attempt_id.clone()),
+            );
+        }
+        let user_message = turn.user_message.clone().unwrap_or_default();
+        let accepted_at = turn.accepted_at;
+        turn.status = "accepted".to_string();
+        CanonicalTurnEventSink::for_store(store, None)
+            .accept_conversation_turn_with_timeline_entry(
+                session_id.clone(),
+                None,
+                TimelineEntryInput::new(
+                    format!("timeline-{turn_id}"),
+                    TimelineEntryKind::UserMessage,
+                    user_message,
+                    accepted_at,
+                ),
+                turn,
+            )
+            .expect("会话 Turn 应通过 canonical sink 持久化");
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("会话 Turn 应进入 preparing");
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt,
+                    status: CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("会话 Turn 应进入 running");
+        CanonicalTurnEventSink::for_store(store, None)
+            .set_status_domain(session_id, Some(turn_id.as_str()), "running")
+            .expect("会话 Turn running 状态应通过 canonical sink 持久化");
+    }
+
     fn spawn_vision_http_stub() -> (String, mpsc::Receiver<serde_json::Value>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("识图模型测试服务必须能监听");
         let address = listener.local_addr().expect("识图模型测试地址必须存在");
@@ -3967,27 +4051,28 @@ mod tests {
             ],
             ts(950),
         );
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("结合图片继续处理".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("结合图片继续处理".to_string()),
-                        Some("user-vision-takeover".to_string()),
-                        thread_id.clone(),
-                    )],
-                },
-            )
-            .expect("识图接管测试当前轮次必须可写入");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            store.as_ref(),
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: turn_id.clone(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("结合图片继续处理".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("结合图片继续处理".to_string()),
+                    Some("user-vision-takeover".to_string()),
+                    thread_id.clone(),
+                )],
+            },
+        );
         let settings = Arc::new(SettingsStore::new());
         settings
             .set_section(
@@ -4020,7 +4105,7 @@ mod tests {
                 }),
             )
             .expect("识图模型配置必须可写入");
-        let registry = ConversationRegistry::new();
+        let registry = ConversationRegistry::with_turn_coordinator(Arc::new(coordinator));
         registry
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
@@ -4111,28 +4196,31 @@ mod tests {
         );
 
         let follow_up_turn_id = "turn-after-vision-takeover".to_string();
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: follow_up_turn_id.clone(),
-                    turn_seq: 2,
-                    accepted_at: ts(2_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续说明刚才的结论".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("继续说明刚才的结论".to_string()),
-                        Some("user-after-vision-takeover".to_string()),
-                        thread_id.clone(),
-                    )],
-                },
-            )
-            .expect("识图后的纯文本轮次必须可写入");
-        registry
+        let follow_up_coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            store.as_ref(),
+            &session_id,
+            &follow_up_coordinator,
+            ActiveExecutionTurn {
+                turn_id: follow_up_turn_id.clone(),
+                turn_seq: 2,
+                accepted_at: ts(2_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("继续说明刚才的结论".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("继续说明刚才的结论".to_string()),
+                    Some("user-after-vision-takeover".to_string()),
+                    thread_id.clone(),
+                )],
+            },
+        );
+        let follow_up_registry =
+            ConversationRegistry::with_turn_coordinator(Arc::new(follow_up_coordinator));
+        follow_up_registry
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), follow_up_turn_id.clone())
             .expect("识图后的纯文本输入边界必须可创建");
@@ -4159,7 +4247,7 @@ mod tests {
             client: &main_client,
             event_bus: &InMemoryEventBus::new(32),
             session_store: store.as_ref(),
-            conversation_registry: &registry,
+            conversation_registry: &follow_up_registry,
             plan_store: &plan_store,
             settings_store: Some(&settings),
             safety_gate: None,
@@ -4380,28 +4468,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(900), || {
                 magi_core::MissionId::new("mission-runtime-steer")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: 1_000,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请给出完整方案".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("请给出完整方案".to_string()),
-                        Some("user-runtime-steer".to_string()),
-                        orchestrator_thread_id.clone(),
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
         let registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: turn_id.clone(),
+                turn_seq: 1_000,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请给出完整方案".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("请给出完整方案".to_string()),
+                    Some("user-runtime-steer".to_string()),
+                    orchestrator_thread_id.clone(),
+                )],
+            },
+        );
         registry
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
@@ -4501,28 +4589,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(900), || {
                 magi_core::MissionId::new("mission-plan-follow-up")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("完成全部计划".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("完成全部计划".to_string()),
-                        Some("user-plan-follow-up".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
         let registry = ConversationRegistry::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: turn_id.clone(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("完成全部计划".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("完成全部计划".to_string()),
+                    Some("user-plan-follow-up".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         registry
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
@@ -4664,28 +4752,28 @@ mod tests {
                 None,
             )
             .expect("goal resume request should wait for an owner");
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: ordinary_turn_id.clone(),
-                    turn_seq: 2,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("执行普通任务".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("执行普通任务".to_string()),
-                        Some("user-ordinary-diversion".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("ordinary turn should be stored");
         let registry = ConversationRegistry::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: ordinary_turn_id.clone(),
+                turn_seq: 2,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("执行普通任务".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("执行普通任务".to_string()),
+                    Some("user-ordinary-diversion".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         registry
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), ordinary_turn_id.clone())
