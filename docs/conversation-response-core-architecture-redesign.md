@@ -897,7 +897,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 继续将 `session_turn_execution` 中的 vision takeover、steer、plan follow-up 和普通 Turn 隔离夹具改为对应 profile 的 Coordinator + canonical sink 接纳；steer 与 follow-up fixture 复用同一个 registry Coordinator，vision follow-up 使用独立 Turn 的输入边界。相关 session execution 定向测试和 workspace Rust 全量测试通过，仍保留未迁移的上下文恢复、历史投影及存储单元测试边界。
 
-随后又迁移了会话错误、空流/流中断恢复、图片错误、placeholder 和 retry event 测试夹具；当前剩余 `session_turn_execution` 直接 `upsert_current_turn` 主要位于从预构造 `SessionStoreState` 读取历史/上下文的测试，以及 context-compaction、最终 item 时序等局部读写断言，未进入生产路径。该批迁移后的 workspace Rust 全量仍通过，17.3/17.7 继续保持未完成。
+随后又迁移了会话错误、空流/流中断恢复、图片错误、placeholder 和 retry event 测试夹具；进一步将 `conversation_loop` 与 `session_turn_execution` 中剩余可迁移的普通 Task/Conversation Turn 构造统一为对应 profile 的 Coordinator + canonical sink 接纳，保留 Task 的 execution-chain、worker thread、上下文历史和终态时序语义。当前直接 `upsert_current_turn` 已不再出现在这两个执行测试模块中，剩余直接写入主要位于从预构造 `SessionStoreState` 读取历史/上下文的测试、context-compaction 与最终 item 时序等局部读写断言，以及 SessionStore/Goal 单元测试和 legacy projection/recovery fixture，未进入生产路径。该批迁移后的 workspace Rust 全量仍通过，17.3/17.7 继续保持未完成。
 
 ### 17.4 Conversation 与 Task 执行分离
 

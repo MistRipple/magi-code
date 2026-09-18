@@ -6303,22 +6303,21 @@ mod tests {
                 message_history: Vec::new(),
             }],
         });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-session-2000".to_string(),
-                    turn_seq: 2000,
-                    accepted_at: ts(2000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some(
-                        "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
-                    ),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-session-2000".to_string(),
+                turn_seq: 2000,
+                accepted_at: ts(2000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string()),
+                items: Vec::new(),
+            },
+        );
 
         let request = SessionTurnExecutionRequest {
             session_id,
@@ -6586,20 +6585,21 @@ mod tests {
                 message_history: Vec::new(),
             }],
         });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-current".to_string(),
-                    turn_seq: 2_000,
-                    accepted_at: ts(2_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("只回复停止后恢复正常".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-current".to_string(),
+                turn_seq: 2_000,
+                accepted_at: ts(2_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("只回复停止后恢复正常".to_string()),
+                items: Vec::new(),
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id,
             turn_id: "turn-current".to_string(),
@@ -6736,20 +6736,21 @@ mod tests {
                 message_history: Vec::new(),
             }],
         });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-session-2000".to_string(),
-                    turn_seq: 2_000,
-                    accepted_at: ts(2_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("最早的上下文标记是什么？".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-session-2000".to_string(),
+                turn_seq: 2_000,
+                accepted_at: ts(2_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("最早的上下文标记是什么？".to_string()),
+                items: Vec::new(),
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id,
             turn_id: "turn-session-2000".to_string(),
@@ -6789,20 +6790,21 @@ mod tests {
         store
             .create_session(session_id.clone(), "workspace context")
             .expect("session should be created");
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-workspace-context".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("分析一下当前项目".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-workspace-context".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("分析一下当前项目".to_string()),
+                items: Vec::new(),
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id,
             turn_id: "turn-workspace-context".to_string(),
@@ -6961,20 +6963,21 @@ mod tests {
         store
             .create_session(session_id.clone(), "current image")
             .expect("session should be created");
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-current-image".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("识别图片".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-current-image".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("识别图片".to_string()),
+                items: Vec::new(),
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id,
             turn_id: "turn-current-image".to_string(),
@@ -7017,20 +7020,21 @@ mod tests {
         store
             .create_session(session_id.clone(), "workspace chat")
             .expect("session should be created");
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-workspace-chat".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("解释一下当前状态".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-workspace-chat".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("解释一下当前状态".to_string()),
+                items: Vec::new(),
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id,
             turn_id: "turn-workspace-chat".to_string(),
@@ -7112,20 +7116,21 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(1000), || {
                 magi_core::MissionId::new("mission-post-tool-final-item")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-post-tool-final-item".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请调用工具后回答".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-post-tool-final-item".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请调用工具后回答".to_string()),
+                items: Vec::new(),
+            },
+        );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
@@ -7273,27 +7278,28 @@ mod tests {
         let (_, thread_id) = store.ensure_session_mission(&session_id, ts(1_000), || {
             magi_core::MissionId::new("mission-context-compaction-notice")
         });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-context-compaction-notice".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续对话".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("继续对话".to_string()),
-                        Some("user-context-compaction-notice".to_string()),
-                        thread_id.clone(),
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-context-compaction-notice".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("继续对话".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("继续对话".to_string()),
+                    Some("user-context-compaction-notice".to_string()),
+                    thread_id.clone(),
+                )],
+            },
+        );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
@@ -7458,20 +7464,21 @@ mod tests {
             provider_context: Vec::new(),
         }));
         store.append_thread_messages(&thread_id, history, ts(2));
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-context-limit-after-tool".to_string(),
-                    turn_seq: 3,
-                    accepted_at: ts(3),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续".to_string()),
-                    items: vec![],
-                },
-            )
-            .expect("current turn should store");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-context-limit-after-tool".to_string(),
+                turn_seq: 3,
+                accepted_at: ts(3),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("继续".to_string()),
+                items: vec![],
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
             turn_id: "turn-context-limit-after-tool".to_string(),
@@ -7565,20 +7572,21 @@ mod tests {
                 .collect(),
             ts(2),
         );
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-context-compaction-failure".to_string(),
-                    turn_seq: 3,
-                    accepted_at: ts(3),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续".to_string()),
-                    items: vec![],
-                },
-            )
-            .expect("current turn should store");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-context-compaction-failure".to_string(),
+                turn_seq: 3,
+                accepted_at: ts(3),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("继续".to_string()),
+                items: vec![],
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
             turn_id: "turn-context-compaction-failure".to_string(),
@@ -7670,20 +7678,21 @@ mod tests {
                 .collect(),
             ts(2),
         );
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-context-compaction-cancelled".to_string(),
-                    turn_seq: 3,
-                    accepted_at: ts(3),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续".to_string()),
-                    items: vec![],
-                },
-            )
-            .expect("current turn should store");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            store.as_ref(),
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-context-compaction-cancelled".to_string(),
+                turn_seq: 3,
+                accepted_at: ts(3),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("继续".to_string()),
+                items: vec![],
+            },
+        );
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
             turn_id: "turn-context-compaction-cancelled".to_string(),
@@ -7762,20 +7771,21 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(1000), || {
                 magi_core::MissionId::new("mission-terminal-duration")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-terminal-duration".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请回答".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let coordinator = SessionTurnCoordinator::new();
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            &coordinator,
+            ActiveExecutionTurn {
+                turn_id: "turn-terminal-duration".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请回答".to_string()),
+                items: Vec::new(),
+            },
+        );
         let event_bus = InMemoryEventBus::new(16);
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),

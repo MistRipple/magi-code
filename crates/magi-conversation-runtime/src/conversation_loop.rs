@@ -6050,20 +6050,15 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis::now(), || task.mission_id.clone());
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-unbounded-tool-rounds".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("验证模型可自主持续调用工具".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("turn should be creatable");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-unbounded-tool-rounds",
+            "验证模型可自主持续调用工具",
+        );
 
         let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(0)));
         let tool_event_bus = Arc::new(InMemoryEventBus::new(16));
@@ -6090,7 +6085,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -6179,20 +6174,15 @@ mod tests {
                 .collect(),
             UtcMillis::now(),
         );
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-task-context-limit-after-tool".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("执行探针后完成".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("turn should create");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-task-context-limit-after-tool",
+            "执行探针后完成",
+        );
         let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(0)));
         let tool_event_bus = Arc::new(InMemoryEventBus::new(16));
         let mut tool_registry = ToolRegistry::new(
@@ -6274,7 +6264,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -6436,20 +6426,15 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis::now(), || task.mission_id.clone());
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-required-delivery-evidence".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("生成当前项目流程图".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("turn should be creatable");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-required-delivery-evidence",
+            "生成当前项目流程图",
+        );
 
         let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(0)));
         let tool_event_bus = Arc::new(InMemoryEventBus::new(16));
@@ -6481,7 +6466,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -6620,20 +6605,15 @@ mod tests {
             ],
             UtcMillis::now(),
         );
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-resumed-delivery-current".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("turn should be creatable");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-resumed-delivery-current",
+            "继续",
+        );
 
         let client = StaticTaskFinalModelBridgeClient {
             content: "流程图已生成，继续任务已完成。",
@@ -6651,7 +6631,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -6947,8 +6927,47 @@ mod tests {
         task: &Task,
         user_message: &str,
     ) {
-        let accepted_at = UtcMillis::now();
         let turn_id = format!("turn-test-{session_id}");
+        ensure_test_current_turn_with_id(
+            session_store,
+            conversation_registry,
+            session_id,
+            task,
+            &turn_id,
+            user_message,
+        );
+    }
+
+    fn ensure_test_current_turn_with_id(
+        session_store: &SessionStore,
+        conversation_registry: &ConversationRegistry,
+        session_id: &SessionId,
+        task: &Task,
+        turn_id: &str,
+        user_message: &str,
+    ) {
+        ensure_test_current_turn_with_id_and_source_thread(
+            session_store,
+            conversation_registry,
+            session_id,
+            task,
+            turn_id,
+            user_message,
+            None,
+        );
+    }
+
+    fn ensure_test_current_turn_with_id_and_source_thread(
+        session_store: &SessionStore,
+        conversation_registry: &ConversationRegistry,
+        session_id: &SessionId,
+        task: &Task,
+        turn_id: &str,
+        user_message: &str,
+        source_thread_id: Option<magi_core::ThreadId>,
+    ) {
+        let accepted_at = UtcMillis::now();
+        let turn_id = turn_id.to_string();
         let request_id = format!("request-{turn_id}");
         let request_fingerprint = format!("fingerprint-{turn_id}");
         let coordinator = conversation_registry.turn_coordinator();
@@ -6969,10 +6988,16 @@ mod tests {
             )) => attempt,
             other => panic!("unexpected fixture admission: {other:?}"),
         };
-        let source_thread_id = session_store
-            .orchestrator_thread_for_session(session_id)
-            .map(|thread| thread.thread_id)
-            .unwrap_or_else(|| magi_core::ThreadId::new(format!("thread-{session_id}")));
+        let source_thread_id = source_thread_id.unwrap_or_else(|| {
+            session_store
+                .orchestrator_thread_for_session(session_id)
+                .map(|thread| thread.thread_id)
+                .unwrap_or_else(|| {
+                    session_store
+                        .ensure_session_mission(session_id, accepted_at, || task.mission_id.clone())
+                        .1
+                })
+        });
         let mut user_item = session_turn_item(
             "user_message",
             "completed",
@@ -8453,21 +8478,6 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "task final root running")
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-task-final-root-running".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("执行深度任务".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("turn should be stored");
-
         let task_store = TaskStore::new();
         let root_task_id = TaskId::new("task-root-final-root-running");
         let task_id = TaskId::new("task-action-final-root-running");
@@ -8479,6 +8489,15 @@ mod tests {
         task.root_task_id = root_task_id;
         task.status = TaskStatus::Completed;
         task_store.insert_task(task.clone()).expect("任务应插入");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-task-final-root-running",
+            "执行深度任务",
+        );
         // 该用例验证"root 未完成时不能提前收尾主线 turn"，因此 task 本身走 Mainline 路径：
         // 传 is_sidechain=false，`task_turn_visibility` 会返回 Mainline，
         // 后续 append_task_final_turn_item 的 `is_mainline()` 分支才会被覆盖到。
@@ -8539,24 +8558,19 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-task-model-failure".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("验证模型失败写回".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
 
         let task_store = TaskStore::new();
         let task = make_task_loop_test_task(task_id.as_str());
         task_store.insert_task(task.clone()).expect("任务应插入");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-task-model-failure",
+            "验证模型失败写回",
+        );
         let lease = task_store
             .grant_lease(
                 &task.task_id,
@@ -8584,7 +8598,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -8735,20 +8749,15 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis::now(), || task.mission_id.clone());
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-task-empty-response-diagnostic".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("验证空响应诊断".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("turn should be creatable");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-task-empty-response-diagnostic",
+            "验证空响应诊断",
+        );
         let client = CountingEmptyTaskModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
         };
@@ -8766,7 +8775,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -8837,20 +8846,6 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-subagent-empty-stream-recovery".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("验证子代理空流恢复".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
 
         let task_store = TaskStore::new();
         let mut task = make_task_loop_test_task(task_id.as_str());
@@ -8884,6 +8879,16 @@ mod tests {
                 message_history: Vec::new(),
             })
             .expect("空流恢复测试 thread 应注册成功");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id_and_source_thread(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-subagent-empty-stream-recovery",
+            "验证子代理空流恢复",
+            Some(worker_thread_id.clone()),
+        );
         let client = EmptyStreamThenRecoveredTaskModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
         };
@@ -8901,7 +8906,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -8967,20 +8972,6 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-subagent-stream-recovery".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("验证子代理流式恢复".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
 
         let task_store = TaskStore::new();
         let mut task = make_task_loop_test_task(task_id.as_str());
@@ -9014,6 +9005,16 @@ mod tests {
                 message_history: Vec::new(),
             })
             .expect("流式恢复测试 thread 应注册成功");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id_and_source_thread(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-subagent-stream-recovery",
+            "验证子代理流式恢复",
+            Some(worker_thread_id.clone()),
+        );
         let client = InterruptedThenRecoveredTaskModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
             non_stream_fallback_count: AtomicUsize::new(0),
@@ -9033,7 +9034,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -9133,20 +9134,15 @@ mod tests {
         let now = UtcMillis::now();
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-task-tool-content".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("验证工具轮正文归属".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-task-tool-content",
+            "验证工具轮正文归属",
+        );
 
         let worker_id = WorkerId::new("worker-task-tool-content");
         let lease = task_store
@@ -9185,7 +9181,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -9317,20 +9313,16 @@ mod tests {
                 .expect("工具批处理测试 thread 应注册成功");
             thread_id
         };
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-task-tool-batch".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("验证 worker 工具并发".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id_and_source_thread(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "turn-task-tool-batch",
+            "验证 worker 工具并发",
+            Some(worker_thread_id.clone()),
+        );
 
         let lease = task_store
             .grant_lease(
@@ -9369,7 +9361,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -9537,20 +9529,15 @@ mod tests {
         } else {
             orchestrator_thread_id
         };
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: format!("turn-duplicate-read-{suffix}"),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
-                    user_message: Some("读取 fixture".to_string()),
-                    items: Vec::new(),
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn_with_id(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            &format!("turn-duplicate-read-{suffix}"),
+            "读取 fixture",
+        );
         let lease = task_store
             .grant_lease(
                 &task.task_id,
@@ -9571,7 +9558,6 @@ mod tests {
         };
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
         let execution_registry = TaskExecutionRegistry::default();
-        let conversation_registry = ConversationRegistry::new();
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store(&format!("plan-duplicate-read-{suffix}"));
