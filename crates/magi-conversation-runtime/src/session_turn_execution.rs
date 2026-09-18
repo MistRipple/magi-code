@@ -5495,27 +5495,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(1_100), || {
                 magi_core::MissionId::new("mission-empty-stream-recovery")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-empty-stream-recovery".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_200),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请回复一句话".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("请回复一句话".to_string()),
-                        Some("user-empty-stream-recovery".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("turn should be stored");
+        let conversation_registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            store.as_ref(),
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-empty-stream-recovery".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_200),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请回复一句话".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("请回复一句话".to_string()),
+                    Some("user-empty-stream-recovery".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         let client = EmptyStreamThenRecoveredSessionModelBridgeClient {
             streaming_calls: AtomicUsize::new(0),
         };
@@ -5545,7 +5546,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: store.as_ref(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: conversation_registry.as_ref(),
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
@@ -5588,27 +5589,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(915), || {
                 magi_core::MissionId::new("mission-partial-stream-failure")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-partial-stream-failure".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请输出长回复".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("请输出长回复".to_string()),
-                        Some("user-partial-stream-failure".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-partial-stream-failure".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请输出长回复".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("请输出长回复".to_string()),
+                    Some("user-partial-stream-failure".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         let client = StreamingThenFailingModelBridgeClient {
             delta_content: "这是一段半截输出".to_string(),
             message:
@@ -5640,7 +5642,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: conversation_registry.as_ref(),
             plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
@@ -5709,27 +5711,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(1_500), || {
                 magi_core::MissionId::new("mission-stream-recovery")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-stream-recovery".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_500),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请输出完整回复".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("请输出完整回复".to_string()),
-                        Some("user-stream-recovery".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-stream-recovery".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_500),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请输出完整回复".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("请输出完整回复".to_string()),
+                    Some("user-stream-recovery".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         let client = InterruptedThenRecoveredSessionModelBridgeClient {
             streaming_calls: AtomicUsize::new(0),
             non_stream_calls: AtomicUsize::new(0),
@@ -5760,7 +5763,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: conversation_registry.as_ref(),
             plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
@@ -5820,27 +5823,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(920), || {
                 magi_core::MissionId::new("mission-image-error-layer")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-image-error-layer".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请识别这张图片".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("请识别这张图片".to_string()),
-                        Some("user-image-error-layer".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            &store,
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-image-error-layer".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请识别这张图片".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("请识别这张图片".to_string()),
+                    Some("user-image-error-layer".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         let client = FailingModelBridgeClient {
             message: "provider response invalid: empty stream response".to_string(),
         };
@@ -5872,7 +5876,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: conversation_registry.as_ref(),
             plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
