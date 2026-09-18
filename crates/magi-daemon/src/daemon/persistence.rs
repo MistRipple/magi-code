@@ -4856,8 +4856,8 @@ mod tests {
             .join(StateRepository::session_projection_file_name(&session_id));
         let stale_projection = fs::read(&projection_path).expect("projection should exist");
 
-        session_store
-            .update_current_turn_status_for_turn(&session_id, Some(turn_id.as_str()), "completed")
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some(turn_id.as_str()), "completed")
             .expect("turn should complete");
         repository
             .save_session_projection_state(
@@ -4897,8 +4897,8 @@ mod tests {
             .execution_sidecar_store_state()
             .runtime_sidecar(&session_id)
             .expect("accepted turn should have a sidecar");
-        session_store
-            .append_current_turn_item_for_turn(
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+            .append_item_sidecar(
                 &session_id,
                 Some(turn_id.as_str()),
                 ActiveExecutionTurnItem {
@@ -4927,8 +4927,8 @@ mod tests {
                 },
             )
             .expect("canonical item should append");
-        session_store
-            .update_current_turn_status_for_turn(&session_id, Some(turn_id.as_str()), "completed")
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some(turn_id.as_str()), "completed")
             .expect("turn should complete");
         repository
             .save_session_projection_state(
@@ -5017,8 +5017,8 @@ mod tests {
             accepted_session_store("workspace-import-session", Some("workspace-import"), 56);
         let session_id = SessionId::new("workspace-import-session");
         install_test_event_authority(&source_repository, &session_store);
-        session_store
-            .update_current_turn_status_for_turn(&session_id, Some(turn_id.as_str()), "completed")
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some(turn_id.as_str()), "completed")
             .expect("workspace import turn should complete");
         let source_events = SessionConversationProjection::load(
             &source_repository.session_event_root(&session_id),
@@ -5188,8 +5188,8 @@ mod tests {
         );
         let session_id = SessionId::new("workspace-import-journal-session");
         install_test_event_authority(&source_repository, &session_store);
-        session_store
-            .update_current_turn_status_for_turn(&session_id, Some(turn_id.as_str()), "completed")
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some(turn_id.as_str()), "completed")
             .expect("journal import turn should complete");
         let source_events = SessionConversationProjection::load(
             &source_repository.session_event_root(&session_id),
@@ -5322,8 +5322,8 @@ mod tests {
         // accepted 事务之后继续追加 canonical item 并完成 Turn，模拟 projection 尚未
         // checkpoint 时 daemon 退出。恢复必须从 event-only canonical 结果重建旧 sidecar。
         session_store.install_canonical_event_writer(Arc::new(repository.clone()));
-        session_store
-            .append_current_turn_item_for_turn(
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+            .append_item_sidecar(
                 &session_id,
                 Some(turn_id.as_str()),
                 ActiveExecutionTurnItem {
@@ -5352,8 +5352,8 @@ mod tests {
                 },
             )
             .expect("event-only canonical item should append");
-        session_store
-            .update_current_turn_status_for_turn(&session_id, Some(turn_id.as_str()), "completed")
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some(turn_id.as_str()), "completed")
             .expect("event-only canonical turn should complete");
         assert!(
             !repository

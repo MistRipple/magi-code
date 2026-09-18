@@ -4333,13 +4333,14 @@ mod tests {
         ModelRetryRuntimePhase,
     };
     use magi_core::{
-        ApprovalRequirement, MissionId, RiskLevel, Task, TaskKind, TaskStatus, TaskTier, WorkerId,
-        WorkspaceRootPath,
+        ApprovalRequirement, MissionId, RiskLevel, Task, TaskId, TaskKind, TaskStatus, TaskTier,
+        WorkerId, WorkspaceRootPath,
     };
     use magi_governance::GovernanceService;
     use magi_session_store::{
-        ActiveExecutionTurn, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
-        ExecutionThread, ExecutionThreadStatus, TimelineEntryKind,
+        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
+        CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus, ExecutionThread,
+        ExecutionThreadStatus, TimelineEntryKind,
     };
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec, ToolExecutionContext};
     use std::{
@@ -6942,23 +6943,121 @@ mod tests {
     fn ensure_test_current_turn(
         session_store: &SessionStore,
         session_id: &SessionId,
+        task: &Task,
         user_message: &str,
     ) {
         let accepted_at = UtcMillis::now();
-        session_store
-            .upsert_current_turn(
+        let turn_id = format!("turn-test-{session_id}");
+        let request_id = format!("request-{turn_id}");
+        let request_fingerprint = format!("fingerprint-{turn_id}");
+        let coordinator = crate::SessionTurnCoordinator::new();
+        let attempt = match coordinator
+            .execute_command(
+                session_id,
+                crate::TurnCommand::Start(crate::TurnAdmission {
+                    turn_id: turn_id.clone(),
+                    request_id: request_id.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    profile: crate::ExecutionProfile::Task,
+                }),
+            )
+            .expect("测试 Turn 应先经过 Coordinator 接纳")
+        {
+            crate::CoordinatorCommandResult::Admission(crate::CoordinatorAdmission::Accepted(
+                attempt,
+            )) => attempt,
+            other => panic!("unexpected fixture admission: {other:?}"),
+        };
+        let source_thread_id = session_store
+            .orchestrator_thread_for_session(session_id)
+            .map(|thread| thread.thread_id)
+            .unwrap_or_else(|| magi_core::ThreadId::new(format!("thread-{session_id}")));
+        let mut user_item = session_turn_item(
+            "user_message",
+            "completed",
+            None,
+            Some(user_message.to_string()),
+            Some(format!("user-{turn_id}")),
+            source_thread_id,
+        );
+        user_item.source = "user".to_string();
+        user_item.item_seq = 1;
+        user_item.request_id = Some(request_id.clone());
+        user_item
+            .metadata
+            .insert("executionProfile".to_string(), serde_json::json!("task"));
+        user_item
+            .metadata
+            .insert("requestId".to_string(), serde_json::json!(request_id));
+        user_item.metadata.insert(
+            "requestFingerprint".to_string(),
+            serde_json::json!(request_fingerprint),
+        );
+        user_item.metadata.insert(
+            "attemptId".to_string(),
+            serde_json::json!(attempt.attempt_id),
+        );
+        let mission_id = task.mission_id.clone();
+        let root_task_id = task.root_task_id.clone();
+        CanonicalTurnEventSink::for_store(session_store, None)
+            .accept_active_execution_chain_with_timeline_entry_and_task(
                 session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: format!("turn-test-{session_id}"),
-                    turn_seq: accepted_at.0,
+                magi_session_store::TimelineEntryInput::new(
+                    format!("timeline-{turn_id}"),
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    user_message,
                     accepted_at,
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some(user_message.to_string()),
-                    items: Vec::new(),
+                ),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id,
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: format!("chain-{turn_id}"),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: vec![WorkerId::new(format!("worker-{turn_id}"))],
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: format!("timeline-{turn_id}"),
+                        trimmed_text: Some(user_message.to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: turn_id.clone(),
+                        turn_seq: accepted_at.0,
+                        accepted_at,
+                        completed_at: None,
+                        status: "accepted".to_string(),
+                        user_message: Some(user_message.to_string()),
+                        items: vec![user_item],
+                    }),
+                },
+                task,
+            )
+            .expect("测试 Turn 应通过 canonical sink 持久化");
+        coordinator
+            .execute_command(
+                session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: crate::CoordinatorTurnStatus::Preparing,
                 },
             )
-            .expect("测试 Turn 应持久化");
+            .expect("测试 Turn 应进入 preparing");
+        coordinator
+            .execute_command(
+                session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt,
+                    status: crate::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("测试 Turn 应进入 running");
+        CanonicalTurnEventSink::for_store(session_store, None)
+            .set_status_domain(session_id, Some(turn_id.as_str()), "running")
+            .expect("测试 Turn running 状态应通过 canonical sink 持久化");
     }
 
     fn run_static_task_final(task: &Task, content: &'static str) -> TaskOutcome {
@@ -6988,7 +7087,7 @@ mod tests {
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         // P7：mainline 场景 task 自身 thread = orchestrator thread。
         let thread_id = orchestrator_thread_id.clone();
-        ensure_test_current_turn(&session_store, &session_id, "请执行任务");
+        ensure_test_current_turn(&session_store, &session_id, task, "请执行任务");
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
             event_bus: &event_bus,
@@ -7057,7 +7156,7 @@ mod tests {
         let now = UtcMillis::now();
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, "请执行任务");
+        ensure_test_current_turn(&session_store, &session_id, &task, "请执行任务");
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &RetryEventTaskModelBridgeClient,
@@ -7147,7 +7246,7 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
-        ensure_test_current_turn(&session_store, &session_id, "识别图片");
+        ensure_test_current_turn(&session_store, &session_id, &task, "识别图片");
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
@@ -7415,7 +7514,12 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
-        ensure_test_current_turn(&session_store, &session_id, "请调用一个失败工具后总结");
+        ensure_test_current_turn(
+            &session_store,
+            &session_id,
+            &task,
+            "请调用一个失败工具后总结",
+        );
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
@@ -7511,6 +7615,7 @@ mod tests {
         ensure_test_current_turn(
             &session_store,
             &session_id,
+            &task,
             "请先处理失败工具，再通过重试完成任务",
         );
 
@@ -7709,7 +7814,7 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, "完成全部计划");
+        ensure_test_current_turn(&session_store, &session_id, &task, "完成全部计划");
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -7819,7 +7924,7 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, "执行普通任务");
+        ensure_test_current_turn(&session_store, &session_id, &task, "执行普通任务");
         let goal = session_store
             .create_goal(
                 session_id.clone(),
@@ -7959,7 +8064,7 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, "完成子代理任务");
+        ensure_test_current_turn(&session_store, &session_id, &task, "完成子代理任务");
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -8060,6 +8165,7 @@ mod tests {
         ensure_test_current_turn(
             &session_store,
             &session_id,
+            &task,
             "当前任务：输出 CURRENT_TASK_RESULT，不要输出 OLD_REFERENCE_RESULT",
         );
         session_store.append_thread_messages(

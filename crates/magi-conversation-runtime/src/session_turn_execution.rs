@@ -3247,17 +3247,23 @@ fn append_final_item(
 mod tests {
     use super::*;
     use crate::session_writeback::append_session_turn_item_for_turn;
+    use crate::{
+        CanonicalTurnEventSink, CoordinatorAdmission, CoordinatorCommandResult,
+        CoordinatorTurnStatus, ExecutionProfile, SessionTurnCoordinator, TurnAdmission,
+        TurnAttempt, TurnCommand,
+    };
     use magi_bridge_client::{
         BridgeClientError, BridgeErrorLayer, ModelResponse, ModelRetryRuntimeEvent,
         ModelRetryRuntimePhase,
     };
-    use magi_core::{SessionLifecycleStatus, TaskId};
+    use magi_core::{MissionId, SessionLifecycleStatus, TaskId};
     use magi_session_store::{
-        ActiveExecutionTurn, CanonicalToolCall, CanonicalTurn, CanonicalTurnItem,
-        CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
-        CanonicalTurnVisibility, CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus,
-        ORCHESTRATOR_ROLE_ID, SessionRecord, SessionStoreState, ThreadChatMessage,
-        ThreadChatToolCall, ThreadChatToolFunction, TimelineEntry, TimelineEntryKind,
+        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
+        CanonicalToolCall, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
+        CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef,
+        ExecutionThread, ExecutionThreadStatus, ORCHESTRATOR_ROLE_ID, SessionRecord,
+        SessionStoreState, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
+        TimelineEntry, TimelineEntryInput, TimelineEntryKind,
     };
     use std::sync::{
         Mutex,
@@ -3279,6 +3285,146 @@ mod tests {
 
     fn ts(value: u64) -> UtcMillis {
         UtcMillis(value)
+    }
+
+    fn seed_task_turn(
+        store: &SessionStore,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        accepted_at: UtcMillis,
+        user_message: &str,
+        thread_id: magi_core::ThreadId,
+        coordinator: &SessionTurnCoordinator,
+    ) -> TurnAttempt {
+        let request_id = format!("request-{turn_id}");
+        let request_fingerprint = format!("fingerprint-{turn_id}");
+        let attempt = match coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::Start(TurnAdmission {
+                    turn_id: turn_id.to_string(),
+                    request_id: request_id.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    profile: ExecutionProfile::Task,
+                }),
+            )
+            .expect("测试 Turn 应先经过 Coordinator 接纳")
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected fixture admission: {other:?}"),
+        };
+        let mut item = session_turn_item(
+            "user_message",
+            "completed",
+            None,
+            Some(user_message.to_string()),
+            Some(format!("user-{turn_id}")),
+            thread_id,
+        );
+        item.source = "user".to_string();
+        item.item_seq = 1;
+        item.request_id = Some(request_id.clone());
+        item.metadata
+            .insert("executionProfile".to_string(), serde_json::json!("task"));
+        item.metadata
+            .insert("requestId".to_string(), serde_json::json!(request_id));
+        item.metadata.insert(
+            "requestFingerprint".to_string(),
+            serde_json::json!(request_fingerprint),
+        );
+        item.metadata.insert(
+            "attemptId".to_string(),
+            serde_json::json!(attempt.attempt_id.clone()),
+        );
+        let task_id = TaskId::new(turn_id.to_string());
+        let mission_id = MissionId::new(format!("mission-{session_id}"));
+        let task = magi_core::Task {
+            task_id: task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: task_id.clone(),
+            parent_task_id: None,
+            kind: magi_core::TaskKind::LocalAgent,
+            title: user_message.to_string(),
+            goal: user_message.to_string(),
+            status: magi_core::TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: Default::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: Default::default(),
+            created_at: accepted_at,
+            updated_at: accepted_at,
+        };
+        CanonicalTurnEventSink::for_store(store, None)
+            .accept_active_execution_chain_with_timeline_entry_and_task(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    format!("timeline-{turn_id}"),
+                    TimelineEntryKind::UserMessage,
+                    user_message,
+                    accepted_at,
+                ),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id,
+                    root_task_id: task_id,
+                    execution_chain_ref: format!("chain-{turn_id}"),
+                    workspace_id: None,
+                    active_branch_task_ids: Vec::new(),
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: format!("timeline-{turn_id}"),
+                        trimmed_text: Some(user_message.to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: turn_id.to_string(),
+                        turn_seq,
+                        accepted_at,
+                        completed_at: None,
+                        status: "accepted".to_string(),
+                        user_message: Some(user_message.to_string()),
+                        items: vec![item],
+                    }),
+                },
+                &task,
+            )
+            .expect("测试 Turn 应通过 canonical sink 持久化");
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("测试 Turn 应进入 preparing");
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("测试 Turn 应进入 running");
+        CanonicalTurnEventSink::for_store(store, None)
+            .set_status_domain(session_id, Some(turn_id), "running")
+            .expect("测试 Turn running 状态应通过 canonical sink 持久化");
+        attempt
     }
 
     fn spawn_vision_http_stub() -> (String, mpsc::Receiver<serde_json::Value>) {
@@ -3724,28 +3870,18 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(900), || {
                 magi_core::MissionId::new("mission-model-cancellation")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("停止测试".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("停止测试".to_string()),
-                        Some("user-model-cancellation".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
-        let registry = ConversationRegistry::new();
+        let coordinator = Arc::new(SessionTurnCoordinator::new());
+        seed_task_turn(
+            store.as_ref(),
+            &session_id,
+            &turn_id,
+            1,
+            ts(1_000),
+            "停止测试",
+            orchestrator_thread_id,
+            coordinator.as_ref(),
+        );
+        let registry = ConversationRegistry::with_turn_coordinator(coordinator);
         registry
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
