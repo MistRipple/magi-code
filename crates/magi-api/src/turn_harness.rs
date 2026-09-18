@@ -1970,6 +1970,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_profile_rejects_explicit_file_write_without_approval_or_side_effect() {
+        let harness = MagiTurnHarness::new_task("只读模式拒绝显式文件写入");
+        let workspace_root = tempfile::tempdir().expect("read-only workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-read-only-file-write-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("read-only workspace should register");
+        let session_id = SessionId::new("harness-read-only-file-write-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "只读文件写入验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("read-only session should create");
+        let target = workspace_root.path().join("read-only-write.txt");
+        harness.provider.set_tool_then_completed(
+            "file_write",
+            serde_json::json!({
+                "path": target.display().to_string(),
+                "content": "must not write"
+            })
+            .to_string(),
+            "只读模式不会写入文件",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：调用 file_write 写入工作区文件，然后汇总结果",
+                "harness-read-only-file-write-request",
+                "harness-read-only-file-write-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("read-only file write task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("read-only task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("read-only task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(!target.exists(), "只读访问模式下写工具不得产生文件副作用");
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            0,
+            "ReadOnly 隐藏 file_write 后应在任务模型调用前直接失败，不能进入 Provider 重试循环"
+        );
+        assert_eq!(
+            harness.provider.requests().len(),
+            0,
+            "ReadOnly 隐藏 file_write 后不应进入 Provider 请求"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested")
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.status == magi_session_store::CanonicalTurnItemStatus::Failed
+                && item.content.as_deref().is_some_and(|content| {
+                    content.contains("要求调用工具 file_write")
+                        && content.contains("当前工具面没有暴露该工具")
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn full_access_profile_executes_write_tool_without_approval() {
         let harness = MagiTurnHarness::new_task("完全授权写入完成");
         let workspace_root = tempfile::tempdir().expect("full access workspace should create");

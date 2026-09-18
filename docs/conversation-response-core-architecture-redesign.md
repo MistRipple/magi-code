@@ -901,6 +901,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 本轮全仓复查确认，除 `CanonicalTurnEventSink` 内部、SessionStore canonical mutation 与存储单元测试外，current Turn 直接 mutation 仅剩 Goal 行为单元测试；旧 thread projection 恢复 fixture 和 App Server canonical replay fixture 已改为通过 `CanonicalTurnEventSink` 接纳 Turn。`conversation_loop` 与 `session_turn_execution` 已无直接 `upsert_current_turn` 调用。Goal 单元测试仍直接验证底层 Goal 中断和存储 mutation，受 crate 依赖方向限制保留在 SessionStore 测试边界；因此 17.3 继续保持未完成。
 
+2026-09-19 又补充了真实 ReadOnly `file_write` harness：当任务原文明确点名 `file_write`、但 ReadOnly 工具面按访问模式隐藏该工具时，Conversation loop 在 Provider 调用前 fail-closed，Turn/Task 均进入 `Failed`，不创建文件、不发布审批请求，也不进入 Provider 重试；错误事实写回 canonical assistant error item。为避免把普通“写入文件”语义误判为必须使用某个被隐藏的工具，缺失工具的前置失败仅适用于任务原文显式包含 canonical 工具名的 required chain；未点名的语义工具链仍由可用工具面自主选择。`cargo test -p magi-api --lib turn_harness -- --test-threads=1` 与 workspace 全量 Rust 测试均通过。
+
 ### 17.4 Conversation 与 Task 执行分离
 
 - [x] 普通 Chat 接入独立 Conversation 执行路径。

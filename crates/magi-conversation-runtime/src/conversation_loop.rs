@@ -1471,7 +1471,17 @@ fn run_conversation_loop_inner(
         };
         let mut round_tools =
             (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
-        if (constrain_to_recovery_tool || strict_goal_mode_round)
+        // 用户明确点名的结构化工具契约必须真实出现在本轮工具面。若访问模式、
+        // 角色策略或工具注册表把点名工具隐藏，继续让模型生成文字只会反复触发
+        // 同一个缺失步骤；语义上的“写入/读取”仍允许模型选择可用的等价工具。
+        let task_goal_lower = task.goal.to_ascii_lowercase();
+        let explicitly_named_required_tool = round_required_tools.iter().any(|tool_name| {
+            !round_completed_tools
+                .iter()
+                .any(|completed| completed == tool_name)
+                && task_goal_lower.contains(tool_name)
+        });
+        if (constrain_to_recovery_tool || strict_goal_mode_round || explicitly_named_required_tool)
             && let Some(next_required_tool) = round_required_tools.iter().find(|tool_name| {
                 !round_completed_tools
                     .iter()
