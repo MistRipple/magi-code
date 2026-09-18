@@ -224,13 +224,33 @@ impl EventBasedResultReceiver {
             if let Err(payload) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.notify(result)))
             {
-                {
+                let should_resume_with_replacement = {
                     let mut state = self
                         .state
                         .lock()
                         .expect("EventBasedResultReceiver state lock poisoned");
                     state.pending.push_front(retry_result);
                     state.notifying = false;
+                    // 如果回调期间没有替换 Sink，停用已经 panic 的实现，避免下次
+                    // 绑定前反复重试同一 panic。若回调已安装新 Sink，则立即接管
+                    // pending，避免 set_completion_sink 观察到 notifying=true 后
+                    // 把结果遗留在队列中。
+                    if state
+                        .sink
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &sink))
+                    {
+                        state.sink = None;
+                        false
+                    } else if state.sink.is_some() {
+                        state.notifying = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_resume_with_replacement {
+                    self.drain_notifications();
                 }
                 std::panic::resume_unwind(payload);
             }
@@ -302,6 +322,18 @@ mod tests {
     impl TaskCompletionSink for PanicCompletionSink {
         fn notify(&self, _result: TaskResult) {
             panic!("completion sink panic");
+        }
+    }
+
+    struct SwitchingPanicCompletionSink {
+        receiver: Arc<EventBasedResultReceiver>,
+        replacement: Arc<RecordingCompletionSink>,
+    }
+
+    impl TaskCompletionSink for SwitchingPanicCompletionSink {
+        fn notify(&self, _result: TaskResult) {
+            self.receiver.set_completion_sink(self.replacement.clone());
+            panic!("completion sink panic after replacement");
         }
     }
 
@@ -425,6 +457,38 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, result.task_id);
         assert_eq!(results[0].lease_id, result.lease_id);
+    }
+
+    #[test]
+    fn panicking_sink_replacement_drains_pending_result() {
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        let result = TaskResult {
+            task_id: TaskId::new("task-switching-panic-sink"),
+            lease_id: LeaseId::new("lease-switching-panic-sink"),
+            outcome: TaskOutcome::Failed {
+                error: "switching panic sink result".to_string(),
+            },
+        };
+        receiver.push_result(result.clone());
+
+        let replacement = Arc::new(RecordingCompletionSink::default());
+        let sink = Arc::new(SwitchingPanicCompletionSink {
+            receiver: Arc::clone(&receiver),
+            replacement: replacement.clone(),
+        });
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            receiver.set_completion_sink(sink);
+        }));
+        assert!(panic_result.is_err());
+
+        let results = replacement
+            .results
+            .lock()
+            .expect("recording completion sink lock poisoned");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, result.task_id);
+        assert_eq!(results[0].lease_id, result.lease_id);
+        assert!(receiver.poll_results().is_empty());
     }
 
     #[test]
