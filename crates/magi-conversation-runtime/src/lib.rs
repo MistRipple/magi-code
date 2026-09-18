@@ -89,7 +89,8 @@ pub use task_helpers::{
     validation_result_rejects_delivery,
 };
 pub use tool_approval::{
-    PendingToolApproval, ToolApprovalDecision, ToolApprovalRegistry, ToolApprovalRequestOutcome,
+    PendingToolApproval, TOOL_APPROVAL_TTL_MILLIS, ToolApprovalDecision, ToolApprovalRegistry,
+    ToolApprovalRequestOutcome,
 };
 pub(crate) use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};

@@ -15,6 +15,7 @@ use magi_bridge_client::{
     ModelResponse, ModelResponseStatus, ModelStreamingDelta, model_invocation_cancelled_error,
 };
 use magi_conversation_runtime::{
+    TOOL_APPROVAL_TTL_MILLIS,
     task_completion_notifier::TaskCompletionNotifier,
     task_execution_dispatcher::{
         ExecutionPipeline, LlmTaskDispatcher, LlmTaskDispatcherDependencies,
@@ -1931,6 +1932,115 @@ mod tests {
                 .iter()
                 .all(|event| event.event_type != "tool.approval.resolved"),
             "未作出决定的审批取消不得发布 resolved 事件"
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_expired_approval_rejects_without_side_effect() {
+        let harness = MagiTurnHarness::new_task("过期审批拒绝写入");
+        let workspace_root = tempfile::tempdir().expect("approval expiry workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-approval-expiry-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("approval expiry workspace should register");
+        let session_id = SessionId::new("harness-approval-expiry-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "过期审批拒绝验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("approval expiry session should create");
+        let target = workspace_root.path().join("approval-expired.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf expired > {}", target.display())
+            })
+            .to_string(),
+            "过期审批不应执行写入",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 执行一个命令，但审批过期后不得执行",
+                "harness-approval-expiry-request",
+                "harness-approval-expiry-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("approval expiry task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("approval expiry task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("approval expiry task should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "shell_exec");
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .expire_stale(UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)),
+            1,
+            "测试必须显式推进审批时钟并清理 pending 请求"
+        );
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(!target.exists(), "过期审批不得产生文件副作用");
+        assert!(
+            turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::ToolCall
+                    && item.tool.as_ref().is_some_and(|tool| {
+                        tool.name == "shell_exec"
+                            && tool.error.as_deref().is_some_and(|error| {
+                                error.contains("tool_approval_expired") || error.contains("过期")
+                            })
+                    })
+            }),
+            "canonical ToolCall 必须记录审批过期错误"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "tool.approval.requested")
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.resolved"),
+            "审批过期不得伪造 resolved 事件"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty()
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            1,
+            "审批过期后不得重复请求 Provider"
         );
     }
 

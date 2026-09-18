@@ -5,6 +5,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 
+/// 用户审批的最长等待时间。过期后不会执行原始工具调用，也不会写入拒绝记忆；
+/// 后续新的模型调用可以重新请求同一组参数的审批。
+pub const TOOL_APPROVAL_TTL_MILLIS: u64 = 5 * 60 * 1_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolApprovalDecision {
@@ -94,6 +98,7 @@ struct ToolApprovalState {
     pending: HashMap<String, PendingApprovalEntry>,
     turn_tool_grants: HashSet<TurnToolGrant>,
     denied_session_tool_calls: HashSet<SessionToolCallFingerprint>,
+    expired: HashSet<(SessionId, String)>,
 }
 
 pub struct ToolApprovalWaiter {
@@ -139,6 +144,47 @@ pub(crate) fn session_turn_is_active(
 }
 
 impl ToolApprovalRegistry {
+    fn expire_stale_locked(state: &mut ToolApprovalState, now: UtcMillis) {
+        let expired = state
+            .pending
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .request
+                    .requested_at
+                    .0
+                    .saturating_add(TOOL_APPROVAL_TTL_MILLIS)
+                    <= now.0
+            })
+            .map(|(approval_id, entry)| (approval_id.clone(), entry.request.session_id.clone()))
+            .collect::<Vec<_>>();
+        for (approval_id, session_id) in expired {
+            state.pending.remove(&approval_id);
+            state.expired.insert((session_id, approval_id));
+        }
+    }
+
+    /// 清理指定时间之前已过期的审批，并关闭对应等待通道。
+    pub fn expire_stale(&self, now: UtcMillis) -> usize {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
+        let before = state.pending.len();
+        Self::expire_stale_locked(&mut state, now);
+        before.saturating_sub(state.pending.len())
+    }
+
+    /// 判断审批是否刚因超时被清理。等待线程用该事实区分“过期”与运行时通道故障。
+    pub fn is_expired(&self, session_id: &SessionId, approval_id: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        Self::expire_stale_locked(&mut state, UtcMillis::now());
+        state
+            .expired
+            .contains(&(session_id.clone(), approval_id.to_string()))
+    }
+
     pub fn request(
         &self,
         request: PendingToolApproval,
@@ -157,6 +203,10 @@ impl ToolApprovalRegistry {
             .state
             .lock()
             .map_err(|_| "工具授权状态锁已损坏".to_string())?;
+        Self::expire_stale_locked(&mut state, UtcMillis::now());
+        state.expired.retain(|(session_id, approval_id)| {
+            session_id != &request.session_id || approval_id != &request.approval_id
+        });
         state.turn_tool_grants.retain(|existing| {
             existing.session_id != grant.session_id || existing.turn_id == grant.turn_id
         });
@@ -194,7 +244,14 @@ impl ToolApprovalRegistry {
             .state
             .lock()
             .map_err(|_| "工具授权状态锁已损坏".to_string())?;
+        Self::expire_stale_locked(&mut state, UtcMillis::now());
         let Some(entry) = state.pending.remove(approval_id) else {
+            if state
+                .expired
+                .contains(&(session_id.clone(), approval_id.to_string()))
+            {
+                return Err("工具授权请求已过期".to_string());
+            }
             return Err("工具授权请求不存在或已经处理".to_string());
         };
         if entry.request.session_id != *session_id {
@@ -234,9 +291,10 @@ impl ToolApprovalRegistry {
     }
 
     pub fn pending_for_session(&self, session_id: &SessionId) -> Vec<PendingToolApproval> {
-        let Ok(state) = self.state.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
+        Self::expire_stale_locked(&mut state, UtcMillis::now());
         let mut requests = state
             .pending
             .values()
@@ -258,6 +316,9 @@ impl ToolApprovalRegistry {
             state.denied_session_tool_calls.retain(|fingerprint| {
                 fingerprint.session_id != *session_id || fingerprint.turn_id != turn_id
             });
+            state
+                .expired
+                .retain(|(expired_session, _)| expired_session != session_id);
         }
     }
 
@@ -276,6 +337,9 @@ impl ToolApprovalRegistry {
             state
                 .denied_session_tool_calls
                 .retain(|fingerprint| fingerprint.session_id != *session_id);
+            state
+                .expired
+                .retain(|(expired_session, _)| expired_session != session_id);
         }
     }
 
@@ -298,6 +362,9 @@ impl ToolApprovalRegistry {
             state
                 .denied_session_tool_calls
                 .retain(|fingerprint| fingerprint.session_id != *session_id);
+            state
+                .expired
+                .retain(|(expired_session, _)| expired_session != session_id);
         }
     }
 }
@@ -326,6 +393,25 @@ pub(crate) fn rejected_tool_approval_result(
     )
 }
 
+pub(crate) fn expired_tool_approval_result(
+    tool_name: &str,
+    approval_id: &str,
+) -> (String, ExecutionResultStatus) {
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": "rejected",
+            "error_code": "tool_approval_expired",
+            "error": "工具授权请求已过期，原始操作未执行",
+            "approval_id": approval_id,
+            "retryable_with_same_arguments": false,
+            "instruction": "授权窗口已过期；如需继续，请重新发起操作。",
+        })
+        .to_string(),
+        ExecutionResultStatus::Rejected,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,8 +425,95 @@ mod tests {
             tool_call_id: "call-approval".to_string(),
             tool_name: "file_write".to_string(),
             reason: "需要写入文件".to_string(),
-            requested_at: UtcMillis(1),
+            requested_at: UtcMillis::now(),
         }
+    }
+
+    #[test]
+    fn stale_approval_closes_waiter_and_can_be_requested_again() {
+        let registry = ToolApprovalRegistry::default();
+        let stale = request("approval-expired");
+        let requested_at = stale.requested_at;
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request(stale.clone())
+            .expect("approval should become pending")
+        else {
+            panic!("approval must initially wait");
+        };
+
+        assert_eq!(
+            registry.expire_stale(UtcMillis(requested_at.0 + TOOL_APPROVAL_TTL_MILLIS + 1,)),
+            1
+        );
+        assert!(registry.pending_for_session(&stale.session_id).is_empty());
+        assert!(waiter.decision_rx.recv().is_err());
+        assert!(registry.is_expired(&stale.session_id, &stale.approval_id));
+        assert_eq!(
+            registry
+                .resolve(
+                    &stale.session_id,
+                    &stale.approval_id,
+                    ToolApprovalDecision::AllowOnce,
+                )
+                .expect_err("expired approval must not resolve"),
+            "工具授权请求已过期"
+        );
+
+        let mut retry = stale;
+        retry.requested_at = UtcMillis::now();
+        let ToolApprovalRequestOutcome::Pending(retry_waiter) = registry
+            .request_with_arguments(retry, r#"{"path":"src/a.txt"}"#)
+            .expect("same approval id should be requestable again")
+        else {
+            panic!("reissued approval must wait");
+        };
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-expired",
+                ToolApprovalDecision::Deny,
+            )
+            .expect("retry approval should resolve");
+        assert_eq!(
+            retry_waiter
+                .decision_rx
+                .recv()
+                .expect("retry decision should arrive"),
+            ToolApprovalDecision::Deny
+        );
+        assert!(
+            registry
+                .pending_for_session(&SessionId::new("session-approval"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expired_approval_does_not_create_deny_memory() {
+        let registry = ToolApprovalRegistry::default();
+        let stale = request("approval-expired-no-deny");
+        let requested_at = stale.requested_at;
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request_with_arguments(stale.clone(), r#"{"path":"src/a.txt"}"#)
+            .expect("approval should become pending")
+        else {
+            panic!("approval must initially wait");
+        };
+        assert_eq!(
+            registry.expire_stale(UtcMillis(requested_at.0 + TOOL_APPROVAL_TTL_MILLIS + 1,)),
+            1
+        );
+        assert!(waiter.decision_rx.recv().is_err());
+
+        let mut retry = stale;
+        retry.approval_id = "approval-expired-no-deny-retry".to_string();
+        retry.requested_at = UtcMillis::now();
+        assert!(matches!(
+            registry
+                .request_with_arguments(retry, r#"{"path":"src/a.txt"}"#)
+                .expect("expiry must not be remembered as denial"),
+            ToolApprovalRequestOutcome::Pending(_)
+        ));
     }
 
     #[test]

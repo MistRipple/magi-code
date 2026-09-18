@@ -2793,6 +2793,12 @@ fn await_session_tool_approval(
                 ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if registry.is_expired(session_id, &approval_id) {
+                    return Err(crate::tool_approval::expired_tool_approval_result(
+                        &tool_call.function.name,
+                        &approval_id,
+                    ));
+                }
                 if !crate::tool_approval::session_turn_is_active(
                     session_store,
                     session_id,
@@ -2813,6 +2819,12 @@ fn await_session_tool_approval(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if registry.is_expired(session_id, &approval_id) {
+                    return Err(crate::tool_approval::expired_tool_approval_result(
+                        &tool_call.function.name,
+                        &approval_id,
+                    ));
+                }
                 if !crate::tool_approval::session_turn_is_active(
                     session_store,
                     session_id,
@@ -5457,6 +5469,216 @@ mod tests {
         let canonical_tool = canonical_item.tool.as_ref().expect("canonical tool");
         assert!(canonical_tool.result.is_some());
         assert!(canonical_tool.error.is_none());
+    }
+
+    #[test]
+    fn session_turn_expired_approval_rejects_without_running_tool() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-turn-expired-approval");
+        let workspace_id = Some(WorkspaceId::new("workspace-turn-expired-approval"));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let target = root.join("expired-approval.txt");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "expired approval session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-expired-approval".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("等待审批过期".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let tool_calls = vec![ChatToolCall {
+            id: "tool-call-expired-approval".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("printf expired > {}", target.display())
+                })
+                .to_string(),
+            },
+        }];
+        let mut messages = Vec::new();
+        let tool_approval_registry = crate::ToolApprovalRegistry::default();
+        let plan_store = crate::test_plan_store("expired-approval-plan");
+        let mission_id = magi_core::MissionId::new("mission-turn-expired-approval");
+        let source_thread_id = ThreadId::new("thread-expired-approval");
+        let mut tool_execution_ledger = ToolExecutionLedger::default();
+
+        let outcome = thread::scope(|scope| {
+            let registry = &tool_approval_registry;
+            let session = &session_id;
+            let resolver = scope.spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    if let Some(pending) = registry.pending_for_session(session).into_iter().next()
+                    {
+                        registry.expire_stale(UtcMillis(
+                            pending.requested_at.0 + crate::TOOL_APPROVAL_TTL_MILLIS + 1,
+                        ));
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "approval request should become pending"
+                    );
+                    std::thread::yield_now();
+                }
+            });
+            let outcome = append_session_tool_call_items_batch_with_context(
+                SessionToolCallBatchContext {
+                    session_store: &session_store,
+                    event_bus: &event_bus,
+                    tool_registry: Some(&tool_registry),
+                    skill_runtime: None,
+                    skill_dispatch_runtime: None,
+                    skill_name: None,
+                    safety_gate: None,
+                    tool_approval_registry: &tool_approval_registry,
+                    plan_store: &plan_store,
+                    mission_id: &mission_id,
+                    session_id: &session_id,
+                    workspace_id: &workspace_id,
+                    workspace_root_path: Some(root.clone()),
+                    context_references: &[],
+                    access_profile: magi_core::AccessProfile::Restricted,
+                    browser_capability_snapshot: None,
+                    browser_execution_id: None,
+                    snapshot_session: None,
+                    execution_group_id: None,
+                    source_thread_id: &source_thread_id,
+                    persist_session_state: None,
+                    expected_turn_id: None,
+                    tool_execution_ledger: &mut tool_execution_ledger,
+                },
+                &tool_calls,
+                &mut messages,
+                || true,
+            );
+            resolver.join().expect("expiry worker should join");
+            outcome
+        });
+
+        assert!(outcome.completed);
+        assert!(outcome.terminal_failure.is_some());
+        assert!(outcome.succeeded_tool_names.is_empty());
+        assert!(!target.exists(), "过期审批不得执行原始工具");
+        let model_visible_result: serde_json::Value = serde_json::from_str(
+            messages
+                .first()
+                .and_then(|message| message.content.as_deref())
+                .expect("expired tool result should be visible to the model"),
+        )
+        .expect("expired result should preserve structured json");
+        assert_eq!(model_visible_result["error_code"], "tool_approval_expired");
+        assert_eq!(
+            model_visible_result["status"], "rejected",
+            "过期应按确定性拒绝收口，避免 Provider 重试"
+        );
+    }
+
+    #[test]
+    fn session_turn_approval_channel_disconnect_remains_runtime_failure() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-turn-approval-disconnect");
+        let workspace_id = None;
+        session_store
+            .create_session(session_id.clone(), "session approval disconnect")
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-approval-disconnect".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("等待审批通道断开".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be active");
+        let registry = crate::ToolApprovalRegistry::default();
+        let mission_id = MissionId::new("mission-approval-disconnect");
+        let source_thread_id = ThreadId::new("thread-approval-disconnect");
+        let writeback_error = Mutex::new(None);
+        let tool_call = ChatToolCall {
+            id: "call-session-approval-disconnect".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: r#"{"command":"printf disconnected"}"#.to_string(),
+            },
+        };
+        let decision = crate::tool_batch::ToolPreflightDecision {
+            payload: serde_json::json!({ "error": "需要用户审批" }).to_string(),
+            status: ExecutionResultStatus::NeedsApproval,
+        };
+
+        let (payload, status) = thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                await_session_tool_approval(
+                    SessionToolApprovalContext {
+                        session_store: &session_store,
+                        event_bus: &event_bus,
+                        registry: &registry,
+                        mission_id: &mission_id,
+                        session_id: &session_id,
+                        workspace_id: &workspace_id,
+                        source_thread_id: &source_thread_id,
+                        expected_turn_id: None,
+                        writeback_error: &writeback_error,
+                    },
+                    &tool_call,
+                    &decision,
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some(pending) = registry.pending_for_session(&session_id).into_iter().next()
+                {
+                    registry.cancel(&pending.approval_id);
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "approval request should become pending"
+                );
+                std::thread::yield_now();
+            }
+            waiter.join().expect("approval waiter should join")
+        })
+        .expect_err("channel disconnect must return a runtime failure");
+
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("failure payload");
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        assert_eq!(parsed["error_code"], "tool_approval_runtime_failed");
+        assert_eq!(
+            parsed["approval_id"],
+            "tool-approval-session-session-turn-approval-disconnect-turn-approval-disconnect-call-session-approval-disconnect"
+        );
     }
 
     #[test]

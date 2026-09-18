@@ -2942,6 +2942,12 @@ fn await_task_tool_approval(
                 ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if registry.is_expired(session_id, &approval_id) {
+                    return Err(crate::tool_approval::expired_tool_approval_result(
+                        &tool_call.function.name,
+                        &approval_id,
+                    ));
+                }
                 let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
                     matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
                 });
@@ -2970,6 +2976,12 @@ fn await_task_tool_approval(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if registry.is_expired(session_id, &approval_id) {
+                    return Err(crate::tool_approval::expired_tool_approval_result(
+                        &tool_call.function.name,
+                        &approval_id,
+                    ));
+                }
                 let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
                     matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
                 });
@@ -5551,6 +5563,89 @@ mod tests {
         assert_eq!(payload["tool"].as_str(), Some("file_remove"));
         assert_eq!(payload["status"].as_str(), Some("succeeded"));
         assert!(!target.exists(), "授权后必须恢复并完成原始删除调用");
+    }
+
+    #[test]
+    fn task_tool_approval_channel_disconnect_remains_runtime_failure() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-task-approval-disconnect");
+        session_store
+            .create_session(session_id.clone(), "task approval disconnect")
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                magi_session_store::ActiveExecutionTurn {
+                    turn_id: "turn-task-approval-disconnect".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("等待审批通道断开".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be active");
+        let task = test_task("task-approval-disconnect", "task-approval-disconnect", None);
+        task_store
+            .insert_task(task.clone())
+            .expect("task should be inserted");
+        let registry = crate::ToolApprovalRegistry::default();
+        let workspace_id = None;
+        let tool_call = ChatToolCall {
+            id: "call-task-approval-disconnect".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::ShellExec.as_str().to_string(),
+                arguments: r#"{"command":"printf disconnected"}"#.to_string(),
+            },
+        };
+        let decision = ToolPreflightDecision {
+            payload: serde_json::json!({ "error": "需要用户审批" }).to_string(),
+            status: ExecutionResultStatus::NeedsApproval,
+        };
+
+        let (payload, status) = thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                await_task_tool_approval(
+                    &event_bus,
+                    &registry,
+                    &task_store,
+                    &session_store,
+                    &task,
+                    &session_id,
+                    &workspace_id,
+                    &tool_call,
+                    &decision,
+                    None,
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some(pending) = registry.pending_for_session(&session_id).into_iter().next()
+                {
+                    registry.cancel(&pending.approval_id);
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "approval request should become pending"
+                );
+                std::thread::yield_now();
+            }
+            waiter.join().expect("approval waiter should join")
+        })
+        .expect_err("channel disconnect must return a runtime failure");
+
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("failure payload");
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        assert_eq!(parsed["error_code"], "tool_approval_runtime_failed");
+        assert_eq!(
+            parsed["approval_id"],
+            "tool-approval-task-approval-disconnect-call-task-approval-disconnect"
+        );
     }
 
     #[test]
