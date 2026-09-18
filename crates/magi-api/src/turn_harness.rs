@@ -2054,6 +2054,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_profile_rejects_explicit_file_copy_and_move_without_side_effect() {
+        let copy_harness = MagiTurnHarness::new_task("只读模式拒绝复制文件");
+        let copy_workspace_root =
+            tempfile::tempdir().expect("read-only copy workspace should create");
+        let copy_workspace_id = magi_core::WorkspaceId::new("harness-read-only-copy-workspace");
+        copy_harness
+            .state
+            .workspace_registry
+            .register_native_path(
+                copy_workspace_id.clone(),
+                copy_workspace_root.path().to_path_buf(),
+            )
+            .expect("read-only copy workspace should register");
+        let copy_session_id = SessionId::new("harness-read-only-copy-session");
+        copy_harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                copy_session_id.clone(),
+                "只读复制文件验收",
+                Some(copy_workspace_id.to_string()),
+            )
+            .expect("read-only copy session should create");
+        let copy_source = copy_workspace_root.path().join("source.txt");
+        let copy_destination = copy_workspace_root.path().join("copy.txt");
+        fs::write(&copy_source, "copy source").expect("read-only copy fixture should write");
+        copy_harness.provider.set_tool_then_completed(
+            "file_copy",
+            serde_json::json!({
+                "source": copy_source.display().to_string(),
+                "destination": copy_destination.display().to_string()
+            })
+            .to_string(),
+            "只读模式不会复制文件",
+        );
+
+        let copy_response = copy_harness
+            .submit_workspace_task_with_access_profile(
+                &copy_session_id,
+                &copy_workspace_id,
+                copy_workspace_root.path(),
+                "执行一个任务：调用 file_copy 复制文件，然后汇总结果",
+                "harness-read-only-copy-request",
+                "harness-read-only-copy-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("read-only file copy task should be accepted");
+        let copy_turn_id = copy_response
+            .turn_id
+            .clone()
+            .expect("read-only copy should have turn");
+        let copy_task_id = copy_response
+            .root_task_id
+            .clone()
+            .expect("read-only copy should have root task");
+        let copy_turn = copy_harness
+            .wait_for_terminal(&copy_session_id, &copy_turn_id)
+            .await;
+        let copy_task = copy_harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(copy_task_id))
+            .await;
+        assert_eq!(copy_turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(copy_task.status, magi_core::TaskStatus::Failed);
+        assert!(
+            !copy_destination.exists(),
+            "ReadOnly file_copy 不得产生复制副作用"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&copy_harness),
+            0,
+            "ReadOnly 隐藏 file_copy 后不得进入 Provider"
+        );
+        assert!(
+            copy_harness
+                .events_for(&copy_session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "ReadOnly file_copy 不应发布审批请求"
+        );
+
+        let move_harness = MagiTurnHarness::new_task("只读模式拒绝移动文件");
+        let move_workspace_root =
+            tempfile::tempdir().expect("read-only move workspace should create");
+        let move_workspace_id = magi_core::WorkspaceId::new("harness-read-only-move-workspace");
+        move_harness
+            .state
+            .workspace_registry
+            .register_native_path(
+                move_workspace_id.clone(),
+                move_workspace_root.path().to_path_buf(),
+            )
+            .expect("read-only move workspace should register");
+        let move_session_id = SessionId::new("harness-read-only-move-session");
+        move_harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                move_session_id.clone(),
+                "只读移动文件验收",
+                Some(move_workspace_id.to_string()),
+            )
+            .expect("read-only move session should create");
+        let move_source = move_workspace_root.path().join("source.txt");
+        let move_destination = move_workspace_root.path().join("moved.txt");
+        fs::write(&move_source, "move source").expect("read-only move fixture should write");
+        move_harness.provider.set_tool_then_completed(
+            "file_move",
+            serde_json::json!({
+                "source": move_source.display().to_string(),
+                "destination": move_destination.display().to_string()
+            })
+            .to_string(),
+            "只读模式不会移动文件",
+        );
+
+        let move_response = move_harness
+            .submit_workspace_task_with_access_profile(
+                &move_session_id,
+                &move_workspace_id,
+                move_workspace_root.path(),
+                "执行一个任务：调用 file_move 移动文件，然后汇总结果",
+                "harness-read-only-move-request",
+                "harness-read-only-move-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("read-only file move task should be accepted");
+        let move_turn_id = move_response
+            .turn_id
+            .clone()
+            .expect("read-only move should have turn");
+        let move_task_id = move_response
+            .root_task_id
+            .clone()
+            .expect("read-only move should have root task");
+        let move_turn = move_harness
+            .wait_for_terminal(&move_session_id, &move_turn_id)
+            .await;
+        let move_task = move_harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(move_task_id))
+            .await;
+        assert_eq!(move_turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(move_task.status, magi_core::TaskStatus::Failed);
+        assert!(move_source.exists(), "ReadOnly file_move 不得删除源文件");
+        assert!(
+            !move_destination.exists(),
+            "ReadOnly file_move 不得创建目标文件"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&move_harness),
+            0,
+            "ReadOnly 隐藏 file_move 后不得进入 Provider"
+        );
+        assert!(
+            move_harness
+                .events_for(&move_session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "ReadOnly file_move 不应发布审批请求"
+        );
+    }
+
+    #[tokio::test]
     async fn read_only_profile_allows_file_read_without_approval() {
         let harness = MagiTurnHarness::new_task("只读模式读取文件完成");
         let workspace_root = tempfile::tempdir().expect("read-only read workspace should create");
