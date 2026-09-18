@@ -899,6 +899,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 随后又迁移了会话错误、空流/流中断恢复、图片错误、placeholder 和 retry event 测试夹具；进一步将 `conversation_loop` 与 `session_turn_execution` 中剩余可迁移的普通 Task/Conversation Turn 构造统一为对应 profile 的 Coordinator + canonical sink 接纳，保留 Task 的 execution-chain、worker thread、上下文历史和终态时序语义。当前直接 `upsert_current_turn` 已不再出现在这两个执行测试模块中，剩余直接写入主要位于从预构造 `SessionStoreState` 读取历史/上下文的测试、context-compaction 与最终 item 时序等局部读写断言，以及 SessionStore/Goal 单元测试和 legacy projection/recovery fixture，未进入生产路径。该批迁移后的 workspace Rust 全量仍通过，17.3/17.7 继续保持未完成。
 
+本轮全仓复查确认，除 `CanonicalTurnEventSink` 内部、SessionStore canonical mutation 与存储单元测试外，current Turn 直接 mutation 仅剩 Goal 行为单元测试和旧 thread projection 恢复 fixture；`conversation_loop` 与 `session_turn_execution` 已无直接 `upsert_current_turn` 调用。两类剩余 fixture 仍验证底层 Goal 中断或历史 thread 重建，暂不以测试辅助器替换，以免削弱其恢复边界断言；因此 17.3 继续保持未完成。
+
 ### 17.4 Conversation 与 Task 执行分离
 
 - [x] 普通 Chat 接入独立 Conversation 执行路径。
