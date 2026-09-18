@@ -1765,6 +1765,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_allow_once_requires_approval_for_each_write_tool_call() {
+        let harness = MagiTurnHarness::new_task("逐次授权完成");
+        let workspace_root = tempfile::tempdir().expect("allow once workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-allow-once-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("allow once workspace should register");
+        let session_id = SessionId::new("harness-allow-once-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "逐次授权验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("allow once session should create");
+        let target = workspace_root.path().join("allow-once.txt");
+        harness.provider.set_tool_then_completed_twice(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf allow_once >> {}", target.display())
+            })
+            .to_string(),
+            "逐次授权后的任务已完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 两次，每次写入前都要求用户确认",
+                "harness-allow-once-request",
+                "harness-allow-once-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("allow once task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("allow once task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("allow once task should have root task");
+
+        let first_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &first_pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let second_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_ne!(
+            first_pending.approval_id, second_pending.approval_id,
+            "allow_once 不得把第一次决定提升为 Turn 级授权"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &second_pending.approval_id,
+            "allow_once",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("allow once writes should be readable"),
+            "allow_onceallow_once"
+        );
+        let approval_requests = harness
+            .events_for(&session_id)
+            .iter()
+            .filter(|event| event.event_type == "tool.approval.requested")
+            .count();
+        let approval_resolutions = harness
+            .events_for(&session_id)
+            .iter()
+            .filter(|event| event.event_type == "tool.approval.resolved")
+            .count();
+        assert_eq!(approval_requests, 2, "allow_once 的两次调用都必须请求审批");
+        assert_eq!(
+            approval_resolutions, 2,
+            "两次 allow_once 都必须产生 resolved 事件"
+        );
+        assert_eq!(
+            turn.items
+                .iter()
+                .filter(|item| {
+                    item.kind == CanonicalTurnItemKind::ToolCall
+                        && item
+                            .tool
+                            .as_ref()
+                            .is_some_and(|tool| tool.name == "shell_exec")
+                })
+                .count(),
+            2,
+            "两次 allow_once 都应执行原始写工具"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "逐次授权完成后不得遗留 pending 请求"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            3,
+            "两次工具轮后应仅请求一次最终答复"
+        );
+    }
+
+    #[tokio::test]
     async fn task_profile_spawns_child_and_waits_for_child_result() {
         let harness = MagiTurnHarness::new_task("验收子代理1：子代理完成");
         harness
