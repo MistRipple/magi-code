@@ -501,7 +501,7 @@ M0 真实基线可观测
 ## 9. 首批开发检查表
 
 - [x] 完成阶段 0 timing schema 和统一 trace 设计。
-- [ ] 完成本地 mock Provider 的确定性延迟基准。
+- [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
 - [ ] 采集真实 Provider 五类场景各 20 轮的 P50/P95 基线。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
@@ -528,6 +528,26 @@ M0 真实基线可观测
 尚未宣称完成的验收：
 
 - 真实 Provider 五类场景各 20 轮的 P50/P95，以及阶段 6 的真实 Provider 性能前后对比尚未完成；当前仅以打包 Electron 的单轮 smoke 作为连通性和功能证据。
+
+### 9.3 本地 mock Provider 五场景 20 轮基线
+
+显式命令：
+
+```bash
+cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scenario_p50_p95_baseline -- --ignored --test-threads=1 --nocapture
+```
+
+本轮结果（单位：ms，格式为 accepted / 首 delta / 首 EventBus 事件 / Turn 终态）：
+
+| 场景 | P50 | P95 | 最大值 |
+|---|---:|---:|---:|
+| 新建个人普通会话 | 0 / 1 / 13 / 13 | 0 / 3 / 14 / 14 | 4 / 7 / 17 / 17 |
+| 已有个人长历史 | 1 / 2 / 14 / 15 | 2 / 4 / 16 / 17 | 2 / 4 / 17 / 18 |
+| 工作区纯聊天 | 0 / 1 / 13 / 13 | 0 / 1 / 13 / 13 | 0 / 1 / 13 / 13 |
+| 工作区工具调用 | 1 / 72 / 124 / 124 | 1 / 77 / 133 / 133 | 1 / 88 / 132 / 134 |
+| 主代理与子代理并发 | 1 / 111 / 127 / 127 | 1 / 112 / 130 / 130 | 1 / 112 / 137 / 137 |
+
+该基线只证明本地 mock 的采样链路和指标计算可复现，不代表真实 Provider、前端 DOM 绘制或性能前后对比已完成。
 
 ### 9.2 真实 Provider 单轮验收记录
 
