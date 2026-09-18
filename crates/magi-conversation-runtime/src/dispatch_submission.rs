@@ -2224,6 +2224,7 @@ mod tests {
                 MissionId::new("mission-dispatch-resume-checkpoint")
             });
         let source_thread_id = magi_core::ThreadId::new("thread-dispatch-resume-source");
+        let source_worker_id = WorkerId::new("worker-dispatch-resume-source");
         let source_history = vec![
             ThreadChatMessage {
                 role: "user".to_string(),
@@ -2261,9 +2262,9 @@ mod tests {
             .register_thread(ExecutionThread {
                 thread_id: source_thread_id.clone(),
                 session_id: session_id.clone(),
-                mission_id,
+                mission_id: mission_id.clone(),
                 role_id: "coordinator".to_string(),
-                worker_instance_id: WorkerId::new("worker-dispatch-resume-source"),
+                worker_instance_id: source_worker_id.clone(),
                 status: ExecutionThreadStatus::Idle,
                 created_at: now,
                 last_used_at: now,
@@ -2272,46 +2273,145 @@ mod tests {
                 message_history: source_history.clone(),
             })
             .expect("source thread 测试数据应注册成功");
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
+        let coordinator = crate::SessionTurnCoordinator::new();
+        let attempt = match coordinator
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::Start(crate::TurnAdmission {
                     turn_id: "turn-dispatch-resume-source".to_string(),
-                    turn_seq: now.0,
-                    accepted_at: now,
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("画当前项目流程图".to_string()),
-                    items: vec![ActiveExecutionTurnItem {
-                        item_id: "user-dispatch-resume-source".to_string(),
-                        item_seq: 1,
-                        kind: "user_message".to_string(),
-                        status: "completed".to_string(),
-                        source: "user".to_string(),
-                        title: None,
-                        content: Some("画当前项目流程图".to_string()),
-                        task_id: Some(source_task_id.clone()),
-                        worker_id: None,
-                        role_id: None,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_status: None,
-                        tool_arguments: None,
-                        tool_result: None,
-                        tool_error: None,
-                        request_id: None,
-                        user_message_id: Some("user-dispatch-resume-source".to_string()),
-                        placeholder_message_id: None,
-                        metadata: Default::default(),
-                        timeline_entry_id: None,
-                        source_thread_id: orchestrator_thread_id,
+                    request_id: "request-dispatch-resume-source".to_string(),
+                    request_fingerprint: "fingerprint-dispatch-resume-source".to_string(),
+                    profile: crate::ExecutionProfile::Task,
+                }),
+            )
+            .expect("source Turn should start")
+        {
+            crate::CoordinatorCommandResult::Admission(crate::CoordinatorAdmission::Accepted(
+                attempt,
+            )) => attempt,
+            other => panic!("unexpected source Turn admission: {other:?}"),
+        };
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-dispatch-resume-source".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            completed_at: None,
+            status: "accepted".to_string(),
+            user_message: Some("画当前项目流程图".to_string()),
+            items: vec![ActiveExecutionTurnItem {
+                item_id: "user-dispatch-resume-source".to_string(),
+                item_seq: 1,
+                kind: "user_message".to_string(),
+                status: "completed".to_string(),
+                source: "user".to_string(),
+                title: None,
+                content: Some("画当前项目流程图".to_string()),
+                task_id: Some(source_task_id.clone()),
+                worker_id: None,
+                role_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_arguments: None,
+                tool_result: None,
+                tool_error: None,
+                request_id: None,
+                user_message_id: Some("user-dispatch-resume-source".to_string()),
+                placeholder_message_id: None,
+                metadata: Default::default(),
+                timeline_entry_id: None,
+                source_thread_id: orchestrator_thread_id,
+            }],
+        };
+        let source_task = make_dispatch_task(DispatchTaskInput {
+            task_id: source_task_id.clone(),
+            mission_id: mission_id.clone(),
+            title: "恢复来源任务".to_string(),
+            goal: "验证中断任务恢复".to_string(),
+            now,
+            target_role: "coordinator",
+            active_skill_id: None,
+            task_tier: TaskTier::ExecutionChain,
+            collaboration_mode: CollaborationMode::Auto,
+            access_profile: AccessProfile::Restricted,
+            context_references: &[],
+            workspace_root_path: None,
+            required_tool_chain: vec!["file_read".to_string()],
+            goal_mode: false,
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            denied_tools: Vec::new(),
+            plan_item_id: None,
+            browser_annotation_refs: &[],
+            browser_node_selections: &[],
+        });
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .accept_active_execution_chain_with_timeline_entry_and_task(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-dispatch-resume-source",
+                    TimelineEntryKind::UserMessage,
+                    "画当前项目流程图",
+                    now,
+                ),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: source_task_id.clone(),
+                    execution_chain_ref: "chain-dispatch-resume-source".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![source_task_id.clone()],
+                    active_worker_bindings: vec![source_worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: source_task_id.clone(),
+                        worker_id: source_worker_id,
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("stage-restart".to_string()),
+                        resume_token: None,
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                        thread_id: source_thread_id.clone(),
                     }],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-dispatch-resume-source".to_string(),
+                        trimmed_text: Some("画当前项目流程图".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(turn),
+                },
+                &source_task,
+            )
+            .expect("source Turn should persist through sink");
+        coordinator
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: crate::CoordinatorTurnStatus::Preparing,
                 },
             )
-            .expect("source turn should persist");
-        session_store
-            .interrupt_current_turn_by_user(&session_id)
-            .expect("source turn should be interrupted by user");
+            .expect("source Turn should prepare");
+        coordinator
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt,
+                    status: crate::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("source Turn should run");
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .interrupt_turn_by_user(&session_id)
+            .expect("source Turn should be interrupted by user");
 
         let request = DispatchSubmissionRequest {
             accepted_at: UtcMillis(3_000),
@@ -2425,50 +2525,149 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "invalid resume checkpoint")
             .expect("session should be creatable");
-        let (_, orchestrator_thread_id) =
+        let (mission_id, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || {
                 MissionId::new("mission-invalid-resume-checkpoint")
             });
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
+        let source_worker_id = WorkerId::new("worker-invalid-resume-source");
+        let coordinator = crate::SessionTurnCoordinator::new();
+        let attempt = match coordinator
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::Start(crate::TurnAdmission {
                     turn_id: "turn-invalid-resume-source".to_string(),
-                    turn_seq: now.0,
-                    accepted_at: now,
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续验证".to_string()),
-                    items: vec![ActiveExecutionTurnItem {
-                        item_id: "user-invalid-resume-source".to_string(),
-                        item_seq: 1,
-                        kind: "user_message".to_string(),
-                        status: "completed".to_string(),
-                        source: "user".to_string(),
-                        title: None,
-                        content: Some("继续验证".to_string()),
-                        task_id: Some(source_task_id.clone()),
-                        worker_id: None,
-                        role_id: None,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_status: None,
-                        tool_arguments: None,
-                        tool_result: None,
-                        tool_error: None,
-                        request_id: None,
-                        user_message_id: None,
-                        placeholder_message_id: None,
-                        metadata: Default::default(),
-                        timeline_entry_id: None,
-                        source_thread_id: orchestrator_thread_id.clone(),
+                    request_id: "request-invalid-resume-source".to_string(),
+                    request_fingerprint: "fingerprint-invalid-resume-source".to_string(),
+                    profile: crate::ExecutionProfile::Task,
+                }),
+            )
+            .expect("invalid source Turn should start")
+        {
+            crate::CoordinatorCommandResult::Admission(crate::CoordinatorAdmission::Accepted(
+                attempt,
+            )) => attempt,
+            other => panic!("unexpected invalid source admission: {other:?}"),
+        };
+        let source_task = make_dispatch_task(DispatchTaskInput {
+            task_id: source_task_id.clone(),
+            mission_id: mission_id.clone(),
+            title: "无效恢复来源任务".to_string(),
+            goal: "验证恢复校验".to_string(),
+            now,
+            target_role: "coordinator",
+            active_skill_id: None,
+            task_tier: TaskTier::ExecutionChain,
+            collaboration_mode: CollaborationMode::Auto,
+            access_profile: AccessProfile::Restricted,
+            context_references: &[],
+            workspace_root_path: None,
+            required_tool_chain: vec!["shell_exec".to_string()],
+            goal_mode: false,
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            denied_tools: Vec::new(),
+            plan_item_id: None,
+            browser_annotation_refs: &[],
+            browser_node_selections: &[],
+        });
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .accept_active_execution_chain_with_timeline_entry_and_task(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-invalid-resume-source",
+                    TimelineEntryKind::UserMessage,
+                    "继续验证",
+                    now,
+                ),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id,
+                    root_task_id: source_task_id.clone(),
+                    execution_chain_ref: "chain-invalid-resume-source".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![source_task_id.clone()],
+                    active_worker_bindings: vec![source_worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: source_task_id.clone(),
+                        worker_id: source_worker_id,
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("stage-restart".to_string()),
+                        resume_token: None,
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                        thread_id: orchestrator_thread_id.clone(),
                     }],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-invalid-resume-source".to_string(),
+                        trimmed_text: Some("继续验证".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-invalid-resume-source".to_string(),
+                        turn_seq: now.0,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "accepted".to_string(),
+                        user_message: Some("继续验证".to_string()),
+                        items: vec![ActiveExecutionTurnItem {
+                            item_id: "user-invalid-resume-source".to_string(),
+                            item_seq: 1,
+                            kind: "user_message".to_string(),
+                            status: "completed".to_string(),
+                            source: "user".to_string(),
+                            title: None,
+                            content: Some("继续验证".to_string()),
+                            task_id: Some(source_task_id.clone()),
+                            worker_id: None,
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_arguments: None,
+                            tool_result: None,
+                            tool_error: None,
+                            request_id: None,
+                            user_message_id: None,
+                            placeholder_message_id: None,
+                            metadata: Default::default(),
+                            timeline_entry_id: None,
+                            source_thread_id: orchestrator_thread_id.clone(),
+                        }],
+                    }),
+                },
+                &source_task,
+            )
+            .expect("invalid source Turn should persist");
+        coordinator
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: crate::CoordinatorTurnStatus::Preparing,
                 },
             )
-            .expect("source turn should persist");
-        session_store
-            .interrupt_current_turn_by_user(&session_id)
-            .expect("source turn should be interrupted by user");
+            .expect("invalid source Turn should prepare");
+        coordinator
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt,
+                    status: crate::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("invalid source Turn should run");
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .interrupt_turn_by_user(&session_id)
+            .expect("invalid source Turn should be interrupted");
         let thread_count_before = session_store.thread_registry_snapshot(&session_id).len();
         let event_count_before = event_bus.snapshot().recent_events.len();
         let request = DispatchSubmissionRequest {

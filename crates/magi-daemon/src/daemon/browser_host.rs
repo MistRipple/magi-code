@@ -1449,7 +1449,9 @@ mod tests {
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_session_store::{ActiveExecutionTurn, SessionStore};
+    use magi_session_store::{
+        ActiveExecutionTurn, SessionStore, TimelineEntryInput, TimelineEntryKind,
+    };
     use magi_workspace::WorkspaceStore;
 
     use super::*;
@@ -1882,21 +1884,73 @@ mod tests {
                 UtcMillis(1),
             )
             .expect("session fixture should create");
+        let turn_id = "turn-disconnect";
+        let attempt = match state
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                magi_conversation_runtime::TurnCommand::Start(
+                    magi_conversation_runtime::TurnAdmission {
+                        turn_id: turn_id.to_string(),
+                        request_id: "request-turn-disconnect".to_string(),
+                        request_fingerprint: "fingerprint-turn-disconnect".to_string(),
+                        profile: magi_conversation_runtime::ExecutionProfile::Conversation,
+                    },
+                ),
+            )
+            .expect("running Turn fixture should start")
+        {
+            magi_conversation_runtime::CoordinatorCommandResult::Admission(
+                magi_conversation_runtime::CoordinatorAdmission::Accepted(attempt),
+            ) => attempt,
+            other => panic!("unexpected running Turn admission: {other:?}"),
+        };
         state
-            .session_store
-            .upsert_current_turn(
+            .turn_event_sink()
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                Some(workspace_id.clone()),
+                TimelineEntryInput::new(
+                    "timeline-turn-disconnect",
+                    TimelineEntryKind::UserMessage,
+                    "普通会话 Turn 应保持运行",
+                    UtcMillis(1),
+                ),
                 ActiveExecutionTurn {
-                    turn_id: "turn-disconnect".to_string(),
+                    turn_id: turn_id.to_string(),
                     turn_seq: 1,
                     accepted_at: UtcMillis(1),
                     completed_at: None,
-                    status: "running".to_string(),
+                    status: "accepted".to_string(),
                     user_message: Some("普通会话 Turn 应保持运行".to_string()),
                     items: Vec::new(),
                 },
             )
-            .expect("running turn fixture should create");
+            .expect("running Turn fixture should persist through sink");
+        state
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                magi_conversation_runtime::TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: magi_conversation_runtime::CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("running Turn fixture should prepare");
+        state
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                magi_conversation_runtime::TurnCommand::SetStatus {
+                    attempt,
+                    status: magi_conversation_runtime::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("running Turn fixture should run");
+        state
+            .turn_event_sink()
+            .set_status_domain(&session_id, Some(turn_id), "running")
+            .expect("running Turn status should persist through sink");
         state
             .mutate_browser_authority(|authority| {
                 authority.register_profile(BrowserProfile {

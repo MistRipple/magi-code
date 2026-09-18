@@ -3075,6 +3075,7 @@ async fn record_dispatch_join_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CanonicalTurnEventSink;
     use crate::model_config::{
         merge_orchestrator_session_override, resolve_orchestrator_model_config,
     };
@@ -3569,16 +3570,42 @@ mod tests {
             .ensure_session_mission(&session_id, accepted_at, || {
                 MissionId::new("mission-model-config-failure")
             });
-        dispatcher
-            .session_store
-            .upsert_current_turn(
+        let turn_id = "turn-model-config-failure";
+        let attempt = match dispatcher
+            .conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::Start(crate::TurnAdmission {
+                    turn_id: turn_id.to_string(),
+                    request_id: "request-model-config-failure".to_string(),
+                    request_fingerprint: "fingerprint-model-config-failure".to_string(),
+                    profile: crate::ExecutionProfile::Conversation,
+                }),
+            )
+            .expect("model config failure Turn should start")
+        {
+            crate::CoordinatorCommandResult::Admission(crate::CoordinatorAdmission::Accepted(
+                attempt,
+            )) => attempt,
+            other => panic!("unexpected model config failure admission: {other:?}"),
+        };
+        CanonicalTurnEventSink::for_store(&dispatcher.session_store, None)
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                None,
+                magi_session_store::TimelineEntryInput::new(
+                    "timeline-model-config-failure",
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    "继续执行",
+                    accepted_at,
+                ),
                 magi_session_store::ActiveExecutionTurn {
-                    turn_id: "turn-model-config-failure".to_string(),
+                    turn_id: turn_id.to_string(),
                     turn_seq: accepted_at.0,
                     accepted_at,
                     completed_at: None,
-                    status: "running".to_string(),
+                    status: "accepted".to_string(),
                     user_message: Some("继续执行".to_string()),
                     items: vec![magi_session_store::ActiveExecutionTurnItem {
                         item_id: "user-model-config-failure".to_string(),
@@ -3597,16 +3624,41 @@ mod tests {
                         tool_arguments: None,
                         tool_result: None,
                         tool_error: None,
-                        request_id: None,
+                        request_id: Some("request-model-config-failure".to_string()),
                         user_message_id: None,
                         placeholder_message_id: None,
                         metadata: Default::default(),
-                        timeline_entry_id: None,
+                        timeline_entry_id: Some("timeline-model-config-failure".to_string()),
                         source_thread_id: orchestrator_thread_id,
                     }],
                 },
             )
-            .expect("current turn should persist");
+            .expect("current Turn should persist through sink");
+        dispatcher
+            .conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: crate::CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("model config failure Turn should prepare");
+        dispatcher
+            .conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt,
+                    status: crate::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("model config failure Turn should run");
+        CanonicalTurnEventSink::for_store(&dispatcher.session_store, None)
+            .set_status_domain(&session_id, Some(turn_id), "running")
+            .expect("current Turn running status should persist through sink");
         let plan_store =
             magi_plan::PlanStore::new(dispatcher.session_store.clone(), session_id.clone());
         plan_store

@@ -3411,8 +3411,8 @@ mod tests {
             _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
             is_cancelled: &dyn Fn() -> bool,
         ) -> Result<ModelResponse, BridgeClientError> {
-            self.store
-                .cancel_current_turn(&self.session_id)
+            CanonicalTurnEventSink::for_store(&self.store, None)
+                .cancel_turn(&self.session_id)
                 .expect("turn cancellation should succeed");
             assert!(is_cancelled());
             Err(magi_bridge_client::model_invocation_cancelled_error())
@@ -3631,8 +3631,8 @@ mod tests {
             &self,
             _request: ModelInvocationRequest,
         ) -> Result<ModelResponse, BridgeClientError> {
-            self.store
-                .cancel_current_turn(&self.session_id)
+            CanonicalTurnEventSink::for_store(&self.store, None)
+                .cancel_turn(&self.session_id)
                 .expect("turn cancellation should succeed");
             Ok(ModelResponse::completed("不应安装的压缩摘要"))
         }

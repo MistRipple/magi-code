@@ -4469,9 +4469,9 @@ done
             .expect("seed task should become recoverable")
             .then_some(())
             .expect("seed task should become recoverable");
-        runtime
-            .session_store
-            .cancel_current_turn(&session_id)
+        state
+            .turn_event_sink()
+            .cancel_turn(&session_id)
             .expect("seed current turn should cancel for recovery");
         let snapshot = runtime.workspace_store.append_execution_snapshot(
             workspace_id.clone(),
