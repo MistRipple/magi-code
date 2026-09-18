@@ -5215,27 +5215,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(910), || {
                 magi_core::MissionId::new("mission-empty-response-layer")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-empty-response-layer".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请回复一句话".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("请回复一句话".to_string()),
-                        Some("user-empty-response-layer".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            store.as_ref(),
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-empty-response-layer".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("请回复一句话".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("请回复一句话".to_string()),
+                    Some("user-empty-response-layer".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         let client = CountingEmptyModelBridgeClient {
             calls: AtomicUsize::new(0),
         };
@@ -5280,7 +5281,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: store.as_ref(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: conversation_registry.as_ref(),
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
@@ -5353,27 +5354,28 @@ mod tests {
             store.ensure_session_mission(&session_id, ts(910), || {
                 magi_core::MissionId::new("mission-invalid-shell-call")
             });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-invalid-shell-call".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("检查项目".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("检查项目".to_string()),
-                        Some("user-invalid-shell-call".to_string()),
-                        orchestrator_thread_id,
-                    )],
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            store.as_ref(),
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-invalid-shell-call".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("检查项目".to_string()),
+                items: vec![session_turn_item(
+                    "user_message",
+                    "completed",
+                    None,
+                    Some("检查项目".to_string()),
+                    Some("user-invalid-shell-call".to_string()),
+                    orchestrator_thread_id,
+                )],
+            },
+        );
         let client = RepeatedInvalidShellModelBridgeClient {
             calls: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
@@ -5417,7 +5419,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: store.as_ref(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: conversation_registry.as_ref(),
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
