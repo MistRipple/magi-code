@@ -1964,6 +1964,9 @@ fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRe
     if session_turn_requests_explicit_task_or_agent_mode(request) {
         return false;
     }
+    if session_turn_explicitly_rejects_tool_execution(&normalized) {
+        return false;
+    }
     let has_direct_work = [
         "修复",
         "修改",
@@ -2143,6 +2146,9 @@ fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto)
         return false;
     };
     let normalized = text.to_ascii_lowercase();
+    if session_turn_explicitly_rejects_tool_execution(&normalized) {
+        return false;
+    }
     if session_turn_requests_workspace_inspection_by_local_rules(&normalized) {
         return true;
     }
@@ -2173,6 +2179,48 @@ fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto)
         "npm",
         "cargo",
         "test",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+/// 用户明确要求只进行解释或普通聊天时，不能因为“执行/运行”等否定句中的
+/// 动词命中本地规则而升级为 Execute。显式公开工具请求仍由
+/// `requested_public_builtin_tool_chain` 单独解析，并在否定语义下返回空链。
+fn session_turn_explicitly_rejects_tool_execution(normalized: &str) -> bool {
+    [
+        "不执行工具",
+        "不要执行工具",
+        "禁止执行工具",
+        "无需执行工具",
+        "不用执行工具",
+        "不调用工具",
+        "不要调用工具",
+        "禁止调用工具",
+        "无需调用工具",
+        "不用调用工具",
+        "不要使用工具",
+        "禁止使用工具",
+        "无需使用工具",
+        "不用使用工具",
+        "只进行普通聊天",
+        "只进行聊天",
+        "仅进行普通聊天",
+        "仅进行聊天",
+        "只聊天",
+        "仅聊天",
+        "只解释",
+        "仅解释",
+        "do not execute tools",
+        "don't execute tools",
+        "without executing tools",
+        "do not call tools",
+        "don't call tools",
+        "without calling tools",
+        "just chat",
+        "only chat",
+        "just explain",
+        "only explain",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
@@ -8496,6 +8544,28 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
         assert!(decision.tool_intent.is_some());
         assert!(decision.forced_tool_name.is_none());
+    }
+
+    #[test]
+    fn explicit_no_tool_workspace_chat_stays_on_conversation_route() {
+        for prompt in [
+            "只进行普通工作区聊天，不执行工具",
+            "不要调用工具，只解释当前项目",
+            "only chat about this workspace without calling tools",
+        ] {
+            let request = session_turn_request(prompt);
+            let decision = normalize_session_turn_decision(
+                local_session_turn_intent_decision(&request, false),
+                &request,
+            );
+
+            assert!(
+                matches!(decision.route, SessionTurnRouteDto::Chat),
+                "明确拒绝工具时不得升级为执行路由: {prompt}"
+            );
+            assert_eq!(decision.reason_code.as_deref(), Some("plain_chat"));
+            assert!(decision.tool_intent.is_none());
+        }
     }
 
     #[test]

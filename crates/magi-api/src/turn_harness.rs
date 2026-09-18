@@ -1000,6 +1000,49 @@ impl MagiTurnHarness {
         .await
     }
 
+    /// 在已注册 workspace 中通过真实 TurnService 提交普通 Conversation profile 请求。
+    /// 该入口用于验证工作区聊天不会因为携带 workspace 作用域而隐式创建 Task runtime。
+    pub async fn submit_workspace_chat(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &magi_core::WorkspaceId,
+        workspace_path: &Path,
+        text: &str,
+        request_id: &str,
+        user_message_id: &str,
+    ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
+        self.provider.begin_timing();
+        let response = TurnService::new(self.state.clone())
+            .submit(SessionTurnRequestDto {
+                desktop_browser_tools_allowed: false,
+                session_id: Some(session_id.to_string()),
+                scope: SessionScopeKindDto::Workspace,
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: Some(workspace_path.display().to_string()),
+                text: Some(text.to_string()),
+                skill_name: None,
+                locale: Some("zh-CN".to_string()),
+                goal_mode: false,
+                images: Vec::new(),
+                context_references: Vec::new(),
+                browser_annotation_refs: Vec::new(),
+                browser_node_selections: Vec::new(),
+                access_profile: None,
+                orchestrator_session_config: None,
+                request_id: Some(request_id.to_string()),
+                user_message_id: Some(user_message_id.to_string()),
+                placeholder_message_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
+                replace_turn_id: None,
+            })
+            .await;
+        if response.is_ok() {
+            self.provider.timing.mark_accepted_returned();
+        }
+        response
+    }
+
     pub async fn submit_workspace_task_with_access_profile(
         &self,
         session_id: &SessionId,
@@ -1409,6 +1452,71 @@ mod tests {
         assert!(timing.provider_request_started_ms <= timing.provider_first_delta_ms);
         assert!(timing.provider_first_delta_ms <= timing.first_stream_event_ms);
         assert!(timing.first_stream_event_ms <= timing.terminal_observed_ms);
+    }
+
+    #[tokio::test]
+    async fn workspace_conversation_does_not_create_task_runtime_resources() {
+        let harness = MagiTurnHarness::new("工作区普通聊天成功");
+        let workspace_root = tempfile::tempdir().expect("workspace chat root should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-conversation-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("workspace chat root should register");
+        let session_id = SessionId::new("harness-conversation-workspace-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "工作区普通聊天",
+                Some(workspace_id.to_string()),
+            )
+            .expect("workspace chat session should create");
+
+        let response = harness
+            .submit_workspace_chat(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "只进行普通工作区聊天，不执行工具",
+                "harness-workspace-chat-request",
+                "harness-workspace-chat-user",
+            )
+            .await
+            .expect("workspace Conversation Turn 应被接纳");
+        assert_eq!(response.route, crate::dto::SessionTurnRouteDto::Chat);
+        assert_eq!(
+            response.execution_profile,
+            Some(magi_conversation_runtime::ExecutionProfile::Conversation)
+        );
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("workspace chat should have turn");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.content.as_deref() == Some("工作区普通聊天成功")
+        }));
+
+        let (task_count, runner_count, snapshot_created, git_context_created) =
+            harness.conversation_runtime_resource_state(&session_id, Some(workspace_root.path()));
+        assert_eq!(task_count, 0, "工作区普通 Chat 不得创建 TaskStore 任务记录");
+        assert_eq!(runner_count, 0, "工作区普通 Chat 不得启动 Runner");
+        assert!(
+            !snapshot_created,
+            "工作区普通 Chat 不得物化 Snapshot session"
+        );
+        assert!(
+            !git_context_created,
+            "工作区普通 Chat 不得创建 Git execution context"
+        );
+        assert!(harness.state.task_store().is_none());
+        assert!(harness.state.runner_manager().is_none());
+        assert_eq!(harness.provider.requests().len(), 1);
     }
 
     #[tokio::test]
