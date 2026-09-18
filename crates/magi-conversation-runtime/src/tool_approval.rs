@@ -577,6 +577,10 @@ mod tests {
         registry.remove_turn(&stale.session_id, "turn-other");
 
         assert!(registry.is_expired(&stale.session_id, &stale.approval_id));
+
+        registry.remove_turn(&stale.session_id, "turn-expired");
+
+        assert!(!registry.is_expired(&stale.session_id, &stale.approval_id));
     }
 
     #[test]
