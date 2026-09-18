@@ -15,7 +15,8 @@ use magi_bridge_client::{
     ModelResponse, ModelResponseStatus, ModelStreamingDelta, model_invocation_cancelled_error,
 };
 use magi_conversation_runtime::{
-    TOOL_APPROVAL_TTL_MILLIS,
+    CoordinatorAdmission, CoordinatorCommandResult, ExecutionProfile, TOOL_APPROVAL_TTL_MILLIS,
+    TurnAdmission, TurnCommand,
     task_completion_notifier::TaskCompletionNotifier,
     task_execution_dispatcher::{
         ExecutionPipeline, LlmTaskDispatcher, LlmTaskDispatcherDependencies,
@@ -28,7 +29,10 @@ use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{OrchestratorService, task_store::TaskStore};
-use magi_session_store::{ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItemKind, SessionStore};
+use magi_session_store::{
+    ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItemKind, SessionStore, TimelineEntryInput,
+    TimelineEntryKind,
+};
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
 use magi_worker_runtime::WorkerRuntime;
@@ -3213,22 +3217,74 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "排队验收")
             .expect("排队场景应创建 session");
+        let turn_id = "harness-active-turn";
+        let attempt = match harness
+            .state
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                TurnCommand::Start(TurnAdmission {
+                    turn_id: turn_id.to_string(),
+                    request_id: "harness-active-request".to_string(),
+                    request_fingerprint: "harness-active-fingerprint".to_string(),
+                    profile: ExecutionProfile::Conversation,
+                }),
+            )
+            .expect("排队占用 Turn 应接纳")
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected queue fixture admission: {other:?}"),
+        };
         harness
             .state
-            .session_store
-            .upsert_current_turn(
+            .turn_event_sink()
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                None,
+                TimelineEntryInput::new(
+                    "harness-active-timeline",
+                    TimelineEntryKind::UserMessage,
+                    "占用执行资源",
+                    UtcMillis::now(),
+                ),
                 ActiveExecutionTurn {
-                    turn_id: "harness-active-turn".to_string(),
+                    turn_id: turn_id.to_string(),
                     turn_seq: 1,
                     accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
+                    status: "accepted".to_string(),
                     completed_at: None,
                     user_message: Some("占用执行资源".to_string()),
                     items: Vec::new(),
                 },
             )
-            .expect("排队场景应持久化活跃 Turn");
+            .expect("排队场景应通过 canonical sink 持久化活跃 Turn");
+        harness
+            .state
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: magi_conversation_runtime::CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("排队占用 Turn 应进入 preparing");
+        harness
+            .state
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                TurnCommand::SetStatus {
+                    attempt,
+                    status: magi_conversation_runtime::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("排队占用 Turn 应进入 running");
+        harness
+            .state
+            .turn_event_sink()
+            .set_status_domain(&session_id, Some(turn_id), "running")
+            .expect("排队占用 Turn running 状态应持久化");
 
         let response = harness
             .submit(

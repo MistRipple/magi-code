@@ -3576,6 +3576,7 @@ fn safety_gate_decision_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CanonicalTurnEventSink;
     use crate::agent_spawn_preflight::{
         agent_spawn_child_policy_snapshot, child_canonical_task_name, parse_agent_context_package,
         valid_agent_task_name,
@@ -5471,20 +5472,69 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "task approval test")
             .expect("approval test session should be creatable");
-        session_store
-            .upsert_current_turn(
+        let turn_id = "turn-file-remove";
+        let attempt = match conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::Start(crate::TurnAdmission {
+                    turn_id: turn_id.to_string(),
+                    request_id: "request-file-remove".to_string(),
+                    request_fingerprint: "fingerprint-file-remove".to_string(),
+                    profile: crate::ExecutionProfile::Task,
+                }),
+            )
+            .expect("approval test Turn should start")
+        {
+            crate::CoordinatorCommandResult::Admission(crate::CoordinatorAdmission::Accepted(
+                attempt,
+            )) => attempt,
+            other => panic!("unexpected approval test admission: {other:?}"),
+        };
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                None,
+                magi_session_store::TimelineEntryInput::new(
+                    "timeline-file-remove",
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    "remove probe",
+                    UtcMillis::now(),
+                ),
                 magi_session_store::ActiveExecutionTurn {
-                    turn_id: "turn-file-remove".to_string(),
+                    turn_id: turn_id.to_string(),
                     turn_seq: 1,
                     accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
+                    status: "accepted".to_string(),
                     user_message: Some("remove probe".to_string()),
                     items: Vec::new(),
                     completed_at: None,
                 },
             )
-            .expect("approval test turn should be active");
+            .expect("approval test Turn should persist through sink");
+        conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: crate::CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("approval test Turn should prepare");
+        conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt,
+                    status: crate::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("approval test Turn should run");
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some(turn_id), "running")
+            .expect("approval test Turn running status should persist");
         let workspace_id = Some(WorkspaceId::new("workspace-file-remove"));
         let tool_call = ChatToolCall {
             id: "call-file-remove".to_string(),
@@ -5574,20 +5624,70 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "task approval disconnect")
             .expect("session should be creatable");
-        session_store
-            .upsert_current_turn(
+        let turn_id = "turn-task-approval-disconnect";
+        let conversation_registry = ConversationRegistry::new();
+        let attempt = match conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::Start(crate::TurnAdmission {
+                    turn_id: turn_id.to_string(),
+                    request_id: "request-task-approval-disconnect".to_string(),
+                    request_fingerprint: "fingerprint-task-approval-disconnect".to_string(),
+                    profile: crate::ExecutionProfile::Task,
+                }),
+            )
+            .expect("approval disconnect Turn should start")
+        {
+            crate::CoordinatorCommandResult::Admission(crate::CoordinatorAdmission::Accepted(
+                attempt,
+            )) => attempt,
+            other => panic!("unexpected approval disconnect admission: {other:?}"),
+        };
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .accept_conversation_turn_with_timeline_entry(
                 session_id.clone(),
+                None,
+                magi_session_store::TimelineEntryInput::new(
+                    "timeline-task-approval-disconnect",
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    "等待审批通道断开",
+                    UtcMillis::now(),
+                ),
                 magi_session_store::ActiveExecutionTurn {
-                    turn_id: "turn-task-approval-disconnect".to_string(),
+                    turn_id: turn_id.to_string(),
                     turn_seq: 1,
                     accepted_at: UtcMillis::now(),
-                    status: "running".to_string(),
+                    status: "accepted".to_string(),
                     user_message: Some("等待审批通道断开".to_string()),
                     items: Vec::new(),
                     completed_at: None,
                 },
             )
-            .expect("turn should be active");
+            .expect("approval disconnect Turn should persist through sink");
+        conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: crate::CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("approval disconnect Turn should prepare");
+        conversation_registry
+            .turn_coordinator()
+            .execute_command(
+                &session_id,
+                crate::TurnCommand::SetStatus {
+                    attempt,
+                    status: crate::CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("approval disconnect Turn should run");
+        CanonicalTurnEventSink::for_store(&session_store, None)
+            .set_status_domain(&session_id, Some(turn_id), "running")
+            .expect("approval disconnect Turn running status should persist");
         let task = test_task("task-approval-disconnect", "task-approval-disconnect", None);
         task_store
             .insert_task(task.clone())
