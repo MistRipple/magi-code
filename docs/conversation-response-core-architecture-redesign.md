@@ -962,6 +962,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 本轮对 `TurnEventSink` 边界做了源码级收敛：写入、状态和事件发布方法统一为 `CanonicalTurnEventSink` inherent API，trait 仅保留接纳、继续、中断和 Task 终态控制合同；仓库内没有发现外部通过 trait 对象调用旧的重复入口，相关 session writeback 与 workspace Rust 全量测试均通过。
 
+2026-09-19 在该收敛之后重新执行了 `npm run protocol:check`、`npm --prefix web run check`、`npm test`、`npm --prefix web run build` 和 Electron `--dir` 打包。protocol 检查、Svelte check（0 errors/0 warnings）、Desktop 99 项、Browser Worker 57 项及 Web golden 全部通过，打包产物重新生成于 `target/electron-dist/mac-arm64/Magi.app`；本次属于回归与打包证据，仍不等同于完整 packaged GUI DOM 内容矩阵或真实 Provider 全矩阵。
+
 ## 18. MagiTurnHarness 验证设计
 
 Codex 的 harness 值得借鉴的是完整链路验证方式，不是把测试 harness 复制到生产路径。
