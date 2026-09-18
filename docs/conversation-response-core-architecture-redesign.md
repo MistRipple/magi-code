@@ -868,7 +868,7 @@ Coordinator
 ### 17.2 事件事实源
 
 - [x] 扩展现有 canonical 持久化，补齐 Turn 序号、幂等、profile、attempt、item version 和恢复字段。
-- [x] 建立独立的 `CanonicalTurnEventSink`/`TurnEventSink` 结构；trait 同时覆盖 Turn 接纳、替换、继续、状态写回、取消、中断、根任务完成和事件发布，生产 Conversation、Task finalizer、steer、continue、App Server browser tool 和 dispatch 状态写回均通过该边界。
+- [x] 建立独立的 `CanonicalTurnEventSink`/`TurnEventSink` 结构；trait 保留 Turn 接纳、替换、继续、取消、中断和根任务完成合同，写入、状态和事件发布统一收敛到 `CanonicalTurnEventSink` inherent API，生产 Conversation、Task finalizer、steer、continue、App Server browser tool 和 dispatch 状态写回均通过该边界。
 - [x] Session/Conversation 与 Task/Agent 读取模型按单向事实源更新；`ThreadChatMessage` 只由 canonical projection 重建。
 - [x] accepted 和终态事实可在 daemon 启动时恢复。
 - [x] 建立覆盖真实 SSE/WebSocket 载体的 Turn 快照断线恢复 harness；`MagiTurnHarness` 通过真实 daemon router body 和 App Server WebSocket 完成断线、重连、订阅和 canonical snapshot 重放。
