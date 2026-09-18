@@ -799,12 +799,26 @@ mod tests {
 
         let mut changed_call = request("approval-deny-changed");
         changed_call.tool_call_id = "call-changed".to_string();
-        assert!(matches!(
-            registry
-                .request_with_arguments(changed_call, r#"{"path":"src/b.txt","content":"a"}"#)
-                .expect("changed call can ask again"),
-            ToolApprovalRequestOutcome::Pending(_)
-        ));
+        let ToolApprovalRequestOutcome::Pending(changed_waiter) = registry
+            .request_with_arguments(changed_call, r#"{"path":"src/b.txt","content":"a"}"#)
+            .expect("changed call can ask again")
+        else {
+            panic!("changed arguments must create a new approval request");
+        };
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                &changed_waiter.request.approval_id,
+                ToolApprovalDecision::AllowOnce,
+            )
+            .expect("changed arguments should be independently resolvable");
+        assert_eq!(
+            changed_waiter
+                .decision_rx
+                .recv()
+                .expect("receive changed-argument decision"),
+            ToolApprovalDecision::AllowOnce
+        );
     }
 
     #[test]
