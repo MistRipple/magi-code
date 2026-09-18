@@ -1189,7 +1189,7 @@ impl MagiTurnHarness {
     }
 
     pub async fn wait_for_task_terminal(&self, task_id: &magi_core::TaskId) -> magi_core::Task {
-        for _ in 0..1_000 {
+        for _ in 0..6_000 {
             if let Some(task) = self
                 .state
                 .task_store()
@@ -1369,6 +1369,255 @@ mod tests {
             .into_iter()
             .filter(|request| !request.prompt.contains("Session Turn 编排分类器"))
             .count()
+    }
+
+    fn timing_metric(
+        timing: &HarnessTimingSnapshot,
+        metric: fn(&HarnessTimingSnapshot) -> Option<u128>,
+    ) -> u128 {
+        metric(timing).expect("性能基准每一轮都必须产生完整时序埋点")
+    }
+
+    fn percentile(samples: &[u128], percentile: usize) -> u128 {
+        assert!(!samples.is_empty(), "性能基准至少需要一轮样本");
+        assert!((1..=100).contains(&percentile));
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let rank = (sorted.len() * percentile).div_ceil(100).max(1) - 1;
+        sorted[rank]
+    }
+
+    fn print_local_mock_baseline(name: &str, timings: &[HarnessTimingSnapshot]) {
+        let accepted = timings
+            .iter()
+            .map(|timing| timing_metric(timing, |timing| timing.accepted_returned_ms))
+            .collect::<Vec<_>>();
+        let first_delta = timings
+            .iter()
+            .map(|timing| timing_metric(timing, |timing| timing.provider_first_delta_ms))
+            .collect::<Vec<_>>();
+        let first_event = timings
+            .iter()
+            .map(|timing| timing_metric(timing, |timing| timing.first_stream_event_ms))
+            .collect::<Vec<_>>();
+        let terminal = timings
+            .iter()
+            .map(|timing| timing_metric(timing, |timing| timing.terminal_observed_ms))
+            .collect::<Vec<_>>();
+        assert!(timings.iter().all(|timing| {
+            timing.accepted_returned_ms <= timing.provider_first_delta_ms
+                && timing.provider_first_delta_ms <= timing.first_stream_event_ms
+                && timing.first_stream_event_ms <= timing.terminal_observed_ms
+                && timing
+                    .first_stream_event_sequence
+                    .is_some_and(|sequence| sequence > 0)
+        }));
+        eprintln!(
+            "LOCAL_MOCK_P95 scenario={name} samples={} accepted_ms={{p50:{},p95:{},max:{}}} first_delta_ms={{p50:{},p95:{},max:{}}} first_event_ms={{p50:{},p95:{},max:{}}} terminal_ms={{p50:{},p95:{},max:{}}}",
+            timings.len(),
+            percentile(&accepted, 50),
+            percentile(&accepted, 95),
+            accepted.iter().copied().max().unwrap_or_default(),
+            percentile(&first_delta, 50),
+            percentile(&first_delta, 95),
+            first_delta.iter().copied().max().unwrap_or_default(),
+            percentile(&first_event, 50),
+            percentile(&first_event, 95),
+            first_event.iter().copied().max().unwrap_or_default(),
+            percentile(&terminal, 50),
+            percentile(&terminal, 95),
+            terminal.iter().copied().max().unwrap_or_default(),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "本地性能基准需显式运行，避免占用常规单元测试"]
+    async fn local_mock_provider_five_scenario_p50_p95_baseline() {
+        const SAMPLE_COUNT: usize = 20;
+        let mut scenario_timings = Vec::new();
+
+        for index in 0..SAMPLE_COUNT {
+            let harness = MagiTurnHarness::new("本地 mock 新会话响应");
+            let response = harness
+                .submit(
+                    None,
+                    "新建个人普通会话",
+                    &format!("local-mock-new-{index}"),
+                    &format!("local-mock-new-user-{index}"),
+                )
+                .await
+                .expect("新建个人普通会话应被接纳");
+            let session_id = SessionId::new(response.session_id.clone());
+            let turn_id = response.turn_id.expect("新建个人普通会话应有 Turn");
+            harness
+                .wait_for_first_stream_event(&session_id, &turn_id)
+                .await;
+            harness.wait_for_terminal(&session_id, &turn_id).await;
+            scenario_timings.push(harness.provider.timing());
+        }
+        print_local_mock_baseline("new_personal_chat", &scenario_timings);
+        scenario_timings.clear();
+
+        let long_personal = MagiTurnHarness::new("本地 mock 长历史响应");
+        let first = long_personal
+            .submit(
+                None,
+                "建立长历史普通会话",
+                "local-mock-history-0",
+                "local-mock-history-user-0",
+            )
+            .await
+            .expect("长历史首轮应被接纳");
+        let history_session_id = SessionId::new(first.session_id.clone());
+        let first_turn_id = first.turn_id.expect("长历史首轮应有 Turn");
+        long_personal
+            .wait_for_first_stream_event(&history_session_id, &first_turn_id)
+            .await;
+        long_personal
+            .wait_for_terminal(&history_session_id, &first_turn_id)
+            .await;
+        scenario_timings.push(long_personal.provider.timing());
+        for index in 1..SAMPLE_COUNT {
+            let response = long_personal
+                .submit(
+                    Some(&history_session_id),
+                    &format!("长历史普通会话第 {index} 轮"),
+                    &format!("local-mock-history-{index}"),
+                    &format!("local-mock-history-user-{index}"),
+                )
+                .await
+                .expect("长历史普通会话应被接纳");
+            let turn_id = response.turn_id.expect("长历史普通会话应有 Turn");
+            long_personal
+                .wait_for_first_stream_event(&history_session_id, &turn_id)
+                .await;
+            long_personal
+                .wait_for_terminal(&history_session_id, &turn_id)
+                .await;
+            scenario_timings.push(long_personal.provider.timing());
+        }
+        print_local_mock_baseline("existing_personal_long_history", &scenario_timings);
+        scenario_timings.clear();
+
+        for index in 0..SAMPLE_COUNT {
+            let harness = MagiTurnHarness::new("本地 mock 工作区聊天响应");
+            let workspace_root = tempfile::tempdir().expect("工作区基准目录应创建");
+            let workspace_id =
+                magi_core::WorkspaceId::new(format!("local-mock-chat-workspace-{index}"));
+            harness
+                .state
+                .workspace_registry
+                .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+                .expect("工作区基准路径应注册");
+            let workspace_session_id = SessionId::new(format!("local-mock-chat-session-{index}"));
+            harness
+                .state
+                .session_store
+                .create_session_for_workspace(
+                    workspace_session_id.clone(),
+                    "工作区纯聊天基准",
+                    Some(workspace_id.to_string()),
+                )
+                .expect("工作区聊天会话应创建");
+            let response = harness
+                .submit_workspace_chat(
+                    &workspace_session_id,
+                    &workspace_id,
+                    workspace_root.path(),
+                    &format!("工作区纯聊天第 {index} 轮"),
+                    &format!("local-mock-workspace-chat-{index}"),
+                    &format!("local-mock-workspace-chat-user-{index}"),
+                )
+                .await
+                .expect("工作区纯聊天应被接纳");
+            let turn_id = response.turn_id.expect("工作区纯聊天应有 Turn");
+            harness
+                .wait_for_first_stream_event(&workspace_session_id, &turn_id)
+                .await;
+            harness
+                .wait_for_terminal(&workspace_session_id, &turn_id)
+                .await;
+            scenario_timings.push(harness.provider.timing());
+        }
+        print_local_mock_baseline("workspace_plain_chat", &scenario_timings);
+        scenario_timings.clear();
+
+        for index in 0..SAMPLE_COUNT {
+            let harness = MagiTurnHarness::new_task("本地 mock 工作区工具响应");
+            let tool_root = tempfile::tempdir().expect("工作区工具基准目录应创建");
+            let tool_workspace_id =
+                magi_core::WorkspaceId::new(format!("local-mock-tool-workspace-{index}"));
+            harness
+                .state
+                .workspace_registry
+                .register_native_path(tool_workspace_id.clone(), tool_root.path().to_path_buf())
+                .expect("工作区工具基准路径应注册");
+            let tool_session_id = SessionId::new(format!("local-mock-tool-session-{index}"));
+            harness
+                .state
+                .session_store
+                .create_session_for_workspace(
+                    tool_session_id.clone(),
+                    "工作区工具调用基准",
+                    Some(tool_workspace_id.to_string()),
+                )
+                .expect("工作区工具会话应创建");
+            harness.provider.set_tool_then_completed(
+                "tool_catalog",
+                r#"{"include_external":false}"#,
+                "本地 mock 工作区工具响应",
+            );
+            let response = harness
+                .submit_workspace_task(
+                    &tool_session_id,
+                    &tool_workspace_id,
+                    tool_root.path(),
+                    &format!("执行工作区工具基准第 {index} 轮"),
+                    &format!("local-mock-workspace-tool-{index}"),
+                    &format!("local-mock-workspace-tool-user-{index}"),
+                )
+                .await
+                .expect("工作区工具任务应被接纳");
+            let turn_id = response.turn_id.expect("工作区工具任务应有 Turn");
+            let task_id = response.root_task_id.expect("工作区工具任务应有 root task");
+            harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(task_id))
+                .await;
+            harness
+                .wait_for_first_stream_event(&tool_session_id, &turn_id)
+                .await;
+            harness.wait_for_terminal(&tool_session_id, &turn_id).await;
+            scenario_timings.push(harness.provider.timing());
+        }
+        print_local_mock_baseline("workspace_tool", &scenario_timings);
+        scenario_timings.clear();
+
+        for index in 0..SAMPLE_COUNT {
+            let harness = MagiTurnHarness::new_task("验收子代理1：子代理完成");
+            harness
+                .provider
+                .set_agent_spawn_then_wait("验收子代理1：子代理完成");
+            let response = harness
+                .submit_task(
+                    "请派发一个子代理完成独立验收，再汇总它的结果",
+                    &format!("local-mock-subagent-{index}"),
+                    &format!("local-mock-subagent-user-{index}"),
+                )
+                .await
+                .expect("子代理基准任务应被接纳");
+            let session_id = SessionId::new(response.session_id.clone());
+            let turn_id = response.turn_id.expect("子代理基准任务应有 Turn");
+            let task_id = response.root_task_id.expect("子代理基准任务应有 root task");
+            harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(task_id))
+                .await;
+            harness
+                .wait_for_first_stream_event(&session_id, &turn_id)
+                .await;
+            harness.wait_for_terminal(&session_id, &turn_id).await;
+            scenario_timings.push(harness.provider.timing());
+        }
+        print_local_mock_baseline("primary_with_subagent", &scenario_timings);
     }
 
     #[tokio::test]

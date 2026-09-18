@@ -952,6 +952,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 2026-09-18 的后续复验将 `session_writeback` 中可迁移的 Conversation Turn 测试夹具统一为 `TurnCommand::Start`、`CanonicalTurnEventSink` 接纳、`SetStatus(Preparing/Running)` 和 sink 状态写回，覆盖流式 delta、并发工具批次、Goal/Plan、skill、审批及过期、通道断开、工具 panic、Snapshot 归因和普通 Turn summary；保留的直接 SessionStore 调用仅位于 Sink/raw writeback 内部边界。新增 Restricted 工作区权限验收确认 `file_patch` 与 `file_mkdir` 在工作区内自动允许、产生文件副作用且不发布审批请求或伪造 resolved 事件。`cargo test -p magi-api --lib turn_harness -- --test-threads=1`（33 项）、`cargo test -p magi-conversation-runtime --lib`（532 项）及 `cargo test --workspace --all-targets --quiet -- --test-threads=1`（magi-api 654、magi-conversation-runtime 532、magi-daemon 127，其余 workspace 测试通过）均通过；17.3、17.7、完整权限矩阵、Electron DOM/真实 Provider 全矩阵和五类场景 P50/P95 仍保持未完成。
 
+随后增加了显式 ignored 的本地 mock Provider 五场景性能基准，固定每个场景 20 轮并输出 accepted、Provider 首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，同时校验时序单调和事件序号存在。显式运行 `cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scenario_p50_p95_baseline -- --ignored --test-threads=1 --nocapture` 的结果为：新建个人普通会话 accepted P95 3ms、首 delta P95 3ms、首事件 P95 14ms、终态 P95 14ms；已有长历史分别为 2/4/16/17ms；工作区纯聊天为 0/1/13/13ms；工作区工具为 1/77/132/133ms；主代理+子代理为 1/112/130/130ms。该数据只证明本地 mock 基准可重复，不替代真实 Provider 五类场景 20 轮、前端 DOM 绘制和性能前后对比，后者仍未完成。
+
 ## 18. MagiTurnHarness 验证设计
 
 Codex 的 harness 值得借鉴的是完整链路验证方式，不是把测试 harness 复制到生产路径。
