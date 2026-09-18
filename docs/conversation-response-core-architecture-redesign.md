@@ -891,6 +891,8 @@ Coordinator
 
 排队与审批测试 harness 也已改为先用 Coordinator 接纳、再由 `CanonicalTurnEventSink` 写入 running Turn；审批等待辅助函数同时等待 pending 状态和 `tool.approval.requested` 事件，避免异步事件发布窗口导致偶发误报。该修复只改变测试同步边界，不改变生产审批状态机。
 
+daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink 构造，保留其“flush 后可从 durable state 重载 canonical Turn”的持久化断言。
+
 ### 17.4 Conversation 与 Task 执行分离
 
 - [x] 普通 Chat 接入独立 Conversation 执行路径。

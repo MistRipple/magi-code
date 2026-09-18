@@ -552,15 +552,43 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
         session_store.ensure_session_mission(&session_id, UtcMillis(5), || {
             MissionId::new("mission-flush-canonical")
         });
-    session_store
-        .upsert_current_turn(
+    let turn_id = "turn-flush-canonical";
+    let coordinator = magi_conversation_runtime::SessionTurnCoordinator::new();
+    let attempt = match coordinator
+        .execute_command(
+            &session_id,
+            magi_conversation_runtime::TurnCommand::Start(
+                magi_conversation_runtime::TurnAdmission {
+                    turn_id: turn_id.to_string(),
+                    request_id: "req-flush-canonical".to_string(),
+                    request_fingerprint: "fingerprint-flush-canonical".to_string(),
+                    profile: magi_conversation_runtime::ExecutionProfile::Conversation,
+                },
+            ),
+        )
+        .expect("flush canonical Turn should start")
+    {
+        magi_conversation_runtime::CoordinatorCommandResult::Admission(
+            magi_conversation_runtime::CoordinatorAdmission::Accepted(attempt),
+        ) => attempt,
+        other => panic!("unexpected flush canonical admission: {other:?}"),
+    };
+    magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+        .accept_conversation_turn_with_timeline_entry(
             session_id.clone(),
+            Some(workspace_id.clone()),
+            magi_session_store::TimelineEntryInput::new(
+                "timeline-flush-canonical",
+                magi_session_store::TimelineEntryKind::UserMessage,
+                "关闭前端后继续执行",
+                UtcMillis(10),
+            ),
             ActiveExecutionTurn {
-                turn_id: "turn-flush-canonical".to_string(),
+                turn_id: turn_id.to_string(),
                 turn_seq: 10,
                 accepted_at: UtcMillis(10),
                 completed_at: None,
-                status: "running".to_string(),
+                status: "accepted".to_string(),
                 user_message: Some("关闭前端后继续执行".to_string()),
                 items: vec![ActiveExecutionTurnItem {
                     item_id: "turn-item-flush-canonical-assistant".to_string(),
@@ -590,7 +618,28 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
                 }],
             },
         )
-        .expect("current turn should upsert");
+        .expect("flush canonical Turn should persist through sink");
+    coordinator
+        .execute_command(
+            &session_id,
+            magi_conversation_runtime::TurnCommand::SetStatus {
+                attempt: attempt.clone(),
+                status: magi_conversation_runtime::CoordinatorTurnStatus::Preparing,
+            },
+        )
+        .expect("flush canonical Turn should prepare");
+    coordinator
+        .execute_command(
+            &session_id,
+            magi_conversation_runtime::TurnCommand::SetStatus {
+                attempt,
+                status: magi_conversation_runtime::CoordinatorTurnStatus::Running,
+            },
+        )
+        .expect("flush canonical Turn should run");
+    magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
+        .set_status_domain(&session_id, Some(turn_id), "running")
+        .expect("flush canonical Turn running status should persist");
 
     let report = persistence
         .flush_runtime_sidecars()
