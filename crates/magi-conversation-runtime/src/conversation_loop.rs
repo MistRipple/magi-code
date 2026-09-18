@@ -6992,11 +6992,7 @@ mod tests {
             session_store
                 .orchestrator_thread_for_session(session_id)
                 .map(|thread| thread.thread_id)
-                .unwrap_or_else(|| {
-                    session_store
-                        .ensure_session_mission(session_id, accepted_at, || task.mission_id.clone())
-                        .1
-                })
+                .unwrap_or_else(|| magi_core::ThreadId::new(format!("thread-{session_id}")))
         });
         let mut user_item = session_turn_item(
             "user_message",
