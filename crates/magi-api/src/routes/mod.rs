@@ -18,6 +18,161 @@ mod turn_input;
 mod workspace_vcs;
 mod workspaces;
 
+#[cfg(test)]
+pub(crate) mod test_turn_fixtures {
+    use magi_conversation_runtime::{
+        CanonicalTurnEventSink, CoordinatorAdmission, CoordinatorCommandResult,
+        CoordinatorTurnStatus, ExecutionProfile, SessionTurnCoordinator, TurnAdmission,
+        TurnCommand,
+    };
+    use magi_core::{SessionId, UtcMillis};
+    use magi_session_store::{
+        ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore, TimelineEntryInput,
+        TimelineEntryKind,
+    };
+
+    /// 通过与生产路径相同的 Coordinator + canonical sink 构造 route 测试 Turn。
+    ///
+    /// 这些 fixture 只模拟普通 conversation Turn；Goal/Task execution chain
+    /// 需要真实 Task 关联时仍应使用对应的 production acceptance API。
+    pub(crate) fn seed_conversation_turn(
+        store: &SessionStore,
+        coordinator: &SessionTurnCoordinator,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        accepted_at: UtcMillis,
+        status: &str,
+        text: &str,
+    ) {
+        let attempt = match coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::Start(TurnAdmission {
+                    turn_id: turn_id.to_string(),
+                    request_id: format!("request-{turn_id}"),
+                    request_fingerprint: format!("fingerprint-{turn_id}"),
+                    profile: ExecutionProfile::Conversation,
+                }),
+            )
+            .expect("fixture Turn should start")
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected fixture admission: {other:?}"),
+        };
+        let item = ActiveExecutionTurnItem {
+            item_id: format!("{turn_id}-item"),
+            item_seq: 1,
+            kind: "user_message".to_string(),
+            status: status.to_string(),
+            source: "user".to_string(),
+            title: None,
+            content: Some(text.to_string()),
+            task_id: None,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id: Some(format!("request-{turn_id}")),
+            user_message_id: None,
+            placeholder_message_id: None,
+            metadata: std::collections::HashMap::from([
+                (
+                    "executionProfile".to_string(),
+                    serde_json::json!("conversation"),
+                ),
+                (
+                    "requestId".to_string(),
+                    serde_json::json!(format!("request-{turn_id}")),
+                ),
+                (
+                    "requestFingerprint".to_string(),
+                    serde_json::json!(format!("fingerprint-{turn_id}")),
+                ),
+                (
+                    "attemptId".to_string(),
+                    serde_json::json!(attempt.attempt_id.clone()),
+                ),
+            ]),
+            timeline_entry_id: Some(format!("timeline-{turn_id}")),
+            source_thread_id: magi_core::ThreadId::new(format!("thread-{turn_id}")),
+        };
+        let mut turn = ActiveExecutionTurn {
+            turn_id: turn_id.to_string(),
+            turn_seq,
+            accepted_at,
+            completed_at: None,
+            status: "accepted".to_string(),
+            user_message: Some(text.to_string()),
+            items: vec![item],
+        };
+        turn.normalize();
+        CanonicalTurnEventSink::for_store(store, None)
+            .accept_conversation_turn_with_timeline_entry(
+                session_id.clone(),
+                None,
+                TimelineEntryInput::new(
+                    format!("timeline-{turn_id}"),
+                    TimelineEntryKind::UserMessage,
+                    text,
+                    accepted_at,
+                ),
+                turn,
+            )
+            .expect("fixture Turn should persist through the canonical sink");
+
+        if status == "accepted" {
+            return;
+        }
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Preparing,
+                },
+            )
+            .expect("fixture Turn should prepare");
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("fixture Turn should run");
+        if status == "running" {
+            CanonicalTurnEventSink::for_store(store, None)
+                .set_status_domain(session_id, Some(turn_id), status)
+                .expect("fixture running status should persist");
+            return;
+        }
+        let terminal = match status {
+            "completed" => CoordinatorTurnStatus::Completed,
+            "failed" => CoordinatorTurnStatus::Failed,
+            "cancelled" => CoordinatorTurnStatus::Cancelled,
+            _ => panic!("unsupported fixture status {status}"),
+        };
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::Finish {
+                    attempt,
+                    status: terminal,
+                },
+            )
+            .expect("fixture Turn should finish");
+        CanonicalTurnEventSink::for_store(store, None)
+            .set_status_domain(session_id, Some(turn_id), status)
+            .expect("fixture terminal status should persist");
+    }
+}
+
 use axum::{
     Json, Router,
     extract::{Query, Request, State},

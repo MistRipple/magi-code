@@ -364,9 +364,8 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::{
-        ActiveExecutionTurn, SessionDurableState, SessionExecutionSidecarStatus,
-        SessionExecutionSidecarStoreState, SessionRecord, SessionRuntimeSidecar, SessionStore,
-        TimelineEntryKind,
+        SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
+        SessionRecord, SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
     use std::{fs, sync::Arc, time::Duration};
@@ -714,29 +713,17 @@ mod tests {
             TimelineEntryKind::UserMessage,
             "触发未读完成",
         );
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-unread-completion".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(10),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("触发未读完成".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should upsert");
-        state
-            .session_store
-            .update_current_turn_status_for_turn(
-                &session_id,
-                Some("turn-unread-completion"),
-                "completed",
-            )
-            .expect("turn should complete");
+        let coordinator = state.turn_coordinator().clone();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            &coordinator,
+            &session_id,
+            "turn-unread-completion",
+            1,
+            UtcMillis(10),
+            "completed",
+            "触发未读完成",
+        );
 
         for _ in 0..2 {
             let response = routes()
@@ -783,25 +770,17 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-mark-viewed".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(10),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("触发已查看".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should upsert");
-        state
-            .session_store
-            .update_current_turn_status_for_turn(&session_id, Some("turn-mark-viewed"), "completed")
-            .expect("turn should complete");
+        let coordinator = state.turn_coordinator().clone();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            &coordinator,
+            &session_id,
+            "turn-mark-viewed",
+            1,
+            UtcMillis(10),
+            "completed",
+            "触发已查看",
+        );
 
         let response = crate::routes::build_router(state.clone())
             .oneshot(
@@ -919,21 +898,17 @@ mod tests {
             TimelineEntryKind::UserMessage,
             "触发运行态",
         );
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-running".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis::now(),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("触发运行态".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should upsert");
+        let coordinator = state.turn_coordinator().clone();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            &coordinator,
+            &session_id,
+            "turn-running",
+            1,
+            UtcMillis::now(),
+            "running",
+            "触发运行态",
+        );
 
         let response = routes()
             .with_state(state.clone())
@@ -957,8 +932,8 @@ mod tests {
         assert_eq!(sessions[0]["runningTaskCount"], 1);
 
         state
-            .session_store
-            .update_current_turn_status_for_turn(&session_id, Some("turn-running"), "interrupted")
+            .turn_event_sink()
+            .interrupt_turn_by_user(&session_id)
             .expect("current turn should be interruptible");
         let response = routes()
             .with_state(state)

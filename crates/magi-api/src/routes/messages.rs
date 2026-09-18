@@ -118,6 +118,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use magi_conversation_runtime::SessionTurnCoordinator;
     use magi_core::{
         AbsolutePath, ExecutionOwnership, SessionId, ThreadId, UtcMillis, WorkspaceId,
     };
@@ -478,44 +479,18 @@ mod tests {
                 Some("workspace-messages-canonical-pagination".to_string()),
             )
             .expect("session should create");
+        let coordinator = SessionTurnCoordinator::new();
         for index in 0..25 {
-            store
-                .upsert_current_turn(
-                    session_id.clone(),
-                    magi_session_store::ActiveExecutionTurn {
-                        turn_id: format!("turn-{index:02}"),
-                        turn_seq: index + 1,
-                        accepted_at: UtcMillis(index + 1),
-                        completed_at: Some(UtcMillis(index + 1)),
-                        status: "completed".to_string(),
-                        user_message: Some(format!("消息 {index}")),
-                        items: vec![magi_session_store::ActiveExecutionTurnItem {
-                            item_id: format!("turn-item-{index:02}"),
-                            item_seq: 1,
-                            kind: "user_message".to_string(),
-                            status: "completed".to_string(),
-                            source: "user".to_string(),
-                            title: None,
-                            content: Some(format!("消息 {index}")),
-                            task_id: None,
-                            worker_id: None,
-                            role_id: None,
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_status: None,
-                            tool_arguments: None,
-                            tool_result: None,
-                            tool_error: None,
-                            request_id: None,
-                            user_message_id: None,
-                            placeholder_message_id: None,
-                            metadata: std::collections::HashMap::new(),
-                            timeline_entry_id: None,
-                            source_thread_id: ThreadId::new("thread-canonical-pagination"),
-                        }],
-                    },
-                )
-                .expect("turn should upsert");
+            crate::routes::test_turn_fixtures::seed_conversation_turn(
+                &store,
+                &coordinator,
+                &session_id,
+                &format!("turn-{index:02}"),
+                index + 1,
+                UtcMillis(index + 1),
+                "completed",
+                &format!("消息 {index}"),
+            );
         }
         let state = test_state(store);
         register_workspace(&state, "workspace-messages-canonical-pagination");
@@ -580,27 +555,24 @@ mod tests {
                 Some("workspace-messages-tool-redaction".to_string()),
             )
             .expect("session should create");
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                magi_session_store::ActiveExecutionTurn {
-                    turn_id: "turn-messages-tool-redaction".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("请读取文件".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("turn should upsert");
-        store
-            .upsert_current_turn_item_for_turn(
+        let coordinator = SessionTurnCoordinator::new();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &store,
+            &coordinator,
+            &session_id,
+            "turn-messages-tool-redaction",
+            1,
+            UtcMillis(1),
+            "running",
+            "请读取文件",
+        );
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&store, None)
+            .upsert_item_sidecar(
                 &session_id,
                 Some("turn-messages-tool-redaction"),
                 magi_session_store::ActiveExecutionTurnItem {
                     item_id: "turn-item-tool-redaction".to_string(),
-                    item_seq: 1,
+                    item_seq: 2,
                     kind: "tool_call_result".to_string(),
                     status: "failed".to_string(),
                     source: "worker".to_string(),
@@ -643,7 +615,11 @@ mod tests {
             .into_iter()
             .find(|turn| turn.turn_id == "turn-messages-tool-redaction")
             .expect("raw canonical turn should exist");
-        let raw_tool = raw_turn.items[0]
+        let raw_tool = raw_turn
+            .items
+            .iter()
+            .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::ToolCall)
+            .expect("raw tool item should exist")
             .tool
             .as_ref()
             .expect("raw tool should exist");
@@ -681,7 +657,12 @@ mod tests {
         assert!(!body_text.contains("resulttoken"));
         assert!(!body_text.contains("error-secret"));
 
-        let tool = &body["canonicalTurns"][0]["items"][0]["tool"];
+        let tool = &body["canonicalTurns"][0]["items"]
+            .as_array()
+            .expect("canonical items should be array")
+            .iter()
+            .find(|item| item["kind"] == "tool_call")
+            .expect("public tool item should exist")["tool"];
         assert_eq!(tool["arguments"]["path"], "secret.txt");
         assert_eq!(tool["arguments"]["token"], "[redacted]");
         assert!(

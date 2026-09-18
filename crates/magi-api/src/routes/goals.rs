@@ -534,7 +534,7 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::{OrchestratorService, task_store::TaskStore};
-    use magi_session_store::{ActiveExecutionTurn, GoalRevisionExpectation, SessionStore};
+    use magi_session_store::{GoalRevisionExpectation, SessionStore};
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
     use magi_workspace::WorkspaceStore;
@@ -686,21 +686,17 @@ mod tests {
             allowed_actions(&state, &session_id, Some(&paused_goal), None).can_resume,
             "空闲会话里的暂停 Goal 应允许恢复"
         );
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-goal-resume-action-running".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("会话正在执行".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("running turn should persist");
+        let coordinator = state.turn_coordinator().clone();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            &coordinator,
+            &session_id,
+            "turn-goal-resume-action-running",
+            1,
+            UtcMillis::now(),
+            "running",
+            "会话正在执行",
+        );
 
         assert!(
             allowed_actions(&state, &session_id, Some(&paused_goal), None).can_resume,
@@ -742,21 +738,17 @@ mod tests {
             .pause_goal_with_plan(&session_id, &goal.goal_id, goal.control_revision, None)
             .expect("goal should pause")
             .0;
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-unrelated-running".to_string(),
-                    turn_seq: 2,
-                    accepted_at: UtcMillis(2),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("执行其他任务".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("running turn should persist");
+        let coordinator = state.turn_coordinator().clone();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            &coordinator,
+            &session_id,
+            "turn-unrelated-running",
+            1,
+            UtcMillis::now(),
+            "running",
+            "执行其他任务",
+        );
 
         let app = Router::new().merge(routes()).with_state(state.clone());
         let response = app
@@ -1153,21 +1145,17 @@ mod tests {
             "expectedRevision": updated_revision,
             "expectedPlanRevision": 1,
         });
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-goal-actions".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("执行当前目标".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("running goal turn should persist");
+        let coordinator = state.turn_coordinator().clone();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            &coordinator,
+            &session_id,
+            "turn-goal-actions",
+            1,
+            UtcMillis::now(),
+            "running",
+            "执行当前目标",
+        );
 
         let response = app
             .clone()
