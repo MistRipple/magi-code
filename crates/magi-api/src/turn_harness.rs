@@ -732,7 +732,9 @@ impl MagiTurnHarness {
         let event_bus = Arc::new(InMemoryEventBus::new(512));
         let workspace_store = Arc::new(WorkspaceStore::default());
         let governance = Arc::new(GovernanceService::default());
-        let task_store = Arc::new(TaskStore::new());
+        // 普通 Conversation harness 不创建 TaskStore；这与生产 profile 边界一致，
+        // 不能只是不把已经创建的 TaskStore 挂到 ApiState 上。
+        let task_store = with_task_runtime.then(|| Arc::new(TaskStore::new()));
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
         let skill_dispatch_runtime = SkillDispatchRuntime::new(
@@ -745,19 +747,23 @@ impl MagiTurnHarness {
             tool_registry.clone(),
             skill_dispatch_runtime,
         );
-        if with_task_runtime {
+        if let Some(task_store) = task_store.as_ref() {
             execution_runtime = execution_runtime.with_task_store(Arc::clone(&task_store));
         }
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
-        let completion_notifier = with_task_runtime
-            .then(|| Arc::new(TaskCompletionNotifier::new(Arc::clone(&task_store))));
+        let completion_notifier = task_store
+            .as_ref()
+            .map(|task_store| Arc::new(TaskCompletionNotifier::new(Arc::clone(task_store))));
         if let Some(notifier) = completion_notifier.as_ref() {
             let notifier_for_status = notifier.clone();
-            task_store.set_status_change_callback(Box::new(
-                move |task_id, _old_status, new_status, task| {
-                    notifier_for_status.notify_terminal_status(task_id, new_status, &task);
-                },
-            ));
+            task_store
+                .as_ref()
+                .expect("TaskStore 应与主动完成通知器同时存在")
+                .set_status_change_callback(Box::new(
+                    move |task_id, _old_status, new_status, task| {
+                        notifier_for_status.notify_terminal_status(task_id, new_status, &task);
+                    },
+                ));
         }
         let mut state = ApiState::new(
             "magi-turn-harness",
@@ -767,8 +773,8 @@ impl MagiTurnHarness {
             governance,
         )
         .with_tool_registry(tool_registry.clone());
-        if with_task_runtime {
-            state = state.with_task_store(Arc::clone(&task_store));
+        if let Some(task_store) = task_store.as_ref() {
+            state = state.with_task_store(Arc::clone(task_store));
             state
                 .task_execution_registry()
                 .clone()
@@ -810,8 +816,11 @@ impl MagiTurnHarness {
             let result_receiver_for_runner = Arc::clone(&result_receiver);
             result_receiver_for_runner.set_completion_sink(notifier.clone());
             let state_for_workers = state.clone();
+            let task_store = task_store
+                .as_ref()
+                .expect("TaskStore 应与 RunnerManager 同时存在");
             let runner_manager = crate::state::RunnerManager::with_dispatcher_and_worker_catalog(
-                Arc::clone(&task_store),
+                Arc::clone(task_store),
                 Arc::clone(&session_store),
                 Arc::new(move || state_for_workers.task_worker_catalog()),
                 dispatcher,
@@ -849,6 +858,39 @@ impl MagiTurnHarness {
         let harness = Self { state, provider };
         harness.state.restore_turn_coordinator_from_session_store();
         harness
+    }
+
+    /// 返回本轮前后可观察的 Task/Runner/Snapshot/Git 运行时资源状态。
+    /// Conversation profile 必须保持四项都为零或未物化。
+    pub fn conversation_runtime_resource_state(
+        &self,
+        session_id: &SessionId,
+        workspace_root: Option<&Path>,
+    ) -> (usize, usize, bool, bool) {
+        let task_count = self
+            .state
+            .task_store()
+            .map(|store| store.all_tasks().len())
+            .unwrap_or(0);
+        let runner_count = if self.state.runner_manager().is_some() {
+            1
+        } else {
+            0
+        };
+        let snapshot_created = workspace_root
+            .and_then(|root| self.state.snapshot_session(session_id, root))
+            .is_some();
+        let git_context_created = self
+            .state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .is_some();
+        (
+            task_count,
+            runner_count,
+            snapshot_created,
+            git_context_created,
+        )
     }
 
     /// 使用同一份 canonical SessionStore 构造新的进程内状态，验证 daemon 重启后的
@@ -1321,6 +1363,15 @@ mod tests {
             .collect::<Vec<_>>();
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        let (task_count, runner_count, snapshot_created, git_context_created) =
+            harness.conversation_runtime_resource_state(&session_id, None);
+        assert_eq!(task_count, 0, "普通 Chat 不得创建 TaskStore 任务记录");
+        assert_eq!(runner_count, 0, "普通 Chat 不得启动 Runner");
+        assert!(!snapshot_created, "普通 Chat 不得物化 Snapshot session");
+        assert!(
+            !git_context_created,
+            "普通 Chat 不得创建 Git execution context"
+        );
         assert!(
             harness.state.task_store().is_none(),
             "普通 Chat 不得装配 TaskStore 或创建 root task"
