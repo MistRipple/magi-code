@@ -958,7 +958,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 权限矩阵又补充了“拒绝后修改参数”的单元验收：同一 Session/Turn/工具的相同规范化参数继续命中拒绝记忆，修改路径后必须重新产生独立 pending approval，并可单独解决为 `allow_once`；因此拒绝记忆不会错误扩大到不同操作。
 
-随后补充了真实 `MagiTurnHarness` 的 ReadOnly `file_read` 允许路径、Restricted 工作区内 `file_write` 自动允许路径，以及 FullAccess 工作区外 `file_write` 路径：只读工具可读取已有文件，受限工具可在工作区内创建文件，完全授权可执行未受任务路径策略限制的绝对路径写入，三者均完成 Turn 和 root Task、无审批事件，并保持读取或写入结果正确。该证据与 ReadOnly 显式 `file_write` fail-closed、Restricted 工作区外路径拒绝验收配对，区分了访问模式与任务路径策略的边界；完整权限组合矩阵仍未完成。
+随后补充了真实 `MagiTurnHarness` 的 ReadOnly `file_read` 允许路径、Restricted 工作区内 `file_write`、`file_copy`、`file_move` 自动允许路径，以及 FullAccess 工作区外 `file_write` 路径：只读工具可读取已有文件，受限工具可在工作区内创建、复制和移动文件，完全授权可执行未受任务路径策略限制的绝对路径写入，这些场景均完成 Turn 和 root Task、无审批事件，并保持读取或写入结果正确。该证据与 ReadOnly 显式 `file_write` fail-closed、Restricted 工作区外路径拒绝验收配对，区分了访问模式与任务路径策略的边界；完整权限组合矩阵仍未完成。
 
 本轮对 `TurnEventSink` 边界做了源码级收敛：写入、状态和事件发布方法统一为 `CanonicalTurnEventSink` inherent API，trait 仅保留接纳、继续、中断和 Task 终态控制合同；仓库内没有发现外部通过 trait 对象调用旧的重复入口，相关 session writeback 与 workspace Rust 全量测试均通过。
 

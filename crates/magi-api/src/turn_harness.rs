@@ -2970,6 +2970,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_auto_allows_file_copy_and_move_inside_workspace() {
+        let copy_harness = MagiTurnHarness::new_task("file_copy 自动允许后完成");
+        let copy_workspace_root = tempfile::tempdir().expect("file copy workspace should create");
+        let copy_workspace_id = magi_core::WorkspaceId::new("harness-file-copy-workspace");
+        copy_harness
+            .state
+            .workspace_registry
+            .register_native_path(
+                copy_workspace_id.clone(),
+                copy_workspace_root.path().to_path_buf(),
+            )
+            .expect("file copy workspace should register");
+        let copy_session_id = SessionId::new("harness-file-copy-session");
+        copy_harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                copy_session_id.clone(),
+                "file_copy 自动允许验收",
+                Some(copy_workspace_id.to_string()),
+            )
+            .expect("file copy session should create");
+        let copy_source = copy_workspace_root.path().join("source.txt");
+        let copy_destination = copy_workspace_root.path().join("copied.txt");
+        fs::write(&copy_source, "copy content").expect("file copy fixture should write");
+        copy_harness.provider.set_tool_then_completed(
+            "file_copy",
+            serde_json::json!({
+                "source": copy_source.display().to_string(),
+                "destination": copy_destination.display().to_string()
+            })
+            .to_string(),
+            "file_copy 自动允许后完成",
+        );
+
+        let copy_response = copy_harness
+            .submit_workspace_task_with_access_profile(
+                &copy_session_id,
+                &copy_workspace_id,
+                copy_workspace_root.path(),
+                "调用 file_copy 复制工作区内文件",
+                "harness-file-copy-request",
+                "harness-file-copy-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("file copy task should be accepted");
+        let copy_turn_id = copy_response
+            .turn_id
+            .clone()
+            .expect("file copy task should have turn");
+        let copy_task_id = copy_response
+            .root_task_id
+            .clone()
+            .expect("file copy task should have root task");
+        let copy_turn = copy_harness
+            .wait_for_terminal(&copy_session_id, &copy_turn_id)
+            .await;
+        let copy_task = copy_harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(copy_task_id))
+            .await;
+        assert_eq!(copy_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(copy_task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&copy_destination).unwrap(),
+            "copy content"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&copy_harness),
+            2,
+            "Restricted file_copy 应执行工具轮和一次最终答复轮"
+        );
+        assert!(
+            copy_harness
+                .events_for(&copy_session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "Restricted 工作区内 file_copy 应自动允许"
+        );
+        assert!(copy_turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "file_copy" && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+
+        let move_harness = MagiTurnHarness::new_task("file_move 自动允许后完成");
+        let move_workspace_root = tempfile::tempdir().expect("file move workspace should create");
+        let move_workspace_id = magi_core::WorkspaceId::new("harness-file-move-workspace");
+        move_harness
+            .state
+            .workspace_registry
+            .register_native_path(
+                move_workspace_id.clone(),
+                move_workspace_root.path().to_path_buf(),
+            )
+            .expect("file move workspace should register");
+        let move_session_id = SessionId::new("harness-file-move-session");
+        move_harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                move_session_id.clone(),
+                "file_move 自动允许验收",
+                Some(move_workspace_id.to_string()),
+            )
+            .expect("file move session should create");
+        let move_source = move_workspace_root.path().join("move-source.txt");
+        let move_destination = move_workspace_root.path().join("move-destination.txt");
+        fs::write(&move_source, "move content").expect("file move fixture should write");
+        move_harness.provider.set_tool_then_completed(
+            "file_move",
+            serde_json::json!({
+                "source": move_source.display().to_string(),
+                "destination": move_destination.display().to_string()
+            })
+            .to_string(),
+            "file_move 自动允许后完成",
+        );
+
+        let move_response = move_harness
+            .submit_workspace_task_with_access_profile(
+                &move_session_id,
+                &move_workspace_id,
+                move_workspace_root.path(),
+                "调用 file_move 移动工作区内文件",
+                "harness-file-move-request",
+                "harness-file-move-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("file move task should be accepted");
+        let move_turn_id = move_response
+            .turn_id
+            .clone()
+            .expect("file move task should have turn");
+        let move_task_id = move_response
+            .root_task_id
+            .clone()
+            .expect("file move task should have root task");
+        let move_turn = move_harness
+            .wait_for_terminal(&move_session_id, &move_turn_id)
+            .await;
+        let move_task = move_harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(move_task_id))
+            .await;
+        assert_eq!(move_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(move_task.status, magi_core::TaskStatus::Completed);
+        assert!(!move_source.exists());
+        assert_eq!(
+            fs::read_to_string(&move_destination).unwrap(),
+            "move content"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&move_harness),
+            2,
+            "Restricted file_move 应执行工具轮和一次最终答复轮"
+        );
+        assert!(
+            move_harness
+                .events_for(&move_session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "Restricted 工作区内 file_move 应自动允许"
+        );
+        assert!(move_turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "file_move" && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn restricted_profile_rejects_write_outside_workspace_without_approval() {
         let harness = MagiTurnHarness::new_task("越界写入被拒绝");
         let workspace_root = tempfile::tempdir().expect("workspace should create");
