@@ -846,6 +846,79 @@ impl<'a> CanonicalTurnEventSink<'a> {
 }
 
 impl<'a> CanonicalTurnEventSink<'a> {
+    pub fn append_item(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> Result<Option<PublishedSessionTurnItem>, String> {
+        append_session_turn_item_for_turn_raw(
+            self.session_store
+                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
+            session_id,
+            expected_turn_id,
+            item,
+            self.task_store,
+        )
+    }
+
+    pub fn upsert_item(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        item: ActiveExecutionTurnItem,
+    ) -> Result<Option<PublishedSessionTurnItem>, String> {
+        upsert_session_turn_item_for_turn_raw(
+            self.session_store
+                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
+            session_id,
+            expected_turn_id,
+            item,
+            self.task_store,
+        )
+    }
+
+    pub fn set_status(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        status: &str,
+    ) -> Result<Option<(SessionRuntimeSidecar, bool)>, String> {
+        self.set_status_domain(session_id, expected_turn_id, status)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn publish_item(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        published: &PublishedSessionTurnItem,
+    ) {
+        if let Some(event_bus) = self.event_bus {
+            publish_session_turn_item_event_raw(event_bus, session_id, workspace_id, published);
+        }
+    }
+
+    pub fn publish_stream(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        published: &PublishedSessionTurnItem,
+        stream_update: &SessionTurnStreamUpdate,
+        publish_gate: &mut SessionTurnStreamPublishGate,
+    ) {
+        if let Some(event_bus) = self.event_bus {
+            publish_session_turn_item_stream_event_raw(
+                event_bus,
+                session_id,
+                workspace_id,
+                published,
+                stream_update,
+                publish_gate,
+            );
+        }
+    }
+
     /// 需要保留 SessionStore 原始 DomainError 的边界（例如 API 要把
     /// CurrentTurnConflict 映射为 409）时使用这些方法。它们仍通过同一个
     /// sink 对象执行 canonical mutation。
@@ -1051,29 +1124,9 @@ impl<'a> CanonicalTurnEventSink<'a> {
     }
 }
 
-/// 统一 Turn 写回能力。实现只允许先 durable mutation，再发布事件。
+/// 统一 Turn 写回能力。接纳、状态、事件发布和终态控制均由
+/// `CanonicalTurnEventSink` 的单一实现提供，避免 trait 与 inherent API 暴露两套入口。
 pub trait TurnEventSink {
-    fn append_item(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        item: ActiveExecutionTurnItem,
-    ) -> Result<Option<PublishedSessionTurnItem>, String>;
-
-    fn upsert_item(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        item: ActiveExecutionTurnItem,
-    ) -> Result<Option<PublishedSessionTurnItem>, String>;
-
-    fn set_status(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        status: &str,
-    ) -> Result<Option<(SessionRuntimeSidecar, bool)>, String>;
-
     /// Turn 接纳、替换、继续和中断也属于 canonical 写回合同；业务边界不得绕过 sink
     /// 直接调用 SessionStore 的 current Turn mutation。
     fn accept_conversation_turn_with_timeline_entry(
@@ -1143,67 +1196,9 @@ pub trait TurnEventSink {
         session_id: &SessionId,
         expected_turn_id: Option<&str>,
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>>;
-
-    fn publish_item(
-        &self,
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-        published: &PublishedSessionTurnItem,
-    );
-
-    fn publish_stream(
-        &self,
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-        published: &PublishedSessionTurnItem,
-        stream_update: &SessionTurnStreamUpdate,
-        publish_gate: &mut SessionTurnStreamPublishGate,
-    );
 }
 
 impl<'a> TurnEventSink for CanonicalTurnEventSink<'a> {
-    fn append_item(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        item: ActiveExecutionTurnItem,
-    ) -> Result<Option<PublishedSessionTurnItem>, String> {
-        append_session_turn_item_for_turn_raw(
-            self.session_store
-                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
-            session_id,
-            expected_turn_id,
-            item,
-            self.task_store,
-        )
-    }
-
-    fn upsert_item(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        item: ActiveExecutionTurnItem,
-    ) -> Result<Option<PublishedSessionTurnItem>, String> {
-        upsert_session_turn_item_for_turn_raw(
-            self.session_store
-                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
-            session_id,
-            expected_turn_id,
-            item,
-            self.task_store,
-        )
-    }
-
-    fn set_status(
-        &self,
-        session_id: &SessionId,
-        expected_turn_id: Option<&str>,
-        status: &str,
-    ) -> Result<Option<(SessionRuntimeSidecar, bool)>, String> {
-        self.set_status_domain(session_id, expected_turn_id, status)
-            .map_err(|error| error.to_string())
-    }
-
     fn accept_conversation_turn_with_timeline_entry(
         &self,
         session_id: SessionId,
@@ -1322,37 +1317,6 @@ impl<'a> TurnEventSink for CanonicalTurnEventSink<'a> {
         expected_turn_id: Option<&str>,
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         CanonicalTurnEventSink::complete_from_root_task(self, session_id, expected_turn_id)
-    }
-
-    fn publish_item(
-        &self,
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-        published: &PublishedSessionTurnItem,
-    ) {
-        if let Some(event_bus) = self.event_bus {
-            publish_session_turn_item_event_raw(event_bus, session_id, workspace_id, published);
-        }
-    }
-
-    fn publish_stream(
-        &self,
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-        published: &PublishedSessionTurnItem,
-        stream_update: &SessionTurnStreamUpdate,
-        publish_gate: &mut SessionTurnStreamPublishGate,
-    ) {
-        if let Some(event_bus) = self.event_bus {
-            publish_session_turn_item_stream_event_raw(
-                event_bus,
-                session_id,
-                workspace_id,
-                published,
-                stream_update,
-                publish_gate,
-            );
-        }
     }
 }
 
