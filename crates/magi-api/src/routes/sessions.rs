@@ -5744,6 +5744,28 @@ mod tests {
         .with_task_store(Arc::new(TaskStore::new()))
     }
 
+    fn seed_conversation_turn(
+        state: &ApiState,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        accepted_at: UtcMillis,
+        status: &str,
+        text: &str,
+    ) {
+        let coordinator = state.turn_coordinator();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            coordinator,
+            session_id,
+            turn_id,
+            turn_seq,
+            accepted_at,
+            status,
+            text,
+        );
+    }
+
     #[tokio::test]
     async fn tool_approval_route_resolves_pending_runtime_call() {
         let state = test_state();
@@ -6295,29 +6317,15 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "个人已查看会话")
             .expect("personal session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-viewed-personal".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(10),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("触发个人未读完成".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should upsert");
-        state
-            .session_store
-            .update_current_turn_status_for_turn(
-                &session_id,
-                Some("turn-viewed-personal"),
-                "completed",
-            )
-            .expect("turn should complete");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-viewed-personal",
+            1,
+            UtcMillis(10),
+            "completed",
+            "触发个人未读完成",
+        );
 
         let (status, body) = post_json(
             state.clone(),
@@ -6560,52 +6568,100 @@ mod tests {
             .expect("task store should exist")
             .insert_task(source_task)
             .expect("源任务应插入");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
+        let coordinator = state.turn_coordinator();
+        let attempt = coordinator
+            .execute_command(
+                &session_id,
+                TurnCommand::Start(TurnAdmission {
                     turn_id: "turn-user-cancelled-resume".to_string(),
-                    turn_seq: now.0,
-                    accepted_at: now,
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some(
-                        "请先读取真实代码，再调用 diagram_render 生成当前项目流程图".to_string(),
-                    ),
-                    items: vec![ActiveExecutionTurnItem {
-                        item_id: "user-user-cancelled-resume".to_string(),
-                        item_seq: 1,
-                        kind: "user_message".to_string(),
-                        status: "completed".to_string(),
-                        source: "user".to_string(),
-                        title: None,
-                        content: Some(
-                            "请先读取真实代码，再调用 diagram_render 生成当前项目流程图"
-                                .to_string(),
-                        ),
-                        task_id: Some(source_task_id),
-                        worker_id: None,
-                        role_id: None,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_status: None,
-                        tool_arguments: None,
-                        tool_result: None,
-                        tool_error: None,
-                        request_id: None,
-                        user_message_id: Some("user-user-cancelled-resume".to_string()),
-                        placeholder_message_id: None,
-                        metadata: Default::default(),
-                        timeline_entry_id: None,
-                        source_thread_id: orchestrator_thread_id,
-                    }],
+                    request_id: "request-user-cancelled-resume".to_string(),
+                    request_fingerprint: "fingerprint-user-cancelled-resume".to_string(),
+                    profile: ExecutionProfile::Task,
+                }),
+            )
+            .expect("task Turn should start");
+        let attempt = match attempt {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected fixture admission: {other:?}"),
+        };
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-user-cancelled-resume".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            completed_at: None,
+            status: "accepted".to_string(),
+            user_message: Some(
+                "请先读取真实代码，再调用 diagram_render 生成当前项目流程图".to_string(),
+            ),
+            items: Vec::new(),
+        };
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&state.session_store, None)
+            .accept_conversation_turn_with_timeline_entry(
+                session_id.clone(),
+                None,
+                TimelineEntryInput::new(
+                    "timeline-user-cancelled-resume",
+                    TimelineEntryKind::UserMessage,
+                    "请先读取真实代码，再调用 diagram_render 生成当前项目流程图",
+                    now,
+                ),
+                turn,
+            )
+            .expect("task turn should persist");
+        coordinator
+            .execute_command(
+                &session_id,
+                TurnCommand::SetStatus {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Preparing,
                 },
             )
-            .expect("turn should persist");
+            .expect("task turn should prepare");
+        coordinator
+            .execute_command(
+                &session_id,
+                TurnCommand::SetStatus {
+                    attempt,
+                    status: CoordinatorTurnStatus::Running,
+                },
+            )
+            .expect("task turn should run");
         state
-            .session_store
-            .interrupt_current_turn_by_user(&session_id)
+            .turn_event_sink()
+            .upsert_item_sidecar(
+                &session_id,
+                Some("turn-user-cancelled-resume"),
+                ActiveExecutionTurnItem {
+                    item_id: "user-user-cancelled-resume".to_string(),
+                    item_seq: 2,
+                    kind: "user_message".to_string(),
+                    status: "completed".to_string(),
+                    source: "user".to_string(),
+                    title: None,
+                    content: Some(
+                        "请先读取真实代码，再调用 diagram_render 生成当前项目流程图".to_string(),
+                    ),
+                    task_id: Some(source_task_id),
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_status: None,
+                    tool_arguments: None,
+                    tool_result: None,
+                    tool_error: None,
+                    request_id: None,
+                    user_message_id: Some("user-user-cancelled-resume".to_string()),
+                    placeholder_message_id: None,
+                    metadata: Default::default(),
+                    timeline_entry_id: None,
+                    source_thread_id: orchestrator_thread_id,
+                },
+            )
+            .expect("task-owned turn item should persist");
+        state
+            .turn_event_sink()
+            .interrupt_turn_by_user(&session_id)
             .expect("turn should be cancellable by user");
 
         let mut request = session_turn_request("继续");
@@ -6758,8 +6814,8 @@ mod tests {
             )
             .expect("active execution chain should persist");
         state
-            .session_store
-            .interrupt_current_turn_by_daemon_restart(&session_id)
+            .turn_event_sink()
+            .interrupt_turn_by_daemon_restart(&session_id)
             .expect("daemon restart interruption should persist");
 
         for text in ["补充一个新的约束", "看看以上内容"] {
@@ -7452,21 +7508,15 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id,
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("执行长命令".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            &turn_id,
+            1,
+            UtcMillis(1),
+            "running",
+            "执行长命令",
+        );
 
         let runner_session_id = session_id.clone();
         let runner_workspace_id = workspace_id.clone();
@@ -7542,74 +7592,46 @@ mod tests {
                 .ensure_session_mission(&session_id, accepted_at, || {
                     MissionId::new("mission-interrupt-canonical")
                 });
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-interrupt-canonical",
+            accepted_at.0,
+            accepted_at,
+            "running",
+            "请生成一段长内容",
+        );
         state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-interrupt-canonical".to_string(),
-                    turn_seq: accepted_at.0,
-                    accepted_at,
+            .turn_event_sink()
+            .upsert_item_sidecar(
+                &session_id,
+                Some("turn-interrupt-canonical"),
+                ActiveExecutionTurnItem {
+                    item_id: "assistant-interrupt-canonical".to_string(),
+                    item_seq: 2,
+                    kind: "assistant_stream".to_string(),
                     status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("请生成一段长内容".to_string()),
-                    items: vec![
-                        ActiveExecutionTurnItem {
-                            item_id: "user-interrupt-canonical".to_string(),
-                            item_seq: 1,
-                            kind: "user_message".to_string(),
-                            status: "completed".to_string(),
-                            source: "user".to_string(),
-                            title: None,
-                            content: Some("请生成一段长内容".to_string()),
-                            task_id: None,
-                            worker_id: None,
-                            role_id: None,
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_status: None,
-                            tool_arguments: None,
-                            tool_result: None,
-                            tool_error: None,
-                            request_id: Some("request-interrupt-canonical".to_string()),
-                            user_message_id: Some("user-interrupt-canonical".to_string()),
-                            placeholder_message_id: Some(
-                                "assistant-interrupt-canonical".to_string(),
-                            ),
-                            metadata: Default::default(),
-                            timeline_entry_id: None,
-                            source_thread_id: orchestrator_thread_id.clone(),
-                        },
-                        ActiveExecutionTurnItem {
-                            item_id: "assistant-interrupt-canonical".to_string(),
-                            item_seq: 2,
-                            kind: "assistant_stream".to_string(),
-                            status: "running".to_string(),
-                            source: "orchestrator".to_string(),
-                            title: Some("生成回复".to_string()),
-                            content: Some("生成中".to_string()),
-                            task_id: None,
-                            worker_id: None,
-                            role_id: None,
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_status: None,
-                            tool_arguments: None,
-                            tool_result: None,
-                            tool_error: None,
-                            request_id: Some("request-interrupt-canonical".to_string()),
-                            user_message_id: Some("user-interrupt-canonical".to_string()),
-                            placeholder_message_id: Some(
-                                "assistant-interrupt-canonical".to_string(),
-                            ),
-                            metadata: Default::default(),
-                            timeline_entry_id: None,
-                            source_thread_id: orchestrator_thread_id,
-                        },
-                    ],
+                    source: "orchestrator".to_string(),
+                    title: Some("生成回复".to_string()),
+                    content: Some("生成中".to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_status: None,
+                    tool_arguments: None,
+                    tool_result: None,
+                    tool_error: None,
+                    request_id: Some("request-interrupt-canonical".to_string()),
+                    user_message_id: Some("user-interrupt-canonical".to_string()),
+                    placeholder_message_id: Some("assistant-interrupt-canonical".to_string()),
+                    metadata: Default::default(),
+                    timeline_entry_id: None,
+                    source_thread_id: orchestrator_thread_id.clone(),
                 },
             )
-            .expect("current turn should persist");
+            .expect("assistant stream item should persist");
         state
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-interrupt-canonical".to_string())
@@ -7693,21 +7715,15 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("仍在执行".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            &turn_id,
+            1,
+            UtcMillis(1),
+            "running",
+            "仍在执行",
+        );
         state
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), turn_id)
@@ -7986,8 +8002,8 @@ mod tests {
             )
             .expect("active execution chain should persist");
         state
-            .session_store
-            .interrupt_current_turn_by_daemon_restart(&session_id)
+            .turn_event_sink()
+            .interrupt_turn_by_daemon_restart(&session_id)
             .expect("interrupted turn should persist");
         state
             .ensure_snapshot_session(&session_id, &workspace_root)
@@ -8170,8 +8186,8 @@ mod tests {
             )
             .expect("goal execution chain should persist");
         state
-            .session_store
-            .interrupt_current_turn_by_daemon_restart(&session_id)
+            .turn_event_sink()
+            .interrupt_turn_by_daemon_restart(&session_id)
             .expect("daemon interruption should persist");
         let active_goal = state
             .session_store
@@ -8235,21 +8251,15 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "继续测试")
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-old-interrupted".to_string(),
-                    turn_seq: 1,
-                    accepted_at: now,
-                    status: "interrupted".to_string(),
-                    completed_at: Some(now),
-                    user_message: Some("旧任务".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("interrupted turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-old-interrupted",
+            1,
+            now,
+            "interrupted",
+            "旧任务",
+        );
 
         let accepted = SessionContinueAccepted {
             session_id: session_id.clone(),
@@ -8313,36 +8323,18 @@ mod tests {
                 .ensure_session_mission(&session_id, accepted_at, || {
                     MissionId::new("mission-session-steer")
                 });
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-session-steer".to_string(),
-                    turn_seq: accepted_at.0,
-                    accepted_at,
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("请生成详细方案".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("active turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-session-steer",
+            accepted_at.0,
+            accepted_at,
+            "running",
+            "请生成详细方案",
+        );
         let _active_input = state
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-session-steer".to_string());
-        state
-            .turn_coordinator()
-            .execute_command(
-                &session_id,
-                TurnCommand::Start(TurnAdmission {
-                    turn_id: "turn-session-steer".to_string(),
-                    request_id: "request-session-steer-root".to_string(),
-                    request_fingerprint: "fp-session-steer-root".to_string(),
-                    profile: ExecutionProfile::Conversation,
-                }),
-            )
-            .expect("active Turn should register with Coordinator");
 
         let (status, body) = post_json(
             state.clone(),
@@ -9761,37 +9753,19 @@ mod tests {
             .ensure_session_mission(&session_id, accepted_at, || {
                 MissionId::new("mission-queued-turn-guide")
             });
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-queued-turn-guide".to_string(),
-                    turn_seq: accepted_at.0,
-                    accepted_at,
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("继续执行当前工作".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("active turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-queued-turn-guide",
+            accepted_at.0,
+            accepted_at,
+            "running",
+            "继续执行当前工作",
+        );
         state
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-queued-turn-guide".to_string())
             .expect("active turn input should begin");
-        state
-            .turn_coordinator()
-            .execute_command(
-                &session_id,
-                TurnCommand::Start(TurnAdmission {
-                    turn_id: "turn-queued-turn-guide".to_string(),
-                    request_id: "request-queued-turn-guide-root".to_string(),
-                    request_fingerprint: "fp-queued-turn-guide-root".to_string(),
-                    profile: ExecutionProfile::Conversation,
-                }),
-            )
-            .expect("active Turn should register with Coordinator");
         let queued = queued_regular_turn(
             &session_id,
             &workspace_id,
@@ -10026,29 +10000,30 @@ mod tests {
             task_id: None,
             source_thread_id: ThreadId::new("thread-canonical-match"),
         });
+        let mut user_item = user_item;
+        user_item.item_seq = 2;
+        let coordinator = state.turn_coordinator();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            coordinator,
+            &session_id,
+            "turn-canonical-match",
+            1,
+            accepted_at,
+            "running",
+            "已接受的排队消息",
+        );
         state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-canonical-match".to_string(),
-                    turn_seq: 1,
-                    accepted_at,
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("已接受的排队消息".to_string()),
-                    items: vec![user_item],
-                },
-            )
-            .expect("canonical turn should persist");
-        state
-            .session_store
-            .update_current_turn_status_for_turn(
-                &session_id,
-                Some("turn-canonical-match"),
-                "completed",
-            )
-            .expect("canonical turn should complete");
+            .turn_event_sink()
+            .upsert_item_sidecar(&session_id, Some("turn-canonical-match"), user_item)
+            .expect("canonical user item should persist");
+        crate::routes::test_turn_fixtures::finish_conversation_turn(
+            &state.session_store,
+            coordinator,
+            &session_id,
+            "turn-canonical-match",
+            "completed",
+        );
         let canonical = state
             .session_store
             .canonical_turns_for_session(&session_id)
@@ -10106,21 +10081,15 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-active-before-queue".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1_777_000_000_200),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("第一条还在运行".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-active-before-queue",
+            1,
+            UtcMillis(1_777_000_000_200),
+            "running",
+            "第一条还在运行",
+        );
 
         let (status, body) = post_json(
             state.clone(),
@@ -10173,14 +10142,13 @@ mod tests {
             queued.request.trimmed_text().as_deref(),
             Some("第二条应该排队")
         );
-        state
-            .session_store
-            .update_current_turn_status_for_turn(
-                &session_id,
-                Some("turn-active-before-queue"),
-                "completed",
-            )
-            .expect("current turn should complete");
+        crate::routes::test_turn_fixtures::finish_conversation_turn(
+            &state.session_store,
+            state.turn_coordinator(),
+            &session_id,
+            "turn-active-before-queue",
+            "completed",
+        );
         assert_eq!(
             drain_next_queued_regular_session_turn(
                 state.clone(),
@@ -10227,21 +10195,15 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-queued-identity-active".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1_777_000_000_400),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("当前消息仍在运行".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-queued-identity-active",
+            1,
+            UtcMillis(1_777_000_000_400),
+            "running",
+            "当前消息仍在运行",
+        );
 
         let (status, body) = post_json(
             state.clone(),
@@ -10322,21 +10284,15 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-before-queued-goal".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1_777_000_000_300),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("前一轮仍在运行".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-before-queued-goal",
+            1,
+            UtcMillis(1_777_000_000_300),
+            "running",
+            "前一轮仍在运行",
+        );
 
         let (status, body) = post_json(
             state.clone(),
@@ -10363,14 +10319,13 @@ mod tests {
             "Goal 模式判定必须随排队消息持久化"
         );
 
-        state
-            .session_store
-            .update_current_turn_status_for_turn(
-                &session_id,
-                Some("turn-before-queued-goal"),
-                "completed",
-            )
-            .expect("current turn should complete");
+        crate::routes::test_turn_fixtures::finish_conversation_turn(
+            &state.session_store,
+            state.turn_coordinator(),
+            &session_id,
+            "turn-before-queued-goal",
+            "completed",
+        );
         assert_eq!(
             drain_next_queued_regular_session_turn(state, session_id, Some(workspace_id),).await,
             QueuedRegularSessionTurnDrainOutcome::Started,
@@ -10407,21 +10362,15 @@ mod tests {
                     Some(workspace_id.to_string()),
                 )
                 .expect("session should create");
-            state
-                .session_store
-                .upsert_current_turn(
-                    session_id.clone(),
-                    ActiveExecutionTurn {
-                        turn_id: format!("turn-active-{session_id}"),
-                        turn_seq: 1,
-                        accepted_at: UtcMillis(1_777_000_001_000),
-                        status: "running".to_string(),
-                        completed_at: None,
-                        user_message: Some("运行中".to_string()),
-                        items: Vec::new(),
-                    },
-                )
-                .expect("current turn should persist");
+            seed_conversation_turn(
+                &state,
+                session_id,
+                &format!("turn-active-{session_id}"),
+                1,
+                UtcMillis(1_777_000_001_000),
+                "running",
+                "运行中",
+            );
         }
 
         let (status_a, response_a) = post_json(
@@ -10481,21 +10430,15 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-active-before-task-queue".to_string(),
-                    turn_seq: 1,
-                    accepted_at: UtcMillis(1_777_000_002_000),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("当前任务还在运行".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-active-before-task-queue",
+            1,
+            UtcMillis(1_777_000_002_000),
+            "running",
+            "当前任务还在运行",
+        );
 
         let (status, body) = post_json(
             state.clone(),
@@ -10980,21 +10923,15 @@ mod tests {
             state
                 .session_store
                 .ensure_session_mission(&session_id, UtcMillis(10), || mission_id.clone());
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-delete-runtime-resources".to_string(),
-                    turn_seq: 11,
-                    accepted_at: UtcMillis(11),
-                    status: "completed".to_string(),
-                    completed_at: Some(UtcMillis(12)),
-                    user_message: Some("删除我".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("canonical turn should persist");
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-delete-runtime-resources",
+            11,
+            UtcMillis(11),
+            "completed",
+            "删除我",
+        );
         state
             .task_execution_registry()
             .insert(
@@ -11175,43 +11112,54 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        pre_restart_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-delete-after-restart".to_string(),
-                    turn_seq: 21,
-                    accepted_at: UtcMillis(21),
+        let pre_restart_coordinator = magi_conversation_runtime::SessionTurnCoordinator::new();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &pre_restart_store,
+            &pre_restart_coordinator,
+            &session_id,
+            "turn-delete-after-restart",
+            21,
+            UtcMillis(21),
+            "running",
+            "重启后删除",
+        );
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&pre_restart_store, None)
+            .upsert_item_sidecar(
+                &session_id,
+                Some("turn-delete-after-restart"),
+                ActiveExecutionTurnItem {
+                    item_id: "item-delete-after-restart-task-owner".to_string(),
+                    item_seq: 2,
+                    kind: "user_message".to_string(),
                     status: "completed".to_string(),
-                    completed_at: Some(UtcMillis(22)),
-                    user_message: Some("重启后删除".to_string()),
-                    items: vec![ActiveExecutionTurnItem {
-                        item_id: "item-delete-after-restart".to_string(),
-                        item_seq: 1,
-                        kind: "user_message".to_string(),
-                        status: "completed".to_string(),
-                        source: "user".to_string(),
-                        title: None,
-                        content: Some("重启后删除".to_string()),
-                        task_id: Some(root_task.task_id.clone()),
-                        worker_id: None,
-                        role_id: None,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_status: None,
-                        tool_arguments: None,
-                        tool_result: None,
-                        tool_error: None,
-                        request_id: None,
-                        user_message_id: None,
-                        placeholder_message_id: None,
-                        metadata: Default::default(),
-                        timeline_entry_id: None,
-                        source_thread_id: ThreadId::new("thread-before-restart"),
-                    }],
+                    source: "user".to_string(),
+                    title: None,
+                    content: Some("重启后删除".to_string()),
+                    task_id: Some(root_task.task_id.clone()),
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_status: None,
+                    tool_arguments: None,
+                    tool_result: None,
+                    tool_error: None,
+                    request_id: None,
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    metadata: Default::default(),
+                    timeline_entry_id: None,
+                    source_thread_id: ThreadId::new("thread-before-restart"),
                 },
             )
-            .expect("canonical history should persist");
+            .expect("canonical task owner item should persist");
+        crate::routes::test_turn_fixtures::finish_conversation_turn(
+            &pre_restart_store,
+            &pre_restart_coordinator,
+            &session_id,
+            "turn-delete-after-restart",
+            "completed",
+        );
         let restored_store = Arc::new(
             SessionStore::from_persisted_parts(
                 pre_restart_store.durable_state(),

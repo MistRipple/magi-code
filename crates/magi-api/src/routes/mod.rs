@@ -155,8 +155,38 @@ pub(crate) mod test_turn_fixtures {
         let terminal = match status {
             "completed" => CoordinatorTurnStatus::Completed,
             "failed" => CoordinatorTurnStatus::Failed,
-            "cancelled" => CoordinatorTurnStatus::Cancelled,
+            "cancelled" | "interrupted" => CoordinatorTurnStatus::Cancelled,
             _ => panic!("unsupported fixture status {status}"),
+        };
+        coordinator
+            .execute_command(
+                session_id,
+                TurnCommand::Finish {
+                    attempt,
+                    status: terminal,
+                },
+            )
+            .expect("fixture Turn should finish");
+        CanonicalTurnEventSink::for_store(store, None)
+            .set_status_domain(session_id, Some(turn_id), status)
+            .expect("fixture terminal status should persist");
+    }
+
+    pub(crate) fn finish_conversation_turn(
+        store: &SessionStore,
+        coordinator: &SessionTurnCoordinator,
+        session_id: &SessionId,
+        turn_id: &str,
+        status: &str,
+    ) {
+        let attempt = coordinator
+            .current_attempt(session_id, turn_id)
+            .expect("fixture Turn should have an active attempt");
+        let terminal = match status {
+            "completed" => CoordinatorTurnStatus::Completed,
+            "failed" => CoordinatorTurnStatus::Failed,
+            "cancelled" | "interrupted" => CoordinatorTurnStatus::Cancelled,
+            _ => panic!("unsupported fixture terminal status {status}"),
         };
         coordinator
             .execute_command(
