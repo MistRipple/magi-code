@@ -450,6 +450,42 @@ mod tests {
     }
 
     #[test]
+    fn resolving_from_another_session_keeps_the_pending_request() {
+        let registry = ToolApprovalRegistry::default();
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request(request("approval-session-scope"))
+            .expect("session-scoped approval")
+        else {
+            panic!("request must wait");
+        };
+
+        let error = registry
+            .resolve(
+                &SessionId::new("another-session"),
+                "approval-session-scope",
+                ToolApprovalDecision::AllowOnce,
+            )
+            .expect_err("another session must not resolve the approval");
+        assert!(error.contains("不属于当前会话"));
+        assert_eq!(
+            registry.pending_for_session(&SessionId::new("session-approval")),
+            vec![waiter.request.clone()]
+        );
+
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-session-scope",
+                ToolApprovalDecision::AllowOnce,
+            )
+            .expect("owning session should resolve the approval");
+        assert_eq!(
+            waiter.decision_rx.recv().expect("receive approval"),
+            ToolApprovalDecision::AllowOnce
+        );
+    }
+
+    #[test]
     fn removing_turn_cancels_pending_and_grants() {
         let registry = ToolApprovalRegistry::default();
         let ToolApprovalRequestOutcome::Pending(waiter) = registry

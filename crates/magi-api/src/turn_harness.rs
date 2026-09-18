@@ -2019,6 +2019,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_rejects_write_outside_workspace_without_approval() {
+        let harness = MagiTurnHarness::new_task("越界写入被拒绝");
+        let workspace_root = tempfile::tempdir().expect("workspace should create");
+        let outside_root = tempfile::tempdir().expect("outside workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-path-deny-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("workspace should register");
+        let session_id = SessionId::new("harness-path-deny-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "越界路径拒绝验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let target = outside_root.path().join("escape.txt");
+        harness.provider.set_tool_then_completed(
+            "file_write",
+            serde_json::json!({
+                "path": target.display().to_string(),
+                "content": "must not escape"
+            })
+            .to_string(),
+            "越界写入不应执行",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 file_write 写入工作区之外的路径",
+                "harness-path-deny-request",
+                "harness-path-deny-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("path policy task should be accepted");
+        let turn_id = response.turn_id.clone().expect("task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(!target.exists(), "工作区外路径不得产生文件副作用");
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "路径拒绝不应创建 pending approval"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "确定性的路径拒绝不应发布审批请求"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            1,
+            "确定性的路径拒绝后不得重试 Provider"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "file_write" && tool.error.is_some())
+        }));
+    }
+
+    #[tokio::test]
     async fn restricted_profile_allow_for_turn_reuses_write_tool_grant() {
         let harness = MagiTurnHarness::new_task("按 Turn 授权完成");
         let workspace_root = tempfile::tempdir().expect("turn grant workspace should create");

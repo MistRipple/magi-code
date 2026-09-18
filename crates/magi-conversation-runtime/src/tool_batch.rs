@@ -2970,6 +2970,32 @@ fn await_task_tool_approval(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
+                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                });
+                let turn_is_active = crate::tool_approval::session_turn_is_active(
+                    session_store,
+                    session_id,
+                    &turn_id,
+                );
+                if !task_is_active || !turn_is_active {
+                    if !turn_is_active {
+                        registry.remove_turn(session_id, &turn_id);
+                    } else {
+                        registry.remove_task(session_id, &task.task_id);
+                    }
+                    return Err((
+                        serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "cancelled",
+                            "error_code": "tool_approval_cancelled",
+                            "error": "任务或对话轮次已停止，待授权操作未执行",
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Cancelled,
+                    ));
+                }
                 registry.cancel(&approval_id);
                 return Err((
                     serde_json::json!({

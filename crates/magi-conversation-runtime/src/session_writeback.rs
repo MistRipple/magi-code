@@ -2813,6 +2813,24 @@ fn await_session_tool_approval(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !crate::tool_approval::session_turn_is_active(
+                    session_store,
+                    session_id,
+                    &turn_id,
+                ) {
+                    registry.remove_turn(session_id, &turn_id);
+                    return Err((
+                        serde_json::json!({
+                            "tool": tool_call.function.name,
+                            "status": "cancelled",
+                            "error_code": "tool_approval_cancelled",
+                            "error": "对话轮次已停止，待授权操作未执行",
+                            "approval_id": approval_id,
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Cancelled,
+                    ));
+                }
                 registry.cancel(&approval_id);
                 return Err((
                     serde_json::json!({
