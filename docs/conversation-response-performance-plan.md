@@ -180,6 +180,11 @@ accepted -> preparing -> running -> streaming -> completed
   - 工作区带工具调用；
   - 主代理与子代理并发。
 
+`MagiTurnHarness` 已能在真实 `TurnService` 链路上记录单轮 accepted 返回、非编排 Provider
+请求开始、首个 Provider delta、首个 EventBus 流事件和 canonical 终态观察，并保留事件序号
+用于验证时间线顺序。该证据用于确认埋点和事件边界，尚未替代五类场景各 20 轮的 P50/P95
+采样，也不能作为性能目标已达标的结论。
+
 #### 预计主要文件
 
 - `crates/magi-api/src/routes/sessions.rs`
