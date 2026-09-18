@@ -6942,6 +6942,7 @@ mod tests {
 
     fn ensure_test_current_turn(
         session_store: &SessionStore,
+        conversation_registry: &ConversationRegistry,
         session_id: &SessionId,
         task: &Task,
         user_message: &str,
@@ -6950,7 +6951,7 @@ mod tests {
         let turn_id = format!("turn-test-{session_id}");
         let request_id = format!("request-{turn_id}");
         let request_fingerprint = format!("fingerprint-{turn_id}");
-        let coordinator = crate::SessionTurnCoordinator::new();
+        let coordinator = conversation_registry.turn_coordinator();
         let attempt = match coordinator
             .execute_command(
                 session_id,
@@ -7087,7 +7088,14 @@ mod tests {
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         // P7：mainline 场景 task 自身 thread = orchestrator thread。
         let thread_id = orchestrator_thread_id.clone();
-        ensure_test_current_turn(&session_store, &session_id, task, "请执行任务");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            task,
+            "请执行任务",
+        );
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
             event_bus: &event_bus,
@@ -7100,7 +7108,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -7156,7 +7164,14 @@ mod tests {
         let now = UtcMillis::now();
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, &task, "请执行任务");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "请执行任务",
+        );
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &RetryEventTaskModelBridgeClient,
@@ -7170,7 +7185,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -7246,7 +7261,14 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
-        ensure_test_current_turn(&session_store, &session_id, &task, "识别图片");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "识别图片",
+        );
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
@@ -7260,7 +7282,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -7514,8 +7536,10 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
+        let conversation_registry = ConversationRegistry::new();
         ensure_test_current_turn(
             &session_store,
+            &conversation_registry,
             &session_id,
             &task,
             "请调用一个失败工具后总结",
@@ -7533,7 +7557,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -7612,8 +7636,10 @@ mod tests {
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
+        let conversation_registry = ConversationRegistry::new();
         ensure_test_current_turn(
             &session_store,
+            &conversation_registry,
             &session_id,
             &task,
             "请先处理失败工具，再通过重试完成任务",
@@ -7631,7 +7657,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -7814,7 +7840,14 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, &task, "完成全部计划");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "完成全部计划",
+        );
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -7850,7 +7883,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -7924,7 +7957,14 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, &task, "执行普通任务");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "执行普通任务",
+        );
         let goal = session_store
             .create_goal(
                 session_id.clone(),
@@ -7992,7 +8032,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -8064,7 +8104,14 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
-        ensure_test_current_turn(&session_store, &session_id, &task, "完成子代理任务");
+        let conversation_registry = ConversationRegistry::new();
+        ensure_test_current_turn(
+            &session_store,
+            &conversation_registry,
+            &session_id,
+            &task,
+            "完成子代理任务",
+        );
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -8100,7 +8147,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -8162,8 +8209,10 @@ mod tests {
         let (_, thread_id) =
             session_store
                 .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        let conversation_registry = ConversationRegistry::new();
         ensure_test_current_turn(
             &session_store,
+            &conversation_registry,
             &session_id,
             &task,
             "当前任务：输出 CURRENT_TASK_RESULT，不要输出 OLD_REFERENCE_RESULT",
@@ -8232,7 +8281,7 @@ mod tests {
             skill_name: None,
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
