@@ -1084,9 +1084,10 @@ impl SessionTurnCoordinator {
             false
         };
         drop(guard);
-        if removed {
-            self.tool_approvals.remove_turn(session_id, turn_id);
-        }
+        // Task profile 可能没有创建 Session steer 输入槽位，但它仍共用同一
+        // Session Turn 的工具审批注册表。关闭 Turn 时必须无条件撤销该 Turn
+        // 的 pending approval 和授权，不能以输入槽位是否存在作为清理条件。
+        self.tool_approvals.remove_turn(session_id, turn_id);
         removed
     }
 
