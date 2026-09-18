@@ -5113,20 +5113,21 @@ mod tests {
         store
             .create_session(session_id.clone(), "runtime invalid state")
             .expect("session should be creatable");
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-runtime-invalid-state".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(1_000),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续处理".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should be stored");
+        let conversation_registry = Arc::new(ConversationRegistry::new());
+        seed_conversation_turn(
+            store.as_ref(),
+            &session_id,
+            conversation_registry.turn_coordinator(),
+            ActiveExecutionTurn {
+                turn_id: "turn-runtime-invalid-state".to_string(),
+                turn_seq: 1,
+                accepted_at: ts(1_000),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("继续处理".to_string()),
+                items: Vec::new(),
+            },
+        );
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
@@ -5156,7 +5157,7 @@ mod tests {
             client: &client,
             event_bus: &InMemoryEventBus::new(16),
             session_store: store.as_ref(),
-            conversation_registry: &ConversationRegistry::new(),
+            conversation_registry: conversation_registry.as_ref(),
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
