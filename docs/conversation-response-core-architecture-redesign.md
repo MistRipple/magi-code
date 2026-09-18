@@ -897,6 +897,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 继续将 `session_turn_execution` 中的 vision takeover、steer、plan follow-up 和普通 Turn 隔离夹具改为对应 profile 的 Coordinator + canonical sink 接纳；steer 与 follow-up fixture 复用同一个 registry Coordinator，vision follow-up 使用独立 Turn 的输入边界。相关 session execution 定向测试和 workspace Rust 全量测试通过，仍保留未迁移的上下文恢复、历史投影及存储单元测试边界。
 
+随后又迁移了会话错误、空流/流中断恢复、图片错误、placeholder 和 retry event 测试夹具；当前剩余 `session_turn_execution` 直接 `upsert_current_turn` 主要位于从预构造 `SessionStoreState` 读取历史/上下文的测试，以及 context-compaction、最终 item 时序等局部读写断言，未进入生产路径。该批迁移后的 workspace Rust 全量仍通过，17.3/17.7 继续保持未完成。
+
 ### 17.4 Conversation 与 Task 执行分离
 
 - [x] 普通 Chat 接入独立 Conversation 执行路径。
