@@ -2880,6 +2880,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_auto_allows_file_write_inside_workspace() {
+        let harness = MagiTurnHarness::new_task("file_write 自动允许后完成");
+        let workspace_root = tempfile::tempdir().expect("file write workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-file-write-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("file write workspace should register");
+        let session_id = SessionId::new("harness-file-write-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "file_write 自动允许验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("file write session should create");
+        let target = workspace_root.path().join("created.txt");
+        harness.provider.set_tool_then_completed(
+            "file_write",
+            serde_json::json!({
+                "path": target.display().to_string(),
+                "content": "restricted write"
+            })
+            .to_string(),
+            "file_write 自动允许后完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 file_write 写入工作区内文件",
+                "harness-file-write-request",
+                "harness-file-write-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("file write task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("file write task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("file write task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "restricted write");
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "Restricted 下工作区内 file_write 应执行工具轮和一次最终答复轮"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            0,
+            "Restricted 下工作区内 file_write 应自动允许"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            0,
+            "自动允许的 file_write 不应伪造审批收口"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "file_write" && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn restricted_profile_rejects_write_outside_workspace_without_approval() {
         let harness = MagiTurnHarness::new_task("越界写入被拒绝");
         let workspace_root = tempfile::tempdir().expect("workspace should create");

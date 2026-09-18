@@ -958,7 +958,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 权限矩阵又补充了“拒绝后修改参数”的单元验收：同一 Session/Turn/工具的相同规范化参数继续命中拒绝记忆，修改路径后必须重新产生独立 pending approval，并可单独解决为 `allow_once`；因此拒绝记忆不会错误扩大到不同操作。
 
-随后补充了真实 `MagiTurnHarness` 的 ReadOnly `file_read` 允许路径：工作区内已有文件可由只读工具读取，Turn 和 root Task 均完成，文件内容保持不变，不发布 `tool.approval.requested`，并且只产生工具轮和一次最终答复轮。该证据与 ReadOnly 显式 `file_write` fail-closed 验收配对，覆盖了只读模式下允许只读能力与阻断写能力两条相反边界；完整权限组合矩阵仍未完成。
+随后补充了真实 `MagiTurnHarness` 的 ReadOnly `file_read` 允许路径，以及 Restricted 工作区内 `file_write` 自动允许路径：只读工具可读取已有文件，受限工具可在工作区内创建文件，二者均完成 Turn 和 root Task、无审批事件，并分别保持读取内容和写入结果正确。该证据与 ReadOnly 显式 `file_write` fail-closed、Restricted 工作区外路径拒绝验收配对，覆盖了允许只读、允许安全工作区写入和阻断越界/只读写入三条边界；完整权限组合矩阵仍未完成。
 
 ## 18. MagiTurnHarness 验证设计
 
