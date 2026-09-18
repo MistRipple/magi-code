@@ -5800,6 +5800,31 @@ mod tests {
             ToolApprovalDecision::AllowOnce
         );
 
+        let duplicate_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/session/tool-approval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "approvalId": "approval-route-1",
+                            "decision": "deny",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("duplicate approval request should build"),
+            )
+            .await
+            .expect("duplicate approval route should respond");
+        assert_eq!(
+            duplicate_response.status(),
+            StatusCode::CONFLICT,
+            "重复决定必须被确定性拒绝"
+        );
+
         let response = app
             .oneshot(
                 Request::builder()
