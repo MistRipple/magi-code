@@ -32,13 +32,105 @@ use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, atomic::AtomicU64},
 };
 use tower::ServiceExt;
+
+#[derive(Clone, Default)]
+struct HarnessTiming {
+    state: Arc<Mutex<HarnessTimingState>>,
+}
+
+#[derive(Default)]
+struct HarnessTimingState {
+    submit_started_at: Option<Instant>,
+    accepted_returned_at: Option<Instant>,
+    provider_request_started_at: Option<Instant>,
+    provider_first_delta_at: Option<Instant>,
+    first_stream_event_at: Option<Instant>,
+    first_stream_event_sequence: Option<u64>,
+    terminal_observed_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarnessTimingSnapshot {
+    pub accepted_returned_ms: Option<u128>,
+    pub provider_request_started_ms: Option<u128>,
+    pub provider_first_delta_ms: Option<u128>,
+    pub first_stream_event_ms: Option<u128>,
+    pub first_stream_event_sequence: Option<u64>,
+    pub terminal_observed_ms: Option<u128>,
+}
+
+impl HarnessTiming {
+    fn reset(&self) {
+        *self.state.lock().expect("harness timing state should hold") =
+            HarnessTimingState::default();
+    }
+
+    fn mark_submit_started(&self) {
+        let mut state = self.state.lock().expect("harness timing state should hold");
+        if state.submit_started_at.is_none() {
+            state.submit_started_at = Some(Instant::now());
+        }
+    }
+
+    fn mark_accepted_returned(&self) {
+        let mut state = self.state.lock().expect("harness timing state should hold");
+        if state.accepted_returned_at.is_none() {
+            state.accepted_returned_at = Some(Instant::now());
+        }
+    }
+
+    fn mark_provider_request_started(&self) {
+        let mut state = self.state.lock().expect("harness timing state should hold");
+        if state.provider_request_started_at.is_none() {
+            state.provider_request_started_at = Some(Instant::now());
+        }
+    }
+
+    fn mark_provider_first_delta(&self) {
+        let mut state = self.state.lock().expect("harness timing state should hold");
+        if state.provider_first_delta_at.is_none() {
+            state.provider_first_delta_at = Some(Instant::now());
+        }
+    }
+
+    fn mark_first_stream_event(&self, sequence: u64) {
+        let mut state = self.state.lock().expect("harness timing state should hold");
+        if state.first_stream_event_at.is_none() {
+            state.first_stream_event_at = Some(Instant::now());
+            state.first_stream_event_sequence = Some(sequence);
+        }
+    }
+
+    fn mark_terminal_observed(&self) {
+        let mut state = self.state.lock().expect("harness timing state should hold");
+        if state.terminal_observed_at.is_none() {
+            state.terminal_observed_at = Some(Instant::now());
+        }
+    }
+
+    fn snapshot(&self) -> HarnessTimingSnapshot {
+        let state = self.state.lock().expect("harness timing state should hold");
+        let Some(started_at) = state.submit_started_at else {
+            return HarnessTimingSnapshot::default();
+        };
+        let elapsed = |at: Option<Instant>| at.map(|at| at.duration_since(started_at).as_millis());
+        HarnessTimingSnapshot {
+            accepted_returned_ms: elapsed(state.accepted_returned_at),
+            provider_request_started_ms: elapsed(state.provider_request_started_at),
+            provider_first_delta_ms: elapsed(state.provider_first_delta_at),
+            first_stream_event_ms: elapsed(state.first_stream_event_at),
+            first_stream_event_sequence: state.first_stream_event_sequence,
+            terminal_observed_ms: elapsed(state.terminal_observed_at),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum ProviderBehavior {
@@ -81,6 +173,7 @@ struct ProviderState {
 #[derive(Clone)]
 pub struct HarnessModelClient {
     state: Arc<Mutex<ProviderState>>,
+    timing: HarnessTiming,
 }
 
 impl HarnessModelClient {
@@ -90,6 +183,7 @@ impl HarnessModelClient {
                 behavior: Some(ProviderBehavior::Completed(response.into())),
                 ..ProviderState::default()
             })),
+            timing: HarnessTiming::default(),
         }
     }
 
@@ -228,6 +322,35 @@ impl HarnessModelClient {
             .clone()
     }
 
+    /// 返回最近一次通过该 Provider 执行的 Turn 时间线。
+    ///
+    /// 这是单轮观测证据，不能替代多轮 P50/P95 采样。
+    pub fn timing(&self) -> HarnessTimingSnapshot {
+        self.timing.snapshot()
+    }
+
+    fn record_delta(
+        &self,
+        delta: &ModelStreamingDelta,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+        track_timing: bool,
+    ) {
+        if track_timing && (!delta.content.is_empty() || !delta.thinking.is_empty()) {
+            self.timing.mark_provider_first_delta();
+        }
+        self.state
+            .lock()
+            .expect("harness provider state should hold")
+            .deltas
+            .push(delta.clone());
+        on_delta(delta);
+    }
+
+    fn begin_timing(&self) {
+        self.timing.reset();
+        self.timing.mark_submit_started();
+    }
+
     pub fn deltas(&self) -> Vec<ModelStreamingDelta> {
         self.state
             .lock()
@@ -241,6 +364,10 @@ impl HarnessModelClient {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<ModelResponse, BridgeClientError> {
+        let track_timing = !request.prompt.contains("Session Turn 编排分类器");
+        if track_timing {
+            self.timing.mark_provider_request_started();
+        }
         let behavior = {
             let mut state = self
                 .state
@@ -266,12 +393,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                     };
-                    self.state
-                        .lock()
-                        .expect("harness provider state should hold")
-                        .deltas
-                        .push(delta.clone());
-                    on_delta(&delta);
+                    self.record_delta(&delta, on_delta, track_timing);
                 }
                 Ok(ModelResponse {
                     status: ModelResponseStatus::Completed,
@@ -315,12 +437,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                     };
-                    self.state
-                        .lock()
-                        .expect("harness provider state should hold")
-                        .deltas
-                        .push(delta.clone());
-                    on_delta(&delta);
+                    self.record_delta(&delta, on_delta, track_timing);
                 }
                 Ok(ModelResponse::completed(response))
             }
@@ -462,12 +579,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                     };
-                    self.state
-                        .lock()
-                        .expect("harness provider state should hold")
-                        .deltas
-                        .push(delta.clone());
-                    on_delta(&delta);
+                    self.record_delta(&delta, on_delta, track_timing);
                 }
                 Ok(ModelResponse::completed(content))
             }
@@ -525,12 +637,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                     };
-                    self.state
-                        .lock()
-                        .expect("harness provider state should hold")
-                        .deltas
-                        .push(delta.clone());
-                    on_delta(&delta);
+                    self.record_delta(&delta, on_delta, track_timing);
                 }
                 Ok(ModelResponse::completed(response))
             }
@@ -567,6 +674,7 @@ impl ModelBridgeClient for HarnessModelClient {
             .is_some_and(|behavior| matches!(behavior, ProviderBehavior::HoldForCancellation));
         let classifier_request = request.prompt.contains("Session Turn 编排分类器");
         if hold && !classifier_request {
+            self.timing.mark_provider_request_started();
             self.state
                 .lock()
                 .expect("harness provider state should hold")
@@ -755,6 +863,7 @@ impl MagiTurnHarness {
         request_id: &str,
         user_message_id: &str,
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
+        self.provider.begin_timing();
         self.submit_with_goal_mode(session_id, text, request_id, user_message_id, false)
             .await
     }
@@ -766,6 +875,7 @@ impl MagiTurnHarness {
         request_id: &str,
         user_message_id: &str,
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
+        self.provider.begin_timing();
         self.submit_with_goal_mode(session_id, text, request_id, user_message_id, true)
             .await
     }
@@ -778,7 +888,7 @@ impl MagiTurnHarness {
         user_message_id: &str,
         goal_mode: bool,
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
-        TurnService::new(self.state.clone())
+        let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
                 desktop_browser_tools_allowed: false,
                 session_id: session_id.map(ToString::to_string),
@@ -802,7 +912,11 @@ impl MagiTurnHarness {
                 expected_turn_id: None,
                 replace_turn_id: None,
             })
-            .await
+            .await;
+        if response.is_ok() {
+            self.provider.timing.mark_accepted_returned();
+        }
+        response
     }
 
     pub async fn submit_task(
@@ -849,7 +963,8 @@ impl MagiTurnHarness {
         user_message_id: &str,
         access_profile: Option<AccessProfile>,
     ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
-        TurnService::new(self.state.clone())
+        self.provider.begin_timing();
+        let response = TurnService::new(self.state.clone())
             .submit(SessionTurnRequestDto {
                 desktop_browser_tools_allowed: false,
                 session_id: Some(session_id.to_string()),
@@ -873,7 +988,11 @@ impl MagiTurnHarness {
                 expected_turn_id: None,
                 replace_turn_id: None,
             })
-            .await
+            .await;
+        if response.is_ok() {
+            self.provider.timing.mark_accepted_returned();
+        }
+        response
     }
 
     pub async fn steer(
@@ -928,12 +1047,47 @@ impl MagiTurnHarness {
                 .canonical_turn_for_session_turn_id(session_id, turn_id)
             {
                 if turn.status.is_terminal() {
+                    self.provider.timing.mark_terminal_observed();
                     return turn;
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("Turn {turn_id} 未在测试窗口内进入终态");
+    }
+
+    pub async fn wait_for_first_stream_event(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Vec<EventEnvelope> {
+        for _ in 0..1_000 {
+            let events = self.events_for(session_id);
+            if events.iter().any(|event| {
+                event.event_type == "session.turn.item"
+                    && event
+                        .payload
+                        .get("turn_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(turn_id)
+                    && event.payload.get("delta").is_some()
+            }) {
+                if let Some(event) = events.iter().find(|event| {
+                    event.event_type == "session.turn.item"
+                        && event
+                            .payload
+                            .get("turn_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(turn_id)
+                        && event.payload.get("delta").is_some()
+                }) {
+                    self.provider.timing.mark_first_stream_event(event.sequence);
+                }
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Turn {turn_id} 未在测试窗口内发布首个流式事件");
     }
 
     pub async fn wait_for_task_terminal(&self, task_id: &magi_core::TaskId) -> magi_core::Task {
@@ -958,13 +1112,15 @@ impl MagiTurnHarness {
     }
 
     pub fn events_for(&self, session_id: &SessionId) -> Vec<EventEnvelope> {
-        self.state
+        let events = self
+            .state
             .event_bus
             .snapshot()
             .recent_events
             .into_iter()
             .filter(|event| event.session_id.as_ref() == Some(session_id))
-            .collect()
+            .collect::<Vec<_>>();
+        events
     }
 }
 
@@ -1135,6 +1291,13 @@ mod tests {
             .turn_id
             .clone()
             .expect("accepted response should expose turn id");
+        let stream_events = harness
+            .wait_for_first_stream_event(&session_id, &turn_id)
+            .await
+            .into_iter()
+            .filter(|event| event.event_type == "session.turn.item")
+            .filter(|event| event.payload.get("delta").is_some())
+            .collect::<Vec<_>>();
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         assert_eq!(turn.status, CanonicalTurnStatus::Completed);
         assert!(
@@ -1151,12 +1314,6 @@ mod tests {
         }));
         assert!(!harness.provider.requests().is_empty());
         assert!(!harness.provider.deltas().is_empty());
-        let stream_events = harness
-            .events_for(&session_id)
-            .into_iter()
-            .filter(|event| event.event_type == "session.turn.item")
-            .filter(|event| event.payload.get("delta").is_some())
-            .collect::<Vec<_>>();
         assert!(
             !stream_events.is_empty(),
             "应通过真实 EventBus 发布流式事件"
@@ -1166,6 +1323,20 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].sequence < pair[1].sequence)
         );
+        let timing = harness.provider.timing();
+        assert!(timing.accepted_returned_ms.is_some());
+        assert!(timing.provider_request_started_ms.is_some());
+        assert!(timing.provider_first_delta_ms.is_some());
+        assert!(timing.first_stream_event_ms.is_some());
+        assert!(
+            timing
+                .first_stream_event_sequence
+                .is_some_and(|sequence| sequence > 0)
+        );
+        assert!(timing.terminal_observed_ms.is_some());
+        assert!(timing.provider_request_started_ms <= timing.provider_first_delta_ms);
+        assert!(timing.provider_first_delta_ms <= timing.first_stream_event_ms);
+        assert!(timing.first_stream_event_ms <= timing.terminal_observed_ms);
     }
 
     #[tokio::test]
