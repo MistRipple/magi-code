@@ -960,7 +960,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 随后补充了真实 `MagiTurnHarness` 的 ReadOnly `file_read` 允许路径、ReadOnly 对 `file_copy`/`file_move` 的 fail-closed 阻断、Restricted 工作区内 `file_write`/`file_copy`/`file_move` 自动允许路径，以及 FullAccess 工作区外 `file_write` 路径：只读工具可读取已有文件，写入、复制和移动在只读模式下不进入 Provider 且无副作用，受限工具可在工作区内完成这些文件操作，完全授权可执行未受任务路径策略限制的绝对路径写入；这些场景均完成 Turn 和 root Task、无审批事件，并保持读取或写入结果正确。该证据与 Restricted 工作区外路径拒绝验收配对，区分了访问模式与任务路径策略的边界；完整权限组合矩阵仍未完成。
 
-本轮对 `TurnEventSink` 边界做了源码级收敛：写入、状态和事件发布方法统一为 `CanonicalTurnEventSink` inherent API，trait 仅保留接纳、继续、中断和 Task 终态控制合同；仓库内没有发现外部通过 trait 对象调用旧的重复入口，相关 session writeback 与 workspace Rust 全量测试均通过。
+本轮对 `TurnEventSink` 边界做了源码级收敛：仓库内没有外部 trait 对象调用，已删除无调用的重复 trait/impl，仅保留 `CanonicalTurnEventSink` 单一 API；相关 session writeback 与 workspace Rust 全量测试均通过。
 
 2026-09-19 在该收敛之后重新执行了 `npm run protocol:check`、`npm --prefix web run check`、`npm test`、`npm --prefix web run build` 和 Electron `--dir` 打包。protocol 检查、Svelte check（0 errors/0 warnings）、Desktop 99 项、Browser Worker 57 项及 Web golden 全部通过，打包产物重新生成于 `target/electron-dist/mac-arm64/Magi.app`；本次属于回归与打包证据，仍不等同于完整 packaged GUI DOM 内容矩阵或真实 Provider 全矩阵。
 
