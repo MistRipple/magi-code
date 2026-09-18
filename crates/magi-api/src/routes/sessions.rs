@@ -5847,6 +5847,77 @@ mod tests {
         assert_eq!(payload["pendingApprovals"], serde_json::json!([]));
     }
 
+    #[tokio::test]
+    async fn tool_approval_route_rejects_expired_decision_without_resolved_event() {
+        let state = test_state();
+        let session_id = SessionId::new("session-tool-approval-expired-route");
+        state
+            .session_store
+            .create_session(session_id.clone(), "expired tool approval route")
+            .expect("session should be creatable");
+        let pending = PendingToolApproval {
+            approval_id: "approval-route-expired-1".to_string(),
+            session_id: session_id.clone(),
+            task_id: TaskId::new("task-tool-approval-expired-route"),
+            turn_id: "turn-tool-approval-expired-route".to_string(),
+            tool_call_id: "call-tool-approval-expired-route".to_string(),
+            tool_name: "file_write".to_string(),
+            reason: "需要写入文件".to_string(),
+            requested_at: UtcMillis::now(),
+        };
+        let approval_id = pending.approval_id.clone();
+        let registry = state.conversation_registry.tool_approvals();
+        let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request(pending)
+            .expect("approval should become pending")
+        else {
+            panic!("first approval request must wait");
+        };
+        let requested_at = waiter.request.requested_at;
+        assert_eq!(
+            registry.expire_stale(UtcMillis(
+                requested_at.0 + magi_conversation_runtime::TOOL_APPROVAL_TTL_MILLIS + 1,
+            )),
+            1
+        );
+
+        let app = routes().with_state(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/session/tool-approval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "approvalId": approval_id,
+                            "decision": "allow_once",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("expired approval request should build"),
+            )
+            .await
+            .expect("expired approval route should respond");
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "过期审批决定必须返回确定性冲突"
+        );
+        assert!(waiter.decision_rx.try_recv().is_err());
+        assert!(registry.pending_for_session(&session_id).is_empty());
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .all(|event| event.event_type != "tool.approval.resolved")
+        );
+    }
+
     struct PendingTaskDispatcher;
 
     impl TaskDispatcher for PendingTaskDispatcher {
