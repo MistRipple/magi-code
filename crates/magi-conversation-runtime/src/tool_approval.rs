@@ -36,6 +36,7 @@ struct TurnToolGrant {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SessionToolCallFingerprint {
     session_id: SessionId,
+    turn_id: String,
     tool_name: String,
     normalized_arguments: String,
 }
@@ -52,6 +53,7 @@ fn grant_for(request: &PendingToolApproval) -> TurnToolGrant {
 fn fingerprint_for(request: &PendingToolApproval, arguments: &str) -> SessionToolCallFingerprint {
     SessionToolCallFingerprint {
         session_id: request.session_id.clone(),
+        turn_id: request.turn_id.clone(),
         tool_name: magi_tool_runtime::canonical_builtin_tool_name(&request.tool_name)
             .unwrap_or_else(|| request.tool_name.trim().to_ascii_lowercase()),
         normalized_arguments: normalize_arguments(arguments),
@@ -253,10 +255,9 @@ impl ToolApprovalRegistry {
             state
                 .turn_tool_grants
                 .retain(|grant| grant.session_id != *session_id || grant.turn_id != turn_id);
-            let _ = turn_id;
-            state
-                .denied_session_tool_calls
-                .retain(|fingerprint| fingerprint.session_id != *session_id);
+            state.denied_session_tool_calls.retain(|fingerprint| {
+                fingerprint.session_id != *session_id || fingerprint.turn_id != turn_id
+            });
         }
     }
 
@@ -534,6 +535,60 @@ mod tests {
                 .request_with_arguments(request("approval-after-cleanup"), r#"{"path":"a"}"#)
                 .expect("request after turn cleanup"),
             ToolApprovalRequestOutcome::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn removing_an_older_turn_does_not_clear_a_new_turn_denial() {
+        let registry = ToolApprovalRegistry::default();
+        let mut old_turn = request("approval-old-turn");
+        old_turn.turn_id = "turn-old".to_string();
+        let ToolApprovalRequestOutcome::Pending(old_waiter) = registry
+            .request_with_arguments(old_turn, r#"{"path":"a"}"#)
+            .expect("old turn approval")
+        else {
+            panic!("old turn request must wait");
+        };
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-old-turn",
+                ToolApprovalDecision::Deny,
+            )
+            .expect("old turn denial");
+        assert_eq!(
+            old_waiter.decision_rx.recv().expect("old denial"),
+            ToolApprovalDecision::Deny
+        );
+
+        let mut new_turn = request("approval-new-turn");
+        new_turn.turn_id = "turn-new".to_string();
+        let ToolApprovalRequestOutcome::Pending(new_waiter) = registry
+            .request_with_arguments(new_turn, r#"{"path":"a"}"#)
+            .expect("new turn approval")
+        else {
+            panic!("new turn request must wait");
+        };
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-new-turn",
+                ToolApprovalDecision::Deny,
+            )
+            .expect("new turn denial");
+        assert_eq!(
+            new_waiter.decision_rx.recv().expect("new denial"),
+            ToolApprovalDecision::Deny
+        );
+
+        registry.remove_turn(&SessionId::new("session-approval"), "turn-old");
+        let mut retry = request("approval-new-turn-retry");
+        retry.turn_id = "turn-new".to_string();
+        assert!(matches!(
+            registry
+                .request_with_arguments(retry, r#"{"path":"a"}"#)
+                .expect("new turn denial should remain scoped"),
+            ToolApprovalRequestOutcome::PreviouslyDenied
         ));
     }
 }
