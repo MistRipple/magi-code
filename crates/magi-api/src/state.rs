@@ -36,7 +36,6 @@ use magi_conversation_runtime::{
     task_runner::TaskRunner,
     task_runner_bridge::{
         EventBasedResultReceiver, RunCycleOutcome, TaskDispatchGate, TaskDispatcher,
-        TaskResultReceiver,
     },
 };
 use magi_core::{
@@ -387,7 +386,6 @@ impl RunnerManager {
             Arc::clone(&self.task_store),
             workers,
             Arc::clone(dispatcher),
-            Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
         )
         .with_worker_catalog_provider(Arc::clone(&self.worker_catalog));
         runner = runner.with_agent_role_registry((*self.agent_role_registry).clone());
@@ -5948,6 +5946,7 @@ mod tests {
             .expect("pending policy should freeze");
 
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
+        result_receiver.set_completion_sink(Arc::new(TaskCompletionNotifier::new(store.clone())));
         let runner_checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let runner_checkpoint_count_for_callback = runner_checkpoint_count.clone();
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(

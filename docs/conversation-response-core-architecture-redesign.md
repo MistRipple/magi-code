@@ -918,13 +918,13 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 - [x] 复用进程级 Provider bridge client 和 Tokio runtime。
 - [x] Provider delta 接入 `TurnStreamBuffer`，首帧、窗口、reset 和 terminal flush 有测试。
 - [x] 增加 `TaskCompletionNotifier`，生产 Worker 结果先 durable 提交 TaskStore，再主动通知 Turn 侧。
-- [x] 生产 Task 完成路径不再依赖 Runner 的 `poll_results` 周期消费；`poll_results` 仅保留测试嵌入读取器，生产 `TaskRunner` 不再持有或调用该轮询路径。
-- [x] 结果接收器在主动通知目标安装前缓冲的结果会按原顺序一次性交付；通知回调可重入，结果去重、兼容轮询队列和主动通知队列由同一状态锁收口；Sink panic 会恢复 pending 和通知状态，回调内替换 Sink 后由新 Sink 继续排空。
+- [x] 生产 Task 完成路径不再依赖 Runner 的周期轮询；结果读取仅保留在 `#[cfg(test)]` 测试嵌入辅助中，生产 `TaskRunner` 不再持有结果读取器。
+- [x] 结果接收器在主动通知目标安装前缓冲的结果会按原顺序一次性交付；通知回调可重入，结果去重、待通知队列和主动通知由同一状态锁收口；Sink panic 会恢复 pending 和通知状态，回调内替换 Sink 后由新 Sink 继续排空。
 - [x] 删除 terminal observer 对 Turn 终态的二次职责。
 - [x] 生产 TaskStore 状态 callback 从 mutation guard 中移出，并在提交后异步执行。
 - [x] 主动完成通知 Sink 的 panic 边界已收口：回调异常时恢复 pending 结果和通知状态；若回调期间已替换 Sink，则由新 Sink 继续排空队列，避免结果遗留。
 
-本阶段已改文件：`crates/magi-conversation-runtime/src/task_completion_notifier.rs`、`crates/magi-conversation-runtime/src/task_runner.rs`、`crates/magi-conversation-runtime/src/task_runner_bridge.rs`、`crates/magi-conversation-runtime/src/turn_stream_buffer.rs`、`crates/magi-orchestrator/src/task_store.rs`、`crates/magi-daemon/src/daemon/runtime.rs`、`crates/magi-api/src/state.rs`。验证命令：`cargo fmt --all -- --check`、`cargo test -p magi-conversation-runtime --lib task_runner_bridge -- --test-threads=1`、`cargo test --workspace --all-targets --quiet`、`npm run protocol:check`、`npm --prefix web run check`、`npm --prefix web run build`、`npm test`、`npm run desktop:package -- --dir`。结果：TaskStore durable terminal 先经 `TaskCompletionNotifier` 通知，生产 daemon 已移除 `RunnerTerminalObserver`；结果接收器新增安装前缓冲 flush 与通知回调重入顺序测试；magi-conversation-runtime 523 项、magi-api 648 项、magi-daemon 127 项及 workspace 其余测试通过，Web check 0 errors/0 warnings，生产构建、golden 和 Electron directory package 通过。`poll_results` 仅保留未装配主动 Sink 的测试/嵌入接口，不再承担生产终态职责。
+本阶段已改文件：`crates/magi-conversation-runtime/src/task_completion_notifier.rs`、`crates/magi-conversation-runtime/src/task_runner.rs`、`crates/magi-conversation-runtime/src/task_runner_bridge.rs`、`crates/magi-conversation-runtime/src/turn_stream_buffer.rs`、`crates/magi-orchestrator/src/task_store.rs`、`crates/magi-daemon/src/daemon/runtime.rs`、`crates/magi-api/src/state.rs`。验证命令：`cargo fmt --all -- --check`、`cargo test -p magi-conversation-runtime --lib task_runner_bridge -- --test-threads=1`、`cargo test --workspace --all-targets --quiet`、`npm run protocol:check`、`npm --prefix web run check`、`npm --prefix web run build`、`npm test`、`npm run desktop:package -- --dir`。结果：TaskStore durable terminal 先经 `TaskCompletionNotifier` 通知，生产 daemon 已移除 `RunnerTerminalObserver`；结果接收器新增安装前缓冲 flush 与通知回调重入顺序测试；magi-conversation-runtime 523 项、magi-api 648 项、magi-daemon 127 项及 workspace 其余测试通过，Web check 0 errors/0 warnings，生产构建、golden 和 Electron directory package 通过。生产 `TaskRunner` 不再持有或调用结果读取器；测试专用读取辅助被限制在 `#[cfg(test)]`，不承担生产终态职责。
 
 ### 17.6 前端和 Desktop 收敛
 

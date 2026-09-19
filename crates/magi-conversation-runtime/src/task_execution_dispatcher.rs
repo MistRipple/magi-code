@@ -3079,7 +3079,6 @@ mod tests {
     use crate::model_config::{
         merge_orchestrator_session_override, resolve_orchestrator_model_config,
     };
-    use crate::task_runner_bridge::TaskResultReceiver;
     use magi_core::{
         MissionId, Task, TaskCompletionAttempt, TaskPolicy, TaskRuntimePayload, TaskTier,
     };
@@ -3713,7 +3712,7 @@ mod tests {
 
         record_dispatch_join_outcome(dispatcher, task_id.clone(), lease_id.clone(), join).await;
 
-        let results = result_receiver.poll_results();
+        let results = result_receiver.poll_results_for_test();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, task_id);
         assert_eq!(results[0].lease_id, lease_id);

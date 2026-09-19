@@ -86,23 +86,10 @@ pub enum TaskOutcome {
     Failed { error: String },
 }
 
-/// 接收 Worker 执行结果。
-///
-/// Worker 结果的接收抽象。
-///
-/// 生产装配使用主动完成通知目标；轮询接口只保留给未装配通知器的测试嵌入读取器。
-pub trait TaskResultReceiver: Send + Sync {
-    /// 仅供没有主动完成通知目标的测试嵌入读取器消费结果。
-    ///
-    /// 生产 TaskRunner 不再调用该方法；生产终态由
-    /// `TaskCompletionNotifier` 在 TaskStore durable mutation 后主动通知。
-    fn poll_results(&self) -> Vec<TaskResult>;
-}
 // --- Event-based result receiver
 
 /// Task 完成的主动通知目标。生产运行时把 Worker 结果直接交给该目标，
-/// 由目标先完成 TaskStore durable mutation，再唤醒 Turn Coordinator；测试和
-/// 未装配通知目标的嵌入场景仍可使用 poll_results。
+/// 由目标先完成 TaskStore durable mutation，再唤醒 Turn Coordinator。
 pub trait TaskCompletionSink: Send + Sync {
     fn notify(&self, result: TaskResult);
 }
@@ -117,8 +104,8 @@ struct CompletionReceiverState {
 
 /// 接收外部推送结果（例如来自 TaskStore 的 `StatusChangeCallback`）。
 ///
-/// 没有主动 completion sink 时，结果会进入测试嵌入读取器的轮询队列；安装 sink
-/// 后，已经缓冲的结果会在返回前交给 sink，不会遗留终态结果。
+/// 没有主动 completion sink 时，结果会进入测试读取队列；安装 sink 后，已经
+/// 缓冲的结果会在返回前交给 sink，不会遗留终态结果。
 ///
 /// 结果按 task ID 和 lease ID 去重。恢复后的任务可能在新租约建立后收到旧执行结果；
 /// 两类结果保持可区分，以便 Runner 只拒绝旧租约。任务回到非终态时调用
@@ -271,8 +258,10 @@ impl EventBasedResultReceiver {
     }
 }
 
-impl TaskResultReceiver for EventBasedResultReceiver {
-    fn poll_results(&self) -> Vec<TaskResult> {
+impl EventBasedResultReceiver {
+    /// 仅供未装配主动完成通知器的测试嵌入读取结果。
+    #[cfg(test)]
+    pub(crate) fn poll_results_for_test(&self) -> Vec<TaskResult> {
         let mut state = self
             .state
             .lock()
@@ -375,7 +364,7 @@ mod tests {
         let sink = Arc::new(RecordingCompletionSink::default());
         receiver.set_completion_sink(sink.clone());
 
-        assert!(receiver.poll_results().is_empty());
+        assert!(receiver.poll_results_for_test().is_empty());
         let results = sink
             .results
             .lock()
@@ -418,7 +407,7 @@ mod tests {
                 "lease-reentrant".to_string()
             ]
         );
-        assert!(receiver.poll_results().is_empty());
+        assert!(receiver.poll_results_for_test().is_empty());
     }
 
     #[test]
@@ -478,7 +467,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, result.task_id);
         assert_eq!(results[0].lease_id, result.lease_id);
-        assert!(receiver.poll_results().is_empty());
+        assert!(receiver.poll_results_for_test().is_empty());
     }
 
     #[test]
@@ -506,7 +495,7 @@ mod tests {
             },
         });
 
-        let results = receiver.poll_results();
+        let results = receiver.poll_results_for_test();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lease_id, LeaseId::new("lease-current"));
         match &results[0].outcome {
@@ -541,7 +530,7 @@ mod tests {
             },
         });
 
-        let results = receiver.poll_results();
+        let results = receiver.poll_results_for_test();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].lease_id, LeaseId::new("lease-stale"));
         assert_eq!(results[1].lease_id, LeaseId::new("lease-current"));

@@ -4,9 +4,11 @@
 //! worker 匹配、租约、结果回收。
 
 use crate::execution_admission::ExecutionAdmissionController;
+#[cfg(test)]
+use crate::task_runner_bridge::EventBasedResultReceiver;
 use crate::task_runner_bridge::{
     RunCycleOutcome, TaskDispatchGate, TaskDispatchGateDecision, TaskDispatcher, TaskOutcome,
-    TaskResult, TaskResultReceiver,
+    TaskResult,
 };
 use magi_agent_role::AgentRoleRegistry;
 use magi_core::{DomainError, SessionId, Task, TaskId, TaskStatus};
@@ -35,7 +37,7 @@ pub struct TaskRunner {
     worker_catalog_provider: Option<Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>>,
     dispatcher: Arc<dyn TaskDispatcher>,
     #[cfg(test)]
-    result_receiver: Arc<dyn TaskResultReceiver>,
+    result_receiver: Option<Arc<EventBasedResultReceiver>>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
     execution_admission: Arc<ExecutionAdmissionController>,
     session_id: Option<SessionId>,
@@ -45,8 +47,8 @@ pub struct TaskRunner {
     agent_role_registry: AgentRoleRegistry,
 }
 
-/// 将 Worker 结果提交到 TaskStore。该函数由主动完成通知和旧 Runner 测试入口共同使用，
-/// 但生产完成路径由 [`TaskCompletionNotifier`] 主动调用，不依赖 Runner 周期轮询。
+/// 将 Worker 结果提交到 TaskStore。生产完成路径由
+/// [`TaskCompletionNotifier`] 主动调用；测试可直接调用以验证完成合同。
 pub fn apply_task_result(store: &TaskStore, result: TaskResult) -> Result<bool, String> {
     let Some(task) = store.get_task(&result.task_id) else {
         tracing::warn!(
@@ -124,7 +126,6 @@ impl TaskRunner {
         store: Arc<TaskStore>,
         workers: Vec<WorkerInfo>,
         dispatcher: Arc<dyn TaskDispatcher>,
-        _result_receiver: Arc<dyn TaskResultReceiver>,
     ) -> Self {
         Self {
             store,
@@ -132,7 +133,7 @@ impl TaskRunner {
             worker_catalog_provider: None,
             dispatcher,
             #[cfg(test)]
-            result_receiver: _result_receiver,
+            result_receiver: None,
             dispatch_gate: None,
             execution_admission: Arc::new(ExecutionAdmissionController::default()),
             session_id: None,
@@ -141,6 +142,18 @@ impl TaskRunner {
             first_dispatch_reported: AtomicBool::new(false),
             agent_role_registry: AgentRoleRegistry::load_default(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_test_result_receiver(
+        store: Arc<TaskStore>,
+        workers: Vec<WorkerInfo>,
+        dispatcher: Arc<dyn TaskDispatcher>,
+        result_receiver: Arc<EventBasedResultReceiver>,
+    ) -> Self {
+        let mut runner = Self::with_dispatcher(store, workers, dispatcher);
+        runner.result_receiver = Some(result_receiver);
+        runner
     }
 
     pub fn with_agent_role_registry(mut self, registry: AgentRoleRegistry) -> Self {
@@ -475,7 +488,10 @@ impl TaskRunner {
 
     #[cfg(test)]
     fn apply_results(&self) -> Result<(), String> {
-        for result in self.result_receiver.poll_results() {
+        let Some(result_receiver) = self.result_receiver.as_ref() else {
+            return Ok(());
+        };
+        for result in result_receiver.poll_results_for_test() {
             let _ = apply_task_result(&self.store, result)?;
             self.set_checkpoint_signal();
         }
@@ -713,7 +729,7 @@ mod tests {
         let root = test_task("task-root-gated", "task-root-gated", None);
         store.insert_task(root.clone()).expect("根任务应插入");
         let receiver = Arc::new(EventBasedResultReceiver::new());
-        let runner = TaskRunner::with_dispatcher(
+        let runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
@@ -746,7 +762,7 @@ mod tests {
         let store = Arc::new(TaskStore::new());
         let root = test_task("task-root-unmatched", "task-root-unmatched", None);
         store.insert_task(root.clone()).expect("根任务应插入");
-        let runner = TaskRunner::with_dispatcher(
+        let runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
@@ -783,7 +799,7 @@ mod tests {
             parallelism_limit: None,
             system_prompt_template: None,
         };
-        let runner = TaskRunner::with_dispatcher(
+        let runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             vec![executor],
             Arc::new(RejectingDispatcher),
@@ -823,7 +839,7 @@ mod tests {
         let dispatcher = Arc::new(HoldingDispatcher {
             permits: Mutex::new(Vec::new()),
         });
-        let runner = TaskRunner::with_dispatcher(
+        let runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             Vec::new(),
             dispatcher,
@@ -887,7 +903,7 @@ mod tests {
                 error: "旧执行轮迟到失败".to_string(),
             },
         });
-        let runner = TaskRunner::with_dispatcher(
+        let runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
@@ -948,7 +964,7 @@ mod tests {
                 },
             },
         });
-        let runner = TaskRunner::with_dispatcher(
+        let runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
@@ -1009,7 +1025,7 @@ mod tests {
         let dispatcher = Arc::new(HoldingDispatcher {
             permits: Mutex::new(Vec::new()),
         });
-        let first_runner = TaskRunner::with_dispatcher(
+        let first_runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             vec![worker.clone()],
             dispatcher.clone(),
@@ -1019,7 +1035,7 @@ mod tests {
             Arc::clone(&controller),
             Some(SessionId::new("session-admission-first")),
         );
-        let second_runner = TaskRunner::with_dispatcher(
+        let second_runner = TaskRunner::with_test_result_receiver(
             Arc::clone(&store),
             vec![worker],
             dispatcher.clone(),
