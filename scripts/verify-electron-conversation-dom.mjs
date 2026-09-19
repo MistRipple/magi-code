@@ -532,6 +532,18 @@ function checkTimingStages(label, record) {
   check(`${label} 每轮记录一次 dom_painted`, record?.stages?.dom_painted?.count === 1);
 }
 
+function timingEvidenceRecord(scenario, turnId, record) {
+  return {
+    scenario,
+    turnId,
+    stages: Object.fromEntries(Object.entries(record?.stages || {}).map(([stage, value]) => [stage, {
+      count: value?.count || 0,
+      firstAt: value?.firstAt ?? null,
+      lastAt: value?.lastAt ?? null,
+    }])),
+  };
+}
+
 async function waitForTimingRecord(page, turnId, label) {
   return waitFor(async () => {
     const snapshot = await rendererTiming(page);
@@ -855,7 +867,11 @@ try {
   check("个人普通 Chat 具有用户和助手消息节点", personal.assistant.length >= 1);
   const personalTurnId = personal.assistant.at(-1)?.turnId;
   const personalTiming = await waitForTimingRecord(page, personalTurnId, "个人 Chat 生产 Renderer timing");
-  rendererTimingSamples.push({ scenario: "personal_chat", record: personalTiming });
+  rendererTimingSamples.push(timingEvidenceRecord(
+    "personal_chat",
+    personalTurnId,
+    personalTiming,
+  ));
   checkTimingStages("个人 Chat 生产 Renderer", personalTiming);
 
   const workspaceRoot = await mkdtemp(join(stateRoot, "workspace-"));
@@ -875,7 +891,11 @@ try {
     workspace.assistant.at(-1)?.turnId,
     "工作区 Chat 生产 Renderer timing",
   );
-  rendererTimingSamples.push({ scenario: "workspace_chat", record: workspaceTiming });
+  rendererTimingSamples.push(timingEvidenceRecord(
+    "workspace_chat",
+    workspace.assistant.at(-1)?.turnId,
+    workspaceTiming,
+  ));
   checkTimingStages("工作区 Chat 生产 Renderer", workspaceTiming);
 
   await selectMostRecentPersonalSession(page);
@@ -889,7 +909,11 @@ try {
     task.assistant.at(-1)?.turnId,
     "Task 工具生产 Renderer timing",
   );
-  rendererTimingSamples.push({ scenario: "workspace_tool", record: taskTiming });
+  rendererTimingSamples.push(timingEvidenceRecord(
+    "workspace_tool",
+    task.assistant.at(-1)?.turnId,
+    taskTiming,
+  ));
   checkTimingStages("Task 工具生产 Renderer", taskTiming);
   check("摘要模式包含 Turn 轮次折叠", task.turns.some((turn) => turn.expanded === "true" || turn.expanded === "false"));
   const latestTurn = task.turns.at(-1);
