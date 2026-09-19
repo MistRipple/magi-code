@@ -49,14 +49,14 @@ function openAiStream(content) {
   ].join("");
 }
 
-function toolCallStream(name, arguments_) {
+function toolCallStream(name, arguments_, id = "electron-dom-tool-call-1") {
   return [
     `data: ${JSON.stringify({
       choices: [{
         delta: {
           tool_calls: [{
             index: 0,
-            id: "electron-dom-tool-call-1",
+            id,
             type: "function",
             function: { name, arguments: JSON.stringify(arguments_) },
           }],
@@ -83,6 +83,22 @@ function requestToolName(body, toolName) {
     const name = tool?.function?.name;
     return name === toolName || name?.endsWith(`_${toolName}`) || name?.endsWith(`.${toolName}`);
   })?.function?.name || toolName;
+}
+
+function toolResultPayload(messages, toolName) {
+  for (const result of [...messages].reverse()) {
+    if (result?.role !== "tool" || typeof result.content !== "string") continue;
+    try {
+      const payload = JSON.parse(result.content);
+      if (payload?.tool === toolName || payload?.tool?.endsWith?.(`_${toolName}`)
+        || payload?.tool?.endsWith?.(`.${toolName}`)) {
+        return payload;
+      }
+    } catch {
+      // 不是结构化工具结果时继续查找同一工具的历史结果。
+    }
+  }
+  return null;
 }
 
 function messageText(message) {
@@ -131,6 +147,7 @@ function createProvider() {
   let domToolFinalEmitted = false;
   let domToolRequestCount = 0;
   let permissionRoundEmitted = false;
+  let goalPhase = 0;
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => { body += chunk; });
@@ -160,14 +177,88 @@ function createProvider() {
         .map(messageText)
         .join("\n");
       const isDomToolPrompt = promptKey.includes("DOM 工具卡片验收");
+      const isGoalPrompt = promptKey.includes("目标 DOM 验收");
       const hasToolResult = (Array.isArray(parsed.messages) ? parsed.messages : [])
         .some((message) => message?.role === "tool");
+      const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
       let payload;
-      if (isDomToolPrompt) {
-        domToolRequestCount += 1;
-        if (domToolRequestCount === 1) {
-          process.stderr.write(`[provider] dom tools=${JSON.stringify((parsed.tools || []).map((tool) => tool?.function?.name).filter(Boolean))}\n`);
+      if (isGoalPrompt) {
+        const getGoalName = requestToolName(parsed, "get_goal");
+        const createGoalName = requestToolName(parsed, "create_goal");
+        const updatePlanName = requestToolName(parsed, "update_plan");
+        const updateGoalName = requestToolName(parsed, "update_goal");
+        const goalResult = toolResultPayload(messages, "get_goal");
+        const createdGoalResult = toolResultPayload(messages, "create_goal");
+        const planResult = toolResultPayload(messages, "update_plan");
+        const updatedGoalResult = toolResultPayload(messages, "update_goal");
+        const goal = updatedGoalResult?.goal || createdGoalResult?.goal || goalResult?.goal;
+        if (goalPhase === 0 && requestContainsTool(parsed, "get_goal")) {
+          goalPhase = 1;
+          payload = toolCallStream(getGoalName, {}, "electron-dom-goal-get-goal-1");
+        } else if (goalPhase === 1 && requestContainsTool(parsed, "create_goal")) {
+          goalPhase = 2;
+          payload = toolCallStream(createGoalName, {
+            objective: "完成目标 DOM 验收并保留可见计划",
+            token_budget: null,
+          }, "electron-dom-goal-create-goal-1");
+        } else if (goalPhase === 2 && requestContainsTool(parsed, "update_plan") && goal) {
+          goalPhase = 3;
+          payload = toolCallStream(updatePlanName, {
+            planId: null,
+            expectedRevision: 0,
+            expectedGoalId: goal.goal_id || goal.goalId || null,
+            expectedGoalControlRevision: goal.control_revision || goal.controlRevision || null,
+            language: "zh-CN",
+            explanation: "建立目标验收计划",
+            plan: [{ itemId: null, step: "完成目标 DOM 验收", status: "in_progress" }],
+          }, "electron-dom-goal-update-plan-1");
+        } else if (goalPhase === 3
+          && requestContainsTool(parsed, "update_plan")
+          && goal
+          && planResult?.plan?.state === "active") {
+          goalPhase = 4;
+          payload = toolCallStream(updatePlanName, {
+            planId: planResult.plan.planId,
+            expectedRevision: planResult.plan.revision,
+            expectedGoalId: goal.goal_id || goal.goalId || null,
+            expectedGoalControlRevision: goal.control_revision || goal.controlRevision || null,
+            language: "zh-CN",
+            explanation: "完成目标验收计划",
+            plan: [{
+              itemId: planResult.plan.items?.[0]?.itemId || null,
+              step: "完成目标 DOM 验收",
+              status: "completed",
+            }],
+          }, "electron-dom-goal-update-plan-2");
+        } else if (goalPhase === 4
+          && requestContainsTool(parsed, "update_goal")
+          && goal
+          && planResult?.plan?.state === "completed") {
+          goalPhase = 5;
+          payload = toolCallStream(updateGoalName, {
+            goal_id: goal.goal_id || goal.goalId || null,
+            expected_revision: goal.control_revision || goal.controlRevision || null,
+            expected_plan_revision: planResult.plan.revision,
+            status: "complete",
+            completion_summary: "目标 DOM 验收计划已完成",
+            evidence_refs: ["electron-dom-goal-update-plan-2"],
+          }, "electron-dom-goal-update-goal-1");
+        } else if (goalPhase >= 5 && updatedGoalResult?.goal?.status === "complete") {
+          payload = openAiStream("ELECTRON_DOM_GOAL_OK");
+        } else {
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({
+            error: "goal_lifecycle_incomplete",
+            phase: goalPhase,
+            hasGoal: Boolean(goal),
+            hasActivePlan: planResult?.plan?.state === "active",
+            hasCompletedPlan: planResult?.plan?.state === "completed",
+            updatedGoalStatus: updatedGoalResult?.goal?.status || null,
+          }));
+          return;
         }
+      } else if (isDomToolPrompt) {
+        domToolRequestCount += 1;
         if (!domToolRoundEmitted && requestContainsTool(parsed, "tool_catalog")) {
           domToolRoundEmitted = true;
           payload = toolCallStream(requestToolName(parsed, "tool_catalog"), { include_external: false });
@@ -322,6 +413,21 @@ async function rendererState(page) {
       .map((item) => item.getAttribute('data-session-id'))
       .filter(Boolean))],
     workspaceIds: [...document.querySelectorAll('[data-workspace-id]')].map((item) => item.getAttribute('data-workspace-id')),
+    goalCard: (() => {
+      const item = document.querySelector('[data-testid="goal-card"]');
+      return item ? {
+        text: item.innerText || '',
+        expanded: item.querySelector('.goal-drawer-toggle')?.getAttribute('aria-expanded'),
+        status: item.className,
+      } : null;
+    })(),
+    planCard: (() => {
+      const item = document.querySelector('[data-testid="plan-card"]');
+      return item ? {
+        text: item.innerText || '',
+        status: item.className,
+      } : null;
+    })(),
   })`);
   return JSON.parse(value || "{}");
 }
@@ -495,6 +601,22 @@ async function chooseAccessProfile(page, profile) {
     if (!option) throw new Error('access profile option missing after open: ' + value);
     option.click();
   })()`);
+}
+
+async function chooseGoalMode(page) {
+  await page.evaluate(`(() => {
+    const button = document.querySelector('.ia-add-btn');
+    if (!button || button.disabled) throw new Error('add menu button unavailable');
+    button.click();
+  })()`);
+  await waitFor(async () => page.evaluate(`Boolean(document.querySelector('.ia-add-popover'))`), "Goal 添加菜单");
+  await page.evaluate(`(() => {
+    const option = [...document.querySelectorAll('.ia-add-item')]
+      .find((item) => item.innerText.includes('Goal') || item.innerText.includes('目标'));
+    if (!option) throw new Error('Goal add menu item missing');
+    option.click();
+  })()`);
+  await waitFor(async () => page.evaluate(`Boolean(document.querySelector('.ia-reference-chip-goal'))`), "Goal 结构化引用标记");
 }
 
 async function clickStop(page) {
@@ -718,6 +840,30 @@ try {
     return state.toolGroups.some((group) => group.expanded === "true") ? state : null;
   }, "工具组二级展开");
   check("工具组二级展开后真实工具内容可见", expandedTools.toolGroups.some((group) => group.expanded === "true"));
+
+  await openPersonalDraft(page);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop ? state : null;
+  }, "Goal DOM 验收输入");
+  await chooseGoalMode(page);
+  await setComposerText(page, "目标 DOM 验收：建立目标并维护一项计划");
+  await clickSend(page);
+  const goal = await waitForAssistant(page, "ELECTRON_DOM_GOAL_OK", "Goal 最终消息");
+  check("Goal 最终消息进入真实 DOM", goal.text.includes("ELECTRON_DOM_GOAL_OK"));
+  const goalCard = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.goalCard && state.planCard ? state : null;
+  }, "Goal/计划卡片加载", 45_000);
+  check("Goal 卡片进入真实 DOM", Boolean(goalCard.goalCard));
+  check("Goal 计划卡片进入真实 DOM", Boolean(goalCard.planCard));
+  check("Goal 卡片包含验收目标", goalCard.goalCard.text.includes("目标 DOM 验收"));
+  await page.evaluate(`document.querySelector('[data-testid="goal-card"] .goal-drawer-toggle')?.click()`);
+  const expandedGoal = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.goalCard?.expanded === "true" ? state : null;
+  }, "Goal 卡片展开");
+  check("Goal 卡片支持二级展开", expandedGoal.goalCard.expanded === "true");
 
   await chooseAccessProfile(page, "read_only");
   await setComposerText(page, "权限拒绝 DOM 验收：请明确调用 file_write 写入文件");

@@ -514,9 +514,9 @@ M0 真实基线可观测
 - [x] 完成阶段 5 的前端增量 reducer、projection 与 Goal 刷新收敛首轮实现。
 - [x] 完成本地 daemon 真实入口的页面启动、会话历史、摘要折叠与工具组逐层展开验收。
 - [x] 完成 Electron `--dir` 打包产物启动、静态资源加载与摘要折叠/工具组展开验收。
-- [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 25 项基础 DOM 检查通过；同一脚本进一步对个人 Chat、工作区 Chat、Task 工具记录四阶段生产 Renderer timing，合计 37 项检查通过，直接证据为 `/tmp/magi-electron-dom-timing-9331.json`。该证据仍不替代五类 Electron 性能 20 轮采样。
+- [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、Goal/Plan 卡片和 Goal 卡片展开、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 42 项检查通过，直接证据为 `/tmp/magi-electron-dom-goal-9527.json`；同一脚本继续对个人 Chat、工作区 Chat、Task 工具记录四阶段生产 Renderer timing。该证据仍不替代五类 Electron 性能 20 轮采样。
 - [ ] 汇总性能前后对比；当前已完成真实 Provider 五场景后端 20 轮基线，但不宣称性能目标达标。
-  - 真实 Provider 性能脚本区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；Electron 生产 Renderer 已提供受限内存 timing registry（`window.__magiPerformanceTiming.snapshot()`），三类单轮场景已经通过打包 Electron CDP 读取，仍需扩展到五类场景 20 轮并补齐可审计的 before 数据。
+  - 真实 Provider 性能脚本区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；Electron 生产 Renderer 已提供受限内存 timing registry（`window.__magiPerformanceTiming.snapshot()`），三类单轮场景已经通过打包 Electron CDP 读取，Goal/Plan DOM 结构也已完成单轮验收；仍需扩展到五类场景 20 轮并补齐可审计的 before 数据。
 
 ### 9.1 本轮本地验收记录
 
@@ -565,7 +565,7 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 | 工作区工具调用 | 51 / 61 / 9144 | 60 / 94 / 34131 | 64 / 103 / 49879 | 20/20 completed |
 | 主代理与子代理并发 | 97 / 130 / 53011 | 131 / 175 / 72882 | 143 / 220 / 139254 | 20/20 completed |
 
-直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，三类单轮 CDP 读取证据见 `/tmp/magi-electron-dom-timing-9331.json`，五类场景 20 轮 CDP 采样和性能前后对比仍未完成。
+直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，三类单轮 CDP timing 证据见 `/tmp/magi-electron-dom-goal-9527.json`，并新增 Goal/Plan DOM 单轮证据；五类场景 20 轮 CDP 采样和性能前后对比仍未完成。
 
 ### 9.2 真实 Provider 单轮验收记录
 
