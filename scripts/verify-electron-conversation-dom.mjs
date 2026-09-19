@@ -1,0 +1,640 @@
+import { createServer } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { setTimeout as sleep } from "node:timers/promises";
+import WebSocket from "ws";
+
+/**
+ * 打包 Electron 消息链路 DOM 验收。
+ *
+ * 该脚本只启动独立状态根和本地 OpenAI-compatible Provider，不接管用户已有的
+ * Electron/daemon 进程。所有页面断言都通过真实 App Renderer CDP 执行，避免用
+ * 裸 HTTP 请求替代桌面入口。
+ */
+
+const repositoryRoot = new URL("..", import.meta.url).pathname.replace(/\/$/u, "");
+const appExecutable = join(
+  repositoryRoot,
+  "target/electron-dist/mac-arm64/Magi.app/Contents/MacOS/Magi",
+);
+const cdpPort = Number.parseInt(process.env.MAGI_ELECTRON_DOM_CDP_PORT || "9257", 10);
+const daemonPort = 38123;
+const responseText = "ELECTRON_DOM_CHAT_OK";
+const toolResponseText = "ELECTRON_DOM_TOOL_OK";
+
+if (!Number.isInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65535) {
+  throw new Error(`无效 CDP 端口: ${cdpPort}`);
+}
+
+const checks = [];
+function check(name, condition, detail = "") {
+  const record = { name, passed: Boolean(condition), detail };
+  checks.push(record);
+  if (!record.passed) {
+    throw new Error(`Electron DOM 验收失败：${name}${detail ? `（${detail}）` : ""}`);
+  }
+}
+
+function openAiStream(content) {
+  return [
+    `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+}
+
+function toolCallStream(name, arguments_) {
+  return [
+    `data: ${JSON.stringify({
+      choices: [{
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "electron-dom-tool-call-1",
+            type: "function",
+            function: { name, arguments: JSON.stringify(arguments_) },
+          }],
+        },
+        finish_reason: null,
+      }],
+    })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+}
+
+function requestContainsTool(body, toolName) {
+  return Array.isArray(body?.tools)
+    && body.tools.some((tool) => {
+      const name = tool?.function?.name;
+      return name === toolName || name?.endsWith(`_${toolName}`) || name?.endsWith(`.${toolName}`);
+    });
+}
+
+function requestToolName(body, toolName) {
+  if (!Array.isArray(body?.tools)) return toolName;
+  return body.tools.find((tool) => {
+    const name = tool?.function?.name;
+    return name === toolName || name?.endsWith(`_${toolName}`) || name?.endsWith(`.${toolName}`);
+  })?.function?.name || toolName;
+}
+
+function messageText(message) {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (typeof part?.text === "string") return part.text;
+        if (typeof part?.content === "string") return part.content;
+        return "";
+      })
+      .join(" ");
+  }
+  if (content && typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (typeof content.content === "string") return content.content;
+  }
+  return "";
+}
+
+function providerResponse(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const promptText = messages
+    .filter((message) => message?.role === "user")
+    .map(messageText)
+    .join("\n");
+
+  if (promptText.includes("权限拒绝 DOM 验收")) {
+    return toolCallStream("file_write", { path: "electron-dom-read-only.txt", content: "must-fail" });
+  }
+  if (promptText.includes("取消 DOM 验收")) {
+    // 取消场景由客户端停止 Turn；服务端保持连接，直到客户端断开。
+    return null;
+  }
+  return openAiStream(responseText);
+}
+
+function createProvider() {
+  const requests = [];
+  let domToolRoundEmitted = false;
+  let domToolFinalEmitted = false;
+  let domToolRequestCount = 0;
+  let permissionRoundEmitted = false;
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      if (request.url === "/v1/models" && request.method === "GET") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          object: "list",
+          data: [{ id: "electron-dom-model", object: "model", owned_by: "harness" }],
+        }));
+        return;
+      }
+      if (request.url !== "/v1/chat/completions" || request.method !== "POST") {
+        response.writeHead(404).end();
+        return;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        response.writeHead(400).end();
+        return;
+      }
+      requests.push(parsed);
+      const promptKey = (Array.isArray(parsed.messages) ? parsed.messages : [])
+        .filter((message) => message?.role === "user")
+        .map(messageText)
+        .join("\n");
+      const isDomToolPrompt = promptKey.includes("DOM 工具卡片验收");
+      const hasToolResult = (Array.isArray(parsed.messages) ? parsed.messages : [])
+        .some((message) => message?.role === "tool");
+      let payload;
+      if (isDomToolPrompt) {
+        domToolRequestCount += 1;
+        if (domToolRequestCount === 1) {
+          process.stderr.write(`[provider] dom tools=${JSON.stringify((parsed.tools || []).map((tool) => tool?.function?.name).filter(Boolean))}\n`);
+        }
+        if (!domToolRoundEmitted && requestContainsTool(parsed, "tool_catalog")) {
+          domToolRoundEmitted = true;
+          payload = toolCallStream(requestToolName(parsed, "tool_catalog"), { include_external: false });
+        } else if (!domToolFinalEmitted && (hasToolResult || domToolRoundEmitted)) {
+          domToolFinalEmitted = true;
+          payload = openAiStream(toolResponseText);
+        } else {
+          // 工具调用只能有一轮；即使客户端未能回传工具结果，也必须收口，
+          // 防止验收 Provider 把执行错误放大成无限重试。
+          domToolFinalEmitted = true;
+          payload = openAiStream(toolResponseText);
+        }
+      } else {
+        const isPermissionPrompt = promptKey.includes("权限拒绝 DOM 验收");
+        if (isPermissionPrompt && !permissionRoundEmitted) {
+          permissionRoundEmitted = true;
+          payload = providerResponse(parsed);
+        } else if (isPermissionPrompt) {
+          payload = openAiStream(responseText);
+        } else {
+          payload = providerResponse(parsed);
+        }
+      }
+      if (payload === null) {
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        const timer = setInterval(() => response.write(": keep-alive\n\n"), 250);
+        request.on("close", () => clearInterval(timer));
+        return;
+      }
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      response.end(payload);
+    });
+  });
+  return { server, requests };
+}
+
+async function waitFor(predicate, label, timeoutMs = 30_000, intervalMs = 100) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const value = await predicate();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`等待超时：${label}${lastError ? `；最后错误：${lastError.message}` : ""}`);
+}
+
+async function connectPage() {
+  const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json();
+  const target = targets.find((candidate) => (
+    candidate.type === "page"
+    && candidate.url.includes(`http://127.0.0.1:${daemonPort}/web.html`)
+  ));
+  if (!target?.webSocketDebuggerUrl) throw new Error("未找到打包 Electron App Renderer");
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  const pending = new Map();
+  let nextId = 1;
+  socket.on("message", (raw) => {
+    const message = JSON.parse(raw.toString());
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    clearTimeout(request.timer);
+    if (message.error) request.reject(new Error(message.error.message || "CDP 请求失败"));
+    else request.resolve(message.result);
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  const call = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      if (pending.delete(id)) reject(new Error(`CDP 请求超时：${method}`));
+    }, 15_000);
+    pending.set(id, { resolve, reject, timer });
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+  await call("Runtime.enable");
+  await call("Page.enable");
+  const evaluate = async (expression) => {
+    const result = await call("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (result?.exceptionDetails) {
+      throw new Error(
+        result.exceptionDetails.exception?.description
+          || result.exceptionDetails.text
+          || "Renderer evaluate 失败",
+      );
+    }
+    return result?.result?.value;
+  };
+  return {
+    call,
+    evaluate,
+    close() {
+      for (const request of pending.values()) {
+        clearTimeout(request.timer);
+        request.reject(new Error("CDP transport closed"));
+      }
+      pending.clear();
+      socket.close();
+    },
+  };
+}
+
+async function rendererState(page) {
+  const value = await page.evaluate(`JSON.stringify({
+    title: document.title,
+    url: location.href,
+    text: document.body?.innerText || '',
+    input: Boolean(document.querySelector('[data-testid="input-textarea"]')),
+    send: Boolean(document.querySelector('[data-testid="input-send-button"]')),
+    sendDisabled: Boolean(document.querySelector('[data-testid="input-send-button"]')?.disabled),
+    stop: Boolean(document.querySelector('[data-testid="input-stop-button"]')),
+    model: [...document.querySelectorAll('.ia-model-btn')].map((item) => item.innerText || '').join(' '),
+    assistant: [...document.querySelectorAll('.message-item.assistant')].map((item) => ({
+      text: item.innerText || '',
+      source: item.getAttribute('data-source'),
+      turnId: item.getAttribute('data-turn-id'),
+    })),
+    turns: [...document.querySelectorAll('[data-conversation-turn-id]')].map((item) => ({
+      id: item.getAttribute('data-conversation-turn-id'),
+      text: item.innerText || '',
+      expanded: item.querySelector('.turn-disclosure-header')?.getAttribute('aria-expanded'),
+    })),
+    toolGroups: [...document.querySelectorAll('.conversation-tool-group')].map((item) => ({
+      text: item.innerText || '',
+      expanded: item.querySelector('.tool-group-header')?.getAttribute('aria-expanded'),
+    })),
+    phases: [...document.querySelectorAll('.conversation-phase')].map((item) => ({
+      text: item.innerText || '',
+      expanded: item.querySelector('.conversation-phase-header')?.getAttribute('aria-expanded'),
+    })),
+    sessionIds: [...document.querySelectorAll('[data-session-id]')].map((item) => item.getAttribute('data-session-id')),
+    workspaceIds: [...document.querySelectorAll('[data-workspace-id]')].map((item) => item.getAttribute('data-workspace-id')),
+  })`);
+  return JSON.parse(value || "{}");
+}
+
+async function waitForRenderer(page, label) {
+  return await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && state.model.includes("electron-dom-model") && state.text.includes("Magi")
+      ? state
+      : null;
+  }, label);
+}
+
+async function setComposerText(page, text) {
+  const escaped = JSON.stringify(text);
+  await page.evaluate(`(() => {
+    const element = document.querySelector('[data-testid="input-textarea"]');
+    if (!element) throw new Error('input-textarea missing');
+    element.focus();
+    element.textContent = ${escaped};
+    element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ${escaped} }));
+  })()`);
+}
+
+async function waitForComposerReady(page, label) {
+  return waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && state.send && !state.sendDisabled && !state.stop ? state : null;
+  }, label, 45_000);
+}
+
+async function openPersonalDraft(page) {
+  await page.evaluate(`(() => {
+    const button = [...document.querySelectorAll('.header-action-btn')]
+      .find((item) => item.getAttribute('title')?.includes('新建会话'));
+    if (!button || button.disabled) throw new Error('new session button unavailable');
+    button.click();
+  })()`);
+  await sleep(1_500);
+}
+
+async function clickSend(page) {
+  return await page.evaluate(`(() => {
+    const element = document.querySelector('[data-testid="input-send-button"]');
+    if (!element || element.disabled) throw new Error('send button unavailable');
+    element.click();
+    return true;
+  })()`);
+}
+
+async function waitForAssistant(page, text, label) {
+  return await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.assistant.some((message) => message.text.includes(text)) ? state : null;
+  }, label, 45_000);
+}
+
+async function selectMostRecentPersonalSession(page) {
+  await waitFor(async () => (await rendererState(page)).sessionIds.length > 0, "个人会话进入侧栏");
+  await page.evaluate(`(() => {
+    const sessions = [...document.querySelectorAll('#recent-session-content [data-session-id]')];
+    const target = sessions.at(-1) || sessions[0];
+    if (!target) throw new Error('personal session missing');
+    target.click();
+  })()`);
+  await sleep(600);
+}
+
+async function setConversationDisplayMode(page, mode) {
+  await page.evaluate(`fetch('/api/settings/update', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: 'conversationDisplayMode', value: ${JSON.stringify(mode)} }),
+  }).then((response) => { if (!response.ok) throw new Error('display mode update failed'); })`);
+  await page.call("Page.reload", { ignoreCache: true });
+  await waitForRenderer(page, `显示模式 ${mode} 重载`);
+  await selectMostRecentPersonalSession(page);
+}
+
+async function registerWorkspace(page, workspacePath) {
+  const workspaceId = await page.evaluate(`fetch('/api/workspaces/register', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path: ${JSON.stringify(workspacePath)} }),
+  }).then(async (response) => {
+    if (!response.ok) throw new Error(await response.text());
+    return (await response.json()).workspaceId;
+  })`);
+  check("工作区注册响应包含 workspaceId", typeof workspaceId === "string" && workspaceId.length > 0);
+  await page.call("Page.reload", { ignoreCache: true });
+  await waitForRenderer(page, "工作区 Renderer 重载");
+  await waitFor(async () => (await rendererState(page)).text.includes("工作区"), "工作区侧栏加载");
+  await page.evaluate(`(() => {
+    const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
+    if (!workspace) throw new Error('workspace row missing');
+    workspace.click();
+    const create = workspace.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    if (!create) throw new Error('workspace new session button missing');
+    create.click();
+  })()`);
+  await sleep(700);
+  return workspaceId;
+}
+
+async function chooseAccessProfile(page, profile) {
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop && !state.sendDisabled;
+  }, "访问模式切换前 Turn 收口", 45_000);
+  await waitFor(async () => page.evaluate(`Boolean(document.querySelector('[aria-label^="访问模式:"]'))`), "访问模式按钮");
+  await page.evaluate(`(() => {
+    const button = document.querySelector('[aria-label^="访问模式:"]');
+    if (!button) throw new Error('access profile button missing');
+    if (button.disabled) throw new Error('access profile button disabled');
+    button.click();
+  })()`);
+  await waitFor(async () => page.evaluate(`document.querySelectorAll('[role="menuitemradio"]').length > 0`), "访问模式选项弹出");
+  await page.evaluate(`(() => {
+    const value = ${JSON.stringify(profile)};
+    const label = value === 'read_only' ? '只读' : value === 'full_access' ? '完全访问' : '受限访问';
+    const option = [...document.querySelectorAll('[role="menuitemradio"]')]
+      .find((item) => item.innerText.includes(label));
+    if (!option) throw new Error('access profile option missing after open: ' + value);
+    option.click();
+  })()`);
+}
+
+async function clickStop(page) {
+  await page.evaluate(`(() => {
+    const button = document.querySelector('[data-testid="input-stop-button"]');
+    if (!button) throw new Error('stop button missing');
+    button.click();
+  })()`);
+}
+
+async function waitForProcessExit(child, timeoutMs = 15_000) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await Promise.race([
+    new Promise((resolve) => {
+      child.once("exit", resolve);
+      child.once("error", resolve);
+    }),
+    sleep(timeoutMs),
+  ]);
+}
+
+async function stopOwnedProcess(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  await waitForProcessExit(child, 15_000);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await waitForProcessExit(child, 5_000);
+  }
+}
+
+async function closeProvider(server) {
+  if (typeof server.closeAllConnections === "function") server.closeAllConnections();
+  if (!server.listening) return;
+  await Promise.race([
+    new Promise((resolve) => server.close(resolve)),
+    sleep(2_000),
+  ]);
+}
+
+async function removeStateRoot(path) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      await sleep(250 * Math.min(attempt + 1, 4));
+    }
+  }
+  throw lastError;
+}
+
+const provider = createProvider();
+await new Promise((resolve) => provider.server.listen(0, "127.0.0.1", resolve));
+const providerPort = provider.server.address().port;
+const stateRoot = await mkdtemp(join(tmpdir(), "magi-electron-conversation-dom-"));
+const electron = spawn(appExecutable, [`--remote-debugging-port=${cdpPort}`, "--disable-gpu"], {
+  cwd: repositoryRoot,
+  env: {
+    ...process.env,
+    MAGI_STATE_ROOT: join(stateRoot, "state"),
+    MAGI_OPEN_BROWSER: "0",
+    MAGI_OPENAI_COMPAT_BASE_URL: `http://127.0.0.1:${providerPort}/v1`,
+    MAGI_OPENAI_COMPAT_API_KEY: "electron-dom-test-key",
+    MAGI_OPENAI_COMPAT_MODEL: "electron-dom-model",
+  },
+  stdio: ["ignore", "pipe", "pipe"],
+});
+electron.stdout.on("data", (chunk) => process.stdout.write(`[electron] ${chunk}`));
+electron.stderr.on("data", (chunk) => process.stderr.write(`[electron] ${chunk}`));
+let page = null;
+try {
+  await waitFor(async () => {
+    try {
+      page = await connectPage();
+      return page;
+    } catch {
+      return null;
+    }
+  }, "打包 Electron App Renderer CDP", 45_000, 250);
+
+  const initial = await waitForRenderer(page, "初始窗口");
+  check("初始窗口显示新对话空态", initial.text.includes("开始一个新对话"));
+  check("初始窗口具有输入框", initial.input);
+
+  await setComposerText(page, "请只回复 ELECTRON_DOM_CHAT_OK");
+  await clickSend(page);
+  const personal = await waitForAssistant(page, responseText, "个人普通 Chat 最终消息");
+  check("个人普通 Chat 最终消息进入真实 DOM", personal.text.includes(responseText));
+  check("个人普通 Chat 具有用户和助手消息节点", personal.assistant.length >= 1);
+
+  const workspaceRoot = await mkdtemp(join(stateRoot, "workspace-"));
+  const workspaceId = await registerWorkspace(page, workspaceRoot);
+  await setComposerText(page, "请只回复 ELECTRON_DOM_CHAT_OK");
+  await clickSend(page);
+  const workspace = await waitForAssistant(page, responseText, "工作区普通 Chat 最终消息");
+  check("工作区普通 Chat 最终消息进入真实 DOM", workspace.text.includes(responseText));
+  check("工作区会话绑定仍显示工作区作用域", workspace.text.includes("工作区"));
+  check(
+    "工作区 DOM 验收使用已注册 workspace",
+    workspace.workspaceIds.includes(workspaceId)
+      || workspace.url.includes(`workspaceId=${encodeURIComponent(workspaceId)}`),
+  );
+
+  await selectMostRecentPersonalSession(page);
+  await setConversationDisplayMode(page, "summary");
+  await setComposerText(page, "DOM 工具卡片验收：调用 tool_catalog 后返回最终结果");
+  await clickSend(page);
+  const task = await waitForAssistant(page, toolResponseText, "Task 工具最终消息");
+  check("Task 工具最终消息进入真实 DOM", task.text.includes(toolResponseText));
+  check("摘要模式包含 Turn 轮次折叠", task.turns.some((turn) => turn.expanded === "true" || turn.expanded === "false"));
+  const latestTurn = task.turns.at(-1);
+  if (latestTurn?.expanded === "false") {
+    await page.evaluate(`(() => {
+      const turns = [...document.querySelectorAll('[data-conversation-turn-id]')];
+      turns.at(-1)?.querySelector('.turn-disclosure-header')?.click();
+    })()`);
+  }
+  const taskExpanded = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.toolGroups.length >= 1 ? state : null;
+  }, "摘要模式展开 Turn 后的工具组");
+  check("摘要模式包含工具组二级折叠", taskExpanded.toolGroups.length >= 1);
+  const toolGroup = taskExpanded.toolGroups.at(-1);
+  if (toolGroup?.expanded === "false") {
+    await page.evaluate(`(() => {
+      const group = [...document.querySelectorAll('.conversation-tool-group')].at(-1);
+      group?.querySelector('.tool-group-header')?.click();
+    })()`);
+  }
+  const expandedTools = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.toolGroups.some((group) => group.expanded === "true") ? state : null;
+  }, "工具组二级展开");
+  check("工具组二级展开后真实工具内容可见", expandedTools.toolGroups.some((group) => group.expanded === "true"));
+
+  await chooseAccessProfile(page, "read_only");
+  await setComposerText(page, "权限拒绝 DOM 验收：请明确调用 file_write 写入文件");
+  await clickSend(page);
+  const permission = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.text.includes("权限") || state.text.includes("只读") || state.text.includes("拒绝")
+      ? state
+      : null;
+  }, "ReadOnly 权限拒绝终态", 45_000);
+  check("ReadOnly 权限拒绝事实进入真实 DOM", permission.text.includes("权限") || permission.text.includes("只读") || permission.text.includes("拒绝"));
+  check("ReadOnly 权限拒绝未创建文件工具组", permission.toolGroups.every((group) => !group.text.includes("file_write")));
+
+  await openPersonalDraft(page);
+  await chooseAccessProfile(page, "restricted");
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop;
+  }, "取消场景输入恢复", 45_000);
+  await setComposerText(page, "取消 DOM 验收：保持响应直到我停止");
+  await clickSend(page);
+  await waitFor(async () => (await rendererState(page)).stop, "取消场景停止按钮", 20_000);
+  await clickStop(page);
+  const cancelled = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.text.includes("取消 DOM 验收") && !state.text.includes("处理中") ? state : null;
+  }, "取消终态 DOM", 30_000);
+  check("取消终态进入真实 DOM", cancelled.text.includes("取消 DOM 验收"));
+
+  const beforeReload = await rendererState(page);
+  await page.call("Page.reload", { ignoreCache: true });
+  await waitForRenderer(page, "Renderer 重连恢复");
+  await selectMostRecentPersonalSession(page);
+  const afterReload = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.text.includes(responseText) ? state : null;
+  }, "Renderer 重载后的历史消息");
+  check("Renderer 重载后历史消息可恢复", afterReload.text.includes(responseText));
+  check("Renderer 重载后保留助手消息", afterReload.assistant.length >= 1);
+
+  console.log(JSON.stringify({
+    type: "electron_conversation_dom_acceptance",
+    app: appExecutable,
+      cdpPort,
+      providerPort,
+      checks,
+      providerRequests: provider.requests.length,
+      providerRequestSummary: provider.requests.map((request) => ({
+        user: (Array.isArray(request.messages) ? request.messages : [])
+          .filter((message) => message?.role === "user")
+          .map(messageText)
+          .at(-1)?.slice(-160) || "",
+        hasTools: Array.isArray(request.tools) && request.tools.length > 0,
+        hasToolResult: (Array.isArray(request.messages) ? request.messages : [])
+          .some((message) => message?.role === "tool"),
+      })),
+      status: "passed",
+  }, null, 2));
+} finally {
+  page?.close();
+  await stopOwnedProcess(electron);
+  await closeProvider(provider.server);
+  await removeStateRoot(stateRoot);
+}
