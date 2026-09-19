@@ -503,7 +503,7 @@ M0 真实基线可观测
 - [x] 完成阶段 0 timing schema 和统一 trace 设计。
 - [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
 - [ ] 采集真实 Provider 五类场景各 20 轮的 P50/P95 基线。
-  - 已新增 `scripts/verify-real-provider-performance.mjs`（npm 命令 `npm run test:real-provider-performance`），使用独立状态根、独立 workspace Git fixture、每请求 `orchestratorSessionConfig` 和 `/events` canonical terminal 事件采样；脚本会保存请求级 JSON 与 daemon `magi.performance` 阶段日志，并在任一 Turn 失败时明确返回 failed。已用 `gpt-5.6-luna` 完成五类场景各 5 轮成功采样；该证据已达到脚本可复核的小批量直接证据，但仍未满足各 20 轮完成条件。
+  - 已新增 `scripts/verify-real-provider-performance.mjs`（npm 命令 `npm run test:real-provider-performance`），使用独立状态根、独立 workspace Git fixture、每请求 `orchestratorSessionConfig` 和 `/events` canonical terminal 事件采样；脚本会保存请求级 JSON 与 daemon `magi.performance` 阶段日志，并在任一 Turn 失败时明确返回 failed。已用 `gpt-5.6-luna` 完成五类场景各 20 轮成功采样，证据文件为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`；仍缺少将五份数据汇总为统一表格并补齐前端 DOM timing 与性能前后对比。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
 - [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
@@ -551,6 +551,20 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 | 主代理与子代理并发 | 1 / 111 / 127 / 127 | 1 / 112 / 130 / 130 | 1 / 112 / 137 / 137 |
 
 该基线只证明本地 mock 的采样链路和指标计算可复现，不代表真实 Provider、前端 DOM 绘制或性能前后对比已完成。
+
+### 9.4 真实 Provider 五场景 20 轮基线
+
+使用 `gpt-5.6-luna`、独立 daemon/state/workspace fixture 和 `scripts/verify-real-provider-performance.mjs` 完成五类场景各 20 轮；指标单位为 ms，顺序为 accepted / 首个 `session.turn.item` / Turn terminal canonical event。
+
+| 场景 | P50 | P95 | 最大值 | 终态 |
+|---|---:|---:|---:|---|
+| 新建个人普通会话 | 88 / 14797 / 15169 | 98 / 27054 / 27488 | 108 / 28756 / 29163 | 20/20 completed |
+| 已有个人长历史 | 92 / 15645 / 15794 | 110 / 26669 / 26782 | 115 / 35299 / 35463 | 20/20 completed |
+| 工作区纯聊天 | 93 / 2981 / 3529 | 104 / 14214 / 14730 | 106 / 18623 / 19037 | 20/20 completed |
+| 工作区工具调用 | 51 / 61 / 9144 | 60 / 94 / 34131 | 64 / 103 / 49879 | 20/20 completed |
+| 主代理与子代理并发 | 97 / 130 / 53011 | 131 / 175 / 72882 | 143 / 220 / 139254 | 20/20 completed |
+
+直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样，但尚未包含 Electron 生产 Renderer 的 `frontend_event_received`、reducer/projection 和 `dom_painted`，也没有性能前后对比，因此性能前后对比项目继续保持未完成。
 
 ### 9.2 真实 Provider 单轮验收记录
 

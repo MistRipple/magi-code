@@ -968,7 +968,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 ## 18. MagiTurnHarness 验证设计
 
-已新增 `scripts/verify-real-provider-performance.mjs` 及 `npm run test:real-provider-performance`，使用独立 daemon、状态根和 workspace Git fixture，按请求保存 accepted、首个 `session.turn.item`、terminal canonical event 以及 daemon `magi.performance` 阶段日志。已用 `gpt-5.6-luna` 完成五类场景各 5 轮成功采样；这仍未替代五类真实 Provider 各 20 轮 P50/P95 直接证据。前端 `frontend_event_received`、reducer/projection 和 `dom_painted` 仍需通过打包 Electron CDP 单独采样。
+已新增 `scripts/verify-real-provider-performance.mjs` 及 `npm run test:real-provider-performance`，使用独立 daemon、状态根和 workspace Git fixture，按请求保存 accepted、首个 `session.turn.item`、terminal canonical event 以及 daemon `magi.performance` 阶段日志。已用 `gpt-5.6-luna` 完成五类场景各 20 轮成功采样，证据文件为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`；仍缺少前端 `frontend_event_received`、reducer/projection、`dom_painted` timing 和性能前后对比。
 
 Codex 的 harness 值得借鉴的是完整链路验证方式，不是把测试 harness 复制到生产路径。
 
