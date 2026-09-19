@@ -22,7 +22,7 @@ use crate::{
     session_turn_execution::{
         BUSINESS_MODEL_PROVIDER, SessionTurnExecutionError, SessionTurnExecutionOutput,
         SessionTurnExecutionRequest, SessionTurnExecutionRuntime, TurnTerminalCommitPolicy,
-        run_session_turn_execution, run_session_turn_execution_without_terminal_commit,
+        run_session_turn_execution,
     },
     session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
     session_writeback::SessionStatePersistCallback,
@@ -69,6 +69,9 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
 };
+
+#[cfg(test)]
+use crate::session_turn_execution::run_session_turn_execution_for_test;
 
 #[derive(Clone)]
 pub struct ExecutionPipeline {
@@ -2186,7 +2189,8 @@ impl LlmTaskDispatcher {
         (!rendered.is_empty()).then(|| rendered.join("\n\n"))
     }
 
-    pub fn execute_session_turn(
+    #[cfg(test)]
+    pub(crate) fn execute_session_turn_for_test(
         &self,
         request: SessionTurnExecutionRequest,
     ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
@@ -2207,7 +2211,8 @@ impl LlmTaskDispatcher {
     fn execute_session_turn_with_policy(
         &self,
         request: SessionTurnExecutionRequest,
-        terminal_policy: TurnTerminalCommitPolicy,
+        #[cfg(test)] terminal_policy: TurnTerminalCommitPolicy,
+        #[cfg(not(test))] _terminal_policy: TurnTerminalCommitPolicy,
     ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
         let plan_store =
             magi_plan::PlanStore::new(self.session_store.clone(), request.session_id.clone());
@@ -2304,12 +2309,13 @@ impl LlmTaskDispatcher {
             );
             selection.render_for_prompt()
         });
+        #[cfg(test)]
         let run = match terminal_policy {
-            TurnTerminalCommitPolicy::Executor => run_session_turn_execution,
-            TurnTerminalCommitPolicy::Coordinator => {
-                run_session_turn_execution_without_terminal_commit
-            }
+            TurnTerminalCommitPolicy::Executor => run_session_turn_execution_for_test,
+            TurnTerminalCommitPolicy::Coordinator => run_session_turn_execution,
         };
+        #[cfg(not(test))]
+        let run = run_session_turn_execution;
         run(SessionTurnExecutionRuntime {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -3676,7 +3682,7 @@ mod tests {
             })
             .expect("plan should persist");
 
-        let result = dispatcher.execute_session_turn(SessionTurnExecutionRequest {
+        let result = dispatcher.execute_session_turn_for_test(SessionTurnExecutionRequest {
             session_id,
             turn_id: "turn-model-config-failure".to_string(),
             workspace_id: None,

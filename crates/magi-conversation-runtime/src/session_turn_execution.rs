@@ -162,20 +162,30 @@ impl SessionTurnExecutionOutput {
     }
 }
 
-/// Turn 终态的唯一提交者。
+/// Turn 终态提交策略。
 ///
-/// 旧 Task 执行仍使用 `Executor` 以保持现有任务链兼容；普通 Conversation 使用
-/// `Coordinator`，执行器只写 item，最终状态由 SessionTurnCoordinator 收口。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TurnTerminalCommitPolicy {
-    #[default]
+/// 生产执行只使用 `Coordinator`。测试专用的 `Executor` 仅验证存储终态写回，
+/// 不参与生产执行路径。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnTerminalCommitPolicy {
+    #[cfg(test)]
     Executor,
     Coordinator,
 }
 
+impl Default for TurnTerminalCommitPolicy {
+    fn default() -> Self {
+        Self::Coordinator
+    }
+}
+
 impl TurnTerminalCommitPolicy {
     const fn commits_terminal(self) -> bool {
-        matches!(self, Self::Executor)
+        #[cfg(test)]
+        if matches!(self, Self::Executor) {
+            return true;
+        }
+        false
     }
 }
 
@@ -857,14 +867,15 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub live_settings_store: Option<Arc<SettingsStore>>,
 }
 
-pub fn run_session_turn_execution(
+#[cfg(test)]
+pub(crate) fn run_session_turn_execution_for_test(
     runtime: SessionTurnExecutionRuntime<'_>,
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     run_session_turn_execution_with_policy(runtime, TurnTerminalCommitPolicy::Executor)
 }
 
 /// Conversation profile 的执行入口。所有失败/完成状态由 Coordinator 提交。
-pub fn run_session_turn_execution_without_terminal_commit(
+pub(crate) fn run_session_turn_execution(
     runtime: SessionTurnExecutionRuntime<'_>,
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     run_session_turn_execution_with_policy(runtime, TurnTerminalCommitPolicy::Coordinator)
@@ -3975,7 +3986,7 @@ mod tests {
             session_id: session_id.clone(),
         };
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &InMemoryEventBus::new(16),
             session_store: store.as_ref(),
@@ -4147,7 +4158,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &main_client,
             event_bus: &InMemoryEventBus::new(32),
             session_store: store.as_ref(),
@@ -4243,7 +4254,7 @@ mod tests {
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
-        let follow_up_output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let follow_up_output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &main_client,
             event_bus: &InMemoryEventBus::new(32),
             session_store: store.as_ref(),
@@ -4522,7 +4533,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
@@ -4636,7 +4647,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             requests: std::sync::Mutex::new(Vec::new()),
         };
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &InMemoryEventBus::new(16),
             session_store: store.as_ref(),
@@ -4784,7 +4795,7 @@ mod tests {
             requests: std::sync::Mutex::new(Vec::new()),
         };
 
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &InMemoryEventBus::new(16),
             session_store: store.as_ref(),
@@ -5153,7 +5164,7 @@ mod tests {
             .to_string(),
         };
 
-        let result = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let result = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &InMemoryEventBus::new(16),
             session_store: store.as_ref(),
@@ -5277,7 +5288,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+        let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
             session_store: store.as_ref(),
@@ -5415,7 +5426,7 @@ mod tests {
             origin: magi_bridge_client::ChatToolOrigin::Builtin,
         }];
 
-        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+        let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
             session_store: store.as_ref(),
@@ -5542,7 +5553,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
             session_store: store.as_ref(),
@@ -5638,7 +5649,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+        let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
@@ -5759,7 +5770,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
@@ -5872,7 +5883,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+        let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
