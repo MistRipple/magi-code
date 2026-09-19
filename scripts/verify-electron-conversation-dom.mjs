@@ -326,6 +326,38 @@ async function rendererState(page) {
   return JSON.parse(value || "{}");
 }
 
+async function rendererTiming(page) {
+  return page.evaluate(`(() => {
+    const reader = window.__magiPerformanceTiming;
+    return reader && typeof reader.snapshot === 'function' ? reader.snapshot() : null;
+  })()`);
+}
+
+function timingHasAllStages(record) {
+  const stages = record?.stages || {};
+  return [
+    "frontend_event_received",
+    "reducer_completed",
+    "projection_completed",
+    "dom_painted",
+  ].every((stage) => stages[stage]?.count > 0);
+}
+
+function checkTimingStages(label, record) {
+  check(`${label} frontend_event_received`, record?.stages?.frontend_event_received?.count > 0);
+  check(`${label} reducer_completed`, record?.stages?.reducer_completed?.count > 0);
+  check(`${label} projection_completed`, record?.stages?.projection_completed?.count > 0);
+  check(`${label} 每轮记录一次 dom_painted`, record?.stages?.dom_painted?.count === 1);
+}
+
+async function waitForTimingRecord(page, turnId, label) {
+  return waitFor(async () => {
+    const snapshot = await rendererTiming(page);
+    const record = snapshot?.turns?.find((candidate) => candidate.turnId === turnId);
+    return timingHasAllStages(record) ? record : null;
+  }, label);
+}
+
 async function waitForRenderer(page, label) {
   return await waitFor(async () => {
     const state = await rendererState(page);
@@ -516,6 +548,31 @@ async function ownedDaemonPid(electronPid) {
   return daemon?.pid ?? null;
 }
 
+async function stopOwnedDaemon(pid) {
+  if (!Number.isInteger(pid)) return;
+  let command = "";
+  try {
+    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="]);
+    command = stdout.trim();
+  } catch {
+    return;
+  }
+  if (!command.includes("magi-daemon-app") || !command.includes("target/electron-dist")) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+  await waitFor(async () => {
+    try {
+      await execFileAsync("ps", ["-p", String(pid), "-o", "pid="]);
+      return false;
+    } catch {
+      return true;
+    }
+  }, `脚本自有 daemon ${pid} 退出`, 5_000, 100).catch(() => undefined);
+}
+
 async function healthSnapshot() {
   const response = await fetch("http://127.0.0.1:38123/health");
   if (!response.ok) throw new Error(`daemon health status ${response.status}`);
@@ -574,9 +631,12 @@ const electron = spawn(appExecutable, [`--remote-debugging-port=${cdpPort}`, "--
 electron.stdout.on("data", (chunk) => process.stdout.write(`[electron] ${chunk}`));
 electron.stderr.on("data", (chunk) => process.stderr.write(`[electron] ${chunk}`));
 let page = null;
+let daemonPidForCleanup = null;
+const rendererTimingSamples = [];
 try {
   await waitFor(async () => {
     try {
+      daemonPidForCleanup = await ownedDaemonPid(electron.pid) || daemonPidForCleanup;
       page = await connectPage();
       return page;
     } catch {
@@ -595,6 +655,10 @@ try {
   check("个人普通 Chat 拥有可恢复的 sessionId", Boolean(initialPersonalSessionId));
   check("个人普通 Chat 最终消息进入真实 DOM", personal.text.includes(responseText));
   check("个人普通 Chat 具有用户和助手消息节点", personal.assistant.length >= 1);
+  const personalTurnId = personal.assistant.at(-1)?.turnId;
+  const personalTiming = await waitForTimingRecord(page, personalTurnId, "个人 Chat 生产 Renderer timing");
+  rendererTimingSamples.push({ scenario: "personal_chat", record: personalTiming });
+  checkTimingStages("个人 Chat 生产 Renderer", personalTiming);
 
   const workspaceRoot = await mkdtemp(join(stateRoot, "workspace-"));
   const workspaceId = await registerWorkspace(page, workspaceRoot);
@@ -608,6 +672,13 @@ try {
     workspace.workspaceIds.includes(workspaceId)
       || workspace.url.includes(`workspaceId=${encodeURIComponent(workspaceId)}`),
   );
+  const workspaceTiming = await waitForTimingRecord(
+    page,
+    workspace.assistant.at(-1)?.turnId,
+    "工作区 Chat 生产 Renderer timing",
+  );
+  rendererTimingSamples.push({ scenario: "workspace_chat", record: workspaceTiming });
+  checkTimingStages("工作区 Chat 生产 Renderer", workspaceTiming);
 
   await selectMostRecentPersonalSession(page);
   await setConversationDisplayMode(page, "summary");
@@ -615,6 +686,13 @@ try {
   await clickSend(page);
   const task = await waitForAssistant(page, toolResponseText, "Task 工具最终消息");
   check("Task 工具最终消息进入真实 DOM", task.text.includes(toolResponseText));
+  const taskTiming = await waitForTimingRecord(
+    page,
+    task.assistant.at(-1)?.turnId,
+    "Task 工具生产 Renderer timing",
+  );
+  rendererTimingSamples.push({ scenario: "workspace_tool", record: taskTiming });
+  checkTimingStages("Task 工具生产 Renderer", taskTiming);
   check("摘要模式包含 Turn 轮次折叠", task.turns.some((turn) => turn.expanded === "true" || turn.expanded === "false"));
   const latestTurn = task.turns.at(-1);
   if (latestTurn?.expanded === "false") {
@@ -742,6 +820,7 @@ try {
       providerPort,
       checks,
       providerRequests: provider.requests.length,
+      rendererTimingSamples,
       providerRequestSummary: provider.requests.map((request) => ({
         user: (Array.isArray(request.messages) ? request.messages : [])
           .filter((message) => message?.role === "user")
@@ -762,7 +841,9 @@ try {
   }
 } finally {
   page?.close();
+  daemonPidForCleanup = await ownedDaemonPid(electron.pid) || daemonPidForCleanup;
   await stopOwnedProcess(electron);
+  await stopOwnedDaemon(daemonPidForCleanup);
   await closeProvider(provider.server);
   await removeStateRoot(stateRoot);
 }

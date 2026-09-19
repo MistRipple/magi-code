@@ -32,7 +32,80 @@ export interface CanonicalTurnPageCommit {
   oldestTurnSeq: number;
 }
 
-const domPaintScheduledTurnIds = new Set<string>();
+const domPaintPendingTurnIds = new Set<string>();
+const domPaintRecordedTurnIds = new Set<string>();
+
+type BrowserTimingStage =
+  | 'frontend_event_received'
+  | 'reducer_completed'
+  | 'projection_completed'
+  | 'dom_painted';
+
+interface BrowserTimingPoint {
+  atMs: number;
+  elapsedMs: number;
+}
+
+interface BrowserTimingStageRecord {
+  count: number;
+  first: BrowserTimingPoint;
+  last: BrowserTimingPoint;
+}
+
+interface BrowserTimingTurnRecord {
+  traceId: string;
+  turnId: string;
+  stages: Partial<Record<BrowserTimingStage, BrowserTimingStageRecord>>;
+}
+
+export interface BrowserTimingSnapshot {
+  generatedAtMs: number;
+  turns: BrowserTimingTurnRecord[];
+}
+
+declare global {
+  interface Window {
+    __magiPerformanceTiming?: {
+      snapshot: () => BrowserTimingSnapshot;
+    };
+  }
+}
+
+const MAX_BROWSER_TIMING_TURNS = 128;
+
+const browserTimingRegistry = new Map<string, BrowserTimingTurnRecord>();
+
+function snapshotBrowserTiming(): BrowserTimingSnapshot {
+  return {
+    generatedAtMs: typeof performance === 'undefined' ? 0 : performance.now(),
+    turns: [...browserTimingRegistry.values()].map((record) => ({
+      traceId: record.traceId,
+      turnId: record.turnId,
+      stages: Object.fromEntries(
+        Object.entries(record.stages).map(([stage, value]) => [stage, {
+          count: value!.count,
+          first: { ...value!.first },
+          last: { ...value!.last },
+        }]),
+      ) as Partial<Record<BrowserTimingStage, BrowserTimingStageRecord>>,
+    })),
+  };
+}
+
+function installBrowserTimingReader(): void {
+  if (typeof window === 'undefined') return;
+  const existing = window.__magiPerformanceTiming;
+  if (existing) return;
+  const reader = Object.freeze({ snapshot: snapshotBrowserTiming });
+  Object.defineProperty(window, '__magiPerformanceTiming', {
+    configurable: false,
+    enumerable: false,
+    value: reader,
+    writable: false,
+  });
+}
+
+installBrowserTimingReader();
 
 function browserTimingTraceId(event: CanonicalTurnEvent): string {
   const metadata = event.turn?.metadata || event.item?.metadata;
@@ -42,17 +115,45 @@ function browserTimingTraceId(event: CanonicalTurnEvent): string {
     : event.turnId;
 }
 
-function markBrowserTiming(stage: string, event: CanonicalTurnEvent, startedAt: number): void {
+function markBrowserTiming(stage: BrowserTimingStage, event: CanonicalTurnEvent, startedAt: number): void {
   const viteEnv = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env;
-  if (!viteEnv?.DEV || typeof performance === 'undefined') return;
-  const elapsed = Math.max(0, performance.now() - startedAt);
-  performance.mark(`magi-${stage}-${event.turnId}-${Math.round(performance.now())}`);
-  console.debug('[magi.performance]', {
-    traceId: browserTimingTraceId(event),
-    turnId: event.turnId,
-    stage,
+  if (typeof performance === 'undefined') return;
+  const atMs = performance.now();
+  const elapsed = Math.max(0, atMs - startedAt);
+  let record = browserTimingRegistry.get(event.turnId);
+  if (!record) {
+    record = {
+      traceId: browserTimingTraceId(event),
+      turnId: event.turnId,
+      stages: {},
+    };
+    browserTimingRegistry.set(event.turnId, record);
+    while (browserTimingRegistry.size > MAX_BROWSER_TIMING_TURNS) {
+      const oldestTurnId = browserTimingRegistry.keys().next().value;
+      if (typeof oldestTurnId !== 'string') break;
+      browserTimingRegistry.delete(oldestTurnId);
+    }
+  }
+  const point = {
+    atMs: Number(atMs.toFixed(2)),
     elapsedMs: Number(elapsed.toFixed(2)),
-  });
+  };
+  const stageRecord = record.stages[stage];
+  if (stageRecord) {
+    stageRecord.count += 1;
+    stageRecord.last = point;
+  } else {
+    record.stages[stage] = { count: 1, first: point, last: point };
+  }
+  if (viteEnv?.DEV) {
+    performance.mark(`magi-${stage}-${event.turnId}-${Math.round(atMs)}`);
+    console.debug('[magi.performance]', {
+      traceId: record.traceId,
+      turnId: event.turnId,
+      stage,
+      elapsedMs: point.elapsedMs,
+    });
+  }
 }
 
 function normalizeSessionId(value: string | null | undefined): string {
@@ -66,7 +167,7 @@ function publishProjection(): SessionTimelineProjection | null {
 
 export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimelineProjection | null {
   const receivedAt = typeof performance === 'undefined' ? 0 : performance.now();
-  markBrowserTiming('event_received', event, receivedAt);
+  markBrowserTiming('frontend_event_received', event, receivedAt);
   const result = reduceCanonicalTurnEvent(turnStoreState.reducer, event);
   markBrowserTiming('reducer_completed', event, receivedAt);
   if (result.error) {
@@ -95,10 +196,18 @@ export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimel
     result.changedTurnIds,
   );
   markBrowserTiming('projection_completed', event, receivedAt);
-  if (result.changed && !domPaintScheduledTurnIds.has(event.turnId)) {
-    domPaintScheduledTurnIds.add(event.turnId);
+  if (result.changed
+    && !domPaintPendingTurnIds.has(event.turnId)
+    && !domPaintRecordedTurnIds.has(event.turnId)) {
+    domPaintPendingTurnIds.add(event.turnId);
     const onPaint = () => {
-      domPaintScheduledTurnIds.delete(event.turnId);
+      domPaintPendingTurnIds.delete(event.turnId);
+      domPaintRecordedTurnIds.add(event.turnId);
+      while (domPaintRecordedTurnIds.size > MAX_BROWSER_TIMING_TURNS) {
+        const oldestTurnId = domPaintRecordedTurnIds.values().next().value;
+        if (typeof oldestTurnId !== 'string') break;
+        domPaintRecordedTurnIds.delete(oldestTurnId);
+      }
       markBrowserTiming('dom_painted', event, receivedAt);
     };
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(onPaint);
