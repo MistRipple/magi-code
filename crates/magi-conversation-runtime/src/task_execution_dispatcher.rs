@@ -154,7 +154,7 @@ pub struct LlmTaskDispatcher {
     settings_store: Option<Arc<SettingsStore>>,
     context_runtime: Option<Arc<ContextRuntime>>,
     /// 由 daemon bootstrap 注入的上下文预算，决定每轮 Turn 装配 prompt 时记忆 / 知识 /
-    /// shared context 各最多取多少条。未注入时退回 [`fallback_context_budget`]，便于
+    /// shared context 各最多取多少条。未注入时退回 [`default_context_budget_for_unconfigured_dispatcher`]，便于
     /// 在测试和最小依赖场景下仍可工作；生产环境 daemon 必须显式注入以保持单一事实源。
     context_budget: Option<ContextBudget>,
     workspace_registry: Option<Arc<WorkspaceStore>>,
@@ -418,11 +418,11 @@ fn build_orchestrator_client(
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>))
 }
 
-/// daemon 未注入 [`ContextBudget`] 时的兜底预算。
+/// daemon 未注入 [`ContextBudget`] 时，为最小运行时和测试构造提供的默认预算。
 ///
 /// `max_memory` 必须 ≥ 一批 session-memory 的 slice 数（当前 5），否则会出现
 /// "辅助模型提取了 5 条会话记忆，预算却只放 2 条进 prompt"的设计错位。
-fn fallback_context_budget() -> ContextBudget {
+fn default_context_budget_for_unconfigured_dispatcher() -> ContextBudget {
     ContextBudget {
         max_turns: 8,
         max_knowledge: 6,
@@ -1944,7 +1944,7 @@ impl LlmTaskDispatcher {
         let mut context_budget = self
             .context_budget
             .clone()
-            .unwrap_or_else(fallback_context_budget);
+            .unwrap_or_else(default_context_budget_for_unconfigured_dispatcher);
         context_budget.max_knowledge = 0;
         if task.kind == TaskKind::LocalAgent
             && !task_is_coordinator(Some(task), Some(self.agent_role_registry.as_ref()))
