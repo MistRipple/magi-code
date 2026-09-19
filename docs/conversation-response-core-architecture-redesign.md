@@ -964,7 +964,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 2026-09-19 在该收敛之后重新执行了 `npm run protocol:check`、`npm --prefix web run check`、`npm test`、`npm --prefix web run build` 和 Electron `--dir` 打包。protocol 检查、Svelte check（0 errors/0 warnings）、Desktop 99 项、Browser Worker 57 项及 Web golden 全部通过，打包产物重新生成于 `target/electron-dist/mac-arm64/Magi.app`；本次属于回归与打包证据，仍不等同于完整 packaged GUI DOM 内容矩阵或真实 Provider 全矩阵。
 
-2026-09-19 新增 `scripts/verify-electron-conversation-dom.mjs`（npm 命令：`npm run test:electron-conversation-dom`），从 `target/electron-dist/mac-arm64/Magi.app` 启动独立状态根和本地 OpenAI-compatible SSE Provider，通过 Renderer CDP 读取真实 DOM。单轮直接证据已覆盖：初始空态和输入框、个人 Chat 最终消息、工作区注册与普通 Chat、摘要模式 Turn 折叠、Task `tool_catalog` 工具轮与工具组二级展开、ReadOnly 明确 `file_write` 的 fail-closed 权限事实、取消终态、Renderer reload 后历史恢复；本次运行 18 项 DOM 检查全部通过，Provider 共收到 5 个请求。脚本清理等待自有 Electron 退出并重试删除临时状态目录，不接管用户已有进程。该结果是打包 Electron 的真实 DOM 单轮/场景证据，仍不足以勾选 Electron packaged GUI 全矩阵、真实 Provider 全矩阵或五类真实 Provider 20 轮性能项目。
+2026-09-19 新增 `scripts/verify-electron-conversation-dom.mjs`（npm 命令：`npm run test:electron-conversation-dom`），从 `target/electron-dist/mac-arm64/Magi.app` 启动独立状态根和本地 OpenAI-compatible SSE Provider，通过 Renderer CDP 读取真实 DOM。单轮直接证据已覆盖：初始空态和输入框、个人 Chat 最终消息、工作区注册与普通 Chat、摘要模式 Turn 折叠、Task `tool_catalog` 工具轮与工具组二级展开、ReadOnly 明确 `file_write` 的 fail-closed 权限事实、取消终态、daemon 非正常重启后的 runtime epoch 与 Renderer 内容恢复、Renderer reload 后历史恢复以及个人历史会话切换；本次运行 25 项 DOM 检查全部通过，Provider 共收到 5 个请求。脚本只向 `ps` 查询自身 Electron 子进程树并终止脚本自有 daemon，清理阶段等待自有 Electron 退出并重试删除临时状态目录，不接管用户已有进程。设置 `MAGI_ELECTRON_DOM_EVIDENCE_PATH` 可保存 JSON 直接证据。本次结果是打包 Electron 的真实 DOM 单轮/场景证据，仍不足以勾选 Electron packaged GUI 全矩阵、真实 Provider 全矩阵或五类真实 Provider 20 轮性能项目。
 
 ## 18. MagiTurnHarness 验证设计
 

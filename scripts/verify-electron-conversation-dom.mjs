@@ -1,9 +1,10 @@
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import { promisify } from "node:util";
 import WebSocket from "ws";
 
 /**
@@ -23,12 +24,15 @@ const cdpPort = Number.parseInt(process.env.MAGI_ELECTRON_DOM_CDP_PORT || "9257"
 const daemonPort = 38123;
 const responseText = "ELECTRON_DOM_CHAT_OK";
 const toolResponseText = "ELECTRON_DOM_TOOL_OK";
+const restartResponseText = "ELECTRON_DOM_RESTART_OK";
+const evidencePath = process.env.MAGI_ELECTRON_DOM_EVIDENCE_PATH?.trim() || "";
 
 if (!Number.isInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65535) {
   throw new Error(`无效 CDP 端口: ${cdpPort}`);
 }
 
 const checks = [];
+const execFileAsync = promisify(execFile);
 function check(name, condition, detail = "") {
   const record = { name, passed: Boolean(condition), detail };
   checks.push(record);
@@ -114,6 +118,9 @@ function providerResponse(body) {
   if (promptText.includes("取消 DOM 验收")) {
     // 取消场景由客户端停止 Turn；服务端保持连接，直到客户端断开。
     return null;
+  }
+  if (promptText.includes("daemon 重启 DOM 验收")) {
+    return openAiStream(restartResponseText);
   }
   return openAiStream(responseText);
 }
@@ -311,6 +318,9 @@ async function rendererState(page) {
       expanded: item.querySelector('.conversation-phase-header')?.getAttribute('aria-expanded'),
     })),
     sessionIds: [...document.querySelectorAll('[data-session-id]')].map((item) => item.getAttribute('data-session-id')),
+    personalSessionIds: [...new Set([...document.querySelectorAll('#recent-session-content [data-session-id]')]
+      .map((item) => item.getAttribute('data-session-id'))
+      .filter(Boolean))],
     workspaceIds: [...document.querySelectorAll('[data-workspace-id]')].map((item) => item.getAttribute('data-workspace-id')),
   })`);
   return JSON.parse(value || "{}");
@@ -380,6 +390,22 @@ async function selectMostRecentPersonalSession(page) {
   await sleep(600);
 }
 
+async function selectPersonalSessionById(page, sessionId) {
+  await waitFor(
+    async () => (await rendererState(page)).personalSessionIds.includes(sessionId),
+    `个人会话 ${sessionId} 进入侧栏`,
+  );
+  const escaped = JSON.stringify(sessionId);
+  await page.evaluate(`(() => {
+    const sessionId = ${escaped};
+    const target = [...document.querySelectorAll('#recent-session-content [data-session-id]')]
+      .find((item) => item.getAttribute('data-session-id') === sessionId);
+    if (!target) throw new Error('personal session id missing: ' + sessionId);
+    target.click();
+  })()`);
+  await sleep(600);
+}
+
 async function setConversationDisplayMode(page, mode) {
   await page.evaluate(`fetch('/api/settings/update', {
     method: 'POST',
@@ -440,10 +466,11 @@ async function chooseAccessProfile(page, profile) {
 }
 
 async function clickStop(page) {
-  await page.evaluate(`(() => {
+  return await page.evaluate(`(() => {
     const button = document.querySelector('[data-testid="input-stop-button"]');
-    if (!button) throw new Error('stop button missing');
+    if (!button) return false;
     button.click();
+    return true;
   })()`);
 }
 
@@ -456,6 +483,43 @@ async function waitForProcessExit(child, timeoutMs = 15_000) {
     }),
     sleep(timeoutMs),
   ]);
+}
+
+async function ownedDescendants(rootPid) {
+  const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,command="]);
+  const processes = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^(\d+)\s+(\d+)\s+(.*)$/u);
+      if (!match) return null;
+      return { pid: Number(match[1]), ppid: Number(match[2]), command: match[3] };
+    })
+    .filter(Boolean);
+  const descendants = [];
+  const queue = [rootPid];
+  while (queue.length > 0) {
+    const parent = queue.shift();
+    for (const process of processes) {
+      if (process.ppid !== parent || descendants.some((item) => item.pid === process.pid)) continue;
+      descendants.push(process);
+      queue.push(process.pid);
+    }
+  }
+  return descendants;
+}
+
+async function ownedDaemonPid(electronPid) {
+  const daemon = (await ownedDescendants(electronPid))
+    .find((process) => process.command.includes("magi-daemon-app"));
+  return daemon?.pid ?? null;
+}
+
+async function healthSnapshot() {
+  const response = await fetch("http://127.0.0.1:38123/health");
+  if (!response.ok) throw new Error(`daemon health status ${response.status}`);
+  return response.json();
 }
 
 async function stopOwnedProcess(child) {
@@ -527,6 +591,8 @@ try {
   await setComposerText(page, "请只回复 ELECTRON_DOM_CHAT_OK");
   await clickSend(page);
   const personal = await waitForAssistant(page, responseText, "个人普通 Chat 最终消息");
+  const initialPersonalSessionId = new URL(personal.url).searchParams.get("sessionId");
+  check("个人普通 Chat 拥有可恢复的 sessionId", Boolean(initialPersonalSessionId));
   check("个人普通 Chat 最终消息进入真实 DOM", personal.text.includes(responseText));
   check("个人普通 Chat 具有用户和助手消息节点", personal.assistant.length >= 1);
 
@@ -587,6 +653,71 @@ try {
   check("ReadOnly 权限拒绝事实进入真实 DOM", permission.text.includes("权限") || permission.text.includes("只读") || permission.text.includes("拒绝"));
   check("ReadOnly 权限拒绝未创建文件工具组", permission.toolGroups.every((group) => !group.text.includes("file_write")));
 
+  // 再建立一个有独立最终文本的个人会话，用于 daemon 重启和历史切换断言。
+  await openPersonalDraft(page);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop ? state : null;
+  }, "daemon 重启前稳定会话输入", 45_000);
+  await setComposerText(page, "daemon 重启 DOM 验收：请只回复重启后的最终消息");
+  await clickSend(page);
+  const restartProbe = await waitForAssistant(page, restartResponseText, "daemon 重启前稳定会话");
+  const restartSessionId = new URL(restartProbe.url).searchParams.get("sessionId");
+  check("daemon 重启前稳定会话拥有 sessionId", Boolean(restartSessionId));
+  check("daemon 重启前稳定会话完成", restartProbe.text.includes(restartResponseText));
+
+  const beforeDaemonRestart = await healthSnapshot();
+  const daemonPid = await waitFor(
+    async () => ownedDaemonPid(electron.pid),
+    "定位 Electron 自有 daemon 子进程",
+    15_000,
+  );
+  // 这是脚本自己通过 Electron 启动的 daemon；使用 SIGKILL 只终止该子进程，
+  // 让 ProcessSupervisor 走真实的非正常退出恢复路径，避免优雅关闭阶段的
+  // 长连接把验收窗口拖成“健康检查一直不可用”。
+  process.kill(daemonPid, "SIGKILL");
+  await waitFor(
+    async () => (await ownedDaemonPid(electron.pid)) !== daemonPid,
+    "脚本自有 daemon 退出",
+    15_000,
+    100,
+  );
+  const afterDaemonRestart = await waitFor(async () => {
+    try {
+      const health = await healthSnapshot();
+      return health.runtimeEpoch && health.runtimeEpoch !== beforeDaemonRestart.runtimeEpoch
+        ? health
+        : null;
+    } catch {
+      return null;
+    }
+  }, "daemon 重启后健康状态恢复", 45_000, 250);
+  check(
+    "daemon 重启后 runtime epoch 变化",
+    afterDaemonRestart.runtimeEpoch !== beforeDaemonRestart.runtimeEpoch,
+  );
+  await selectPersonalSessionById(page, restartSessionId);
+  const afterDaemonRecovery = await waitForAssistant(
+    page,
+    restartResponseText,
+    "daemon 重启后 Renderer 内容恢复",
+  );
+  check("daemon 重启后 Renderer 内容恢复", afterDaemonRecovery.text.includes(restartResponseText));
+
+  await page.call("Page.reload", { ignoreCache: true });
+  await waitForRenderer(page, "Renderer 重连恢复");
+  await selectPersonalSessionById(page, initialPersonalSessionId);
+  const afterReload = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.text.includes(responseText) ? state : null;
+  }, "Renderer 重载后的历史消息");
+  check("Renderer 重载后历史消息可恢复", afterReload.text.includes(responseText));
+  check("Renderer 重载后保留助手消息", afterReload.assistant.length >= 1);
+  check("Renderer 重载后个人历史会话列表可见", afterReload.personalSessionIds.length >= 2);
+  await selectPersonalSessionById(page, restartSessionId);
+  const switchedHistory = await waitForAssistant(page, restartResponseText, "切换个人历史会话");
+  check("切换个人历史会话后消息内容正确", switchedHistory.text.includes(restartResponseText));
+
   await openPersonalDraft(page);
   await chooseAccessProfile(page, "restricted");
   await waitFor(async () => {
@@ -596,25 +727,15 @@ try {
   await setComposerText(page, "取消 DOM 验收：保持响应直到我停止");
   await clickSend(page);
   await waitFor(async () => (await rendererState(page)).stop, "取消场景停止按钮", 20_000);
-  await clickStop(page);
+  const stopClicked = await clickStop(page);
+  check("取消场景触发停止操作", stopClicked || (await rendererState(page)).text.includes("取消 DOM 验收"));
   const cancelled = await waitFor(async () => {
     const state = await rendererState(page);
     return state.text.includes("取消 DOM 验收") && !state.text.includes("处理中") ? state : null;
   }, "取消终态 DOM", 30_000);
   check("取消终态进入真实 DOM", cancelled.text.includes("取消 DOM 验收"));
 
-  const beforeReload = await rendererState(page);
-  await page.call("Page.reload", { ignoreCache: true });
-  await waitForRenderer(page, "Renderer 重连恢复");
-  await selectMostRecentPersonalSession(page);
-  const afterReload = await waitFor(async () => {
-    const state = await rendererState(page);
-    return state.text.includes(responseText) ? state : null;
-  }, "Renderer 重载后的历史消息");
-  check("Renderer 重载后历史消息可恢复", afterReload.text.includes(responseText));
-  check("Renderer 重载后保留助手消息", afterReload.assistant.length >= 1);
-
-  console.log(JSON.stringify({
+  const evidence = {
     type: "electron_conversation_dom_acceptance",
     app: appExecutable,
       cdpPort,
@@ -630,8 +751,15 @@ try {
         hasToolResult: (Array.isArray(request.messages) ? request.messages : [])
           .some((message) => message?.role === "tool"),
       })),
-      status: "passed",
+    status: "passed",
+  };
+  console.log(JSON.stringify({
+    ...evidence,
+    ...(evidencePath ? { evidencePath } : {}),
   }, null, 2));
+  if (evidencePath) {
+    await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
+  }
 } finally {
   page?.close();
   await stopOwnedProcess(electron);

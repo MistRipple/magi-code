@@ -512,7 +512,7 @@ M0 真实基线可观测
 - [x] 完成阶段 5 的前端增量 reducer、projection 与 Goal 刷新收敛首轮实现。
 - [x] 完成本地 daemon 真实入口的页面启动、会话历史、摘要折叠与工具组逐层展开验收。
 - [x] 完成 Electron `--dir` 打包产物启动、静态资源加载与摘要折叠/工具组展开验收。
-- [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、ReadOnly 明确写工具阻断、取消和 Renderer reload 历史恢复共 18 项检查通过；该证据仍不替代真实 Provider 五场景 20 轮性能采样。
+- [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 25 项检查通过；该证据仍不替代真实 Provider 五场景 20 轮性能采样。
 - [ ] 汇总性能前后对比；当前仅完成真实 Provider 单轮 smoke，不宣称真实 Provider P50/P95 指标达标。
 
 ### 9.1 本轮本地验收记录
