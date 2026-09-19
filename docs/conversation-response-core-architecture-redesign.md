@@ -901,7 +901,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 本轮全仓复查确认，除 `CanonicalTurnEventSink` 内部、SessionStore canonical mutation 与存储单元测试外，current Turn 直接 mutation 仅剩 Goal 行为单元测试；旧 thread projection 恢复 fixture 和 App Server canonical replay fixture 已改为通过 `CanonicalTurnEventSink` 接纳 Turn。`conversation_loop` 与 `session_turn_execution` 已无直接 `upsert_current_turn` 调用。Goal 单元测试仍直接验证底层 Goal 中断和存储 mutation，受 crate 依赖方向限制保留在 SessionStore 测试边界；因此 17.3 继续保持未完成。
 
-2026-09-19 又补充了真实 ReadOnly `file_write` harness：当任务原文明确点名 `file_write`、但 ReadOnly 工具面按访问模式隐藏该工具时，Conversation loop 在 Provider 调用前 fail-closed，Turn/Task 均进入 `Failed`，不创建文件、不发布审批请求，也不进入 Provider 重试；错误事实写回 canonical assistant error item。为避免把普通“写入文件”语义误判为必须使用某个被隐藏的工具，缺失工具的前置失败仅适用于任务原文显式包含 canonical 工具名的 required chain；未点名的语义工具链仍由可用工具面自主选择。`cargo test -p magi-api --lib turn_harness -- --test-threads=1` 与 workspace 全量 Rust 测试均通过。
+2026-09-19 又补充了真实 ReadOnly 文件工具阻断 harness：当任务原文明确点名 `file_write`、`file_copy`、`file_move`、`file_patch`、`file_mkdir` 或 `file_remove`，但 ReadOnly 工具面按访问模式隐藏该工具时，Conversation loop 在 Provider 调用前 fail-closed，Turn/Task 均进入 `Failed`，不产生文件或目录副作用、不发布审批请求，也不进入 Provider 重试；错误事实写回 canonical assistant error item。为避免把普通“写入文件”语义误判为必须使用某个被隐藏的工具，缺失工具的前置失败仅适用于任务原文显式包含 canonical 工具名的 required chain；未点名的语义工具链仍由可用工具面自主选择。新增测试 `read_only_profile_rejects_explicit_file_patch_mkdir_and_remove_without_side_effect` 直接验证 patch 保持原内容、mkdir 不创建目录、remove 保留文件，并验证三种调用均无 Provider 请求或审批事件。定向测试和 workspace 全量 Rust 测试均通过。
 
 ### 17.4 Conversation 与 Task 执行分离
 
@@ -944,7 +944,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 - [ ] 删除所有外部 current Turn 写入口。
 - [x] 删除旧结果轮询与二次 finalizer 的生产职责。
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
-- [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。新增 Restricted `file_remove` 拒绝、工作区外路径写入确定性拒绝、pending approval 随 Turn 取消、审批请求会话隔离、重复决定冲突、跨 Turn 拒绝记忆隔离以及 5 分钟审批 TTL 到期后的确定性拒绝测试，过期审批索引会随 task、Turn 或 session 清理，仍不足以覆盖完整权限矩阵。
+- [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。新增 Restricted `file_remove` 拒绝、ReadOnly 对六类显式文件写工具的 fail-closed 阻断、Restricted 下 `file_patch`/`file_mkdir`/`file_copy`/`file_move`/`file_remove` 工作区外路径确定性拒绝、pending approval 随 Turn 取消、审批请求会话隔离、重复决定冲突、跨 Turn 拒绝记忆隔离以及 5 分钟审批 TTL 到期后的确定性拒绝测试，过期审批索引会随 task、Turn 或 session 清理，仍不足以覆盖完整权限矩阵。
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 全矩阵端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 

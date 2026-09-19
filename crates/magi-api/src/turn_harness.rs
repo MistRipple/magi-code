@@ -1371,6 +1371,196 @@ mod tests {
             .count()
     }
 
+    async fn run_read_only_explicit_file_tool_case<F>(
+        tool_name: &'static str,
+        request_suffix: &'static str,
+        prompt: String,
+        configure: F,
+    ) -> (tempfile::TempDir, PathBuf, CanonicalTurn, magi_core::Task)
+    where
+        F: FnOnce(&Path) -> (PathBuf, serde_json::Value),
+    {
+        let harness = MagiTurnHarness::new_task(format!("只读模式拒绝显式 {tool_name}"));
+        let workspace_root =
+            tempfile::tempdir().expect("read-only explicit file tool workspace should create");
+        let (target, arguments) = configure(workspace_root.path());
+        let workspace_id =
+            magi_core::WorkspaceId::new(format!("harness-read-only-{request_suffix}-workspace"));
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("read-only explicit file tool workspace should register");
+        let session_id = SessionId::new(format!("harness-read-only-{request_suffix}-session"));
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                format!("只读显式 {tool_name} 验收"),
+                Some(workspace_id.to_string()),
+            )
+            .expect("read-only explicit file tool session should create");
+        harness.provider.set_tool_then_completed(
+            tool_name,
+            arguments.to_string(),
+            "只读模式不会执行文件写工具",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                &prompt,
+                &format!("harness-read-only-{request_suffix}-request"),
+                &format!("harness-read-only-{request_suffix}-user"),
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("read-only explicit file tool task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("read-only explicit file tool should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("read-only explicit file tool should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            0,
+            "ReadOnly 隐藏显式 {tool_name} 后不得进入 Provider"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "ReadOnly 隐藏显式 {tool_name} 后不得发布审批请求"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.status == magi_session_store::CanonicalTurnItemStatus::Failed
+                && item
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains(tool_name))
+        }));
+        (workspace_root, target, turn, task)
+    }
+
+    async fn run_restricted_outside_file_tool_case<F>(
+        tool_name: &'static str,
+        request_suffix: &'static str,
+        prompt: impl Into<String>,
+        configure: F,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        CanonicalTurn,
+        magi_core::Task,
+    )
+    where
+        F: FnOnce(&Path, &Path) -> (PathBuf, serde_json::Value),
+    {
+        let prompt = prompt.into();
+        let harness = MagiTurnHarness::new_task(format!("受限模式拒绝工作区外 {tool_name}"));
+        let workspace_root =
+            tempfile::tempdir().expect("restricted outside file tool workspace should create");
+        let outside_root =
+            tempfile::tempdir().expect("restricted outside file tool target should create");
+        let (observed_target, arguments) = configure(workspace_root.path(), outside_root.path());
+        let workspace_id = magi_core::WorkspaceId::new(format!(
+            "harness-restricted-outside-{request_suffix}-workspace"
+        ));
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("restricted outside file tool workspace should register");
+        let session_id = SessionId::new(format!(
+            "harness-restricted-outside-{request_suffix}-session"
+        ));
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                format!("受限模式工作区外 {tool_name} 验收"),
+                Some(workspace_id.to_string()),
+            )
+            .expect("restricted outside file tool session should create");
+        harness.provider.set_tool_then_completed(
+            tool_name,
+            arguments.to_string(),
+            "工作区外文件操作不应执行",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                &prompt,
+                &format!("harness-restricted-outside-{request_suffix}-request"),
+                &format!("harness-restricted-outside-{request_suffix}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("restricted outside file tool task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("restricted outside file tool should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("restricted outside file tool should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            1,
+            "工作区外 {tool_name} 被确定性拒绝后不得重试 Provider"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "工作区外 {tool_name} 不得创建 pending approval"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "工作区外 {tool_name} 不得发布审批请求"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == tool_name && tool.error.is_some())
+        }));
+        (workspace_root, outside_root, observed_target, turn, task)
+    }
+
     fn timing_metric(
         timing: &HarnessTimingSnapshot,
         metric: fn(&HarnessTimingSnapshot) -> Option<u128>,
@@ -2214,6 +2404,102 @@ mod tests {
                 .iter()
                 .all(|event| event.event_type != "tool.approval.requested"),
             "ReadOnly file_move 不应发布审批请求"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_profile_rejects_explicit_file_patch_mkdir_and_remove_without_side_effect() {
+        let (_patch_workspace, patch_target, patch_turn, _patch_task) =
+            run_read_only_explicit_file_tool_case(
+                "file_patch",
+                "file-patch",
+                "执行一个任务：调用 file_patch 修改工作区文件，然后汇总结果".to_string(),
+                |workspace_root| {
+                    let target = workspace_root.join("read-only-patch.txt");
+                    fs::write(&target, "before\n").expect("read-only patch fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "path": target.display().to_string(),
+                            "old_string": "before",
+                            "new_string": "after"
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(
+            fs::read_to_string(&patch_target).expect("read-only patch target should remain"),
+            "before\n",
+            "ReadOnly file_patch 不得产生文件副作用"
+        );
+        assert!(
+            patch_turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::AssistantText
+                    && item.content.as_deref().is_some_and(|content| {
+                        content.contains("file_patch")
+                            && content.contains("当前工具面没有暴露该工具")
+                    })
+            }),
+            "ReadOnly file_patch 应写回明确的 fail-closed 错误"
+        );
+
+        let (_mkdir_workspace, mkdir_target, mkdir_turn, _mkdir_task) =
+            run_read_only_explicit_file_tool_case(
+                "file_mkdir",
+                "file-mkdir",
+                "执行一个任务：调用 file_mkdir 创建工作区目录，然后汇总结果".to_string(),
+                |workspace_root| {
+                    let target = workspace_root.join("read-only-mkdir").join("nested");
+                    (
+                        target.clone(),
+                        serde_json::json!({"path": target.display().to_string()}),
+                    )
+                },
+            )
+            .await;
+        assert!(!mkdir_target.exists(), "ReadOnly file_mkdir 不得创建目录");
+        assert!(
+            mkdir_turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::AssistantText
+                    && item.content.as_deref().is_some_and(|content| {
+                        content.contains("file_mkdir")
+                            && content.contains("当前工具面没有暴露该工具")
+                    })
+            }),
+            "ReadOnly file_mkdir 应写回明确的 fail-closed 错误"
+        );
+
+        let (_remove_workspace, remove_target, remove_turn, _remove_task) =
+            run_read_only_explicit_file_tool_case(
+                "file_remove",
+                "file-remove",
+                "执行一个任务：调用 file_remove 删除工作区文件，然后汇总结果".to_string(),
+                |workspace_root| {
+                    let target = workspace_root.join("read-only-remove.txt");
+                    fs::write(&target, "must remain")
+                        .expect("read-only remove fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({"path": target.display().to_string()}),
+                    )
+                },
+            )
+            .await;
+        assert!(remove_target.exists(), "ReadOnly file_remove 不得删除文件");
+        assert_eq!(
+            fs::read_to_string(&remove_target).expect("read-only remove target should remain"),
+            "must remain"
+        );
+        assert!(
+            remove_turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::AssistantText
+                    && item.content.as_deref().is_some_and(|content| {
+                        content.contains("file_remove")
+                            && content.contains("当前工具面没有暴露该工具")
+                    })
+            }),
+            "ReadOnly file_remove 应写回明确的 fail-closed 错误"
         );
     }
 
@@ -3392,6 +3678,117 @@ mod tests {
                     .as_ref()
                     .is_some_and(|tool| tool.name == "file_write" && tool.error.is_some())
         }));
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_rejects_file_patch_mkdir_copy_move_and_remove_outside_workspace() {
+        let (_patch_workspace, _patch_outside, patch_target, patch_turn, _patch_task) =
+            run_restricted_outside_file_tool_case(
+                "file_patch",
+                "file-patch",
+                "调用 file_patch 修改工作区之外的文件",
+                |_workspace_root, outside_root| {
+                    let target = outside_root.join("outside-patch.txt");
+                    fs::write(&target, "before\n").expect("outside patch fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "path": target.display().to_string(),
+                            "old_string": "before",
+                            "new_string": "after"
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(
+            fs::read_to_string(&patch_target).expect("outside patch target should remain"),
+            "before\n"
+        );
+        assert!(patch_turn.status.is_terminal());
+
+        let (_mkdir_workspace, _mkdir_outside, mkdir_target, mkdir_turn, _mkdir_task) =
+            run_restricted_outside_file_tool_case(
+                "file_mkdir",
+                "file-mkdir",
+                "调用 file_mkdir 创建工作区之外的目录",
+                |_workspace_root, outside_root| {
+                    let target = outside_root.join("outside-mkdir").join("nested");
+                    (
+                        target.clone(),
+                        serde_json::json!({"path": target.display().to_string()}),
+                    )
+                },
+            )
+            .await;
+        assert!(!mkdir_target.exists());
+        assert!(mkdir_turn.status.is_terminal());
+
+        let (_copy_workspace, _copy_outside, copy_target, copy_turn, _copy_task) =
+            run_restricted_outside_file_tool_case(
+                "file_copy",
+                "file-copy",
+                "调用 file_copy 将文件复制到工作区之外",
+                |workspace_root, outside_root| {
+                    let source = workspace_root.join("copy-source.txt");
+                    let target = outside_root.join("outside-copy.txt");
+                    fs::write(&source, "copy source").expect("copy source fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": target.display().to_string()
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert!(!copy_target.exists());
+        assert!(copy_turn.status.is_terminal());
+
+        let (_move_workspace, _move_outside, move_target, move_turn, _move_task) =
+            run_restricted_outside_file_tool_case(
+                "file_move",
+                "file-move",
+                "调用 file_move 将文件移动到工作区之外",
+                |workspace_root, outside_root| {
+                    let source = workspace_root.join("move-source.txt");
+                    let target = outside_root.join("outside-move.txt");
+                    fs::write(&source, "move source").expect("move source fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": target.display().to_string()
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert!(!move_target.exists());
+        assert!(move_turn.status.is_terminal());
+
+        let (_remove_workspace, _remove_outside, remove_target, remove_turn, _remove_task) =
+            run_restricted_outside_file_tool_case(
+                "file_remove",
+                "file-remove",
+                "调用 file_remove 删除工作区之外的文件",
+                |_workspace_root, outside_root| {
+                    let target = outside_root.join("outside-remove.txt");
+                    fs::write(&target, "must remain").expect("remove target fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({"path": target.display().to_string()}),
+                    )
+                },
+            )
+            .await;
+        assert!(remove_target.exists());
+        assert_eq!(
+            fs::read_to_string(&remove_target).expect("outside remove target should remain"),
+            "must remain"
+        );
+        assert!(remove_turn.status.is_terminal());
     }
 
     #[tokio::test]
