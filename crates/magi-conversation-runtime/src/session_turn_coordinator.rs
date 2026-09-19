@@ -91,7 +91,7 @@ pub enum CoordinatorAdmission {
 }
 
 /// Coordinator 命令的结果。命令执行只改变内存中的生命周期所有权，
-/// durable Turn 事实仍必须由调用方在命令成功后交给 TurnEventSink。
+/// durable Turn 事实仍必须由调用方在命令成功后交给 `CanonicalTurnEventSink`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoordinatorCommandResult {
     Admission(CoordinatorAdmission),

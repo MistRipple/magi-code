@@ -210,7 +210,7 @@ pub struct TurnEventEnvelope {
 }
 
 /// Coordinator 的唯一命令边界。命令只验证生命周期身份；canonical 内容必须由
-/// TurnEventSink 在 durable mutation 成功后产生。
+/// `CanonicalTurnEventSink` 在 durable mutation 成功后产生。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnCommand {
     Start(TurnAdmission),

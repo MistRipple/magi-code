@@ -854,7 +854,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> Result<Option<PublishedSessionTurnItem>, String> {
         append_session_turn_item_for_turn_raw(
             self.session_store
-                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
+                .ok_or_else(|| "CanonicalTurnEventSink 缺少 SessionStore".to_string())?,
             session_id,
             expected_turn_id,
             item,
@@ -870,7 +870,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> Result<Option<PublishedSessionTurnItem>, String> {
         upsert_session_turn_item_for_turn_raw(
             self.session_store
-                .ok_or_else(|| "TurnEventSink 缺少 SessionStore".to_string())?,
+                .ok_or_else(|| "CanonicalTurnEventSink 缺少 SessionStore".to_string())?,
             session_id,
             expected_turn_id,
             item,
@@ -921,7 +921,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
 
     /// 需要保留 SessionStore 原始 DomainError 的边界（例如 API 要把
     /// CurrentTurnConflict 映射为 409）时使用这些方法。它们仍通过同一个
-    /// sink 对象执行 canonical mutation。
+    /// `CanonicalTurnEventSink` 对象执行 canonical mutation。
     pub fn append_item_sidecar(
         &self,
         session_id: &SessionId,
@@ -930,7 +930,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .append_current_turn_item_for_turn(session_id, expected_turn_id, item)
     }
@@ -943,7 +943,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .upsert_current_turn_item_for_turn(session_id, expected_turn_id, item)
     }
@@ -956,7 +956,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<(SessionRuntimeSidecar, bool)>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .update_current_turn_status_for_turn_with_change(session_id, expected_turn_id, status)
     }
@@ -971,7 +971,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .accept_conversation_turn_with_timeline_entry(
                 session_id,
@@ -991,7 +991,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .accept_active_execution_chain_with_timeline_entry_and_task(
                 session_id,
@@ -1012,7 +1012,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar, Option<CanonicalTurn>)> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .accept_goal_continuation_with_timeline_entry_and_task(
                 session_id,
@@ -1035,7 +1035,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .replace_current_turn_with_active_execution_chain_and_timeline_entry_and_task(
                 session_id,
@@ -1054,7 +1054,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .finalize_current_turn_for_continue(session_id, expected_turn_id)
     }
@@ -1068,7 +1068,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<(String, SessionRuntimeSidecar)> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .accept_current_turn_with_timeline_entry(session_id, timeline_entry, turn)
     }
@@ -1079,7 +1079,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .cancel_current_turn(session_id)
     }
@@ -1094,7 +1094,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .interrupt_current_turn_by_user(session_id)
     }
@@ -1106,7 +1106,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .interrupt_current_turn_by_daemon_restart(session_id)
     }
@@ -1118,7 +1118,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     ) -> magi_core::DomainResult<Option<SessionRuntimeSidecar>> {
         self.session_store
             .ok_or_else(|| magi_core::DomainError::InvalidState {
-                message: "TurnEventSink 缺少 SessionStore".to_string(),
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
             })?
             .complete_current_turn_from_completed_root_task_for_turn(session_id, expected_turn_id)
     }

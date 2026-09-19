@@ -565,7 +565,7 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 | 工作区工具调用 | 51 / 61 / 9144 | 60 / 94 / 34131 | 64 / 103 / 49879 | 20/20 completed |
 | 主代理与子代理并发 | 97 / 130 / 53011 | 131 / 175 / 72882 | 143 / 220 / 139254 | 20/20 completed |
 
-直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，三类单轮 CDP timing 证据见 `/tmp/magi-electron-dom-goal-9527.json`，并新增 Goal/Plan DOM 单轮证据；五类场景 20 轮 CDP 采样和性能前后对比仍未完成。
+直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，三类单轮 CDP timing 证据见 `/tmp/magi-electron-dom-agent-9587.json`，并新增 Goal/Plan 与子代理/代理运行中心 DOM 单轮证据；五类场景 20 轮 CDP 采样和性能前后对比仍未完成。
 
 ### 9.2 真实 Provider 单轮验收记录
 

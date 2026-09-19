@@ -35,7 +35,7 @@ Canonical Turn Log
 
 1. 每个 Session 只有一个 `SessionTurnCoordinator`，负责当前 Turn 的生命周期、输入队列、取消和终态。
 2. 普通 Chat 不创建 TaskStore 根任务；只有确实需要工程执行时才创建 Task Run。
-3. 所有 Turn 状态、消息内容和完成通知都经过同一个 `TurnEventSink`，前端和其他模块只消费投影。
+3. 所有 Turn 状态、消息内容和完成通知都经过唯一的 `CanonicalTurnEventSink`，前端和其他模块只消费投影。
 4. TaskStore 只管理任务树、租约和任务恢复，不决定主对话 Turn 是否完成。
 
 这套设计保留 Magi 的工程工作能力，同时把普通对话从任务调度、租约、Git 准备和终态观察链中解耦。它解决的是执行模型本身，不是在现有链路上继续增加补丁。
@@ -53,7 +53,7 @@ Magi 是本地优先的 AI 工程工作空间。主对话既可以回答问题�
 | Task Run | 一轮需要工程执行的运行实例 | TaskRunSupervisor |
 | Task | Task Run 中的一个可调度工作节点 | TaskStore / TaskScheduler |
 | Agent Role | 子代理的角色、能力、模型绑定和提示配置 | AgentRoleRegistry |
-| Turn Event | Turn 的持久事实和实时通知 | TurnEventSink / Canonical Turn Log |
+| Turn Event | Turn 的持久事实和实时通知 | CanonicalTurnEventSink / Canonical Turn Log |
 | Projection | 从 canonical 记录或 TaskStore 生成的读取模型 | 现有读取模型更新器 |
 
 ### 2.2 Turn 执行级别
@@ -163,7 +163,7 @@ flowchart TD
     Scheduler[TaskScheduler]
     Agent[AgentOrchestrator]
     Transport[ProviderTransportPool]
-    Sink[TurnEventSink]
+    Sink[CanonicalTurnEventSink]
     Log[Durable Canonical Turn Log]
     TaskLog[TaskStore]
     Projection[Session / Task / Agent Read Models]
@@ -263,7 +263,7 @@ Coordinator 的唯一性由 `session_id` 建立，不能同时存在 SessionStor
 - 调用共享 ProviderTransport；
 - 产生 assistant item delta；
 - 处理取消和 Provider 错误；
-- 将最终内容交给 TurnEventSink。
+- 将最终内容交给 CanonicalTurnEventSink。
 
 它不创建 TaskStore、lease、Runner、Snapshot 或 Git execution context。
 
@@ -285,13 +285,13 @@ TaskStore 只保存任务树、租约、状态、checkpoint 和恢复数据。Ta
 
 任务状态回调必须在 TaskStore 事务提交完成后异步发布，禁止在 task mutation 临界区内直接执行 SessionStore 写入、磁盘同步或跨模块回调。
 
-### 5.6 `TurnEventSink`
+### 5.6 `CanonicalTurnEventSink`
 
 所有 Turn 事实经过唯一的 Turn Event Sink；Task 状态先提交 TaskStore，再由 TaskCompletionNotifier 通知 Coordinator。TaskStore 不直接写 Session Projection，Coordinator 也不通过扫描 TaskStore 推断 Turn 终态：
 
 ```text
 TurnCommand / ProviderDelta
-  -> TurnEventSink
+  -> CanonicalTurnEventSink
   -> Canonical Turn Log
   -> Read Model Projection
   -> SSE / App Server Notification
@@ -299,7 +299,7 @@ TurnCommand / ProviderDelta
 TaskStore
   -> TaskCompletionNotifier
   -> SessionTurnCoordinator
-  -> TurnEventSink（只记录 Turn 侧关联事实）
+  -> CanonicalTurnEventSink（只记录 Turn 侧关联事实）
 ```
 
 职责：
@@ -462,14 +462,14 @@ ExecutionFinished { turn_id, result }
 Client
   -> TurnService.start
   -> SessionTurnCoordinator.admit
-  -> TurnEventSink.append(turn.accepted + user item)
+  -> CanonicalTurnEventSink.append(turn.accepted + user item)
   -> 返回 accepted receipt
   -> 后台 ConversationExecutor
   -> ContextService 获取冻结上下文
   -> ProviderTransportPool 发起流式请求
-  -> TurnEventSink 发布 assistant item delta
+  -> CanonicalTurnEventSink 发布 assistant item delta
   -> ProviderCompleted
-  -> TurnEventSink 持久化完整内容
+  -> CanonicalTurnEventSink 持久化完整内容
   -> Coordinator 产生 turn.completed
   -> 客户端收到 completed notification
 ```
@@ -487,10 +487,10 @@ Client
   -> TaskScheduler 创建并调度 root task
   -> AgentOrchestrator 按需创建 child task
   -> TaskCompletionNotifier 回到 Coordinator
-  -> Provider / Tool / Agent 事件进入 TurnEventSink
+  -> Provider / Tool / Agent 事件进入 CanonicalTurnEventSink
   -> Task Run 完成或阻塞
   -> Coordinator 生成最终响应
-  -> TurnEventSink 产生 turn.completed / blocked / failed
+  -> CanonicalTurnEventSink 产生 turn.completed / blocked / failed
 ```
 
 子代理不是独立的普通对话，也不创建第二套消息协议。子代理 item 通过 `turn_id + task_id + worker_id + role_id` 关联到主 Turn。
@@ -529,7 +529,7 @@ turn.failed
 turn.cancelled
 ```
 
-事件列表中的 `task.*` 由 TaskStore 产生，`turn.*` 由 TurnEventSink 产生；两者通过 `turn_id` 和 `causation_id` 关联，客户端可以统一订阅但不能混用事实源。
+事件列表中的 `task.*` 由 TaskStore 产生，`turn.*` 由 CanonicalTurnEventSink 产生；两者通过 `turn_id` 和 `causation_id` 关联，客户端可以统一订阅但不能混用事实源。
 
 ### 9.2 `turn.item_delta`
 
@@ -842,7 +842,7 @@ Coordinator
 | terminal observer 二次收口 | 删除，终态直接从 Coordinator 产生 |
 | EventBasedResultReceiver 轮询结果 | 改为 TaskCompletionNotifier |
 | ConversationRegistry 同时维护 session/task Conversation | 已收敛为 task Conversation；session Turn 和 steer 队列由 Coordinator/TurnService 负责 |
-| 每个 delta 完整 canonical upsert | 改为 TurnStreamBuffer + TurnEventSink |
+| 每个 delta 完整 canonical upsert | 改为 TurnStreamBuffer + CanonicalTurnEventSink |
 | 全局 canonical commit lock | 改为 Session/分区级 writer |
 | TaskStore 回调中直接写 SessionStore | 改为提交后异步事件 |
 | App Server 调用 HTTP 路由 | 改为共享 TurnService |
@@ -868,7 +868,7 @@ Coordinator
 ### 17.2 事件事实源
 
 - [x] 扩展现有 canonical 持久化，补齐 Turn 序号、幂等、profile、attempt、item version 和恢复字段。
-- [x] 建立独立的 `CanonicalTurnEventSink`/`TurnEventSink` 结构；trait 保留 Turn 接纳、替换、继续、取消、中断和根任务完成合同，写入、状态和事件发布统一收敛到 `CanonicalTurnEventSink` inherent API，生产 Conversation、Task finalizer、steer、continue、App Server browser tool 和 dispatch 状态写回均通过该边界。
+- [x] 建立唯一的 `CanonicalTurnEventSink` 结构；Turn 接纳、替换、继续、取消、中断和根任务完成合同，以及写入、状态和事件发布均收敛到 `CanonicalTurnEventSink` API，生产 Conversation、Task finalizer、steer、continue、App Server browser tool 和 dispatch 状态写回均通过该边界。
 - [x] Session/Conversation 与 Task/Agent 读取模型按单向事实源更新；`ThreadChatMessage` 只由 canonical projection 重建。
 - [x] accepted 和终态事实可在 daemon 启动时恢复。
 - [x] 建立覆盖真实 SSE/WebSocket 载体的 Turn 快照断线恢复 harness；`MagiTurnHarness` 通过真实 daemon router body 和 App Server WebSocket 完成断线、重连、订阅和 canonical snapshot 重放。
@@ -944,7 +944,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 - [ ] 删除所有外部 current Turn 写入口。
 - [x] 删除旧结果轮询与二次 finalizer 的生产职责。
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
-- [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。新增 Restricted `file_remove` 拒绝、ReadOnly 对七类显式文件写工具的 fail-closed 阻断、Restricted 下 `file_patch`/`file_mkdir`/`file_copy`/`file_move`/`file_remove`/`apply_patch` 工作区外路径确定性拒绝、pending approval 随 Turn 取消、审批请求会话隔离、重复决定冲突、跨 Turn 拒绝记忆隔离以及 5 分钟审批 TTL 到期后的确定性拒绝测试，过期审批索引会随 task、Turn 或 session 清理，仍不足以覆盖完整权限矩阵。2026-09-19 又新增 `magi-tool-runtime` 的访问模式矩阵验收：逐一核对全部 76 个内置工具在 ReadOnly/Restricted/FullAccess 工具轴上的 Allow/Deny/NeedsApproval 结果，补充 shell 命令与路径范围轴、浏览器读写能力轴以及内部 process 工具的只读拒绝、受限审批和完全授权执行；`MagiTurnHarness` 同时新增 ReadOnly `shell_exec` 明确 `access_mode=read_only` 的真实工具轮验收。该批测试只收敛策略分类和代表性真实调用，仍不足以覆盖全部外部工具、副作用、Git 和 MCP 组合。
+- [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。2026-09-19 又新增 `magi-tool-runtime` 的访问模式矩阵验收：逐一核对全部 76 个内置工具在 ReadOnly/Restricted/FullAccess 工具轴上的 Allow/Deny/NeedsApproval 结果，补充 shell 命令与路径范围轴、浏览器读写能力轴以及内部 process 工具的只读拒绝、受限审批和完全授权执行；`MagiTurnHarness` 同时新增 ReadOnly `shell_exec` 明确 `access_mode=read_only` 的真实工具轮验收。该批测试只收敛策略分类和代表性真实调用，仍不足以覆盖全部外部工具、副作用、Git 和 MCP 组合。
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 全矩阵端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 
@@ -960,7 +960,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 随后补充了真实 `MagiTurnHarness` 的 ReadOnly `file_read` 允许路径、ReadOnly 对 `file_copy`/`file_move` 的 fail-closed 阻断、Restricted 工作区内 `file_write`/`file_patch`/`file_mkdir`/`file_copy`/`file_move` 自动允许路径，以及 FullAccess 工作区外 `file_write`、工作区内 `file_patch`/`file_mkdir`/`file_copy`/`file_move`/`file_remove` 路径：只读工具可读取已有文件，写入、复制和移动在只读模式下不进入 Provider 且无副作用，受限工具可在工作区内完成这些文件操作，完全授权可执行未受任务路径策略限制的绝对路径文件操作；这些场景均完成 Turn 和 root Task、无审批事件，并保持读取、写入、复制、移动或删除结果正确。该证据与 Restricted 工作区外路径拒绝验收配对，区分了访问模式与任务路径策略的边界；完整权限组合矩阵仍未完成。
 
-本轮对 `TurnEventSink` 边界做了源码级收敛：仓库内没有外部 trait 对象调用，已删除无调用的重复 trait/impl，仅保留 `CanonicalTurnEventSink` 单一 API；相关 session writeback 与 workspace Rust 全量测试均通过。
+本轮对 `CanonicalTurnEventSink` 边界做了源码级收敛：仓库内没有外部 trait 对象调用，已删除无调用的重复 trait/impl，仅保留 `CanonicalTurnEventSink` 单一 API；相关 session writeback 与 workspace Rust 全量测试均通过。
 
 2026-09-19 在该收敛之后重新执行了 `npm run protocol:check`、`npm --prefix web run check`、`npm test`、`npm --prefix web run build` 和 Electron `--dir` 打包。protocol 检查、Svelte check（0 errors/0 warnings）、Desktop 99 项、Browser Worker 57 项及 Web golden 全部通过，打包产物重新生成于 `target/electron-dist/mac-arm64/Magi.app`；本次属于回归与打包证据，仍不等同于完整 packaged GUI DOM 内容矩阵或真实 Provider 全矩阵。
 
@@ -1001,7 +1001,7 @@ MagiTurnHarness
 13. 终态只产生一次；
 14. 前端首次可见 delta 和最终 DOM 内容。
 
-Harness 必须通过真实 `TurnService` 和真实事件投递路径验证，不能只调用 `TurnEventSink` 或某个内部函数后宣称链路正常。
+Harness 必须通过真实 `TurnService` 和真实事件投递路径验证，不能只调用 `CanonicalTurnEventSink` 或某个内部函数后宣称链路正常。
 
 当前已落地的测试实现位于 `crates/magi-api/src/turn_harness.rs`：它装配真实 `ApiState`、`SessionStore`、`EventBus`、`SessionTurnCoordinator` 和 Conversation/Task dispatcher，通过 `TurnService::submit` 接纳请求；Provider 替身负责可观测累计 delta、工具调用轮次、空流、失败、首帧前暂态重试和可取消阻塞。普通 Chat 的真实链路测试还会记录同一轮的 accepted 返回、Provider 请求开始、首个 Provider delta、首个 EventBus 流事件和 canonical 终态观察时间，并校验事件序号存在且时间线单调；这只是单轮时序证据，不代表 P50/P95 达标。现有测试覆盖普通 Chat、首 delta、最终 canonical projection、普通 Chat 不装配 TaskStore/Runner、Task profile 主链、Task 工具成功执行、单个和多个子代理、自定义 Agent Role 快照、Goal profile 的 Provider 失败收口、steer、取消、真实 SSE/WebSocket 载体断线重连、EventBus 快照重放、request replay、fingerprint conflict、Provider 失败/空流/超时/重试、workspace Git branch 漂移和 merge conflict 阻塞、ReadOnly profile 下写工具确定性阻塞、Restricted profile 下真实 HTTP 审批允许/拒绝、同一 Turn 的 `allow_for_turn` 写工具授权复用、逐次 `allow_once` 写工具授权、Restricted `file_remove` allow_once 删除收口、FullAccess profile 下写工具无审批执行、`file_remove` 拒绝后的文件保留、工作区外路径写入拒绝、待审批操作随 Turn 取消的无副作用收口、跨会话审批决定拒绝，以及重建状态后的 canonical replay。Restricted 审批 harness 验证待审批工具调用通过 `tool.approval.requested` 进入 pending，真实 `/api/session/tool-approval` 的 `allow_once` 会产生文件副作用并继续最终答复，`deny` 不产生副作用且不重复调用 Provider；`allow_for_turn` 场景验证同一 Turn 内同名写工具只产生一次审批并执行两次，逐次 `allow_once` 场景验证两次调用分别审批且各自产生副作用，`file_remove` 拒绝保留目标文件，取消 pending Turn 会清理审批并阻止副作用，FullAccess 场景验证写入产生副作用且不发布审批请求。Task 结果接收器的安装前缓冲 flush、主动通知与兼容轮询的单一有序队列、通知回调重入、Sink panic 后 pending 恢复与回调内替换 Sink 后继续排空也已由 `task_runner_bridge` 定向测试覆盖。该实现仍是分阶段 harness，尚未覆盖完整 approval/权限矩阵和 Electron DOM 全矩阵；忙碌 session 的资源排队、队列身份重放、fingerprint 冲突和 dirty 工作区继续执行已有测试。
 
