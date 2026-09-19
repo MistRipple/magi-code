@@ -2226,12 +2226,11 @@ fn interrupted_execution_resume_restores_owned_goal_plan_and_live_timing() {
         .expect("second owned resume should succeed")
         .expect("second owned resume should produce checkpoint");
     drop(checkpoint);
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn(resumed_turn_id, "running", 20),
-        )
-        .expect("resumed turn should become canonical");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn(resumed_turn_id, "running", 20),
+    );
     let running_goal = store.current_goal(&session_id).expect("goal should remain");
     assert_eq!(running_goal.timing_started_at, Some(UtcMillis(20)));
     assert_eq!(
@@ -2680,9 +2679,7 @@ fn active_goal_terminal_turn_is_not_a_user_response_duration_boundary() {
         "验证 Goal 中间 Turn 不展示总耗时",
         None,
     );
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
-        .expect("goal turn should start");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
     store
         .update_current_turn_status_for_turn(&session_id, Some(turn_id), "failed")
         .expect("goal progress turn should become terminal");
@@ -2741,9 +2738,7 @@ fn goal_time_uses_owned_canonical_turn_wall_clock_without_model_usage() {
     );
     let mut turn = test_turn(turn_id, "completed", 1_000);
     turn.completed_at = Some(UtcMillis(5_250));
-    store
-        .upsert_current_turn(session_id.clone(), turn)
-        .expect("terminal goal turn should upsert");
+    accept_test_turn(&store, &session_id, turn);
 
     let current = store
         .current_goal(&session_id)
@@ -2801,9 +2796,7 @@ fn running_goal_turn_exposes_live_timing_until_terminal_settlement() {
         .create_session(session_id.clone(), "Goal Live Time")
         .expect("session should be creatable");
     create_test_goal(&store, &session_id, turn_id, "验证 Goal 运行中计时", None);
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 1_000))
-        .expect("running goal turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 1_000));
 
     let running = store
         .current_goal(&session_id)
@@ -2839,9 +2832,7 @@ fn paused_goal_hides_live_timing_and_completed_goal_keeps_final_turn_running() {
         .create_session(session_id.clone(), "Goal Timing Status")
         .expect("session should be creatable");
     let goal = create_test_goal(&store, &session_id, turn_id, "验证 Goal 状态计时边界", None);
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 1_000))
-        .expect("running goal turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 1_000));
 
     let (paused, _) = store
         .pause_goal_with_plan(&session_id, &goal.goal_id, goal.control_revision, None)
@@ -2888,9 +2879,7 @@ fn blocked_goal_turn_with_completion_timestamp_is_settled() {
     create_test_goal(&store, &session_id, turn_id, "验证阻塞 Turn 计时结算", None);
     let mut turn = test_turn(turn_id, "blocked", 1_000);
     turn.completed_at = Some(UtcMillis(5_250));
-    store
-        .upsert_current_turn(session_id.clone(), turn)
-        .expect("blocked goal turn should upsert");
+    accept_test_turn(&store, &session_id, turn);
 
     let current = store
         .current_goal(&session_id)
@@ -2914,9 +2903,7 @@ fn completed_goal_terminal_turn_is_the_user_response_duration_boundary() {
         "验证 Goal 最终 Turn 展示总耗时",
         None,
     );
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 20))
-        .expect("goal turn should start");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 20));
     store
         .complete_goal(
             &session_id,
@@ -2951,9 +2938,7 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
     user_item.item_seq = 1;
     user_item.request_id = Some("request-durable-turn".to_string());
     running_turn.items.push(user_item);
-    store
-        .upsert_current_turn(session_id.clone(), running_turn)
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, running_turn);
 
     let mut assistant_item = test_turn_item("turn-item-durable-assistant", "持久回复");
     assistant_item.kind = "assistant_stream".to_string();
@@ -3020,9 +3005,7 @@ fn canonical_writer_failure_keeps_completion_goal_plan_and_flush_unchanged() {
             Some(0),
         )
         .expect("plan should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
-        .expect("running turn should be stored");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
 
     let before = store_mutation_snapshot(&store);
     reject_canonical_writes(&store);
@@ -3050,9 +3033,7 @@ fn canonical_writer_failure_keeps_root_task_completion_unchanged() {
     store
         .create_session(session_id.clone(), "Writer Failure Root Completion")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
-        .expect("running turn should be stored");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
 
     let before = store_mutation_snapshot(&store);
     reject_canonical_writes(&store);
@@ -3105,9 +3086,7 @@ fn canonical_writer_failure_keeps_cancelled_turn_and_goal_plan_unchanged() {
             Some(0),
         )
         .expect("plan should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
-        .expect("running turn should be stored");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
 
     let before = store_mutation_snapshot(&store);
     reject_canonical_writes(&store);
@@ -3645,9 +3624,7 @@ fn image_only_user_message_is_renderable_without_synthetic_text() {
             "dataUrl": "data:image/png;base64,AAA"
         }]),
     );
-    store
-        .upsert_current_turn(session_id.clone(), turn)
-        .expect("image-only turn should upsert");
+    accept_test_turn(&store, &session_id, turn);
 
     let user_message = store
         .canonical_turns_for_session(&session_id)
@@ -3667,12 +3644,11 @@ fn blocked_current_turn_is_terminal_in_canonical_log() {
     store
         .create_session(session_id.clone(), "Blocked Terminal Canonical")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-blocked-terminal", "running", 10),
-        )
-        .expect("turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-blocked-terminal", "running", 10),
+    );
 
     let mut assistant_item = test_turn_item("turn-item-blocked-assistant", "等待用户处理");
     assistant_item.kind = "assistant_error".to_string();
@@ -3709,12 +3685,11 @@ fn killed_current_turn_status_is_stored_as_cancelled_terminal_turn() {
     store
         .create_session(session_id.clone(), "Killed Terminal Canonical")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-killed-terminal", "running", 10),
-        )
-        .expect("turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-killed-terminal", "running", 10),
+    );
 
     let mut assistant_item = test_turn_item("turn-item-killed-assistant", "任务执行已终止");
     assistant_item.kind = "assistant_error".to_string();
