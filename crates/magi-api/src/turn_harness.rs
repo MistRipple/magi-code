@@ -1565,6 +1565,98 @@ mod tests {
         (workspace_root, outside_root, observed_target, turn, task)
     }
 
+    async fn run_full_access_file_tool_case<F>(
+        tool_name: &'static str,
+        request_suffix: &'static str,
+        prompt: &'static str,
+        configure: F,
+    ) -> (tempfile::TempDir, PathBuf, CanonicalTurn, magi_core::Task)
+    where
+        F: FnOnce(&Path) -> (PathBuf, serde_json::Value),
+    {
+        let harness = MagiTurnHarness::new_task(format!("完全授权 {tool_name}"));
+        let workspace_root =
+            tempfile::tempdir().expect("full access file tool workspace should create");
+        let (observed_target, arguments) = configure(workspace_root.path());
+        let workspace_id =
+            magi_core::WorkspaceId::new(format!("harness-full-access-{request_suffix}-workspace"));
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("full access file tool workspace should register");
+        let session_id = SessionId::new(format!("harness-full-access-{request_suffix}-session"));
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                format!("完全授权 {tool_name} 验收"),
+                Some(workspace_id.to_string()),
+            )
+            .expect("full access file tool session should create");
+        harness.provider.set_tool_then_completed(
+            tool_name,
+            arguments.to_string(),
+            "完全授权文件工具完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                prompt,
+                &format!("harness-full-access-{request_suffix}-request"),
+                &format!("harness-full-access-{request_suffix}-user"),
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("full access file tool task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("full access file tool should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("full access file tool should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "完全授权 {tool_name} 应执行工具轮和一次最终答复轮"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "完全授权 {tool_name} 不应创建 pending approval"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "完全授权 {tool_name} 不应发布审批请求"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == tool_name && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+        (workspace_root, observed_target, turn, task)
+    }
+
     fn timing_metric(
         timing: &HarnessTimingSnapshot,
         metric: fn(&HarnessTimingSnapshot) -> Option<u128>,
@@ -4046,6 +4138,90 @@ mod tests {
                     tool.name == "file_remove" && tool.result.is_some() && tool.error.is_none()
                 })
         }));
+    }
+
+    #[tokio::test]
+    async fn full_access_profile_executes_patch_mkdir_copy_and_move_without_approval() {
+        let (_patch_workspace, patch_target, _patch_turn, _patch_task) =
+            run_full_access_file_tool_case(
+                "file_patch",
+                "file-patch",
+                "调用 file_patch 修改文件并返回结果",
+                |workspace_root| {
+                    let target = workspace_root.join("full-access-patch.txt");
+                    fs::write(&target, "before\n").expect("full access patch fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "path": target.display().to_string(),
+                            "old_string": "before",
+                            "new_string": "after"
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(fs::read_to_string(&patch_target).unwrap(), "after\n");
+
+        let (_mkdir_workspace, mkdir_target, _mkdir_turn, _mkdir_task) =
+            run_full_access_file_tool_case(
+                "file_mkdir",
+                "file-mkdir",
+                "调用 file_mkdir 创建目录并返回结果",
+                |workspace_root| {
+                    let target = workspace_root.join("full-access-mkdir").join("nested");
+                    (
+                        target.clone(),
+                        serde_json::json!({"path": target.display().to_string()}),
+                    )
+                },
+            )
+            .await;
+        assert!(mkdir_target.is_dir());
+
+        let (_copy_workspace, copy_target, _copy_turn, _copy_task) =
+            run_full_access_file_tool_case(
+                "file_copy",
+                "file-copy",
+                "调用 file_copy 复制文件并返回结果",
+                |workspace_root| {
+                    let source = workspace_root.join("full-access-copy-source.txt");
+                    let target = workspace_root.join("full-access-copy-target.txt");
+                    fs::write(&source, "copy content")
+                        .expect("full access copy fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": target.display().to_string()
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(fs::read_to_string(&copy_target).unwrap(), "copy content");
+
+        let (_move_workspace, move_target, _move_turn, _move_task) =
+            run_full_access_file_tool_case(
+                "file_move",
+                "file-move",
+                "调用 file_move 移动文件并返回结果",
+                |workspace_root| {
+                    let source = workspace_root.join("full-access-move-source.txt");
+                    let target = workspace_root.join("full-access-move-target.txt");
+                    fs::write(&source, "move content")
+                        .expect("full access move fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": target.display().to_string()
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(fs::read_to_string(&move_target).unwrap(), "move content");
     }
 
     #[tokio::test]
