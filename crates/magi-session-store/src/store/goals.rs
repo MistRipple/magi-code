@@ -1,8 +1,8 @@
-use super::{SessionStore, unique_timeline_entry_id};
+use super::{SessionStore, TimelineEntryInput, unique_timeline_entry_id};
 use crate::models::{
-    GoalBlockerState, GoalCompletionRecord, GoalContinuationPhase, GoalContinuationState,
-    GoalResumeCheckpoint, GoalRevisionExpectation, GoalStatus, SessionGoal, SessionPlan,
-    SessionStoreState, TimelineEntry, TimelineEntryKind,
+    ActiveExecutionTurn, GoalBlockerState, GoalCompletionRecord, GoalContinuationPhase,
+    GoalContinuationState, GoalResumeCheckpoint, GoalRevisionExpectation, GoalStatus, SessionGoal,
+    SessionPlan, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     AccessProfile, DomainError, DomainResult, GoalId, PlanItemStatus, PlanState, SessionId, TaskId,
@@ -2375,9 +2375,15 @@ mod tests {
             None,
         );
         store
-            .upsert_current_turn(
+            .accept_current_turn_with_timeline_entry(
                 session_id.clone(),
-                crate::models::ActiveExecutionTurn {
+                TimelineEntryInput::new(
+                    "timeline-goal-interrupt-owner",
+                    TimelineEntryKind::UserMessage,
+                    "推进目标",
+                    UtcMillis(1),
+                ),
+                ActiveExecutionTurn {
                     turn_id: "turn-goal-interrupt-owner".to_string(),
                     turn_seq: 1,
                     accepted_at: UtcMillis(1),
