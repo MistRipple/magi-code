@@ -3331,12 +3331,11 @@ fn canonical_turn_request_id_lookup_survives_normalization_and_restore() {
     store
         .create_session(session_id.clone(), "Request ID Lookup")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-request-id", "running", 10),
-        )
-        .expect("turn should be accepted");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-request-id", "running", 10),
+    );
 
     let mut item = test_turn_item("item-request-id", "幂等请求");
     item.request_id = Some("request-id-1".to_string());
@@ -3376,12 +3375,11 @@ fn completed_current_turn_marks_session_completion_unread() {
     store
         .create_session(session_id.clone(), "Unread Completion")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-unread-completion", "running", 10),
-        )
-        .expect("running turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-unread-completion", "running", 10),
+    );
 
     store
         .update_current_turn_status_for_turn(
@@ -3403,12 +3401,11 @@ fn completed_root_task_marks_session_completion_unread() {
     store
         .create_session(session_id.clone(), "Root Task Unread Completion")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-root-task-unread-completion", "running", 10),
-        )
-        .expect("running turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-root-task-unread-completion", "running", 10),
+    );
 
     store
         .complete_current_turn_from_completed_root_task_for_turn(
@@ -3429,12 +3426,11 @@ fn marking_session_viewed_clears_unread_completion_and_survives_restore() {
     store
         .create_session(session_id.clone(), "Viewed Completion")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-viewed-completion", "running", 10),
-        )
-        .expect("running turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-viewed-completion", "running", 10),
+    );
     store
         .update_current_turn_status_for_turn(
             &session_id,
@@ -3478,12 +3474,11 @@ fn failed_current_turn_does_not_mark_successful_completion_unread() {
     store
         .create_session(session_id.clone(), "Failed Completion")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-failed-no-unread-completion", "running", 10),
-        )
-        .expect("running turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-failed-no-unread-completion", "running", 10),
+    );
 
     store
         .update_current_turn_status_for_turn(
@@ -3505,12 +3500,11 @@ fn replaying_completed_current_turn_keeps_original_completion_read_state() {
     store
         .create_session(session_id.clone(), "Completed Replay")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-completed-replay", "running", 10),
-        )
-        .expect("running turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-completed-replay", "running", 10),
+    );
     store
         .update_current_turn_status_for_turn(
             &session_id,
@@ -3546,12 +3540,11 @@ fn current_turn_hides_runtime_internal_tool_calls_in_durable_canonical_log() {
     store
         .create_session(session_id.clone(), "Durable Internal Tool Hidden")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-internal-tool", "running", 10),
-        )
-        .expect("running turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-internal-tool", "running", 10),
+    );
 
     let mut wait_item = test_turn_item("turn-item-agent-wait", "{\"status\":\"succeeded\"}");
     wait_item.kind = "tool_call_result".to_string();
@@ -3835,12 +3828,11 @@ fn killed_task_status_item_is_written_as_cancelled_canonical_item() {
     store
         .create_session(session_id.clone(), "Killed Task Status Item")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-killed-task-status-item", "running", 10),
-        )
-        .expect("turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-killed-task-status-item", "running", 10),
+    );
 
     let mut task_item = test_turn_item("turn-item-task-killed", "子任务已终止");
     task_item.kind = "task_status".to_string();
@@ -3870,12 +3862,11 @@ fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() 
     store
         .create_session(session_id.clone(), "Sidecar Terminal Wins")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-terminal-wins", "running", 10),
-        )
-        .expect("turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-terminal-wins", "running", 10),
+    );
     store
         .update_current_turn_status_for_turn(&session_id, Some("turn-terminal-wins"), "completed")
         .expect("turn should complete");
@@ -3911,12 +3902,11 @@ fn persisted_parts_rejects_non_terminal_canonical_and_sidecar_item_mismatch() {
     store
         .create_session(session_id.clone(), "Terminal Active Item Repair")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-terminal-active-item-repair", "running", 10),
-        )
-        .expect("turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-terminal-active-item-repair", "running", 10),
+    );
 
     let mut assistant_item = test_turn_item("turn-item-terminal-active", "任务执行需要处理");
     assistant_item.kind = "assistant_error".to_string();
@@ -3955,12 +3945,11 @@ fn persisted_parts_rejects_sidecar_turn_without_canonical_fact() {
     store
         .create_session(session_id.clone(), "Sidecar Without Canonical")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-sidecar-without-canonical", "running", 10),
-        )
-        .expect("turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-sidecar-without-canonical", "running", 10),
+    );
     let mut durable = store.durable_state();
     durable.canonical_turns.clear();
 
@@ -4089,15 +4078,11 @@ fn stale_turn_writeback_cannot_mutate_a_replacement_turn_or_resurrect_cancelled_
     store
         .create_session(session_id.clone(), "Stale Writeback Replacement")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-old", "running", 1))
-        .expect("old turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-old", "running", 1));
     store
         .interrupt_current_turn_by_user(&session_id)
         .expect("old turn should be interruptible");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-new", "running", 2))
-        .expect("replacement turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-new", "running", 2));
 
     let stale_item = store.append_current_turn_item_for_turn(
         &session_id,
@@ -5460,12 +5445,11 @@ fn delete_session_removes_canonical_turns_and_execution_threads() {
         .create_session(session_id.clone(), "Delete Runtime History")
         .expect("session should be creatable");
     store.ensure_session_mission(&session_id, UtcMillis(10), || mission_id);
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-delete-runtime-history", "completed", 11),
-        )
-        .expect("canonical turn should persist");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-delete-runtime-history", "completed", 11),
+    );
 
     assert_eq!(store.thread_registry_snapshot(&session_id).len(), 1);
     assert_eq!(store.canonical_turns_for_session(&session_id).len(), 1);
@@ -5570,9 +5554,7 @@ fn execution_task_ids_are_recoverable_from_durable_canonical_turns() {
     let mut item = test_turn_item("item-durable-task-ids", "task item");
     item.task_id = Some(task_id.clone());
     turn.items.push(item);
-    store
-        .upsert_current_turn(session_id.clone(), turn)
-        .expect("canonical turn should persist");
+    accept_test_turn(&store, &session_id, turn);
 
     let restored = SessionStore::from_persisted_parts(
         store.durable_state(),
