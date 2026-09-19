@@ -2933,6 +2933,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_file_remove_allow_once_deletes_target_without_retry() {
+        let harness = MagiTurnHarness::new_task("审批后删除文件");
+        let workspace_root = tempfile::tempdir().expect("remove approval workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-remove-approval-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("remove approval workspace should register");
+        let session_id = SessionId::new("harness-remove-approval-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "审批删除文件验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("remove approval session should create");
+        let target = workspace_root.path().join("approval-remove.txt");
+        fs::write(&target, "delete after approval").expect("remove approval fixture should write");
+        harness.provider.set_tool_then_completed(
+            "file_remove",
+            serde_json::json!({"path": target.display().to_string()}).to_string(),
+            "审批删除文件完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 file_remove 删除工作区内文件，等待审批后汇总结果",
+                "harness-remove-approval-request",
+                "harness-remove-approval-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("remove approval task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("remove approval task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("remove approval task should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "file_remove");
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert!(!target.exists(), "allow_once file_remove 应删除目标文件");
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "allow_once file_remove 后不得重复请求 Provider"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "tool.approval.resolved"),
+            "allow_once file_remove 必须发布 resolved 事件"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "file_remove" && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn restricted_profile_approval_denial_fails_without_repeating_write_tool() {
         let harness = MagiTurnHarness::new_task("不会执行被拒绝写入");
         let workspace_root = tempfile::tempdir().expect("approval workspace should create");
