@@ -1315,8 +1315,12 @@ pub fn prepare_pending_dispatch_submission(
     })
 }
 
-/// 由直接调用 runtime 的旧测试/内部入口使用，完整装配仍在返回 graph 前完成。
-pub fn run_dispatch_submission(
+/// 测试专用的完整 dispatch 装配入口。
+///
+/// 生产 API 使用 `prepare_pending_dispatch_submission` 与
+/// `materialize_dispatch_submission` 分阶段接纳，避免保留第二条提交路径。
+#[cfg(test)]
+fn run_dispatch_submission_for_test(
     runtime: &DispatchSubmissionRuntime<'_>,
     request: &DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionGraph, DispatchSubmissionRunError> {
@@ -1955,7 +1959,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request)
+        let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("dispatch submission should build graph");
         let chain = graph
             .active_execution_chain
@@ -2037,9 +2041,9 @@ mod tests {
             turn_origin: DispatchTurnOrigin::User,
         };
 
-        let first = run_dispatch_submission(&runtime, &make_request(UtcMillis(1_000)))
+        let first = run_dispatch_submission_for_test(&runtime, &make_request(UtcMillis(1_000)))
             .expect("first coordinator dispatch should build");
-        let second = run_dispatch_submission(&runtime, &make_request(UtcMillis(2_000)))
+        let second = run_dispatch_submission_for_test(&runtime, &make_request(UtcMillis(2_000)))
             .expect("second coordinator dispatch should build");
         let orchestrator_thread_id = session_store
             .orchestrator_thread_for_session(&session_id)
@@ -2147,7 +2151,7 @@ mod tests {
             workspace_root_path: Some(Path::new("/tmp/workspace-dispatch-browser-annotation")),
         };
 
-        let graph = run_dispatch_submission(&runtime, &request)
+        let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("browser annotation dispatch should build graph");
         let task = task_store
             .get_task(&graph.root_task_id)
@@ -2469,7 +2473,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request)
+        let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("resume dispatch should build graph");
         let destination_thread_id = graph
             .active_execution_chain
@@ -2723,7 +2727,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let error = match run_dispatch_submission(&runtime, &request) {
+        let error = match run_dispatch_submission_for_test(&runtime, &request) {
             Ok(_) => panic!("mismatched source thread should reject dispatch"),
             Err(error) => error,
         };
@@ -2823,7 +2827,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request)
+        let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("execution chain dispatch should build graph");
 
         let action_task = task_store
@@ -2936,7 +2940,8 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request).expect("dispatch should build");
+        let graph =
+            run_dispatch_submission_for_test(&runtime, &request).expect("dispatch should build");
         let root_task = task_store
             .get_task(&graph.root_task_id)
             .expect("root task should exist");
@@ -3009,7 +3014,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request)
+        let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("dispatch submission should build graph");
         let action_task = task_store
             .get_task(&graph.action_task_id)
@@ -3088,7 +3093,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request)
+        let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("dispatch submission should build graph");
         let action_task = task_store
             .get_task(&graph.action_task_id)
@@ -3174,7 +3179,7 @@ mod tests {
             workspace_root_path: Some(&workspace_root),
         };
 
-        let graph = run_dispatch_submission(&runtime, &request)
+        let graph = run_dispatch_submission_for_test(&runtime, &request)
             .expect("dispatch submission should propagate context reference");
         let task = task_store
             .get_task(&graph.action_task_id)
@@ -3281,7 +3286,8 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request).expect("dispatch should build");
+        let graph =
+            run_dispatch_submission_for_test(&runtime, &request).expect("dispatch should build");
         let chain = graph
             .active_execution_chain
             .as_ref()
@@ -3409,7 +3415,8 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let graph = run_dispatch_submission(&runtime, &request).expect("dispatch should build");
+        let graph =
+            run_dispatch_submission_for_test(&runtime, &request).expect("dispatch should build");
         let root_task_id = graph.root_task_id.clone();
         let mut clear_request = request.clone();
         clear_request.accepted_at = UtcMillis(6_001);
@@ -3449,7 +3456,7 @@ mod tests {
         assert_eq!(paused.status, GoalStatus::Paused);
         assert_eq!(paused.continuation.phase, GoalContinuationPhase::Idle);
 
-        let clear_graph = run_dispatch_submission(&runtime, &clear_request)
+        let clear_graph = run_dispatch_submission_for_test(&runtime, &clear_request)
             .expect("dispatch should build before goal clear");
         let clear_root_task_id = clear_graph.root_task_id.clone();
         session_store
@@ -3524,7 +3531,7 @@ mod tests {
             })
             .expect("conflicting thread should register");
 
-        let error = match run_dispatch_submission(&runtime, &request) {
+        let error = match run_dispatch_submission_for_test(&runtime, &request) {
             Ok(_) => panic!("duplicate worker thread id must reject materialization"),
             Err(error) => error,
         };
