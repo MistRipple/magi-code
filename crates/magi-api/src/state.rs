@@ -27,6 +27,8 @@ use magi_browser_authority::{
     BrowserProfile, BrowserProfileKind, BrowserSession, BrowserSessionLifecycle,
     BrowserSurfaceControlSnapshot,
 };
+#[cfg(test)]
+use magi_conversation_runtime::task_runner_bridge::EventBasedResultReceiver;
 use magi_conversation_runtime::{
     CanonicalTurnEventSink, ConversationRegistry, CoordinatorCommandResult, SessionTurnCoordinator,
     TaskCompletionNotifier,
@@ -34,9 +36,7 @@ use magi_conversation_runtime::{
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
     task_runner::TaskRunner,
-    task_runner_bridge::{
-        EventBasedResultReceiver, RunCycleOutcome, TaskDispatchGate, TaskDispatcher,
-    },
+    task_runner_bridge::{RunCycleOutcome, TaskDispatchGate, TaskDispatcher},
 };
 use magi_core::{
     AccessProfile, BrowserProfileId, BrowserTabId, DomainError, DomainResult, SessionId,
@@ -284,9 +284,6 @@ pub struct RunnerManager {
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
     execution_admission: Arc<ExecutionAdmissionController>,
-    /// Shared result receiver that collects task completion/failure results
-    /// pushed from the TaskStore's status-change callback.
-    result_receiver: Arc<EventBasedResultReceiver>,
     /// 任务快照提交回调。daemon 在这里把 manifest 提交与 accepted WAL 收敛绑定为
     /// 同一个持久化事务，Runner 不允许绕过该入口直接写 projection。
     checkpoint_persist: Option<TaskCheckpointPersist>,
@@ -328,7 +325,6 @@ impl RunnerManager {
         session_store: Arc<SessionStore>,
         worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
         dispatcher: Arc<dyn TaskDispatcher>,
-        result_receiver: Arc<EventBasedResultReceiver>,
     ) -> Self {
         Self {
             runners: Arc::new(Mutex::new(HashMap::new())),
@@ -341,7 +337,6 @@ impl RunnerManager {
             dispatcher: Some(dispatcher),
             dispatch_gate: None,
             execution_admission: Arc::new(ExecutionAdmissionController::default()),
-            result_receiver,
             checkpoint_persist: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -400,13 +395,6 @@ impl RunnerManager {
     pub fn with_checkpoint_persist(mut self, persist: TaskCheckpointPersist) -> Self {
         self.checkpoint_persist = Some(persist);
         self
-    }
-
-    /// Get a reference to the shared result receiver.
-    ///
-    /// 供 daemon 读取共享结果接收器并装配主动完成通知目标。
-    pub fn result_receiver(&self) -> &Arc<EventBasedResultReceiver> {
-        &self.result_receiver
     }
 
     /// 串行化指定 session 与 root task 生命周期后启动 runner。
@@ -5559,7 +5547,6 @@ mod tests {
                 ]
             }),
             dispatcher,
-            Arc::new(EventBasedResultReceiver::new()),
         )
         .with_agent_role_registry(Arc::new(AgentRoleRegistry::from_map(HashMap::from([
             ("executor".to_string(), test_agent_role("executor")),
@@ -5616,7 +5603,6 @@ mod tests {
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
             }),
-            Arc::new(EventBasedResultReceiver::new()),
         );
         let cancel = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicBool::new(true));
@@ -5663,7 +5649,6 @@ mod tests {
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
             }),
-            Arc::new(EventBasedResultReceiver::new()),
         );
         let session_id = SessionId::new("session-blocked-runner-cleanup");
         let root_task_id = "task-blocked-runner-cleanup";
@@ -5733,7 +5718,6 @@ mod tests {
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
             }),
-            Arc::new(EventBasedResultReceiver::new()),
         );
         let cancel = Arc::new(AtomicBool::new(false));
         let background_cancel = cancel.clone();
@@ -5773,7 +5757,6 @@ mod tests {
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
             }),
-            Arc::new(EventBasedResultReceiver::new()),
         );
         let cancel = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicBool::new(true));
@@ -5814,7 +5797,6 @@ mod tests {
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
             }),
-            Arc::new(EventBasedResultReceiver::new()),
         );
         let root_task_id = "task-runner-join-panic";
         let join_handle = tokio::spawn(async move {
@@ -5859,7 +5841,6 @@ mod tests {
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
             }),
-            Arc::new(EventBasedResultReceiver::new()),
         );
 
         assert!(matches!(
@@ -5889,7 +5870,6 @@ mod tests {
                 }]
             }),
             Arc::new(PanickingDispatcher),
-            Arc::new(EventBasedResultReceiver::new()),
         );
 
         let handle = manager
@@ -5964,7 +5944,6 @@ mod tests {
             Arc::new(CompletingDispatcher {
                 result_receiver: result_receiver.clone(),
             }),
-            result_receiver,
         )
         .with_checkpoint_persist(Arc::new(move |_| {
             runner_checkpoint_count_for_callback.fetch_add(1, Ordering::SeqCst);
@@ -6017,7 +5996,6 @@ mod tests {
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
             }),
-            Arc::new(EventBasedResultReceiver::new()),
         )
         .with_checkpoint_persist(Arc::new(|_| {
             Err(DomainError::Persistence {

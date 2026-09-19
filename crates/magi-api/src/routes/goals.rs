@@ -654,7 +654,6 @@ mod tests {
             session_store,
             Arc::new(move || state_for_workers.task_worker_catalog()),
             runner_dispatcher,
-            result_receiver,
         )
         .with_agent_role_registry(Arc::clone(&state.agent_role_registry));
         state

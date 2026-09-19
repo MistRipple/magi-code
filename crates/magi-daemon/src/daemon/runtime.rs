@@ -1961,7 +1961,6 @@ impl DaemonRuntime {
             state.session_store.clone(),
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
             llm_task_dispatcher,
-            runner_result_receiver,
         )
         .with_agent_role_registry(state.agent_role_registry.clone())
         .with_execution_admission(Arc::clone(&execution_admission))

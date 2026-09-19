@@ -5745,10 +5745,8 @@ mod tests {
         http::{Request, StatusCode},
     };
     use magi_conversation_runtime::{
-        CanonicalTurnEventSink,
-        execution_admission::ExecutionAdmissionPermit,
-        task_execution_registry::TaskExecutionPlan,
-        task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher},
+        CanonicalTurnEventSink, execution_admission::ExecutionAdmissionPermit,
+        task_execution_registry::TaskExecutionPlan, task_runner_bridge::TaskDispatcher,
     };
     use magi_core::{
         AbsolutePath, ExecutionOwnership, ExecutionResultStatus, GoalId, MissionId, Task,
@@ -6022,7 +6020,6 @@ mod tests {
                 }]
             }),
             Arc::new(PendingTaskDispatcher),
-            Arc::new(EventBasedResultReceiver::new()),
         );
         ApiState::new(
             "magi-test",
