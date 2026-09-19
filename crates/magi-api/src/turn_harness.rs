@@ -3972,6 +3972,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_access_profile_executes_file_remove_without_approval() {
+        let harness = MagiTurnHarness::new_task("完全授权删除文件");
+        let workspace_root =
+            tempfile::tempdir().expect("full access remove workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-full-access-remove-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("full access remove workspace should register");
+        let session_id = SessionId::new("harness-full-access-remove-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "完全授权删除文件验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("full access remove session should create");
+        let target = workspace_root.path().join("full-access-remove.txt");
+        fs::write(&target, "remove me").expect("full access remove fixture should write");
+        harness.provider.set_tool_then_completed(
+            "file_remove",
+            serde_json::json!({"path": target.display().to_string()}).to_string(),
+            "完全授权删除文件完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 file_remove 删除工作区内文件并返回结果",
+                "harness-full-access-remove-request",
+                "harness-full-access-remove-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("full access remove task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("full access remove task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("full access remove task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert!(!target.exists(), "完全授权 file_remove 应删除目标文件");
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "完全授权 file_remove 应执行工具轮和一次最终答复轮"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "完全授权 file_remove 不应发布审批请求"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "file_remove" && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn restricted_profile_allow_for_turn_reuses_write_tool_grant() {
         let harness = MagiTurnHarness::new_task("按 Turn 授权完成");
         let workspace_root = tempfile::tempdir().expect("turn grant workspace should create");
