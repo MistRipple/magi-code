@@ -1431,8 +1431,12 @@ mod tests {
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed, "tool={tool_name}");
+        assert_eq!(
+            task.status,
+            magi_core::TaskStatus::Failed,
+            "tool={tool_name}"
+        );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
             0,
@@ -2526,6 +2530,45 @@ mod tests {
                     content.contains("apply_patch") && content.contains("当前工具面没有暴露该工具")
                 })
         }));
+    }
+
+    #[tokio::test]
+    async fn read_only_profile_rejects_explicit_image_and_git_writes() {
+        for (tool_name, request_suffix, prompt, arguments) in [
+            (
+                "image_generate",
+                "image-generate",
+                "执行一个任务：调用 image_generate 生成文件，然后汇总结果",
+                serde_json::json!({
+                    "prompt": "must not generate",
+                    "output_path": "read-only-image.png"
+                }),
+            ),
+            (
+                "git_push",
+                "git-push",
+                "执行一个任务：调用 git_push 推送分支，然后汇总结果",
+                serde_json::json!({"remote": "origin", "branch": "blocked"}),
+            ),
+        ] {
+            let (_workspace, target, turn, task) = run_read_only_explicit_file_tool_case(
+                tool_name,
+                request_suffix,
+                prompt.to_string(),
+                |workspace_root| {
+                    let target = workspace_root.join(format!("{request_suffix}.marker"));
+                    (target, arguments.clone())
+                },
+            )
+            .await;
+            assert!(!target.exists(), "ReadOnly {tool_name} 不得产生文件副作用");
+            assert_eq!(turn.status, CanonicalTurnStatus::Failed, "tool={tool_name}");
+            assert_eq!(
+                task.status,
+                magi_core::TaskStatus::Failed,
+                "tool={tool_name}"
+            );
+        }
     }
 
     #[tokio::test]
