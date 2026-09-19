@@ -3673,6 +3673,63 @@ fn registry_rejects_process_side_effects_in_read_only_access() {
 }
 
 #[test]
+fn internal_process_access_profile_matrix_is_fail_closed() {
+    let root = unique_temp_dir("magi-tool-process-profile-matrix");
+    let registry = make_registry();
+    let context = ToolExecutionContext {
+        task_id: Some(TaskId::new("task-process-profile-matrix")),
+        session_id: Some(SessionId::new("session-process-profile-matrix")),
+        workspace_id: Some(WorkspaceId::new("workspace-process-profile-matrix")),
+        working_directory: Some(root.clone()),
+        ..ToolExecutionContext::default()
+    };
+    let input = || {
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tc-process-profile-matrix"),
+            BuiltinToolName::ProcessLaunch.as_str(),
+            serde_json::json!({ "command": "sleep 2" }).to_string(),
+        )
+    };
+
+    let read_only = registry.execute_internal_builtin_with_policy(
+        input(),
+        context.clone(),
+        &ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::ReadOnly,
+            ..ToolExecutionPolicy::default()
+        },
+    );
+    assert_eq!(read_only.status, ExecutionResultStatus::Rejected);
+
+    let restricted = registry.execute_internal_builtin_with_policy(
+        input(),
+        context.clone(),
+        &ToolExecutionPolicy::default(),
+    );
+    assert_eq!(restricted.status, ExecutionResultStatus::NeedsApproval);
+
+    let full_access = registry.execute_internal_builtin_with_policy(
+        input(),
+        context.clone(),
+        &full_access_policy(),
+    );
+    assert_eq!(full_access.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&full_access.payload).expect("process payload");
+    let terminal_id = payload["terminal_id"].as_u64().expect("terminal id");
+    let killed = registry.execute_internal_builtin_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tc-process-profile-matrix-kill"),
+            BuiltinToolName::ProcessKill.as_str(),
+            serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+        ),
+        context,
+        &full_access_policy(),
+    );
+    assert_eq!(killed.status, ExecutionResultStatus::Succeeded);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn registry_rejects_background_shell_declared_read_only_in_read_only_access() {
     let root = unique_temp_dir("magi-tool-read-only-background-shell");
     let target = root.join("must-not-exist.txt");
@@ -4928,6 +4985,180 @@ fn permission_engine_read_only_tool_axis_matches_builtin_side_effect_classificat
             tool.is_access_profile_write_operation(),
             "只读权限工具分类与内置工具副作用分类不一致: {tool:?}"
         );
+    }
+}
+
+#[test]
+fn permission_engine_profile_matrix_covers_every_builtin_tool() {
+    let engine = builtin_permission_engine();
+    let policy = magi_permissions::PermissionPolicy::default();
+
+    for tool in BuiltinToolName::ALL {
+        let tool_name = tool.as_str();
+        let is_write_tool = tool.is_access_profile_write_operation();
+        let request = magi_permissions::PermissionRequest::ToolInvocation {
+            tool_name,
+            is_write_tool,
+        };
+
+        assert_eq!(
+            engine.decide(&request, &policy, magi_core::AccessProfile::ReadOnly),
+            if is_write_tool {
+                magi_permissions::Decision::Deny {
+                    reason: format!("只读任务不允许执行写入工具：{tool_name}"),
+                }
+            } else {
+                magi_permissions::Decision::Allow
+            },
+            "ReadOnly 工具面必须覆盖全部内置工具: {tool_name}"
+        );
+
+        assert_eq!(
+            engine.decide(&request, &policy, magi_core::AccessProfile::FullAccess),
+            magi_permissions::Decision::Allow,
+            "FullAccess 工具轴不应把常规工具误判为审批: {tool_name}"
+        );
+
+        let restricted = engine.decide(&request, &policy, magi_core::AccessProfile::Restricted);
+        let expected_restricted =
+            if is_write_tool && tool.restricted_write_profile_policy().is_none() {
+                magi_permissions::Decision::NeedsApproval {
+                    reason: format!("受限执行未自动授权写入工具：{tool_name}"),
+                }
+            } else {
+                magi_permissions::Decision::Allow
+            };
+        assert_eq!(
+            restricted, expected_restricted,
+            "Restricted 工具轴必须区分自动允许和需审批工具: {tool_name}"
+        );
+    }
+}
+
+#[test]
+fn permission_engine_shell_and_path_axes_cover_read_restricted_and_full_access() {
+    let engine = builtin_permission_engine();
+    let policy = magi_permissions::PermissionPolicy {
+        allowed_paths: vec!["/tmp/magi-permission-matrix-workspace".into()],
+        ..magi_permissions::PermissionPolicy::default()
+    };
+
+    let read_shell = magi_permissions::PermissionRequest::ShellCommand {
+        arguments_json: r#"{"command":"printf read","access_mode":"read_only"}"#,
+    };
+    let write_shell = magi_permissions::PermissionRequest::ShellCommand {
+        arguments_json: r#"{"command":"printf write > result.txt","access_mode":"maybe_write"}"#,
+    };
+    let inside = magi_permissions::PermissionRequest::PathAccess {
+        absolute_path: std::path::Path::new("/tmp/magi-permission-matrix-workspace/result.txt"),
+        kind: magi_permissions::PathAccessKind::Write,
+    };
+    let outside = magi_permissions::PermissionRequest::PathAccess {
+        absolute_path: std::path::Path::new("/tmp/magi-permission-matrix-outside/result.txt"),
+        kind: magi_permissions::PathAccessKind::Write,
+    };
+    let full_policy = magi_permissions::PermissionPolicy::default();
+
+    assert_eq!(
+        engine.decide(&read_shell, &policy, magi_core::AccessProfile::ReadOnly),
+        magi_permissions::Decision::Allow
+    );
+    assert!(matches!(
+        engine.decide(&write_shell, &policy, magi_core::AccessProfile::ReadOnly),
+        magi_permissions::Decision::Deny { .. }
+    ));
+    assert!(matches!(
+        engine.decide(&write_shell, &policy, magi_core::AccessProfile::Restricted),
+        magi_permissions::Decision::NeedsApproval { .. }
+    ));
+    assert_eq!(
+        engine.decide(&write_shell, &policy, magi_core::AccessProfile::FullAccess),
+        magi_permissions::Decision::Allow
+    );
+    assert_eq!(
+        engine.decide(&inside, &policy, magi_core::AccessProfile::Restricted),
+        magi_permissions::Decision::Allow
+    );
+    assert!(matches!(
+        engine.decide(&outside, &policy, magi_core::AccessProfile::Restricted),
+        magi_permissions::Decision::Deny { .. }
+    ));
+    assert_eq!(
+        engine.decide(&outside, &full_policy, magi_core::AccessProfile::FullAccess),
+        magi_permissions::Decision::Allow
+    );
+}
+
+#[test]
+fn browser_access_profile_matrix_keeps_read_and_write_capabilities_distinct() {
+    use magi_browser_authority::{BrowserCapabilitySnapshot, BrowserHostStatus};
+
+    let ready = |access_profile| BrowserCapabilitySnapshot {
+        revision: 1,
+        in_app_browser_enabled: true,
+        browser_use_enabled: true,
+        host_status: BrowserHostStatus::Ready,
+        host_protocol_compatible: true,
+        access_profile,
+    };
+    for profile in [
+        magi_core::AccessProfile::ReadOnly,
+        magi_core::AccessProfile::Restricted,
+        magi_core::AccessProfile::FullAccess,
+    ] {
+        let snapshot = ready(profile);
+        for kind in magi_browser_authority::BrowserToolKind::ALL {
+            let tool = BuiltinToolName::from_name(kind.name()).expect("catalog browser tool");
+            assert!(snapshot.allows_catalog_tool(kind));
+            assert!(!tool.is_access_profile_write_operation());
+            match kind.catalog_access() {
+                magi_browser_authority::BrowserToolAccess::Read => {
+                    assert!(
+                        snapshot
+                            .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
+                            .is_ok()
+                    );
+                    assert!(
+                        snapshot
+                            .allows_execution(
+                                kind,
+                                magi_browser_authority::BrowserToolAccess::Write
+                            )
+                            .is_err()
+                    );
+                }
+                magi_browser_authority::BrowserToolAccess::Write => {
+                    assert!(
+                        snapshot
+                            .allows_execution(
+                                kind,
+                                magi_browser_authority::BrowserToolAccess::Write
+                            )
+                            .is_ok()
+                    );
+                    assert!(
+                        snapshot
+                            .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
+                            .is_err()
+                    );
+                }
+                magi_browser_authority::BrowserToolAccess::Mixed => {
+                    assert!(
+                        snapshot
+                            .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
+                            .is_ok()
+                    );
+                    assert!(
+                        snapshot
+                            .allows_execution(
+                                kind,
+                                magi_browser_authority::BrowserToolAccess::Write
+                            )
+                            .is_ok()
+                    );
+                }
+            }
+        }
     }
 }
 

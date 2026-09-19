@@ -944,7 +944,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 - [ ] 删除所有外部 current Turn 写入口。
 - [x] 删除旧结果轮询与二次 finalizer 的生产职责。
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
-- [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。新增 Restricted `file_remove` 拒绝、ReadOnly 对七类显式文件写工具的 fail-closed 阻断、Restricted 下 `file_patch`/`file_mkdir`/`file_copy`/`file_move`/`file_remove`/`apply_patch` 工作区外路径确定性拒绝、pending approval 随 Turn 取消、审批请求会话隔离、重复决定冲突、跨 Turn 拒绝记忆隔离以及 5 分钟审批 TTL 到期后的确定性拒绝测试，过期审批索引会随 task、Turn 或 session 清理，仍不足以覆盖完整权限矩阵。
+- [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。新增 Restricted `file_remove` 拒绝、ReadOnly 对七类显式文件写工具的 fail-closed 阻断、Restricted 下 `file_patch`/`file_mkdir`/`file_copy`/`file_move`/`file_remove`/`apply_patch` 工作区外路径确定性拒绝、pending approval 随 Turn 取消、审批请求会话隔离、重复决定冲突、跨 Turn 拒绝记忆隔离以及 5 分钟审批 TTL 到期后的确定性拒绝测试，过期审批索引会随 task、Turn 或 session 清理，仍不足以覆盖完整权限矩阵。2026-09-19 又新增 `magi-tool-runtime` 的访问模式矩阵验收：逐一核对全部 76 个内置工具在 ReadOnly/Restricted/FullAccess 工具轴上的 Allow/Deny/NeedsApproval 结果，补充 shell 命令与路径范围轴、浏览器读写能力轴以及内部 process 工具的只读拒绝、受限审批和完全授权执行；`MagiTurnHarness` 同时新增 ReadOnly `shell_exec` 明确 `access_mode=read_only` 的真实工具轮验收。该批测试只收敛策略分类和代表性真实调用，仍不足以覆盖全部外部工具、副作用、Git 和 MCP 组合。
 - [ ] 完成 Rust、Web、daemon、Electron 和真实 Provider 全矩阵端到端验证。
 - [x] 记录本轮架构实现提交 SHA。
 

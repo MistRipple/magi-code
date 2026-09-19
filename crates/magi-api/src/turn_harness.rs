@@ -2740,6 +2740,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_profile_allows_explicit_read_only_shell_without_approval() {
+        let harness = MagiTurnHarness::new_task("只读 Shell 读取完成");
+        let workspace_root = tempfile::tempdir().expect("read-only shell workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-read-only-shell-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("read-only shell workspace should register");
+        let session_id = SessionId::new("harness-read-only-shell-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "只读 Shell 读取验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("read-only shell session should create");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": "printf READONLY_SHELL_OK",
+                "access_mode": "read_only"
+            })
+            .to_string(),
+            "只读 Shell 读取完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "在只读模式下明确调用 shell_exec，以 read_only 执行读取命令，然后汇总结果",
+                "harness-read-only-shell-request",
+                "harness-read-only-shell-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("read-only shell task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("read-only shell task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("read-only shell task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "ReadOnly read-only shell 不应进入审批流程"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "shell_exec"
+                        && tool
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.to_string().contains("READONLY_SHELL_OK"))
+                        && tool.error.is_none()
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn full_access_profile_executes_write_tool_without_approval() {
         let harness = MagiTurnHarness::new_task("完全授权写入完成");
         let workspace_root = tempfile::tempdir().expect("full access workspace should create");
