@@ -1,8 +1,12 @@
-use super::{SessionStore, TimelineEntryInput, unique_timeline_entry_id};
+use super::{SessionStore, unique_timeline_entry_id};
+#[cfg(test)]
+use super::TimelineEntryInput;
+#[cfg(test)]
+use crate::models::ActiveExecutionTurn;
 use crate::models::{
-    ActiveExecutionTurn, GoalBlockerState, GoalCompletionRecord, GoalContinuationPhase,
-    GoalContinuationState, GoalResumeCheckpoint, GoalRevisionExpectation, GoalStatus, SessionGoal,
-    SessionPlan, SessionStoreState, TimelineEntry, TimelineEntryKind,
+    GoalBlockerState, GoalCompletionRecord, GoalContinuationPhase, GoalContinuationState,
+    GoalResumeCheckpoint, GoalRevisionExpectation, GoalStatus, SessionGoal, SessionPlan,
+    SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     AccessProfile, DomainError, DomainResult, GoalId, PlanItemStatus, PlanState, SessionId, TaskId,
