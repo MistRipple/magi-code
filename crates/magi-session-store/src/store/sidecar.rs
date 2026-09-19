@@ -2670,7 +2670,7 @@ impl SessionStore {
     ///
     /// ThreadChatMessage 只是读取投影，不能再作为 Provider/工具路径的独立事实源。
     /// 只有当当前 session 存在属于该 thread 的 canonical item 时才替换 transcript；
-    /// 没有 canonical 历史的旧 thread 保留原值，交由迁移/恢复路径处理。
+    /// 没有 canonical 历史的 thread 保留原值，交由明确的迁移/恢复路径处理。
     pub fn rebuild_thread_message_projection(
         &self,
         thread_id: &ThreadId,
@@ -2887,17 +2887,17 @@ impl SessionStore {
         Ok(if changed { 1 } else { 0 })
     }
 
-    /// 重建 projection；仅对没有任何 canonical item 的旧 thread 使用一次性迁移
+    /// 重建 projection；仅对没有任何 canonical item 的 thread 使用一次性迁移
     /// 输入。新 Turn 一旦有 canonical 事实，传入的迁移输入会被忽略，避免
     /// Provider/工具回调重新建立第二份事实源。
-    pub fn rebuild_thread_message_projection_with_legacy(
+    pub fn rebuild_thread_message_projection_with_migration_input(
         &self,
         thread_id: &ThreadId,
-        legacy_messages: Vec<ThreadChatMessage>,
+        migration_messages: Vec<ThreadChatMessage>,
         now: UtcMillis,
     ) -> DomainResult<usize> {
         let projected = self.rebuild_thread_message_projection(thread_id, now)?;
-        if projected > 0 || legacy_messages.is_empty() {
+        if projected > 0 || migration_messages.is_empty() {
             return Ok(projected);
         }
         let mut state = self
@@ -2918,7 +2918,7 @@ impl SessionStore {
             .find(|thread| &thread.thread_id == thread_id)
             .ok_or(DomainError::NotFound { entity: "thread" })?;
         let session_id = thread.session_id.clone();
-        thread.message_history.extend(legacy_messages);
+        thread.message_history.extend(migration_messages);
         thread.last_used_at = now;
         drop(state);
         self.mark_sidecar_dirty_for_session(

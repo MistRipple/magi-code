@@ -1122,12 +1122,12 @@ fn run_session_turn_execution_inner(
     if let Some(current_user_message) = messages.last() {
         // 当前用户消息已经在 Turn accepted 事务中写入 canonical；这里只更新
         // ThreadChatMessage projection，不能在 Provider 执行路径追加第二份事实。
-        let mut legacy_message = chat_message_to_thread_chat_message(current_user_message);
-        legacy_message.images.clear();
+        let mut migration_message = chat_message_to_thread_chat_message(current_user_message);
+        migration_message.images.clear();
         session_store
-            .rebuild_thread_message_projection_with_legacy(
+            .rebuild_thread_message_projection_with_migration_input(
                 &orchestrator_thread_id,
-                vec![legacy_message],
+                vec![migration_message],
                 UtcMillis::now(),
             )
             .map_err(|error| {

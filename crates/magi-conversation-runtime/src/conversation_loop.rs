@@ -271,9 +271,13 @@ pub(crate) fn append_thread_messages_checkpoint(
     checkpoint: &'static str,
 ) -> Result<(), String> {
     // 新 Turn 一旦存在 canonical item，provider/tool 回调只触发 projection 重建；
-    // 没有 canonical 历史的旧 thread 才允许一次性使用迁移输入。
+    // 没有 canonical 历史的 thread 才允许一次性使用迁移输入。
     session_store
-        .rebuild_thread_message_projection_with_legacy(thread_id, messages, UtcMillis::now())
+        .rebuild_thread_message_projection_with_migration_input(
+            thread_id,
+            messages,
+            UtcMillis::now(),
+        )
         .map_err(|error| format!("从 canonical Turn 重建 thread projection 失败: {error}"))?;
     persist_session_state_checkpoint(persist_session_state, checkpoint)
 }
