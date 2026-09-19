@@ -4767,7 +4767,13 @@ impl SessionStore {
         Ok(updated)
     }
 
-    pub fn upsert_current_turn(
+    /// 为 SessionStore crate 内的持久化单元测试构造 current Turn。
+    ///
+    /// 生产代码必须通过 `CanonicalTurnEventSink` 的接纳、item 和状态 API
+    /// 写入 Turn；这个原始替换入口只在本 crate 的测试编译中存在，避免把
+    /// current Turn 的第二条生产写入路径暴露给其他 crate。
+    #[cfg(test)]
+    pub(crate) fn upsert_current_turn(
         &self,
         session_id: SessionId,
         mut turn: ActiveExecutionTurn,
