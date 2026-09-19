@@ -1731,9 +1731,7 @@ fn accept_current_turn_with_timeline_entry_rejects_running_turn_without_timeline
     store
         .create_session(session_id.clone(), "Atomic Chat Reject")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
 
     let result = store.accept_current_turn_with_timeline_entry(
         session_id.clone(),
@@ -1852,9 +1850,7 @@ fn finalize_current_turn_for_continue_rejects_a_stale_turn_owner() {
     store
         .create_session(session_id.clone(), "Finalize Continue Stale")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-current", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-current", "running", 1));
 
     let result = store.finalize_current_turn_for_continue(&session_id, "turn-stale");
     assert!(matches!(
@@ -2464,9 +2460,7 @@ fn accept_active_execution_chain_rejects_running_turn_without_timeline_write() {
     store
         .create_session(session_id.clone(), "Atomic Task Reject")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
     let chain = test_active_chain(
         &session_id,
         "chain-atomic-task-reject",
@@ -2515,9 +2509,7 @@ fn upsert_active_execution_chain_rejects_different_running_turn() {
     store
         .create_session(session_id.clone(), "Upsert Chain Running Reject")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
     let chain = test_active_chain(
         &session_id,
         "chain-reject-running",
@@ -2550,9 +2542,7 @@ fn append_current_turn_item_with_timeline_entry_writes_item_and_timeline_atomica
     store
         .create_session(session_id.clone(), "Append Item Timeline")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
 
     let updated = store
         .append_current_turn_item_with_timeline_entry_for_turn(
@@ -2594,9 +2584,7 @@ fn upsert_current_turn_item_allows_assistant_stream_to_final_canonical_update() 
     store
         .create_session(session_id.clone(), "Canonical Assistant Update")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
 
     let mut stream_item = test_turn_item("turn-item-assistant", "流式回复");
     stream_item.kind = "assistant_stream".to_string();
@@ -4019,9 +4007,7 @@ fn upsert_current_turn_item_rejects_canonical_immutable_field_conflict() {
     store
         .create_session(session_id.clone(), "Canonical Conflict")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
 
     let mut stream_item = test_turn_item("turn-item-conflict", "流式回复");
     stream_item.kind = "assistant_stream".to_string();
@@ -4065,9 +4051,7 @@ fn upsert_current_turn_item_rejects_canonical_status_regression() {
     store
         .create_session(session_id.clone(), "Canonical Status Regression")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-running", "running", 1));
 
     let mut final_item = test_turn_item("turn-item-status", "最终回复");
     final_item.kind = "assistant_final".to_string();
@@ -4106,9 +4090,7 @@ fn upsert_current_turn_item_for_turn_rejects_a_stale_turn_owner() {
     store
         .create_session(session_id.clone(), "Turn Owner Check")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn("turn-current", "running", 1))
-        .expect("running turn should upsert");
+    accept_test_turn(&store, &session_id, test_turn("turn-current", "running", 1));
 
     let result = store.upsert_current_turn_item_for_turn(
         &session_id,
