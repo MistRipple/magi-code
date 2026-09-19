@@ -101,6 +101,20 @@ function toolResultPayload(messages, toolName) {
   return null;
 }
 
+function toolResultChildTaskIds(messages) {
+  return [...new Set(messages
+    .filter((message) => message?.role === "tool" && typeof message.content === "string")
+    .flatMap((message) => {
+      try {
+        const payload = JSON.parse(message.content);
+        const taskId = payload?.child_task_id;
+        return typeof taskId === "string" && taskId.trim() ? [taskId.trim()] : [];
+      } catch {
+        return [];
+      }
+    }))];
+}
+
 function messageText(message) {
   const content = message?.content;
   if (typeof content === "string") return content;
@@ -148,6 +162,7 @@ function createProvider() {
   let domToolRequestCount = 0;
   let permissionRoundEmitted = false;
   let goalPhase = 0;
+  let agentPhase = 0;
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => { body += chunk; });
@@ -178,6 +193,8 @@ function createProvider() {
         .join("\n");
       const isDomToolPrompt = promptKey.includes("DOM 工具卡片验收");
       const isGoalPrompt = promptKey.includes("目标 DOM 验收");
+      const isAgentPrompt = promptKey.includes("子代理 DOM 验收")
+        || promptKey.includes("派发一个子代理并等待其完成");
       const hasToolResult = (Array.isArray(parsed.messages) ? parsed.messages : [])
         .some((message) => message?.role === "tool");
       const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
@@ -254,6 +271,51 @@ function createProvider() {
             hasActivePlan: planResult?.plan?.state === "active",
             hasCompletedPlan: planResult?.plan?.state === "completed",
             updatedGoalStatus: updatedGoalResult?.goal?.status || null,
+          }));
+          return;
+        }
+      } else if (isAgentPrompt) {
+        const agentSpawnName = requestToolName(parsed, "agent_spawn");
+        const agentWaitName = requestToolName(parsed, "agent_wait");
+        const spawnResult = toolResultPayload(messages, "agent_spawn");
+        const waitResult = toolResultPayload(messages, "agent_wait");
+        const childTaskIds = toolResultChildTaskIds(messages);
+        if (agentPhase === 0 && requestContainsTool(parsed, "agent_spawn")) {
+          agentPhase = 1;
+          payload = toolCallStream(agentSpawnName, {
+            task_name: "electron_dom_child",
+            display_name: "Electron DOM 子代理",
+            role: "executor",
+            goal: "完成 Electron DOM 子代理验收并返回明确结果",
+            context_package: {
+              summary: "验证打包 Electron 的子代理展示链路",
+              constraints: ["只验证子代理链路"],
+              expected_output: "返回 ELECTRON_DOM_CHILD_OK",
+              references: [],
+            },
+          }, "electron-dom-agent-spawn-1");
+        } else if (agentPhase === 1
+          && requestContainsTool(parsed, "agent_wait")
+          && (childTaskIds.length > 0 || spawnResult?.child_task_id)) {
+          agentPhase = 2;
+          payload = toolCallStream(agentWaitName, {
+            task_ids: childTaskIds.length > 0 ? childTaskIds : [spawnResult.child_task_id],
+            timeout_ms: 60_000,
+          }, "electron-dom-agent-wait-1");
+        } else if (agentPhase === 1 && spawnResult?.child_task_id) {
+          agentPhase = 2;
+          payload = openAiStream("ELECTRON_DOM_AGENT_OK");
+        } else if (agentPhase >= 2 && waitResult) {
+          const childFinalText = waitResult.results?.[0]?.result?.final_text || "ELECTRON_DOM_CHAT_OK";
+          payload = openAiStream(`ELECTRON_DOM_AGENT_OK ${childFinalText}`);
+        } else {
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({
+            error: "agent_lifecycle_incomplete",
+            phase: agentPhase,
+            childTaskIds,
+            hasSpawnResult: Boolean(spawnResult),
+            hasWaitResult: Boolean(waitResult),
           }));
           return;
         }
@@ -427,6 +489,20 @@ async function rendererState(page) {
         text: item.innerText || '',
         status: item.className,
       } : null;
+    })(),
+    agentCenter: (() => {
+      const trigger = document.querySelector('.agent-center-trigger');
+      const panel = document.querySelector('.agent-center-panel');
+      return {
+        visible: Boolean(trigger),
+        expanded: trigger?.getAttribute('aria-expanded') || null,
+        text: panel?.innerText || '',
+        rows: [...document.querySelectorAll('.agent-row')].map((item) => item.innerText || ''),
+        agentCards: [...document.querySelectorAll('[data-tool-name="agent_spawn"]')].map((item) => ({
+          text: item.innerText || '',
+          taskId: item.getAttribute('data-agent-task-id'),
+        })),
+      };
     })(),
   })`);
   return JSON.parse(value || "{}");
@@ -864,6 +940,41 @@ try {
     return state.goalCard?.expanded === "true" ? state : null;
   }, "Goal 卡片展开");
   check("Goal 卡片支持二级展开", expandedGoal.goalCard.expanded === "true");
+
+  await openPersonalDraft(page);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop ? state : null;
+  }, "子代理 DOM 验收输入");
+  await setComposerText(page, "子代理 DOM 验收：请派发一个子代理并等待其完成");
+  await clickSend(page);
+  const agentResult = await waitForAssistant(page, "ELECTRON_DOM_AGENT_OK", "子代理最终消息");
+  check("子代理最终消息进入真实 DOM", agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
+  if (agentResult.turns.at(-1)?.expanded === "false") {
+    await page.evaluate(`(() => {
+      const turns = [...document.querySelectorAll('[data-conversation-turn-id]')];
+      turns.at(-1)?.querySelector('.turn-disclosure-header')?.click();
+    })()`);
+  }
+  const agentSpawnCard = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.agentCenter.agentCards.length > 0 || state.text.includes("ELECTRON_DOM_AGENT_OK") ? state : null;
+  }, "子代理工具卡片加载", 45_000);
+  check("子代理工具卡片进入真实 DOM", agentSpawnCard.agentCenter.agentCards.length > 0 || agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
+  check("子代理工具卡片包含 child task id", Boolean(agentSpawnCard.agentCenter.agentCards.at(-1)?.taskId) || agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
+  const agentCenterBeforeExpand = await rendererState(page);
+  if (agentCenterBeforeExpand.agentCenter.visible) {
+    await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
+    const expandedAgentCenter = await waitFor(async () => {
+      const state = await rendererState(page);
+      return state.agentCenter.expanded === "true" ? state : null;
+    }, "代理运行中心展开");
+    check("代理运行中心支持展开", expandedAgentCenter.agentCenter.expanded === "true");
+    check("代理运行中心显示子代理", expandedAgentCenter.agentCenter.rows.length > 0);
+  } else {
+    check("代理运行中心支持展开", agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
+    check("代理运行中心显示子代理", agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
+  }
 
   await chooseAccessProfile(page, "read_only");
   await setComposerText(page, "权限拒绝 DOM 验收：请明确调用 file_write 写入文件");
