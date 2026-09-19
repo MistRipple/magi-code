@@ -2504,6 +2504,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_profile_rejects_explicit_apply_patch_without_side_effect() {
+        let (_workspace, target, turn, _task) = run_read_only_explicit_file_tool_case(
+            "apply_patch",
+            "apply-patch",
+            "执行一个任务：调用 apply_patch 新建工作区文件，然后汇总结果".to_string(),
+            |workspace_root| {
+                let target = workspace_root.join("read-only-apply-patch.txt");
+                let patch = "*** Begin Patch\n*** Add File: read-only-apply-patch.txt\n+must not create\n*** End Patch\n";
+                (
+                    target,
+                    serde_json::json!({"patch": patch}),
+                )
+            },
+        )
+        .await;
+        assert!(!target.exists(), "ReadOnly apply_patch 不得创建文件");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.content.as_deref().is_some_and(|content| {
+                    content.contains("apply_patch") && content.contains("当前工具面没有暴露该工具")
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn read_only_profile_allows_file_read_without_approval() {
         let harness = MagiTurnHarness::new_task("只读模式读取文件完成");
         let workspace_root = tempfile::tempdir().expect("read-only read workspace should create");
@@ -3789,6 +3814,26 @@ mod tests {
             "must remain"
         );
         assert!(remove_turn.status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_rejects_apply_patch_outside_workspace() {
+        let (_workspace, _outside, target, turn, _task) = run_restricted_outside_file_tool_case(
+            "apply_patch",
+            "apply-patch",
+            "调用 apply_patch 新建工作区之外的文件",
+            |_workspace_root, outside_root| {
+                let target = outside_root.join("outside-apply-patch.txt");
+                let patch = format!(
+                    "*** Begin Patch\n*** Add File: {}\n+must not create\n*** End Patch\n",
+                    target.display()
+                );
+                (target, serde_json::json!({"patch": patch}))
+            },
+        )
+        .await;
+        assert!(!target.exists(), "Restricted apply_patch 不得写入工作区外");
+        assert!(turn.status.is_terminal());
     }
 
     #[tokio::test]
