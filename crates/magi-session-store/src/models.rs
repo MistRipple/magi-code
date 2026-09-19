@@ -667,7 +667,7 @@ pub enum SessionSidecarFlushReason {
     ApplyRecoveryResumeInput,
     ApplyResumeExecutionTarget,
     UpsertActiveExecutionChain,
-    UpsertCurrentTurn,
+    AcceptCurrentTurn,
     UpdateActiveExecutionBranchSnapshot,
     AppendCurrentTurnItem,
     UpdateCurrentTurnStatus,

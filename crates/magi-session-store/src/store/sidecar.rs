@@ -3508,7 +3508,7 @@ impl SessionStore {
         )?;
         self.mark_sidecar_dirty_for_session(
             Some(&session_id),
-            SessionSidecarFlushReason::UpsertCurrentTurn,
+            SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok((entry_id, updated))
     }
@@ -3631,7 +3631,7 @@ impl SessionStore {
         )?;
         self.mark_sidecar_dirty_for_session(
             Some(&session_id),
-            SessionSidecarFlushReason::UpsertCurrentTurn,
+            SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok((entry_id, updated, canonical_turn))
     }
@@ -3868,7 +3868,7 @@ impl SessionStore {
         )?;
         self.mark_sidecar_dirty_for_session(
             Some(&session_id),
-            SessionSidecarFlushReason::UpsertCurrentTurn,
+            SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok(updated)
     }
@@ -3960,7 +3960,7 @@ impl SessionStore {
         )?;
         self.mark_sidecar_dirty_for_session(
             Some(&session_id),
-            SessionSidecarFlushReason::UpsertCurrentTurn,
+            SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok((entry_id, updated, superseded_turn))
     }
