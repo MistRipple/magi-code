@@ -567,6 +567,8 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 
 直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，三类单轮 CDP timing 证据见 `/tmp/magi-electron-dom-agent-9587.json`，并新增 Goal/Plan 与子代理/代理运行中心 DOM 单轮证据；五类场景 20 轮 CDP 采样和性能前后对比仍未完成。
 
+2026-09-20 的代码审计和 workspace 全量复验没有改变上述验收范围：TaskRunner 的生产 worker catalog 来源已收敛为单一动态 provider，测试读取结果仍是 `#[cfg(test)]` 辅助；SessionStore 原始 current Turn 替换入口和 `UpsertCurrentTurn` flush reason 已删除。该结构收敛不产生新的性能样本，因此不能把后端五场景数据扩大解释为 Electron 五场景 Renderer timing 或 before/after 对比。
+
 ### 9.2 真实 Provider 单轮验收记录
 
 本轮使用已保存的 Magi API 配置，在打包产物
