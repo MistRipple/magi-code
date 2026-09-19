@@ -538,8 +538,8 @@ function timingEvidenceRecord(scenario, turnId, record) {
     turnId,
     stages: Object.fromEntries(Object.entries(record?.stages || {}).map(([stage, value]) => [stage, {
       count: value?.count || 0,
-      firstAt: value?.firstAt ?? null,
-      lastAt: value?.lastAt ?? null,
+      first: value?.first ? { ...value.first } : null,
+      last: value?.last ? { ...value.last } : null,
     }])),
   };
 }
