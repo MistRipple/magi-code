@@ -503,6 +503,7 @@ M0 真实基线可观测
 - [x] 完成阶段 0 timing schema 和统一 trace 设计。
 - [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
 - [ ] 采集真实 Provider 五类场景各 20 轮的 P50/P95 基线。
+  - 已新增 `scripts/verify-real-provider-performance.mjs`（npm 命令 `npm run test:real-provider-performance`），使用独立状态根、独立 workspace Git fixture、每请求 `orchestratorSessionConfig` 和 `/events` canonical terminal 事件采样；脚本会保存请求级 JSON 与 daemon `magi.performance` 阶段日志，并在任一 Turn 失败时明确返回 failed。当前仅完成单场景小样本连通性校验，未将其计入五场景 20 轮基线。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
 - [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
@@ -514,6 +515,7 @@ M0 真实基线可观测
 - [x] 完成 Electron `--dir` 打包产物启动、静态资源加载与摘要折叠/工具组展开验收。
 - [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 25 项检查通过；该证据仍不替代真实 Provider 五场景 20 轮性能采样。
 - [ ] 汇总性能前后对比；当前仅完成真实 Provider 单轮 smoke，不宣称真实 Provider P50/P95 指标达标。
+  - 真实 Provider 性能脚本会区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；`frontend_event_received`、reducer/projection 和 `dom_painted` 仍需通过打包 Electron CDP 追加采样，不能用后端时间代替。
 
 ### 9.1 本轮本地验收记录
 

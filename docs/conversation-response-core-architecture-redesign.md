@@ -968,6 +968,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 ## 18. MagiTurnHarness 验证设计
 
+已新增 `scripts/verify-real-provider-performance.mjs` 及 `npm run test:real-provider-performance`，使用独立 daemon、状态根和 workspace Git fixture，按请求保存 accepted、首个 `session.turn.item`、terminal canonical event 以及 daemon `magi.performance` 阶段日志。当前只完成小样本连通性校验，未替代五类真实 Provider 各 20 轮 P50/P95 直接证据；前端 `frontend_event_received`、reducer/projection 和 `dom_painted` 仍需通过打包 Electron CDP 单独采样。
+
 Codex 的 harness 值得借鉴的是完整链路验证方式，不是把测试 harness 复制到生产路径。
 
 Magi 必须新增真实入口 harness：
