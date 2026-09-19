@@ -30,11 +30,9 @@ const DEFAULT_LEASE_DURATION_MS: u64 = 60_000;
 
 pub struct TaskRunner {
     store: Arc<TaskStore>,
-    /// 兼容直接构造 Runner 的调用方所提供的初始目录。生产 Runner 通过
-    /// `worker_catalog_provider` 在每次匹配时读取最新角色目录；已经派发的任务仍持有
-    /// 当次匹配复制出的 WorkerInfo，因此角色编辑不会改变运行中的 Worker 快照。
-    workers: Vec<WorkerInfo>,
-    worker_catalog_provider: Option<Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>>,
+    /// 每次匹配都读取最新角色目录；已经派发的任务仍持有当次匹配复制出的
+    /// WorkerInfo，因此角色编辑不会改变运行中的 Worker 快照。
+    worker_catalog_provider: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
     dispatcher: Arc<dyn TaskDispatcher>,
     #[cfg(test)]
     result_receiver: Option<Arc<EventBasedResultReceiver>>,
@@ -122,15 +120,14 @@ pub fn apply_task_result(store: &TaskStore, result: TaskResult) -> Result<bool, 
 }
 
 impl TaskRunner {
-    pub fn with_dispatcher(
+    pub fn with_dispatcher_and_worker_catalog(
         store: Arc<TaskStore>,
-        workers: Vec<WorkerInfo>,
+        worker_catalog_provider: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
         dispatcher: Arc<dyn TaskDispatcher>,
     ) -> Self {
         Self {
             store,
-            workers,
-            worker_catalog_provider: None,
+            worker_catalog_provider,
             dispatcher,
             #[cfg(test)]
             result_receiver: None,
@@ -142,6 +139,19 @@ impl TaskRunner {
             first_dispatch_reported: AtomicBool::new(false),
             agent_role_registry: AgentRoleRegistry::load_default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_dispatcher(
+        store: Arc<TaskStore>,
+        workers: Vec<WorkerInfo>,
+        dispatcher: Arc<dyn TaskDispatcher>,
+    ) -> Self {
+        Self::with_dispatcher_and_worker_catalog(
+            store,
+            Arc::new(move || workers.clone()),
+            dispatcher,
+        )
     }
 
     #[cfg(test)]
@@ -163,11 +173,12 @@ impl TaskRunner {
 
     /// 注入动态 Worker 目录。目录只用于尚未派发任务的匹配，WorkerInfo 在成功匹配
     /// 后会被复制并随派发请求传递下去，确保角色热更新不改写运行中的任务。
-    pub fn with_worker_catalog_provider(
+    #[cfg(test)]
+    fn with_worker_catalog_provider(
         mut self,
         provider: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
     ) -> Self {
-        self.worker_catalog_provider = Some(provider);
+        self.worker_catalog_provider = provider;
         self
     }
 
@@ -552,11 +563,7 @@ impl TaskRunner {
         if explicitly_bound_role.is_some() && role.is_none() {
             return None;
         }
-        let workers = self
-            .worker_catalog_provider
-            .as_ref()
-            .map(|provider| provider())
-            .unwrap_or_else(|| self.workers.clone());
+        let workers = (self.worker_catalog_provider)();
         workers
             .iter()
             .find(|worker| {

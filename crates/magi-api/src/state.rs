@@ -342,10 +342,6 @@ impl RunnerManager {
         }
     }
 
-    fn resolved_workers(&self) -> Vec<WorkerInfo> {
-        (self.worker_catalog)()
-    }
-
     pub fn with_dispatch_gate(mut self, gate: Arc<TaskDispatchGate>) -> Self {
         self.dispatch_gate = Some(gate);
         self
@@ -372,17 +368,15 @@ impl RunnerManager {
     }
 
     fn build_task_runner(&self, session_id: Option<SessionId>) -> TaskRunner {
-        let workers = self.resolved_workers();
         let dispatcher = self
             .dispatcher
             .as_ref()
             .expect("RunnerManager 缺少 LLM dispatcher");
-        let mut runner = TaskRunner::with_dispatcher(
+        let mut runner = TaskRunner::with_dispatcher_and_worker_catalog(
             Arc::clone(&self.task_store),
-            workers,
+            Arc::clone(&self.worker_catalog),
             Arc::clone(dispatcher),
-        )
-        .with_worker_catalog_provider(Arc::clone(&self.worker_catalog));
+        );
         runner = runner.with_agent_role_registry((*self.agent_role_registry).clone());
         runner = runner.with_execution_admission(Arc::clone(&self.execution_admission), session_id);
         if let Some(gate) = &self.dispatch_gate {
