@@ -503,7 +503,7 @@ M0 真实基线可观测
 - [x] 完成阶段 0 timing schema 和统一 trace 设计。
 - [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
 - [ ] 采集真实 Provider 五类场景各 20 轮的 P50/P95 基线。
-  - 已新增 `scripts/verify-real-provider-performance.mjs`（npm 命令 `npm run test:real-provider-performance`），使用独立状态根、独立 workspace Git fixture、每请求 `orchestratorSessionConfig` 和 `/events` canonical terminal 事件采样；脚本会保存请求级 JSON 与 daemon `magi.performance` 阶段日志，并在任一 Turn 失败时明确返回 failed。当前仅完成单场景小样本连通性校验，未将其计入五场景 20 轮基线。
+  - 已新增 `scripts/verify-real-provider-performance.mjs`（npm 命令 `npm run test:real-provider-performance`），使用独立状态根、独立 workspace Git fixture、每请求 `orchestratorSessionConfig` 和 `/events` canonical terminal 事件采样；脚本会保存请求级 JSON 与 daemon `magi.performance` 阶段日志，并在任一 Turn 失败时明确返回 failed。已用 `gpt-5.6-luna` 完成五类场景各 5 轮成功采样；该证据已达到脚本可复核的小批量直接证据，但仍未满足各 20 轮完成条件。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
 - [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
