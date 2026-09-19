@@ -502,8 +502,9 @@ M0 真实基线可观测
 
 - [x] 完成阶段 0 timing schema 和统一 trace 设计。
 - [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
+- [x] 完成真实 Provider/daemon 五类场景各 20 轮的后端 P50/P95 基线；统一汇总见 9.4，直接证据为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`。
 - [ ] 完成真实 Provider 五类场景各 20 轮的端到端 P50/P95 基线。
-  - Provider/daemon 的五类各 20 轮采样已经成功完成，统一汇总见 9.4，直接证据为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`。该项仍需合并 Electron 生产 Renderer 的 `frontend_event_received`、reducer/projection、`dom_painted` 采样后才能闭合阶段 0 的端到端基线。
+  - 该端到端项目仍需把 Electron 生产 Renderer 的 `frontend_event_received`、reducer/projection、`dom_painted` 与同一轮的 accepted、Provider 首 delta、首 EventBus 事件、terminal canonical event 关联起来；当前三类单轮 CDP timing 已有直接证据，五类场景各 20 轮尚未完成。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
 - [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
