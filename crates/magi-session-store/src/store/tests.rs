@@ -149,6 +149,26 @@ fn test_turn(turn_id: &str, status: &str, accepted_at: u64) -> ActiveExecutionTu
     }
 }
 
+fn accept_test_turn(store: &SessionStore, session_id: &SessionId, turn: ActiveExecutionTurn) {
+    let turn_id = turn.turn_id.clone();
+    let message = turn
+        .user_message
+        .clone()
+        .unwrap_or_else(|| format!("message for {turn_id}"));
+    store
+        .accept_current_turn_with_timeline_entry(
+            session_id.clone(),
+            TimelineEntryInput::new(
+                format!("timeline-test-{turn_id}-{}", turn.accepted_at.0),
+                TimelineEntryKind::UserMessage,
+                message,
+                turn.accepted_at,
+            ),
+            turn,
+        )
+        .expect("test turn should be accepted through the canonical boundary");
+}
+
 fn test_active_chain(
     session_id: &SessionId,
     chain_ref: &str,
@@ -816,9 +836,7 @@ fn persistence_waits_for_canonical_commit_before_capturing_projection() {
     store
         .create_session(session_id.clone(), "Persistence canonical order")
         .expect("session should create");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
-        .expect("initial turn should be stored");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
 
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -875,9 +893,7 @@ fn sidecar_flush_waits_for_canonical_commit_before_capturing_projection() {
     store
         .create_session(session_id.clone(), "Sidecar canonical order")
         .expect("session should create");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
-        .expect("initial turn should be stored");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
     store.bind_execution_ownership(
         session_id.clone(),
         ExecutionOwnership {
@@ -976,9 +992,7 @@ fn canonical_event_commit_does_not_hold_state_lock_until_event_writer_finishes()
     store
         .create_session(session_id.clone(), "Canonical commit atomicity")
         .expect("session should create");
-    store
-        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
-        .expect("initial turn should be stored");
+    accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
 
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
