@@ -1,6 +1,6 @@
-use super::{SessionStore, unique_timeline_entry_id};
 #[cfg(test)]
 use super::TimelineEntryInput;
+use super::{SessionStore, unique_timeline_entry_id};
 #[cfg(test)]
 use crate::models::ActiveExecutionTurn;
 use crate::models::{
