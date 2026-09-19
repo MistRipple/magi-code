@@ -1591,20 +1591,19 @@ fn active_execution_chain_turn_replaces_stale_session_turn() {
         .create_session(session_id.clone(), "Active Chain Turn Replace")
         .expect("session should be creatable");
 
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            ActiveExecutionTurn {
-                turn_id: "turn-chat".to_string(),
-                turn_seq: 1,
-                accepted_at: UtcMillis(1),
-                status: "completed".to_string(),
-                user_message: Some("普通问答".to_string()),
-                items: Vec::new(),
-                completed_at: None,
-            },
-        )
-        .expect("chat turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        ActiveExecutionTurn {
+            turn_id: "turn-chat".to_string(),
+            turn_seq: 1,
+            accepted_at: UtcMillis(1),
+            status: "completed".to_string(),
+            user_message: Some("普通问答".to_string()),
+            items: Vec::new(),
+            completed_at: None,
+        },
+    );
 
     let task_turn = ActiveExecutionTurn {
         turn_id: "turn-task".to_string(),
@@ -1668,20 +1667,19 @@ fn active_execution_chain_does_not_reuse_turn_from_different_chain() {
         .create_session(session_id.clone(), "Active Chain Turn Isolated")
         .expect("session should be creatable");
 
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            ActiveExecutionTurn {
-                turn_id: "turn-chat".to_string(),
-                turn_seq: 1,
-                accepted_at: UtcMillis(1),
-                status: "completed".to_string(),
-                user_message: Some("普通问答".to_string()),
-                items: Vec::new(),
-                completed_at: None,
-            },
-        )
-        .expect("chat turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        ActiveExecutionTurn {
+            turn_id: "turn-chat".to_string(),
+            turn_seq: 1,
+            accepted_at: UtcMillis(1),
+            status: "completed".to_string(),
+            user_message: Some("普通问答".to_string()),
+            items: Vec::new(),
+            completed_at: None,
+        },
+    );
 
     store
         .upsert_active_execution_chain(
@@ -1775,12 +1773,11 @@ fn finalize_current_turn_for_continue_closes_active_turn_and_chain_atomically() 
     store
         .create_session(session_id.clone(), "Finalize Continue")
         .expect("session should be creatable");
-    store
-        .upsert_current_turn(
-            session_id.clone(),
-            test_turn("turn-before-continue", "running", 1),
-        )
-        .expect("running turn should upsert");
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-before-continue", "running", 1),
+    );
 
     let mut tool_item = test_turn_item("tool-before-continue", "执行中的工具");
     tool_item.kind = "tool_call_started".to_string();
