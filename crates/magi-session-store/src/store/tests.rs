@@ -1241,9 +1241,7 @@ fn v1_migration_uses_newer_sidecar_snapshot_for_conflicting_turn() {
             item
         })
         .collect();
-    store
-        .upsert_current_turn(session_id.clone(), seed_turn)
-        .expect("seed turn should be stored");
+    accept_test_turn(&store, &session_id, seed_turn);
 
     let mut durable = store.durable_state();
     let canonical = durable
@@ -1326,9 +1324,7 @@ fn v1_migration_preserves_sidecar_only_items_when_canonical_is_newer() {
     let mut canonical_item = test_turn_item("item-canonical", "权威最新正文");
     canonical_item.item_seq = 1;
     seed_turn.items = vec![canonical_item];
-    store
-        .upsert_current_turn(session_id.clone(), seed_turn)
-        .expect("seed turn should be stored");
+    accept_test_turn(&store, &session_id, seed_turn);
 
     let mut durable = store.durable_state();
     let canonical = durable
