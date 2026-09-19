@@ -879,13 +879,15 @@ Coordinator
 
 - [x] 每个 Session 建立唯一 `SessionTurnCoordinator`。
 - [x] 将 start、steer、continue、cancel、recover 完全统一为 Coordinator command；生产 start、Steer、Continue、Recover、Cancel、Abort、Finish 以及 preparing/running 状态均通过携带并校验同一 `TurnAttempt` 的 command 入口，canonical restore 和断线恢复也复用 Recover command；Coordinator 内部的 mutation helper 已收为私有，仅由 command 分发。
-- [ ] 删除所有外部模块直接修改 current Turn 的路径。生产用户中断已统一经 `CanonicalTurnEventSink::interrupt_turn_by_user` 写入并保留 `interruptionSource=user`，生产会话关闭、Goal pause、daemon restart 和接受失败也经 sink 收口；剩余直接写入仅限测试 fixture 和 sink 内部。当前进一步统一了 canonical 恢复与 `TurnRecord` 投影的身份读取及历史 profile 推断，避免恢复状态与事件投影分叉；测试夹具写入仍待清理。
+- [ ] 删除所有外部模块直接修改 current Turn 的路径。生产用户中断已统一经 `CanonicalTurnEventSink::interrupt_turn_by_user` 写入并保留 `interruptionSource=user`，生产会话关闭、Goal pause、daemon restart 和接受失败也经 sink 收口；SessionStore 内部原始 `upsert_current_turn` 测试替换入口已移除，Goal 计时测试仅使用测试编译的确定性终态辅助；剩余直接写入仅限测试 fixture、SessionStore canonical mutation 和 sink 内部。当前进一步统一了 canonical 恢复与 `TurnRecord` 投影的身份读取及历史 profile 推断，避免恢复状态与事件投影分叉；复杂测试夹具和完整 Coordinator/Sink 边界仍待逐项清理。
 - [x] 实现 attempt ID 校验、迟到结果拒绝和终态冲突。
 - [x] Continue 在接纳新 Turn 前收口旧 attempt，并在新 Turn 上注册 Task attempt。
 
 本阶段已改文件：`crates/magi-conversation-runtime/src/session_turn_coordinator.rs`、`crates/magi-conversation-runtime/src/turn_contract.rs`、`crates/magi-api/src/routes/sessions.rs`、`crates/magi-api/src/routes/dispatch_flow.rs`、`crates/magi-api/src/session_continue.rs`、`crates/magi-api/src/routes/goals.rs`、`crates/magi-api/src/task_turn_finalize.rs`、`crates/magi-conversation-runtime/src/session_writeback.rs`。验证命令：`cargo test -p magi-conversation-runtime --lib session_turn_coordinator`、`cargo test -p magi-api --lib`、`cargo test -p magi-daemon --lib`。结果：生产 start、preparing/running、steer、continue、recover、finish、cancel 和 abort 均走 `TurnCommand`；状态命令携带并校验 `TurnAttempt`，用户中断的 canonical 写回经 `CanonicalTurnEventSink` 保留来源 metadata，并发/迟到/恢复后队列推进测试通过。Coordinator 的 accept/set_status/finish/abort 仅保留为 command 内部私有实现，跨 crate fixture 也通过 `TurnCommand::Start` 接纳。剩余工作是清理测试 fixture 中直接构造 canonical Turn 的兼容写入口。
 
 2026-09-18 的源码审计逐一核对了 `upsert_current_turn`、`update_current_turn_status_for_turn`、`cancel_current_turn`、`interrupt_current_turn_by_user`、`interrupt_current_turn_by_daemon_restart`、`append_current_turn_item_for_turn` 和 `accept_current_turn_with_timeline_entry` 的调用位置。`magi-conversation-runtime/src/session_writeback.rs` 中的调用属于 `CanonicalTurnEventSink` 实现，`magi-session-store/src/store/sidecar.rs` 中的调用属于 canonical mutation 定义；`magi-session-store/src/store/tests.rs`、daemon persistence/runtime tests、routes tests、App Server tests、Conversation/Task execution tests 和 harness 均位于 `#[cfg(test)]` fixture 边界。生产 daemon 启动收敛、Browser Host 断线、会话关闭、Goal pause、用户中断、Continue 和 Task finalizer 的对应路径均调用 sink。`upsert_active_execution_chain` 属于 execution-chain sidecar/recovery mutation，不是 current Turn 写入口。此次审计没有发现新的生产绕过路径，因此不删除合法迁移或存储单元测试；17.3 仍保持未完成，原因是测试 fixture 尚未全面迁移到 Coordinator/Sink 构造。
+
+随后移除了 SessionStore 内部唯一的 `upsert_current_turn` 测试替换入口。Goal 计时单元测试改用仅在测试编译提供的 `settle_current_turn_at_for_test`，该辅助复用状态终态 mutation，只额外注入确定性的 `completed_at`，并通过 expected Turn ID 校验归属；生产代码和测试源码均不再调用或暴露原始 current Turn 替换方法。剩余 `upsert_current_turn_item_for_turn`、`update_current_turn_status_for_turn` 等调用均是存储 canonical mutation 单元测试，或 `CanonicalTurnEventSink` 内部实现，不属于外部 current Turn 写入口。该收敛后的 `magi-session-store` 121 项测试通过，17.3 仍保持未完成，因为其他模块仍有复杂恢复/投影 fixture 与完整 Coordinator/Sink 端到端迁移边界待逐项核对。
 
 随后将 `routes/messages.rs`、`routes/workspaces.rs`、`routes/goals.rs` 以及 `routes/sessions.rs` 中可迁移的普通 Conversation/排队/查看/中断测试夹具统一改为共享的 `#[cfg(test)]` Coordinator + `CanonicalTurnEventSink` 构造器；`dispatch_submission` 的中断恢复夹具也改为显式 Start/SetStatus + sink 中断，保留 Task checkpoint 和独占 Thread 语义。随后又将 Browser Host 断线、daemon recovery route、session turn cancellation mock 和 dispatcher model configuration failure fixture 收敛到对应的 Coordinator/Sink 写回边界。需要完整 Task execution chain、旧 thread projection、daemon restart recovery 或持久化重建的其他夹具仍保留在各自的迁移/恢复测试边界内。新增 fixture 不改变生产代码路径，相关定向测试与 workspace 全量 Rust 测试均通过。17.3 和 17.7 仍未完成，剩余直接写入主要限于尚未迁移的复杂执行/恢复夹具、存储 canonical mutation 和 Sink 内部实现。
 
@@ -941,7 +943,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 - [x] 普通 Chat 的旧 Task 化入口已删除。
 - [x] 删除 session Conversation 生命周期；`ConversationRegistry` 只保留 task/worker Conversation。
-- [ ] 删除所有外部 current Turn 写入口。
+- [ ] 删除所有外部 current Turn 写入口。SessionStore 内部唯一的原始 `upsert_current_turn` 测试替换入口已删除；Goal 计时测试改用仅测试编译存在、带 expected Turn ID 的终态辅助，生产路径继续只有 `CanonicalTurnEventSink`。
 - [x] 删除旧结果轮询与二次 finalizer 的生产职责。
 - [x] 普通 Provider stream 完整 upsert 已改为有界缓冲和版本化通知。
 - [ ] 清理失效兼容字段、分支、注释和测试夹具。最新复验确认缺失 `executionProfile` 的历史 Turn 在恢复和 `TurnRecord` 投影中共用 route/worker 推断，显式未知 profile 仍拒绝；历史字段读取和测试夹具仍保留在明确边界内。2026-09-19 又新增 `magi-tool-runtime` 的访问模式矩阵验收：逐一核对全部 76 个内置工具在 ReadOnly/Restricted/FullAccess 工具轴上的 Allow/Deny/NeedsApproval 结果，补充 shell 命令与路径范围轴、浏览器读写能力轴以及内部 process 工具的只读拒绝、受限审批和完全授权执行；`MagiTurnHarness` 同时新增 ReadOnly `shell_exec` 明确 `access_mode=read_only` 的真实工具轮验收。该批测试只收敛策略分类和代表性真实调用，仍不足以覆盖全部外部工具、副作用、Git 和 MCP 组合。

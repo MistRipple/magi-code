@@ -4767,80 +4767,6 @@ impl SessionStore {
         Ok(updated)
     }
 
-    /// 为 SessionStore crate 内的持久化单元测试构造 current Turn。
-    ///
-    /// 生产代码必须通过 `CanonicalTurnEventSink` 的接纳、item 和状态 API
-    /// 写入 Turn；这个原始替换入口只在本 crate 的测试编译中存在，避免把
-    /// current Turn 的第二条生产写入路径暴露给其他 crate。
-    #[cfg(test)]
-    pub(crate) fn upsert_current_turn(
-        &self,
-        session_id: SessionId,
-        mut turn: ActiveExecutionTurn,
-    ) -> DomainResult<SessionRuntimeSidecar> {
-        turn.status = normalize_stored_current_turn_status(turn.status);
-        turn.normalize();
-        let updated = self.commit_canonical_transaction(
-            &session_id,
-            |state| {
-                let existing = state
-                    .execution_sidecar_store
-                    .runtime_sidecars
-                    .iter()
-                    .find(|sidecar| sidecar.session_id == session_id)
-                    .cloned();
-                let (ownership, recovery_id, active_execution_chain, status) =
-                    if let Some(existing) = existing {
-                        (
-                            existing.ownership,
-                            existing.recovery_id,
-                            existing.active_execution_chain,
-                            existing.status,
-                        )
-                    } else {
-                        (
-                            ExecutionOwnership {
-                                session_id: Some(session_id.clone()),
-                                ..ExecutionOwnership::default()
-                            },
-                            None,
-                            None,
-                            SessionExecutionSidecarStatus::Detached,
-                        )
-                    };
-                let updated = SessionRuntimeSidecar {
-                    session_id: session_id.clone(),
-                    ownership,
-                    recovery_id,
-                    current_turn: Some(turn.clone()),
-                    active_execution_chain,
-                    status,
-                    updated_at: UtcMillis::now(),
-                };
-                let canonical_plan = Self::canonical_turn_commit_plan(
-                    state,
-                    &session_id,
-                    updated.current_turn.as_ref().expect("current turn was set"),
-                    None,
-                )?;
-                Ok(CanonicalCommitPlan {
-                    mutations: canonical_plan.mutations,
-                    value: updated,
-                    acceptance: canonical_plan.acceptance,
-                })
-            },
-            |state, updated| {
-                upsert_runtime_sidecar_in_state(state, updated.clone());
-                updated
-            },
-        )?;
-        self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
-            SessionSidecarFlushReason::UpsertCurrentTurn,
-        );
-        Ok(updated)
-    }
-
     pub fn append_current_turn_item_for_turn(
         &self,
         session_id: &SessionId,
@@ -5101,6 +5027,21 @@ impl SessionStore {
         expected_turn_id: Option<&str>,
         status: impl Into<String>,
     ) -> DomainResult<Option<(SessionRuntimeSidecar, bool)>> {
+        self.update_current_turn_status_for_turn_with_change_at(
+            session_id,
+            expected_turn_id,
+            status,
+            None,
+        )
+    }
+
+    fn update_current_turn_status_for_turn_with_change_at(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        status: impl Into<String>,
+        completion_at: Option<UtcMillis>,
+    ) -> DomainResult<Option<(SessionRuntimeSidecar, bool)>> {
         let next_status = normalize_stored_current_turn_status(status.into());
         let updated = self.commit_canonical_transaction(
             session_id,
@@ -5141,7 +5082,7 @@ impl SessionStore {
                     settle_active_current_turn_items(&mut turn.items, item_status);
                 }
                 if turn.completed_at.is_none() && current_turn_status_is_terminal(&turn.status) {
-                    turn.completed_at = Some(UtcMillis::now());
+                    turn.completed_at = Some(completion_at.unwrap_or_else(UtcMillis::now));
                 }
                 turn.normalize();
                 if let Some(chain) = candidate.active_execution_chain.as_mut() {
@@ -5186,6 +5127,27 @@ impl SessionStore {
             );
         }
         Ok(updated)
+    }
+
+    /// 为 SessionStore 持久化单元测试提供确定性的终态时间写入。
+    ///
+    /// 生产代码必须通过 `CanonicalTurnEventSink` 写回终态；该入口只在测试编译中存在，
+    /// 用于验证 Goal 计时等依赖 `completed_at` 墙钟值的恢复语义，不提供原始 Turn 替换。
+    #[cfg(test)]
+    pub(crate) fn settle_current_turn_at_for_test(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        status: impl Into<String>,
+        completed_at: UtcMillis,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        self.update_current_turn_status_for_turn_with_change_at(
+            session_id,
+            expected_turn_id,
+            status,
+            Some(completed_at),
+        )
+        .map(|updated| updated.map(|(sidecar, _)| sidecar))
     }
 
     /// 保留 SessionStore 的既有调用契约；需要区分重复提交时使用

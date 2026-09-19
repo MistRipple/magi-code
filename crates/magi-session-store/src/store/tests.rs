@@ -2804,11 +2804,25 @@ fn running_goal_turn_exposes_live_timing_until_terminal_settlement() {
     let mut terminal_turn = test_turn(turn_id, "completed", 1_000);
     terminal_turn.completed_at = Some(UtcMillis(5_250));
     store
-        .upsert_current_turn(session_id.clone(), terminal_turn.clone())
+        .settle_current_turn_at_for_test(
+            &session_id,
+            Some(turn_id),
+            terminal_turn.status.clone(),
+            terminal_turn
+                .completed_at
+                .expect("terminal time should exist"),
+        )
         .expect("terminal goal turn should settle timing");
     store
-        .upsert_current_turn(session_id.clone(), terminal_turn)
-        .expect("repeated terminal upsert should remain idempotent");
+        .settle_current_turn_at_for_test(
+            &session_id,
+            Some(turn_id),
+            terminal_turn.status,
+            terminal_turn
+                .completed_at
+                .expect("terminal time should exist"),
+        )
+        .expect("repeated terminal status should remain idempotent");
 
     let settled = store
         .current_goal(&session_id)
