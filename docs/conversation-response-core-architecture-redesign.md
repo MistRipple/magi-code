@@ -964,6 +964,8 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 
 同时将 dispatcher 中未注入上下文预算的最小运行时默认值重命名为 `default_context_budget_for_unconfigured_dispatcher`，避免把正常的配置缺失默认值描述成生产降级回退；daemon 生产装配继续显式注入唯一 `ContextBudget`，该默认值只服务最小构造和测试边界。17.7 仍保持未完成。
 
+本轮对 `magi-conversation-runtime` 中剩余 `fallback` 语义做了边界复核：流式中断后的单次非流式重试、工具重复执行时的安全重试、模型错误公开信息兜底和 agent degraded 改派均属于明确的传输错误恢复或业务结果合同，不是旧 Turn/Task 双轨；`legacy` 仅保留历史数据拒绝、迁移和回归测试语义。没有删除这些仍承担职责的分支，17.7 继续保持未完成。
+
 随后增加了显式 ignored 的本地 mock Provider 五场景性能基准，固定每个场景 20 轮并输出 accepted、Provider 首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，同时校验时序单调和事件序号存在。显式运行 `cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scenario_p50_p95_baseline -- --ignored --test-threads=1 --nocapture` 的结果为：新建个人普通会话 accepted P95 3ms、首 delta P95 3ms、首事件 P95 14ms、终态 P95 14ms；已有长历史分别为 2/4/16/17ms；工作区纯聊天为 0/1/13/13ms；工作区工具为 1/77/132/133ms；主代理+子代理为 1/112/130/130ms。该数据只证明本地 mock 基准可重复，不替代真实 Provider 五类场景 20 轮、前端 DOM 绘制和性能前后对比，后者仍未完成。
 
 权限矩阵又补充了“拒绝后修改参数”的单元验收：同一 Session/Turn/工具的相同规范化参数继续命中拒绝记忆，修改路径后必须重新产生独立 pending approval，并可单独解决为 `allow_once`；因此拒绝记忆不会错误扩大到不同操作。

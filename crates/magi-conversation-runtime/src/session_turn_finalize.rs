@@ -234,7 +234,7 @@ pub fn latest_orchestrator_assistant_final(
 ///
 /// coordinator root 现在有独立 task thread，但前端会把不带 worker/role 的 root item
 /// 投射到主线。如果这里只认 session orchestrator thread，root 已经生成的 final 会和
-/// fallback orchestrator summary 双显。
+/// 自动生成的 orchestrator summary 双显。
 pub fn latest_root_task_assistant_final(
     turn: &ActiveExecutionTurn,
     root_task_id: &TaskId,

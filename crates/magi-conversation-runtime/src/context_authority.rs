@@ -121,6 +121,8 @@ pub(crate) struct ContextAuthority<'a> {
 }
 
 pub(crate) struct ContextPrepareRequest {
+    /// canonical/thread transcript 尚未可读时的一次性恢复输入；正常运行不会用它
+    /// 覆盖已有 transcript，避免形成第二份上下文事实源。
     pub recovery_history: Vec<ThreadChatMessage>,
     pub phase: &'static str,
     pub context_window_override: Option<u64>,

@@ -135,7 +135,7 @@ pub struct ConversationLoopRequest<'a> {
     /// 也不允许 `memory_write` 工具调用成功。
     pub project_memory: Option<&'a magi_project_memory::ProjectMemoryStore>,
     /// codex goal 桥：mission 维度记账 sidecar 句柄。`None` 表示当前 task 未绑定
-    /// workspace 或 dispatcher 未注入 metrics（旧路径回退），此时不做记账写入。
+    /// workspace 或 dispatcher 未注入 metrics，此时不做记账写入。
     /// 设计上每轮 LLM 调用后调用一次 `record_mission_turn`，与 `publish_model_usage_record`
     /// 并列收口；失败仅 warn，不阻断主轮次。
     pub mission_metrics: Option<&'a Arc<magi_mission_metrics::MissionMetricsStore>>,
