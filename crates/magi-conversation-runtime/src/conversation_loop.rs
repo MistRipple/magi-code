@@ -988,7 +988,7 @@ fn run_conversation_loop_inner(
         .with_expected_turn_id(expected_turn_id.as_deref())
         .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
         .prepare(ContextPrepareRequest {
-            fallback_history: Vec::new(),
+            recovery_history: Vec::new(),
             phase,
             context_window_override: Some(context_window),
             additional_token_estimate,
@@ -4681,7 +4681,7 @@ mod tests {
             });
         let event_bus = InMemoryEventBus::new(32);
         let workspace_id = Some(WorkspaceId::new("workspace-context-compaction"));
-        let fallback_history = repeated_thread_history(1_000, 1_000);
+        let recovery_history = repeated_thread_history(1_000, 1_000);
 
         let authority = ContextAuthority::new(
             &client,
@@ -4693,7 +4693,7 @@ mod tests {
             None,
         );
         let first = authority.prepare(ContextPrepareRequest {
-            fallback_history: fallback_history.clone(),
+            recovery_history: recovery_history.clone(),
             phase: "pre_turn",
             context_window_override: None,
             additional_token_estimate: 0,
@@ -4704,9 +4704,9 @@ mod tests {
         assert!(first.compaction.is_some());
         assert_eq!(
             session_store.thread_message_history(&thread_id).len(),
-            fallback_history.len()
+            recovery_history.len()
         );
-        assert!(first.messages.len() < fallback_history.len());
+        assert!(first.messages.len() < recovery_history.len());
         assert!(
             session_store
                 .thread_context_checkpoint(&thread_id)
@@ -4721,7 +4721,7 @@ mod tests {
         );
 
         let second = authority.prepare(ContextPrepareRequest {
-            fallback_history,
+            recovery_history,
             phase: "pre_turn",
             context_window_override: None,
             additional_token_estimate: 0,
@@ -4762,7 +4762,7 @@ mod tests {
         );
 
         let first = authority.prepare(ContextPrepareRequest {
-            fallback_history: Vec::new(),
+            recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
             context_window_override: Some(20_000),
             additional_token_estimate: 1_000,
@@ -4782,7 +4782,7 @@ mod tests {
             UtcMillis(3),
         );
         let second = authority.prepare(ContextPrepareRequest {
-            fallback_history: Vec::new(),
+            recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
             context_window_override: None,
             additional_token_estimate: 1_000,
@@ -4915,7 +4915,7 @@ mod tests {
             None,
         )
         .prepare(ContextPrepareRequest {
-            fallback_history: Vec::new(),
+            recovery_history: Vec::new(),
             phase: "pre_turn",
             context_window_override: None,
             additional_token_estimate: 0,

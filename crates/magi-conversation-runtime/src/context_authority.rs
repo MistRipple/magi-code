@@ -121,7 +121,7 @@ pub(crate) struct ContextAuthority<'a> {
 }
 
 pub(crate) struct ContextPrepareRequest {
-    pub fallback_history: Vec<ThreadChatMessage>,
+    pub recovery_history: Vec<ThreadChatMessage>,
     pub phase: &'static str,
     pub context_window_override: Option<u64>,
     pub additional_token_estimate: usize,
@@ -248,8 +248,8 @@ impl<'a> ContextAuthority<'a> {
                 .thread_context_window_tokens(self.thread_id)
         });
         let mut transcript = self.session_store.thread_message_history(self.thread_id);
-        if transcript.is_empty() && !request.fallback_history.is_empty() {
-            transcript = request.fallback_history;
+        if transcript.is_empty() && !request.recovery_history.is_empty() {
+            transcript = request.recovery_history;
             if request.persist_checkpoint {
                 self.session_store.replace_thread_messages(
                     self.thread_id,

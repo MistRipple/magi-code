@@ -803,7 +803,7 @@ fn rebuild_messages_for_context_window(
     .with_expected_turn_id(Some(&request.turn_id))
     .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
-        fallback_history: Vec::new(),
+        recovery_history: Vec::new(),
         phase: "context_limit_recovery",
         context_window_override: Some(context_window),
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
@@ -985,7 +985,7 @@ fn run_session_turn_execution_inner(
             format!("中断工具历史持久化失败：{error}"),
         )
     })?;
-    let fallback_history = canonical_session_turn_history(session_store, &request);
+    let recovery_history = canonical_session_turn_history(session_store, &request);
     let selected_model = settings_store
         .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
         .and_then(|config| config.to_usage_llm_config())
@@ -1067,7 +1067,7 @@ fn run_session_turn_execution_inner(
     .with_expected_turn_id(Some(&request.turn_id))
     .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
-        fallback_history,
+        recovery_history,
         phase: "pre_turn",
         context_window_override: Some(effective_context_window),
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
