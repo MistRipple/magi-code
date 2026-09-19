@@ -88,16 +88,14 @@ pub enum TaskOutcome {
 
 /// 接收 Worker 执行结果。
 ///
-/// `poll_results` 仅供没有主动完成通知目标的嵌入式 Runner 使用。生产装配会安装
-/// completion sink，结果立即交付，不再等待下一轮调度循环。
+/// Worker 结果的接收抽象。
+///
+/// 生产装配使用主动完成通知目标；轮询接口只保留给未装配通知器的测试嵌入读取器。
 pub trait TaskResultReceiver: Send + Sync {
-    /// 生产运行时若返回 true，Worker 结果已经由主动完成通知提交，Runner
-    /// 不应再通过周期轮询消费同一结果。
-    fn uses_active_completion_sink(&self) -> bool {
-        false
-    }
-
-    /// 仅保留给未装配主动通知目标的嵌入测试/兼容读取器。
+    /// 仅供没有主动完成通知目标的测试嵌入读取器消费结果。
+    ///
+    /// 生产 TaskRunner 不再调用该方法；生产终态由
+    /// `TaskCompletionNotifier` 在 TaskStore durable mutation 后主动通知。
     fn poll_results(&self) -> Vec<TaskResult>;
 }
 // --- Event-based result receiver
@@ -119,8 +117,8 @@ struct CompletionReceiverState {
 
 /// 接收外部推送结果（例如来自 TaskStore 的 `StatusChangeCallback`）。
 ///
-/// 没有主动 completion sink 时，结果会进入嵌入式 Runner 的兼容轮询队列；安装 sink
-/// 后，已经缓冲的结果会在返回前交给 sink，切换装配模式不会遗留终态结果。
+/// 没有主动 completion sink 时，结果会进入测试嵌入读取器的轮询队列；安装 sink
+/// 后，已经缓冲的结果会在返回前交给 sink，不会遗留终态结果。
 ///
 /// 结果按 task ID 和 lease ID 去重。恢复后的任务可能在新租约建立后收到旧执行结果；
 /// 两类结果保持可区分，以便 Runner 只拒绝旧租约。任务回到非终态时调用
@@ -142,8 +140,8 @@ impl EventBasedResultReceiver {
         }
     }
 
-    /// 配置主动完成通知目标。配置后新结果直接进入 durable completion path，
-    /// 不再等待 Runner 的下一轮 `poll_results`；已经缓冲的结果也会先交给该目标。
+    /// 配置主动完成通知目标。配置后新结果直接进入 durable completion path；
+    /// 已经缓冲的结果也会先交给该目标。
     pub fn set_completion_sink(&self, sink: Arc<dyn TaskCompletionSink>) {
         let should_notify = {
             let mut state = self
@@ -274,14 +272,6 @@ impl EventBasedResultReceiver {
 }
 
 impl TaskResultReceiver for EventBasedResultReceiver {
-    fn uses_active_completion_sink(&self) -> bool {
-        self.state
-            .lock()
-            .expect("EventBasedResultReceiver state lock poisoned")
-            .sink
-            .is_some()
-    }
-
     fn poll_results(&self) -> Vec<TaskResult> {
         let mut state = self
             .state

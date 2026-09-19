@@ -34,6 +34,7 @@ pub struct TaskRunner {
     workers: Vec<WorkerInfo>,
     worker_catalog_provider: Option<Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>>,
     dispatcher: Arc<dyn TaskDispatcher>,
+    #[cfg(test)]
     result_receiver: Arc<dyn TaskResultReceiver>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
     execution_admission: Arc<ExecutionAdmissionController>,
@@ -123,14 +124,15 @@ impl TaskRunner {
         store: Arc<TaskStore>,
         workers: Vec<WorkerInfo>,
         dispatcher: Arc<dyn TaskDispatcher>,
-        result_receiver: Arc<dyn TaskResultReceiver>,
+        _result_receiver: Arc<dyn TaskResultReceiver>,
     ) -> Self {
         Self {
             store,
             workers,
             worker_catalog_provider: None,
             dispatcher,
-            result_receiver,
+            #[cfg(test)]
+            result_receiver: _result_receiver,
             dispatch_gate: None,
             execution_admission: Arc::new(ExecutionAdmissionController::default()),
             session_id: None,
@@ -186,12 +188,10 @@ impl TaskRunner {
 
     pub fn run_cycle(&self, root_task_id: &TaskId) -> RunCycleOutcome {
         let cycle_started_at = Instant::now();
-        if !self.result_receiver.uses_active_completion_sink()
-            && let Err(error) = self.apply_results()
-        {
+        #[cfg(test)]
+        if let Err(error) = self.apply_results() {
             return RunCycleOutcome::Error(error);
         }
-
         if let Err(error) = self.expire_stale_leases(root_task_id) {
             return RunCycleOutcome::Error(error);
         }
@@ -473,9 +473,10 @@ impl TaskRunner {
         }
     }
 
+    #[cfg(test)]
     fn apply_results(&self) -> Result<(), String> {
         for result in self.result_receiver.poll_results() {
-            let _ = apply_task_result(self.store.as_ref(), result)?;
+            let _ = apply_task_result(&self.store, result)?;
             self.set_checkpoint_signal();
         }
         Ok(())

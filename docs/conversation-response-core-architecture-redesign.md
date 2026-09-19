@@ -129,7 +129,7 @@ Profile 选择结果必须写入 Turn accepted 事件，后续执行器只能读
 
 ### 3.4 任务完成依赖轮询和二次收口
 
-`EventBasedResultReceiver` 的接口仍然是 `poll_results`，Runner 在下一轮 cycle 才消费任务结果。任务终态之后又要通过 terminal observer 和 session finalizer 收口。
+`EventBasedResultReceiver` 的旧接口曾由 Runner 在下一轮 cycle 轮询任务结果，任务终态之后又要通过 terminal observer 和 session finalizer 收口。
 
 这会造成：
 
@@ -918,7 +918,7 @@ daemon persistence 的 canonical flush fixture 也已改为 Coordinator + Sink �
 - [x] 复用进程级 Provider bridge client 和 Tokio runtime。
 - [x] Provider delta 接入 `TurnStreamBuffer`，首帧、窗口、reset 和 terminal flush 有测试。
 - [x] 增加 `TaskCompletionNotifier`，生产 Worker 结果先 durable 提交 TaskStore，再主动通知 Turn 侧。
-- [x] 生产 Task 完成路径不再依赖 Runner 的 `poll_results` 周期消费；轮询接口仅保留未装配通知器的嵌入测试入口。
+- [x] 生产 Task 完成路径不再依赖 Runner 的 `poll_results` 周期消费；`poll_results` 仅保留测试嵌入读取器，生产 `TaskRunner` 不再持有或调用该轮询路径。
 - [x] 结果接收器在主动通知目标安装前缓冲的结果会按原顺序一次性交付；通知回调可重入，结果去重、兼容轮询队列和主动通知队列由同一状态锁收口；Sink panic 会恢复 pending 和通知状态，回调内替换 Sink 后由新 Sink 继续排空。
 - [x] 删除 terminal observer 对 Turn 终态的二次职责。
 - [x] 生产 TaskStore 状态 callback 从 mutation guard 中移出，并在提交后异步执行。
