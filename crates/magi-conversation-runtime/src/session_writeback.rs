@@ -920,7 +920,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
     }
 
     /// 需要保留 SessionStore 原始 DomainError 的边界（例如 API 要把
-    /// CurrentTurnConflict 映射为 409）时使用这些方法。它们仍通过同一个
+    /// CurrentTurnConflict 映射为 409）时使用这些方法。它们仍通过当前
     /// `CanonicalTurnEventSink` 对象执行 canonical mutation。
     pub fn append_item_sidecar(
         &self,
