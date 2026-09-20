@@ -2932,6 +2932,39 @@ async fn task_turn_replays_after_daemon_restart_without_duplicate_canonical_acce
         "restart must recover the canonical task user item and request identity"
     );
 
+    let bootstrap = get_json(
+        restarted_app.clone(),
+        &format!(
+            "/bootstrap?scope=workspace&workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"
+        ),
+    )
+    .await;
+    assert_eq!(bootstrap["currentSession"]["sessionId"], session_id);
+    assert!(
+        bootstrap["timeline"]
+            .as_array()
+            .expect("restarted task bootstrap timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "执行任务并在 daemon 重启后验证同一 Turn 回放"),
+        "daemon restart bootstrap should replay the task user message"
+    );
+
+    let messages = get_json(
+        restarted_app.clone(),
+        &format!(
+            "/api/messages?scope=workspace&workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"
+        ),
+    )
+    .await;
+    assert!(
+        messages["timeline"]
+            .as_array()
+            .expect("restarted task messages timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "执行任务并在 daemon 重启后验证同一 Turn 回放"),
+        "daemon restart messages should replay the task user message"
+    );
+
     let (replay_status, replay_body) = post_json(restarted_app, "/api/session/turn", request).await;
     assert_eq!(
         replay_status,

@@ -38,9 +38,11 @@ const responseText = "ELECTRON_DOM_CHAT_OK";
 const toolResponseText = "ELECTRON_DOM_TOOL_OK";
 const restartResponseText = "ELECTRON_DOM_RESTART_OK";
 const approvalResponseText = "ELECTRON_DOM_APPROVAL_OK";
+const approvalDeniedResponseText = "ELECTRON_DOM_APPROVAL_DENIED";
 const evidencePath = process.env.MAGI_ELECTRON_DOM_EVIDENCE_PATH?.trim() || "";
 const timingOnly = process.env.MAGI_ELECTRON_DOM_TIMING_ONLY === "1";
 let approvalTarget = join(tmpdir(), `magi-electron-dom-approval-${process.pid}.txt`);
+let approvalDenyTarget = join(tmpdir(), `magi-electron-dom-approval-deny-${process.pid}.txt`);
 
 const backendTimingByTurn = new Map();
 const traceToTurn = new Map();
@@ -304,6 +306,15 @@ function providerResponse(body) {
     .join("\n");
   const timingToken = timingResponseToken(promptText);
 
+  if (promptText.includes("审批拒绝 DOM 验收")) {
+    if (messages.some((message) => message?.role === "tool")) {
+      return openAiStream(approvalDeniedResponseText);
+    }
+    return toolCallStream("shell_exec", {
+      command: `printf denied > ${approvalDenyTarget}`,
+      access_mode: "maybe_write",
+    });
+  }
   if (promptText.includes("审批 DOM 验收")) {
     if (messages.some((message) => message?.role === "tool")) {
       return openAiStream(approvalResponseText);
@@ -547,8 +558,28 @@ function createProvider() {
         }
       } else {
         const isPermissionPrompt = promptKey.includes("权限拒绝 DOM 验收");
+        const isApprovalDenyPrompt = promptKey.includes("审批拒绝 DOM 验收");
         const isApprovalPrompt = promptKey.includes("审批 DOM 验收");
-        if (isApprovalPrompt) {
+        if (isApprovalDenyPrompt) {
+          const nextApprovalState = approvalStates.get("approval-deny") || { emitted: false, completed: false };
+          if (!nextApprovalState.emitted) {
+            nextApprovalState.emitted = true;
+            approvalStates.set("approval-deny", nextApprovalState);
+            payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+              command: `printf denied > ${approvalDenyTarget}`,
+              access_mode: "maybe_write",
+            }, "electron-dom-approval-deny-shell-exec-1");
+          } else if (hasToolResult) {
+            nextApprovalState.completed = true;
+            approvalStates.set("approval-deny", nextApprovalState);
+            payload = openAiStream(approvalDeniedResponseText);
+          } else {
+            payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+              command: `printf denied > ${approvalDenyTarget}`,
+              access_mode: "maybe_write",
+            }, "electron-dom-approval-deny-shell-exec-1");
+          }
+        } else if (isApprovalPrompt) {
           const nextApprovalState = approvalStates.get("approval") || { emitted: false, completed: false };
           if (!nextApprovalState.emitted) {
             nextApprovalState.emitted = true;
@@ -1330,6 +1361,7 @@ try {
   const workspaceRoot = await mkdtemp(join(stateRoot, "workspace-"));
   const workspaceId = await registerWorkspace(page, workspaceRoot);
   approvalTarget = join(workspaceRoot, ".magi-electron-dom-approval.txt");
+  approvalDenyTarget = join(workspaceRoot, ".magi-electron-dom-approval-deny.txt");
   await setComposerText(page, "请只回复 ELECTRON_DOM_CHAT_OK");
   await clickSend(page);
   const workspace = await waitForAssistant(page, responseText, "工作区普通 Chat 最终消息");
@@ -1574,6 +1606,69 @@ try {
   }
   check("审批允许后真实文件副作用存在", approvalFileExists);
 
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.workspaceIds.includes(workspaceId) ? state : null;
+  }, "审批拒绝工作区可用");
+  await page.evaluate(`(() => {
+    const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
+    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    if (!create) throw new Error('approval denial workspace new session button missing');
+    create.click();
+  })()`);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && state.inputEditable && !state.stop && state.assistant.length === 0
+      ? state
+      : null;
+  }, "审批拒绝工作区草稿");
+  await chooseAccessProfile(page, "restricted");
+  await setComposerText(page, `审批拒绝 DOM 验收：请明确调用 shell_exec 写入 ${approvalDenyTarget}`);
+  await clickSend(page);
+  const denialApproval = await waitFor(async () => {
+    const state = await rendererState(page);
+    const card = await page.evaluate(`(() => {
+      const root = document.querySelector('.tool-approval');
+      if (!root) return null;
+      const buttons = [...root.querySelectorAll('button')];
+      const primary = root.querySelector('button.approval-button--primary');
+      return {
+        text: root.innerText || '',
+        allowOnce: Boolean(primary && !primary.disabled),
+        deny: buttons.some((button) => button.innerText.includes('拒绝')),
+      };
+    })()`);
+    return card?.allowOnce ? { ...state, approval: card } : null;
+  }, "Restricted 审批拒绝卡片", 45_000);
+  check("Restricted 审批拒绝卡片进入真实 DOM", denialApproval.approval.text.length > 0);
+  check("Restricted 审批拒绝卡片包含拒绝操作", denialApproval.approval.deny);
+  await page.evaluate(`(() => {
+    const root = document.querySelector('.tool-approval');
+    const deny = [...(root?.querySelectorAll('button') || [])]
+      .find((button) => button.innerText.includes('拒绝'));
+    if (!deny) throw new Error('approval denial button missing');
+    deny.click();
+  })()`);
+  const denied = await waitFor(async () => {
+    const state = await rendererState(page);
+    const text = state.text.toLowerCase();
+    const hasDeniedText = text.includes("拒绝") || text.includes("denied")
+      || text.includes("permission") || text.includes("权限");
+    return state.input && state.inputEditable && !state.stop && hasDeniedText ? state : null;
+  }, "审批拒绝终态", 45_000);
+  check(
+    "审批拒绝事实进入真实 DOM",
+    denied.text.includes("拒绝") || denied.text.toLowerCase().includes("denied")
+      || denied.text.toLowerCase().includes("permission") || denied.text.includes("权限"),
+  );
+  let deniedFileExists = true;
+  try {
+    await access(approvalDenyTarget);
+  } catch {
+    deniedFileExists = false;
+  }
+  check("审批拒绝后真实文件副作用不存在", !deniedFileExists);
+
   // 再建立一个有独立最终文本的个人会话，用于 daemon 重启和历史切换断言。
   await selectMostRecentPersonalSession(page);
   await openPersonalDraft(page);
@@ -1692,5 +1787,6 @@ try {
   await stopOwnedDaemon(daemonPidForCleanup);
   await closeProvider(provider.server);
   await rm(approvalTarget, { force: true });
+  await rm(approvalDenyTarget, { force: true });
   await removeStateRoot(stateRoot);
 }
