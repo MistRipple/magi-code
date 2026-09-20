@@ -909,6 +909,7 @@ try {
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
       timingSamples.push(timingEvidenceRecord(scenario, turnId, timing));
       checkTimingStages(`${scenario} Renderer`, timing);
+      await waitForComposerReady(page, `${scenario} Turn 收口`);
     };
     const ensurePersonalDraft = async (first) => {
       if (!first) {
