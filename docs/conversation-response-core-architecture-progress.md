@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-20
-代码基线：`9f77c04b`（补齐 Electron Goal 失败恢复验收）
+代码基线：`abba8270`（记录 Electron Goal 失败恢复证据）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -112,6 +112,18 @@
 
 首轮审计尚未发现可以直接删除的生产双轨路径；B 仍保持未完成，下一步需要把每个保留项绑定到具体测试，并继续寻找失效注释、无效 fixture 和不再可达的兼容分支。
 本轮复核以 `rg -n --glob '*.rs' 'legacy|Legacy|fallback|compat|兼容|旧路径|回退' crates/magi-conversation-runtime crates/magi-session-store crates/magi-api crates/magi-daemon` 得到 523 条命中；排除测试样例、迁移/恢复、协议字段、浏览器/MCP 能力状态和配置/路由错误边界后，未发现新的可删除生产双轨。新增命中仍属于已知边界：daemon 归档目录名中的 `fallback-*`、旧 thread history 重建标记、MCP skill 默认名称、OpenAI-compatible 环境变量配置和 HTTP 路由 fallback。`session_projection_full_fallback_completed` 只处理没有 session 归属的 dirty 标记，`fallback_udp_ip` 只处理本机 UDP 探测失败，均不属于消息响应双实现。
+
+B 的保留语义已绑定到以下测试边界：
+
+| 语义 | 绑定测试或验证 | 保留理由 |
+| --- | --- | --- |
+| v1→v2 会话、sidecar、thread projection 迁移 | `magi-session-store::store::tests::v2_store_rejects_legacy_todo_list_payload`、`magi-session-store::store::tests::sidecar_rejects_legacy_recovery_ref_json`、`magi-daemon::daemon::persistence::tests::legacy_layout_migrates_once_and_archives_sources`、`interrupted_layout_migration_restarts_from_legacy_source` | 只接收历史输入并转换到 canonical v2；删除会破坏已有状态恢复 |
+| 已提交 v2 后的旧目录重引入与孤儿事件隔离 | `committed_v2_layout_quarantines_proven_legacy_orphan_event_log`、`committed_v2_layout_cleans_empty_reintroduced_legacy_files`、`interrupted_layout_migration_restarts_from_legacy_authority` | 防止旧进程迟到写回覆盖新事实或孤儿事件复活 |
+| 损坏状态拒绝，不回退空状态 | `corrupted_accepted_journal_is_rejected_without_backup_or_empty_fallback`、`corrupted_durable_state_is_rejected_without_empty_fallback` | 空状态会静默丢失 canonical Turn，必须保持 fail-closed |
+| 协议旧字段拒绝和 profile/replay 身份 | `durable_records_reject_legacy_snake_case_fields`、`turn_contract::tests::legacy_canonical_turn_without_request_identity_is_not_replayable`、MCP `instruction_skill_operations_reject_legacy_name_fields` | 这些字段属于对外合同和安全拒绝边界，不是生产双实现 |
+| Provider/工具传输恢复 | `magi-bridge-client` 的 `streaming_retries_before_first_delta_only`、`streaming_does_not_retry_after_visible_delta`，以及 `tool_batch` 的重复调用安全重试测试 | 只处理当前唯一执行链中的传输错误，不生成第二条 Turn 事实链 |
+
+上述绑定没有发现可删除的失效生产分支；B 仍保持进行中，下一步只处理能证明不可达的注释或 fixture，不删除真实迁移、恢复、拒绝和传输恢复逻辑。
 
 ## C 工作包首轮证据
 
