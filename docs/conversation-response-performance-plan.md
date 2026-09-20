@@ -187,6 +187,14 @@ accepted -> preparing -> running -> streaming -> completed
 事件、canonical 终态和 Renderer 四阶段；统计证据见第 9.5 节。该证据确认埋点和事件边界，
 但仍不能替代历史后端基线的统一合并，也不能作为性能目标已达标或 before/after 对比完成的结论。
 
+最终关联证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：五类场景各 20 轮、
+100 条唯一 `turn_id`、903 项检查和 280 次 Provider 请求，每条都具备五个后端阶段与四个
+Renderer 阶段。重新打包当前 Web/Desktop 工作区后的复验为
+`/tmp/magi-electron-dom-correlated-timing-20-10031.json`，同样为 100 条唯一 `turn_id`、903
+项检查和 280 次 Provider 请求。两份证据均使用日志时间戳计算 `sinceAcceptedMs`，只证明同轮
+阶段边界和顺序；它们尚未形成与历史真实 Provider JSON 同口径的端到端 P50/P95，也不能替代
+旧版本 before 数据。
+
 #### 预计主要文件
 
 - `crates/magi-api/src/routes/sessions.rs`
@@ -509,6 +517,7 @@ M0 真实基线可观测
 - [ ] 完成真实 Provider 五类场景各 20 轮的端到端 P50/P95 基线。
   - Electron Renderer 五类场景各 20 轮已完成，原始证据为 `/tmp/magi-electron-dom-timing-personal-20-10020.json`、`/tmp/magi-electron-dom-timing-workspace-chat-20-10021.json`、`/tmp/magi-electron-dom-timing-workspace-tool-20-10022.json`、`/tmp/magi-electron-dom-timing-goal-20-10025.json`、`/tmp/magi-electron-dom-timing-subagent-20-10026.json`，聚合统计为 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`。
   - 最新同轮结构化证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：五类各 20 轮、100 条唯一 `turn_id`、903 项检查通过；每轮均包含 accepted、runner、Provider 首个可见 delta、首 EventBus 事件、canonical terminal 和 Renderer 四阶段。
+  - 当前打包产物复验为 `/tmp/magi-electron-dom-correlated-timing-20-10031.json`：同样五类各 20 轮、100 条唯一 `turn_id`、903 项检查和 280 次 Provider 请求，终态来源全部为 `canonical_terminal_published`。
   - 该证据已经完成后端与 Renderer 的同轮关联，但仍需与 `/tmp/magi-real-provider-perf-*.json` 的历史后端样本统一场景和统计口径；工具调用首轮的 raw tool-call-only Provider chunk 也尚未单独按 `turn_id` 作为首原始 delta 统计。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
