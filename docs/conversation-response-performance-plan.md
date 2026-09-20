@@ -514,9 +514,9 @@ M0 真实基线可观测
 - [x] 完成阶段 5 的前端增量 reducer、projection 与 Goal 刷新收敛首轮实现。
 - [x] 完成本地 daemon 真实入口的页面启动、会话历史、摘要折叠与工具组逐层展开验收。
 - [x] 完成 Electron `--dir` 打包产物启动、静态资源加载与摘要折叠/工具组展开验收。
-- [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、Goal/Plan 卡片和 Goal 卡片展开、子代理工具卡片与代理运行中心、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 47 项检查通过；2026-09-20 重新运行并保存 `/tmp/magi-electron-dom-timing-9707.json`，该证据同时保存个人 Chat、工作区 Chat、Task 工具四阶段 Renderer timing 的 count、first/last 时间点和 elapsedMs。该证据仍不替代五类 Electron 性能 20 轮采样。
+- [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、Goal/Plan 卡片和 Goal 卡片展开、子代理工具卡片与代理运行中心、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 47 项检查通过；2026-09-20 重新运行并保存 `/tmp/magi-electron-dom-timing-9707.json`，该证据同时保存个人 Chat、工作区 Chat、Task 工具四阶段 Renderer timing；端口 9857 的更新证据 `/tmp/magi-electron-dom-timing-9857.json` 共 55 项通过，并为个人 Chat、工作区 Chat、Task 工具、Goal、子代理五类单轮场景保存四阶段 timing。该证据仍不替代五类 Electron 性能 20 轮采样。
 - [ ] 汇总性能前后对比；当前已完成真实 Provider 五场景后端 20 轮基线，但不宣称性能目标达标。
-  - 真实 Provider 性能脚本区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；Electron 生产 Renderer 已提供受限内存 timing registry（`window.__magiPerformanceTiming.snapshot()`），三类单轮场景已经通过打包 Electron CDP 读取，Goal/Plan 和子代理/代理运行中心 DOM 也已完成单轮验收；仍需扩展到五类场景 20 轮并补齐可审计的 before 数据。
+  - 真实 Provider 性能脚本区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；Electron 生产 Renderer 已提供受限内存 timing registry（`window.__magiPerformanceTiming.snapshot()`），端口 9857 的单轮证据已覆盖个人 Chat、工作区 Chat、Task 工具、Goal、子代理五类场景并保存四阶段 timing；仍需扩展到五类场景各 20 轮并补齐可审计的 before 数据。
 
 ### 9.1 本轮本地验收记录
 
