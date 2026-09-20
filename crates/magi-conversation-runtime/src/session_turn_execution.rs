@@ -2433,7 +2433,7 @@ fn stream_session_turn_round(
         tools: tools.clone(),
         tool_choice,
     };
-    let non_stream_fallback_template = invocation_request.clone();
+    let non_stream_recovery_template = invocation_request.clone();
     let response = match client.invoke_streaming_with_cancellation(
         invocation_request,
         &on_delta,
@@ -2617,22 +2617,22 @@ fn stream_session_turn_round(
                 return Err(SessionTurnRoundError::StreamInterruptedRecovered);
             }
 
-            let mut fallback_request = non_stream_fallback_template;
-            fallback_request.messages = Some(messages.clone());
+            let mut recovery_request = non_stream_recovery_template;
+            recovery_request.messages = Some(messages.clone());
             tracing::warn!(
                 session_id = %request.session_id,
                 round,
                 preserved_visible_chars = partial_visible_content.len(),
                 "流式恢复已耗尽，降级为非流式完成请求"
             );
-            match client.invoke_with_cancellation(fallback_request, &|| {
+            match client.invoke_with_cancellation(recovery_request, &|| {
                 !request_turn_is_writable(session_store, request)
             }) {
                 Ok(response) => response,
-                Err(fallback_error) => {
-                    let fallback_raw_error = fallback_error.to_string();
-                    let fallback_classification =
-                        classify_model_invocation_error(&fallback_raw_error);
+                Err(recovery_error) => {
+                    let recovery_raw_error = recovery_error.to_string();
+                    let recovery_classification =
+                        classify_model_invocation_error(&recovery_raw_error);
                     publish_model_usage_record_for_turn(
                         event_bus,
                         session_store,
@@ -2642,22 +2642,22 @@ fn stream_session_turn_round(
                             session_id: &request.session_id,
                             workspace_id: &request.workspace_id,
                             binding: usage_binding,
-                            call_id: format!("{call_id}-non-stream-fallback"),
+                            call_id: format!("{call_id}-non-stream-recovery"),
                             usage: None,
                             status: UsageCallStatus::Failed,
                             assignment_id: None,
-                            error_code: Some(fallback_classification.code.to_string()),
+                            error_code: Some(recovery_classification.code.to_string()),
                         },
                     );
                     tracing::error!(
                         session_id = %request.session_id,
                         round,
-                        ?fallback_error,
+                        ?recovery_error,
                         "非流式降级请求失败"
                     );
                     return Err(SessionTurnRoundError::Failed {
-                        error: fallback_raw_error,
-                        context_overflow: fallback_error.context_overflow(),
+                        error: recovery_raw_error,
+                        context_overflow: recovery_error.context_overflow(),
                         non_stream_fallback_attempted: true,
                     });
                 }
@@ -4884,7 +4884,7 @@ mod tests {
             *self
                 .recovery_messages
                 .lock()
-                .expect("fallback messages mutex poisoned") = request.messages.unwrap_or_default();
+                .expect("recovery messages mutex poisoned") = request.messages.unwrap_or_default();
             Ok(model_response(serde_json::json!({
                 "content": "已通过非流式降级完成。",
                 "finish_reason": "stop"
@@ -5590,7 +5590,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_stream_failure_preserves_output_before_terminal_fallback_failure() {
+    fn partial_stream_failure_preserves_output_before_terminal_recovery_failure() {
         let session_id = SessionId::new("session-partial-stream-failure");
         let store = SessionStore::new();
         store
@@ -5801,7 +5801,7 @@ mod tests {
         let recovery_messages = client
             .recovery_messages
             .lock()
-            .expect("fallback messages mutex poisoned");
+            .expect("recovery messages mutex poisoned");
         assert_eq!(
             recovery_messages
                 .iter()
