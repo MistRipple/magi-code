@@ -2007,7 +2007,7 @@ impl DaemonRuntime {
         }
 
         // 把 SnapshotManager 桥接到 session-store 生命周期事件。生产路径必装；
-        // 测试可用 ApiState::new 直接构造而不调用此函数，惰性 fallback 仍兜底。
+        // 测试可用 ApiState::new 直接构造而不调用此函数，惰性初始化仍可用。
         state.install_snapshot_lifecycle_observer();
         let reconciled_browser_sessions = state
             .reconcile_browser_sessions_with_session_store()
@@ -2829,7 +2829,7 @@ done
                 .push(request);
             Ok(BridgeResponse {
                 ok: true,
-                payload: "fallback-ok".to_string(),
+                payload: "default-client-ok".to_string(),
             })
         }
     }
@@ -3319,12 +3319,12 @@ done
     #[test]
     fn settings_backed_mcp_bridge_delegates_unconfigured_targets_to_default_client() {
         let settings_store = Arc::new(SettingsStore::new());
-        let fallback = Arc::new(RecordingMcpClient::default());
-        let calls = fallback.calls.clone();
+        let default_client = Arc::new(RecordingMcpClient::default());
+        let calls = default_client.calls.clone();
         let client = SettingsBackedMcpBridgeClient::new(
             settings_store,
             Arc::new(RwLock::new(HashMap::new())),
-            fallback,
+            default_client,
         );
 
         let response = client
@@ -3359,8 +3359,8 @@ done
                 ]),
             )
             .unwrap();
-        let fallback = Arc::new(RecordingMcpClient::default());
-        let calls = fallback.calls.clone();
+        let default_client = Arc::new(RecordingMcpClient::default());
+        let calls = default_client.calls.clone();
         let connections = Arc::new(RwLock::new(HashMap::new()));
         connections
             .write()
@@ -3376,7 +3376,7 @@ done
                 })),
             );
         let client =
-            SettingsBackedMcpBridgeClient::new(settings_store, connections.clone(), fallback);
+            SettingsBackedMcpBridgeClient::new(settings_store, connections.clone(), default_client);
 
         let error = client
             .call_tool(McpToolCallRequest {

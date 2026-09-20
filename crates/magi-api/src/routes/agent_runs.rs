@@ -144,7 +144,7 @@ fn require_session_task_scope(
     )?;
     // 投影是只读查询：活跃执行链归档后 ownership.mission_id 会被清空，
     // 但 session 一生一 mission，orchestrator thread 保留权威 mission。
-    // 这里回退到 thread mission，保证终态任务的投影仍可按会话历史读取。
+    // ownership 没有 mission 时再从 thread mission 读取，保证终态任务的投影仍可按会话历史读取。
     let mission_id = state
         .session_store
         .execution_ownership(&execution.session_id)

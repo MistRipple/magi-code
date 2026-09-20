@@ -141,7 +141,7 @@ pub(crate) fn resolve_session_change_scope(
                 .map(ToString::to_string)
                 .or_else(|| Some(session_execution_group_id(session_id)))
         })
-        .expect("session execution group must always have a fallback");
+        .expect("session execution group must always have a stable id");
 
     let workspace_root = resolve_workspace_root(state, &bound_workspace_id)?;
     let contributors = state

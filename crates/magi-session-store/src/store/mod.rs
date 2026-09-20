@@ -202,7 +202,7 @@ fn with_session_message_count(
 }
 
 /// 会话列表统一按"更新时间倒序"排序：最近活跃的会话排在最前。
-/// updated_at 相同则回退到 created_at 倒序，最后才用 session_id 倒序作为
+/// updated_at 相同则再按 created_at 倒序，最后才用 session_id 倒序作为
 /// 稳定的 tie-breaker，保证测试期确定性。
 pub(crate) fn cmp_sessions_newest_first(
     left: &SessionRecord,

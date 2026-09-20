@@ -2137,7 +2137,7 @@ impl ApiState {
         // Runner 同时承接主线 coordinator task 和 agent_spawn 创建的 Worker task。
         // registry 对外的 role template 列表只包含可被 agent_spawn 派发的角色，
         // 因此这里必须显式补入唯一的内部 coordinator，不能依赖 TaskRunner 的
-        // 角色不匹配回退，否则目标续跑会被错误标记为不可运行。
+        // 角色不匹配时继续补入唯一 coordinator，否则目标续跑会被错误标记为不可运行。
         let mut role_ids = registered_role_template_ids(self);
         if let Some(coordinator) = self.agent_role_registry.default_coordinator() {
             role_ids.push(coordinator.id);
