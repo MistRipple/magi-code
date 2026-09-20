@@ -2790,6 +2790,301 @@ mod tests {
         assert_eq!(payload["details"]["supported_platform"], "desktop");
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_access_profile_matrix_reaches_real_host_protocol_for_read_and_write() {
+        use futures_util::{SinkExt, StreamExt};
+        use magi_browser_authority::{
+            BrowserHostCommand, BrowserHostCommandOutcome, BrowserHostCommandResult,
+            BrowserHostEvent, BrowserHostEventEnvelope, BrowserHostHandshake, BrowserHostPageState,
+            BrowserHostProtocolVersion, BrowserHostRect, BrowserHostRequestEnvelope,
+            BrowserHostResponseEnvelope, BrowserHostSnapshot, BrowserNavigation,
+            BrowserSnapshotNode, BrowserSurfaceBinding,
+        };
+        use std::time::Duration;
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let temp_dir = tempfile::tempdir().expect("browser host matrix temp dir should create");
+        let socket_path = temp_dir.path().join("desktop-control.sock");
+        let listener = UnixListener::bind(&socket_path).expect("browser host socket should bind");
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let navigation_urls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let commands_for_host = Arc::clone(&commands);
+        let navigation_urls_for_host = Arc::clone(&navigation_urls);
+        let host = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("browser client should connect");
+            let mut websocket = accept_async(stream)
+                .await
+                .expect("browser host websocket should accept");
+            let ready = BrowserHostEventEnvelope {
+                protocol_version: BrowserHostProtocolVersion::CURRENT,
+                sequence: 1,
+                event: BrowserHostEvent::Ready(BrowserHostHandshake {
+                    protocol_version: BrowserHostProtocolVersion::CURRENT,
+                    desktop_version: "browser-matrix-test".to_string(),
+                    electron_version: "electron-test".to_string(),
+                    chromium_version: "chromium-test".to_string(),
+                    process_id: 42,
+                    desktop_epoch: "desktop-epoch".to_string(),
+                    worker_epoch: "worker-epoch".to_string(),
+                }),
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&ready)
+                        .expect("ready event should serialize")
+                        .into(),
+                ))
+                .await
+                .expect("ready event should send");
+
+            while let Some(message) = websocket.next().await {
+                let message = message.expect("browser host request should read");
+                let Message::Text(message) = message else {
+                    continue;
+                };
+                let request: BrowserHostRequestEnvelope =
+                    serde_json::from_str(message.as_str()).expect("browser request should decode");
+                let command_name = match &request.command {
+                    BrowserHostCommand::CreatePage { .. } => "create_page",
+                    BrowserHostCommand::RestorePage { .. } => "restore_page",
+                    BrowserHostCommand::EnsureSurface { .. } => "ensure_surface",
+                    BrowserHostCommand::UpdateControl { .. } => "update_control",
+                    BrowserHostCommand::Navigate { .. } => "navigate",
+                    BrowserHostCommand::Snapshot { .. } => "snapshot",
+                    _ => "other",
+                };
+                commands_for_host
+                    .lock()
+                    .expect("browser command audit lock should hold")
+                    .push(command_name.to_string());
+
+                let result = match request.command {
+                    BrowserHostCommand::CreatePage { tab_id, .. }
+                    | BrowserHostCommand::RestorePage { tab_id, .. } => {
+                        BrowserHostCommandResult::PageState(BrowserHostPageState {
+                            tab_id,
+                            url: "about:blank".to_string(),
+                            origin: None,
+                            title: "Blank".to_string(),
+                            navigation_revision: 0,
+                        })
+                    }
+                    BrowserHostCommand::EnsureSurface { tab_id } => {
+                        BrowserHostCommandResult::SurfaceBinding(BrowserSurfaceBinding {
+                            desktop_epoch: "desktop-epoch".to_string(),
+                            window_id: "window-browser-matrix".to_string(),
+                            surface_id: format!("surface-{tab_id}"),
+                            surface_revision: 1,
+                            tab_id,
+                            web_contents_id: 7,
+                            target_id: "target-browser-matrix".to_string(),
+                            browser_context_id: "context-browser-matrix".to_string(),
+                            navigation_revision: 0,
+                        })
+                    }
+                    BrowserHostCommand::Navigate {
+                        tab_id,
+                        navigation: BrowserNavigation::Url { url, .. },
+                        ..
+                    } => {
+                        navigation_urls_for_host
+                            .lock()
+                            .expect("browser navigation audit lock should hold")
+                            .push(url.clone());
+                        BrowserHostCommandResult::PageState(BrowserHostPageState {
+                            tab_id,
+                            url,
+                            origin: Some("https://example.test".to_string()),
+                            title: "Matrix page".to_string(),
+                            navigation_revision: 1,
+                        })
+                    }
+                    BrowserHostCommand::Snapshot {
+                        tab_id,
+                        navigation_revision,
+                        snapshot_revision,
+                        ..
+                    } => BrowserHostCommandResult::Snapshot(BrowserHostSnapshot {
+                        tab_id,
+                        navigation_revision,
+                        snapshot_revision,
+                        root: BrowserSnapshotNode {
+                            element_ref: "root".to_string(),
+                            role: Some("document".to_string()),
+                            name: Some("Matrix page".to_string()),
+                            value: None,
+                            description: None,
+                            disabled: false,
+                            focused: false,
+                            editable: false,
+                            sensitive_input_kind: None,
+                            visible: true,
+                            bounds: Some(BrowserHostRect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 100.0,
+                                height: 100.0,
+                            }),
+                            children: Vec::new(),
+                        },
+                        returned_nodes: 1,
+                        total_nodes: 1,
+                        text_bytes: 11,
+                        truncated: false,
+                        continuation_refs: Vec::new(),
+                        accessibility_tree: Vec::new(),
+                    }),
+                    _ => BrowserHostCommandResult::Empty,
+                };
+                let response = BrowserHostResponseEnvelope {
+                    request_id: request.request_id,
+                    protocol_version: BrowserHostProtocolVersion::CURRENT,
+                    outcome: BrowserHostCommandOutcome::Succeeded(Box::new(result)),
+                };
+                websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&response)
+                            .expect("browser response should serialize")
+                            .into(),
+                    ))
+                    .await
+                    .expect("browser response should send");
+            }
+        });
+
+        let connection = magi_browser_authority::BrowserHostClient::connect_desktop_socket(
+            socket_path.to_str().expect("socket path should be UTF-8"),
+            "test-token",
+            "desktop-epoch",
+            42,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("browser runtime should connect to host protocol");
+
+        let mut authority = BrowserAuthority::new();
+        authority
+            .register_profile(BrowserProfile {
+                profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
+                kind: BrowserProfileKind::ManagedDefault,
+                data_path: tempfile::tempdir()
+                    .expect("browser profile data dir should create")
+                    .keep(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            })
+            .expect("browser profile should register");
+        let host_status = Arc::new(RwLock::new(BrowserHostStatusSnapshot {
+            revision: 1,
+            in_app_browser_enabled: true,
+            browser_use_enabled: true,
+            status: BrowserHostStatus::Ready,
+            protocol_compatible: true,
+            last_error_code: None,
+        }));
+        let host_client = Arc::new(RwLock::new(Some(connection.client.clone())));
+        let runtime = BrowserToolRuntimeDependencies {
+            authority: Arc::new(Mutex::new(authority)),
+            write_lock: Arc::new(Mutex::new(())),
+            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            state_writable: Arc::new(AtomicBool::new(true)),
+            host_status,
+            host_client,
+            event_bus: Arc::new(InMemoryEventBus::new(32)),
+            session_store: Arc::new(SessionStore::new()),
+            persistence: None,
+        };
+
+        for (index, access_profile) in [
+            magi_core::AccessProfile::ReadOnly,
+            magi_core::AccessProfile::Restricted,
+            magi_core::AccessProfile::FullAccess,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = SessionId::new(format!("session-browser-host-matrix-{index}"));
+            let context = magi_tool_runtime::ToolExecutionContext {
+                session_id: Some(session_id.clone()),
+                workspace_id: Some(WorkspaceId::new(format!("workspace-browser-host-{index}"))),
+                access_profile,
+                browser_execution_id: Some(format!("turn-browser-host-matrix-{index}")),
+                browser_capability_snapshot: Some(BrowserCapabilitySnapshot {
+                    revision: 1,
+                    in_app_browser_enabled: true,
+                    browser_use_enabled: true,
+                    host_status: BrowserHostStatus::Ready,
+                    host_protocol_compatible: true,
+                    access_profile,
+                }),
+                ..Default::default()
+            };
+            let (snapshot, snapshot_status) = runtime.execute(
+                &ToolCallId::new(format!("browser-host-snapshot-{index}")),
+                "browser_snapshot",
+                "{}",
+                &context,
+            );
+            assert_eq!(snapshot_status, ExecutionResultStatus::Succeeded);
+            assert_eq!(
+                serde_json::from_str::<Value>(&snapshot).expect("snapshot result should be JSON")["status"],
+                "succeeded"
+            );
+
+            let (navigation, navigation_status) = runtime.execute(
+                &ToolCallId::new(format!("browser-host-navigate-{index}")),
+                "browser_navigate",
+                r#"{"url":"https://example.test/matrix"}"#,
+                &context,
+            );
+            assert_eq!(navigation_status, ExecutionResultStatus::Succeeded);
+            assert_eq!(
+                serde_json::from_str::<Value>(&navigation)
+                    .expect("navigation result should be JSON")["status"],
+                "succeeded"
+            );
+        }
+
+        let commands = commands
+            .lock()
+            .expect("browser command audit lock should hold")
+            .clone();
+        let navigation_urls = navigation_urls
+            .lock()
+            .expect("browser navigation audit lock should hold")
+            .clone();
+        assert_eq!(navigation_urls.len(), 3);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command == &"snapshot")
+                .count(),
+            3
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command == &"navigate")
+                .count(),
+            3
+        );
+        assert!(
+            commands
+                .iter()
+                .filter(|command| command == &"ensure_surface")
+                .count()
+                >= 3
+        );
+
+        connection.client.close().await;
+        host.await.expect("browser host matrix server should stop");
+    }
+
     #[test]
     fn browser_devtools_contract_uses_source_target_fields_and_expression() {
         let mut arguments = Map::new();
