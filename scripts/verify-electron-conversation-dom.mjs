@@ -26,6 +26,14 @@ const timingSampleCount = Number.parseInt(
   process.env.MAGI_ELECTRON_DOM_TIMING_SAMPLES || "1",
   10,
 );
+const timingScenario = process.env.MAGI_ELECTRON_DOM_TIMING_SCENARIO?.trim() || "";
+const timingScenarioNames = [
+  "personal_chat",
+  "workspace_chat",
+  "workspace_tool",
+  "goal",
+  "subagent",
+];
 const responseText = "ELECTRON_DOM_CHAT_OK";
 const toolResponseText = "ELECTRON_DOM_TOOL_OK";
 const restartResponseText = "ELECTRON_DOM_RESTART_OK";
@@ -37,6 +45,9 @@ if (!Number.isInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65535) {
 }
 if (!Number.isInteger(timingSampleCount) || timingSampleCount < 1 || timingSampleCount > 20) {
   throw new Error(`MAGI_ELECTRON_DOM_TIMING_SAMPLES 必须在 1 到 20 之间: ${timingSampleCount}`);
+}
+if (timingScenario && !timingScenarioNames.includes(timingScenario)) {
+  throw new Error(`MAGI_ELECTRON_DOM_TIMING_SCENARIO 无效: ${timingScenario}`);
 }
 
 const checks = [];
@@ -650,13 +661,20 @@ async function waitForComposerReady(page, label) {
 }
 
 async function openPersonalDraft(page) {
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && state.inputEditable && !state.stop ? state : null;
+  }, "个人上一轮 Turn 收口", 45_000);
   await page.evaluate(`(() => {
     const button = [...document.querySelectorAll('.header-action-btn')]
       .find((item) => item.getAttribute('title')?.includes('新建会话'));
     if (!button || button.disabled) throw new Error('new session button unavailable');
     button.click();
   })()`);
-  await sleep(1_500);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && state.inputEditable && !state.stop ? state : null;
+  }, "个人新会话草稿就绪", 45_000);
 }
 
 async function clickSend(page) {
@@ -936,6 +954,7 @@ try {
   }, "打包 Electron App Renderer CDP", 45_000, 250);
 
   if (timingOnly) {
+    const shouldRunScenario = (scenario) => !timingScenario || timingScenario === scenario;
     const initial = await waitForRenderer(page, "初始窗口");
     check("timing 采样初始窗口显示新对话空态", initial.text.includes("开始一个新对话"));
     check("timing 采样初始窗口具有输入框", initial.input);
@@ -947,10 +966,15 @@ try {
         return state.input && state.inputEditable && !state.stop ? state : null;
       }, label);
     };
-    const waitForTimingTerminal = async (scenario) => waitFor(async () => {
-      const state = await rendererState(page);
-      return state.input && !state.stop ? state : null;
-    }, `${scenario} terminal 收口`, 45_000);
+    const waitForTimingTerminal = async (scenario, expectedText) => {
+      return waitFor(async () => {
+        const state = await rendererState(page);
+        return state.input && state.inputEditable && !state.stop
+          && state.assistant.some((message) => message.text.includes(expectedText))
+          ? state
+          : null;
+      }, `${scenario} terminal 收口`, 45_000);
+    };
     const collectTiming = async (scenario, prompt, expectedText) => {
       await waitForTimingInput(`${scenario} 发送前输入`);
       await setComposerText(page, prompt);
@@ -964,7 +988,7 @@ try {
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
       timingSamples.push(timingEvidenceRecord(scenario, turnId, timing));
       checkTimingStages(`${scenario} Renderer`, timing);
-      await waitForTimingTerminal(scenario);
+      await waitForTimingTerminal(scenario, expectedText);
     };
     const ensurePersonalDraft = async (first) => {
       if (!first) {
@@ -974,51 +998,69 @@ try {
       await waitForTimingInput("个人 timing 采样输入");
     };
 
-    await ensurePersonalDraft(true);
-    for (let index = 0; index < timingSampleCount; index += 1) {
-      const token = `ELECTRON_TIMING_PERSONAL_${index}`;
-      await collectTiming("personal_chat", `Electron timing 个人聊天 ${token}`, token);
+    if (shouldRunScenario("personal_chat")) {
+      await ensurePersonalDraft(true);
+      for (let index = 0; index < timingSampleCount; index += 1) {
+        const token = `ELECTRON_TIMING_PERSONAL_${index}`;
+        await collectTiming("personal_chat", `Electron timing 个人聊天 ${token}`, token);
+      }
     }
 
-    const workspaceRoot = await mkdtemp(join(stateRoot, "timing-workspace-"));
-    const workspaceId = await registerWorkspace(page, workspaceRoot);
-    const openWorkspaceDraft = async () => {
-      await waitForTimingInput("工作区 timing 上一轮收口");
-      await waitFor(async () => {
-        const state = await rendererState(page);
-        return state.workspaceIds.includes(workspaceId) ? state : null;
-      }, "工作区 timing 采样会话");
-      await page.evaluate(`(() => {
-        const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
-        const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
-        if (!create) throw new Error('workspace timing new session button missing');
-        create.click();
-      })()`);
-      await waitForTimingInput("工作区 timing 采样输入");
-    };
-    await openWorkspaceDraft();
-    for (let index = 0; index < timingSampleCount; index += 1) {
-      const token = `ELECTRON_TIMING_WORKSPACE_${index}`;
-      await collectTiming("workspace_chat", `Electron timing 工作区聊天 ${token}`, token);
+    if (shouldRunScenario("workspace_chat") || shouldRunScenario("workspace_tool")) {
+      const workspaceRoot = await mkdtemp(join(stateRoot, "timing-workspace-"));
+      const workspaceId = await registerWorkspace(page, workspaceRoot);
+      const openWorkspaceDraft = async () => {
+        await waitForTimingInput("工作区 timing 上一轮收口");
+        await waitFor(async () => {
+          const state = await rendererState(page);
+          return state.workspaceIds.includes(workspaceId) ? state : null;
+        }, "工作区 timing 采样会话");
+        await page.evaluate(`(() => {
+          const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
+          const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+          if (!create) throw new Error('workspace timing new session button missing');
+          create.click();
+        })()`);
+        await waitFor(async () => {
+          const state = await rendererState(page);
+          return state.input && state.inputEditable && !state.stop && state.assistant.length === 0
+            ? state
+            : null;
+        }, "工作区新会话草稿就绪", 45_000);
+      };
+      if (shouldRunScenario("workspace_chat")) {
+        await openWorkspaceDraft();
+        for (let index = 0; index < timingSampleCount; index += 1) {
+          const token = `ELECTRON_TIMING_WORKSPACE_${index}`;
+          await collectTiming("workspace_chat", `Electron timing 工作区聊天 ${token}`, token);
+        }
+      }
+      if (shouldRunScenario("workspace_tool")) {
+        await openWorkspaceDraft();
+        for (let index = 0; index < timingSampleCount; index += 1) {
+          const token = `ELECTRON_TIMING_TOOL_${index}`;
+          await collectTiming("workspace_tool", `Electron timing 工作区工具：调用 tool_catalog 后返回 ${token}`, token);
+        }
+      }
     }
 
-    await openWorkspaceDraft();
-    for (let index = 0; index < timingSampleCount; index += 1) {
-      const token = `ELECTRON_TIMING_TOOL_${index}`;
-      await collectTiming("workspace_tool", `Electron timing 工作区工具：调用 tool_catalog 后返回 ${token}`, token);
+    if (shouldRunScenario("goal")) {
+      await ensurePersonalDraft(false);
+      for (let index = 0; index < timingSampleCount; index += 1) {
+        if (index > 0) await openPersonalDraft(page);
+        await chooseGoalMode(page);
+        const token = `ELECTRON_TIMING_GOAL_${index}`;
+        await collectTiming("goal", `Electron timing Goal：维护目标计划并返回 ${token}`, token);
+      }
     }
 
-    await ensurePersonalDraft(false);
-    for (let index = 0; index < timingSampleCount; index += 1) {
-      await chooseGoalMode(page);
-      const token = `ELECTRON_TIMING_GOAL_${index}`;
-      await collectTiming("goal", `Electron timing Goal：维护目标计划并返回 ${token}`, token);
-    }
-
-    await clearGoalMode(page);
-    for (let index = 0; index < timingSampleCount; index += 1) {
-      const token = `ELECTRON_TIMING_AGENT_${index}`;
-      await collectTiming("subagent", `Electron timing 子代理：派发一个子代理并等待其完成后返回 ${token}`, token);
+    if (shouldRunScenario("subagent")) {
+      await clearGoalMode(page);
+      for (let index = 0; index < timingSampleCount; index += 1) {
+        if (index > 0) await openPersonalDraft(page);
+        const token = `ELECTRON_TIMING_AGENT_${index}`;
+        await collectTiming("subagent", `Electron timing 子代理：派发一个子代理并等待其完成后返回 ${token}`, token);
+      }
     }
 
     const evidence = {
@@ -1027,7 +1069,7 @@ try {
       cdpPort,
       providerPort,
       sampleCount: timingSampleCount,
-      scenarios: ["personal_chat", "workspace_chat", "workspace_tool", "goal", "subagent"],
+      scenarios: timingScenario ? [timingScenario] : timingScenarioNames,
       checks,
       providerRequests: provider.requests.length,
       rendererTimingSamples: timingSamples,
