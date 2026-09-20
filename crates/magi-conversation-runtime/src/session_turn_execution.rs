@@ -4327,7 +4327,7 @@ mod tests {
     struct InterruptedThenRecoveredSessionModelBridgeClient {
         streaming_calls: AtomicUsize,
         non_stream_calls: AtomicUsize,
-        fallback_messages: Mutex<Vec<ChatMessage>>,
+        recovery_messages: Mutex<Vec<ChatMessage>>,
     }
 
     struct SteeringModelBridgeClient {
@@ -4882,7 +4882,7 @@ mod tests {
         ) -> Result<ModelResponse, BridgeClientError> {
             self.non_stream_calls.fetch_add(1, Ordering::SeqCst);
             *self
-                .fallback_messages
+                .recovery_messages
                 .lock()
                 .expect("fallback messages mutex poisoned") = request.messages.unwrap_or_default();
             Ok(model_response(serde_json::json!({
@@ -5747,7 +5747,7 @@ mod tests {
         let client = InterruptedThenRecoveredSessionModelBridgeClient {
             streaming_calls: AtomicUsize::new(0),
             non_stream_calls: AtomicUsize::new(0),
-            fallback_messages: Mutex::new(Vec::new()),
+            recovery_messages: Mutex::new(Vec::new()),
         };
         let event_bus = InMemoryEventBus::new(32);
         let request = SessionTurnExecutionRequest {
@@ -5798,12 +5798,12 @@ mod tests {
             MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
         );
         assert_eq!(client.non_stream_calls.load(Ordering::SeqCst), 1);
-        let fallback_messages = client
-            .fallback_messages
+        let recovery_messages = client
+            .recovery_messages
             .lock()
             .expect("fallback messages mutex poisoned");
         assert_eq!(
-            fallback_messages
+            recovery_messages
                 .iter()
                 .filter(|message| {
                     message.role == "user"
