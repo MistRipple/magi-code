@@ -106,7 +106,7 @@
 | 2026-09-20 | C | 将现有权限验收按工具面、AccessProfile、workspace 作用域、生命周期、副作用、审批事件和 Provider 请求次数登记为可复核矩阵；明确 Browser/MCP、process、Git 和跨 Turn/session 的剩余格子 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：51 passed、1 ignored；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored |
 | 2026-09-20 | E | 增加打包 Electron Restricted 审批拒绝验收：真实 DOM 中点击“拒绝并继续”，验证拒绝终态可见且没有工作区文件副作用 | `/tmp/magi-electron-dom-regression-10220.json`：68 checks passed、36 次 Provider 请求；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
 | 2026-09-20 | E | 增加打包 Electron Restricted 审批取消验收：真实 DOM 中点击停止按钮取消等待授权的 Turn，验证取消终态和无文件副作用 | `/tmp/magi-electron-dom-regression-10222.json`：73 checks passed、37 次 Provider 请求；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
-| 2026-09-20 | A/C/D/E | 在 daemon 重启回放、权限矩阵登记和 Electron 审批取消验收后重新执行 Rust workspace 全量测试，确认新增证据测试没有改变其它 crate 行为 | `cargo fmt --all -- --check`；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：672 passed、1 ignored；其中 conversation-runtime 534、magi-api 673、magi-daemon 128、magi-tool-runtime 225、magi-session-store 121 均通过 |
+| 2026-09-20 | A/C/D/E | 在 daemon 重启回放、权限矩阵登记和 Electron 审批取消验收后重新执行 Rust workspace 全量测试，确认新增证据测试没有改变其它 crate 行为 | `cargo fmt --all -- --check`；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：672 passed、1 ignored；新增 daemon 测试所在 crate 为 128 passed，其余 workspace 测试均通过 |
 
 ## B 工作包首轮审计
 
