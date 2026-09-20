@@ -903,13 +903,13 @@ try {
         return state.input && !state.stop ? state : null;
       }, `${scenario} 发送前输入`);
       await setComposerText(page, prompt);
+      await waitForComposerReady(page, `${scenario} 输入内容就绪`);
       await clickSend(page);
       const result = await waitForAssistant(page, expectedText, `${scenario} ${prompt} 最终消息`);
       const turnId = result.assistant.at(-1)?.turnId;
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
       timingSamples.push(timingEvidenceRecord(scenario, turnId, timing));
       checkTimingStages(`${scenario} Renderer`, timing);
-      await waitForComposerReady(page, `${scenario} Turn 收口`);
     };
     const ensurePersonalDraft = async (first) => {
       if (!first) {
