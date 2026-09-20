@@ -3433,6 +3433,290 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_git_branch_switch_duplicate_replays_pending_approval() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("duplicate", "Git 分支重复审批回放验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "Git 分支重复请求最终完成",
+        );
+
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，等待审批后汇总结果",
+                "harness-git-approval-duplicate-request",
+                "harness-git-approval-duplicate-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 重复审批首次请求应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首次请求应有 Turn");
+        let first_root_task_id = first.root_task_id.clone().expect("首次请求应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，等待审批后汇总结果",
+                "harness-git-approval-duplicate-request",
+                "harness-git-approval-duplicate-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 重复审批请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(
+            replay.root_task_id.as_deref(),
+            Some(first_root_task_id.as_str())
+        );
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1,
+            "重复 Git 请求不得创建第二个 pending 审批"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(
+            current_git_branch(&workspace_root),
+            "approval-target",
+            "重复提交回放后仍只应产生一次真实分支切换"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_switch_allow_for_turn_does_not_cross_turn() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("cross-turn", "Git 分支跨 Turn 授权隔离验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "第一轮 Git 分支已切换",
+        );
+
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，等待本轮授权后完成",
+                "harness-git-approval-cross-turn-first",
+                "harness-git-approval-cross-turn-user-1",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 跨 Turn 首轮应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首轮应有 Turn");
+        let first_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &first_pending.approval_id,
+            "allow_for_turn",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .wait_for_terminal(&session_id, &first_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Completed
+        );
+        assert_eq!(current_git_branch(&workspace_root), "approval-target");
+
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "main"}).to_string(),
+            "第二轮 Git 分支不会绕过审批",
+        );
+        let second = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切回 main，必须重新等待审批",
+                "harness-git-approval-cross-turn-second",
+                "harness-git-approval-cross-turn-user-2",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 跨 Turn 第二轮应被接纳");
+        let second_turn_id = second.turn_id.clone().expect("第二轮应有 Turn");
+        let second_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_ne!(first_pending.approval_id, second_pending.approval_id);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            2,
+            "allow_for_turn 不得跨 Turn 复用 Git 授权"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &second_pending.approval_id,
+            "deny",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .wait_for_terminal(&session_id, &second_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Failed
+        );
+        assert_eq!(current_git_branch(&workspace_root), "approval-target");
+        assert_eq!(non_classifier_provider_request_count(&harness), 3);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_switch_allow_for_turn_does_not_cross_session() {
+        let (harness, workspace_id, workspace_root, first_session_id) =
+            prepare_git_approval_case("cross-session", "Git 分支跨 Session 授权隔离验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "第一 Session Git 分支已切换",
+        );
+
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &first_session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，等待本轮授权后完成",
+                "harness-git-approval-cross-session-first",
+                "harness-git-approval-cross-session-user-1",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("首个 Session 应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首个 Session 应有 Turn");
+        let first_pending = wait_for_pending_tool_approval(&harness, &first_session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &first_session_id,
+            &workspace_id,
+            &workspace_root,
+            &first_pending.approval_id,
+            "allow_for_turn",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .wait_for_terminal(&first_session_id, &first_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Completed
+        );
+        assert_eq!(current_git_branch(&workspace_root), "approval-target");
+
+        let second_session_id = SessionId::new("harness-git-approval-cross-session-second");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                second_session_id.clone(),
+                "Git 分支跨 Session 第二会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("第二 Session 应创建");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "main"}).to_string(),
+            "第二 Session 不应绕过 Git 审批",
+        );
+        let second = harness
+            .submit_workspace_task_with_access_profile(
+                &second_session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切回 main，必须重新等待审批",
+                "harness-git-approval-cross-session-second",
+                "harness-git-approval-cross-session-user-2",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("第二 Session 应被接纳");
+        let second_turn_id = second.turn_id.clone().expect("第二 Session 应有 Turn");
+        let second_pending = wait_for_pending_tool_approval(&harness, &second_session_id).await;
+        assert_ne!(first_pending.approval_id, second_pending.approval_id);
+        assert_eq!(
+            harness
+                .events_for(&second_session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1,
+            "allow_for_turn 不得跨 Session 复用 Git 授权"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &second_session_id,
+            &workspace_id,
+            &workspace_root,
+            &second_pending.approval_id,
+            "deny",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .wait_for_terminal(&second_session_id, &second_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Failed
+        );
+        assert_eq!(current_git_branch(&workspace_root), "approval-target");
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn restricted_profile_git_branch_switch_denial_preserves_branch_and_fails_turn() {
         let (harness, workspace_id, workspace_root, session_id) =
             prepare_git_approval_case("deny", "Git 分支审批拒绝验收");
