@@ -14,8 +14,8 @@
 | --- | --- | --- | --- |
 | A | 17.3：current Turn 写入口和测试夹具边界 | 进行中 | 生产路径只经 `CanonicalTurnEventSink`；剩余底层 fixture 已逐项分类，能迁移的已迁移，保留项有精确理由和测试覆盖 |
 | B | 17.7：失效 legacy/兼容语义清理 | 待开始 | 失效生产双轨、旧注释和无效 fixture 清除；迁移、恢复、协议兼容、旧字段拒绝逻辑保留并有边界说明 |
-| C | 完整权限组合矩阵 | 待开始 | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
-| D | 真实 Provider 全矩阵 | 待开始 | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
+| C | 完整权限组合矩阵 | 进行中（基础 runtime/API 矩阵已跑通；组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
+| D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮及基础 cancel/reconnect 已有；全矩阵未完成） | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
 | E | Electron packaged GUI 全矩阵 | 部分完成 | 在现有 55 项单轮基础上补齐 Agent drawer、Goal/Plan 组合、Git/审批错误和 reconnect/history/restart 组合 |
 | F | Electron 五类场景各 20 轮端到端 timing | 进行中（Renderer 五类 20/20；后端同轮关联未完成） | 5 类 × 20 轮均有同轮 accepted、Provider 首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
 | G | 性能 before/after 对比 | 待开始 | 有可审计的旧版本 before 数据，并与当前 after 数据使用同一场景、同一指标和同一统计方法 |
@@ -76,6 +76,7 @@
 | 2026-09-20 | A | 完成生产 current Turn 写入口审计；将仅测试使用的状态包装改为测试专用命名和可见性 | `cargo fmt --all -- --check`；`cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed |
 | 2026-09-20 | F | 完成五类 timing 各 2 轮，并新增每轮 terminal 收口门槛；20 轮采样在 Goal 第 12 轮暴露上下文隔离问题 | `/tmp/magi-electron-dom-timing-2-9999d.json`：5 类 × 2，43 checks passed；`/tmp/magi-electron-dom-timing-20-9998.json` 未形成完整证据 |
 | 2026-09-20 | F | 通过 `MAGI_ELECTRON_DOM_TIMING_SCENARIO` 按场景隔离采样，并对 Goal/子代理轮次切换到独立个人草稿；五类 Renderer timing 各完成 20 轮 | `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`；5 类各 20 条唯一 `turnId`，每条均有四个 Renderer 阶段和 terminal 收口 |
+| 2026-09-20 | C | 跑通权限 runtime/API 基础矩阵并记录组合缺口 | `magi-api turn_harness`：48 passed、1 ignored；`magi-tool-runtime`：225 passed、1 ignored |
 
 ## B 工作包首轮审计
 
@@ -88,6 +89,22 @@
 - daemon 路由 `.fallback(get(...))` 和配置缺失时返回 unavailable：属于 HTTP 路由/配置错误边界，不是消息响应双实现。
 
 首轮审计尚未发现可以直接删除的生产双轨路径；B 仍保持未完成，下一步需要把每个保留项绑定到具体测试，并继续寻找失效注释、无效 fixture 和不再可达的兼容分支。
+
+## C 工作包首轮证据
+
+已运行的基础矩阵：
+
+- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：48 passed、1 ignored。覆盖 ReadOnly 的 file/shell/Git/image 拒绝和只读读取、Restricted 的 workspace 内外写入、allow once、allow for turn、deny、cancel、expiry、Provider 请求次数与审批事件、FullAccess 的 workspace 内外写入，以及 Git dirty/branch drift/merge conflict。
+- `cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored。覆盖全部内置工具策略分类、Browser 与 MCP 读写轴、shell/process/path 边界、workspace 作用域、写保护、取消和真实文件/进程副作用。
+
+这些证据证明权限引擎和 Turn Harness 的基础轴已存在，但 C 不能关闭。仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；Electron packaged GUI 和真实 Provider 的权限组合也尚未全部覆盖。
+
+## D 工作包首轮证据
+
+- 真实 Provider/daemon 五类场景各 20 轮后端证据已存在：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。
+- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 48 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict 和部分权限审批恢复。
+
+D 仍不能关闭。缺口是 daemon restart、history/replay、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
 
 ## 关闭规则
 
