@@ -4589,7 +4589,7 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_plan_continues_beyond_legacy_follow_up_limit() {
+    fn unfinished_plan_continues_beyond_prior_follow_up_limit() {
         let session_id = SessionId::new("session-plan-follow-up");
         let turn_id = "turn-plan-follow-up".to_string();
         let store = Arc::new(SessionStore::new());

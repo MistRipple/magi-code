@@ -4854,7 +4854,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restricted_shell_workspace_fallback_uses_canonical_root_for_symlink_workspace() {
+    fn restricted_shell_workspace_uses_canonical_root_for_symlink_workspace() {
         let workspace = tempdir().expect("workspace tempdir");
         let real_root = workspace.path().join("real-root");
         let link_root = workspace.path().join("link-root");

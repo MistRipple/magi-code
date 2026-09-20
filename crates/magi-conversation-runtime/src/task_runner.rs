@@ -790,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_unknown_role_is_not_silently_fallback_to_executor() {
+    fn explicit_unknown_role_is_not_silently_reassigned_to_executor() {
         let store = Arc::new(TaskStore::new());
         let mut root = test_task(
             "task-explicit-unknown-role",
@@ -800,7 +800,7 @@ mod tests {
         root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("missing-role"));
         store.insert_task(root.clone()).expect("根任务应插入");
         let executor = WorkerInfo {
-            worker_id: WorkerId::new("worker-executor-fallback-check"),
+            worker_id: WorkerId::new("worker-executor-reassignment-check"),
             role: "executor".to_string(),
             supported_kinds: vec![TaskKind::LocalAgent],
             parallelism_limit: None,

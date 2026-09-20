@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_turn_continues_beyond_legacy_round_limit() {
+    fn advance_turn_continues_beyond_prior_round_limit() {
         let mut conv = Conversation::new(SessionId::new("s"));
         let mut rounds = (0..64).map(|_| RoundOutcome::Continue).collect::<Vec<_>>();
         rounds.push(RoundOutcome::Done);

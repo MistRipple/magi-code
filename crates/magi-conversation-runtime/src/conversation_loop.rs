@@ -6035,7 +6035,7 @@ mod tests {
     }
 
     #[test]
-    fn task_loop_keeps_tools_available_beyond_legacy_round_limit() {
+    fn task_loop_keeps_tools_available_beyond_prior_round_limit() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(128);
         let session_id = SessionId::new("session-unbounded-tool-rounds");
