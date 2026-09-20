@@ -82,6 +82,7 @@
 | 2026-09-20 | C | 跑通权限 runtime/API 基础矩阵并记录组合缺口 | `magi-api turn_harness`：48 passed、1 ignored；`magi-tool-runtime`：225 passed、1 ignored |
 | 2026-09-20 | F | 为生产 Conversation、Task、Goal 和子代理路径补充后端阶段日志，并在 Electron 脚本中解析 chunk 行缓冲、按 `turnId` 聚合和等待终态发布；五类各 20 轮完成同轮关联 | `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：100 条唯一 `turnId`、903 checks passed、每条后端五阶段和 Renderer 四阶段齐全；`cargo check -p magi-api -p magi-conversation-runtime`、`node --check scripts/verify-electron-conversation-dom.mjs`、`npm run desktop:package -- --dir` |
 | 2026-09-20 | F | 将同轮关联证据写入口径补充到性能计划，并确认脚本在输出前 flush 日志缓冲；保留工具调用 raw tool-call-only 首 chunk 尚未纳入首原始 delta 统计的限制 | `/tmp/magi-electron-dom-correlated-timing-20-10108.json`；`cargo test -p magi-conversation-runtime --lib conversation_loop -- --test-threads=1`：55 passed；`cargo test -p magi-conversation-runtime --lib session_writeback -- --test-threads=1`：34 passed；`cargo test -p magi-api --lib task_turn_finalize -- --test-threads=1`：6 passed；`node --check scripts/verify-electron-conversation-dom.mjs` |
+| 2026-09-20 | F | 在当前 timing 埋点和脚本收口提交后重新执行 Rust workspace 全量验收，确认时序日志不会改变既有架构行为 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：669 passed、1 ignored；其中 conversation-runtime 532、magi-api 670、magi-daemon 127、magi-tool-runtime 225、magi-session-store 121 均通过 |
 
 ## B 工作包首轮审计
 
