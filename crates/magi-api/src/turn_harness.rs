@@ -3267,6 +3267,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_profile_duplicate_request_replays_pending_approval_without_duplicate_side_effects()
+     {
+        let harness = MagiTurnHarness::new_task("重复审批请求回放");
+        let workspace_root =
+            tempfile::tempdir().expect("duplicate approval workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-duplicate-approval-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("duplicate approval workspace should register");
+        let session_id = SessionId::new("harness-duplicate-approval-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "重复审批请求回放",
+                Some(workspace_id.to_string()),
+            )
+            .expect("duplicate approval session should create");
+        let target = workspace_root.path().join("duplicate-approval.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf duplicate > {}", target.display())
+            })
+            .to_string(),
+            "重复审批请求最终完成",
+        );
+
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 写入文件，等待审批后汇总结果",
+                "harness-duplicate-approval-request",
+                "harness-duplicate-approval-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("首次受限请求应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首次请求应有 Turn");
+        let first_task_id = first.root_task_id.clone().expect("首次请求应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 写入文件，等待审批后汇总结果",
+                "harness-duplicate-approval-request",
+                "harness-duplicate-approval-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("相同 requestId/fingerprint 应回放待处理 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1,
+            "重复提交不得创建第二个 pending 审批"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1,
+            "重复提交不得重复发布审批请求事件"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            1,
+            "待审批期间重复提交不得重复请求 Provider"
+        );
+
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("审批允许后应产生一次文件副作用"),
+            "duplicate"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1,
+            "重复提交后的审批请求总数仍应为一"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1,
+            "同一 pending 审批只能收口一次"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "审批放行后只允许原始工具轮和一次最终答复轮"
+        );
+    }
+
+    #[tokio::test]
     async fn restricted_profile_file_remove_allow_once_deletes_target_without_retry() {
         let harness = MagiTurnHarness::new_task("审批后删除文件");
         let workspace_root = tempfile::tempdir().expect("remove approval workspace should create");

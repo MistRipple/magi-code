@@ -14,7 +14,7 @@
 | --- | --- | --- | --- |
 | A | 17.3：current Turn 写入口和测试夹具边界 | 进行中（底层 fixture 审计完成，待主方案文档同步） | 生产路径只经 `CanonicalTurnEventSink`；剩余底层 fixture 已逐项分类，均为验证原子 mutation/恢复边界的测试，保留理由和测试覆盖已记录，并需同步方案文档的 17.3 勾选状态 |
 | B | 17.7：失效 legacy/兼容语义清理 | 进行中（首轮审计完成；未发现可直接删除的生产双轨） | 失效生产双轨、旧注释和无效 fixture 清除；迁移、恢复、协议兼容、旧字段拒绝逻辑保留并有边界说明 |
-| C | 完整权限组合矩阵 | 进行中（基础 runtime/API 矩阵和跨 Turn 授权隔离已跑通；组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
+| C | 完整权限组合矩阵 | 进行中（基础 runtime/API、跨 Turn/Session 隔离和重复审批回放已跑通；完整组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
 | D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮、基础 cancel/reconnect 及 Task restart replay 已有；全矩阵未完成） | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
 | E | Electron packaged GUI 全矩阵 | 部分完成 | 在现有 55 项单轮基础上补齐 Agent drawer、Goal/Plan 组合、Git/审批错误和 reconnect/history/restart 组合 |
 | F | Electron 五类场景各 20 轮端到端 timing | 进行中（100/100 已完成同轮结构化关联，仍需与历史后端基线统一统计） | 5 类 × 20 轮均有同轮 accepted、Provider 首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
@@ -47,6 +47,7 @@
 - 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误继续传播。回归测试覆盖 running、blocked、替换 Turn，以及活动 Turn 内 immutable canonical item 冲突，避免把预期迟到写回记录成生产错误，也避免吞掉真实写回错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
 - 该关联证据仍不能关闭 F：它尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
 - 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。工具调用首轮只有 tool-call block 时，`provider_first_delta` 继续表示首个可见 content/thinking delta，raw tool-call-only chunk 仍单独记录为 `provider_response_received`。
+- Restricted `shell_exec` 的重复 requestId/fingerprint 回放已补充到真实 `TurnService` harness：待审批期间第二次提交复用同一 `turn_id`/root task，不创建第二个 pending 审批、不重复发布 `tool.approval.requested`、不重复请求 Provider；放行后只产生一次真实文件副作用并完成 canonical Turn。该证据只覆盖 duplicate + approval 组合，不能替代完整工具类型、访问模式、作用域和生命周期矩阵。
 
 ## 推进顺序
 
@@ -94,6 +95,7 @@
 | 2026-09-20 | B | 对 runtime/session-store/api/daemon 的 legacy、compat、fallback、旧路径命中重新审计；523 条命中均归入迁移、恢复、协议/能力状态、配置或路由错误边界，未找到可安全删除的生产双轨 | `rg -n --glob '*.rs' 'legacy|Legacy|fallback|compat|兼容|旧路径|回退' crates/magi-conversation-runtime crates/magi-session-store crates/magi-api crates/magi-daemon`：523 条命中；保留项分类已写入 B 工作包记录 |
 | 2026-09-20 | A/D/E | 修复并发子任务状态 callback 与 root Turn 终态收口之间的迟到写回竞态；仅对已切换、缺失或终态 Turn 丢弃旧 item，同一活动 Turn 的 immutable canonical 写回错误继续返回 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：8 passed；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：671 passed、1 ignored；对应提交 `b9c13529`，新增 `task_status_write_preserves_active_turn_canonical_errors` |
 | 2026-09-20 | C/D | 增加同一 Session 跨 Turn、跨 Session 的 `allow_for_turn` 审批隔离和 Task profile restart/replay 验收；验证真实文件副作用、审批请求数、canonical 终态和 Provider 请求不重复 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：50 passed、1 ignored；`cargo test -p magi-daemon --lib daemon::tests::session_turn_persists_without_live_subscriber_and_recovers_after_restart -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib runtime_restart -- --test-threads=1`：3 passed；对应提交 `0251c710` |
+| 2026-09-20 | C | 补充 Restricted `shell_exec` 重复 requestId/fingerprint 的待审批回放验收，确认 duplicate 不重复创建审批、Provider 请求或真实副作用 | `cargo test -p magi-api --lib turn_harness::tests::restricted_profile_duplicate_request_replays_pending_approval_without_duplicate_side_effects -- --test-threads=1`：1 passed；相关实现位于 `crates/magi-api/src/turn_harness.rs` |
 | 2026-09-20 | A/D | 将 `killed` 与 `superseded` 纳入任务 Turn 终态判定，确保迟到 task status callback 在所有 canonical 终态下都按 stale item 丢弃；不改变同一活动 Turn 的真实错误传播 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；对应提交 `b9c13529` |
 
 ## B 工作包首轮审计
@@ -117,6 +119,19 @@
 - `cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored。覆盖全部内置工具策略分类、Browser 与 MCP 读写轴、shell/process/path 边界、workspace 作用域、写保护、取消和真实文件/进程副作用。
 
 这些证据证明权限引擎和 Turn Harness 的基础轴已存在。新增 `restricted_profile_allow_for_turn_requires_new_approval_on_next_turn` 覆盖同一 Session 跨两个 Turn 及新 Session 的 `allow_for_turn` 隔离、三次真实文件副作用和三条审批请求；C 仍不能关闭。仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；其它工具类型、重复请求和 Electron/真实 Provider 权限组合也尚未全部覆盖。
+
+当前组合覆盖按轴记录如下：
+
+| 轴 | 已有直接证据 | 当前缺口 |
+| --- | --- | --- |
+| file | ReadOnly 读/写拒绝、Restricted 工作区写入与审批、FullAccess 写入；`file_remove`、`file_patch`、`file_mkdir`、`file_copy`、`file_move` 有真实副作用断言 | 各工具在三种 AccessProfile 与 workspace 内外的完整生命周期组合尚未逐项导出 |
+| shell/process | ReadOnly 显式只读 shell、写 shell 拒绝；Restricted shell 审批/允许/拒绝/取消/过期；process 规则在 runtime 矩阵中覆盖 | process 真实副作用和 duplicate/cross-session 仍主要依赖 runtime/API 分散测试 |
+| Git | dirty、branch drift、merge conflict 的 Provider 不调用或终态失败证据已有 | Git 工具逐项审批生命周期及 GUI 可见错误尚未合并 |
+| browser/MCP | `magi-tool-runtime` 已覆盖能力分类、读写策略和协议状态 | 真实 Browser/MCP 外部副作用、三种 AccessProfile 的同轮 Provider 计数尚未完成 |
+| AccessProfile / scope | ReadOnly、Restricted、FullAccess；workspace 内外；`allow_for_turn` 跨 Turn/Session 隔离已有 | 每个工具类型尚未形成统一的行级矩阵和可复核 JSON |
+| lifecycle | allow once、allow for turn、deny、cancel、expiry、duplicate 待审批回放均有代表性测试 | 组合表尚未覆盖每个工具类型的所有生命周期格子 |
+
+因此 C 当前新增的是 duplicate 审批回放证据，剩余工作是把已有分散测试整理为统一可审计矩阵，并补齐 Browser/MCP、process 和 Git 的真实组合缺口。
 
 ## D 工作包首轮证据
 
