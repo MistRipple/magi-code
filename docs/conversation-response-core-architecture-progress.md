@@ -68,6 +68,18 @@
 | 2026-09-20 | A | 完成生产 current Turn 写入口审计；将仅测试使用的状态包装改为测试专用命名和可见性 | `cargo fmt --all -- --check`；`cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed |
 | 2026-09-20 | F | 完成五类 timing 各 2 轮，并新增每轮 terminal 收口门槛；20 轮采样在 Goal 第 12 轮暴露上下文隔离问题 | `/tmp/magi-electron-dom-timing-2-9999d.json`：5 类 × 2，43 checks passed；`/tmp/magi-electron-dom-timing-20-9998.json` 未形成完整证据 |
 
+## B 工作包首轮审计
+
+当前检索到的 `legacy` / `fallback` 语义按职责分为：
+
+- `magi-session-store` 的 v1 -> v2 转换、旧 sidecar/thread projection 重建和 `legacyMigration` 标记：属于一次性迁移输入，保留。
+- `magi-daemon` 的旧目录读取、归档、重引入隔离和损坏状态拒绝：属于恢复与数据安全边界，保留。
+- MCP/Browser 的 `fallback-only`、`available_fallback` 和协议兼容状态：属于对外状态合同，保留。
+- `agent_runs.fallback_mode`、`openai-compatible` Provider 名称以及旧字段拒绝测试：属于现有协议或兼容性验证，保留。
+- daemon 路由 `.fallback(get(...))` 和配置缺失时返回 unavailable：属于 HTTP 路由/配置错误边界，不是消息响应双实现。
+
+首轮审计尚未发现可以直接删除的生产双轨路径；B 仍保持未完成，下一步需要把每个保留项绑定到具体测试，并继续寻找失效注释、无效 fixture 和不再可达的兼容分支。
+
 ## 关闭规则
 
 任何工作包只有在代码或脚本变更、直接证据、定向测试和文档记录都齐全后，才能从“进行中”改为“已完成”。单轮证据不能替代多轮矩阵；当前 after 数据不能替代 before 数据；生产路径收敛不能替代测试 fixture 边界审计。
