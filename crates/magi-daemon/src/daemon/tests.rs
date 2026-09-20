@@ -2863,6 +2863,97 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
 }
 
 #[tokio::test]
+async fn task_turn_replays_after_daemon_restart_without_duplicate_canonical_acceptance() {
+    let state_root = temp_state_root("e2e-task-turn-restart-replay");
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+    let request_id = "request-task-turn-restart-replay";
+    let user_message_id = "user-task-turn-restart-replay";
+    let request = json!({
+        "scope": "workspace",
+        "text": "执行任务并在 daemon 重启后验证同一 Turn 回放",
+        "skillName": "code",
+        "images": [],
+        "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
+        "requestId": request_id,
+        "userMessageId": user_message_id,
+    });
+
+    let (status, body) = post_json(app.clone(), "/api/session/turn", request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "task Turn should accept: {body:?}");
+    let session_id = body["sessionId"]
+        .as_str()
+        .expect("task Turn should include session id")
+        .to_string();
+    let turn_id = body["canonicalTurn"]["turnId"]
+        .as_str()
+        .expect("task Turn should include canonical turn id")
+        .to_string();
+    let root_task_id = body["rootTaskId"]
+        .as_str()
+        .expect("task Turn should include root task id")
+        .to_string();
+    assert_eq!(
+        body["canonicalItem"]["metadata"]["requestId"], request_id,
+        "accepted task item must retain request identity"
+    );
+
+    drop(app);
+    drop(state);
+    drop(runtime);
+
+    let restarted_runtime =
+        DaemonRuntime::restore(&config).expect("daemon restart should recover task state");
+    let (restarted_app, restarted_state) =
+        restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
+    let restarted_session_id = SessionId::new(session_id.clone());
+    let restarted_turn = restarted_state
+        .session_store
+        .canonical_turn_for_session_turn_id(&restarted_session_id, &turn_id)
+        .expect("restart should recover the accepted task Turn");
+    assert_eq!(restarted_turn.turn_id, turn_id);
+    assert!(
+        restarted_turn.items.iter().any(|item| {
+            item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                && item.item_id == user_message_id
+                && item
+                    .metadata
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request_id)
+                && item
+                    .metadata
+                    .get("userMessageId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(user_message_id)
+        }),
+        "restart must recover the canonical task user item and request identity"
+    );
+
+    let (replay_status, replay_body) = post_json(restarted_app, "/api/session/turn", request).await;
+    assert_eq!(
+        replay_status,
+        StatusCode::OK,
+        "same task request should replay after daemon restart: {replay_body:?}"
+    );
+    assert_eq!(replay_body["sessionId"], session_id);
+    assert_eq!(replay_body["canonicalTurn"]["turnId"], turn_id);
+    assert_eq!(replay_body["rootTaskId"], root_task_id);
+    assert_eq!(
+        restarted_state
+            .session_store
+            .canonical_turns_for_session(&restarted_session_id)
+            .iter()
+            .filter(|turn| turn.turn_id == turn_id)
+            .count(),
+        1,
+        "daemon restart replay must not append a duplicate canonical Turn"
+    );
+}
+
+#[tokio::test]
 async fn workspace_sessions_and_events_stay_workspace_scoped() {
     let state_root = temp_state_root("e2e-workspace-session-isolation");
     let second_workspace_root = temp_state_root("e2e-workspace-session-isolation-second");
