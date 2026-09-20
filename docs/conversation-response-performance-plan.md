@@ -642,6 +642,20 @@ tool-call block、没有可见 content/thinking delta 的 Provider 响应；当�
 证据与既有 `/tmp/magi-real-provider-perf-*.json` 使用同一场景、同一指标和同一统计方法合并，
 并补齐可审计的旧版本 before 数据。
 
+重新打包当前 Web/Desktop 工作区后的复验见 `/tmp/magi-electron-dom-correlated-timing-20-10031.json`：
+五类各 20 轮、100 条唯一 `turn_id`、903 项检查通过、280 次 Provider 请求，0 条缺少后端阶段，
+终态来源全部为 `canonical_terminal_published`。该复验确认当前打包产物仍满足同轮关联，但不改变
+before 数据缺失和 raw tool-call-only 首 chunk 尚未单独统计的限制。当前复验的 P50/P95（单位 ms，
+后端为 `sinceAcceptedMs`，DOM 为 Renderer 局部 `elapsedMs`）为：
+
+| 场景 | runner P50/P95 | Provider 首可见 delta P50/P95 | EventBus 首事件 P50/P95 | terminal P50/P95 | DOM paint P50/P95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| personal_chat | 0 / 1 | 2 / 5 | 11 / 14 | 96 / 113 | 8.5 / 24.4 |
+| workspace_chat | 1 / 2 | 3 / 5 | 12 / 14 | 98 / 111 | 7.2 / 16.5 |
+| workspace_tool | 166 / 385 | 304 / 695 | 173 / 391 | 441 / 896 | 14.1 / 28.7 |
+| goal | 196 / 256 | 403 / 485 | 206 / 265 | 517 / 595 | 14.5 / 37.4 |
+| subagent | 253 / 333 | 425 / 502 | 265 / 359 | 678 / 765 | 16.7 / 40.9 |
+
 ## 10. 关键源码证据
 
 Magi 当前主要证据位置：
