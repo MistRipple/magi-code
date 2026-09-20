@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-20
-代码基线：`dbbd7daff681802b59fac789dadbb25914614a87`
+代码基线：`eb1cac1c825816a286291ddc05bc55afe928fb7f`（迟到任务状态写回竞态修复）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -41,7 +41,7 @@
 - before 版本性能数据当前不存在，因此 G 保持未完成。
 - Electron 五类各 20 轮后端/Renderer 同轮关联已完成：`/tmp/magi-electron-dom-correlated-timing-20-10108.json`，100 条唯一 `turnId`、903 项脚本检查、280 次 Provider 请求；每条记录都包含 `accepted_response_sent`、`runner_started`、`provider_first_delta`、`event_bus_first_event`、`canonical_terminal_published` 和 Renderer 四阶段。证据中的 `sinceAcceptedMs` 由日志时间戳计算，仅用于同轮阶段顺序和分布统计；Provider 首 delta 与终态仍保留各自后端阶段耗时。
 - 在重新打包后的当前 Electron/Web 工作区上复验同一 timing-only 五类 × 20 轮：`/tmp/magi-electron-dom-correlated-timing-20-10031.json`，`status=passed`、903 项检查、280 次 Provider 请求、100 条唯一 `turnId`、0 条缺少后端阶段、终态来源全部为 `canonical_terminal_published`。该复验用于确认打包产物和当前 Web/Desktop 状态仍能完成同轮关联；Provider 波动下的分布不能直接替换历史性能基线。
-- 该复验日志还观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`；脚本检查未把这类日志当作通过条件。该竞态需要在 D/E 的 Provider/GUI 全矩阵中继续分类，不能把 100 条 timing 通过扩大解释为所有任务状态 item 写回都无错误。
+- 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误仍继续传播。新增回归测试覆盖 running、blocked 和替换 Turn，避免把预期迟到写回记录成生产错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
 - 该关联证据仍不能关闭 F：它尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
 - 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。工具调用首轮只有 tool-call block 时，`provider_first_delta` 继续表示首个可见 content/thinking delta，raw tool-call-only chunk 仍单独记录为 `provider_response_received`。
 
@@ -87,6 +87,7 @@
 | 2026-09-20 | F | 将同轮关联证据写入口径补充到性能计划，并确认脚本在输出前 flush 日志缓冲；保留工具调用 raw tool-call-only 首 chunk 尚未纳入首原始 delta 统计的限制 | `/tmp/magi-electron-dom-correlated-timing-20-10108.json`；`cargo test -p magi-conversation-runtime --lib conversation_loop -- --test-threads=1`：55 passed；`cargo test -p magi-conversation-runtime --lib session_writeback -- --test-threads=1`：34 passed；`cargo test -p magi-api --lib task_turn_finalize -- --test-threads=1`：6 passed；`node --check scripts/verify-electron-conversation-dom.mjs` |
 | 2026-09-20 | F | 在当前 timing 埋点和脚本收口提交后重新执行 Rust workspace 全量验收，确认时序日志不会改变既有架构行为 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：669 passed、1 ignored；其中 conversation-runtime 532、magi-api 670、magi-daemon 127、magi-tool-runtime 225、magi-session-store 121 均通过 |
 | 2026-09-20 | E/F | 在其他 Agent 的 Web/Desktop 修改仍保留的工作区上复验协议、Svelte、生产构建和 npm golden；这些结果只证明当前工作区可构建，不扩大为完整 Electron GUI 或 Provider 全矩阵 | `npm run protocol:check`；`npm --prefix web run check`：0 errors、0 warnings；`npm --prefix web run build`；`npm test`：Desktop 99、Browser Worker 57 及 Web golden 全部通过 |
+| 2026-09-20 | D/E | 修复并发子任务状态 callback 与 root Turn 终态收口之间的迟到写回竞态；仅对已切换、缺失或终态 Turn 丢弃旧 item，同一活动 Turn 的真实错误继续返回 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：669 passed、1 ignored；对应提交 `eb1cac1c` |
 
 ## B 工作包首轮审计
 
