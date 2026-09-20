@@ -3506,6 +3506,100 @@ fn structured_git_builtins_delegate_through_runtime_resource() {
 }
 
 #[test]
+fn structured_git_access_profile_matrix_blocks_mutations_before_executor() {
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let calls_for_executor = Arc::clone(&calls);
+    let registry = make_registry().with_git_tool_executor(Arc::new(move |tool, input, _| {
+        calls_for_executor
+            .lock()
+            .expect("Git executor audit lock should hold")
+            .push(format!("{tool}:{input}"));
+        (
+            serde_json::json!({ "tool": tool, "status": "succeeded" }).to_string(),
+            ExecutionResultStatus::Succeeded,
+        )
+    }));
+    let context = ToolExecutionContext {
+        session_id: Some(SessionId::new("session-git-profile-matrix")),
+        workspace_id: Some(WorkspaceId::new("workspace-git-profile-matrix")),
+        access_profile: magi_core::AccessProfile::Restricted,
+        working_directory: Some(PathBuf::from("/tmp/git-profile-matrix")),
+        browser_capability_snapshot: None,
+        browser_execution_id: None,
+        ..ToolExecutionContext::default()
+    };
+
+    for access_profile in [
+        magi_core::AccessProfile::ReadOnly,
+        magi_core::AccessProfile::Restricted,
+        magi_core::AccessProfile::FullAccess,
+    ] {
+        let read = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("git-status-{access_profile:?}")),
+                BuiltinToolName::GitStatus.as_str(),
+                "{}",
+            ),
+            context.clone(),
+            &ToolExecutionPolicy {
+                access_profile,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+        assert_eq!(
+            read.status,
+            ExecutionResultStatus::Succeeded,
+            "Git read operation should execute under {access_profile:?}"
+        );
+
+        let mutation = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("git-switch-{access_profile:?}")),
+                BuiltinToolName::GitBranchSwitch.as_str(),
+                r#"{"branch":"feature"}"#,
+            ),
+            context.clone(),
+            &ToolExecutionPolicy {
+                access_profile,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+        match access_profile {
+            magi_core::AccessProfile::ReadOnly => {
+                assert_eq!(mutation.status, ExecutionResultStatus::Rejected)
+            }
+            magi_core::AccessProfile::Restricted => {
+                assert_eq!(mutation.status, ExecutionResultStatus::NeedsApproval)
+            }
+            magi_core::AccessProfile::FullAccess => {
+                assert_eq!(mutation.status, ExecutionResultStatus::Succeeded)
+            }
+        }
+    }
+
+    let calls = calls.lock().expect("Git executor audit lock should hold");
+    assert_eq!(
+        calls.len(),
+        4,
+        "three Git reads plus only the FullAccess mutation reach the executor"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("git_status:"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("git_branch_switch:"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn registry_enforces_read_only_profile_for_write_tools() {
     let root = unique_temp_dir("magi-tool-read-only-profile");
     let registry = make_registry();

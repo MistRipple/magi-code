@@ -110,7 +110,7 @@
 | 2026-09-20 | A/C/D/E | 在 daemon 重启回放、权限矩阵登记和 Electron 审批取消验收后重新执行 Rust workspace 全量测试，确认新增证据测试没有改变其它 crate 行为 | `cargo fmt --all -- --check`；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：672 passed、1 ignored；新增 daemon 测试所在 crate 为 128 passed，其余 workspace 测试均通过 |
 | 2026-09-21 | F | 扩展 `ModelStreamingDelta` 的 raw tool-call snapshot，并在 Task/Goal/子代理路径记录 `provider_first_raw_delta`；重新打包后完成单轮和五类 × 20 轮同轮复验 | `/tmp/magi-electron-dom-raw-tool-1-10230.json`：13 checks passed；`/tmp/magi-electron-dom-correlated-timing-20-10231.json`：963 checks passed、100 条唯一 `turnId`、280 次 Provider 请求、60 条 Task/Goal/子代理 sample 均具备 raw stage；`cargo test -p magi-bridge-client --lib -- --test-threads=1`：252 passed；`cargo test -p magi-conversation-runtime --lib conversation_loop -- --test-threads=1`：55 passed；`npm run desktop:package -- --dir` |
 | 2026-09-21 | F | 在 raw delta 代码和最新打包证据后重新执行 workspace 全量测试，确认新增 `tool_calls` 字段和 raw timing stage 没有破坏其它 crate | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：672 passed、1 ignored；`magi-bridge-client`：252 passed；`magi-conversation-runtime`：534 passed；`magi-api turn_harness`：51 passed、1 ignored；`magi-daemon`：128 passed；`magi-tool-runtime`：225 passed、1 ignored |
-| 2026-09-21 | C | 将外部 MCP 读写权限组合展开为 ReadOnly/Restricted/FullAccess × read/write 的 6 行 executor side-effect 矩阵；明确每行的状态和 executor 是否被调用 | `cargo test -p magi-tool-runtime --lib external_mcp_access_profile_matrix_records_executor_side_effects -- --test-threads=1`：1 passed；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：226 passed、1 ignored |
+| 2026-09-21 | C | 将外部 MCP 读写权限组合展开为 ReadOnly/Restricted/FullAccess × read/write 的 6 行 executor side-effect 矩阵，并补充 Git 读/写 × 三种 AccessProfile 的 executor 到达矩阵 | `cargo test -p magi-tool-runtime --lib external_mcp_access_profile_matrix_records_executor_side_effects -- --test-threads=1`：1 passed；`cargo test -p magi-tool-runtime --lib structured_git_access_profile_matrix_blocks_mutations_before_executor -- --test-threads=1`：1 passed；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：227 passed、1 ignored |
 
 ## B 工作包首轮审计
 
@@ -144,7 +144,7 @@ B 的保留语义已绑定到以下测试边界：
 - `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：51 passed、1 ignored。覆盖 ReadOnly 的 file/shell/Git/image 拒绝和只读读取、Restricted 的 workspace 内外写入、allow once、allow for turn、deny、cancel、expiry、Provider 请求次数与审批事件、跨 Turn/Session 授权隔离、FullAccess 的 workspace 内外写入，以及 Git dirty/branch drift/merge conflict。
 - `cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored。覆盖全部内置工具策略分类、Browser 与 MCP 读写轴、shell/process/path 边界、workspace 作用域、写保护、取消和真实文件/进程副作用。
 
-这些证据证明权限引擎和 Turn Harness 的基础轴已存在。新增 `restricted_profile_allow_for_turn_requires_new_approval_on_next_turn` 覆盖同一 Session 跨两个 Turn 及新 Session 的 `allow_for_turn` 隔离、三次真实文件副作用和三条审批请求；新增 `external_mcp_access_profile_matrix_records_executor_side_effects` 将外部 MCP 读/写工具 × 三种 AccessProfile 展开为 6 行，验证真实 executor 只接收允许的 4 行，并保留 Restricted 写工具的 `NeedsApproval` 与 ReadOnly 写工具的硬拒绝。C 仍不能关闭。仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；其它工具类型、重复请求和 Electron/真实 Provider 权限组合也尚未全部覆盖。
+这些证据证明权限引擎和 Turn Harness 的基础轴已存在。新增 `restricted_profile_allow_for_turn_requires_new_approval_on_next_turn` 覆盖同一 Session 跨两个 Turn 及新 Session 的 `allow_for_turn` 隔离、三次真实文件副作用和三条审批请求；新增 `external_mcp_access_profile_matrix_records_executor_side_effects` 将外部 MCP 读/写工具 × 三种 AccessProfile 展开为 6 行，验证真实 executor 只接收允许的 4 行，并保留 Restricted 写工具的 `NeedsApproval` 与 ReadOnly 写工具的硬拒绝；新增 `structured_git_access_profile_matrix_blocks_mutations_before_executor` 将 Git 读/写 × 三种 AccessProfile 展开，验证三次 Git 读调用和仅一次 FullAccess 写调用到达 executor。C 仍不能关闭。仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；其它工具类型、重复请求和 Electron/真实 Provider 权限组合也尚未全部覆盖。
 
 当前组合覆盖按轴记录如下：
 
@@ -152,7 +152,7 @@ B 的保留语义已绑定到以下测试边界：
 | --- | --- | --- |
 | file | ReadOnly 读/写拒绝、Restricted 工作区写入与审批、FullAccess 写入；`file_remove`、`file_patch`、`file_mkdir`、`file_copy`、`file_move` 有真实副作用断言 | 各工具在三种 AccessProfile 与 workspace 内外的完整生命周期组合尚未逐项导出 |
 | shell/process | ReadOnly 显式只读 shell、写 shell 拒绝；Restricted shell 审批/允许/拒绝/取消/过期；process 规则在 runtime 矩阵中覆盖 | process 真实副作用和 duplicate/cross-session 仍主要依赖 runtime/API 分散测试 |
-| Git | dirty、branch drift、merge conflict 的 Provider 不调用或终态失败证据已有 | Git 工具逐项审批生命周期及 GUI 可见错误尚未合并 |
+| Git | dirty、branch drift、merge conflict 的 Provider 不调用或终态失败证据已有；`structured_git_access_profile_matrix_blocks_mutations_before_executor` 验证 Git 读/写在三种 AccessProfile 下的 executor 到达边界 | Git 工具逐项审批生命周期及 GUI 可见错误尚未合并 |
 | browser/MCP | `magi-tool-runtime` 已覆盖能力分类、读写策略和协议状态 | 真实 Browser/MCP 外部副作用、三种 AccessProfile 的同轮 Provider 计数尚未完成 |
 | AccessProfile / scope | ReadOnly、Restricted、FullAccess；workspace 内外；`allow_for_turn` 跨 Turn/Session 隔离已有 | 每个工具类型尚未形成统一的行级矩阵和可复核 JSON |
 | lifecycle | allow once、allow for turn、deny、cancel、expiry、duplicate 待审批回放均有代表性测试 | 组合表尚未覆盖每个工具类型的所有生命周期格子 |
