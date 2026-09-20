@@ -3824,6 +3824,134 @@ fn internal_process_access_profile_matrix_is_fail_closed() {
 }
 
 #[test]
+fn internal_process_access_profile_matrix_records_lifecycle_side_effects() {
+    let root = unique_temp_dir("magi-tool-process-lifecycle-matrix");
+    let registry = make_registry();
+    let context = ToolExecutionContext {
+        task_id: Some(TaskId::new("task-process-lifecycle-matrix")),
+        session_id: Some(SessionId::new("session-process-lifecycle-matrix")),
+        workspace_id: Some(WorkspaceId::new("workspace-process-lifecycle-matrix")),
+        working_directory: Some(root.clone()),
+        ..ToolExecutionContext::default()
+    };
+    let mut rows = Vec::new();
+
+    for access_profile in [
+        magi_core::AccessProfile::ReadOnly,
+        magi_core::AccessProfile::Restricted,
+        magi_core::AccessProfile::FullAccess,
+    ] {
+        let policy = ToolExecutionPolicy {
+            access_profile,
+            ..ToolExecutionPolicy::default()
+        };
+        let launch = registry.execute_internal_builtin_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("process-lifecycle-launch-{access_profile:?}")),
+                BuiltinToolName::ProcessLaunch.as_str(),
+                serde_json::json!({ "command": "cat" }).to_string(),
+            ),
+            context.clone(),
+            &policy,
+        );
+        rows.push(serde_json::json!({
+            "access_profile": format!("{access_profile:?}"),
+            "stage": "launch",
+            "status": format!("{:?}", launch.status),
+        }));
+
+        match access_profile {
+            magi_core::AccessProfile::ReadOnly => {
+                assert_eq!(launch.status, ExecutionResultStatus::Rejected);
+            }
+            magi_core::AccessProfile::Restricted => {
+                assert_eq!(launch.status, ExecutionResultStatus::NeedsApproval);
+            }
+            magi_core::AccessProfile::FullAccess => {
+                assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+                let launch_payload: Value =
+                    serde_json::from_str(&launch.payload).expect("launch payload should be JSON");
+                let terminal_id = launch_payload["terminal_id"]
+                    .as_u64()
+                    .expect("full access launch should return terminal id");
+
+                let read = registry.execute_internal_builtin_with_policy(
+                    ToolExecutionInput::for_builtin_invocation(
+                        ToolCallId::new("process-lifecycle-read"),
+                        BuiltinToolName::ProcessRead.as_str(),
+                        serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                    ),
+                    context.clone(),
+                    &policy,
+                );
+                assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+
+                let write = registry.execute_internal_builtin_with_policy(
+                    ToolExecutionInput::for_builtin_invocation(
+                        ToolCallId::new("process-lifecycle-write"),
+                        BuiltinToolName::ProcessWrite.as_str(),
+                        serde_json::json!({
+                            "terminal_id": terminal_id,
+                            "input": "permission-matrix\n"
+                        })
+                        .to_string(),
+                    ),
+                    context.clone(),
+                    &policy,
+                );
+                assert_eq!(write.status, ExecutionResultStatus::Succeeded);
+
+                let kill = registry.execute_internal_builtin_with_policy(
+                    ToolExecutionInput::for_builtin_invocation(
+                        ToolCallId::new("process-lifecycle-kill"),
+                        BuiltinToolName::ProcessKill.as_str(),
+                        serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                    ),
+                    context.clone(),
+                    &policy,
+                );
+                assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
+                rows.extend([
+                    serde_json::json!({
+                        "access_profile": format!("{access_profile:?}"),
+                        "stage": "read",
+                        "status": format!("{:?}", read.status),
+                    }),
+                    serde_json::json!({
+                        "access_profile": format!("{access_profile:?}"),
+                        "stage": "write",
+                        "status": format!("{:?}", write.status),
+                    }),
+                    serde_json::json!({
+                        "access_profile": format!("{access_profile:?}"),
+                        "stage": "kill",
+                        "status": format!("{:?}", kill.status),
+                    }),
+                ]);
+            }
+        }
+    }
+
+    assert_eq!(
+        rows.iter().filter(|row| row["stage"] == "launch").count(),
+        3
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["status"] == "NeedsApproval")
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["stage"] == "kill" && row["status"] == "Succeeded")
+            .count(),
+        1
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn registry_rejects_background_shell_declared_read_only_in_read_only_access() {
     let root = unique_temp_dir("magi-tool-read-only-background-shell");
     let target = root.join("must-not-exist.txt");
