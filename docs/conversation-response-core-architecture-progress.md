@@ -106,6 +106,12 @@
 
 D 仍不能关闭。缺口是 daemon restart、history/replay、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
 
+## E 工作包首轮证据
+
+最新打包 Electron/CDP 回归 `/tmp/magi-electron-dom-regression-10027.json` 为 `status=passed`，55 项检查通过、15 次 Provider 请求。现有覆盖包括个人/工作区 Chat、Task 工具卡片和工具组展开、Goal/Plan 卡片和 Goal 展开、子代理工具卡片与 `child_task_id`、代理运行中心、ReadOnly 写入拒绝、daemon restart、Renderer reload、history/session switch 和 cancel。
+
+E 仍保持部分完成。尚缺 Agent drawer 的更多状态组合、Goal/Plan 的失败与恢复、Git dirty/drift/conflict 的可见错误、审批阻塞/恢复以及 reconnect/history/restart 的组合矩阵；55 项单轮回归不能替代这些组合。
+
 ## 关闭规则
 
 任何工作包只有在代码或脚本变更、直接证据、定向测试和文档记录都齐全后，才能从“进行中”改为“已完成”。单轮证据不能替代多轮矩阵；当前 after 数据不能替代 before 数据；生产路径收敛不能替代测试 fixture 边界审计。
