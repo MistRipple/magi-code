@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-20
-代码基线：`eb1cac1c825816a286291ddc05bc55afe928fb7f`（迟到任务状态写回竞态修复）
+代码基线：`43836ae552ddc9afaceb5df305211b02333c88c4`（任务重启回放与跨 Turn 审批验收）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -14,8 +14,8 @@
 | --- | --- | --- | --- |
 | A | 17.3：current Turn 写入口和测试夹具边界 | 进行中 | 生产路径只经 `CanonicalTurnEventSink`；剩余底层 fixture 已逐项分类，能迁移的已迁移，保留项有精确理由和测试覆盖 |
 | B | 17.7：失效 legacy/兼容语义清理 | 进行中（首轮审计完成；未发现可直接删除的生产双轨） | 失效生产双轨、旧注释和无效 fixture 清除；迁移、恢复、协议兼容、旧字段拒绝逻辑保留并有边界说明 |
-| C | 完整权限组合矩阵 | 进行中（基础 runtime/API 矩阵已跑通；组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
-| D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮及基础 cancel/reconnect 已有；全矩阵未完成） | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
+| C | 完整权限组合矩阵 | 进行中（基础 runtime/API 矩阵和跨 Turn 授权隔离已跑通；组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
+| D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮、基础 cancel/reconnect 及 Task restart replay 已有；全矩阵未完成） | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
 | E | Electron packaged GUI 全矩阵 | 部分完成 | 在现有 55 项单轮基础上补齐 Agent drawer、Goal/Plan 组合、Git/审批错误和 reconnect/history/restart 组合 |
 | F | Electron 五类场景各 20 轮端到端 timing | 进行中（100/100 已完成同轮结构化关联，仍需与历史后端基线统一统计） | 5 类 × 20 轮均有同轮 accepted、Provider 首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
 | G | 性能 before/after 对比 | 待开始 | 有可审计的旧版本 before 数据，并与当前 after 数据使用同一场景、同一指标和同一统计方法 |
@@ -39,6 +39,7 @@
 - 历史首次 20 轮采样 `/tmp/magi-electron-dom-timing-20-9998.json` 未生成完整证据：曾在 Goal 第 12 轮因单一 Session 的上下文增长触发语义压缩而停止；该文件只作为失败记录保留，不能作为完成证据。
 - 上述首次采样问题已通过脚本场景筛选和 Goal/子代理每轮切换独立个人草稿解决；新的五类 20 轮证据仍只关闭 Renderer timing 子项。
 - before 版本性能数据当前不存在，因此 G 保持未完成。
+- Task profile 的进程内 restart/replay 已补充真实 `TurnService` harness：终态 canonical Turn 在重建 Coordinator、EventBus、dispatcher、TaskStore 后按同一 requestId 返回 replay，Provider 请求数不增加；这只覆盖 harness 的 restart/replay 轴，不能替代 daemon 进程重启和 Provider 全矩阵。
 - Electron 五类各 20 轮后端/Renderer 同轮关联已完成：`/tmp/magi-electron-dom-correlated-timing-20-10108.json`，100 条唯一 `turnId`、903 项脚本检查、280 次 Provider 请求；每条记录都包含 `accepted_response_sent`、`runner_started`、`provider_first_delta`、`event_bus_first_event`、`canonical_terminal_published` 和 Renderer 四阶段。证据中的 `sinceAcceptedMs` 由日志时间戳计算，仅用于同轮阶段顺序和分布统计；Provider 首 delta 与终态仍保留各自后端阶段耗时。
 - 在重新打包后的当前 Electron/Web 工作区上复验同一 timing-only 五类 × 20 轮：`/tmp/magi-electron-dom-correlated-timing-20-10031.json`，`status=passed`、903 项检查、280 次 Provider 请求、100 条唯一 `turnId`、0 条缺少后端阶段、终态来源全部为 `canonical_terminal_published`。该复验用于确认打包产物和当前 Web/Desktop 状态仍能完成同轮关联；Provider 波动下的分布不能直接替换历史性能基线。
 - 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误仍继续传播。新增回归测试覆盖 running、blocked 和替换 Turn，避免把预期迟到写回记录成生产错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
@@ -88,6 +89,7 @@
 | 2026-09-20 | F | 在当前 timing 埋点和脚本收口提交后重新执行 Rust workspace 全量验收，确认时序日志不会改变既有架构行为 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：669 passed、1 ignored；其中 conversation-runtime 532、magi-api 670、magi-daemon 127、magi-tool-runtime 225、magi-session-store 121 均通过 |
 | 2026-09-20 | E/F | 在其他 Agent 的 Web/Desktop 修改仍保留的工作区上复验协议、Svelte、生产构建和 npm golden；这些结果只证明当前工作区可构建，不扩大为完整 Electron GUI 或 Provider 全矩阵 | `npm run protocol:check`；`npm --prefix web run check`：0 errors、0 warnings；`npm --prefix web run build`；`npm test`：Desktop 99、Browser Worker 57 及 Web golden 全部通过 |
 | 2026-09-20 | D/E | 修复并发子任务状态 callback 与 root Turn 终态收口之间的迟到写回竞态；仅对已切换、缺失或终态 Turn 丢弃旧 item，同一活动 Turn 的真实错误继续返回 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：669 passed、1 ignored；对应提交 `eb1cac1c` |
+| 2026-09-20 | C/D | 增加同一 Session 跨 Turn `allow_for_turn` 审批隔离和 Task profile restart/replay 验收；验证真实文件副作用、审批请求数、canonical 终态和 Provider 请求不重复 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：50 passed、1 ignored；`cargo test -p magi-daemon --lib daemon::tests::session_turn_persists_without_live_subscriber_and_recovers_after_restart -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib runtime_restart -- --test-threads=1`：3 passed；对应提交 `43836ae5` |
 
 ## B 工作包首轮审计
 
@@ -108,14 +110,14 @@
 - `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：48 passed、1 ignored。覆盖 ReadOnly 的 file/shell/Git/image 拒绝和只读读取、Restricted 的 workspace 内外写入、allow once、allow for turn、deny、cancel、expiry、Provider 请求次数与审批事件、FullAccess 的 workspace 内外写入，以及 Git dirty/branch drift/merge conflict。
 - `cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored。覆盖全部内置工具策略分类、Browser 与 MCP 读写轴、shell/process/path 边界、workspace 作用域、写保护、取消和真实文件/进程副作用。
 
-这些证据证明权限引擎和 Turn Harness 的基础轴已存在，但 C 不能关闭。仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；Electron packaged GUI 和真实 Provider 的权限组合也尚未全部覆盖。
+这些证据证明权限引擎和 Turn Harness 的基础轴已存在。新增 `restricted_profile_allow_for_turn_requires_new_approval_on_next_turn` 覆盖同一 Session 跨两个 Turn 的 `allow_for_turn` 隔离、两次真实文件副作用和两条审批请求；C 仍不能关闭。仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；跨 Session、重复请求和 Electron/真实 Provider 权限组合也尚未全部覆盖。
 
 ## D 工作包首轮证据
 
 - 真实 Provider/daemon 五类场景各 20 轮后端证据已存在：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。
 - `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 48 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict 和部分权限审批恢复。
 
-D 仍不能关闭。缺口是 daemon restart、history/replay、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
+D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_provider_reexecution` 覆盖进程内重建 runtime 后的 Task canonical replay，且既有 daemon restart/replay 测试继续通过。缺口是独立 daemon 进程 restart、history/replay 的更多场景、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
 
 ## E 工作包首轮证据
 
