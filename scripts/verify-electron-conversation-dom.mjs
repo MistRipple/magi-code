@@ -951,6 +951,17 @@ try {
   await clickSend(page);
   const goal = await waitForAssistant(page, "ELECTRON_DOM_GOAL_OK", "Goal 最终消息");
   check("Goal 最终消息进入真实 DOM", goal.text.includes("ELECTRON_DOM_GOAL_OK"));
+  const goalTiming = await waitForTimingRecord(
+    page,
+    goal.assistant.at(-1)?.turnId,
+    "Goal 生产 Renderer timing",
+  );
+  rendererTimingSamples.push(timingEvidenceRecord(
+    "goal",
+    goal.assistant.at(-1)?.turnId,
+    goalTiming,
+  ));
+  checkTimingStages("Goal 生产 Renderer", goalTiming);
   const goalCard = await waitFor(async () => {
     const state = await rendererState(page);
     return state.goalCard && state.planCard ? state : null;
@@ -974,6 +985,17 @@ try {
   await clickSend(page);
   const agentResult = await waitForAssistant(page, "ELECTRON_DOM_AGENT_OK", "子代理最终消息");
   check("子代理最终消息进入真实 DOM", agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
+  const agentTiming = await waitForTimingRecord(
+    page,
+    agentResult.assistant.at(-1)?.turnId,
+    "子代理生产 Renderer timing",
+  );
+  rendererTimingSamples.push(timingEvidenceRecord(
+    "subagent",
+    agentResult.assistant.at(-1)?.turnId,
+    agentTiming,
+  ));
+  checkTimingStages("子代理生产 Renderer", agentTiming);
   if (agentResult.turns.at(-1)?.expanded === "false") {
     await page.evaluate(`(() => {
       const turns = [...document.querySelectorAll('[data-conversation-turn-id]')];
