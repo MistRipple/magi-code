@@ -5257,6 +5257,123 @@ fn browser_access_profile_matrix_keeps_read_and_write_capabilities_distinct() {
 }
 
 #[test]
+fn browser_access_profile_matrix_records_host_executor_side_effects() {
+    use magi_browser_authority::{BrowserCapabilitySnapshot, BrowserHostStatus};
+
+    let host_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let host_calls_for_executor = Arc::clone(&host_calls);
+    let registry = make_registry().with_browser_automation(
+        Arc::new(move |_, tool, input, context| {
+            host_calls_for_executor
+                .lock()
+                .expect("browser host audit lock should hold")
+                .push(format!(
+                    "profile={:?};tool={tool};session={:?};workspace={:?};input={input}",
+                    context.access_profile, context.session_id, context.workspace_id,
+                ));
+            (
+                serde_json::json!({
+                    "tool": tool,
+                    "status": "succeeded",
+                    "host_side_effect": true,
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }),
+        Arc::new(|_| BrowserCapabilitySnapshot {
+            revision: 1,
+            in_app_browser_enabled: true,
+            browser_use_enabled: true,
+            host_status: BrowserHostStatus::Ready,
+            host_protocol_compatible: true,
+            access_profile: magi_core::AccessProfile::Restricted,
+        }),
+    );
+    let context = ToolExecutionContext {
+        session_id: Some(SessionId::new("session-browser-profile-matrix")),
+        workspace_id: Some(WorkspaceId::new("workspace-browser-profile-matrix")),
+        ..ToolExecutionContext::default()
+    };
+
+    let mut rows = Vec::new();
+    for access_profile in [
+        magi_core::AccessProfile::ReadOnly,
+        magi_core::AccessProfile::Restricted,
+        magi_core::AccessProfile::FullAccess,
+    ] {
+        for (tool, input, access) in [
+            (
+                BuiltinToolName::BrowserSnapshot,
+                r#"{}"#,
+                magi_browser_authority::BrowserToolAccess::Read,
+            ),
+            (
+                BuiltinToolName::BrowserNavigate,
+                r#"{"url":"https://example.test/matrix"}"#,
+                magi_browser_authority::BrowserToolAccess::Write,
+            ),
+        ] {
+            let capability = registry
+                .browser_capability_snapshot(access_profile, context.session_id.as_ref())
+                .expect("browser capability provider should return a snapshot");
+            capability
+                .allows_execution(
+                    tool.browser_tool_kind().expect("browser catalog tool"),
+                    access,
+                )
+                .expect("catalog access should reach the injected host executor");
+
+            let output = registry.execute_with_policy(
+                ToolExecutionInput::for_builtin_invocation(
+                    ToolCallId::new(format!("browser-{access_profile:?}-{}", tool.as_str())),
+                    tool.as_str(),
+                    input,
+                ),
+                context.clone(),
+                &ToolExecutionPolicy {
+                    access_profile,
+                    ..ToolExecutionPolicy::default()
+                },
+            );
+            assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+            let payload: Value = serde_json::from_str(&output.payload)
+                .expect("browser host side-effect payload should be JSON");
+            assert_eq!(payload["host_side_effect"], true);
+            rows.push(serde_json::json!({
+                "tool": tool.as_str(),
+                "catalog_access": format!("{access:?}"),
+                "access_profile": format!("{access_profile:?}"),
+                "status": format!("{:?}", output.status),
+                "host_executor_called": true,
+            }));
+        }
+    }
+
+    let host_calls = host_calls
+        .lock()
+        .expect("browser host audit lock should hold")
+        .clone();
+    assert_eq!(
+        host_calls.len(),
+        6,
+        "every profile/read-write row reaches the host boundary"
+    );
+    assert!(
+        host_calls
+            .iter()
+            .any(|call| call.contains("tool=browser_snapshot"))
+    );
+    assert!(
+        host_calls
+            .iter()
+            .any(|call| call.contains("tool=browser_navigate"))
+    );
+    assert_eq!(rows.len(), 6, "matrix must record every profile/tool row");
+    assert!(rows.iter().all(|row| row["host_executor_called"] == true));
+}
+
+#[test]
 fn builtin_permission_engine_uses_restricted_write_policy() {
     let engine = builtin_permission_engine();
     let policy = magi_permissions::PermissionPolicy::default();
