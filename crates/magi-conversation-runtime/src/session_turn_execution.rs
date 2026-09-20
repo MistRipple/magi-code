@@ -1442,7 +1442,7 @@ fn run_session_turn_execution_inner(
             Err(SessionTurnRoundError::Failed {
                 error,
                 context_overflow,
-                non_stream_fallback_attempted,
+                non_stream_recovery_attempted,
             }) => {
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
@@ -1516,7 +1516,7 @@ fn run_session_turn_execution_inner(
                 let retry_attempts = pre_output_invocation_recovery_attempts
                     + stream_interruption_recovery_attempts
                     + empty_response_recovery_attempts
-                    + usize::from(non_stream_fallback_attempted);
+                    + usize::from(non_stream_recovery_attempted);
                 let execution_error = if classification.code == "model_empty_response" {
                     session_turn_empty_response_error(
                         &request,
@@ -2042,7 +2042,7 @@ enum SessionTurnRoundError {
     Failed {
         error: String,
         context_overflow: Option<magi_bridge_client::ContextOverflowInfo>,
-        non_stream_fallback_attempted: bool,
+        non_stream_recovery_attempted: bool,
     },
     InvalidResponse(Box<ModelFailureDiagnostic>),
     TerminalToolFailure(DeterministicToolFailure),
@@ -2497,7 +2497,7 @@ fn stream_session_turn_round(
                 return Err(SessionTurnRoundError::Failed {
                     error: raw_error,
                     context_overflow: error.context_overflow(),
-                    non_stream_fallback_attempted: false,
+                    non_stream_recovery_attempted: false,
                 });
             }
 
@@ -2658,7 +2658,7 @@ fn stream_session_turn_round(
                     return Err(SessionTurnRoundError::Failed {
                         error: recovery_raw_error,
                         context_overflow: recovery_error.context_overflow(),
-                        non_stream_fallback_attempted: true,
+                        non_stream_recovery_attempted: true,
                     });
                 }
             }
@@ -2962,7 +2962,7 @@ fn stream_session_turn_round(
             return Err(SessionTurnRoundError::Failed {
                 error: failure,
                 context_overflow: None,
-                non_stream_fallback_attempted: false,
+                non_stream_recovery_attempted: false,
             });
         }
         let snapshot_session = snapshot_manager.and_then(|mgr| {
