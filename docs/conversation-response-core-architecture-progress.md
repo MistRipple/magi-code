@@ -127,7 +127,7 @@ D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_
 
 ## E 工作包首轮证据
 
-最新打包 Electron/CDP 回归 `/tmp/magi-electron-dom-regression-10120.json` 为 `status=passed`，55 项检查通过、15 次 Provider 请求；此前 `/tmp/magi-electron-dom-regression-10027.json` 同样通过。现有覆盖包括个人/工作区 Chat、Task 工具卡片和工具组展开、Goal/Plan 卡片和 Goal 展开、子代理工具卡片与 `child_task_id`、代理运行中心、ReadOnly 写入拒绝、daemon restart、Renderer reload、history/session switch 和 cancel。
+最新打包 Electron/CDP 回归 `/tmp/magi-electron-dom-regression-10142.json` 为 `status=passed`，61 项检查通过、17 次 Provider 请求；此前 `/tmp/magi-electron-dom-regression-10120.json` 为 55 项检查通过。现有覆盖包括个人/工作区 Chat、Task 工具卡片和工具组展开、Goal/Plan 卡片和 Goal 展开、子代理工具卡片与 `child_task_id`、代理运行中心、ReadOnly 写入拒绝、Restricted 审批卡片与允许一次后的真实工作区副作用、daemon restart、Renderer reload、history/session switch 和 cancel。
 
 E 仍保持部分完成。尚缺 Agent drawer 的更多状态组合、Goal/Plan 的失败与恢复、Git dirty/drift/conflict 的可见错误、审批阻塞/恢复以及 reconnect/history/restart 的组合矩阵；55 项单轮回归不能替代这些组合。
 
