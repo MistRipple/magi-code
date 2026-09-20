@@ -46,6 +46,7 @@
 - 应用迟到任务状态写回修复并重新打包后，标准 Electron DOM 回归 `/tmp/magi-electron-dom-regression-10120.json` 仍为 `status=passed`、55 项检查、15 次 Provider 请求和 5 条 Renderer timing sample；该结果只确认修复没有破坏既有单轮 GUI 流程。日志中仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示，不能扩大为完整 Desktop IPC 验收。
 - 在当前打包产物上补充 Restricted 审批 GUI 验收：`/tmp/magi-electron-dom-regression-10142.json` 为 `status=passed`、61 项检查、17 次 Provider 请求。该场景使用已注册工作区中的 `shell_exec` 写入请求，验证审批卡片进入真实 DOM、包含“仅允许本次 / 本轮允许同类操作 / 拒绝并继续”三个操作、允许一次后最终消息恢复以及工作区内真实文件副作用；随后仍通过个人会话、daemon restart、history/reload 和 cancel 既有断言。该证据只补齐 E 的审批阻塞/恢复单场景，不能替代 Git/Goal 失败恢复和 reconnect/history/restart 组合矩阵。日志仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示。
 - 在最新打包产物上补充 Goal Provider 失败后恢复验收：`/tmp/magi-electron-dom-regression-10201.json` 为 `status=passed`、64 项检查、35 次 Provider 请求。脚本先让 Goal 真实进入 Provider 500 失败终态，验证失败事实进入 Renderer DOM，再新建会话重新建立并完成 Goal/Plan，验证恢复后的 Goal 卡片和计划卡片重新出现；该证据只覆盖 Goal 失败/恢复单场景，仍不能替代 Git 错误、Agent drawer 多状态和 reconnect/history/restart 组合矩阵。日志仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示。
+- 在同一打包 Electron 流程上补充 Restricted 审批拒绝验收：`/tmp/magi-electron-dom-regression-10220.json` 为 `status=passed`、68 项检查、36 次 Provider 请求。脚本在独立 workspace session 中展示真实审批卡片，点击“拒绝并继续”后验证拒绝事实进入 DOM，且工作区目标文件没有产生；此前审批允许一次的真实文件副作用仍在同一回归中保留。该证据只补齐审批拒绝单场景，审批过期/取消以及 Git 错误和 reconnect/history/restart 组合仍未完成。
 - 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误继续传播。回归测试覆盖 running、blocked、替换 Turn，以及活动 Turn 内 immutable canonical item 冲突，避免把预期迟到写回记录成生产错误，也避免吞掉真实写回错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
 - 该关联证据仍不能关闭 F：它尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
 - 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。工具调用首轮只有 tool-call block 时，`provider_first_delta` 继续表示首个可见 content/thinking delta，raw tool-call-only chunk 仍单独记录为 `provider_response_received`。
@@ -101,6 +102,8 @@
 | 2026-09-20 | C | 补充 Restricted `shell_exec` 重复 requestId/fingerprint 的待审批回放验收，确认 duplicate 不重复创建审批、Provider 请求或真实副作用 | `cargo test -p magi-api --lib turn_harness::tests::restricted_profile_duplicate_request_replays_pending_approval_without_duplicate_side_effects -- --test-threads=1`：1 passed；相关实现位于 `crates/magi-api/src/turn_harness.rs` |
 | 2026-09-20 | A/D | 将 `killed` 与 `superseded` 纳入任务 Turn 终态判定，确保迟到 task status callback 在所有 canonical 终态下都按 stale item 丢弃；不改变同一活动 Turn 的真实错误传播 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；对应提交 `b9c13529` |
 | 2026-09-20 | D | 增加真实 daemon runtime 重启后的 Task Turn replay 验收：恢复 canonical Turn 和用户 request identity，并用相同 requestId/fingerprint 重提交验证不重复创建 canonical Turn | `cargo test -p magi-daemon --lib daemon::tests::task_turn_replays_after_daemon_restart_without_duplicate_canonical_acceptance -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib -- --test-threads=1`：128 passed |
+| 2026-09-20 | C | 将现有权限验收按工具面、AccessProfile、workspace 作用域、生命周期、副作用、审批事件和 Provider 请求次数登记为可复核矩阵；明确 Browser/MCP、process、Git 和跨 Turn/session 的剩余格子 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：51 passed、1 ignored；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored |
+| 2026-09-20 | E | 增加打包 Electron Restricted 审批拒绝验收：真实 DOM 中点击“拒绝并继续”，验证拒绝终态可见且没有工作区文件副作用 | `/tmp/magi-electron-dom-regression-10220.json`：68 checks passed、36 次 Provider 请求；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
 
 ## B 工作包首轮审计
 
@@ -131,7 +134,7 @@ B 的保留语义已绑定到以下测试边界：
 
 已运行的基础矩阵：
 
-- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：50 passed、1 ignored。覆盖 ReadOnly 的 file/shell/Git/image 拒绝和只读读取、Restricted 的 workspace 内外写入、allow once、allow for turn、deny、cancel、expiry、Provider 请求次数与审批事件、跨 Turn/Session 授权隔离、FullAccess 的 workspace 内外写入，以及 Git dirty/branch drift/merge conflict。
+- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：51 passed、1 ignored。覆盖 ReadOnly 的 file/shell/Git/image 拒绝和只读读取、Restricted 的 workspace 内外写入、allow once、allow for turn、deny、cancel、expiry、Provider 请求次数与审批事件、跨 Turn/Session 授权隔离、FullAccess 的 workspace 内外写入，以及 Git dirty/branch drift/merge conflict。
 - `cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored。覆盖全部内置工具策略分类、Browser 与 MCP 读写轴、shell/process/path 边界、workspace 作用域、写保护、取消和真实文件/进程副作用。
 
 这些证据证明权限引擎和 Turn Harness 的基础轴已存在。新增 `restricted_profile_allow_for_turn_requires_new_approval_on_next_turn` 覆盖同一 Session 跨两个 Turn 及新 Session 的 `allow_for_turn` 隔离、三次真实文件副作用和三条审批请求；C 仍不能关闭。仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；其它工具类型、重复请求和 Electron/真实 Provider 权限组合也尚未全部覆盖。
@@ -149,10 +152,29 @@ B 的保留语义已绑定到以下测试边界：
 
 因此 C 当前新增的是 duplicate 审批回放证据，剩余工作是把已有分散测试整理为统一可审计矩阵，并补齐 Browser/MCP、process 和 Git 的真实组合缺口。
 
+### C 组合矩阵登记（当前已覆盖项）
+
+下面的登记把已有测试按同一组审计字段展开：工具面、AccessProfile、workspace 作用域、生命周期动作、真实副作用、审批事件和 Provider 请求次数。`—` 表示该路径按设计不应产生对应事实，不表示缺少断言。
+
+| 工具面 | AccessProfile / 作用域 | 生命周期 | 副作用与审批事实 | Provider 请求 | 直接测试 |
+| --- | --- | --- | --- | ---: | --- |
+| `file_write`、`file_copy`、`file_move`、`file_patch`、`file_mkdir`、`file_remove` | ReadOnly / workspace 内 | deny | 无文件副作用；不发布审批 | 1 或 0（按拒绝阶段） | `read_only_profile_rejects_explicit_*` |
+| `file_write`、`file_patch`、`file_mkdir`、`file_copy`、`file_move` | Restricted / workspace 内 | auto allow | 真实文件副作用；无 pending approval | 2 | `restricted_profile_auto_allows_*_inside_workspace` |
+| `shell_exec`、`file_remove` | Restricted / workspace 内 | allow once | 真实写入或删除；发布 requested/resolved | 2 | `restricted_profile_approval_allows_original_write_tool_once`、`restricted_profile_file_remove_allow_once_deletes_target_without_retry` |
+| `shell_exec` | Restricted / workspace 内 | duplicate pending | 只保留一个 pending approval；只执行一次副作用 | 1→2 | `restricted_profile_duplicate_request_replays_pending_approval_without_duplicate_side_effects` |
+| `shell_exec`、`file_remove` | Restricted / workspace 内 | deny / cancel / expiry | 无副作用；Turn 失败或取消；pending 收口 | 1 | `restricted_profile_approval_denial_*`、`restricted_profile_pending_approval_is_cancelled_with_turn_without_side_effect`、`restricted_profile_expired_approval_rejects_without_side_effect` |
+| `file_*`、`apply_patch`、`shell_exec` | Restricted / workspace 外 | reject | 不写入工作区外；不进入执行器或不创建审批 | 0 或 1 | `restricted_profile_rejects_*_outside_workspace`、`registry_rejects_outside_shell_path_before_approval` |
+| `file_*`、`shell_exec`、Git 写工具 | FullAccess / workspace 内外 | auto allow | 允许的真实副作用；不发布常规审批 | 2 或按 Git 前置失败 | `full_access_profile_*`、`workspace_task_with_git_*` |
+| Browser 读写能力 | ReadOnly / Restricted / FullAccess | policy classification | Browser 读写能力分离；当前主要验证策略和 schema | — | `browser_access_profile_matrix_keeps_read_and_write_capabilities_distinct` |
+| 外部 MCP 读写能力 | ReadOnly / Restricted / FullAccess | deny / allow | ReadOnly 在 executor 前阻断，写工具要求 FullAccess；已覆盖 mock executor | — | `external_mcp_*_profile*` |
+| process 内部工具 | ReadOnly / Restricted / FullAccess | deny / allow / cancel | 跨 session 隔离、读写策略和取消清理；部分真实进程面由 runtime 测试覆盖 | — | `internal_process_access_profile_matrix_is_fail_closed`、`process_tools_do_not_cross_sessions_with_workspace_only_context` |
+
+该登记仍不是关闭矩阵：Browser/MCP 的真实外部副作用、process 的完整审批生命周期、Git 工具的逐项审批，以及每一行的 duplicate/cross-turn/cross-session 结构化 JSON 仍需补齐。最近一次定向验证为 `magi-api turn_harness`：51 passed、1 ignored；`magi-tool-runtime`：225 passed、1 ignored。
+
 ## D 工作包首轮证据
 
 - 真实 Provider/daemon 五类场景各 20 轮后端证据已存在：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。
-- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 50 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict、Task restart replay 和部分权限审批恢复；`magi-daemon` 的 session restart/history 测试也分别通过既有恢复测试、3 个 runtime restart 测试和新增的 daemon Task Turn restart/replay 测试。
+- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 51 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict、Task restart replay 和部分权限审批恢复；`magi-daemon` 的 session restart/history 测试也分别通过既有恢复测试、3 个 runtime restart 测试和新增的 daemon Task Turn restart/replay 测试。
 
 D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_provider_reexecution` 覆盖进程内重建 runtime 后的 Task canonical replay，且既有 daemon restart/replay 测试继续通过。缺口是独立 daemon 进程 restart、history/replay 的更多场景、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
 
@@ -160,7 +182,7 @@ D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_
 
 最新打包 Electron/CDP 回归 `/tmp/magi-electron-dom-regression-10201.json` 为 `status=passed`，64 项检查通过、35 次 Provider 请求；此前 `/tmp/magi-electron-dom-regression-10142.json` 为 61 项检查通过。现有覆盖包括个人/工作区 Chat、Task 工具卡片和工具组展开、Goal/Plan 成功卡片和二级展开、Goal Provider 失败后重新建目标恢复、子代理工具卡片与 `child_task_id`、代理运行中心、ReadOnly 写入拒绝、Restricted 审批卡片与允许一次后的真实工作区副作用、daemon restart、Renderer reload、history/session switch 和 cancel。
 
-E 仍保持部分完成。已补齐 Goal/Plan 的一个失败/恢复场景和 Restricted 审批成功场景；尚缺 Agent drawer 的更多状态组合、Git dirty/drift/conflict 的可见错误、审批拒绝/过期/取消的 GUI 组合以及 reconnect/history/restart 的组合矩阵；64 项单轮回归不能替代这些组合。
+E 仍保持部分完成。已补齐 Goal/Plan 的一个失败/恢复场景和 Restricted 审批允许/拒绝场景；尚缺 Agent drawer 的更多状态组合、Git dirty/drift/conflict 的可见错误、审批过期/取消的 GUI 组合以及 reconnect/history/restart 的组合矩阵；68 项回归不能替代这些组合。
 
 ## 关闭规则
 
