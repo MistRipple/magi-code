@@ -2264,6 +2264,75 @@ mod tests {
             fs::read_to_string(&second_target).expect("第二轮写入应存在"),
             "second"
         );
+
+        let other_session_id = SessionId::new("harness-cross-session-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                other_session_id.clone(),
+                "跨 Session 授权会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("cross session should create");
+        let third_target = workspace_root.path().join("cross-session.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf third > {}", third_target.display())
+            })
+            .to_string(),
+            "跨 Session 完成",
+        );
+        let third = harness
+            .submit_workspace_task_with_access_profile(
+                &other_session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "新 Session 再次执行 shell_exec，必须独立审批",
+                "harness-cross-session-request",
+                "harness-cross-session-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("跨 Session 提交应成功");
+        let third_turn_id = third.turn_id.clone().expect("跨 Session 应有 Turn");
+        let third_task_id = third
+            .root_task_id
+            .clone()
+            .expect("跨 Session 应有 root task");
+        let third_pending = wait_for_pending_tool_approval(&harness, &other_session_id).await;
+        assert_ne!(
+            second_pending.approval_id, third_pending.approval_id,
+            "allow_for_turn 授权不得跨 Session 复用"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &other_session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &third_pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .wait_for_terminal(&other_session_id, &third_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Completed
+        );
+        assert_eq!(
+            harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(third_task_id))
+                .await
+                .status,
+            magi_core::TaskStatus::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(&third_target).expect("跨 Session 写入应存在"),
+            "third"
+        );
         assert_eq!(
             harness
                 .events_for(&session_id)
@@ -2272,6 +2341,15 @@ mod tests {
                 .count(),
             2,
             "两个 Turn 必须分别产生审批请求"
+        );
+        assert_eq!(
+            harness
+                .events_for(&other_session_id)
+                .into_iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1,
+            "新 Session 必须产生独立审批请求"
         );
     }
 
