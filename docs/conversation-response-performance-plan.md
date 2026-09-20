@@ -504,7 +504,7 @@ M0 真实基线可观测
 - [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
 - [x] 完成真实 Provider/daemon 五类场景各 20 轮的后端 P50/P95 基线；统一汇总见 9.4，直接证据为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`。
 - [ ] 完成真实 Provider 五类场景各 20 轮的端到端 P50/P95 基线。
-  - 该端到端项目仍需把 Electron 生产 Renderer 的 `frontend_event_received`、reducer/projection、`dom_painted` 与同一轮的 accepted、Provider 首 delta、首 EventBus 事件、terminal canonical event 关联起来；当前三类单轮 CDP timing 已有直接证据，五类场景各 20 轮尚未完成。
+  - 该端到端项目仍需把 Electron 生产 Renderer 的 `frontend_event_received`、reducer/projection、`dom_painted` 与同一轮的 accepted、Provider 首 delta、首 EventBus 事件、terminal canonical event 关联起来；当前五类单轮 CDP timing 已有直接证据，五类场景各 20 轮尚未完成。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
 - [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
@@ -565,7 +565,7 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 | 工作区工具调用 | 51 / 61 / 9144 | 60 / 94 / 34131 | 64 / 103 / 49879 | 20/20 completed |
 | 主代理与子代理并发 | 97 / 130 / 53011 | 131 / 175 / 72882 | 143 / 220 / 139254 | 20/20 completed |
 
-直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，三类单轮 CDP timing 证据见 `/tmp/magi-electron-dom-agent-9587.json`，并新增 Goal/Plan 与子代理/代理运行中心 DOM 单轮证据；五类场景 20 轮 CDP 采样和性能前后对比仍未完成。
+直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，五类单轮 CDP timing 证据见 `/tmp/magi-electron-dom-timing-9857.json`，并保留 47 项 DOM 基础验收证据；五类场景 20 轮 CDP 采样和性能前后对比仍未完成。
 
 2026-09-20 的代码审计和 workspace 全量复验没有改变上述验收范围：TaskRunner 的生产 worker catalog 来源已收敛为单一动态 provider，测试读取结果仍是 `#[cfg(test)]` 辅助；SessionStore 原始 current Turn 替换入口和 `UpsertCurrentTurn` flush reason 已删除。该结构收敛不产生新的性能样本，因此不能把后端五场景数据扩大解释为 Electron 五场景 Renderer timing 或 before/after 对比。
 

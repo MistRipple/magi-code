@@ -22,13 +22,21 @@ const appExecutable = join(
 );
 const cdpPort = Number.parseInt(process.env.MAGI_ELECTRON_DOM_CDP_PORT || "9257", 10);
 const daemonPort = 38123;
+const timingSampleCount = Number.parseInt(
+  process.env.MAGI_ELECTRON_DOM_TIMING_SAMPLES || "1",
+  10,
+);
 const responseText = "ELECTRON_DOM_CHAT_OK";
 const toolResponseText = "ELECTRON_DOM_TOOL_OK";
 const restartResponseText = "ELECTRON_DOM_RESTART_OK";
 const evidencePath = process.env.MAGI_ELECTRON_DOM_EVIDENCE_PATH?.trim() || "";
+const timingOnly = process.env.MAGI_ELECTRON_DOM_TIMING_ONLY === "1";
 
 if (!Number.isInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65535) {
   throw new Error(`无效 CDP 端口: ${cdpPort}`);
+}
+if (!Number.isInteger(timingSampleCount) || timingSampleCount < 1 || timingSampleCount > 20) {
+  throw new Error(`MAGI_ELECTRON_DOM_TIMING_SAMPLES 必须在 1 到 20 之间: ${timingSampleCount}`);
 }
 
 const checks = [];
@@ -135,12 +143,25 @@ function messageText(message) {
   return "";
 }
 
+function timingResponseToken(promptText) {
+  const matches = promptText.match(/ELECTRON_TIMING_[A-Z]+_\d+/gu);
+  return matches?.at(-1) || null;
+}
+
+function latestUserText(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => message?.role === "user")
+    .map(messageText)
+    .at(-1) || "";
+}
+
 function providerResponse(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const promptText = messages
     .filter((message) => message?.role === "user")
     .map(messageText)
     .join("\n");
+  const timingToken = timingResponseToken(promptText);
 
   if (promptText.includes("权限拒绝 DOM 验收")) {
     return toolCallStream("file_write", { path: "electron-dom-read-only.txt", content: "must-fail" });
@@ -152,17 +173,16 @@ function providerResponse(body) {
   if (promptText.includes("daemon 重启 DOM 验收")) {
     return openAiStream(restartResponseText);
   }
+  if (timingToken) return openAiStream(timingToken);
   return openAiStream(responseText);
 }
 
 function createProvider() {
   const requests = [];
-  let domToolRoundEmitted = false;
-  let domToolFinalEmitted = false;
-  let domToolRequestCount = 0;
+  const domToolStates = new Map();
   let permissionRoundEmitted = false;
-  let goalPhase = 0;
-  let agentPhase = 0;
+  const goalStates = new Map();
+  const agentStates = new Map();
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => { body += chunk; });
@@ -191,15 +211,20 @@ function createProvider() {
         .filter((message) => message?.role === "user")
         .map(messageText)
         .join("\n");
-      const isDomToolPrompt = promptKey.includes("DOM 工具卡片验收");
-      const isGoalPrompt = promptKey.includes("目标 DOM 验收");
-      const isAgentPrompt = promptKey.includes("子代理 DOM 验收")
-        || promptKey.includes("派发一个子代理并等待其完成");
+      const currentUserText = latestUserText(parsed.messages);
+      const isDomToolPrompt = currentUserText.includes("DOM 工具卡片验收")
+        || currentUserText.includes("Electron timing 工作区工具");
+      const isGoalPrompt = currentUserText.includes("目标 DOM 验收")
+        || currentUserText.includes("Electron timing Goal");
+      const isAgentPrompt = currentUserText.includes("子代理 DOM 验收")
+        || currentUserText.includes("Electron timing 子代理")
+        || currentUserText.includes("派发一个子代理并等待其完成");
       const hasToolResult = (Array.isArray(parsed.messages) ? parsed.messages : [])
         .some((message) => message?.role === "tool");
       const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
       let payload;
       if (isGoalPrompt) {
+        const goalState = goalStates.get(currentUserText) || { phase: 0 };
         const getGoalName = requestToolName(parsed, "get_goal");
         const createGoalName = requestToolName(parsed, "create_goal");
         const updatePlanName = requestToolName(parsed, "update_plan");
@@ -209,17 +234,20 @@ function createProvider() {
         const planResult = toolResultPayload(messages, "update_plan");
         const updatedGoalResult = toolResultPayload(messages, "update_goal");
         const goal = updatedGoalResult?.goal || createdGoalResult?.goal || goalResult?.goal;
-        if (goalPhase === 0 && requestContainsTool(parsed, "get_goal")) {
-          goalPhase = 1;
-          payload = toolCallStream(getGoalName, {}, "electron-dom-goal-get-goal-1");
-        } else if (goalPhase === 1 && requestContainsTool(parsed, "create_goal")) {
-          goalPhase = 2;
+        if (goalState.phase === 0 && requestContainsTool(parsed, "get_goal")) {
+          goalState.phase = 1;
+          goalStates.set(currentUserText, goalState);
+          payload = toolCallStream(getGoalName, {}, `electron-dom-goal-get-goal-${goalStates.size}`);
+        } else if (goalState.phase === 1 && requestContainsTool(parsed, "create_goal")) {
+          goalState.phase = 2;
+          goalStates.set(currentUserText, goalState);
           payload = toolCallStream(createGoalName, {
             objective: "完成目标 DOM 验收并保留可见计划",
             token_budget: null,
           }, "electron-dom-goal-create-goal-1");
-        } else if (goalPhase === 2 && requestContainsTool(parsed, "update_plan") && goal) {
-          goalPhase = 3;
+        } else if (goalState.phase === 2 && requestContainsTool(parsed, "update_plan") && goal) {
+          goalState.phase = 3;
+          goalStates.set(currentUserText, goalState);
           payload = toolCallStream(updatePlanName, {
             planId: null,
             expectedRevision: 0,
@@ -229,11 +257,12 @@ function createProvider() {
             explanation: "建立目标验收计划",
             plan: [{ itemId: null, step: "完成目标 DOM 验收", status: "in_progress" }],
           }, "electron-dom-goal-update-plan-1");
-        } else if (goalPhase === 3
+        } else if (goalState.phase === 3
           && requestContainsTool(parsed, "update_plan")
           && goal
           && planResult?.plan?.state === "active") {
-          goalPhase = 4;
+          goalState.phase = 4;
+          goalStates.set(currentUserText, goalState);
           payload = toolCallStream(updatePlanName, {
             planId: planResult.plan.planId,
             expectedRevision: planResult.plan.revision,
@@ -247,11 +276,12 @@ function createProvider() {
               status: "completed",
             }],
           }, "electron-dom-goal-update-plan-2");
-        } else if (goalPhase === 4
+        } else if (goalState.phase === 4
           && requestContainsTool(parsed, "update_goal")
           && goal
           && planResult?.plan?.state === "completed") {
-          goalPhase = 5;
+          goalState.phase = 5;
+          goalStates.set(currentUserText, goalState);
           payload = toolCallStream(updateGoalName, {
             goal_id: goal.goal_id || goal.goalId || null,
             expected_revision: goal.control_revision || goal.controlRevision || null,
@@ -260,13 +290,13 @@ function createProvider() {
             completion_summary: "目标 DOM 验收计划已完成",
             evidence_refs: ["electron-dom-goal-update-plan-2"],
           }, "electron-dom-goal-update-goal-1");
-        } else if (goalPhase >= 5 && updatedGoalResult?.goal?.status === "complete") {
-          payload = openAiStream("ELECTRON_DOM_GOAL_OK");
+        } else if (goalState.phase >= 5 && updatedGoalResult?.goal?.status === "complete") {
+          payload = openAiStream(timingResponseToken(currentUserText) || "ELECTRON_DOM_GOAL_OK");
         } else {
           response.writeHead(500, { "content-type": "application/json" });
           response.end(JSON.stringify({
             error: "goal_lifecycle_incomplete",
-            phase: goalPhase,
+            phase: goalState.phase,
             hasGoal: Boolean(goal),
             hasActivePlan: planResult?.plan?.state === "active",
             hasCompletedPlan: planResult?.plan?.state === "completed",
@@ -275,13 +305,15 @@ function createProvider() {
           return;
         }
       } else if (isAgentPrompt) {
+        const agentState = agentStates.get(currentUserText) || { phase: 0 };
         const agentSpawnName = requestToolName(parsed, "agent_spawn");
         const agentWaitName = requestToolName(parsed, "agent_wait");
         const spawnResult = toolResultPayload(messages, "agent_spawn");
         const waitResult = toolResultPayload(messages, "agent_wait");
         const childTaskIds = toolResultChildTaskIds(messages);
-        if (agentPhase === 0 && requestContainsTool(parsed, "agent_spawn")) {
-          agentPhase = 1;
+        if (agentState.phase === 0 && requestContainsTool(parsed, "agent_spawn")) {
+          agentState.phase = 1;
+          agentStates.set(currentUserText, agentState);
           payload = toolCallStream(agentSpawnName, {
             task_name: "electron_dom_child",
             display_name: "Electron DOM 子代理",
@@ -294,25 +326,27 @@ function createProvider() {
               references: [],
             },
           }, "electron-dom-agent-spawn-1");
-        } else if (agentPhase === 1
+        } else if (agentState.phase === 1
           && requestContainsTool(parsed, "agent_wait")
           && (childTaskIds.length > 0 || spawnResult?.child_task_id)) {
-          agentPhase = 2;
+          agentState.phase = 2;
+          agentStates.set(currentUserText, agentState);
           payload = toolCallStream(agentWaitName, {
             task_ids: childTaskIds.length > 0 ? childTaskIds : [spawnResult.child_task_id],
             timeout_ms: 60_000,
           }, "electron-dom-agent-wait-1");
-        } else if (agentPhase === 1 && spawnResult?.child_task_id) {
-          agentPhase = 2;
-          payload = openAiStream("ELECTRON_DOM_AGENT_OK");
-        } else if (agentPhase >= 2 && waitResult) {
+        } else if (agentState.phase === 1 && spawnResult?.child_task_id) {
+          agentState.phase = 2;
+          agentStates.set(currentUserText, agentState);
+          payload = openAiStream(timingResponseToken(currentUserText) || "ELECTRON_DOM_AGENT_OK");
+        } else if (agentState.phase >= 2 && waitResult) {
           const childFinalText = waitResult.results?.[0]?.result?.final_text || "ELECTRON_DOM_CHAT_OK";
-          payload = openAiStream(`ELECTRON_DOM_AGENT_OK ${childFinalText}`);
+          payload = openAiStream(`${timingResponseToken(currentUserText) || "ELECTRON_DOM_AGENT_OK"} ${childFinalText}`);
         } else {
           response.writeHead(500, { "content-type": "application/json" });
           response.end(JSON.stringify({
             error: "agent_lifecycle_incomplete",
-            phase: agentPhase,
+            phase: agentState.phase,
             childTaskIds,
             hasSpawnResult: Boolean(spawnResult),
             hasWaitResult: Boolean(waitResult),
@@ -320,18 +354,21 @@ function createProvider() {
           return;
         }
       } else if (isDomToolPrompt) {
-        domToolRequestCount += 1;
-        if (!domToolRoundEmitted && requestContainsTool(parsed, "tool_catalog")) {
-          domToolRoundEmitted = true;
+        const domToolState = domToolStates.get(currentUserText) || { emitted: false, completed: false };
+        if (!domToolState.emitted && requestContainsTool(parsed, "tool_catalog")) {
+          domToolState.emitted = true;
+          domToolStates.set(currentUserText, domToolState);
           payload = toolCallStream(requestToolName(parsed, "tool_catalog"), { include_external: false });
-        } else if (!domToolFinalEmitted && (hasToolResult || domToolRoundEmitted)) {
-          domToolFinalEmitted = true;
-          payload = openAiStream(toolResponseText);
+        } else if (!domToolState.completed && (hasToolResult || domToolState.emitted)) {
+          domToolState.completed = true;
+          domToolStates.set(currentUserText, domToolState);
+          payload = openAiStream(timingResponseToken(currentUserText) || toolResponseText);
         } else {
           // 工具调用只能有一轮；即使客户端未能回传工具结果，也必须收口，
           // 防止验收 Provider 把执行错误放大成无限重试。
-          domToolFinalEmitted = true;
-          payload = openAiStream(toolResponseText);
+          domToolState.completed = true;
+          domToolStates.set(currentUserText, domToolState);
+          payload = openAiStream(timingResponseToken(currentUserText) || toolResponseText);
         }
       } else {
         const isPermissionPrompt = promptKey.includes("权限拒绝 DOM 验收");
@@ -854,6 +891,108 @@ try {
     }
   }, "打包 Electron App Renderer CDP", 45_000, 250);
 
+  if (timingOnly) {
+    const initial = await waitForRenderer(page, "初始窗口");
+    check("timing 采样初始窗口显示新对话空态", initial.text.includes("开始一个新对话"));
+    check("timing 采样初始窗口具有输入框", initial.input);
+
+    const timingSamples = [];
+    const collectTiming = async (scenario, prompt, expectedText) => {
+      await waitFor(async () => {
+        const state = await rendererState(page);
+        return state.input && !state.stop ? state : null;
+      }, `${scenario} 发送前输入`);
+      await setComposerText(page, prompt);
+      await clickSend(page);
+      const result = await waitForAssistant(page, expectedText, `${scenario} ${prompt} 最终消息`);
+      const turnId = result.assistant.at(-1)?.turnId;
+      const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
+      timingSamples.push(timingEvidenceRecord(scenario, turnId, timing));
+      checkTimingStages(`${scenario} Renderer`, timing);
+    };
+    const ensurePersonalDraft = async (first) => {
+      if (!first) {
+        await waitFor(async () => {
+          const state = await rendererState(page);
+          return state.input && !state.stop ? state : null;
+        }, "个人 timing 上一轮收口");
+        await openPersonalDraft(page);
+      }
+      await waitFor(async () => {
+        const state = await rendererState(page);
+        return state.input && !state.stop ? state : null;
+      }, "个人 timing 采样输入");
+    };
+
+    for (let index = 0; index < timingSampleCount; index += 1) {
+      await ensurePersonalDraft(index === 0);
+      const token = `ELECTRON_TIMING_PERSONAL_${index}`;
+      await collectTiming("personal_chat", `Electron timing 个人聊天 ${token}`, token);
+    }
+
+    const workspaceRoot = await mkdtemp(join(stateRoot, "timing-workspace-"));
+    const workspaceId = await registerWorkspace(page, workspaceRoot);
+    const openWorkspaceDraft = async () => {
+      await waitFor(async () => {
+        const state = await rendererState(page);
+        return state.input && !state.stop ? state : null;
+      }, "工作区 timing 上一轮收口");
+      await waitFor(async () => {
+        const state = await rendererState(page);
+        return state.workspaceIds.includes(workspaceId) ? state : null;
+      }, "工作区 timing 采样会话");
+      await page.evaluate(`(() => {
+        const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
+        const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+        if (!create) throw new Error('workspace timing new session button missing');
+        create.click();
+      })()`);
+      await waitFor(async () => {
+        const state = await rendererState(page);
+        return state.input && !state.stop ? state : null;
+      }, "工作区 timing 采样输入");
+    };
+    await openWorkspaceDraft();
+    for (let index = 0; index < timingSampleCount; index += 1) {
+      if (index > 0) await openWorkspaceDraft();
+      const token = `ELECTRON_TIMING_WORKSPACE_${index}`;
+      await collectTiming("workspace_chat", `Electron timing 工作区聊天 ${token}`, token);
+    }
+
+    for (let index = 0; index < timingSampleCount; index += 1) {
+      await openWorkspaceDraft();
+      const token = `ELECTRON_TIMING_TOOL_${index}`;
+      await collectTiming("workspace_tool", `Electron timing 工作区工具：调用 tool_catalog 后返回 ${token}`, token);
+    }
+
+    for (let index = 0; index < timingSampleCount; index += 1) {
+      await ensurePersonalDraft(false);
+      await chooseGoalMode(page);
+      const token = `ELECTRON_TIMING_GOAL_${index}`;
+      await collectTiming("goal", `Electron timing Goal：维护目标计划并返回 ${token}`, token);
+    }
+
+    for (let index = 0; index < timingSampleCount; index += 1) {
+      await ensurePersonalDraft(false);
+      const token = `ELECTRON_TIMING_AGENT_${index}`;
+      await collectTiming("subagent", `Electron timing 子代理：派发一个子代理并等待其完成后返回 ${token}`, token);
+    }
+
+    const evidence = {
+      type: "electron_conversation_renderer_timing",
+      app: appExecutable,
+      cdpPort,
+      providerPort,
+      sampleCount: timingSampleCount,
+      scenarios: ["personal_chat", "workspace_chat", "workspace_tool", "goal", "subagent"],
+      checks,
+      providerRequests: provider.requests.length,
+      rendererTimingSamples: timingSamples,
+      status: "passed",
+    };
+    console.log(JSON.stringify({ ...evidence, ...(evidencePath ? { evidencePath } : {}) }, null, 2));
+    if (evidencePath) await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
+  } else {
   const initial = await waitForRenderer(page, "初始窗口");
   check("初始窗口显示新对话空态", initial.text.includes("开始一个新对话"));
   check("初始窗口具有输入框", initial.input);
@@ -1141,6 +1280,7 @@ try {
   }, null, 2));
   if (evidencePath) {
     await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
+  }
   }
 } finally {
   page?.close();
