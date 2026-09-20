@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-20
-代码基线：`0251c710c70611075879d6974bd7bdc32297fe59`（跨 Turn/Session 审批隔离验收）
+代码基线：`b9c13529`（统一终态任务 Turn 迟到写回判定）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -91,6 +91,7 @@
 | 2026-09-20 | E/F | 在其他 Agent 的 Web/Desktop 修改仍保留的工作区上复验协议、Svelte、生产构建和 npm golden；这些结果只证明当前工作区可构建，不扩大为完整 Electron GUI 或 Provider 全矩阵 | `npm run protocol:check`；`npm --prefix web run check`：0 errors、0 warnings；`npm --prefix web run build`；`npm test`：Desktop 99、Browser Worker 57 及 Web golden 全部通过 |
 | 2026-09-20 | D/E | 修复并发子任务状态 callback 与 root Turn 终态收口之间的迟到写回竞态；仅对已切换、缺失或终态 Turn 丢弃旧 item，同一活动 Turn 的真实错误继续返回 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：669 passed、1 ignored；对应提交 `eb1cac1c` |
 | 2026-09-20 | C/D | 增加同一 Session 跨 Turn、跨 Session 的 `allow_for_turn` 审批隔离和 Task profile restart/replay 验收；验证真实文件副作用、审批请求数、canonical 终态和 Provider 请求不重复 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：50 passed、1 ignored；`cargo test -p magi-daemon --lib daemon::tests::session_turn_persists_without_live_subscriber_and_recovers_after_restart -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib runtime_restart -- --test-threads=1`：3 passed；对应提交 `0251c710` |
+| 2026-09-20 | A/D | 将 `killed` 与 `superseded` 纳入任务 Turn 终态判定，确保迟到 task status callback 在所有 canonical 终态下都按 stale item 丢弃；不改变同一活动 Turn 的真实错误传播 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；对应提交 `b9c13529` |
 
 ## B 工作包首轮审计
 
