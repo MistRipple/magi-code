@@ -367,6 +367,7 @@ function createProvider() {
         || currentUserText.includes("Electron timing 工作区工具");
       const isGoalPrompt = currentUserText.includes("目标 DOM 验收")
         || currentUserText.includes("Electron timing Goal");
+      const isGoalFailurePrompt = currentUserText.includes("目标失败 DOM 验收");
       const isAgentPrompt = currentUserText.includes("子代理 DOM 验收")
         || currentUserText.includes("Electron timing 子代理")
         || currentUserText.includes("派发一个子代理并等待其完成");
@@ -382,6 +383,13 @@ function createProvider() {
         approvalState.completed = true;
         approvalStates.set("approval", approvalState);
         payload = openAiStream(approvalResponseText);
+      } else if (isGoalFailurePrompt) {
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          error: "electron_goal_provider_failure",
+          message: "Electron Goal failure recovery probe",
+        }));
+        return;
       } else if (isGoalPrompt) {
         const goalState = goalStates.get(currentUserText) || {
           phase: 0,
@@ -1421,6 +1429,41 @@ try {
     return state.goalCard?.expanded === "true" ? state : null;
   }, "Goal 卡片展开");
   check("Goal 卡片支持二级展开", expandedGoal.goalCard.expanded === "true");
+
+  await openPersonalDraft(page);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop ? state : null;
+  }, "Goal 失败验收输入");
+  await chooseGoalMode(page);
+  await setComposerText(page, "目标失败 DOM 验收：验证失败后仍可恢复新的目标");
+  await clickSend(page);
+  const failedGoal = await waitFor(async () => {
+    const state = await rendererState(page);
+    const text = state.text.toLowerCase();
+    const hasFailureText = text.includes("失败") || text.includes("错误")
+      || text.includes("failed") || text.includes("error");
+    return state.input && state.inputEditable && !state.stop && hasFailureText ? state : null;
+  }, "Goal 失败终态", 60_000);
+  check(
+    "Goal Provider 失败事实进入真实 DOM",
+    failedGoal.text.includes("失败") || failedGoal.text.includes("错误")
+      || failedGoal.text.toLowerCase().includes("failed")
+      || failedGoal.text.toLowerCase().includes("error"),
+  );
+
+  await openPersonalDraft(page);
+  await clearGoalMode(page);
+  await chooseGoalMode(page);
+  await setComposerText(page, "目标 DOM 验收：失败后重新建立目标并完成计划");
+  await clickSend(page);
+  const recoveredGoal = await waitForAssistant(page, "ELECTRON_DOM_GOAL_OK", "Goal 失败后恢复最终消息");
+  check("Goal 失败后可重新建立并完成目标", recoveredGoal.text.includes("ELECTRON_DOM_GOAL_OK"));
+  const recoveredGoalCard = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.goalCard && state.planCard ? state : null;
+  }, "Goal 失败后恢复卡片", 45_000);
+  check("Goal 失败后恢复卡片进入真实 DOM", Boolean(recoveredGoalCard.goalCard && recoveredGoalCard.planCard));
 
   await openPersonalDraft(page);
   await waitFor(async () => {
