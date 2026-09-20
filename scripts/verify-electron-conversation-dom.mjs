@@ -43,6 +43,7 @@ const evidencePath = process.env.MAGI_ELECTRON_DOM_EVIDENCE_PATH?.trim() || "";
 const timingOnly = process.env.MAGI_ELECTRON_DOM_TIMING_ONLY === "1";
 let approvalTarget = join(tmpdir(), `magi-electron-dom-approval-${process.pid}.txt`);
 let approvalDenyTarget = join(tmpdir(), `magi-electron-dom-approval-deny-${process.pid}.txt`);
+let approvalCancelTarget = join(tmpdir(), `magi-electron-dom-approval-cancel-${process.pid}.txt`);
 
 const backendTimingByTurn = new Map();
 const traceToTurn = new Map();
@@ -315,6 +316,12 @@ function providerResponse(body) {
       access_mode: "maybe_write",
     });
   }
+  if (promptText.includes("审批取消 DOM 验收")) {
+    return toolCallStream("shell_exec", {
+      command: `printf cancelled > ${approvalCancelTarget}`,
+      access_mode: "maybe_write",
+    });
+  }
   if (promptText.includes("审批 DOM 验收")) {
     if (messages.some((message) => message?.role === "tool")) {
       return openAiStream(approvalResponseText);
@@ -559,6 +566,7 @@ function createProvider() {
       } else {
         const isPermissionPrompt = promptKey.includes("权限拒绝 DOM 验收");
         const isApprovalDenyPrompt = promptKey.includes("审批拒绝 DOM 验收");
+        const isApprovalCancelPrompt = promptKey.includes("审批取消 DOM 验收");
         const isApprovalPrompt = promptKey.includes("审批 DOM 验收");
         if (isApprovalDenyPrompt) {
           const nextApprovalState = approvalStates.get("approval-deny") || { emitted: false, completed: false };
@@ -578,6 +586,21 @@ function createProvider() {
               command: `printf denied > ${approvalDenyTarget}`,
               access_mode: "maybe_write",
             }, "electron-dom-approval-deny-shell-exec-1");
+          }
+        } else if (isApprovalCancelPrompt) {
+          const nextApprovalState = approvalStates.get("approval-cancel") || { emitted: false, completed: false };
+          if (!nextApprovalState.emitted) {
+            nextApprovalState.emitted = true;
+            approvalStates.set("approval-cancel", nextApprovalState);
+            payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+              command: `printf cancelled > ${approvalCancelTarget}`,
+              access_mode: "maybe_write",
+            }, "electron-dom-approval-cancel-shell-exec-1");
+          } else {
+            payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+              command: `printf cancelled > ${approvalCancelTarget}`,
+              access_mode: "maybe_write",
+            }, "electron-dom-approval-cancel-shell-exec-1");
           }
         } else if (isApprovalPrompt) {
           const nextApprovalState = approvalStates.get("approval") || { emitted: false, completed: false };
@@ -1362,6 +1385,7 @@ try {
   const workspaceId = await registerWorkspace(page, workspaceRoot);
   approvalTarget = join(workspaceRoot, ".magi-electron-dom-approval.txt");
   approvalDenyTarget = join(workspaceRoot, ".magi-electron-dom-approval-deny.txt");
+  approvalCancelTarget = join(workspaceRoot, ".magi-electron-dom-approval-cancel.txt");
   await setComposerText(page, "请只回复 ELECTRON_DOM_CHAT_OK");
   await clickSend(page);
   const workspace = await waitForAssistant(page, responseText, "工作区普通 Chat 最终消息");
@@ -1669,6 +1693,54 @@ try {
   }
   check("审批拒绝后真实文件副作用不存在", !deniedFileExists);
 
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.workspaceIds.includes(workspaceId) ? state : null;
+  }, "审批取消工作区可用");
+  await page.evaluate(`(() => {
+    const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
+    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    if (!create) throw new Error('approval cancellation workspace new session button missing');
+    create.click();
+  })()`);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && state.inputEditable && !state.stop && state.assistant.length === 0
+      ? state
+      : null;
+  }, "审批取消工作区草稿");
+  await chooseAccessProfile(page, "restricted");
+  await setComposerText(page, `审批取消 DOM 验收：请明确调用 shell_exec 写入 ${approvalCancelTarget}`);
+  await clickSend(page);
+  const cancellationApproval = await waitFor(async () => {
+    const state = await rendererState(page);
+    const card = await page.evaluate(`Boolean(document.querySelector('.tool-approval'))`);
+    return card && state.stop ? state : null;
+  }, "Restricted 审批取消卡片", 45_000);
+  check("Restricted 审批取消卡片进入真实 DOM", cancellationApproval.text.length > 0);
+  check("Restricted 审批取消卡片显示停止操作", cancellationApproval.stop);
+  const stopApproval = await clickStop(page);
+  check("审批取消场景触发停止操作", stopApproval);
+  const cancelledApproval = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.text.includes("审批取消 DOM 验收")
+      && !state.stop && !state.text.includes("处理中")
+      ? state
+      : null;
+  }, "审批取消终态", 45_000);
+  check(
+    "审批取消终态进入真实 DOM",
+    cancelledApproval.text.includes("审批取消 DOM 验收") && !cancelledApproval.text.includes("处理中"),
+    `DOM text: ${cancelledApproval.text.slice(-240)}`,
+  );
+  let cancelledFileExists = true;
+  try {
+    await access(approvalCancelTarget);
+  } catch {
+    cancelledFileExists = false;
+  }
+  check("审批取消后真实文件副作用不存在", !cancelledFileExists);
+
   // 再建立一个有独立最终文本的个人会话，用于 daemon 重启和历史切换断言。
   await selectMostRecentPersonalSession(page);
   await openPersonalDraft(page);
@@ -1788,5 +1860,6 @@ try {
   await closeProvider(provider.server);
   await rm(approvalTarget, { force: true });
   await rm(approvalDenyTarget, { force: true });
+  await rm(approvalCancelTarget, { force: true });
   await removeStateRoot(stateRoot);
 }
