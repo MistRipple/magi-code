@@ -978,6 +978,10 @@ Task 流中断测试替身的 `non_stream_fallback_count` 也已统一为 `non_s
 
 代理等待提示中的 `degraded/fallback` 也改为明确的“降级/接管”语义，模型配置错误说明改为“替代模型”而不再使用旧回退措辞；对应代理等待和角色模型定向测试通过。
 
+工具执行账本中重复调用无法复用结果时的内部 `fallback_indices` 重命名为 `retry_indices`，只收敛实现命名；对外工具结果的 `fallback_mode` 字段属于既有协议合同，继续保留并由测试锁定。
+
+同时清理了模型角色继承、失败任务重新打开、执行租约恢复提交和严格 Goal 工具面的旧“回退”注释；这些位置现在直接描述继承、重新打开、提交或 fail-closed 行为，不改变协议字段和真实恢复分支。
+
 随后增加了显式 ignored 的本地 mock Provider 五场景性能基准，固定每个场景 20 轮并输出 accepted、Provider 首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，同时校验时序单调和事件序号存在。显式运行 `cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scenario_p50_p95_baseline -- --ignored --test-threads=1 --nocapture` 的结果为：新建个人普通会话 accepted P95 3ms、首 delta P95 3ms、首事件 P95 14ms、终态 P95 14ms；已有长历史分别为 2/4/16/17ms；工作区纯聊天为 0/1/13/13ms；工作区工具为 1/77/132/133ms；主代理+子代理为 1/112/130/130ms。该数据只证明本地 mock 基准可重复，不替代真实 Provider 五类场景 20 轮、前端 DOM 绘制和性能前后对比，后者仍未完成。
 
 权限矩阵又补充了“拒绝后修改参数”的单元验收：同一 Session/Turn/工具的相同规范化参数继续命中拒绝记忆，修改路径后必须重新产生独立 pending approval，并可单独解决为 `allow_once`；因此拒绝记忆不会错误扩大到不同操作。

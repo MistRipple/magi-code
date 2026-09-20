@@ -483,12 +483,12 @@ impl TaskRunner {
         match task.status {
             // 已经在 Pending：等待 dispatcher 派发，无需动作
             TaskStatus::Pending => Ok(()),
-            // 用户显式继续：把 Failed 任务回退到 Pending，由 dispatcher 重新派发
+            // 用户显式继续：把 Failed 任务重新打开为 Pending，由 dispatcher 重新派发
             // 这条路径是 `/api/session/continue` 的 root-status==Failed 入口
             TaskStatus::Failed => self
                 .store
                 .reopen_failed_task_for_recovery(task_id)
-                .map_err(|error| format!("将任务 {task_id} 回退到 Pending 失败: {error}")),
+                .map_err(|error| format!("将任务 {task_id} 重新打开为 Pending 失败: {error}")),
             // 终态：Completed / Killed 不可恢复；Running 仍在跑也不需要 resume
             other => Err(format!(
                 "任务系统 不支持从 {:?} 状态恢复任务 {}",

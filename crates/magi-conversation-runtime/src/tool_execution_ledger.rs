@@ -351,7 +351,7 @@ impl ToolExecutionLedger {
             results[*execution_index] = Some(result);
         }
 
-        let mut fallback_indices = Vec::new();
+        let mut retry_indices = Vec::new();
         for (index, decision) in decisions.iter().enumerate() {
             if let Some(result) = decision.immediate_result() {
                 results[index] = Some(result);
@@ -370,7 +370,7 @@ impl ToolExecutionLedger {
                     {
                         results[index] = Some(reused);
                     } else {
-                        fallback_indices.push(index);
+                        retry_indices.push(index);
                     }
                 }
                 ToolCallExecutionDecision::Execute { .. } => {}
@@ -382,13 +382,13 @@ impl ToolExecutionLedger {
             }
         }
 
-        if !fallback_indices.is_empty() {
-            let fallback_calls = fallback_indices
+        if !retry_indices.is_empty() {
+            let retry_calls = retry_indices
                 .iter()
                 .map(|index| tool_calls[*index].clone())
                 .collect::<Vec<_>>();
-            let fallback_results = execute(&fallback_calls);
-            for (index, result) in fallback_indices.into_iter().zip(fallback_results) {
+            let retry_results = execute(&retry_calls);
+            for (index, result) in retry_indices.into_iter().zip(retry_results) {
                 let ToolCallExecutionDecision::ReuseAfterExecution { fingerprint, .. } =
                     &decisions[index]
                 else {

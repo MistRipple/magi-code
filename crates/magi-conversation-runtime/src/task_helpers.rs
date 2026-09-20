@@ -933,7 +933,7 @@ pub fn required_tool_definitions_for_round(
 
 /// 目标模式的严格工具面。
 ///
-/// 目标模式不能因为当前工具面缺少必经步骤而回退到完整工具面。完整工具面会
+/// 目标模式不能因为当前工具面缺少必经步骤而改用完整工具面。完整工具面会
 /// 让模型绕过 Goal/Plan 生命周期，随后再由结果校验被动发现，属于 fail-open。
 /// 普通任务的恢复工具仍使用 `required_tool_definitions_for_round`，只有目标模式
 /// 走这个 fail-closed 版本。

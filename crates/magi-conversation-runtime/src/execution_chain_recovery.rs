@@ -160,7 +160,7 @@ pub fn finalize_terminal_worker_branches(
         if matches!(terminal_status, TaskStatus::Completed) {
             let lease_id = branch.lease_id.as_ref().ok_or_else(|| {
                 format!(
-                    "恢复 branch {} 缺少执行租约，拒绝无 lease 完成回退",
+                    "恢复 branch {} 缺少执行租约，拒绝无 lease 完成提交",
                     branch.task_id
                 )
             })?;
@@ -742,7 +742,7 @@ mod tests {
         let error =
             finalize_terminal_worker_branches(&session_store, Some(&task_store), None, &session_id)
                 .expect_err("completion without lease must be rejected");
-        assert!(error.contains("拒绝无 lease 完成回退"));
+        assert!(error.contains("拒绝无 lease 完成提交"));
         assert_eq!(
             task_store
                 .get_task(&branch_task_id)

@@ -696,7 +696,7 @@ fn role_engine_binding(
             continue;
         }
         // `engineId` 空串 = 继承编排模型（resolve_target_for_role 在 Agent 分支返回 None 后
-        // 上层会显式回退到 Orchestrator）；非空 = 显式绑定到某个 engine。
+        // 上层显式选择 Orchestrator）；非空 = 显式绑定到某个 engine。
         // 该字段是「继承 vs 显式」的唯一事实源，不再保留 modelSource 二次枚举。
         let engine_id = string_field(raw, "engineId").unwrap_or_default();
         if engine_id.is_empty() {

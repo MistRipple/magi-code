@@ -320,7 +320,7 @@ impl Drop for AgentWorktreeCleanup {
 ///
 /// 三类目标对应 settings.json 中三段独立配置：
 /// - [`RoleTarget::Orchestrator`]：`orchestrator` 段——业务主对话的权威入口，
-///   携带 `reasoningEffort` 等全套字段。未配置时回退到 daemon bootstrap 注入的
+///   携带 `reasoningEffort` 等全套字段。未配置时使用 daemon bootstrap 注入的
 ///   `default_client`（`MAGI_OPENAI_COMPAT_*` env 兜底）。
 /// - [`RoleTarget::Auxiliary`]：`auxiliary` 段——会话标题精修、知识抽取、会话记忆、
 ///   Prompt 增强等"低价值/低延迟敏感"任务。未配置时返回 `None`，调用方静默跳过。
@@ -387,7 +387,7 @@ pub fn resolve_target_for_role(
 
 /// 内部 helper：从 settings 指定段（"orchestrator" / "auxiliary"）读取并构造 client。
 ///
-/// 未配置（缺 base_url）时返回 `None`，与既有"段未配置 → 静默跳过/回退"语义一致。
+/// 未配置（缺 base_url）时返回 `None`，表示该辅助能力静默跳过。
 fn build_client_from_section(
     settings_store: &Arc<SettingsStore>,
     section: &str,
@@ -2732,7 +2732,7 @@ struct AuxiliaryModelExtractionContext<'a> {
 /// 与 `session_title::refine_new_session_title` 保持同一套约定：
 /// - 辅助模型未配置时调用方应在外层短路（缺失则不会进入本函数）。
 /// - 模型返回失败、`ok=false` 等异常一律 `tracing::debug!` 并返回明确失败原因，
-///   由上层发布诊断事件；不做任何降级到 marker 路径的回退。
+///   由上层发布诊断事件；不降级到 marker 路径。
 fn extract_learnings_via_auxiliary(
     context: AuxiliaryModelExtractionContext<'_>,
     text: &str,
