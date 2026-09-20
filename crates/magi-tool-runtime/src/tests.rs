@@ -7210,6 +7210,123 @@ fn external_mcp_read_only_tool_can_execute_in_read_only_profile() {
 }
 
 #[test]
+fn external_mcp_access_profile_matrix_records_executor_side_effects() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+    let executor_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let executor_calls_for_executor = Arc::clone(&executor_calls);
+    let registry = ToolRegistry::new(governance, event_bus)
+        .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+            mcp_tools: vec![
+                ExternalMcpToolCatalogEntry {
+                    server_id: "matrix-server".to_string(),
+                    server_name: "Permission Matrix Server".to_string(),
+                    model_tool_name: "mcp__matrix_server__read".to_string(),
+                    tool_name: "read".to_string(),
+                    description: "Read external state".to_string(),
+                    read_only: true,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                ExternalMcpToolCatalogEntry {
+                    server_id: "matrix-server".to_string(),
+                    server_name: "Permission Matrix Server".to_string(),
+                    model_tool_name: "mcp__matrix_server__write".to_string(),
+                    tool_name: "write".to_string(),
+                    description: "Write external state".to_string(),
+                    read_only: false,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+            ..ExternalToolCatalogSnapshot::default()
+        }))
+        .with_external_mcp_tool_executor(Arc::new(move |server, tool, arguments| {
+            executor_calls_for_executor
+                .lock()
+                .expect("MCP executor audit lock should hold")
+                .push(format!("{server}:{tool}:{arguments}"));
+            (
+                serde_json::json!({
+                    "status": "succeeded",
+                    "server": server,
+                    "tool": tool,
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }));
+
+    let mut rows = Vec::new();
+    for access_profile in [
+        magi_core::AccessProfile::ReadOnly,
+        magi_core::AccessProfile::Restricted,
+        magi_core::AccessProfile::FullAccess,
+    ] {
+        for (tool_name, read_only) in [
+            ("mcp__matrix_server__read", true),
+            ("mcp__matrix_server__write", false),
+        ] {
+            let result = registry
+                .execute_external_mcp_tool(tool_name, r#"{"value":"matrix"}"#, access_profile)
+                .expect("matrix MCP tool must be present in the same catalog snapshot");
+            let executed = result.1 == ExecutionResultStatus::Succeeded;
+            rows.push(serde_json::json!({
+                "tool": tool_name,
+                "read_only": read_only,
+                "access_profile": format!("{access_profile:?}"),
+                "status": format!("{:?}", result.1),
+                "executor_called": executed,
+            }));
+            if read_only {
+                assert_eq!(
+                    result.1,
+                    ExecutionResultStatus::Succeeded,
+                    "read-only MCP tools may execute under every access profile"
+                );
+            } else {
+                match access_profile {
+                    magi_core::AccessProfile::ReadOnly => {
+                        assert_eq!(result.1, ExecutionResultStatus::Rejected)
+                    }
+                    magi_core::AccessProfile::Restricted => {
+                        assert_eq!(result.1, ExecutionResultStatus::NeedsApproval)
+                    }
+                    magi_core::AccessProfile::FullAccess => {
+                        assert_eq!(result.1, ExecutionResultStatus::Succeeded)
+                    }
+                }
+            }
+        }
+    }
+
+    let calls = executor_calls
+        .lock()
+        .expect("MCP executor audit lock should hold")
+        .clone();
+    assert_eq!(
+        calls.len(),
+        4,
+        "only allowed MCP rows may reach the executor"
+    );
+    assert!(calls.iter().any(|call| call.contains(":read:")));
+    assert!(calls.iter().any(|call| call.contains(":write:")));
+    assert_eq!(rows.len(), 6, "matrix must record every profile/tool row");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["status"] == "NeedsApproval")
+            .count(),
+        1,
+        "restricted write must remain an explicit approval boundary"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["status"] == "Rejected")
+            .count(),
+        1,
+        "read-only write must remain a hard rejection"
+    );
+}
+
+#[test]
 fn search_semantic_uses_context_workspace_when_multiple_indexes_are_ready() {
     let root_a = unique_temp_dir("magi-tool-search-scope-a");
     let root_b = unique_temp_dir("magi-tool-search-scope-b");
