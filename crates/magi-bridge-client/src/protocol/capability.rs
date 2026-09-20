@@ -53,7 +53,7 @@ pub struct ModelCapabilityProfile {
     /// `LlmMessageParams::reasoning_effort` 注入到 OpenAI 兼容请求体。
     pub supports_openai_reasoning_effort: bool,
     /// 默认 thinking budget tokens（仅在 [`ThinkingKind::BudgetTokens`]
-    /// 形态下被读取）。`0` 表示无显式默认，由适配器使用其内置 fallback。
+    /// 形态下被读取）。`0` 表示无显式默认，由适配器使用其内置默认预算。
     pub default_budget_tokens: u32,
     /// 调用时必须附带的 HTTP beta header（如 Opus 4.7 的
     /// `anthropic-beta: task-budgets-2026-03-13`）。

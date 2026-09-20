@@ -988,6 +988,8 @@ Current Turn 的剩余直接 mutation 搜索结果已复核为 `CanonicalTurnEve
 
 本轮继续清理已确认不代表第二条执行路径的旧命名：MCP 测试替身统一使用 `default_client`，Session/Agent 投影和 Snapshot 生命周期注释改为直接描述稳定 ID、mission 读取和惰性初始化。没有改动 MCP 默认客户端、Task/Turn 生命周期或任何协议字段；仍保留实际承担传输恢复、协议兼容、迁移和旧字段拒绝职责的 `fallback`/`legacy` 语义，17.7 继续保持未完成。
 
+随后将 Anthropic 旧版 thinking 的固定预算常量从 `FALLBACK_THINKING_BUDGET_TOKENS` 更名为 `DEFAULT_THINKING_BUDGET_TOKENS`，明确它是能力未提供显式预算时的协议默认值，不是另一条 Provider 或 Turn 执行路径；请求体和能力选择行为未改变，相关桥接测试继续覆盖。
+
 随后增加了显式 ignored 的本地 mock Provider 五场景性能基准，固定每个场景 20 轮并输出 accepted、Provider 首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，同时校验时序单调和事件序号存在。显式运行 `cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scenario_p50_p95_baseline -- --ignored --test-threads=1 --nocapture` 的结果为：新建个人普通会话 accepted P95 3ms、首 delta P95 3ms、首事件 P95 14ms、终态 P95 14ms；已有长历史分别为 2/4/16/17ms；工作区纯聊天为 0/1/13/13ms；工作区工具为 1/77/132/133ms；主代理+子代理为 1/112/130/130ms。该数据只证明本地 mock 基准可重复，不替代真实 Provider 五类场景 20 轮、前端 DOM 绘制和性能前后对比，后者仍未完成。
 
 权限矩阵又补充了“拒绝后修改参数”的单元验收：同一 Session/Turn/工具的相同规范化参数继续命中拒绝记忆，修改路径后必须重新产生独立 pending approval，并可单独解决为 `allow_once`；因此拒绝记忆不会错误扩大到不同操作。

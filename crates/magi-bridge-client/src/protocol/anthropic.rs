@@ -14,7 +14,7 @@ use magi_usage_authority::ReasoningEffort;
 ///
 /// 仅在 `ThinkingKind::BudgetTokens` 形态、且能力表未提供 `default_budget_tokens`、
 /// 且调用方未传 `reasoning_effort` 时使用。Anthropic 要求 `max_tokens > budget_tokens`。
-const FALLBACK_THINKING_BUDGET_TOKENS: u32 = 4096;
+const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 4096;
 /// 启用 thinking 时 `max_tokens` 的最低值（必须严格大于 budget）。
 const MIN_MAX_TOKENS_WITH_THINKING: u32 = 8192;
 
@@ -270,7 +270,7 @@ fn translate_tool_choice_for_anthropic(choice: &ToolChoice) -> Value {
 ///
 /// - `None`：模型不支持 thinking，返回 `None`，主体不写 `thinking` 字段；
 /// - `BudgetTokens`（3.7 / 4.x legacy）：写 `{ type:"enabled", budget_tokens }`，
-///   优先用调用方 `reasoning_effort` 映射的预算，否则用能力表 default，再否则用全局 fallback；
+///   优先用调用方 `reasoning_effort` 映射的预算，否则用能力表 default，再否则用全局默认预算；
 /// - `Effort`（4.7+ Adaptive Thinking only mode）：写 `{ type:"adaptive" }`，
 ///   推理强度由顶层 `output_config.effort` 控制（见 body 组装处），不再用
 ///   已被服务端拒绝的 `{ type:"enabled", effort }` 形态；
@@ -297,7 +297,7 @@ fn build_thinking_value(
                     if default_budget > 0 {
                         default_budget
                     } else {
-                        FALLBACK_THINKING_BUDGET_TOKENS
+                        DEFAULT_THINKING_BUDGET_TOKENS
                     }
                 });
             Some(attach_display(json!({
