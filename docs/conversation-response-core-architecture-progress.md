@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-20
-代码基线：`dc858aa2`（补齐 Electron Restricted 审批验收）
+代码基线：`c34319f3`（同步 Electron 审批回归证据）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -12,7 +12,7 @@
 
 | 编号 | 工作包 | 状态 | 关闭条件 |
 | --- | --- | --- | --- |
-| A | 17.3：current Turn 写入口和测试夹具边界 | 进行中 | 生产路径只经 `CanonicalTurnEventSink`；剩余底层 fixture 已逐项分类，能迁移的已迁移，保留项有精确理由和测试覆盖 |
+| A | 17.3：current Turn 写入口和测试夹具边界 | 进行中（底层 fixture 审计完成，待主方案文档同步） | 生产路径只经 `CanonicalTurnEventSink`；剩余底层 fixture 已逐项分类，均为验证原子 mutation/恢复边界的测试，保留理由和测试覆盖已记录，并需同步方案文档的 17.3 勾选状态 |
 | B | 17.7：失效 legacy/兼容语义清理 | 进行中（首轮审计完成；未发现可直接删除的生产双轨） | 失效生产双轨、旧注释和无效 fixture 清除；迁移、恢复、协议兼容、旧字段拒绝逻辑保留并有边界说明 |
 | C | 完整权限组合矩阵 | 进行中（基础 runtime/API 矩阵和跨 Turn 授权隔离已跑通；组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
 | D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮、基础 cancel/reconnect 及 Task restart replay 已有；全矩阵未完成） | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
@@ -44,7 +44,7 @@
 - 在重新打包后的当前 Electron/Web 工作区上复验同一 timing-only 五类 × 20 轮：`/tmp/magi-electron-dom-correlated-timing-20-10031.json`，`status=passed`、903 项检查、280 次 Provider 请求、100 条唯一 `turnId`、0 条缺少后端阶段、终态来源全部为 `canonical_terminal_published`。该复验用于确认打包产物和当前 Web/Desktop 状态仍能完成同轮关联；Provider 波动下的分布不能直接替换历史性能基线。
 - 应用迟到任务状态写回修复并重新打包后，标准 Electron DOM 回归 `/tmp/magi-electron-dom-regression-10120.json` 仍为 `status=passed`、55 项检查、15 次 Provider 请求和 5 条 Renderer timing sample；该结果只确认修复没有破坏既有单轮 GUI 流程。日志中仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示，不能扩大为完整 Desktop IPC 验收。
 - 在当前打包产物上补充 Restricted 审批 GUI 验收：`/tmp/magi-electron-dom-regression-10142.json` 为 `status=passed`、61 项检查、17 次 Provider 请求。该场景使用已注册工作区中的 `shell_exec` 写入请求，验证审批卡片进入真实 DOM、包含“仅允许本次 / 本轮允许同类操作 / 拒绝并继续”三个操作、允许一次后最终消息恢复以及工作区内真实文件副作用；随后仍通过个人会话、daemon restart、history/reload 和 cancel 既有断言。该证据只补齐 E 的审批阻塞/恢复单场景，不能替代 Git/Goal 失败恢复和 reconnect/history/restart 组合矩阵。日志仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示。
-- 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误仍继续传播。新增回归测试覆盖 running、blocked 和替换 Turn，避免把预期迟到写回记录成生产错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
+- 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误继续传播。回归测试覆盖 running、blocked、替换 Turn，以及活动 Turn 内 immutable canonical item 冲突，避免把预期迟到写回记录成生产错误，也避免吞掉真实写回错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
 - 该关联证据仍不能关闭 F：它尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
 - 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。工具调用首轮只有 tool-call block 时，`provider_first_delta` 继续表示首个可见 content/thinking delta，raw tool-call-only chunk 仍单独记录为 `provider_response_received`。
 
@@ -61,9 +61,9 @@
 
 - 生产代码没有 `upsert_current_turn(...)`、`TaskResultReceiver`、`uses_active_completion_sink`、生产 `poll_results(...)` 或旧 `run_dispatch_submission(...)`。
 - `CanonicalTurnEventSink` 内部仍调用 SessionStore 的 canonical mutation，这是允许的内部边界。
-- `magi-session-store/src/store/tests.rs` 仍有 19 处 `update_current_turn_status_for_turn(...)` 和 16 处 `upsert_current_turn_item_for_turn(...)` 测试调用；前者仅是测试便利包装，后者同时被 Sink 的生产写回使用，不能直接删除。
+- `magi-session-store/src/store/tests.rs` 当前有 19 处 `set_current_turn_status_for_test(...)`、2 处 `settle_current_turn_at_for_test(...)` 和 16 处 `upsert_current_turn_item_for_turn(...)` 测试调用（另有 1 处同名测试函数声明）；前两者仅是测试便利包装，后者同时被 Sink 的生产写回使用，不能直接删除。
 - 首轮已将仅测试使用的 `update_current_turn_status_for_turn` 包装收敛为 `#[cfg(test)] pub(crate) set_current_turn_status_for_test`；生产编译不再暴露这个 current Turn 写入口。
-- `upsert_current_turn_item_for_turn` 仍被 `CanonicalTurnEventSink` 的生产写回使用，不能按测试入口删除；下一步逐个判断 16 处 storage fixture 是否能改用接纳、追加或 Sink 测试辅助。
+- `upsert_current_turn_item_for_turn` 仍被 `CanonicalTurnEventSink` 的生产写回使用，不能按测试入口删除；16 处 storage fixture 已逐个判断，均直接验证 SessionStore canonical mutation 的原子性、版本、恢复投影或冲突拒绝，不能改成只验证上层 Coordinator 的黑盒流程。
 
 这 16 处调用目前按职责分为：
 
@@ -73,16 +73,16 @@
 - 1 处 request ID 元数据持久化验收；
 - 2 处内部 `agent_wait` / `agent_spawn` item 投影验收；
 - 4 处 blocked/killed/terminal item 收口验收；
-- 5 处 stale owner、不可变字段和状态回退拒绝验收。
+- 5 处 stale owner、不可变字段、状态回退和迟到旧轮次拒绝验收。
 
-这些测试直接验证 SessionStore canonical mutation 的原子性、版本和冲突规则，不能改成只验证上层 Coordinator 的黑盒流程；它们的合法底层边界会保留在 A 的关闭记录中。
+这些测试直接验证 SessionStore canonical mutation 的原子性、版本和冲突规则，不能改成只验证上层 Coordinator 的黑盒流程；它们的合法底层边界已完成分类。`session_turn_finalize::task_status_write_preserves_active_turn_canonical_errors` 另行证明迟到写回判定不会吞掉同一活动 Turn 的真实 canonical 冲突。A 仍需在方案文档同步勾选状态后关闭。
 
 ## 变更记录
 
 | 日期 | 工作包 | 进展 | 验证 |
 | --- | --- | --- | --- |
 | 2026-09-20 | F/E | 形成 55 项 Electron 单轮 DOM 回归和五类单轮 Renderer timing | `npm run test:electron-conversation-dom`；证据见上 |
-| 2026-09-20 | A | 完成生产 current Turn 写入口审计；将仅测试使用的状态包装改为测试专用命名和可见性 | `cargo fmt --all -- --check`；`cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed |
+| 2026-09-20 | A | 完成生产 current Turn 写入口审计；将仅测试使用的状态包装改为测试专用命名和可见性，并逐项确认 16 处底层 item fixture 均直接验证 canonical mutation 原子性、恢复投影或冲突拒绝，无可迁移到 Coordinator/Sink 的黑盒替代 | `cargo fmt --all -- --check`；`cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed；`cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：8 passed |
 | 2026-09-20 | F | 完成五类 timing 各 2 轮，并新增每轮 terminal 收口门槛；20 轮采样在 Goal 第 12 轮暴露上下文隔离问题 | `/tmp/magi-electron-dom-timing-2-9999d.json`：5 类 × 2，43 checks passed；`/tmp/magi-electron-dom-timing-20-9998.json` 未形成完整证据 |
 | 2026-09-20 | F | 通过 `MAGI_ELECTRON_DOM_TIMING_SCENARIO` 按场景隔离采样，并对 Goal/子代理轮次切换到独立个人草稿；五类 Renderer timing 各完成 20 轮 | `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`；5 类各 20 条唯一 `turnId`，每条均有四个 Renderer 阶段和 terminal 收口 |
 | 2026-09-20 | C | 跑通权限 runtime/API 基础矩阵并记录组合缺口 | `magi-api turn_harness`：48 passed、1 ignored；`magi-tool-runtime`：225 passed、1 ignored |
@@ -92,7 +92,7 @@
 | 2026-09-20 | E/F | 在其他 Agent 的 Web/Desktop 修改仍保留的工作区上复验协议、Svelte、生产构建和 npm golden；这些结果只证明当前工作区可构建，不扩大为完整 Electron GUI 或 Provider 全矩阵 | `npm run protocol:check`；`npm --prefix web run check`：0 errors、0 warnings；`npm --prefix web run build`；`npm test`：Desktop 99、Browser Worker 57 及 Web golden 全部通过 |
 | 2026-09-20 | E/C | 增加打包 Electron Restricted 审批卡片与真实 shell 写入验收；保留个人会话切回，避免工作区审批场景污染 daemon restart/history 断言 | `/tmp/magi-electron-dom-regression-10142.json`：61 checks passed、17 次 Provider 请求；审批卡片、三种操作、允许一次后的最终消息和真实文件副作用均通过；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
 | 2026-09-20 | B | 对 runtime/session-store/api/daemon 的 legacy、compat、fallback、旧路径命中重新审计；523 条命中均归入迁移、恢复、协议/能力状态、配置或路由错误边界，未找到可安全删除的生产双轨 | `rg -n --glob '*.rs' 'legacy|Legacy|fallback|compat|兼容|旧路径|回退' crates/magi-conversation-runtime crates/magi-session-store crates/magi-api crates/magi-daemon`：523 条命中；保留项分类已写入 B 工作包记录 |
-| 2026-09-20 | D/E | 修复并发子任务状态 callback 与 root Turn 终态收口之间的迟到写回竞态；仅对已切换、缺失或终态 Turn 丢弃旧 item，同一活动 Turn 的真实错误继续返回 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：671 passed、1 ignored；对应提交 `b9c13529` |
+| 2026-09-20 | A/D/E | 修复并发子任务状态 callback 与 root Turn 终态收口之间的迟到写回竞态；仅对已切换、缺失或终态 Turn 丢弃旧 item，同一活动 Turn 的 immutable canonical 写回错误继续返回 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：8 passed；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：671 passed、1 ignored；对应提交 `b9c13529`，新增 `task_status_write_preserves_active_turn_canonical_errors` |
 | 2026-09-20 | C/D | 增加同一 Session 跨 Turn、跨 Session 的 `allow_for_turn` 审批隔离和 Task profile restart/replay 验收；验证真实文件副作用、审批请求数、canonical 终态和 Provider 请求不重复 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：50 passed、1 ignored；`cargo test -p magi-daemon --lib daemon::tests::session_turn_persists_without_live_subscriber_and_recovers_after_restart -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib runtime_restart -- --test-threads=1`：3 passed；对应提交 `0251c710` |
 | 2026-09-20 | A/D | 将 `killed` 与 `superseded` 纳入任务 Turn 终态判定，确保迟到 task status callback 在所有 canonical 终态下都按 stale item 丢弃；不改变同一活动 Turn 的真实错误传播 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；对应提交 `b9c13529` |
 

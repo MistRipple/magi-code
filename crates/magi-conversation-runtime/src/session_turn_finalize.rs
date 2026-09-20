@@ -1349,6 +1349,109 @@ mod tests {
     }
 
     #[test]
+    fn task_status_write_preserves_active_turn_canonical_errors() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-task-status-active-error");
+        let mission_id = MissionId::new("mission-task-status-active-error");
+        let root_task_id = TaskId::new("task-task-status-active-error");
+        let accepted_at = UtcMillis(10);
+        session_store
+            .create_session(session_id.clone(), "Task status active error")
+            .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
+
+        let turn_id = "turn-task-status-active-error";
+        session_store
+            .accept_active_execution_chain_with_timeline_entry(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-task-status-active-error",
+                    TimelineEntryKind::UserMessage,
+                    "任务状态活动轮写回错误",
+                    accepted_at,
+                ),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-task-status-active-error".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: "timeline-task-status-active-error".to_string(),
+                        trimmed_text: Some("任务状态活动轮写回错误".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: turn_id.to_string(),
+                        turn_seq: 1,
+                        accepted_at,
+                        completed_at: None,
+                        status: "running".to_string(),
+                        user_message: Some("任务状态活动轮写回错误".to_string()),
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active execution chain should be accepted");
+
+        let task = failed_task(
+            root_task_id.as_str(),
+            &mission_id,
+            &root_task_id,
+            None,
+            Vec::new(),
+        );
+        task_store
+            .insert_task(task.clone())
+            .expect("root task should be inserted");
+
+        let item_id = format!("turn-item-task-status-{turn_id}-{}", task.task_id);
+        let mut conflicting_item = session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("已存在的 canonical item".to_string()),
+            Some("不可被任务状态覆盖".to_string()),
+            Some(item_id),
+            orchestrator_thread_id,
+        );
+        conflicting_item.source = "orchestrator".to_string();
+        conflicting_item.task_id = Some(root_task_id);
+        session_store
+            .upsert_current_turn_item_for_turn(&session_id, Some(turn_id), conflicting_item)
+            .expect("conflicting item fixture should be stored");
+
+        let error = publish_task_status_turn_item_for_active_sessions(
+            &event_bus,
+            &session_store,
+            Some(&task_store),
+            &task,
+            TaskStatus::Running,
+        )
+        .expect_err("同一活动 Turn 的 canonical 写回错误不能被当作迟到回调吞掉");
+
+        assert!(
+            error.contains("kind"),
+            "应保留 immutable kind 冲突，实际错误：{error}"
+        );
+        assert_eq!(
+            session_store
+                .runtime_sidecar(&session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .map(|turn| turn.status),
+            Some("running".to_string()),
+            "活动 Turn 必须保持可写，才能区分真实写回错误与迟到写回",
+        );
+    }
+
+    #[test]
     fn task_failure_message_exposes_redacted_root_error() {
         let task_store = TaskStore::new();
         let mission_id = MissionId::new("mission-direct-failure");
