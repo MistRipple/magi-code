@@ -5,7 +5,7 @@
 
 use crate::{
     dto::{SessionScopeKindDto, SessionTurnRequestDto, SessionTurnResponseDto},
-    state::ApiState,
+    state::{ApiState, RuntimeStatePersistence},
     turn_service::TurnService,
 };
 use axum::{body::Body, http::Request};
@@ -736,10 +736,43 @@ impl MagiTurnHarness {
         let event_bus = Arc::new(InMemoryEventBus::new(512));
         let workspace_store = Arc::new(WorkspaceStore::default());
         let governance = Arc::new(GovernanceService::default());
+        let git_service = Arc::new(magi_git::GitService::new());
+        let session_code_contexts = magi_git::SessionCodeContextRegistry::default();
+        let workspace_git_coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
+        let snapshot_manager = Arc::new(magi_snapshot::SnapshotManager::new());
+        let knowledge_store = Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        static HARNESS_RUNTIME_SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+        let runtime_sequence = HARNESS_RUNTIME_SEQUENCE
+            .get_or_init(|| AtomicU64::new(0))
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let runtime_state_root = std::env::temp_dir().join(format!(
+            "magi-turn-harness-runtime-{}-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0,
+            runtime_sequence
+        ));
+        let runtime_persistence = Arc::new(RuntimeStatePersistence::new(
+            runtime_state_root.clone(),
+            runtime_state_root.join("workspaces.json"),
+            runtime_state_root.join("knowledge.json"),
+        ));
+        let git_tool_executor = crate::git_tool_runtime::build_git_tool_executor(
+            crate::git_tool_runtime::GitToolRuntimeDependencies {
+                git_service: git_service.clone(),
+                session_code_contexts: session_code_contexts.clone(),
+                workspace_git_coordinator: workspace_git_coordinator.clone(),
+                event_bus: event_bus.clone(),
+                knowledge_store: knowledge_store.clone(),
+                snapshot_manager: snapshot_manager.clone(),
+                runtime_persistence: runtime_persistence.clone(),
+                managed_worktree_root: runtime_state_root.join("worktrees"),
+            },
+        );
         // 普通 Conversation harness 不创建 TaskStore；这与生产 profile 边界一致，
         // 不能只是不把已经创建的 TaskStore 挂到 ApiState 上。
         let task_store = with_task_runtime.then(|| Arc::new(TaskStore::new()));
-        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus))
+            .with_git_tool_executor(git_tool_executor);
         tool_registry.register_default_builtins();
         let skill_dispatch_runtime = SkillDispatchRuntime::new(
             tool_registry.clone(),
@@ -776,6 +809,14 @@ impl MagiTurnHarness {
             workspace_store,
             governance,
         )
+        .with_git_context_runtime(
+            git_service.clone(),
+            session_code_contexts.clone(),
+            workspace_git_coordinator.clone(),
+        )
+        .with_snapshot_manager(snapshot_manager.clone())
+        .with_knowledge_store(knowledge_store.clone())
+        .with_runtime_persistence(runtime_persistence.clone())
         .with_tool_registry(tool_registry.clone());
         if let Some(task_store) = task_store.as_ref() {
             state = state.with_task_store(Arc::clone(task_store));
@@ -808,7 +849,11 @@ impl MagiTurnHarness {
                 UtcMillis::now().0
             )),
         )
-        .with_model_bridge_client(Arc::new(provider.clone()));
+        .with_model_bridge_client(Arc::new(provider.clone()))
+        .with_workspace_registry(Arc::clone(&state.workspace_registry))
+        .with_git_context_runtime(git_service, session_code_contexts)
+        .with_workspace_git_coordinator(workspace_git_coordinator)
+        .with_snapshot_manager(snapshot_manager);
         if let Some(notifier) = completion_notifier.as_ref() {
             dispatcher_builder = dispatcher_builder.with_completion_notifier(notifier.clone());
         }
@@ -3268,6 +3313,336 @@ mod tests {
             2,
             "允许原始调用后只应有工具轮和一次最终答复轮"
         );
+    }
+
+    fn prepare_git_approval_case(
+        label: &str,
+        title: &str,
+    ) -> (MagiTurnHarness, magi_core::WorkspaceId, PathBuf, SessionId) {
+        let harness = MagiTurnHarness::new_task(title);
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        git_fixture_command(&workspace_root, &["switch", "-c", "approval-target"]);
+        git_fixture_command(&workspace_root, &["switch", "main"]);
+        let session_id = SessionId::new(format!("harness-git-approval-{label}-session"));
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(session_id.clone(), title, Some(workspace_id.to_string()))
+            .expect("Git 审批 session 应创建");
+        (harness, workspace_id, workspace_root, session_id)
+    }
+
+    fn current_git_branch(workspace_root: &Path) -> String {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("Git 当前分支查询应启动");
+        assert!(
+            output.status.success(),
+            "Git 当前分支查询失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_switch_allow_once_changes_real_branch() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("allow", "Git 分支审批允许验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "Git 分支已在审批后切换",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，等待审批后汇总结果",
+                "harness-git-approval-allow-request",
+                "harness-git-approval-allow-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 分支审批请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 分支审批请求应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 分支审批请求应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_branch_switch");
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            current_git_branch(&workspace_root),
+            "approval-target",
+            "allow_once 后必须产生真实 Git 分支副作用"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "Git 审批放行后只允许原始工具轮和一次最终答复轮"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1,
+            "Git 分支切换只应请求一次审批"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1,
+            "Git 分支审批允许后应收口一次"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "git_branch_switch"
+                        && tool.result.is_some()
+                        && tool.error.is_none()
+                })
+        }));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_switch_denial_preserves_branch_and_fails_turn() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("deny", "Git 分支审批拒绝验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "不会执行被拒绝的 Git 分支切换",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，但必须等待用户审批",
+                "harness-git-approval-deny-request",
+                "harness-git-approval-deny-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 分支拒绝请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("拒绝请求应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("拒绝请求应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "deny",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(
+            current_git_branch(&workspace_root),
+            "main",
+            "拒绝审批不得切换真实 Git 分支"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "git_branch_switch"
+                        && tool
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("拒绝"))
+                })
+        }));
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            1,
+            "拒绝 Git mutation 后不得再次请求 Provider"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_switch_cancel_preserves_branch_without_resolution() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("cancel", "Git 分支审批取消验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "不会执行被取消的 Git 分支切换",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，但在审批前取消当前 Turn",
+                "harness-git-approval-cancel-request",
+                "harness-git-approval-cancel-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 分支取消请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("取消请求应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("取消请求应有 root task");
+        let _pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        harness
+            .cancel_with_workspace(&session_id, Some(&workspace_id))
+            .await
+            .expect("取消 Git 审批 Turn 应成功");
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Cancelled);
+        assert!(matches!(
+            task.status,
+            magi_core::TaskStatus::Failed | magi_core::TaskStatus::Killed
+        ));
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty()
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            0,
+            "取消未作出审批决定时不得发布 resolved 事件"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_switch_expiry_preserves_branch_without_resolution() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("expiry", "Git 分支审批过期验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "不会执行已过期的 Git 分支切换",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，但审批过期后不得执行",
+                "harness-git-approval-expiry-request",
+                "harness-git-approval-expiry-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 分支过期请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("过期请求应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("过期请求应有 root task");
+        let _pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .expire_stale(UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)),
+            1,
+            "测试必须显式推进 Git 审批时钟"
+        );
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "git_branch_switch"
+                        && tool.error.as_deref().is_some_and(|error| {
+                            error.contains("tool_approval_expired") || error.contains("过期")
+                        })
+                })
+        }));
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            0
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
