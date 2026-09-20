@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile, spawn } from "node:child_process";
@@ -37,8 +37,10 @@ const timingScenarioNames = [
 const responseText = "ELECTRON_DOM_CHAT_OK";
 const toolResponseText = "ELECTRON_DOM_TOOL_OK";
 const restartResponseText = "ELECTRON_DOM_RESTART_OK";
+const approvalResponseText = "ELECTRON_DOM_APPROVAL_OK";
 const evidencePath = process.env.MAGI_ELECTRON_DOM_EVIDENCE_PATH?.trim() || "";
 const timingOnly = process.env.MAGI_ELECTRON_DOM_TIMING_ONLY === "1";
+let approvalTarget = join(tmpdir(), `magi-electron-dom-approval-${process.pid}.txt`);
 
 const backendTimingByTurn = new Map();
 const traceToTurn = new Map();
@@ -302,6 +304,15 @@ function providerResponse(body) {
     .join("\n");
   const timingToken = timingResponseToken(promptText);
 
+  if (promptText.includes("审批 DOM 验收")) {
+    if (messages.some((message) => message?.role === "tool")) {
+      return openAiStream(approvalResponseText);
+    }
+    return toolCallStream("shell_exec", {
+      command: `printf approval > ${approvalTarget}`,
+      access_mode: "maybe_write",
+    });
+  }
   if (promptText.includes("权限拒绝 DOM 验收")) {
     return toolCallStream("file_write", { path: "electron-dom-read-only.txt", content: "must-fail" });
   }
@@ -319,6 +330,7 @@ function providerResponse(body) {
 function createProvider() {
   const requests = [];
   const domToolStates = new Map();
+  const approvalStates = new Map();
   let permissionRoundEmitted = false;
   const goalStates = new Map();
   const agentStates = new Map();
@@ -361,8 +373,16 @@ function createProvider() {
       const hasToolResult = (Array.isArray(parsed.messages) ? parsed.messages : [])
         .some((message) => message?.role === "tool");
       const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+      const approvalState = approvalStates.get("approval");
+      const approvalFollowup = approvalState?.emitted
+        && !approvalState.completed
+        && messages.length > 6;
       let payload;
-      if (isGoalPrompt) {
+      if (approvalFollowup) {
+        approvalState.completed = true;
+        approvalStates.set("approval", approvalState);
+        payload = openAiStream(approvalResponseText);
+      } else if (isGoalPrompt) {
         const goalState = goalStates.get(currentUserText) || {
           phase: 0,
           startMessageCount: messages.length,
@@ -519,7 +539,25 @@ function createProvider() {
         }
       } else {
         const isPermissionPrompt = promptKey.includes("权限拒绝 DOM 验收");
-        if (isPermissionPrompt && !permissionRoundEmitted) {
+        const isApprovalPrompt = promptKey.includes("审批 DOM 验收");
+        if (isApprovalPrompt) {
+          const nextApprovalState = approvalStates.get("approval") || { emitted: false, completed: false };
+          if (!nextApprovalState.emitted) {
+            nextApprovalState.emitted = true;
+            approvalStates.set("approval", nextApprovalState);
+            payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+              command: `printf approval > ${approvalTarget}`,
+              access_mode: "maybe_write",
+            }, "electron-dom-approval-shell-exec-1");
+          } else if (hasToolResult) {
+            payload = openAiStream(approvalResponseText);
+          } else {
+            payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+              command: `printf approval > ${approvalTarget}`,
+              access_mode: "maybe_write",
+            }, "electron-dom-approval-shell-exec-1");
+          }
+        } else if (isPermissionPrompt && !permissionRoundEmitted) {
           permissionRoundEmitted = true;
           payload = providerResponse(parsed);
         } else if (isPermissionPrompt) {
@@ -1283,6 +1321,7 @@ try {
 
   const workspaceRoot = await mkdtemp(join(stateRoot, "workspace-"));
   const workspaceId = await registerWorkspace(page, workspaceRoot);
+  approvalTarget = join(workspaceRoot, ".magi-electron-dom-approval.txt");
   await setComposerText(page, "请只回复 ELECTRON_DOM_CHAT_OK");
   await clickSend(page);
   const workspace = await waitForAssistant(page, responseText, "工作区普通 Chat 最终消息");
@@ -1441,7 +1480,59 @@ try {
   check("ReadOnly 权限拒绝事实进入真实 DOM", permission.text.includes("权限") || permission.text.includes("只读") || permission.text.includes("拒绝"));
   check("ReadOnly 权限拒绝未创建文件工具组", permission.toolGroups.every((group) => !group.text.includes("file_write")));
 
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.workspaceIds.includes(workspaceId) ? state : null;
+  }, "审批工作区可用");
+  await page.evaluate(`(() => {
+    const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
+    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    if (!create) throw new Error('approval workspace new session button missing');
+    create.click();
+  })()`);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && state.inputEditable && !state.stop && state.assistant.length === 0
+      ? state
+      : null;
+  }, "审批工作区草稿");
+  await chooseAccessProfile(page, "restricted");
+  await setComposerText(page, `审批 DOM 验收：请明确调用 shell_exec 写入 ${approvalTarget}`);
+  await clickSend(page);
+  const approval = await waitFor(async () => {
+    const state = await rendererState(page);
+    const card = await page.evaluate(`(() => {
+      const root = document.querySelector('.tool-approval');
+      if (!root) return null;
+      const buttons = [...root.querySelectorAll('button')];
+      const primary = root.querySelector('button.approval-button--primary');
+      return {
+        text: root.innerText || '',
+        allowOnce: Boolean(primary && !primary.disabled),
+        allowOncePresent: Boolean(primary),
+        allowForTurn: buttons.some((button) => button.innerText.includes('本轮')),
+        deny: buttons.some((button) => button.innerText.includes('拒绝')),
+      };
+    })()`);
+    return card?.allowOnce ? { ...state, approval: card } : null;
+  }, "Restricted 审批卡片", 45_000);
+  check("Restricted 审批卡片进入真实 DOM", approval.approval.text.length > 0);
+  check("Restricted 审批卡片包含允许一次操作", approval.approval.allowOncePresent);
+  check("Restricted 审批卡片包含按 Turn 允许操作", approval.approval.allowForTurn);
+  check("Restricted 审批卡片包含拒绝操作", approval.approval.deny);
+  await page.evaluate(`document.querySelector('.tool-approval button.approval-button--primary')?.click()`);
+  const approvalResult = await waitForAssistant(page, approvalResponseText, "审批恢复最终消息");
+  check("审批允许后最终消息进入真实 DOM", approvalResult.text.includes(approvalResponseText));
+  let approvalFileExists = true;
+  try {
+    await access(approvalTarget);
+  } catch {
+    approvalFileExists = false;
+  }
+  check("审批允许后真实文件副作用存在", approvalFileExists);
+
   // 再建立一个有独立最终文本的个人会话，用于 daemon 重启和历史切换断言。
+  await selectMostRecentPersonalSession(page);
   await openPersonalDraft(page);
   await waitFor(async () => {
     const state = await rendererState(page);
@@ -1557,5 +1648,6 @@ try {
   await stopOwnedProcess(electron);
   await stopOwnedDaemon(daemonPidForCleanup);
   await closeProvider(provider.server);
+  await rm(approvalTarget, { force: true });
   await removeStateRoot(stateRoot);
 }
