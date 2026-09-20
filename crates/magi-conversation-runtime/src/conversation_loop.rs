@@ -3256,7 +3256,7 @@ fn agent_coordination_recovery_prompt(
         .collect::<Vec<_>>();
     if !pending_child_ids.is_empty() {
         return Some(format!(
-            "你已经启动代理，但仍有代理未进入终态：{}。不要给最终答复；必须调用 agent_wait(task_ids=[...]) 等待并收集这些代理结果。如果部分代理不可用，agent_wait 会返回 degraded/fallback 指令，再由主线改派或接管。",
+            "你已经启动代理，但仍有代理未进入终态：{}。不要给最终答复；必须调用 agent_wait(task_ids=[...]) 等待并收集这些代理结果。如果部分代理不可用，agent_wait 会返回 degraded/接管指令，再由主线改派或接管。",
             pending_child_ids.join(", ")
         ));
     }

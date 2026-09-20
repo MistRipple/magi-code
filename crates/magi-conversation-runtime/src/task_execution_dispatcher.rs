@@ -344,7 +344,7 @@ pub enum RoleTarget<'a> {
 /// 返回 `Result<Option<Arc<dyn ModelBridgeClient>>, String>`：
 /// - `Ok(Some(client))`：成功解析出 client；
 /// - `Ok(None)`：目标未配置（按 target 含义视作正常的"跳过"或"继承"信号）；
-/// - `Err(msg)`：配置存在但字段非法时返回，调用方应失败，避免 fallback 掩盖坏配置。
+/// - `Err(msg)`：配置存在但字段非法时返回，调用方应失败，避免替代模型掩盖坏配置。
 pub fn resolve_target_for_role(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
