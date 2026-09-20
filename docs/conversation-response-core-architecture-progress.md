@@ -25,6 +25,7 @@
 - Rust workspace：`cargo test --workspace --all-targets --quiet -- --test-threads=1`，669 passed、1 ignored。
 - Web/npm：protocol check、Svelte check/build、npm golden 已通过。
 - Electron 单轮回归：`/tmp/magi-electron-dom-regression-10027.json`，55 项检查通过；此前 `/tmp/magi-electron-dom-regression-9983.json` 同样通过。
+- 在最新 Web/Desktop 工作区状态重新打包并运行 Electron DOM 回归：`/tmp/magi-electron-dom-regression-10030.json`，`status=passed`、55 项检查通过、15 次 Provider 请求、5 条 Renderer timing sample；脚本自有 Electron/daemon 已清理。日志仍出现其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示，不能把该结果扩大为完整 Desktop IPC 验收。
 - Electron 五类单轮 Renderer timing：`/tmp/magi-electron-dom-timing-9857.json`，覆盖 `personal_chat`、`workspace_chat`、`workspace_tool`、`goal`、`subagent`，每类已有单轮四阶段 timing。
 - Electron 五类各 2 轮 timing：`/tmp/magi-electron-dom-timing-2-9999d.json`，`status=passed`、43 项脚本检查通过、28 次 Provider 请求；每类 2 条记录均通过 Renderer 四阶段和 terminal 收口检查。该证据仍未包含同轮后端 accepted/首 delta/首 EventBus/terminal 的结构化关联。
 - Electron 五类各 20 轮 Renderer timing 已分别完成，聚合统计：`/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`。原始证据为：
