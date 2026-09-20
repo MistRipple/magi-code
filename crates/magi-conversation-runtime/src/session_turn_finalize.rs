@@ -79,6 +79,19 @@ pub fn current_turn_status_accepts_task_status_item(status: &str) -> bool {
     )
 }
 
+fn task_status_write_is_stale(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    expected_turn_id: &str,
+) -> bool {
+    session_store
+        .runtime_sidecar(session_id)
+        .and_then(|current| current.current_turn)
+        .is_none_or(|current| {
+            current.turn_id != expected_turn_id || current_turn_status_is_terminal(&current.status)
+        })
+}
+
 pub fn publish_task_status_turn_item_for_active_sessions(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
@@ -142,21 +155,29 @@ pub fn publish_task_status_turn_item_for_active_sessions(
         if let Some(branch) = branch {
             item.worker_id = Some(branch.worker_id.clone());
         }
-        let published = append_session_turn_item_for_turn(
+        let expected_turn_id = turn.turn_id.clone();
+        let published = match append_session_turn_item_for_turn(
             session_store,
             &sidecar.session_id,
-            Some(&turn.turn_id),
+            Some(&expected_turn_id),
             item,
             task_store,
-        )?
-        .ok_or_else(|| {
-            format!(
-                "会话 {} 的当前 Turn 已不可写，无法记录任务 {} 的状态 {}",
-                sidecar.session_id,
-                task.task_id,
-                task_status_text(new_status)
-            )
-        })?;
+        ) {
+            Ok(Some(published)) => published,
+            Ok(None) => continue,
+            Err(error) => {
+                // Task 状态回调与 root Turn 终态收口是两个独立的异步事实源。
+                // root finalizer 可能已经在本次回调读取 sidecar 后把同一 Turn 收口，
+                // 或者 Continue/新提交已经切换了 current Turn。此时旧 task 状态
+                // item 已经失去写入归属，丢弃它比把一个预期的迟到写入记录成生产
+                // 错误更准确；仍属于同一活动 Turn 的其它写回错误必须继续暴露。
+                if task_status_write_is_stale(session_store, &sidecar.session_id, &expected_turn_id)
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         let workspace_id = sidecar
             .active_execution_chain
             .as_ref()
@@ -1151,7 +1172,8 @@ mod tests {
     use super::*;
     use magi_core::{MissionId, TaskRuntimePayload};
     use magi_session_store::{
-        ActiveExecutionChain, ActiveExecutionDispatchContext, SessionExecutionSidecarStatus,
+        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
+        SessionExecutionSidecarStatus, TimelineEntryInput, TimelineEntryKind,
     };
 
     fn failed_task(
@@ -1242,6 +1264,86 @@ mod tests {
             turn_item_status_for_task_status(TaskStatus::Killed),
             "cancelled"
         );
+    }
+
+    #[test]
+    fn task_status_write_treats_terminal_or_replaced_turn_as_stale() {
+        let store = SessionStore::new();
+        let session_id = SessionId::new("session-task-status-stale");
+        store
+            .create_session(session_id.clone(), "Task status stale")
+            .expect("session should be creatable");
+        let accepted_at = UtcMillis(1);
+        store
+            .accept_current_turn_with_timeline_entry(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-task-status-stale",
+                    TimelineEntryKind::UserMessage,
+                    "任务状态竞态",
+                    accepted_at,
+                ),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-status-stale".to_string(),
+                    turn_seq: 1,
+                    accepted_at,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("任务状态竞态".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("turn should be accepted");
+
+        assert!(!task_status_write_is_stale(
+            &store,
+            &session_id,
+            "turn-task-status-stale"
+        ));
+        store
+            .update_current_turn_status_for_turn_with_change(
+                &session_id,
+                Some("turn-task-status-stale"),
+                "blocked",
+            )
+            .expect("turn should settle");
+        assert!(task_status_write_is_stale(
+            &store,
+            &session_id,
+            "turn-task-status-stale"
+        ));
+
+        let next_accepted_at = UtcMillis(2);
+        store
+            .accept_current_turn_with_timeline_entry(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-task-status-next",
+                    TimelineEntryKind::UserMessage,
+                    "下一轮",
+                    next_accepted_at,
+                ),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-status-next".to_string(),
+                    turn_seq: 2,
+                    accepted_at: next_accepted_at,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("下一轮".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("next turn should be accepted");
+        assert!(task_status_write_is_stale(
+            &store,
+            &session_id,
+            "turn-task-status-stale"
+        ));
+        assert!(!task_status_write_is_stale(
+            &store,
+            &session_id,
+            "turn-task-status-next"
+        ));
     }
 
     #[test]
