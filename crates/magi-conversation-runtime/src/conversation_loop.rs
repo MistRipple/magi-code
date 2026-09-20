@@ -169,14 +169,14 @@ pub struct ConversationLoopRequest<'a> {
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
 
-fn direct_runtime_error(error: &BridgeClientError, fallback: &str) -> String {
+fn direct_runtime_error(error: &BridgeClientError, default_message: &str) -> String {
     let mut raw_error = error.to_string();
     if let Some(code) = error.code() {
         raw_error.push_str(&format!(" (error_code={code})"));
     }
     let detail = public_runtime_excerpt(&raw_error, 4096);
     if detail.trim().is_empty() {
-        fallback.to_string()
+        default_message.to_string()
     } else {
         detail
     }
@@ -1238,7 +1238,7 @@ fn run_conversation_loop_inner(
     let mut had_tool_calls = false;
     let mut empty_response_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
-    let mut stream_interruption_non_stream_fallback_attempted = false;
+    let mut stream_interruption_non_stream_recovery_attempted = false;
     let mut context_budget_recheck_required = false;
     let mut context_limit_recovery_attempted = false;
     let mut discovery_only_rounds = 0usize;
@@ -1600,7 +1600,7 @@ fn run_conversation_loop_inner(
             })
         });
         let invocation_request_template = invocation_request.clone();
-        let non_stream_fallback_template = invocation_request.clone();
+        let non_stream_recovery_template = invocation_request.clone();
         let invocation_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
         tracing::info!(
             target: "magi.performance",
@@ -1796,7 +1796,7 @@ fn run_conversation_loop_inner(
                         if classification.code == "model_stream_interrupted"
                             && (stream_interruption_recovery_attempts
                                 < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
-                                || !stream_interruption_non_stream_fallback_attempted)
+                                || !stream_interruption_non_stream_recovery_attempted)
                         {
                             if !partial_thinking.is_empty()
                                 && let Err(error) = upsert_task_thinking_turn_item(
@@ -1876,9 +1876,9 @@ fn run_conversation_loop_inner(
                                 continue 'conversation_round;
                             }
 
-                            stream_interruption_non_stream_fallback_attempted = true;
-                            let mut fallback_request = non_stream_fallback_template;
-                            fallback_request.messages = Some(messages.clone());
+                            stream_interruption_non_stream_recovery_attempted = true;
+                            let mut recovery_request = non_stream_recovery_template;
+                            recovery_request.messages = Some(messages.clone());
                             tracing::warn!(
                                 task_id = %task.task_id,
                                 round = round,
@@ -1886,17 +1886,17 @@ fn run_conversation_loop_inner(
                                 "子代理流式恢复已耗尽，降级为非流式完成请求"
                             );
                             match client
-                                .invoke_with_cancellation(fallback_request, &invocation_cancelled)
+                                .invoke_with_cancellation(recovery_request, &invocation_cancelled)
                             {
                                 Ok(response) => break 'streaming_invocation response,
-                                Err(fallback_error) => {
-                                    let fallback_raw_error = fallback_error.to_string();
-                                    let fallback_classification =
-                                        classify_model_invocation_error(&fallback_raw_error);
-                                    let fallback_message =
-                                        fallback_classification.public_message.to_string();
-                                    let fallback_detail =
-                                        direct_runtime_error(&fallback_error, &fallback_message);
+                                Err(recovery_error) => {
+                                    let recovery_raw_error = recovery_error.to_string();
+                                    let recovery_classification =
+                                        classify_model_invocation_error(&recovery_raw_error);
+                                    let recovery_message =
+                                        recovery_classification.public_message.to_string();
+                                    let recovery_detail =
+                                        direct_runtime_error(&recovery_error, &recovery_message);
                                     publish_model_usage_record_for_turn(
                                         event_bus,
                                         session_store,
@@ -1907,26 +1907,26 @@ fn run_conversation_loop_inner(
                                             workspace_id,
                                             binding: usage_binding,
                                             call_id: format!(
-                                                "task-{}-{}-{round}-non-stream-fallback",
+                                                "task-{}-{}-{round}-non-stream-recovery",
                                                 task_id, lease_id
                                             ),
                                             usage: None,
                                             status: UsageCallStatus::Failed,
                                             assignment_id: Some(lease_id.to_string()),
                                             error_code: Some(
-                                                fallback_classification.code.to_string(),
+                                                recovery_classification.code.to_string(),
                                             ),
                                         },
                                     );
                                     tracing::error!(
                                         task_id = %task.task_id,
                                         round = round,
-                                        ?fallback_error,
+                                        ?recovery_error,
                                         "子代理非流式降级请求失败"
                                     );
                                     let model_failure = ModelFailureDiagnostic::from_invocation(
-                                        fallback_classification,
-                                        &fallback_detail,
+                                        recovery_classification,
+                                        &recovery_detail,
                                         "response_stream_recovery",
                                         pre_output_invocation_recovery_attempts
                                             + stream_interruption_recovery_attempts
@@ -1935,7 +1935,7 @@ fn run_conversation_loop_inner(
                                     if task_lease_is_current(task_store, task_id, lease_id)
                                         && let Err(writeback_error) = append_task_error_turn_item(
                                             turn_writeback_context,
-                                            &fallback_message,
+                                            &recovery_message,
                                             streaming_entry_id.or(last_stream_item_id.as_deref()),
                                             Some(&model_failure),
                                             None,
@@ -1944,7 +1944,7 @@ fn run_conversation_loop_inner(
                                         return (
                                             TaskOutcome::Failed {
                                                 error: format!(
-                                                    "{fallback_detail}；失败事实写回失败：{writeback_error}"
+                                                    "{recovery_detail}；失败事实写回失败：{writeback_error}"
                                                 ),
                                             },
                                             context_summary,
@@ -1952,7 +1952,7 @@ fn run_conversation_loop_inner(
                                     }
                                     return (
                                         TaskOutcome::Failed {
-                                            error: fallback_detail,
+                                            error: recovery_detail,
                                         },
                                         context_summary,
                                     );
@@ -3050,7 +3050,7 @@ fn run_conversation_loop_inner(
         let retry_attempts = empty_response_recovery_attempts
             + stream_interruption_recovery_attempts
             + pre_output_invocation_recovery_attempts
-            + usize::from(stream_interruption_non_stream_fallback_attempted);
+            + usize::from(stream_interruption_non_stream_recovery_attempted);
         let model_failure = ModelFailureDiagnostic::empty_response(
             had_tool_calls,
             retry_attempts,
