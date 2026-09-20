@@ -2,9 +2,9 @@
 
 > 文档类型：架构优化与开发验收基线
 >
-> 当前状态：阶段 0～5 已完成首轮实现，阶段 6 的本地入口、前端回归与 Electron 打包验收已完成；真实 Provider 五类场景已分别完成 20 轮后端采样，Electron 五类 Renderer timing 也已分别完成 20 轮，但同轮后端事件关联和性能前后对比仍未完成
+> 当前状态：阶段 0～5 已完成首轮实现，阶段 6 的本地入口、前端回归与 Electron 打包验收已完成；真实 Provider 五类场景已分别完成 20 轮后端采样，Electron 五类场景也已完成 20 轮后端/Renderer 同轮关联；性能前后对比仍未完成
 >
-> 更新日期：2026-08-24
+> 更新日期：2026-09-20
 >
 > 适用范围：用户发送消息、会话接纳、任务准备、模型请求、流式事件、canonical turn、前端投影与对话区域渲染
 >
@@ -182,8 +182,10 @@ accepted -> preparing -> running -> streaming -> completed
 
 `MagiTurnHarness` 已能在真实 `TurnService` 链路上记录单轮 accepted 返回、非编排 Provider
 请求开始、首个 Provider delta、首个 EventBus 流事件和 canonical 终态观察，并保留事件序号
-用于验证时间线顺序。该证据用于确认埋点和事件边界；Electron Renderer 五类场景各 20 轮
-的局部 timing 已有独立证据，但尚未与后端同轮 P50/P95 关联，也不能作为性能目标已达标的结论。
+用于验证时间线顺序。打包 Electron 的五类场景也已各完成 20 轮后端/Renderer 同轮关联，
+每条记录使用同一 `turn_id` 保存 accepted、runner、Provider 首个可见 delta、首个 EventBus
+事件、canonical 终态和 Renderer 四阶段；统计证据见第 9.5 节。该证据确认埋点和事件边界，
+但仍不能替代历史后端基线的统一合并，也不能作为性能目标已达标或 before/after 对比完成的结论。
 
 #### 预计主要文件
 
@@ -198,9 +200,10 @@ accepted -> preparing -> running -> streaming -> completed
 
 #### 退出条件
 
-- 一轮真实对话可以生成完整的端到端时序。
+- 一轮真实对话可以生成完整的端到端时序；打包 Electron 五类场景各 20 轮已经生成同轮结构化证据。
 - Provider 自身 TTFT 与 Magi 内部开销可独立计算。
-- 五类基准各完成至少 20 轮采样，并输出 P50、P95、最大值；后端和 Renderer 仍需使用同一 `turn_id` 完成关联。
+- 五类基准各完成至少 20 轮采样，并输出 P50、P95、最大值；Electron 证据已经使用同一 `turn_id`
+  关联后端和 Renderer，仍需把该口径与历史后端基线统一后再进入性能目标判定。
 - 埋点不会改变请求顺序和 canonical 事实。
 
 #### 预计工期
@@ -505,7 +508,8 @@ M0 真实基线可观测
 - [x] 完成真实 Provider/daemon 五类场景各 20 轮的后端 P50/P95 基线；统一汇总见 9.4，直接证据为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`。
 - [ ] 完成真实 Provider 五类场景各 20 轮的端到端 P50/P95 基线。
   - Electron Renderer 五类场景各 20 轮已完成，原始证据为 `/tmp/magi-electron-dom-timing-personal-20-10020.json`、`/tmp/magi-electron-dom-timing-workspace-chat-20-10021.json`、`/tmp/magi-electron-dom-timing-workspace-tool-20-10022.json`、`/tmp/magi-electron-dom-timing-goal-20-10025.json`、`/tmp/magi-electron-dom-timing-subagent-20-10026.json`，聚合统计为 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`。
-  - 该端到端项目仍需把 Renderer 的 `frontend_event_received`、reducer/projection、`dom_painted` 与同一轮的 accepted、Provider 首 delta、首 EventBus 事件、terminal canonical event 关联起来；当前 Renderer P50/P95 只代表前端局部阶段耗时。
+  - 最新同轮结构化证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：五类各 20 轮、100 条唯一 `turn_id`、903 项检查通过；每轮均包含 accepted、runner、Provider 首个可见 delta、首 EventBus 事件、canonical terminal 和 Renderer 四阶段。
+  - 该证据已经完成后端与 Renderer 的同轮关联，但仍需与 `/tmp/magi-real-provider-perf-*.json` 的历史后端样本统一场景和统计口径；工具调用首轮的 raw tool-call-only Provider chunk 也尚未单独按 `turn_id` 作为首原始 delta 统计。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
 - [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
@@ -516,8 +520,8 @@ M0 真实基线可观测
 - [x] 完成本地 daemon 真实入口的页面启动、会话历史、摘要折叠与工具组逐层展开验收。
 - [x] 完成 Electron `--dir` 打包产物启动、静态资源加载与摘要折叠/工具组展开验收。
 - [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、Goal/Plan 卡片和 Goal 卡片展开、子代理工具卡片与代理运行中心、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 55 项检查通过；最新证据为 `/tmp/magi-electron-dom-regression-10027.json`。同脚本已完成五类各 20 轮 Renderer 局部 timing，证据见本节端到端基线条目；这些证据仍不替代后端同轮事件关联。
-- [ ] 汇总性能前后对比；当前已完成真实 Provider 五场景后端 20 轮基线，但不宣称性能目标达标。
-  - 真实 Provider 性能脚本区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；Electron 生产 Renderer 已提供受限内存 timing registry（`window.__magiPerformanceTiming.snapshot()`），五类场景各 20 轮 Renderer 证据已生成；仍需完成同轮关联并补齐可审计的 before 数据。
+- [ ] 汇总性能前后对比；当前已完成真实 Provider 五场景后端 20 轮基线和 Electron 五类场景各 20 轮同轮关联，但不宣称性能目标达标。
+  - 真实 Provider 性能脚本区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；Electron 生产 Renderer 已提供受限内存 timing registry（`window.__magiPerformanceTiming.snapshot()`），同轮证据已生成；仍缺可审计的 before 数据、统一历史样本口径和目标判定。
 
 ### 9.1 本轮本地验收记录
 
@@ -532,7 +536,7 @@ M0 真实基线可观测
 
 尚未宣称完成的验收：
 
-- 真实 Provider 五类场景各 20 轮的 Provider/daemon P50/P95 已完成（见 9.4）；Electron 生产 Renderer 五类各 20 轮局部阶段 timing 已完成，但同轮后端事件关联和阶段 6 的性能前后对比尚未完成，当前仍不能宣称性能目标达标。
+- 真实 Provider 五类场景各 20 轮的 Provider/daemon P50/P95 已完成（见 9.4）；Electron 生产 Renderer 五类各 20 轮后端/Renderer 同轮关联已完成（见 9.5），但阶段 6 的性能前后对比仍未完成，当前仍不能宣称性能目标达标。
 
 ### 9.3 本地 mock Provider 五场景 20 轮基线
 
@@ -566,7 +570,7 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 | 工作区工具调用 | 51 / 61 / 9144 | 60 / 94 / 34131 | 64 / 103 / 49879 | 20/20 completed |
 | 主代理与子代理并发 | 97 / 130 / 53011 | 131 / 175 / 72882 | 143 / 220 / 139254 | 20/20 completed |
 
-直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，五类场景各 20 轮 CDP 证据见 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json` 及其五个原始 JSON，并保留 55 项 DOM 基础验收证据；同轮后端关联和性能前后对比仍未完成。
+直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，五类场景各 20 轮 CDP 证据见 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json` 及其五个原始 JSON，并保留 55 项 DOM 基础验收证据。最新同轮后端/Renderer 关联见第 9.5 节；历史后端样本尚未与该证据合并，性能前后对比仍未完成。
 
 2026-09-20 的代码审计和 workspace 全量复验没有改变上述验收范围：TaskRunner 的生产 worker catalog 来源已收敛为单一动态 provider，测试读取结果仍是 `#[cfg(test)]` 辅助；SessionStore 原始 current Turn 替换入口和 `UpsertCurrentTurn` flush reason 已删除。该结构收敛不产生新的性能样本，因此不能把后端五场景数据扩大解释为 Electron 五场景 Renderer timing 或 before/after 对比。
 
@@ -598,6 +602,45 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 注意：对话历史中的权限结果属于提交该轮时的访问模式快照；底部访问模式按钮表示下一轮发送将使用的模式，不会改写历史轮次。因此，历史轮次显示“权限受限”而当前按钮显示“完全访问”并不矛盾。
 
 该记录证明已保存的 Provider 配置可以驱动真实流式、工具、取消和访问模式路径；受限访问已经能够快速阻断并收口。旧回归记录中只读模式下模型重复尝试属于修复前的历史现象；本轮在新打包产物中确认权限快照会覆盖线程旧历史，写入被立即拒绝且不会重复调用，切换为完全访问后可正常写入。
+
+### 9.5 Electron 五类场景后端/Renderer 同轮关联
+
+使用打包 Electron、真实 Provider 和 `scripts/verify-electron-conversation-dom.mjs` 的 timing-only
+模式完成五类场景各 20 轮。直接证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：
+`status=passed`、100 条唯一 `turn_id`、903 项检查通过、280 次 Provider 请求、0 条缺失后端阶段，
+终态来源全部为 `canonical_terminal_published`。每条 sample 同时包含：
+
+```text
+accepted_response_sent
+runner_started
+provider_first_delta
+event_bus_first_event
+canonical_terminal_published
+frontend_event_received
+reducer_completed
+projection_completed
+dom_painted
+```
+
+后端阶段的 `sinceAcceptedMs` 由 Electron 日志中各阶段时间戳减去同一轮
+`accepted_response_sent` 时间戳计算；`accepted_response_sent` 自身按定义为 0，原始日志中的
+trace elapsed 仍保留。Renderer 阶段使用生产 timing registry 的局部 `elapsedMs`。P50/P95 使用
+排序后的 nearest-rank 统计，单位为毫秒：
+
+| 场景 | runner P50/P95 | Provider 首可见 delta P50/P95 | EventBus 首事件 P50/P95 | terminal P50/P95 | DOM paint P50/P95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| personal_chat | 1 / 1 | 2 / 3 | 11 / 12 | 98 / 119 | 10.1 / 18.5 |
+| workspace_chat | 2 / 2 | 3 / 4 | 12 / 15 | 101 / 128 | 6.9 / 19.3 |
+| workspace_tool | 223 / 355 | 390 / 646 | 241 / 369 | 635 / 1080 | 13.5 / 36.5 |
+| goal | 190 / 251 | 426 / 493 | 199 / 261 | 540 / 604 | 11.5 / 32.6 |
+| subagent | 232 / 268 | 391 / 434 | 244 / 279 | 643 / 711 | 10.3 / 40.0 |
+
+该表只描述当前 after 证据的同轮阶段分布，不是性能目标达标表。工具调用首轮有只包含
+tool-call block、没有可见 content/thinking delta 的 Provider 响应；当前
+`provider_first_delta` 表示该 Turn 首个可观测可见 Provider delta，raw tool-call-only 首 chunk
+尚未单独按 `turn_id` 纳入首原始 Provider 事件统计。要关闭端到端基线和性能阶段，仍需把这批
+证据与既有 `/tmp/magi-real-provider-perf-*.json` 使用同一场景、同一指标和同一统计方法合并，
+并补齐可审计的旧版本 before 数据。
 
 ## 10. 关键源码证据
 

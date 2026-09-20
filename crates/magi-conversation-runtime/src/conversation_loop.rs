@@ -749,6 +749,17 @@ fn run_conversation_loop_inner(
         persist_session_state,
     } = request;
     let expected_turn_id = execution_registry.turn_id(task_id);
+    tracing::info!(
+        target: "magi.performance",
+        session_id = %session_id,
+        task_id = %task_id,
+        turn_id = expected_turn_id.as_deref().unwrap_or_default(),
+        provider_call_id = "",
+        stage = "runner_started",
+        elapsed_ms = 0u64,
+        "conversation response timing"
+    );
+    let first_provider_delta_reported = std::cell::Cell::new(false);
 
     let mut static_context_messages = Vec::new();
     // ===================================================================
@@ -1614,6 +1625,17 @@ fn run_conversation_loop_inner(
             stage = "task_model_request_ready",
             "conversation response timing"
         );
+        tracing::info!(
+            target: "magi.performance",
+            session_id = %session_id,
+            task_id = %task_id,
+            turn_id = expected_turn_id.as_deref().unwrap_or_default(),
+            provider_call_id = %round_call_id,
+            round,
+            elapsed_ms = model_round_wall_started_at.elapsed().as_millis() as u64,
+            stage = "provider_request_started",
+            "conversation response timing"
+        );
 
         let response = if streaming_entry_id.is_some() {
             let on_delta = |delta: &ModelStreamingDelta| {
@@ -1625,6 +1647,22 @@ fn run_conversation_loop_inner(
                         .is_some()
                 {
                     return;
+                }
+                if !first_provider_delta_reported.get()
+                    && (!delta.content.is_empty() || !delta.thinking.is_empty())
+                {
+                    first_provider_delta_reported.set(true);
+                    tracing::info!(
+                        target: "magi.performance",
+                        session_id = %session_id,
+                        task_id = %task_id,
+                        turn_id = expected_turn_id.as_deref().unwrap_or_default(),
+                        provider_call_id = %round_call_id,
+                        round,
+                        elapsed_ms = model_round_wall_started_at.elapsed().as_millis() as u64,
+                        stage = "provider_first_delta",
+                        "conversation response timing"
+                    );
                 }
                 if let Some(tracker) = context_usage_tracker.as_ref() {
                     tracker.observe_accumulated_output(&delta.content, &delta.thinking);
@@ -2169,6 +2207,23 @@ fn run_conversation_loop_inner(
                 }
             }
         };
+        if !first_provider_delta_reported.get() {
+            // 工具调用首轮可能只有提供方 tool-call block，没有可见文本 delta；统一在该
+            // 轮响应收口处记录补充观测；真正的 provider_first_delta 仍由后续可见
+            // 内容回调记录，避免把工具调用响应误标为首 delta。
+            tracing::info!(
+                target: "magi.performance",
+                session_id = %session_id,
+                task_id = %task_id,
+                turn_id = expected_turn_id.as_deref().unwrap_or_default(),
+                provider_call_id = %round_call_id,
+                round,
+                observation = "response_completion_without_visible_delta",
+                elapsed_ms = model_round_wall_started_at.elapsed().as_millis() as u64,
+                stage = "provider_response_received",
+                "conversation response timing"
+            );
+        }
         tracing::info!(
             target: "magi.performance",
             session_id = %session_id,

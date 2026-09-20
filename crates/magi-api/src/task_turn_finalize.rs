@@ -252,8 +252,26 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
     expected_turn_id: Option<&str>,
 ) -> Result<bool, String> {
     let finalize_started_at = Instant::now();
+    let trace_id = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .filter(|turn| expected_turn_id.is_none_or(|expected| turn.turn_id == expected))
+        .and_then(|turn| {
+            turn.items.into_iter().find_map(|item| {
+                item.request_id.or_else(|| {
+                    item.metadata
+                        .get("traceId")
+                        .or_else(|| item.metadata.get("requestId"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+            })
+        });
     tracing::info!(
         target: "magi.performance",
+        trace_id = trace_id.as_deref().unwrap_or_default(),
+        request_id = trace_id.as_deref().unwrap_or_default(),
         session_id = %session_id,
         root_task_id = %root_task_id,
         runner_status,
@@ -277,11 +295,31 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
         )?;
     tracing::info!(
         target: "magi.performance",
+        trace_id = trace_id.as_deref().unwrap_or_default(),
+        request_id = trace_id.as_deref().unwrap_or_default(),
         session_id = %session_id,
         root_task_id = %root_task_id,
+        turn_id = expected_turn_id.unwrap_or_default(),
         finalized,
         elapsed_ms = finalize_started_at.elapsed().as_millis() as u64,
         stage = "session_terminal_finalize_core_completed",
+        "conversation response timing"
+    );
+    tracing::info!(
+        target: "magi.performance",
+        trace_id = trace_id.as_deref().unwrap_or_default(),
+        request_id = trace_id.as_deref().unwrap_or_default(),
+        session_id = %session_id,
+        root_task_id = %root_task_id,
+        turn_id = expected_turn_id.unwrap_or_default(),
+        provider_call_id = "",
+        finalized,
+        elapsed_ms = finalize_started_at.elapsed().as_millis() as u64,
+        stage = if finalized {
+            "canonical_terminal_published"
+        } else {
+            "canonical_terminal_ignored"
+        },
         "conversation response timing"
     );
     if finalized {

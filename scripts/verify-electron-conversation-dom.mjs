@@ -40,6 +40,110 @@ const restartResponseText = "ELECTRON_DOM_RESTART_OK";
 const evidencePath = process.env.MAGI_ELECTRON_DOM_EVIDENCE_PATH?.trim() || "";
 const timingOnly = process.env.MAGI_ELECTRON_DOM_TIMING_ONLY === "1";
 
+const backendTimingByTurn = new Map();
+const traceToTurn = new Map();
+const pendingBackendTimingByTrace = new Map();
+const electronLogBuffers = { stdout: "", stderr: "" };
+
+function logField(line, key) {
+  const match = line.match(new RegExp(`${key}=(?:"([^"]*)"|([^\\s]+))`, "u"));
+  return match?.[1] ?? match?.[2] ?? "";
+}
+
+function timingLogTimestamp(line) {
+  const match = line.match(/\b(\d{4}-\d{2}-\d{2}T[^\s]+Z)\b/u);
+  const timestamp = match?.[1] ? Date.parse(match[1]) : Number.NaN;
+  return Number.isFinite(timestamp) ? timestamp : Date.now();
+}
+
+function backendTimingRecord(turnId) {
+  let record = backendTimingByTurn.get(turnId);
+  if (!record) {
+    record = { turnId, traceId: "", sessionId: "", stages: {} };
+    backendTimingByTurn.set(turnId, record);
+  }
+  return record;
+}
+
+function addBackendTimingEvent(event, turnIdOverride = "") {
+  const turnId = turnIdOverride || event.turnId;
+  if (!turnId) return;
+  const record = backendTimingRecord(turnId);
+  if (event.traceId) record.traceId ||= event.traceId;
+  if (event.sessionId) record.sessionId ||= event.sessionId;
+  const previous = record.stages[event.stage];
+  const point = {
+    atMs: event.atMs,
+    elapsedMs: event.elapsedMs,
+    traceId: event.traceId || record.traceId || null,
+    requestId: event.requestId || null,
+    sessionId: event.sessionId || record.sessionId || null,
+    providerCallId: event.providerCallId || null,
+    source: "electron_log",
+  };
+  record.stages[event.stage] = {
+    count: (previous?.count || 0) + 1,
+    first: previous?.first || point,
+    last: point,
+  };
+}
+
+function mergePendingBackendTiming(traceId, turnId) {
+  const pending = pendingBackendTimingByTrace.get(traceId);
+  if (!pending) return;
+  for (const event of pending) addBackendTimingEvent(event, turnId);
+  pendingBackendTimingByTrace.delete(traceId);
+}
+
+function parseBackendTimingLine(line) {
+  if (!line.includes("conversation response timing")) return;
+  const stage = logField(line, "stage");
+  if (!stage) return;
+  const event = {
+    stage,
+    traceId: logField(line, "trace_id"),
+    requestId: logField(line, "request_id"),
+    sessionId: logField(line, "session_id"),
+    turnId: logField(line, "turn_id") || logField(line, "expected_turn_id"),
+    providerCallId: logField(line, "provider_call_id"),
+    elapsedMs: Number.parseInt(logField(line, "elapsed_ms"), 10) || 0,
+    atMs: timingLogTimestamp(line),
+  };
+  if (!event.turnId && event.traceId && traceToTurn.has(event.traceId)) {
+    event.turnId = traceToTurn.get(event.traceId);
+  }
+  if (event.turnId) {
+    addBackendTimingEvent(event);
+    if (event.traceId) {
+      traceToTurn.set(event.traceId, event.turnId);
+      mergePendingBackendTiming(event.traceId, event.turnId);
+    }
+    return;
+  }
+  if (event.traceId) {
+    const pending = pendingBackendTimingByTrace.get(event.traceId) || [];
+    pending.push(event);
+    pendingBackendTimingByTrace.set(event.traceId, pending);
+  }
+}
+
+function consumeElectronLogChunk(stream, chunk) {
+  const text = chunk.toString();
+  process.stdout.write(`[electron] ${text}`);
+  const combined = electronLogBuffers[stream] + text;
+  const lines = combined.split(/\r?\n/u);
+  electronLogBuffers[stream] = lines.pop() || "";
+  for (const line of lines) parseBackendTimingLine(line);
+}
+
+function flushElectronLogBuffers() {
+  for (const stream of Object.keys(electronLogBuffers)) {
+    const line = electronLogBuffers[stream];
+    if (line) parseBackendTimingLine(line);
+    electronLogBuffers[stream] = "";
+  }
+}
+
 if (!Number.isInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65535) {
   throw new Error(`无效 CDP 端口: ${cdpPort}`);
 }
@@ -613,7 +717,7 @@ function checkTimingStages(label, record) {
   check(`${label} 每轮记录一次 dom_painted`, record?.stages?.dom_painted?.count === 1);
 }
 
-function timingEvidenceRecord(scenario, turnId, record) {
+function timingEvidenceRecord(scenario, turnId, record, backend = null) {
   return {
     scenario,
     turnId,
@@ -622,7 +726,69 @@ function timingEvidenceRecord(scenario, turnId, record) {
       first: value?.first ? { ...value.first } : null,
       last: value?.last ? { ...value.last } : null,
     }])),
+    ...(backend ? { backend } : {}),
   };
+}
+
+function backendTimingEvidence(turnId) {
+  const record = backendTimingByTurn.get(turnId);
+  if (!record) return null;
+  const raw = record.stages;
+  const stages = { ...raw };
+  const alias = (name, candidates) => {
+    const sourceStage = candidates.find((candidate) => raw[candidate]);
+    if (!sourceStage) return;
+    const source = raw[sourceStage];
+    stages[name] = {
+      count: 1,
+      first: source.first,
+      last: source.first,
+      sourceStage,
+    };
+  };
+  alias("accepted_response_sent", ["accepted_response_sent"]);
+  alias("runner_started", ["runner_started"]);
+  alias("provider_first_delta", ["provider_first_delta"]);
+  alias("event_bus_first_event", ["event_bus_item_published"]);
+  alias("terminal", ["canonical_terminal_published", "canonical_terminal_ignored"]);
+  const acceptedAtMs = stages.accepted_response_sent?.first?.atMs;
+  if (Number.isFinite(acceptedAtMs)) {
+    for (const stage of Object.values(stages)) {
+      if (!stage) continue;
+      for (const key of ["first", "last"]) {
+        if (stage[key] && Number.isFinite(stage[key].atMs)) {
+          stage[key] = {
+            ...stage[key],
+            sinceAcceptedMs: stage[key].atMs - acceptedAtMs,
+          };
+        }
+      }
+    }
+  }
+  return {
+    traceId: record.traceId || null,
+    sessionId: record.sessionId || null,
+    stages,
+  };
+}
+
+function backendTimingHasRequiredStages(record) {
+  const stages = record?.stages || {};
+  return [
+    "accepted_response_sent",
+    "runner_started",
+    "provider_first_delta",
+    "event_bus_first_event",
+  ].every((stage) => stages[stage]?.count > 0)
+    && stages.canonical_terminal_published?.count > 0;
+}
+
+function checkBackendTimingStages(label, backend) {
+  check(`${label} accepted_response_sent`, backend?.stages?.accepted_response_sent?.count > 0);
+  check(`${label} runner_started`, backend?.stages?.runner_started?.count > 0);
+  check(`${label} provider_first_delta`, backend?.stages?.provider_first_delta?.count > 0);
+  check(`${label} 首 EventBus`, backend?.stages?.event_bus_first_event?.count > 0);
+  check(`${label} terminal`, backend?.stages?.terminal?.count > 0);
 }
 
 async function waitForTimingRecord(page, turnId, label) {
@@ -631,6 +797,13 @@ async function waitForTimingRecord(page, turnId, label) {
     const record = snapshot?.turns?.find((candidate) => candidate.turnId === turnId);
     return timingHasAllStages(record) ? record : null;
   }, label);
+}
+
+async function waitForBackendTiming(turnId, label) {
+  return waitFor(() => {
+    const evidence = backendTimingEvidence(turnId);
+    return backendTimingHasRequiredStages(evidence) ? evidence : null;
+  }, label, 45_000);
 }
 
 async function waitForRenderer(page, label) {
@@ -937,8 +1110,15 @@ const electron = spawn(appExecutable, [`--remote-debugging-port=${cdpPort}`, "--
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
-electron.stdout.on("data", (chunk) => process.stdout.write(`[electron] ${chunk}`));
-electron.stderr.on("data", (chunk) => process.stderr.write(`[electron] ${chunk}`));
+electron.stdout.on("data", (chunk) => consumeElectronLogChunk("stdout", chunk));
+electron.stderr.on("data", (chunk) => {
+  process.stderr.write(`[electron] ${chunk}`);
+  const text = chunk.toString();
+  const combined = electronLogBuffers.stderr + text;
+  const lines = combined.split(/\r?\n/u);
+  electronLogBuffers.stderr = lines.pop() || "";
+  for (const line of lines) parseBackendTimingLine(line);
+});
 let page = null;
 let daemonPidForCleanup = null;
 const rendererTimingSamples = [];
@@ -986,7 +1166,9 @@ try {
       const result = await waitForAssistant(page, expectedText, `${scenario} ${prompt} 最终消息`);
       const turnId = result.assistant.at(-1)?.turnId;
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
-      timingSamples.push(timingEvidenceRecord(scenario, turnId, timing));
+      const backend = await waitForBackendTiming(turnId, `${scenario} 后端 timing 关联`);
+      checkBackendTimingStages(`${scenario} 后端`, backend);
+      timingSamples.push(timingEvidenceRecord(scenario, turnId, timing, backend));
       checkTimingStages(`${scenario} Renderer`, timing);
       await waitForTimingTerminal(scenario, expectedText);
     };
@@ -1063,6 +1245,7 @@ try {
       }
     }
 
+    flushElectronLogBuffers();
     const evidence = {
       type: "electron_conversation_renderer_timing",
       app: appExecutable,
@@ -1340,6 +1523,7 @@ try {
   }, "取消终态 DOM", 30_000);
   check("取消终态进入真实 DOM", cancelled.text.includes("取消 DOM 验收"));
 
+  flushElectronLogBuffers();
   const evidence = {
     type: "electron_conversation_dom_acceptance",
     app: appExecutable,

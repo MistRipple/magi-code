@@ -2664,6 +2664,8 @@ async fn submit_conversation_session_turn(
         ApiError::InvalidInput("conversation Turn 缺少 userMessageId".to_string())
     })?;
     let turn_id = format!("turn-session-conversation-{}", accepted_at.0);
+    let trace = PerformanceTrace::new(Some(request_id.as_str()), accepted_at);
+    trace.mark("submit_received", session_id.as_str(), Some(&turn_id), None);
     // Conversation 也支持请求级主模型覆盖；先持久化会话模型身份，再接纳
     // canonical Turn，确保后台执行读取到与 accepted 请求一致的 Provider 配置。
     if let Some(config) = request.orchestrator_session_config.as_ref() {
@@ -2803,6 +2805,12 @@ async fn submit_conversation_session_turn(
             return Err(ApiError::internal_assembly("接受 conversation Turn", error));
         }
     };
+    trace.mark(
+        "admission_completed",
+        session_id.as_str(),
+        Some(&turn_id),
+        None,
+    );
     if let Err(error) = state
         .turn_coordinator()
         .begin_session_turn_input(session_id.clone(), turn_id.clone())
@@ -2857,6 +2865,12 @@ async fn submit_conversation_session_turn(
     {
         tracing::warn!(session_id = %session_id, error = ?error, "conversation Turn accepted checkpoint 持久化失败");
     }
+    trace.mark(
+        "accepted_response_sent",
+        session_id.as_str(),
+        Some(&turn_id),
+        None,
+    );
     let execution_request = SessionTurnExecutionRequest {
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
@@ -2883,7 +2897,7 @@ async fn submit_conversation_session_turn(
             .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
             .map(|path| path.to_string_lossy().into_owned()),
     };
-    schedule_conversation_execution(state.clone(), execution_request, attempt);
+    schedule_conversation_execution(state.clone(), execution_request, attempt, trace);
     let session_summary = if created_session {
         state
             .session_store
@@ -3051,6 +3065,7 @@ fn schedule_conversation_execution(
     state: ApiState,
     request: SessionTurnExecutionRequest,
     attempt: magi_conversation_runtime::TurnAttempt,
+    trace: PerformanceTrace,
 ) {
     tokio::spawn(async move {
         let session_id = request.session_id.clone();
@@ -3066,6 +3081,12 @@ fn schedule_conversation_execution(
             )
             .is_err()
         {
+            trace.mark(
+                "canonical_terminal_failed",
+                session_id.as_str(),
+                Some(&turn_id),
+                None,
+            );
             return;
         }
         let Some(dispatcher) = state.session_turn_dispatcher().cloned() else {
@@ -3202,6 +3223,16 @@ fn schedule_conversation_execution(
                 "conversation Turn 终态 checkpoint 持久化失败"
             );
         }
+        trace.mark(
+            if canonical_changed {
+                "canonical_terminal_published"
+            } else {
+                "canonical_terminal_ignored"
+            },
+            session_id.as_str(),
+            Some(&turn_id),
+            None,
+        );
         schedule_next_queued_regular_session_turn(state, session_id, None);
     });
 }

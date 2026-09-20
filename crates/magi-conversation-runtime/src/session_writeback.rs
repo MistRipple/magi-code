@@ -1193,6 +1193,7 @@ pub fn publish_session_turn_item_event(
     published: &PublishedSessionTurnItem,
 ) {
     CanonicalTurnEventSink::for_events(event_bus).publish_item(session_id, workspace_id, published);
+    record_event_bus_item_timing(session_id, published);
 }
 
 fn publish_session_turn_item_event_raw(
@@ -1272,6 +1273,59 @@ pub fn publish_session_turn_item_stream_event(
         published,
         stream_update,
         publish_gate,
+    );
+    record_event_bus_item_timing(session_id, published);
+}
+
+/// 记录模型/工具产生的第一类 session.turn.item 发布事实。
+///
+/// accepted 用户 item 也会经过同一 EventBus，但它属于接纳阶段；这里跳过 user
+/// source，只记录执行面产生的 item，供 Electron timing 证据按 turn_id 关联。
+fn record_event_bus_item_timing(session_id: &SessionId, published: &PublishedSessionTurnItem) {
+    if published.item.source == "user" || published.item.kind == "user_message" {
+        return;
+    }
+    let trace_id = published
+        .item
+        .request_id
+        .as_deref()
+        .or_else(|| {
+            published
+                .item
+                .metadata
+                .get("traceId")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            published
+                .item
+                .metadata
+                .get("requestId")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            published.canonical_turn.as_ref().and_then(|turn| {
+                turn.items.iter().find_map(|item| {
+                    item.metadata
+                        .get("traceId")
+                        .or_else(|| item.metadata.get("requestId"))
+                        .and_then(Value::as_str)
+                })
+            })
+        });
+    let Some(trace_id) = trace_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    tracing::info!(
+        target: "magi.performance",
+        trace_id,
+        request_id = trace_id,
+        session_id = %session_id,
+        turn_id = %published.turn_id,
+        provider_call_id = "",
+        stage = "event_bus_item_published",
+        elapsed_ms = 0u64,
+        "conversation response timing"
     );
 }
 
