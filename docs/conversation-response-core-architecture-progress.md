@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`8b0dcfb4`（补齐 Git 工具 API 审批生命周期验收）
+代码基线：`3e87a610`（扩展 Git 审批跨请求与作用域验收）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -22,7 +22,7 @@
 
 ## 已有直接证据
 
-- Rust workspace：`cargo test --workspace --all-targets --quiet -- --test-threads=1`，677 passed、1 ignored；本轮包含 Browser Host 协议、process 生命周期矩阵、daemon Task Turn 重启回放、Git mutation 审批生命周期、跨 Turn/Session 审批测试和终态判定收敛。
+- Rust workspace：`cargo test --workspace --all-targets --quiet -- --test-threads=1`，680 passed、1 ignored；本轮包含 Browser Host 协议、process 生命周期矩阵、daemon Task Turn 重启回放、Git mutation 审批生命周期、跨 Turn/Session 审批测试和终态判定收敛。
 - Web/npm：protocol check、Svelte check/build、npm golden 已通过。
 - Electron 单轮回归：`/tmp/magi-electron-dom-regression-10027.json`，55 项检查通过；此前 `/tmp/magi-electron-dom-regression-9983.json` 同样通过。
 - 在最新 Web/Desktop 工作区状态重新打包并运行 Electron DOM 回归：`/tmp/magi-electron-dom-regression-10030.json`，`status=passed`、55 项检查通过、15 次 Provider 请求、5 条 Renderer timing sample；脚本自有 Electron/daemon 已清理。日志仍出现其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示，不能把该结果扩大为完整 Desktop IPC 验收。
@@ -148,7 +148,7 @@ B 的保留语义已绑定到以下测试边界：
 
 已运行的基础矩阵：
 
-- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：55 passed、1 ignored。覆盖 ReadOnly 的 file/shell/Git/image 拒绝和只读读取、Restricted 的 workspace 内外写入、allow once、allow for turn、deny、cancel、expiry、Provider 请求次数与审批事件、跨 Turn/Session 授权隔离、FullAccess 的 workspace 内外写入，以及 Git dirty/branch drift/merge conflict 和 `git_branch_switch` API 审批生命周期。
+- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：58 passed、1 ignored。覆盖 ReadOnly 的 file/shell/Git/image 拒绝和只读读取、Restricted 的 workspace 内外写入、allow once、allow for turn、deny、cancel、expiry、Provider 请求次数与审批事件、跨 Turn/Session 授权隔离、FullAccess 的 workspace 内外写入，以及 Git dirty/branch drift/merge conflict 和 `git_branch_switch` API 审批生命周期。
 - `cargo test -p magi-tool-runtime --lib -- --test-threads=1`：229 passed、1 ignored。覆盖全部内置工具策略分类、Browser 与 MCP 读写轴、shell/process/path 边界、workspace 作用域、写保护、取消和真实文件/进程副作用。
 
 这些证据证明权限引擎和 Turn Harness 的基础轴已存在。新增 `restricted_profile_allow_for_turn_requires_new_approval_on_next_turn` 覆盖同一 Session 跨两个 Turn 及新 Session 的 `allow_for_turn` 隔离、三次真实文件副作用和三条审批请求；新增 `external_mcp_access_profile_matrix_records_executor_side_effects` 将外部 MCP 读/写工具 × 三种 AccessProfile 展开为 6 行，验证真实 executor 只接收允许的 4 行，并保留 Restricted 写工具的 `NeedsApproval` 与 ReadOnly 写工具的硬拒绝；新增 `structured_git_access_profile_matrix_blocks_mutations_before_executor` 将 Git 读/写 × 三种 AccessProfile 展开，验证三次 Git 读调用和仅一次 FullAccess 写调用到达 executor；新增 `browser_access_profile_matrix_records_host_executor_side_effects` 将 Browser snapshot/navigate × 三种 AccessProfile 展开为 6 行，验证每行均经过带 session/workspace 上下文的 host executor，并保留 Browser capability 对读写动作的分类断言；新增 `browser_access_profile_matrix_reaches_real_host_protocol_for_read_and_write` 通过 Unix WebSocket 接收真实 `BrowserHostClient` 的 `CreatePage`、`RestorePage`、`EnsureSurface`、`Snapshot`、`UpdateControl` 和 `Navigate` 请求；新增 `internal_process_access_profile_matrix_records_lifecycle_side_effects` 覆盖 process 的启动、读取、写入、终止四个阶段，并把 ReadOnly/Restricted/FullAccess 的 launch 结果登记为结构化 JSON 行；新增 Git API 层七条审批生命周期测试，验证结构化 Git mutation 经过真实 runtime executor 后的 branch 副作用、重复请求幂等、跨 Turn/Session 授权隔离或 fail-closed 结果。C 仍不能关闭：Browser Host 证据使用确定性协议 double，尚不等价于真实 Chromium 外部副作用；仍缺少一份可审计的组合表，把 file/shell/process/Git/browser/MCP × 三种 AccessProfile × workspace 内外 × allow once/allow for turn/deny/cancel/expiry/duplicate/cross-turn/session 逐项关联到同一轮的副作用、审批事件和 Provider 请求次数；其它工具类型、重复请求和 Electron/真实 Provider 权限组合也尚未全部覆盖。
