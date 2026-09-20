@@ -4404,7 +4404,7 @@ mod tests {
     }
     struct InterruptedThenRecoveredTaskModelBridgeClient {
         invoke_count: AtomicUsize,
-        non_stream_fallback_count: AtomicUsize,
+        non_stream_recovery_count: AtomicUsize,
         recovery_messages: Mutex<Vec<ChatMessage>>,
     }
     struct StaticTaskFinalModelBridgeClient {
@@ -5298,7 +5298,7 @@ mod tests {
             &self,
             request: ModelInvocationRequest,
         ) -> Result<ModelResponse, BridgeClientError> {
-            self.non_stream_fallback_count
+            self.non_stream_recovery_count
                 .fetch_add(1, Ordering::SeqCst);
             *self
                 .recovery_messages
@@ -9027,7 +9027,7 @@ mod tests {
         );
         let client = InterruptedThenRecoveredTaskModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
-            non_stream_fallback_count: AtomicUsize::new(0),
+            non_stream_recovery_count: AtomicUsize::new(0),
             recovery_messages: Mutex::new(Vec::new()),
         };
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
@@ -9078,7 +9078,7 @@ mod tests {
             MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
         );
         assert_eq!(
-            client.non_stream_fallback_count.load(Ordering::SeqCst),
+            client.non_stream_recovery_count.load(Ordering::SeqCst),
             1,
             "连续流中断耗尽后必须恰好降级一次非流式请求"
         );
