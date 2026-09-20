@@ -5152,7 +5152,12 @@ impl SessionStore {
 
     /// 保留 SessionStore 的既有调用契约；需要区分重复提交时使用
     /// `update_current_turn_status_for_turn_with_change`。
-    pub fn update_current_turn_status_for_turn(
+    /// 为 SessionStore 持久化单元测试提供不带 changed 标记的状态更新辅助。
+    ///
+    /// 生产代码必须通过 `CanonicalTurnEventSink` 写回 Turn 状态；该便利包装只在
+    /// 测试编译中保留，避免把底层 current Turn 写入口暴露给生产模块。
+    #[cfg(test)]
+    pub(crate) fn set_current_turn_status_for_test(
         &self,
         session_id: &SessionId,
         expected_turn_id: Option<&str>,
