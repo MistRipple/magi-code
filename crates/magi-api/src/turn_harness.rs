@@ -2097,6 +2097,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_profile_restart_replays_completed_turn_without_provider_reexecution() {
+        let harness = MagiTurnHarness::new_task("任务重启回放");
+        let request_id = "harness-task-restart-replay-request";
+        let user_message_id = "harness-task-restart-replay-user";
+        let text = "请执行一个任务并在重启后验证终态回放";
+        let first = harness
+            .submit_task(text, request_id, user_message_id)
+            .await
+            .expect("首次任务提交应成功");
+        let session_id = SessionId::new(first.session_id.clone());
+        let turn_id = first.turn_id.clone().expect("任务提交应有 Turn");
+        let root_task_id = first.root_task_id.clone().expect("任务提交应有 root task");
+        let completed = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(completed.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+
+        let request_count = harness.provider.requests().len();
+        let restarted = harness.restart();
+        let replay = restarted
+            .submit_task(text, request_id, user_message_id)
+            .await
+            .expect("重启后的任务请求应返回 replay");
+
+        assert_eq!(replay.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(restarted.provider.requests().len(), request_count);
+        assert_eq!(
+            restarted
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session_id, &turn_id)
+                .expect("重启后应保留 canonical Turn")
+                .status,
+            CanonicalTurnStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_allow_for_turn_requires_new_approval_on_next_turn() {
+        let harness = MagiTurnHarness::new_task("跨 Turn 授权隔离");
+        let workspace_root = tempfile::tempdir().expect("cross turn workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-cross-turn-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("cross turn workspace should register");
+        let session_id = SessionId::new("harness-cross-turn-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "跨 Turn 授权会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("cross turn session should create");
+
+        let first_target = workspace_root.path().join("cross-turn-first.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf first > {}", first_target.display())
+            })
+            .to_string(),
+            "第一轮完成",
+        );
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "第一轮执行 shell_exec 并在 Turn 内复用授权",
+                "harness-cross-turn-request-1",
+                "harness-cross-turn-user-1",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("第一轮提交应成功");
+        let first_turn_id = first.turn_id.clone().expect("第一轮应有 Turn");
+        let first_task_id = first.root_task_id.clone().expect("第一轮应有 root task");
+        let first_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &first_pending.approval_id,
+            "allow_for_turn",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .wait_for_terminal(&session_id, &first_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Completed
+        );
+        assert_eq!(
+            harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+                .await
+                .status,
+            magi_core::TaskStatus::Completed
+        );
+
+        let second_target = workspace_root.path().join("cross-turn-second.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf second > {}", second_target.display())
+            })
+            .to_string(),
+            "第二轮完成",
+        );
+        let second = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "第二轮再次执行 shell_exec，必须重新审批",
+                "harness-cross-turn-request-2",
+                "harness-cross-turn-user-2",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("第二轮提交应成功");
+        let second_turn_id = second.turn_id.clone().expect("第二轮应有 Turn");
+        let second_task_id = second.root_task_id.clone().expect("第二轮应有 root task");
+        let second_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_ne!(
+            first_pending.approval_id, second_pending.approval_id,
+            "allow_for_turn 授权不得跨 Turn 复用"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &second_pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .wait_for_terminal(&session_id, &second_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Completed
+        );
+        assert_eq!(
+            harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(second_task_id))
+                .await
+                .status,
+            magi_core::TaskStatus::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(&first_target).expect("第一轮写入应存在"),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(&second_target).expect("第二轮写入应存在"),
+            "second"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .into_iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            2,
+            "两个 Turn 必须分别产生审批请求"
+        );
+    }
+
+    #[tokio::test]
     async fn task_profile_keeps_task_store_and_notifier_as_task_fact_source() {
         let harness = MagiTurnHarness::new_task("任务执行成功");
         let response = harness
