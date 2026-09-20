@@ -903,7 +903,11 @@ try {
         return state.input && !state.stop ? state : null;
       }, `${scenario} 发送前输入`);
       await setComposerText(page, prompt);
-      await clickSend(page);
+      await page.evaluate(`(() => {
+        const element = document.querySelector('[data-testid="input-send-button"]');
+        if (!element) throw new Error('send button unavailable');
+        element.click();
+      })()`);
       const result = await waitForAssistant(page, expectedText, `${scenario} ${prompt} 最终消息`);
       const turnId = result.assistant.at(-1)?.turnId;
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
