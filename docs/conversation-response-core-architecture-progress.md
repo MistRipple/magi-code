@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`184f4df3`（同步 process 矩阵代码基线）
+代码基线：待本轮 HTTP daemon 实例重启验收提交
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -113,6 +113,7 @@
 | 2026-09-21 | C | 将外部 MCP 读写权限组合展开为 ReadOnly/Restricted/FullAccess × read/write 的 6 行 executor side-effect 矩阵，并补充 Git 读/写与 Browser snapshot/navigate × 三种 AccessProfile 的 host executor 到达矩阵；明确 Browser 仍是注入 host executor 边界而非真实 Chromium 外部副作用 | `cargo test -p magi-tool-runtime --lib external_mcp_access_profile_matrix_records_executor_side_effects -- --test-threads=1`：1 passed；`cargo test -p magi-tool-runtime --lib structured_git_access_profile_matrix_blocks_mutations_before_executor -- --test-threads=1`：1 passed；`cargo test -p magi-tool-runtime --lib browser_access_profile_matrix_records_host_executor_side_effects -- --test-threads=1`：1 passed；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：228 passed、1 ignored |
 | 2026-09-21 | C | 增加 process_launch/read/write/kill 的 AccessProfile 生命周期矩阵；ReadOnly 拒绝、Restricted 保持 NeedsApproval，FullAccess 完成真实 cat 进程启动、读取、写入和终止，行级结果以结构化 JSON 断言保留 | `cargo test -p magi-tool-runtime --lib internal_process_access_profile_matrix_records_lifecycle_side_effects -- --test-threads=1`：1 passed；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：229 passed、1 ignored |
 | 2026-09-21 | A/C/D/E/F | 在 Browser Host 协议和 process 生命周期矩阵后重新执行 workspace 全量验收，确认新增测试没有改变其它 crate 行为 | `cargo fmt --all -- --check`；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：673 passed、1 ignored；`magi-api`：673 passed、1 ignored；`magi-tool-runtime`：229 passed、1 ignored；`magi-conversation-runtime`：534 passed；`magi-daemon`：128 passed |
+| 2026-09-21 | D | 增加真实 HTTP daemon 实例重启验收：启动第一台 daemon、通过真实 HTTP 接纳 Task Turn，关闭并用同一 state root 启动第二台 daemon，验证 bootstrap/messages 回放、相同 requestId/fingerprint 返回同一 session/turn/root task 且用户 item 不重复 | `cargo test -p magi-daemon --lib daemon::tests::daemon_http_server_restart_replays_task_turn_without_duplicate_acceptance -- --test-threads=1`：1 passed；该测试覆盖真实 HTTP server 生命周期，但仍是同一测试进程内的两个 daemon 实例，不扩大为独立 OS 进程证据 |
 | 2026-09-21 | C | 增加 BrowserHostClient Unix WebSocket 协议验收：三种 AccessProfile 各执行 snapshot 与 navigate，验证真实 BrowserHostClient 请求经过 Desktop Host 协议、Surface 绑定、页面状态和导航命令，并记录 3 次 snapshot、3 次 navigate 的 Host 命令；Host 仍为确定性协议 double，不扩大为真实 Chromium 进程副作用 | `cargo test -p magi-api --lib browser_tool_runtime -- --test-threads=1`：14 passed；新增 `browser_access_profile_matrix_reaches_real_host_protocol_for_read_and_write` 通过 |
 
 ## B 工作包首轮审计
@@ -186,7 +187,7 @@ B 的保留语义已绑定到以下测试边界：
 - 真实 Provider/daemon 五类场景各 20 轮后端证据已存在：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。
 - `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 51 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict、Task restart replay 和部分权限审批恢复；`magi-daemon` 的 session restart/history 测试也分别通过既有恢复测试、3 个 runtime restart 测试和新增的 daemon Task Turn restart/replay 测试。
 
-D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_provider_reexecution` 覆盖进程内重建 runtime 后的 Task canonical replay，且既有 daemon restart/replay 测试继续通过。缺口是独立 daemon 进程 restart、history/replay 的更多场景、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
+D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_provider_reexecution` 覆盖进程内重建 runtime 后的 Task canonical replay，并新增真实 HTTP daemon 实例重启后的 Task Turn 回放；缺口是独立 OS 进程 restart、history/replay 的更多场景、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
 
 ## E 工作包首轮证据
 
