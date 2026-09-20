@@ -47,6 +47,7 @@
 - 在当前打包产物上补充 Restricted 审批 GUI 验收：`/tmp/magi-electron-dom-regression-10142.json` 为 `status=passed`、61 项检查、17 次 Provider 请求。该场景使用已注册工作区中的 `shell_exec` 写入请求，验证审批卡片进入真实 DOM、包含“仅允许本次 / 本轮允许同类操作 / 拒绝并继续”三个操作、允许一次后最终消息恢复以及工作区内真实文件副作用；随后仍通过个人会话、daemon restart、history/reload 和 cancel 既有断言。该证据只补齐 E 的审批阻塞/恢复单场景，不能替代 Git/Goal 失败恢复和 reconnect/history/restart 组合矩阵。日志仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示。
 - 在最新打包产物上补充 Goal Provider 失败后恢复验收：`/tmp/magi-electron-dom-regression-10201.json` 为 `status=passed`、64 项检查、35 次 Provider 请求。脚本先让 Goal 真实进入 Provider 500 失败终态，验证失败事实进入 Renderer DOM，再新建会话重新建立并完成 Goal/Plan，验证恢复后的 Goal 卡片和计划卡片重新出现；该证据只覆盖 Goal 失败/恢复单场景，仍不能替代 Git 错误、Agent drawer 多状态和 reconnect/history/restart 组合矩阵。日志仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示。
 - 在同一打包 Electron 流程上补充 Restricted 审批拒绝验收：`/tmp/magi-electron-dom-regression-10220.json` 为 `status=passed`、68 项检查、36 次 Provider 请求。脚本在独立 workspace session 中展示真实审批卡片，点击“拒绝并继续”后验证拒绝事实进入 DOM，且工作区目标文件没有产生；此前审批允许一次的真实文件副作用仍在同一回归中保留。该证据只补齐审批拒绝单场景，审批过期/取消以及 Git 错误和 reconnect/history/restart 组合仍未完成。
+- 在同一打包 Electron 流程上补充 Restricted 审批取消验收：`/tmp/magi-electron-dom-regression-10222.json` 为 `status=passed`、73 项检查、37 次 Provider 请求。脚本在独立 workspace session 中展示审批卡片，点击停止按钮取消等待授权的 Turn，并验证停止后没有工作区文件副作用；审批允许一次和拒绝两条路径仍在同一回归中保留。该证据补齐审批取消单场景，审批过期以及 Git 错误和 reconnect/history/restart 组合仍未完成。
 - 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误继续传播。回归测试覆盖 running、blocked、替换 Turn，以及活动 Turn 内 immutable canonical item 冲突，避免把预期迟到写回记录成生产错误，也避免吞掉真实写回错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
 - 该关联证据仍不能关闭 F：它尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
 - 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。工具调用首轮只有 tool-call block 时，`provider_first_delta` 继续表示首个可见 content/thinking delta，raw tool-call-only chunk 仍单独记录为 `provider_response_received`。
@@ -104,6 +105,7 @@
 | 2026-09-20 | D | 增加真实 daemon runtime 重启后的 Task Turn replay 验收：恢复 canonical Turn 和用户 request identity，并用相同 requestId/fingerprint 重提交验证不重复创建 canonical Turn | `cargo test -p magi-daemon --lib daemon::tests::task_turn_replays_after_daemon_restart_without_duplicate_canonical_acceptance -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib -- --test-threads=1`：128 passed |
 | 2026-09-20 | C | 将现有权限验收按工具面、AccessProfile、workspace 作用域、生命周期、副作用、审批事件和 Provider 请求次数登记为可复核矩阵；明确 Browser/MCP、process、Git 和跨 Turn/session 的剩余格子 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：51 passed、1 ignored；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：225 passed、1 ignored |
 | 2026-09-20 | E | 增加打包 Electron Restricted 审批拒绝验收：真实 DOM 中点击“拒绝并继续”，验证拒绝终态可见且没有工作区文件副作用 | `/tmp/magi-electron-dom-regression-10220.json`：68 checks passed、36 次 Provider 请求；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
+| 2026-09-20 | E | 增加打包 Electron Restricted 审批取消验收：真实 DOM 中点击停止按钮取消等待授权的 Turn，验证取消终态和无文件副作用 | `/tmp/magi-electron-dom-regression-10222.json`：73 checks passed、37 次 Provider 请求；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
 
 ## B 工作包首轮审计
 
@@ -182,7 +184,7 @@ D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_
 
 最新打包 Electron/CDP 回归 `/tmp/magi-electron-dom-regression-10201.json` 为 `status=passed`，64 项检查通过、35 次 Provider 请求；此前 `/tmp/magi-electron-dom-regression-10142.json` 为 61 项检查通过。现有覆盖包括个人/工作区 Chat、Task 工具卡片和工具组展开、Goal/Plan 成功卡片和二级展开、Goal Provider 失败后重新建目标恢复、子代理工具卡片与 `child_task_id`、代理运行中心、ReadOnly 写入拒绝、Restricted 审批卡片与允许一次后的真实工作区副作用、daemon restart、Renderer reload、history/session switch 和 cancel。
 
-E 仍保持部分完成。已补齐 Goal/Plan 的一个失败/恢复场景和 Restricted 审批允许/拒绝场景；尚缺 Agent drawer 的更多状态组合、Git dirty/drift/conflict 的可见错误、审批过期/取消的 GUI 组合以及 reconnect/history/restart 的组合矩阵；68 项回归不能替代这些组合。
+E 仍保持部分完成。已补齐 Goal/Plan 的一个失败/恢复场景和 Restricted 审批允许/拒绝/取消场景；尚缺 Agent drawer 的更多状态组合、Git dirty/drift/conflict 的可见错误、审批过期的 GUI 组合以及 reconnect/history/restart 的组合矩阵；73 项回归不能替代这些组合。
 
 ## 关闭规则
 
