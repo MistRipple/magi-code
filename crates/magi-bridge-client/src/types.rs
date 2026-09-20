@@ -292,10 +292,14 @@ mod model_response_tests {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelStreamingDelta {
     pub content: String,
     pub thinking: String,
+    /// 上游只有工具调用增量、没有可见正文时仍必须把这一事实交给执行层。
+    /// 该字段用于首个 raw tool-call chunk 的时序观测，不代表工具已经执行。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

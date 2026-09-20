@@ -3678,6 +3678,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: "重连后完成".to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -3729,6 +3730,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -3779,6 +3781,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: "主模型完成".to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -3923,6 +3926,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: "主线在暂态空流后完成。".to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -4406,6 +4410,7 @@ mod tests {
                     "最终收口".to_string()
                 },
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -4462,6 +4467,7 @@ mod tests {
                     "全部计划完成".to_string()
                 },
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -4870,6 +4876,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -4904,6 +4911,7 @@ mod tests {
                     "，后续流仍然中断".to_string()
                 },
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Transport,

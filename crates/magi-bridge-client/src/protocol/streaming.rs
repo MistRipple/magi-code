@@ -4,7 +4,7 @@ use super::adapter::{AdaptedResponse, ProviderFamily};
 use crate::llm_types::{
     LlmStreamChunk, LlmStreamChunkType, LlmUsage, PartialToolCall, ToolCall, parse_tool_arguments,
 };
-use crate::types::ModelProviderContext;
+use crate::types::{ChatToolCall, ChatToolFunction, ModelProviderContext};
 
 #[derive(Clone, Debug)]
 pub enum ProviderContextStreamDelta {
@@ -985,6 +985,27 @@ impl StreamAccumulator {
 
     pub fn accumulated_thinking(&self) -> String {
         self.thinking.clone()
+    }
+
+    /// 返回当前已经收到的工具调用快照。参数可能仍是半截 JSON；该快照只用于
+    /// 流式观测和首 raw tool-call delta，不作为最终工具执行输入。
+    pub fn accumulated_tool_calls(&self) -> Vec<ChatToolCall> {
+        self.active_tool_calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| ChatToolCall {
+                id: if call.id.trim().is_empty() {
+                    format!("stream-tool-call-{index}")
+                } else {
+                    call.id.clone()
+                },
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: call.name.clone(),
+                    arguments: call.arguments_buffer.clone(),
+                },
+            })
+            .collect()
     }
 
     pub fn pending_tool_call_count(&self) -> usize {

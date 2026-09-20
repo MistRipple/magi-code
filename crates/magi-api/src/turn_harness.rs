@@ -397,6 +397,7 @@ impl HarnessModelClient {
                     let delta = ModelStreamingDelta {
                         content: cumulative.clone(),
                         thinking: String::new(),
+                        tool_calls: Vec::new(),
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -441,6 +442,7 @@ impl HarnessModelClient {
                     let delta = ModelStreamingDelta {
                         content: cumulative.clone(),
                         thinking: String::new(),
+                        tool_calls: Vec::new(),
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -583,6 +585,7 @@ impl HarnessModelClient {
                     let delta = ModelStreamingDelta {
                         content: cumulative.clone(),
                         thinking: String::new(),
+                        tool_calls: Vec::new(),
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -641,6 +644,7 @@ impl HarnessModelClient {
                     let delta = ModelStreamingDelta {
                         content: cumulative.clone(),
                         thinking: String::new(),
+                        tool_calls: Vec::new(),
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }

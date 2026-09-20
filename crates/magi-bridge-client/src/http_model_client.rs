@@ -1003,6 +1003,7 @@ fn apply_provider_stream_event(
     accumulator: &mut StreamAccumulator,
     last_content_delta_len: &mut usize,
     last_thinking_delta_len: &mut usize,
+    last_tool_call_count: &mut usize,
     tx: &std::sync::mpsc::Sender<StreamMessage>,
 ) -> Result<bool, BridgeClientError> {
     if let Some(error) = provider_stream_event_error(provider_family, event) {
@@ -1022,15 +1023,20 @@ fn apply_provider_stream_event(
     }
     let accumulated_content = accumulator.accumulated_content();
     let accumulated_thinking = accumulator.accumulated_thinking();
+    let accumulated_tool_calls = accumulator.accumulated_tool_calls();
+    let tool_call_count = accumulated_tool_calls.len();
     if accumulated_content.len() > *last_content_delta_len
         || accumulated_thinking.len() > *last_thinking_delta_len
+        || tool_call_count > *last_tool_call_count
     {
         *last_content_delta_len = accumulated_content.len();
         *last_thinking_delta_len = accumulated_thinking.len();
+        *last_tool_call_count = tool_call_count;
         if tx
             .send(StreamMessage::Chunk(ModelStreamingDelta {
                 content: accumulated_content,
                 thinking: accumulated_thinking,
+                tool_calls: accumulated_tool_calls,
             }))
             .is_err()
         {
@@ -1334,6 +1340,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
     let mut utf8_remainder: Vec<u8> = Vec::new();
     let mut last_content_delta_len = 0usize;
     let mut last_thinking_delta_len = 0usize;
+    let mut last_tool_call_count = 0usize;
     let mut saw_sse_event = false;
     let mut saw_protocol_terminal = false;
     let mut terminal_drain_deadline = None;
@@ -1399,12 +1406,16 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                 &mut accumulator,
                 &mut last_content_delta_len,
                 &mut last_thinking_delta_len,
+                &mut last_tool_call_count,
                 &tx,
             )? {
                 saw_protocol_terminal = true;
                 break 'stream_read;
             }
-            if !first_delta_reported && (last_content_delta_len > 0 || last_thinking_delta_len > 0)
+            if !first_delta_reported
+                && (last_content_delta_len > 0
+                    || last_thinking_delta_len > 0
+                    || last_tool_call_count > 0)
             {
                 first_delta_reported = true;
                 tracing::info!(
@@ -1431,6 +1442,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                 &mut accumulator,
                 &mut last_content_delta_len,
                 &mut last_thinking_delta_len,
+                &mut last_tool_call_count,
                 &tx,
             )? {
                 saw_protocol_terminal = true;
@@ -2695,10 +2707,29 @@ mod tests {
             "any-openai-compatible-model".to_string(),
         );
 
+        let deltas = std::sync::Mutex::new(Vec::new());
         let response = client
-            .invoke_streaming(invocation, &|_| {})
+            .invoke_streaming(invocation, &|delta| {
+                deltas
+                    .lock()
+                    .expect("delta lock should hold")
+                    .push(delta.clone());
+            })
             .expect("streaming response should be bridgeable");
 
+        assert!(
+            deltas
+                .lock()
+                .expect("delta lock should hold")
+                .iter()
+                .any(|delta| {
+                    delta
+                        .tool_calls
+                        .iter()
+                        .any(|call| call.function.name == wire_name)
+                }),
+            "tool-call-only streaming must expose a raw tool-call delta"
+        );
         assert_eq!(response.tool_calls[0].function.name, "web_search");
         assert_eq!(
             response.tool_calls[0].function.arguments,

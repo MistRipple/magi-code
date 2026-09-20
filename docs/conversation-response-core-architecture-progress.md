@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
-更新时间：2026-09-20
-代码基线：`7ef670f9`（补充 Electron 审批取消验收）
+更新时间：2026-09-21
+代码基线：`b4f80672`（raw tool-call-only Provider delta 证据复验前的已推送基线）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -17,7 +17,7 @@
 | C | 完整权限组合矩阵 | 进行中（基础 runtime/API、跨 Turn/Session 隔离和重复审批回放已跑通；完整组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
 | D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮、基础 cancel/reconnect 及 Task restart replay 已有；全矩阵未完成） | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
 | E | Electron packaged GUI 全矩阵 | 部分完成 | 在现有 55 项单轮基础上补齐 Agent drawer、Goal/Plan 组合、Git/审批错误和 reconnect/history/restart 组合 |
-| F | Electron 五类场景各 20 轮端到端 timing | 进行中（100/100 已完成同轮结构化关联，仍需与历史后端基线统一统计） | 5 类 × 20 轮均有同轮 accepted、Provider 首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
+| F | Electron 五类场景各 20 轮端到端 timing | 进行中（最新 100/100 已包含 Task raw tool-call-only 首 delta，仍需与历史后端基线统一统计） | 5 类 × 20 轮均有同轮 accepted、Provider raw/可见首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
 | G | 性能 before/after 对比 | 待开始 | 有可审计的旧版本 before 数据，并与当前 after 数据使用同一场景、同一指标和同一统计方法 |
 
 ## 已有直接证据
@@ -48,9 +48,10 @@
 - 在最新打包产物上补充 Goal Provider 失败后恢复验收：`/tmp/magi-electron-dom-regression-10201.json` 为 `status=passed`、64 项检查、35 次 Provider 请求。脚本先让 Goal 真实进入 Provider 500 失败终态，验证失败事实进入 Renderer DOM，再新建会话重新建立并完成 Goal/Plan，验证恢复后的 Goal 卡片和计划卡片重新出现；该证据只覆盖 Goal 失败/恢复单场景，仍不能替代 Git 错误、Agent drawer 多状态和 reconnect/history/restart 组合矩阵。日志仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示。
 - 在同一打包 Electron 流程上补充 Restricted 审批拒绝验收：`/tmp/magi-electron-dom-regression-10220.json` 为 `status=passed`、68 项检查、36 次 Provider 请求。脚本在独立 workspace session 中展示真实审批卡片，点击“拒绝并继续”后验证拒绝事实进入 DOM，且工作区目标文件没有产生；此前审批允许一次的真实文件副作用仍在同一回归中保留。该证据只补齐审批拒绝单场景，审批过期/取消以及 Git 错误和 reconnect/history/restart 组合仍未完成。
 - 在同一打包 Electron 流程上补充 Restricted 审批取消验收：`/tmp/magi-electron-dom-regression-10222.json` 为 `status=passed`、73 项检查、37 次 Provider 请求。脚本在独立 workspace session 中展示审批卡片，点击停止按钮取消等待授权的 Turn，并验证停止后没有工作区文件副作用；审批允许一次和拒绝两条路径仍在同一回归中保留。该证据补齐审批取消单场景，审批过期以及 Git 错误和 reconnect/history/restart 组合仍未完成。
+- 为 Task/Goal/子代理路径补充 raw tool-call-only Provider 首 delta：`ModelStreamingDelta.tool_calls` 现在从 bridge streaming accumulator 传递工具调用快照，执行层另记 `provider_first_raw_delta`，而 `provider_first_delta` 继续只表示首个可见 content/thinking delta。单轮证据 `/tmp/magi-electron-dom-raw-tool-1-10230.json` 为 `status=passed`、13 项检查；最新五类 × 20 轮证据 `/tmp/magi-electron-dom-correlated-timing-20-10231.json` 为 `status=passed`、963 项检查、100 条唯一 `turnId`、280 次 Provider 请求，五类各 20 条，60 条 Task/Goal/子代理 sample 全部包含 `provider_first_raw_delta`，且每条仍具备 accepted、runner、可见首 delta、首 EventBus、canonical terminal 和 Renderer 四阶段。该证据只补齐 raw 首 chunk 的同轮观测，不关闭历史 Provider 样本统一和 before/after 性能缺口。
 - 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误继续传播。回归测试覆盖 running、blocked、替换 Turn，以及活动 Turn 内 immutable canonical item 冲突，避免把预期迟到写回记录成生产错误，也避免吞掉真实写回错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
-- 该关联证据仍不能关闭 F：它尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
-- 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。工具调用首轮只有 tool-call block 时，`provider_first_delta` 继续表示首个可见 content/thinking delta，raw tool-call-only chunk 仍单独记录为 `provider_response_received`。
+- 该关联证据仍不能关闭 F：最新证据已包含 raw tool-call-only 首 delta，但尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
+- 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。`provider_first_raw_delta` 表示首个包含工具调用快照或可见内容/思考的 Provider delta；`provider_first_delta` 仍只表示首个可见 content/thinking delta。工具调用首轮可能没有可见正文，两个阶段因此可以落在不同 Provider round。
 - Restricted `shell_exec` 的重复 requestId/fingerprint 回放已补充到真实 `TurnService` harness：待审批期间第二次提交复用同一 `turn_id`/root task，不创建第二个 pending 审批、不重复发布 `tool.approval.requested`、不重复请求 Provider；放行后只产生一次真实文件副作用并完成 canonical Turn。该证据只覆盖 duplicate + approval 组合，不能替代完整工具类型、访问模式、作用域和生命周期矩阵。
 
 ## 推进顺序
@@ -107,6 +108,7 @@
 | 2026-09-20 | E | 增加打包 Electron Restricted 审批拒绝验收：真实 DOM 中点击“拒绝并继续”，验证拒绝终态可见且没有工作区文件副作用 | `/tmp/magi-electron-dom-regression-10220.json`：68 checks passed、36 次 Provider 请求；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
 | 2026-09-20 | E | 增加打包 Electron Restricted 审批取消验收：真实 DOM 中点击停止按钮取消等待授权的 Turn，验证取消终态和无文件副作用 | `/tmp/magi-electron-dom-regression-10222.json`：73 checks passed、37 次 Provider 请求；`node --check scripts/verify-electron-conversation-dom.mjs`、`git diff --check` |
 | 2026-09-20 | A/C/D/E | 在 daemon 重启回放、权限矩阵登记和 Electron 审批取消验收后重新执行 Rust workspace 全量测试，确认新增证据测试没有改变其它 crate 行为 | `cargo fmt --all -- --check`；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：672 passed、1 ignored；新增 daemon 测试所在 crate 为 128 passed，其余 workspace 测试均通过 |
+| 2026-09-21 | F | 扩展 `ModelStreamingDelta` 的 raw tool-call snapshot，并在 Task/Goal/子代理路径记录 `provider_first_raw_delta`；重新打包后完成单轮和五类 × 20 轮同轮复验 | `/tmp/magi-electron-dom-raw-tool-1-10230.json`：13 checks passed；`/tmp/magi-electron-dom-correlated-timing-20-10231.json`：963 checks passed、100 条唯一 `turnId`、280 次 Provider 请求、60 条 Task/Goal/子代理 sample 均具备 raw stage；`cargo test -p magi-bridge-client --lib -- --test-threads=1`：252 passed；`cargo test -p magi-conversation-runtime --lib conversation_loop -- --test-threads=1`：55 passed；`npm run desktop:package -- --dir` |
 
 ## B 工作包首轮审计
 

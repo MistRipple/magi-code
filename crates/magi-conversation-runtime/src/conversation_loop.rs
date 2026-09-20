@@ -760,6 +760,7 @@ fn run_conversation_loop_inner(
         "conversation response timing"
     );
     let first_provider_delta_reported = std::cell::Cell::new(false);
+    let first_provider_raw_delta_reported = std::cell::Cell::new(false);
 
     let mut static_context_messages = Vec::new();
     // ===================================================================
@@ -1647,6 +1648,25 @@ fn run_conversation_loop_inner(
                         .is_some()
                 {
                     return;
+                }
+                if !first_provider_raw_delta_reported.get()
+                    && (!delta.content.is_empty()
+                        || !delta.thinking.is_empty()
+                        || !delta.tool_calls.is_empty())
+                {
+                    first_provider_raw_delta_reported.set(true);
+                    tracing::info!(
+                        target: "magi.performance",
+                        session_id = %session_id,
+                        task_id = %task_id,
+                        turn_id = expected_turn_id.as_deref().unwrap_or_default(),
+                        provider_call_id = %round_call_id,
+                        round,
+                        elapsed_ms = model_round_wall_started_at.elapsed().as_millis() as u64,
+                        stage = "provider_first_raw_delta",
+                        tool_call_count = delta.tool_calls.len(),
+                        "conversation response timing"
+                    );
                 }
                 if !first_provider_delta_reported.get()
                     && (!delta.content.is_empty() || !delta.thinking.is_empty())
@@ -5082,11 +5102,13 @@ mod tests {
                 on_delta(&ModelStreamingDelta {
                     content: "Considering file reading approach before calling tools.".to_string(),
                     thinking: String::new(),
+                    tool_calls: Vec::new(),
                 });
             } else {
                 on_delta(&ModelStreamingDelta {
                     content: "最终回复：文件检查完成。".to_string(),
                     thinking: String::new(),
+                    tool_calls: Vec::new(),
                 });
             }
             self.invoke(request)
@@ -5211,6 +5233,7 @@ mod tests {
                 on_delta(&ModelStreamingDelta {
                     content: "Considering file reading approach".to_string(),
                     thinking: String::new(),
+                    tool_calls: Vec::new(),
                 });
             }
             self.invoke(request)
@@ -5321,6 +5344,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: "子代理在暂态空响应后完成。".to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -5379,6 +5403,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: content.to_string(),
                 thinking: thinking.to_string(),
+                tool_calls: Vec::new(),
             });
             *self
                 .recovery_messages
@@ -5411,6 +5436,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: self.content.to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -5479,6 +5505,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: "子代理重连后完成".to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -5532,6 +5559,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: "已看到图片".to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -5574,6 +5602,7 @@ mod tests {
                 on_delta(&ModelStreamingDelta {
                     content: "工具失败后已完成可交付总结。".to_string(),
                     thinking: String::new(),
+                    tool_calls: Vec::new(),
                 });
             }
             self.invoke(request)
@@ -5628,6 +5657,7 @@ mod tests {
                 on_delta(&ModelStreamingDelta {
                     content: "工具失败已通过重试恢复，任务可以完成。".to_string(),
                     thinking: String::new(),
+                    tool_calls: Vec::new(),
                 });
             }
             self.invoke(request)
@@ -5674,6 +5704,7 @@ mod tests {
             on_delta(&ModelStreamingDelta {
                 content: self.content.to_string(),
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }
@@ -5730,6 +5761,7 @@ mod tests {
                     "全部阶段完成".to_string()
                 },
                 thinking: String::new(),
+                tool_calls: Vec::new(),
             });
             self.invoke(request)
         }

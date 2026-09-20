@@ -2,9 +2,9 @@
 
 > 文档类型：架构优化与开发验收基线
 >
-> 当前状态：阶段 0～5 已完成首轮实现，阶段 6 的本地入口、前端回归与 Electron 打包验收已完成；真实 Provider 五类场景已分别完成 20 轮后端采样，Electron 五类场景也已完成 20 轮后端/Renderer 同轮关联；性能前后对比仍未完成
+> 当前状态：阶段 0～5 已完成首轮实现，阶段 6 的本地入口、前端回归与 Electron 打包验收已完成；真实 Provider 五类场景已分别完成 20 轮后端采样，Electron 五类场景也已完成 20 轮后端/Renderer 同轮关联，并补齐 Task raw tool-call-only 首 delta 观测；性能前后对比仍未完成
 >
-> 更新日期：2026-09-20
+> 更新日期：2026-09-21
 >
 > 适用范围：用户发送消息、会话接纳、任务准备、模型请求、流式事件、canonical turn、前端投影与对话区域渲染
 >
@@ -181,7 +181,7 @@ accepted -> preparing -> running -> streaming -> completed
   - 主代理与子代理并发。
 
 `MagiTurnHarness` 已能在真实 `TurnService` 链路上记录单轮 accepted 返回、非编排 Provider
-请求开始、首个 Provider delta、首个 EventBus 流事件和 canonical 终态观察，并保留事件序号
+请求开始、首个 raw Provider delta、首个可见 Provider delta、首个 EventBus 流事件和 canonical 终态观察，并保留事件序号
 用于验证时间线顺序。打包 Electron 的五类场景也已各完成 20 轮后端/Renderer 同轮关联，
 每条记录使用同一 `turn_id` 保存 accepted、runner、Provider 首个可见 delta、首个 EventBus
 事件、canonical 终态和 Renderer 四阶段；统计证据见第 9.5 节。该证据确认埋点和事件边界，
@@ -194,6 +194,14 @@ Renderer 阶段。重新打包当前 Web/Desktop 工作区后的复验为
 项检查和 280 次 Provider 请求。两份证据均使用日志时间戳计算 `sinceAcceptedMs`，只证明同轮
 阶段边界和顺序；它们尚未形成与历史真实 Provider JSON 同口径的端到端 P50/P95，也不能替代
 旧版本 before 数据。
+
+raw delta 复验使用 `/tmp/magi-electron-dom-raw-tool-1-10230.json` 和
+`/tmp/magi-electron-dom-correlated-timing-20-10231.json`。后者为 `status=passed`、963 项检查、
+100 条唯一 `turn_id`、280 次 Provider 请求，五类各 20 轮；`workspace_tool`、`goal`、`subagent`
+的 60 条 sample 全部包含 `provider_first_raw_delta`。`ModelStreamingDelta.tool_calls` 保存
+Provider 流式工具调用快照，`provider_first_raw_delta` 记录首个工具调用或可见内容/思考 delta，
+`provider_first_delta` 仍只记录首个可见 content/thinking delta。该证据补齐 raw tool-call-only
+首 chunk 的同轮关联，但尚未改变历史样本合并和 before/after 缺口。
 
 #### 预计主要文件
 
@@ -518,7 +526,7 @@ M0 真实基线可观测
   - Electron Renderer 五类场景各 20 轮已完成，原始证据为 `/tmp/magi-electron-dom-timing-personal-20-10020.json`、`/tmp/magi-electron-dom-timing-workspace-chat-20-10021.json`、`/tmp/magi-electron-dom-timing-workspace-tool-20-10022.json`、`/tmp/magi-electron-dom-timing-goal-20-10025.json`、`/tmp/magi-electron-dom-timing-subagent-20-10026.json`，聚合统计为 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`。
   - 最新同轮结构化证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：五类各 20 轮、100 条唯一 `turn_id`、903 项检查通过；每轮均包含 accepted、runner、Provider 首个可见 delta、首 EventBus 事件、canonical terminal 和 Renderer 四阶段。
   - 当前打包产物复验为 `/tmp/magi-electron-dom-correlated-timing-20-10031.json`：同样五类各 20 轮、100 条唯一 `turn_id`、903 项检查和 280 次 Provider 请求，终态来源全部为 `canonical_terminal_published`。
-  - 该证据已经完成后端与 Renderer 的同轮关联，但仍需与 `/tmp/magi-real-provider-perf-*.json` 的历史后端样本统一场景和统计口径；工具调用首轮的 raw tool-call-only Provider chunk 也尚未单独按 `turn_id` 作为首原始 delta 统计。
+  - 该证据已经完成后端与 Renderer 的同轮关联；最新复验 `/tmp/magi-electron-dom-correlated-timing-20-10231.json` 已把 Task/Goal/子代理的 raw tool-call-only Provider chunk 按 `turn_id` 记录为 `provider_first_raw_delta`，但仍需与 `/tmp/magi-real-provider-perf-*.json` 的历史后端样本统一场景和统计口径。
 - [x] 明确 durable submission 的最小字段和恢复规则。
 - [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
 - [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
@@ -645,7 +653,7 @@ trace elapsed 仍保留。Renderer 阶段使用生产 timing registry 的局部 
 | subagent | 232 / 268 | 391 / 434 | 244 / 279 | 643 / 711 | 10.3 / 40.0 |
 
 该表只描述当前 after 证据的同轮阶段分布，不是性能目标达标表。工具调用首轮有只包含
-tool-call block、没有可见 content/thinking delta 的 Provider 响应；当前
+tool-call block、没有可见 content/thinking delta 的 Provider 响应；在这份历史 10108 证据中，
 `provider_first_delta` 表示该 Turn 首个可观测可见 Provider delta，raw tool-call-only 首 chunk
 尚未单独按 `turn_id` 纳入首原始 Provider 事件统计。要关闭端到端基线和性能阶段，仍需把这批
 证据与既有 `/tmp/magi-real-provider-perf-*.json` 使用同一场景、同一指标和同一统计方法合并，
@@ -654,7 +662,7 @@ tool-call block、没有可见 content/thinking delta 的 Provider 响应；当�
 重新打包当前 Web/Desktop 工作区后的复验见 `/tmp/magi-electron-dom-correlated-timing-20-10031.json`：
 五类各 20 轮、100 条唯一 `turn_id`、903 项检查通过、280 次 Provider 请求，0 条缺少后端阶段，
 终态来源全部为 `canonical_terminal_published`。该复验确认当前打包产物仍满足同轮关联，但不改变
-before 数据缺失和 raw tool-call-only 首 chunk 尚未单独统计的限制。当前复验的 P50/P95（单位 ms，
+before 数据缺失和历史证据未单独统计 raw tool-call-only 首 chunk 的限制。当前复验的 P50/P95（单位 ms，
 后端为 `sinceAcceptedMs`，DOM 为 Renderer 局部 `elapsedMs`）为：
 
 | 场景 | runner P50/P95 | Provider 首可见 delta P50/P95 | EventBus 首事件 P50/P95 | terminal P50/P95 | DOM paint P50/P95 |
@@ -664,6 +672,27 @@ before 数据缺失和 raw tool-call-only 首 chunk 尚未单独统计的限制�
 | workspace_tool | 166 / 385 | 304 / 695 | 173 / 391 | 441 / 896 | 14.1 / 28.7 |
 | goal | 196 / 256 | 403 / 485 | 206 / 265 | 517 / 595 | 14.5 / 37.4 |
 | subagent | 253 / 333 | 425 / 502 | 265 / 359 | 678 / 765 | 16.7 / 40.9 |
+
+raw tool-call-only 的最新复验使用 `/tmp/magi-electron-dom-raw-tool-1-10230.json` 和
+`/tmp/magi-electron-dom-correlated-timing-20-10231.json`。单轮证据为 `status=passed`、13 项检查；
+最新五类 × 20 轮证据为 `status=passed`、963 项检查、100 条唯一 `turn_id`、280 次 Provider 请求，
+五类各 20 条，60 条 `workspace_tool`、`goal`、`subagent` sample 全部出现
+`provider_first_raw_delta`。新增 raw stage 的 P50/P95（`sinceAcceptedMs`，毫秒）与可见首 delta
+和 Renderer DOM paint 如下：
+
+| 场景 | Provider 首 raw delta P50/P95 | Provider 首可见 delta P50/P95 | DOM paint P50/P95 |
+| --- | ---: | ---: | ---: |
+| personal_chat | — | 2 / 4 | 9.1 / 19.4 |
+| workspace_chat | — | 3 / 4 | 12.5 / 22.5 |
+| workspace_tool | 202 / 379 | 270 / 639 | 12.7 / 19.5 |
+| goal | 228 / 306 | 451 / 874 | 13.3 / 21.6 |
+| subagent | 232 / 296 | 382 / 501 | 9.9 / 33.8 |
+
+`ModelStreamingDelta.tool_calls` 只保存 Provider 流式工具调用快照，不代表工具已经执行；
+`provider_first_raw_delta` 是首个包含工具调用快照或可见内容/思考的 delta，
+`provider_first_delta` 仍只表示首个可见 content/thinking delta。该复验补齐 raw 首 chunk 的同轮
+观测，但仍不是 before/after 对比，也没有把历史真实 Provider JSON 与本次打包 Electron 证据合并成
+统一的端到端基线。
 
 ## 10. 关键源码证据
 

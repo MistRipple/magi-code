@@ -848,6 +848,7 @@ function backendTimingEvidence(turnId) {
   };
   alias("accepted_response_sent", ["accepted_response_sent"]);
   alias("runner_started", ["runner_started"]);
+  alias("provider_first_raw_delta", ["provider_first_raw_delta"]);
   alias("provider_first_delta", ["provider_first_delta"]);
   alias("event_bus_first_event", ["event_bus_item_published"]);
   alias("terminal", ["canonical_terminal_published", "canonical_terminal_ignored"]);
@@ -872,20 +873,27 @@ function backendTimingEvidence(turnId) {
   };
 }
 
-function backendTimingHasRequiredStages(record) {
+function backendTimingHasRequiredStages(record, scenario = "") {
   const stages = record?.stages || {};
-  return [
+  const required = [
     "accepted_response_sent",
     "runner_started",
     "provider_first_delta",
     "event_bus_first_event",
-  ].every((stage) => stages[stage]?.count > 0)
+  ];
+  if (["workspace_tool", "goal", "subagent"].includes(scenario)) {
+    required.push("provider_first_raw_delta");
+  }
+  return required.every((stage) => stages[stage]?.count > 0)
     && stages.canonical_terminal_published?.count > 0;
 }
 
-function checkBackendTimingStages(label, backend) {
+function checkBackendTimingStages(label, backend, scenario = "") {
   check(`${label} accepted_response_sent`, backend?.stages?.accepted_response_sent?.count > 0);
   check(`${label} runner_started`, backend?.stages?.runner_started?.count > 0);
+  if (["workspace_tool", "goal", "subagent"].includes(scenario)) {
+    check(`${label} provider_first_raw_delta`, backend?.stages?.provider_first_raw_delta?.count > 0);
+  }
   check(`${label} provider_first_delta`, backend?.stages?.provider_first_delta?.count > 0);
   check(`${label} 首 EventBus`, backend?.stages?.event_bus_first_event?.count > 0);
   check(`${label} terminal`, backend?.stages?.terminal?.count > 0);
@@ -899,10 +907,10 @@ async function waitForTimingRecord(page, turnId, label) {
   }, label);
 }
 
-async function waitForBackendTiming(turnId, label) {
+async function waitForBackendTiming(turnId, label, scenario = "") {
   return waitFor(() => {
     const evidence = backendTimingEvidence(turnId);
-    return backendTimingHasRequiredStages(evidence) ? evidence : null;
+    return backendTimingHasRequiredStages(evidence, scenario) ? evidence : null;
   }, label, 45_000);
 }
 
@@ -1266,8 +1274,8 @@ try {
       const result = await waitForAssistant(page, expectedText, `${scenario} ${prompt} 最终消息`);
       const turnId = result.assistant.at(-1)?.turnId;
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
-      const backend = await waitForBackendTiming(turnId, `${scenario} 后端 timing 关联`);
-      checkBackendTimingStages(`${scenario} 后端`, backend);
+      const backend = await waitForBackendTiming(turnId, `${scenario} 后端 timing 关联`, scenario);
+      checkBackendTimingStages(`${scenario} 后端`, backend, scenario);
       timingSamples.push(timingEvidenceRecord(scenario, turnId, timing, backend));
       checkTimingStages(`${scenario} Renderer`, timing);
       await waitForTimingTerminal(scenario, expectedText);
