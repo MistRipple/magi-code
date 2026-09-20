@@ -93,8 +93,9 @@ function requestToolName(body, toolName) {
   })?.function?.name || toolName;
 }
 
-function toolResultPayload(messages, toolName) {
-  for (const result of [...messages].reverse()) {
+function toolResultPayload(messages, toolName, startIndex = 0) {
+  for (let index = messages.length - 1; index >= startIndex; index -= 1) {
+    const result = messages[index];
     if (result?.role !== "tool" || typeof result.content !== "string") continue;
     try {
       const payload = JSON.parse(result.content);
@@ -109,8 +110,8 @@ function toolResultPayload(messages, toolName) {
   return null;
 }
 
-function toolResultChildTaskIds(messages) {
-  return [...new Set(messages
+function toolResultChildTaskIds(messages, startIndex = 0) {
+  return [...new Set(messages.slice(startIndex)
     .filter((message) => message?.role === "tool" && typeof message.content === "string")
     .flatMap((message) => {
       try {
@@ -153,6 +154,29 @@ function latestUserText(messages) {
     .filter((message) => message?.role === "user")
     .map(messageText)
     .at(-1) || "";
+}
+
+function latestPromptText(messages) {
+  const text = latestUserText(messages);
+  const taskMarker = "--- Task ---";
+  const taskIndex = text.lastIndexOf(taskMarker);
+  if (taskIndex >= 0) {
+    const taskText = text.slice(taskIndex + taskMarker.length).trim();
+    const executionMarker = "执行:";
+    const executionIndex = taskText.indexOf(executionMarker);
+    if (executionIndex >= 0) {
+      return taskText.slice(executionIndex + executionMarker.length).trim().split(/\r?\n/u)[0].trim();
+    }
+    return taskText.split(/\r?\n/u).filter(Boolean).at(-1)?.trim() || taskText;
+  }
+  const markerIndex = text.lastIndexOf("用户原始输入");
+  if (markerIndex >= 0) {
+    return text
+      .slice(markerIndex + "用户原始输入".length)
+      .replace(/^\s*[:：]\s*/u, "")
+      .trim();
+  }
+  return text.trim();
 }
 
 function providerResponse(body) {
@@ -211,7 +235,7 @@ function createProvider() {
         .filter((message) => message?.role === "user")
         .map(messageText)
         .join("\n");
-      const currentUserText = latestUserText(parsed.messages);
+      const currentUserText = latestPromptText(parsed.messages);
       const isDomToolPrompt = currentUserText.includes("DOM 工具卡片验收")
         || currentUserText.includes("Electron timing 工作区工具");
       const isGoalPrompt = currentUserText.includes("目标 DOM 验收")
@@ -224,15 +248,19 @@ function createProvider() {
       const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
       let payload;
       if (isGoalPrompt) {
-        const goalState = goalStates.get(currentUserText) || { phase: 0 };
+        const goalState = goalStates.get(currentUserText) || {
+          phase: 0,
+          startMessageCount: messages.length,
+        };
         const getGoalName = requestToolName(parsed, "get_goal");
         const createGoalName = requestToolName(parsed, "create_goal");
         const updatePlanName = requestToolName(parsed, "update_plan");
         const updateGoalName = requestToolName(parsed, "update_goal");
-        const goalResult = toolResultPayload(messages, "get_goal");
-        const createdGoalResult = toolResultPayload(messages, "create_goal");
-        const planResult = toolResultPayload(messages, "update_plan");
-        const updatedGoalResult = toolResultPayload(messages, "update_goal");
+        const lifecycleStart = goalState.startMessageCount || 0;
+        const goalResult = toolResultPayload(messages, "get_goal", lifecycleStart);
+        const createdGoalResult = toolResultPayload(messages, "create_goal", lifecycleStart);
+        const planResult = toolResultPayload(messages, "update_plan", lifecycleStart);
+        const updatedGoalResult = toolResultPayload(messages, "update_goal", lifecycleStart);
         const goal = updatedGoalResult?.goal || createdGoalResult?.goal || goalResult?.goal;
         if (goalState.phase === 0 && requestContainsTool(parsed, "get_goal")) {
           goalState.phase = 1;
@@ -305,12 +333,16 @@ function createProvider() {
           return;
         }
       } else if (isAgentPrompt) {
-        const agentState = agentStates.get(currentUserText) || { phase: 0 };
+        const agentState = agentStates.get(currentUserText) || {
+          phase: 0,
+          startMessageCount: messages.length,
+        };
         const agentSpawnName = requestToolName(parsed, "agent_spawn");
         const agentWaitName = requestToolName(parsed, "agent_wait");
-        const spawnResult = toolResultPayload(messages, "agent_spawn");
-        const waitResult = toolResultPayload(messages, "agent_wait");
-        const childTaskIds = toolResultChildTaskIds(messages);
+        const lifecycleStart = agentState.startMessageCount || 0;
+        const spawnResult = toolResultPayload(messages, "agent_spawn", lifecycleStart);
+        const waitResult = toolResultPayload(messages, "agent_wait", lifecycleStart);
+        const childTaskIds = toolResultChildTaskIds(messages, lifecycleStart);
         if (agentState.phase === 0 && requestContainsTool(parsed, "agent_spawn")) {
           agentState.phase = 1;
           agentStates.set(currentUserText, agentState);
@@ -485,6 +517,7 @@ async function rendererState(page) {
     url: location.href,
     text: document.body?.innerText || '',
     input: Boolean(document.querySelector('[data-testid="input-textarea"]')),
+    inputEditable: document.querySelector('[data-testid="input-textarea"]')?.getAttribute('contenteditable') === 'true',
     send: Boolean(document.querySelector('[data-testid="input-send-button"]')),
     sendDisabled: Boolean(document.querySelector('[data-testid="input-send-button"]')?.disabled),
     stop: Boolean(document.querySelector('[data-testid="input-stop-button"]')),
@@ -744,6 +777,17 @@ async function chooseGoalMode(page) {
   await waitFor(async () => page.evaluate(`Boolean(document.querySelector('.ia-reference-chip-goal'))`), "Goal 结构化引用标记");
 }
 
+async function clearGoalMode(page) {
+  const hasGoalMode = await page.evaluate(`Boolean(document.querySelector('.ia-reference-chip-goal'))`);
+  if (!hasGoalMode) return;
+  await page.evaluate(`(() => {
+    const remove = document.querySelector('.ia-reference-chip-goal .ia-reference-chip-remove');
+    if (!remove) throw new Error('Goal reference remove button missing');
+    remove.click();
+  })()`);
+  await waitFor(async () => !await page.evaluate(`Boolean(document.querySelector('.ia-reference-chip-goal'))`), "Goal 结构化引用清理");
+}
+
 async function clickStop(page) {
   return await page.evaluate(`(() => {
     const button = document.querySelector('[data-testid="input-stop-button"]');
@@ -897,39 +941,41 @@ try {
     check("timing 采样初始窗口具有输入框", initial.input);
 
     const timingSamples = [];
+    const waitForTimingInput = async (label) => {
+      return waitFor(async () => {
+        const state = await rendererState(page);
+        return state.input && state.inputEditable && !state.stop ? state : null;
+      }, label);
+    };
+    const waitForTimingTerminal = async (scenario) => waitFor(async () => {
+      const state = await rendererState(page);
+      return state.input && !state.stop ? state : null;
+    }, `${scenario} terminal 收口`, 45_000);
     const collectTiming = async (scenario, prompt, expectedText) => {
+      await waitForTimingInput(`${scenario} 发送前输入`);
+      await setComposerText(page, prompt);
       await waitFor(async () => {
         const state = await rendererState(page);
-        return state.input && !state.stop ? state : null;
-      }, `${scenario} 发送前输入`);
-      await setComposerText(page, prompt);
-      await page.evaluate(`(() => {
-        const element = document.querySelector('[data-testid="input-send-button"]');
-        if (!element) throw new Error('send button unavailable');
-        element.click();
-      })()`);
+        return state.input && state.send && !state.sendDisabled && !state.stop ? state : null;
+      }, `${scenario} 发送按钮可用`, 45_000);
+      await clickSend(page);
       const result = await waitForAssistant(page, expectedText, `${scenario} ${prompt} 最终消息`);
       const turnId = result.assistant.at(-1)?.turnId;
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
       timingSamples.push(timingEvidenceRecord(scenario, turnId, timing));
       checkTimingStages(`${scenario} Renderer`, timing);
+      await waitForTimingTerminal(scenario);
     };
     const ensurePersonalDraft = async (first) => {
       if (!first) {
-        await waitFor(async () => {
-          const state = await rendererState(page);
-          return state.input && !state.stop ? state : null;
-        }, "个人 timing 上一轮收口");
+        await waitForTimingInput("个人 timing 上一轮收口");
         await openPersonalDraft(page);
       }
-      await waitFor(async () => {
-        const state = await rendererState(page);
-        return state.input && !state.stop ? state : null;
-      }, "个人 timing 采样输入");
+      await waitForTimingInput("个人 timing 采样输入");
     };
 
+    await ensurePersonalDraft(true);
     for (let index = 0; index < timingSampleCount; index += 1) {
-      await ensurePersonalDraft(index === 0);
       const token = `ELECTRON_TIMING_PERSONAL_${index}`;
       await collectTiming("personal_chat", `Electron timing 个人聊天 ${token}`, token);
     }
@@ -937,10 +983,7 @@ try {
     const workspaceRoot = await mkdtemp(join(stateRoot, "timing-workspace-"));
     const workspaceId = await registerWorkspace(page, workspaceRoot);
     const openWorkspaceDraft = async () => {
-      await waitFor(async () => {
-        const state = await rendererState(page);
-        return state.input && !state.stop ? state : null;
-      }, "工作区 timing 上一轮收口");
+      await waitForTimingInput("工作区 timing 上一轮收口");
       await waitFor(async () => {
         const state = await rendererState(page);
         return state.workspaceIds.includes(workspaceId) ? state : null;
@@ -951,33 +994,29 @@ try {
         if (!create) throw new Error('workspace timing new session button missing');
         create.click();
       })()`);
-      await waitFor(async () => {
-        const state = await rendererState(page);
-        return state.input && !state.stop ? state : null;
-      }, "工作区 timing 采样输入");
+      await waitForTimingInput("工作区 timing 采样输入");
     };
     await openWorkspaceDraft();
     for (let index = 0; index < timingSampleCount; index += 1) {
-      if (index > 0) await openWorkspaceDraft();
       const token = `ELECTRON_TIMING_WORKSPACE_${index}`;
       await collectTiming("workspace_chat", `Electron timing 工作区聊天 ${token}`, token);
     }
 
+    await openWorkspaceDraft();
     for (let index = 0; index < timingSampleCount; index += 1) {
-      await openWorkspaceDraft();
       const token = `ELECTRON_TIMING_TOOL_${index}`;
       await collectTiming("workspace_tool", `Electron timing 工作区工具：调用 tool_catalog 后返回 ${token}`, token);
     }
 
+    await ensurePersonalDraft(false);
     for (let index = 0; index < timingSampleCount; index += 1) {
-      await ensurePersonalDraft(false);
       await chooseGoalMode(page);
       const token = `ELECTRON_TIMING_GOAL_${index}`;
       await collectTiming("goal", `Electron timing Goal：维护目标计划并返回 ${token}`, token);
     }
 
+    await clearGoalMode(page);
     for (let index = 0; index < timingSampleCount; index += 1) {
-      await ensurePersonalDraft(false);
       const token = `ELECTRON_TIMING_AGENT_${index}`;
       await collectTiming("subagent", `Electron timing 子代理：派发一个子代理并等待其完成后返回 ${token}`, token);
     }

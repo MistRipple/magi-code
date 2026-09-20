@@ -17,7 +17,7 @@
 | C | 完整权限组合矩阵 | 待开始 | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
 | D | 真实 Provider 全矩阵 | 待开始 | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
 | E | Electron packaged GUI 全矩阵 | 部分完成 | 在现有 55 项单轮基础上补齐 Agent drawer、Goal/Plan 组合、Git/审批错误和 reconnect/history/restart 组合 |
-| F | Electron 五类场景各 20 轮端到端 timing | 待开始 | 5 类 × 20 轮均有同轮 accepted、Provider 首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
+| F | Electron 五类场景各 20 轮端到端 timing | 进行中（每类 2/20） | 5 类 × 20 轮均有同轮 accepted、Provider 首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
 | G | 性能 before/after 对比 | 待开始 | 有可审计的旧版本 before 数据，并与当前 after 数据使用同一场景、同一指标和同一统计方法 |
 
 ## 已有直接证据
@@ -26,8 +26,9 @@
 - Web/npm：protocol check、Svelte check/build、npm golden 已通过。
 - Electron 单轮回归：`/tmp/magi-electron-dom-regression-9983.json`，55 项检查通过。
 - Electron 五类单轮 Renderer timing：`/tmp/magi-electron-dom-timing-9857.json`，覆盖 `personal_chat`、`workspace_chat`、`workspace_tool`、`goal`、`subagent`，每类已有单轮四阶段 timing。
+- Electron 五类各 2 轮 timing：`/tmp/magi-electron-dom-timing-2-9999d.json`，`status=passed`、43 项脚本检查通过、28 次 Provider 请求；每类 2 条记录均通过 Renderer 四阶段和 terminal 收口检查。该证据仍未包含同轮后端 accepted/首 delta/首 EventBus/terminal 的结构化关联。
 - 真实 Provider 后端五类场景各 20 轮：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。
-- 五类 Electron 各 20 轮 timing 的证据文件 `/tmp/magi-electron-dom-timing-only-9984.json` 和 `/tmp/magi-electron-dom-timing-20-9985.json` 当前尚未形成，因此 F 保持未完成。
+- 五类 Electron 各 20 轮的首次采样 `/tmp/magi-electron-dom-timing-20-9998.json` 未生成完整证据：在 Goal 第 12 轮因单一 Session 的上下文增长触发语义压缩，Provider harness 的历史 Goal 生命周期匹配失败，脚本在该轮停止。继续采样前需要解决“每轮隔离上下文”和 Renderer 新会话重载的边界，不能把部分结果当作 20 轮完成。
 - before 版本性能数据当前不存在，因此 G 保持未完成。
 
 ## 推进顺序
@@ -65,6 +66,7 @@
 | --- | --- | --- | --- |
 | 2026-09-20 | F/E | 形成 55 项 Electron 单轮 DOM 回归和五类单轮 Renderer timing | `npm run test:electron-conversation-dom`；证据见上 |
 | 2026-09-20 | A | 完成生产 current Turn 写入口审计；将仅测试使用的状态包装改为测试专用命名和可见性 | `cargo fmt --all -- --check`；`cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed |
+| 2026-09-20 | F | 完成五类 timing 各 2 轮，并新增每轮 terminal 收口门槛；20 轮采样在 Goal 第 12 轮暴露上下文隔离问题 | `/tmp/magi-electron-dom-timing-2-9999d.json`：5 类 × 2，43 checks passed；`/tmp/magi-electron-dom-timing-20-9998.json` 未形成完整证据 |
 
 ## 关闭规则
 
