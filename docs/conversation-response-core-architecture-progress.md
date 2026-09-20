@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-20
-代码基线：`dd07ee04`（补充 Electron 同轮性能关联证据）
+代码基线：`76880eaf`（补充 daemon Task Turn restart/replay 验收）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -40,6 +40,7 @@
 - 上述首次采样问题已通过脚本场景筛选和 Goal/子代理每轮切换独立个人草稿解决；新的五类 20 轮证据仍只关闭 Renderer timing 子项。
 - before 版本性能数据当前不存在，因此 G 保持未完成。
 - Task profile 的进程内 restart/replay 已补充真实 `TurnService` harness：终态 canonical Turn 在重建 Coordinator、EventBus、dispatcher、TaskStore 后按同一 requestId 返回 replay，Provider 请求数不增加；这只覆盖 harness 的 restart/replay 轴，不能替代 daemon 进程重启和 Provider 全矩阵。
+- 新增真实 daemon runtime 重启/replay 验收：`task_turn_replays_after_daemon_restart_without_duplicate_canonical_acceptance` 通过 `DaemonRuntime::restore` 销毁并重建 runtime，验证 Task Turn、canonical 用户 item 的 request/userMessage identity 和 root task 恢复；使用同一 requestId/fingerprint 重提交后返回同一 session/turn/root task，canonical Turn 数量保持为 1。该证据补齐 D 的独立 daemon restart/replay 轴，但仍不覆盖完整权限、Git、审批和 history/replay 组合。
 - Electron 五类各 20 轮后端/Renderer 同轮关联已完成：`/tmp/magi-electron-dom-correlated-timing-20-10108.json`，100 条唯一 `turnId`、903 项脚本检查、280 次 Provider 请求；每条记录都包含 `accepted_response_sent`、`runner_started`、`provider_first_delta`、`event_bus_first_event`、`canonical_terminal_published` 和 Renderer 四阶段。证据中的 `sinceAcceptedMs` 由日志时间戳计算，仅用于同轮阶段顺序和分布统计；Provider 首 delta 与终态仍保留各自后端阶段耗时。
 - 在重新打包后的当前 Electron/Web 工作区上复验同一 timing-only 五类 × 20 轮：`/tmp/magi-electron-dom-correlated-timing-20-10031.json`，`status=passed`、903 项检查、280 次 Provider 请求、100 条唯一 `turnId`、0 条缺少后端阶段、终态来源全部为 `canonical_terminal_published`。该复验用于确认打包产物和当前 Web/Desktop 状态仍能完成同轮关联；Provider 波动下的分布不能直接替换历史性能基线。
 - 应用迟到任务状态写回修复并重新打包后，标准 Electron DOM 回归 `/tmp/magi-electron-dom-regression-10120.json` 仍为 `status=passed`、55 项检查、15 次 Provider 请求和 5 条 Renderer timing sample；该结果只确认修复没有破坏既有单轮 GUI 流程。日志中仍有其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示，不能扩大为完整 Desktop IPC 验收。
@@ -99,6 +100,7 @@
 | 2026-09-20 | C/D | 增加同一 Session 跨 Turn、跨 Session 的 `allow_for_turn` 审批隔离和 Task profile restart/replay 验收；验证真实文件副作用、审批请求数、canonical 终态和 Provider 请求不重复 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：50 passed、1 ignored；`cargo test -p magi-daemon --lib daemon::tests::session_turn_persists_without_live_subscriber_and_recovers_after_restart -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib runtime_restart -- --test-threads=1`：3 passed；对应提交 `0251c710` |
 | 2026-09-20 | C | 补充 Restricted `shell_exec` 重复 requestId/fingerprint 的待审批回放验收，确认 duplicate 不重复创建审批、Provider 请求或真实副作用 | `cargo test -p magi-api --lib turn_harness::tests::restricted_profile_duplicate_request_replays_pending_approval_without_duplicate_side_effects -- --test-threads=1`：1 passed；相关实现位于 `crates/magi-api/src/turn_harness.rs` |
 | 2026-09-20 | A/D | 将 `killed` 与 `superseded` 纳入任务 Turn 终态判定，确保迟到 task status callback 在所有 canonical 终态下都按 stale item 丢弃；不改变同一活动 Turn 的真实错误传播 | `cargo test -p magi-conversation-runtime --lib session_turn_finalize -- --test-threads=1`：7 passed；对应提交 `b9c13529` |
+| 2026-09-20 | D | 增加真实 daemon runtime 重启后的 Task Turn replay 验收：恢复 canonical Turn 和用户 request identity，并用相同 requestId/fingerprint 重提交验证不重复创建 canonical Turn | `cargo test -p magi-daemon --lib daemon::tests::task_turn_replays_after_daemon_restart_without_duplicate_canonical_acceptance -- --test-threads=1`：1 passed；`cargo test -p magi-daemon --lib -- --test-threads=1`：128 passed |
 
 ## B 工作包首轮审计
 
@@ -150,7 +152,7 @@ B 的保留语义已绑定到以下测试边界：
 ## D 工作包首轮证据
 
 - 真实 Provider/daemon 五类场景各 20 轮后端证据已存在：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。
-- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 50 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict、Task restart replay 和部分权限审批恢复；`magi-daemon` 的 session restart/history 测试也分别通过 1 个恢复测试和 3 个 runtime restart 测试。
+- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 50 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict、Task restart replay 和部分权限审批恢复；`magi-daemon` 的 session restart/history 测试也分别通过既有恢复测试、3 个 runtime restart 测试和新增的 daemon Task Turn restart/replay 测试。
 
 D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_provider_reexecution` 覆盖进程内重建 runtime 后的 Task canonical replay，且既有 daemon restart/replay 测试继续通过。缺口是独立 daemon 进程 restart、history/replay 的更多场景、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
 
