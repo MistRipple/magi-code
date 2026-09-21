@@ -3731,6 +3731,134 @@ mod tests {
         run_restricted_background_shell_approval_case("expiry", "expiry").await;
     }
 
+    #[tokio::test]
+    async fn restricted_profile_background_shell_duplicate_replays_pending_approval() {
+        let harness = MagiTurnHarness::new_task("后台进程审批重复回放");
+        let workspace_root =
+            tempfile::tempdir().expect("duplicate process workspace should create");
+        let workspace_id =
+            magi_core::WorkspaceId::new("harness-process-approval-duplicate-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("duplicate process workspace should register");
+        let session_id = SessionId::new("harness-process-approval-duplicate-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "后台进程审批重复回放验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("duplicate process session should create");
+        let target = workspace_root.path().join("background-duplicate.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf duplicate > {}", target.display()),
+                "background": true,
+            })
+            .to_string(),
+            "后台进程审批重复请求最终完成",
+        );
+
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 在后台写入文件，等待审批后汇总结果",
+                "harness-process-approval-duplicate-request",
+                "harness-process-approval-duplicate-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("重复后台进程审批首次请求应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首次请求应有 Turn");
+        let first_task_id = first.root_task_id.clone().expect("首次请求应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 在后台写入文件，等待审批后汇总结果",
+                "harness-process-approval-duplicate-request",
+                "harness-process-approval-duplicate-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("重复后台进程审批请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1,
+            "重复后台进程请求不得创建第二个 pending 审批"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("重复后台进程放行后文件应存在"),
+            "duplicate"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "background_process_duplicate",
+            "tool": "shell_exec",
+            "surface": "background_process",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "duplicate_pending",
+            "approval_requested": true,
+            "approval_resolved": true,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "completed",
+            "task_status": "completed",
+            "side_effect": "background_process_started_once",
+        }));
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     fn prepare_git_approval_case(
         label: &str,
         title: &str,
