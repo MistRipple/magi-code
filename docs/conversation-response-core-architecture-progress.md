@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`9091b6ca`（校正兼容语义审计证据）
+代码基线：`96339eea`（同步最新进度文档基线）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -161,6 +161,7 @@
 | 2026-09-21 | C/D | 将 Git API 审批代表格扩展到 `git_branch_create` 和 `git_branch_delete` 的 allow once/deny，并将后台 `shell_exec` 扩展到 duplicate pending：验证 Restricted 下真实 Git/进程副作用、拒绝或重复提交后的状态保持、审批事件、Provider 请求次数及 canonical Turn/Task 终态，并把五行写入统一权限 artifact | `cargo fmt --all -- --check`；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_create_ -- --test-threads=1`：2 passed；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_delete_ -- --test-threads=1`：2 passed；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_background_shell_duplicate_replays_pending_approval -- --test-threads=1`：1 passed；随后完整 `turn_harness`：68 passed、1 ignored；`/tmp/magi-api-permission-matrix.json`：16 行，包含 `git_branch_create`、`git_branch_delete`、`git_branch_switch` 和 `shell_exec` |
 | 2026-09-21 | A/C/D/E/F/G | 复核 ZCode dynamic-workflow harness、生命周期、协议和 prompt-trajectory，实现级结论写入本进度文档和性能计划：吸收单一 settlement owner、关闭闸门、typed envelope、fixture/ledger/derive 与 fail-closed boundary，明确不复制 VM 沙箱或手写双协议 | 外部复核固定到 ZCode `872ad960de7ec172591f7e1952f7849229f94521`；本进度文档和性能计划保存源码链接、Magi 映射、采用项和排除项；该记录不改变各工作包未完成状态 |
 | 2026-09-21 | A/C/D/E/F/G | 将 ZCode 复核转为当前目标的新增硬约束：单一 settlement owner、关闭闸门、版本化 Provider trajectory、统一 envelope、fail-closed 恢复和可重算性能证据，并重排后续 C→D/F→E→G 验收顺序 | 目标更新写入本文“目标更新”与“推进顺序”；未新增代码或完成证据，C/D/E/F/G 仍保持未关闭 |
+| 2026-09-21 | A/B | 按当前源码复验底层 canonical fixture、历史身份拒绝和传输恢复边界；未发现生产 current Turn 绕过或可删除的兼容双轨 | `cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed；`cargo test -p magi-bridge-client --lib http_model_client::tests::streaming_retries_before_first_delta_only -- --test-threads=1`：1 passed；`cargo test -p magi-bridge-client --lib http_model_client::tests::streaming_does_not_retry_after_visible_delta -- --test-threads=1`：1 passed；`cargo test -p magi-conversation-runtime --lib turn_contract::tests::legacy_canonical_turn_without_request_identity_is_not_replayable -- --test-threads=1`：1 passed；A/B 仍未关闭，主方案 17.3/17.7 勾选和不可迁移 fixture 边界仍待完成 |
 
 ## B 工作包首轮审计
 
