@@ -7833,6 +7833,166 @@ fn external_mcp_access_profile_matrix_records_executor_side_effects() {
 }
 
 #[test]
+fn file_and_shell_access_profile_matrix_records_runtime_side_effects() {
+    let root = unique_temp_dir("magi-tool-file-shell-permission-matrix");
+    let read_path = root.join("read.txt");
+    fs::write(&read_path, "matrix-read").expect("permission matrix read fixture should write");
+    let registry = make_registry();
+    let context = ToolExecutionContext {
+        session_id: Some(SessionId::new("session-file-shell-permission-matrix")),
+        workspace_id: Some(WorkspaceId::new("workspace-file-shell-permission-matrix")),
+        working_directory: Some(root.clone()),
+        ..ToolExecutionContext::default()
+    };
+    let mut rows = Vec::new();
+
+    for access_profile in [
+        magi_core::AccessProfile::ReadOnly,
+        magi_core::AccessProfile::Restricted,
+        magi_core::AccessProfile::FullAccess,
+    ] {
+        let policy = ToolExecutionPolicy {
+            access_profile,
+            ..ToolExecutionPolicy::default()
+        };
+        let profile_name = format!("{access_profile:?}");
+
+        let read = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("file-read-matrix-{profile_name}")),
+                BuiltinToolName::FileRead.as_str(),
+                serde_json::json!({ "path": read_path.to_string_lossy() }).to_string(),
+            ),
+            context.clone(),
+            &policy,
+        );
+        assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+        rows.push(serde_json::json!({
+            "case": format!("file_read_{profile_name}"),
+            "surface": "file_executor",
+            "tool": "file_read",
+            "access_profile": profile_name,
+            "scope": "workspace_internal",
+            "lifecycle": "read",
+            "status": format!("{:?}", read.status),
+            "executor_called": true,
+            "side_effect": "file_read",
+            "provider_requests": null,
+            "approval_events": [],
+        }));
+
+        let write_path = root.join(format!("write-{profile_name}.txt"));
+        let write = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("file-write-matrix-{profile_name}")),
+                BuiltinToolName::FileWrite.as_str(),
+                serde_json::json!({
+                    "path": write_path.to_string_lossy(),
+                    "content": "matrix-write"
+                })
+                .to_string(),
+            ),
+            context.clone(),
+            &policy,
+        );
+        assert_eq!(
+            write.status,
+            match access_profile {
+                magi_core::AccessProfile::ReadOnly => ExecutionResultStatus::Rejected,
+                magi_core::AccessProfile::Restricted | magi_core::AccessProfile::FullAccess => {
+                    ExecutionResultStatus::Succeeded
+                }
+            }
+        );
+        rows.push(serde_json::json!({
+            "case": format!("file_write_{profile_name}"),
+            "surface": "file_executor",
+            "tool": "file_write",
+            "access_profile": profile_name,
+            "scope": "workspace_internal",
+            "lifecycle": "write",
+            "status": format!("{:?}", write.status),
+            "executor_called": write.status == ExecutionResultStatus::Succeeded,
+            "side_effect": if write_path.exists() { "file_written" } else { "write_blocked" },
+            "provider_requests": null,
+            "approval_events": [],
+        }));
+
+        let shell_read = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("shell-read-matrix-{profile_name}")),
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({
+                    "command": "printf matrix-shell-read",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+            ),
+            context.clone(),
+            &policy,
+        );
+        assert_eq!(shell_read.status, ExecutionResultStatus::Succeeded);
+        rows.push(serde_json::json!({
+            "case": format!("shell_read_{profile_name}"),
+            "surface": "shell_executor",
+            "tool": "shell_exec",
+            "access_profile": profile_name,
+            "scope": "workspace_internal",
+            "lifecycle": "read",
+            "status": format!("{:?}", shell_read.status),
+            "executor_called": true,
+            "side_effect": "stdout_only",
+            "provider_requests": null,
+            "approval_events": [],
+        }));
+
+        let shell_write_path = root.join(format!("shell-{profile_name}.txt"));
+        let shell_write = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(format!("shell-write-matrix-{profile_name}")),
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({
+                    "command": format!("printf matrix-shell-write > {}", shell_write_path.display()),
+                    "access_mode": "maybe_write"
+                })
+                .to_string(),
+            ),
+            context.clone(),
+            &policy,
+        );
+        assert_eq!(
+            shell_write.status,
+            match access_profile {
+                magi_core::AccessProfile::ReadOnly => ExecutionResultStatus::Rejected,
+                magi_core::AccessProfile::Restricted => ExecutionResultStatus::NeedsApproval,
+                magi_core::AccessProfile::FullAccess => ExecutionResultStatus::Succeeded,
+            }
+        );
+        rows.push(serde_json::json!({
+            "case": format!("shell_write_{profile_name}"),
+            "surface": "shell_executor",
+            "tool": "shell_exec",
+            "access_profile": profile_name,
+            "scope": "workspace_internal",
+            "lifecycle": "write",
+            "status": format!("{:?}", shell_write.status),
+            "executor_called": shell_write.status == ExecutionResultStatus::Succeeded,
+            "side_effect": if shell_write_path.exists() { "file_written" } else { "write_blocked" },
+            "provider_requests": null,
+            "approval_events": [],
+        }));
+    }
+
+    assert_eq!(
+        rows.len(),
+        12,
+        "file and shell matrix must cover all profiles"
+    );
+    record_permission_matrix_rows(rows);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn search_semantic_uses_context_workspace_when_multiple_indexes_are_ready() {
     let root_a = unique_temp_dir("magi-tool-search-scope-a");
     let root_b = unique_temp_dir("magi-tool-search-scope-b");
