@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`6c8b45f0`（统一真实 Provider raw delta 证据字段）
+代码基线：`d70e772b`（收紧 Provider harness 工具契约）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -22,7 +22,7 @@
 
 ## 已有直接证据
 
-- Rust workspace：`cargo test --workspace --all-targets --quiet -- --test-threads=1`，684 passed、1 ignored；本轮包含 Browser Host 协议、process 生命周期矩阵、daemon Task Turn 重启回放、Git mutation 审批生命周期、后台进程审批、跨 Turn/Session 审批测试和终态判定收敛。
+- Rust workspace：`cargo test --workspace --all-targets --quiet -- --test-threads=1`，685 passed、1 ignored；本轮包含 Browser Host 协议、process 生命周期矩阵、daemon Task Turn 重启回放、Git mutation 审批生命周期、后台进程审批、跨 Turn/Session 审批测试和终态判定收敛。
 - Web/npm：protocol check、Svelte check/build、npm golden 已通过。
 - Electron 单轮回归：`/tmp/magi-electron-dom-regression-10027.json`，55 项检查通过；此前 `/tmp/magi-electron-dom-regression-9983.json` 同样通过。
 - 在最新 Web/Desktop 工作区状态重新打包并运行 Electron DOM 回归：`/tmp/magi-electron-dom-regression-10030.json`，`status=passed`、55 项检查通过、15 次 Provider 请求、5 条 Renderer timing sample；脚本自有 Electron/daemon 已清理。日志仍出现其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示，不能把该结果扩大为完整 Desktop IPC 验收。
@@ -63,7 +63,7 @@
 - API Harness 还补充 Restricted `shell_exec(background=true)` 的审批生命周期：通过真实后台进程启动并写入工作区文件，及 deny/cancel/expiry 三条不执行路径，验证审批 requested/resolved、Provider 请求次数、真实副作用边界和 canonical Turn/Task 终态；四行结果写入 `/tmp/magi-api-process-approval-matrix.json`。该证据仍只覆盖 workspace 内 Restricted 的代表格，跨作用域和 duplicate/cross-turn/session 组合仍未关闭。
 - API Harness 将 `git_branch_switch` 七行和后台 `shell_exec` 四行合并写入 `/tmp/magi-api-permission-matrix.json`，统一字段包括 tool、surface、AccessProfile、作用域、生命周期、审批事实、Provider 请求次数和 Turn/Task 终态；该 11 行 artifact 仍是 API 代表格，不等价于全部工具面和所有作用域组合。
 - 参考 ZCode 的 dynamic-workflow harness 后，确认当前 Magi 验收应继续坚持三条边界：测试 harness 只驱动 `TurnService` 并等待真实 canonical 终态；watchdog/关闭逻辑只负责取消和资源收口，不直接伪造业务终态；Provider 请求、raw delta、工具调用、审批、真实副作用和 canonical terminal 应保留为可追加的原始轨迹，再派生权限矩阵与 timing artifact。ZCode 的父进程/引擎分离、`engine.settled` 单一终态事实源、按 parent session 的 orphan reconcile，以及 `prompt-trajectory` 的 fixture/ledger/derive 分层可作为 C/D/E/F 后续验收的设计参照，但不引入 VM 或第二套子进程执行边界。
-- ZCode 的一次性 mock response resolver 也明确了 Magi Provider fixture 的剩余改进方向：当前 `set_tool_then_completed` 仍按工具 surface 触发，后续应让测试替身按 `turnId`、`requestId`、Provider round、工具名和参数指纹消费一次响应；额外请求应立即产生结构化 contract failure，避免 action contract 不匹配时重复工具轮次。该项尚未实现，不作为现有 D/F 完成证据。
+- ZCode 的一次性 mock response resolver 也明确了 Magi Provider fixture 的收紧方向：`HarnessModelClient::set_tool_then_completed` 现在会在非分类器请求缺少预期工具 surface 时立即返回结构化 `Protocol` contract failure，避免 action contract 不匹配时伪造最终答复或进入重复工具轮次；新增 `harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed` 回归覆盖该边界。由于当前 `ModelInvocationRequest` 尚未携带 `turnId`/`requestId`，按身份和参数指纹的一次性 response rule 仍是后续改进，不作为现有 D/F 完成证据。
 
 ## 推进顺序
 
@@ -128,6 +128,7 @@
 | 2026-09-21 | D | 增加真实 HTTP daemon 实例重启验收：启动第一台 daemon、通过真实 HTTP 接纳 Task Turn，关闭并用同一 state root 启动第二台 daemon，验证 bootstrap/messages 回放、相同 requestId/fingerprint 返回同一 session/turn/root task 且用户 item 不重复 | `cargo test -p magi-daemon --lib daemon::tests::daemon_http_server_restart_replays_task_turn_without_duplicate_acceptance -- --test-threads=1`：1 passed；该测试覆盖真实 HTTP server 生命周期，但仍是同一测试进程内的两个 daemon 实例，不扩大为独立 OS 进程证据 |
 | 2026-09-21 | D | 通过真实 `target/debug/magi-daemon-app` 启动两个独立 OS daemon 进程，使用同一 `MAGI_STATE_ROOT` 完成 Task Turn 接纳、SIGTERM、第二进程启动、bootstrap/messages 回放和相同 requestId/fingerprint 重提交 | `/tmp/magi-daemon-independent-process-restart-20260921.json`：`status=passed`，transport=`real independent magi-daemon-app process`，首/回放 Turn 与 root task 相同，userMessageCount=1；两个自启动进程均在验收后退出 |
 | 2026-09-21 | D | 增加普通 conversation profile 的 daemon runtime 重启/replay 验收，确认重启后只恢复 canonical Turn 和历史，不创建 TaskStore 任务或重复 canonical Turn | `cargo test -p magi-daemon --lib daemon::tests::conversation_turn_replays_after_daemon_restart_without_task_or_duplicate_acceptance -- --test-threads=1`：1 passed |
+| 2026-09-21 | C/D/F | 参考 ZCode 的一次性 mock response resolver 收紧 `MagiTurnHarness`：非分类器请求缺少已配置工具时立即返回 Protocol contract failure，并新增回归，避免 action contract 不匹配时伪造最终答复或进入重复工具轮次 | `cargo test -p magi-api --lib turn_harness::tests::harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed -- --test-threads=1`：1 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：63 passed、1 ignored；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：685 passed、1 ignored |
 | 2026-09-21 | D | 将 conversation profile 重启/replay 扩展到真实 HTTP daemon 实例生命周期，验证共享 state root 下的 bootstrap/messages 回放、重复接纳幂等和无 root task | 定向测试：1 passed；随后 `cargo test -p magi-daemon --lib -- --test-threads=1`：131 passed |
 | 2026-09-21 | C | 增加 BrowserHostClient Unix WebSocket 协议验收：三种 AccessProfile 各执行 snapshot 与 navigate，验证真实 BrowserHostClient 请求经过 Desktop Host 协议、Surface 绑定、页面状态和导航命令，并记录 3 次 snapshot、3 次 navigate 的 Host 命令；Host 仍为确定性协议 double，不扩大为真实 Chromium 进程副作用 | `cargo test -p magi-api --lib browser_tool_runtime -- --test-threads=1`：14 passed；新增 `browser_access_profile_matrix_reaches_real_host_protocol_for_read_and_write` 通过 |
 | 2026-09-21 | C/D | 为 API Turn Harness 注入与 daemon 相同的结构化 Git runtime，补齐 Restricted `git_branch_switch` 的 allow once、deny、cancel、expiry、duplicate pending、allow_for_turn 跨 Turn 和跨 Session 七条真实审批生命周期；allow once 切换真实 branch，其他路径保持 branch 不变并收口 canonical Turn/Task | `cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_switch_ -- --test-threads=1`：7 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：58 passed、1 ignored |
