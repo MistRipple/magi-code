@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`53077d2d`（Git 审批矩阵 artifact 代码基线）
+代码基线：`904a3ce4`（Git 审批矩阵 artifact 代码基线）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -54,6 +54,7 @@
 - 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。`provider_first_raw_delta` 表示首个包含工具调用快照或可见内容/思考的 Provider delta；`provider_first_delta` 仍只表示首个可见 content/thinking delta。工具调用首轮可能没有可见正文，两个阶段因此可以落在不同 Provider round。
 - Restricted `shell_exec` 的重复 requestId/fingerprint 回放已补充到真实 `TurnService` harness：待审批期间第二次提交复用同一 `turn_id`/root task，不创建第二个 pending 审批、不重复发布 `tool.approval.requested`、不重复请求 Provider；放行后只产生一次真实文件副作用并完成 canonical Turn。该证据只覆盖 duplicate + approval 组合，不能替代完整工具类型、访问模式、作用域和生命周期矩阵。
 - Git 结构化工具现在由 `MagiTurnHarness` 注入与 daemon 相同的 `GitToolRuntime`、Session Git Context、Snapshot 和 runtime persistence；新增 `git_branch_switch` 的 allow once、deny、cancel、expiry、duplicate pending、allow_for_turn 跨 Turn 和跨 Session 共七个 API 层验收。allow once 实际切换到 `approval-target`，deny/cancel/expiry 保持原分支，重复提交只保留一个 pending 审批，allow_for_turn 在下一 Turn/Session 都重新请求审批；测试同时断言 canonical ToolCall、审批 requested/resolved 事件、Provider 请求次数和 Turn/Task 终态，并将七行结果写入 `/tmp/magi-api-git-approval-matrix.json`。这补齐 `git_branch_switch` 的 API 审批生命周期代表格，但不替代其它 Git mutation、GUI、Browser/MCP 外部副作用和统一全组合 JSON 矩阵。
+- API Harness 还补充 Restricted `shell_exec(background=true)` 的审批允许路径：通过真实后台进程启动并写入工作区文件，验证审批 requested/resolved、Provider 两轮请求和 canonical Turn/Task completed，结果写入 `/tmp/magi-api-process-approval-matrix.json`。该证据只覆盖 process 的 allow once 代表格，拒绝、取消、过期和跨作用域组合仍未关闭。
 
 ## 推进顺序
 
@@ -119,6 +120,7 @@
 | 2026-09-21 | C | 增加 BrowserHostClient Unix WebSocket 协议验收：三种 AccessProfile 各执行 snapshot 与 navigate，验证真实 BrowserHostClient 请求经过 Desktop Host 协议、Surface 绑定、页面状态和导航命令，并记录 3 次 snapshot、3 次 navigate 的 Host 命令；Host 仍为确定性协议 double，不扩大为真实 Chromium 进程副作用 | `cargo test -p magi-api --lib browser_tool_runtime -- --test-threads=1`：14 passed；新增 `browser_access_profile_matrix_reaches_real_host_protocol_for_read_and_write` 通过 |
 | 2026-09-21 | C/D | 为 API Turn Harness 注入与 daemon 相同的结构化 Git runtime，补齐 Restricted `git_branch_switch` 的 allow once、deny、cancel、expiry、duplicate pending、allow_for_turn 跨 Turn 和跨 Session 七条真实审批生命周期；allow once 切换真实 branch，其他路径保持 branch 不变并收口 canonical Turn/Task | `cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_switch_ -- --test-threads=1`：7 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：58 passed、1 ignored |
 | 2026-09-21 | C/D | 将 `git_branch_switch` 七条 API 审批生命周期的真实分支副作用、审批事实、Provider 请求次数和 Turn/Task 终态写入结构化 artifact；其它 Git mutation 仍保持未登记 | `/tmp/magi-api-git-approval-matrix.json`：7 行；`cargo fmt --all -- --check`；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_switch_ -- --test-threads=1`：7 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：58 passed、1 ignored |
+| 2026-09-21 | C/D | 增加 Restricted `shell_exec(background=true)` 的真实后台进程审批允许验收，验证工作区文件副作用、审批事件、Provider 请求次数和 canonical Turn/Task 终态，并写入单行 process artifact；拒绝、取消、过期和跨作用域仍未覆盖 | `/tmp/magi-api-process-approval-matrix.json`：1 行；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_background_shell_approval_runs_real_process_once -- --test-threads=1`：1 passed；`cargo fmt --all -- --check` |
 
 ## B 工作包首轮审计
 
@@ -182,14 +184,14 @@ B 的保留语义已绑定到以下测试边界：
 | `file_*`、`shell_exec`、Git 写工具 | FullAccess / workspace 内外 | auto allow | 允许的真实副作用；不发布常规审批 | 2 或按 Git 前置失败 | `full_access_profile_*`、`workspace_task_with_git_*` |
 | Browser 读写能力 | ReadOnly / Restricted / FullAccess | Host protocol side effect | snapshot/navigate 六行均到达带 session/workspace 上下文的 Host；Unix WebSocket 协议层记录 3 次 snapshot 与 3 次 navigate；能力快照仍按读写分类 | — | `browser_access_profile_matrix_keeps_read_and_write_capabilities_distinct`、`browser_access_profile_matrix_records_host_executor_side_effects`、`browser_access_profile_matrix_reaches_real_host_protocol_for_read_and_write` |
 | 外部 MCP 读写能力 | ReadOnly / Restricted / FullAccess | deny / allow | ReadOnly 在 executor 前阻断，Restricted 写工具返回 NeedsApproval，FullAccess 和所有读工具产生真实 mock executor side effect；6 行 profile/tool 组合已在同一测试中登记 | — | `external_mcp_access_profile_matrix_records_executor_side_effects`、`external_mcp_*_profile*` |
-| process 内部工具 | ReadOnly / Restricted / FullAccess | deny / allow / cancel | ReadOnly 拒绝、Restricted NeedsApproval；FullAccess 真实 cat 进程完成 launch/read/write/kill，并保留跨 session 隔离与取消清理 | — | `internal_process_access_profile_matrix_is_fail_closed`、`internal_process_access_profile_matrix_records_lifecycle_side_effects`、`process_tools_do_not_cross_sessions_with_workspace_only_context` |
+| process 内部工具 | ReadOnly / Restricted / FullAccess | deny / allow / cancel | ReadOnly 拒绝、Restricted NeedsApproval；FullAccess 真实 cat 进程完成 launch/read/write/kill，并保留跨 session 隔离与取消清理；API Harness 另以 `shell_exec(background=true)` 验证 Restricted allow once 的真实文件副作用和审批事件，结果写入 `/tmp/magi-api-process-approval-matrix.json` | API Harness allow once 为 2；其它 runtime 行不涉及 Provider | `internal_process_access_profile_matrix_is_fail_closed`、`internal_process_access_profile_matrix_records_lifecycle_side_effects`、`process_tools_do_not_cross_sessions_with_workspace_only_context`、`restricted_profile_background_shell_approval_runs_real_process_once` |
 
-该登记仍不是关闭矩阵：Browser/MCP 的真实外部副作用、process 的完整审批生命周期、其它 Git mutation 的统一 JSON 登记，以及每一行统一 JSON 产物仍需补齐。当前 Git artifact 只覆盖 `git_branch_switch` 七行代表格。最近一次定向验证为 `magi-api turn_harness`：58 passed、1 ignored；`magi-tool-runtime`：229 passed、1 ignored；`magi-api browser_tool_runtime`：14 passed。
+该登记仍不是关闭矩阵：Browser/MCP 的真实外部副作用、process 的完整审批生命周期、其它 Git mutation 的统一 JSON 登记，以及每一行统一 JSON 产物仍需补齐。当前 Git artifact 覆盖 `git_branch_switch` 七行代表格，process artifact 只覆盖后台进程 allow once 一行。最近一次定向验证为 `magi-api turn_harness`：59 passed、1 ignored；`magi-tool-runtime`：229 passed、1 ignored；`magi-api browser_tool_runtime`：14 passed。
 
 ## D 工作包首轮证据
 
 - 真实 Provider/daemon 五类场景各 20 轮后端证据已存在：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。
-- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 58 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict、`git_branch_switch` 审批生命周期、Task restart replay 和部分权限审批恢复；`magi-daemon` 的 session restart/history 测试也分别通过既有恢复测试、3 个 runtime restart 测试和新增的 daemon Task Turn restart/replay 测试。
+- `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1` 的 59 个通过测试已覆盖真实 `TurnService` 链路中的取消、SSE/WebSocket reconnect、duplicate request、Task/Goal/工具/子代理、Provider 重试、Git dirty/branch drift/merge conflict、`git_branch_switch` 审批生命周期、后台进程审批、Task restart replay 和部分权限审批恢复；`magi-daemon` 的 session restart/history 测试也分别通过既有恢复测试、3 个 runtime restart 测试和新增的 daemon Task Turn restart/replay 测试。
 
 D 仍不能关闭。新增 `task_profile_restart_replays_completed_turn_without_provider_reexecution`、真实 HTTP daemon 实例重启和独立 `magi-daemon-app` OS 进程重启后的 Task Turn 回放；API harness 现在还覆盖 Git `git_branch_switch` 审批 allow once/deny/cancel/expiry、duplicate、cross-turn、cross-session 的 Provider 请求次数、审批事件、真实 branch 副作用与 canonical 终态。缺口仍是 history/replay 的更多场景、三种 AccessProfile 与 Git/审批场景的 Provider 级同轮证据，以及把这些后端阶段与 Electron Renderer 的 20 轮 `turnId` 逐轮关联；已有后端性能 JSON 不能直接扩大解释为 Provider 全矩阵完成。
 

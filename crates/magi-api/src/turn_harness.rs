@@ -3315,6 +3315,139 @@ mod tests {
         );
     }
 
+    fn record_process_approval_matrix_row(
+        lifecycle: &str,
+        side_effect: &str,
+        approval_requested: bool,
+        approval_resolved: bool,
+        provider_requests: usize,
+        turn_status: &str,
+        task_status: &str,
+    ) {
+        let path = PathBuf::from("/tmp/magi-api-process-approval-matrix.json");
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "case": "background_shell_allow_once",
+                "tool": "shell_exec",
+                "surface": "background_process",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": lifecycle,
+                "approval_requested": approval_requested,
+                "approval_resolved": approval_resolved,
+                "provider_requests": provider_requests,
+                "turn_status": turn_status,
+                "task_status": task_status,
+                "side_effect": side_effect,
+            }]))
+            .expect("process matrix rows should serialize"),
+        )
+        .expect("process matrix evidence should write");
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_background_shell_approval_runs_real_process_once() {
+        let harness = MagiTurnHarness::new_task("后台进程审批");
+        let workspace_root = tempfile::tempdir().expect("process approval workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-process-approval-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("process approval workspace should register");
+        let session_id = SessionId::new("harness-process-approval-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "后台进程审批验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("process approval session should create");
+        let target = workspace_root.path().join("background-approved.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf background-approved > {}", target.display()),
+                "background": true,
+            })
+            .to_string(),
+            "后台进程审批后的任务已完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 在后台启动进程，等待审批后汇总结果",
+                "harness-process-approval-request",
+                "harness-process-approval-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("restricted background process task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("background process task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("background process task should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "shell_exec");
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !target.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&target).expect("background process write should be readable"),
+            "background-approved"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "tool.approval.requested")
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "tool.approval.resolved")
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        record_process_approval_matrix_row(
+            "allow_once",
+            "background_process_started_and_wrote_file",
+            true,
+            true,
+            non_classifier_provider_request_count(&harness),
+            "completed",
+            "completed",
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     fn prepare_git_approval_case(
         label: &str,
         title: &str,
