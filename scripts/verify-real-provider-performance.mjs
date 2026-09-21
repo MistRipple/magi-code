@@ -333,6 +333,7 @@ async function main() {
   daemon.stderr.pipe(logStream);
   let rows = [];
   let completed = false;
+  let samplingError = null;
   try {
     const health = await waitForDaemonPort();
     const workspace = await requestJson("/api/workspaces/register", {
@@ -341,58 +342,63 @@ async function main() {
     });
     const workspaceId = workspace.workspaceId;
     const personal = [];
-    if (selectedScenarios.includes("new_personal_chat")) {
-      for (let index = 0; index < sampleCount; index += 1) {
-        personal.push(await submitTurn({
-          scenario: "new_personal_chat",
-          text: `只回答 REAL_PROVIDER_PERF_OK，新建个人会话样本 ${index}。`,
-        }));
+    try {
+      if (selectedScenarios.includes("new_personal_chat")) {
+        for (let index = 0; index < sampleCount; index += 1) {
+          const row = await submitTurn({
+            scenario: "new_personal_chat",
+            text: `只回答 REAL_PROVIDER_PERF_OK，新建个人会话样本 ${index}。`,
+          });
+          personal.push(row);
+          rows.push(row);
+        }
       }
-    }
-    rows.push(...personal);
-    if (selectedScenarios.includes("personal_long_history")) {
-      const longHistorySessionId = personal[0]?.sessionId;
-      if (!longHistorySessionId) throw new Error("个人长历史场景需要先完成至少一轮新建个人会话");
-      for (let index = 0; index < sampleCount; index += 1) {
-        rows.push(await submitTurn({
-          scenario: "personal_long_history",
-          sessionId: longHistorySessionId,
-          text: `只回答 REAL_PROVIDER_PERF_OK，个人长历史样本 ${index}。`,
-        }));
+      if (selectedScenarios.includes("personal_long_history")) {
+        const longHistorySessionId = personal[0]?.sessionId;
+        if (!longHistorySessionId) throw new Error("个人长历史场景需要先完成至少一轮新建个人会话");
+        for (let index = 0; index < sampleCount; index += 1) {
+          rows.push(await submitTurn({
+            scenario: "personal_long_history",
+            sessionId: longHistorySessionId,
+            text: `只回答 REAL_PROVIDER_PERF_OK，个人长历史样本 ${index}。`,
+          }));
+        }
       }
-    }
-    if (selectedScenarios.includes("workspace_chat")) {
-      for (let index = 0; index < sampleCount; index += 1) {
-        rows.push(await submitTurn({
-          scenario: "workspace_chat",
-          scope: "workspace",
-          workspaceId,
-          workspacePath,
-          text: `只回答 REAL_PROVIDER_PERF_OK，工作区普通聊天样本 ${index}。`,
-        }));
+      if (selectedScenarios.includes("workspace_chat")) {
+        for (let index = 0; index < sampleCount; index += 1) {
+          rows.push(await submitTurn({
+            scenario: "workspace_chat",
+            scope: "workspace",
+            workspaceId,
+            workspacePath,
+            text: `只回答 REAL_PROVIDER_PERF_OK，工作区普通聊天样本 ${index}。`,
+          }));
+        }
       }
-    }
-    if (selectedScenarios.includes("workspace_tool")) {
-      for (let index = 0; index < sampleCount; index += 1) {
-        rows.push(await submitTurn({
-          scenario: "workspace_tool",
-          scope: "workspace",
-          workspaceId,
-          workspacePath,
-          text: `请明确调用 file_read 工具读取路径 ${join(workspacePath, "README.md")}，然后只回答 REAL_PROVIDER_PERF_OK，工作区工具样本 ${index}。`,
-        }));
+      if (selectedScenarios.includes("workspace_tool")) {
+        for (let index = 0; index < sampleCount; index += 1) {
+          rows.push(await submitTurn({
+            scenario: "workspace_tool",
+            scope: "workspace",
+            workspaceId,
+            workspacePath,
+            text: `请明确调用 file_read 工具读取路径 ${join(workspacePath, "README.md")}，然后只回答 REAL_PROVIDER_PERF_OK，工作区工具样本 ${index}。`,
+          }));
+        }
       }
-    }
-    if (selectedScenarios.includes("subagent_concurrency")) {
-      for (let index = 0; index < sampleCount; index += 1) {
-        rows.push(await submitTurn({
-          scenario: "subagent_concurrency",
-          scope: "workspace",
-          workspaceId,
-          workspacePath,
-          text: `请创建两个子代理并行检查 ${join(workspacePath, "README.md")}，等待它们完成后只回答 REAL_PROVIDER_PERF_OK，主代理与子代理并发样本 ${index}。`,
-        }));
+      if (selectedScenarios.includes("subagent_concurrency")) {
+        for (let index = 0; index < sampleCount; index += 1) {
+          rows.push(await submitTurn({
+            scenario: "subagent_concurrency",
+            scope: "workspace",
+            workspaceId,
+            workspacePath,
+            text: `请创建两个子代理并行检查 ${join(workspacePath, "README.md")}，等待它们完成后只回答 REAL_PROVIDER_PERF_OK，主代理与子代理并发样本 ${index}。`,
+          }));
+        }
       }
+    } catch (error) {
+      samplingError = error instanceof Error ? error.message : String(error);
     }
     logStream.end();
     await new Promise((resolve) => logStream.once("close", resolve));
@@ -417,7 +423,8 @@ async function main() {
       if (!rawDeltaRequiredScenarios.has(row.scenario)) return false;
       return !timingByRequest[row.requestId]?.provider_first_raw_delta?.length;
     });
-    const allSuccessful = rows.length === expectedSamples
+    const allSuccessful = samplingError === null
+      && rows.length === expectedSamples
       && rows.every((row) => row.status === "completed")
       && missingRawDeltaRows.length === 0;
     const preservedLogPath = `${evidencePath}.daemon.log`;
@@ -437,6 +444,7 @@ async function main() {
         providerFirstDeltaMs: "daemon 日志中该 requestId 的首个可见 content/thinking delta",
       },
       summary: summarize(rows, timingByRequest),
+      ...(samplingError === null ? {} : { samplingError }),
       samples: rows.map((row) => ({
         ...row,
         providerFirstRawDeltaMs: timingByRequest[row.requestId]?.provider_first_raw_delta?.[0] ?? null,
@@ -452,7 +460,11 @@ async function main() {
     completed = allSuccessful;
     console.log(JSON.stringify({ status: evidence.status, evidencePath, summary: evidence.summary }, null, 2));
     if (!allSuccessful) {
-      throw new Error("真实 Provider 性能采样包含失败 Turn；已保存完整 JSON 证据，不能把失败样本标记为通过。");
+      throw new Error(
+        samplingError
+          ? `真实 Provider 性能采样中断：${samplingError}；已保存部分 JSON 证据。`
+          : "真实 Provider 性能采样包含失败 Turn；已保存完整 JSON 证据，不能把失败样本标记为通过。",
+      );
     }
   } finally {
     if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGTERM");
