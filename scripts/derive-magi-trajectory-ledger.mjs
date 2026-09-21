@@ -285,11 +285,20 @@ async function main() {
       path: inputPath,
       payload_hash: hashJson(input),
       status: input.status || "unknown",
+      ...(input.samplingError ? { sampling_error: input.samplingError } : {}),
     });
     if (Array.isArray(input.samples)) allRecords.push(...realProviderRecords(input, inputPath));
     if (Array.isArray(input.rendererTimingSamples)) allRecords.push(...electronRecords(input, inputPath));
   }
   const errors = validateRecords(allRecords);
+  for (const input of inputMetadata) {
+    if (input.status !== "passed") {
+      errors.push(`输入 evidence 未通过：${input.path} status=${input.status}`);
+    }
+    if (input.sampling_error) {
+      errors.push(`输入 evidence 含 samplingError：${input.path}`);
+    }
+  }
   const phaseCounts = Object.fromEntries(
     [...new Set(allRecords.map((record) => record.phase))]
       .sort()
