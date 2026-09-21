@@ -1,10 +1,23 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`4ec3f6c5`（补齐 Git 分支删除审批矩阵）
+代码基线：`1ba17cfb`（整理 ZCode harness 借鉴边界）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
+
+## 目标更新：统一事实轨迹与 Harness 验收闭环
+
+在原有“单一 `SessionTurnCoordinator`、统一 `TurnService`、conversation/task profile 分离、canonical Turn 唯一事实源、流式通知和重启恢复”的目标上，增加以下不可省略的验收约束。它们来自对 ZCode dynamic-workflow harness 的源码复核，用来约束 Magi 的测试和证据形态，不改变产品边界，也不引入第二套执行路径。
+
+1. **单一结算所有者**：Harness 只能通过 `TurnService` 接纳并等待 Coordinator/Sink 的真实终态；测试清理、watchdog、Provider mock 和 Electron 驱动不得直接写 canonical terminal。
+2. **关闭闸门与真实 settlement**：关闭 daemon、runtime 或 GUI 测试宿主时，必须先停止新接纳，再取消活动 Turn，最后等待 settlement promise；固定 sleep、周期轮询和“看到进程退出就猜终态”不能作为完成证据。
+3. **原始轨迹先行**：Provider request、raw/visible delta、tool call、tool result、approval、EventBus、canonical terminal 和 Renderer 阶段先写入带版本的结构化 ledger，再由同一 derive 规则生成权限、replay 和 timing artifact。
+4. **边界协议有唯一真源**：跨进程或测试 Host 的 envelope 必须保留 `request_id`、`turn_id`、序号、事件类型、错误类别和终态来源；Rust `serde`/schema 是生产协议真源，不维护手写双协议。
+5. **恢复保持 fail-closed**：缺 request identity、canonical boundary、可信 replay 前缀或历史连续性时拒绝或明确标记失败，不合成空状态，不把失败样本降级成通过样本。
+6. **性能证据可重算**：P50/P95、权限矩阵和 before/after 必须记录输入轨迹哈希、fixture、schema/derive 版本和统计口径；没有可审计 before 数据时，G 不得关闭。
+
+这组约束会改变 C/D/E/F/G 的关闭条件，但不会降低原方案要求。当前仍有未完成工作包，不能据此宣称整体重构完成。
 
 ## 总览
 
@@ -14,11 +27,11 @@
 | --- | --- | --- | --- |
 | A | 17.3：current Turn 写入口和测试夹具边界 | 进行中（底层 fixture 审计完成，待主方案文档同步） | 生产路径只经 `CanonicalTurnEventSink`；剩余底层 fixture 已逐项分类，均为验证原子 mutation/恢复边界的测试，保留理由和测试覆盖已记录，并需同步方案文档的 17.3 勾选状态 |
 | B | 17.7：失效 legacy/兼容语义清理 | 进行中（首轮审计完成；未发现可直接删除的生产双轨） | 失效生产双轨、旧注释和无效 fixture 清除；迁移、恢复、协议兼容、旧字段拒绝逻辑保留并有边界说明 |
-| C | 完整权限组合矩阵 | 进行中（基础 runtime/API、跨 Turn/Session 隔离和重复审批回放已跑通；完整组合关联未完成） | ReadOnly/Restricted/FullAccess 与 file/shell/process/Git/browser/MCP、workspace 内外、审批生命周期和真实副作用均有证据 |
-| D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮、基础 cancel/reconnect 及 Task restart replay 已有；全矩阵未完成） | Chat/Task/Goal/工具/子代理覆盖 cancel、reconnect、restart、history/replay、权限、Git 冲突和审批阻塞恢复 |
-| E | Electron packaged GUI 全矩阵 | 部分完成 | 在现有 55 项单轮基础上补齐 Agent drawer、Goal/Plan 组合、Git/审批错误和 reconnect/history/restart 组合 |
-| F | Electron 五类场景各 20 轮端到端 timing | 进行中（最新 100/100 已包含 Task raw tool-call-only 首 delta，仍需与历史后端基线统一统计） | 5 类 × 20 轮均有同轮 accepted、Provider raw/可见首 delta、首 EventBus、Renderer 四阶段和 terminal 关联 |
-| G | 性能 before/after 对比 | 待开始 | 有可审计的旧版本 before 数据，并与当前 after 数据使用同一场景、同一指标和同一统计方法 |
+| C | 完整权限组合矩阵 | 进行中（基础 runtime/API、跨 Turn/Session 隔离和重复审批回放已跑通；完整组合关联未完成） | 每行有版本化 fixture、真实副作用或明确拒绝、审批事实、Provider 请求数、终态来源，并覆盖 ReadOnly/Restricted/FullAccess、工具面和作用域组合 |
+| D | 真实 Provider 全矩阵 | 进行中（五类后端 20 轮、基础 cancel/reconnect 及 Task restart replay 已有；全矩阵未完成） | 主 Turn/sidecar 分类、Provider 原始轨迹、cancel/reconnect/restart/history/replay、权限/Git/审批阻塞恢复均可按同一 ledger 重算 |
+| E | Electron packaged GUI 全矩阵 | 部分完成 | 在现有 55 项单轮基础上补齐 Agent drawer、Goal/Plan 组合、Git/审批错误和 reconnect/history/restart 组合，并验证关闭闸门后的真实 settlement |
+| F | Electron 五类场景各 20 轮端到端 timing | 进行中（最新 100/100 已包含 Task raw tool-call-only 首 delta，仍需与历史后端基线统一统计） | 5 类 × 20 轮均有同轮 accepted、Provider raw/可见首 delta、首 EventBus、Renderer 四阶段和 terminal 关联，并由版本化 ledger 派生 |
+| G | 性能 before/after 对比 | 待开始 | 旧版与当前版使用同一 fixture、ledger schema、derive 版本和统计口径；before 输入和结果可独立复核 |
 
 ## 已有直接证据
 
@@ -65,15 +78,16 @@
 - API Harness 还补充 Restricted `shell_exec(background=true)` 的审批生命周期：通过真实后台进程启动并写入工作区文件，及 deny/cancel/expiry 三条不执行路径，验证审批 requested/resolved、Provider 请求次数、真实副作用边界和 canonical Turn/Task 终态；四行结果写入 `/tmp/magi-api-process-approval-matrix.json`。该证据仍只覆盖 workspace 内 Restricted 的代表格，跨作用域和 duplicate/cross-turn/session 组合仍未关闭。
 - API Harness 将 `git_branch_switch` 七行、`git_branch_create` 两行、`git_branch_delete` 两行和后台 `shell_exec` 五行合并写入 `/tmp/magi-api-permission-matrix.json`，统一字段包括 tool、surface、AccessProfile、作用域、生命周期、审批事实、Provider 请求次数和 Turn/Task 终态；该 16 行 artifact 仍是 API 代表格，不等价于全部工具面和所有作用域组合。
 - `magi-tool-runtime` 的 Browser Host、file、Git、MCP、shell 和内部 process 生命周期矩阵现在也写入 `/tmp/magi-tool-runtime-permission-matrix.json`；完整 tool-runtime 测试生成 36 行，覆盖六个 surface、三种 AccessProfile 和每行的状态、executor 到达、副作用、审批事件/Provider 请求字段。该 artifact 补齐策略/executor 代表格，但仍不等价于真实 Provider 同轮权限矩阵，也不覆盖 workspace 外、重复请求、跨 Turn/Session 全组合。
-- 已复核 ZCode `main` 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 [dynamic-workflow harness](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/dynamic-workflow-runtime/src/harness.ts)、[NDJSON protocol](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/dynamic-workflow-runtime/src/protocol.ts)、[run lifecycle](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/bootstrap/src/app/dynamic-workflow-run-lifecycle.ts) 和 [prompt-trajectory recorder](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/tools/prompt-trajectory/src/record.ts)。可迁移结论已写入方案第 18.1 节：Magi 只吸收单一 settlement owner、关闭闸门后等待真实结算、typed envelope、fixture/ledger/derive 分层和 fail-closed boundary；不引入 VM 或第二套执行路径。
+- 已复核 ZCode `main` 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 [dynamic-workflow harness](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/dynamic-workflow-runtime/src/harness.ts)、[NDJSON protocol](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/dynamic-workflow-runtime/src/protocol.ts)、[run lifecycle](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/bootstrap/src/app/dynamic-workflow-run-lifecycle.ts) 和 [prompt-trajectory recorder](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/tools/prompt-trajectory/src/record.ts)。可迁移结论已写入本进度文档的“目标更新”、[性能计划的 trajectory ledger 章节](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-performance-plan.md:703) 和此前已提交的复核记录：Magi 只吸收单一 settlement owner、关闭闸门后等待真实结算、typed envelope、fixture/ledger/derive 分层和 fail-closed boundary；不引入 VM 或第二套执行路径。
 - ZCode 的一次性 mock response resolver 也明确了 Magi Provider fixture 的收紧方向：`HarnessModelClient::set_tool_then_completed` 现在会在非分类器请求缺少预期工具 surface 时立即返回结构化 `Protocol` contract failure，避免 action contract 不匹配时伪造最终答复或进入重复工具轮次；新增 `harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed` 回归覆盖该边界。由于当前 `ModelInvocationRequest` 尚未携带 `turnId`/`requestId`，按身份和参数指纹的一次性 response rule 仍是后续改进，不作为现有 D/F 完成证据。
 
 ## 推进顺序
 
-1. 先完成 A，收紧剩余测试专用 current Turn 边界并记录不可迁移的底层 canonical fixture。
-2. 再完成 B，逐项处理明确失效的 legacy/兼容语义，不触碰真实迁移和恢复职责。
-3. 依次补齐 C、D、E，所有矩阵都必须包含真实副作用或明确的拒绝证据。
-4. 完成 F 的五类 × 20 轮同轮关联，随后再处理 G 的 before/after 对比。
+1. 完成 A、B：收紧测试专用 current Turn 边界，逐项绑定可保留 fixture，并清理能够证明不可达的旧注释或分支。
+2. 完成 C：冻结权限 case fixture 和统一行级 schema，先把已有 runtime/API artifact 转换为可重算矩阵，再补缺失的真实外部副作用和生命周期组合。
+3. 完成 D、F：建立 Provider trajectory ledger，按 `query_source` 分离主 Turn/sidecar，统一 raw tool-call-only、可见 delta、EventBus、canonical 和 Renderer 的同轮关联。
+4. 完成 E：补齐 Electron 的失败/过期/Git/reconnect/history/restart 组合，并验证宿主关闭时“停止接纳 → 取消 → 等待 settlement”的顺序。
+5. 完成 G：取得同一 fixture 和 derive 口径下的旧版 before 数据，再与当前 after 数据做可审计比较；在此之前保持未完成。
 
 ## A 工作包首轮审计
 
@@ -145,7 +159,8 @@
 | 2026-09-21 | C | Git `git_branch_switch` 七行与后台 process 四行 API 审批结果合并为统一 JSON artifact，保留代表格和缺口声明 | `/tmp/magi-api-permission-matrix.json`：11 行，覆盖 `git_branch_switch` 的 allow/deny/cancel/expiry/duplicate/cross-turn/cross-session 与 `shell_exec(background=true)` 的 allow/deny/cancel/expiry；生成由 `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：62 passed、1 ignored 触发 |
 | 2026-09-21 | A/C/D/E | 在当前 Web/Desktop 工作区重新打包并运行最新 Electron DOM 回归，确认打包产物仍能完成个人/工作区 Chat、Task/Goal/子代理、审批允许/拒绝/取消、daemon restart、history/reload 和 cancel 场景；日志中的 Desktop IPC schema 与辅助模型提示仍属于其他 Agent 修改的已知边界 | `npm run desktop:package -- --dir`；`MAGI_ELECTRON_DOM_CDP_PORT=10301 MAGI_ELECTRON_DOM_EVIDENCE_PATH=/tmp/magi-electron-dom-regression-10301.json npm run test:electron-conversation-dom`：`status=passed`、76 checks、39 次 Provider 请求；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：685 passed、1 ignored；`magi-api turn_harness`：63 passed、1 ignored；`magi-tool-runtime`：230 passed、1 ignored |
 | 2026-09-21 | C/D | 将 Git API 审批代表格扩展到 `git_branch_create` 和 `git_branch_delete` 的 allow once/deny，并将后台 `shell_exec` 扩展到 duplicate pending：验证 Restricted 下真实 Git/进程副作用、拒绝或重复提交后的状态保持、审批事件、Provider 请求次数及 canonical Turn/Task 终态，并把五行写入统一权限 artifact | `cargo fmt --all -- --check`；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_create_ -- --test-threads=1`：2 passed；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_delete_ -- --test-threads=1`：2 passed；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_background_shell_duplicate_replays_pending_approval -- --test-threads=1`：1 passed；随后完整 `turn_harness`：68 passed、1 ignored；`/tmp/magi-api-permission-matrix.json`：16 行，包含 `git_branch_create`、`git_branch_delete`、`git_branch_switch` 和 `shell_exec` |
-| 2026-09-21 | A/C/D/E/F/G | 复核 ZCode dynamic-workflow harness、生命周期、协议和 prompt-trajectory，实现级结论写入主方案 18.1：吸收单一 settlement owner、关闭闸门、typed envelope、fixture/ledger/derive 与 fail-closed boundary，明确不复制 VM 沙箱或手写双协议 | 外部复核固定到 ZCode `872ad960de7ec172591f7e1952f7849229f94521`；主方案与进度文档保存源码链接、Magi 映射、采用项和排除项；该记录不改变各工作包未完成状态 |
+| 2026-09-21 | A/C/D/E/F/G | 复核 ZCode dynamic-workflow harness、生命周期、协议和 prompt-trajectory，实现级结论写入本进度文档和性能计划：吸收单一 settlement owner、关闭闸门、typed envelope、fixture/ledger/derive 与 fail-closed boundary，明确不复制 VM 沙箱或手写双协议 | 外部复核固定到 ZCode `872ad960de7ec172591f7e1952f7849229f94521`；本进度文档和性能计划保存源码链接、Magi 映射、采用项和排除项；该记录不改变各工作包未完成状态 |
+| 2026-09-21 | A/C/D/E/F/G | 将 ZCode 复核转为当前目标的新增硬约束：单一 settlement owner、关闭闸门、版本化 Provider trajectory、统一 envelope、fail-closed 恢复和可重算性能证据，并重排后续 C→D/F→E→G 验收顺序 | 目标更新写入本文“目标更新”与“推进顺序”；未新增代码或完成证据，C/D/E/F/G 仍保持未关闭 |
 
 ## B 工作包首轮审计
 
