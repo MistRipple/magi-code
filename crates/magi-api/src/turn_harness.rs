@@ -681,6 +681,19 @@ impl HarnessModelClient {
                         provider_context: Vec::new(),
                     });
                 }
+                if !request.prompt.contains("Session Turn 编排分类器")
+                    && request.tools.as_ref().is_none_or(|tools| {
+                        !tools.iter().any(|tool| tool.function.name == tool_name)
+                    })
+                {
+                    return Err(BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::Protocol,
+                        code: None,
+                        message: format!(
+                            "harness provider contract mismatch: expected tool {tool_name} was not exposed"
+                        ),
+                    });
+                }
                 let mut cumulative = String::new();
                 for chunk in response
                     .chars()
@@ -2568,6 +2581,34 @@ mod tests {
             timing.provider_first_raw_delta_ms <= timing.provider_first_delta_ms,
             "raw tool-call 首 delta 应先于可见正文首 delta"
         );
+    }
+
+    #[test]
+    fn harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed() {
+        let provider = HarnessModelClient::new("不会到达最终答复");
+        provider.set_tool_then_completed("missing_harness_tool", "{}", "不会到达最终答复");
+
+        let error = provider
+            .invoke(ModelInvocationRequest {
+                provider: "harness".to_string(),
+                prompt: "执行一个工具任务".to_string(),
+                messages: None,
+                tools: Some(Vec::new()),
+                tool_choice: None,
+            })
+            .expect_err("工具契约不匹配时必须立即失败");
+
+        match error {
+            BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Protocol,
+                message,
+                ..
+            } => {
+                assert!(message.contains("missing_harness_tool"));
+                assert!(message.contains("not exposed"));
+            }
+            other => panic!("unexpected harness contract error: {other:?}"),
+        }
     }
 
     #[tokio::test]
