@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`904a3ce4`（Git 审批矩阵 artifact 代码基线）
+代码基线：`5fa1176c`（后台进程审批矩阵 artifact 代码基线）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -22,7 +22,7 @@
 
 ## 已有直接证据
 
-- Rust workspace：`cargo test --workspace --all-targets --quiet -- --test-threads=1`，680 passed、1 ignored；本轮包含 Browser Host 协议、process 生命周期矩阵、daemon Task Turn 重启回放、Git mutation 审批生命周期、跨 Turn/Session 审批测试和终态判定收敛。
+- Rust workspace：`cargo test --workspace --all-targets --quiet -- --test-threads=1`，681 passed、1 ignored；本轮包含 Browser Host 协议、process 生命周期矩阵、daemon Task Turn 重启回放、Git mutation 审批生命周期、后台进程审批、跨 Turn/Session 审批测试和终态判定收敛。
 - Web/npm：protocol check、Svelte check/build、npm golden 已通过。
 - Electron 单轮回归：`/tmp/magi-electron-dom-regression-10027.json`，55 项检查通过；此前 `/tmp/magi-electron-dom-regression-9983.json` 同样通过。
 - 在最新 Web/Desktop 工作区状态重新打包并运行 Electron DOM 回归：`/tmp/magi-electron-dom-regression-10030.json`，`status=passed`、55 项检查通过、15 次 Provider 请求、5 条 Renderer timing sample；脚本自有 Electron/daemon 已清理。日志仍出现其他 Agent Desktop 修改产生的 `desktop_ipc_invalid:/channel` 和辅助模型未配置提示，不能把该结果扩大为完整 Desktop IPC 验收。
@@ -121,6 +121,7 @@
 | 2026-09-21 | C/D | 为 API Turn Harness 注入与 daemon 相同的结构化 Git runtime，补齐 Restricted `git_branch_switch` 的 allow once、deny、cancel、expiry、duplicate pending、allow_for_turn 跨 Turn 和跨 Session 七条真实审批生命周期；allow once 切换真实 branch，其他路径保持 branch 不变并收口 canonical Turn/Task | `cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_switch_ -- --test-threads=1`：7 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：58 passed、1 ignored |
 | 2026-09-21 | C/D | 将 `git_branch_switch` 七条 API 审批生命周期的真实分支副作用、审批事实、Provider 请求次数和 Turn/Task 终态写入结构化 artifact；其它 Git mutation 仍保持未登记 | `/tmp/magi-api-git-approval-matrix.json`：7 行；`cargo fmt --all -- --check`；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_switch_ -- --test-threads=1`：7 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：58 passed、1 ignored |
 | 2026-09-21 | C/D | 增加 Restricted `shell_exec(background=true)` 的真实后台进程审批允许验收，验证工作区文件副作用、审批事件、Provider 请求次数和 canonical Turn/Task 终态，并写入单行 process artifact；拒绝、取消、过期和跨作用域仍未覆盖 | `/tmp/magi-api-process-approval-matrix.json`：1 行；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_background_shell_approval_runs_real_process_once -- --test-threads=1`：1 passed；`cargo fmt --all -- --check` |
+| 2026-09-21 | A/C/D | 后台进程审批测试加入后重新执行 workspace 全量 Rust 验收，确认新增真实进程审批路径未改变其它 crate 行为 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：681 passed、1 ignored；`magi-api turn_harness`：59 passed、1 ignored；`magi-conversation-runtime`：534 passed；`magi-daemon`：129 passed；`magi-tool-runtime`：229 passed、1 ignored |
 
 ## B 工作包首轮审计
 
