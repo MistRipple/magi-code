@@ -681,16 +681,21 @@ impl HarnessModelClient {
                         provider_context: Vec::new(),
                     });
                 }
+                let expected_tool_missing = request
+                    .tools
+                    .as_ref()
+                    .is_none_or(|tools| !tools.iter().any(|tool| tool.function.name == tool_name));
+                let tool_choice_conflict = request.tool_choice.as_ref().is_some_and(|choice| {
+                    choice.kind == "function" && choice.function.name != tool_name
+                });
                 if !request.prompt.contains("Session Turn 编排分类器")
-                    && request.tools.as_ref().is_none_or(|tools| {
-                        !tools.iter().any(|tool| tool.function.name == tool_name)
-                    })
+                    && (expected_tool_missing || tool_choice_conflict)
                 {
                     return Err(BridgeClientError::CallFailed {
                         layer: BridgeErrorLayer::Protocol,
-                        code: None,
+                        code: Some(-32_004),
                         message: format!(
-                            "harness provider contract mismatch: expected tool {tool_name} was not exposed"
+                            "harness provider contract mismatch: expected tool {tool_name} was not exposed or selected"
                         ),
                     });
                 }
@@ -2601,11 +2606,12 @@ mod tests {
         match error {
             BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Protocol,
+                code: Some(-32_004),
                 message,
                 ..
             } => {
                 assert!(message.contains("missing_harness_tool"));
-                assert!(message.contains("not exposed"));
+                assert!(message.contains("not exposed or selected"));
             }
             other => panic!("unexpected harness contract error: {other:?}"),
         }
