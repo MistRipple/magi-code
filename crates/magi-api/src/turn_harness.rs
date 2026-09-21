@@ -3347,6 +3347,46 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn record_git_approval_matrix_row(
+        case_name: &str,
+        lifecycle: &str,
+        branch_before: &str,
+        branch_after: &str,
+        approval_requested: bool,
+        approval_resolved: bool,
+        provider_requests: usize,
+        turn_status: &str,
+        task_status: &str,
+        side_effect: &str,
+    ) {
+        static ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+        let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
+        let mut rows = rows.lock().expect("Git matrix rows lock should hold");
+        rows.retain(|row| row["case"] != case_name);
+        rows.push(serde_json::json!({
+            "case": case_name,
+            "tool": "git_branch_switch",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": lifecycle,
+            "branch_before": branch_before,
+            "branch_after": branch_after,
+            "approval_requested": approval_requested,
+            "approval_resolved": approval_resolved,
+            "provider_requests": provider_requests,
+            "turn_status": turn_status,
+            "task_status": task_status,
+            "side_effect": side_effect,
+        }));
+        rows.sort_by(|left, right| left["case"].as_str().cmp(&right["case"].as_str()));
+        let path = PathBuf::from("/tmp/magi-api-git-approval-matrix.json");
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&*rows).expect("Git matrix rows should serialize"),
+        )
+        .expect("Git matrix evidence should write");
+    }
+
     #[tokio::test]
     async fn restricted_profile_git_branch_switch_allow_once_changes_real_branch() {
         let (harness, workspace_id, workspace_root, session_id) =
@@ -3428,6 +3468,19 @@ mod tests {
                         && tool.error.is_none()
                 })
         }));
+
+        record_git_approval_matrix_row(
+            "allow_once",
+            "allow_once",
+            "main",
+            &current_git_branch(&workspace_root),
+            true,
+            true,
+            non_classifier_provider_request_count(&harness),
+            "completed",
+            "completed",
+            "branch_switched",
+        );
 
         let _ = fs::remove_dir_all(workspace_root);
     }
@@ -3519,6 +3572,18 @@ mod tests {
                 .filter(|event| event.event_type == "tool.approval.resolved")
                 .count(),
             1
+        );
+        record_git_approval_matrix_row(
+            "duplicate",
+            "duplicate_pending",
+            "main",
+            &current_git_branch(&workspace_root),
+            true,
+            true,
+            non_classifier_provider_request_count(&harness),
+            "completed",
+            "completed",
+            "branch_switched_once",
         );
         let _ = fs::remove_dir_all(workspace_root);
     }
@@ -3612,6 +3677,18 @@ mod tests {
         );
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
         assert_eq!(non_classifier_provider_request_count(&harness), 3);
+        record_git_approval_matrix_row(
+            "cross_turn",
+            "allow_for_turn_cross_turn",
+            "main",
+            &current_git_branch(&workspace_root),
+            true,
+            true,
+            non_classifier_provider_request_count(&harness),
+            "completed_then_failed",
+            "completed_then_failed",
+            "branch_switched_then_unchanged",
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -3713,6 +3790,18 @@ mod tests {
             CanonicalTurnStatus::Failed
         );
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
+        record_git_approval_matrix_row(
+            "cross_session",
+            "allow_for_turn_cross_session",
+            "main",
+            &current_git_branch(&workspace_root),
+            true,
+            true,
+            non_classifier_provider_request_count(&harness),
+            "completed_then_failed",
+            "completed_then_failed",
+            "branch_switched_then_unchanged",
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -3796,6 +3885,18 @@ mod tests {
                 .count(),
             1
         );
+        record_git_approval_matrix_row(
+            "deny",
+            "deny",
+            "main",
+            &current_git_branch(&workspace_root),
+            true,
+            true,
+            non_classifier_provider_request_count(&harness),
+            "failed",
+            "failed",
+            "branch_unchanged",
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -3860,6 +3961,18 @@ mod tests {
             "取消未作出审批决定时不得发布 resolved 事件"
         );
         assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        record_git_approval_matrix_row(
+            "cancel",
+            "cancel",
+            "main",
+            &current_git_branch(&workspace_root),
+            true,
+            false,
+            non_classifier_provider_request_count(&harness),
+            "cancelled",
+            "failed_or_killed",
+            "branch_unchanged",
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -3926,6 +4039,18 @@ mod tests {
             0
         );
         assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        record_git_approval_matrix_row(
+            "expiry",
+            "expiry",
+            "main",
+            &current_git_branch(&workspace_root),
+            true,
+            false,
+            non_classifier_provider_request_count(&harness),
+            "failed",
+            "failed",
+            "branch_unchanged",
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
