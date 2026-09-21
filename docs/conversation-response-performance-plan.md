@@ -525,7 +525,7 @@ M0 真实基线可观测
 ## 9. 首批开发检查表
 
 - [x] 完成阶段 0 timing schema 和统一 trace 设计。
-- [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
+- [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 raw delta、首可见 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
 - [x] 完成真实 Provider/daemon 五类场景各 20 轮的后端 P50/P95 基线；统一汇总见 9.4，直接证据为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`。
 - [ ] 完成真实 Provider 五类场景各 20 轮的端到端 P50/P95 基线。
   - Electron Renderer 五类场景各 20 轮已完成，原始证据为 `/tmp/magi-electron-dom-timing-personal-20-10020.json`、`/tmp/magi-electron-dom-timing-workspace-chat-20-10021.json`、`/tmp/magi-electron-dom-timing-workspace-tool-20-10022.json`、`/tmp/magi-electron-dom-timing-goal-20-10025.json`、`/tmp/magi-electron-dom-timing-subagent-20-10026.json`，聚合统计为 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`。
@@ -568,15 +568,16 @@ M0 真实基线可观测
 cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scenario_p50_p95_baseline -- --ignored --test-threads=1 --nocapture
 ```
 
-本轮结果（单位：ms，格式为 accepted / 首 delta / 首 EventBus 事件 / Turn 终态）：
+本轮结果（单位：ms，格式为 accepted / 首 raw delta / 首可见 delta / 首 EventBus 事件 / Turn 终态）见
+`/tmp/magi-local-mock-baseline-raw-20260921.log`：
 
 | 场景 | P50 | P95 | 最大值 |
 |---|---:|---:|---:|
-| 新建个人普通会话 | 0 / 1 / 13 / 13 | 0 / 3 / 14 / 14 | 4 / 7 / 17 / 17 |
-| 已有个人长历史 | 1 / 2 / 14 / 15 | 2 / 4 / 16 / 17 | 2 / 4 / 17 / 18 |
-| 工作区纯聊天 | 0 / 1 / 13 / 13 | 0 / 1 / 13 / 13 | 0 / 1 / 13 / 13 |
-| 工作区工具调用 | 1 / 72 / 124 / 124 | 1 / 77 / 133 / 133 | 1 / 88 / 132 / 134 |
-| 主代理与子代理并发 | 1 / 111 / 127 / 127 | 1 / 112 / 130 / 130 | 1 / 112 / 137 / 137 |
+| 新建个人普通会话 | 8 / 8 / 8 / 20 / 20 | 9 / 9 / 9 / 28 / 28 | 36 / 48 / 48 / 49 / 62 |
+| 已有个人长历史 | 10 / 12 / 12 / 24 / 25 | 11 / 14 / 14 / 27 / 28 | 12 / 15 / 15 / 28 / 29 |
+| 工作区纯聊天 | 7 / 8 / 8 / 19 / 19 | 10 / 10 / 10 / 21 / 21 | 10 / 11 / 11 / 22 / 22 |
+| 工作区工具调用 | 1 / 54 / 82 / 128 / 131 | 1 / 59 / 87 / 136 / 138 | 5 / 128 / 157 / 202 / 203 |
+| 主代理与子代理并发 | 1 / 15 / 120 / 140 / 141 | 1 / 18 / 122 / 151 / 151 | 1 / 28 / 128 / 155 / 156 |
 
 该基线只证明本地 mock 的采样链路和指标计算可复现，不代表真实 Provider、前端 DOM 绘制或性能前后对比已完成。
 
