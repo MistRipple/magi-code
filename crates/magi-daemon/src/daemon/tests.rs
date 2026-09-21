@@ -3282,6 +3282,134 @@ async fn daemon_http_server_restart_replays_task_turn_without_duplicate_acceptan
 }
 
 #[tokio::test]
+async fn daemon_http_server_restart_replays_conversation_turn_without_task_or_duplicate_acceptance()
+{
+    let state_root = temp_state_root("e2e-http-daemon-conversation-restart");
+    let config = DaemonConfig::new(
+        "127.0.0.1",
+        0,
+        "daemon-http-conversation-restart-test",
+        state_root,
+    );
+    let client = reqwest::Client::new();
+    let request = json!({
+        "scope": "personal",
+        "text": "普通对话在 HTTP daemon 实例重启后回放同一 Turn",
+        "images": [],
+        "requestId": "request-http-daemon-conversation-restart",
+        "userMessageId": "user-http-daemon-conversation-restart",
+    });
+
+    let first_daemon = Daemon::new(config.clone());
+    let first = first_daemon
+        .start()
+        .await
+        .expect("first conversation daemon HTTP instance should start");
+    let first_base = format!("http://{}", first.bound_addr());
+    let first_response = client
+        .post(format!("{first_base}/api/session/turn"))
+        .json(&request)
+        .send()
+        .await
+        .expect("conversation request should reach first daemon");
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first_body: Value = first_response
+        .json()
+        .await
+        .expect("first conversation response should be JSON");
+    assert_eq!(first_body["executionProfile"], "conversation");
+    assert!(first_body["rootTaskId"].is_null());
+    let session_id = first_body["sessionId"]
+        .as_str()
+        .expect("conversation response should include session id")
+        .to_string();
+    let turn_id = first_body["canonicalTurn"]["turnId"]
+        .as_str()
+        .expect("conversation response should include canonical turn id")
+        .to_string();
+
+    first
+        .shutdown("HTTP daemon conversation instance restart probe")
+        .expect("first conversation daemon should accept shutdown");
+    first
+        .wait()
+        .await
+        .expect("first conversation daemon should shut down cleanly");
+
+    let second_daemon = Daemon::new(config);
+    let second = second_daemon
+        .start()
+        .await
+        .expect("second conversation daemon should start from the same state root");
+    let second_base = format!("http://{}", second.bound_addr());
+    let bootstrap_response = client
+        .get(format!(
+            "{second_base}/bootstrap?scope=personal&sessionId={session_id}"
+        ))
+        .send()
+        .await
+        .expect("conversation bootstrap should reach restarted daemon");
+    assert_eq!(bootstrap_response.status(), reqwest::StatusCode::OK);
+    let bootstrap: Value = bootstrap_response
+        .json()
+        .await
+        .expect("restarted conversation bootstrap should be JSON");
+    assert_eq!(bootstrap["currentSession"]["sessionId"], session_id);
+    assert!(
+        bootstrap["timeline"]
+            .as_array()
+            .expect("restarted conversation timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "普通对话在 HTTP daemon 实例重启后回放同一 Turn"),
+        "restarted daemon must replay the accepted conversation user message"
+    );
+
+    let replay_response = client
+        .post(format!("{second_base}/api/session/turn"))
+        .json(&request)
+        .send()
+        .await
+        .expect("duplicate conversation request should reach restarted daemon");
+    assert_eq!(replay_response.status(), reqwest::StatusCode::OK);
+    let replay: Value = replay_response
+        .json()
+        .await
+        .expect("replayed conversation response should be JSON");
+    assert_eq!(replay["sessionId"], session_id);
+    assert_eq!(replay["canonicalTurn"]["turnId"], turn_id);
+    assert!(replay["rootTaskId"].is_null());
+    assert_eq!(replay["executionProfile"], "conversation");
+
+    let messages_response = client
+        .get(format!(
+            "{second_base}/api/messages?scope=personal&sessionId={session_id}"
+        ))
+        .send()
+        .await
+        .expect("conversation messages should reach restarted daemon");
+    assert_eq!(messages_response.status(), reqwest::StatusCode::OK);
+    let messages: Value = messages_response
+        .json()
+        .await
+        .expect("restarted conversation messages response should be JSON");
+    let user_messages = messages["timeline"]
+        .as_array()
+        .expect("restarted conversation messages timeline should be an array")
+        .iter()
+        .filter(|entry| entry["message"] == "普通对话在 HTTP daemon 实例重启后回放同一 Turn")
+        .count();
+    assert_eq!(user_messages, 1);
+
+    second
+        .shutdown("HTTP daemon conversation instance restart probe complete")
+        .expect("second conversation daemon should accept shutdown");
+    second
+        .wait()
+        .await
+        .expect("second conversation daemon should shut down cleanly");
+}
+
+#[tokio::test]
 async fn workspace_sessions_and_events_stay_workspace_scoped() {
     let state_root = temp_state_root("e2e-workspace-session-isolation");
     let second_workspace_root = temp_state_root("e2e-workspace-session-isolation-second");
