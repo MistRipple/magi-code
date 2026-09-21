@@ -55,6 +55,7 @@ struct HarnessTimingState {
     submit_started_at: Option<Instant>,
     accepted_returned_at: Option<Instant>,
     provider_request_started_at: Option<Instant>,
+    provider_first_raw_delta_at: Option<Instant>,
     provider_first_delta_at: Option<Instant>,
     first_stream_event_at: Option<Instant>,
     first_stream_event_sequence: Option<u64>,
@@ -65,6 +66,7 @@ struct HarnessTimingState {
 pub struct HarnessTimingSnapshot {
     pub accepted_returned_ms: Option<u128>,
     pub provider_request_started_ms: Option<u128>,
+    pub provider_first_raw_delta_ms: Option<u128>,
     pub provider_first_delta_ms: Option<u128>,
     pub first_stream_event_ms: Option<u128>,
     pub first_stream_event_sequence: Option<u64>,
@@ -95,6 +97,13 @@ impl HarnessTiming {
         let mut state = self.state.lock().expect("harness timing state should hold");
         if state.provider_request_started_at.is_none() {
             state.provider_request_started_at = Some(Instant::now());
+        }
+    }
+
+    fn mark_provider_first_raw_delta(&self) {
+        let mut state = self.state.lock().expect("harness timing state should hold");
+        if state.provider_first_raw_delta_at.is_none() {
+            state.provider_first_raw_delta_at = Some(Instant::now());
         }
     }
 
@@ -129,6 +138,7 @@ impl HarnessTiming {
         HarnessTimingSnapshot {
             accepted_returned_ms: elapsed(state.accepted_returned_at),
             provider_request_started_ms: elapsed(state.provider_request_started_at),
+            provider_first_raw_delta_ms: elapsed(state.provider_first_raw_delta_at),
             provider_first_delta_ms: elapsed(state.provider_first_delta_at),
             first_stream_event_ms: elapsed(state.first_stream_event_at),
             first_stream_event_sequence: state.first_stream_event_sequence,
@@ -340,8 +350,16 @@ impl HarnessModelClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         track_timing: bool,
     ) {
-        if track_timing && (!delta.content.is_empty() || !delta.thinking.is_empty()) {
-            self.timing.mark_provider_first_delta();
+        if track_timing {
+            if !delta.content.is_empty()
+                || !delta.thinking.is_empty()
+                || !delta.tool_calls.is_empty()
+            {
+                self.timing.mark_provider_first_raw_delta();
+            }
+            if !delta.content.is_empty() || !delta.thinking.is_empty() {
+                self.timing.mark_provider_first_delta();
+            }
         }
         self.state
             .lock()
@@ -502,30 +520,40 @@ impl HarnessModelClient {
                 };
                 if can_emit_agent_spawn {
                     let child_index = spawn_count + 1;
+                    let tool_call = ChatToolCall {
+                        id: format!("harness-agent-spawn-call-{child_index}"),
+                        kind: "function".to_string(),
+                        function: magi_bridge_client::ChatToolFunction {
+                            name: "agent_spawn".to_string(),
+                            arguments: serde_json::json!({
+                                "task_name": format!("harness_child_{child_index}"),
+                                "display_name": format!("{display_name}{child_index}"),
+                                "role": role,
+                                "goal": "完成 harness 子任务并返回明确结果",
+                                "context_package": {
+                                    "summary": "harness 子代理上下文",
+                                    "constraints": ["只验证子代理链路"],
+                                    "expected_output": "子代理完成",
+                                    "references": []
+                                }
+                            })
+                            .to_string(),
+                        },
+                    };
+                    self.record_delta(
+                        &ModelStreamingDelta {
+                            content: String::new(),
+                            thinking: String::new(),
+                            tool_calls: vec![tool_call.clone()],
+                        },
+                        on_delta,
+                        track_timing,
+                    );
                     return Ok(ModelResponse {
                         status: ModelResponseStatus::RequiresToolExecution,
                         content: None,
                         thinking: None,
-                        tool_calls: vec![ChatToolCall {
-                            id: format!("harness-agent-spawn-call-{child_index}"),
-                            kind: "function".to_string(),
-                            function: magi_bridge_client::ChatToolFunction {
-                                name: "agent_spawn".to_string(),
-                                arguments: serde_json::json!({
-                                    "task_name": format!("harness_child_{child_index}"),
-                                    "display_name": format!("{display_name}{child_index}"),
-                                    "role": role,
-                                    "goal": "完成 harness 子任务并返回明确结果",
-                                    "context_package": {
-                                        "summary": "harness 子代理上下文",
-                                        "constraints": ["只验证子代理链路"],
-                                        "expected_output": "子代理完成",
-                                        "references": []
-                                    }
-                                })
-                                .to_string(),
-                            },
-                        }],
+                        tool_calls: vec![tool_call],
                         usage: None,
                         finish_reason: Some("tool_calls".to_string()),
                         provider_context: Vec::new(),
@@ -547,22 +575,32 @@ impl HarnessModelClient {
                         })
                         .collect::<Vec<_>>();
                     if child_task_ids.len() >= child_count {
+                        let tool_call = ChatToolCall {
+                            id: "harness-agent-wait-call".to_string(),
+                            kind: "function".to_string(),
+                            function: magi_bridge_client::ChatToolFunction {
+                                name: "agent_wait".to_string(),
+                                arguments: serde_json::json!({
+                                    "task_ids": child_task_ids,
+                                    "timeout_ms": 60_000
+                                })
+                                .to_string(),
+                            },
+                        };
+                        self.record_delta(
+                            &ModelStreamingDelta {
+                                content: String::new(),
+                                thinking: String::new(),
+                                tool_calls: vec![tool_call.clone()],
+                            },
+                            on_delta,
+                            track_timing,
+                        );
                         return Ok(ModelResponse {
                             status: ModelResponseStatus::RequiresToolExecution,
                             content: None,
                             thinking: None,
-                            tool_calls: vec![ChatToolCall {
-                                id: "harness-agent-wait-call".to_string(),
-                                kind: "function".to_string(),
-                                function: magi_bridge_client::ChatToolFunction {
-                                    name: "agent_wait".to_string(),
-                                    arguments: serde_json::json!({
-                                        "task_ids": child_task_ids,
-                                        "timeout_ms": 60_000
-                                    })
-                                    .to_string(),
-                                },
-                            }],
+                            tool_calls: vec![tool_call],
                             usage: None,
                             finish_reason: Some("tool_calls".to_string()),
                             provider_context: Vec::new(),
@@ -616,18 +654,28 @@ impl HarnessModelClient {
                     }
                 };
                 if let Some(tool_round_index) = tool_round_index {
+                    let tool_call = ChatToolCall {
+                        id: format!("harness-tool-call-{tool_round_index}"),
+                        kind: "function".to_string(),
+                        function: magi_bridge_client::ChatToolFunction {
+                            name: tool_name,
+                            arguments,
+                        },
+                    };
+                    self.record_delta(
+                        &ModelStreamingDelta {
+                            content: String::new(),
+                            thinking: String::new(),
+                            tool_calls: vec![tool_call.clone()],
+                        },
+                        on_delta,
+                        track_timing,
+                    );
                     return Ok(ModelResponse {
                         status: ModelResponseStatus::RequiresToolExecution,
                         content: None,
                         thinking: None,
-                        tool_calls: vec![ChatToolCall {
-                            id: format!("harness-tool-call-{tool_round_index}"),
-                            kind: "function".to_string(),
-                            function: magi_bridge_client::ChatToolFunction {
-                                name: tool_name,
-                                arguments,
-                            },
-                        }],
+                        tool_calls: vec![tool_call],
                         usage: None,
                         finish_reason: Some("tool_calls".to_string()),
                         provider_context: Vec::new(),
@@ -1730,6 +1778,10 @@ mod tests {
             .iter()
             .map(|timing| timing_metric(timing, |timing| timing.provider_first_delta_ms))
             .collect::<Vec<_>>();
+        let first_raw_delta = timings
+            .iter()
+            .map(|timing| timing_metric(timing, |timing| timing.provider_first_raw_delta_ms))
+            .collect::<Vec<_>>();
         let first_event = timings
             .iter()
             .map(|timing| timing_metric(timing, |timing| timing.first_stream_event_ms))
@@ -1739,7 +1791,8 @@ mod tests {
             .map(|timing| timing_metric(timing, |timing| timing.terminal_observed_ms))
             .collect::<Vec<_>>();
         assert!(timings.iter().all(|timing| {
-            timing.accepted_returned_ms <= timing.provider_first_delta_ms
+            timing.accepted_returned_ms <= timing.provider_first_raw_delta_ms
+                && timing.provider_first_raw_delta_ms <= timing.provider_first_delta_ms
                 && timing.provider_first_delta_ms <= timing.first_stream_event_ms
                 && timing.first_stream_event_ms <= timing.terminal_observed_ms
                 && timing
@@ -1747,11 +1800,14 @@ mod tests {
                     .is_some_and(|sequence| sequence > 0)
         }));
         eprintln!(
-            "LOCAL_MOCK_P95 scenario={name} samples={} accepted_ms={{p50:{},p95:{},max:{}}} first_delta_ms={{p50:{},p95:{},max:{}}} first_event_ms={{p50:{},p95:{},max:{}}} terminal_ms={{p50:{},p95:{},max:{}}}",
+            "LOCAL_MOCK_P95 scenario={name} samples={} accepted_ms={{p50:{},p95:{},max:{}}} first_raw_delta_ms={{p50:{},p95:{},max:{}}} first_delta_ms={{p50:{},p95:{},max:{}}} first_event_ms={{p50:{},p95:{},max:{}}} terminal_ms={{p50:{},p95:{},max:{}}}",
             timings.len(),
             percentile(&accepted, 50),
             percentile(&accepted, 95),
             accepted.iter().copied().max().unwrap_or_default(),
+            percentile(&first_raw_delta, 50),
+            percentile(&first_raw_delta, 95),
+            first_raw_delta.iter().copied().max().unwrap_or_default(),
             percentile(&first_delta, 50),
             percentile(&first_delta, 95),
             first_delta.iter().copied().max().unwrap_or_default(),
@@ -2024,6 +2080,7 @@ mod tests {
         let timing = harness.provider.timing();
         assert!(timing.accepted_returned_ms.is_some());
         assert!(timing.provider_request_started_ms.is_some());
+        assert!(timing.provider_first_raw_delta_ms.is_some());
         assert!(timing.provider_first_delta_ms.is_some());
         assert!(timing.first_stream_event_ms.is_some());
         assert!(
@@ -2033,6 +2090,7 @@ mod tests {
         );
         assert!(timing.terminal_observed_ms.is_some());
         assert!(timing.provider_request_started_ms <= timing.provider_first_delta_ms);
+        assert!(timing.provider_first_raw_delta_ms <= timing.provider_first_delta_ms);
         assert!(timing.provider_first_delta_ms <= timing.first_stream_event_ms);
         assert!(timing.first_stream_event_ms <= timing.terminal_observed_ms);
     }
@@ -2492,6 +2550,24 @@ mod tests {
                 })
             })
         }));
+        assert!(
+            harness.provider.deltas().iter().any(|delta| {
+                !delta.tool_calls.is_empty()
+                    && delta.content.is_empty()
+                    && delta.thinking.is_empty()
+            }),
+            "工具调用轮必须保留没有可见正文的 raw tool-call delta"
+        );
+        let timing = harness.provider.timing();
+        assert!(
+            timing.provider_first_raw_delta_ms.is_some(),
+            "工具调用轮必须记录 raw tool-call 首 delta"
+        );
+        assert!(timing.provider_first_delta_ms.is_some());
+        assert!(
+            timing.provider_first_raw_delta_ms <= timing.provider_first_delta_ms,
+            "raw tool-call 首 delta 应先于可见正文首 delta"
+        );
     }
 
     #[tokio::test]

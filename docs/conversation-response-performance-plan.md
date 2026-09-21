@@ -187,6 +187,11 @@ accepted -> preparing -> running -> streaming -> completed
 事件、canonical 终态和 Renderer 四阶段；统计证据见第 9.5 节。该证据确认埋点和事件边界，
 但仍不能替代历史后端基线的统一合并，也不能作为性能目标已达标或 before/after 对比完成的结论。
 
+本地 Provider 替身的工具调用响应也遵循同一 raw delta 合同：返回 `RequiresToolExecution` 时先通过
+`ModelStreamingDelta.tool_calls` 发出没有可见正文的快照，`HarnessTimingSnapshot` 独立记录
+`provider_first_raw_delta_ms`，随后才记录可见正文首 delta。这样本地基准不会把工具调用首 chunk
+误算成可见文本首帧；它只验证埋点语义，不替代真实 Provider 或 Electron 证据。
+
 最终关联证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：五类场景各 20 轮、
 100 条唯一 `turn_id`、903 项检查和 280 次 Provider 请求，每条都具备五个后端阶段与四个
 Renderer 阶段。重新打包当前 Web/Desktop 工作区后的复验为
