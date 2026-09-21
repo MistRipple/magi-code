@@ -162,6 +162,7 @@
 | 2026-09-21 | A/C/D/E/F/G | 复核 ZCode dynamic-workflow harness、生命周期、协议和 prompt-trajectory，实现级结论写入本进度文档和性能计划：吸收单一 settlement owner、关闭闸门、typed envelope、fixture/ledger/derive 与 fail-closed boundary，明确不复制 VM 沙箱或手写双协议 | 外部复核固定到 ZCode `872ad960de7ec172591f7e1952f7849229f94521`；本进度文档和性能计划保存源码链接、Magi 映射、采用项和排除项；该记录不改变各工作包未完成状态 |
 | 2026-09-21 | A/C/D/E/F/G | 将 ZCode 复核转为当前目标的新增硬约束：单一 settlement owner、关闭闸门、版本化 Provider trajectory、统一 envelope、fail-closed 恢复和可重算性能证据，并重排后续 C→D/F→E→G 验收顺序 | 目标更新写入本文“目标更新”与“推进顺序”；未新增代码或完成证据，C/D/E/F/G 仍保持未关闭 |
 | 2026-09-21 | A/B | 按当前源码复验底层 canonical fixture、历史身份拒绝和传输恢复边界；未发现生产 current Turn 绕过或可删除的兼容双轨 | `cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed；`cargo test -p magi-bridge-client --lib http_model_client::tests::streaming_retries_before_first_delta_only -- --test-threads=1`：1 passed；`cargo test -p magi-bridge-client --lib http_model_client::tests::streaming_does_not_retry_after_visible_delta -- --test-threads=1`：1 passed；`cargo test -p magi-conversation-runtime --lib turn_contract::tests::legacy_canonical_turn_without_request_identity_is_not_replayable -- --test-threads=1`：1 passed；A/B 仍未关闭，主方案 17.3/17.7 勾选和不可迁移 fixture 边界仍待完成 |
+| 2026-09-21 | A/B | 在当前工作树（保留其他 Agent 未提交修改）上复验 Rust workspace 全量测试；所有现有测试通过，未改变 A/B 的未完成判断 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：690 passed、1 ignored；A/B 仍未关闭 |
 
 ## B 工作包首轮审计
 
