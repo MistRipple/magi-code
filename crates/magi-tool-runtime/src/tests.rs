@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -28,6 +28,61 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("{}-{}-{}", name, std::process::id(), suffix));
     fs::create_dir_all(&path).expect("create temp dir");
     path
+}
+
+fn record_permission_matrix_rows(new_rows: Vec<Value>) {
+    static ROWS: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
+    let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut rows = rows
+        .lock()
+        .expect("tool runtime permission matrix lock should hold");
+    for row in new_rows {
+        for field in [
+            "case",
+            "surface",
+            "tool",
+            "access_profile",
+            "scope",
+            "lifecycle",
+            "status",
+            "executor_called",
+            "side_effect",
+        ] {
+            assert!(
+                row.get(field).is_some(),
+                "tool runtime permission row must contain {field}: {row}"
+            );
+        }
+        assert!(row.get("provider_requests").is_some());
+        assert!(row.get("approval_events").is_some());
+        let case_name = row["case"].as_str();
+        let surface = row["surface"].as_str();
+        let tool = row["tool"].as_str();
+        let access_profile = row["access_profile"].as_str();
+        rows.retain(|existing| {
+            !(existing["case"].as_str() == case_name
+                && existing["surface"].as_str() == surface
+                && existing["tool"].as_str() == tool
+                && existing["access_profile"].as_str() == access_profile)
+        });
+        rows.push(row);
+    }
+    rows.sort_by(|left, right| {
+        left["surface"]
+            .as_str()
+            .cmp(&right["surface"].as_str())
+            .then_with(|| left["tool"].as_str().cmp(&right["tool"].as_str()))
+            .then_with(|| {
+                left["access_profile"]
+                    .as_str()
+                    .cmp(&right["access_profile"].as_str())
+            })
+    });
+    fs::write(
+        "/tmp/magi-tool-runtime-permission-matrix.json",
+        serde_json::to_vec_pretty(&*rows).expect("tool runtime matrix rows should serialize"),
+    )
+    .expect("tool runtime permission matrix evidence should write");
 }
 
 #[cfg(unix)]
@@ -3528,6 +3583,7 @@ fn structured_git_access_profile_matrix_blocks_mutations_before_executor() {
         browser_execution_id: None,
         ..ToolExecutionContext::default()
     };
+    let mut rows = Vec::new();
 
     for access_profile in [
         magi_core::AccessProfile::ReadOnly,
@@ -3551,6 +3607,19 @@ fn structured_git_access_profile_matrix_blocks_mutations_before_executor() {
             ExecutionResultStatus::Succeeded,
             "Git read operation should execute under {access_profile:?}"
         );
+        rows.push(serde_json::json!({
+            "case": format!("git_status_{access_profile:?}"),
+            "surface": "git_executor",
+            "tool": "git_status",
+            "access_profile": format!("{access_profile:?}"),
+            "scope": "workspace_internal",
+            "lifecycle": "policy_decision",
+            "status": format!("{:?}", read.status),
+            "executor_called": read.status == ExecutionResultStatus::Succeeded,
+            "side_effect": "read_only",
+            "provider_requests": null,
+            "approval_events": [],
+        }));
 
         let mutation = registry.execute_with_policy(
             ToolExecutionInput::for_builtin_invocation(
@@ -3575,6 +3644,23 @@ fn structured_git_access_profile_matrix_blocks_mutations_before_executor() {
                 assert_eq!(mutation.status, ExecutionResultStatus::Succeeded)
             }
         }
+        rows.push(serde_json::json!({
+            "case": format!("git_branch_switch_{access_profile:?}"),
+            "surface": "git_executor",
+            "tool": "git_branch_switch",
+            "access_profile": format!("{access_profile:?}"),
+            "scope": "workspace_internal",
+            "lifecycle": "policy_decision",
+            "status": format!("{:?}", mutation.status),
+            "executor_called": mutation.status == ExecutionResultStatus::Succeeded,
+            "side_effect": if mutation.status == ExecutionResultStatus::Succeeded {
+                "mutation_reached_executor"
+            } else {
+                "mutation_blocked_before_executor"
+            },
+            "provider_requests": null,
+            "approval_events": [],
+        }));
     }
 
     let calls = calls.lock().expect("Git executor audit lock should hold");
@@ -3597,6 +3683,7 @@ fn structured_git_access_profile_matrix_blocks_mutations_before_executor() {
             .count(),
         1
     );
+    record_permission_matrix_rows(rows);
 }
 
 #[test]
@@ -3947,6 +4034,32 @@ fn internal_process_access_profile_matrix_records_lifecycle_side_effects() {
             .filter(|row| row["stage"] == "kill" && row["status"] == "Succeeded")
             .count(),
         1
+    );
+    record_permission_matrix_rows(
+        rows.into_iter()
+            .map(|row| {
+                let access_profile = row["access_profile"]
+                    .as_str()
+                    .expect("process matrix access profile")
+                    .to_string();
+                let stage = row["stage"].as_str().expect("process matrix stage").to_string();
+                let status = row["status"].as_str().expect("process matrix status").to_string();
+                let executor_called = status == "Succeeded";
+                serde_json::json!({
+                    "case": format!("process_{access_profile}_{stage}"),
+                    "surface": "process_executor",
+                    "tool": format!("process_{stage}"),
+                    "access_profile": access_profile,
+                    "scope": "workspace_internal",
+                    "lifecycle": stage,
+                    "status": status,
+                    "executor_called": executor_called,
+                    "side_effect": if executor_called { "process_lifecycle_executed" } else { "process_blocked_before_executor" },
+                    "provider_requests": null,
+                    "approval_events": [],
+                })
+            })
+            .collect(),
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -5499,6 +5612,33 @@ fn browser_access_profile_matrix_records_host_executor_side_effects() {
     );
     assert_eq!(rows.len(), 6, "matrix must record every profile/tool row");
     assert!(rows.iter().all(|row| row["host_executor_called"] == true));
+    record_permission_matrix_rows(
+        rows.into_iter()
+            .map(|row| {
+                let access_profile = row["access_profile"]
+                    .as_str()
+                    .expect("Browser matrix access profile")
+                    .to_string();
+                let tool = row["tool"]
+                    .as_str()
+                    .expect("Browser matrix tool")
+                    .to_string();
+                serde_json::json!({
+                    "case": format!("browser_{access_profile}_{tool}"),
+                    "surface": "browser_host",
+                    "tool": tool,
+                    "access_profile": access_profile,
+                    "scope": "host_surface",
+                    "lifecycle": "policy_decision",
+                    "status": row["status"],
+                    "executor_called": row["host_executor_called"],
+                    "side_effect": "host_command_received",
+                    "provider_requests": null,
+                    "approval_events": [],
+                })
+            })
+            .collect(),
+    );
 }
 
 #[test]
@@ -7662,6 +7802,33 @@ fn external_mcp_access_profile_matrix_records_executor_side_effects() {
             .count(),
         1,
         "read-only write must remain a hard rejection"
+    );
+    record_permission_matrix_rows(
+        rows.into_iter()
+            .map(|row| {
+                let access_profile = row["access_profile"]
+                    .as_str()
+                    .expect("MCP matrix access profile")
+                    .to_string();
+                let tool = row["tool"].as_str().expect("MCP matrix tool").to_string();
+                let executor_called = row["executor_called"]
+                    .as_bool()
+                    .expect("MCP matrix executor flag");
+                serde_json::json!({
+                    "case": format!("mcp_{access_profile}_{tool}"),
+                    "surface": "mcp_executor",
+                    "tool": tool,
+                    "access_profile": access_profile,
+                    "scope": "external",
+                    "lifecycle": "policy_decision",
+                    "status": row["status"],
+                    "executor_called": executor_called,
+                    "side_effect": if executor_called { "executor_invoked" } else { "executor_blocked" },
+                    "provider_requests": null,
+                    "approval_events": [],
+                })
+            })
+            .collect(),
     );
 }
 
