@@ -2987,6 +2987,151 @@ async fn task_turn_replays_after_daemon_restart_without_duplicate_canonical_acce
 }
 
 #[tokio::test]
+async fn conversation_turn_replays_after_daemon_restart_without_task_or_duplicate_acceptance() {
+    let state_root = temp_state_root("e2e-conversation-turn-restart-replay");
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+    let request_id = "request-conversation-turn-restart-replay";
+    let user_message_id = "user-conversation-turn-restart-replay";
+    let request = json!({
+        "scope": "personal",
+        "text": "这是一段普通对话，重启后应回放同一 Turn 且不创建任务",
+        "images": [],
+        "requestId": request_id,
+        "userMessageId": user_message_id,
+    });
+
+    let (status, body) = post_json(app.clone(), "/api/session/turn", request.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "conversation Turn should accept: {body:?}"
+    );
+    assert_eq!(body["executionProfile"], "conversation");
+    assert!(
+        body["rootTaskId"].is_null(),
+        "普通 Conversation Turn 不应创建 root task: {body:?}"
+    );
+    let session_id = body["sessionId"]
+        .as_str()
+        .expect("conversation Turn should include session id")
+        .to_string();
+    let turn_id = body["canonicalTurn"]["turnId"]
+        .as_str()
+        .expect("conversation Turn should include canonical turn id")
+        .to_string();
+    assert_eq!(
+        body["canonicalItem"]["metadata"]["requestId"], request_id,
+        "accepted conversation item must retain request identity"
+    );
+    assert_eq!(
+        state
+            .task_store()
+            .expect("task store should be configured")
+            .all_tasks()
+            .len(),
+        0,
+        "普通 Conversation Turn 接纳时不应创建 TaskStore 任务"
+    );
+
+    drop(app);
+    drop(state);
+    drop(runtime);
+
+    let restarted_runtime =
+        DaemonRuntime::restore(&config).expect("daemon restart should recover conversation state");
+    let (restarted_app, restarted_state) =
+        restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
+    let restarted_session_id = SessionId::new(session_id.clone());
+    let restarted_turn = restarted_state
+        .session_store
+        .canonical_turn_for_session_turn_id(&restarted_session_id, &turn_id)
+        .expect("restart should recover the accepted conversation Turn");
+    assert_eq!(restarted_turn.turn_id, turn_id);
+    assert!(
+        restarted_turn.items.iter().any(|item| {
+            item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage
+                && item.item_id == user_message_id
+                && item
+                    .metadata
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request_id)
+                && item
+                    .metadata
+                    .get("userMessageId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(user_message_id)
+        }),
+        "restart must recover the canonical conversation user item and request identity"
+    );
+    assert_eq!(
+        restarted_state
+            .task_store()
+            .expect("restarted task store should be configured")
+            .all_tasks()
+            .len(),
+        0,
+        "Conversation restart replay must not create a task"
+    );
+
+    let bootstrap = get_json(
+        restarted_app.clone(),
+        &format!("/bootstrap?scope=personal&sessionId={session_id}"),
+    )
+    .await;
+    assert_eq!(bootstrap["currentSession"]["sessionId"], session_id);
+    assert!(
+        bootstrap["timeline"]
+            .as_array()
+            .expect("restarted conversation bootstrap timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "这是一段普通对话，重启后应回放同一 Turn 且不创建任务"),
+        "daemon restart bootstrap should replay the conversation user message"
+    );
+
+    let messages = get_json(
+        restarted_app.clone(),
+        &format!("/api/messages?scope=personal&sessionId={session_id}"),
+    )
+    .await;
+    assert_eq!(
+        messages["timeline"]
+            .as_array()
+            .expect("restarted conversation messages timeline should be an array")
+            .iter()
+            .filter(
+                |entry| entry["message"] == "这是一段普通对话，重启后应回放同一 Turn 且不创建任务"
+            )
+            .count(),
+        1,
+        "conversation restart replay must not duplicate the user item"
+    );
+
+    let (replay_status, replay_body) = post_json(restarted_app, "/api/session/turn", request).await;
+    assert_eq!(
+        replay_status,
+        StatusCode::OK,
+        "same conversation request should replay after daemon restart: {replay_body:?}"
+    );
+    assert_eq!(replay_body["sessionId"], session_id);
+    assert_eq!(replay_body["canonicalTurn"]["turnId"], turn_id);
+    assert!(replay_body["rootTaskId"].is_null());
+    assert_eq!(
+        restarted_state
+            .session_store
+            .canonical_turns_for_session(&restarted_session_id)
+            .iter()
+            .filter(|turn| turn.turn_id == turn_id)
+            .count(),
+        1,
+        "conversation restart replay must not append a duplicate canonical Turn"
+    );
+}
+
+#[tokio::test]
 async fn daemon_http_server_restart_replays_task_turn_without_duplicate_acceptance() {
     let state_root = temp_state_root("e2e-http-daemon-instance-restart");
     let workspace_root = temp_state_root("e2e-http-daemon-instance-restart-workspace");
