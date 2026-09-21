@@ -125,8 +125,16 @@ async function requestJson(path, init = {}) {
   return body;
 }
 
-function extractStage(line, traceId) {
-  if (!line.includes(traceId)) return null;
+function lineContainsIdentity(line, { traceId, turnId }) {
+  if (traceId && line.includes(traceId)) return true;
+  if (!turnId) return false;
+  return line.includes(`turn_id=${turnId}`)
+    || line.includes(`turn_id="${turnId}"`)
+    || line.includes(`turn_id='${turnId}'`);
+}
+
+function extractStage(line, identity) {
+  if (!lineContainsIdentity(line, identity)) return null;
   const stage = line.match(/stage="?([A-Za-z0-9_]+)"?/u)?.[1];
   const elapsed = line.match(/elapsed_ms=(\d+)/u)?.[1];
   if (!stage || elapsed === undefined) return null;
@@ -393,7 +401,10 @@ async function main() {
     for (const row of rows) {
       const stages = logText
         .split("\n")
-        .map((line) => extractStage(line, row.requestId))
+        .map((line) => extractStage(line, {
+          traceId: row.requestId,
+          turnId: row.turnId,
+        }))
         .filter(Boolean);
       timingByRequest[row.requestId] = stages.reduce((result, { stage, elapsedMs }) => {
         (result[stage] ||= []).push(elapsedMs);
