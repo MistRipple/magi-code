@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`c94cd104`（同步 Provider 失败证据基线）
+代码基线：`51a0acb7`（记录真实 Provider 工具时序 smoke）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -143,6 +143,7 @@
 | 2026-09-21 | C/D | 扩展 Restricted `shell_exec(background=true)` 的真实后台进程审批验收，覆盖 allow once、deny、cancel、expiry 四行，验证工作区文件副作用、审批事件、Provider 请求次数和 canonical Turn/Task 终态 | `/tmp/magi-api-process-approval-matrix.json`：4 行；`cargo fmt --all -- --check`；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_background_shell_approval_ -- --test-threads=1`：4 passed |
 | 2026-09-21 | A/C/D/E | 后台进程审批测试和最新 Electron 打包回归加入后重新执行 workspace Rust、Web 检查/构建、npm golden 和 Electron directory package 验收 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：684 passed、1 ignored；`magi-api turn_harness`：62 passed、1 ignored；`magi-conversation-runtime`：534 passed；`magi-daemon`：129 passed；`magi-tool-runtime`：229 passed、1 ignored；`npm --prefix web run check`；`npm --prefix web run build`；`npm test`；`npm run desktop:package -- --dir`；`/tmp/magi-electron-dom-regression-10240.json`：73 checks passed |
 | 2026-09-21 | C | Git `git_branch_switch` 七行与后台 process 四行 API 审批结果合并为统一 JSON artifact，保留代表格和缺口声明 | `/tmp/magi-api-permission-matrix.json`：11 行，覆盖 `git_branch_switch` 的 allow/deny/cancel/expiry/duplicate/cross-turn/cross-session 与 `shell_exec(background=true)` 的 allow/deny/cancel/expiry；生成由 `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：62 passed、1 ignored 触发 |
+| 2026-09-21 | A/C/D/E | 在当前 Web/Desktop 工作区重新打包并运行最新 Electron DOM 回归，确认打包产物仍能完成个人/工作区 Chat、Task/Goal/子代理、审批允许/拒绝/取消、daemon restart、history/reload 和 cancel 场景；日志中的 Desktop IPC schema 与辅助模型提示仍属于其他 Agent 修改的已知边界 | `npm run desktop:package -- --dir`；`MAGI_ELECTRON_DOM_CDP_PORT=10301 MAGI_ELECTRON_DOM_EVIDENCE_PATH=/tmp/magi-electron-dom-regression-10301.json npm run test:electron-conversation-dom`：`status=passed`、76 checks、39 次 Provider 请求；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：685 passed、1 ignored；`magi-api turn_harness`：63 passed、1 ignored；`magi-tool-runtime`：230 passed、1 ignored |
 
 ## B 工作包首轮审计
 
