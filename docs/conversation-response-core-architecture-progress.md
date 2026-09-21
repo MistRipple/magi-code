@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`d88960da`（同步 Provider 契约错误码基线）
+代码基线：`15814a49`（校验统一权限矩阵行结构）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -129,6 +129,7 @@
 | 2026-09-21 | D | 通过真实 `target/debug/magi-daemon-app` 启动两个独立 OS daemon 进程，使用同一 `MAGI_STATE_ROOT` 完成 Task Turn 接纳、SIGTERM、第二进程启动、bootstrap/messages 回放和相同 requestId/fingerprint 重提交 | `/tmp/magi-daemon-independent-process-restart-20260921.json`：`status=passed`，transport=`real independent magi-daemon-app process`，首/回放 Turn 与 root task 相同，userMessageCount=1；两个自启动进程均在验收后退出 |
 | 2026-09-21 | D | 增加普通 conversation profile 的 daemon runtime 重启/replay 验收，确认重启后只恢复 canonical Turn 和历史，不创建 TaskStore 任务或重复 canonical Turn | `cargo test -p magi-daemon --lib daemon::tests::conversation_turn_replays_after_daemon_restart_without_task_or_duplicate_acceptance -- --test-threads=1`：1 passed |
 | 2026-09-21 | C/D/F | 参考 ZCode 的一次性 mock response resolver 收紧 `MagiTurnHarness`：非分类器请求缺少已配置工具时立即返回 Protocol contract failure，并新增回归，避免 action contract 不匹配时伪造最终答复或进入重复工具轮次 | `cargo test -p magi-api --lib turn_harness::tests::harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed -- --test-threads=1`：1 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：63 passed、1 ignored；`cargo test --workspace --all-targets --quiet -- --test-threads=1`：685 passed、1 ignored |
+| 2026-09-21 | C | 为统一权限 artifact 增加行级 schema 断言，要求 surface、AccessProfile、作用域、审批事实、Provider 请求数和 Turn/Task 终态齐全，并补齐 Git `git_workspace` surface；完整 `turn_harness` 运行生成 11 行统一矩阵且没有缺失 surface | `/tmp/magi-api-permission-matrix.json`：11 行，工具为 `git_branch_switch`/`shell_exec`，surface 为 `git_workspace`/`background_process`，`missing_surface=0`；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：63 passed、1 ignored |
 | 2026-09-21 | D | 将 conversation profile 重启/replay 扩展到真实 HTTP daemon 实例生命周期，验证共享 state root 下的 bootstrap/messages 回放、重复接纳幂等和无 root task | 定向测试：1 passed；随后 `cargo test -p magi-daemon --lib -- --test-threads=1`：131 passed |
 | 2026-09-21 | C | 增加 BrowserHostClient Unix WebSocket 协议验收：三种 AccessProfile 各执行 snapshot 与 navigate，验证真实 BrowserHostClient 请求经过 Desktop Host 协议、Surface 绑定、页面状态和导航命令，并记录 3 次 snapshot、3 次 navigate 的 Host 命令；Host 仍为确定性协议 double，不扩大为真实 Chromium 进程副作用 | `cargo test -p magi-api --lib browser_tool_runtime -- --test-threads=1`：14 passed；新增 `browser_access_profile_matrix_reaches_real_host_protocol_for_read_and_write` 通过 |
 | 2026-09-21 | C/D | 为 API Turn Harness 注入与 daemon 相同的结构化 Git runtime，补齐 Restricted `git_branch_switch` 的 allow once、deny、cancel、expiry、duplicate pending、allow_for_turn 跨 Turn 和跨 Session 七条真实审批生命周期；allow once 切换真实 branch，其他路径保持 branch 不变并收口 canonical Turn/Task | `cargo test -p magi-api --lib turn_harness::tests::restricted_profile_git_branch_switch_ -- --test-threads=1`：7 passed；`cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：58 passed、1 ignored |
