@@ -702,7 +702,7 @@ raw tool-call-only 的最新复验使用 `/tmp/magi-electron-dom-raw-tool-1-1023
 
 ### 9.6 Provider trajectory ledger 目标形态
 
-参考 ZCode 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 `prompt-trajectory` 分层，Magi 后续不再让真实 Provider、Electron timing 和权限矩阵各自维护无法互证的统计源。目标是先保存可追加的原始轨迹，再从同一轨迹派生性能、replay 和权限 artifact。当前已新增 `scripts/derive-magi-trajectory-ledger.mjs` 作为只读派生入口；它不会补造缺失阶段，缺少 `session_id`、`turn_id`、`request_id` 或终态 `event_sequence` 时输出 `incomplete` 并失败。当前只有最小 fixture 的脚本级验证，尚未用真实 Provider/Electron 20 轮 artifact 生成可关闭 D/F/G 的 ledger。
+参考 ZCode 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 `prompt-trajectory` 分层，Magi 后续不再让真实 Provider、Electron timing 和权限矩阵各自维护无法互证的统计源。目标是先保存可追加的原始轨迹，再从同一轨迹派生性能、replay 和权限 artifact。当前已新增 `scripts/derive-magi-trajectory-ledger.mjs` 作为只读派生入口；它不会补造缺失阶段，缺少 `session_id`、`turn_id`、`request_id` 或终态 `event_sequence` 时输出 `incomplete` 并失败。真实 Provider 四类一轮 smoke 已成功派生 22 条 ledger 记录，但尚未用五类 × 20 轮 Provider 和 Electron 同轮 artifact 生成可关闭 D/F/G 的统一 ledger。
 
 派生命令形态为：
 
@@ -714,6 +714,11 @@ node scripts/derive-magi-trajectory-ledger.mjs \
 ```
 
 输出会记录 `schema_version`、`derive_version`、输入 JSON 的 `payload_hash`、phase 计数和验证错误；只有身份、阶段序号和同轮终态约束全部满足时才输出 `status=passed`。本轮的最小 fixture 验证仅证明派生器和 fail-closed 校验语义，不能替代真实输入。
+
+真实 smoke 证据：`/tmp/magi-real-provider-ledger-smoke-20260921.json` 与
+`/tmp/magi-real-provider-ledger-smoke-20260921-ledger.json`。后者包含 4 个 accepted、4 个
+provider_request、2 个 raw delta、4 个 visible delta、4 个 EventBus 和 4 个 canonical terminal
+记录；工具和子代理样本均保留 raw tool-call-only 关联。该证据只验证真实 Provider 输入的派生链路，不能替代 20 轮矩阵或 Electron Renderer 阶段。
 
 每条原始记录至少包含以下字段：
 
