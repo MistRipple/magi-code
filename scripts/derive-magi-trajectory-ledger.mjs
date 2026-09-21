@@ -138,10 +138,13 @@ function makeRecord({
 }
 
 function stageFrom(sample, name) {
-  return sample.backendStages?.[name]?.[0]
-    || sample.backend?.stages?.[name]
-    || sample.stages?.[name]
-    || null;
+  const backendStage = sample.backendStages?.[name];
+  if (backendStage !== undefined) {
+    return Array.isArray(backendStage) ? backendStage[0] ?? null : backendStage;
+  }
+  return sample.backend?.stages?.[name]
+    ?? sample.stages?.[name]
+    ?? null;
 }
 
 function addStage(records, options) {
