@@ -259,15 +259,21 @@ async function submitTurn({ scenario, scope = "personal", workspaceId = null, wo
   };
 }
 
-function summarize(rows) {
+function summarize(rows, timingByRequest) {
   const scenarios = [...new Set(rows.map((row) => row.scenario))];
   return Object.fromEntries(scenarios.map((scenario) => {
     const samples = rows.filter((row) => row.scenario === scenario);
+    const backendStageValues = (stage) => samples.map((row) => {
+      const values = timingByRequest[row.requestId]?.[stage];
+      return Array.isArray(values) ? values[0] : null;
+    });
     return [scenario, {
       sampleCount: samples.length,
       acceptedMs: metrics(samples.map((row) => row.acceptedMs)),
       firstEventMs: metrics(samples.map((row) => row.firstEventMs)),
       terminalMs: metrics(samples.map((row) => row.terminalMs)),
+      providerFirstRawDeltaMs: metrics(backendStageValues("provider_first_raw_delta")),
+      providerFirstDeltaMs: metrics(backendStageValues("provider_first_delta")),
       statusCounts: Object.fromEntries([...new Set(samples.map((row) => row.status))].map((status) => [
         status,
         samples.filter((row) => row.status === status).length,
@@ -395,7 +401,14 @@ async function main() {
       }, {});
     }
     const expectedSamples = selectedScenarios.length * sampleCount;
-    const allSuccessful = rows.length === expectedSamples && rows.every((row) => row.status === "completed");
+    const rawDeltaRequiredScenarios = new Set(["workspace_tool", "subagent_concurrency"]);
+    const missingRawDeltaRows = rows.filter((row) => {
+      if (!rawDeltaRequiredScenarios.has(row.scenario)) return false;
+      return !timingByRequest[row.requestId]?.provider_first_raw_delta?.length;
+    });
+    const allSuccessful = rows.length === expectedSamples
+      && rows.every((row) => row.status === "completed")
+      && missingRawDeltaRows.length === 0;
     const preservedLogPath = `${evidencePath}.daemon.log`;
     await writeFile(preservedLogPath, logText);
     const evidence = {
@@ -409,10 +422,20 @@ async function main() {
         firstEventMs: "脚本发出 POST 到收到该 Turn 首个 session.turn.item 事件",
         terminalMs: "脚本发出 POST 到收到该 Turn terminal canonical event",
         backendStages: "daemon magi.performance 日志中按 requestId 关联的阶段；不代表浏览器 DOM 绘制",
+        providerFirstRawDeltaMs: "daemon 日志中该 requestId 的首个 raw Provider delta；工具/子代理场景必须存在",
+        providerFirstDeltaMs: "daemon 日志中该 requestId 的首个可见 content/thinking delta",
       },
-      summary: summarize(rows),
-      samples: rows.map((row) => ({ ...row, backendStages: timingByRequest[row.requestId] || {} })),
+      summary: summarize(rows, timingByRequest),
+      samples: rows.map((row) => ({
+        ...row,
+        providerFirstRawDeltaMs: timingByRequest[row.requestId]?.provider_first_raw_delta?.[0] ?? null,
+        providerFirstDeltaMs: timingByRequest[row.requestId]?.provider_first_delta?.[0] ?? null,
+        backendStages: timingByRequest[row.requestId] || {},
+      })),
       logPath: preservedLogPath,
+      ...(missingRawDeltaRows.length > 0
+        ? { missingRawDeltaRequestIds: missingRawDeltaRows.map((row) => row.requestId) }
+        : {}),
     };
     await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
     completed = allSuccessful;

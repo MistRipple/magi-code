@@ -583,7 +583,7 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 
 ### 9.4 真实 Provider 五场景 20 轮基线
 
-使用 `gpt-5.6-luna`、独立 daemon/state/workspace fixture 和 `scripts/verify-real-provider-performance.mjs` 完成五类场景各 20 轮；指标单位为 ms，顺序为 accepted / 首个 `session.turn.item` / Turn terminal canonical event。
+使用 `gpt-5.6-luna`、独立 daemon/state/workspace fixture 和 `scripts/verify-real-provider-performance.mjs` 完成五类场景各 20 轮；指标单位为 ms，顺序为 accepted / 首个 `session.turn.item` / Turn terminal canonical event。该脚本同时按 `requestId` 保存 daemon 的 `provider_first_raw_delta` 与 `provider_first_delta`，并要求工作区工具和子代理样本具备 raw stage；当前还没有在本轮重新生成真实 Provider artifact，因此不把这项脚本能力当作新的真实证据。
 
 | 场景 | P50 | P95 | 最大值 | 终态 |
 |---|---:|---:|---:|---|
