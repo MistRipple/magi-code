@@ -4097,6 +4097,128 @@ mod tests {
         let _ = fs::remove_dir_all(workspace_root);
     }
 
+    async fn run_restricted_git_branch_delete_case(
+        case_name: &'static str,
+        decision: &'static str,
+    ) {
+        let title = format!("Git 删除分支审批验收-{case_name}");
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(case_name, &title);
+        harness.provider.set_tool_then_completed(
+            "git_branch_delete",
+            serde_json::json!({
+                "branch": "approval-target",
+                "force": false,
+            })
+            .to_string(),
+            format!("Git 删除分支审批 {case_name} 已收口"),
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &format!(
+                    "调用 git_branch_delete 删除 approval-target 分支，等待审批后完成 {case_name} 验收"
+                ),
+                &format!("harness-git-delete-{case_name}-request"),
+                &format!("harness-git-delete-{case_name}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 删除分支审批请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 删除分支应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 删除分支应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_branch_delete");
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            decision,
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        let allowed = decision == "allow_once";
+        assert_eq!(
+            turn.status,
+            if allowed {
+                CanonicalTurnStatus::Completed
+            } else {
+                CanonicalTurnStatus::Failed
+            }
+        );
+        assert_eq!(
+            task.status,
+            if allowed {
+                magi_core::TaskStatus::Completed
+            } else {
+                magi_core::TaskStatus::Failed
+            }
+        );
+        assert_eq!(
+            git_branch_exists(&workspace_root, "approval-target"),
+            !allowed,
+            "Git 删除分支的审批结果必须与真实分支副作用一致"
+        );
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            if allowed { 2 } else { 1 }
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": format!("git_branch_delete_{case_name}"),
+            "tool": "git_branch_delete",
+            "surface": "git_workspace",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": decision,
+            "approval_requested": true,
+            "approval_resolved": true,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": if allowed { "completed" } else { "failed" },
+            "task_status": if allowed { "completed" } else { "failed" },
+            "side_effect": if allowed { "branch_deleted" } else { "branch_unchanged" },
+        }));
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_delete_allow_once_deletes_real_branch() {
+        run_restricted_git_branch_delete_case("allow_once", "allow_once").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_delete_denial_preserves_branch() {
+        run_restricted_git_branch_delete_case("deny", "deny").await;
+    }
+
     #[tokio::test]
     async fn restricted_profile_git_branch_switch_duplicate_replays_pending_approval() {
         let (harness, workspace_id, workspace_root, session_id) =
