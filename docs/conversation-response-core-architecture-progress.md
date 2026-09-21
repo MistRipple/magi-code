@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`2443df0b`（后台进程审批矩阵 artifact 代码基线）
+代码基线：`c5ce09bf`（后台进程审批矩阵 artifact 代码基线）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -56,6 +56,7 @@
 - Restricted `shell_exec` 的重复 requestId/fingerprint 回放已补充到真实 `TurnService` harness：待审批期间第二次提交复用同一 `turn_id`/root task，不创建第二个 pending 审批、不重复发布 `tool.approval.requested`、不重复请求 Provider；放行后只产生一次真实文件副作用并完成 canonical Turn。该证据只覆盖 duplicate + approval 组合，不能替代完整工具类型、访问模式、作用域和生命周期矩阵。
 - Git 结构化工具现在由 `MagiTurnHarness` 注入与 daemon 相同的 `GitToolRuntime`、Session Git Context、Snapshot 和 runtime persistence；新增 `git_branch_switch` 的 allow once、deny、cancel、expiry、duplicate pending、allow_for_turn 跨 Turn 和跨 Session 共七个 API 层验收。allow once 实际切换到 `approval-target`，deny/cancel/expiry 保持原分支，重复提交只保留一个 pending 审批，allow_for_turn 在下一 Turn/Session 都重新请求审批；测试同时断言 canonical ToolCall、审批 requested/resolved 事件、Provider 请求次数和 Turn/Task 终态，并将七行结果写入 `/tmp/magi-api-git-approval-matrix.json`。这补齐 `git_branch_switch` 的 API 审批生命周期代表格，但不替代其它 Git mutation、GUI、Browser/MCP 外部副作用和统一全组合 JSON 矩阵。
 - API Harness 还补充 Restricted `shell_exec(background=true)` 的审批生命周期：通过真实后台进程启动并写入工作区文件，及 deny/cancel/expiry 三条不执行路径，验证审批 requested/resolved、Provider 请求次数、真实副作用边界和 canonical Turn/Task 终态；四行结果写入 `/tmp/magi-api-process-approval-matrix.json`。该证据仍只覆盖 workspace 内 Restricted 的代表格，跨作用域和 duplicate/cross-turn/session 组合仍未关闭。
+- API Harness 将 `git_branch_switch` 七行和后台 `shell_exec` 四行合并写入 `/tmp/magi-api-permission-matrix.json`，统一字段包括 tool、surface、AccessProfile、作用域、生命周期、审批事实、Provider 请求次数和 Turn/Task 终态；该 11 行 artifact 仍是 API 代表格，不等价于全部工具面和所有作用域组合。
 
 ## 推进顺序
 
@@ -125,6 +126,7 @@
 | 2026-09-21 | A/C/D | 后台进程审批测试加入后重新执行 workspace 全量 Rust 验收，确认新增真实进程审批路径未改变其它 crate 行为 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：681 passed、1 ignored；`magi-api turn_harness`：59 passed、1 ignored；`magi-conversation-runtime`：534 passed；`magi-daemon`：129 passed；`magi-tool-runtime`：229 passed、1 ignored |
 | 2026-09-21 | C/D | 扩展 Restricted `shell_exec(background=true)` 的真实后台进程审批验收，覆盖 allow once、deny、cancel、expiry 四行，验证工作区文件副作用、审批事件、Provider 请求次数和 canonical Turn/Task 终态 | `/tmp/magi-api-process-approval-matrix.json`：4 行；`cargo fmt --all -- --check`；`cargo test -p magi-api --lib turn_harness::tests::restricted_profile_background_shell_approval_ -- --test-threads=1`：4 passed |
 | 2026-09-21 | A/C/D/E | 后台进程审批测试和最新 Electron 打包回归加入后重新执行 workspace Rust、Web 检查/构建、npm golden 和 Electron directory package 验收 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：684 passed、1 ignored；`magi-api turn_harness`：62 passed、1 ignored；`magi-conversation-runtime`：534 passed；`magi-daemon`：129 passed；`magi-tool-runtime`：229 passed、1 ignored；`npm --prefix web run check`；`npm --prefix web run build`；`npm test`；`npm run desktop:package -- --dir`；`/tmp/magi-electron-dom-regression-10240.json`：73 checks passed |
+| 2026-09-21 | C | Git `git_branch_switch` 七行与后台 process 四行 API 审批结果合并为统一 JSON artifact，保留代表格和缺口声明 | `/tmp/magi-api-permission-matrix.json`：11 行，覆盖 `git_branch_switch` 的 allow/deny/cancel/expiry/duplicate/cross-turn/cross-session 与 `shell_exec(background=true)` 的 allow/deny/cancel/expiry；生成由 `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：62 passed、1 ignored 触发 |
 
 ## B 工作包首轮审计
 

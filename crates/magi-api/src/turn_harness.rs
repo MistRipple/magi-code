@@ -3315,6 +3315,35 @@ mod tests {
         );
     }
 
+    fn record_unified_permission_matrix_row(row: serde_json::Value) {
+        static ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+        let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
+        let mut rows = rows
+            .lock()
+            .expect("unified permission matrix lock should hold");
+        let case_name = row["case"].as_str();
+        let tool_name = row["tool"].as_str();
+        let surface = row["surface"].as_str();
+        rows.retain(|existing| {
+            !(existing["case"].as_str() == case_name
+                && existing["tool"].as_str() == tool_name
+                && existing["surface"].as_str() == surface)
+        });
+        rows.push(row);
+        rows.sort_by(|left, right| {
+            left["tool"]
+                .as_str()
+                .cmp(&right["tool"].as_str())
+                .then_with(|| left["case"].as_str().cmp(&right["case"].as_str()))
+        });
+        fs::write(
+            "/tmp/magi-api-permission-matrix.json",
+            serde_json::to_vec_pretty(&*rows)
+                .expect("unified permission matrix rows should serialize"),
+        )
+        .expect("unified permission matrix evidence should write");
+    }
+
     fn record_process_approval_matrix_row(
         case_name: &str,
         lifecycle: &str,
@@ -3329,7 +3358,7 @@ mod tests {
         let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
         let mut rows = rows.lock().expect("process matrix rows lock should hold");
         rows.retain(|row| row["case"] != case_name);
-        rows.push(serde_json::json!({
+        let row = serde_json::json!({
             "case": case_name,
             "tool": "shell_exec",
             "surface": "background_process",
@@ -3342,8 +3371,10 @@ mod tests {
             "turn_status": turn_status,
             "task_status": task_status,
             "side_effect": side_effect,
-        }));
+        });
+        rows.push(row.clone());
         rows.sort_by(|left, right| left["case"].as_str().cmp(&right["case"].as_str()));
+        record_unified_permission_matrix_row(row);
         let path = PathBuf::from("/tmp/magi-api-process-approval-matrix.json");
         fs::write(
             path,
@@ -3588,7 +3619,7 @@ mod tests {
         let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
         let mut rows = rows.lock().expect("Git matrix rows lock should hold");
         rows.retain(|row| row["case"] != case_name);
-        rows.push(serde_json::json!({
+        let row = serde_json::json!({
             "case": case_name,
             "tool": "git_branch_switch",
             "access_profile": "Restricted",
@@ -3602,8 +3633,10 @@ mod tests {
             "turn_status": turn_status,
             "task_status": task_status,
             "side_effect": side_effect,
-        }));
+        });
+        rows.push(row.clone());
         rows.sort_by(|left, right| left["case"].as_str().cmp(&right["case"].as_str()));
+        record_unified_permission_matrix_row(row);
         let path = PathBuf::from("/tmp/magi-api-git-approval-matrix.json");
         fs::write(
             path,
