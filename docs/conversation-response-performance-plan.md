@@ -700,6 +700,43 @@ raw tool-call-only 的最新复验使用 `/tmp/magi-electron-dom-raw-tool-1-1023
 观测，但仍不是 before/after 对比，也没有把历史真实 Provider JSON 与本次打包 Electron 证据合并成
 统一的端到端基线。
 
+### 9.6 Provider trajectory ledger 目标形态
+
+参考 ZCode 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 `prompt-trajectory` 分层，Magi 后续不再让真实 Provider、Electron timing 和权限矩阵各自维护无法互证的统计源。目标是先保存可追加的原始轨迹，再从同一轨迹派生性能、replay 和权限 artifact。该节定义后续实现约束，当前尚未形成新的 ledger 代码或完成证据。
+
+每条原始记录至少包含以下字段：
+
+```text
+schema_version
+scenario
+sample_index
+query_source
+session_id
+turn_id
+request_id
+event_sequence
+phase
+timestamp_ms
+provider_round
+tool_call_count
+payload_hash
+source
+outcome
+```
+
+`phase` 的最小集合为 `accepted`、`provider_request`、`provider_raw_delta`、`provider_visible_delta`、`tool_call`、`tool_result`、`approval_requested`、`approval_resolved`、`event_bus`、`canonical_terminal`、`renderer_received`、`reducer_completed`、`projection_completed` 和 `dom_painted`。轨迹只保存做关联和一致性判断所需的结构化摘要；不落 API key、认证头、用户正文或完整 Provider 输出。确需保存请求/响应正文时，写入独立受控 artifact，并在 ledger 中只保留内容哈希、字节数和路径。
+
+派生规则必须满足：
+
+1. 主 Turn 与标题生成、压缩、分类器等 sidecar 请求按 `query_source` 分离，性能样本不得串入辅助模型请求。
+2. trajectory continuity 只接受 append-only 历史；只忽略明确登记的传输元数据漂移，正文、thinking、工具调用和工具结果被改写时必须分段或失败。
+3. `provider_raw_delta` 与 `provider_visible_delta` 分开，tool-call-only 首 chunk 不能被可见文本口径覆盖。
+4. 同一 `turn_id` 的 canonical terminal 只能有一条；重复 request replay 允许再次观察同一终态，但不能派生第二个 Turn。
+5. timeout、Provider 失败、取消和缺阶段的样本也要 flush 原始轨迹并标记 `outcome`，不得只保留成功样本或把部分样本计入通过统计。
+6. P50/P95、权限矩阵和 before/after 都从版本化 derive 程序产生，artifact 必须记录输入轨迹哈希、derive 版本和统计口径。
+
+这套 ledger 可以统一 F 的历史真实 Provider 样本与 Electron 同轮证据，也能为 G 提供可审计的 before/after 输入。只有旧版本与当前版本使用同一 fixture、同一 ledger schema、同一 derive 版本且输入可复核时，才允许判定性能目标是否达标。
+
 ## 10. 关键源码证据
 
 Magi 当前主要证据位置：
