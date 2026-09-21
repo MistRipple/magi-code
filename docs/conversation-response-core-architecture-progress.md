@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`eda2af5b`（conversation HTTP daemon 重启回放验收基线）
+代码基线：`6c8b45f0`（统一真实 Provider raw delta 证据字段）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -62,6 +62,8 @@
 - Git 结构化工具现在由 `MagiTurnHarness` 注入与 daemon 相同的 `GitToolRuntime`、Session Git Context、Snapshot 和 runtime persistence；新增 `git_branch_switch` 的 allow once、deny、cancel、expiry、duplicate pending、allow_for_turn 跨 Turn 和跨 Session 共七个 API 层验收。allow once 实际切换到 `approval-target`，deny/cancel/expiry 保持原分支，重复提交只保留一个 pending 审批，allow_for_turn 在下一 Turn/Session 都重新请求审批；测试同时断言 canonical ToolCall、审批 requested/resolved 事件、Provider 请求次数和 Turn/Task 终态，并将七行结果写入 `/tmp/magi-api-git-approval-matrix.json`。这补齐 `git_branch_switch` 的 API 审批生命周期代表格，但不替代其它 Git mutation、GUI、Browser/MCP 外部副作用和统一全组合 JSON 矩阵。
 - API Harness 还补充 Restricted `shell_exec(background=true)` 的审批生命周期：通过真实后台进程启动并写入工作区文件，及 deny/cancel/expiry 三条不执行路径，验证审批 requested/resolved、Provider 请求次数、真实副作用边界和 canonical Turn/Task 终态；四行结果写入 `/tmp/magi-api-process-approval-matrix.json`。该证据仍只覆盖 workspace 内 Restricted 的代表格，跨作用域和 duplicate/cross-turn/session 组合仍未关闭。
 - API Harness 将 `git_branch_switch` 七行和后台 `shell_exec` 四行合并写入 `/tmp/magi-api-permission-matrix.json`，统一字段包括 tool、surface、AccessProfile、作用域、生命周期、审批事实、Provider 请求次数和 Turn/Task 终态；该 11 行 artifact 仍是 API 代表格，不等价于全部工具面和所有作用域组合。
+- 参考 ZCode 的 dynamic-workflow harness 后，确认当前 Magi 验收应继续坚持三条边界：测试 harness 只驱动 `TurnService` 并等待真实 canonical 终态；watchdog/关闭逻辑只负责取消和资源收口，不直接伪造业务终态；Provider 请求、raw delta、工具调用、审批、真实副作用和 canonical terminal 应保留为可追加的原始轨迹，再派生权限矩阵与 timing artifact。ZCode 的父进程/引擎分离、`engine.settled` 单一终态事实源、按 parent session 的 orphan reconcile，以及 `prompt-trajectory` 的 fixture/ledger/derive 分层可作为 C/D/E/F 后续验收的设计参照，但不引入 VM 或第二套子进程执行边界。
+- ZCode 的一次性 mock response resolver 也明确了 Magi Provider fixture 的剩余改进方向：当前 `set_tool_then_completed` 仍按工具 surface 触发，后续应让测试替身按 `turnId`、`requestId`、Provider round、工具名和参数指纹消费一次响应；额外请求应立即产生结构化 contract failure，避免 action contract 不匹配时重复工具轮次。该项尚未实现，不作为现有 D/F 完成证据。
 
 ## 推进顺序
 
