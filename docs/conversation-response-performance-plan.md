@@ -583,7 +583,7 @@ cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scena
 
 ### 9.4 真实 Provider 五场景 20 轮基线
 
-使用 `gpt-5.6-luna`、独立 daemon/state/workspace fixture 和 `scripts/verify-real-provider-performance.mjs` 完成五类场景各 20 轮；指标单位为 ms，顺序为 accepted / 首个 `session.turn.item` / Turn terminal canonical event。该脚本同时按 `requestId` 保存 daemon 的 `provider_first_raw_delta` 与 `provider_first_delta`，并要求工作区工具和子代理样本具备 raw stage；当前还没有在本轮重新生成真实 Provider artifact，因此不把这项脚本能力当作新的真实证据。
+使用 `gpt-5.6-luna`、独立 daemon/state/workspace fixture 和 `scripts/verify-real-provider-performance.mjs` 完成历史五类场景各 20 轮；指标单位为 ms，顺序为 accepted / 首个 `session.turn.item` / Turn terminal canonical event。该脚本同时按 `requestId` 保存 daemon 的 `provider_first_raw_delta` 与 `provider_first_delta`，并要求工作区工具和子代理样本具备 raw stage。2026-09-21 重新采样尝试使用独立端口 `39242`，个人 Chat、个人长历史、工作区 Chat、工作区工具各完成 20 条，子代理完成 4 条后事件流超时；部分 evidence 为 `/tmp/magi-real-provider-perf-current20-20260921.json`，因此不能把本轮失败尝试当作新的完整基线。
 
 | 场景 | P50 | P95 | 最大值 | 终态 |
 |---|---:|---:|---:|---|
@@ -719,6 +719,10 @@ node scripts/derive-magi-trajectory-ledger.mjs \
 `/tmp/magi-real-provider-ledger-smoke-20260921-ledger.json`。后者包含 4 个 accepted、4 个
 provider_request、2 个 raw delta、4 个 visible delta、4 个 EventBus 和 4 个 canonical terminal
 记录；工具和子代理样本均保留 raw tool-call-only 关联。该证据只验证真实 Provider 输入的派生链路，不能替代 20 轮矩阵或 Electron Renderer 阶段。
+
+失败采样证据：`/tmp/magi-real-provider-perf-current20-20260921.json` 的 `status=failed` 和
+`samplingError` 必须保留；其派生 ledger `/tmp/magi-real-provider-perf-current20-20260921-ledger.json`
+为 `status=incomplete`、退出码 2。失败样本不计入通过统计，也不能用于关闭 D/F/G。
 
 每条原始记录至少包含以下字段：
 

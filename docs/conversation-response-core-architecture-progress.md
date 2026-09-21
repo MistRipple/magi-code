@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`f1af0e0c`（保留 ledger 的零值 Provider 阶段）
+代码基线：`e5be72fe`（阻止失败 evidence 伪装为通过 ledger）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -82,6 +82,7 @@
 - ZCode 的一次性 mock response resolver 也明确了 Magi Provider fixture 的收紧方向：`HarnessModelClient::set_tool_then_completed` 现在会在非分类器请求缺少预期工具 surface 时立即返回结构化 `Protocol` contract failure，避免 action contract 不匹配时伪造最终答复或进入重复工具轮次；新增 `harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed` 回归覆盖该边界。由于当前 `ModelInvocationRequest` 尚未携带 `turnId`/`requestId`，按身份和参数指纹的一次性 response rule 仍是后续改进，不作为现有 D/F 完成证据。
 - 新增 `scripts/derive-magi-trajectory-ledger.mjs`，从真实 Provider 或 Electron timing JSON 派生 `magi.trajectory.v1` 记录，统一保存 `turn_id`、`request_id`、phase、序号、相对时间、工具调用数、payload hash、source 和 outcome；同一 `turn_id` 的多个 canonical terminal、缺失身份或缺失终态序号会输出 `incomplete` 并以非零退出，不降级为通过。当前用最小 fixture 验证了 6 条记录的成功派生和 3 个缺失字段的 fail-closed；当前工作树没有可复用的真实 `/tmp` Provider/Electron JSON，因此该脚本尚未形成 D/F 的真实 ledger 证据。
 - 使用独立端口 `39241`、独立 daemon/state/workspace 运行真实 Provider 四类各 1 轮 smoke：`/tmp/magi-real-provider-ledger-smoke-20260921.json` 为 `status=passed`，4 条 Turn 均 completed；派生 `/tmp/magi-real-provider-ledger-smoke-20260921-ledger.json` 为 `status=passed`、22 条记录、4 个 accepted/provider_request/event_bus/canonical_terminal、4 个 visible delta，工具和子代理各有 1 个 raw delta。该证据验证真实输入的 ledger 关联和零值阶段保留，但不是五类 × 20 轮，也没有 Electron Renderer 记录，D/F/G 仍未关闭。
+- 重新运行五类真实 Provider 20 轮时，个人 Chat、个人长历史、工作区 Chat、工作区工具各完成 20 条，子代理完成 4 条后事件流等待超时；脚本保留 `/tmp/magi-real-provider-perf-current20-20260921.json`，`status=failed`、84 条完成样本、samplingError 明确记录；派生 `/tmp/magi-real-provider-perf-current20-20260921-ledger.json` 为 `status=incomplete`、444 条记录、退出码 2。该失败证据证明 fail-closed 行为有效，但不能替代五类完整 20 轮。
 
 ## 推进顺序
 
@@ -167,6 +168,7 @@
 | 2026-09-21 | A/B | 在当前工作树（保留其他 Agent 未提交修改）上复验 Rust workspace 全量测试；所有现有测试通过，未改变 A/B 的未完成判断 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：690 passed、1 ignored；A/B 仍未关闭 |
 | 2026-09-21 | C | 按当前代码重新生成 API 和 tool-runtime 权限代表格；API artifact 的 16 行字段完整，tool-runtime artifact 的 36 行覆盖六个 surface 与三种 AccessProfile，Provider 请求在 executor 层明确为空值 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：68 passed、1 ignored；`/tmp/magi-api-permission-matrix.json`：16 行，surface=`git_workspace/background_process`，字段无缺失；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：230 passed、1 ignored；`/tmp/magi-tool-runtime-permission-matrix.json`：36 行，surface=`browser_host/file_executor/git_executor/mcp_executor/process_executor/shell_executor`，profiles=`ReadOnly/Restricted/FullAccess`。这些是 runtime/API 代表格，不能关闭完整 Provider 权限矩阵 |
 | 2026-09-21 | D/F | 通过真实 OpenAI-compatible Provider 四类一轮 smoke 生成并派生 trajectory ledger，修正派生器保留 `provider_request_started=0` 的合法零值 | `/tmp/magi-real-provider-ledger-smoke-20260921.json`：4 条 completed sample、raw stage 出现在 workspace_tool/subagent；`/tmp/magi-real-provider-ledger-smoke-20260921-ledger.json`：22 条记录、`status=passed`、无验证错误；`MAGI_PERF_PORT=39241 MAGI_PERF_SAMPLES=1 MAGI_PERF_SCENARIOS=new_personal_chat,workspace_chat,workspace_tool,subagent_concurrency MAGI_PERF_EVIDENCE=/tmp/magi-real-provider-ledger-smoke-20260921.json node scripts/verify-real-provider-performance.mjs`；该 smoke 不替代五类 × 20 轮或 Electron 同轮 ledger |
+| 2026-09-21 | D/F | 尝试当前真实 Provider 五类 × 20 轮采样；四类完整，子代理在第 5 条附近事件流超时，采样脚本保留部分 evidence，ledger 派生器拒绝把失败输入标记为通过 | `MAGI_PERF_PORT=39242 MAGI_PERF_SAMPLES=20 MAGI_PERF_SCENARIOS=new_personal_chat,personal_long_history,workspace_chat,workspace_tool,subagent_concurrency MAGI_PERF_EVIDENCE=/tmp/magi-real-provider-perf-current20-20260921.json node scripts/verify-real-provider-performance.mjs`：退出 1、`status=failed`、84 条样本；`/tmp/magi-real-provider-perf-current20-20260921-ledger.json`：`status=incomplete`、444 条记录、退出 2；D/F 仍未关闭 |
 | 2026-09-21 | D/F | 新增版本化 trajectory ledger 派生入口；从 Provider/Electron evidence 统一生成 `magi.trajectory.v1`，并对缺失身份、终态序号和重复 terminal fail-closed | `node --check scripts/derive-magi-trajectory-ledger.mjs`；完整最小 fixture：6 条记录、`status=passed`；缺失身份/序号 fixture：`status=incomplete`、退出码 2；当前没有真实 Provider/Electron JSON 可供合并，因此 D/F/G 仍未关闭 |
 
 ## B 工作包首轮审计
