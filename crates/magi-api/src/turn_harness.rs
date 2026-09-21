@@ -3763,6 +3763,21 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn git_branch_exists(workspace_root: &Path, branch: &str) -> bool {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["branch", "--list", branch])
+            .output()
+            .expect("Git branch existence query should start");
+        assert!(
+            output.status.success(),
+            "Git branch existence query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+    }
+
     fn record_git_approval_matrix_row(
         case_name: &str,
         lifecycle: &str,
@@ -3901,6 +3916,184 @@ mod tests {
             "branch_switched",
         );
 
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_create_allow_once_creates_real_branch() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("create-allow", "Git 创建分支审批允许验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_create",
+            serde_json::json!({
+                "branch": "approval-created",
+                "startPoint": "main",
+                "switch": false,
+            })
+            .to_string(),
+            "Git 分支已在审批后创建",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_create 创建 approval-created 分支，等待审批后汇总结果",
+                "harness-git-create-allow-request",
+                "harness-git-create-allow-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 创建分支审批请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 创建分支应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 创建分支应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_branch_create");
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert!(
+            git_branch_exists(&workspace_root, "approval-created"),
+            "allow_once 后必须产生真实 Git 分支创建副作用"
+        );
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "git_branch_create_allow_once",
+            "tool": "git_branch_create",
+            "surface": "git_workspace",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "allow_once",
+            "approval_requested": true,
+            "approval_resolved": true,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "completed",
+            "task_status": "completed",
+            "side_effect": "branch_created",
+        }));
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_create_denial_preserves_branch_state() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("create-deny", "Git 创建分支审批拒绝验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_create",
+            serde_json::json!({
+                "branch": "approval-denied",
+                "startPoint": "main",
+                "switch": false,
+            })
+            .to_string(),
+            "Git 创建分支被拒绝",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_create 创建 approval-denied 分支，但必须等待审批",
+                "harness-git-create-deny-request",
+                "harness-git-create-deny-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 创建分支拒绝请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 创建分支拒绝应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 创建分支拒绝应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_branch_create");
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "deny",
+        )
+        .await;
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(
+            !git_branch_exists(&workspace_root, "approval-denied"),
+            "拒绝 Git 分支创建后不得产生真实分支副作用"
+        );
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "git_branch_create_deny",
+            "tool": "git_branch_create",
+            "surface": "git_workspace",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "deny",
+            "approval_requested": true,
+            "approval_resolved": true,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "failed",
+            "task_status": "failed",
+            "side_effect": "branch_unchanged",
+        }));
         let _ = fs::remove_dir_all(workspace_root);
     }
 
