@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`f4568bca`（扩展工具权限矩阵到文件与 Shell）
+代码基线：`1768e0bf`（按 Turn 身份关联真实 Provider 时序）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -54,7 +54,8 @@
 - 为 Task/Goal/子代理路径补充 raw tool-call-only Provider 首 delta：`ModelStreamingDelta.tool_calls` 现在从 bridge streaming accumulator 传递工具调用快照，执行层另记 `provider_first_raw_delta`，而 `provider_first_delta` 继续只表示首个可见 content/thinking delta。单轮证据 `/tmp/magi-electron-dom-raw-tool-1-10230.json` 为 `status=passed`、13 项检查；最新五类 × 20 轮证据 `/tmp/magi-electron-dom-correlated-timing-20-10231.json` 为 `status=passed`、963 项检查、100 条唯一 `turnId`、280 次 Provider 请求，五类各 20 条，60 条 Task/Goal/子代理 sample 全部包含 `provider_first_raw_delta`，且每条仍具备 accepted、runner、可见首 delta、首 EventBus、canonical terminal 和 Renderer 四阶段。该证据只补齐 raw 首 chunk 的同轮观测，不关闭历史 Provider 样本统一和 before/after 性能缺口。
 - `MagiTurnHarness` 的本地 Provider 替身现在也发出 tool-call-only `ModelStreamingDelta`，并在 `HarnessTimingSnapshot` 中独立记录 `provider_first_raw_delta_ms`；工具轮回归断言 raw delta 不含可见正文时仍被保留，五类本地性能基准的阶段顺序同时要求 accepted → raw delta → 可见 delta → EventBus → terminal。该改动补齐测试 harness 的 raw 首 chunk 观测，不新增 Electron 证据，也不关闭 F/G 的历史样本和 before/after 缺口。
 - 重新运行五类本地 mock Provider 各 20 轮基准，原始日志为 `/tmp/magi-local-mock-baseline-raw-20260921.log`；五类均通过 accepted → raw delta → 可见 delta → EventBus → terminal 顺序校验，工具场景 raw delta P50/P95 为 54/59ms、可见 delta 为 82/87ms，子代理场景 raw delta P50/P95 为 15/18ms、可见 delta 为 120/122ms。该证据只验证本地替身的 raw timing 语义和可重复性，不替代真实 Provider 或 before/after 性能基线。
-- `scripts/verify-real-provider-performance.mjs` 现在也按 `requestId` 保存真实 daemon 的 `provider_first_raw_delta` / `provider_first_delta`，并对工作区工具和子代理样本缺少 raw stage 直接判定采样失败；本轮只完成脚本语法检查，未重新生成真实 Provider artifact，因此 D/F/G 仍保持未完成。
+- `scripts/verify-real-provider-performance.mjs` 按 `requestId` 或同轮 `turnId` 保存真实 daemon 的 `provider_first_raw_delta` / `provider_first_delta`，并对工作区工具和子代理样本缺少 raw stage 直接判定采样失败；本轮已完成单轮 smoke，尚未重新生成五类 × 20 轮真实 Provider artifact，因此 D/F/G 仍保持未完成。
+- 真实 Provider 单轮 smoke 发现并修复了时序采样器的关联缺口：Provider 阶段日志只带 `turn_id` 而不带 request trace 时，脚本现在按 `requestId` 或同轮 `turnId` 关联。修复后 `workspace_tool` 和 `subagent_concurrency` 各 1 轮均通过并记录 raw/可见首 delta；证据为 `/tmp/magi-real-provider-perf-smoke-tool-20260921-retry.json` 与 `/tmp/magi-real-provider-perf-smoke-subagent-20260921.json`。这只证明真实 Provider 单轮关联恢复，不能替代五类 × 20 轮或 before/after 性能验收。
 - 该复验日志观察到并发子任务收口窗口的一次 `任务状态事实写回会话 Turn 失败`（`已有活动轮次`）后续仍由 root finalizer 发布 `canonical_terminal_published`。`session_turn_finalize` 现在会重新读取当前 sidecar：旧 Turn 已切换、缺失或进入终态时丢弃迟到 task status item；同一活动 Turn 的其它 canonical 写回错误继续传播。回归测试覆盖 running、blocked、替换 Turn，以及活动 Turn 内 immutable canonical item 冲突，避免把预期迟到写回记录成生产错误，也避免吞掉真实写回错误。该修复只收敛已确认的竞态，D/E 的 Provider/GUI 全矩阵仍需继续验证，不能把 100 条 timing 通过扩大解释为全矩阵无错误。
 - 该关联证据仍不能关闭 F：最新证据已包含 raw tool-call-only 首 delta，但尚未与 `/tmp/magi-real-provider-perf-*.json` 的历史后端 20 轮采样合并，也没有 before 版本，因此性能前后对比和统一目标判定仍未完成。
 - 同轮采样脚本现在会保留 stdout/stderr 的跨 chunk 行缓冲，并在 evidence 写入前 flush；缺少后端阶段时该轮直接失败，不会把 Renderer-only 记录当作关联通过。`provider_first_raw_delta` 表示首个包含工具调用快照或可见内容/思考的 Provider delta；`provider_first_delta` 仍只表示首个可见 content/thinking delta。工具调用首轮可能没有可见正文，两个阶段因此可以落在不同 Provider round。
