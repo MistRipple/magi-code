@@ -3439,6 +3439,43 @@ mod tests {
     }
 
     fn record_unified_permission_matrix_row(row: serde_json::Value) {
+        const REQUIRED_STRING_FIELDS: &[&str] = &[
+            "case",
+            "tool",
+            "surface",
+            "access_profile",
+            "scope",
+            "lifecycle",
+            "turn_status",
+            "task_status",
+            "side_effect",
+        ];
+        for field in REQUIRED_STRING_FIELDS {
+            assert!(
+                row.get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
+                "permission matrix row must contain string field {field}: {row}"
+            );
+        }
+        assert!(
+            row.get("approval_requested")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "permission matrix row must contain boolean approval_requested: {row}"
+        );
+        assert!(
+            row.get("approval_resolved")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "permission matrix row must contain boolean approval_resolved: {row}"
+        );
+        assert!(
+            row.get("provider_requests")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "permission matrix row must contain numeric provider_requests: {row}"
+        );
         static ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
         let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
         let mut rows = rows
@@ -3745,6 +3782,7 @@ mod tests {
         let row = serde_json::json!({
             "case": case_name,
             "tool": "git_branch_switch",
+            "surface": "git_workspace",
             "access_profile": "Restricted",
             "scope": "workspace_internal",
             "lifecycle": lifecycle,
