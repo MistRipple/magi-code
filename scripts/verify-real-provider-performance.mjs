@@ -237,34 +237,54 @@ async function submitTurn({ scenario, scope = "personal", workspaceId = null, wo
     orchestratorSessionConfig: { model: providerModel, reasoningEffort },
   };
   const startedAt = now();
-  const accepted = await requestJson("/api/session/turn", {
-    method: "POST",
-    body: JSON.stringify(request),
-  });
-  const acceptedAt = now();
-  const turnId = accepted.turnId;
-  const observed = await observeTurnEvents({
-    sessionId: accepted.sessionId,
-    scope,
-    workspaceId,
-    afterSequence: accepted.eventSequence,
-    turnId,
-    startedAt,
-  });
-  return {
-    scenario,
-    requestId,
-    sessionId: accepted.sessionId,
-    turnId,
-    route: accepted.route,
-    executionProfile: accepted.executionProfile,
-    status: observed.terminal.status,
-    acceptedMs: acceptedAt - startedAt,
-    firstEventMs: observed.firstEventMs,
-    terminalMs: observed.terminal.observedMs,
-    firstEventSequence: observed.firstEventSequence,
-    terminalSequence: observed.terminal.sequence,
-  };
+  let accepted = null;
+  let acceptedAt = null;
+  try {
+    accepted = await requestJson("/api/session/turn", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    acceptedAt = now();
+    const turnId = accepted.turnId;
+    const observed = await observeTurnEvents({
+      sessionId: accepted.sessionId,
+      scope,
+      workspaceId,
+      afterSequence: accepted.eventSequence,
+      turnId,
+      startedAt,
+    });
+    return {
+      scenario,
+      requestId,
+      sessionId: accepted.sessionId,
+      turnId,
+      route: accepted.route,
+      executionProfile: accepted.executionProfile,
+      status: observed.terminal.status,
+      acceptedMs: acceptedAt - startedAt,
+      firstEventMs: observed.firstEventMs,
+      terminalMs: observed.terminal.observedMs,
+      firstEventSequence: observed.firstEventSequence,
+      terminalSequence: observed.terminal.sequence,
+    };
+  } catch (error) {
+    return {
+      scenario,
+      requestId,
+      sessionId: accepted?.sessionId || sessionId,
+      turnId: accepted?.turnId || null,
+      route: accepted?.route || null,
+      executionProfile: accepted?.executionProfile || null,
+      status: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      acceptedMs: acceptedAt === null ? null : acceptedAt - startedAt,
+      firstEventMs: null,
+      terminalMs: null,
+      firstEventSequence: null,
+      terminalSequence: null,
+    };
+  }
 }
 
 function summarize(rows, timingByRequest) {
@@ -354,7 +374,7 @@ async function main() {
         }
       }
       if (selectedScenarios.includes("personal_long_history")) {
-        const longHistorySessionId = personal[0]?.sessionId;
+        const longHistorySessionId = personal.find((row) => row.sessionId)?.sessionId;
         if (!longHistorySessionId) throw new Error("个人长历史场景需要先完成至少一轮新建个人会话");
         for (let index = 0; index < sampleCount; index += 1) {
           rows.push(await submitTurn({
@@ -418,6 +438,17 @@ async function main() {
       }, {});
     }
     const expectedSamples = selectedScenarios.length * sampleCount;
+    const sampleErrors = rows
+      .filter((row) => row.error)
+      .map((row) => ({
+        scenario: row.scenario,
+        requestId: row.requestId,
+        turnId: row.turnId,
+        error: row.error,
+      }));
+    if (samplingError === null && sampleErrors.length > 0) {
+      samplingError = `${sampleErrors.length} 个样本未完成；首个失败：${sampleErrors[0].error}`;
+    }
     const rawDeltaRequiredScenarios = new Set(["workspace_tool", "subagent_concurrency"]);
     const missingRawDeltaRows = rows.filter((row) => {
       if (!rawDeltaRequiredScenarios.has(row.scenario)) return false;
@@ -445,6 +476,7 @@ async function main() {
       },
       summary: summarize(rows, timingByRequest),
       ...(samplingError === null ? {} : { samplingError }),
+      ...(sampleErrors.length > 0 ? { sampleErrors } : {}),
       samples: rows.map((row) => ({
         ...row,
         providerFirstRawDeltaMs: timingByRequest[row.requestId]?.provider_first_raw_delta?.[0] ?? null,
