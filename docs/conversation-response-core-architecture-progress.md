@@ -1,7 +1,7 @@
 # 消息响应核心架构重构进度
 
 更新时间：2026-09-21
-代码基线：`96339eea`（同步最新进度文档基线）
+代码基线：`8fda7dd1`（新增 Provider 轨迹 ledger 派生器）
 对应方案：[conversation-response-core-architecture-redesign.md](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-core-architecture-redesign.md)
 
 本文只记录尚未满足完成定义的工作包、直接证据和推进顺序。完成一个工作包前，必须同时更新状态、证据路径和验证命令；没有直接证据的内容保持未完成。
@@ -80,6 +80,7 @@
 - `magi-tool-runtime` 的 Browser Host、file、Git、MCP、shell 和内部 process 生命周期矩阵现在也写入 `/tmp/magi-tool-runtime-permission-matrix.json`；完整 tool-runtime 测试生成 36 行，覆盖六个 surface、三种 AccessProfile 和每行的状态、executor 到达、副作用、审批事件/Provider 请求字段。该 artifact 补齐策略/executor 代表格，但仍不等价于真实 Provider 同轮权限矩阵，也不覆盖 workspace 外、重复请求、跨 Turn/Session 全组合。
 - 已复核 ZCode `main` 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 [dynamic-workflow harness](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/dynamic-workflow-runtime/src/harness.ts)、[NDJSON protocol](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/dynamic-workflow-runtime/src/protocol.ts)、[run lifecycle](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/bootstrap/src/app/dynamic-workflow-run-lifecycle.ts) 和 [prompt-trajectory recorder](https://github.com/zai-org/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/tools/prompt-trajectory/src/record.ts)。可迁移结论已写入本进度文档的“目标更新”、[性能计划的 trajectory ledger 章节](/Users/xie/code/magi-rust-rewrite/docs/conversation-response-performance-plan.md:703) 和此前已提交的复核记录：Magi 只吸收单一 settlement owner、关闭闸门后等待真实结算、typed envelope、fixture/ledger/derive 分层和 fail-closed boundary；不引入 VM 或第二套执行路径。
 - ZCode 的一次性 mock response resolver 也明确了 Magi Provider fixture 的收紧方向：`HarnessModelClient::set_tool_then_completed` 现在会在非分类器请求缺少预期工具 surface 时立即返回结构化 `Protocol` contract failure，避免 action contract 不匹配时伪造最终答复或进入重复工具轮次；新增 `harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed` 回归覆盖该边界。由于当前 `ModelInvocationRequest` 尚未携带 `turnId`/`requestId`，按身份和参数指纹的一次性 response rule 仍是后续改进，不作为现有 D/F 完成证据。
+- 新增 `scripts/derive-magi-trajectory-ledger.mjs`，从真实 Provider 或 Electron timing JSON 派生 `magi.trajectory.v1` 记录，统一保存 `turn_id`、`request_id`、phase、序号、相对时间、工具调用数、payload hash、source 和 outcome；同一 `turn_id` 的多个 canonical terminal、缺失身份或缺失终态序号会输出 `incomplete` 并以非零退出，不降级为通过。当前用最小 fixture 验证了 6 条记录的成功派生和 3 个缺失字段的 fail-closed；当前工作树没有可复用的真实 `/tmp` Provider/Electron JSON，因此该脚本尚未形成 D/F 的真实 ledger 证据。
 
 ## 推进顺序
 
@@ -164,6 +165,7 @@
 | 2026-09-21 | A/B | 按当前源码复验底层 canonical fixture、历史身份拒绝和传输恢复边界；未发现生产 current Turn 绕过或可删除的兼容双轨 | `cargo test -p magi-session-store --lib -- --test-threads=1`：121 passed；`cargo test -p magi-bridge-client --lib http_model_client::tests::streaming_retries_before_first_delta_only -- --test-threads=1`：1 passed；`cargo test -p magi-bridge-client --lib http_model_client::tests::streaming_does_not_retry_after_visible_delta -- --test-threads=1`：1 passed；`cargo test -p magi-conversation-runtime --lib turn_contract::tests::legacy_canonical_turn_without_request_identity_is_not_replayable -- --test-threads=1`：1 passed；A/B 仍未关闭，主方案 17.3/17.7 勾选和不可迁移 fixture 边界仍待完成 |
 | 2026-09-21 | A/B | 在当前工作树（保留其他 Agent 未提交修改）上复验 Rust workspace 全量测试；所有现有测试通过，未改变 A/B 的未完成判断 | `cargo test --workspace --all-targets --quiet -- --test-threads=1`：690 passed、1 ignored；A/B 仍未关闭 |
 | 2026-09-21 | C | 按当前代码重新生成 API 和 tool-runtime 权限代表格；API artifact 的 16 行字段完整，tool-runtime artifact 的 36 行覆盖六个 surface 与三种 AccessProfile，Provider 请求在 executor 层明确为空值 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：68 passed、1 ignored；`/tmp/magi-api-permission-matrix.json`：16 行，surface=`git_workspace/background_process`，字段无缺失；`cargo test -p magi-tool-runtime --lib -- --test-threads=1`：230 passed、1 ignored；`/tmp/magi-tool-runtime-permission-matrix.json`：36 行，surface=`browser_host/file_executor/git_executor/mcp_executor/process_executor/shell_executor`，profiles=`ReadOnly/Restricted/FullAccess`。这些是 runtime/API 代表格，不能关闭完整 Provider 权限矩阵 |
+| 2026-09-21 | D/F | 新增版本化 trajectory ledger 派生入口；从 Provider/Electron evidence 统一生成 `magi.trajectory.v1`，并对缺失身份、终态序号和重复 terminal fail-closed | `node --check scripts/derive-magi-trajectory-ledger.mjs`；完整最小 fixture：6 条记录、`status=passed`；缺失身份/序号 fixture：`status=incomplete`、退出码 2；当前没有真实 Provider/Electron JSON 可供合并，因此 D/F/G 仍未关闭 |
 
 ## B 工作包首轮审计
 

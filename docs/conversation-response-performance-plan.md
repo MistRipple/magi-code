@@ -702,7 +702,18 @@ raw tool-call-only 的最新复验使用 `/tmp/magi-electron-dom-raw-tool-1-1023
 
 ### 9.6 Provider trajectory ledger 目标形态
 
-参考 ZCode 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 `prompt-trajectory` 分层，Magi 后续不再让真实 Provider、Electron timing 和权限矩阵各自维护无法互证的统计源。目标是先保存可追加的原始轨迹，再从同一轨迹派生性能、replay 和权限 artifact。该节定义后续实现约束，当前尚未形成新的 ledger 代码或完成证据。
+参考 ZCode 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 `prompt-trajectory` 分层，Magi 后续不再让真实 Provider、Electron timing 和权限矩阵各自维护无法互证的统计源。目标是先保存可追加的原始轨迹，再从同一轨迹派生性能、replay 和权限 artifact。当前已新增 `scripts/derive-magi-trajectory-ledger.mjs` 作为只读派生入口；它不会补造缺失阶段，缺少 `session_id`、`turn_id`、`request_id` 或终态 `event_sequence` 时输出 `incomplete` 并失败。当前只有最小 fixture 的脚本级验证，尚未用真实 Provider/Electron 20 轮 artifact 生成可关闭 D/F/G 的 ledger。
+
+派生命令形态为：
+
+```bash
+node scripts/derive-magi-trajectory-ledger.mjs \
+  --output /tmp/magi-trajectory-ledger.json \
+  /tmp/magi-real-provider-perf-personal20.json \
+  /tmp/magi-electron-dom-correlated-timing-20-10231.json
+```
+
+输出会记录 `schema_version`、`derive_version`、输入 JSON 的 `payload_hash`、phase 计数和验证错误；只有身份、阶段序号和同轮终态约束全部满足时才输出 `status=passed`。本轮的最小 fixture 验证仅证明派生器和 fail-closed 校验语义，不能替代真实输入。
 
 每条原始记录至少包含以下字段：
 
