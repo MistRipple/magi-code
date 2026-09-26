@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import MagiWordmark from './MagiWordmark.svelte';
+  import MagiIcon from './MagiIcon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { vscode } from '../lib/vscode-bridge';
 
@@ -14,7 +14,10 @@
 <div class="settings-tab-inner project-tab">
   <div class="project-content">
     <section class="project-introduction" aria-label={i18n.t('settings.project.title')}>
-      <MagiWordmark width={134} height={39} />
+      <div class="project-brand">
+        <MagiIcon size={64} />
+        <span class="project-brand-name">Magi</span>
+      </div>
       <p>{i18n.t('settings.project.intro')}</p>
     </section>
 
@@ -70,8 +73,17 @@
     border-bottom: 1px solid var(--ind-border-separator);
   }
 
-  .project-introduction :global(.magi-wordmark) {
+  .project-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .project-brand-name {
     color: var(--ind-foreground);
+    font-size: 32px;
+    font-weight: 750;
+    letter-spacing: -0.04em;
   }
 
   .project-introduction p {

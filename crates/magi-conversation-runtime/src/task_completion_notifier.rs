@@ -81,11 +81,10 @@ pub struct TaskCompletionNotifier {
     /// unrunnable tasks and runner panic).
     task_contexts: Arc<Mutex<HashMap<TaskId, TaskCompletionContext>>>,
     /// A TaskStore transition and an explicit worker result can describe the
-    /// same durable terminal fact. Suppress duplicate notifications with the
-    /// committed timestamp plus the execution identities. The timestamp is
-    /// the durable transition generation; the identities distinguish a retry
-    /// that happens within the same millisecond.
-    published_terminals: Arc<Mutex<HashSet<(TaskId, String, u64, String, String)>>>,
+    /// same durable terminal fact. Deduplicate by the committed task generation,
+    /// not by optional Turn/lease context, which may be consumed by the first
+    /// notification before a repeated callback arrives.
+    published_terminals: Arc<Mutex<HashSet<(TaskId, String, u64, u32)>>>,
     observer: Arc<Mutex<Option<Observer>>>,
 }
 
@@ -237,22 +236,11 @@ impl TaskCompletionNotifier {
             }
         };
         let context = merge_completion_context(stored_context, explicit_context);
-        let coordinator_attempt_id = context
-            .as_ref()
-            .and_then(|context| context.coordinator_attempt_id.clone())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_default();
-        let lease_id = context
-            .as_ref()
-            .and_then(|context| context.lease_id.clone())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| attempt_id.clone());
         let key = (
             task_id.clone(),
             format!("{status:?}"),
             task.updated_at.0,
-            coordinator_attempt_id,
-            lease_id,
+            task.retry_count,
         );
         if !self
             .published_terminals
@@ -371,6 +359,7 @@ mod tests {
     use super::*;
     use magi_core::{MissionId, Task, TaskKind, TaskRuntimePayload, UtcMillis, WorkerId};
     use magi_orchestrator::task_store::TaskStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     fn pending_task(task_id: &str) -> Task {
@@ -455,6 +444,50 @@ mod tests {
         assert_eq!(
             store.get_task(&notification.task_id).unwrap().status,
             TaskStatus::Failed
+        );
+    }
+
+    #[test]
+    fn repeated_terminal_status_callback_is_idempotent_after_context_consumption() {
+        let store = Arc::new(TaskStore::new());
+        let task_id = TaskId::new("task-notifier-duplicate-terminal");
+        store
+            .insert_task(pending_task(task_id.as_str()))
+            .expect("pending task should insert");
+        assert!(
+            store
+                .revoke_active_lease_and_set_task_terminal(
+                    &task_id,
+                    &task_id,
+                    TaskStatus::Killed,
+                    Vec::new(),
+                )
+                .expect("terminal status should commit")
+        );
+        let task = store
+            .get_task(&task_id)
+            .expect("committed terminal task should remain");
+        let notifier = TaskCompletionNotifier::new(store);
+        notifier.bind_coordinator_attempt(
+            &task_id,
+            "coordinator-attempt-notifier-duplicate",
+            Some(SessionId::new("session-notifier-duplicate")),
+            Some("turn-notifier-duplicate".to_string()),
+        );
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        notifier.set_observer(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        notifier.notify_terminal_status(&task_id, TaskStatus::Killed, &task);
+        notifier.notify_terminal_status(&task_id, TaskStatus::Killed, &task);
+        notifier.notify_terminal_status(&task_id, TaskStatus::Killed, &task);
+
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            1,
+            "repeated callbacks for the same durable terminal generation must notify once"
         );
     }
 }

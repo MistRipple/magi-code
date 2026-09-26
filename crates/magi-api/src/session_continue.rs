@@ -540,7 +540,7 @@ fn rebuild_thread_history_from_canonical(
                         serde_json::json!({
                             "tool": tool.name,
                             "status": "interrupted",
-                            "reason": "legacy_thread_history_rebuilt_without_result",
+                            "reason": "recovered_thread_history_without_tool_result",
                         })
                         .to_string()
                     });

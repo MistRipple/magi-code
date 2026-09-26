@@ -39,13 +39,18 @@ assert.doesNotMatch(
 );
 assert.match(
   runtimePanelSource,
-  /<div class="runtime-diagnostics-slot">\s*\{#if panelVisible\}[\s\S]*?<\/div>/,
-  '运行态面板必须在稳定的 overlay 容器内按可见状态渲染',
+  /<div class="runtime-diagnostics-slot" class:runtime-diagnostics-slot--visible=\{panelVisible\}>\s*\{#if panelVisible\}[\s\S]*?<\/div>/,
+  '运行态面板必须在稳定容器内按可见状态渲染',
 );
 assert.match(
   runtimePanelSource,
   /\.runtime-diagnostics-slot\s*\{[\s\S]*?position:\s*absolute;[\s\S]*?height:\s*0;[\s\S]*?pointer-events:\s*none;/,
-  '运行态 overlay 不得参与主内容 flex 布局',
+  '运行态面板隐藏时不得占用主内容布局空间',
+);
+assert.match(
+  runtimePanelSource,
+  /\.runtime-diagnostics-slot--visible\s*\{[\s\S]*?position:\s*relative;[\s\S]*?flex:\s*0 0 42px;[\s\S]*?height:\s*42px;/,
+  '运行态面板可见时必须在主内容顶部预留卡片高度，避免覆盖首条消息',
 );
 
 await withGoldenViteServer(async (server) => {

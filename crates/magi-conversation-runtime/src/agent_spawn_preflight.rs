@@ -1038,3 +1038,79 @@ fn bounded_context_text(
     }
     Ok(text)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{MissionId, SessionId, TaskCompletionContract, TaskRuntimePayload};
+    use magi_orchestrator::task_store::TaskStore;
+
+    #[test]
+    fn legacy_agent_spawn_context_is_rejected_before_runtime_mutation() {
+        let session_id = SessionId::new("session-legacy-agent-context");
+        let session_store = SessionStore::default();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::empty();
+        let plan_store = PlanStore::from_store(&session_store, session_id.clone());
+        let parent_task = Task {
+            task_id: TaskId::new("task-legacy-agent-context-parent"),
+            mission_id: MissionId::new("mission-legacy-agent-context"),
+            root_task_id: TaskId::new("task-legacy-agent-context-parent"),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "协调器任务".to_string(),
+            goal: "验证旧格式 agent_spawn 输入被拒绝".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::None,
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        };
+        let parsed = serde_json::json!({
+            "task_name": "legacy_context",
+            "role": "executor",
+            "goal": "执行旧格式代理任务",
+            "context": "旧版字符串上下文",
+        });
+        let workspace_id = None;
+
+        let error = preflight_agent_spawn(AgentSpawnPreflightInput {
+            parsed: &parsed,
+            parent_task: &parent_task,
+            task_store: &task_store,
+            session_store: &session_store,
+            execution_registry: &execution_registry,
+            agent_role_registry: &agent_role_registry,
+            plan_store: &plan_store,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            now: UtcMillis(2),
+            sequence: 1,
+        })
+        .expect_err("旧版 context 字符串必须在创建 child task 前拒绝");
+
+        assert_eq!(error.error_code, "legacy_context_rejected");
+        assert!(task_store.all_tasks().is_empty());
+        assert!(session_store.runtime_sidecar(&session_id).is_none());
+        assert!(
+            execution_registry
+                .get(&TaskId::new(
+                    "task-spawn-task-legacy-agent-context-parent-2-1"
+                ))
+                .is_none()
+        );
+    }
+}

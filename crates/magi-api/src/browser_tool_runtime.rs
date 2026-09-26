@@ -2557,8 +2557,8 @@ mod tests {
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_requested_access,
         browser_tool_snapshot_value, normalize_screenshot_clip, optional_snapshot_target,
         parse_browser_navigation, parse_normalized_rect, screenshot_has_element_scope,
-        validate_browser_tabs_arguments, validate_devtools_arguments, validate_screenshot_binary,
-        validate_screenshot_scope,
+        tab_in_session, validate_browser_tabs_arguments, validate_devtools_arguments,
+        validate_screenshot_binary, validate_screenshot_scope,
     };
     use crate::state::BrowserHostStatusSnapshot;
     use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
@@ -2654,6 +2654,100 @@ mod tests {
                 .filter(|event| event.event_type == "browser.session.created")
                 .count(),
             1
+        );
+
+        let mismatched_workspace_id = WorkspaceId::new("workspace-browser-tabs-other");
+        let error = runtime
+            .ensure_session(&session_id, Some(&mismatched_workspace_id))
+            .expect_err("an existing Browser Session must not be rebound to another workspace");
+        assert_eq!(error.code, "browser_workspace_scope_mismatch");
+        assert_eq!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .filter(|event| event.event_type == "browser.session.created")
+                .count(),
+            1,
+            "scope mismatch must not create a second Browser Session"
+        );
+    }
+
+    #[test]
+    fn browser_tab_from_another_session_is_rejected_by_scope_guard() {
+        let mut authority = BrowserAuthority::new();
+        authority
+            .register_profile(BrowserProfile {
+                profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
+                kind: BrowserProfileKind::ManagedDefault,
+                data_path: tempfile::tempdir()
+                    .expect("browser profile fixture should create")
+                    .keep(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            })
+            .expect("browser profile should register");
+        let runtime = BrowserToolRuntimeDependencies {
+            authority: Arc::new(Mutex::new(authority)),
+            write_lock: Arc::new(Mutex::new(())),
+            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            state_writable: Arc::new(AtomicBool::new(true)),
+            host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
+            host_client: Arc::new(RwLock::new(None)),
+            event_bus: Arc::new(InMemoryEventBus::new(8)),
+            session_store: Arc::new(SessionStore::new()),
+            persistence: None,
+        };
+        let current_session_id = SessionId::new("session-browser-current-scope");
+        let current_session = runtime
+            .ensure_session(&current_session_id, None)
+            .expect("current Browser Session should create");
+
+        let foreign_session_id = SessionId::new("session-browser-foreign-scope");
+        let foreign_browser_session_id = BrowserSessionId::new("browser-session-foreign-scope");
+        let foreign_tab_id = BrowserTabId::new("browser-tab-foreign-scope");
+        {
+            let mut authority = runtime
+                .authority
+                .lock()
+                .expect("browser authority lock should hold");
+            authority
+                .create_session(CreateBrowserSession {
+                    browser_session_id: foreign_browser_session_id.clone(),
+                    workspace_id: None,
+                    session_id: foreign_session_id,
+                    profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
+                    now: UtcMillis(2),
+                })
+                .expect("foreign Browser Session should create");
+            authority
+                .transition_session(
+                    &foreign_browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(3),
+                )
+                .expect("foreign Browser Session should become ready");
+            authority
+                .create_tab(CreateBrowserTab {
+                    tab_id: foreign_tab_id.clone(),
+                    browser_session_id: foreign_browser_session_id,
+                    url: "about:blank".to_string(),
+                    now: UtcMillis(4),
+                })
+                .expect("foreign Tab should create");
+        }
+
+        let error = tab_in_session(&runtime, &current_session, &foreign_tab_id)
+            .expect_err("a Tab from another Magi Session must be rejected");
+        assert_eq!(error.code, "browser_tab_scope_mismatch");
+        assert!(
+            runtime
+                .authority
+                .lock()
+                .expect("browser authority lock should hold")
+                .primary_surface(&foreign_tab_id)
+                .is_none(),
+            "scope rejection must happen before requesting a Desktop Surface"
         );
     }
 
@@ -2788,6 +2882,7 @@ mod tests {
         assert_eq!(payload["error_code"], "capability_unavailable");
         assert_eq!(payload["details"]["capability"], "desktop_browser_surface");
         assert_eq!(payload["details"]["supported_platform"], "desktop");
+        assert_eq!(payload["details"]["available_fallback"], "browser_records");
     }
 
     #[cfg(unix)]

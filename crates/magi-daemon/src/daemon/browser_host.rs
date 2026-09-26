@@ -1297,9 +1297,10 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
             .active_goal_for_execution_owner(&browser_session.session_id, &current_turn.turn_id)
             .is_some();
         let request_id = request_id_for_turn(&current_turn);
-        if let Some(chain) = state
+        let active_chain = state
             .session_store
-            .active_execution_chain(&browser_session.session_id)
+            .active_execution_chain(&browser_session.session_id);
+        if let Some(chain) = active_chain.as_ref()
             && let Some(manager) = state.runner_manager()
             && let Err(error) = manager.kill_tree(chain.root_task_id.as_str())
         {
@@ -1310,10 +1311,18 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
                 "daemon 关闭时终止浏览器执行树失败"
             );
         }
-        match state
-            .turn_event_sink()
-            .interrupt_turn_by_daemon_restart(&browser_session.session_id)
-        {
+        // Browser session 也可能停留在 accepted/preparing，尚未建立 task
+        // execution chain；无链路时仍必须通过 canonical sink 取消当前 Turn。
+        let settled = if active_chain.is_some() {
+            state
+                .turn_event_sink()
+                .interrupt_turn_by_daemon_restart(&browser_session.session_id)
+        } else {
+            state
+                .turn_event_sink()
+                .cancel_turn(&browser_session.session_id)
+        };
+        match settled {
             Ok(Some(_)) => {
                 state
                     .turn_coordinator()

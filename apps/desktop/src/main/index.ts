@@ -8,9 +8,11 @@ import {
   BrowserWindow,
   ipcMain,
   Menu,
+  nativeImage,
   nativeTheme,
   session,
   shell,
+  Tray,
   type MenuItemConstructorOptions,
   type Rectangle,
 } from "electron";
@@ -86,6 +88,7 @@ let automationWorker: AutomationWorker | null = null;
 let controlServer: DesktopControlServer | null = null;
 let processSupervisor: ProcessSupervisor | null = null;
 let updateManager: UpdateManager | null = null;
+let tray: Tray | null = null;
 let desktopConnectionGeneration: number | null = null;
 let workerInvalidatedDesktopConnection = false;
 let browserComponentError: BrowserComponentError | null = null;
@@ -211,6 +214,7 @@ if (singleInstance) {
       const manager = new WindowManager({
         desktopEpoch,
         preloadPath: paths.preload,
+        iconPath: paths.appIcon,
         agentOrigin: AGENT_ORIGIN,
         surfaceManager: surfaces,
         windows,
@@ -225,8 +229,13 @@ if (singleInstance) {
             // Window may have closed between reducer and publication.
           }
         },
+        shouldHideWindowOnClose: () => !shuttingDown,
       });
       windowManager = manager;
+      if (process.platform === "darwin" && app.dock) {
+        app.dock.setIcon(paths.appIcon);
+      }
+      createSystemTray(paths.trayIcon);
       registerIpc();
       control = new DesktopControlServer({
         socketPath: controlSocket,
@@ -326,9 +335,20 @@ function configureAppRendererAuthentication(token: string): void {
   );
 }
 
-app.on("window-all-closed", () => app.quit());
+// 窗口关闭默认收进系统托盘；只有托盘菜单中的“退出 Magi”或操作系统显式
+// 退出动作才会进入下面的优雅关闭事务。
+app.on("window-all-closed", () => {
+  if (!tray) app.quit();
+});
+app.on("activate", () => showMainWindow());
 app.on("before-quit", (event) => {
-  if (shuttingDown) return;
+  // shutdown() 会销毁托盘和窗口；这可能同步触发 window-all-closed ->
+  // app.quit()。重入的 before-quit 仍必须阻止默认退出，直到第一次关闭
+  // 事务完成，否则 Electron 会绕过 ProcessSupervisor 的 daemon settlement。
+  if (shuttingDown) {
+    event.preventDefault();
+    return;
+  }
   event.preventDefault();
   shuttingDown = true;
   void shutdown().finally(() => app.exit(0));
@@ -347,13 +367,14 @@ function registerIpc(): void {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     const request = rejectUnknownFields(
       object(value),
-      ["workspaceId", "workspacePath", "sessionId"],
+      ["workspaceId", "workspacePath", "sessionId", "sessionTitle"],
       "context",
     );
     return manager.setRendererContext(windowId, {
       workspaceId: optionalText(request.workspaceId, "workspaceId"),
       workspacePath: optionalText(request.workspacePath, "workspacePath"),
       sessionId: optionalText(request.sessionId, "sessionId"),
+      sessionTitle: optionalText(request.sessionTitle, "sessionTitle"),
     });
   });
   handleIpc("magi-desktop:activate-browser", async (event, value: unknown) => {
@@ -1076,6 +1097,45 @@ function broadcastAll(channel: string, value: unknown): void {
   }
 }
 
+function createSystemTray(iconPath: string): void {
+  if (tray) return;
+  const image = nativeImage.createFromPath(iconPath);
+  if (image.isEmpty()) {
+    console.error("Magi 状态栏图标加载失败", { iconPath });
+    return;
+  }
+  const trayImage =
+    process.platform === "darwin"
+      ? image.resize({ width: 18, height: 18, quality: "best" })
+      : image;
+  tray = new Tray(trayImage);
+  tray.setToolTip("Magi");
+  tray.on("click", () => showMainWindow());
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: "打开 Magi", click: () => showMainWindow() },
+      { type: "separator" },
+      { label: "退出 Magi", click: () => app.quit() },
+    ]),
+  );
+}
+
+function showMainWindow(): void {
+  const manager = windowManager;
+  if (!manager) return;
+  let windowId: string;
+  try {
+    windowId = manager.activeWindowId();
+  } catch {
+    return;
+  }
+  const window = windows.get(windowId);
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
+
 async function shutdown(): Promise<void> {
   if (browserComponentSnapshotTimer)
     clearInterval(browserComponentSnapshotTimer);
@@ -1083,6 +1143,8 @@ async function shutdown(): Promise<void> {
   lastBrowserComponentSnapshot = "";
   desktopControlConnected = false;
   desktopRuntimeRecoveryCoordinator.shutdown();
+  tray?.destroy();
+  tray = null;
   windowManager?.closeAll();
   surfaceManager?.closeAll();
   await automationWorker?.stop();
@@ -1277,6 +1339,8 @@ function resolveRuntimePaths(): {
   preload: string;
   webDist: string;
   webRoot: string;
+  appIcon: string;
+  trayIcon: string;
 } {
   const moduleDirectory = fileURLToPath(new URL(".", import.meta.url));
   if (app.isPackaged) {
@@ -1296,6 +1360,8 @@ function resolveRuntimePaths(): {
       preload: join(moduleDirectory, "..", "preload", "index.cjs"),
       webDist: join(process.resourcesPath, "web", "dist"),
       webRoot: join(process.resourcesPath, "web"),
+      appIcon: join(process.resourcesPath, "magi-app.png"),
+      trayIcon: join(process.resourcesPath, "magi-tray.png"),
     };
   }
   const root = resolve(moduleDirectory, "../../../..");
@@ -1310,6 +1376,8 @@ function resolveRuntimePaths(): {
     preload: join(root, "apps", "desktop", "dist", "preload", "index.cjs"),
     webDist: join(root, "web", "dist"),
     webRoot: join(root, "web"),
+    appIcon: join(root, "apps", "desktop", "icons", "512x512.png"),
+    trayIcon: join(root, "apps", "desktop", "icons", "32x32.png"),
   };
 }
 

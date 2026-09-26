@@ -102,10 +102,10 @@
     processingStartedAt={messagesState.thinkingStartAt}
     turnStage={messagesState.turnStage}
   />
+  <ActiveAgentCenter />
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
     <ConversationApprovalTray approvals={unanchoredApprovals} />
-    <ActiveAgentCenter />
   </div>
 
   <GoalRunDrawers />

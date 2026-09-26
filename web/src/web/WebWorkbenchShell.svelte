@@ -3,7 +3,7 @@
   import App from '../App.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
-  import MagiWordmark from '../components/MagiWordmark.svelte';
+  import MagiIcon from '../components/MagiIcon.svelte';
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
   import {
@@ -38,6 +38,11 @@
     resolveSessionRunningState,
     shouldMarkSessionCompletionViewed,
   } from '../lib/session-activity-indicator';
+  import {
+    uiClockState,
+    retainUiClock,
+  } from '../stores/ui-clock.svelte';
+  import { formatRelativeTime } from '../lib/relative-time';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { normalizeRustBootstrapPayload } from '../shared/bridges/rust-daemon-contract';
   import { i18n } from '../stores/i18n.svelte';
@@ -1089,23 +1094,9 @@ import {
       && (!preview || preview === '新对话');
   }
 
-  function formatRelativeTime(timestamp: string | number | Date | null | undefined): string {
-    if (!timestamp) return '';
-    const date = new Date(timestamp);
-    const ms = Date.now() - date.getTime();
-    if (Number.isNaN(ms) || ms < 0) {
-      return date.toLocaleDateString(i18n.locale, { month: 'short', day: 'numeric' });
-    }
-    const isZh = (i18n.locale || '').toLowerCase().startsWith('zh');
-    const minutes = Math.floor(ms / 60000);
-    if (minutes < 1) return isZh ? '刚刚' : 'just now';
-    if (minutes < 60) return isZh ? `${minutes} 分钟` : `${minutes}m`;
-    const hours = Math.floor(ms / 3600000);
-    if (hours < 24) return isZh ? `${hours} 小时` : `${hours}h`;
-    const days = Math.floor(ms / 86400000);
-    if (days < 30) return isZh ? `${days} 天` : `${days}d`;
-    return date.toLocaleDateString(i18n.locale, { month: 'short', day: 'numeric' });
-  }
+  const relativeTimeNow = $derived(Math.floor(uiClockState.now / 15_000) * 15_000);
+
+  onMount(() => retainUiClock());
 
 
   const themeIconName = $derived.by<IconName>(() => {
@@ -2933,7 +2924,10 @@ import {
   >
     <div class="sidebar-header">
       <div class="sidebar-toolbar">
-        <MagiWordmark />
+        <div class="sidebar-brand" aria-label="Magi">
+          <MagiIcon size={30} />
+          <span class="sidebar-brand-name">Magi</span>
+        </div>
         <div class="sidebar-header-tools">
           <button
             class="theme-toggle-btn"
@@ -3155,7 +3149,7 @@ import {
                                 <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
                                 <span class="session-meta">
                                   <span class="session-msg-count" title={i18n.t('header.messageCount', { count: session.messageCount ?? 0 })}>{session.messageCount ?? 0}</span>
-                                  <span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt)}</span>
+                                  <span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span>
                                 </span>
                               </button>
                               <div class="session-actions">
@@ -3284,7 +3278,7 @@ import {
                     <button type="button" class="session-item" class:active={session.id === currentSessionId && !currentBootstrapWorkspaceId()} class:pending={session.id === pendingSessionSwitchId && pendingSessionSwitchWorkspaceId === null} data-session-id={session.id} title={session.name || i18n.t('header.unnamedSession')} onclick={() => switchPersonalSession(session.id)}>
                       <span class="session-running-dot" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} aria-hidden="true"></span>
                       <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
-                      <span class="session-meta"><span class="session-msg-count">{session.messageCount ?? 0}</span><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt)}</span></span>
+                      <span class="session-meta"><span class="session-msg-count">{session.messageCount ?? 0}</span><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span></span>
                     </button>
                     <div class="session-actions">
                       <button type="button" class="session-action-btn session-rename-btn" title={i18n.t('header.renameSession')} onclick={() => void beginPersonalSessionRename(session)}><Icon name="pencil" size={12} /></button>
@@ -3588,6 +3582,20 @@ import {
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
+  }
+
+  .sidebar-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    color: var(--foreground);
+  }
+
+  .sidebar-brand-name {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
   }
 
   .sidebar-header-tools {

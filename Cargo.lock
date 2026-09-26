@@ -1585,6 +1585,7 @@ dependencies = [
  "base64",
  "dirs",
  "encoding_rs",
+ "magi-bridge-client",
  "magi-browser-authority",
  "magi-core",
  "magi-event-bus",

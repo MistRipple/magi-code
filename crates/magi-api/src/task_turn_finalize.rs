@@ -280,6 +280,35 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
         "conversation response timing"
     );
     let persist_session_state = session_state_persist_callback(state);
+    let turn_was_terminal = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .filter(|turn| expected_turn_id.is_none_or(|expected| turn.turn_id == expected))
+        .is_some_and(|turn| {
+            magi_conversation_runtime::session_turn_finalize::current_turn_status_is_terminal(
+                &turn.status,
+            )
+        });
+    let defer_execution_resource_settlement = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .filter(|turn| expected_turn_id.is_none_or(|expected| turn.turn_id == expected))
+        .is_some_and(|turn| {
+            matches!(
+                turn.status.trim().to_ascii_lowercase().as_str(),
+                "cancelled" | "canceled" | "interrupted"
+            )
+        });
+    let settle_execution_resources = || {
+        // 用户取消时，interrupt handler 负责先等待 Runner/dispatch quiescence，
+        // 再释放 Git lease。TaskStore 的 Killed 通知可能在 quiesce 前触发本 finalizer。
+        if !defer_execution_resource_settlement {
+            state.release_session_git_execution_lease(session_id);
+        }
+        Ok(())
+    };
     let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
             magi_conversation_runtime::session_turn_finalize::FinalizeBackgroundSessionTaskTurnContext {
                 session_store: state.session_store.as_ref(),
@@ -289,8 +318,13 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 root_task_id,
                 runner_status,
                 expected_turn_id,
-                coordinator: Some(state.turn_coordinator()),
+                // user interrupt already durably marked the canonical Turn terminal,
+                // but the Coordinator slot must stay occupied until interrupt_session_turn
+                // has awaited Runner/dispatch quiescence and sends Cancel itself.
+                coordinator: (!defer_execution_resource_settlement)
+                    .then_some(state.turn_coordinator().as_ref()),
                 persist_session_state: Some(persist_session_state.as_ref()),
+                settle_execution_resources: Some(&settle_execution_resources),
             },
         )?;
     tracing::info!(
@@ -315,14 +349,14 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
         provider_call_id = "",
         finalized,
         elapsed_ms = finalize_started_at.elapsed().as_millis() as u64,
-        stage = if finalized {
+        stage = if finalized && !turn_was_terminal {
             "canonical_terminal_published"
         } else {
             "canonical_terminal_ignored"
         },
         "conversation response timing"
     );
-    if finalized {
+    if finalized && !turn_was_terminal {
         let owns_active_plan = state
             .session_store
             .active_plan_for_execution_owner(session_id, root_task_id.as_str())
@@ -383,7 +417,6 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 None,
             );
         }
-        state.release_session_git_execution_lease(session_id);
         schedule_next_queued_session_turn(state, session_id);
     }
     Ok(finalized)

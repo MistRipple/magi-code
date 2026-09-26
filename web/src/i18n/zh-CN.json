@@ -5,6 +5,7 @@
   "common.refresh": "刷新",
   "common.workspace": "工作区",
   "common.unlimited": "不限",
+  "app.documentTitle": "Magi",
   "app.bootstrapConnecting": "正在打开 Magi...",
   "app.bootstrapConnectingHint": "正在准备会话，请稍候",
   "app.bootstrapConnectionFailed": "Magi 暂时无法打开",

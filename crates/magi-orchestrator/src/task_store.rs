@@ -1781,6 +1781,44 @@ impl TaskStore {
         status: TaskStatus,
         output_refs: Vec<String>,
     ) -> DomainResult<bool> {
+        self.revoke_lease_and_set_task_terminal_inner(
+            task_id,
+            root_task_id,
+            lease_id,
+            status,
+            output_refs,
+            false,
+        )
+    }
+
+    /// 用户取消语义：在 TaskStore mutation lock 内读取并撤销当前活跃租约，
+    /// 避免 Runner 在调用方“先读 lease、再写终态”的窗口里刚好授予新 lease。
+    pub fn revoke_active_lease_and_set_task_terminal(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        status: TaskStatus,
+        output_refs: Vec<String>,
+    ) -> DomainResult<bool> {
+        self.revoke_lease_and_set_task_terminal_inner(
+            task_id,
+            root_task_id,
+            None,
+            status,
+            output_refs,
+            true,
+        )
+    }
+
+    fn revoke_lease_and_set_task_terminal_inner(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        lease_id: Option<&LeaseId>,
+        status: TaskStatus,
+        output_refs: Vec<String>,
+        discover_active_lease: bool,
+    ) -> DomainResult<bool> {
         if !matches!(status, TaskStatus::Failed | TaskStatus::Killed) {
             return Err(DomainError::InvalidState {
                 message: format!("任务终态只能是 Failed 或 Killed，收到 {:?}", status),
@@ -1815,6 +1853,11 @@ impl TaskStore {
                 });
             }
         }
+        if discover_active_lease && active_leases.len() > 1 {
+            return Err(DomainError::InvalidState {
+                message: format!("任务 {} 同时拥有多个活跃租约，不能安全取消", task_id),
+            });
+        }
         let task = tasks
             .get(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
@@ -1826,28 +1869,32 @@ impl TaskStore {
             }
             return Ok(false);
         }
-        let requested_lease = match lease_id {
-            Some(expected) => {
-                let Some(lease) = leases.get(expected).cloned() else {
-                    return Ok(false);
-                };
-                if lease.task_id != *task_id {
-                    return Err(DomainError::InvalidState {
-                        message: format!("租约 {} 不属于任务 {}", expected, task_id),
-                    });
+        let requested_lease = if discover_active_lease {
+            active_leases.first().cloned()
+        } else {
+            match lease_id {
+                Some(expected) => {
+                    let Some(lease) = leases.get(expected).cloned() else {
+                        return Ok(false);
+                    };
+                    if lease.task_id != *task_id {
+                        return Err(DomainError::InvalidState {
+                            message: format!("租约 {} 不属于任务 {}", expected, task_id),
+                        });
+                    }
+                    Self::validate_lease_contract(&tasks, &lease)?;
+                    if lease.root_task_id != *root_task_id {
+                        return Err(DomainError::InvalidState {
+                            message: format!("租约 {} 不属于 root task {}", expected, root_task_id),
+                        });
+                    }
+                    if lease.lease_status != TaskLeaseState::Active {
+                        return Ok(false);
+                    }
+                    Some(lease)
                 }
-                Self::validate_lease_contract(&tasks, &lease)?;
-                if lease.root_task_id != *root_task_id {
-                    return Err(DomainError::InvalidState {
-                        message: format!("租约 {} 不属于 root task {}", expected, root_task_id),
-                    });
-                }
-                if lease.lease_status != TaskLeaseState::Active {
-                    return Ok(false);
-                }
-                Some(lease)
+                None => None,
             }
-            None => None,
         };
         let active_lease_id = active_leases.first().map(|lease| lease.lease_id.clone());
         if let Some(active_lease) = active_lease_id
@@ -3091,7 +3138,7 @@ mod tests {
     use super::*;
     use magi_core::{TaskCompletionEvidence, TaskEvidenceRequirement, TaskExecutorBinding};
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     fn task(task_id: &str, status: TaskStatus) -> Task {
         let now = UtcMillis::now();
@@ -3533,10 +3580,9 @@ mod tests {
             .expect("pending task should insert");
         assert!(
             kill_store
-                .revoke_lease_and_set_task_terminal(
+                .revoke_active_lease_and_set_task_terminal(
                     &pending.task_id,
                     &pending.root_task_id,
-                    None,
                     TaskStatus::Killed,
                     Vec::new(),
                 )
@@ -3550,6 +3596,116 @@ mod tests {
             TaskStatus::Killed
         );
         assert!(kill_store.get_active_lease(&pending.task_id).is_none());
+
+        let active_kill_store = TaskStore::new();
+        let root = rooted_task("root-active-kill", "root-active-kill");
+        let mut running = rooted_task("root-active-kill", "task-active-kill");
+        running.status = TaskStatus::Pending;
+        active_kill_store
+            .insert_task(root)
+            .expect("active-kill root should insert");
+        active_kill_store
+            .insert_task(running.clone())
+            .expect("active-kill task should insert");
+        let lease = active_kill_store
+            .grant_lease_and_start_task(
+                &running.task_id,
+                &running.root_task_id,
+                &WorkerId::new("worker-active-kill"),
+                "executor",
+                60_000,
+            )
+            .expect("active-kill lease should grant")
+            .expect("active-kill lease should exist");
+        assert!(
+            active_kill_store
+                .revoke_active_lease_and_set_task_terminal(
+                    &running.task_id,
+                    &running.root_task_id,
+                    TaskStatus::Killed,
+                    Vec::new(),
+                )
+                .expect("atomic cancellation should revoke the current lease")
+        );
+        assert_eq!(
+            active_kill_store
+                .get_task(&running.task_id)
+                .expect("active-kill task should remain")
+                .status,
+            TaskStatus::Killed
+        );
+        assert_eq!(
+            active_kill_store
+                .get_lease(&lease.lease_id)
+                .expect("revoked lease should remain as history")
+                .lease_status,
+            TaskLeaseState::Revoked
+        );
+    }
+
+    #[test]
+    fn active_lease_cancellation_is_linearizable_with_runner_lease_handoff() {
+        for attempt in 0..32 {
+            let store = Arc::new(TaskStore::new());
+            let root_task_id = TaskId::new(format!("root-cancel-lease-handoff-{attempt}"));
+            let task_id = TaskId::new(format!("task-cancel-lease-handoff-{attempt}"));
+            let root = rooted_task(root_task_id.as_str(), root_task_id.as_str());
+            let mut task = rooted_task(root_task_id.as_str(), task_id.as_str());
+            task.status = TaskStatus::Pending;
+            store.insert_task(root).expect("root should insert");
+            store.insert_task(task).expect("pending task should insert");
+
+            let barrier = Arc::new(Barrier::new(2));
+            let grant_store = Arc::clone(&store);
+            let grant_barrier = Arc::clone(&barrier);
+            let grant_task_id = task_id.clone();
+            let grant_root_task_id = root_task_id.clone();
+            let grant = std::thread::spawn(move || {
+                grant_barrier.wait();
+                grant_store.grant_lease_and_start_task(
+                    &grant_task_id,
+                    &grant_root_task_id,
+                    &WorkerId::new(format!("worker-cancel-lease-handoff-{attempt}")),
+                    "executor",
+                    60_000,
+                )
+            });
+
+            barrier.wait();
+            assert!(
+                store
+                    .revoke_active_lease_and_set_task_terminal(
+                        &task_id,
+                        &root_task_id,
+                        TaskStatus::Killed,
+                        Vec::new(),
+                    )
+                    .expect("cancellation must serialize with lease handoff")
+            );
+            let grant_result = grant.join().expect("lease handoff thread should finish");
+            match grant_result {
+                Ok(Some(lease)) => assert_eq!(
+                    store
+                        .get_lease(&lease.lease_id)
+                        .expect("won handoff lease should remain as history")
+                        .lease_status,
+                    TaskLeaseState::Revoked,
+                    "if lease handoff wins the race, cancellation must revoke that exact active lease"
+                ),
+                Err(DomainError::InvalidState { .. }) => {}
+                other => {
+                    panic!("cancellation and lease handoff had an invalid race result: {other:?}")
+                }
+            }
+            let cancelled_task = store
+                .get_task(&task_id)
+                .expect("cancelled task should remain");
+            assert_eq!(cancelled_task.status, TaskStatus::Killed);
+            assert!(
+                store.get_active_lease(&cancelled_task.task_id).is_none(),
+                "linearized cancellation must leave no active lease"
+            );
+        }
     }
 
     #[test]

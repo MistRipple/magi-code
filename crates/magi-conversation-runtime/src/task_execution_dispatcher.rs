@@ -321,7 +321,7 @@ impl Drop for AgentWorktreeCleanup {
 /// 三类目标对应 settings.json 中三段独立配置：
 /// - [`RoleTarget::Orchestrator`]：`orchestrator` 段——业务主对话的权威入口，
 ///   携带 `reasoningEffort` 等全套字段。未配置时使用 daemon bootstrap 注入的
-///   `default_client`（`MAGI_OPENAI_COMPAT_*` env 兜底）。
+///   `default_client`（由 `MAGI_OPENAI_COMPAT_*` 环境变量提供配置）。
 /// - [`RoleTarget::Auxiliary`]：`auxiliary` 段——会话标题精修、知识抽取、会话记忆、
 ///   Prompt 增强等"低价值/低延迟敏感"任务。未配置时返回 `None`，调用方静默跳过。
 /// - [`RoleTarget::Agent`]：代理角色，按 `agents[*]` 段查 `engineId` 绑定，
@@ -5364,7 +5364,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_orchestrator_model_config_uses_defaults_for_legacy_session() {
+    fn resolve_orchestrator_model_config_uses_user_defaults_without_session_override() {
         use magi_settings_store::{ORCHESTRATOR_SESSION_DEFAULTS_SECTION, SettingsStore};
 
         let store = SettingsStore::new();
@@ -5388,10 +5388,11 @@ mod tests {
                 }),
             )
             .unwrap();
-        let legacy_session = SessionId::new("session-without-model-override");
+        let session_without_model_override = SessionId::new("session-without-model-override");
 
-        let config = resolve_orchestrator_model_config(&store, Some(&legacy_session))
-            .expect("旧会话应继承权威的用户默认模型");
+        let config =
+            resolve_orchestrator_model_config(&store, Some(&session_without_model_override))
+                .expect("没有模型覆盖的会话应继承权威的用户默认模型");
         assert_eq!(
             config.require_model().expect("默认模型必须可执行"),
             "model-last-used"

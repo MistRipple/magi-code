@@ -1,4 +1,8 @@
 use super::*;
+use magi_bridge_client::{
+    HttpMcpServerConfig, McpBridgeClient, McpServerClient, McpServerConfig,
+    McpServerConnectionConfig, McpToolCallRequest,
+};
 use magi_core::{
     ApprovalRequirement, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ToolCallId,
     UtcMillis, WorkerId, WorkspaceId,
@@ -36,7 +40,33 @@ fn record_permission_matrix_rows(new_rows: Vec<Value>) {
     let mut rows = rows
         .lock()
         .expect("tool runtime permission matrix lock should hold");
-    for row in new_rows {
+    for mut row in new_rows {
+        let fixture_id = format!(
+            "tool-runtime:{}:{}:{}:{}",
+            row["surface"].as_str().unwrap_or("unknown"),
+            row["tool"].as_str().unwrap_or("unknown"),
+            row["access_profile"].as_str().unwrap_or("unknown"),
+            row["case"].as_str().unwrap_or("unknown"),
+        );
+        row["fixture_id"] = Value::String(fixture_id);
+        row["schema_version"] = Value::String("magi.permission.fixture.v1".to_string());
+        // Tool runtime fixture 不经过 Provider 或 TurnService；用显式 0/不适用值区分
+        // “该边界没有这些事实”和“测试漏记字段”，避免派生器把两者混为缺口。
+        if row.get("provider_requests").is_none() || row["provider_requests"].is_null() {
+            row["provider_requests"] = Value::from(0u64);
+        }
+        row["turn_status"] = row
+            .get("turn_status")
+            .cloned()
+            .unwrap_or_else(|| Value::String("not_applicable".to_string()));
+        row["task_status"] = row
+            .get("task_status")
+            .cloned()
+            .unwrap_or_else(|| Value::String("not_applicable".to_string()));
+        row["terminal_source"] = row
+            .get("terminal_source")
+            .cloned()
+            .unwrap_or_else(|| Value::String("executor_boundary".to_string()));
         for field in [
             "case",
             "surface",
@@ -78,8 +108,11 @@ fn record_permission_matrix_rows(new_rows: Vec<Value>) {
                     .cmp(&right["access_profile"].as_str())
             })
     });
+    let evidence_path = std::env::var_os("MAGI_TOOL_RUNTIME_PERMISSION_MATRIX_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/magi-tool-runtime-permission-matrix.json"));
     fs::write(
-        "/tmp/magi-tool-runtime-permission-matrix.json",
+        evidence_path,
         serde_json::to_vec_pretty(&*rows).expect("tool runtime matrix rows should serialize"),
     )
     .expect("tool runtime permission matrix evidence should write");
@@ -2411,6 +2444,61 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
             .expect("processes should be array")
             .is_empty()
     );
+
+    record_permission_matrix_rows(vec![
+        serde_json::json!({
+            "case": "process_scope_owner_full_access_launch",
+            "surface": "process_executor",
+            "tool": "process_launch",
+            "access_profile": "FullAccess",
+            "scope": "workspace_internal",
+            "lifecycle": "allow",
+            "status": "Succeeded",
+            "executor_called": true,
+            "side_effect": "owner_process_started",
+            "provider_requests": 0,
+            "approval_events": [],
+        }),
+        serde_json::json!({
+            "case": "process_scope_workspace_only_read_rejected",
+            "surface": "process_executor",
+            "tool": "process_read",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "scope_reject",
+            "status": "Failed",
+            "executor_called": false,
+            "side_effect": "sessionless_context_cannot_read_process",
+            "provider_requests": 0,
+            "approval_events": [],
+        }),
+        serde_json::json!({
+            "case": "process_scope_other_session_read_rejected",
+            "surface": "process_executor",
+            "tool": "process_read",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "scope_reject",
+            "status": "Failed",
+            "executor_called": false,
+            "side_effect": "other_session_process_hidden",
+            "provider_requests": 0,
+            "approval_events": [],
+        }),
+        serde_json::json!({
+            "case": "process_scope_workspace_only_list_is_empty",
+            "surface": "process_executor",
+            "tool": "process_list",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "scope_filter",
+            "status": "Succeeded",
+            "executor_called": true,
+            "side_effect": "workspace_only_process_list_empty",
+            "provider_requests": 0,
+            "approval_events": [],
+        }),
+    ]);
 
     let kill = tool_registry.execute_internal_builtin_with_policy(
         ToolExecutionInput {
@@ -5495,6 +5583,34 @@ fn browser_access_profile_matrix_keeps_read_and_write_capabilities_distinct() {
             }
         }
     }
+
+    let policy_rows = magi_browser_authority::BrowserToolKind::ALL
+        .iter()
+        .flat_map(|kind| {
+            [
+                magi_core::AccessProfile::ReadOnly,
+                magi_core::AccessProfile::Restricted,
+                magi_core::AccessProfile::FullAccess,
+            ]
+            .into_iter()
+            .map(move |access_profile| {
+                serde_json::json!({
+                    "case": format!("browser_policy_{access_profile:?}_{}", kind.name()),
+                    "surface": "browser_host",
+                    "tool": kind.name(),
+                    "access_profile": format!("{access_profile:?}"),
+                    "scope": "host_surface",
+                    "lifecycle": "policy_decision",
+                    "status": "Succeeded",
+                    "executor_called": false,
+                    "side_effect": "policy_only",
+                    "provider_requests": 0,
+                    "approval_events": [],
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    record_permission_matrix_rows(policy_rows);
 }
 
 #[test]
@@ -7830,6 +7946,352 @@ fn external_mcp_access_profile_matrix_records_executor_side_effects() {
             })
             .collect(),
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_mcp_access_profile_matrix_reaches_real_stdio_server_for_write_side_effect() {
+    let root = unique_temp_dir("magi-tool-mcp-stdio-permission-matrix");
+    let target = root.join("mcp-write.txt");
+    let script = format!(
+        r#"
+while IFS= read -r line; do
+    method=$(echo "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+    id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    case "$method" in
+        initialize)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"matrix-mcp","version":"1.0"}}}}}}\n' "$id"
+            ;;
+        notifications/initialized)
+            ;;
+        tools/list)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"write_file","description":"Write one file","inputSchema":{{"type":"object"}}}}]}}}}\n' "$id"
+            ;;
+        tools/call)
+            printf 'mcp-stdio-side-effect\n' > {target}
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"stdio-write-ok"}}]}}}}\n' "$id"
+            ;;
+    esac
+done
+"#,
+        target = target.display(),
+    );
+    let client =
+        McpServerClient::from_stdio(McpServerConfig::new("sh", vec!["-c".to_string(), script]));
+    let client = Arc::new(client);
+
+    let catalog = ExternalToolCatalogSnapshot {
+        mcp_tools: vec![ExternalMcpToolCatalogEntry {
+            server_id: "matrix-mcp".to_string(),
+            server_name: "Matrix MCP".to_string(),
+            model_tool_name: "mcp__matrix_mcp__write_file".to_string(),
+            tool_name: "write_file".to_string(),
+            description: "Write one file".to_string(),
+            read_only: false,
+            input_schema: serde_json::json!({"type":"object"}),
+        }],
+        ..ExternalToolCatalogSnapshot::default()
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_executor = Arc::clone(&calls);
+    let registry = ToolRegistry::new(
+        Arc::new(GovernanceService::default()),
+        Arc::new(magi_event_bus::InMemoryEventBus::new(16)),
+    )
+    .with_external_tool_catalog_provider(Arc::new(move || catalog.clone()))
+    .with_external_mcp_tool_executor(Arc::new(move |server, tool, arguments| {
+        calls_for_executor.fetch_add(1, Ordering::SeqCst);
+        let response = client
+            .call_tool(McpToolCallRequest {
+                server_name: server.to_string(),
+                tool_name: tool.to_string(),
+                input: arguments.to_string(),
+            })
+            .expect("real stdio MCP call should succeed");
+        (
+            response.payload,
+            if response.ok {
+                ExecutionResultStatus::Succeeded
+            } else {
+                ExecutionResultStatus::Failed
+            },
+        )
+    }));
+
+    let read_only = registry
+        .execute_external_mcp_tool(
+            "mcp__matrix_mcp__write_file",
+            &serde_json::json!({"path": target}).to_string(),
+            magi_core::AccessProfile::ReadOnly,
+        )
+        .expect("read-only MCP row should be represented");
+    assert_eq!(read_only.1, ExecutionResultStatus::Rejected);
+    assert!(
+        !target.exists(),
+        "ReadOnly must not reach the real MCP process"
+    );
+
+    let restricted = registry
+        .execute_external_mcp_tool(
+            "mcp__matrix_mcp__write_file",
+            &serde_json::json!({"path": target}).to_string(),
+            magi_core::AccessProfile::Restricted,
+        )
+        .expect("restricted MCP row should be represented");
+    assert_eq!(restricted.1, ExecutionResultStatus::NeedsApproval);
+    assert!(
+        !target.exists(),
+        "Restricted pending approval must not cause a side effect"
+    );
+
+    let full_access = registry
+        .execute_external_mcp_tool(
+            "mcp__matrix_mcp__write_file",
+            &serde_json::json!({"path": target}).to_string(),
+            magi_core::AccessProfile::FullAccess,
+        )
+        .expect("full access MCP row should be represented");
+    assert_eq!(full_access.1, ExecutionResultStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(&target).expect("MCP should write target"),
+        "mcp-stdio-side-effect\n"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    record_permission_matrix_rows(vec![
+        serde_json::json!({
+            "case": "mcp_stdio_write_read_only",
+            "surface": "mcp_executor",
+            "tool": "mcp__matrix_mcp__write_file",
+            "access_profile": "ReadOnly",
+            "scope": "external",
+            "lifecycle": "deny",
+            "status": "Rejected",
+            "executor_called": false,
+            "side_effect": "stdio_server_not_called",
+            "provider_requests": 0,
+            "approval_events": [],
+        }),
+        serde_json::json!({
+            "case": "mcp_stdio_write_restricted",
+            "surface": "mcp_executor",
+            "tool": "mcp__matrix_mcp__write_file",
+            "access_profile": "Restricted",
+            "scope": "external",
+            "lifecycle": "needs_approval",
+            "status": "NeedsApproval",
+            "executor_called": false,
+            "side_effect": "stdio_server_not_called",
+            "provider_requests": 0,
+            "approval_events": [],
+        }),
+        serde_json::json!({
+            "case": "mcp_stdio_write_full_access",
+            "surface": "mcp_executor",
+            "tool": "mcp__matrix_mcp__write_file",
+            "access_profile": "FullAccess",
+            "scope": "external",
+            "lifecycle": "allow",
+            "status": "Succeeded",
+            "executor_called": true,
+            "side_effect": "stdio_server_wrote_file",
+            "provider_requests": 0,
+            "approval_events": [],
+        }),
+    ]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn external_mcp_access_profile_matrix_reaches_real_http_server_for_write_side_effect() {
+    let root = unique_temp_dir("magi-tool-mcp-http-permission-matrix");
+    let target = root.join("mcp-http-write.txt");
+    let server_target = target.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("HTTP MCP matrix listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("HTTP MCP matrix listener should have address");
+    let server = thread::spawn(move || {
+        for index in 0..3 {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("HTTP MCP matrix server should accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("HTTP MCP matrix read timeout should configure");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("HTTP MCP matrix request should be readable");
+                assert!(read > 0, "HTTP MCP matrix request closed before headers");
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let header_text = String::from_utf8(bytes[..header_end].to_vec())
+                .expect("HTTP MCP matrix headers should be UTF-8");
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        (name.eq_ignore_ascii_case("content-length"))
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                })
+                .expect("HTTP MCP matrix request should include content length");
+            while bytes.len() - header_end < content_length {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("HTTP MCP matrix body should be readable");
+                assert!(read > 0, "HTTP MCP matrix request closed before body");
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            let body: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                    .expect("HTTP MCP matrix request body should be JSON");
+            let (status, headers, response_body) = match index {
+                0 => (
+                    "200 OK",
+                    "Content-Type: application/json\r\nMcp-Session-Id: http-matrix-session\r\n",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "http-matrix", "version": "1.0"}
+                        }
+                    })
+                    .to_string(),
+                ),
+                1 => ("202 Accepted", "", String::new()),
+                2 => {
+                    assert_eq!(body["method"], "tools/call");
+                    fs::write(&server_target, "mcp-http-side-effect\n")
+                        .expect("HTTP MCP server should write the target");
+                    (
+                        "200 OK",
+                        "Content-Type: application/json\r\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {
+                                "content": [{"type": "text", "text": "http-write-ok"}]
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{response_body}",
+                response_body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("HTTP MCP matrix response should write");
+        }
+    });
+
+    let client = Arc::new(McpServerClient::new(
+        McpServerConnectionConfig::StreamableHttp(HttpMcpServerConfig {
+            url: format!("http://{address}/mcp"),
+            headers: std::collections::BTreeMap::new(),
+            request_timeout: Duration::from_secs(2),
+        }),
+    ));
+    let catalog = ExternalToolCatalogSnapshot {
+        mcp_tools: vec![ExternalMcpToolCatalogEntry {
+            server_id: "http-matrix".to_string(),
+            server_name: "HTTP Matrix MCP".to_string(),
+            model_tool_name: "mcp__http_matrix__write_file".to_string(),
+            tool_name: "write_file".to_string(),
+            description: "Write one file over HTTP MCP".to_string(),
+            read_only: false,
+            input_schema: serde_json::json!({"type":"object"}),
+        }],
+        ..ExternalToolCatalogSnapshot::default()
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_executor = Arc::clone(&calls);
+    let registry = ToolRegistry::new(
+        Arc::new(GovernanceService::default()),
+        Arc::new(magi_event_bus::InMemoryEventBus::new(16)),
+    )
+    .with_external_tool_catalog_provider(Arc::new(move || catalog.clone()))
+    .with_external_mcp_tool_executor(Arc::new(move |server, tool, arguments| {
+        calls_for_executor.fetch_add(1, Ordering::SeqCst);
+        let response = client
+            .call_tool(McpToolCallRequest {
+                server_name: server.to_string(),
+                tool_name: tool.to_string(),
+                input: arguments.to_string(),
+            })
+            .expect("real HTTP MCP call should succeed");
+        (
+            response.payload,
+            if response.ok {
+                ExecutionResultStatus::Succeeded
+            } else {
+                ExecutionResultStatus::Failed
+            },
+        )
+    }));
+
+    let tool_name = "mcp__http_matrix__write_file";
+    let arguments = serde_json::json!({"path": target}).to_string();
+    for (access_profile, expected_status, should_exist) in [
+        (
+            magi_core::AccessProfile::ReadOnly,
+            ExecutionResultStatus::Rejected,
+            false,
+        ),
+        (
+            magi_core::AccessProfile::Restricted,
+            ExecutionResultStatus::NeedsApproval,
+            false,
+        ),
+        (
+            magi_core::AccessProfile::FullAccess,
+            ExecutionResultStatus::Succeeded,
+            true,
+        ),
+    ] {
+        let result = registry
+            .execute_external_mcp_tool(tool_name, &arguments, access_profile)
+            .expect("HTTP MCP row should be represented");
+        assert_eq!(result.1, expected_status);
+        assert_eq!(target.exists(), should_exist);
+        record_permission_matrix_rows(vec![serde_json::json!({
+            "case": format!("mcp_http_write_{access_profile:?}"),
+            "surface": "mcp_executor",
+            "tool": tool_name,
+            "access_profile": format!("{access_profile:?}"),
+            "scope": "external",
+            "lifecycle": match access_profile {
+                magi_core::AccessProfile::ReadOnly => "deny",
+                magi_core::AccessProfile::Restricted => "needs_approval",
+                magi_core::AccessProfile::FullAccess => "allow",
+            },
+            "status": format!("{:?}", result.1),
+            "executor_called": access_profile == magi_core::AccessProfile::FullAccess,
+            "side_effect": if should_exist { "http_server_wrote_file" } else { "http_server_not_called" },
+            "provider_requests": 0,
+            "approval_events": [],
+        })]);
+    }
+    assert_eq!(
+        fs::read_to_string(&target).expect("HTTP MCP should write target"),
+        "mcp-http-side-effect\n"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.join().expect("HTTP MCP matrix server should stop");
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

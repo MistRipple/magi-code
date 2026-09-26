@@ -1029,7 +1029,8 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_workspace_resolution_rejects_unknown_explicit_workspace_before_session_fallback() {
+    fn bootstrap_workspace_resolution_rejects_unknown_explicit_workspace_before_session_scope_resolution()
+     {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-bootstrap-valid-session");
         state
@@ -1166,7 +1167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_route_rejects_unknown_explicit_workspace_before_session_fallback() {
+    async fn bootstrap_route_rejects_unknown_explicit_workspace_before_session_scope_resolution() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-bootstrap-route-valid-session");
         state

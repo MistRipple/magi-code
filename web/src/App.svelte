@@ -18,6 +18,7 @@
     synchronizeBrowserTabs,
   } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
+  import { resolveCurrentSessionTitle } from './lib/session-title';
   import {
     RUNTIME_CONNECTION_EVENT,
     BROWSER_AUTHORITY_CHANGED_EVENT,
@@ -35,6 +36,14 @@
       : 'thread'
   );
   const isWebMode = isWebAgentMode();
+  const currentSessionTitle = $derived(resolveCurrentSessionTitle({
+    sessionId: messagesState.currentSessionId,
+    workspaceId: messagesState.currentWorkspaceId,
+    workspacePath: messagesState.currentWorkspacePath,
+    workspaceSessions: messagesState.workspaceSessionProjection,
+    workspaceSessionProjections: messagesState.workspaceSessionProjections,
+    personalSessions: messagesState.personalSessionProjection.sessions,
+  }));
   const changeRefreshIntervalMs = 1000;
   async function synchronizeCurrentBrowserAuthority(revealTabId = ''): Promise<void> {
     if (!messagesState.bootstrapped) return;
@@ -228,6 +237,11 @@
     if (messagesState.bootstrapped) {
       bootstrapConnectionFailed = false;
     }
+  });
+
+  $effect(() => {
+    if (typeof document === 'undefined') return;
+    document.title = currentSessionTitle || i18n.t('app.documentTitle');
   });
 
   $effect(() => {

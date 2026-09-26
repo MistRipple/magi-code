@@ -621,7 +621,7 @@ impl UnavailableBusinessModelBridgeClient {
             message:
                 "业务模型桥未配置：请在设置面板「模型 · 主对话/编排模型」中填入 baseUrl / apiKey，\
                  并在会话输入区选择当前会话主模型，\
-                 或退回到环境变量 MAGI_OPENAI_COMPAT_BASE_URL / MAGI_OPENAI_COMPAT_API_KEY / MAGI_OPENAI_COMPAT_MODEL 作为兜底。\
+                 开发或测试场景也可通过环境变量 MAGI_OPENAI_COMPAT_BASE_URL / MAGI_OPENAI_COMPAT_API_KEY / MAGI_OPENAI_COMPAT_MODEL 提供配置。\
                  settings.json 的 auxiliary 段仅用于辅助模型（会话标题精修 / 知识抽取 / 会话记忆 / Prompt 增强），不参与业务派发。"
                     .to_string(),
         }
@@ -1250,6 +1250,17 @@ impl DaemonRuntime {
         &self,
         reason: impl Into<String>,
     ) -> Result<(), DaemonError> {
+        // 关闭闸门先收口所有仍在运行的 canonical Turn，再终止工具/子进程并
+        // 关闭 HTTP server。不能只依赖进程退出或下一次 restore 才修复孤儿 Turn：
+        // Desktop shutdown 的完成证据必须在当前 daemon 生命周期内看到唯一终态。
+        let settled_turn_count = self.interrupt_active_session_turns_for_shutdown();
+        if settled_turn_count > 0 {
+            info!(
+                settled_turn_count,
+                "daemon 关闭前已将活动 Session Turn 收口为 canonical terminal"
+            );
+        }
+        self.runtime_maintenance.request_graceful_shutdown(reason);
         self.browser_host_controller_lifecycle.request_shutdown();
         let cancelled_process_count = ToolRegistry::cancel_all_active_processes();
         if cancelled_process_count > 0 {
@@ -1262,9 +1273,41 @@ impl DaemonRuntime {
                 "daemon 关闭前已终止全部受管子进程树"
             );
         }
-        self.runtime_maintenance.request_graceful_shutdown(reason);
         self.runtime_maintenance.run_once()?;
         Ok(())
+    }
+
+    fn interrupt_active_session_turns_for_shutdown(&self) -> usize {
+        let sink = CanonicalTurnEventSink::for_store(&self.session_store, None);
+        let mut settled_count = 0usize;
+        for sidecar in self.session_store.runtime_sidecars() {
+            let Some(turn) = sidecar.current_turn.as_ref() else {
+                continue;
+            };
+            if current_turn_status_is_terminal(&turn.status) {
+                continue;
+            }
+            // 普通 conversation Turn 可能已经 durable accepted 但尚未建立
+            // task execution chain；关闭闸门仍必须把它收口，不能因为缺少
+            // 可恢复链而留下非终态 current_turn。已有 execution chain 的
+            // Task/sidecar 保留 daemon-restart interruption 语义，没有链的
+            // Turn 使用同一 canonical sink 的 cancel 语义。
+            let settled = if sidecar.active_execution_chain.is_some() {
+                sink.interrupt_turn_by_daemon_restart(&sidecar.session_id)
+            } else {
+                sink.cancel_turn(&sidecar.session_id)
+            };
+            match settled {
+                Ok(Some(_)) => settled_count += 1,
+                Ok(None) => {}
+                Err(error) => warn!(
+                    session_id = %sidecar.session_id,
+                    ?error,
+                    "daemon 关闭时收口活动 Session Turn 失败"
+                ),
+            }
+        }
+        settled_count
     }
 
     pub(crate) fn publish_started_event(&self, service_name: &str) {
@@ -1514,7 +1557,7 @@ impl DaemonRuntime {
         //   1. 测试场景 model_bridge_override 注入的 stub
         //   2. settings.json 的 `orchestrator` 段（前端「主对话/编排模型」表单写入位置，
         //      携带 reasoningEffort / urlMode 全套字段，是业务模型的权威入口）
-        //   3. 此处 daemon bootstrap 注入的 env 兜底 client（MAGI_OPENAI_COMPAT_*）
+        //   3. 此处 daemon bootstrap 注入的环境变量配置 client（MAGI_OPENAI_COMPAT_*）
         //      —— 仅在 settings.json 未配置 orchestrator 段时生效，
         //      用于开发/测试不带 UI 也能跑通的场景。
         //
@@ -2353,7 +2396,7 @@ impl DaemonRuntime {
     /// 1. `bridge_env` overrides（测试场景注入）
     /// 2. 进程级 env（`MAGI_OPENAI_COMPAT_*`）
     ///
-    /// **不再回退**读 `settings.json` 的 `auxiliary` 段 —— aux 段是辅助模型专用配置，
+    /// 不读取 `settings.json` 的 `auxiliary` 段 —— aux 段是辅助模型专用配置，
     /// 业务模型与辅助模型混读同一份字段会造成"改 aux 设置静默切换业务模型"的
     /// 配置错位。业务模型未配置时返回 `None`，调用方应据此走 unavailable-client 提示。
     ///

@@ -1,781 +1,344 @@
 # Magi 对话响应链路性能开发与验收计划
 
-> 文档类型：架构优化与开发验收基线
+> 本文只定义怎么测、怎么统计和什么时候可以关闭性能工作包；不保存当前 artifact 或当前通过数。
+> 当前状态、证据路径和剩余缺口见[重构进度](conversation-response-core-architecture-progress.md)，职责边界和整体完成定义见[目标架构](conversation-response-core-architecture-redesign.md)。
 >
-> 当前状态：阶段 0～5 已完成首轮实现，阶段 6 的本地入口、前端回归与 Electron 打包验收已完成；真实 Provider 五类场景已分别完成 20 轮后端采样，Electron 五类场景也已完成 20 轮后端/Renderer 同轮关联，并补齐 Task raw tool-call-only 首 delta 观测；性能前后对比仍未完成
->
-> 更新日期：2026-09-21
->
-> 适用范围：用户发送消息、会话接纳、任务准备、模型请求、流式事件、canonical turn、前端投影与对话区域渲染
->
-> 对照源码：OpenAI Codex `068c49f075`；Magi `ff3bdad1`
+> 任何性能收益都必须建立在终态、权限、幂等、恢复和真实副作用正确的前提上。旧 ledger 若使用「derive.v2」或缺少当前输入身份，必须先按本计划重新派生，不能与当前数据直接比较。
 
-## 1. 文档目的
+## 1. 测量边界
 
-本文档用于解决 Magi 在使用相同模型 API 时，相比 Codex Desktop 出现的发送确认慢、首内容慢和持续流式渲染不够轻的问题。
+只测三段，不把它们相加成一个未经定义的“总延迟”：
 
-后续开发、代码评审、性能测试和最终验收均以本文档为准。未达到当前阶段退出条件，不进入下一阶段；不以调小单个延迟常量、隐藏 loading 或减少 UI 动画作为性能问题的最终解决方案。
+| 层 | 起点和终点 | 说明 |
+| --- | --- | --- |
+| 提交控制面 | 「submit_received → accepted_response_sent」 | 输入校验、幂等和最小 durable accepted；不包含模型执行。 |
+| 后台执行面 | 「accepted_response_sent → canonical_terminal」 | 准备、Provider、事件投递和 canonical 终态；按阶段拆开。 |
+| 呈现面 | 「renderer_received → dom_painted」 | Renderer 接收、reducer、projection 和 DOM paint；使用页面局部时钟。 |
 
-## 2. 当前分析结论
+Provider TTFT、Magi 本地准备、事件传输和 Renderer 绘制分别统计。标题、分类、上下文压缩等 sidecar 必须按 query_source 分开，不能混入主 Turn。
 
-Magi 的主要延迟不在模型 API，而在模型请求前后叠加了过多同步工作。当前主要链路为：
+性能采样不得跳过权限、Git、幂等、审计、恢复或取消 settlement；不得用 sleep、轮询、loading、bootstrap 刷新或删除失败样本制造结果。异常结果是 correctness evidence 和异常性能样本，不得混入正常成功统计。
 
-```text
-用户点击发送
-  -> 前端写入本地乐观 Turn
-  -> POST /api/session/turn
-  -> 会话与任务分类
-  -> Snapshot 初始化
-  -> Git 状态观测与 Session Git Context 建立
-  -> 任务图、Mission、Thread 和执行注册表写入
-  -> 会话与 Git Context 持久化
-  -> Runner 启动
-  -> HTTP accepted 返回
-  -> Runner 调度
-  -> 模型配置、知识上下文、技能和工具面准备
-  -> 历史读取、token 估算和上下文压缩判断
-  -> 必要时同步调用辅助模型压缩历史
-  -> 新建 OS 线程、Tokio Runtime 和 reqwest::Client
-  -> Provider 请求
-  -> Provider SSE
-  -> 完整运行 item 写回与 canonical turn 重建
-  -> Magi SSE
-  -> 前端 reducer、projection 和 Svelte 派生计算
-  -> 对话区域渲染
-```
+## 2. 统一轨迹合同
 
-Codex 的关键设计差异是：`turn/start` 只等待 Core 完成“启动、引导或拒绝”的路由决定，不等待用户 hooks、模型上下文更新、rollout 持久化和模型采样；模型事件通过独立的长连接事件通道持续发送。
+### 2.1 身份、版本和来源
 
-### 2.1 已确认的主要根因
-
-按优先级排序：
-
-1. Magi 的 `/api/session/turn` 在返回 accepted 前同步执行 Git、Snapshot、持久化和 Runner 启动。
-2. 首次 Provider 请求前需要完成知识上下文、工具定义、历史读取、token 估算和上下文压缩判断；长会话可能先同步调用一次辅助模型。
-3. Magi 每次模型调用重新创建 OS 线程、Tokio Runtime 和 `reqwest::Client`，无法稳定复用 DNS、TCP、TLS、HTTP/2 和 Provider 连接池。
-4. 每个 Provider delta 都构造完整累积内容和完整运行 item，并重建 canonical turn。
-5. 前端 stream reducer 对完整字符串执行 `Array.from()`，部分状态比较使用 `JSON.stringify()`，projection 会重建变更 Turn 的全部 artifact。
-6. 每个 `session.turn.item` 事件还会触发 Goal 权威快照刷新，给浏览器和 daemon 增加额外请求与状态更新。
-
-### 2.2 已排除的错误方向
-
-- 发送前 SSE 预连接采用 `waitUntilOpen: false`，不是当前 accepted 延迟的主要原因。
-- Runner 的 100ms sleep 发生在一次 cycle 返回 `Continue` 之后，不是首 cycle 的固定等待；它会影响后续工具循环，但不是首 token 的首要根因。
-- 后端 80ms / 24 字符的 stream publish gate 只控制事件发布频率，不能解决 accepted、模型建连和状态重建问题。
-- 单纯提高 stream 频率会增加 CPU 和 GC 压力，不能作为“更快”的等价方案。
-
-## 3. 性能指标与统一口径
-
-性能验收必须区分三个阶段，禁止用一个“总耗时”掩盖真实瓶颈。
-
-| 指标 | 起点 | 终点 | 目标 |
-|---|---|---|---:|
-| 提交确认延迟 | 用户点击发送 | 前端收到 accepted | 本地 P95 不高于 100ms |
-| 首内容额外延迟 | 用户点击发送 | 前端收到首个可见模型 delta | 排除 Provider TTFT 后，Magi P95 额外开销不高于 300ms |
-| UI 呈现延迟 | daemon 收到 Provider delta | 浏览器完成对应内容绘制 | P95 不高于 50ms |
-
-补充指标：
-
-- `accepted_to_runner_started_ms`
-- `runner_started_to_context_ready_ms`
-- `context_ready_to_provider_request_ms`
-- `provider_request_to_headers_ms`
-- `provider_headers_to_first_delta_ms`
-- `provider_delta_to_event_publish_ms`
-- `browser_event_to_reducer_ms`
-- `reducer_to_dom_paint_ms`
-- 每 1,000 个输出字符的 Rust CPU、浏览器主线程 CPU、内存分配和 SSE 事件数
-
-## 4. 目标架构
+规范化 trajectory ledger 的每条记录至少包含：
 
 ```text
-┌──────────────────── 提交控制面 ────────────────────┐
-│ 输入校验 -> 幂等/admission -> Durable Submission   │
-│          -> canonical accepted -> HTTP 立即返回     │
-└────────────────────────┬───────────────────────────┘
-                         │
-                         v
-┌──────────────────── 后台执行面 ────────────────────┐
-│ preparing                                             │
-│   -> Git / Snapshot / Context / Task preparation      │
-│   -> shared model transport                           │
-│   -> Provider streaming                               │
-│   -> completed / blocked / failed                     │
-└────────────────────────┬───────────────────────────┘
-                         │ canonical delta events
-                         v
-┌──────────────────── 前端呈现面 ────────────────────┐
-│ itemId + version + delta 增量 reducer                │
-│   -> 单 artifact 更新                                 │
-│   -> 原始模式 / 摘要模式共享同一事实源               │
-└────────────────────────────────────────────────────┘
+fixture
+schema_version / derive_version
+session_id / turn_id / request_id
+query_source / execution_profile
+phase / timestamp_ms / event_sequence*
+payload_hash / input_hash? / source / outcome
+settlement? / settlement_required?
 ```
 
-### 4.1 Turn 状态模型
-
-统一状态流转：
+当前派生版本由脚本固定为：
 
 ```text
-accepted -> preparing -> running -> streaming -> completed
-                    \-> blocked
-                    \-> failed
+schema_version = magi.trajectory.v1
+derive_version = magi-trajectory-derive.v5
+electron_renderer_derive_version = magi-electron-renderer-derive.v2
+electron_context_compaction_derive_version = magi-electron-context-compaction-metrics.v1
+performance_envelope_derive_version = magi-performance-envelope-derive.v1
+permission_schema_version = magi.permission.v5
+permission_derive_version = magi-permission-derive.v8
 ```
 
-语义规定：
+`event_sequence` 对后端 `event_bus` 和 `canonical_terminal` 是必填；`accepted`、Provider 阶段和 Electron 本地阶段使用同一 `turn_id` 关联，但本地阶段没有独立的 durable EventBus 序号时保留 `null`，不得用估算序号填充。Electron sample 仍必须保留该 outcome 所需的后端 durable 序号；正常样本包含 EventBus/终态序号，前置阻断样本至少包含终态序号，供同轮校验。
 
-- `accepted`：请求已通过基础校验并可靠写入提交记录，可以在 daemon 重启后恢复。
-- `preparing`：正在执行 Git、Snapshot、上下文、任务和模型调用准备。
-- `running`：执行器已启动，但 Provider 尚未交付可见内容。
-- `streaming`：已经收到 Provider 可见 delta。
-- `blocked`：需要用户处理权限、Git 冲突或其他可恢复阻塞。
-- `failed`：准备或执行不可恢复地失败。
-- `completed`：当前 Turn 已完整收口并完成终态持久化。
+原始 evidence 可以使用 camelCase（如 trajectoryMode、expectedOutcome、inputHash、settlementRequired）；派生 ledger 统一为 snake_case。字段或校验规则改变时必须增加版本并更新 golden test，不能静默复用旧 artifact。
 
-### 4.2 核心所有权边界
+真实 daemon 和打包 Electron evidence 还必须记录 source_commit、worktree_fingerprint_sha256，以及适用时的 executable_sha256；打包 Electron 若比较多文件资源，还必须记录覆盖 `app.asar`、Web bundle 和 daemon payload 的 `app_artifact_sha256`，并验证采样期间稳定。只记录 branch、dirty 标记或二进制路径不足以绑定证据。工作区有其他 Agent 修改时，dirty=true 是事实，不是通过条件；关键是 before/after fingerprint 在同一采样内相等。
 
-| 模块 | 唯一职责 | 禁止行为 |
-|---|---|---|
-| Session submission | 基础校验、幂等、最小持久化、accepted 事件 | 等待模型采样和完整执行准备 |
-| Preparation worker | Git、Snapshot、任务和上下文准备 | 重新生成第二条提交事实链 |
-| Model transport | Provider 连接、取消、重试、流解析 | 每轮创建独立 Runtime 和 Client |
-| Conversation runtime | 模型轮次、工具循环、stream buffer、终态写回 | 每个 delta 重建完整持久化状态 |
-| Canonical turn store | 稳定 Turn/Item 事实、版本与恢复快照 | 承担 UI 布局和折叠逻辑 |
-| Web reducer | 按版本应用 canonical delta | 重新推导后端业务状态 |
-| 原始/摘要视图 | 基于同一 projection 呈现 | 维护两套消息或执行状态 |
+settlement 的含义必须写清观察层级：
 
-## 5. 分阶段开发计划
+- 普通成功 timing 只证明同一 Turn 有唯一 canonical_terminal，不自动证明 daemon/Electron 进程关闭 settlement。
+- 取消、恢复、关闭闸门、异常样本或显式 settlement_required=true 必须记录已观察的 settlement。
+- session_terminal_finalize_core_completed 只表示 finalizer core 完成，可能早于 Sink 发布 terminal；若要证明阻塞 Turn 已释放接纳槽，还要记录下一轮接纳检查。
+- canonical_terminal_ignored 只表示迟到结果被终态闸门拒绝，不能当第二个终态。
 
-### 阶段 0：全链路埋点与性能基线
+### 2.2 阶段和主链路
 
-#### 目标
+原始日志可以保留更细的 stage；规范化 ledger 使用以下阶段：
 
-先得到可重复、可比较的真实数据，确定每一毫秒消耗在哪个模块，作为所有后续阶段的验收依据。
+| 层 | ledger phase | 原始 stage 示例 |
+| --- | --- | --- |
+| 后端 | accepted | accepted_response_sent |
+| 后端 | provider_request | provider_request_started |
+| 后端 | provider_raw_delta | provider_first_raw_delta |
+| 后端 | provider_visible_delta | provider_first_delta |
+| 后端 | event_bus | event_bus_first_event / event_bus_item_published |
+| 后端 | canonical_terminal | canonical_terminal_published |
+| 业务事实 | tool_call、tool_result、approval_requested、approval_resolved | Provider、工具和审批事件 |
+| Electron | renderer_received | frontend_event_received |
+| Electron | reducer_completed | reducer_completed |
+| Electron | projection_completed | projection_completed |
+| Electron | dom_painted | dom_painted |
 
-#### 开发范围
-
-- 生成并贯穿同一 `trace_id`、`request_id`、`turn_id` 和 `provider_call_id`。
-- 后端记录：
-  - `submit_received`
-  - `admission_completed`
-  - `accepted_persisted`
-  - `accepted_response_sent`
-  - `runner_started`
-  - `context_prepare_started/completed`
-  - `provider_request_started`
-  - `provider_headers_received`
-  - `provider_first_delta`
-  - `canonical_event_published`
-- 前端记录：
-  - `submit_clicked`
-  - `accepted_received`
-  - `stream_event_received`
-  - `reducer_completed`
-  - `projection_completed`
-  - `dom_painted`
-- 开发态输出结构化性能报告；正常用户界面不增加长期性能卡片。
-- 建立五类固定基准：
-  - 新建个人纯文本会话；
-  - 已有个人长会话；
-  - 工作区纯聊天；
-  - 工作区带工具调用；
-  - 主代理与子代理并发。
-
-`MagiTurnHarness` 已能在真实 `TurnService` 链路上记录单轮 accepted 返回、非编排 Provider
-请求开始、首个 raw Provider delta、首个可见 Provider delta、首个 EventBus 流事件和 canonical 终态观察，并保留事件序号
-用于验证时间线顺序。打包 Electron 的五类场景也已各完成 20 轮后端/Renderer 同轮关联，
-每条记录使用同一 `turn_id` 保存 accepted、runner、Provider 首个可见 delta、首个 EventBus
-事件、canonical 终态和 Renderer 四阶段；统计证据见第 9.5 节。该证据确认埋点和事件边界，
-但仍不能替代历史后端基线的统一合并，也不能作为性能目标已达标或 before/after 对比完成的结论。
-
-本地 Provider 替身的工具调用响应也遵循同一 raw delta 合同：返回 `RequiresToolExecution` 时先通过
-`ModelStreamingDelta.tool_calls` 发出没有可见正文的快照，`HarnessTimingSnapshot` 独立记录
-`provider_first_raw_delta_ms`，随后才记录可见正文首 delta。这样本地基准不会把工具调用首 chunk
-误算成可见文本首帧；它只验证埋点语义，不替代真实 Provider 或 Electron 证据。
-
-最终关联证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：五类场景各 20 轮、
-100 条唯一 `turn_id`、903 项检查和 280 次 Provider 请求，每条都具备五个后端阶段与四个
-Renderer 阶段。重新打包当前 Web/Desktop 工作区后的复验为
-`/tmp/magi-electron-dom-correlated-timing-20-10031.json`，同样为 100 条唯一 `turn_id`、903
-项检查和 280 次 Provider 请求。两份证据均使用日志时间戳计算 `sinceAcceptedMs`，只证明同轮
-阶段边界和顺序；它们尚未形成与历史真实 Provider JSON 同口径的端到端 P50/P95，也不能替代
-旧版本 before 数据。
-
-raw delta 复验使用 `/tmp/magi-electron-dom-raw-tool-1-10230.json` 和
-`/tmp/magi-electron-dom-correlated-timing-20-10231.json`。后者为 `status=passed`、963 项检查、
-100 条唯一 `turn_id`、280 次 Provider 请求，五类各 20 轮；`workspace_tool`、`goal`、`subagent`
-的 60 条 sample 全部包含 `provider_first_raw_delta`。`ModelStreamingDelta.tool_calls` 保存
-Provider 流式工具调用快照，`provider_first_raw_delta` 记录首个工具调用或可见内容/思考 delta，
-`provider_first_delta` 仍只记录首个可见 content/thinking delta。该证据补齐 raw tool-call-only
-首 chunk 的同轮关联，但尚未改变历史样本合并和 before/after 缺口。
-
-#### 预计主要文件
-
-- `crates/magi-api/src/routes/sessions.rs`
-- `crates/magi-api/src/routes/dispatch_flow.rs`
-- `crates/magi-api/src/state.rs`
-- `crates/magi-bridge-client/src/http_model_client.rs`
-- `crates/magi-conversation-runtime/src/session_turn_execution.rs`
-- `web/src/shared/bridges/web-client-bridge.ts`
-- `web/src/stores/turn-store.svelte.ts`
-- `web/src/components/MessageList.svelte`
-
-#### 退出条件
-
-- 一轮真实对话可以生成完整的端到端时序；打包 Electron 五类场景各 20 轮已经生成同轮结构化证据。
-- Provider 自身 TTFT 与 Magi 内部开销可独立计算。
-- 五类基准各完成至少 20 轮采样，并输出 P50、P95、最大值；Electron 证据已经使用同一 `turn_id`
-  关联后端和 Renderer，仍需把该口径与历史后端基线统一后再进入性能目标判定。
-- 埋点不会改变请求顺序和 canonical 事实。
-
-#### 预计工期
-
-1～2 个工作日。
-
-### 阶段 1：提交接纳与后台准备解耦
-
-#### 目标
-
-让 `/api/session/turn` 只承担可靠接纳，不再等待完整执行准备；这是首个产品体感里程碑。
-
-#### 开发范围
-
-- 新增或收敛为唯一的 durable submission record。
-- HTTP 返回前只执行：
-  - 输入和范围校验；
-  - requestId 幂等校验；
-  - 会话可接纳状态校验；
-  - 最小用户 Turn / submission 持久化；
-  - canonical `turn accepted` 事件发布。
-- 把以下工作移入后台 preparation：
-  - `ensure_snapshot_session_for_workspace_id`；
-  - `ensure_session_code_context`；
-  - Git 观测和 baseline 对齐；
-  - 任务图和执行计划的重型准备；
-  - Runner 启动；
-  - 非接纳必要的全量 checkpoint。
-- 删除 `/api/session/turn` 对 `finalize_session_task_dispatch().await` 的同步等待。
-- preparation 失败时沿原 Turn 发布 `blocked` 或 `failed`，禁止再创建独立错误消息链。
-- daemon 重启时从 durable submission 恢复未完成 preparation。
-- 前端本地乐观 Turn 与 accepted Turn 通过 requestId 原位合并。
-
-#### 架构约束
-
-- 不允许用纯 `tokio::spawn` 代替 durable submission；accepted 后必须可恢复。
-- 不允许长期保留“旧同步提交”和“新异步提交”双轨实现。
-- Git 冲突和权限问题从 HTTP 长等待改为明确的 Turn 阻塞状态，不能静默执行。
-- accepted 不表示执行已经成功启动，产品文案和事件语义必须与状态模型一致。
-
-#### 退出条件
-
-- 本地 accepted P95 不高于 100ms。
-- 大型 Git 仓库、dirty worktree 和慢磁盘不阻塞 accepted。
-- accepted 后立即杀死并重启 daemon，Turn 可以继续 preparation 或稳定失败收口。
-- 相同 requestId 重试不会生成重复 Turn、任务或用户消息。
-- 个人、工作区、目标、普通、继续和编辑重试路径全部使用同一提交状态机。
-
-#### 预计工期
-
-3～5 个工作日。
-
-### 阶段 2：模型 Transport 与连接复用
-
-#### 目标
-
-消除每次模型请求重新创建线程、Runtime、HTTP Client 和连接的固定成本。
-
-#### 目标结构
+主链路：
 
 ```text
-ModelTransportRuntime（进程级）
-  -> 长生命周期 Tokio Runtime
-  -> ProviderClientPool
-       key = protocol + endpoint + auth identity + proxy/TLS config
-  -> ProviderConcurrencyGate
-  -> TurnTransportSession
+submit_received
+  -> accepted_persisted
+  -> accepted_response_sent
+  -> preparation_started/completed
+  -> provider_request_started
+  -> provider_first_raw_delta
+  -> provider_first_visible_delta
+  -> event_bus_first_event
+  -> canonical_terminal
+  -> renderer_received
+  -> reducer_completed
+  -> projection_completed
+  -> dom_painted
 ```
 
-#### 开发范围
+provider_raw_delta 包括只有 tool-call 的首 chunk；provider_visible_delta 只表示首个可见 content/thinking。不能用可见首 delta 代替 raw 首 chunk，也不能把工具往返时间伪装成 Magi 本地开销。
 
-- `HttpModelBridgeClient` 持有共享 transport handle。
-- `reqwest::Client` 按 Provider 配置复用。
-- 所有流式和非流式请求进入同一长生命周期 Runtime。
-- 保留当前取消、idle timeout、重试、空流恢复和并发门控语义。
-- 记录连接复用、DNS、connect、TLS、headers、首 delta 的分段耗时。
-- Responses Provider 支持时，设计 turn-scoped transport session：
-  - turn 内重试和工具 continuation 复用连接；
-  - 支持 Provider sticky routing；
-  - 支持 incremental request continuation；
-  - 新会话可进行有限时长 prewarm。
-- WebSocket 能力只有在取消、重试、代理并发、工具循环和错误归一化全部覆盖后，才能替换对应 Provider HTTP 路径。
+必需阶段按 outcome 分支：
 
-#### 退出条件
+| 轨迹 | 必需阶段 | 规则 |
+| --- | --- | --- |
+| 正常后端 | accepted + provider_request + event_bus + canonical_terminal | raw/visible 按实际记录；正常结果必须有连续身份和序号。 |
+| 已 dispatch 的异常后端 | accepted + provider_request + canonical_terminal | 缺少 raw、visible 或 EventBus 时记录缺席原因，不合成事件。 |
+| 正常或异常 Electron | 对应后端阶段 + renderer_received + reducer_completed + projection_completed + dom_painted | 所有阶段关联同一 `turn_id`；后端 durable 阶段保留序号，Renderer 阶段使用页面局部时钟，不伪造 EventBus 序号；异常还须写 `expectedOutcome`。 |
+| Provider 未 dispatch 的前置阻断 | accepted + canonical_terminal | trajectoryMode=abnormal、expectedOutcome=failed|blocked、providerDispatch=not_dispatched、非空 providerBlockReason、inputHash、settlementRequired=true 和已观察 settlement；不得出现 Provider 阶段。 |
 
-- 连续模型调用能证明复用底层连接。
-- 不再为每个请求创建 OS 线程和 Tokio Runtime。
-- 取消后 Provider 槽和连接状态正确释放。
-- 主代理和至少五个子代理并发时不阻塞 daemon 异步事件循环。
-- 重试不会重复交付已经输出的 delta。
-- 相同 API 下的 `context_ready -> first_delta` 明显接近 Codex 基线。
+若阻断 Turn 的唯一 EventBus envelope 同时是终态 envelope，event_bus 与 canonical_terminal 可以共享同一 event_sequence，但终态不能早于 EventBus。
 
-#### 预计工期
+### 2.3 派生和证据规则
 
-HTTP/Runtime 复用 3～5 个工作日；Responses WebSocket 完整能力另计 3～5 个工作日。
+1. 主 Turn 与标题、分类、压缩等 sidecar 按 query_source 分离；sidecar 不计入主 Turn 的 Provider TTFT 或 terminal。
+2. trajectory 必须 append-only；正文、thinking、工具调用和工具结果被改写时失败或分段，不能只忽略传输元数据差异。
+3. 同一 turn_id 只能有一个 canonical terminal；重复 request replay 可以再次观察同一终态，但不能派生第二个 Turn。
+4. 正常、失败、取消、超时和 blocked 都要 flush 原始轨迹并写 outcome；缺阶段必须解释，不能补造。
+5. 缺少身份、后端必需序号、源 fingerprint、必需 hash 或 settlement 时 fail-closed。Renderer 本地阶段的 `event_sequence=null` 只有在同一 sample 已有该 outcome 所需的后端 durable 序号且阶段顺序可校验时才允许；通过 ledger 只表示该声明切片通过，不扩大为完整场景矩阵。
+6. Electron paired comparison 必须在同一 Turn sample 内同时验证后端阶段和 Renderer 四阶段，保留五个原始输入文件的 SHA-256 与 canonical input hash；后端使用 `sinceAcceptedMs`，Renderer 使用页面局部 `elapsedMs`，输出两组统计和非加和声明，不能把它们拼成总延迟。
+7. 分层性能 envelope 可以绑定 daemon sidecar 与 Electron comparison 的输入 hash、场景映射、source identity 和时钟合同，但必须显式保留不同 fixture 的未配对场景；envelope 不是新的事实源，也不能制造 total latency。
 
-### 阶段 3：上下文准备前移、缓存与预测压缩
+### 2.4 性能 interval sidecar
 
-#### 目标
-
-减少 Provider 请求发出前的重复计算，并让绝大多数长会话不在用户发送后同步等待辅助模型压缩。
-
-#### 开发范围
-
-- 缓存模型配置解析结果，按配置 revision 失效。
-- 缓存工具定义，按工具、技能、MCP、浏览器能力和权限 revision 失效。
-- 知识上下文按 workspace、query fingerprint 和知识 revision 复用。
-- 会话历史维护增量 token 统计和历史 fingerprint。
-- Turn 终态或 daemon 空闲时预测下一轮上下文压力。
-- 接近 proactive threshold 时后台生成候选 context checkpoint。
-- 新消息到达后只在历史 fingerprint、模型 identity 和 checkpoint generation 全部一致时安装候选结果。
-- 达到硬限制仍允许同步压缩，但必须进入可见 `preparing/context_compaction` 阶段。
-- 辅助模型与主模型的 Provider 并发策略需要避免互相饿死。
-
-#### 退出条件
-
-- 普通轮次不再完整重算未变化的工具面和历史 token。
-- 长会话的大多数轮次可以直接复用有效 checkpoint。
-- 过期的后台压缩结果不会被安装。
-- 模型切换、权限变化、工具变化和知识 revision 变化会正确失效缓存。
-- 同步压缩失败有明确终态，不会重复执行无界重试。
-
-#### 预计工期
-
-3～5 个工作日。
-
-### 阶段 4：后端流式写回增量化
-
-#### 目标
-
-Provider delta 热路径只追加增量，避免反复复制完整正文、完整 sidecar 和完整 canonical turn。
-
-#### 目标数据流
+trajectory ledger 保存事件事实；跨事件的局部耗时可以由同一 raw evidence/log 派生为 `magi.performance.v1` sidecar，但不能用 sidecar 替代 accepted、Provider、EventBus 或终态记录。sidecar 是有意分离的性能读模型，不再把 interval metric 重复写入事件 ledger；daemon 与 Electron 使用各自的 derive，均通过相同 raw evidence、canonical `input_payload_hash`、fixture、sample identity 和 source identity 关联。sidecar 必须保留 input evidence 的 canonical `input_payload_hash`（须等于 trajectory `inputs[].payload_hash`）以及 raw input/log 的 SHA-256；每条 metric 必须保留 `fixture`、`comparison_role`、`scenario`、`sample_index`、`session_id`、`turn_id`、`request_id`、`outcome` 和 source identity，并固定以下区间：
 
 ```text
-Provider delta
-  -> TurnStreamBuffer 追加
-  -> canonical stream delta
-  -> SSE
-  -> 定时内存快照
-  -> 阶段边界、工具边界和终态强制持久化
+accepted_response_sent -> provider_request_started
+provider_request_started -> provider_first_raw_delta
+accepted_response_sent -> provider_first_raw_delta
+accepted_response_sent -> provider_first_delta
+accepted_response_sent -> event_bus_item_published
+accepted_response_sent -> canonical_terminal_published
 ```
 
-#### 开发范围
+`derive-magi-performance-metrics.mjs` 使用绝对 daemon 时间、每个正常场景 20 条样本和 nearest-rank 派生 P50/P95/最大值；它遇到缺失阶段、身份或 source 稳定性时失败，不从 `elapsed_ms` 估算跨阶段间隔。sidecar 与 trajectory ledger 必须用同一 raw evidence、fixture 和 sample identity 关联；两者统计不能相加为未定义的“总延迟”。
 
-- 为正文、思考和工具参数分别建立 `TurnStreamBuffer`。
-- 热路径只维护新增 delta、内容长度、itemVersion 和更新时间。
-- canonical stream 协议继续使用 `itemId + version + baseLength + delta`。
-- 完整 canonical item 只在首帧、reset、阶段边界和终态发布。
-- sidecar 使用 dirty 标记与定时 flush；终态必须强制 flush。
-- 崩溃恢复时用最后 durable snapshot 与事件游标恢复，不得损坏已有 Turn。
-- 移除每个 delta 调用完整 `upsert_current_turn_item` 和 `upsert_canonical_turn_in_state` 的路径。
+## 3. 指标、预算和采样
 
-#### 退出条件
+### 3.1 正确性先决条件
 
-- 长文本输出时，Rust CPU、分配次数和全局状态锁持有时间明显下降。
-- 中文、多字节字符、Markdown、代码块和图表内容不丢失、不重复、不乱码。
-- SSE 断线后可以由权威快照补齐尾部内容。
-- Provider 最终正文、canonical 终态正文和重启恢复正文完全一致。
-- 思考、正文与工具参数不会因增量缓冲错误混合。
+只有在终态唯一、内容可恢复一致、幂等冲突拒绝、Session 隔离、取消后真实 settlement，以及权限/Git/审批/恢复边界不退化时，延迟才可用于比较。先决条件失败时，延迟只作诊断。
 
-#### 预计工期
+### 3.2 候选预算
 
-4～6 个工作日。
+以下是需要用固定 before/after fixture 冻结的候选预算，不是当前达标声明：
 
-### 阶段 5：前端增量 reducer 与渲染热路径收敛
+| 指标 | 起点 → 终点 | 候选 P95 | 备注 |
+| --- | --- | ---: | --- |
+| conversation accepted | submit_received → accepted_response_sent | ≤ 200 ms | 控制面门槛。 |
+| task accepted | submit_received → accepted_response_sent | ≤ 500 ms | 控制面门槛。 |
+| conversation 本地准备 | accepted_response_sent → provider_request_started | ≤ 500 ms | 只约束本地段。 |
+| task 本地准备 | accepted_response_sent → provider_request_started | ≤ 1,000 ms | 只约束本地段。 |
+| 可计算的 Magi 首内容开销 | accepted_response_sent → provider_first_visible_delta，扣除 Provider TTFT | ≤ 300 ms | 首 raw 直接产生可见内容时才计算。 |
+| Renderer 局部绘制 | renderer_received → dom_painted | ≤ 50 ms | 不包含 Provider 和 EventBus。 |
 
-#### 目标
+Provider 等待和完整 terminal 受上游、输出长度和任务复杂度影响，只作同口径观察和 before/after 比较。若 fixture 证明预算不合理，必须记录原因、版本和新基线，不能静默放宽。
 
-让一个 stream delta 只更新一个 item 和一个可见 artifact，不再触发整轮 projection 和全部消息签名重算。
+Task 的本地准备预算包含 workspace snapshot、code context、execution materialization 和 checkpoint；这些步骤承载工具权限、Git/变更账本和恢复事实，不能为了满足候选延迟而跳过。若其候选预算持续超出，应优化不改变事实边界的实现，或按版本化证据重新基线。
 
-#### 开发范围
+统计口径：
 
-- reducer 建立 `turnId -> index`、`itemId -> index` 索引。
-- 使用协议长度和增量偏移，移除热路径对完整正文的多次 `Array.from()`。
-- 使用字段版本和稳定 revision 代替 `JSON.stringify()` 等价比较。
-- stream delta 直接更新当前 artifact；阶段或终态变化才重建 Turn presentation。
-- projection 的 `updatedAt` 只在事实实际变化时更新。
-- MessageList 不再遍历所有可见消息生成内容签名。
-- 当前流式消息独立触发滚动与 ResizeObserver 协调。
-- `session.turn.item` 不再无条件刷新 Goal；仅 Goal、Plan、工具状态和 Turn 终态事件触发权威刷新。
-- 原始模式和摘要模式共享同一 reducer/projection，只保留呈现层差异。
-- 主对话和代理对话面板复用同一增量组件行为。
+- Provider TTFT 使用同一机器的 provider_request_started → provider_first_raw_delta；request-to-headers 另报。
+- 只有 request、raw、visible 使用可比较时钟且首 raw 直接产生可见内容时，才计算 Magi 首内容开销；否则按阶段分别报告。
+- 后端统一使用同一 accepted 基准的 sinceAcceptedMs；Renderer 使用 timing registry 的局部 elapsedMs，两者不可相加。
+- P50/P95/最大值使用固定 nearest-rank。失败、空流、超时、取消、reconnect、restart、replay 和阻塞恢复单独报告，不混入正常成功 P50/P95。
 
-#### 退出条件
+### 3.3 采样规则
 
-- 72 条以上可见历史消息时持续输出无明显掉帧。
-- 浏览器性能录制中，普通 delta 不产生超过 50ms 的主线程长任务。
-- 原始模式与摘要模式最终内容、工具状态和时间信息一致。
-- 摘要阶段自动展开/折叠、工具小折叠和代理面板行为无回归。
-- 后端事件进入浏览器到 DOM 绘制 P95 不高于 50ms。
+- 每个正常性能场景至少 20 个独立 Turn；不足 20 只能报告 correctness，不能称为稳定 P95。
+- 异常、恢复、关闭和权限/Git/审批阻塞按声明切片采样。异常 evidence 必须有 trajectoryMode、expectedOutcome；需要证明 settlement 的切片还必须有 inputHash 和 settlement。
+- 固定模型/参数、工具面、历史形态、fixture、源码/可执行文件 fingerprint、schema、derive 和统计方法；保留原始输入及 payload hash。
+- baseline 无法产生当前合同要求的阶段时必须 fail-closed；不得用 null、估算值或后续版本的事件补造 before 阶段。失败 evidence 可以保留作诊断，但不进入 before/after 统计。
+- `MAGI_PERF_CONTINUE_AFTER_SAMPLE_FAILURE=1` 只能让采样器在真实 settlement 后继续收集剩余样本；它不改变单条失败、缺阶段或最终 evidence 的失败状态，也不允许把失败样本纳入统计。
+- 空流/idle timeout 可以使用可重复 HTTP fault-injection fixture，但只能证明 transport 错误归一化、Coordinator 收口和声明的 settlement，不能证明上游 Provider 业务可用性。
+- 上下文压缩 fixture 必须把 `context_compaction=completed` 与合法的 `context_compaction=skipped` 区分：连续 Turn 在历史已经满足预算时可以 skipped；`running` 只是中间事实，不能计作样本终态。每条样本都必须有 completed/skipped 终态事实，且整个 fixture 至少有一条 completed，才能关闭真实压缩 correctness。daemon 专项固定为新建 Chat 20 条 + 长历史 20 条；Electron 专项固定为同一 Session 预填充历史后的长历史 20 条。达到样本数且专用 derive 输出固定 schema、保留 input/source identity 时，可以报告该 fixture 的专项 P50/P95；只有存在同口径配对 baseline，才能形成 before/after 或性能收益结论。
+- 审批取消必须证明唯一 turn.cancelled、无 approval.resolved、无副作用以及 settlement 后下一轮可接纳；取消不是 deny/allow 决定。
+- 审批过期必须证明 tool_approval_expired、唯一 failed terminal、无副作用；不要求 Provider 再生成成功文本。
+- 观察超时是采样控制参数，不是性能指标；复杂 Task/Agent 可以延长观察窗，但取消后的 settlement 必须单独记录。
 
-#### 预计工期
+## 4. 验收顺序与性能退出条件
 
-4～6 个工作日。
+当前每个工作包的状态只见[重构进度](conversation-response-core-architecture-progress.md)，本节不复制 artifact。
 
-### 阶段 6：整链路回归、打包与最终验收
+1. 将 D、E、F 的真实入口 correctness 作为性能前置，覆盖正常、异常、取消、恢复和权限/Git/审批边界；主 Turn 与 sidecar 分开。
+2. 对 F，异常和 recovery evidence 必须把同一 `turn_id` 的后端、Renderer、outcome 以及所需 settlement 接入同一 ledger；timing-only 不能关闭 F。
+3. D、E、F 关闭后，固定所有输入和版本，采集 before 与 after；before/after 必须使用同一 fixture、模型/参数、工具面、历史形态、ledger schema、derive 版本、采样轮数和 nearest-rank。
+4. 后端 evidence 通过只关闭“后端轨迹可复算”这一子项；还必须从同一原始日志重算 accepted、局部准备、Provider TTFT 和适用的 Magi overhead，并用同口径 Renderer before/after 证据覆盖 DOM paint。
+5. 只有前四步和正确性硬门槛通过后，才评估 CPU、分配、事件数量、长历史主线程或连接复用。细分指标不能替代核心链路。
 
-#### 功能测试矩阵
+G 只有同时满足以下条件才能关闭：
 
-| 维度 | 场景 |
-|---|---|
-| 会话范围 | 个人、工作区 |
-| 会话历史 | 新会话、短会话、长历史、压缩后会话 |
-| 展示模式 | 原始模式、摘要模式 |
-| 内容 | 纯文本、思考、工具调用、文件、图片、图表 |
-| 执行者 | 主代理、子代理、多个子代理并发 |
-| 状态 | 正常、取消、权限等待、Git 冲突、Provider 重试、空流 |
-| 恢复 | SSE 断线、daemon 重启、桌面应用重启 |
-| Git | clean、dirty、conflict、fast-forward、branch 变化 |
-| 运行载体 | daemon 开发入口、Electron 打包产物 |
+1. before/after 原始输入可独立复算，并有 hash、源码/可执行文件或多文件 App artifact 身份和版本；
+2. 正常与声明异常场景都有 outcome；缺席阶段有原因，主 Turn/sidecar 不混淆；
+3. accepted、本地准备、Provider TTFT、可计算的 Magi overhead、Renderer paint 的 P50/P95/最大值可重算，时间基准不混加；每个候选预算若未满足，必须在进度文档记录原因、版本、复测或重新基线决定，不能静默放宽；
+4. 终态、内容、幂等、隔离、取消 settlement、恢复和真实副作用硬门槛通过；
+5. 性能收益没有以权限、Git、审批、审计或恢复退化为代价。
 
-#### 验证命令
+同一 Electron evidence 内的 `source.before == source.after` 只证明该次采样稳定，不能代替架构 before/after；没有独立 baseline 时，DOM paint 只能作当前观察，G 保持未关闭。
 
-按实际改动范围至少执行：
+同一限制也适用于 daemon sidecar：`source_commit` 相同而 worktree fingerprint、可执行文件或 App artifact 不同，可以证明两组输入可独立复算、采样期间身份稳定以及候选预算观察，但不能单独证明重构带来的因果收益。若要宣称“性能收益”，必须补充独立源码/可执行文件身份的 before baseline；在此之前，报告使用“可复算 before/after 观察”和“预算满足”，不使用“整体性能提升”。
+
+在 D、E、F、G 全部关闭前，不得宣称性能目标达标或整体架构完成。
+
+## 5. 验证入口
+
+### 5.1 复采与派生流程
+
+性能复采必须使用新的 run-id、空闲端口和稳定的输入/source identity；不得覆盖旧 artifact。正常场景固定每类 20 个独立 Turn，失败或不完整 evidence 保留但不进入统计。最小流程如下：
+
+```bash
+MAGI_PERF_DAEMON_BIN=target/release/magi-daemon-app \
+MAGI_PERF_PORT=<free-port> \
+MAGI_PERF_FIXTURE=real-provider-performance-v1 \
+MAGI_PERF_CONTINUE_AFTER_SAMPLE_FAILURE=1 \
+MAGI_PERF_TURN_TIMEOUT_MS=300000 \
+MAGI_PERF_SAMPLES=20 \
+MAGI_PERF_EVIDENCE=/tmp/magi-real-provider-performance-after-<run-id>.json \
+  node scripts/verify-real-provider-performance.mjs
+
+node scripts/derive-magi-trajectory-ledger.mjs \
+  --output /tmp/magi-trajectory-ledger-after-<run-id>.json \
+  /tmp/magi-real-provider-performance-after-<run-id>.json
+node scripts/derive-magi-performance-metrics.mjs \
+  --role after \
+  --input /tmp/magi-real-provider-performance-after-<run-id>.json \
+  --output /tmp/magi-performance-metrics-after-<run-id>.json
+# 只有 before evidence/sidecar 已通过同一合同后，才执行以下 compare。
+node scripts/derive-magi-performance-metrics.mjs \
+  --compare /tmp/magi-performance-metrics-before-<run-id>.json \
+  /tmp/magi-performance-metrics-after-<run-id>.json \
+  --output /tmp/magi-performance-comparison-<run-id>.json
+
+# 上下文压缩专项：每条长历史样本必须有 completed/skipped，且至少一条 completed。
+node scripts/derive-magi-context-compaction-metrics.mjs \
+  --role after \
+  --input /tmp/magi-real-provider-performance-compression-<run-id>.json \
+  --output /tmp/magi-performance-metrics-context-compaction-after-<run-id>.json
+# daemon 压缩 compare 要求 before/after 都是 20 条新建 Chat + 20 条长历史的通过输入。
+node scripts/derive-magi-context-compaction-metrics.mjs \
+  --compare /tmp/magi-performance-metrics-context-compaction-before-<run-id>.json \
+  /tmp/magi-performance-metrics-context-compaction-after-<run-id>.json \
+  --output /tmp/magi-performance-comparison-context-compaction-<run-id>.json
+
+# Electron 上下文压缩专项：同一 Session 预填充历史后固定采集 20 条长历史 Turn。
+# 该 evidence/sidecar 只能形成 Electron after-only 观察；独立 before 存在后再执行 compare。
+MAGI_ELECTRON_DOM_CDP_PORT=<free-port> \
+MAGI_ELECTRON_DOM_COMPACTION_ONLY=1 \
+MAGI_ELECTRON_DOM_COMPACTION_SAMPLES=20 \
+MAGI_ELECTRON_DOM_COMPACTION_PREFILL_TURNS=12 \
+MAGI_ELECTRON_DOM_EVIDENCE_PATH=/tmp/magi-electron-context-compaction-after-<run-id>.json \
+  npm run test:electron-conversation-dom
+node scripts/derive-electron-context-compaction-metrics.mjs \
+  --role after \
+  --input /tmp/magi-electron-context-compaction-after-<run-id>.json \
+  --output /tmp/magi-performance-metrics-electron-context-compaction-after-<run-id>.json
+node scripts/derive-magi-trajectory-ledger.mjs \
+  --output /tmp/magi-trajectory-ledger-electron-context-compaction-after-<run-id>.json \
+  /tmp/magi-electron-context-compaction-after-<run-id>.json
+# 只有 before evidence/sidecar 已通过同一合同后，才执行以下 compare。
+node scripts/derive-electron-context-compaction-metrics.mjs \
+  --compare /tmp/magi-performance-metrics-electron-context-compaction-before-<run-id>.json \
+  /tmp/magi-performance-metrics-electron-context-compaction-after-<run-id>.json \
+  --output /tmp/magi-performance-comparison-electron-context-compaction-<run-id>.json
+```
+
+Renderer 的五类输入先分别完成 20 轮，再由 `derive-electron-renderer-comparison.mjs` 生成 before/after comparison；该脚本同时重算同一 Turn 的 backendStats、Renderer stats、原始输入 hash 和 before/after delta，随后分别用 trajectory derive 校验其后端阶段、Renderer 阶段和 outcome。before/after 的完整命令可按该脚本的 `--help` 及当前进度中的证据命名执行；不要把 daemon 与 Electron 两组 fixture 的指标相加。
+
+完成 daemon sidecar 与 Electron comparison 后，可生成分层 envelope：
+
+```bash
+node scripts/derive-magi-performance-envelope.mjs \
+  --daemon-before /tmp/magi-performance-metrics-before-<run-id>.json \
+  --daemon-after /tmp/magi-performance-metrics-after-<run-id>.json \
+  --electron-before /tmp/magi-electron-dom-renderer-before-<run-id>.json \
+  --electron-after /tmp/magi-electron-dom-renderer-after-<run-id>.json \
+  --electron-comparison /tmp/magi-electron-dom-renderer-cross-layer-comparison-<run-id>.json \
+  --output /tmp/magi-performance-envelope-<run-id>.json
+```
+
+### 5.2 最小验证命令
+
+按改动面执行最小充分检查；只有整体审计或发布前才运行全量命令。文档、ledger 或采样脚本改变时至少执行：
+
+```bash
+node --check scripts/derive-magi-trajectory-ledger.mjs
+node --check scripts/derive-electron-renderer-comparison.mjs
+node --check scripts/derive-electron-renderer-comparison-golden.mjs
+node --check scripts/derive-magi-performance-metrics.mjs
+node --check scripts/derive-magi-context-compaction-metrics.mjs
+node --check scripts/derive-electron-context-compaction-metrics.mjs
+node --check scripts/derive-magi-context-compaction-metrics-golden.mjs
+node --check scripts/derive-electron-context-compaction-metrics-golden.mjs
+node --check scripts/derive-magi-trajectory-ledger-golden.mjs
+npm run test:electron-renderer-comparison
+npm run test:context-compaction-metrics
+npm run test:electron-context-compaction-metrics
+npm run test:trajectory-ledger
+node --check scripts/derive-magi-permission-ledger.mjs
+node --check scripts/derive-magi-permission-ledger-golden.mjs
+npm run test:permission-ledger
+node --check scripts/verify-real-provider-performance.mjs
+node --check scripts/verify-real-provider-restart-replay.mjs
+node --check scripts/verify-electron-conversation-dom.mjs
+node --check scripts/verify-electron-browser-permission-matrix.mjs
+git diff --check
+```
+
+涉及 Rust/API/daemon 的实现时补充：
 
 ```bash
 cargo fmt --all -- --check
-cargo check -p magi-daemon
-cargo check -p magi-api
-cargo check -p magi-conversation-runtime
-cargo check -p magi-bridge-client
-npm --prefix web run check
-npm --prefix web run build
+cargo check -p magi-daemon -p magi-api -p magi-conversation-runtime -p magi-bridge-client
 ```
 
-最终必须执行项目完整本地发布前置校验和当前操作系统 Electron 打包验证，并使用打包产物完成真实模型对话、工具调用、取消、权限、恢复和两种展示模式验收。
-
-#### 退出条件
-
-- 所有目标性能指标达到要求，或对未达标项给出可复现证据和明确阻断原因。
-- 开发服务与打包产物行为一致。
-- 没有旧同步提交、旧独立 Runtime、旧完整 stream upsert 等重复实现残留。
-- 没有为性能优化牺牲权限、Git 安全、幂等、崩溃恢复和 canonical 一致性。
-- 完整回归测试通过，并形成最终性能前后对比记录。
-
-#### 预计工期
-
-2～3 个工作日。
-
-## 6. 阶段顺序与里程碑
-
-```text
-M0 真实基线可观测
-  -> M1 accepted 与 preparation 解耦
-  -> M2 HTTP Client / Runtime 复用
-  -> M3 上下文准备前移
-  -> M4 后端 stream 增量化
-  -> M5 前端单 artifact 增量渲染
-  -> M6 Electron 全流程验收
-```
-
-里程碑说明：
-
-- M1 完成后，发送消息的产品体感应首先明显改善。
-- M2、M3 决定实际首 token 是否接近 Codex。
-- M4、M5 决定长回复、工具循环和长历史下的持续流畅度。
-- M6 完成后才能判定本项目性能优化真正收口。
-
-## 7. 工作量评估
-
-不包含 Responses WebSocket 时，预计 17～27 个工作日；包含完整 WebSocket transport session 时，预计 20～32 个工作日。
-
-预计有效变更规模：
-
-- Rust：2,000～3,500 行；
-- Web：800～1,500 行；
-- 测试与基准：1,000～2,000 行。
-
-该工作属于中大型架构优化，必须分阶段提交和验收，不应一次性跨越提交、Transport、状态存储和 UI 四层后再统一排错。
-
-## 8. 风险与控制措施
-
-### 8.1 accepted 过早导致状态不可靠
-
-控制：HTTP 返回前必须完成最小 durable submission；后台 preparation 只能消费可靠记录。
-
-### 8.2 Git 与权限安全被性能优化绕开
-
-控制：Git、Snapshot、权限检查仍是执行前置条件，只从 HTTP 同步路径移入明确的 `preparing` 状态，不得跳过。
-
-### 8.3 连接复用导致跨会话状态污染
-
-控制：HTTP Client 可以跨请求复用；Provider turn state、sticky token 和增量 request state 必须限定在 turn-scoped session，不能跨 Turn 复用。
-
-### 8.4 流式增量导致崩溃时尾部丢失
-
-控制：定义明确的 flush 周期、终态强制 flush 和恢复协议；性能基准必须同时验证一致性和恢复能力。
-
-### 8.5 前端优化造成两种展示模式事实分叉
-
-控制：原始模式与摘要模式共享 canonical reducer 和 timeline projection，只允许视图组合不同。
-
-### 8.6 性能指标被 Provider 波动污染
-
-控制：单独记录 Provider TTFT；同时使用本地可控 SSE mock 和真实 Provider 两套基准。
-
-## 9. 首批开发检查表
-
-- [x] 完成阶段 0 timing schema 和统一 trace 设计。
-- [x] 完成本地 mock Provider 的确定性延迟基准；`MagiTurnHarness` 以 ignored 基准固定五类场景各 20 轮，输出 accepted、首 raw delta、首可见 delta、首 EventBus 事件和 Turn 终态的 P50/P95/最大值，并校验时序单调和事件序号存在。
-- [x] 完成真实 Provider/daemon 五类场景各 20 轮的后端 P50/P95 基线；统一汇总见 9.4，直接证据为 `/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json` 和 `/tmp/magi-real-provider-perf-subagent20.json`。
-- [ ] 完成真实 Provider 五类场景各 20 轮的端到端 P50/P95 基线。
-  - Electron Renderer 五类场景各 20 轮已完成，原始证据为 `/tmp/magi-electron-dom-timing-personal-20-10020.json`、`/tmp/magi-electron-dom-timing-workspace-chat-20-10021.json`、`/tmp/magi-electron-dom-timing-workspace-tool-20-10022.json`、`/tmp/magi-electron-dom-timing-goal-20-10025.json`、`/tmp/magi-electron-dom-timing-subagent-20-10026.json`，聚合统计为 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json`。
-  - 最新同轮结构化证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：五类各 20 轮、100 条唯一 `turn_id`、903 项检查通过；每轮均包含 accepted、runner、Provider 首个可见 delta、首 EventBus 事件、canonical terminal 和 Renderer 四阶段。
-  - 当前打包产物复验为 `/tmp/magi-electron-dom-correlated-timing-20-10031.json`：同样五类各 20 轮、100 条唯一 `turn_id`、903 项检查和 280 次 Provider 请求，终态来源全部为 `canonical_terminal_published`。
-  - 该证据已经完成后端与 Renderer 的同轮关联；最新复验 `/tmp/magi-electron-dom-correlated-timing-20-10231.json` 已把 Task/Goal/子代理的 raw tool-call-only Provider chunk 按 `turn_id` 记录为 `provider_first_raw_delta`，但仍需与 `/tmp/magi-real-provider-perf-*.json` 的历史后端样本统一场景和统计口径。
-- [x] 明确 durable submission 的最小字段和恢复规则。
-- [x] 明确 accepted、preparing、running、streaming 的 canonical 事件合同。
-- [x] 完成阶段 1 代码改造与异步 preparation 回归测试。
-- [x] 完成阶段 2 的 HTTP Client、Tokio Runtime 与连接池复用首轮实现。
-- [x] 完成阶段 3 的模型、工具定义、知识上下文缓存与 checkpoint 绑定校验首轮实现。
-- [x] 完成阶段 4 的 canonical stream item 增量写回首轮实现。
-- [x] 完成阶段 5 的前端增量 reducer、projection 与 Goal 刷新收敛首轮实现。
-- [x] 完成本地 daemon 真实入口的页面启动、会话历史、摘要折叠与工具组逐层展开验收。
-- [x] 完成 Electron `--dir` 打包产物启动、静态资源加载与摘要折叠/工具组展开验收。
-- [x] 通过 `scripts/verify-electron-conversation-dom.mjs` 完成打包 Electron 真实 Renderer DOM 单轮场景验收：初始窗口、个人/工作区 Chat、摘要 Turn/工具组折叠、Goal/Plan 卡片和 Goal 卡片展开、子代理工具卡片与代理运行中心、ReadOnly 明确写工具阻断、daemon 重启恢复、历史会话切换、取消和 Renderer reload 历史恢复共 55 项检查通过；最新证据为 `/tmp/magi-electron-dom-regression-10027.json`。同脚本已完成五类各 20 轮 Renderer 局部 timing，证据见本节端到端基线条目；这些证据仍不替代后端同轮事件关联。
-- [ ] 汇总性能前后对比；当前已完成真实 Provider 五场景后端 20 轮基线和 Electron 五类场景各 20 轮同轮关联，但不宣称性能目标达标。
-  - 真实 Provider 性能脚本区分 accepted、首个 `session.turn.item`、terminal canonical event 与 daemon 后端阶段；Electron 生产 Renderer 已提供受限内存 timing registry（`window.__magiPerformanceTiming.snapshot()`），同轮证据已生成；仍缺可审计的 before 数据、统一历史样本口径和目标判定。
-
-### 9.1 本轮本地验收记录
-
-已通过：
-
-- Rust：`cargo fmt --all -- --check`；`cargo check -p magi-daemon -p magi-api -p magi-conversation-runtime -p magi-bridge-client`。
-- Rust 测试：settings 17、knowledge 104、context 21、session 99、bridge 240、conversation 452、API 579 全部通过。
-- Web：`npm run check`、`npm run build`、完整 `npm run test` 全部通过；canonical turn、transport、agent、bridge、turn navigation 等 golden replay 均通过。
-- daemon 入口：`http://127.0.0.1:38123/web.html` 返回 200，`/health` 返回 `status=ok`。
-- Electron：`npm run desktop:package -- --dir` 成功生成并启动
-  `target/electron-dist/mac-arm64/Magi.app`；已在打包窗口验证摘要模式下的轮次折叠和工具组二级展开。
-
-尚未宣称完成的验收：
-
-- 真实 Provider 五类场景各 20 轮的 Provider/daemon P50/P95 已完成（见 9.4）；Electron 生产 Renderer 五类各 20 轮后端/Renderer 同轮关联已完成（见 9.5），但阶段 6 的性能前后对比仍未完成，当前仍不能宣称性能目标达标。
-
-### 9.3 本地 mock Provider 五场景 20 轮基线
-
-显式命令：
+涉及协议、Web 或打包 Electron 时补充：
 
 ```bash
-cargo test -p magi-api --lib turn_harness::tests::local_mock_provider_five_scenario_p50_p95_baseline -- --ignored --test-threads=1 --nocapture
+npm run protocol:check
+npm --prefix web run check
+npm --prefix web run build
+npm run test:electron-conversation-dom
+npm run desktop:package -- --dir
 ```
 
-本轮结果（单位：ms，格式为 accepted / 首 raw delta / 首可见 delta / 首 EventBus 事件 / Turn 终态）见
-`/tmp/magi-local-mock-baseline-raw-20260921.log`：
+整体审计再执行：
 
-| 场景 | P50 | P95 | 最大值 |
-|---|---:|---:|---:|
-| 新建个人普通会话 | 8 / 8 / 8 / 20 / 20 | 9 / 9 / 9 / 28 / 28 | 36 / 48 / 48 / 49 / 62 |
-| 已有个人长历史 | 10 / 12 / 12 / 24 / 25 | 11 / 14 / 14 / 27 / 28 | 12 / 15 / 15 / 28 / 29 |
-| 工作区纯聊天 | 7 / 8 / 8 / 19 / 19 | 10 / 10 / 10 / 21 / 21 | 10 / 11 / 11 / 22 / 22 |
-| 工作区工具调用 | 1 / 54 / 82 / 128 / 131 | 1 / 59 / 87 / 136 / 138 | 5 / 128 / 157 / 202 / 203 |
-| 主代理与子代理并发 | 1 / 15 / 120 / 140 / 141 | 1 / 18 / 122 / 151 / 151 | 1 / 28 / 128 / 155 / 156 |
-
-该基线只证明本地 mock 的采样链路和指标计算可复现，不代表真实 Provider、前端 DOM 绘制或性能前后对比已完成。
-
-### 9.4 真实 Provider 五场景 20 轮基线
-
-使用 `gpt-5.6-luna`、独立 daemon/state/workspace fixture 和 `scripts/verify-real-provider-performance.mjs` 完成历史五类场景各 20 轮；指标单位为 ms，顺序为 accepted / 首个 `session.turn.item` / Turn terminal canonical event。该脚本同时按 `requestId` 保存 daemon 的 `provider_first_raw_delta` 与 `provider_first_delta`，并要求工作区工具和子代理样本具备 raw stage。2026-09-21 重新采样尝试使用独立端口 `39242`，个人 Chat、个人长历史、工作区 Chat、工作区工具各完成 20 条，子代理完成 4 条后事件流超时；部分 evidence 为 `/tmp/magi-real-provider-perf-current20-20260921.json`，因此不能把本轮失败尝试当作新的完整基线。
-
-| 场景 | P50 | P95 | 最大值 | 终态 |
-|---|---:|---:|---:|---|
-| 新建个人普通会话 | 88 / 14797 / 15169 | 98 / 27054 / 27488 | 108 / 28756 / 29163 | 20/20 completed |
-| 已有个人长历史 | 92 / 15645 / 15794 | 110 / 26669 / 26782 | 115 / 35299 / 35463 | 20/20 completed |
-| 工作区纯聊天 | 93 / 2981 / 3529 | 104 / 14214 / 14730 | 106 / 18623 / 19037 | 20/20 completed |
-| 工作区工具调用 | 51 / 61 / 9144 | 60 / 94 / 34131 | 64 / 103 / 49879 | 20/20 completed |
-| 主代理与子代理并发 | 97 / 130 / 53011 | 131 / 175 / 72882 | 143 / 220 / 139254 | 20/20 completed |
-
-直接 JSON 证据：`/tmp/magi-real-provider-perf-personal20.json`、`/tmp/magi-real-provider-perf-workspace20.json`、`/tmp/magi-real-provider-perf-tool20.json`、`/tmp/magi-real-provider-perf-subagent20.json`。该基线完成 Provider/daemon 时序采样；Electron 生产 Renderer 的 timing registry 已落地，五类场景各 20 轮 CDP 证据见 `/tmp/magi-electron-dom-timing-20-summary-10020-10026.json` 及其五个原始 JSON，并保留 55 项 DOM 基础验收证据。最新同轮后端/Renderer 关联见第 9.5 节；历史后端样本尚未与该证据合并，性能前后对比仍未完成。
-
-2026-09-20 的代码审计和 workspace 全量复验没有改变上述验收范围：TaskRunner 的生产 worker catalog 来源已收敛为单一动态 provider，测试读取结果仍是 `#[cfg(test)]` 辅助；SessionStore 原始 current Turn 替换入口和 `UpsertCurrentTurn` flush reason 已删除。该结构收敛不产生新的性能样本，因此不能把后端五场景数据扩大解释为 Electron 五场景 Renderer timing 或 before/after 对比。
-
-### 9.2 真实 Provider 单轮验收记录
-
-本轮使用已保存的 Magi API 配置，在打包产物
-`target/electron-dist/mac-arm64/Magi.app` 中通过桌面端真实入口执行，未使用无凭证的裸 `curl` 探测替代应用链路：
-
-| 场景 | 结果 | UI 终态/耗时 |
-|---|---|---:|
-| 纯文本流式响应 `PERFSMOKEOK` | 通过，响应正文准确收口 | 已处理 10s |
-| 完全访问纯文本 `TEXTSCENEOK` | 通过，无工具调用，正文准确收口 | 已处理 5s |
-| 只读 Shell 工具 `pwd` | 通过，工具卡片可见，阶段折叠后可二级展开 | 已处理 9s |
-| 完全访问只读 Shell `ls -la /tmp` | 通过，正文准确收口 | 已处理 14s |
-| 受限访问只读 Shell `pwd` | 通过，正文准确收口 | 已处理 10s |
-| 只读访问只读 Shell `pwd` | 通过，正文准确收口 | 已处理 13s |
-| 摘要模式阶段折叠与工具二级展开 | 通过，展开阶段后显示 `运行 pwd`，继续展开显示 `Shell 命令 pwd` | — |
-| 长流取消 | 通过，停止后进入“代理运行中心·任务已停止”，可归档 | — |
-| 只读模式下写入请求 | 权限拒绝被明确展示，未创建项目文件；模型重复尝试导致任务未自行快速收口，已手动停止 | 1m42s |
-| 只读访问明确写入拦截 | 通过，返回 `READONLYBLOCKED`，未创建临时文件 | 已处理 10s |
-| 受限访问下写入请求 | 通过，明确显示“权限受限，已停止，未重试”，未创建临时文件 | 已处理 12s |
-| 完全访问下写入 `/tmp` | 通过，工具完成并返回 `PERMISSIONWRITEOK` | 已处理 13s |
-| 完全访问复现写入 `/tmp` | 通过，当前界面显示完全访问，Shell 写入成功并返回完整结果 | 已处理 16s |
-| 同一会话旧只读历史后切换完全访问 | 通过，显式 `full_access` 下 Shell 写入成功并返回 `POSTFIXOK` | 已处理 30s 内 |
-| 同一会话切回只读后写入 | 通过，立即拒绝且不重试，未创建临时文件 | 已处理 1s 内 |
-| 只读模式下继续执行 `pwd` | 通过，Shell 读取成功并返回 `READONLYPOSTFIXREADOK` | 已处理 4s |
-| 多阶段长任务 | 通过，23 次工具调用、连续写入/读取/校验/删除/计划收口，最终 27 个 turn item、无失败项，最终仅保留 `manifest.txt` 与 `report.txt` | 182s |
-
-注意：对话历史中的权限结果属于提交该轮时的访问模式快照；底部访问模式按钮表示下一轮发送将使用的模式，不会改写历史轮次。因此，历史轮次显示“权限受限”而当前按钮显示“完全访问”并不矛盾。
-
-该记录证明已保存的 Provider 配置可以驱动真实流式、工具、取消和访问模式路径；受限访问已经能够快速阻断并收口。旧回归记录中只读模式下模型重复尝试属于修复前的历史现象；本轮在新打包产物中确认权限快照会覆盖线程旧历史，写入被立即拒绝且不会重复调用，切换为完全访问后可正常写入。
-
-### 9.5 Electron 五类场景后端/Renderer 同轮关联
-
-使用打包 Electron、真实 Provider 和 `scripts/verify-electron-conversation-dom.mjs` 的 timing-only
-模式完成五类场景各 20 轮。直接证据为 `/tmp/magi-electron-dom-correlated-timing-20-10108.json`：
-`status=passed`、100 条唯一 `turn_id`、903 项检查通过、280 次 Provider 请求、0 条缺失后端阶段，
-终态来源全部为 `canonical_terminal_published`。每条 sample 同时包含：
-
-```text
-accepted_response_sent
-runner_started
-provider_first_delta
-event_bus_first_event
-canonical_terminal_published
-frontend_event_received
-reducer_completed
-projection_completed
-dom_painted
+```bash
+cargo test --workspace --all-targets --quiet -- --test-threads=1
+npm test
 ```
 
-后端阶段的 `sinceAcceptedMs` 由 Electron 日志中各阶段时间戳减去同一轮
-`accepted_response_sent` 时间戳计算；`accepted_response_sent` 自身按定义为 0，原始日志中的
-trace elapsed 仍保留。Renderer 阶段使用生产 timing registry 的局部 `elapsedMs`。P50/P95 使用
-排序后的 nearest-rank 统计，单位为毫秒：
-
-| 场景 | runner P50/P95 | Provider 首可见 delta P50/P95 | EventBus 首事件 P50/P95 | terminal P50/P95 | DOM paint P50/P95 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| personal_chat | 1 / 1 | 2 / 3 | 11 / 12 | 98 / 119 | 10.1 / 18.5 |
-| workspace_chat | 2 / 2 | 3 / 4 | 12 / 15 | 101 / 128 | 6.9 / 19.3 |
-| workspace_tool | 223 / 355 | 390 / 646 | 241 / 369 | 635 / 1080 | 13.5 / 36.5 |
-| goal | 190 / 251 | 426 / 493 | 199 / 261 | 540 / 604 | 11.5 / 32.6 |
-| subagent | 232 / 268 | 391 / 434 | 244 / 279 | 643 / 711 | 10.3 / 40.0 |
-
-该表只描述当前 after 证据的同轮阶段分布，不是性能目标达标表。工具调用首轮有只包含
-tool-call block、没有可见 content/thinking delta 的 Provider 响应；在这份历史 10108 证据中，
-`provider_first_delta` 表示该 Turn 首个可观测可见 Provider delta，raw tool-call-only 首 chunk
-尚未单独按 `turn_id` 纳入首原始 Provider 事件统计。要关闭端到端基线和性能阶段，仍需把这批
-证据与既有 `/tmp/magi-real-provider-perf-*.json` 使用同一场景、同一指标和同一统计方法合并，
-并补齐可审计的旧版本 before 数据。
-
-重新打包当前 Web/Desktop 工作区后的复验见 `/tmp/magi-electron-dom-correlated-timing-20-10031.json`：
-五类各 20 轮、100 条唯一 `turn_id`、903 项检查通过、280 次 Provider 请求，0 条缺少后端阶段，
-终态来源全部为 `canonical_terminal_published`。该复验确认当前打包产物仍满足同轮关联，但不改变
-before 数据缺失和历史证据未单独统计 raw tool-call-only 首 chunk 的限制。当前复验的 P50/P95（单位 ms，
-后端为 `sinceAcceptedMs`，DOM 为 Renderer 局部 `elapsedMs`）为：
-
-| 场景 | runner P50/P95 | Provider 首可见 delta P50/P95 | EventBus 首事件 P50/P95 | terminal P50/P95 | DOM paint P50/P95 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| personal_chat | 0 / 1 | 2 / 5 | 11 / 14 | 96 / 113 | 8.5 / 24.4 |
-| workspace_chat | 1 / 2 | 3 / 5 | 12 / 14 | 98 / 111 | 7.2 / 16.5 |
-| workspace_tool | 166 / 385 | 304 / 695 | 173 / 391 | 441 / 896 | 14.1 / 28.7 |
-| goal | 196 / 256 | 403 / 485 | 206 / 265 | 517 / 595 | 14.5 / 37.4 |
-| subagent | 253 / 333 | 425 / 502 | 265 / 359 | 678 / 765 | 16.7 / 40.9 |
-
-raw tool-call-only 的最新复验使用 `/tmp/magi-electron-dom-raw-tool-1-10230.json` 和
-`/tmp/magi-electron-dom-correlated-timing-20-10231.json`。单轮证据为 `status=passed`、13 项检查；
-最新五类 × 20 轮证据为 `status=passed`、963 项检查、100 条唯一 `turn_id`、280 次 Provider 请求，
-五类各 20 条，60 条 `workspace_tool`、`goal`、`subagent` sample 全部出现
-`provider_first_raw_delta`。新增 raw stage 的 P50/P95（`sinceAcceptedMs`，毫秒）与可见首 delta
-和 Renderer DOM paint 如下：
-
-| 场景 | Provider 首 raw delta P50/P95 | Provider 首可见 delta P50/P95 | DOM paint P50/P95 |
-| --- | ---: | ---: | ---: |
-| personal_chat | — | 2 / 4 | 9.1 / 19.4 |
-| workspace_chat | — | 3 / 4 | 12.5 / 22.5 |
-| workspace_tool | 202 / 379 | 270 / 639 | 12.7 / 19.5 |
-| goal | 228 / 306 | 451 / 874 | 13.3 / 21.6 |
-| subagent | 232 / 296 | 382 / 501 | 9.9 / 33.8 |
-
-`ModelStreamingDelta.tool_calls` 只保存 Provider 流式工具调用快照，不代表工具已经执行；
-`provider_first_raw_delta` 是首个包含工具调用快照或可见内容/思考的 delta，
-`provider_first_delta` 仍只表示首个可见 content/thinking delta。该复验补齐 raw 首 chunk 的同轮
-观测，但仍不是 before/after 对比，也没有把历史真实 Provider JSON 与本次打包 Electron 证据合并成
-统一的端到端基线。
-
-### 9.6 Provider trajectory ledger 目标形态
-
-参考 ZCode 固定提交 `872ad960de7ec172591f7e1952f7849229f94521` 的 `prompt-trajectory` 分层，Magi 后续不再让真实 Provider、Electron timing 和权限矩阵各自维护无法互证的统计源。目标是先保存可追加的原始轨迹，再从同一轨迹派生性能、replay 和权限 artifact。当前已新增 `scripts/derive-magi-trajectory-ledger.mjs` 作为只读派生入口；它不会补造缺失阶段，缺少 `session_id`、`turn_id`、`request_id` 或终态 `event_sequence` 时输出 `incomplete` 并失败。真实 Provider 四类一轮 smoke 已成功派生 22 条 ledger 记录，但尚未用五类 × 20 轮 Provider 和 Electron 同轮 artifact 生成可关闭 D/F/G 的统一 ledger。
-
-派生命令形态为：
+派生命令：
 
 ```bash
 node scripts/derive-magi-trajectory-ledger.mjs \
-  --output /tmp/magi-trajectory-ledger.json \
-  /tmp/magi-real-provider-perf-personal20.json \
-  /tmp/magi-electron-dom-correlated-timing-20-10231.json
+  --output /tmp/magi-trajectory-ledger-<run-id>.json \
+  /tmp/magi-real-provider-<slice>-<run-id>.json
+
+node scripts/derive-magi-permission-ledger.mjs \
+  --output /tmp/magi-permission-ledger-<run-id>.json \
+  /tmp/magi-permission-evidence-<run-id>.json
 ```
 
-输出会记录 `schema_version`、`derive_version`、输入 JSON 的 `payload_hash`、phase 计数和验证错误；只有身份、阶段序号和同轮终态约束全部满足时才输出 `status=passed`。本轮的最小 fixture 验证仅证明派生器和 fail-closed 校验语义，不能替代真实输入。
-
-真实 smoke 证据：`/tmp/magi-real-provider-ledger-smoke-20260921.json` 与
-`/tmp/magi-real-provider-ledger-smoke-20260921-ledger.json`。后者包含 4 个 accepted、4 个
-provider_request、2 个 raw delta、4 个 visible delta、4 个 EventBus 和 4 个 canonical terminal
-记录；工具和子代理样本均保留 raw tool-call-only 关联。该证据只验证真实 Provider 输入的派生链路，不能替代 20 轮矩阵或 Electron Renderer 阶段。
-
-失败采样证据：`/tmp/magi-real-provider-perf-current20-20260921.json` 的 `status=failed` 和
-`samplingError` 必须保留；其派生 ledger `/tmp/magi-real-provider-perf-current20-20260921-ledger.json`
-为 `status=incomplete`、退出码 2。失败样本不计入通过统计，也不能用于关闭 D/F/G。
-
-每条原始记录至少包含以下字段：
-
-```text
-schema_version
-scenario
-sample_index
-query_source
-session_id
-turn_id
-request_id
-event_sequence
-phase
-timestamp_ms
-provider_round
-tool_call_count
-payload_hash
-source
-outcome
-```
-
-`phase` 的最小集合为 `accepted`、`provider_request`、`provider_raw_delta`、`provider_visible_delta`、`tool_call`、`tool_result`、`approval_requested`、`approval_resolved`、`event_bus`、`canonical_terminal`、`renderer_received`、`reducer_completed`、`projection_completed` 和 `dom_painted`。轨迹只保存做关联和一致性判断所需的结构化摘要；不落 API key、认证头、用户正文或完整 Provider 输出。确需保存请求/响应正文时，写入独立受控 artifact，并在 ledger 中只保留内容哈希、字节数和路径。
-
-派生规则必须满足：
-
-1. 主 Turn 与标题生成、压缩、分类器等 sidecar 请求按 `query_source` 分离，性能样本不得串入辅助模型请求。
-2. trajectory continuity 只接受 append-only 历史；只忽略明确登记的传输元数据漂移，正文、thinking、工具调用和工具结果被改写时必须分段或失败。
-3. `provider_raw_delta` 与 `provider_visible_delta` 分开，tool-call-only 首 chunk 不能被可见文本口径覆盖。
-4. 同一 `turn_id` 的 canonical terminal 只能有一条；重复 request replay 允许再次观察同一终态，但不能派生第二个 Turn。
-5. timeout、Provider 失败、取消和缺阶段的样本也要 flush 原始轨迹并标记 `outcome`，不得只保留成功样本或把部分样本计入通过统计。
-6. P50/P95、权限矩阵和 before/after 都从版本化 derive 程序产生，artifact 必须记录输入轨迹哈希、derive 版本和统计口径。
-
-这套 ledger 可以统一 F 的历史真实 Provider 样本与 Electron 同轮证据，也能为 G 提供可审计的 before/after 输入。只有旧版本与当前版本使用同一 fixture、同一 ledger schema、同一 derive 版本且输入可复核时，才允许判定性能目标是否达标。
-
-## 10. 关键源码证据
-
-Magi 当前主要证据位置：
-
-- `crates/magi-api/src/routes/sessions.rs`：`submit_mainline_session_turn` 在返回前等待 dispatch finalize。
-- `crates/magi-api/src/routes/dispatch_flow.rs`：接纳前执行 Snapshot、Git Context 和 checkpoint。
-- `crates/magi-api/src/state.rs`：Session Git 观测、完整 durable state 和 Git Context 持久化。
-- `crates/magi-bridge-client/src/http_model_client.rs`：每次流式请求创建线程、Runtime 和 `reqwest::Client`。
-- `crates/magi-conversation-runtime/src/session_turn_execution.rs`：首请求前上下文准备，以及每个 delta 的完整 item upsert。
-- `crates/magi-session-store/src/store/sidecar.rs`：运行 item 更新时重建 canonical turn。
-- `web/src/stores/turn-reducer.ts`：完整字符串字符数组转换与对象等价比较。
-- `web/src/stores/turn-projection.ts`：变更 Turn 的 presentation/artifact 重建。
-- `web/src/shared/bridges/web-client-bridge.ts`：stream item 事件处理及 Goal 刷新。
-- `web/src/components/MessageList.svelte`：可见消息内容签名和滚动派生计算。
-
-Codex 对照位置：
-
-- `/Users/xie/code/codex/codex-rs/core/src/session/turn_input.rs`：只等待 Core 路由决定。
-- `/Users/xie/code/codex/codex-rs/app-server/src/request_processors/turn_processor.rs`：`turn/start` 在启动后立即返回。
-- `/Users/xie/code/codex/codex-rs/core/src/client.rs`：turn-scoped `ModelClientSession` 与连接复用。
-- `/Users/xie/code/codex/codex-rs/core/src/session_startup_prewarm.rs`：启动预热。
-- `/Users/xie/code/codex/codex-rs/app-server/src/outgoing_message.rs`：响应和事件通过独立 outgoing 消息发送。
+每次采样使用新的 run-id 和空闲端口，不覆盖旧 artifact。失败或不完整 artifact 保留作诊断，但不得计入关闭统计；实际采样入口和当前缺口只记录在[重构进度](conversation-response-core-architecture-progress.md)。

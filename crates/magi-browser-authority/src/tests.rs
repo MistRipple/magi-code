@@ -399,6 +399,144 @@ fn lease_is_scoped_to_one_tab_and_surface() {
 }
 
 #[test]
+fn browser_lease_rejects_owner_turn_tab_and_surface_drift() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    let other_tab_id = ready_tab_with_id(&mut authority, &browser_session_id, "browser-tab-other");
+    authority
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+
+    let lease_id = BrowserLeaseId::new("lease-scope-drift");
+    let lease_owner = owner();
+    let lease = authority
+        .acquire_lease(AcquireBrowserLease {
+            lease_id: lease_id.clone(),
+            tab_id: tab_id.clone(),
+            surface_id: surface_id(),
+            owner: lease_owner.clone(),
+            turn_id: "turn-scope-drift".to_string(),
+            goal_binding: None,
+            acquired_at: at(8),
+            expires_at: at(100),
+        })
+        .expect("lease should acquire for its owner and turn");
+
+    let mut other_owner = lease_owner.clone();
+    other_owner.task_id = Some(magi_core::TaskId::new("another-owner-task"));
+    let error = authority
+        .validate_write(ValidateBrowserWrite {
+            lease_id: &lease_id,
+            fence: lease.fence,
+            tab_id: &tab_id,
+            surface_id: &surface_id(),
+            owner: &other_owner,
+            turn_id: "turn-scope-drift",
+            goal_binding: None,
+            now: at(9),
+        })
+        .expect_err("a lease must reject an owner change within the same session");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::LeaseOwnerMismatch
+    ));
+
+    let error = authority
+        .validate_write(ValidateBrowserWrite {
+            lease_id: &lease_id,
+            fence: lease.fence,
+            tab_id: &tab_id,
+            surface_id: &surface_id(),
+            owner: &lease_owner,
+            turn_id: "another-turn",
+            goal_binding: None,
+            now: at(9),
+        })
+        .expect_err("a lease must not cross Turn boundaries");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::LeaseTurnMismatch
+    ));
+
+    let error = authority
+        .validate_write(ValidateBrowserWrite {
+            lease_id: &lease_id,
+            fence: lease.fence,
+            tab_id: &other_tab_id,
+            surface_id: &surface_id(),
+            owner: &lease_owner,
+            turn_id: "turn-scope-drift",
+            goal_binding: None,
+            now: at(9),
+        })
+        .expect_err("a lease must not control a different logical Tab");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::LeaseTabMismatch { .. }
+    ));
+
+    let error = authority
+        .validate_write(ValidateBrowserWrite {
+            lease_id: &lease_id,
+            fence: lease.fence,
+            tab_id: &tab_id,
+            surface_id: "another-surface",
+            owner: &lease_owner,
+            turn_id: "turn-scope-drift",
+            goal_binding: None,
+            now: at(9),
+        })
+        .expect_err("a lease must not control a different physical Surface");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::LeaseSurfaceMismatch { .. }
+    ));
+
+    authority
+        .validate_write(ValidateBrowserWrite {
+            lease_id: &lease_id,
+            fence: lease.fence,
+            tab_id: &tab_id,
+            surface_id: &surface_id(),
+            owner: &lease_owner,
+            turn_id: "turn-scope-drift",
+            goal_binding: None,
+            now: at(9),
+        })
+        .expect("rejected scope drift must not consume the valid lease");
+
+    let replacement = binding(&tab_id, "surface-replacement", 2);
+    let revoked = authority
+        .set_primary_surface(replacement, at(10))
+        .expect("surface replacement should revoke its old lease");
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].lease_id, lease_id);
+    assert_eq!(revoked[0].lifecycle, BrowserLeaseLifecycle::Revoked);
+    assert_eq!(
+        revoked[0].end_reason,
+        Some(BrowserLeaseEndReason::RuntimeUnavailable)
+    );
+    let error = authority
+        .validate_write(ValidateBrowserWrite {
+            lease_id: &lease_id,
+            fence: lease.fence,
+            tab_id: &tab_id,
+            surface_id: &surface_id(),
+            owner: &lease_owner,
+            turn_id: "turn-scope-drift",
+            goal_binding: None,
+            now: at(11),
+        })
+        .expect_err("a stale lease must not survive Surface replacement");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::LeaseNotHeld(_)
+    ));
+}
+
+#[test]
 fn surface_replacement_revokes_only_that_surface() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);

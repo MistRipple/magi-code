@@ -72,6 +72,23 @@ for (const file of schemaFiles) {
 }
 ajv.compile(schemas.get("worker-ipc.schema.json"));
 
+const validateDesktopIpc = ajv.compile(schemas.get("desktop-ipc.schema.json"));
+assert.ok(
+  validateDesktopIpc({
+    channel: "magi-desktop:set-context",
+    payload: { sessionId: "session-contract", sessionTitle: "Conversation title" },
+  }),
+  `set-context 必须接受 sessionTitle：${JSON.stringify(validateDesktopIpc.errors)}`,
+);
+assert.equal(
+  validateDesktopIpc({
+    channel: "magi-desktop:set-context",
+    payload: { sessionTitle: "Conversation title", unexpected: true },
+  }),
+  false,
+  "set-context 仍须拒绝未声明字段",
+);
+
 const browserToolSchema = schemas.get("browser-tool.schema.json");
 const browserToolCatalog = browserToolSchema["x-magi-browser-tool-catalog"];
 assert.ok(Array.isArray(browserToolCatalog) && browserToolCatalog.length > 0, "浏览器工具目录不能为空");

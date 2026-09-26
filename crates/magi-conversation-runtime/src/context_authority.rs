@@ -31,6 +31,9 @@ use std::{
 
 const THREAD_HISTORY_RECENT_MESSAGE_TARGET: usize = 12;
 const COMPACTION_PROMPT_RESERVE_TOKENS: usize = 768;
+// 九个交接标题、关键标识和工具事实不能稳定地塞进 768 token；过小的预算会把
+// 本应可恢复的 task 长历史直接收口为 context_compaction_failed。
+const MIN_COMPACTION_SUMMARY_TOKENS: usize = 1_024;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ContextCompactionProgress {
@@ -601,7 +604,9 @@ impl<'a> ContextAuthority<'a> {
             );
             return Ok(None);
         }
-        let summary_target_tokens = target_history_tokens.div_ceil(3).clamp(256, 2_000);
+        let summary_target_tokens = target_history_tokens
+            .div_ceil(3)
+            .clamp(MIN_COMPACTION_SUMMARY_TOKENS, 2_000);
         let tail_target_tokens = target_history_tokens.saturating_sub(summary_target_tokens);
         let source_budget =
             compaction_source_budget(decision.context_window_tokens(), summary_target_tokens);
@@ -1450,8 +1455,8 @@ fn choose_thread_history_compaction_split(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextCompactionProgress, ContextCompactionProgressGate, bound_model_visible_tool_results,
-        serialize_compaction_source, validate_compaction_summary,
+        ContextCompactionProgress, ContextCompactionProgressGate, MIN_COMPACTION_SUMMARY_TOKENS,
+        bound_model_visible_tool_results, serialize_compaction_source, validate_compaction_summary,
     };
     use magi_session_store::ThreadChatMessage;
 
@@ -1477,9 +1482,41 @@ mod tests {
     #[test]
     fn compaction_summary_quality_gate_rejects_lossy_output() {
         let summary = "## 目标与完成标准\n- 完成任务\n## 约束与权限\n- restricted，未授权\n## 工作区事实\n- /tmp/project\n## 工具与外部操作\n- file_read succeeded\n## 代理状态\n- 无\n## 已确认决策\n- 保持现有方案\n## 阻塞与风险\n- 无\n## 下一步\n- 继续验证\n## 禁止重复\n- 不重复读取";
-        assert!(validate_compaction_summary(summary, 800).is_ok());
-        assert!(validate_compaction_summary("只返回了提示词复述", 800).is_err());
-        assert!(validate_compaction_summary(&"内容".repeat(10_000), 800).is_err());
+        assert!(validate_compaction_summary(summary, MIN_COMPACTION_SUMMARY_TOKENS).is_ok());
+        assert!(
+            validate_compaction_summary("只返回了提示词复述", MIN_COMPACTION_SUMMARY_TOKENS)
+                .is_err()
+        );
+        assert!(
+            validate_compaction_summary(&"内容".repeat(10_000), MIN_COMPACTION_SUMMARY_TOKENS)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compaction_summary_accepts_handoff_above_legacy_budget() {
+        let sections = [
+            "## 目标与完成标准",
+            "## 约束与权限",
+            "## 工作区事实",
+            "## 工具与外部操作",
+            "## 代理状态",
+            "## 已确认决策",
+            "## 阻塞与风险",
+            "## 下一步",
+            "## 禁止重复",
+        ];
+        let mut summary = sections
+            .iter()
+            .map(|section| format!("{section}\n- 保留可恢复的关键事实"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        while magi_core::estimate_text_tokens(&summary) <= 512 {
+            summary.push_str("\n- 保留工具结果、授权状态和未解决风险");
+        }
+        assert!(magi_core::estimate_text_tokens(&summary) > 512);
+        assert!(magi_core::estimate_text_tokens(&summary) <= MIN_COMPACTION_SUMMARY_TOKENS);
+        assert!(validate_compaction_summary(&summary, MIN_COMPACTION_SUMMARY_TOKENS).is_ok());
     }
 
     #[test]

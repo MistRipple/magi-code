@@ -4320,7 +4320,10 @@ fn append_task_error_turn_item(
         "failed",
         Some("回复生成失败".to_string()),
         Some(error_text.to_string()),
-        Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
+        Some(format!(
+            "turn-item-assistant-error-{}",
+            context.task.task_id
+        )),
         context.turn_visibility.thread_id().clone(),
     );
     apply_task_turn_visibility(&mut error_item, context.task, context.turn_visibility);
@@ -4338,50 +4341,45 @@ fn append_task_error_turn_item(
         );
     }
     let error_item_id = error_item.item_id.clone();
-    let published = append_session_turn_item_for_turn(
-        context.session_store,
-        context.session_id,
-        context.expected_turn_id,
-        error_item,
-        Some(context.task_store),
-    )?
+    let published = if context.turn_visibility.is_mainline() {
+        upsert_session_turn_item_for_turn(
+            context.session_store,
+            context.session_id,
+            context.expected_turn_id,
+            error_item,
+            Some(context.task_store),
+        )?
+    } else {
+        append_session_turn_item_for_turn(
+            context.session_store,
+            context.session_id,
+            context.expected_turn_id,
+            error_item,
+            Some(context.task_store),
+        )?
+    }
     .ok_or_else(|| {
         format!(
             "会话 {} 没有可写入的当前 Turn，无法记录失败 item {}",
             context.session_id, error_item_id
         )
     })?;
+    if context.turn_visibility.is_mainline() {
+        // Mainline Task 的失败 item 只是 Task 执行事实，不能在 TaskStore durable
+        // 终态提交之前把它发布成 Turn 终态。否则消费者会看到 failed snapshot，
+        // 但 TaskStore/Coordinator 仍未 settlement，下一轮会在短窗口内得到 409。
+        // TaskCompletionNotifier -> finalizer 会在 TaskStore Failed 提交后补齐
+        // Coordinator 收口、资源 settlement 和唯一 terminal event；这里仅持久化
+        // 可恢复的错误 item。Sidechain item 不拥有 root Turn 终态，仍可即时展示。
+        persist_session_state_checkpoint(context.persist_session_state, "task_turn_error_item")?;
+        return Ok(());
+    }
     publish_session_turn_item_event(
         context.event_bus,
         context.session_id,
         context.workspace_id,
         &published,
     );
-    if context.turn_visibility.is_mainline() {
-        CanonicalTurnEventSink::for_store(context.session_store, Some(context.task_store))
-            .set_status_domain(context.session_id, context.expected_turn_id, "failed")
-            .map_err(|error| {
-                format!(
-                    "提交会话 {} 的 Turn failed 状态失败: {error}",
-                    context.session_id
-                )
-            })?
-            .ok_or_else(|| {
-                format!(
-                    "会话 {} 没有可更新的当前 Turn，无法提交 failed 状态",
-                    context.session_id
-                )
-            })?;
-        persist_session_state_checkpoint(context.persist_session_state, "task_turn_failed")?;
-        publish_current_session_turn_item_event(
-            context.event_bus,
-            context.session_store,
-            context.session_id,
-            context.workspace_id,
-            &error_item_id,
-            Some(context.task_store),
-        )?;
-    }
     Ok(())
 }
 
@@ -8731,6 +8729,48 @@ mod tests {
             }
             other => panic!("model failure must fail the task loop, got {other:?}"),
         }
+
+        let pending_turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("失败 item 写回后 Turn 应仍可观察");
+        assert_eq!(pending_turn.status, "running");
+        assert!(event_bus.snapshot().recent_events.iter().all(|event| {
+            event
+                .payload
+                .get("current_turn")
+                .and_then(|turn| turn.get("status"))
+                .and_then(serde_json::Value::as_str)
+                != Some("failed")
+        }));
+        assert!(
+            task_store
+                .revoke_lease_and_set_task_terminal(
+                    &task_id,
+                    &task.root_task_id,
+                    Some(&lease.lease_id),
+                    TaskStatus::Failed,
+                    vec!["RemoteBusiness: model bridge unavailable (-32099)".to_string()],
+                )
+                .expect("TaskStore Failed 终态应持久化")
+        );
+        assert!(
+            crate::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
+                crate::session_turn_finalize::FinalizeBackgroundSessionTaskTurnContext {
+                    session_store: &session_store,
+                    event_bus: &event_bus,
+                    task_store: Some(&task_store),
+                    session_id: &session_id,
+                    root_task_id: &task_id,
+                    runner_status: "error",
+                    expected_turn_id: Some("turn-task-model-failure"),
+                    coordinator: Some(conversation_registry.turn_coordinator()),
+                    persist_session_state: None,
+                    settle_execution_resources: None,
+                },
+            )
+            .expect("TaskStore terminal 后 finalizer 应收口 Turn")
+        );
 
         let turn = session_store
             .runtime_sidecar(&session_id)

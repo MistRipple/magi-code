@@ -428,7 +428,7 @@ assert.doesNotMatch(
 );
 assert.match(
   workbenchShellSource,
-  /import MagiWordmark[\s\S]*?<MagiWordmark\s*\/>/,
+  /(?:import MagiWordmark[\s\S]*?<MagiWordmark\s*\/>|import MagiIcon[\s\S]*?<div class="sidebar-brand" aria-label="Magi">[\s\S]*?<MagiIcon size=\{30\}\s*\/>[\s\S]*?<span class="sidebar-brand-name">Magi<\/span>)/,
   '产品标识应保留在左侧面板顶部，不能因清理应用 Header 而一并删除',
 );
 assert.match(

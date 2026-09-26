@@ -21,7 +21,7 @@ pub(crate) fn new_startup_nonce() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!(
-        "fallback-{timestamp}-{}-{}",
+        "time-sequenced-{timestamp}-{}-{}",
         std::process::id(),
         STARTUP_NONCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )

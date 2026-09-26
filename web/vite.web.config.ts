@@ -29,7 +29,7 @@ function magiDaemonDevGuardPlugin(agentBaseUrl: string, webRoot: string) {
           res.setHeader('content-type', 'text/html; charset=utf-8');
           res.end(`<!doctype html>
 <html lang="zh-CN">
-  <head><meta charset="utf-8" /><title>Magi Web 开发入口</title></head>
+  <head><meta charset="utf-8" /><title>Magi</title></head>
   <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 24px; line-height: 1.6;">
     <h1>请从 daemon 入口访问 Magi Web</h1>
     <p>开发模式请启动 <code>MAGI_WEB_DEV=1 cargo run -p magi-daemon-app</code>，然后访问 <code>${agentBaseUrl}/web.html</code>。</p>

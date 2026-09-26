@@ -347,7 +347,8 @@
       "properties": {
         "workspaceId": { "$ref": "#/$defs/optionalText" },
         "workspacePath": { "$ref": "#/$defs/optionalText" },
-        "sessionId": { "$ref": "#/$defs/optionalText" }
+        "sessionId": { "$ref": "#/$defs/optionalText" },
+        "sessionTitle": { "$ref": "#/$defs/optionalText" }
       }
     },
     "getSnapshot": {

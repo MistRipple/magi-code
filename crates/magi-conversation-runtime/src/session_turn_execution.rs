@@ -326,8 +326,11 @@ fn current_turn_status_is_writable(status: &str) -> bool {
             | "success"
             | "failed"
             | "error"
+            | "interrupted"
             | "cancelled"
             | "canceled"
+            | "killed"
+            | "superseded"
     )
 }
 
@@ -2219,6 +2222,7 @@ fn stream_session_turn_round(
     let writeback_error = std::cell::RefCell::new(None::<String>);
     let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
     let provider_started_at = Instant::now();
+    let first_raw_delta_reported = std::cell::Cell::new(false);
     let first_delta_reported = std::cell::Cell::new(false);
     mark_turn_timing(
         "provider_request_started",
@@ -2255,6 +2259,16 @@ fn stream_session_turn_round(
     let content_buffer = std::cell::RefCell::new(TurnStreamBuffer::default());
     let thinking_buffer = std::cell::RefCell::new(TurnStreamBuffer::default());
     let on_delta = |delta: &ModelStreamingDelta| {
+        if (!delta.content.is_empty() || !delta.thinking.is_empty() || !delta.tool_calls.is_empty())
+            && !first_raw_delta_reported.replace(true)
+        {
+            mark_turn_timing(
+                "provider_first_raw_delta",
+                request,
+                provider_started_at.elapsed().as_millis(),
+                Some(&call_id),
+            );
+        }
         if writeback_error.borrow().is_some() || !request_turn_is_writable(session_store, request) {
             writeback_aborted.set(true);
             return;
@@ -4030,6 +4044,13 @@ mod tests {
         })
         .expect("cancelled model invocation should resolve as interrupted turn");
         assert!(output.interrupted);
+    }
+
+    #[test]
+    fn interrupted_canonical_turn_is_not_writable() {
+        assert!(!current_turn_status_is_writable("interrupted"));
+        assert!(!current_turn_status_is_writable("cancelled"));
+        assert!(current_turn_status_is_writable("running"));
     }
 
     #[test]

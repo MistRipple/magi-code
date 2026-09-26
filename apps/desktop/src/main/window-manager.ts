@@ -61,6 +61,14 @@ export interface DesktopRendererContext {
   workspaceId: string;
   workspacePath: string;
   sessionId: string;
+  sessionTitle: string;
+}
+
+const DEFAULT_WINDOW_TITLE = "Magi";
+
+function resolveWindowTitle(sessionTitle: string): string {
+  const normalized = sessionTitle.trim();
+  return normalized || DEFAULT_WINDOW_TITLE;
 }
 
 export interface DesktopWindowSnapshot {
@@ -81,6 +89,7 @@ export interface DesktopWindowSnapshot {
 export class WindowManager {
   readonly #desktopEpoch: string;
   readonly #preloadPath: string;
+  readonly #iconPath: string;
   readonly #agentOrigin: string;
   readonly #surfaceManager: BrowserSurfaceManager;
   readonly #windows: Map<string, BrowserWindow>;
@@ -91,6 +100,7 @@ export class WindowManager {
   >();
   readonly #windowReadiness = new DesktopWindowReadiness();
   readonly #onSnapshot: (snapshot: DesktopWindowSnapshot) => void;
+  readonly #shouldHideWindowOnClose: () => boolean;
   #browserRuntimeReadyRevision = 0;
   #appearance: DesktopAppearance = {
     backgroundColor: "#0f1115",
@@ -103,17 +113,21 @@ export class WindowManager {
   constructor(input: {
     desktopEpoch: string;
     preloadPath: string;
+    iconPath?: string;
     agentOrigin: string;
     surfaceManager: BrowserSurfaceManager;
     windows: Map<string, BrowserWindow>;
     onSnapshot: (snapshot: DesktopWindowSnapshot) => void;
+    shouldHideWindowOnClose?: () => boolean;
   }) {
     this.#desktopEpoch = input.desktopEpoch;
     this.#preloadPath = input.preloadPath;
+    this.#iconPath = input.iconPath ?? "";
     this.#agentOrigin = input.agentOrigin;
     this.#surfaceManager = input.surfaceManager;
     this.#windows = input.windows;
     this.#onSnapshot = input.onSnapshot;
+    this.#shouldHideWindowOnClose = input.shouldHideWindowOnClose ?? (() => false);
   }
 
   createWindow(): string {
@@ -132,7 +146,8 @@ export class WindowManager {
       height,
       minWidth: WINDOW_LAYOUT.minDesktopWindowWidth,
       minHeight: 520,
-      title: "Magi",
+      title: DEFAULT_WINDOW_TITLE,
+      ...(this.#iconPath ? { icon: this.#iconPath } : {}),
       // App Renderer 完成主题握手前窗口保持隐藏；这里的背景只是 native
       // view 的首帧兜底，并始终使用最近一次已同步的主题材质。
       backgroundColor: this.#appearance.backgroundColor,
@@ -178,6 +193,7 @@ export class WindowManager {
         workspaceId: "",
         workspacePath: "",
         sessionId: "",
+        sessionTitle: "",
       },
       browserActivationRevision: 0,
       rendererLoadFailed: false,
@@ -498,6 +514,9 @@ export class WindowManager {
       windowId,
       ...input,
     };
+    if (!record.window.isDestroyed()) {
+      record.window.setTitle(resolveWindowTitle(record.context.sessionTitle));
+    }
     if (!record.window.webContents.isDestroyed()) {
       record.window.webContents.send("magi-desktop:context", record.context);
     }
@@ -739,6 +758,11 @@ export class WindowManager {
       }
     };
     screen.on("display-metrics-changed", handleDisplayMetricsChanged);
+    window.on("close", (event) => {
+      if (!this.#shouldHideWindowOnClose()) return;
+      event.preventDefault();
+      window.hide();
+    });
     window.on("closed", () => this.closeRecord(record));
     window.once("closed", () =>
       screen.off("display-metrics-changed", handleDisplayMetricsChanged),

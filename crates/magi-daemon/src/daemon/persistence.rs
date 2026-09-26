@@ -3059,19 +3059,19 @@ impl StateRepository {
             }
         }
         if reconciled {
-            let mut legacy_journal = self.read_accepted_submission_journal_strict(&path)?;
+            let mut journal_state = self.read_accepted_submission_journal_strict(&path)?;
             for record in &records {
                 if record.task_checkpointed
-                    && let Some(legacy) = legacy_journal.records.iter_mut().find(|legacy| {
-                        legacy.session.session.session_id == record.session.session.session_id
-                            && legacy.session.canonical_turn.turn_id
+                    && let Some(candidate) = journal_state.records.iter_mut().find(|candidate| {
+                        candidate.session.session.session_id == record.session.session.session_id
+                            && candidate.session.canonical_turn.turn_id
                                 == record.session.canonical_turn.turn_id
                     })
                 {
-                    legacy.task_checkpointed = true;
+                    candidate.task_checkpointed = true;
                 }
             }
-            self.finish_accepted_submission_journal_locked(path, legacy_journal)?;
+            self.finish_accepted_submission_journal_locked(path, journal_state)?;
         }
         records.retain(|record| !(record.session_checkpointed && record.task_checkpointed));
         Ok(records)
@@ -3363,7 +3363,7 @@ impl StateRepository {
         let content = fs::read_to_string(&path)?;
         serde_json::from_str(&content).map_err(|error| {
             DaemonError::internal(format!(
-                "持久状态文件损坏，拒绝回退到空状态 {}: {error}",
+                "持久状态文件损坏，拒绝以空状态继续 {}: {error}",
                 path.display()
             ))
         })
@@ -3617,7 +3617,7 @@ impl RuntimeSidecarPersistence {
                 target: "magi.performance",
                 session_count = session_ids.len(),
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
-                stage = "session_projection_full_fallback_completed",
+                stage = "session_projection_unscoped_full_snapshot_completed",
                 "conversation response timing"
             );
             return result;
@@ -4204,7 +4204,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_accepted_journal_is_rejected_without_backup_or_empty_fallback() {
+    fn corrupted_accepted_journal_is_rejected_without_backup_or_empty_state_recovery() {
         let state_root = unique_temp_dir("magi-accepted-journal-corrupted");
         let repository = StateRepository::new(state_root.clone());
         let path = repository.accepted_submissions_path();
@@ -4230,7 +4230,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_durable_state_is_rejected_without_empty_fallback() {
+    fn corrupted_durable_state_is_rejected_without_empty_state_recovery() {
         let state_root = unique_temp_dir("magi-durable-state-corrupted");
         let repository = StateRepository::new(state_root.clone());
         let path = state_root.join("workspaces.json");
@@ -4239,7 +4239,7 @@ mod tests {
         let error = repository
             .load_workspace_durable_state()
             .expect_err("corrupted durable state must reject recovery");
-        assert!(error.to_string().contains("拒绝回退到空状态"));
+        assert!(error.to_string().contains("拒绝以空状态继续"));
         assert!(path.exists(), "损坏状态必须原地保留以便诊断和恢复");
         assert!(!path.with_file_name("workspaces.json.stale").exists());
 

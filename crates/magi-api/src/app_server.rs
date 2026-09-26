@@ -47,8 +47,12 @@ use std::sync::{
 use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 
 use crate::{
-    dto::SessionDirectoryEntryDto, errors::ApiError, session_activity::session_running_task_count,
-    state::ApiState, turn_service::TurnService,
+    dto::SessionDirectoryEntryDto,
+    errors::ApiError,
+    session_activity::session_running_task_count,
+    sse::{EventStreamScope, canonical_recovery_event},
+    state::ApiState,
+    turn_service::TurnService,
 };
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
@@ -872,6 +876,8 @@ async fn subscribe_events(
         }
     };
     let after_sequence = params.after_sequence.unwrap_or(0);
+    let recovery_session_id = session_id.clone();
+    let recovery_workspace_id = workspace_id.clone();
     {
         let mut guard = connection_state.lock().await;
         guard.subscription = EventSubscription {
@@ -881,11 +887,35 @@ async fn subscribe_events(
             after_sequence,
         };
     }
-    let snapshot = initial_snapshot
+    let raw_snapshot = initial_snapshot
         .take()
         .unwrap_or_else(|| state.event_bus.snapshot());
-    let resync_required = snapshot_requires_resync(&snapshot, after_sequence);
-    let snapshot = filter_snapshot(snapshot, after_sequence, connection_state).await;
+    let recovery_scope = match recovery_workspace_id {
+        Some(workspace_id) => EventStreamScope::Workspace(workspace_id),
+        None => EventStreamScope::Personal,
+    };
+    let canonical_recovery = (after_sequence > 0)
+        .then_some(())
+        .and_then(|()| recovery_session_id.as_ref())
+        .and_then(|session_id| {
+            canonical_recovery_event(
+                state,
+                &recovery_scope,
+                Some(session_id),
+                Some(after_sequence),
+                &raw_snapshot,
+            )
+        });
+    let resync_required =
+        snapshot_requires_resync(&raw_snapshot, after_sequence) || canonical_recovery.is_some();
+    let mut snapshot = filter_snapshot(raw_snapshot, after_sequence, connection_state).await;
+    if let Some(recovery) = canonical_recovery {
+        snapshot.next_sequence = snapshot
+            .next_sequence
+            .max(recovery.sequence.saturating_add(1));
+        snapshot.recent_events.push(recovery);
+        snapshot.recent_events.sort_by_key(|event| event.sequence);
+    }
     let next_sequence = snapshot.next_sequence;
     // snapshot_and_subscribe 的快照与实时 receiver 是一个连续切面。快照已经
     // 包含截至 nextSequence - 1 的事件，游标必须前移到该边界，否则同一事件
@@ -2510,9 +2540,12 @@ mod tests {
         changed.locale = Some("en-US".to_string());
         assert!(!request_matches_queued_turn(&changed, &queued));
 
-        let mut legacy = queued;
-        legacy.request_fingerprint = None;
-        assert!(!request_matches_queued_turn(&request, &legacy));
+        let mut without_request_fingerprint = queued;
+        without_request_fingerprint.request_fingerprint = None;
+        assert!(!request_matches_queued_turn(
+            &request,
+            &without_request_fingerprint
+        ));
     }
 
     #[test]
@@ -2564,9 +2597,14 @@ mod tests {
         changed.access_profile = Some(magi_core::AccessProfile::ReadOnly);
         assert!(!request_matches_canonical_turn(&changed, &turn));
 
-        let mut legacy = turn;
-        legacy.items[0].metadata.remove("requestFingerprint");
-        assert!(!request_matches_canonical_turn(&request, &legacy));
+        let mut without_request_fingerprint = turn;
+        without_request_fingerprint.items[0]
+            .metadata
+            .remove("requestFingerprint");
+        assert!(!request_matches_canonical_turn(
+            &request,
+            &without_request_fingerprint
+        ));
     }
 
     #[tokio::test]

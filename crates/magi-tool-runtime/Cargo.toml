@@ -21,3 +21,6 @@ base64 = "0.22"
 encoding_rs = "0.8"
 dirs = "6"
 tracing.workspace = true
+
+[dev-dependencies]
+magi-bridge-client = { path = "../magi-bridge-client" }

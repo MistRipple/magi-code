@@ -39,6 +39,7 @@
   import { openAgentTab } from '../stores/right-pane.svelte';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
+  import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
 
   const MOBILE_BREAKPOINT = 768;
   const STORAGE_PREFIX = 'magi.active-agent-center.v1';
@@ -51,7 +52,6 @@
   let completedExpanded = $state(false);
   let restartConfirmationOpen = $state(false);
   let mobile = $state(typeof window !== 'undefined' && window.innerWidth <= MOBILE_BREAKPOINT);
-  let nowMs = $state(Date.now());
   let pinnedProjection: AgentRunProjectionDto | null = $state(null);
   let dismissedRootTaskId = $state('');
   let activeScopeKey = '';
@@ -116,6 +116,11 @@
   });
 
   $effect(() => {
+    if (!visible) return;
+    return retainUiClock();
+  });
+
+  $effect(() => {
     const scopeKey = agentCenterScopeKey();
     if (scopeKey === activeScopeKey) return;
     activeScopeKey = scopeKey;
@@ -160,9 +165,6 @@
   });
 
   onMount(() => {
-    const durationTimer = window.setInterval(() => {
-      nowMs = Date.now();
-    }, 1_000);
     const updateViewport = () => {
       mobile = window.innerWidth <= MOBILE_BREAKPOINT;
     };
@@ -182,7 +184,6 @@
     document.addEventListener('pointerdown', closeOnOutsidePointer);
     document.addEventListener('keydown', closeOnEscape);
     return () => {
-      window.clearInterval(durationTimer);
       window.removeEventListener('resize', updateViewport);
       document.removeEventListener('pointerdown', closeOnOutsidePointer);
       document.removeEventListener('keydown', closeOnEscape);
@@ -256,7 +257,7 @@
   }
 
   function durationLabel(agent: AgentProjectionDto): string {
-    return formatAgentDuration(agentDurationSeconds(agent, nowMs));
+    return formatAgentDuration(agentDurationSeconds(agent, uiClockState.now));
   }
 
   function summaryLabel(): string {
@@ -620,10 +621,17 @@
 
 <style>
   .active-agent-center {
-    position: absolute;
-    top: 12px;
-    right: 16px;
+    position: relative;
+    flex: 0 0 44px;
+    height: 44px;
+    min-height: 44px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-end;
+    box-sizing: border-box;
+    padding: 6px 16px 0;
     z-index: var(--z-sticky);
+    pointer-events: none;
   }
 
   .agent-center-trigger {
@@ -643,6 +651,7 @@
     backdrop-filter: blur(14px);
     -webkit-backdrop-filter: blur(14px);
     cursor: pointer;
+    pointer-events: auto;
   }
 
   .agent-center-trigger:hover {
@@ -682,6 +691,7 @@
     border-radius: var(--radius-lg);
     background: var(--dropdown-bg);
     box-shadow: var(--shadow-xl);
+    pointer-events: auto;
   }
 
   .panel-header {
@@ -1093,8 +1103,10 @@
 
   @media (max-width: 768px) {
     .active-agent-center {
-      top: 8px;
-      right: 10px;
+      flex-basis: 38px;
+      height: 38px;
+      min-height: 38px;
+      padding: 4px 10px 0;
     }
 
     .agent-center-trigger {
@@ -1110,6 +1122,7 @@
       display: block;
       border: 0;
       background: var(--overlay);
+      pointer-events: auto;
     }
 
     .agent-center-panel {

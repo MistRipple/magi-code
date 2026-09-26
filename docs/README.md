@@ -40,6 +40,10 @@ npm run desktop:dev
 
 发布统一由 Electron Builder 生成 macOS Apple Silicon/Intel DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
 
+## 发布流程
+
+- [GitHub 新版本发布流程](./release-process.md)：发布前完整预检、main 与 CI 门禁、Tag 顺序及发布后交付物核对。
+
 ## 目标与代理运行设计
 
 - 简单事走会话流和工具证据，不生成额外抽屉

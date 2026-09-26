@@ -458,8 +458,15 @@ impl TaskRunner {
             self.execution_admission.remove_queued_task(task_id);
             return Ok(());
         }
-        let changed =
-            self.close_task(&task.root_task_id, task_id, TaskStatus::Killed, Vec::new())?;
+        let changed = self
+            .store
+            .revoke_active_lease_and_set_task_terminal(
+                task_id,
+                &task.root_task_id,
+                TaskStatus::Killed,
+                Vec::new(),
+            )
+            .map_err(|error| format!("任务 {task_id} 取消收口失败: {error}"))?;
         if !changed {
             return Err(format!("终止任务 {task_id} 时当前任务租约已失效"));
         }

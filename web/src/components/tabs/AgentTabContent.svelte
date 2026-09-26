@@ -13,6 +13,7 @@
   import { messagesState } from '../../stores/messages.svelte';
   import { getAgentRunState } from '../../stores/agent-run-store.svelte';
   import { i18n } from '../../stores/i18n.svelte';
+  import { uiClockState, retainUiClock } from '../../stores/ui-clock.svelte';
   import MessageList from '../MessageList.svelte';
 
   interface Props {
@@ -114,6 +115,11 @@
     return status === 'pending' || status === 'running';
   });
 
+  $effect(() => {
+    if (!agentRuntimeActive) return;
+    return retainUiClock();
+  });
+
   const agentRuntimeStartedAt = $derived.by(() => {
     const startedAt = agentProjection?.startedAt;
     if (typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0) {
@@ -126,7 +132,7 @@
   });
 
   const agentRuntimeTimingState = $derived.by(() => (
-    agentProjection ? agentRuntimeTiming(agentProjection, Date.now()) : null
+    agentProjection ? agentRuntimeTiming(agentProjection, uiClockState.now) : null
   ));
   const agentRuntimeCompletedAt = $derived.by(() => {
     const timing = agentRuntimeTimingState;

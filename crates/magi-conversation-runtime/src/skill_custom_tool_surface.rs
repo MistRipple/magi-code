@@ -164,7 +164,7 @@ fn skill_custom_tool_binding_segment(binding_id: &str) -> String {
     )
 }
 
-fn model_tool_name_segment(value: &str, fallback: &str, max_len: usize) -> String {
+fn model_tool_name_segment(value: &str, default_segment: &str, max_len: usize) -> String {
     let trimmed = value.trim();
     let mut segment = String::new();
     let mut last_was_separator = false;
@@ -186,7 +186,7 @@ fn model_tool_name_segment(value: &str, fallback: &str, max_len: usize) -> Strin
         .trim_matches(|ch| ch == '_' || ch == '-')
         .to_string();
     let mut segment = if segment.is_empty() {
-        fallback.to_string()
+        default_segment.to_string()
     } else {
         segment
     };
@@ -203,7 +203,7 @@ fn model_tool_name_segment(value: &str, fallback: &str, max_len: usize) -> Strin
             .trim_matches(|ch| ch == '_' || ch == '-')
             .to_string();
         if segment.is_empty() {
-            segment = fallback.to_string();
+            segment = default_segment.to_string();
         }
     }
     format!("{segment}{suffix}")

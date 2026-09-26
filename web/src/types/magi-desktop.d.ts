@@ -56,6 +56,7 @@ interface MagiDesktopContextSnapshot {
   workspaceId: string;
   workspacePath: string;
   sessionId: string;
+  sessionTitle: string;
 }
 
 type MagiDesktopLayoutIntent =
@@ -217,6 +218,7 @@ interface MagiDesktopBridge {
     workspaceId: string;
     workspacePath: string;
     sessionId: string;
+    sessionTitle: string;
   }): Promise<MagiDesktopContextSnapshot>;
   submitLayoutIntent(
     intent: MagiDesktopLayoutIntent,

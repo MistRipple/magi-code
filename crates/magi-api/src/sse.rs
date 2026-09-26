@@ -147,6 +147,13 @@ fn event_envelope_stream(
     let live_scope = scope;
     let snapshot_session_id = session_id.clone();
     let live_session_id = session_id;
+    let canonical_recovery = canonical_recovery_event(
+        &snapshot_state,
+        &snapshot_scope,
+        snapshot_session_id.as_ref(),
+        after_sequence,
+        &snapshot,
+    );
     let snapshot_gap_recovery = snapshot_gap_skipped_count(&snapshot, after_sequence)
         .map(|skipped| lagged_recovery_event(skipped, &snapshot_scope));
     let recent_stream = stream::iter(snapshot.recent_events.into_iter().filter(move |event| {
@@ -189,9 +196,106 @@ fn event_envelope_stream(
                 }
             }
         });
+    // EventBus 只保留进程内实时事件。daemon 重启后，旧 afterSequence 可能大于
+    // 新 EventBus 的游标；此时从已恢复的 canonical Turn 生成一次性 recovery
+    // envelope，供客户端获取 canonical snapshot，而不是重发 Provider 请求。
     stream::iter(snapshot_gap_recovery)
         .chain(recent_stream)
+        .chain(stream::iter(canonical_recovery))
         .chain(live_stream)
+}
+
+pub(crate) fn canonical_recovery_event(
+    state: &ApiState,
+    scope: &EventStreamScope,
+    session_id: Option<&SessionId>,
+    after_sequence: Option<u64>,
+    snapshot: &magi_event_bus::EventStreamSnapshot,
+) -> Option<EventEnvelope> {
+    let after_sequence = after_sequence?;
+    let session_id = session_id?;
+    let has_session_event_at_cursor = snapshot.recent_events.iter().any(|event| {
+        event.sequence == after_sequence && event_session_id(event).as_ref() == Some(session_id)
+    });
+    if has_session_event_at_cursor {
+        return None;
+    }
+    let has_matching_event_after_cursor = snapshot.recent_events.iter().any(|event| {
+        event.sequence > after_sequence
+            && event_session_id(event).as_ref() == Some(session_id)
+            && event_matches_scope(state, event, scope, Some(session_id))
+    });
+    if has_matching_event_after_cursor {
+        return None;
+    }
+
+    let session = state.session_store.session(session_id)?;
+    let workspace_id = session.workspace_id.clone().map(WorkspaceId::new);
+    match scope {
+        EventStreamScope::Personal if workspace_id.is_some() => return None,
+        EventStreamScope::Workspace(requested) if workspace_id.as_ref() != Some(requested) => {
+            return None;
+        }
+        _ => {}
+    }
+    let canonical_turn = state
+        .session_store
+        .canonical_turns_for_session(session_id)
+        .into_iter()
+        .max_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        })?;
+    let canonical_item = canonical_turn
+        .items
+        .iter()
+        .rev()
+        .find(|item| item.visibility.renderable && item.status.is_terminal())
+        .or_else(|| {
+            canonical_turn
+                .items
+                .iter()
+                .rev()
+                .find(|item| item.visibility.renderable)
+        })
+        .or_else(|| canonical_turn.items.last());
+    let canonical_event_kind = if canonical_turn.status.is_terminal() {
+        "turn_completed"
+    } else if canonical_turn.status == magi_session_store::CanonicalTurnStatus::Pending {
+        "turn_started"
+    } else {
+        "turn_item_upsert"
+    };
+    // 保持全局 EventBus 序号不冲突：若第二个 daemon 已先发布 system/global
+    // 事件，恢复 envelope 排在当前快照尾部；若旧 cursor 仍更大，则继续从 cursor
+    // 之后生成定向序号。
+    let sequence = after_sequence.saturating_add(1).max(snapshot.next_sequence);
+    let mut event = EventEnvelope::domain(
+        EventId::new(format!(
+            "event-session-turn-recovered-{session_id}-{}-{sequence}",
+            canonical_turn.turn_id
+        )),
+        "session.turn.recovered",
+        serde_json::json!({
+            "session_id": session_id,
+            "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+            "recovery": "canonical_after_runtime_restart",
+            "canonical_schema_version": "canonical-turn.v1",
+            "canonical_event_kind": canonical_event_kind,
+            "canonical_turn": canonical_turn,
+            "canonical_item": canonical_item,
+        }),
+    )
+    .with_context(EventContext {
+        session_id: Some(session_id.clone()),
+        workspace_id,
+        ..EventContext::default()
+    });
+    // 该 envelope 是按 cursor 定向生成的一次性恢复通知，不写回 EventBus；它必须
+    // 位于请求 cursor 之后，才能被 SSE 客户端消费并继续使用新的游标。
+    event.sequence = sequence;
+    Some(event)
 }
 
 fn is_runtime_shutdown_complete(event: &EventEnvelope) -> bool {

@@ -5172,6 +5172,18 @@ impl SessionStore {
         session_id: &SessionId,
         expected_turn_id: Option<&str>,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        self.complete_current_turn_from_completed_root_task_for_turn_with_change(
+            session_id,
+            expected_turn_id,
+        )
+        .map(|updated| updated.map(|(sidecar, _)| sidecar))
+    }
+
+    pub fn complete_current_turn_from_completed_root_task_for_turn_with_change(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+    ) -> DomainResult<Option<(SessionRuntimeSidecar, bool)>> {
         let updated = self.commit_canonical_transaction(
             session_id,
             |state| {
@@ -5227,21 +5239,22 @@ impl SessionStore {
                         .expect("current turn was set"),
                     None,
                 )?;
+                let changed = !canonical_plan.mutations.is_empty();
                 Ok(CanonicalCommitPlan {
                     mutations: canonical_plan.mutations,
-                    value: Some((sidecar_index, candidate)),
+                    value: Some((sidecar_index, candidate, changed)),
                     acceptance: None,
                 })
             },
             |state, updated| {
-                let (sidecar_index, candidate) = updated?;
+                let (sidecar_index, candidate, changed) = updated?;
                 state.execution_sidecar_store.runtime_sidecars[sidecar_index] = candidate.clone();
                 if let Some(turn) = candidate.current_turn.as_ref()
                     && let Some(completed_at) = turn.completed_at
                 {
                     record_session_completion(state, session_id, completed_at);
                 }
-                Some(candidate)
+                Some((candidate, changed))
             },
         )?;
         if updated.is_some() {

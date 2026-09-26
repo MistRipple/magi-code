@@ -20,6 +20,7 @@
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
   import { readStoredAccessProfile } from '../shared/access-profile';
+  import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
 
   const currentSessionId = $derived(messagesState.currentSessionId);
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
@@ -36,7 +37,6 @@
   let observedBudgetGoalRevision = '';
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
   let planClearLoading = $state(false);
-  let goalClockNow = $state(Date.now());
   let goalClockObservedAt = $state(Date.now());
 
   $effect(() => {
@@ -61,7 +61,7 @@
       && typeof serverObservedAt === 'number'
       && Number.isFinite(serverObservedAt)
       ? Math.max(0, serverObservedAt - timingStartedAt)
-        + Math.max(0, goalClockNow - goalClockObservedAt)
+        + Math.max(0, uiClockState.now - goalClockObservedAt)
       : 0;
     return Math.floor((settledMillis + runningMillis) / 1000);
   });
@@ -73,7 +73,6 @@
     const timingStartedAt = currentGoal?.timingStartedAt;
     const serverObservedAt = goalState.response?.observedAt;
     const localObservedAt = Date.now();
-    goalClockNow = localObservedAt;
     goalClockObservedAt = localObservedAt;
     if (
       typeof timingStartedAt !== 'number'
@@ -84,10 +83,7 @@
     ) {
       return;
     }
-    const timer = window.setInterval(() => {
-      goalClockNow = Date.now();
-    }, 1000);
-    return () => window.clearInterval(timer);
+    return retainUiClock();
   });
 
   $effect(() => {

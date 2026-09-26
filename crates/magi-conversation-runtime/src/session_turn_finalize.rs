@@ -3,9 +3,7 @@
 //! 公开 API 使用显式依赖参数（`&SessionStore`、`&InMemoryEventBus`、`Option<&TaskStore>`），
 //! 不再耦合 ApiState。magi-api 侧保留薄壳转发。
 
-use magi_core::{
-    SessionId, Task, TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, public_runtime_excerpt,
-};
+use magi_core::{SessionId, Task, TaskId, TaskKind, TaskStatus, ThreadId, public_runtime_excerpt};
 use magi_event_bus::InMemoryEventBus;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{ActiveExecutionTurn, SessionStore};
@@ -14,7 +12,7 @@ use crate::session_turn_coordinator::{CoordinatorTurnStatus, SessionTurnCoordina
 use crate::session_writeback::{
     CanonicalTurnEventSink, SessionStatePersistCallback, append_session_turn_item_for_turn,
     persist_session_state_checkpoint, publish_current_session_turn_item_event,
-    publish_session_turn_item_event, session_turn_item,
+    publish_session_turn_item_event, session_turn_item, upsert_session_turn_item_for_turn,
 };
 use crate::turn_contract::TurnCommand;
 
@@ -41,6 +39,13 @@ pub struct FinalizeBackgroundSessionTaskTurnContext<'a> {
     /// 收口 attempt；None 仅供不依赖 Coordinator 的纯 runtime 单元测试。
     pub coordinator: Option<&'a SessionTurnCoordinator>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+    /// Turn durable terminal 已写入后、终态事件发布前释放外部执行资源。
+    ///
+    /// Task finalizer 不依赖具体资源实现；生产 API 通过该回调释放 session
+    /// Git execution lease。这样 canonical terminal event 对消费者可见时，
+    /// 资源已经进入可供下一轮接纳的 settlement 边界。测试和不持有外部资源的
+    /// runtime fixture 可以省略该回调。
+    pub settle_execution_resources: Option<&'a dyn Fn() -> Result<(), String>>,
 }
 
 pub fn turn_item_status_for_task_status(status: TaskStatus) -> &'static str {
@@ -560,6 +565,8 @@ pub fn finalize_background_session_task_turn_if_root_completed(
         root_task_id,
         None,
         persist_session_state,
+        None,
+        None,
     )
 }
 
@@ -582,6 +589,8 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
         root_task_id,
         expected_turn_id,
         persist_session_state,
+        None,
+        None,
     )
 }
 
@@ -593,6 +602,8 @@ fn finalize_completed_root_task_turn_for_turn(
     root_task_id: &TaskId,
     expected_turn_id: Option<&str>,
     persist_session_state: Option<&SessionStatePersistCallback>,
+    settle_execution_resources: Option<&dyn Fn() -> Result<(), String>>,
+    coordinator: Option<&SessionTurnCoordinator>,
 ) -> Result<bool, String> {
     let Some(task_store) = task_store else {
         return Ok(false);
@@ -656,10 +667,13 @@ fn finalize_completed_root_task_turn_for_turn(
         return Ok(false);
     };
 
-    if let Err(error) =
+    let completed_changed =
         update_current_turn_completed_from_root(session_store, session_id, expected_turn_id)
-    {
-        return Err(format!("根任务完成时 Turn completed 状态提交失败: {error}"));
+            .map_err(|error| format!("根任务完成时 Turn completed 状态提交失败: {error}"))?;
+    if !completed_changed {
+        // 另一条 finalizer 已经完成同一 Turn；它负责唯一的 terminal event、资源
+        // settlement 和 Coordinator 收口。
+        return Ok(false);
     }
     archive_terminal_active_execution_chain(
         session_store,
@@ -668,6 +682,13 @@ fn finalize_completed_root_task_turn_for_turn(
         root_task_id,
     )?;
     persist_session_state_checkpoint(persist_session_state, "session_task_turn_completed")?;
+    settle_execution_resources_before_terminal_event(settle_execution_resources)?;
+    finish_coordinator_after_durable_terminal(
+        coordinator,
+        session_store,
+        session_id,
+        expected_turn_id,
+    )?;
     if let Err(error) = publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -797,12 +818,12 @@ fn update_current_turn_completed_from_root(
     session_store: &SessionStore,
     session_id: &SessionId,
     expected_turn_id: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     match CanonicalTurnEventSink::for_store(session_store, None)
-        .complete_from_root_task(session_id, expected_turn_id)
+        .complete_from_root_task_with_change(session_id, expected_turn_id)
         .map_err(|error| format!("完成当前 Turn 失败: {error}"))?
     {
-        Some(_) => Ok(()),
+        Some((_, changed)) => Ok(changed),
         None => Err(format!("会话 {} 没有可完成的当前 Turn", session_id)),
     }
 }
@@ -841,26 +862,35 @@ fn finish_coordinator_after_durable_terminal(
             turn.turn_id
         ));
     }
-    let attempt = coordinator
-        .current_attempt(session_id, &turn.turn_id)
-        .map_err(|error| {
-            format!(
-                "Task Turn {} 缺少 Coordinator attempt: {error}",
-                turn.turn_id
-            )
-        })?;
-    if attempt.profile != crate::session_turn_coordinator::ExecutionProfile::Task {
-        return Err(format!(
-            "Task Turn {} 的 Coordinator profile 不是 task",
-            turn.turn_id
-        ));
-    }
     let status = match turn.status.trim().to_ascii_lowercase().as_str() {
         "completed" | "complete" | "succeeded" | "success" => CoordinatorTurnStatus::Completed,
         "failed" | "error" => CoordinatorTurnStatus::Failed,
         "cancelled" | "canceled" | "interrupted" => CoordinatorTurnStatus::Cancelled,
         other => return Err(format!("Task Turn {} 终态非法: {other}", turn.turn_id)),
     };
+    let attempt = match coordinator.current_attempt(session_id, &turn.turn_id) {
+        Ok(attempt) => attempt,
+        Err(crate::session_turn_coordinator::CoordinatorError::NoActiveTurn)
+            if coordinator.current_status(session_id, &turn.turn_id) == Ok(status) =>
+        {
+            // TaskStore terminal notification and explicit Turn cancellation may race.
+            // The durable canonical Turn wins; a repeated callback for the same terminal
+            // state is an idempotent no-op, not a missing-attempt failure.
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Task Turn {} 缺少 Coordinator attempt: {error}",
+                turn.turn_id
+            ));
+        }
+    };
+    if attempt.profile != crate::session_turn_coordinator::ExecutionProfile::Task {
+        return Err(format!(
+            "Task Turn {} 的 Coordinator profile 不是 task",
+            turn.turn_id
+        ));
+    }
     coordinator
         .execute_command(session_id, TurnCommand::Finish { attempt, status })
         .map(|_| ())
@@ -870,6 +900,15 @@ fn finish_coordinator_after_durable_terminal(
                 turn.turn_id
             )
         })
+}
+
+fn settle_execution_resources_before_terminal_event(
+    settle_execution_resources: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<(), String> {
+    if let Some(settle_execution_resources) = settle_execution_resources {
+        settle_execution_resources()?;
+    }
+    Ok(())
 }
 
 pub fn finalize_background_session_task_turn_if_root_terminal(
@@ -885,6 +924,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         expected_turn_id,
         coordinator,
         persist_session_state,
+        settle_execution_resources,
     } = context;
     match finalize_completed_root_task_turn_for_turn(
         session_store,
@@ -894,14 +934,10 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         root_task_id,
         expected_turn_id,
         persist_session_state,
+        settle_execution_resources,
+        coordinator,
     ) {
         Ok(true) => {
-            finish_coordinator_after_durable_terminal(
-                coordinator,
-                session_store,
-                session_id,
-                expected_turn_id,
-            )?;
             return Ok(true);
         }
         Ok(false) => {}
@@ -973,13 +1009,13 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
                 .map(|item| item.source_thread_id.clone())
         })
         .unwrap_or_else(|| ThreadId::new(format!("thread-orchestrator-{session_id}")));
-    let existing_error_item_id = current_turn
+    let existing_error_item = current_turn
         .items
         .iter()
         .find(|item| {
             item.kind == "assistant_error" && item.source_thread_id == orchestrator_thread_id
         })
-        .map(|item| item.item_id.clone());
+        .cloned();
 
     // 已经收口的 Turn 不再重复 checkpoint 或广播同一个错误 item。只有仍占用
     // active chain 的历史终态需要在这里完成一次归档，归档成功后由调用方释放 lease。
@@ -997,13 +1033,24 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         if archived {
             persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived")?;
         }
+        settle_execution_resources_before_terminal_event(settle_execution_resources)?;
+        finish_coordinator_after_durable_terminal(
+            coordinator,
+            session_store,
+            session_id,
+            expected_turn_id,
+        )?;
         return Ok(archived);
     }
 
-    let item_id = if let Some(item_id) = existing_error_item_id {
-        item_id
-    } else {
-        let item_id = format!("turn-item-assistant-error-{}", UtcMillis::now().0);
+    // 失败收口可能同时由 preparation error 和 TaskStore terminal notifier 触发。
+    // 错误 item 使用 Turn 稳定 ID 并走 upsert，避免两个 finalizer 在状态提交前各自
+    // 追加一条错误 item；后续 terminal status 的 changed 标记再作为唯一事件发布闸门。
+    let item_id = existing_error_item
+        .as_ref()
+        .map(|item| item.item_id.clone())
+        .unwrap_or_else(|| format!("turn-item-assistant-error-{}", current_turn.turn_id));
+    if existing_error_item.is_none() {
         let mut error_item = session_turn_item(
             "assistant_error",
             turn_status,
@@ -1013,7 +1060,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             orchestrator_thread_id.clone(),
         );
         error_item.task_id = Some(root_task_id.clone());
-        append_session_turn_item_for_turn(
+        upsert_session_turn_item_for_turn(
             session_store,
             session_id,
             expected_turn_id,
@@ -1022,17 +1069,20 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         )?
         .ok_or_else(|| {
             format!("终态 Turn 没有可写入的错误 item: session={session_id}, task={root_task_id}")
-        })?
-        .item
-        .item_id
-    };
+        })?;
+    }
 
-    CanonicalTurnEventSink::for_store(session_store, Some(task_store))
+    let (_, status_changed) = CanonicalTurnEventSink::for_store(session_store, Some(task_store))
         .set_status_domain(session_id, expected_turn_id, turn_status)
         .map_err(|error| format!("终态 Turn 失败状态提交失败: {error}"))?
         .ok_or_else(|| {
             format!("终态 Turn 没有可更新的失败状态: session={session_id}, task={root_task_id}")
         })?;
+    if !status_changed {
+        // 另一条 finalizer 已经提交了同一 Turn 的终态；它负责唯一的事件发布、资源
+        // settlement 和 Coordinator 收口，本次只保留幂等的 canonical item upsert。
+        return Ok(false);
+    }
     if terminal_chain_requires_archival(root_task.status, turn_status) {
         archive_terminal_active_execution_chain(
             session_store,
@@ -1042,6 +1092,13 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         )?;
     }
     persist_session_state_checkpoint(persist_session_state, "session_task_turn_failed")?;
+    settle_execution_resources_before_terminal_event(settle_execution_resources)?;
+    finish_coordinator_after_durable_terminal(
+        coordinator,
+        session_store,
+        session_id,
+        expected_turn_id,
+    )?;
     if let Err(error) = publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -1052,13 +1109,6 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     ) {
         return Err(format!("根任务失败时 Turn 终态事件发布失败: {error}"));
     }
-    finish_coordinator_after_durable_terminal(
-        coordinator,
-        session_store,
-        session_id,
-        expected_turn_id,
-    )?;
-
     Ok(true)
 }
 
@@ -1128,6 +1178,7 @@ pub fn reconcile_terminal_session_task_turns_with_coordinator(
                     expected_turn_id: Some(turn_id),
                     coordinator,
                     persist_session_state: None,
+                    settle_execution_resources: None,
                 },
             )
             .is_ok_and(|finalized| finalized)
@@ -1172,7 +1223,7 @@ pub fn runner_status_for_terminal_task(status: TaskStatus) -> Option<&'static st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{MissionId, TaskRuntimePayload};
+    use magi_core::{MissionId, TaskRuntimePayload, UtcMillis};
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
         SessionExecutionSidecarStatus, TimelineEntryInput, TimelineEntryKind,
@@ -1212,6 +1263,88 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn repeated_task_terminal_notification_is_idempotent_for_coordinator() {
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-repeat-task-terminal");
+        let mission_id = MissionId::new("mission-repeat-task-terminal");
+        let root_task_id = TaskId::new("task-repeat-task-terminal");
+        let now = UtcMillis::now();
+        session_store
+            .create_session(session_id.clone(), "repeat task terminal")
+            .expect("session should create");
+        session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id,
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-repeat-task-terminal".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "entry-repeat-task-terminal".to_string(),
+                        trimmed_text: Some("重复终态通知".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-repeat-task-terminal".to_string(),
+                        turn_seq: now.0,
+                        accepted_at: now,
+                        completed_at: Some(now),
+                        status: "completed".to_string(),
+                        user_message: Some("重复终态通知".to_string()),
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("terminal execution chain should persist");
+
+        let coordinator = SessionTurnCoordinator::new();
+        let attempt = match coordinator
+            .execute_command(
+                &session_id,
+                TurnCommand::Start(crate::TurnAdmission {
+                    turn_id: "turn-repeat-task-terminal".to_string(),
+                    request_id: "request-repeat-task-terminal".to_string(),
+                    request_fingerprint: "fp-repeat-task-terminal".to_string(),
+                    profile: crate::ExecutionProfile::Task,
+                }),
+            )
+            .expect("Task Turn should be admitted")
+        {
+            crate::CoordinatorCommandResult::Admission(crate::CoordinatorAdmission::Accepted(
+                attempt,
+            )) => attempt,
+            other => panic!("unexpected Coordinator result: {other:?}"),
+        };
+        coordinator
+            .execute_command(
+                &session_id,
+                TurnCommand::Finish {
+                    attempt,
+                    status: CoordinatorTurnStatus::Completed,
+                },
+            )
+            .expect("first completion should finish the Coordinator slot");
+
+        assert!(
+            finish_coordinator_after_durable_terminal(
+                Some(&coordinator),
+                &session_store,
+                &session_id,
+                Some("turn-repeat-task-terminal"),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

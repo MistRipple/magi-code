@@ -499,7 +499,7 @@ fn collect_repository_skills(
             .strip_prefix(repository_root)
             .map_err(|_| ApiError::InvalidInput("Skill 仓库目录结构无效".to_string()))?
             .to_path_buf();
-        let fallback_name = current_dir
+        let directory_name = current_dir
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or(&repository.name)
@@ -507,7 +507,7 @@ fn collect_repository_skills(
         let metadata = read_skill_directory_metadata(current_dir)?;
         skills.push(RepositorySkill {
             skill_id: repository.skill_id(&relative_path)?,
-            name: read_skill_frontmatter_value(current_dir, "name").unwrap_or(fallback_name),
+            name: read_skill_frontmatter_value(current_dir, "name").unwrap_or(directory_name),
             description: read_skill_frontmatter_value(current_dir, "description")
                 .unwrap_or_else(|| read_local_skill_description(current_dir)),
             author: read_skill_frontmatter_value(current_dir, "author"),

@@ -893,10 +893,16 @@ impl<'a> CanonicalTurnEventSink<'a> {
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
         published: &PublishedSessionTurnItem,
-    ) {
+    ) -> u64 {
         if let Some(event_bus) = self.event_bus {
-            publish_session_turn_item_event_raw(event_bus, session_id, workspace_id, published);
+            return publish_session_turn_item_event_raw(
+                event_bus,
+                session_id,
+                workspace_id,
+                published,
+            );
         }
+        0
     }
 
     pub fn publish_stream(
@@ -906,9 +912,9 @@ impl<'a> CanonicalTurnEventSink<'a> {
         published: &PublishedSessionTurnItem,
         stream_update: &SessionTurnStreamUpdate,
         publish_gate: &mut SessionTurnStreamPublishGate,
-    ) {
+    ) -> Option<u64> {
         if let Some(event_bus) = self.event_bus {
-            publish_session_turn_item_stream_event_raw(
+            return publish_session_turn_item_stream_event_raw(
                 event_bus,
                 session_id,
                 workspace_id,
@@ -917,6 +923,7 @@ impl<'a> CanonicalTurnEventSink<'a> {
                 publish_gate,
             );
         }
+        None
     }
 
     /// 需要保留 SessionStore 原始 DomainError 的边界（例如 API 要把
@@ -1122,6 +1129,21 @@ impl<'a> CanonicalTurnEventSink<'a> {
             })?
             .complete_current_turn_from_completed_root_task_for_turn(session_id, expected_turn_id)
     }
+
+    pub fn complete_from_root_task_with_change(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+    ) -> magi_core::DomainResult<Option<(SessionRuntimeSidecar, bool)>> {
+        self.session_store
+            .ok_or_else(|| magi_core::DomainError::InvalidState {
+                message: "CanonicalTurnEventSink 缺少 SessionStore".to_string(),
+            })?
+            .complete_current_turn_from_completed_root_task_for_turn_with_change(
+                session_id,
+                expected_turn_id,
+            )
+    }
 }
 
 pub fn append_session_turn_item_for_turn(
@@ -1192,8 +1214,12 @@ pub fn publish_session_turn_item_event(
     workspace_id: &Option<WorkspaceId>,
     published: &PublishedSessionTurnItem,
 ) {
-    CanonicalTurnEventSink::for_events(event_bus).publish_item(session_id, workspace_id, published);
-    record_event_bus_item_timing(session_id, published);
+    let event_sequence = CanonicalTurnEventSink::for_events(event_bus).publish_item(
+        session_id,
+        workspace_id,
+        published,
+    );
+    record_event_bus_item_timing(session_id, published, event_sequence);
 }
 
 fn publish_session_turn_item_event_raw(
@@ -1201,7 +1227,7 @@ fn publish_session_turn_item_event_raw(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     published: &PublishedSessionTurnItem,
-) {
+) -> u64 {
     let payload = serde_json::json!({
         "session_id": session_id.to_string(),
         "workspace_id": workspace_id.as_ref().map(ToString::to_string),
@@ -1215,7 +1241,7 @@ fn publish_session_turn_item_event_raw(
         "canonical_turn": published.canonical_turn,
         "canonical_item": published.canonical_item,
     });
-    publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload);
+    publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload)
 }
 
 pub fn publish_model_retry_runtime_event(
@@ -1267,21 +1293,27 @@ pub fn publish_session_turn_item_stream_event(
     stream_update: &SessionTurnStreamUpdate,
     publish_gate: &mut SessionTurnStreamPublishGate,
 ) {
-    CanonicalTurnEventSink::for_events(event_bus).publish_stream(
+    let event_sequence = CanonicalTurnEventSink::for_events(event_bus).publish_stream(
         session_id,
         workspace_id,
         published,
         stream_update,
         publish_gate,
     );
-    record_event_bus_item_timing(session_id, published);
+    if let Some(event_sequence) = event_sequence {
+        record_event_bus_item_timing(session_id, published, event_sequence);
+    }
 }
 
 /// 记录模型/工具产生的第一类 session.turn.item 发布事实。
 ///
 /// accepted 用户 item 也会经过同一 EventBus，但它属于接纳阶段；这里跳过 user
 /// source，只记录执行面产生的 item，供 Electron timing 证据按 turn_id 关联。
-fn record_event_bus_item_timing(session_id: &SessionId, published: &PublishedSessionTurnItem) {
+fn record_event_bus_item_timing(
+    session_id: &SessionId,
+    published: &PublishedSessionTurnItem,
+    event_sequence: u64,
+) {
     if published.item.source == "user" || published.item.kind == "user_message" {
         return;
     }
@@ -1323,10 +1355,30 @@ fn record_event_bus_item_timing(session_id: &SessionId, published: &PublishedSes
         session_id = %session_id,
         turn_id = %published.turn_id,
         provider_call_id = "",
+        event_sequence,
         stage = "event_bus_item_published",
         elapsed_ms = 0u64,
         "conversation response timing"
     );
+    if published
+        .canonical_turn
+        .as_ref()
+        .is_some_and(|turn| turn.status.is_terminal())
+    {
+        tracing::info!(
+            target: "magi.performance",
+            trace_id,
+            request_id = trace_id,
+            session_id = %session_id,
+            turn_id = %published.turn_id,
+            provider_call_id = "",
+            event_sequence,
+            finalized = true,
+            elapsed_ms = 0u64,
+            stage = "canonical_terminal_published",
+            "conversation response timing"
+        );
+    }
 }
 
 fn publish_session_turn_item_stream_event_raw(
@@ -1336,15 +1388,15 @@ fn publish_session_turn_item_stream_event_raw(
     published: &PublishedSessionTurnItem,
     stream_update: &SessionTurnStreamUpdate,
     publish_gate: &mut SessionTurnStreamPublishGate,
-) {
+) -> Option<u64> {
     let Some(canonical_item) = published.canonical_item.as_ref() else {
-        return;
+        return None;
     };
     let current_content = canonical_item.content.as_deref().unwrap_or_default();
     let Some((item_version, stream_update)) =
         publish_gate.prepare_publish(stream_update, current_content)
     else {
-        return;
+        return None;
     };
     let mut payload = serde_json::json!({
         "session_id": session_id.to_string(),
@@ -1380,7 +1432,12 @@ fn publish_session_turn_item_stream_event_raw(
                     .expect("canonical stream item must be serializable"),
             );
     }
-    publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload);
+    Some(publish_session_turn_item_payload(
+        event_bus,
+        session_id,
+        workspace_id,
+        payload,
+    ))
 }
 
 fn publish_session_turn_item_payload(
@@ -1388,7 +1445,7 @@ fn publish_session_turn_item_payload(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     payload: Value,
-) {
+) -> u64 {
     event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!("event-session-turn-item-{}", UtcMillis::now().0)),
@@ -1400,7 +1457,7 @@ fn publish_session_turn_item_payload(
             session_id: Some(session_id.clone()),
             ..EventContext::default()
         }),
-    );
+    )
 }
 
 pub fn publish_current_session_turn_item_event(
@@ -1535,7 +1592,13 @@ fn append_session_turn_error_item_with_terminal_commit(
         persist_session_state_checkpoint(persist_session_state, "session_turn_failed")?;
     } else {
         // 失败 item 本身仍需可靠落盘，终态由 Coordinator 在随后同一执行边界提交。
+        // 生产 Task 路径不能在这里发布 item：TaskStore finalizer 可能并发提交
+        // canonical failed 状态，此处若重新读取 current Turn 会把“失败 item 写回”
+        // 伪装成 terminal event，并先于 Coordinator settlement 唤醒下一轮接纳。
+        // finalizer 会以稳定 item ID 做幂等 upsert，并在 Coordinator 收口后发布完整
+        // canonical terminal snapshot；持久化事实仍可在断线/重启恢复。
         persist_session_state_checkpoint(persist_session_state, "session_turn_error_item")?;
+        return Ok(());
     }
     let _ = item_published;
     publish_current_session_turn_item_event(

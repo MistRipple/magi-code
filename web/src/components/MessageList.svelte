@@ -45,6 +45,7 @@
     isTurnNavigationStatus,
     type TurnNavigationMessage,
   } from '../lib/turn-navigation';
+  import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -546,31 +547,16 @@
     `${runtimeIndicatorKey}:${runtimeIndicatorInsertionIndex}`
   );
 
-  let elapsedSeconds = $state(0);
-  let timerInterval: ReturnType<typeof setInterval> | null = null;
-
   $effect(() => {
-    const shouldRun = shouldRunTimer;
-    if (shouldRun) {
-      // 立即计算一次
-      elapsedSeconds = Math.floor((Date.now() - timerStartTime) / 1000);
-      timerInterval = setInterval(() => {
-        elapsedSeconds = Math.floor((Date.now() - timerStartTime) / 1000);
-      }, 1000);
-    } else {
-      if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-      }
-      elapsedSeconds = 0;
-    }
-    return () => {
-      if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-      }
-    };
+    if (!shouldRunTimer) return;
+    return retainUiClock();
   });
+
+  const elapsedSeconds = $derived(
+    shouldRunTimer
+      ? Math.max(0, Math.floor((uiClockState.now - timerStartTime) / 1000))
+      : 0,
+  );
 
   // 空状态默认值
   const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);

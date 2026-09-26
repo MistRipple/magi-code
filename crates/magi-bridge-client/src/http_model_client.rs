@@ -28,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime};
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
+const OPENAI_STREAM_IDLE_TIMEOUT_MS_ENV: &str = "MAGI_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS";
 const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
 const MODEL_PROVIDER_MAX_RETRIES: usize = 5;
 const MODEL_PROVIDER_EMPTY_STREAM_RETRIES: usize = 2;
@@ -37,6 +38,11 @@ const MODEL_PROVIDER_EMPTY_STREAM_RETRY_DELAYS_MILLIS: [u64; MODEL_PROVIDER_EMPT
     [1_000, 3_000];
 const MODEL_PROVIDER_MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(60);
 const MODEL_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const MODEL_PROVIDER_MIN_STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+const MODEL_PROVIDER_MAX_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(3_600);
+// 上下文压缩使用非流式辅助模型请求；30 秒不足以覆盖真实 Provider 的长历史摘要，
+// 但取消仍由 execute_cancellable_http_post 的 cancellation channel 及时打断。
+const MODEL_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MODEL_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MODEL_PROVIDER_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -509,7 +515,7 @@ fn shared_request_http_client() -> Result<reqwest::Client, BridgeClientError> {
     match CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(MODEL_PROVIDER_REQUEST_TIMEOUT)
             .build()
             .map_err(|error| error.to_string())
     }) {
@@ -627,6 +633,25 @@ fn retryable_empty_stream_error(error: &BridgeClientError) -> bool {
             code: Some(-32007),
             message,
         } if message.contains("empty stream response")
+    )
+}
+
+fn provider_stream_idle_timeout_from_env(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map(|value| {
+            value.clamp(
+                MODEL_PROVIDER_MIN_STREAM_IDLE_TIMEOUT,
+                MODEL_PROVIDER_MAX_STREAM_IDLE_TIMEOUT,
+            )
+        })
+        .unwrap_or(MODEL_PROVIDER_STREAM_IDLE_TIMEOUT)
+}
+
+fn provider_stream_idle_timeout() -> Duration {
+    provider_stream_idle_timeout_from_env(
+        env::var(OPENAI_STREAM_IDLE_TIMEOUT_MS_ENV).ok().as_deref(),
     )
 }
 
@@ -1050,13 +1075,13 @@ fn apply_provider_stream_event(
     Ok(false)
 }
 
-fn provider_stream_idle_timeout_error(stage: &str) -> BridgeClientError {
+fn provider_stream_idle_timeout_error(stage: &str, timeout: Duration) -> BridgeClientError {
     BridgeClientError::CallFailed {
         layer: BridgeErrorLayer::Transport,
         code: Some(-32005),
         message: format!(
-            "provider stream idle timeout after {} seconds while waiting for {stage}",
-            MODEL_PROVIDER_STREAM_IDLE_TIMEOUT.as_secs()
+            "provider stream idle timeout after {} ms while waiting for {stage}",
+            timeout.as_millis()
         ),
     }
 }
@@ -1271,6 +1296,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
     } = request;
     let started_at = Instant::now();
     let client = shared_streaming_http_client()?;
+    let stream_idle_timeout = provider_stream_idle_timeout();
 
     let mut req_builder = client
         .post(&url)
@@ -1284,7 +1310,7 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
 
     let mut response = tokio::select! {
         _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
-        result = tokio::time::timeout(MODEL_PROVIDER_STREAM_IDLE_TIMEOUT, req_builder.send()) => {
+        result = tokio::time::timeout(stream_idle_timeout, req_builder.send()) => {
             match result {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
@@ -1294,7 +1320,12 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
                         message: format!("provider transport failed: {error}"),
                     });
                 }
-                Err(_) => return Err(provider_stream_idle_timeout_error("response headers")),
+                Err(_) => {
+                    return Err(provider_stream_idle_timeout_error(
+                        "response headers",
+                        stream_idle_timeout,
+                    ));
+                }
             }
         },
     };
@@ -1317,10 +1348,15 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
     if !(200..300).contains(&status) {
         let response_body = tokio::select! {
             _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
-            result = tokio::time::timeout(MODEL_PROVIDER_STREAM_IDLE_TIMEOUT, response.text()) => {
+            result = tokio::time::timeout(stream_idle_timeout, response.text()) => {
                 match result {
                     Ok(result) => result,
-                    Err(_) => return Err(provider_stream_idle_timeout_error("error response body")),
+                    Err(_) => {
+                        return Err(provider_stream_idle_timeout_error(
+                            "error response body",
+                            stream_idle_timeout,
+                        ));
+                    }
                 }
             },
         }
@@ -1358,11 +1394,16 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
             tokio::select! {
                 _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
                 result = tokio::time::timeout(
-                    MODEL_PROVIDER_STREAM_IDLE_TIMEOUT,
+                    stream_idle_timeout,
                     response.chunk(),
                 ) => match result {
                     Ok(result) => result,
-                    Err(_) => return Err(provider_stream_idle_timeout_error("SSE event")),
+                    Err(_) => {
+                        return Err(provider_stream_idle_timeout_error(
+                            "SSE event",
+                            stream_idle_timeout,
+                        ));
+                    }
                 },
             }
         };
@@ -2196,6 +2237,30 @@ mod tests {
             // SAFETY: same as above.
             unsafe { env::set_var(OPENAI_BASE_URL_ENV, value) };
         }
+    }
+
+    #[test]
+    fn stream_idle_timeout_uses_bounded_optional_runtime_override() {
+        assert_eq!(
+            provider_stream_idle_timeout_from_env(None),
+            MODEL_PROVIDER_STREAM_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            provider_stream_idle_timeout_from_env(Some("250")),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            provider_stream_idle_timeout_from_env(Some("1")),
+            MODEL_PROVIDER_MIN_STREAM_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            provider_stream_idle_timeout_from_env(Some("999999999")),
+            MODEL_PROVIDER_MAX_STREAM_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            provider_stream_idle_timeout_from_env(Some("not-a-duration")),
+            MODEL_PROVIDER_STREAM_IDLE_TIMEOUT
+        );
     }
 
     #[test]

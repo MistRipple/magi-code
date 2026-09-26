@@ -782,7 +782,7 @@
   }
 </script>
 
-<div class="runtime-diagnostics-slot">
+<div class="runtime-diagnostics-slot" class:runtime-diagnostics-slot--visible={panelVisible}>
   {#if panelVisible}
   <section
     bind:this={panelRef}
@@ -1023,9 +1023,19 @@
     z-index: 12;
   }
 
+  /* 收起态卡片需要进入主布局，不能覆盖消息列表的首条消息。展开内容仍通过
+     runtime-diagnostics__content 作为浮层显示，不额外推动消息列表。 */
+  .runtime-diagnostics-slot--visible {
+    position: relative;
+    flex: 0 0 42px;
+    height: 42px;
+    padding-top: 6px;
+    box-sizing: border-box;
+  }
+
   .runtime-diagnostics {
     --runtime-status-color: var(--vscode-editorWidget-border, var(--border));
-    margin: 6px 12px 0;
+    margin: 0 12px;
     border: 1px solid var(--vscode-editorWidget-border, var(--border));
     border-left: 2px solid var(--runtime-status-color);
     border-radius: 8px;

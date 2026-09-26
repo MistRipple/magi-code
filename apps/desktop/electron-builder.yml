@@ -45,6 +45,10 @@ extraResources:
     to: licenses
   - from: dist/resources/sbom/magi-desktop.cdx.json
     to: sbom/magi-desktop.cdx.json
+  - from: icons/32x32.png
+    to: magi-tray.png
+  - from: icons/512x512.png
+    to: magi-app.png
 
 afterPack: ./scripts/after-pack.mjs
 artifactName: Magi-${version}-${os}-${arch}.${ext}

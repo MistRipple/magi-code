@@ -115,19 +115,24 @@ function browserTimingTraceId(event: CanonicalTurnEvent): string {
     : event.turnId;
 }
 
-function markBrowserTiming(stage: BrowserTimingStage, event: CanonicalTurnEvent, startedAt: number): void {
+function recordBrowserTiming(
+  stage: BrowserTimingStage,
+  turnId: string,
+  traceId: string,
+  startedAt: number,
+): void {
   const viteEnv = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env;
   if (typeof performance === 'undefined') return;
   const atMs = performance.now();
   const elapsed = Math.max(0, atMs - startedAt);
-  let record = browserTimingRegistry.get(event.turnId);
+  let record = browserTimingRegistry.get(turnId);
   if (!record) {
     record = {
-      traceId: browserTimingTraceId(event),
-      turnId: event.turnId,
+      traceId,
+      turnId,
       stages: {},
     };
-    browserTimingRegistry.set(event.turnId, record);
+    browserTimingRegistry.set(turnId, record);
     while (browserTimingRegistry.size > MAX_BROWSER_TIMING_TURNS) {
       const oldestTurnId = browserTimingRegistry.keys().next().value;
       if (typeof oldestTurnId !== 'string') break;
@@ -146,14 +151,40 @@ function markBrowserTiming(stage: BrowserTimingStage, event: CanonicalTurnEvent,
     record.stages[stage] = { count: 1, first: point, last: point };
   }
   if (viteEnv?.DEV) {
-    performance.mark(`magi-${stage}-${event.turnId}-${Math.round(atMs)}`);
+    performance.mark(`magi-${stage}-${turnId}-${Math.round(atMs)}`);
     console.debug('[magi.performance]', {
       traceId: record.traceId,
-      turnId: event.turnId,
+      turnId,
       stage,
       elapsedMs: point.elapsedMs,
     });
   }
+}
+
+function markBrowserTiming(stage: BrowserTimingStage, event: CanonicalTurnEvent, startedAt: number): void {
+  recordBrowserTiming(stage, event.turnId, browserTimingTraceId(event), startedAt);
+}
+
+function markCanonicalSnapshotTiming(turn: CanonicalTurn, startedAt: number): void {
+  if (browserTimingRegistry.has(turn.turnId)) return;
+  const traceId = canonicalTurnRequestId(turn) || turn.turnId;
+  recordBrowserTiming('frontend_event_received', turn.turnId, traceId, startedAt);
+  recordBrowserTiming('reducer_completed', turn.turnId, traceId, startedAt);
+  recordBrowserTiming('projection_completed', turn.turnId, traceId, startedAt);
+  if (domPaintPendingTurnIds.has(turn.turnId) || domPaintRecordedTurnIds.has(turn.turnId)) return;
+  domPaintPendingTurnIds.add(turn.turnId);
+  const onPaint = () => {
+    domPaintPendingTurnIds.delete(turn.turnId);
+    domPaintRecordedTurnIds.add(turn.turnId);
+    while (domPaintRecordedTurnIds.size > MAX_BROWSER_TIMING_TURNS) {
+      const oldestTurnId = domPaintRecordedTurnIds.values().next().value;
+      if (typeof oldestTurnId !== 'string') break;
+      domPaintRecordedTurnIds.delete(oldestTurnId);
+    }
+    recordBrowserTiming('dom_painted', turn.turnId, traceId, startedAt);
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(onPaint);
+  else setTimeout(onPaint, 0);
 }
 
 function normalizeSessionId(value: string | null | undefined): string {
@@ -172,7 +203,15 @@ export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimel
   markBrowserTiming('reducer_completed', event, receivedAt);
   if (result.error) {
     turnStoreState.lastError = result.error;
-    console.error('[canonical-turn-store] 拒绝 canonical turn event:', result.error);
+    console.error('[canonical-turn-store] 拒绝 canonical turn event:', JSON.stringify({
+      error: result.error,
+      eventId: event.eventId,
+      eventSeq: event.eventSeq,
+      eventKind: event.kind,
+      incomingStatus: event.turn?.status ?? null,
+      existingStatus: turnStoreState.reducer.turns.find((turn) => turn.turnId === event.turnId)?.status ?? null,
+      lastAppliedEventSeq: turnStoreState.reducer.lastAppliedEventSeq,
+    }));
     return null;
   }
   if (result.recoveryRequired) {
@@ -228,7 +267,10 @@ export function replaceCanonicalSessionTurns(
 ): SessionTimelineProjection | null {
   turnStoreState.reducer = replaceCanonicalTurns(sessionId, turns, lastAppliedEventSeq);
   turnStoreState.lastError = null;
-  return publishProjection();
+  const projection = publishProjection();
+  const startedAt = typeof performance === 'undefined' ? 0 : performance.now();
+  for (const turn of turns) markCanonicalSnapshotTiming(turn, startedAt);
+  return projection;
 }
 
 /**
@@ -288,7 +330,10 @@ export function mergeCanonicalSessionTurns(
       .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId)),
   };
   turnStoreState.lastError = null;
-  return publishProjection();
+  const projection = publishProjection();
+  const startedAt = typeof performance === 'undefined' ? 0 : performance.now();
+  for (const turn of turns) markCanonicalSnapshotTiming(turn, startedAt);
+  return projection;
 }
 
 export function prependCanonicalSessionTurns(

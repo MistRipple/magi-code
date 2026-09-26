@@ -5,6 +5,7 @@
   "common.refresh": "Refresh",
   "common.workspace": "Workspace",
   "common.unlimited": "Unlimited",
+  "app.documentTitle": "Magi",
   "app.bootstrapConnecting": "Opening Magi...",
   "app.bootstrapConnectingHint": "Preparing your conversation, please wait",
   "app.bootstrapConnectionFailed": "Magi is unavailable right now",

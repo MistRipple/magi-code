@@ -1,32 +1,26 @@
 <script lang="ts">
   import type { RetryRuntimeState } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
+  import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
 
   interface Props {
     runtime: RetryRuntimeState;
   }
 
   let { runtime }: Props = $props();
-  let now = $state(Date.now());
+  const now = $derived(uiClockState.now);
 
   $effect(() => {
     if (runtime.phase !== 'scheduled') {
       return;
     }
 
-    now = Date.now();
-    const timer = setInterval(() => {
-      now = Date.now();
-    }, 1000);
-
-    return () => {
-      clearInterval(timer);
-    };
+    return retainUiClock();
   });
 
   const waitSeconds = $derived(
     runtime.phase === 'scheduled'
-      ? Math.max(0, Math.ceil(((runtime.nextRetryAt ?? Date.now()) - now) / 1000))
+      ? Math.max(0, Math.ceil(((runtime.nextRetryAt ?? now) - now) / 1000))
       : 0
   );
 </script>

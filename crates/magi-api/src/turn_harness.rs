@@ -11,8 +11,10 @@ use crate::{
 use axum::{body::Body, http::Request};
 use futures_util::{SinkExt, StreamExt};
 use magi_bridge_client::{
-    BridgeClientError, BridgeErrorLayer, ChatToolCall, ModelBridgeClient, ModelInvocationRequest,
-    ModelResponse, ModelResponseStatus, ModelStreamingDelta, model_invocation_cancelled_error,
+    BridgeClientError, BridgeErrorLayer, ChatToolCall, HttpMcpServerConfig, McpBridgeClient,
+    McpServerClient, McpServerConfig, McpServerConnectionConfig, McpToolCallRequest,
+    ModelBridgeClient, ModelInvocationRequest, ModelResponse, ModelResponseStatus,
+    ModelStreamingDelta, model_invocation_cancelled_error,
 };
 use magi_conversation_runtime::{
     CoordinatorAdmission, CoordinatorCommandResult, ExecutionProfile, TOOL_APPROVAL_TTL_MILLIS,
@@ -34,12 +36,14 @@ use magi_session_store::{
     TimelineEntryKind,
 };
 use magi_skill_runtime::SkillDispatchRuntime;
-use magi_tool_runtime::ToolRegistry;
+use magi_tool_runtime::{ExternalMcpToolExecutor, ExternalToolCatalogSnapshot, ToolRegistry};
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
 use std::time::{Duration, Instant};
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, atomic::AtomicU64},
 };
@@ -155,6 +159,10 @@ enum ProviderBehavior {
     ToolThenCompleted {
         tool_name: String,
         arguments: String,
+        response: String,
+    },
+    ToolSequenceThenCompleted {
+        steps: Vec<(String, String)>,
         response: String,
     },
     AgentSpawnThenWait {
@@ -327,6 +335,26 @@ impl HarnessModelClient {
         });
         state.tool_round_emitted = 0;
         state.tool_round_limit = 2;
+    }
+
+    pub fn set_tool_sequence_then_completed(
+        &self,
+        steps: Vec<(impl Into<String>, impl Into<String>)>,
+        response: impl Into<String>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("harness provider state should hold");
+        state.behavior = Some(ProviderBehavior::ToolSequenceThenCompleted {
+            steps: steps
+                .into_iter()
+                .map(|(tool, arguments)| (tool.into(), arguments.into()))
+                .collect(),
+            response: response.into(),
+        });
+        state.tool_round_emitted = 0;
+        state.tool_round_limit = 0;
     }
 
     pub fn requests(&self) -> Vec<ModelInvocationRequest> {
@@ -716,6 +744,99 @@ impl HarnessModelClient {
                 }
                 Ok(ModelResponse::completed(response))
             }
+            ProviderBehavior::ToolSequenceThenCompleted { steps, response } => {
+                let next_tool = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .expect("harness provider state should hold");
+                    let classifier_request = request.prompt.contains("Session Turn 编排分类器");
+                    let next_tool = steps.get(state.tool_round_emitted).cloned();
+                    let should_emit = !classifier_request
+                        && state.tool_round_emitted < steps.len()
+                        && next_tool.as_ref().is_some_and(|(tool_name, _)| {
+                            request.tools.as_ref().is_some_and(|tools| {
+                                tools.iter().any(|tool| tool.function.name == *tool_name)
+                            })
+                        });
+                    if should_emit {
+                        state.tool_round_emitted += 1;
+                        next_tool
+                    } else {
+                        None
+                    }
+                };
+                if let Some((tool_name, arguments)) = next_tool {
+                    let tool_call = ChatToolCall {
+                        id: format!(
+                            "harness-tool-call-{}",
+                            self.state
+                                .lock()
+                                .expect("harness provider state should hold")
+                                .tool_round_emitted
+                        ),
+                        kind: "function".to_string(),
+                        function: magi_bridge_client::ChatToolFunction {
+                            name: tool_name,
+                            arguments,
+                        },
+                    };
+                    self.record_delta(
+                        &ModelStreamingDelta {
+                            content: String::new(),
+                            thinking: String::new(),
+                            tool_calls: vec![tool_call.clone()],
+                        },
+                        on_delta,
+                        track_timing,
+                    );
+                    return Ok(ModelResponse {
+                        status: ModelResponseStatus::RequiresToolExecution,
+                        content: None,
+                        thinking: None,
+                        tool_calls: vec![tool_call],
+                        usage: None,
+                        finish_reason: Some("tool_calls".to_string()),
+                        provider_context: Vec::new(),
+                    });
+                }
+                let emitted_steps = self
+                    .state
+                    .lock()
+                    .expect("harness provider state should hold")
+                    .tool_round_emitted;
+                let expected_step_missing =
+                    steps.get(emitted_steps).is_some_and(|(tool_name, _)| {
+                        request.tools.as_ref().is_none_or(|tools| {
+                            !tools.iter().any(|tool| tool.function.name == *tool_name)
+                        })
+                    });
+                if !request.prompt.contains("Session Turn 编排分类器") && expected_step_missing
+                {
+                    return Err(BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::Protocol,
+                        code: Some(-32_004),
+                        message: "harness provider contract mismatch: expected tool sequence step was not exposed or selected"
+                            .to_string(),
+                    });
+                }
+                let mut cumulative = String::new();
+                for chunk in response
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .chunks(2)
+                    .map(|chunk| chunk.iter().collect::<String>())
+                {
+                    cumulative.push_str(&chunk);
+                    let delta = ModelStreamingDelta {
+                        content: cumulative.clone(),
+                        thinking: String::new(),
+                        tool_calls: Vec::new(),
+                    };
+                    self.record_delta(&delta, on_delta, track_timing);
+                }
+                Ok(ModelResponse::completed(response))
+            }
         }
     }
 }
@@ -774,6 +895,8 @@ impl ModelBridgeClient for HarnessModelClient {
 pub struct MagiTurnHarness {
     pub state: ApiState,
     pub provider: HarnessModelClient,
+    external_mcp_catalog: Option<ExternalToolCatalogSnapshot>,
+    external_mcp_executor: Option<ExternalMcpToolExecutor>,
 }
 
 impl MagiTurnHarness {
@@ -798,6 +921,35 @@ impl MagiTurnHarness {
         session_store: Arc<SessionStore>,
         provider: HarnessModelClient,
         with_task_runtime: bool,
+    ) -> Self {
+        Self::from_parts_with_external_mcp(session_store, provider, with_task_runtime, None, None)
+    }
+
+    /// 装配带真实外部 MCP 执行器的 Task harness。
+    ///
+    /// catalog 仍由测试显式提供，执行器则可以连接真实 stdio/HTTP MCP server。
+    /// 这样权限判定、Provider tool-call、Task/Turn 终态和外部副作用都经过同一
+    /// TurnService 链路，不把 MCP 证据降级为 ToolRegistry 单测。
+    pub fn new_task_with_external_mcp(
+        response: impl Into<String>,
+        catalog: ExternalToolCatalogSnapshot,
+        executor: ExternalMcpToolExecutor,
+    ) -> Self {
+        Self::from_parts_with_external_mcp(
+            Arc::new(SessionStore::default()),
+            HarnessModelClient::new(response),
+            true,
+            Some(catalog),
+            Some(executor),
+        )
+    }
+
+    fn from_parts_with_external_mcp(
+        session_store: Arc<SessionStore>,
+        provider: HarnessModelClient,
+        with_task_runtime: bool,
+        external_mcp_catalog: Option<ExternalToolCatalogSnapshot>,
+        external_mcp_executor: Option<ExternalMcpToolExecutor>,
     ) -> Self {
         let event_bus = Arc::new(InMemoryEventBus::new(512));
         let workspace_store = Arc::new(WorkspaceStore::default());
@@ -839,6 +991,13 @@ impl MagiTurnHarness {
         let task_store = with_task_runtime.then(|| Arc::new(TaskStore::new()));
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus))
             .with_git_tool_executor(git_tool_executor);
+        if let Some(catalog) = external_mcp_catalog.clone() {
+            tool_registry = tool_registry
+                .with_external_tool_catalog_provider(Arc::new(move || catalog.clone()));
+        }
+        if let Some(executor) = external_mcp_executor.clone() {
+            tool_registry = tool_registry.with_external_mcp_tool_executor(executor);
+        }
         tool_registry.register_default_builtins();
         let skill_dispatch_runtime = SkillDispatchRuntime::new(
             tool_registry.clone(),
@@ -969,7 +1128,12 @@ impl MagiTurnHarness {
                 }
             });
         }
-        let harness = Self { state, provider };
+        let harness = Self {
+            state,
+            provider,
+            external_mcp_catalog,
+            external_mcp_executor,
+        };
         harness.state.restore_turn_coordinator_from_session_store();
         harness
     }
@@ -1010,10 +1174,12 @@ impl MagiTurnHarness {
     /// 使用同一份 canonical SessionStore 构造新的进程内状态，验证 daemon 重启后的
     /// request replay 和 Coordinator 身份恢复；EventBus、dispatcher 和 TaskStore 均重建。
     pub fn restart(&self) -> Self {
-        Self::from_parts(
+        Self::from_parts_with_external_mcp(
             Arc::clone(&self.state.session_store),
             self.provider.clone(),
             self.state.runner_manager().is_some(),
+            self.external_mcp_catalog.clone(),
+            self.external_mcp_executor.clone(),
         )
     }
 
@@ -1476,6 +1642,45 @@ mod tests {
         panic!("Turn {session_id} 未在测试窗口内产生工具审批请求");
     }
 
+    async fn submit_restricted_external_mcp_turn(
+        harness: &MagiTurnHarness,
+        session_id: &SessionId,
+        workspace_id: &magi_core::WorkspaceId,
+        workspace_path: &Path,
+        target: &Path,
+        request_id: &str,
+    ) -> SessionTurnResponseDto {
+        harness.provider.set_tool_sequence_then_completed(
+            vec![
+                (
+                    "tool_catalog".to_string(),
+                    serde_json::json!({
+                        "include_external": true,
+                        "include_mcp_servers": true,
+                    })
+                    .to_string(),
+                ),
+                (
+                    "mcp__cancel_mcp__write_file".to_string(),
+                    serde_json::json!({"path": target.display().to_string()}).to_string(),
+                ),
+            ],
+            "MCP cancellation final response",
+        );
+        harness
+            .submit_workspace_task_with_access_profile(
+                session_id,
+                workspace_id,
+                workspace_path,
+                "请以复杂任务模式执行：调用 MCP 写入文件并等待审批，授权后汇总结果",
+                request_id,
+                &format!("user-{request_id}"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Restricted MCP Turn should be accepted")
+    }
+
     fn non_classifier_provider_request_count(harness: &MagiTurnHarness) -> usize {
         harness
             .provider
@@ -1571,6 +1776,29 @@ mod tests {
                     .as_deref()
                     .is_some_and(|content| content.contains(tool_name))
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("read_only_{request_suffix}"),
+                "tool": tool_name,
+                "surface": if tool_name.starts_with("git_") {
+                    "git_workspace"
+                } else if tool_name == "image_generate" {
+                    "image_generation"
+                } else {
+                    "file_executor"
+                },
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &turn,
+        );
         (workspace_root, target, turn, task)
     }
 
@@ -1676,6 +1904,23 @@ mod tests {
                     .as_ref()
                     .is_some_and(|tool| tool.name == tool_name && tool.error.is_some())
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("restricted_external_{request_suffix}"),
+                "tool": tool_name,
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_external",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "external_path_blocked",
+            }),
+            &turn,
+        );
         (workspace_root, outside_root, observed_target, turn, task)
     }
 
@@ -1768,7 +2013,145 @@ mod tests {
                     tool.name == tool_name && tool.result.is_some() && tool.error.is_none()
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("full_access_{request_suffix}"),
+                "tool": tool_name,
+                "surface": "file_executor",
+                "access_profile": "FullAccess",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_operation_executed",
+            }),
+            &turn,
+        );
         (workspace_root, observed_target, turn, task)
+    }
+
+    async fn run_full_access_external_file_tool_case<F>(
+        tool_name: &'static str,
+        request_suffix: &'static str,
+        prompt: &'static str,
+        side_effect: &'static str,
+        configure: F,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        CanonicalTurn,
+        magi_core::Task,
+    )
+    where
+        F: FnOnce(&Path, &Path) -> (PathBuf, serde_json::Value),
+    {
+        let harness = MagiTurnHarness::new_task(format!("完全授权工作区外 {tool_name}"));
+        let workspace_root =
+            tempfile::tempdir().expect("full access external file tool workspace should create");
+        let outside_root =
+            tempfile::tempdir().expect("full access external file tool target should create");
+        let (observed_target, arguments) = configure(workspace_root.path(), outside_root.path());
+        let workspace_id = magi_core::WorkspaceId::new(format!(
+            "harness-full-access-external-{request_suffix}-workspace"
+        ));
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("full access external file tool workspace should register");
+        let session_id = SessionId::new(format!(
+            "harness-full-access-external-{request_suffix}-session"
+        ));
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                format!("完全授权工作区外 {tool_name} 验收"),
+                Some(workspace_id.to_string()),
+            )
+            .expect("full access external file tool session should create");
+        harness.provider.set_tool_then_completed(
+            tool_name,
+            arguments.to_string(),
+            "完全授权工作区外文件工具完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                prompt,
+                &format!("harness-full-access-external-{request_suffix}-request"),
+                &format!("harness-full-access-external-{request_suffix}-user"),
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("full access external file tool task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("full access external file tool should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("full access external file tool should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "完全授权工作区外 {tool_name} 应执行工具轮和一次最终答复轮"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "完全授权工作区外 {tool_name} 不应创建 pending approval"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "完全授权工作区外 {tool_name} 不应发布审批请求"
+        );
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == tool_name && tool.result.is_some() && tool.error.is_none()
+                })
+        }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("full_access_external_{request_suffix}"),
+                "tool": tool_name,
+                "surface": "file_executor",
+                "access_profile": "FullAccess",
+                "scope": "workspace_external",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": side_effect,
+            }),
+            &turn,
+        );
+        (workspace_root, outside_root, observed_target, turn, task)
     }
 
     fn timing_metric(
@@ -2588,6 +2971,858 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_profile_real_stdio_mcp_call_is_bound_to_turn_and_terminal() {
+        let workspace_root = tempfile::tempdir().expect("MCP Turn workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-mcp-turn-workspace");
+        let session_id = SessionId::new("harness-mcp-turn-session");
+        let target = workspace_root.path().join("mcp-turn-side-effect.txt");
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+    method=$(echo "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+    id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    case "$method" in
+        initialize)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"turn-mcp","version":"1.0"}}}}}}\n' "$id"
+            ;;
+        notifications/initialized)
+            ;;
+        tools/call)
+            printf 'mcp-stdio-turn-side-effect\n' > '{target}'
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"stdio-turn-ok"}}]}}}}\n' "$id"
+            ;;
+    esac
+done
+"#,
+            target = target.display(),
+        );
+        let client = Arc::new(McpServerClient::from_stdio(McpServerConfig::new(
+            "sh",
+            vec!["-c".to_string(), script],
+        )));
+        let catalog = ExternalToolCatalogSnapshot {
+            mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                server_id: "turn-mcp".to_string(),
+                server_name: "Turn MCP".to_string(),
+                model_tool_name: "mcp__turn_mcp__write_file".to_string(),
+                tool_name: "write_file".to_string(),
+                description: "Write one MCP fixture file".to_string(),
+                read_only: false,
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        };
+        let executor: ExternalMcpToolExecutor = Arc::new(move |server, tool, arguments| {
+            let response = client
+                .call_tool(McpToolCallRequest {
+                    server_name: server.to_string(),
+                    tool_name: tool.to_string(),
+                    input: arguments.to_string(),
+                })
+                .expect("real stdio MCP call should succeed through TurnService");
+            (
+                response.payload,
+                if response.ok {
+                    magi_core::ExecutionResultStatus::Succeeded
+                } else {
+                    magi_core::ExecutionResultStatus::Failed
+                },
+            )
+        });
+        let harness =
+            MagiTurnHarness::new_task_with_external_mcp("MCP Turn 最终答复", catalog, executor);
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("MCP Turn workspace should register");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "MCP Turn 真实链路",
+                Some(workspace_id.to_string()),
+            )
+            .expect("MCP Turn session should create");
+        harness.provider.set_tool_sequence_then_completed(
+            vec![
+                (
+                    "tool_catalog".to_string(),
+                    serde_json::json!({
+                        "include_external": true,
+                        "include_mcp_servers": true,
+                    })
+                    .to_string(),
+                ),
+                (
+                    "mcp__turn_mcp__write_file".to_string(),
+                    serde_json::json!({"path": target}).to_string(),
+                ),
+            ],
+            "MCP Turn 最终答复",
+        );
+
+        let request_id = "harness-mcp-turn-request";
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：调用真实 stdio MCP 工具写入 fixture，然后返回结果",
+                request_id,
+                "harness-mcp-turn-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("真实 MCP Task Turn 应被接纳");
+        let turn_id = response.turn_id.clone().expect("MCP Turn 应有 turn_id");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("MCP Task 应有 root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("真实 MCP server 应写入 fixture"),
+            "mcp-stdio-turn-side-effect\n"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 3);
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "mcp__turn_mcp__write_file")
+        }));
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.content.as_deref() == Some("MCP Turn 最终答复")
+        }));
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "mcp_stdio_real_turn_full_access",
+            "tool": "mcp__turn_mcp__write_file",
+            "surface": "mcp_executor",
+            "access_profile": "FullAccess",
+            "scope": "external",
+            "lifecycle": "allow",
+            "approval_requested": false,
+            "approval_resolved": false,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "completed",
+            "task_status": "completed",
+            "side_effect": "stdio_server_wrote_file",
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "execution_profile": "task",
+        }));
+    }
+
+    #[tokio::test]
+    async fn read_only_task_turn_allows_real_stdio_mcp_read_and_records_identity() {
+        let workspace_root = tempfile::tempdir().expect("ReadOnly MCP workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-read-only-mcp-workspace");
+        let session_id = SessionId::new("harness-read-only-mcp-session");
+        let target = workspace_root.path().join("read-only-mcp-source.txt");
+        fs::write(&target, "read-only-mcp-result")
+            .expect("ReadOnly MCP source fixture should write");
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+    method=$(echo "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+    id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    case "$method" in
+        initialize)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"read-only-mcp","version":"1.0"}}}}}}\n' "$id"
+            ;;
+        notifications/initialized)
+            ;;
+        tools/call)
+            content=$(cat '{target}')
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"%s"}}]}}}}\n' "$id" "$content"
+            ;;
+    esac
+done
+"#,
+            target = target.display(),
+        );
+        let client = Arc::new(McpServerClient::from_stdio(McpServerConfig::new(
+            "sh",
+            vec!["-c".to_string(), script],
+        )));
+        let executor_calls = Arc::new(AtomicU64::new(0));
+        let executor_calls_for_executor = Arc::clone(&executor_calls);
+        let catalog = ExternalToolCatalogSnapshot {
+            mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                server_id: "read-only-mcp".to_string(),
+                server_name: "Read Only MCP".to_string(),
+                model_tool_name: "mcp__read_only_mcp__read_file".to_string(),
+                tool_name: "read_file".to_string(),
+                description: "Read one registered MCP fixture file".to_string(),
+                read_only: true,
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        };
+        let executor: ExternalMcpToolExecutor = Arc::new(move |server, tool, arguments| {
+            let response = client
+                .call_tool(McpToolCallRequest {
+                    server_name: server.to_string(),
+                    tool_name: tool.to_string(),
+                    input: arguments.to_string(),
+                })
+                .expect("real stdio ReadOnly MCP call should succeed through TurnService");
+            executor_calls_for_executor.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                response.payload,
+                if response.ok {
+                    magi_core::ExecutionResultStatus::Succeeded
+                } else {
+                    magi_core::ExecutionResultStatus::Failed
+                },
+            )
+        });
+        let harness =
+            MagiTurnHarness::new_task_with_external_mcp("ReadOnly MCP 最终答复", catalog, executor);
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("ReadOnly MCP workspace should register");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "ReadOnly MCP 真实 Turn",
+                Some(workspace_id.to_string()),
+            )
+            .expect("ReadOnly MCP session should create");
+        harness.provider.set_tool_sequence_then_completed(
+            vec![
+                (
+                    "tool_catalog".to_string(),
+                    serde_json::json!({
+                        "include_external": true,
+                        "include_mcp_servers": true,
+                    })
+                    .to_string(),
+                ),
+                (
+                    "mcp__read_only_mcp__read_file".to_string(),
+                    serde_json::json!({"path": target}).to_string(),
+                ),
+            ],
+            "ReadOnly MCP 最终答复",
+        );
+
+        let request_id = "harness-read-only-mcp-request";
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：通过注册为只读的 MCP 工具读取 fixture 并汇总结果",
+                request_id,
+                "harness-read-only-mcp-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("ReadOnly MCP Task Turn should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("ReadOnly MCP Turn should have identity");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("ReadOnly MCP Task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(non_classifier_provider_request_count(&harness), 3);
+        assert_eq!(executor_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "mcp__read_only_mcp__read_file"
+                        && tool.result.is_some()
+                        && tool.error.is_none()
+                        && tool.result.as_ref().is_some_and(|result| {
+                            result.to_string().contains("read-only-mcp-result")
+                        })
+                })
+        }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "mcp_read_only_real_stdio_turn_read",
+                "tool": "mcp__read_only_mcp__read_file",
+                "surface": "mcp_executor",
+                "access_profile": "ReadOnly",
+                "scope": "external",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "read_only_file_read",
+            }),
+            &turn,
+        );
+    }
+
+    #[tokio::test]
+    async fn task_profile_real_http_mcp_call_is_bound_to_turn_and_terminal() {
+        let workspace_root = tempfile::tempdir().expect("HTTP MCP Turn workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-http-mcp-turn-workspace");
+        let session_id = SessionId::new("harness-http-mcp-turn-session");
+        let target = workspace_root.path().join("http-mcp-turn-side-effect.txt");
+        let server_target = target.clone();
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("HTTP MCP Turn listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("HTTP MCP Turn listener should have address");
+        let server = std::thread::spawn(move || {
+            for request_index in 0..3 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("HTTP MCP Turn server should accept request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("HTTP MCP Turn read timeout should configure");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let header_end = loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("HTTP MCP Turn request should be readable");
+                    assert!(read > 0, "HTTP MCP Turn request closed before headers");
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(position) =
+                        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break position + 4;
+                    }
+                };
+                let header_text = String::from_utf8(bytes[..header_end].to_vec())
+                    .expect("HTTP MCP Turn headers should be UTF-8");
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            (name.eq_ignore_ascii_case("content-length"))
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                    })
+                    .expect("HTTP MCP Turn request should include content length");
+                while bytes.len() - header_end < content_length {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("HTTP MCP Turn body should be readable");
+                    assert!(read > 0, "HTTP MCP Turn request closed before body");
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .expect("HTTP MCP Turn body should be JSON");
+                let method = body["method"]
+                    .as_str()
+                    .expect("HTTP MCP Turn request should contain method");
+                let (status, headers, response_body) = match (request_index, method) {
+                    (0, "initialize") => (
+                        "200 OK",
+                        "Content-Type: application/json\r\nMcp-Session-Id: turn-http-session\r\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {
+                                "protocolVersion": "2024-11-05",
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "turn-http-mcp", "version": "1.0"}
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    (1, "notifications/initialized") => ("202 Accepted", "", String::new()),
+                    (2, "tools/call") => {
+                        fs::write(&server_target, "mcp-http-turn-side-effect\n")
+                            .expect("HTTP MCP Turn server should write target");
+                        (
+                            "200 OK",
+                            "Content-Type: application/json\r\n",
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body["id"],
+                                "result": {
+                                    "content": [{"type": "text", "text": "http-turn-ok"}]
+                                }
+                            })
+                            .to_string(),
+                        )
+                    }
+                    other => panic!("unexpected HTTP MCP Turn request: {other:?}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{response_body}",
+                    response_body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("HTTP MCP Turn response should write");
+            }
+        });
+
+        let client = Arc::new(McpServerClient::new(
+            McpServerConnectionConfig::StreamableHttp(HttpMcpServerConfig {
+                url: format!("http://{address}/mcp"),
+                headers: std::collections::BTreeMap::new(),
+                request_timeout: Duration::from_secs(2),
+            }),
+        ));
+        let catalog = ExternalToolCatalogSnapshot {
+            mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                server_id: "turn-http-mcp".to_string(),
+                server_name: "Turn HTTP MCP".to_string(),
+                model_tool_name: "mcp__turn_http_mcp__write_file".to_string(),
+                tool_name: "write_file".to_string(),
+                description: "Write one HTTP MCP fixture file".to_string(),
+                read_only: false,
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        };
+        let executor: ExternalMcpToolExecutor = Arc::new(move |server, tool, arguments| {
+            let response = client
+                .call_tool(McpToolCallRequest {
+                    server_name: server.to_string(),
+                    tool_name: tool.to_string(),
+                    input: arguments.to_string(),
+                })
+                .expect("real HTTP MCP call should succeed through TurnService");
+            (
+                response.payload,
+                if response.ok {
+                    magi_core::ExecutionResultStatus::Succeeded
+                } else {
+                    magi_core::ExecutionResultStatus::Failed
+                },
+            )
+        });
+        let harness = MagiTurnHarness::new_task_with_external_mcp(
+            "HTTP MCP Turn 最终答复",
+            catalog,
+            executor,
+        );
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("HTTP MCP Turn workspace should register");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "HTTP MCP Turn 真实链路",
+                Some(workspace_id.to_string()),
+            )
+            .expect("HTTP MCP Turn session should create");
+        harness.provider.set_tool_sequence_then_completed(
+            vec![
+                (
+                    "tool_catalog".to_string(),
+                    serde_json::json!({
+                        "include_external": true,
+                        "include_mcp_servers": true,
+                    })
+                    .to_string(),
+                ),
+                (
+                    "mcp__turn_http_mcp__write_file".to_string(),
+                    serde_json::json!({"path": target}).to_string(),
+                ),
+            ],
+            "HTTP MCP Turn 最终答复",
+        );
+
+        let request_id = "harness-http-mcp-turn-request";
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：调用真实 HTTP MCP 工具写入 fixture，然后返回结果",
+                request_id,
+                "harness-http-mcp-turn-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("真实 HTTP MCP Task Turn 应被接纳");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("HTTP MCP Turn 应有 turn_id");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("HTTP MCP Task 应有 root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        server.join().expect("HTTP MCP Turn server should stop");
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("真实 HTTP MCP server 应写入 fixture"),
+            "mcp-http-turn-side-effect\n"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 3);
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item.tool.as_ref().is_some_and(|tool| {
+                    tool.name == "mcp__turn_http_mcp__write_file"
+                        && tool.result.is_some()
+                        && tool.error.is_none()
+                })
+        }));
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.content.as_deref() == Some("HTTP MCP Turn 最终答复")
+        }));
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "mcp_http_real_turn_full_access",
+            "tool": "mcp__turn_http_mcp__write_file",
+            "surface": "mcp_executor",
+            "access_profile": "FullAccess",
+            "scope": "external",
+            "lifecycle": "allow",
+            "approval_requested": false,
+            "approval_resolved": false,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "completed",
+            "task_status": "completed",
+            "side_effect": "http_server_wrote_file",
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "execution_profile": "task",
+        }));
+    }
+
+    #[tokio::test]
+    async fn task_profile_mcp_restricted_cancellation_isolated_across_turn_and_session() {
+        let workspace_root = tempfile::tempdir().expect("MCP cancellation workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-mcp-cancel-workspace");
+        let session_id = SessionId::new("harness-mcp-cancel-session");
+        let other_session_id = SessionId::new("harness-mcp-cancel-other-session");
+        let first_target = workspace_root.path().join("mcp-first.txt");
+        let second_target = workspace_root.path().join("mcp-second.txt");
+        let third_target = workspace_root.path().join("mcp-third.txt");
+        let executor_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let executor_calls_for_executor = Arc::clone(&executor_calls);
+        let catalog = ExternalToolCatalogSnapshot {
+            mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                server_id: "cancel-mcp".to_string(),
+                server_name: "Cancellation MCP".to_string(),
+                model_tool_name: "mcp__cancel_mcp__write_file".to_string(),
+                tool_name: "write_file".to_string(),
+                description: "Write one cancellation fixture file".to_string(),
+                read_only: false,
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        };
+        let executor: ExternalMcpToolExecutor = Arc::new(move |server, tool, arguments| {
+            let input: serde_json::Value =
+                serde_json::from_str(arguments).expect("MCP cancellation arguments should be JSON");
+            let path = input["path"]
+                .as_str()
+                .expect("MCP cancellation arguments should contain path");
+            fs::write(path, "mcp-cancellation-side-effect\n")
+                .expect("MCP cancellation executor should write target");
+            executor_calls_for_executor
+                .lock()
+                .expect("MCP cancellation executor audit lock should hold")
+                .push(format!("{server}:{tool}:{path}"));
+            (
+                serde_json::json!({"status":"succeeded","path":path}).to_string(),
+                magi_core::ExecutionResultStatus::Succeeded,
+            )
+        });
+        let harness = MagiTurnHarness::new_task_with_external_mcp(
+            "MCP cancellation final response",
+            catalog,
+            executor,
+        );
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("MCP cancellation workspace should register");
+        for current_session_id in [&session_id, &other_session_id] {
+            harness
+                .state
+                .session_store
+                .create_session_for_workspace(
+                    (*current_session_id).clone(),
+                    "MCP cancellation isolation",
+                    Some(workspace_id.to_string()),
+                )
+                .expect("MCP cancellation session should create");
+        }
+
+        let first_requests_before = non_classifier_provider_request_count(&harness);
+        let first = submit_restricted_external_mcp_turn(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &first_target,
+            "harness-mcp-cancel-request-1",
+        )
+        .await;
+        let first_turn_id = first
+            .turn_id
+            .clone()
+            .expect("first MCP Turn should have id");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .unwrap_or_else(|| panic!("first MCP Task should have id; response={first:?}"));
+        let first_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        harness
+            .cancel_with_workspace(&session_id, Some(&workspace_id))
+            .await
+            .expect("cancelling first MCP approval should succeed");
+        let first_turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let first_task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        harness
+            .state
+            .runner_manager()
+            .expect("MCP cancellation Task should have RunnerManager")
+            .quiesce_for_restart(first.root_task_id.as_deref().expect("first root task id"))
+            .await;
+        assert_eq!(first_turn.status, CanonicalTurnStatus::Cancelled);
+        assert!(matches!(
+            first_task.status,
+            magi_core::TaskStatus::Killed | magi_core::TaskStatus::Failed
+        ));
+        assert!(!first_target.exists(), "取消 MCP 审批不得产生外部副作用");
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "取消后同一 Session 不得遗留 MCP pending approval"
+        );
+        let first_provider_requests =
+            non_classifier_provider_request_count(&harness) - first_requests_before;
+        assert_eq!(first_provider_requests, 2);
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "mcp_restricted_cancel_first_turn",
+            "tool": "mcp__cancel_mcp__write_file",
+            "surface": "mcp_executor",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "cancel",
+            "approval_requested": true,
+            "approval_resolved": false,
+            "provider_requests": first_provider_requests,
+            "turn_status": "cancelled",
+            "task_status": match first_task.status {
+                magi_core::TaskStatus::Killed => "killed",
+                magi_core::TaskStatus::Failed => "failed",
+                _ => "unexpected",
+            },
+            "side_effect": "mcp_executor_not_called_file_unchanged",
+            "request_id": "harness-mcp-cancel-request-1",
+            "turn_id": first_turn_id,
+            "execution_profile": "task",
+        }));
+
+        let second_requests_before = non_classifier_provider_request_count(&harness);
+        let second = submit_restricted_external_mcp_turn(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &second_target,
+            "harness-mcp-cancel-request-2",
+        )
+        .await;
+        let second_turn_id = second
+            .turn_id
+            .clone()
+            .expect("second MCP Turn should have id");
+        let second_task_id = second
+            .root_task_id
+            .clone()
+            .unwrap_or_else(|| panic!("second MCP Task should have id; response={second:?}"));
+        let second_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_ne!(
+            first_pending.approval_id, second_pending.approval_id,
+            "取消第一轮后，第二轮必须创建新的 MCP approval"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &second_pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let second_turn = tokio::time::timeout(
+            Duration::from_secs(3),
+            harness.wait_for_terminal(&session_id, &second_turn_id),
+        )
+        .await
+        .expect("MCP approved Turn did not settle");
+        let second_task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(second_task_id))
+            .await;
+        harness
+            .state
+            .runner_manager()
+            .expect("MCP allow-once Task should have RunnerManager")
+            .quiesce_for_restart(second.root_task_id.as_deref().expect("second root task id"))
+            .await;
+        assert_eq!(second_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(second_task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&second_target).expect("放行的 MCP Turn 应产生文件"),
+            "mcp-cancellation-side-effect\n"
+        );
+        let second_provider_requests =
+            non_classifier_provider_request_count(&harness) - second_requests_before;
+        assert_eq!(second_provider_requests, 3);
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "mcp_restricted_allow_after_cancelled_turn",
+            "tool": "mcp__cancel_mcp__write_file",
+            "surface": "mcp_executor",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "allow_once",
+            "approval_requested": true,
+            "approval_resolved": true,
+            "provider_requests": second_provider_requests,
+            "turn_status": "completed",
+            "task_status": "completed",
+            "side_effect": "mcp_executor_wrote_file",
+            "request_id": "harness-mcp-cancel-request-2",
+            "turn_id": second_turn_id,
+            "execution_profile": "task",
+        }));
+
+        let third_requests_before = non_classifier_provider_request_count(&harness);
+        let third = submit_restricted_external_mcp_turn(
+            &harness,
+            &other_session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &third_target,
+            "harness-mcp-cancel-request-3",
+        )
+        .await;
+        let third_turn_id = third
+            .turn_id
+            .clone()
+            .expect("third MCP Turn should have id");
+        let third_task_id = third
+            .root_task_id
+            .clone()
+            .unwrap_or_else(|| panic!("third MCP Task should have id; response={third:?}"));
+        let third_pending = wait_for_pending_tool_approval(&harness, &other_session_id).await;
+        assert_ne!(
+            second_pending.approval_id, third_pending.approval_id,
+            "不同 Session 不得复用 MCP approval"
+        );
+        assert!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "Session A 完成后不得影响 Session B 的审批边界"
+        );
+        harness
+            .cancel_with_workspace(&other_session_id, Some(&workspace_id))
+            .await
+            .expect("cancelling second-session MCP approval should succeed");
+        let third_turn = harness
+            .wait_for_terminal(&other_session_id, &third_turn_id)
+            .await;
+        let third_task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(third_task_id))
+            .await;
+        harness
+            .state
+            .runner_manager()
+            .expect("second-session MCP Task should have RunnerManager")
+            .quiesce_for_restart(third.root_task_id.as_deref().expect("third root task id"))
+            .await;
+        assert_eq!(third_turn.status, CanonicalTurnStatus::Cancelled);
+        assert!(matches!(
+            third_task.status,
+            magi_core::TaskStatus::Killed | magi_core::TaskStatus::Failed
+        ));
+        assert!(
+            !third_target.exists(),
+            "Session B 取消 MCP 审批不得产生副作用"
+        );
+        let third_provider_requests =
+            non_classifier_provider_request_count(&harness) - third_requests_before;
+        assert_eq!(third_provider_requests, 2);
+        assert_eq!(
+            executor_calls
+                .lock()
+                .expect("MCP cancellation executor audit lock should hold")
+                .len(),
+            1,
+            "只有明确放行的第二轮 MCP 调用可以到达 executor"
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "mcp_restricted_cancel_other_session",
+            "tool": "mcp__cancel_mcp__write_file",
+            "surface": "mcp_executor",
+            "access_profile": "Restricted",
+            "scope": "workspace_internal",
+            "lifecycle": "cancel",
+            "approval_requested": true,
+            "approval_resolved": false,
+            "provider_requests": third_provider_requests,
+            "turn_status": "cancelled",
+            "task_status": match third_task.status {
+                magi_core::TaskStatus::Killed => "killed",
+                magi_core::TaskStatus::Failed => "failed",
+                _ => "unexpected",
+            },
+            "side_effect": "mcp_executor_not_called_file_unchanged",
+            "request_id": "harness-mcp-cancel-request-3",
+            "turn_id": third_turn_id,
+            "execution_profile": "task",
+        }));
+    }
+
     #[test]
     fn harness_provider_contract_fails_fast_when_expected_tool_is_not_exposed() {
         let provider = HarnessModelClient::new("不会到达最终答复");
@@ -2684,6 +3919,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_profile_rejects_explicit_background_shell_without_side_effect() {
+        let harness = MagiTurnHarness::new_task("只读模式拒绝后台进程写入");
+        let workspace_root =
+            tempfile::tempdir().expect("read-only process workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-read-only-process-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("read-only process workspace should register");
+        let session_id = SessionId::new("harness-read-only-process-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "只读后台进程写入验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("read-only process session should create");
+        let target = workspace_root.path().join("read-only-background.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf blocked > {}", target.display()),
+                "background": true,
+            })
+            .to_string(),
+            "只读模式不会启动后台进程",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：调用 shell_exec 在后台写入文件，然后汇总结果",
+                "harness-read-only-process-request",
+                "harness-read-only-process-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("read-only process task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("read-only process should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("read-only process should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert!(!target.exists(), "ReadOnly 后台进程不得产生文件副作用");
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            1,
+            "ReadOnly shell_exec 仍是可用的只读工具面；后台写操作应在工具执行前被拒绝"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "ReadOnly 后台进程拒绝不应发布审批请求"
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "read_only_background_shell",
+            "tool": "shell_exec",
+            "surface": "background_process",
+            "access_profile": "ReadOnly",
+            "scope": "workspace_internal",
+            "lifecycle": "deny",
+            "approval_requested": false,
+            "approval_resolved": false,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "failed",
+            "task_status": "failed",
+            "side_effect": "background_process_not_started_file_unchanged",
+            "request_id": "harness-read-only-process-request",
+            "turn_id": turn_id,
+            "execution_profile": "task",
+        }));
+    }
+
+    #[tokio::test]
+    async fn full_access_profile_allows_background_shell_without_approval() {
+        let harness = MagiTurnHarness::new_task("完全授权后台进程完成");
+        let workspace_root =
+            tempfile::tempdir().expect("full access process workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-full-access-process-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("full access process workspace should register");
+        let session_id = SessionId::new("harness-full-access-process-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "完全授权后台进程验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("full access process session should create");
+        let target = workspace_root.path().join("full-access-background.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf full_access_background > {}", target.display()),
+                "background": true,
+            })
+            .to_string(),
+            "完全授权后台进程已完成",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 在后台写入文件并返回结果",
+                "harness-full-access-process-request",
+                "harness-full-access-process-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("full access process task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("full access process should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("full access process should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !target.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("full access background output should be readable"),
+            "full_access_background"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            2,
+            "完全授权后台进程应执行工具轮和一次最终答复轮"
+        );
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "完全授权后台进程不应发布审批请求"
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "full_access_background_shell",
+            "tool": "shell_exec",
+            "surface": "background_process",
+            "access_profile": "FullAccess",
+            "scope": "workspace_internal",
+            "lifecycle": "allow",
+            "approval_requested": false,
+            "approval_resolved": false,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "completed",
+            "task_status": "completed",
+            "side_effect": "background_process_started_and_wrote_file",
+            "request_id": "harness-full-access-process-request",
+            "turn_id": turn_id,
+            "execution_profile": "task",
+        }));
+    }
+
+    #[tokio::test]
     async fn read_only_profile_rejects_explicit_file_write_without_approval_or_side_effect() {
         let harness = MagiTurnHarness::new_task("只读模式拒绝显式文件写入");
         let workspace_root = tempfile::tempdir().expect("read-only workspace should create");
@@ -2765,6 +4187,23 @@ mod tests {
                         && content.contains("当前工具面没有暴露该工具")
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_file_write",
+                "tool": "file_write",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -2929,6 +4368,40 @@ mod tests {
                 .all(|event| event.event_type != "tool.approval.requested"),
             "ReadOnly file_move 不应发布审批请求"
         );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_file_copy",
+                "tool": "file_copy",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&copy_harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &copy_turn,
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_file_move",
+                "tool": "file_move",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&move_harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &move_turn,
+        );
     }
 
     #[tokio::test]
@@ -2967,6 +4440,23 @@ mod tests {
             }),
             "ReadOnly file_patch 应写回明确的 fail-closed 错误"
         );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_file-patch",
+                "tool": "file_patch",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": 0,
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &patch_turn,
+        );
 
         let (_mkdir_workspace, mkdir_target, mkdir_turn, _mkdir_task) =
             run_read_only_explicit_file_tool_case(
@@ -2992,6 +4482,23 @@ mod tests {
                     })
             }),
             "ReadOnly file_mkdir 应写回明确的 fail-closed 错误"
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_file-mkdir",
+                "tool": "file_mkdir",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": 0,
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &mkdir_turn,
         );
 
         let (_remove_workspace, remove_target, remove_turn, _remove_task) =
@@ -3025,6 +4532,23 @@ mod tests {
             }),
             "ReadOnly file_remove 应写回明确的 fail-closed 错误"
         );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_file-remove",
+                "tool": "file_remove",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": 0,
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &remove_turn,
+        );
     }
 
     #[tokio::test]
@@ -3050,6 +4574,23 @@ mod tests {
                     content.contains("apply_patch") && content.contains("当前工具面没有暴露该工具")
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_apply-patch",
+                "tool": "apply_patch",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": 0,
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -3069,6 +4610,12 @@ mod tests {
                 "git-push",
                 "执行一个任务：调用 git_push 推送分支，然后汇总结果",
                 serde_json::json!({"remote": "origin", "branch": "blocked"}),
+            ),
+            (
+                "git_branch_switch",
+                "git-branch-switch",
+                "执行一个任务：调用 git_branch_switch 切换分支，然后汇总结果",
+                serde_json::json!({"branch": "approval-target"}),
             ),
         ] {
             let (_workspace, target, turn, task) = run_read_only_explicit_file_tool_case(
@@ -3165,6 +4712,23 @@ mod tests {
                     tool.name == "file_read" && tool.result.is_some() && tool.error.is_none()
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_file_read",
+                "tool": "file_read",
+                "surface": "file_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_read",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -3243,6 +4807,23 @@ mod tests {
                         && tool.error.is_none()
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "read_only_shell_read",
+                "tool": "shell_exec",
+                "surface": "shell_executor",
+                "access_profile": "ReadOnly",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "stdout_only",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -3332,6 +4913,23 @@ mod tests {
             non_classifier_provider_request_count(&harness),
             2,
             "完全授权写入应执行工具轮并请求一次最终答复"
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "full_access_shell_write",
+                "tool": "shell_exec",
+                "surface": "shell_executor",
+                "access_profile": "FullAccess",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_written",
+            }),
+            &turn,
         );
     }
 
@@ -3436,9 +5034,39 @@ mod tests {
             2,
             "允许原始调用后只应有工具轮和一次最终答复轮"
         );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_shell_write_allow_once",
+                "tool": "shell_exec",
+                "surface": "shell_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow_once",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_written",
+            }),
+            &turn,
+        );
     }
 
-    fn record_unified_permission_matrix_row(row: serde_json::Value) {
+    fn record_unified_permission_matrix_row(mut row: serde_json::Value) {
+        let fixture_id = format!(
+            "turn-service-api:{}:{}:{}:{}",
+            row["surface"].as_str().unwrap_or("unknown"),
+            row["tool"].as_str().unwrap_or("unknown"),
+            row["access_profile"].as_str().unwrap_or("unknown"),
+            row["case"].as_str().unwrap_or("unknown"),
+        );
+        row["fixture_id"] = serde_json::Value::String(fixture_id);
+        row["schema_version"] = serde_json::Value::String("magi.permission.fixture.v1".to_string());
+        row["terminal_source"] = row
+            .get("terminal_source")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("canonical_turn_coordinator".to_string()));
         const REQUIRED_STRING_FIELDS: &[&str] = &[
             "case",
             "tool",
@@ -3476,6 +5104,19 @@ mod tests {
                 .is_some(),
             "permission matrix row must contain numeric provider_requests: {row}"
         );
+        for field in ["request_id", "turn_id", "execution_profile"] {
+            assert!(
+                row.get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "Turn permission matrix row must contain {field}: {row}"
+            );
+        }
+        assert_eq!(
+            row["execution_profile"].as_str(),
+            Some("task"),
+            "tool permission matrix rows must come from a task-profile Turn: {row}"
+        );
         static ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
         let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
         let mut rows = rows
@@ -3496,12 +5137,57 @@ mod tests {
                 .cmp(&right["tool"].as_str())
                 .then_with(|| left["case"].as_str().cmp(&right["case"].as_str()))
         });
+        let evidence_path = std::env::var_os("MAGI_API_PERMISSION_MATRIX_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/magi-api-permission-matrix.json"));
         fs::write(
-            "/tmp/magi-api-permission-matrix.json",
+            evidence_path,
             serde_json::to_vec_pretty(&*rows)
                 .expect("unified permission matrix rows should serialize"),
         )
         .expect("unified permission matrix evidence should write");
+    }
+
+    fn record_turn_permission_matrix_row(mut row: serde_json::Value, turn: &CanonicalTurn) {
+        let user_message = turn
+            .items
+            .iter()
+            .find(|item| item.kind == CanonicalTurnItemKind::UserMessage);
+        let metadata_value = |key: &str, snake_key: &str| {
+            turn.metadata
+                .get(key)
+                .or_else(|| turn.metadata.get(snake_key))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    user_message.and_then(|item| {
+                        item.metadata
+                            .get(key)
+                            .or_else(|| item.metadata.get(snake_key))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                })
+        };
+        let request_id = metadata_value("requestId", "request_id")
+            .filter(|value| !value.trim().is_empty())
+            .expect("permission matrix Turn must carry its canonical request identity");
+        let execution_profile = metadata_value("executionProfile", "execution_profile")
+            .filter(|value| !value.trim().is_empty())
+            .expect("permission matrix Turn must carry its canonical execution profile");
+
+        for (field, expected) in [
+            ("request_id", request_id),
+            ("turn_id", turn.turn_id.as_str()),
+            ("execution_profile", execution_profile),
+        ] {
+            if let Some(actual) = row.get(field).and_then(serde_json::Value::as_str) {
+                assert_eq!(
+                    actual, expected,
+                    "permission matrix {field} must match canonical Turn"
+                );
+            }
+            row[field] = serde_json::Value::String(expected.to_string());
+        }
+        record_unified_permission_matrix_row(row);
     }
 
     fn record_process_approval_matrix_row(
@@ -3513,12 +5199,14 @@ mod tests {
         provider_requests: usize,
         turn_status: &str,
         task_status: &str,
+        turn_id: Option<&str>,
+        request_id: Option<&str>,
     ) {
         static ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
         let rows = ROWS.get_or_init(|| Mutex::new(Vec::new()));
         let mut rows = rows.lock().expect("process matrix rows lock should hold");
         rows.retain(|row| row["case"] != case_name);
-        let row = serde_json::json!({
+        let mut row = serde_json::json!({
             "case": case_name,
             "tool": "shell_exec",
             "surface": "background_process",
@@ -3531,11 +5219,20 @@ mod tests {
             "turn_status": turn_status,
             "task_status": task_status,
             "side_effect": side_effect,
+            "execution_profile": "task",
         });
+        if let Some(turn_id) = turn_id {
+            row["turn_id"] = serde_json::Value::String(turn_id.to_string());
+        }
+        if let Some(request_id) = request_id {
+            row["request_id"] = serde_json::Value::String(request_id.to_string());
+        }
         rows.push(row.clone());
         rows.sort_by(|left, right| left["case"].as_str().cmp(&right["case"].as_str()));
         record_unified_permission_matrix_row(row);
-        let path = PathBuf::from("/tmp/magi-api-process-approval-matrix.json");
+        let path = std::env::var_os("MAGI_API_PROCESS_APPROVAL_MATRIX_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/magi-api-process-approval-matrix.json"));
         fs::write(
             path,
             serde_json::to_vec_pretty(&*rows).expect("process matrix rows should serialize"),
@@ -3707,6 +5404,8 @@ mod tests {
                 magi_core::TaskStatus::Killed => "killed",
                 _ => "unexpected",
             },
+            Some(&turn_id),
+            Some(&format!("harness-process-approval-{case_name}-request")),
         );
         let _ = fs::remove_dir_all(workspace_root);
     }
@@ -3842,20 +5541,294 @@ mod tests {
                 .count(),
             1
         );
-        record_unified_permission_matrix_row(serde_json::json!({
-            "case": "background_process_duplicate",
-            "tool": "shell_exec",
-            "surface": "background_process",
-            "access_profile": "Restricted",
-            "scope": "workspace_internal",
-            "lifecycle": "duplicate_pending",
-            "approval_requested": true,
-            "approval_resolved": true,
-            "provider_requests": non_classifier_provider_request_count(&harness),
-            "turn_status": "completed",
-            "task_status": "completed",
-            "side_effect": "background_process_started_once",
-        }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "background_process_duplicate",
+                "tool": "shell_exec",
+                "surface": "background_process",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "duplicate_pending",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "background_process_started_once",
+                "request_id": "harness-process-approval-duplicate-request",
+                "turn_id": first_turn_id,
+                "execution_profile": "task",
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_background_shell_allow_for_turn_does_not_cross_turn_or_session() {
+        let harness = MagiTurnHarness::new_task("后台进程 allow_for_turn 隔离");
+        let workspace_root =
+            tempfile::tempdir().expect("process cross-scope workspace should create");
+        let workspace_id =
+            magi_core::WorkspaceId::new("harness-process-approval-cross-scope-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("process cross-scope workspace should register");
+        let session_id = SessionId::new("harness-process-approval-cross-scope-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "后台进程 allow_for_turn 隔离会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("process cross-scope session should create");
+
+        let first_requests_before = non_classifier_provider_request_count(&harness);
+        let first_target = workspace_root.path().join("process-cross-turn-first.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf first > {}", first_target.display()),
+                "background": true,
+            })
+            .to_string(),
+            "后台进程第一轮完成",
+        );
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：调用 shell_exec 第一轮启动后台进程并授予本 Turn 权限",
+                "harness-process-cross-scope-request-1",
+                "harness-process-cross-scope-user-1",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("后台进程第一轮应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("后台进程第一轮应有 Turn");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .expect("后台进程第一轮应有 root task");
+        let first_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &first_pending.approval_id,
+            "allow_for_turn",
+        )
+        .await;
+        let first_turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let first_task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(first_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(first_task.status, magi_core::TaskStatus::Completed);
+        let first_deadline = Instant::now() + Duration::from_secs(2);
+        while !first_target.exists() && Instant::now() < first_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&first_target).expect("第一轮后台进程文件应存在"),
+            "first"
+        );
+        let first_provider_requests =
+            non_classifier_provider_request_count(&harness) - first_requests_before;
+        assert_eq!(first_provider_requests, 2);
+        record_process_approval_matrix_row(
+            "background_process_allow_for_turn_initial_turn",
+            "allow_for_turn",
+            "first_background_process_started_file_written",
+            true,
+            true,
+            first_provider_requests,
+            "completed",
+            "completed",
+            Some(&first_turn_id),
+            Some("harness-process-cross-scope-request-1"),
+        );
+
+        let second_requests_before = non_classifier_provider_request_count(&harness);
+        let second_target = workspace_root.path().join("process-cross-turn-second.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf second > {}", second_target.display()),
+                "background": true,
+            })
+            .to_string(),
+            "后台进程第二轮完成",
+        );
+        let second = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：调用 shell_exec 第二轮启动后台进程，必须重新审批",
+                "harness-process-cross-scope-request-2",
+                "harness-process-cross-scope-user-2",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("后台进程第二轮应被接纳");
+        let second_turn_id = second.turn_id.clone().expect("后台进程第二轮应有 Turn");
+        let second_task_id = second
+            .root_task_id
+            .clone()
+            .expect("后台进程第二轮应有 root task");
+        let second_pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_ne!(
+            first_pending.approval_id, second_pending.approval_id,
+            "后台进程 allow_for_turn 不得跨 Turn 复用"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &second_pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let second_turn = harness
+            .wait_for_terminal(&session_id, &second_turn_id)
+            .await;
+        let second_task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(second_task_id))
+            .await;
+        assert_eq!(second_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(second_task.status, magi_core::TaskStatus::Completed);
+        let second_deadline = Instant::now() + Duration::from_secs(2);
+        while !second_target.exists() && Instant::now() < second_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&second_target).expect("第二轮后台进程文件应存在"),
+            "second"
+        );
+        let second_provider_requests =
+            non_classifier_provider_request_count(&harness) - second_requests_before;
+        assert_eq!(second_provider_requests, 2);
+        record_process_approval_matrix_row(
+            "background_process_reapproval_after_turn_grant",
+            "fresh_allow_once_after_turn_grant",
+            "second_background_process_started_after_new_approval",
+            true,
+            true,
+            second_provider_requests,
+            "completed",
+            "completed",
+            Some(&second_turn_id),
+            Some("harness-process-cross-scope-request-2"),
+        );
+
+        let third_requests_before = non_classifier_provider_request_count(&harness);
+        let other_session_id = SessionId::new("harness-process-approval-cross-scope-other-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                other_session_id.clone(),
+                "后台进程 allow_for_turn 新 Session",
+                Some(workspace_id.to_string()),
+            )
+            .expect("process cross-scope other session should create");
+        let third_target = workspace_root.path().join("process-cross-session.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf third > {}", third_target.display()),
+                "background": true,
+            })
+            .to_string(),
+            "后台进程新 Session 完成",
+        );
+        let third = harness
+            .submit_workspace_task_with_access_profile(
+                &other_session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：调用 shell_exec 新 Session 启动后台进程，必须独立审批",
+                "harness-process-cross-scope-request-3",
+                "harness-process-cross-scope-user-3",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("后台进程新 Session 应被接纳");
+        let third_turn_id = third.turn_id.clone().expect("后台进程新 Session 应有 Turn");
+        let third_task_id = third
+            .root_task_id
+            .clone()
+            .expect("后台进程新 Session 应有 root task");
+        let third_pending = wait_for_pending_tool_approval(&harness, &other_session_id).await;
+        assert_ne!(
+            second_pending.approval_id, third_pending.approval_id,
+            "后台进程 allow_for_turn 不得跨 Session 复用"
+        );
+        resolve_tool_approval_via_http(
+            &harness,
+            &other_session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &third_pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let third_turn = harness
+            .wait_for_terminal(&other_session_id, &third_turn_id)
+            .await;
+        let third_task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(third_task_id))
+            .await;
+        assert_eq!(third_turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(third_task.status, magi_core::TaskStatus::Completed);
+        let third_deadline = Instant::now() + Duration::from_secs(2);
+        while !third_target.exists() && Instant::now() < third_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&third_target).expect("跨 Session 后台进程文件应存在"),
+            "third"
+        );
+        let third_provider_requests =
+            non_classifier_provider_request_count(&harness) - third_requests_before;
+        assert_eq!(third_provider_requests, 2);
+        record_process_approval_matrix_row(
+            "background_process_reapproval_in_new_session",
+            "fresh_allow_once_after_session_change",
+            "third_background_process_started_after_new_approval",
+            true,
+            true,
+            third_provider_requests,
+            "completed",
+            "completed",
+            Some(&third_turn_id),
+            Some("harness-process-cross-scope-request-3"),
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            2
+        );
+        assert_eq!(
+            harness
+                .events_for(&other_session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 6);
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -3891,6 +5864,51 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn current_git_head(workspace_root: &Path) -> String {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("Git HEAD 查询应启动");
+        assert!(
+            output.status.success(),
+            "Git HEAD 查询失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn git_worktree_paths(workspace_root: &Path) -> Vec<PathBuf> {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("Git worktree 查询应启动");
+        assert!(
+            output.status.success(),
+            "Git worktree 查询失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    fn git_worktree_count(workspace_root: &Path) -> usize {
+        git_worktree_paths(workspace_root).len()
+    }
+
+    fn same_git_path(left: &Path, right: &Path) -> bool {
+        match (fs::canonicalize(left), fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left == right,
+        }
+    }
+
     fn git_branch_exists(workspace_root: &Path, branch: &str) -> bool {
         let output = magi_process::std_command("git")
             .arg("-C")
@@ -3906,7 +5924,1766 @@ mod tests {
         !String::from_utf8_lossy(&output.stdout).trim().is_empty()
     }
 
+    fn remote_git_branch_exists(remote_root: &Path, branch: &str) -> bool {
+        let reference = format!("refs/heads/{branch}");
+        magi_process::std_command("git")
+            .args([
+                "--git-dir",
+                remote_root.to_string_lossy().as_ref(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+            ])
+            .arg(reference)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn prepare_git_push_approval_case(
+        label: &str,
+        title: &str,
+    ) -> (
+        MagiTurnHarness,
+        magi_core::WorkspaceId,
+        PathBuf,
+        SessionId,
+        tempfile::TempDir,
+    ) {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(label, title);
+        let remote_root = tempfile::tempdir().expect("Git push bare remote should create");
+        git_fixture_command(remote_root.path(), &["init", "--bare"]);
+        let remote_path = remote_root.path().to_string_lossy().to_string();
+        git_fixture_command(
+            &workspace_root,
+            &["remote", "add", "origin", remote_path.as_str()],
+        );
+        (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            remote_root,
+        )
+    }
+
+    fn prepare_git_pull_approval_case(
+        label: &str,
+        title: &str,
+    ) -> (
+        MagiTurnHarness,
+        magi_core::WorkspaceId,
+        PathBuf,
+        SessionId,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        String,
+    ) {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(label, title);
+        let remote_root = tempfile::tempdir().expect("Git pull bare remote should create");
+        git_fixture_command(remote_root.path(), &["init", "--bare"]);
+        let remote_path = remote_root.path().to_string_lossy().to_string();
+        git_fixture_command(
+            &workspace_root,
+            &["remote", "add", "origin", remote_path.as_str()],
+        );
+        git_fixture_command(
+            &workspace_root,
+            &["push", "--set-upstream", "origin", "main"],
+        );
+        git_fixture_command(
+            remote_root.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        let initial_head = current_git_head(&workspace_root);
+
+        let peer_parent = tempfile::tempdir().expect("Git pull peer parent should create");
+        let peer_root = peer_parent.path().join("peer");
+        let peer_path = peer_root.to_string_lossy().to_string();
+        git_fixture_command(
+            peer_parent.path(),
+            &[
+                "clone",
+                "--branch",
+                "main",
+                remote_path.as_str(),
+                peer_path.as_str(),
+            ],
+        );
+        git_fixture_command(&peer_root, &["config", "user.name", "Magi Pull Peer"]);
+        git_fixture_command(
+            &peer_root,
+            &["config", "user.email", "magi-pull-peer@example.test"],
+        );
+        fs::write(peer_root.join("pulled.txt"), "from remote pull\n")
+            .expect("Git pull remote fixture should write");
+        git_fixture_command(&peer_root, &["add", "pulled.txt"]);
+        git_fixture_command(&peer_root, &["commit", "-m", "remote pull update"]);
+        git_fixture_command(&peer_root, &["push", "origin", "main"]);
+
+        (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            remote_root,
+            peer_parent,
+            initial_head,
+        )
+    }
+
+    fn prepare_git_merge_approval_case(
+        label: &str,
+        title: &str,
+    ) -> (
+        MagiTurnHarness,
+        magi_core::WorkspaceId,
+        PathBuf,
+        SessionId,
+        String,
+    ) {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(label, title);
+        git_fixture_command(&workspace_root, &["switch", "approval-target"]);
+        fs::write(workspace_root.join("merged.txt"), "from merge\n")
+            .expect("Git merge fixture should write");
+        git_fixture_command(&workspace_root, &["add", "merged.txt"]);
+        git_fixture_command(&workspace_root, &["commit", "-m", "merge update"]);
+        git_fixture_command(&workspace_root, &["switch", "main"]);
+        let initial_head = current_git_head(&workspace_root);
+        (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            initial_head,
+        )
+    }
+
+    async fn run_restricted_git_push_case(case_name: &'static str, decision: &'static str) {
+        let title = format!("Git 推送审批验收-{case_name}");
+        let (harness, workspace_id, workspace_root, session_id, remote_root) =
+            prepare_git_push_approval_case(case_name, &title);
+        harness.provider.set_tool_then_completed(
+            "git_push",
+            serde_json::json!({
+                "remote": "origin",
+                "branch": "main",
+                "setUpstream": true,
+            })
+            .to_string(),
+            format!("Git 推送审批 {case_name} 已收口"),
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &format!("调用 git_push 推送 main 分支，等待审批后完成 {case_name} 验收"),
+                &format!("harness-git-push-{case_name}-request"),
+                &format!("harness-git-push-{case_name}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 推送审批请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 推送应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 推送应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_push");
+        match decision {
+            "allow_once" | "deny" => {
+                resolve_tool_approval_via_http(
+                    &harness,
+                    &session_id,
+                    &workspace_id,
+                    &workspace_root,
+                    &pending.approval_id,
+                    decision,
+                )
+                .await;
+            }
+            "cancel" => {
+                harness
+                    .cancel_with_workspace(&session_id, Some(&workspace_id))
+                    .await
+                    .expect("取消 Git 推送审批应成功");
+            }
+            "expiry" => {
+                assert_eq!(
+                    harness
+                        .state
+                        .turn_coordinator()
+                        .tool_approvals()
+                        .expire_stale(
+                            UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)
+                        ),
+                    1,
+                    "测试必须显式推进 Git 推送审批时钟"
+                );
+            }
+            other => panic!("未知 Git 推送审批决定: {other}"),
+        }
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        let allowed = decision == "allow_once";
+        assert_eq!(
+            turn.status,
+            if allowed {
+                CanonicalTurnStatus::Completed
+            } else if decision == "cancel" {
+                CanonicalTurnStatus::Cancelled
+            } else {
+                CanonicalTurnStatus::Failed
+            }
+        );
+        assert_eq!(
+            task.status,
+            if allowed {
+                magi_core::TaskStatus::Completed
+            } else if decision == "cancel" {
+                magi_core::TaskStatus::Killed
+            } else {
+                magi_core::TaskStatus::Failed
+            }
+        );
+        assert_eq!(
+            remote_git_branch_exists(remote_root.path(), "main"),
+            allowed,
+            "Git 推送审批结果必须与 bare remote 的真实 ref 副作用一致"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            if allowed { 2 } else { 1 }
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            if matches!(decision, "allow_once" | "deny") {
+                1
+            } else {
+                0
+            }
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("git_push_{case_name}"),
+                "tool": "git_push",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": decision,
+                "approval_requested": true,
+                "approval_resolved": matches!(decision, "allow_once" | "deny"),
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                "task_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "killed"
+                } else {
+                    "failed"
+                },
+                "side_effect": if allowed { "remote_branch_pushed" } else { "remote_unchanged" },
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_push_allow_once_updates_real_remote() {
+        run_restricted_git_push_case("allow_once", "allow_once").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_push_denial_preserves_remote() {
+        run_restricted_git_push_case("deny", "deny").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_push_cancel_preserves_remote() {
+        run_restricted_git_push_case("cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_push_expiry_preserves_remote() {
+        run_restricted_git_push_case("expiry", "expiry").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_push_duplicate_replays_pending_approval() {
+        let title = "Git 推送重复审批回放验收";
+        let (harness, workspace_id, workspace_root, session_id, remote_root) =
+            prepare_git_push_approval_case("duplicate", title);
+        harness.provider.set_tool_then_completed(
+            "git_push",
+            serde_json::json!({
+                "remote": "origin",
+                "branch": "main",
+                "setUpstream": true,
+            })
+            .to_string(),
+            "Git 推送重复审批请求最终完成",
+        );
+        let request_id = "harness-git-push-duplicate-request";
+        let user_message_id = "harness-git-push-duplicate-user";
+        let prompt = "调用 git_push 推送 main 分支，等待审批后汇总重复请求结果";
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 推送重复请求首次应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首次 Git 推送应有 Turn");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .expect("首次 Git 推送应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 推送重复请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert!(remote_git_branch_exists(remote_root.path(), "main"));
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_push_duplicate_pending",
+                "tool": "git_push",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "duplicate_pending",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "remote_branch_pushed_once",
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    async fn run_restricted_git_pull_case(case_name: &'static str, decision: &'static str) {
+        let title = format!("Git 拉取审批验收-{case_name}");
+        let (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            _remote_root,
+            _peer_parent,
+            initial_head,
+        ) = prepare_git_pull_approval_case(case_name, &title);
+        harness.provider.set_tool_then_completed(
+            "git_pull",
+            serde_json::json!({
+                "remote": "origin",
+                "branch": "main",
+                "ffOnly": true,
+            })
+            .to_string(),
+            format!("Git 拉取审批 {case_name} 已收口"),
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &format!("调用 git_pull 拉取 origin/main，等待审批后完成 {case_name} 验收"),
+                &format!("harness-git-pull-{case_name}-request"),
+                &format!("harness-git-pull-{case_name}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 拉取审批请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 拉取应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 拉取应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_pull");
+        match decision {
+            "allow_once" | "deny" => {
+                resolve_tool_approval_via_http(
+                    &harness,
+                    &session_id,
+                    &workspace_id,
+                    &workspace_root,
+                    &pending.approval_id,
+                    decision,
+                )
+                .await;
+            }
+            "cancel" => {
+                harness
+                    .cancel_with_workspace(&session_id, Some(&workspace_id))
+                    .await
+                    .expect("取消 Git 拉取审批应成功");
+            }
+            "expiry" => {
+                assert_eq!(
+                    harness
+                        .state
+                        .turn_coordinator()
+                        .tool_approvals()
+                        .expire_stale(
+                            UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)
+                        ),
+                    1,
+                    "测试必须显式推进 Git 拉取审批时钟"
+                );
+            }
+            other => panic!("未知 Git 拉取审批决定: {other}"),
+        }
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        let allowed = decision == "allow_once";
+        assert_eq!(
+            turn.status,
+            if allowed {
+                CanonicalTurnStatus::Completed
+            } else if decision == "cancel" {
+                CanonicalTurnStatus::Cancelled
+            } else {
+                CanonicalTurnStatus::Failed
+            }
+        );
+        assert_eq!(
+            task.status,
+            if allowed {
+                magi_core::TaskStatus::Completed
+            } else if decision == "cancel" {
+                magi_core::TaskStatus::Killed
+            } else {
+                magi_core::TaskStatus::Failed
+            }
+        );
+        assert_eq!(
+            current_git_head(&workspace_root) != initial_head,
+            allowed,
+            "Git 拉取审批结果必须与本地 fast-forward 的真实副作用一致"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("pulled.txt")).is_ok(),
+            allowed,
+            "Git 拉取审批结果必须与工作区文件副作用一致"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            if allowed { 2 } else { 1 }
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            if matches!(decision, "allow_once" | "deny") {
+                1
+            } else {
+                0
+            }
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("git_pull_{case_name}"),
+                "tool": "git_pull",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": decision,
+                "approval_requested": true,
+                "approval_resolved": matches!(decision, "allow_once" | "deny"),
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                "task_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "killed"
+                } else {
+                    "failed"
+                },
+                "side_effect": if allowed {
+                    "workspace_fast_forward_applied"
+                } else {
+                    "workspace_unchanged"
+                },
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_pull_allow_once_updates_workspace_from_real_remote() {
+        run_restricted_git_pull_case("allow_once", "allow_once").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_pull_denial_preserves_workspace() {
+        run_restricted_git_pull_case("deny", "deny").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_pull_cancel_preserves_workspace() {
+        run_restricted_git_pull_case("cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_pull_expiry_preserves_workspace() {
+        run_restricted_git_pull_case("expiry", "expiry").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_pull_duplicate_replays_pending_approval() {
+        let title = "Git 拉取重复审批回放验收";
+        let (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            _remote_root,
+            _peer_parent,
+            initial_head,
+        ) = prepare_git_pull_approval_case("duplicate", title);
+        harness.provider.set_tool_then_completed(
+            "git_pull",
+            serde_json::json!({
+                "remote": "origin",
+                "branch": "main",
+                "ffOnly": true,
+            })
+            .to_string(),
+            "Git 拉取重复审批请求最终完成",
+        );
+        let request_id = "harness-git-pull-duplicate-request";
+        let user_message_id = "harness-git-pull-duplicate-user";
+        let prompt = "调用 git_pull 拉取 origin/main，等待审批后汇总重复请求结果";
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 拉取重复请求首次应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首次 Git 拉取应有 Turn");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .expect("首次 Git 拉取应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 拉取重复请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_ne!(current_git_head(&workspace_root), initial_head);
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("pulled.txt"))
+                .expect("Git 拉取重复放行后文件应存在"),
+            "from remote pull\n"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_pull_duplicate_pending",
+                "tool": "git_pull",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "duplicate_pending",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "workspace_fast_forward_applied_once",
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    async fn run_restricted_git_merge_case(case_name: &'static str, decision: &'static str) {
+        let title = format!("Git 合并审批验收-{case_name}");
+        let (harness, workspace_id, workspace_root, session_id, initial_head) =
+            prepare_git_merge_approval_case(case_name, &title);
+        harness.provider.set_tool_then_completed(
+            "git_merge",
+            serde_json::json!({
+                "target": "approval-target",
+                "ffOnly": true,
+                "confirm": true,
+            })
+            .to_string(),
+            format!("Git 合并审批 {case_name} 已收口"),
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &format!(
+                    "先预览再调用 git_merge 合并 approval-target，等待审批后完成 {case_name} 验收"
+                ),
+                &format!("harness-git-merge-{case_name}-request"),
+                &format!("harness-git-merge-{case_name}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 合并审批请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 合并应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 合并应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_merge");
+        match decision {
+            "allow_once" | "deny" => {
+                resolve_tool_approval_via_http(
+                    &harness,
+                    &session_id,
+                    &workspace_id,
+                    &workspace_root,
+                    &pending.approval_id,
+                    decision,
+                )
+                .await;
+            }
+            "cancel" => {
+                harness
+                    .cancel_with_workspace(&session_id, Some(&workspace_id))
+                    .await
+                    .expect("取消 Git 合并审批应成功");
+            }
+            "expiry" => {
+                assert_eq!(
+                    harness
+                        .state
+                        .turn_coordinator()
+                        .tool_approvals()
+                        .expire_stale(
+                            UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)
+                        ),
+                    1,
+                    "测试必须显式推进 Git 合并审批时钟"
+                );
+            }
+            other => panic!("未知 Git 合并审批决定: {other}"),
+        }
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        let allowed = decision == "allow_once";
+        assert_eq!(
+            turn.status,
+            if allowed {
+                CanonicalTurnStatus::Completed
+            } else if decision == "cancel" {
+                CanonicalTurnStatus::Cancelled
+            } else {
+                CanonicalTurnStatus::Failed
+            }
+        );
+        assert_eq!(
+            task.status,
+            if allowed {
+                magi_core::TaskStatus::Completed
+            } else if decision == "cancel" {
+                magi_core::TaskStatus::Killed
+            } else {
+                magi_core::TaskStatus::Failed
+            }
+        );
+        assert_eq!(
+            current_git_head(&workspace_root) != initial_head,
+            allowed,
+            "Git 合并审批结果必须与真实 fast-forward 副作用一致"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("merged.txt")).is_ok(),
+            allowed,
+            "Git 合并审批结果必须与工作区文件副作用一致"
+        );
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            if allowed { 2 } else { 1 }
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            if matches!(decision, "allow_once" | "deny") {
+                1
+            } else {
+                0
+            }
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("git_merge_{case_name}"),
+                "tool": "git_merge",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": decision,
+                "approval_requested": true,
+                "approval_resolved": matches!(decision, "allow_once" | "deny"),
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                "task_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "killed"
+                } else {
+                    "failed"
+                },
+                "side_effect": if allowed {
+                    "workspace_fast_forward_merge_applied"
+                } else {
+                    "workspace_unchanged"
+                },
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_merge_allow_once_updates_workspace() {
+        run_restricted_git_merge_case("allow_once", "allow_once").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_merge_denial_preserves_workspace() {
+        run_restricted_git_merge_case("deny", "deny").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_merge_cancel_preserves_workspace() {
+        run_restricted_git_merge_case("cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_merge_expiry_preserves_workspace() {
+        run_restricted_git_merge_case("expiry", "expiry").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_merge_duplicate_replays_pending_approval() {
+        let title = "Git 合并重复审批回放验收";
+        let (harness, workspace_id, workspace_root, session_id, initial_head) =
+            prepare_git_merge_approval_case("duplicate", title);
+        harness.provider.set_tool_then_completed(
+            "git_merge",
+            serde_json::json!({
+                "target": "approval-target",
+                "ffOnly": true,
+                "confirm": true,
+            })
+            .to_string(),
+            "Git 合并重复审批请求最终完成",
+        );
+        let request_id = "harness-git-merge-duplicate-request";
+        let user_message_id = "harness-git-merge-duplicate-user";
+        let prompt = "先预览再调用 git_merge 合并 approval-target，等待审批后汇总重复请求结果";
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 合并重复请求首次应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("首次 Git 合并应有 Turn");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .expect("首次 Git 合并应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 合并重复请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_ne!(current_git_head(&workspace_root), initial_head);
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("merged.txt"))
+                .expect("Git 合并重复放行后文件应存在"),
+            "from merge\n"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_merge_duplicate_pending",
+                "tool": "git_merge",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "duplicate_pending",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "workspace_fast_forward_merge_applied_once",
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    async fn run_restricted_git_worktree_create_case(
+        case_name: &'static str,
+        decision: &'static str,
+    ) {
+        let title = format!("Git worktree 创建审批验收-{case_name}");
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(case_name, &title);
+        let initial_worktree_count = git_worktree_count(&workspace_root);
+        harness.provider.set_tool_then_completed(
+            "git_worktree_create",
+            serde_json::json!({
+                "mode": "writable",
+                "branch": "approval-worktree",
+                "allocationKey": "approval-worktree",
+            })
+            .to_string(),
+            format!("Git worktree 创建审批 {case_name} 已收口"),
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &format!("调用 git_worktree_create 创建 writable worktree，等待审批后完成 {case_name} 验收"),
+                &format!("harness-git-worktree-create-{case_name}-request"),
+                &format!("harness-git-worktree-create-{case_name}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git worktree 创建审批请求应被接纳");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("Git worktree 创建应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git worktree 创建应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_worktree_create");
+        match decision {
+            "allow_once" | "deny" => {
+                resolve_tool_approval_via_http(
+                    &harness,
+                    &session_id,
+                    &workspace_id,
+                    &workspace_root,
+                    &pending.approval_id,
+                    decision,
+                )
+                .await;
+            }
+            "cancel" => {
+                harness
+                    .cancel_with_workspace(&session_id, Some(&workspace_id))
+                    .await
+                    .expect("取消 Git worktree 创建审批应成功");
+            }
+            "expiry" => {
+                assert_eq!(
+                    harness
+                        .state
+                        .turn_coordinator()
+                        .tool_approvals()
+                        .expire_stale(
+                            UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)
+                        ),
+                    1,
+                    "测试必须显式推进 Git worktree 创建审批时钟"
+                );
+            }
+            other => panic!("未知 Git worktree 创建审批决定: {other}"),
+        }
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        let allowed = decision == "allow_once";
+        assert_eq!(
+            turn.status,
+            if allowed {
+                CanonicalTurnStatus::Completed
+            } else if decision == "cancel" {
+                CanonicalTurnStatus::Cancelled
+            } else {
+                CanonicalTurnStatus::Failed
+            }
+        );
+        assert_eq!(
+            task.status,
+            if allowed {
+                magi_core::TaskStatus::Completed
+            } else if decision == "cancel" {
+                magi_core::TaskStatus::Killed
+            } else {
+                magi_core::TaskStatus::Failed
+            }
+        );
+        let worktree_paths = git_worktree_paths(&workspace_root);
+        assert_eq!(
+            worktree_paths.len() > initial_worktree_count,
+            allowed,
+            "Git worktree 审批结果必须与真实 worktree 副作用一致"
+        );
+        if allowed {
+            assert!(
+                worktree_paths
+                    .iter()
+                    .any(|path| !same_git_path(path, &workspace_root)),
+                "放行后必须出现额外的 Magi 管理 worktree"
+            );
+        }
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            if allowed { 2 } else { 1 }
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            if matches!(decision, "allow_once" | "deny") {
+                1
+            } else {
+                0
+            }
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("git_worktree_create_{case_name}"),
+                "tool": "git_worktree_create",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": decision,
+                "approval_requested": true,
+                "approval_resolved": matches!(decision, "allow_once" | "deny"),
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                "task_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "killed"
+                } else {
+                    "failed"
+                },
+                "side_effect": if allowed {
+                    "managed_worktree_created"
+                } else {
+                    "worktree_unchanged"
+                },
+            }),
+            &turn,
+        );
+        for path in git_worktree_paths(&workspace_root)
+            .into_iter()
+            .filter(|path| !same_git_path(path, &workspace_root))
+        {
+            let path_string = path.to_string_lossy().to_string();
+            git_fixture_command(
+                &workspace_root,
+                &["worktree", "remove", "--force", path_string.as_str()],
+            );
+        }
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_create_allow_once_creates_real_worktree() {
+        run_restricted_git_worktree_create_case("allow_once", "allow_once").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_create_denial_preserves_worktrees() {
+        run_restricted_git_worktree_create_case("deny", "deny").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_create_cancel_preserves_worktrees() {
+        run_restricted_git_worktree_create_case("cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_create_expiry_preserves_worktrees() {
+        run_restricted_git_worktree_create_case("expiry", "expiry").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_create_duplicate_replays_pending_approval() {
+        let title = "Git worktree 创建重复审批回放验收";
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("duplicate", title);
+        let initial_worktree_count = git_worktree_count(&workspace_root);
+        harness.provider.set_tool_then_completed(
+            "git_worktree_create",
+            serde_json::json!({
+                "mode": "writable",
+                "branch": "approval-worktree",
+                "allocationKey": "approval-worktree",
+            })
+            .to_string(),
+            "Git worktree 创建重复审批请求最终完成",
+        );
+        let request_id = "harness-git-worktree-create-duplicate-request";
+        let user_message_id = "harness-git-worktree-create-duplicate-user";
+        let prompt = "调用 git_worktree_create 创建 writable worktree，等待审批后汇总重复请求结果";
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git worktree 创建重复请求首次应被接纳");
+        let first_turn_id = first
+            .turn_id
+            .clone()
+            .expect("首次 Git worktree 创建应有 Turn");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .expect("首次 Git worktree 创建应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git worktree 创建重复请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            git_worktree_count(&workspace_root),
+            initial_worktree_count + 1,
+            "重复放行只能创建一个 worktree"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_worktree_create_duplicate_pending",
+                "tool": "git_worktree_create",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "duplicate_pending",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "managed_worktree_created_once",
+            }),
+            &turn,
+        );
+        for path in git_worktree_paths(&workspace_root)
+            .into_iter()
+            .filter(|path| !same_git_path(path, &workspace_root))
+        {
+            let path_string = path.to_string_lossy().to_string();
+            git_fixture_command(
+                &workspace_root,
+                &["worktree", "remove", "--force", path_string.as_str()],
+            );
+        }
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    fn prepare_git_worktree_remove_approval_case(
+        label: &str,
+        title: &str,
+    ) -> (
+        MagiTurnHarness,
+        magi_core::WorkspaceId,
+        PathBuf,
+        SessionId,
+        PathBuf,
+        usize,
+    ) {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(label, title);
+        let state_root = harness
+            .state
+            .runtime_persistence()
+            .and_then(RuntimeStatePersistence::state_root)
+            .expect("Git worktree remove harness should expose runtime state root");
+        let managed_root = state_root.join("worktrees").join(workspace_id.to_string());
+        fs::create_dir_all(&managed_root).expect("Git worktree remove managed root should create");
+        let remove_path = managed_root.join("approval-remove");
+        let remove_path_string = remove_path.to_string_lossy().to_string();
+        git_fixture_command(
+            &workspace_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "approval-remove",
+                remove_path_string.as_str(),
+                "HEAD",
+            ],
+        );
+        let initial_worktree_count = git_worktree_count(&workspace_root);
+        (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            remove_path,
+            initial_worktree_count,
+        )
+    }
+
+    async fn run_restricted_git_worktree_remove_case(
+        case_name: &'static str,
+        decision: &'static str,
+    ) {
+        let title = format!("Git worktree 移除审批验收-{case_name}");
+        let (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            remove_path,
+            initial_worktree_count,
+        ) = prepare_git_worktree_remove_approval_case(case_name, &title);
+        let remove_path_string = remove_path.to_string_lossy().to_string();
+        harness.provider.set_tool_then_completed(
+            "git_worktree_remove",
+            serde_json::json!({
+                "path": remove_path_string,
+                "force": false,
+            })
+            .to_string(),
+            format!("Git worktree 移除审批 {case_name} 已收口"),
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &format!(
+                    "调用 git_worktree_remove 移除管理 worktree，等待审批后完成 {case_name} 验收"
+                ),
+                &format!("harness-git-worktree-remove-{case_name}-request"),
+                &format!("harness-git-worktree-remove-{case_name}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git worktree 移除审批请求应被接纳");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("Git worktree 移除应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git worktree 移除应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_worktree_remove");
+        match decision {
+            "allow_once" | "deny" => {
+                resolve_tool_approval_via_http(
+                    &harness,
+                    &session_id,
+                    &workspace_id,
+                    &workspace_root,
+                    &pending.approval_id,
+                    decision,
+                )
+                .await;
+            }
+            "cancel" => {
+                harness
+                    .cancel_with_workspace(&session_id, Some(&workspace_id))
+                    .await
+                    .expect("取消 Git worktree 移除审批应成功");
+            }
+            "expiry" => {
+                assert_eq!(
+                    harness
+                        .state
+                        .turn_coordinator()
+                        .tool_approvals()
+                        .expire_stale(
+                            UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)
+                        ),
+                    1,
+                    "测试必须显式推进 Git worktree 移除审批时钟"
+                );
+            }
+            other => panic!("未知 Git worktree 移除审批决定: {other}"),
+        }
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        let allowed = decision == "allow_once";
+        assert_eq!(
+            turn.status,
+            if allowed {
+                CanonicalTurnStatus::Completed
+            } else if decision == "cancel" {
+                CanonicalTurnStatus::Cancelled
+            } else {
+                CanonicalTurnStatus::Failed
+            }
+        );
+        assert_eq!(
+            task.status,
+            if allowed {
+                magi_core::TaskStatus::Completed
+            } else if decision == "cancel" {
+                magi_core::TaskStatus::Killed
+            } else {
+                magi_core::TaskStatus::Failed
+            }
+        );
+        assert_eq!(
+            git_worktree_count(&workspace_root),
+            if allowed {
+                initial_worktree_count - 1
+            } else {
+                initial_worktree_count
+            },
+            "Git worktree 移除审批结果必须与真实 worktree 副作用一致"
+        );
+        assert_eq!(remove_path.exists(), !allowed);
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            if allowed { 2 } else { 1 }
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            if matches!(decision, "allow_once" | "deny") {
+                1
+            } else {
+                0
+            }
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("git_worktree_remove_{case_name}"),
+                "tool": "git_worktree_remove",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": decision,
+                "approval_requested": true,
+                "approval_resolved": matches!(decision, "allow_once" | "deny"),
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                "task_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "killed"
+                } else {
+                    "failed"
+                },
+                "side_effect": if allowed {
+                    "managed_worktree_removed"
+                } else {
+                    "worktree_unchanged"
+                },
+            }),
+            &turn,
+        );
+        if remove_path.exists() {
+            let remove_path_string = remove_path.to_string_lossy().to_string();
+            git_fixture_command(
+                &workspace_root,
+                &["worktree", "remove", "--force", remove_path_string.as_str()],
+            );
+        }
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_remove_allow_once_removes_real_worktree() {
+        run_restricted_git_worktree_remove_case("allow_once", "allow_once").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_remove_denial_preserves_worktree() {
+        run_restricted_git_worktree_remove_case("deny", "deny").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_remove_cancel_preserves_worktree() {
+        run_restricted_git_worktree_remove_case("cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_remove_expiry_preserves_worktree() {
+        run_restricted_git_worktree_remove_case("expiry", "expiry").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_worktree_remove_duplicate_replays_pending_approval() {
+        let title = "Git worktree 移除重复审批回放验收";
+        let (
+            harness,
+            workspace_id,
+            workspace_root,
+            session_id,
+            remove_path,
+            initial_worktree_count,
+        ) = prepare_git_worktree_remove_approval_case("duplicate", title);
+        let remove_path_string = remove_path.to_string_lossy().to_string();
+        harness.provider.set_tool_then_completed(
+            "git_worktree_remove",
+            serde_json::json!({
+                "path": remove_path_string,
+                "force": false,
+            })
+            .to_string(),
+            "Git worktree 移除重复审批请求最终完成",
+        );
+        let request_id = "harness-git-worktree-remove-duplicate-request";
+        let user_message_id = "harness-git-worktree-remove-duplicate-user";
+        let prompt = "调用 git_worktree_remove 移除管理 worktree，等待审批后汇总重复请求结果";
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git worktree 移除重复请求首次应被接纳");
+        let first_turn_id = first
+            .turn_id
+            .clone()
+            .expect("首次 Git worktree 移除应有 Turn");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .expect("首次 Git worktree 移除应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                prompt,
+                request_id,
+                user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git worktree 移除重复请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            git_worktree_count(&workspace_root),
+            initial_worktree_count - 1
+        );
+        assert!(!remove_path.exists());
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_worktree_remove_duplicate_pending",
+                "tool": "git_worktree_remove",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "duplicate_pending",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "managed_worktree_removed_once",
+            }),
+            &turn,
+        );
+        if remove_path.exists() {
+            let remove_path_string = remove_path.to_string_lossy().to_string();
+            git_fixture_command(
+                &workspace_root,
+                &["worktree", "remove", "--force", remove_path_string.as_str()],
+            );
+        }
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     fn record_git_approval_matrix_row(
+        turn: &CanonicalTurn,
         case_name: &str,
         lifecycle: &str,
         branch_before: &str,
@@ -3940,8 +7717,10 @@ mod tests {
         });
         rows.push(row.clone());
         rows.sort_by(|left, right| left["case"].as_str().cmp(&right["case"].as_str()));
-        record_unified_permission_matrix_row(row);
-        let path = PathBuf::from("/tmp/magi-api-git-approval-matrix.json");
+        record_turn_permission_matrix_row(row, turn);
+        let path = std::env::var_os("MAGI_API_GIT_APPROVAL_MATRIX_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/magi-api-git-approval-matrix.json"));
         fs::write(
             path,
             serde_json::to_vec_pretty(&*rows).expect("Git matrix rows should serialize"),
@@ -4032,6 +7811,7 @@ mod tests {
         }));
 
         record_git_approval_matrix_row(
+            &turn,
             "allow_once",
             "allow_once",
             "main",
@@ -4044,6 +7824,152 @@ mod tests {
             "branch_switched",
         );
 
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn full_access_profile_git_branch_switch_runs_without_approval() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("full-access-switch", "FullAccess Git 分支直接执行验收");
+        harness.provider.set_tool_then_completed(
+            "git_branch_switch",
+            serde_json::json!({"branch": "approval-target"}).to_string(),
+            "FullAccess Git 分支已切换",
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 git_branch_switch 切换到 approval-target，无需审批并汇总结果",
+                "harness-git-full-access-switch-request",
+                "harness-git-full-access-switch-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("FullAccess Git branch switch should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("FullAccess Git branch switch should have Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("FullAccess Git branch switch should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(current_git_branch(&workspace_root), "approval-target");
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested")
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_branch_switch_full_access",
+                "tool": "git_branch_switch",
+                "surface": "git_workspace",
+                "access_profile": "FullAccess",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "branch_switched",
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn full_access_profile_git_branch_create_runs_without_approval() {
+        let harness = MagiTurnHarness::new_task("完全授权 Git 创建分支");
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        let session_id = SessionId::new("harness-full-access-git-create-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "完全授权 Git 创建分支验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("FullAccess Git session should create");
+        harness.provider.set_tool_then_completed(
+            "git_branch_create",
+            serde_json::json!({
+                "branch": "full-access-created",
+                "startPoint": "main",
+                "switch": false,
+            })
+            .to_string(),
+            "完全授权 Git 分支创建完成",
+        );
+        let request_id = "harness-full-access-git-create-request";
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "执行一个任务：调用 git_branch_create 创建 full-access-created 分支",
+                request_id,
+                "harness-full-access-git-create-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("FullAccess Git request should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("FullAccess Git Turn should exist");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("FullAccess Git root task should exist");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert!(git_branch_exists(&workspace_root, "full-access-created"));
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .all(|event| event.event_type != "tool.approval.requested"),
+            "FullAccess Git mutation must not request approval"
+        );
+        record_unified_permission_matrix_row(serde_json::json!({
+            "case": "git_branch_create_full_access",
+            "tool": "git_branch_create",
+            "surface": "git_workspace",
+            "access_profile": "FullAccess",
+            "scope": "workspace_internal",
+            "lifecycle": "allow",
+            "approval_requested": false,
+            "approval_resolved": false,
+            "provider_requests": non_classifier_provider_request_count(&harness),
+            "turn_status": "completed",
+            "task_status": "completed",
+            "side_effect": "branch_created",
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "execution_profile": "task",
+        }));
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -4119,20 +8045,23 @@ mod tests {
                 .count(),
             1
         );
-        record_unified_permission_matrix_row(serde_json::json!({
-            "case": "git_branch_create_allow_once",
-            "tool": "git_branch_create",
-            "surface": "git_workspace",
-            "access_profile": "Restricted",
-            "scope": "workspace_internal",
-            "lifecycle": "allow_once",
-            "approval_requested": true,
-            "approval_resolved": true,
-            "provider_requests": non_classifier_provider_request_count(&harness),
-            "turn_status": "completed",
-            "task_status": "completed",
-            "side_effect": "branch_created",
-        }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_branch_create_allow_once",
+                "tool": "git_branch_create",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow_once",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "branch_created",
+            }),
+            &turn,
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -4208,21 +8137,304 @@ mod tests {
                 .count(),
             1
         );
-        record_unified_permission_matrix_row(serde_json::json!({
-            "case": "git_branch_create_deny",
-            "tool": "git_branch_create",
-            "surface": "git_workspace",
-            "access_profile": "Restricted",
-            "scope": "workspace_internal",
-            "lifecycle": "deny",
-            "approval_requested": true,
-            "approval_resolved": true,
-            "provider_requests": non_classifier_provider_request_count(&harness),
-            "turn_status": "failed",
-            "task_status": "failed",
-            "side_effect": "branch_unchanged",
-        }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "git_branch_create_deny",
+                "tool": "git_branch_create",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "branch_unchanged",
+            }),
+            &turn,
+        );
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    async fn run_restricted_git_branch_create_terminal_case(
+        case_name: &'static str,
+        lifecycle: &'static str,
+    ) {
+        let title = format!("Git 创建分支审批终态验收-{case_name}");
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(case_name, &title);
+        let branch = format!("approval-created-{case_name}");
+        harness.provider.set_tool_then_completed(
+            "git_branch_create",
+            serde_json::json!({
+                "branch": branch,
+                "startPoint": "main",
+                "switch": false,
+            })
+            .to_string(),
+            format!("Git 创建分支审批 {case_name} 已收口"),
+        );
+
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &format!("调用 git_branch_create 创建 {branch}，等待审批后完成 {case_name} 验收"),
+                &format!("harness-git-create-{case_name}-request"),
+                &format!("harness-git-create-{case_name}-user"),
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 创建分支终态请求应被接纳");
+        let turn_id = response.turn_id.clone().expect("Git 创建分支应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("Git 创建分支应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "git_branch_create");
+        match lifecycle {
+            "cancel" => {
+                harness
+                    .cancel_with_workspace(&session_id, Some(&workspace_id))
+                    .await
+                    .expect("取消 Git 创建分支审批应成功");
+            }
+            "expiry" => {
+                assert_eq!(
+                    harness
+                        .state
+                        .turn_coordinator()
+                        .tool_approvals()
+                        .expire_stale(
+                            UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)
+                        ),
+                    1,
+                    "测试必须显式推进 Git 创建分支审批时钟"
+                );
+            }
+            other => panic!("未知 Git 创建分支终态: {other}"),
+        }
+
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
+        assert_eq!(
+            turn.status,
+            if lifecycle == "cancel" {
+                CanonicalTurnStatus::Cancelled
+            } else {
+                CanonicalTurnStatus::Failed
+            }
+        );
+        assert!(matches!(
+            task.status,
+            magi_core::TaskStatus::Failed | magi_core::TaskStatus::Killed
+        ));
+        assert!(
+            !git_branch_exists(&workspace_root, &branch),
+            "Git 创建分支未完成审批时不得产生真实分支副作用"
+        );
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            0,
+            "取消或过期不得伪造 resolved 事件"
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("git_branch_create_{case_name}"),
+                "tool": "git_branch_create",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": lifecycle,
+                "approval_requested": true,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": if lifecycle == "cancel" { "cancelled" } else { "failed" },
+                "task_status": "failed_or_killed",
+                "side_effect": "branch_unchanged",
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_create_cancel_preserves_branch_state() {
+        run_restricted_git_branch_create_terminal_case("cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_create_expiry_preserves_branch_state() {
+        run_restricted_git_branch_create_terminal_case("expiry", "expiry").await;
+    }
+
+    async fn run_restricted_git_branch_duplicate_pending_case(
+        tool_name: &'static str,
+        case_name: &'static str,
+        branch: &'static str,
+        arguments: serde_json::Value,
+        expected_side_effect: &'static str,
+        branch_should_exist_after: bool,
+    ) {
+        let title = format!("Git {tool_name} 重复审批回放验收");
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case(case_name, &title);
+        harness.provider.set_tool_then_completed(
+            tool_name,
+            arguments.to_string(),
+            format!("Git {tool_name} 重复审批请求最终完成"),
+        );
+        let request_id = format!("harness-git-{tool_name}-{case_name}-request");
+        let user_message_id = format!("harness-git-{tool_name}-{case_name}-user");
+        let prompt = format!("调用 {tool_name} 操作 {branch}，等待审批后汇总重复请求结果");
+
+        let first = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &prompt,
+                &request_id,
+                &user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 重复审批首次请求应被接纳");
+        let first_turn_id = first.turn_id.clone().expect("Git 重复审批应有 Turn");
+        let first_task_id = first
+            .root_task_id
+            .clone()
+            .expect("Git 重复审批应有 root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, tool_name);
+
+        let replay = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                &prompt,
+                &request_id,
+                &user_message_id,
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Git 重复审批请求应回放原 Turn");
+        assert_eq!(replay.turn_id.as_deref(), Some(first_turn_id.as_str()));
+        assert_eq!(replay.root_task_id.as_deref(), Some(first_task_id.as_str()));
+        assert_eq!(
+            harness
+                .state
+                .turn_coordinator()
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .len(),
+            1,
+            "重复 Git 请求不得创建第二个 pending 审批"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1,
+            "重复 Git 请求不得重复发布审批事件"
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        let turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(first_task_id))
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            git_branch_exists(&workspace_root, branch),
+            branch_should_exist_after,
+            "重复 Git 审批放行后的真实分支副作用必须只执行一次"
+        );
+        assert_eq!(current_git_branch(&workspace_root), "main");
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .filter(|event| event.event_type == "tool.approval.resolved")
+                .count(),
+            1
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("{tool_name}_duplicate_pending"),
+                "tool": tool_name,
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "duplicate_pending",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": expected_side_effect,
+            }),
+            &turn,
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_create_duplicate_replays_pending_approval() {
+        run_restricted_git_branch_duplicate_pending_case(
+            "git_branch_create",
+            "create-duplicate",
+            "approval-created-duplicate",
+            serde_json::json!({
+                "branch": "approval-created-duplicate",
+                "startPoint": "main",
+                "switch": false,
+            }),
+            "branch_created_once",
+            true,
+        )
+        .await;
     }
 
     async fn run_restricted_git_branch_delete_case(
@@ -4263,15 +8475,39 @@ mod tests {
             .expect("Git 删除分支应有 root task");
         let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
         assert_eq!(pending.tool_name, "git_branch_delete");
-        resolve_tool_approval_via_http(
-            &harness,
-            &session_id,
-            &workspace_id,
-            &workspace_root,
-            &pending.approval_id,
-            decision,
-        )
-        .await;
+        match decision {
+            "allow_once" | "deny" => {
+                resolve_tool_approval_via_http(
+                    &harness,
+                    &session_id,
+                    &workspace_id,
+                    &workspace_root,
+                    &pending.approval_id,
+                    decision,
+                )
+                .await;
+            }
+            "cancel" => {
+                harness
+                    .cancel_with_workspace(&session_id, Some(&workspace_id))
+                    .await
+                    .expect("取消 Git 删除分支审批应成功");
+            }
+            "expiry" => {
+                assert_eq!(
+                    harness
+                        .state
+                        .turn_coordinator()
+                        .tool_approvals()
+                        .expire_stale(
+                            UtcMillis(UtcMillis::now().0 + TOOL_APPROVAL_TTL_MILLIS + 1,)
+                        ),
+                    1,
+                    "测试必须显式推进 Git 删除分支审批时钟"
+                );
+            }
+            other => panic!("未知 Git 删除分支审批决定: {other}"),
+        }
 
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         let task = harness
@@ -4282,6 +8518,8 @@ mod tests {
             turn.status,
             if allowed {
                 CanonicalTurnStatus::Completed
+            } else if decision == "cancel" {
+                CanonicalTurnStatus::Cancelled
             } else {
                 CanonicalTurnStatus::Failed
             }
@@ -4290,6 +8528,8 @@ mod tests {
             task.status,
             if allowed {
                 magi_core::TaskStatus::Completed
+            } else if decision == "cancel" {
+                magi_core::TaskStatus::Killed
             } else {
                 magi_core::TaskStatus::Failed
             }
@@ -4318,22 +8558,35 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == "tool.approval.resolved")
                 .count(),
-            1
+            if matches!(decision, "allow_once" | "deny") {
+                1
+            } else {
+                0
+            }
         );
-        record_unified_permission_matrix_row(serde_json::json!({
-            "case": format!("git_branch_delete_{case_name}"),
-            "tool": "git_branch_delete",
-            "surface": "git_workspace",
-            "access_profile": "Restricted",
-            "scope": "workspace_internal",
-            "lifecycle": decision,
-            "approval_requested": true,
-            "approval_resolved": true,
-            "provider_requests": non_classifier_provider_request_count(&harness),
-            "turn_status": if allowed { "completed" } else { "failed" },
-            "task_status": if allowed { "completed" } else { "failed" },
-            "side_effect": if allowed { "branch_deleted" } else { "branch_unchanged" },
-        }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": format!("git_branch_delete_{case_name}"),
+                "tool": "git_branch_delete",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": decision,
+                "approval_requested": true,
+                "approval_resolved": matches!(decision, "allow_once" | "deny"),
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": if allowed {
+                    "completed"
+                } else if decision == "cancel" {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                "task_status": if allowed { "completed" } else { "failed" },
+                "side_effect": if allowed { "branch_deleted" } else { "branch_unchanged" },
+            }),
+            &turn,
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -4345,6 +8598,32 @@ mod tests {
     #[tokio::test]
     async fn restricted_profile_git_branch_delete_denial_preserves_branch() {
         run_restricted_git_branch_delete_case("deny", "deny").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_delete_cancel_preserves_branch() {
+        run_restricted_git_branch_delete_case("cancel", "cancel").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_delete_expiry_preserves_branch() {
+        run_restricted_git_branch_delete_case("expiry", "expiry").await;
+    }
+
+    #[tokio::test]
+    async fn restricted_profile_git_branch_delete_duplicate_replays_pending_approval() {
+        run_restricted_git_branch_duplicate_pending_case(
+            "git_branch_delete",
+            "delete-duplicate",
+            "approval-target",
+            serde_json::json!({
+                "branch": "approval-target",
+                "force": false,
+            }),
+            "branch_deleted_once",
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4436,6 +8715,7 @@ mod tests {
             1
         );
         record_git_approval_matrix_row(
+            &turn,
             "duplicate",
             "duplicate_pending",
             "main",
@@ -4454,6 +8734,7 @@ mod tests {
     async fn restricted_profile_git_branch_switch_allow_for_turn_does_not_cross_turn() {
         let (harness, workspace_id, workspace_root, session_id) =
             prepare_git_approval_case("cross-turn", "Git 分支跨 Turn 授权隔离验收");
+        let first_provider_requests_before = non_classifier_provider_request_count(&harness);
         harness.provider.set_tool_then_completed(
             "git_branch_switch",
             serde_json::json!({"branch": "approval-target"}).to_string(),
@@ -4483,15 +8764,29 @@ mod tests {
             "allow_for_turn",
         )
         .await;
-        assert_eq!(
-            harness
-                .wait_for_terminal(&session_id, &first_turn_id)
-                .await
-                .status,
-            CanonicalTurnStatus::Completed
-        );
+        let first_turn = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        assert_eq!(first_turn.status, CanonicalTurnStatus::Completed);
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "allow_for_turn_initial_turn",
+                "tool": "git_branch_switch",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow_for_turn",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness)
+                    - first_provider_requests_before,
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "branch_switched",
+            }),
+            &first_turn,
+        );
 
+        let second_provider_requests_before = non_classifier_provider_request_count(&harness);
         harness.provider.set_tool_then_completed(
             "git_branch_switch",
             serde_json::json!({"branch": "main"}).to_string(),
@@ -4530,26 +8825,26 @@ mod tests {
             "deny",
         )
         .await;
-        assert_eq!(
-            harness
-                .wait_for_terminal(&session_id, &second_turn_id)
-                .await
-                .status,
-            CanonicalTurnStatus::Failed
-        );
+        let second_turn = harness
+            .wait_for_terminal(&session_id, &second_turn_id)
+            .await;
+        assert_eq!(second_turn.status, CanonicalTurnStatus::Failed);
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
-        assert_eq!(non_classifier_provider_request_count(&harness), 3);
+        let second_provider_requests =
+            non_classifier_provider_request_count(&harness) - second_provider_requests_before;
+        assert_eq!(second_provider_requests, 1);
         record_git_approval_matrix_row(
+            &second_turn,
             "cross_turn",
             "allow_for_turn_cross_turn",
             "main",
             &current_git_branch(&workspace_root),
             true,
             true,
-            non_classifier_provider_request_count(&harness),
-            "completed_then_failed",
-            "completed_then_failed",
-            "branch_switched_then_unchanged",
+            second_provider_requests,
+            "failed",
+            "failed",
+            "branch_unchanged",
         );
         let _ = fs::remove_dir_all(workspace_root);
     }
@@ -4558,6 +8853,7 @@ mod tests {
     async fn restricted_profile_git_branch_switch_allow_for_turn_does_not_cross_session() {
         let (harness, workspace_id, workspace_root, first_session_id) =
             prepare_git_approval_case("cross-session", "Git 分支跨 Session 授权隔离验收");
+        let first_provider_requests_before = non_classifier_provider_request_count(&harness);
         harness.provider.set_tool_then_completed(
             "git_branch_switch",
             serde_json::json!({"branch": "approval-target"}).to_string(),
@@ -4587,15 +8883,31 @@ mod tests {
             "allow_for_turn",
         )
         .await;
-        assert_eq!(
-            harness
-                .wait_for_terminal(&first_session_id, &first_turn_id)
-                .await
-                .status,
-            CanonicalTurnStatus::Completed
-        );
+        let first_turn = harness
+            .wait_for_terminal(&first_session_id, &first_turn_id)
+            .await;
+        assert_eq!(first_turn.status, CanonicalTurnStatus::Completed);
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "allow_for_turn_initial_session",
+                "tool": "git_branch_switch",
+                "surface": "git_workspace",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow_for_turn",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness)
+                    - first_provider_requests_before,
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "branch_switched",
+            }),
+            &first_turn,
+        );
 
+        let second_provider_requests_before = non_classifier_provider_request_count(&harness);
         let second_session_id = SessionId::new("harness-git-approval-cross-session-second");
         harness
             .state
@@ -4644,25 +8956,25 @@ mod tests {
             "deny",
         )
         .await;
-        assert_eq!(
-            harness
-                .wait_for_terminal(&second_session_id, &second_turn_id)
-                .await
-                .status,
-            CanonicalTurnStatus::Failed
-        );
+        let second_turn = harness
+            .wait_for_terminal(&second_session_id, &second_turn_id)
+            .await;
+        assert_eq!(second_turn.status, CanonicalTurnStatus::Failed);
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
+        let second_provider_requests =
+            non_classifier_provider_request_count(&harness) - second_provider_requests_before;
         record_git_approval_matrix_row(
+            &second_turn,
             "cross_session",
             "allow_for_turn_cross_session",
             "main",
             &current_git_branch(&workspace_root),
             true,
             true,
-            non_classifier_provider_request_count(&harness),
-            "completed_then_failed",
-            "completed_then_failed",
-            "branch_switched_then_unchanged",
+            second_provider_requests,
+            "failed",
+            "failed",
+            "branch_unchanged",
         );
         let _ = fs::remove_dir_all(workspace_root);
     }
@@ -4748,6 +9060,7 @@ mod tests {
             1
         );
         record_git_approval_matrix_row(
+            &turn,
             "deny",
             "deny",
             "main",
@@ -4824,6 +9137,7 @@ mod tests {
         );
         assert_eq!(non_classifier_provider_request_count(&harness), 1);
         record_git_approval_matrix_row(
+            &turn,
             "cancel",
             "cancel",
             "main",
@@ -4902,6 +9216,7 @@ mod tests {
         );
         assert_eq!(non_classifier_provider_request_count(&harness), 1);
         record_git_approval_matrix_row(
+            &turn,
             "expiry",
             "expiry",
             "main",
@@ -5133,6 +9448,23 @@ mod tests {
                     tool.name == "file_remove" && tool.result.is_some() && tool.error.is_none()
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_file_remove_allow_once",
+                "tool": "file_remove",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow_once",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_removed",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -5230,6 +9562,23 @@ mod tests {
                 .is_empty(),
             "审批拒绝后不得遗留 pending 请求"
         );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_shell_write_deny",
+                "tool": "shell_exec",
+                "surface": "shell_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -5325,6 +9674,23 @@ mod tests {
                 .iter()
                 .all(|event| event.event_type != "tool.approval.resolved"),
             "未作出决定的审批取消不得发布 resolved 事件"
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_shell_write_cancel",
+                "tool": "shell_exec",
+                "surface": "shell_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "cancel",
+                "approval_requested": true,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "cancelled",
+                "task_status": "killed",
+                "side_effect": "write_blocked",
+            }),
+            &turn,
         );
     }
 
@@ -5435,6 +9801,23 @@ mod tests {
             1,
             "审批过期后不得重复请求 Provider"
         );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_shell_write_expiry",
+                "tool": "shell_exec",
+                "surface": "shell_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "expiry",
+                "approval_requested": true,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "write_blocked",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -5519,6 +9902,23 @@ mod tests {
                             .is_some_and(|error| error.contains("拒绝"))
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_file_remove_deny",
+                "tool": "file_remove",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "deny",
+                "approval_requested": true,
+                "approval_resolved": true,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "file_preserved",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -5690,6 +10090,40 @@ mod tests {
             0,
             "Restricted 下工作区内 file_mkdir 应自动允许"
         );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_file-patch_internal",
+                "tool": "file_patch",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&patch_harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_patched",
+            }),
+            &patch_turn,
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_file-mkdir_internal",
+                "tool": "file_mkdir",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&mkdir_harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "directory_created",
+            }),
+            &mkdir_turn,
+        );
     }
 
     #[tokio::test]
@@ -5780,6 +10214,23 @@ mod tests {
                     tool.name == "file_write" && tool.result.is_some() && tool.error.is_none()
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_file_write_internal",
+                "tool": "file_write",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_written",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -5954,6 +10405,40 @@ mod tests {
                     tool.name == "file_move" && tool.result.is_some() && tool.error.is_none()
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_file-copy_internal",
+                "tool": "file_copy",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&copy_harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_copied",
+            }),
+            &copy_turn,
+        );
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_file-move_internal",
+                "tool": "file_move",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_internal",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&move_harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "file_moved",
+            }),
+            &move_turn,
+        );
     }
 
     #[tokio::test]
@@ -6041,6 +10526,23 @@ mod tests {
                     .as_ref()
                     .is_some_and(|tool| tool.name == "file_write" && tool.error.is_some())
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "restricted_external_file-write",
+                "tool": "file_write",
+                "surface": "file_executor",
+                "access_profile": "Restricted",
+                "scope": "workspace_external",
+                "lifecycle": "deny",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "failed",
+                "task_status": "failed",
+                "side_effect": "external_path_blocked",
+            }),
+            &turn,
+        );
     }
 
     #[tokio::test]
@@ -6264,6 +10766,144 @@ mod tests {
                     tool.name == "file_write" && tool.result.is_some() && tool.error.is_none()
                 })
         }));
+        record_turn_permission_matrix_row(
+            serde_json::json!({
+                "case": "full_access_file_write_external",
+                "tool": "file_write",
+                "surface": "file_executor",
+                "access_profile": "FullAccess",
+                "scope": "workspace_external",
+                "lifecycle": "allow",
+                "approval_requested": false,
+                "approval_resolved": false,
+                "provider_requests": non_classifier_provider_request_count(&harness),
+                "turn_status": "completed",
+                "task_status": "completed",
+                "side_effect": "external_file_written",
+            }),
+            &turn,
+        );
+    }
+
+    #[tokio::test]
+    async fn full_access_profile_executes_file_operations_outside_workspace_without_approval() {
+        let (_patch_workspace, _patch_outside, patch_target, _, _) =
+            run_full_access_external_file_tool_case(
+                "file_patch",
+                "file-patch",
+                "调用 file_patch 修改工作区之外的文件并返回结果",
+                "external_file_patched",
+                |_workspace_root, outside_root| {
+                    let target = outside_root.join("external-patch.txt");
+                    fs::write(&target, "before\n").expect("external patch fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "path": target.display().to_string(),
+                            "old_string": "before",
+                            "new_string": "after"
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(
+            fs::read_to_string(&patch_target).expect("external patch target should be readable"),
+            "after\n"
+        );
+
+        let (_mkdir_workspace, _mkdir_outside, mkdir_target, _, _) =
+            run_full_access_external_file_tool_case(
+                "file_mkdir",
+                "file-mkdir",
+                "调用 file_mkdir 创建工作区之外的目录并返回结果",
+                "external_directory_created",
+                |_workspace_root, outside_root| {
+                    let target = outside_root.join("external-mkdir").join("nested");
+                    (
+                        target.clone(),
+                        serde_json::json!({"path": target.display().to_string()}),
+                    )
+                },
+            )
+            .await;
+        assert!(
+            mkdir_target.is_dir(),
+            "完全授权 file_mkdir 应创建工作区外目录"
+        );
+
+        let (_copy_workspace, _copy_outside, copy_target, _, _) =
+            run_full_access_external_file_tool_case(
+                "file_copy",
+                "file-copy",
+                "调用 file_copy 将文件复制到工作区之外并返回结果",
+                "external_file_copied",
+                |workspace_root, outside_root| {
+                    let source = workspace_root.join("external-copy-source.txt");
+                    let target = outside_root.join("external-copy-target.txt");
+                    fs::write(&source, "copy content")
+                        .expect("external copy source fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": target.display().to_string()
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(
+            fs::read_to_string(&copy_target).expect("external copy target should be readable"),
+            "copy content"
+        );
+
+        let (_move_workspace, _move_outside, move_target, _, _) =
+            run_full_access_external_file_tool_case(
+                "file_move",
+                "file-move",
+                "调用 file_move 将文件移动到工作区之外并返回结果",
+                "external_file_moved",
+                |workspace_root, outside_root| {
+                    let source = workspace_root.join("external-move-source.txt");
+                    let target = outside_root.join("external-move-target.txt");
+                    fs::write(&source, "move content")
+                        .expect("external move source fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": target.display().to_string()
+                        }),
+                    )
+                },
+            )
+            .await;
+        assert_eq!(
+            fs::read_to_string(&move_target).expect("external move target should be readable"),
+            "move content"
+        );
+
+        let (_remove_workspace, _remove_outside, remove_target, _, _) =
+            run_full_access_external_file_tool_case(
+                "file_remove",
+                "file-remove",
+                "调用 file_remove 删除工作区之外的文件并返回结果",
+                "external_file_removed",
+                |_workspace_root, outside_root| {
+                    let target = outside_root.join("external-remove.txt");
+                    fs::write(&target, "remove me").expect("external remove fixture should write");
+                    (
+                        target.clone(),
+                        serde_json::json!({"path": target.display().to_string()}),
+                    )
+                },
+            )
+            .await;
+        assert!(
+            !remove_target.exists(),
+            "完全授权 file_remove 应删除工作区外文件"
+        );
     }
 
     #[tokio::test]
@@ -7310,6 +11950,10 @@ mod tests {
             .expect("可取消的 Turn 应先被接纳");
         let session_id = SessionId::new(response.session_id.clone());
         let turn_id = response.turn_id.clone().expect("可取消 Turn 应有 Turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("task profile 应有 root task");
         for _ in 0..100 {
             if !harness.provider.requests().is_empty() {
                 break;
@@ -7320,7 +11964,20 @@ mod tests {
             !harness.provider.requests().is_empty(),
             "取消前 Provider 必须已经进入执行"
         );
+        let provider_request_count_before_cancel = harness.provider.requests().len();
         harness.cancel(&session_id).await.expect("取消应成功");
+        assert!(
+            harness
+                .state
+                .runner_manager()
+                .is_some_and(|manager| manager.status(&root_task_id).is_none()),
+            "取消响应返回前必须等待 Runner 和 in-flight dispatch quiescent"
+        );
+        assert_eq!(
+            harness.provider.requests().len(),
+            provider_request_count_before_cancel,
+            "settlement 后不得再启动该 Turn 的 Provider 请求"
+        );
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         assert_eq!(turn.status, CanonicalTurnStatus::Cancelled);
         let terminal_events = harness
@@ -7337,6 +11994,102 @@ mod tests {
             })
             .count();
         assert_eq!(terminal_events, 1, "取消终态只能发布一次");
+    }
+
+    #[tokio::test]
+    async fn immediate_task_turn_cancel_settles_before_next_turn_is_accepted() {
+        let harness = MagiTurnHarness::new_task("取消后的请求完成");
+        harness.provider.set_hold_for_cancellation();
+        let accepted = harness
+            .submit_task(
+                "请执行一个任务：在 Runner 启动交接期间允许立即取消",
+                "harness-immediate-cancel-request",
+                "harness-immediate-cancel-user",
+            )
+            .await
+            .expect("Task Turn 应先被可靠接纳");
+        let session_id = SessionId::new(accepted.session_id.clone());
+        let first_turn_id = accepted.turn_id.clone().expect("首轮 Turn 应有身份");
+        let root_task_id = accepted
+            .root_task_id
+            .clone()
+            .expect("Task profile 应有 root task");
+
+        harness
+            .cancel(&session_id)
+            .await
+            .expect("Runner lease 交接期间的取消必须收口成功");
+
+        let cancelled = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        assert_eq!(cancelled.status, CanonicalTurnStatus::Cancelled);
+        assert!(
+            harness
+                .state
+                .runner_manager()
+                .is_some_and(|manager| manager.status(&root_task_id).is_none())
+        );
+        let task_store = harness
+            .state
+            .task_store()
+            .expect("Task harness 应有 TaskStore");
+        let root_task = task_store
+            .get_task(&magi_core::TaskId::new(root_task_id.clone()))
+            .expect("取消后的 root task 应保留历史事实");
+        assert_eq!(root_task.status, magi_core::TaskStatus::Killed);
+        assert!(
+            task_store.get_active_lease(&root_task.task_id).is_none(),
+            "取消收口后 root task 不得保留活跃 lease"
+        );
+        assert_eq!(
+            harness
+                .events_for(&session_id)
+                .into_iter()
+                .filter(|event| event.event_type == "session.turn.item")
+                .filter(|event| {
+                    event
+                        .payload
+                        .get("canonical_turn")
+                        .and_then(|turn| turn.get("turnId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(first_turn_id.as_str())
+                        && event
+                            .payload
+                            .get("canonical_turn")
+                            .and_then(|turn| turn.get("status"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("cancelled")
+                })
+                .count(),
+            1,
+            "立即取消只能发布一个 canonical 终态"
+        );
+
+        harness.provider.set_completed_response("取消后的请求完成");
+        let next = harness
+            .submit(
+                Some(&session_id),
+                "请执行一个任务：验证取消结算后同一 Session 可以启动下一轮",
+                "harness-immediate-cancel-next-request",
+                "harness-immediate-cancel-next-user",
+            )
+            .await
+            .expect("取消结算后下一 Turn 应可接纳");
+        let next_turn_id = next.turn_id.expect("下一 Turn 应有身份");
+        let completed = harness.wait_for_terminal(&session_id, &next_turn_id).await;
+        assert_eq!(completed.status, CanonicalTurnStatus::Completed);
+        assert!(completed.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.content.as_deref() == Some("取消后的请求完成")
+        }));
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session_id, &first_turn_id)
+                .expect("首轮取消事实应保留在历史")
+                .status,
+            CanonicalTurnStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -7360,6 +12113,218 @@ mod tests {
             item.kind == CanonicalTurnItemKind::AssistantText
                 && item.status == magi_session_store::CanonicalTurnItemStatus::Failed
         }));
+    }
+
+    #[tokio::test]
+    async fn workspace_task_provider_failure_settles_git_lease_before_next_turn() {
+        let harness = MagiTurnHarness::new_task("第二轮完成");
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        let session_id = SessionId::new("harness-provider-failure-lease-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Provider 失败后继续下一轮",
+                Some(workspace_id.to_string()),
+            )
+            .expect("workspace session should create");
+        harness
+            .state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("workspace Git context should initialize");
+        harness
+            .state
+            .release_session_git_execution_lease(&session_id);
+        harness.provider.set_failure("第一轮 Provider 故障");
+
+        let first = harness
+            .submit_workspace_task(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "执行第一轮任务并验证 Provider 失败收口",
+                "harness-provider-failure-lease-first",
+                "harness-provider-failure-lease-first-user",
+            )
+            .await
+            .expect("第一轮应先被接纳");
+        let first_turn_id = first.turn_id.clone().expect("第一轮应有 Turn");
+        let first_root_task_id = first.root_task_id.clone().expect("第一轮应有 root task");
+        assert_eq!(
+            harness
+                .wait_for_terminal(&session_id, &first_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Failed
+        );
+        assert_eq!(
+            harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(first_root_task_id))
+                .await
+                .status,
+            magi_core::TaskStatus::Failed
+        );
+
+        harness.provider.set_completed_response("第二轮完成");
+        let second = harness
+            .submit_workspace_task(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "执行第二轮任务并返回完成结果",
+                "harness-provider-failure-lease-second",
+                "harness-provider-failure-lease-second-user",
+            )
+            .await
+            .expect("第一轮失败后第二轮仍应能够接纳");
+        let second_turn_id = second.turn_id.clone().expect("第二轮应有 Turn");
+        let second_turn = harness
+            .wait_for_terminal(&session_id, &second_turn_id)
+            .await;
+        assert_eq!(second_turn.status, CanonicalTurnStatus::Completed);
+        assert!(second_turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.content.as_deref() == Some("第二轮完成")
+        }));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_task_provider_failure_releases_turn_slot_but_keeps_explicit_continue_chain()
+    {
+        let harness = MagiTurnHarness::new_task("继续后完成");
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        let session_id = SessionId::new("harness-provider-failure-continue-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Provider 失败后显式继续",
+                Some(workspace_id.to_string()),
+            )
+            .expect("workspace session should create");
+        harness
+            .state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("workspace Git context should initialize");
+        harness
+            .state
+            .release_session_git_execution_lease(&session_id);
+        harness.provider.set_failure("第一轮 Provider 故障");
+
+        let first = harness
+            .submit_workspace_task(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "执行第一轮任务并保留可继续的执行链",
+                "harness-provider-failure-continue-first",
+                "harness-provider-failure-continue-first-user",
+            )
+            .await
+            .expect("第一轮应先被接纳");
+        let first_turn_id = first.turn_id.clone().expect("第一轮应有 Turn");
+        let first_root_task_id = first.root_task_id.clone().expect("第一轮应有 root task");
+        assert_eq!(
+            harness
+                .wait_for_terminal(&session_id, &first_turn_id)
+                .await
+                .status,
+            CanonicalTurnStatus::Failed
+        );
+        assert_eq!(
+            harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(first_root_task_id.clone()))
+                .await
+                .status,
+            magi_core::TaskStatus::Failed
+        );
+        assert!(
+            harness
+                .state
+                .session_store
+                .active_execution_chain(&session_id)
+                .is_some(),
+            "失败 Turn 的可继续执行链必须保留"
+        );
+        let mut coordinator_released = false;
+        for _ in 0..200 {
+            if harness
+                .state
+                .turn_coordinator()
+                .current_attempt(&session_id, &first_turn_id)
+                .is_err()
+            {
+                coordinator_released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            coordinator_released,
+            "失败 Turn 终态完成后不得继续占用 Coordinator 当前槽位"
+        );
+
+        harness.provider.set_completed_response("继续后完成");
+        let response = crate::routes::build_router(harness.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/continue")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "workspaceId": workspace_id,
+                            "requestId": "harness-provider-failure-continue-next",
+                            "userMessageId": "harness-provider-failure-continue-next-user"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("continue request should build"),
+            )
+            .await
+            .expect("continue route should respond");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("continue response body should read");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "显式 Continue 应在失败 Turn 收口后被接纳: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("continue response should be JSON");
+        let continued_turn_id = payload["turnId"]
+            .as_str()
+            .expect("continue response should expose turnId")
+            .to_string();
+        let continued_turn = harness
+            .wait_for_terminal(&session_id, &continued_turn_id)
+            .await;
+        assert_eq!(continued_turn.status, CanonicalTurnStatus::Completed);
+        assert!(continued_turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::AssistantText
+                && item.content.as_deref() == Some("继续后完成")
+        }));
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session_id, &first_turn_id)
+                .expect("failed source turn should remain in history")
+                .status,
+            CanonicalTurnStatus::Failed
+        );
+
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

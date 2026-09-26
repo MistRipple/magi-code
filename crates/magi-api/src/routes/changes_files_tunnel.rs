@@ -245,7 +245,7 @@ async fn get_diff(
     State(state): State<ApiState>,
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // 没有 sessionId 时不再回退到 git diff —— 全局变更视图已不再属于本系统职责。
+    // 没有 sessionId 时不读取 git diff —— 全局变更视图已不再属于本系统职责。
     let (diff, binding, pending_changes_state, file_detail) = match query
         .session_id
         .as_deref()
@@ -990,7 +990,7 @@ fn resolve_preferred_lan_ipv4() -> String {
 
     let text = match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return fallback_udp_ip(),
+        Err(_) => return local_udp_probe_address(),
     };
 
     let mut candidates: Vec<(String, i32)> = Vec::new();
@@ -1018,7 +1018,7 @@ fn resolve_preferred_lan_ipv4() -> String {
         .into_iter()
         .next()
         .map(|(ip, _)| ip)
-        .unwrap_or_else(fallback_udp_ip)
+        .unwrap_or_else(local_udp_probe_address)
 }
 
 fn extract_ipv4_from_line(line: &str) -> Option<String> {
@@ -1093,7 +1093,7 @@ fn addr_in_172_private_range(addr: &str) -> bool {
     matches!(second_octet.parse::<u8>(), Ok(16..=31))
 }
 
-fn fallback_udp_ip() -> String {
+fn local_udp_probe_address() -> String {
     use std::net::UdpSocket;
     if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
         && socket.connect("8.8.8.8:80").is_ok()

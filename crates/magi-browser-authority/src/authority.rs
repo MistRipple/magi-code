@@ -1977,12 +1977,12 @@ fn migrate_legacy_tab_order(tabs: &mut [BrowserDurableTab], sessions: &[BrowserS
         }
     }
 
-    let mut fallback_indices = tabs
+    let mut unassigned_tab_indices = tabs
         .iter()
         .enumerate()
         .filter_map(|(index, tab)| (!ordered_tab_ids.contains(&tab.tab_id)).then_some(index))
         .collect::<Vec<_>>();
-    fallback_indices.sort_by(|left, right| {
+    unassigned_tab_indices.sort_by(|left, right| {
         let left_tab = &tabs[*left];
         let right_tab = &tabs[*right];
         left_tab
@@ -1993,7 +1993,7 @@ fn migrate_legacy_tab_order(tabs: &mut [BrowserDurableTab], sessions: &[BrowserS
             .then_with(|| left_tab.tab_id.as_str().cmp(right_tab.tab_id.as_str()))
     });
 
-    for index in fallback_indices {
+    for index in unassigned_tab_indices {
         let tab = &mut tabs[index];
         let next_order = next_order_by_session
             .entry(tab.browser_session_id.clone())

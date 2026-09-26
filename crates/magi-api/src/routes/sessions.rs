@@ -6,6 +6,7 @@ use axum::{
 };
 use magi_browser_authority::BrowserToolKind;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
+use magi_conversation_runtime::task_runner_bridge::TaskDispatcher;
 use magi_conversation_runtime::{
     CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus, ExecutionProfile,
     SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
@@ -3135,6 +3136,33 @@ fn schedule_conversation_execution(
         {
             return;
         }
+        // Coordinator 的 running 状态必须同步投影到 canonical Turn，再启动执行器。
+        // 否则首个流式 item 可能携带 running 的 item 状态，但 canonical Turn 仍是
+        // accepted/pending；Renderer 用该首帧接管本地 optimistic Turn 后，随后到达的
+        // 工具或完整快照会形成 running -> pending 的非法回退。
+        match state
+            .turn_event_sink()
+            .set_status_domain(&session_id, Some(&turn_id), "running")
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    turn_id = %turn_id,
+                    "conversation Turn 进入 running 时未找到当前 canonical Turn"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    turn_id = %turn_id,
+                    %error,
+                    "conversation Turn running 状态写回失败"
+                );
+                return;
+            }
+        }
         let failure_request = request.clone();
         let execution =
             tokio::task::spawn_blocking(move || dispatcher.execute_conversation_turn(request))
@@ -4556,6 +4584,10 @@ async fn interrupt_session_turn(
         .session_store
         .runtime_sidecar(&session_id)
         .and_then(|sidecar| sidecar.current_turn);
+    let active_root_task_id = state
+        .session_store
+        .active_execution_chain(&session_id)
+        .map(|chain| chain.root_task_id);
     let turn_id = current_turn.as_ref().map(|turn| turn.turn_id.clone());
     let coordinator_attempt = turn_id.as_deref().and_then(|turn_id| {
         state
@@ -4588,17 +4620,25 @@ async fn interrupt_session_turn(
 
     let mut cancelled_tool_process_count = 0;
     if interrupted {
+        let runner_manager = state.runner_manager();
+        let _restart_guard = if let (Some(root_task_id), Some(manager)) =
+            (active_root_task_id.as_ref(), runner_manager)
+        {
+            Some(manager.lock_for_restart(root_task_id.as_str()).await)
+        } else {
+            None
+        };
         let cancelled_item_id = state
             .turn_event_sink()
             .interrupt_turn_by_user(&session_id)
             .map_err(|error| ApiError::internal_assembly("中断 session turn 失败", error))?
             .and_then(|sidecar| sidecar.current_turn)
             .and_then(|turn| turn.items.last().map(|item| item.item_id.clone()));
-        if let Some(chain) = state.session_store.active_execution_chain(&session_id)
-            && let Some(manager) = state.runner_manager()
+        if let Some(root_task_id) = active_root_task_id.as_ref()
+            && let Some(manager) = runner_manager
         {
             manager
-                .kill_tree(chain.root_task_id.as_str())
+                .kill_tree(root_task_id.as_str())
                 .map_err(|error| ApiError::internal_assembly("中断活动任务树失败", error))?;
         }
         cancelled_tool_process_count = state
@@ -4609,22 +4649,20 @@ async fn interrupt_session_turn(
                 magi_browser_authority::BrowserLeaseEndReason::TurnStopped,
             )
             .total();
+        if let Some(root_task_id) = active_root_task_id.as_ref() {
+            if let Some(manager) = runner_manager {
+                manager.quiesce_for_restart(root_task_id.as_str()).await;
+            } else if let Some(dispatcher) = state.session_turn_dispatcher() {
+                // 轻量嵌入/测试状态可能没有 RunnerManager，但仍必须等异步
+                // spawn_blocking dispatch 退出，不能把 canonical terminal 当成 settlement。
+                dispatcher.wait_for_quiesce(root_task_id).await;
+            }
+            state.release_session_git_execution_lease(&session_id);
+        }
         for entry_id in &streaming_entry_ids {
             state
                 .session_store
                 .remove_timeline_entry(&session_id, entry_id);
-        }
-        if let Some(item_id) = cancelled_item_id.as_deref() {
-            // 聊天 UI 只接受 canonical turn 事实，interrupt 事件只做运行态通知。
-            publish_current_session_turn_item_event(
-                &state.event_bus,
-                &state.session_store,
-                &session_id,
-                &workspace_id,
-                item_id,
-                None,
-            )
-            .map_err(|error| ApiError::internal_assembly("发布中断 Turn 事实失败", error))?;
         }
         if let Some(turn_id) = turn_id.as_deref() {
             state
@@ -4645,6 +4683,19 @@ async fn interrupt_session_turn(
                     );
                 }
             }
+        }
+        if let Some(item_id) = cancelled_item_id.as_deref() {
+            // 聊天 UI 只接受 canonical turn 事实，interrupt 事件只做运行态通知。
+            // Runner/dispatch 已经 quiescent，且 Coordinator 已收口后才发布终态。
+            publish_current_session_turn_item_event(
+                &state.event_bus,
+                &state.session_store,
+                &session_id,
+                &workspace_id,
+                item_id,
+                None,
+            )
+            .map_err(|error| ApiError::internal_assembly("发布中断 Turn 事实失败", error))?;
         }
         if let Some(goal) = owned_goal_before_interrupt.as_ref() {
             if let Some(plan) = state
@@ -6999,13 +7050,13 @@ mod tests {
     }
 
     #[test]
-    fn continue_rebuilds_missing_legacy_thread_with_tool_history() {
+    fn continue_rebuilds_missing_branch_thread_with_tool_history() {
         let state = test_state();
-        let session_id = SessionId::new("session-legacy-continue-thread");
-        let mission_id = MissionId::new("mission-legacy-continue-thread");
-        let task_id = TaskId::new("task-legacy-continue-thread");
-        let worker_id = WorkerId::new("worker-legacy-continue-thread");
-        let thread_id = ThreadId::new("thread-legacy-continue-thread");
+        let session_id = SessionId::new("session-recovered-thread");
+        let mission_id = MissionId::new("mission-recovered-thread");
+        let task_id = TaskId::new("task-recovered-thread");
+        let worker_id = WorkerId::new("worker-recovered-thread");
+        let thread_id = ThreadId::new("thread-recovered-thread");
         let now = UtcMillis(4_000);
         state
             .session_store
@@ -7023,20 +7074,20 @@ mod tests {
                 session_id.clone(),
                 None,
                 TimelineEntryInput::new(
-                    "timeline-legacy-continue-thread",
+                    "timeline-recovered-thread",
                     TimelineEntryKind::UserMessage,
                     "检查项目",
                     now,
                 ),
                 ActiveExecutionTurn {
-                    turn_id: "turn-legacy-continue-thread".to_string(),
+                    turn_id: "turn-recovered-thread".to_string(),
                     turn_seq: now.0,
                     accepted_at: now,
                     status: "interrupted".to_string(),
                     completed_at: Some(UtcMillis(now.0 + 1)),
                     user_message: Some("检查项目".to_string()),
                     items: vec![ActiveExecutionTurnItem {
-                        item_id: "tool-legacy-continue-thread".to_string(),
+                        item_id: "tool-recovered-thread".to_string(),
                         item_seq: 1,
                         kind: "tool_call_result".to_string(),
                         status: "completed".to_string(),
@@ -7046,7 +7097,7 @@ mod tests {
                         task_id: Some(task_id.clone()),
                         worker_id: Some(worker_id.clone()),
                         role_id: Some("coordinator".to_string()),
-                        tool_call_id: Some("call-legacy-read".to_string()),
+                        tool_call_id: Some("call-recovered-read".to_string()),
                         tool_name: Some("file_read".to_string()),
                         tool_status: Some("completed".to_string()),
                         tool_arguments: Some(r#"{"path":"README.md"}"#.to_string()),
@@ -7085,7 +7136,7 @@ mod tests {
             session_id: session_id.clone(),
             mission_id,
             root_task_id: task_id.clone(),
-            execution_chain_ref: "chain-legacy-continue-thread".to_string(),
+            execution_chain_ref: "chain-recovered-thread".to_string(),
             workspace_id: None,
             active_branch_task_ids: vec![task_id],
             active_worker_bindings: vec![worker_id],
@@ -7093,7 +7144,7 @@ mod tests {
             recovery_ref: None,
             dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                 accepted_at: now,
-                entry_id: "timeline-legacy-continue-thread".to_string(),
+                entry_id: "timeline-recovered-thread".to_string(),
                 trimmed_text: Some("检查项目".to_string()),
                 skill_name: None,
             },
@@ -7119,7 +7170,7 @@ mod tests {
         assert_eq!(threads[0].message_history[1].role, "tool");
         assert_eq!(
             threads[0].message_history[1].tool_call_id.as_deref(),
-            Some("call-legacy-read")
+            Some("call-recovered-read")
         );
     }
 

@@ -190,8 +190,8 @@ const daemonClientSource = await readFile(
 
 assert.match(
   threadPanelSource,
-  /<ActiveAgentCenter\s*\/>/,
-  '活跃代理中心必须挂载在主对话区域，而不是输入框上方抽屉',
+  /<RuntimeStatePanel[\s\S]*?\/\>\s*<ActiveAgentCenter\s*\/\>\s*<div class="main-content">\s*<MessageList/,
+  '活跃代理中心必须在主内容容器外参与线程布局，不能覆盖首条消息或被消息滚动容器裁剪',
 );
 assert.match(
   activeAgentCenterSource,
@@ -211,6 +211,16 @@ assert.match(
   agentTabContentSource,
   /runtimeCompletedAt=\{agentRuntimeCompletedAt\}[\s\S]*runtimeDurationMs=\{agentRuntimeDurationMs\}/,
   '代理详情必须把完成时刻与总耗时传给统一消息时间线',
+);
+assert.match(
+  agentTabContentSource,
+  /uiClockState\.now/,
+  '代理详情中的运行耗时必须读取统一 UI 时钟',
+);
+assert.match(
+  agentTabContentSource,
+  /retainUiClock\(\)/,
+  '代理详情中的运行耗时必须注册统一 UI 时钟消费者',
 );
 assert.match(
   messageListSource,
@@ -271,6 +281,11 @@ assert.match(
   activeAgentCenterSource,
   /@media \(max-width:\s*768px\)[\s\S]*?\.agent-center-panel\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?bottom:\s*8px;/,
   '手机端必须使用底部抽屉而不是右上角悬浮层',
+);
+assert.match(
+  activeAgentCenterSource,
+  /\.active-agent-center\s*\{[\s\S]*?position:\s*relative;[\s\S]*?flex:\s*0 0 44px;[\s\S]*?height:\s*44px;/,
+  '活跃代理入口必须在消息列表前预留稳定布局高度',
 );
 assert.doesNotMatch(
   goalRunDrawersSource,
