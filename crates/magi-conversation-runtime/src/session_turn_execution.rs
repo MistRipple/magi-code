@@ -819,7 +819,7 @@ fn rebuild_messages_for_context_window(
     .prepare(ContextPrepareRequest {
         recovery_history: Vec::new(),
         phase: "context_limit_recovery",
-        context_window_override: Some(context_window),
+        context_window_tokens: context_window,
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
             .saturating_add(estimate_tool_definition_tokens(tools)),
         persist_checkpoint,
@@ -1093,7 +1093,7 @@ fn run_session_turn_execution_inner(
     .prepare(ContextPrepareRequest {
         recovery_history,
         phase: compaction_phase,
-        context_window_override: Some(effective_context_window),
+        context_window_tokens: effective_context_window,
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
             .saturating_add(estimate_tool_definition_tokens(tools.as_deref())),
         persist_checkpoint: vision_execution_config.is_none(),

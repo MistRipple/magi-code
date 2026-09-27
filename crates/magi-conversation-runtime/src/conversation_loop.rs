@@ -1002,7 +1002,7 @@ fn run_conversation_loop_inner(
         .prepare(ContextPrepareRequest {
             recovery_history: Vec::new(),
             phase,
-            context_window_override: Some(context_window),
+            context_window_tokens: context_window,
             additional_token_estimate,
             persist_checkpoint: vision_execution_config.is_none(),
             model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
@@ -4661,7 +4661,9 @@ mod tests {
             observed_at: Some(UtcMillis(1)),
             ..SessionRuntimeUsageObservation::default()
         };
-        assert!(thread_history_compaction_decision(&history, Some(&low_usage), None, 0).is_none());
+        assert!(
+            thread_history_compaction_decision(&history, Some(&low_usage), 256_000, 0).is_none()
+        );
 
         let high_usage = SessionRuntimeUsageObservation {
             context_window_tokens: 245_000,
@@ -4669,26 +4671,28 @@ mod tests {
             observed_at: Some(UtcMillis(2)),
             ..SessionRuntimeUsageObservation::default()
         };
-        let decision = thread_history_compaction_decision(&history, Some(&high_usage), None, 0);
+        let decision = thread_history_compaction_decision(&history, Some(&high_usage), 256_000, 0);
         assert!(decision.is_none(), "历史本身低于保留目标时无需生成无效摘要");
     }
 
     #[test]
     fn thread_history_compaction_uses_estimated_prefill_only_without_usage() {
         let normal_history = repeated_thread_history(40, 1_000);
-        assert!(thread_history_compaction_decision(&normal_history, None, None, 0).is_none());
+        assert!(thread_history_compaction_decision(&normal_history, None, 256_000, 0).is_none());
 
         let huge_history = repeated_thread_history(1_000, 1_000);
-        let decision = thread_history_compaction_decision(&huge_history, None, None, 0)
+        let decision = thread_history_compaction_decision(&huge_history, None, 256_000, 0)
             .expect("huge cold-start history should trigger estimated prefill compaction");
         match decision {
             ThreadHistoryCompactionDecision::EstimatedPrefill {
                 estimated_tokens,
+                token_limit,
                 threshold_tokens,
                 ..
             } => {
                 assert!(estimated_tokens >= threshold_tokens);
                 assert_eq!(threshold_tokens, 217_600);
+                assert_eq!(token_limit, 256_000, "估算决策必须携带真实窗口");
             }
             other => panic!("expected estimated prefill decision, got {other:?}"),
         }
@@ -4697,24 +4701,27 @@ mod tests {
     #[test]
     fn thread_history_compaction_counts_non_history_request_tokens() {
         let history = repeated_thread_history(40, 1_000);
-        assert!(thread_history_compaction_decision(&history, None, Some(20_000), 0).is_some());
+        assert!(thread_history_compaction_decision(&history, None, 20_000, 0).is_some());
         assert!(matches!(
-            thread_history_compaction_decision(&history, None, Some(20_000), 12_000),
-            Some(ThreadHistoryCompactionDecision::ContextWindowPressure { .. })
+            thread_history_compaction_decision(&history, None, 20_000, 12_000),
+            Some(ThreadHistoryCompactionDecision::EstimatedPrefill {
+                token_limit: 20_000,
+                ..
+            })
         ));
     }
 
     #[test]
     fn reported_small_context_window_uses_dynamic_history_target() {
         let history = repeated_thread_history(20, 1_000);
-        let decision = thread_history_compaction_decision(&history, None, Some(4_000), 500)
+        let decision = thread_history_compaction_decision(&history, None, 4_000, 500)
             .expect("上游报告的小窗口必须覆盖固定 8K 压缩目标");
-        let ThreadHistoryCompactionDecision::ContextWindowPressure {
+        let ThreadHistoryCompactionDecision::EstimatedPrefill {
             target_history_tokens,
             ..
         } = decision
         else {
-            panic!("small reported context should trigger pressure compaction");
+            panic!("small reported context should trigger estimated compaction");
         };
         assert_eq!(target_history_tokens, 220);
     }
@@ -4732,7 +4739,7 @@ mod tests {
         let decision = thread_history_compaction_decision(
             &huge_history,
             Some(&low_usage_after_compaction),
-            None,
+            256_000,
             0,
         )
         .expect("完整历史仍超过窗口水位时必须继续压缩，不能因上轮压缩后用量降低而反弹");
@@ -4771,7 +4778,7 @@ mod tests {
         let first = authority.prepare(ContextPrepareRequest {
             recovery_history: recovery_history.clone(),
             phase: "pre_turn",
-            context_window_override: None,
+            context_window_tokens: 256_000,
             additional_token_estimate: 0,
             persist_checkpoint: true,
             model_identity: None,
@@ -4799,7 +4806,7 @@ mod tests {
         let second = authority.prepare(ContextPrepareRequest {
             recovery_history,
             phase: "pre_turn",
-            context_window_override: None,
+            context_window_tokens: 256_000,
             additional_token_estimate: 0,
             persist_checkpoint: true,
             model_identity: None,
@@ -4840,7 +4847,7 @@ mod tests {
         let first = authority.prepare(ContextPrepareRequest {
             recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
-            context_window_override: Some(20_000),
+            context_window_tokens: 20_000,
             additional_token_estimate: 1_000,
             persist_checkpoint: true,
             model_identity: None,
@@ -4860,7 +4867,7 @@ mod tests {
         let second = authority.prepare(ContextPrepareRequest {
             recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
-            context_window_override: None,
+            context_window_tokens: 20_000,
             additional_token_estimate: 1_000,
             persist_checkpoint: true,
             model_identity: None,
@@ -4993,7 +5000,7 @@ mod tests {
         .prepare(ContextPrepareRequest {
             recovery_history: Vec::new(),
             phase: "pre_turn",
-            context_window_override: None,
+            context_window_tokens: 256_000,
             additional_token_estimate: 0,
             persist_checkpoint: true,
             model_identity: None,
@@ -5091,7 +5098,7 @@ mod tests {
         ContextPrepareRequest {
             recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
-            context_window_override: Some(COMPACTION_FAILURE_TEST_WINDOW),
+            context_window_tokens: COMPACTION_FAILURE_TEST_WINDOW,
             additional_token_estimate,
             persist_checkpoint: true,
             model_identity: None,

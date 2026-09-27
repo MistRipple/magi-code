@@ -23,8 +23,7 @@ use magi_session_store::{
 };
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
-    ContextBudgetPolicy, DEFAULT_CONTEXT_WINDOW, ModelIdentitySnapshot, UsageCallStatus,
-    UsagePhase, resolve_context_window,
+    ContextBudgetPolicy, ModelIdentitySnapshot, UsageCallStatus, UsagePhase,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -188,7 +187,9 @@ pub(crate) struct ContextPrepareRequest {
     /// 覆盖已有 transcript，避免形成第二份上下文事实源。
     pub recovery_history: Vec<ThreadChatMessage>,
     pub phase: &'static str,
-    pub context_window_override: Option<u64>,
+    /// 本次请求实际模型的上下文窗口。所有压力、阈值、保留目标和工具结果预算
+    /// 都只由它计算；调用方必须提供，不存在默认窗口兜底。
+    pub context_window_tokens: u64,
     pub additional_token_estimate: usize,
     /// 识图模型只在当前回合使用压缩后的临时视图，不能把检查点或压缩事实写回主线。
     pub persist_checkpoint: bool,
@@ -206,8 +207,10 @@ pub(crate) struct CurrentFileFact {
     pub summary: String,
 }
 
+/// 压缩决策。两种变体都基于当前请求模型的真实窗口，只区分触发依据（测量来源）。
 #[derive(Clone, Debug)]
 pub(crate) enum ThreadHistoryCompactionDecision {
+    /// provider 上报的实际用量锚点达到主动阈值。
     ContextWindowPressure {
         tokens_used: u64,
         token_limit: u64,
@@ -215,8 +218,10 @@ pub(crate) enum ThreadHistoryCompactionDecision {
         target_history_tokens: usize,
         resolved_model: Option<String>,
     },
+    /// 锚点未达阈值（或尚无锚点），但本地估算的请求量达到主动阈值。
     EstimatedPrefill {
         estimated_tokens: usize,
+        token_limit: u64,
         threshold_tokens: usize,
         target_history_tokens: usize,
     },
@@ -246,7 +251,7 @@ impl ThreadHistoryCompactionDecision {
     fn context_window_tokens(&self) -> u64 {
         match self {
             Self::ContextWindowPressure { token_limit, .. } => *token_limit,
-            Self::EstimatedPrefill { .. } => DEFAULT_CONTEXT_WINDOW.max(0) as u64,
+            Self::EstimatedPrefill { token_limit, .. } => *token_limit,
         }
     }
 
@@ -299,19 +304,14 @@ impl<'a> ContextAuthority<'a> {
     }
 
     pub(crate) fn prepare(&self, request: ContextPrepareRequest) -> PreparedThreadHistory {
-        if request.persist_checkpoint
-            && let Some(context_window) = request.context_window_override
-        {
+        let context_window = request.context_window_tokens.max(1);
+        if request.persist_checkpoint {
             self.session_store.record_thread_context_window_tokens(
                 self.thread_id,
                 context_window,
                 UtcMillis::now(),
             );
         }
-        let effective_context_window = request.context_window_override.or_else(|| {
-            self.session_store
-                .thread_context_window_tokens(self.thread_id)
-        });
         let mut transcript = self.session_store.thread_message_history(self.thread_id);
         if transcript.is_empty() && !request.recovery_history.is_empty() {
             transcript = request.recovery_history;
@@ -338,11 +338,9 @@ impl<'a> ContextAuthority<'a> {
                         || checkpoint
                             .binding_revision
                             .is_some_and(|revision| revision != identity.binding_revision)
-                }) || effective_context_window.is_some_and(|window| {
-                    checkpoint
-                        .context_window_limit_tokens
-                        .is_some_and(|checkpoint_window| checkpoint_window != window)
-                })
+                }) || checkpoint
+                    .context_window_limit_tokens
+                    .is_some_and(|checkpoint_window| checkpoint_window != context_window)
             });
         if checkpoint_binding_changed {
             if let Some(checkpoint) = previous_checkpoint.as_ref() {
@@ -377,10 +375,7 @@ impl<'a> ContextAuthority<'a> {
             history = transcript;
         }
         validate_workspace_file_facts(&mut history);
-        bound_model_visible_tool_results(
-            &mut history,
-            effective_context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW.max(1) as u64),
-        );
+        bound_model_visible_tool_results(&mut history, context_window);
         let stale_checkpoint_id = request
             .persist_checkpoint
             .then_some(previous_checkpoint.as_ref())
@@ -418,22 +413,18 @@ impl<'a> ContextAuthority<'a> {
             .filter(|observation| {
                 // 模型切换或上下文窗口配置变化会使旧 provider 锚点失效；
                 // 不能把旧模型的分子套进当前模型的压缩预算。
-                effective_context_window.is_none_or(|window| {
-                    observation
-                        .context_window_limit_tokens
-                        .is_none_or(|observed_window| observed_window == window)
-                })
+                observation
+                    .context_window_limit_tokens
+                    .is_none_or(|observed_window| observed_window == context_window)
             });
         let decision = thread_history_compaction_decision(
             &history,
             usage_observation.as_ref(),
-            effective_context_window,
+            context_window,
             request.additional_token_estimate,
         )
         .or_else(|| {
             request.mode.bypasses_threshold().then(|| {
-                let context_window =
-                    effective_context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW.max(1) as u64);
                 let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
                 let current_history_tokens = estimate_thread_history_tokens(&history);
                 ThreadHistoryCompactionDecision::ContextWindowPressure {
@@ -1092,6 +1083,7 @@ impl<'a> ContextAuthority<'a> {
             }
             ThreadHistoryCompactionDecision::EstimatedPrefill {
                 estimated_tokens,
+                token_limit,
                 threshold_tokens,
                 target_history_tokens,
             } => {
@@ -1100,10 +1092,7 @@ impl<'a> ContextAuthority<'a> {
                         "context_window_tokens".to_string(),
                         (*estimated_tokens as u64).into(),
                     );
-                    object.insert(
-                        "token_limit".to_string(),
-                        (DEFAULT_CONTEXT_WINDOW.max(0) as u64).into(),
-                    );
+                    object.insert("token_limit".to_string(), (*token_limit).into());
                     object.insert(
                         "threshold_tokens".to_string(),
                         (*threshold_tokens as u64).into(),
@@ -1505,87 +1494,52 @@ fn thread_history_fingerprint(history: &[ThreadChatMessage]) -> String {
     format!("{digest:x}")
 }
 
+/// 按当前请求模型的窗口判断是否需要主动压缩。
+///
+/// 压力取 provider 锚点（已按窗口过滤）与本地估算中的较大值：锚点反映真实用量，
+/// 估算保证压缩后新增历史或冷启动时不会因锚点偏低而漏判。
 pub(crate) fn thread_history_compaction_decision(
     history: &[ThreadChatMessage],
     usage_observation: Option<&SessionRuntimeUsageObservation>,
-    context_window_override: Option<u64>,
+    context_window: u64,
     additional_token_estimate: usize,
 ) -> Option<ThreadHistoryCompactionDecision> {
     let history_tokens = estimate_thread_history_tokens(history);
     let estimated_tokens = history_tokens.saturating_add(additional_token_estimate);
-    if let Some(context_window) = context_window_override {
-        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
-        let threshold_tokens = policy.proactive_threshold_tokens;
-        let target_history_tokens =
-            target_history_tokens_for_window(context_window, additional_token_estimate);
-        let pressure_tokens = usage_observation
-            .map(|observation| {
-                if observation.projected_request_tokens > 0 {
-                    observation.projected_request_tokens
-                } else {
-                    observation.context_window_tokens
-                }
-            })
-            .unwrap_or_default()
-            .max(estimated_tokens as u64);
-        if pressure_tokens >= threshold_tokens.max(1) && history_tokens > target_history_tokens {
-            return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
-                tokens_used: pressure_tokens,
-                token_limit: context_window,
-                threshold_tokens: threshold_tokens.max(1),
-                target_history_tokens,
-                resolved_model: usage_observation
-                    .and_then(|observation| observation.resolved_model.clone()),
-            });
-        }
-        return None;
-    }
-    if let Some(observation) = usage_observation {
-        let context_window = observation.context_window_limit_tokens.unwrap_or_else(|| {
-            resolve_context_window(observation.resolved_model.as_deref().unwrap_or("")).max(1)
-                as u64
-        });
-        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
-        let threshold_tokens = policy.proactive_threshold_tokens;
-        let target_history_tokens =
-            target_history_tokens_for_window(context_window, additional_token_estimate);
-        let observed_tokens = if observation.projected_request_tokens > 0 {
-            observation.projected_request_tokens
-        } else {
-            observation.context_window_tokens
-        };
-        if observed_tokens >= threshold_tokens && history_tokens > target_history_tokens {
-            return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
-                tokens_used: observed_tokens,
-                token_limit: context_window,
-                threshold_tokens,
-                target_history_tokens,
-                resolved_model: observation.resolved_model.clone(),
-            });
-        }
-        if estimated_tokens >= threshold_tokens as usize && history_tokens > target_history_tokens {
-            return Some(ThreadHistoryCompactionDecision::EstimatedPrefill {
-                estimated_tokens,
-                threshold_tokens: threshold_tokens as usize,
-                target_history_tokens,
-            });
-        }
-        return None;
-    }
-    let context_window = DEFAULT_CONTEXT_WINDOW.max(1) as u64;
     let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
-    let threshold_tokens = policy.proactive_threshold_tokens as usize;
-    (estimated_tokens >= threshold_tokens
-        && history_tokens
-            > target_history_tokens_for_window(context_window, additional_token_estimate))
-    .then_some(ThreadHistoryCompactionDecision::EstimatedPrefill {
-        estimated_tokens,
-        threshold_tokens,
-        target_history_tokens: target_history_tokens_for_window(
-            context_window,
-            additional_token_estimate,
-        ),
-    })
+    let threshold_tokens = policy.proactive_threshold_tokens.max(1);
+    let target_history_tokens =
+        target_history_tokens_for_window(context_window, additional_token_estimate);
+    if history_tokens <= target_history_tokens {
+        return None;
+    }
+    let observed_tokens = usage_observation
+        .map(|observation| {
+            if observation.projected_request_tokens > 0 {
+                observation.projected_request_tokens
+            } else {
+                observation.context_window_tokens
+            }
+        })
+        .unwrap_or_default();
+    if observed_tokens >= threshold_tokens {
+        return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
+            tokens_used: observed_tokens.max(estimated_tokens as u64),
+            token_limit: context_window,
+            threshold_tokens,
+            target_history_tokens,
+            resolved_model: usage_observation
+                .and_then(|observation| observation.resolved_model.clone()),
+        });
+    }
+    (estimated_tokens as u64 >= threshold_tokens).then_some(
+        ThreadHistoryCompactionDecision::EstimatedPrefill {
+            estimated_tokens,
+            token_limit: context_window,
+            threshold_tokens: threshold_tokens as usize,
+            target_history_tokens,
+        },
+    )
 }
 
 fn target_history_tokens_for_window(
