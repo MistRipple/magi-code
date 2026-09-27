@@ -60,6 +60,7 @@
     filterSlashCommands,
     resolveSlashTrigger,
     type ComposerAction,
+    type ComposerSessionCommand,
     type ComposerSkillOption,
   } from '../lib/composer-actions';
   import {
@@ -101,6 +102,7 @@
     browserAnnotations: SelectedBrowserAnnotation[];
     browserNodeSelections: MessageBrowserNodeSelection[];
     goalMode: boolean;
+    sessionCommand: ComposerSessionCommand | null;
     skill: SkillOption | null;
   }
 
@@ -151,6 +153,7 @@
 
   // 斜杠快捷引用：Goal 决定持续推进生命周期，Skill 决定本轮执行方法，两者可同时引用。
   let selectedGoalMode = $state(false);
+  let selectedSessionCommand = $state<ComposerSessionCommand | null>(null);
   let selectedSkill = $state<SkillOption | null>(null);
   let selectedContextReferences = $state<ComposerContextReference[]>([]);
   let selectedBrowserAnnotations = $state<SelectedBrowserAnnotation[]>([]);
@@ -418,11 +421,16 @@
         name: i18n.t('input.goalMode.name'),
         description: i18n.t('input.goalMode.description'),
       },
+      compact: {
+        name: i18n.t('input.compact.name'),
+        description: i18n.t('input.compact.description'),
+      },
       context: {
         name: i18n.t('input.add.context'),
         description: i18n.t('input.add.contextDescription'),
       },
     },
+    { sessionCommandsAvailable: !isDraftSession },
   ));
 
   const filteredSlashCommands = $derived.by<Array<Exclude<ComposerAction, { kind: 'resource' }>>>(() => {
@@ -430,7 +438,9 @@
     return filterSlashCommands(composerActions, slashFilter).filter((command) => (
       command.kind === 'goal'
         ? !selectedGoalMode
-        : command.id !== selectedSkill?.skillId
+        : command.kind === 'command'
+          ? command.id !== selectedSessionCommand
+          : command.id !== selectedSkill?.skillId
     ));
   });
 
@@ -461,6 +471,7 @@
     selectedBrowserAnnotations = [];
     selectedBrowserNodeSelections = [];
     selectedGoalMode = false;
+    selectedSessionCommand = null;
     selectedSkill = null;
     addMenuOpen = false;
     contextPickerOpen = false;
@@ -476,6 +487,7 @@
       || selectedBrowserAnnotations.length > 0
       || selectedBrowserNodeSelections.length > 0
       || selectedGoalMode
+      || selectedSessionCommand !== null
       || selectedSkill,
     );
   }
@@ -620,6 +632,7 @@
       browserAnnotations: selectedBrowserAnnotations.map((annotation) => ({ ...annotation })),
       browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
       goalMode: selectedGoalMode,
+      sessionCommand: selectedSessionCommand,
       skill: selectedSkill ? { ...selectedSkill } : null,
     };
   }
@@ -632,6 +645,7 @@
       && selectedBrowserAnnotations.length === 0
       && selectedBrowserNodeSelections.length === 0
       && !selectedGoalMode
+      && selectedSessionCommand === null
       && selectedSkill === null;
   }
 
@@ -644,6 +658,7 @@
     selectedBrowserAnnotations = draft.browserAnnotations.map((annotation) => ({ ...annotation }));
     selectedBrowserNodeSelections = draft.browserNodeSelections.map(cloneBrowserNodeSelection);
     selectedGoalMode = draft.goalMode;
+    selectedSessionCommand = draft.sessionCommand;
     selectedSkill = draft.skill ? { ...draft.skill } : null;
     queueMicrotask(focusEditor);
   }
@@ -660,6 +675,7 @@
       || selectedBrowserAnnotations.length > 0
       || selectedBrowserNodeSelections.length > 0
       || selectedGoalMode
+      || selectedSessionCommand !== null
       || selectedSkill !== null
       || editingTurn !== null,
     );
@@ -700,6 +716,7 @@
       bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
     }));
     selectedGoalMode = draft.goalMode;
+    selectedSessionCommand = null;
     selectedSkill = draft.skillName
       ? (availableSkills.find((skill) => skill.skillId === draft.skillName) || null)
       : null;
@@ -1038,7 +1055,15 @@
   function commitSlashCommand(command: Exclude<ComposerAction, { kind: 'resource' }>) {
     if (command.kind === 'goal') {
       selectedGoalMode = true;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+    } else if (command.kind === 'command') {
+      selectedGoalMode = false;
+      selectedSessionCommand = command.id;
+      selectedSkill = null;
     } else {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
       selectedSkill = command.skill;
     }
     if (inputTextareaEl && slashTriggerStart !== null) {
@@ -1059,6 +1084,11 @@
     queueMicrotask(focusEditor);
   }
 
+  function removeSessionCommand() {
+    selectedSessionCommand = null;
+    queueMicrotask(focusEditor);
+  }
+
   function removeSelectedSkill() {
     selectedSkill = null;
     queueMicrotask(focusEditor);
@@ -1076,7 +1106,15 @@
     }
     if (action.kind === 'goal') {
       selectedGoalMode = !selectedGoalMode;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+    } else if (action.kind === 'command') {
+      selectedGoalMode = false;
+      selectedSessionCommand = selectedSessionCommand === action.id ? null : action.id;
+      selectedSkill = null;
     } else {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
       selectedSkill = selectedSkill?.skillId === action.skill.skillId ? null : action.skill;
     }
     closeAddMenu();
@@ -1480,7 +1518,7 @@
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (
-        (!normalizedContent && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
+        (!normalizedContent && selectedSessionCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
         || sessionInputLocked
         || isInteractionBlocking
       ) return;
@@ -1529,6 +1567,7 @@
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
+        command: selectedSessionCommand,
         accessProfile: selectedAccessProfile,
         ...(isDraftSession ? { orchestratorSessionConfig } : {}),
         followUpMode: !replaceTurnId && !isDraftSession && isSending ? 'queue' : undefined,
@@ -2234,7 +2273,7 @@
     {/if}
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
-    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedGoalMode || selectedSkill}
+    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedGoalMode || selectedSessionCommand || selectedSkill}
       <div class="ia-reference-chip-row">
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
@@ -2306,6 +2345,22 @@
             </button>
           </span>
         {/if}
+        {#if selectedSessionCommand}
+          <span class="ia-reference-chip ia-reference-chip-goal" title={i18n.t('input.compact.description')}>
+            <Icon name="refresh" size={11} />
+            <span class="ia-reference-chip-label">/compact</span>
+            <span class="ia-reference-chip-desc">{i18n.t('input.compact.name')}</span>
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={removeSessionCommand}
+              title={i18n.t('input.removeCompact')}
+              aria-label={i18n.t('input.removeCompact')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/if}
         {#if selectedSkill}
           <span class="ia-skill-chip" title={selectedSkill.description}>
             <Icon name="skill" size={11} />
@@ -2341,6 +2396,8 @@
       aria-disabled={sessionInputLocked || isInteractionBlocking}
       data-placeholder={selectedGoalMode
         ? i18n.t('input.placeholderWithGoal')
+        : selectedSessionCommand
+          ? i18n.t('input.placeholderWithCompact')
         : selectedSkill
           ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
         : selectedImages.length > 0
@@ -2366,7 +2423,9 @@
               <div class="ia-slash-group-label">
                 {command.kind === 'goal'
                   ? i18n.t('input.slash.modeGroup')
-                  : i18n.t('input.slash.skillGroup')}
+                  : command.kind === 'command'
+                    ? i18n.t('input.slash.commandGroup')
+                    : i18n.t('input.slash.skillGroup')}
               </div>
             {/if}
             <button
@@ -2379,10 +2438,10 @@
               onmousedown={(e) => { e.preventDefault(); commitSlashCommand(command); }}
             >
               <span class="ia-slash-item-icon" class:goal={command.kind === 'goal'}>
-                <Icon name={command.kind === 'goal' ? 'infinity' : 'skill'} size={12} />
+                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : 'skill'} size={12} />
               </span>
               <span class="ia-slash-item-content">
-                <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.name}</span>
+                <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.kind === 'command' ? command.id : command.name}</span>
                 {#if command.description}
                   <span class="ia-slash-item-description">{command.description}</span>
                 {/if}
@@ -2434,7 +2493,9 @@
                       ? i18n.t('input.add.resourceGroup')
                       : action.kind === 'goal'
                         ? i18n.t('input.slash.modeGroup')
-                        : i18n.t('input.slash.skillGroup')}
+                        : action.kind === 'command'
+                          ? i18n.t('input.slash.commandGroup')
+                          : i18n.t('input.slash.skillGroup')}
                   </div>
                 {/if}
                 <button
@@ -2442,6 +2503,8 @@
                   class="ia-add-item"
                   class:selected={action.kind === 'goal'
                     ? selectedGoalMode
+                    : action.kind === 'command'
+                      ? selectedSessionCommand === action.id
                     : action.kind === 'skill'
                       ? selectedSkill?.skillId === action.skill.skillId
                       : false}
@@ -2452,8 +2515,10 @@
                     <Icon
                       name={action.kind === 'resource'
                         ? 'folder'
-                        : action.kind === 'goal'
+                      : action.kind === 'goal'
                           ? 'infinity'
+                          : action.kind === 'command'
+                            ? 'refresh'
                           : 'skill'}
                       size={13}
                     />

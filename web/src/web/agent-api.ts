@@ -2,6 +2,7 @@ import { getDefaultAgentBaseUrl } from '../shared/agent-shared-config';
 import { getTransport } from '../shared/transport';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import type { RoleTemplate } from '../shared/types/role-templates';
+import type { SessionTurnCommand } from '../shared/app-server-protocol.generated';
 import type {
   SettingsBootstrapPayload,
   SettingsBuiltinTool,
@@ -2047,6 +2048,7 @@ export async function submitSessionTurn(
     skillName?: string | null;
     locale?: string;
     goalMode?: boolean;
+    command?: SessionTurnCommand | null;
     images: AgentSessionTurnImagePayload[];
     contextReferences?: Array<{
       kind: 'file' | 'directory';
@@ -2081,6 +2083,7 @@ export async function submitSessionTurn(
         skillName: payload.skillName ?? null,
         locale: payload.locale ?? i18n.locale,
         goalMode: payload.goalMode === true,
+        command: payload.command ?? null,
         accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,

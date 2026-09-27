@@ -2697,7 +2697,7 @@ impl SessionStore {
         for turn in state
             .canonical_turns
             .iter()
-            .filter(|turn| turn.session_id == thread.session_id)
+            .filter(|turn| turn.session_id == thread.session_id && !turn.is_session_command())
         {
             for item in turn.items.iter().filter(|item| {
                 item.source_thread_id == *thread_id

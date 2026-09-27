@@ -3700,6 +3700,7 @@ mod tests {
             goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         });
 
         assert!(result.is_err());

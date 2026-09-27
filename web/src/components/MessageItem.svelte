@@ -362,6 +362,9 @@
       if (compactionState === 'cancelled') {
         return i18n.t('messageItem.contextCompactionCancelled');
       }
+      if (compactionState === 'deferred') {
+        return i18n.t('messageItem.contextCompactionDeferred');
+      }
       if (compactionState === 'failed') {
         return i18n.t('messageItem.contextCompactionFailed');
       }

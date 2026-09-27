@@ -22,6 +22,10 @@ await withGoldenViteServer(async (server) => {
       name: '目标模式',
       description: '创建长期目标并持续推进',
     },
+    compact: {
+      name: '压缩上下文',
+      description: '总结当前会话上下文，不生成模型回复',
+    },
     context: {
       name: '文件和文件夹',
       description: '添加本轮上下文引用',
@@ -33,6 +37,7 @@ await withGoldenViteServer(async (server) => {
     [
       ['resource', 'file-or-directory'],
       ['goal', 'goal'],
+      ['command', 'compact'],
       ['skill', 'cn-engineering-standard'],
       ['skill', 'browser-control'],
     ],
@@ -47,6 +52,11 @@ await withGoldenViteServer(async (server) => {
     composerActions.filterSlashCommands(commands, '目标').map((command) => command.id),
     ['goal'],
     'Chinese goal keywords must resolve the built-in goal command',
+  );
+  assert.deepEqual(
+    composerActions.filterSlashCommands(commands, '压缩').map((command) => command.id),
+    ['compact'],
+    'Chinese compact keywords must resolve the built-in compact command',
   );
   assert.deepEqual(
     composerActions.filterSlashCommands(commands, '工程').map((command) => command.id),

@@ -285,6 +285,10 @@
       "type": "string",
       "enum": ["read_only", "restricted", "full_access"]
     },
+    "SessionTurnCommand": {
+      "type": "string",
+      "enum": ["compact"]
+    },
     "TurnStartParams": {
       "type": "object",
       "additionalProperties": false,
@@ -298,6 +302,13 @@
         "skillName": { "type": ["string", "null"] },
         "locale": { "type": ["string", "null"] },
         "goalMode": { "type": "boolean", "default": false, "x-rust-default": true },
+        "command": {
+          "oneOf": [
+            { "$ref": "#/$defs/SessionTurnCommand" },
+            { "type": "null" }
+          ],
+          "x-rust-default": true
+        },
         "images": {
           "type": "array",
           "items": { "$ref": "#/$defs/SessionTurnImage" },

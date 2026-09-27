@@ -11,7 +11,9 @@ use crate::models::{
     SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionPlan,
     SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
-use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, Task, UtcMillis};
+use magi_core::{
+    DomainError, DomainResult, SessionId, SessionLifecycleStatus, Task, ThreadId, UtcMillis,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -112,6 +114,10 @@ pub struct SessionStore {
     sidecar_flush_lock: Arc<Mutex<()>>,
     lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
     canonical_event_writer: Arc<RwLock<Option<Arc<dyn CanonicalTurnEventWriter>>>>,
+    /// 每个 thread 连续主动压缩失败次数，仅作进程内熔断状态，不持久化。
+    ///
+    /// daemon 重启后重新允许尝试压缩；成功安装检查点即清零。
+    context_compaction_failures: Arc<Mutex<HashMap<ThreadId, u32>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -325,6 +331,7 @@ impl Default for SessionStore {
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
             canonical_event_writer: Arc::new(RwLock::new(None)),
+            context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -332,6 +339,35 @@ impl Default for SessionStore {
 impl SessionStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 当前 thread 连续主动压缩失败次数。
+    pub fn thread_context_compaction_failures(&self, thread_id: &ThreadId) -> u32 {
+        self.context_compaction_failures
+            .lock()
+            .expect("context compaction failures lock poisoned")
+            .get(thread_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// 记录一次压缩失败，返回记录后的连续失败次数。
+    pub fn record_thread_context_compaction_failure(&self, thread_id: &ThreadId) -> u32 {
+        let mut failures = self
+            .context_compaction_failures
+            .lock()
+            .expect("context compaction failures lock poisoned");
+        let count = failures.entry(thread_id.clone()).or_default();
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// 检查点成功安装后清零连续失败次数。
+    pub fn reset_thread_context_compaction_failures(&self, thread_id: &ThreadId) {
+        self.context_compaction_failures
+            .lock()
+            .expect("context compaction failures lock poisoned")
+            .remove(thread_id);
     }
 
     pub fn from_state(state: SessionStoreState) -> Self {
@@ -344,6 +380,7 @@ impl SessionStore {
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
             canonical_event_writer: Arc::new(RwLock::new(None)),
+            context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

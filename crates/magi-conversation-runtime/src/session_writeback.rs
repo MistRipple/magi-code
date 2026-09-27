@@ -122,6 +122,9 @@ pub(crate) fn upsert_context_compaction_progress_notice(
         ContextCompactionProgress::Cancelled => {
             ("cancelled", "cancelled", "info", None, None, None)
         }
+        ContextCompactionProgress::Deferred => {
+            ("completed", "deferred", "warning", None, None, None)
+        }
         ContextCompactionProgress::Failed => ("failed", "failed", "warning", None, None, None),
     };
     let mut item = session_turn_item(

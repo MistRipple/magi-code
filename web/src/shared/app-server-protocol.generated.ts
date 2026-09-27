@@ -222,6 +222,8 @@ export interface BrowserNodeSelection {
 
 export type AccessProfile = "read_only" | "restricted" | "full_access";
 
+export type SessionTurnCommand = "compact";
+
 export interface TurnStartParams {
   sessionId?: string | null;
   scope: SessionScope;
@@ -231,6 +233,7 @@ export interface TurnStartParams {
   skillName?: string | null;
   locale?: string | null;
   goalMode?: boolean;
+  command?: SessionTurnCommand | null;
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
   browserAnnotationRefs?: Array<string>;

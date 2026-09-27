@@ -5,8 +5,8 @@
 //! 等方式桥接到 `ApiError` 枚举。
 
 use crate::context_authority::{
-    ContextAuthority, ContextCompactionTerminal, ContextPrepareRequest, current_session_file_facts,
-    estimate_chat_messages_tokens, estimate_tool_definition_tokens,
+    ContextAuthority, ContextCompactionMode, ContextCompactionTerminal, ContextPrepareRequest,
+    current_session_file_facts, estimate_chat_messages_tokens, estimate_tool_definition_tokens,
 };
 #[cfg(test)]
 use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
@@ -120,6 +120,14 @@ impl SessionGoalTurnMode {
     }
 }
 
+/// 用户显式发起的会话命令。命令与普通对话共用 Turn 接纳、队列、取消和终态链路，
+/// 只替换执行器内的模型调用阶段。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionTurnCommand {
+    /// `/compact`：立即压缩主线上下文，可附带对摘要重点的补充要求。
+    CompactContext { instructions: Option<String> },
+}
+
 #[derive(Clone)]
 pub struct SessionTurnExecutionRequest {
     pub session_id: SessionId,
@@ -139,6 +147,8 @@ pub struct SessionTurnExecutionRequest {
     pub goal_turn_mode: SessionGoalTurnMode,
     pub product_locale: String,
     pub workspace_root_path: Option<String>,
+    /// 非空时本轮执行该命令，不调用主模型生成回复。
+    pub command: Option<SessionTurnCommand>,
 }
 
 pub struct SessionTurnExecutionOutput {
@@ -285,7 +295,7 @@ impl SessionTurnExecutionError {
     fn context_compaction_failed() -> Self {
         Self::new(
             SessionTurnFailureReason::ContextCompactionFailed,
-            "上下文压缩失败，本轮已停止。请检查辅助模型配置或网络后重试。",
+            "上下文压缩失败，本轮已停止。请检查压缩模型配置或网络后重试。",
         )
     }
 }
@@ -371,6 +381,7 @@ fn canonical_session_turn_history(
                         && turn.accepted_at.0 < accepted_at.0
                         && turn.status != magi_session_store::CanonicalTurnStatus::Cancelled
                         && turn.status != magi_session_store::CanonicalTurnStatus::Superseded
+                        && !turn.is_session_command()
                 })
                 .flat_map(|turn| turn.items.into_iter())
                 .filter_map(|item| {
@@ -813,7 +824,7 @@ fn rebuild_messages_for_context_window(
             .saturating_add(estimate_tool_definition_tokens(tools)),
         persist_checkpoint,
         model_identity: None,
-        force_compaction: true,
+        mode: ContextCompactionMode::Recovery,
     });
     if let Some(terminal) = prepared.terminal {
         return Err(terminal);
@@ -1034,8 +1045,18 @@ fn run_session_turn_execution_inner(
         knowledge_context_prompt.as_deref(),
         &[],
     );
+    let (compaction_phase, compaction_mode) = match request.command.as_ref() {
+        Some(SessionTurnCommand::CompactContext { instructions }) => (
+            "manual",
+            ContextCompactionMode::Manual {
+                instructions: instructions.clone(),
+            },
+        ),
+        None => ("pre_turn", ContextCompactionMode::Automatic),
+    };
+    let manual_compaction = matches!(compaction_mode, ContextCompactionMode::Manual { .. });
     let compaction_item_id =
-        new_context_compaction_item_id(&request.turn_id, &orchestrator_thread_id, "pre_turn");
+        new_context_compaction_item_id(&request.turn_id, &orchestrator_thread_id, compaction_phase);
     let compaction_writeback = ContextCompactionWritebackContext {
         event_bus,
         session_store,
@@ -1043,7 +1064,7 @@ fn run_session_turn_execution_inner(
         workspace_id: &request.workspace_id,
         thread_id: &orchestrator_thread_id,
         item_id: &compaction_item_id,
-        phase: "pre_turn",
+        phase: compaction_phase,
         persist_session_state,
         task: None,
         turn_visibility: None,
@@ -1071,7 +1092,7 @@ fn run_session_turn_execution_inner(
     .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
         recovery_history,
-        phase: "pre_turn",
+        phase: compaction_phase,
         context_window_override: Some(effective_context_window),
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
             .saturating_add(estimate_tool_definition_tokens(tools.as_deref())),
@@ -1084,7 +1105,7 @@ fn run_session_turn_execution_inner(
             resolved_context_model.clone(),
             0,
         )),
-        force_compaction: false,
+        mode: compaction_mode,
     });
     mark_turn_timing(
         "context_prepare_completed",
@@ -1109,6 +1130,11 @@ fn run_session_turn_execution_inner(
                 )
             },
         )?;
+    }
+    if manual_compaction {
+        // `/compact` 只更新上下文检查点；压缩结果由压缩通知 item 展示，
+        // 不调用主模型，也不把命令本身写入模型可见历史。
+        return Ok(SessionTurnExecutionOutput::completed(String::new()));
     }
     let mut proactive_context_compaction_completed = prepared_history.compaction.is_some();
     let mut messages =
@@ -4035,6 +4061,7 @@ mod tests {
                 goal_turn_mode: SessionGoalTurnMode::None,
                 product_locale: "zh-CN".to_string(),
                 workspace_root_path: None,
+                command: None,
             },
             prompt: "停止测试".to_string(),
             knowledge_context_prompt: None,
@@ -4181,6 +4208,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -4278,6 +4306,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let follow_up_output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
             client: &main_client,
@@ -4558,6 +4587,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -4705,6 +4735,7 @@ mod tests {
                 goal_turn_mode: SessionGoalTurnMode::None,
                 product_locale: "zh-CN".to_string(),
                 workspace_root_path: None,
+                command: None,
             },
             prompt: "完成全部计划".to_string(),
             knowledge_context_prompt: None,
@@ -4853,6 +4884,7 @@ mod tests {
                 goal_turn_mode: SessionGoalTurnMode::None,
                 product_locale: "zh-CN".to_string(),
                 workspace_root_path: None,
+                command: None,
             },
             prompt: "执行普通任务".to_string(),
             knowledge_context_prompt: None,
@@ -4962,6 +4994,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let tools = vec![ChatToolDefinition {
             kind: "function".to_string(),
@@ -5027,6 +5060,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         assert_eq!(
@@ -5059,6 +5093,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::Start,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         assert_eq!(
@@ -5100,6 +5135,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let tools = ["shell_exec", "file_write", "file_read"]
             .into_iter()
@@ -5224,6 +5260,7 @@ mod tests {
                 goal_turn_mode: SessionGoalTurnMode::None,
                 product_locale: "zh-CN".to_string(),
                 workspace_root_path: None,
+                command: None,
             },
             prompt: "继续处理".to_string(),
             knowledge_context_prompt: None,
@@ -5315,6 +5352,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -5440,6 +5478,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let tools = vec![ChatToolDefinition {
             kind: "function".to_string(),
@@ -5580,6 +5619,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -5676,6 +5716,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -5797,6 +5838,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -5910,6 +5952,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -6016,6 +6059,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
         let mut messages = vec![ChatMessage {
@@ -6154,6 +6198,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
         let mut messages = vec![ChatMessage {
@@ -6377,6 +6422,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let history = canonical_session_turn_history(&store, &request);
         let messages =
@@ -6658,6 +6704,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let history = canonical_session_turn_history(&store, &request);
@@ -6809,6 +6856,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let history = canonical_session_turn_history(&store, &request);
@@ -6863,6 +6911,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
+            command: None,
         };
 
         let history = canonical_session_turn_history(&store, &request);
@@ -6917,6 +6966,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
+            command: None,
         };
 
         let history = canonical_session_turn_history(&store, &request);
@@ -6962,6 +7012,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
+            command: None,
         };
 
         let messages = build_session_turn_messages(
@@ -7039,6 +7090,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let history = canonical_session_turn_history(&store, &request);
@@ -7093,6 +7145,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
+            command: None,
         };
 
         let history = canonical_session_turn_history(&store, &request);
@@ -7190,6 +7243,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         let mut pre_tool_stream = session_turn_item(
@@ -7359,6 +7413,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let item_id = new_context_compaction_item_id(&request.turn_id, &thread_id, "pre_turn");
         let writeback = ContextCompactionWritebackContext {
@@ -7537,6 +7592,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let client = SemanticContextCompactionModelBridgeClient {
             requests: Mutex::new(Vec::new()),
@@ -7645,6 +7701,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let client = FailingContextCompactionModelBridgeClient {
             calls: AtomicUsize::new(0),
@@ -7751,6 +7808,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
         let client = CancellingContextCompactionModelBridgeClient {
             store: Arc::clone(&store),
@@ -7845,6 +7903,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
+            command: None,
         };
 
         append_final_item(

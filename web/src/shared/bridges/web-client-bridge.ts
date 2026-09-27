@@ -21,6 +21,7 @@ import {
   type WorkspaceAgentBindingOverride,
 } from '../../web/agent-binding-context';
 import { i18n } from '../../stores/i18n.svelte';
+import type { SessionTurnCommand } from '../app-server-protocol.generated';
 import { getHostApi, getTransport, initTransport } from '../transport';
 import {
   approveAgentChange,
@@ -3875,6 +3876,7 @@ interface ExecuteTaskInput {
   requestId?: string;
   skillName?: string | null;
   goalMode?: boolean;
+  command?: SessionTurnCommand | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   followUpMode?: 'queue';
@@ -4072,7 +4074,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       }))
       .filter((selection) => selection.browserSessionId && selection.tabId && selection.surfaceId)
     : [];
-  if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
+  const command = input.command === 'compact' ? input.command : null;
+  if (!command && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
@@ -4109,7 +4112,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     id: userMessageId,
     role: 'user',
     source: 'user',
-    content: text || '',
+    // 与 daemon timeline 展示一致：命令轮次显示为 `/compact 补充要求`。
+    content: command ? [`/${command}`, normalizedText].filter(Boolean).join(' ') : text || '',
     timestamp: requestCreatedAt,
     isStreaming: false,
     isComplete: true,
@@ -4128,6 +4132,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       ...(browserAnnotationRefs.length > 0 ? { browserAnnotationRefs } : {}),
       ...(skillName ? { skillName } : {}),
       ...(input.goalMode === true ? { goalMode: true } : {}),
+      ...(command ? { sessionCommand: command } : {}),
     },
   };
   beginLocalTurnSubmission({
@@ -4153,6 +4158,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       skillName,
       locale: i18n.locale,
       goalMode: input.goalMode === true,
+      command,
       images,
       contextReferences,
       browserAnnotationRefs,
@@ -5389,6 +5395,7 @@ export function createWebClientBridge(): ClientBridge {
             || (Array.isArray(message.contextReferences) && message.contextReferences.length > 0)
             || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
             || (Array.isArray(message.browserNodeSelections) && message.browserNodeSelections.length > 0)
+            || message.command === 'compact'
           ) {
             void executeTask({
               text: typeof message.text === 'string' ? message.text : null,
@@ -5398,6 +5405,7 @@ export function createWebClientBridge(): ClientBridge {
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               goalMode: message.goalMode === true,
+              command: message.command === 'compact' ? 'compact' : null,
               accessProfile: message.accessProfile === 'read_only'
                 || message.accessProfile === 'restricted'
                 || message.accessProfile === 'full_access'

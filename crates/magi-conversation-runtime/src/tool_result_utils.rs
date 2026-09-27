@@ -11,12 +11,26 @@ pub const TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
     "安全防护要求确认该操作，授权后将继续当前调用";
 /// 模型可见的单个工具结果上限。完整结果仍由审计、UI 和恢复状态保存。
 pub const MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES: usize = 12 * 1024;
-/// 单轮模型上下文中所有历史工具结果的总预算。
+/// 模型视图中历史工具结果总预算的下限。
 ///
 /// 单条结果上限只能阻止一个大文件拖垮请求；长时间的只读探索会累积很多
 /// 小结果，仍然把每一轮请求推向上下文上限。这里把模型视图中的工具结果
 /// 做一次确定性总量收敛，完整结果继续保留在 thread/audit/UI 中。
-pub const MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES: usize = 48 * 1024;
+pub const MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES: usize = 48 * 1024;
+/// 历史工具结果最多占用上下文窗口的比例（按约 4 字节/token 换算）。
+const MODEL_VISIBLE_TOOL_HISTORY_WINDOW_PERCENT: u64 = 25;
+
+/// 按当前模型上下文窗口计算历史工具结果的总预算。
+///
+/// 预算与窗口成比例：大窗口模型保留更多近期文件与搜索结果，避免上下文尚空时
+/// 就截断旧结果导致重复读取；超出部分由上下文压缩处理，而不是固定常数。
+pub fn model_visible_tool_history_budget_bytes(context_window_tokens: u64) -> usize {
+    let proportional_tokens =
+        context_window_tokens.saturating_mul(MODEL_VISIBLE_TOOL_HISTORY_WINDOW_PERCENT) / 100;
+    usize::try_from(proportional_tokens.saturating_mul(4))
+        .unwrap_or(usize::MAX)
+        .max(MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES)
+}
 const MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES: usize = 2 * 1024;
 const MODEL_VISIBLE_TOOL_RESULT_MARKER: &str = "...[model output truncated]...";
 
@@ -428,7 +442,7 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
 ///
 /// 最近结果优先保留完整内容；较早结果降为结构化事实摘要。该函数不调用
 /// 模型、不修改持久化结果，调用方只应把返回值用于下一次模型请求的上下文视图。
-pub fn bound_model_visible_tool_history(results: &[String]) -> Vec<String> {
+pub fn bound_model_visible_tool_history(results: &[String], budget_bytes: usize) -> Vec<String> {
     if results.is_empty() {
         return Vec::new();
     }
@@ -437,12 +451,12 @@ pub fn bound_model_visible_tool_history(results: &[String]) -> Vec<String> {
         .map(|result| model_visible_tool_result(result, tool_result_execution_status(result)))
         .collect::<Vec<_>>();
     let total = visible.iter().map(String::len).sum::<usize>();
-    if total <= MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES {
+    if total <= budget_bytes {
         return visible;
     }
 
     // 至少给最近一批结果留出一半预算；它们最可能直接决定下一步动作。
-    let recent_budget = MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES / 2;
+    let recent_budget = budget_bytes / 2;
     let mut recent_start = visible.len();
     let mut recent_bytes = 0usize;
     for (index, result) in visible.iter().enumerate().rev() {
@@ -455,12 +469,9 @@ pub fn bound_model_visible_tool_history(results: &[String]) -> Vec<String> {
     }
     let old_count = recent_start;
     if old_count == 0 {
-        return vec![truncate_history_result(
-            &visible[0],
-            MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES,
-        )];
+        return vec![truncate_history_result(&visible[0], budget_bytes)];
     }
-    let old_budget = MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES.saturating_sub(recent_bytes);
+    let old_budget = budget_bytes.saturating_sub(recent_bytes);
     let per_old_budget = old_budget / old_count;
     let mut bounded = Vec::with_capacity(visible.len());
     for (index, result) in visible.into_iter().enumerate() {
@@ -693,6 +704,19 @@ mod tests {
     }
 
     #[test]
+    fn tool_history_budget_is_proportional_to_the_context_window() {
+        assert_eq!(model_visible_tool_history_budget_bytes(256_000), 256_000);
+        assert_eq!(
+            model_visible_tool_history_budget_bytes(1_000_000),
+            1_000_000
+        );
+        assert_eq!(
+            model_visible_tool_history_budget_bytes(16_000),
+            MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES
+        );
+    }
+
+    #[test]
     fn bound_model_visible_tool_history_applies_a_total_budget_and_keeps_recent_results() {
         let results = (0..80)
             .map(|index| {
@@ -707,10 +731,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let bounded = bound_model_visible_tool_history(&results);
+        let bounded =
+            bound_model_visible_tool_history(&results, MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES);
 
         assert!(
-            bounded.iter().map(String::len).sum::<usize>() <= MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES
+            bounded.iter().map(String::len).sum::<usize>() <= MODEL_VISIBLE_TOOL_HISTORY_MIN_BYTES
         );
         assert!(
             bounded

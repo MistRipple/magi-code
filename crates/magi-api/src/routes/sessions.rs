@@ -9,7 +9,7 @@ use magi_conversation_runtime::session_writeback::publish_current_session_turn_i
 use magi_conversation_runtime::task_runner_bridge::TaskDispatcher;
 use magi_conversation_runtime::{
     CoordinatorAdmission, CoordinatorCommandResult, CoordinatorTurnStatus, ExecutionProfile,
-    SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
+    SessionTurnCommand, SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
 };
 use magi_conversation_runtime::{
     PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
@@ -1189,7 +1189,8 @@ async fn submit_steer_current_turn_after_turn_commit(
 }
 
 fn session_turn_request_is_plain_text(request: &SessionTurnRequestDto) -> bool {
-    request.trimmed_text().is_some()
+    request.command.is_none()
+        && request.trimmed_text().is_some()
         && request
             .skill_name
             .as_deref()
@@ -1220,6 +1221,9 @@ fn steer_input_error(error: SessionTurnInputError) -> ApiError {
 }
 
 fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
+    if request.command.is_some() {
+        return validate_session_turn_command(request);
+    }
     if request.trimmed_text().is_none()
         && request
             .skill_name
@@ -1247,6 +1251,55 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
     Ok(())
 }
 
+/// 会话命令只能作为已有会话中的独立轮次提交；文本是命令参数。
+fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
+    if request.requested_session_id().is_none() {
+        return Err(ApiError::InvalidInput(
+            "会话命令需要明确的 sessionId".to_string(),
+        ));
+    }
+    let combined_with_other_input = request
+        .skill_name
+        .as_deref()
+        .is_some_and(|skill_name| !skill_name.trim().is_empty())
+        || request.goal_mode
+        || !request.images.is_empty()
+        || !request.context_references.is_empty()
+        || !request.browser_annotation_refs.is_empty()
+        || !request.browser_node_selections.is_empty();
+    if combined_with_other_input {
+        return Err(ApiError::InvalidInput(
+            "会话命令不能与技能、目标模式、图片或上下文引用同时提交".to_string(),
+        ));
+    }
+    if request.steer_current_turn || request.replace_turn_id().is_some() {
+        return Err(ApiError::InvalidInput(
+            "会话命令必须作为新的独立轮次提交".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 会话命令不经过意图分类，固定作为 conversation Turn 执行。
+fn session_turn_command_decision() -> SessionTurnIntentDecision {
+    SessionTurnIntentDecision {
+        route: SessionTurnRouteDto::Chat,
+        task_title: None,
+        execution_goal: None,
+        task_tier: TaskTier::ExecutionChain,
+        collaboration_mode: CollaborationMode::Auto,
+        tool_intent: None,
+        forced_tool_name: None,
+        required_tool_chain: Vec::new(),
+        completion_contract: TaskCompletionContract::default(),
+        recovery_checkpoint: None,
+        confidence: 1.0,
+        reason_code: Some("session_command".to_string()),
+        route_reason: Some("用户显式选择了会话命令。".to_string()),
+        task_evidence: Vec::new(),
+    }
+}
+
 fn decide_session_turn_with_task_planner(
     state: &ApiState,
     request: &SessionTurnRequestDto,
@@ -1268,6 +1321,9 @@ fn decide_session_turn_with_task_planner(
             "恢复异常中断会话失败",
             "当前会话的恢复正在启动，请等待本轮恢复完成",
         ));
+    }
+    if request.command.is_some() {
+        return Ok(session_turn_command_decision());
     }
     if request.replace_turn_id().is_none()
         && let Some(resume) = user_interrupted_turn_resume(state, request)
@@ -1349,6 +1405,7 @@ fn user_interrupted_turn_resume(
         .session_store
         .canonical_turns_for_session(&session_id)
         .into_iter()
+        .filter(|turn| !turn.is_session_command())
         .max_by(|left, right| {
             left.turn_seq
                 .cmp(&right.turn_seq)
@@ -2727,6 +2784,13 @@ async fn submit_conversation_session_turn(
             &context_references,
         ),
     );
+    if let Some(command) = request.command.as_ref() {
+        // 命令轮次的用户 item 只用于展示和审计，历史重建据此排除，不进入模型上下文。
+        metadata.insert(
+            magi_session_store::SESSION_COMMAND_METADATA_KEY.to_string(),
+            serde_json::to_value(command).expect("session command must serialize"),
+        );
+    }
     metadata.extend([
         (
             "route".to_string(),
@@ -2897,6 +2961,13 @@ async fn submit_conversation_session_turn(
             .as_ref()
             .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
             .map(|path| path.to_string_lossy().into_owned()),
+        command: request.command.as_ref().map(|command| match command {
+            magi_app_server_protocol::SessionTurnCommand::Compact => {
+                SessionTurnCommand::CompactContext {
+                    instructions: request.trimmed_text(),
+                }
+            }
+        }),
     };
     schedule_conversation_execution(state.clone(), execution_request, attempt, trace);
     let session_summary = if created_session {
@@ -6506,7 +6577,76 @@ mod tests {
             steer_current_turn: false,
             expected_turn_id: None,
             replace_turn_id: None,
+            command: None,
         }
+    }
+
+    fn compact_command_request(text: Option<&str>) -> SessionTurnRequestDto {
+        let mut request = session_turn_request(text.unwrap_or_default());
+        request.text = text.map(str::to_string);
+        request.session_id = Some("session-compact-command".to_string());
+        request.command = Some(magi_app_server_protocol::SessionTurnCommand::Compact);
+        request
+    }
+
+    #[test]
+    fn compact_command_is_a_standalone_conversation_turn() {
+        let state = test_state();
+        let request = compact_command_request(Some("保留接口约束"));
+        validate_session_turn_input(&request).expect("带补充要求的 /compact 应被接受");
+        validate_session_turn_input(&compact_command_request(None))
+            .expect("不带补充要求的 /compact 也应被接受");
+
+        // 命令不经过意图分类，即使参数文本像执行请求也固定走 conversation。
+        let mut execution_like = compact_command_request(Some("运行测试并修改代码"));
+        execution_like.session_id = Some("session-compact-command".to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &execution_like)
+            .expect("命令应得到固定决策");
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert_eq!(decision.reason_code.as_deref(), Some("session_command"));
+
+        assert_eq!(
+            request.timeline_message(request.trimmed_text().as_deref()),
+            "/compact 保留接口约束"
+        );
+        let bare = compact_command_request(None);
+        assert_eq!(
+            bare.timeline_message(bare.trimmed_text().as_deref()),
+            "/compact"
+        );
+        assert!(!session_turn_request_is_plain_text(&request));
+        assert_ne!(
+            request.request_fingerprint().expect("fingerprint"),
+            {
+                let mut plain = request.clone();
+                plain.command = None;
+                plain.request_fingerprint().expect("fingerprint")
+            },
+            "命令必须进入请求指纹，避免与同文本普通消息幂等冲突"
+        );
+    }
+
+    #[test]
+    fn compact_command_rejects_combined_or_sessionless_input() {
+        let mut without_session = compact_command_request(None);
+        without_session.session_id = None;
+        assert!(validate_session_turn_input(&without_session).is_err());
+
+        let mut with_goal = compact_command_request(None);
+        with_goal.goal_mode = true;
+        assert!(validate_session_turn_input(&with_goal).is_err());
+
+        let mut with_skill = compact_command_request(None);
+        with_skill.skill_name = Some("skill".to_string());
+        assert!(validate_session_turn_input(&with_skill).is_err());
+
+        let mut as_steer = compact_command_request(None);
+        as_steer.steer_current_turn = true;
+        assert!(validate_session_turn_input(&as_steer).is_err());
+
+        let mut as_edit = compact_command_request(None);
+        as_edit.replace_turn_id = Some("turn-1".to_string());
+        assert!(validate_session_turn_input(&as_edit).is_err());
     }
 
     fn queued_regular_turn(

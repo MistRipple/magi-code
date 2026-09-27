@@ -25,8 +25,8 @@ pub use generated::{
     ProtocolVersion, RequestId, ServerCapabilities, ServerNotification, ServerRequest,
     ServerResponse, SessionContextReference, SessionContextReferenceKind, SessionListParams,
     SessionListResult, SessionReadParams, SessionReadResult, SessionScope, SessionSummary,
-    SessionTurnImage, TurnQueueInfo, TurnStartKind, TurnStartParams, TurnStartResult,
-    TurnStartRoute,
+    SessionTurnCommand, SessionTurnImage, TurnQueueInfo, TurnStartKind, TurnStartParams,
+    TurnStartResult, TurnStartRoute,
 };
 
 pub use generated::{

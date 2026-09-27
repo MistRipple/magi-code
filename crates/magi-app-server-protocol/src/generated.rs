@@ -492,6 +492,13 @@ pub enum AccessProfile {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionTurnCommand {
+    #[serde(rename = "compact")]
+    Compact,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TurnStartParams {
     #[serde(default)]
@@ -520,6 +527,9 @@ pub struct TurnStartParams {
     #[serde(default)]
     #[serde(rename = "goalMode")]
     pub goal_mode: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<SessionTurnCommand>,
     #[serde(default)]
     pub images: Vec<SessionTurnImage>,
     #[serde(default)]

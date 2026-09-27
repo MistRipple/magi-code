@@ -61,7 +61,7 @@ pub use session_turn_coordinator::{
     SessionTurnInputCommitError, SessionTurnInputError, TurnAdmission, TurnAttempt,
     request_fingerprint,
 };
-pub use session_turn_execution::SessionTurnExecutionRequest;
+pub use session_turn_execution::{SessionTurnCommand, SessionTurnExecutionRequest};
 pub use session_writeback::CanonicalTurnEventSink;
 pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,

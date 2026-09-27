@@ -462,6 +462,7 @@ fn rebuild_thread_history_from_canonical(
     let mut history = Vec::new();
     for item in turns
         .iter()
+        .filter(|turn| !turn.is_session_command())
         .flat_map(|turn| turn.items.iter())
         .filter(|item| &item.source_thread_id == thread_id)
     {
@@ -1208,4 +1209,64 @@ where
     git_execution_lease.commit();
     recovery_attempt.commit();
     Ok((accepted, prepared_input, prepared_turn))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebuild_thread_history_from_canonical;
+    use magi_core::ThreadId;
+    use magi_session_store::{CanonicalTurn, SESSION_COMMAND_METADATA_KEY};
+
+    fn canonical_turn(
+        turn_id: &str,
+        turn_seq: u64,
+        user_text: &str,
+        command: bool,
+    ) -> CanonicalTurn {
+        let mut user_metadata = serde_json::Map::new();
+        if command {
+            user_metadata.insert(
+                SESSION_COMMAND_METADATA_KEY.to_string(),
+                serde_json::json!("compact"),
+            );
+        }
+        serde_json::from_value(serde_json::json!({
+            "sessionId": "session-command-history",
+            "turnId": turn_id,
+            "turnSeq": turn_seq,
+            "acceptedAt": turn_seq,
+            "status": "completed",
+            "items": [{
+                "sessionId": "session-command-history",
+                "turnId": turn_id,
+                "turnSeq": turn_seq,
+                "itemId": format!("{turn_id}-user"),
+                "itemSeq": 1,
+                "kind": "user_message",
+                "createdAt": turn_seq,
+                "status": "completed",
+                "updatedAt": turn_seq,
+                "content": user_text,
+                "sourceThreadId": "thread-orchestrator",
+                "metadata": user_metadata,
+            }],
+        }))
+        .expect("canonical turn fixture should deserialize")
+    }
+
+    #[test]
+    fn session_command_turns_never_enter_rebuilt_model_history() {
+        let turns = vec![
+            canonical_turn("turn-plain", 1, "实现登录接口", false),
+            canonical_turn("turn-compact", 2, "/compact 保留接口约束", true),
+        ];
+        assert!(turns[1].is_session_command());
+        let history =
+            rebuild_thread_history_from_canonical(&turns, &ThreadId::new("thread-orchestrator"));
+        let contents = history
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, vec!["实现登录接口"]);
+    }
 }

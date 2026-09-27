@@ -4983,6 +4983,7 @@ mod tests {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                command: None,
             },
             request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),

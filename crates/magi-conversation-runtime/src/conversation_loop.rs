@@ -1,6 +1,6 @@
 use crate::context_authority::{
-    ContextAuthority, ContextCompactionTerminal, ContextPrepareRequest, current_session_file_facts,
-    estimate_chat_messages_tokens, estimate_tool_definition_tokens,
+    ContextAuthority, ContextCompactionMode, ContextCompactionTerminal, ContextPrepareRequest,
+    current_session_file_facts, estimate_chat_messages_tokens, estimate_tool_definition_tokens,
 };
 #[cfg(test)]
 use crate::context_authority::{
@@ -28,8 +28,8 @@ use crate::tool_call_validation::{
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
     DeterministicToolFailureTracker, bound_model_visible_tool_history, infer_tool_call_status,
-    model_visible_tool_result, non_retryable_tool_failure, summarize_tool_result,
-    tool_execution_status_label, turn_item_status_for_tool_result,
+    model_visible_tool_history_budget_bytes, model_visible_tool_result, non_retryable_tool_failure,
+    summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
     BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput, activate_skill_tool_definitions,
@@ -970,7 +970,7 @@ fn run_conversation_loop_inner(
     let prepare_task_history = |phase: &'static str,
                                 context_window: u64,
                                 additional_token_estimate: usize,
-                                force_compaction: bool| {
+                                mode: ContextCompactionMode| {
         let compaction_item_id = new_context_compaction_item_id(task_id.as_str(), thread_id, phase);
         let compaction_writeback = ContextCompactionWritebackContext {
             event_bus,
@@ -1013,7 +1013,7 @@ fn run_conversation_loop_inner(
                 resolved_context_model.clone(),
                 0,
             )),
-            force_compaction,
+            mode,
         });
         if let Some(compaction) = prepared.compaction.as_ref()
             && let Err(error) =
@@ -1035,7 +1035,7 @@ fn run_conversation_loop_inner(
         "pre_turn",
         effective_context_window,
         additional_token_estimate,
-        false,
+        ContextCompactionMode::Automatic,
     );
     if let Some(terminal) = initial_prepared_history.terminal {
         return (
@@ -1096,7 +1096,7 @@ fn run_conversation_loop_inner(
             "interrupted_tool_normalization",
             effective_context_window,
             additional_token_estimate,
-            false,
+            ContextCompactionMode::Automatic,
         );
         if let Some(terminal) = normalized_history.terminal {
             return (
@@ -1262,7 +1262,7 @@ fn run_conversation_loop_inner(
                                 context_window: u64,
                                 round_tools: Option<&[ChatToolDefinition]>,
                                 active_skill_name: Option<&str>,
-                                force_compaction: bool| {
+                                mode: ContextCompactionMode| {
         let mut context_base_messages = static_context_messages.clone();
         context_base_messages.push(system_prompt_fragment_message(
             PromptFragmentKind::CurrentAccessProfile,
@@ -1292,7 +1292,7 @@ fn run_conversation_loop_inner(
             context_window,
             estimate_chat_messages_tokens(&context_base_messages)
                 .saturating_add(estimate_tool_definition_tokens(round_tools)),
-            force_compaction,
+            mode,
         );
         if let Some(terminal) = prepared.terminal {
             return Err(terminal);
@@ -1550,7 +1550,7 @@ fn run_conversation_loop_inner(
                 effective_context_window,
                 round_tools.as_deref(),
                 active_skill_name.as_deref(),
-                false,
+                ContextCompactionMode::Automatic,
             ) {
                 Ok(Some(rebuilt_messages)) => {
                     messages = rebuilt_messages;
@@ -1570,7 +1570,7 @@ fn run_conversation_loop_inner(
             }
         }
         context_budget_recheck_required = false;
-        bound_model_visible_chat_tool_results(&mut messages);
+        bound_model_visible_chat_tool_results(&mut messages, effective_context_window);
         let model_round_wall_started_at = Instant::now();
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
@@ -1779,7 +1779,7 @@ fn run_conversation_loop_inner(
                                 effective_context_window,
                                 round_tools.as_deref(),
                                 active_skill_name.as_deref(),
-                                true,
+                                ContextCompactionMode::Recovery,
                             ) {
                                 Ok(Some(rebuilt_messages)) => {
                                     messages = rebuilt_messages;
@@ -2117,7 +2117,7 @@ fn run_conversation_loop_inner(
                             effective_context_window,
                             round_tools.as_deref(),
                             active_skill_name.as_deref(),
-                            true,
+                            ContextCompactionMode::Recovery,
                         ) {
                             Ok(Some(rebuilt_messages)) => {
                                 messages = rebuilt_messages;
@@ -3215,7 +3215,7 @@ fn run_conversation_loop_inner(
 ///
 /// thread 中的完整结果仍由 session store 保留；这里仅收敛本轮模型视图，避免
 /// 长时间只读探索把每个旧 file_read/search 结果永久累加到下一轮 prefill。
-fn bound_model_visible_chat_tool_results(messages: &mut [ChatMessage]) {
+fn bound_model_visible_chat_tool_results(messages: &mut [ChatMessage], context_window_tokens: u64) {
     let indices = messages
         .iter()
         .enumerate()
@@ -3227,7 +3227,10 @@ fn bound_model_visible_chat_tool_results(messages: &mut [ChatMessage]) {
         .iter()
         .filter_map(|index| messages[*index].content.clone())
         .collect::<Vec<_>>();
-    let bounded = bound_model_visible_tool_history(&results);
+    let bounded = bound_model_visible_tool_history(
+        &results,
+        model_visible_tool_history_budget_bytes(context_window_tokens),
+    );
     for (index, result) in indices.into_iter().zip(bounded) {
         messages[index].content = Some(result);
     }
@@ -4772,7 +4775,7 @@ mod tests {
             additional_token_estimate: 0,
             persist_checkpoint: true,
             model_identity: None,
-            force_compaction: false,
+            mode: ContextCompactionMode::Automatic,
         });
         assert!(first.compaction.is_some());
         assert_eq!(
@@ -4800,7 +4803,7 @@ mod tests {
             additional_token_estimate: 0,
             persist_checkpoint: true,
             model_identity: None,
-            force_compaction: false,
+            mode: ContextCompactionMode::Automatic,
         });
         assert!(second.compaction.is_none());
         assert_eq!(second.messages.len(), first.messages.len());
@@ -4841,7 +4844,7 @@ mod tests {
             additional_token_estimate: 1_000,
             persist_checkpoint: true,
             model_identity: None,
-            force_compaction: false,
+            mode: ContextCompactionMode::Automatic,
         });
         assert!(first.compaction.is_some());
         let first_source_count = session_store
@@ -4861,7 +4864,7 @@ mod tests {
             additional_token_estimate: 1_000,
             persist_checkpoint: true,
             model_identity: None,
-            force_compaction: false,
+            mode: ContextCompactionMode::Automatic,
         });
 
         assert!(
@@ -4994,7 +4997,7 @@ mod tests {
             additional_token_estimate: 0,
             persist_checkpoint: true,
             model_identity: None,
-            force_compaction: false,
+            mode: ContextCompactionMode::Automatic,
         });
 
         assert!(
@@ -5014,6 +5017,329 @@ mod tests {
                 .as_deref()
                 .is_some_and(|content| content.contains("old fact"))
         }));
+    }
+
+    struct FailingCompactionModelBridgeClient {
+        calls: AtomicUsize,
+    }
+
+    impl ModelBridgeClient for FailingCompactionModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32099),
+                message: "compaction model unavailable".to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    const COMPACTION_FAILURE_TEST_WINDOW: u64 = 200_000;
+
+    fn compaction_failure_fixture(
+        name: &str,
+    ) -> (
+        SessionStore,
+        SessionId,
+        ThreadId,
+        Vec<ThreadChatMessage>,
+        usize,
+    ) {
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new(format!("session-{name}"));
+        session_store
+            .create_session(session_id.clone(), name)
+            .expect("session should be created");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(1), || {
+                MissionId::new(format!("mission-{name}"))
+            });
+        let history = repeated_thread_history(100, 2_000);
+        session_store.append_thread_messages(&thread_id, history.clone(), UtcMillis(2));
+        let history_tokens = crate::context_authority::estimate_thread_history_tokens(&history);
+        let policy = magi_usage_authority::ContextBudgetPolicy::for_window(
+            COMPACTION_FAILURE_TEST_WINDOW,
+            None,
+            0,
+        );
+        assert!(history_tokens > policy.retained_history_target_tokens as usize);
+        assert!((history_tokens as u64) < policy.proactive_threshold_tokens);
+        (
+            session_store,
+            session_id,
+            thread_id,
+            history,
+            history_tokens,
+        )
+    }
+
+    fn compaction_request(
+        additional_token_estimate: usize,
+        mode: ContextCompactionMode,
+    ) -> ContextPrepareRequest {
+        ContextPrepareRequest {
+            recovery_history: Vec::new(),
+            phase: "runtime_budget_gate",
+            context_window_override: Some(COMPACTION_FAILURE_TEST_WINDOW),
+            additional_token_estimate,
+            persist_checkpoint: true,
+            model_identity: None,
+            mode,
+        }
+    }
+
+    /// 让“历史 + 固定输入”落在主动阈值与硬上限之间：需要压缩，但不压缩也能发送。
+    fn pressure_within_window(history_tokens: usize) -> usize {
+        let policy = magi_usage_authority::ContextBudgetPolicy::for_window(
+            COMPACTION_FAILURE_TEST_WINDOW,
+            None,
+            0,
+        );
+        (policy.proactive_threshold_tokens as usize).saturating_sub(history_tokens) + 1
+    }
+
+    #[test]
+    fn proactive_compaction_failure_continues_with_full_history_when_request_fits() {
+        let (session_store, session_id, thread_id, history, history_tokens) =
+            compaction_failure_fixture("compaction-deferred");
+        let client = FailingCompactionModelBridgeClient {
+            calls: AtomicUsize::new(0),
+        };
+        let event_bus = InMemoryEventBus::new(32);
+        let progress = Mutex::new(Vec::new());
+        let observer =
+            |event: crate::context_authority::ContextCompactionProgress| -> Result<(), String> {
+                progress
+                    .lock()
+                    .expect("progress mutex poisoned")
+                    .push(format!("{event:?}"));
+                Ok(())
+            };
+        let never_cancelled = || false;
+        let prepared = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        )
+        .with_compaction_runtime(&observer, &never_cancelled)
+        .prepare(compaction_request(
+            pressure_within_window(history_tokens),
+            ContextCompactionMode::Automatic,
+        ));
+
+        assert!(
+            prepared.terminal.is_none(),
+            "请求仍在窗口内时压缩失败不能终止本轮"
+        );
+        assert!(prepared.compaction.is_none());
+        assert_eq!(prepared.messages.len(), history.len());
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            session_store.thread_context_compaction_failures(&thread_id),
+            1
+        );
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .is_none()
+        );
+        assert!(
+            progress
+                .lock()
+                .expect("progress mutex poisoned")
+                .iter()
+                .any(|event| event == "Deferred")
+        );
+    }
+
+    #[test]
+    fn proactive_compaction_circuit_breaker_stops_repeated_failing_summaries() {
+        let (session_store, session_id, thread_id, _, history_tokens) =
+            compaction_failure_fixture("compaction-breaker");
+        let client = FailingCompactionModelBridgeClient {
+            calls: AtomicUsize::new(0),
+        };
+        let event_bus = InMemoryEventBus::new(32);
+        let authority = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        );
+        for _ in 0..5 {
+            let prepared = authority.prepare(compaction_request(
+                pressure_within_window(history_tokens),
+                ContextCompactionMode::Automatic,
+            ));
+            assert!(prepared.terminal.is_none());
+        }
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            3,
+            "连续失败达到熔断阈值后不能每轮重复发送摘要请求"
+        );
+
+        // 真正需要压缩时（provider 已报告超限）熔断不生效，成功后清零失败计数。
+        let success_client = SemanticCompactionModelBridgeClient;
+        let recovered = ContextAuthority::new(
+            &success_client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        )
+        .prepare(compaction_request(0, ContextCompactionMode::Recovery));
+        assert!(recovered.terminal.is_none());
+        assert!(recovered.compaction.is_some());
+        assert_eq!(
+            session_store.thread_context_compaction_failures(&thread_id),
+            0
+        );
+    }
+
+    #[test]
+    fn manual_compaction_compacts_below_threshold_and_reports_short_history() {
+        let (session_store, session_id, thread_id, history, _) =
+            compaction_failure_fixture("compaction-manual");
+        let client = SemanticCompactionModelBridgeClient;
+        let event_bus = InMemoryEventBus::new(32);
+        let progress = Mutex::new(Vec::new());
+        let observer =
+            |event: crate::context_authority::ContextCompactionProgress| -> Result<(), String> {
+                progress
+                    .lock()
+                    .expect("progress mutex poisoned")
+                    .push(format!("{event:?}"));
+                Ok(())
+            };
+        let never_cancelled = || false;
+        let authority = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        )
+        .with_compaction_runtime(&observer, &never_cancelled);
+
+        // 历史低于主动阈值：自动模式不压缩，手动模式立即压缩。
+        let automatic = authority.prepare(compaction_request(0, ContextCompactionMode::Automatic));
+        assert!(automatic.compaction.is_none());
+        let manual = authority.prepare(compaction_request(
+            0,
+            ContextCompactionMode::Manual {
+                instructions: Some("保留接口约束".to_string()),
+            },
+        ));
+        assert!(manual.terminal.is_none());
+        assert!(manual.compaction.is_some());
+        assert!(manual.messages.len() < history.len());
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .is_some()
+        );
+
+        // 只剩单条可见消息时没有可压缩前缀：报告无需压缩，而不是失败。
+        let short_session = SessionId::new("session-compaction-manual-short");
+        session_store
+            .create_session(short_session.clone(), "manual short")
+            .expect("session should be created");
+        let (_, short_thread) =
+            session_store.ensure_session_mission(&short_session, UtcMillis(1), || {
+                MissionId::new("mission-compaction-manual-short")
+            });
+        session_store.append_thread_messages(
+            &short_thread,
+            repeated_thread_history(1, 100),
+            UtcMillis(2),
+        );
+        progress.lock().expect("progress mutex poisoned").clear();
+        let short = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &short_session,
+            &None,
+            &short_thread,
+            None,
+        )
+        .with_compaction_runtime(&observer, &never_cancelled)
+        .prepare(compaction_request(
+            0,
+            ContextCompactionMode::Manual { instructions: None },
+        ));
+        assert!(short.terminal.is_none());
+        assert!(short.compaction.is_none());
+        assert!(
+            progress
+                .lock()
+                .expect("progress mutex poisoned")
+                .iter()
+                .any(|event| event == "Skipped")
+        );
+    }
+
+    #[test]
+    fn compaction_failure_is_terminal_when_request_cannot_fit_or_recovery_is_forced() {
+        let (session_store, session_id, thread_id, _, history_tokens) =
+            compaction_failure_fixture("compaction-terminal");
+        let client = FailingCompactionModelBridgeClient {
+            calls: AtomicUsize::new(0),
+        };
+        let event_bus = InMemoryEventBus::new(32);
+        let authority = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        );
+        let policy = magi_usage_authority::ContextBudgetPolicy::for_window(
+            COMPACTION_FAILURE_TEST_WINDOW,
+            None,
+            0,
+        );
+        let overflow =
+            (policy.hard_request_limit_tokens as usize).saturating_sub(history_tokens) + 1;
+        let overflowing = authority.prepare(compaction_request(
+            overflow,
+            ContextCompactionMode::Automatic,
+        ));
+        assert!(matches!(
+            overflowing.terminal,
+            Some(ContextCompactionTerminal::Failed)
+        ));
+
+        let forced = authority.prepare(compaction_request(0, ContextCompactionMode::Recovery));
+        assert!(matches!(
+            forced.terminal,
+            Some(ContextCompactionTerminal::Failed)
+        ));
     }
 
     impl ModelBridgeClient for SemanticCompactionModelBridgeClient {

@@ -193,6 +193,9 @@ pub struct SessionTurnRequestDto {
     pub locale: Option<String>,
     #[serde(default)]
     pub goal_mode: bool,
+    /// 用户显式选择的会话命令（如 `/compact`）；`text` 此时是命令参数。
+    #[serde(default)]
+    pub command: Option<magi_app_server_protocol::SessionTurnCommand>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
@@ -430,6 +433,16 @@ impl SessionTurnRequestDto {
     }
 
     pub fn timeline_message(&self, trimmed_text: Option<&str>) -> String {
+        if let Some(command) = self.command.as_ref() {
+            // 命令在时间线中按用户输入的形式展示：`/compact 补充要求`。
+            let name = match command {
+                magi_app_server_protocol::SessionTurnCommand::Compact => "/compact",
+            };
+            return match trimmed_text {
+                Some(text) => format!("{name} {text}"),
+                None => name.to_string(),
+            };
+        }
         let mut message_lines = Vec::new();
 
         if let Some(text) = trimmed_text {
@@ -500,6 +513,7 @@ impl SessionTurnRequestDto {
             "skillName": trimmed_non_empty(normalized.skill_name.as_deref()),
             "locale": trimmed_non_empty(normalized.locale.as_deref()),
             "goalMode": normalized.goal_mode,
+            "command": normalized.command,
             "images": normalized.images,
             "contextReferences": context_references,
             "browserAnnotationRefs": normalized.browser_annotation_refs(),
@@ -791,6 +805,7 @@ mod tests {
             steer_current_turn: false,
             expected_turn_id: None,
             replace_turn_id: None,
+            command: None,
         };
 
         assert_eq!(

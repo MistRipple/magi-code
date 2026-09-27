@@ -6,7 +6,7 @@
 >
 > 目标执行人：Luna
 >
-> 更新日期：2026-08-14
+> 更新日期：2026-09-27
 >
 > 适用范围：Magi 主对话、识图模型单轮接管、辅助模型、worker、上下文统计、上下文压缩、超限恢复、检查点、事件投影和前端上下文用量展示
 
@@ -261,9 +261,13 @@ retained_history_target = floor(context_window × 18%)
 
 该步骤是压缩输入的一部分，不是第二套“microcompact”功能。
 
+模型视图中历史工具结果的总预算与当前窗口成比例：`max(48KB, context_window × 25% × 4 字节)`（`model_visible_tool_history_budget_bytes`）。大窗口模型不会在上下文尚空时就截断旧文件与搜索结果；超过预算时最近结果保留一半预算，较早结果降为保留 ID、状态、路径和哈希的结构化事实。
+
 ### 8.4 摘要模型输入预算
 
-摘要输入预算从实际摘要模型的上下文窗口、输入 prompt、工具定义和输出预留计算，不再使用 `COMPACTION_MAX_SOURCE_TOKENS = 32_000`。
+摘要由唯一的压缩模型绑定执行：配置了辅助模型时使用辅助模型，否则使用当前主模型。输入预算从这个实际调用模型的上下文窗口计算（`resolve_compaction_model` → `compaction_source_budget`），不得使用主模型窗口为辅助模型计算预算，也不再使用 `COMPACTION_MAX_SOURCE_TOKENS = 32_000`。
+
+摘要目标随保留历史线性放大：`clamp(retained_history_target / 3, 1K, 16K)`，且不超过摘要模型窗口的 1/4（`compaction_summary_target_tokens`）。256K 窗口约 15K token，足以承载长任务的交接事实；不得使用固定的小额度把几十万 token 的历史压进 2K。
 
 摘要内容必须包含：
 
@@ -281,8 +285,8 @@ retained_history_target = floor(context_window × 18%)
 摘要安装前必须通过：
 
 1. 非空、非纯提示词复述、非错误文本。
-2. token 数在摘要目标范围内。
-3. 包含最少的目标、事实、完成情况和未完成项结构。
+2. 包含全部固定交接标题。标题是结构标记，提示词要求逐字原样输出；标题下正文使用历史主要语言，因此英文会话不会因标题被翻译而失败。
+3. 摘要长度不单独作为失败条件；目标 token 只写入提示词，是否有效由第 4 条统一裁决，避免有效但略长的摘要被误判失败。
 4. 压缩后 `projected_request_tokens` 小于压缩前。
 5. 压缩后压力低于主动阈值；若没有达到，记录 `needs_follow_up_compaction`，不递归循环。
 6. 工具配对、消息角色和图片引用校验通过。
@@ -366,6 +370,17 @@ RetryInvoke context overflow
   -> still overflow --------------------> TerminalContextOverflow
 ```
 
+压缩失败的唯一收口（`ContextAuthority::compaction_failed`）：
+
+| 场景 | 结果 | 用户可见状态 |
+| --- | --- | --- |
+| 主动压缩失败，且“历史 + 本次固定输入”仍不超过 `hard_request_limit` | 本轮使用未压缩历史继续执行，失败次数 +1 | `compactionState=deferred`：“上下文压缩未完成，本轮使用完整历史继续” |
+| 主动压缩失败，且请求已超过 `hard_request_limit` | 当前执行以 `context_compaction_failed` 终止 | `compactionState=failed` |
+| provider 已报告超限后的强制压缩失败 | 当前执行以 `context_compaction_failed` 终止 | `compactionState=failed` |
+| 检查点安装时 transcript 或代际已变化 | 按上面三行同样裁决，不安装候选检查点 | 同上 |
+
+会话级熔断：同一 thread 连续 3 次压缩失败后，只要请求仍在硬上限内，就不再发送主动摘要请求；请求超限或 provider 报告超限时仍会压缩。成功安装检查点即清零。失败计数是 `SessionStore` 的进程内运行状态，不持久化，daemon 重启后重新允许尝试。
+
 约束：
 
 - 同一个 turn 不重复追加用户消息。
@@ -375,7 +390,25 @@ RetryInvoke context overflow
 - 第二次恢复仍失败时显示明确错误，并说明当前上下文无法在现有模型窗口内继续。
 - 连续多个 turn 的同类失败使用 session 级有界熔断和结构化原因，不能每轮自动打同一请求。
 
-### 10.3 取消
+### 10.3 手动压缩（`/compact`）
+
+压缩策略由 `ContextCompactionMode` 表达，三种策略共用同一条选择边界、摘要、质量门禁和检查点安装链路：
+
+| 策略 | 触发 | 阈值与熔断 | 失败语义 |
+| --- | --- | --- | --- |
+| `Automatic` | 请求前主动阈值 | 受主动阈值和熔断约束 | 请求仍在窗口内则继续（`deferred`），否则终止 |
+| `Recovery` | provider 报告上下文超限 | 无视阈值和熔断 | 失败即终止 |
+| `Manual` | 用户 `/compact [补充要求]` | 无视阈值和熔断 | 失败即终止；没有可压缩前缀时报告 `skipped` |
+
+`/compact` 是会话命令轮次，不是旁路接口：
+
+1. Web 输入框以命令 chip 表达命令，输入文本作为可选补充要求；`turn/start` 与 HTTP `/api/session/turn` 使用同一 `command: "compact"` 字段（schema：`contracts/app-server/app-server.schema.json` 的 `SessionTurnCommand`）。
+2. `TurnService` 校验命令只能用于已有会话，且不能与技能、目标模式、图片、上下文引用、引导或编辑组合；命令进入请求指纹，不经意图分类，固定作为 conversation Turn 接纳。因此排队、幂等、取消、重连恢复和终态都复用普通 Turn 链路。
+3. 执行器在轮前上下文准备阶段以 `Manual` 策略强制压缩，写入压缩通知 item 后以 completed 收口，不调用主模型，也不把命令文本写入模型可见历史。补充要求只影响摘要保留重点，不改变固定交接标题。
+4. canonical user item 带 `sessionCommand` metadata；所有从 canonical Turn 重建模型历史的路径（thread projection、执行恢复历史、continue 重建、中断恢复查找）都通过 `CanonicalTurn::is_session_command` 排除命令轮次。
+5. 摘要仍由辅助模型执行（未配置时使用主模型），与自动压缩一致。
+
+### 10.4 取消
 
 取消必须同时停止摘要模型、当前模型调用和恢复重试。取消不会安装候选检查点，不修改原始 transcript，不发布“压缩成功”。
 
@@ -448,6 +481,7 @@ observed_at
 - 压缩成功后立刻回落，不等待下一次模型调用。
 - tooltip 可以展示“当前请求预计占用”和“完整窗口”，不得把累计账单称为当前已用上下文。
 - 超限恢复过程中显示处理中状态，不显示中间失败错误。
+- 压缩通知状态只来自后端 `compactionState`：`running`、`completed`、`skipped`、`deferred`、`cancelled`、`failed`。前端不推断压缩失败是否终止了本轮。
 
 ## 13. 代码改造边界
 
@@ -553,6 +587,9 @@ observed_at
 - 大工具结果缩减后 ID、状态和 artifact 引用保持。
 - 32K 以下、超过摘要模型窗口和超过主模型窗口的历史。
 - 空摘要、重复 prompt、摘要无效和压缩率不足。
+- 主动压缩失败但请求仍在窗口内时继续执行；超过硬上限或强制压缩失败时终止。
+- 连续失败熔断后不再重复发送摘要请求；强制压缩成功后清零。
+- 摘要目标随窗口和摘要模型窗口缩放；长度略超目标的有效摘要不判失败。
 - source fingerprint 变化、模型切换和取消不会安装结果。
 - 检查点连续二次压缩和 daemon 重启恢复。
 

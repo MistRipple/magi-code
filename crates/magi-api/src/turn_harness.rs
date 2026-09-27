@@ -1238,6 +1238,7 @@ impl MagiTurnHarness {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                command: None,
             })
             .await;
         if response.is_ok() {
@@ -1315,6 +1316,7 @@ impl MagiTurnHarness {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                command: None,
             })
             .await;
         if response.is_ok() {
@@ -1357,6 +1359,7 @@ impl MagiTurnHarness {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                command: None,
             })
             .await;
         if response.is_ok() {
@@ -1396,6 +1399,7 @@ impl MagiTurnHarness {
                 steer_current_turn: true,
                 expected_turn_id: Some(expected_turn_id.to_string()),
                 replace_turn_id: None,
+                command: None,
             })
             .await
     }

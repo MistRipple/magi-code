@@ -4,8 +4,15 @@ export interface ComposerSkillOption {
   description: string;
 }
 
+/** 会话命令：由 daemon 执行的独立轮次，不调用主模型回复。 */
+export type ComposerSessionCommand = 'compact';
+
 export interface ComposerActionLabels {
   goal: {
+    name: string;
+    description: string;
+  };
+  compact: {
     name: string;
     description: string;
   };
@@ -30,6 +37,13 @@ export type ComposerAction =
       aliases: string[];
     }
   | {
+      kind: 'command';
+      id: ComposerSessionCommand;
+      name: string;
+      description: string;
+      aliases: string[];
+    }
+  | {
       kind: 'skill';
       id: string;
       name: string;
@@ -49,6 +63,7 @@ function fuzzyMatch(text: string, query: string): boolean {
 export function buildComposerActions(
   skills: ComposerSkillOption[],
   labels: ComposerActionLabels,
+  options: { sessionCommandsAvailable: boolean } = { sessionCommandsAvailable: true },
 ): ComposerAction[] {
   return [
     {
@@ -64,6 +79,16 @@ export function buildComposerActions(
       description: labels.goal.description,
       aliases: ['goal', 'goal mode', 'goalmode', '目标', '目标模式', '长期目标'],
     },
+    // 会话命令作用于已有会话的上下文；新建草稿会话没有可压缩的历史。
+    ...(options.sessionCommandsAvailable
+      ? [{
+          kind: 'command' as const,
+          id: 'compact' as const,
+          name: labels.compact.name,
+          description: labels.compact.description,
+          aliases: ['compact', 'compress', 'summarize', '压缩', '压缩上下文', '上下文', '总结'],
+        }]
+      : []),
     ...skills.map<ComposerAction>((skill) => ({
       kind: 'skill',
       id: skill.skillId,
@@ -85,8 +110,8 @@ export function filterSlashCommands(
     ))
     .filter((action) => {
       if (!query) return true;
-      const searchParts = action.kind === 'goal'
-        ? [action.name, action.description, ...action.aliases]
+      const searchParts = action.kind === 'goal' || action.kind === 'command'
+        ? [action.id, action.name, action.description, ...action.aliases]
         : [action.id, action.name, action.description];
       return searchParts.some((part) => {
         const normalized = part.toLowerCase();

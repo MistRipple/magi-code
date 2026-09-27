@@ -103,6 +103,11 @@ pub struct ActiveExecutionBranchSnapshotUpdate {
 }
 
 pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
+/// canonical user item 上标记会话命令（如 `/compact`）的 metadata key。
+///
+/// 命令轮次只用于展示和审计；从 canonical Turn 重建模型历史的路径都通过
+/// [`CanonicalTurn::is_session_command`] 排除该轮，命令文本不进入模型上下文。
+pub const SESSION_COMMAND_METADATA_KEY: &str = "sessionCommand";
 
 /// `source_thread_id` 的可见性判定结果：
 /// - `Main`：对应 session 的 orchestrator thread，item 归属主线时间线
@@ -389,6 +394,14 @@ pub struct CanonicalTurn {
 }
 
 impl CanonicalTurn {
+    /// 该轮是否为用户显式发起的会话命令。
+    pub fn is_session_command(&self) -> bool {
+        self.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::UserMessage
+                && item.metadata.contains_key(SESSION_COMMAND_METADATA_KEY)
+        })
+    }
+
     pub fn normalize(&mut self) {
         self.items.sort_by(|left, right| {
             left.item_seq
