@@ -1436,37 +1436,53 @@ async fn observe_unlocked(path: &Path) -> Result<GitObservation, GitError> {
             other => other,
         })?;
     let worktree_path = canonical_or_original(&repository_root);
-    let git_common_dir = resolve_git_path(
-        &worktree_path,
-        &required_text(&worktree_path, &["rev-parse", "--git-common-dir"]).await?,
+    // 这些查询只读取 Git 状态，彼此没有数据依赖；并行执行可以减少每轮任务
+    // preparation 中 Git context 的固定进程启动开销。最终仍由同一个
+    // `GitObservation` 作为本轮事实快照，调用方继续按原有 branch/HEAD/worktree
+    // precondition 做一致性校验。
+    let (git_common_dir, worktree_git_dir) = tokio::join!(
+        required_text(&worktree_path, &["rev-parse", "--git-common-dir"]),
+        required_text(&worktree_path, &["rev-parse", "--git-dir"]),
     );
-    let worktree_git_dir = resolve_git_path(
-        &worktree_path,
-        &required_text(&worktree_path, &["rev-parse", "--git-dir"]).await?,
+    let git_common_dir = resolve_git_path(&worktree_path, &git_common_dir?);
+    let worktree_git_dir = resolve_git_path(&worktree_path, &worktree_git_dir?);
+
+    let (branch, head, upstream, origin_url) = tokio::join!(
+        optional_text(
+            &worktree_path,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        ),
+        optional_text(&worktree_path, &["rev-parse", "--verify", "HEAD"]),
+        optional_text(
+            &worktree_path,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        ),
+        optional_text(&worktree_path, &["remote", "get-url", "origin"]),
     );
-    let branch = optional_text(
-        &worktree_path,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .await?;
-    let head = optional_text(&worktree_path, &["rev-parse", "--verify", "HEAD"]).await?;
-    let upstream = optional_text(
-        &worktree_path,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    )
-    .await?;
-    let origin_url = optional_text(&worktree_path, &["remote", "get-url", "origin"]).await?;
-    let (ahead, behind) = if upstream.is_some() {
-        ahead_behind(&worktree_path).await?
-    } else {
-        (0, 0)
+    let branch = branch?;
+    let head = head?;
+    let upstream = upstream?;
+    let origin_url = origin_url?;
+    let ahead_behind_future = async {
+        if upstream.is_some() {
+            ahead_behind(&worktree_path).await
+        } else {
+            Ok((0, 0))
+        }
     };
-    let dirty = dirty_summary(&worktree_path, head.is_some()).await?;
+    let (ahead_behind_result, dirty) = tokio::join!(
+        ahead_behind_future,
+        // dirty_summary 内部仍按原顺序完成 status + diff，避免改变 additions /
+        // deletions 的统计口径。
+        dirty_summary(&worktree_path, head.is_some()),
+    );
+    let (ahead, behind) = ahead_behind_result?;
+    let dirty = dirty?;
     Ok(GitObservation {
         repository_root: worktree_path.clone(),
         git_common_dir: canonical_or_original(&git_common_dir),

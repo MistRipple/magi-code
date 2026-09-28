@@ -56,7 +56,14 @@ app.commandLine.appendSwitch(
   "AutofillServerCommunication,MediaRouter,OptimizationHints,PasswordManagerOnboarding",
 );
 
-const AGENT_ORIGIN = "http://127.0.0.1:38123";
+const daemonPort = Number.parseInt(
+  process.env.MAGI_DESKTOP_DAEMON_PORT?.trim() || "38123",
+  10,
+);
+if (!Number.isInteger(daemonPort) || daemonPort < 1024 || daemonPort > 65535) {
+  throw new Error(`magi_desktop_daemon_port_invalid:${daemonPort}`);
+}
+const AGENT_ORIGIN = `http://127.0.0.1:${daemonPort}`;
 const DESKTOP_RENDERER_AUTH_HEADER = "X-Magi-Desktop-Renderer-Token";
 const MAGI_DAEMON_SERVICE_NAME = "magi-rust-backend";
 const DESKTOP_HOST_READY_POLL_INTERVAL_MS = 50;
@@ -274,7 +281,7 @@ if (singleInstance) {
         environment: {
           ...process.env,
           MAGI_HOST: "127.0.0.1",
-          MAGI_PORT: "38123",
+          MAGI_PORT: String(daemonPort),
           MAGI_SERVICE_NAME: MAGI_DAEMON_SERVICE_NAME,
           MAGI_PRODUCT_VERSION: PRODUCT_VERSION,
           MAGI_BUILD_ID: BUILD_IDENTITY,

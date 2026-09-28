@@ -79,7 +79,7 @@ function sample(index, role, state = index === 19 ? "skipped" : "completed") {
 function source(role) {
   return {
     source_commit: "golden-electron-source-commit",
-    worktree_fingerprint_sha256: "golden-electron-worktree",
+    worktree_fingerprint_sha256: `golden-electron-worktree-${role}`,
     executable_sha256: `golden-launcher-${role}`,
     app_bundle: `/tmp/golden-${role}.app`,
     app_artifact_sha256: `golden-electron-artifact-${role}`,
@@ -130,7 +130,7 @@ try {
     assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
     const sidecar = JSON.parse(await readFile(sidecars[role], "utf8"));
     assert.equal(sidecar.status, "passed");
-    assert.equal(sidecar.metric_version, "magi-electron-context-compaction-metrics.v1");
+    assert.equal(sidecar.metric_version, "magi-electron-context-compaction-metrics.v2");
     assert.equal(sidecar.sample_count, 20);
     assert.equal(sidecar.context.completed_samples, 19);
     assert.equal(sidecar.context.skipped_samples, 1);
@@ -146,6 +146,7 @@ try {
   assert.equal(comparison.status, "passed");
   assert.equal(comparison.validation.separate_non_additive_clocks, true);
   assert.equal(comparison.validation.distinct_source_identity, true);
+  assert.equal(comparison.validation.same_worktree_fingerprint, false);
   assert.equal(comparison.deltas["renderer.dom_painted"].p95_ms, 0);
   console.log("electron context compaction metrics golden passed");
 } finally {

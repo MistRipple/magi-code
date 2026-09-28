@@ -26,7 +26,7 @@ const BACKEND_METRICS = [
   "accepted_to_terminal_ms",
 ];
 const PAIRED_FIXTURE = "electron-dom-timing-paired-v1";
-const DERIVE_VERSION = "magi-electron-renderer-derive.v2";
+const DERIVE_VERSION = "magi-electron-renderer-derive.v3";
 
 function usage() {
   console.error([
@@ -316,9 +316,10 @@ async function compare({ output, compare }) {
   assert(before.rendererTimingSamples.length === 100 && after.rendererTimingSamples.length === 100,
     "before/after 必须各有 100 条 Renderer sample");
   assert(before.source.stable === true && after.source.stable === true, "before/after source 未稳定");
-  assert(before.source.before.source_commit === after.source.before.source_commit, "before/after source commit 不一致");
-  assert(before.source.before.worktree_fingerprint_sha256 === after.source.before.worktree_fingerprint_sha256,
-    "before/after worktree fingerprint 不一致");
+  const beforeSource = before.source.before;
+  const afterSource = after.source.before;
+  const distinctSourceIdentity = identityKey(beforeSource) !== identityKey(afterSource);
+  assert(distinctSourceIdentity, "before/after source 身份未区分");
   assert(before.source.before.app_artifact_sha256 !== after.source.before.app_artifact_sha256,
     "before/after app artifact 相同，不能证明是两个版本");
   assert(before.input_payload_hash !== after.input_payload_hash,
@@ -375,8 +376,6 @@ async function compare({ output, compare }) {
     backendDeltas,
     validation: {
       same_fixture: true,
-      same_source_commit: true,
-      same_worktree_fingerprint: true,
       distinct_app_artifact: true,
       distinct_input_payload_hash: true,
       same_provider_request_count: true,
@@ -384,6 +383,10 @@ async function compare({ output, compare }) {
       nearest_rank: true,
       backend_stage_contract: true,
       backend_and_renderer_same_turn: true,
+      same_source_commit: beforeSource.source_commit === afterSource.source_commit,
+      same_worktree_fingerprint:
+        beforeSource.worktree_fingerprint_sha256 === afterSource.worktree_fingerprint_sha256,
+      distinct_source_identity: distinctSourceIdentity,
       separate_non_additive_clocks: true,
     },
     status: "passed",

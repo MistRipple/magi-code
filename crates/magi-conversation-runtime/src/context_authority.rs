@@ -174,6 +174,15 @@ impl ContextCompactionMode {
         !matches!(self, Self::Automatic)
     }
 
+    /// 压缩原因标签：显式策略直接说明来源，自动策略使用决策的测量来源。
+    fn reason_label(&self, decision: &ThreadHistoryCompactionDecision) -> &'static str {
+        match self {
+            Self::Automatic => decision.reason_label(),
+            Self::Recovery => "context_limit_recovery",
+            Self::Manual { .. } => "manual",
+        }
+    }
+
     fn instructions(&self) -> Option<&str> {
         match self {
             Self::Manual { instructions } => instructions.as_deref(),
@@ -591,7 +600,7 @@ impl<'a> ContextAuthority<'a> {
                 checkpoint_id: format!("context-checkpoint-{}", compacted_at.0),
                 source_message_count,
                 summary_message: compacted[0].clone(),
-                reason: decision.reason_label().to_string(),
+                reason: request.mode.reason_label(&decision).to_string(),
                 original_token_estimate: original_tokens,
                 checkpoint_token_estimate: compacted_tokens,
                 created_at: compacted_at,
@@ -645,6 +654,7 @@ impl<'a> ContextAuthority<'a> {
                 .reset_thread_context_compaction_failures(self.thread_id);
             self.publish_compaction(
                 request.phase,
+                request.mode.reason_label(&decision),
                 &decision,
                 original_count,
                 compacted_count,
@@ -660,7 +670,7 @@ impl<'a> ContextAuthority<'a> {
             compaction: request
                 .persist_checkpoint
                 .then_some(ContextCompactionRecord {
-                    reason: decision.reason_label(),
+                    reason: request.mode.reason_label(&decision),
                     original_message_count: original_count,
                     compacted_message_count: compacted_count,
                     original_token_estimate: original_tokens,
@@ -979,6 +989,7 @@ impl<'a> ContextAuthority<'a> {
     fn publish_compaction(
         &self,
         phase: &'static str,
+        reason: &'static str,
         decision: &ThreadHistoryCompactionDecision,
         original_count: usize,
         compacted_count: usize,
@@ -998,7 +1009,7 @@ impl<'a> ContextAuthority<'a> {
             "thread_id": self.thread_id.to_string(),
             "session_id": self.session_id.to_string(),
             "phase": phase,
-            "reason": decision.reason_label(),
+            "reason": reason,
             "original_message_count": original_count,
             "compacted_message_count": compacted_count,
             "original_token_estimate": original_tokens,
@@ -1068,7 +1079,7 @@ impl<'a> ContextAuthority<'a> {
                     thread_id = %self.thread_id,
                     session_id = %self.session_id,
                     phase,
-                    reason = decision.reason_label(),
+                    reason,
                     original_count,
                     compacted_count,
                     original_tokens,
@@ -1106,7 +1117,7 @@ impl<'a> ContextAuthority<'a> {
                     thread_id = %self.thread_id,
                     session_id = %self.session_id,
                     phase,
-                    reason = decision.reason_label(),
+                    reason,
                     original_count,
                     compacted_count,
                     original_tokens,

@@ -63,6 +63,8 @@ npm run desktop:dev
 - [Magi 对话响应链路性能开发与验收计划](./conversation-response-performance-plan.md)：发送接纳、后台准备、模型连接复用、流式增量写回、前端渲染和桌面端性能验收基线。
 - [用户自定义子代理角色设计方案](./custom-worker-role-design.md)：在现有 Worker 体系中统一支持用户角色的创建、注册、调度、导入和导出。
 - [用户自定义子代理角色开发计划](./custom-worker-role-development-plan.md)：按阶段记录实现、验证和最终提交状态。
+- [Magi Web 模型浏览器设计基线](./web-model-browser-design.md)：**未实现的最终设计基线**（固定决策 A1–A24）；应用级 GPT Web 浏览器会话与登录态持久化、Web 模型发现与内置浏览器模型传输的设计结论、状态所有权、工具档位（T0 / T2 / T3；T1 已删除）、T3 通道（Magi Connect 优先 / OpenAI Tunnel 正式交付）与上下文一致性边界。
+- [Magi Web 模型浏览器实现计划](./web-model-browser-product-implementation-plan.md)：阶段划分、阶段 0 实测、文件级工单、接口契约、错误码、验收与代码索引。
 
 ## 用户场景与产品要求
 

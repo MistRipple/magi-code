@@ -5261,7 +5261,11 @@ mod tests {
             },
         ));
         assert!(manual.terminal.is_none());
-        assert!(manual.compaction.is_some());
+        assert_eq!(
+            manual.compaction.as_ref().map(|record| record.reason),
+            Some("manual"),
+            "手动压缩的原因必须如实记录，不能显示为自动压缩"
+        );
         assert!(manual.messages.len() < history.len());
         assert!(
             session_store

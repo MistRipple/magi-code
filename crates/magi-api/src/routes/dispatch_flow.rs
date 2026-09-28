@@ -737,24 +737,50 @@ async fn prepare_session_task_dispatch(
             .session_store
             .execution_ownership(&accepted.session_id)
             .and_then(|ownership| ownership.workspace_id);
-        state
-            .ensure_snapshot_session_for_workspace_id(&accepted.session_id, &execution_workspace_id)
-            .await?;
-        trace.mark(
-            "preparation_snapshot_ready",
-            accepted.session_id.as_str(),
-            Some(&accepted.turn_id),
-            None,
+        // Snapshot 建立与 Git/code context 观测都受各自的内部协调器保护，且
+        // `ensure_session_code_context` 在需要时也会幂等地确保 snapshot 存在。
+        // 并行等待两条独立的准备链，缩短工具/子代理首个 provider 请求之前的
+        // 本地准备时间；二者都完成后才进入 materialize，保持执行面事实边界不变。
+        let snapshot_future = state.ensure_snapshot_session_for_workspace_id(
+            &accepted.session_id,
+            &execution_workspace_id,
         );
-        state
-            .ensure_session_code_context(&accepted.session_id, &execution_workspace_id)
-            .await?;
-        trace.mark(
-            "preparation_code_context_ready",
-            accepted.session_id.as_str(),
-            Some(&accepted.turn_id),
-            None,
-        );
+        let code_context_future =
+            state.ensure_session_code_context(&accepted.session_id, &execution_workspace_id);
+        tokio::pin!(snapshot_future);
+        tokio::pin!(code_context_future);
+        let mut snapshot_result = None;
+        let mut code_context_result = None;
+        while snapshot_result.is_none() || code_context_result.is_none() {
+            tokio::select! {
+                result = &mut snapshot_future, if snapshot_result.is_none() => {
+                    if result.is_ok() {
+                        trace.mark(
+                            "preparation_snapshot_ready",
+                            accepted.session_id.as_str(),
+                            Some(&accepted.turn_id),
+                            None,
+                        );
+                    }
+                    snapshot_result = Some(result);
+                }
+                result = &mut code_context_future, if code_context_result.is_none() => {
+                    if result.is_ok() {
+                        trace.mark(
+                            "preparation_code_context_ready",
+                            accepted.session_id.as_str(),
+                            Some(&accepted.turn_id),
+                            None,
+                        );
+                    }
+                    code_context_result = Some(result);
+                }
+            }
+        }
+        snapshot_result
+            .expect("snapshot preparation future must settle")
+            .map(|_| ())?;
+        code_context_result.expect("code context preparation future must settle")?;
     } else {
         trace.mark(
             "preparation_workspace_context_skipped",

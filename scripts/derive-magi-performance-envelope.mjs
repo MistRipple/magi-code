@@ -19,7 +19,7 @@ const ELECTRON_SCENARIOS = [
   "subagent",
 ];
 const ENVELOPE_DERIVE_VERSION = "magi-performance-envelope-derive.v1";
-const ELECTRON_DERIVE_VERSION = "magi-electron-renderer-derive.v2";
+const ELECTRON_DERIVE_VERSION = "magi-electron-renderer-derive.v3";
 
 function usage() {
   console.error([

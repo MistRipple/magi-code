@@ -26,7 +26,10 @@ const appBundlePath = process.env.MAGI_ELECTRON_DOM_APP_BUNDLE?.trim()
   || dirname(dirname(dirname(appExecutable)));
 const cdpPort = Number.parseInt(process.env.MAGI_ELECTRON_DOM_CDP_PORT || "9257", 10);
 const appRestartCdpPort = cdpPort + 1;
-const daemonPort = 38123;
+const daemonPort = Number.parseInt(
+  process.env.MAGI_ELECTRON_DOM_DAEMON_PORT || "38123",
+  10,
+);
 const timingSampleCount = Number.parseInt(
   process.env.MAGI_ELECTRON_DOM_TIMING_SAMPLES || "1",
   10,
@@ -117,6 +120,9 @@ const recoveryTransportTimeoutMs = Number.parseInt(
 );
 if (!Number.isInteger(approvalExpiryWaitMs) || approvalExpiryWaitMs < 0) {
   throw new Error(`MAGI_ELECTRON_DOM_APPROVAL_EXPIRY_WAIT_MS 必须是非负整数：${approvalExpiryWaitMs}`);
+}
+if (!Number.isInteger(daemonPort) || daemonPort < 1024 || daemonPort > 65535) {
+  throw new Error(`MAGI_ELECTRON_DOM_DAEMON_PORT 必须在 1024 到 65535 之间：${daemonPort}`);
 }
 const timingFixture = "electron-dom-timing-v1";
 const timingSchemaVersion = "magi.electron.timing.v1";
@@ -2633,7 +2639,7 @@ async function stopOwnedDaemon(pid) {
 }
 
 async function healthSnapshot() {
-  const response = await fetch("http://127.0.0.1:38123/health");
+  const response = await fetch(`http://127.0.0.1:${daemonPort}/health`);
   if (!response.ok) throw new Error(`daemon health status ${response.status}`);
   return response.json();
 }
@@ -2720,6 +2726,7 @@ function spawnElectron(port) {
     cwd: repositoryRoot,
     env: {
       ...process.env,
+      MAGI_DESKTOP_DAEMON_PORT: String(daemonPort),
       MAGI_STATE_ROOT: join(stateRoot, "state"),
       MAGI_OPEN_BROWSER: "0",
       MAGI_OPENAI_COMPAT_BASE_URL: `http://127.0.0.1:${providerPort}/v1`,

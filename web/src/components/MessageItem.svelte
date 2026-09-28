@@ -368,10 +368,15 @@
       if (compactionState === 'failed') {
         return i18n.t('messageItem.contextCompactionFailed');
       }
-      return i18n.t('messageItem.contextCompaction', {
-        before: compactTokenLabel(message.metadata.originalTokenEstimate),
-        after: compactTokenLabel(message.metadata.compactedTokenEstimate),
-      });
+      return i18n.t(
+        message.metadata.reason === 'manual'
+          ? 'messageItem.contextCompactionManual'
+          : 'messageItem.contextCompaction',
+        {
+          before: compactTokenLabel(message.metadata.originalTokenEstimate),
+          after: compactTokenLabel(message.metadata.compactedTokenEstimate),
+        },
+      );
     }
     return message.content;
   });

@@ -1422,9 +1422,10 @@ async function runRestartReconnect({ transport = "sse" } = {}) {
     const secondCanonicalTerminals = countCanonicalTerminals(secondLog, turnId, firstRequestId);
     const timeline = Array.isArray(messages?.timeline) ? messages.timeline : [];
     const matchingUsers = timeline.filter((entry) => entry?.message === requestText);
-    const reconnectTerminalSequence = transport === "websocket"
-      ? reconnectTerminal.event.sequence
-      : reconnectTerminal.sequence;
+    // SSE 和 WebSocket 观察器都返回带有原始事件的匹配对象；两条恢复路径
+    // 必须从同一层读取 durable event sequence。此前 SSE 分支读取了不存在的
+    // 顶层 `sequence`，会把已经收到的 replay terminal 误判为恢复失败。
+    const reconnectTerminalSequence = reconnectTerminal.event.sequence;
     const terminalStatus = reconnectTerminal.status;
     const workspaceStable = !isTaskProfile || firstWorkspaceId === secondWorkspaceId;
     const passed = firstTerminal.status === "completed"

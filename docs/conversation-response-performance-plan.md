@@ -40,8 +40,8 @@ settlement? / settlement_required?
 ```text
 schema_version = magi.trajectory.v1
 derive_version = magi-trajectory-derive.v5
-electron_renderer_derive_version = magi-electron-renderer-derive.v2
-electron_context_compaction_derive_version = magi-electron-context-compaction-metrics.v1
+electron_renderer_derive_version = magi-electron-renderer-derive.v3
+electron_context_compaction_derive_version = magi-electron-context-compaction-metrics.v2
 performance_envelope_derive_version = magi-performance-envelope-derive.v1
 permission_schema_version = magi.permission.v5
 permission_derive_version = magi-permission-derive.v8
@@ -153,6 +153,18 @@ accepted_response_sent -> canonical_terminal_published
 | 可计算的 Magi 首内容开销 | accepted_response_sent → provider_first_visible_delta，扣除 Provider TTFT | ≤ 300 ms | 首 raw 直接产生可见内容时才计算。 |
 | Renderer 局部绘制 | renderer_received → dom_painted | ≤ 50 ms | 不包含 Provider 和 EventBus。 |
 
+预算适用性版本：`magi-performance-budget-applicability.v2`（2026-09-28）。普通五场景
+fixture 的 `accepted_response_sent → provider_request_started` 才用于上表的
+conversation/task 本地准备预算。上下文压缩是独立的 sidecar fixture：该区间包含摘要模型
+完成历史压缩的等待，不能与普通 conversation 本地准备混为同一指标，也不能用它反向证明
+普通预算达标。压缩 fixture 仍必须报告同一 before/after 口径和完整身份；若要给压缩准备
+时间设预算，必须另行增加版本化预算与基线。
+
+当前 daemon 压缩 after 的长历史 P95 为 `52,613 ms`（`magi-performance-comparison-
+context-compaction-20260928-v9.json`），这是一项已观测的专项例外，不是被静默放宽的
+普通预算。原因是该区间包含必要的语义摘要模型调用；本版本的决定是保留该数值作为压缩
+专项观察、分开报告正常五场景预算，并不宣称整体性能目标达标。
+
 Provider 等待和完整 terminal 受上游、输出长度和任务复杂度影响，只作同口径观察和 before/after 比较。若 fixture 证明预算不合理，必须记录原因、版本和新基线，不能静默放宽。
 
 Task 的本地准备预算包含 workspace snapshot、code context、execution materialization 和 checkpoint；这些步骤承载工具权限、Git/变更账本和恢复事实，不能为了满足候选延迟而跳过。若其候选预算持续超出，应优化不改变事实边界的实现，或按版本化证据重新基线。
@@ -243,6 +255,7 @@ node scripts/derive-magi-context-compaction-metrics.mjs \
 
 # Electron 上下文压缩专项：同一 Session 预填充历史后固定采集 20 条长历史 Turn。
 # 该 evidence/sidecar 只能形成 Electron after-only 观察；独立 before 存在后再执行 compare。
+MAGI_ELECTRON_DOM_DAEMON_PORT=<free-port> \
 MAGI_ELECTRON_DOM_CDP_PORT=<free-port> \
 MAGI_ELECTRON_DOM_COMPACTION_ONLY=1 \
 MAGI_ELECTRON_DOM_COMPACTION_SAMPLES=20 \
@@ -256,7 +269,8 @@ node scripts/derive-electron-context-compaction-metrics.mjs \
 node scripts/derive-magi-trajectory-ledger.mjs \
   --output /tmp/magi-trajectory-ledger-electron-context-compaction-after-<run-id>.json \
   /tmp/magi-electron-context-compaction-after-<run-id>.json
-# 只有 before evidence/sidecar 已通过同一合同后，才执行以下 compare。
+# 只有 before evidence/sidecar 已通过同一合同后，才执行以下 compare；
+# compare 必须保留独立 baseline 的 source identity，不能要求 before/after 共用 worktree fingerprint。
 node scripts/derive-electron-context-compaction-metrics.mjs \
   --compare /tmp/magi-performance-metrics-electron-context-compaction-before-<run-id>.json \
   /tmp/magi-performance-metrics-electron-context-compaction-after-<run-id>.json \

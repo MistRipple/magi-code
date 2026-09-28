@@ -37,7 +37,7 @@ function electron(role) {
   return {
     status: "passed",
     schema_version: "magi.electron.timing.v1",
-    derive_version: "magi-electron-renderer-derive.v2",
+    derive_version: "magi-electron-renderer-derive.v3",
     fixture: "electron-dom-timing-paired-v1",
     comparison_role: role,
     sampleCount: 20,
@@ -55,7 +55,7 @@ function comparison() {
   return {
     status: "passed",
     schema_version: "magi.electron.timing.v1",
-    derive_version: "magi-electron-renderer-derive.v2",
+    derive_version: "magi-electron-renderer-derive.v3",
     fixture: "electron-dom-timing-paired-v1",
     before: { input_payload_hash: "electron-before-input", providerRequests: 100 },
     after: { input_payload_hash: "electron-after-input", providerRequests: 100 },

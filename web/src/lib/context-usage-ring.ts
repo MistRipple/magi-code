@@ -182,6 +182,10 @@ export function formatCompactionReason(reason: string | null | undefined, t: Tra
       return t('input.contextRing.compactionReason.contextWindowPressure');
     case 'estimated_prefill':
       return t('input.contextRing.compactionReason.estimatedPrefill');
+    case 'context_limit_recovery':
+      return t('input.contextRing.compactionReason.contextLimitRecovery');
+    case 'manual':
+      return t('input.contextRing.compactionReason.manual');
     default:
       return t('input.contextRing.compactionReason.unknown');
   }

@@ -21,7 +21,7 @@ const RENDERER_STAGES = [
 ];
 const SCHEMA_VERSION = "magi.performance.v1";
 const EVIDENCE_SCHEMA_VERSION = "magi.electron.context-compaction.v1";
-const DERIVE_VERSION = "magi-electron-context-compaction-metrics.v1";
+const DERIVE_VERSION = "magi-electron-context-compaction-metrics.v2";
 const FIXTURE = "electron-dom-context-compaction-v1";
 
 function usage() {
@@ -343,10 +343,6 @@ async function compare({ compare, output }) {
     "压缩 before/after source 身份未区分");
   const beforeIdentity = sourceIdentity(before.source);
   const afterIdentity = sourceIdentity(after.source);
-  assert(beforeIdentity.source_commit === afterIdentity.source_commit,
-    "压缩 before/after source commit 不一致");
-  assert(beforeIdentity.worktree_fingerprint_sha256 === afterIdentity.worktree_fingerprint_sha256,
-    "压缩 before/after worktree fingerprint 不一致");
   assert(before.input_payload_hash !== after.input_payload_hash,
     "压缩 before/after input payload hash 相同");
   const result = {
@@ -375,8 +371,9 @@ async function compare({ compare, output }) {
       same_context_window: true,
       same_long_history_chars: true,
       same_sample_count_per_scenario: 20,
-      same_source_commit: true,
-      same_worktree_fingerprint: true,
+      same_source_commit: beforeIdentity.source_commit === afterIdentity.source_commit,
+      same_worktree_fingerprint:
+        beforeIdentity.worktree_fingerprint_sha256 === afterIdentity.worktree_fingerprint_sha256,
       distinct_source_identity: true,
       distinct_input_payload_hash: true,
       separate_non_additive_clocks: true,

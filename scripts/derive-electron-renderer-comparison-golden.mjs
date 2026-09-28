@@ -75,7 +75,7 @@ function sample(scenario, index, role) {
 function identity(role) {
   return {
     source_commit: "golden-source-commit",
-    worktree_fingerprint_sha256: "golden-worktree-fingerprint",
+    worktree_fingerprint_sha256: `golden-worktree-fingerprint-${role}`,
     executable_sha256: "golden-electron-launcher",
     app_bundle: `/tmp/magi-golden-${role}.app`,
     app_artifact_sha256: `golden-app-artifact-${role}`,
@@ -125,7 +125,7 @@ try {
     ]);
     const output = JSON.parse(await readFile(aggregated[role], "utf8"));
     assert.equal(output.status, "passed");
-    assert.equal(output.derive_version, "magi-electron-renderer-derive.v2");
+    assert.equal(output.derive_version, "magi-electron-renderer-derive.v3");
     assert.equal(output.rendererTimingSamples.length, 100);
     assert.equal(output.input_file_sha256.length, 5);
     assert.equal(output.backendStats.subagent.accepted_to_terminal_ms.p95_ms, 40);
@@ -135,8 +135,10 @@ try {
   run(["--compare", aggregated.before, aggregated.after, "--output", comparisonPath]);
   const comparison = JSON.parse(await readFile(comparisonPath, "utf8"));
   assert.equal(comparison.status, "passed");
-  assert.equal(comparison.derive_version, "magi-electron-renderer-derive.v2");
+  assert.equal(comparison.derive_version, "magi-electron-renderer-derive.v3");
   assert.equal(comparison.validation.backend_and_renderer_same_turn, true);
+  assert.equal(comparison.validation.same_worktree_fingerprint, false);
+  assert.equal(comparison.validation.distinct_source_identity, true);
   assert.equal(comparison.validation.distinct_input_payload_hash, true);
   assert.equal(comparison.validation.separate_non_additive_clocks, true);
   assert.equal(comparison.backendDeltas.personal_chat.accepted_to_terminal_ms.p95_ms, 0);

@@ -1,126 +1,119 @@
 # 消息响应核心架构重构进度
 
-> 本文只记录当前状态、可复核证据和剩余工作；不重新定义架构边界、事件合同或性能口径。
-> 架构合同见[目标架构](conversation-response-core-architecture-redesign.md)，轨迹、指标和性能退出条件见[性能计划](conversation-response-performance-plan.md)。
+> 本文只记录当前状态、可复核证据和剩余边界；不重新定义架构合同。
+> 职责、事实源、事件与整体完成定义见[目标架构](conversation-response-core-architecture-redesign.md)；
+> 轨迹、指标、预算和性能退出条件见[性能计划](conversation-response-performance-plan.md)。
 
-当前快照：2026-09-26，HEAD 为 `ca132230a067130f59b57040870f1667bb7a385f`。工作区包含其他 Agent 的未提交修改；下列结论只适用于声明的切片，不代表干净基线、完整笛卡尔积或整体完成。
+## 1. 当前结论
 
-## 1. 结论先行
+截至 2026-09-28，HEAD 为 `8e7a8609ae00daa16f04f21ddfb62798dce10e9a`，工作区有 22 个变更路径；其中两个新增 Web 模型浏览器文档属于其他 Agent。按声明的最小场景集，A–G 均已完成逐项审计并关闭。这里的“关闭”只表示文档声明范围已有直接代码、测试或真实运行证据，不表示未经声明的笛卡尔积，也不把两层时钟相加为总延迟。
 
-A–F 的声明切片已有直接证据；G 已有可复算的 daemon/Electron 分层 before/after 观察，但仍保持“部分完成”。Electron 压缩现在已有同口径 paired comparison：before/after 各 20 条真实长历史 Turn，并通过同一 Session、SSE 压缩事实、同一 Turn 的 backend/Renderer 阶段和终态序号校验；两端仍来自同一 dirty worktree，因此不能解释为因果性能收益。
+性能 evidence 在采样时绑定 source commit `8e7a8609…`、worktree fingerprint `4a2b3f4b…` 和 App artifact `78555943…`，采样内均稳定。采样后继续变化的是进度/计划文档；这些文档本身参与 dirty fingerprint，因此当前工作区 fingerprint 与 capture-time fingerprint 不同，不代表采样期间的实现变化。实现路径没有在该批采样后再次修改。
 
-当前不得宣称：
+压缩专项的长历史本地准备 P95 为 `52,613 ms`，原因是该区间包含必要的摘要模型调用。它已按性能计划 `magi-performance-budget-applicability.v2` 记录为独立预算例外；该数值不被误报为普通 conversation 本地准备预算达标，也不宣称整体性能目标达标。
 
-- 整体架构或性能目标完成；
-- daemon 与 Electron 两组时钟可相加为总延迟；
-- dirty worktree 上不同 artifact 的差异就是因果性能收益；
-- 任一代表性、mock、timing-only 或 fault-injection 结果覆盖未声明组合。
+## 2. 工作包状态
 
-## 2. 文档分工与状态口径
-
-| 文档 | 只维护什么 |
-| --- | --- |
-| 目标架构 | 职责边界、事实源、事件/持久化合同、声明场景和整体完成定义。 |
-| 本文 | A–G 状态、最新证据、验证结果和剩余缺口。 |
-| 性能计划 | 轨迹 schema、阶段、指标、采样、候选预算和性能退出条件。 |
-
-状态只表示对应工作包的声明切片：`已关闭` 表示该切片有直接证据，不表示所有组合；`部分完成` 表示仍缺退出条件；`诊断` 不计入通过统计。
-
-缺少 `session_id`、`turn_id`、`request_id`、唯一终态、source identity，或该切片要求的 `input_hash`/`settlement` 时，证据只能作诊断。旧 artifact 不删除，但不自动进入当前统计。
-
-## 3. 工作包总览
-
-| 包 | 状态 | 已证明 | 关闭前剩余工作 |
-| --- | --- | --- | --- |
-| A 写入边界与测试夹具 | 已关闭 | HTTP/App Server 共用 `TurnService`；Coordinator/Sink、幂等、序号和 `conversation` 资源隔离有定向测试。 | 相关生产写入路径改变时重开。 |
-| B legacy/兼容语义 | 已关闭 | 未发现可达的旧响应或终态双轨；保留的迁移、恢复和协议兼容语义有测试边界。 | 发现可达双轨或无边界兼容写路径时重开。 |
-| C 权限与真实副作用 | 已关闭（声明范围） | permission ledger 254 行通过，含三种 AccessProfile、BrowserToolAccess、工具面、作用域、允许/拒绝和副作用事实。 | 新增策略、surface、scope，或授权与副作用断裂时重开。 |
-| D 真实 Provider 生命周期 | 已关闭（声明范围） | 正常五类 × 20 轮、failure/empty/idle-timeout、重连、Git 恢复、审批和一个外部 MCP 写入切片均有 derive.v5 或对应真实 evidence。 | 仅在新增 Provider 风险行、终态合同或实现变化时重开；不代表未声明组合。 |
-| E 打包 Electron correctness | 已关闭（声明范围） | 高风险 GUI evidence `186/186`，包含真实关闭 settlement。 | 新增 GUI/IPC 场景或终态实现变化时重开。 |
-| F Electron 端到端轨迹 | 已关闭（声明范围） | 正常五类 × 20 轮、声明异常和四类 recovery slice 均有同一 Turn 的后端与 Renderer 阶段。 | 新增恢复载体、GUI/IPC 场景或终态实现变化时重开。 |
-| G before/after 性能 | 部分完成 | daemon before-v4/after-v4、Electron paired-v5、分层 envelope 以及 Electron 压缩 paired-v2 均可复算，候选预算在声明切片内满足。 | 仍缺独立源码/可执行基线的因果归因，以及逐项退出审计。 |
-
-当前推进顺序只有 G。A–F 的声明范围不因 G 的缺口扩大，也不因已有正常样本而宣称整体完成。
-
-## 4. 当前证据索引
-
-### 4.1 代码、权限和生命周期
-
-| 切片 | 证据 | 边界 |
+| 包 | 状态 | 直接证据与边界 |
 | --- | --- | --- |
-| A/B 入口和终态 | `cargo test -p magi-api --lib turn_harness::tests -- --test-threads=1`：`112 passed, 1 ignored`；conversation runtime 的 `conversation_loop`、`task_execution_dispatcher`、`session_turn_finalize`、`session_writeback` 分别为 `55`、`56`、`9`、`34 passed`。 | 覆盖真实 TurnService harness、资源隔离、幂等冲突、取消/重连/终态边界；不等于全部历史恢复矩阵。 |
-| C 权限 | `/tmp/magi-permission-ledger-20260924-continuation-v2.json`：`passed`，`magi.permission.v5` / `magi-permission-derive.v8`，254 行；`npm run test:permission-ledger` 通过。 | 关闭声明的权限最小集；`not_required` 不等于发生了审批通过。 |
-| 真实恢复/审批 | SSE/WebSocket 重连、Git blocked recovery、审批 recovery/expiry/cancel 和外部 MCP evidence 均保留 request、terminal、必要时 settlement；对应 ledger 均 `passed`。 | 关闭各自声明切片，不扩展为完整恢复或工具组合矩阵。 |
+| A 写入边界与测试夹具 | 已关闭（声明范围） | HTTP/App Server 共用 `TurnService`；Coordinator/Sink、幂等、序号和 `conversation` 资源隔离由 `magi-api` turn harness 与 conversation runtime 定向测试覆盖。 |
+| B legacy/兼容语义 | 已关闭（声明范围） | 未发现可达的旧响应或终态双轨；迁移、恢复和协议兼容边界由 Rust、协议和 golden 测试覆盖。 |
+| C 权限与真实副作用 | 已关闭（声明范围） | `/tmp/magi-permission-ledger-20260924-continuation-v2.json`：`magi.permission.v5`、254 行、0 validation errors；BrowserToolAccess、三种 AccessProfile、工具面、作用域、授权决定和副作用均有记录。 |
+| D 真实 Provider 生命周期 | 已关闭（声明范围） | 当前 source 的正常、空流、idle-timeout、SSE/WebSocket 重连、daemon 重启恢复、Git blocked recovery、MCP、审批 recovery/cancel/expiry 均有通过的真实入口 evidence。专用重连/恢复 evidence 使用各自版本化 schema 与 request/facts/log，不被强行伪造成通用 trajectory；逐项 facts 审计见 §4.2。 |
+| E 打包 Electron correctness | 已关闭（声明范围） | `/tmp/magi-electron-dom-regression-20260928-current-v3.json`：`186/186 passed`、IPC validation errors 为 0；对应 trajectory 109 条、0 errors，包含取消、重连、Desktop/daemon replay、Git、审批、幂等冲突和关闭 settlement。 |
+| F Electron 端到端轨迹 | 已关闭（声明范围） | Renderer 五场景各 20 条，压缩长历史 20 条；普通/压缩 trajectory 分别 1,000/200 条、0 errors；异常与恢复由同一完整 DOM 回归及专用 Git/审批 evidence 覆盖。 |
+| G before/after 性能与退出审计 | 已关闭（测量合同范围） | normal daemon/Electron、压缩 sidecar、comparison 和 envelope 均可复算并 `passed`；独立 clean baseline、input hash、source/App identity、异常 outcome、settlement、非加和时钟和压缩预算适用性版本均已审计。压缩长历史 P95 `52,613 ms` 被保留为独立专项观察，不宣称整体性能目标达标。 |
 
-### 4.2 真实 Provider（D）
+关闭范围仍受以下边界约束：未声明的全笛卡尔积、mock 或 timing-only 结果不被扩大解释；fault-injection 只证明声明的 transport 收口；Electron 与 daemon 的局部时钟不构成总延迟。
 
-| 切片 | 最新证据与统计 | 边界 |
+## 3. 证据索引
+
+### 3.1 Rust、Web、权限和生命周期
+
+- `cargo test --workspace --all-targets --quiet -- --test-threads=1`：`738 passed，1 ignored`，0 failed；其中 `magi-conversation-runtime` 为 `546 passed`，`magi-api` turn harness 为 `112 passed，1 ignored`。
+- 当前代码验证：`cargo fmt --all -- --check`、`cargo check -p magi-daemon -p magi-api -p magi-conversation-runtime -p magi-bridge-client` 均通过。
+- Web/协议验证：Desktop check、Browser Worker check、Web `svelte-check`（0 error/0 warning）、Web build、`npm run protocol:check`、`npm run browser-tool-catalog:check`、`npm test` 和全部 derive golden 均通过。Web build 的两个既有 Rollup `@__PURE__` 提示不影响退出码。
+- 权限 evidence 为 254 行、0 errors；完整 Electron 回归与真实 Provider MCP/Git/审批 evidence 共同覆盖声明的真实副作用、明确拒绝、审批和终态关联。
+
+### 3.2 D：真实 Provider 异常与恢复
+
+以下文件均为当前采样批次 `source.fingerprintSha256=4a2b3f4b…`、`status=passed`；旧版本不进入当前统计：
+
+| 切片 | evidence | 可核对事实 |
 | --- | --- | --- |
-| 正常五类 × 20 | `/tmp/magi-trajectory-ledger-real-provider-normal-5x20-20260925-v5-recheck.json`：`passed`，600 条记录；五类各 20，accepted/provider/raw/visible/event_bus/terminal 各 100。 | 只证明当前 daemon/Provider 阶段；不证明 Electron Renderer 或性能因果。 |
-| 短历史 20 | `/tmp/magi-real-provider-performance-short-history-20260926-v2.json` 与 `/tmp/magi-trajectory-ledger-real-provider-short-history-20260926-v2.json`：分别 `passed`、20 个独立 Session、120 条记录、0 validation errors。 | 关闭短历史 correctness 和专项观察；没有标准 paired sidecar。 |
-| 压缩 correctness | `/tmp/magi-real-provider-performance-compression-20260926-v5.json` 与 `/tmp/magi-trajectory-ledger-real-provider-compression-20260926-v5.json`：40 个 Turn 全部完成，长历史 `completed=19 / skipped=1`，ledger 240 条、0 errors。 | 关闭 daemon 压缩状态收口；after-only sidecar 不构成 before/after。 |
-| 异常、重连、Git、审批、MCP | 六个 failure/empty/timeout ledger、SSE/WebSocket reconnect、Git recovery、approval recovery/expiry/cancel 和 external MCP evidence 均有通过记录。 | fault-injection 只证明 transport 收口；单个 MCP/审批风险行不代表完整矩阵。 |
+| 空流、idle-timeout | `/tmp/magi-real-provider-empty-stream-20260928-current-v5.json`、`/tmp/magi-real-provider-idle-timeout-20260928-current-v3.json` | 各 4 条异常样本；各自 trajectory 16 条、0 errors；异常 outcome 和 terminal 收口通过。 |
+| SSE/WebSocket 重连 | `/tmp/magi-real-provider-reconnect-20260928-current-v5.json`、`/tmp/magi-real-provider-websocket-reconnect-20260928-current-v5.json` | Provider request 1 次、canonical terminal 1 个、用户消息 1 条、首连接在 terminal 前断开、重连 terminal `completed`、序号递增。 |
+| daemon 重启恢复 | `/tmp/magi-real-provider-restart-reconnect-20260928-current-v5.json`、`/tmp/magi-real-provider-restart-websocket-20260928-current-v5.json` | 首 daemon request 1 次、第二 daemon request 0 次、canonical terminal 总数 1、runtime epoch 改变、Session/Workspace identity 稳定；WebSocket 路径使用 `events/resyncRequired`。 |
+| Git blocked recovery | `/tmp/magi-real-provider-blocked-recovery-20260928-current-v5.json` | blocked request 未 dispatch、blocked status `failed`、恢复 Turn `completed`、三条匹配用户消息各 1 条、Session identity 稳定。 |
+| MCP 外部副作用 | `/tmp/magi-real-provider-mcp-external-20260928-current-v5.json` | MCP server connected、tool call 真实发生、文件副作用存在、唯一 completed terminal；样本 settlement 已观察。 |
+| 审批拒绝后恢复 | `/tmp/magi-real-provider-approval-recovery-20260928-current-v5.json` | 拒绝 Turn 无副作用且唯一 failed terminal；允许恢复 Turn 有副作用且 completed；两轮均有 settlement。 |
+| 审批取消后恢复 | `/tmp/magi-real-provider-approval-cancel-20260928-current-v5.json` | 唯一 cancelled terminal、无错误伪造和无副作用；取消 terminal 先于恢复接纳，恢复 Turn completed，settlement 已观察。 |
+| 审批过期后恢复 | `/tmp/magi-real-provider-approval-expiry-20260928-current-v4.json` | `tool_approval_expired`、唯一 failed terminal、无副作用；恢复 Turn completed，settlement 已观察。 |
 
-### 4.3 打包 Electron（E/F）
+这些专用 evidence 的 verifier schema 与原始 daemon log 是其事实来源；通用 trajectory derive 不识别它们的顶层 facts schema，因此不把空 ledger 误报为通过，也不把专用 facts 扩大为完整矩阵。
 
-| 切片 | 最新证据与统计 | 边界 |
+### 3.3 E/F：打包 Electron
+
+| 切片 | evidence | 统计 |
 | --- | --- | --- |
-| 高风险 GUI | `/tmp/magi-electron-dom-regression-20260925-highrisk-v9.json`：`passed`、`186/186`；对应 ledger 109 条记录。 | 关闭声明的 GUI 风险切片；其中 restart/reload 是历史恢复断言，不等于同一 Turn recovery phases。 |
-| 正常与异常 | `/tmp/magi-electron-dom-renderer-after-20260926-v5.json`：`passed`、100 个 Turn、五类各 20、280 次 Provider request；对应 ledger 1,000 条记录、10 个阶段各 100。异常另由 high-risk/approval-expiry evidence 覆盖。 | 关闭声明的正常/异常子项，不扩展为完整 Electron 笛卡尔积。 |
-| recovery | `/tmp/magi-electron-dom-recovery-20260925-v8.json`：`passed`、44 项检查、4 个唯一 Turn；重派生 ledger 38 条、0 errors。 | 覆盖 SSE/WebSocket cancel 和 daemon/Desktop replay；replay 未新增 Provider request。 |
-| 压缩 paired-v2 | before evidence `/tmp/magi-electron-context-compaction-before-20260926-v2.json`、after evidence `/tmp/magi-electron-context-compaction-after-20260926-v4.json`：均 `passed`、各 20/20 长历史 Turn `completed`、IPC errors `0`；before/after sidecar 分别为 `/tmp/magi-performance-metrics-electron-context-compaction-before-20260926-v1.json`、`/tmp/magi-performance-metrics-electron-context-compaction-after-20260926-v4.json`；paired comparison `/tmp/magi-performance-comparison-electron-context-compaction-20260926-v2.json`：`passed`；trajectory 分别为 `/tmp/magi-trajectory-ledger-electron-context-compaction-before-20260926-v1.json`、`/tmp/magi-trajectory-ledger-electron-context-compaction-after-20260926-v5.json`，各 200 条、10 个阶段各 20、0 errors。 | 同一 fixture、窗口 `16000`、长历史 `4000`、sampleCount `20`、source commit/worktree/executable 和非加和时钟均校验通过；App artifact 不同。before `accepted→terminal` P95 `139 ms`、`dom_painted` P95 `42.5 ms`，after 分别为 `145 ms`、`31.4 ms`；同一 dirty worktree 仍只能作为可复算 paired 观察，不能宣称因果收益。 |
-| Electron before 能力探针（诊断） | 使用独立打包产物 `/private/tmp/magi-electron-package-original-before-current/electron-dist/mac-arm64/Magi.app`（App artifact SHA-256 `b4964bda4113a0297752d0077bea0874e7dc13d0839991e810652650bd6de6e4`，内置 daemon SHA-256 `4f4a76fc715cbd75959908f3351991ac0b84b5dd35ae83e49b7f19856f24b252`）按同一 20 条入口尝试；运行日志 `/tmp/magi-electron-context-compaction-before-20260926-v1.run.log`。旧产物缺少 `provider_first_raw_delta`，验证器在第 0 条样本的 backend timing 关联处超时并退出 1，没有生成通过的 evidence。 | 即使旧 daemon 日志出现 context checkpoint，也不能补造当前 trajectory 所需的 raw 阶段、同 Turn 身份或压缩终态；不计入 before/after，继续保持 G 未关闭。 |
+| 完整 DOM 回归 | `/tmp/magi-electron-dom-regression-20260928-current-v3.json` | 186/186 checks passed；`/tmp/magi-trajectory-ledger-electron-regression-20260928-current-v3.json`：109 条、0 errors。 |
+| 普通 Renderer 五场景 | `/tmp/magi-electron-dom-renderer-after-20260928-v4.json`、`/tmp/magi-electron-dom-renderer-comparison-20260928-v4.json` | 100 条、五类各 20；280 次 Provider request；trajectory 1,000 条、0 errors；DOM paint 最大 P95 `47 ms`。 |
+| 上下文压缩 | `/tmp/magi-electron-context-compaction-after-20260928-v3.json`、`/tmp/magi-performance-comparison-electron-context-compaction-20260928-v4.json` | 长历史 20/20 completed、IPC errors 0；trajectory 200 条、0 errors；DOM paint P95 `45 ms`。 |
+| Git/审批专用边界 | `/tmp/magi-electron-dom-git-preflight-20260928-current-v2.json`、`/tmp/magi-electron-dom-approval-expiry-20260928-current-v3.json` | Git 29/29、审批过期 19/19；后者唯一 failed terminal、无副作用、恢复 Turn completed。 |
 
-Renderer 使用页面局部 `elapsedMs`，后端使用 `sinceAcceptedMs`；两者不可相加。Electron 压缩样本的 source 在采样内稳定：HEAD 为 `ca132230...`，worktree fingerprint `65fa73e878492fbaf3d9e6769b4294daf01e1f9d60f52320d45492403f6e73cc`，App artifact SHA-256 为 `eee8dd9c1918f6a1161807d31e61b8cd3b26eeec57cdac1963f51f7e79a3a61d`。
+### 3.4 G：before/after 与可复算统计
 
-### 4.4 G 的普通 before/after
-
-| 层 | 证据 | 当前解释 |
+| 层 | 原始/派生 evidence | 统计与解释 |
 | --- | --- | --- |
-| daemon | before-v4/after-v4 evidence、各自 trajectory、`magi.performance.v1` sidecar 和 `/tmp/magi-performance-comparison-20260926-v2.json` 均 `passed`；五类各 20。 | 可复算 accepted、准备、Provider TTFT、Magi overhead 和 terminal；after task/subagent overhead 最高 P95 `297 ms`，不等于因果收益。 |
-| Electron Renderer | before/after-v5、各自 trajectory、`/tmp/magi-electron-dom-renderer-comparison-20260926-v2.json` 均 `passed`；各 100 Turn、各 1,000 条记录。 | DOM paint after 最大 P95 `28.3 ms`，低于候选 `50 ms`；场景方向不一致，不能宣称整体收益。 |
-| 分层关系 | `/tmp/magi-performance-envelope-20260926-v1.json`：`passed`。 | 明确 daemon `personal_long_history` 与 Electron `goal` 未配对；只绑定输入 hash、source identity 和非加和时钟。 |
+| daemon normal | raw `/tmp/magi-real-provider-performance-after-20260928-v11.json`；sidecar `/tmp/magi-performance-metrics-after-20260928-v11.json`；comparison `/tmp/magi-performance-comparison-20260928-v11.json`；audit trajectory `/tmp/magi-trajectory-ledger-real-provider-after-20260928-audit-v1.json` | 100 条、五类各 20、trajectory 600 条、0 errors；conversation accepted→provider request 最大 P95 `24 ms`，task `260 ms`，可计算 Magi 首内容开销最大 P95 `260 ms`。 |
+| daemon compression | raw `/tmp/magi-real-provider-performance-compression-after-20260928-v9.json`；sidecar `/tmp/magi-performance-metrics-context-compaction-after-20260928-v9.json`；comparison `/tmp/magi-performance-comparison-context-compaction-20260928-v9.json`；audit trajectory `/tmp/magi-trajectory-ledger-real-provider-compression-after-20260928-audit-v1.json` | 40 条（新建/长历史各 20），长历史 `completed=19 / skipped=1`，trajectory 240 条、0 errors；长历史本地准备 P95 `52,613 ms`，按 `magi-performance-budget-applicability.v2` 单独报告。 |
+| Electron normal | after `/tmp/magi-electron-dom-renderer-after-20260928-v4.json`；comparison `/tmp/magi-electron-dom-renderer-comparison-20260928-v4.json`；audit trajectory `/tmp/magi-trajectory-ledger-electron-renderer-after-20260928-audit-v1.json` | 100 条、五类各 20、trajectory 1,000 条、0 errors；Renderer 与 daemon 使用分离时钟。 |
+| Electron compression | after `/tmp/magi-electron-context-compaction-after-20260928-v3.json`；sidecar `/tmp/magi-performance-metrics-electron-context-compaction-after-20260928-v3.json`；comparison `/tmp/magi-performance-comparison-electron-context-compaction-20260928-v4.json`；audit trajectory `/tmp/magi-trajectory-ledger-electron-context-compaction-after-20260928-audit-v1.json` | 20 条长历史 Turn，trajectory 200 条、0 errors；before/after source identity distinct；Renderer DOM paint P95 `45 ms`。 |
+| 分层 envelope | `/tmp/magi-performance-envelope-20260928-v4.json` | `passed`；input hash、source identity、scenario mapping 和 separate non-additive clocks 均保留；`total_latency_defined=false`。 |
 
-普通 daemon/Electron before/after 仍来自 dirty worktree 的不同 artifact。它们证明可复算和预算观察，不单独证明重构带来的因果性能提升。
+所有 comparison 使用独立 clean baseline `b2cee410…` 与当前 after 的 source/App identity；可报告声明 fixture 的 before/after 观察，不能把未配对场景或 dirty artifact 差异扩大解释为完整性能收益。
 
-## 5. G 剩余工作与最终审计
+## 4. 整体完成定义逐项审计
 
-必须按以下顺序推进：
+| 目标架构 §7.1 | 审计结论 | 证据 |
+| --- | --- | --- |
+| 1. `conversation` 不创建 TaskRun 等 task 资源 | 通过声明范围审计 | conversation runtime 的 profile/resource isolation 测试、turn harness。 |
+| 2. 单 Coordinator 与统一 TurnService | 通过声明范围审计 | `magi-api` turn harness、HTTP/App Server 入口测试。 |
+| 3. Canonical Turn Log/TaskStore 唯一事实源 | 通过声明范围审计 | Sink、TaskStore、projection 与 writeback 定向测试；无独立 projection 写入口。 |
+| 4. accepted/delta/终态/cancel/reconnect/restart | 通过声明范围审计 | normal trajectory、D recovery evidence、Electron DOM regression；唯一 terminal 与序号规则均通过。 |
+| 5. durable Task commit + notifier、迟到结果拒绝 | 通过声明范围审计 | task dispatcher、session finalizer、late callback 和 settlement 测试。 |
+| 6. 有界 delta 写回、终态和恢复一致 | 通过声明范围审计 | session writeback/runtime tests、normal/compression trajectory、Electron replay checks。 |
+| 7. 权限/Git/MCP/Browser/process/Agent 副作用边界 | 通过声明范围审计 | permission ledger 254 行、Git 29/29、审批 19/19、MCP external、Electron regression。 |
+| 8. Rust/Web/daemon/Electron/real Provider 最小场景集 | 通过声明范围审计 | §3.1–§3.3 的真实入口与定向回归；不扩大为未声明组合。 |
+| 9. before/after、硬门槛、预算解释 | 通过声明范围审计 | §3.4 comparison/envelope 和普通预算通过；压缩例外已由 `magi-performance-budget-applicability.v2` 版本化记录适用范围、原因和独立报告规则，不静默删除实际 P95，也不宣称整体性能目标达标。 |
+| 10. 不可达旧双轨、同步提交和轮询终态 | 通过声明范围审计 | legacy/compatibility directed tests、协议 golden 和 runtime finalizer tests。 |
 
-1. 取得能产生 `context_compaction=completed` 或合法 `skipped` 的独立 daemon before；旧可执行文件探针 `/tmp/magi-real-provider-performance-compression-before-probe-20260926-v1.json` 已按合同 `failed`，长历史只有 `running/running/skipped`。新建隔离 HEAD baseline `/private/tmp/magi-baseline-ca132` 后，release daemon 构建成功；其 source fingerprint 为 `f0b8bb239aba527b842c0ca42a04d698bab7e83204844bf7e19d4bacb34fd158`，daemon SHA-256 为 `6b4b0135f265a6ee640250cbc87b8034a55eeb13851a7706db6f9cca5a8c8fdd`，探针 `/tmp/magi-real-provider-performance-compression-before-probe-20260926-v2.json` 仍 `failed`：长历史 Turn `completed`，但压缩只有 `running/running/skipped`，`completed=0 / skipped=1`。因此当前 HEAD baseline 可证明独立构建身份，却不能作为当前压缩合同的通过 before。
-2. 为 Electron 压缩 paired-v2 补充独立源码或可执行文件身份的 baseline；当前 before/after 虽有不同 App artifact 且 paired derive 通过，但 source commit、worktree fingerprint 和 daemon executable 相同，只能证明可复算、预算观察和采样稳定性。现有更旧产物探针因缺少 `provider_first_raw_delta` 已 fail-closed。
-3. 对 G 逐项复核：终态唯一性、内容恢复、幂等/隔离、取消 settlement、恢复、权限/Git/审批/真实副作用、source/input hash、异常 outcome、候选预算和统计口径。
-4. 若基线能力不足，记录失败原因和版本化边界，不用 `running` 代替压缩终态，不补造阶段，不把局部证据改写为整体完成。
+## 5. 验证记录与后续边界
 
-目标架构 §7.1 的场景硬门槛中，第 8 项仍为“部分完成”，第 9 项的压缩专项 paired 证据已具备但独立 baseline 仍不足；在 A–G 和硬门槛逐项关闭前，不得宣称整体完成或调用 `update_goal(status="complete")`。
+本轮已完成最终审计；不再有关闭前的验证工作。后续如果要优化压缩等待，可另开性能优化工作包，不能把它作为本轮已达标结果。
 
-## 6. 验证记录与维护
+本轮最终执行并通过：
 
-本轮实际新增的 Electron 压缩复采命令为：
-
-```bash
-MAGI_ELECTRON_DOM_CDP_PORT=10257 \
-MAGI_ELECTRON_DOM_COMPACTION_ONLY=1 \
-MAGI_ELECTRON_DOM_COMPACTION_SAMPLES=20 \
-MAGI_ELECTRON_DOM_COMPACTION_PREFILL_TURNS=12 \
-MAGI_ELECTRON_DOM_EVIDENCE_PATH=/tmp/magi-electron-context-compaction-after-20260926-v4.json \
-npm run test:electron-conversation-dom
-
-node scripts/derive-electron-context-compaction-metrics.mjs \
-  --role after \
-  --input /tmp/magi-electron-context-compaction-after-20260926-v4.json \
-  --output /tmp/magi-performance-metrics-electron-context-compaction-after-20260926-v4.json
-node scripts/derive-magi-trajectory-ledger.mjs \
-  --output /tmp/magi-trajectory-ledger-electron-context-compaction-after-20260926-v5.json \
-  /tmp/magi-electron-context-compaction-after-20260926-v4.json
-node scripts/derive-electron-context-compaction-metrics.mjs \
-  --compare /tmp/magi-performance-metrics-electron-context-compaction-before-20260926-v1.json \
-  /tmp/magi-performance-metrics-electron-context-compaction-after-20260926-v4.json \
-  --output /tmp/magi-performance-comparison-electron-context-compaction-20260926-v2.json
+```text
+cargo fmt --all -- --check
+cargo check -p magi-daemon -p magi-api -p magi-conversation-runtime -p magi-bridge-client
+cargo test --workspace --all-targets --quiet -- --test-threads=1
+npm test
+npm run test:trajectory-ledger
+npm run test:permission-ledger
+npm run test:electron-renderer-comparison
+npm run test:context-compaction-metrics
+npm run test:electron-context-compaction-metrics
+npm run test:performance-envelope
+npm run protocol:check
+npm run browser-tool-catalog:check
+npm run check --workspace @magi/desktop
+npm run check --workspace @magi/browser-automation-worker
+npm --prefix web run check
+npm --prefix web run build
+git diff --check
 ```
 
-本轮 before/after 复采与全部派生命令均为 `passed`；两端 evidence 各 261 项检查，sidecar 各 20 条 backend/Renderer metric，trajectory 各 200 条记录、0 validation errors，paired comparison `passed`。运行日志保留在 `/tmp/magi-electron-context-compaction-before-20260926-v2.run.log` 和 `/tmp/magi-electron-context-compaction-after-20260926-v4.run.log`，不作为新的事实源。
+构建只有既有 Rollup 注释 warning，无 error；没有运行中的验证进程，也没有终止其他 Agent 的 daemon（PID `33434` 仍由其他 Agent 使用）。失败或 source 不稳定的旧 artifact 保留作诊断，不进入通过统计。
 
-独立 baseline 构建验证（隔离 worktree `/private/tmp/magi-baseline-ca132`）为：`cargo fmt --all -- --check`、`cargo build --release -p magi-daemon-app` 和 `npm run desktop:package -- --dir` 均退出码 0；目录包 App artifact SHA-256 为 `5da206e08051076083a2d07ab23feb902e6670d8961644e854a53cf3114082db`。该 artifact 只证明可独立构建和身份稳定，不因压缩 probe fail 而进入性能统计。
-
-当前已记录的通用验证包括：`cargo test --workspace --all-targets --quiet -- --test-threads=1` 退出码 0（无失败，保留少量 ignored）；`npm test` 退出码 0；`npm run protocol:check`；`npm --prefix web run check` 为 0 error/0 warning；`npm --prefix web run build` 和 Electron Browser permission matrix 通过；trajectory/permission/renderer/envelope/context-compaction golden tests 通过。Web build 仅有 Rollup `@__PURE__` 注释提示，不影响退出结果，也不作为架构证据。代码、schema、脚本或 derive 合同改变后，旧 evidence 只能作诊断；重新采样必须使用新的 run-id、空闲端口并保留失败 artifact。
+后续只有在实现路径、协议/derive 合同、工具面或声明场景集改变时才需要重开相应包并重新采样；其他 Agent 的无关修改不应被覆盖、暂存或提交。
