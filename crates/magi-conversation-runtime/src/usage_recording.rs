@@ -58,6 +58,9 @@ pub struct ContextUsageRuntimeTrackerInput<'a> {
     pub turn_id: Option<&'a str>,
     pub call_id: &'a str,
     pub resolved_model: &'a str,
+    /// 本轮实际使用的模型窗口。调用方已经完成模型配置、会话覆盖和
+    /// vision 接管的解析，运行时观测不得再次按模型名猜测窗口。
+    pub context_window_tokens: u64,
     pub prefill_tokens: u64,
     pub thread_id: Option<&'a ThreadId>,
     pub model_provider: Option<String>,
@@ -82,6 +85,7 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             input.call_id,
             input.resolved_model,
             input.prefill_tokens,
+            Some(input.context_window_tokens),
             input.thread_id,
             input.model_provider.as_deref(),
             input.binding_revision,
@@ -122,6 +126,7 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             self.input.call_id,
             self.input.resolved_model,
             estimated_context_tokens,
+            Some(self.input.context_window_tokens),
             self.input.thread_id,
             self.input.model_provider.as_deref(),
             self.input.binding_revision,
@@ -305,6 +310,7 @@ pub fn publish_model_usage_record(
         input,
         None,
         None,
+        None,
     );
 }
 
@@ -326,6 +332,30 @@ pub fn publish_model_usage_record_for_turn(
         input,
         None,
         expected_turn_id,
+        None,
+    );
+}
+
+/// 为已绑定固定模型窗口的 Turn 记录用量。
+///
+/// authoritative pressure 事件必须继续使用该 Turn 实际发送请求时的窗口，不能在
+/// provider 返回后重新按模型名或已变化的设置推导分母。
+pub fn publish_model_usage_record_for_turn_with_context_window(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    settings_store: Option<&Arc<SettingsStore>>,
+    expected_turn_id: Option<&str>,
+    context_window_tokens: u64,
+    input: ModelUsageRecordInput<'_>,
+) {
+    publish_model_usage_record_internal(
+        event_bus,
+        session_store,
+        settings_store,
+        input,
+        None,
+        expected_turn_id,
+        Some(context_window_tokens),
     );
 }
 
@@ -343,6 +373,7 @@ pub fn publish_model_usage_record_with_config(
         input,
         Some(model_config),
         None,
+        None,
     );
 }
 
@@ -356,6 +387,7 @@ pub fn publish_context_usage_update(
     call_id: &str,
     resolved_model: &str,
     token_used: u64,
+    context_window_override: Option<u64>,
     thread_id: Option<&ThreadId>,
     model_provider: Option<&str>,
     binding_revision: u32,
@@ -363,7 +395,9 @@ pub fn publish_context_usage_update(
     phase: &str,
     accuracy: &str,
 ) {
-    let context_window = resolve_model_context_window(settings_store, resolved_model).max(1);
+    let context_window = context_window_override
+        .unwrap_or_else(|| resolve_model_context_window(settings_store, resolved_model))
+        .max(1);
     let previous_anchor = latest_usage_observations_from_ledger(
         &event_bus.audit_usage_ledger_snapshot().usage_entries,
     )
@@ -384,6 +418,11 @@ pub fn publish_context_usage_update(
         observation
             .checkpoint_generation
             .is_none_or(|generation| generation == checkpoint_generation)
+    })
+    .filter(|observation| {
+        observation
+            .context_window_limit_tokens
+            .is_none_or(|window| window == context_window)
     })
     .and_then(|observation| observation.provider_context_tokens);
     let projected_tokens = token_used.max(previous_anchor.unwrap_or_default());
@@ -470,6 +509,7 @@ fn publish_model_usage_record_internal(
     input: ModelUsageRecordInput<'_>,
     explicit_model_config: Option<LlmConfig>,
     expected_turn_id: Option<&str>,
+    context_window_override: Option<u64>,
 ) {
     let ModelUsageRecordInput {
         session_id,
@@ -588,6 +628,7 @@ fn publish_model_usage_record_internal(
             &input.call_identity.call_id,
             &resolved_model,
             authoritative_context_tokens,
+            context_window_override,
             thread_id.as_ref(),
             Some(&model_provider),
             binding.binding_revision,
@@ -885,6 +926,7 @@ mod tests {
             turn_id: Some("turn-context-runtime"),
             call_id: "call-context-runtime",
             resolved_model: "gpt-5.6-luna",
+            context_window_tokens: 256_000,
             prefill_tokens: 1_000,
             thread_id: None,
             model_provider: None,
@@ -904,6 +946,7 @@ mod tests {
         assert_eq!(events[0].payload["phase"], json!("prefill"));
         assert_eq!(events[0].payload["accuracy"], json!("estimated"));
         assert_eq!(events[0].payload["token_used"], json!(1_000));
+        assert_eq!(events[0].payload["context_window_tokens"], json!(256_000));
         assert_eq!(events[1].payload["phase"], json!("streaming"));
         assert_eq!(events[1].payload["accuracy"], json!("estimated"));
         assert!(events[1].payload["token_used"].as_u64().unwrap_or_default() > 1_000);
@@ -1118,6 +1161,61 @@ mod tests {
             context_event.payload["resolved_model"],
             json!("gpt-session-test")
         );
+    }
+
+    #[test]
+    fn fixed_turn_context_window_is_kept_for_authoritative_usage_snapshot() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-fixed-context-window");
+        settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://example.test",
+                    "apiProtocol": "openai_chat",
+                    "apiKey": "secret"
+                }),
+            )
+            .unwrap();
+        settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({"model": "gpt-fixed-window"}),
+            )
+            .unwrap();
+        let binding = session_turn_model_usage_binding(true);
+        let workspace_id = None;
+
+        publish_model_usage_record_for_turn_with_context_window(
+            &event_bus,
+            &session_store,
+            Some(&settings_store),
+            Some("turn-fixed-context-window"),
+            256_000,
+            ModelUsageRecordInput {
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                binding: &binding,
+                call_id: "call-fixed-context-window".to_string(),
+                usage: Some(&json!({"prompt_tokens": 42, "completion_tokens": 7})),
+                status: UsageCallStatus::Success,
+                assignment_id: None,
+                error_code: None,
+            },
+        );
+
+        let event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "session.context.pressure.updated")
+            .expect("固定窗口必须写入 authoritative pressure 事件");
+        assert_eq!(event.payload["context_window_tokens"], json!(256_000));
+        assert_eq!(event.payload["context_window_limit_tokens"], json!(256_000));
+        assert_eq!(event.payload["token_used"], json!(42));
     }
 
     struct SuccessfulAuxiliaryClient;

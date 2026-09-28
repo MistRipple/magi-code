@@ -63,8 +63,9 @@ use crate::{
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         account_active_goal_usage, publish_model_usage_record_for_turn,
-        resolved_model_for_usage_binding, resolved_provider_for_usage_binding,
-        session_turn_model_usage_binding, vision_model_usage_binding,
+        publish_model_usage_record_for_turn_with_context_window, resolved_model_for_usage_binding,
+        resolved_provider_for_usage_binding, session_turn_model_usage_binding,
+        vision_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -1379,6 +1380,7 @@ fn run_session_turn_execution_inner(
                 pre_output_invocation_recovery_attempts,
                 stream_interruption_recovery_attempts,
                 round,
+                context_window_tokens: effective_context_window,
                 orchestrator_thread_id: &orchestrator_thread_id,
                 orchestrator_mission_id: &orchestrator_mission_id,
                 persist_session_state,
@@ -2043,6 +2045,7 @@ struct SessionTurnRoundRuntime<'a> {
     pre_output_invocation_recovery_attempts: usize,
     stream_interruption_recovery_attempts: usize,
     round: usize,
+    context_window_tokens: u64,
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
     orchestrator_mission_id: &'a magi_core::MissionId,
@@ -2210,6 +2213,7 @@ fn stream_session_turn_round(
         pre_output_invocation_recovery_attempts,
         stream_interruption_recovery_attempts,
         round,
+        context_window_tokens,
         orchestrator_thread_id,
         orchestrator_mission_id,
         persist_session_state,
@@ -2272,6 +2276,7 @@ fn stream_session_turn_round(
             turn_id: Some(&request.turn_id),
             call_id: &call_id,
             resolved_model: &resolved_model,
+            context_window_tokens,
             prefill_tokens: prefill_tokens as u64,
             thread_id: Some(orchestrator_thread_id),
             model_provider: resolved_provider,
@@ -2731,11 +2736,12 @@ fn stream_session_turn_round(
         ),
         ModelResponseStatus::Completed | ModelResponseStatus::RequiresToolExecution => None,
     };
-    publish_model_usage_record_for_turn(
+    publish_model_usage_record_for_turn_with_context_window(
         event_bus,
         session_store,
         settings_store,
         Some(&request.turn_id),
+        context_window_tokens,
         crate::usage_recording::ModelUsageRecordInput {
             session_id: &request.session_id,
             workspace_id: &request.workspace_id,
@@ -6093,6 +6099,7 @@ mod tests {
                 stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,
                 round: 0,
+                context_window_tokens: 256_000,
                 orchestrator_thread_id: &orchestrator_thread_id,
                 orchestrator_mission_id: &mission_id,
                 persist_session_state: None,
@@ -6232,6 +6239,7 @@ mod tests {
                 stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,
                 round: 0,
+                context_window_tokens: 256_000,
                 orchestrator_thread_id: &orchestrator_thread_id,
                 orchestrator_mission_id: &mission_id,
                 persist_session_state: None,

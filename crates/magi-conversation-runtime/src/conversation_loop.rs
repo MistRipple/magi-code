@@ -64,7 +64,8 @@ use crate::{
     session_images::{SessionTurnImage, session_turn_image_sources},
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
-        account_active_goal_usage, publish_model_usage_record_for_turn, record_mission_turn,
+        account_active_goal_usage, publish_model_usage_record_for_turn,
+        publish_model_usage_record_for_turn_with_context_window, record_mission_turn,
         resolved_model_for_usage_binding, resolved_provider_for_usage_binding,
         vision_model_usage_binding,
     },
@@ -940,7 +941,10 @@ fn run_conversation_loop_inner(
         .unwrap_or(&selected_context_model)
         .to_string();
     let mut effective_context_window = resolve_model_context_window_with_override(
-        live_settings_store.or(settings_store).map(Arc::as_ref),
+        // 与模型 client、vision 配置和 usage binding 使用同一份已接纳的执行快照。
+        // 不能在 Turn 执行中改用 live settings，否则模型仍是旧配置而窗口可能
+        // 来自新配置，/compact 会按错误的分母规划历史。
+        settings_store.or(live_settings_store).map(Arc::as_ref),
         &resolved_context_model,
         vision_execution_config
             .as_ref()
@@ -1599,6 +1603,7 @@ fn run_conversation_loop_inner(
                 turn_id: expected_turn_id.as_deref(),
                 call_id: &round_call_id,
                 resolved_model: &resolved_context_model,
+                context_window_tokens: effective_context_window,
                 prefill_tokens: estimate_chat_messages_tokens(&messages)
                     .saturating_add(estimate_tool_definition_tokens(round_tools.as_deref()))
                     as u64,
@@ -2369,11 +2374,12 @@ fn run_conversation_loop_inner(
             ),
             ModelResponseStatus::Completed | ModelResponseStatus::RequiresToolExecution => None,
         };
-        publish_model_usage_record_for_turn(
+        publish_model_usage_record_for_turn_with_context_window(
             event_bus,
             session_store,
             settings_store,
             expected_turn_id.as_deref(),
+            effective_context_window,
             crate::usage_recording::ModelUsageRecordInput {
                 session_id,
                 workspace_id,
@@ -5026,8 +5032,162 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn context_authority_keeps_large_history_under_model_hard_limit_in_one_prepare() {
+        let client = SemanticCompactionModelBridgeClient;
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-context-compaction-hard-limit");
+        session_store
+            .create_session(session_id.clone(), "context compaction hard limit")
+            .expect("session should be created");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(1), || {
+                MissionId::new("mission-context-compaction-hard-limit")
+            });
+        let event_bus = InMemoryEventBus::new(32);
+        let history = repeated_thread_history(2_500, 1_000);
+        let original_tokens = crate::context_authority::estimate_thread_history_tokens(&history);
+        session_store.append_thread_messages(&thread_id, history, UtcMillis(2));
+
+        let prepared = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        )
+        .prepare(ContextPrepareRequest {
+            recovery_history: Vec::new(),
+            phase: "pre_turn",
+            context_window_tokens: 256_000,
+            additional_token_estimate: 0,
+            persist_checkpoint: true,
+            model_identity: None,
+            mode: ContextCompactionMode::Automatic,
+        });
+
+        let compacted_tokens =
+            crate::context_authority::estimate_thread_history_tokens(&prepared.messages);
+        let policy = magi_usage_authority::ContextBudgetPolicy::for_window(256_000, None, 0);
+        assert!(prepared.compaction.is_some());
+        assert!(compacted_tokens < original_tokens);
+        assert!(
+            compacted_tokens as u64 <= policy.hard_request_limit_tokens,
+            "一次 /compact 后不得继续把超过模型硬上限的历史安装为 completed: {} > {}",
+            compacted_tokens,
+            policy.hard_request_limit_tokens
+        );
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn manual_compact_folds_multi_pass_history_to_selected_model_retained_target() {
+        let client = SemanticCompactionModelBridgeClient;
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-context-compaction-manual-retained-target");
+        session_store
+            .create_session(session_id.clone(), "manual retained target")
+            .expect("session should be created");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(1), || {
+                MissionId::new("mission-context-compaction-manual-retained-target")
+            });
+        let event_bus = InMemoryEventBus::new(64);
+        session_store.append_thread_messages(
+            &thread_id,
+            repeated_thread_history(2_500, 1_000),
+            UtcMillis(2),
+        );
+
+        let prepared = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        )
+        .prepare(ContextPrepareRequest {
+            recovery_history: Vec::new(),
+            phase: "manual",
+            context_window_tokens: 256_000,
+            additional_token_estimate: 0,
+            persist_checkpoint: true,
+            model_identity: None,
+            mode: ContextCompactionMode::Manual { instructions: None },
+        });
+
+        let compacted_tokens =
+            crate::context_authority::estimate_thread_history_tokens(&prepared.messages);
+        let policy = magi_usage_authority::ContextBudgetPolicy::for_window(256_000, None, 0);
+        assert!(prepared.compaction.is_some());
+        assert!(
+            compacted_tokens as u64 <= policy.retained_history_target_tokens,
+            "一次 /compact 必须按所选模型窗口完成连续折叠: {} > {}",
+            compacted_tokens,
+            policy.retained_history_target_tokens
+        );
+        assert!(
+            compacted_tokens as u64 <= policy.hard_request_limit_tokens,
+            "已安装的 /compact 检查点不得超过模型硬请求上限: {} > {}",
+            compacted_tokens,
+            policy.hard_request_limit_tokens
+        );
+        let compacted_event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "session.context.compacted")
+            .expect("手动压缩应发布结构化完成事实");
+        assert_eq!(
+            compacted_event.payload["context_window_limit_tokens"],
+            serde_json::json!(256_000)
+        );
+        assert_eq!(
+            compacted_event.payload["context_window_tokens"],
+            serde_json::json!(256_000),
+            "压缩事件中的 context_window_tokens 必须是模型窗口，不得写入 prefill 估算"
+        );
+        assert!(
+            compacted_event.payload["request_token_estimate"]
+                .as_u64()
+                .is_some_and(|tokens| tokens <= policy.retained_history_target_tokens)
+        );
+    }
+
     struct FailingCompactionModelBridgeClient {
         calls: AtomicUsize,
+    }
+
+    struct OversizedCompactionModelBridgeClient {
+        calls: AtomicUsize,
+    }
+
+    impl ModelBridgeClient for OversizedCompactionModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut summary = "## 目标与完成标准\n- 完成当前任务。\n## 约束与权限\n- 当前权限有效。\n## 工作区事实\n- 测试工作区。\n## 工具与外部操作\n- 无。\n## 代理状态\n- 无。\n## 已确认决策\n- 继续。\n## 阻塞与风险\n- 无。\n## 下一步\n- 继续。\n## 禁止重复\n- 无。".to_string();
+            summary.push_str(&"\n- oversized handoff fact".repeat(100_000));
+            Ok(ModelResponse::completed(summary))
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.invoke(request)
+        }
     }
 
     impl ModelBridgeClient for FailingCompactionModelBridgeClient {
@@ -5089,6 +5249,36 @@ mod tests {
             history,
             history_tokens,
         )
+    }
+
+    #[test]
+    fn oversized_compaction_output_is_rejected_before_checkpoint_install() {
+        let (session_store, session_id, thread_id, _, _) =
+            compaction_failure_fixture("compaction-oversized-output");
+        let client = OversizedCompactionModelBridgeClient {
+            calls: AtomicUsize::new(0),
+        };
+        let event_bus = InMemoryEventBus::new(32);
+        let authority = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        );
+        let prepared = authority.prepare(compaction_request(0, ContextCompactionMode::Recovery));
+
+        assert!(prepared.compaction.is_none());
+        assert_eq!(prepared.terminal, Some(ContextCompactionTerminal::Failed));
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .is_none(),
+            "provider 忽略输出上限时不能安装超大摘要检查点"
+        );
     }
 
     fn compaction_request(

@@ -6,11 +6,31 @@
 
 ## 1. 当前结论
 
-截至 2026-09-28，HEAD 为 `8e7a8609ae00daa16f04f21ddfb62798dce10e9a`，工作区有 22 个变更路径；其中两个新增 Web 模型浏览器文档属于其他 Agent。按声明的最小场景集，A–G 均已完成逐项审计并关闭。这里的“关闭”只表示文档声明范围已有直接代码、测试或真实运行证据，不表示未经声明的笛卡尔积，也不把两层时钟相加为总延迟。
+截至 2026-09-29，当前 HEAD 为 `30e58c83`，工作区有 11 个变更路径；其中 Browser 相关文档改动属于其他 Agent，本轮不覆盖、不清理。按声明的最小场景集，A–G 均已完成逐项审计并关闭。这里的“关闭”只表示文档声明范围已有直接代码、测试或真实运行证据，不表示未经声明的笛卡尔积，也不把两层时钟相加为总延迟。
 
 性能 evidence 在采样时绑定 source commit `8e7a8609…`、worktree fingerprint `4a2b3f4b…` 和 App artifact `78555943…`，采样内均稳定。采样后继续变化的是进度/计划文档；这些文档本身参与 dirty fingerprint，因此当前工作区 fingerprint 与 capture-time fingerprint 不同，不代表采样期间的实现变化。实现路径没有在该批采样后再次修改。
 
 压缩专项的长历史本地准备 P95 为 `52,613 ms`，原因是该区间包含必要的摘要模型调用。它已按性能计划 `magi-performance-budget-applicability.v2` 记录为独立预算例外；该数值不被误报为普通 conversation 本地准备预算达标，也不宣称整体性能目标达标。
+
+### 1.1 当前上下文窗口压缩修复（2026-09-29）
+
+本轮复核确认了一个此前未被旧性能 artifact 暴露的 correctness 缺口：原压缩路径一次只收缩摘要模型输入预算允许的连续前缀，用户执行 `/compact` 后可能仍留下超过所选模型窗口的活动上下文（例如 `603.7K → 466.8K → 329.8K`）。该现象不能用旧的单轮代表性压缩证据解释为已满足 256K 窗口约束。
+
+当前实现已完成以下修复：
+
+- `/compact` 使用同一个连续前缀 planner 在单条命令内执行有界多轮折叠，直到 `projected_request_tokens` 不超过所选模型的 `retained_history_target_tokens`；固定输入已经占满保留目标时，退回当前模型安全请求门禁。自动压缩与超限恢复仍在安全门禁处收口，不改变原有恢复调用上限。
+- 摘要输出预算同时受摘要包装、保留尾部和当前模型窗口约束；HTTP Chat Completions、Responses、Anthropic 三种协议都转发 `max output`，provider 忽略上限时在检查点安装前拒绝候选。
+- 上下文压力事件和流式 prefill 使用执行路径已经解析出的实际模型窗口，不再在 usage 观测阶段只按模型名重新猜测窗口；最终 authoritative pressure 事件也沿用该 Turn 窗口；估算 prefill 不再写入 `context_window_tokens` 字段。Task 执行使用已接纳的 settings snapshot，避免运行中 live settings 改变压缩分母。
+
+已通过的定向证据：
+
+- `cargo test -p magi-conversation-runtime --lib`：`552 passed / 0 failed`；其中 `manual_compact_folds_multi_pass_history_to_selected_model_retained_target` 对 2,500 条长历史、256,000 token 窗口验证一次 `/compact` 后不超过约 46,080 token 保留目标和硬请求上限；`oversized_compaction_output_is_rejected_before_checkpoint_install` 验证超大摘要不安装检查点；`fixed_turn_context_window_is_kept_for_authoritative_usage_snapshot` 验证最终 pressure 事件仍保留该 Turn 的 256K 分母。
+- `cargo test -p magi-bridge-client --lib`：`254 passed / 0 failed`；`compaction_output_limit_is_forwarded_to_provider_request` 覆盖三种 HTTP 协议。
+- `cargo test -p magi-event-bus read_model --lib`：`24 passed / 0 failed`；`cargo test -p magi-usage-authority --lib`：`32 passed / 0 failed`。
+- `cargo check -p magi-daemon -p magi-api -p magi-conversation-runtime -p magi-bridge-client`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- `npm --prefix web run check`、`npm --prefix web run test:context-ring`、`npm --prefix web run test:bridge`：通过（Svelte 0 error/0 warning，圆环和事件桥 golden 全部通过）。
+
+剩余边界：本轮只完成代码级、定向 Rust 和构建验证；尚未用修复后的 source 重新采集真实 Provider daemon/Electron 的 20 条压缩专项矩阵，因此旧的 `52,613 ms` 性能 artifact 不能作为本修复后的新性能结论。重新采样前不宣称完整真实矩阵或整体性能目标已重新验收。
 
 ## 2. 工作包状态
 

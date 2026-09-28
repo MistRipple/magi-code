@@ -1,7 +1,7 @@
 # Magi Web 模型浏览器 · 设计基线
 
 > 状态：**最终设计基线**（未实现）。设计结论、状态所有权、上下文一致性与安全边界以本文为准；阶段划分、实测清单、接口草案、错误码、验收与代码索引见《[实现计划](./web-model-browser-product-implementation-plan.md)》。
-> 更新日期：2026-09-28（已完成三轮四路联合审核：第一轮 R1–R21、第二轮 R22–R35、第三轮 R36–R46；第四轮为用户裁决 **R47「A10 改判：Connect 优先、未就绪时以 OpenAI Tunnel 正式交付」** 与 **R48「删除 T1」**）
+> 更新日期：2026-09-28（**第五轮源码复核后定版**）。历史轮次：第一轮 R1–R21、第二轮 R22–R35、第三轮 R36–R46；第四轮为用户裁决 **R47「A10 改判：Connect 优先、未就绪时以 OpenAI Tunnel 正式交付」** 与 **R48「删除 T1」**；第五轮按源码事实修正 **R49 后台可驱动宿主（方案 A）**、**R50 绑定键加 thread**、**R51 累计账不走 `ModelResponse.usage`**、**R52 重锚块下发每次发送的随机串**、**R53 删除 T3 v1**、**R54 stdio 中继经本地 socket 连 daemon**、**R55 绑定表只驻内存**、**R56 最小分片排进阶段 3**、**R57 工具调用块改长围栏**、**R58 T3 `tool_call_id` 与去重口径**、**R59 `pending_tools` 不存明文令牌**，以及一致性修复 R60–R62。修改依据见《实现计划》附录 B。
 > 相关文档：[工程约束与运行入口](./README.md)、[内置浏览器完整设计](./browser-runtime-design.md)、[上下文压力与压缩架构](./context-pressure-compaction-architecture.md)、[Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)、[Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)
 >
 > 参考实现：[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)。本文只借鉴其已验证的机制思路，不照搬形态，不引入其代码或运行时依赖。
@@ -31,10 +31,11 @@
 | 编号 | 结论 | 边界与理由 |
 | --- | --- | --- |
 | A1 | 只接入 ChatGPT 网页版；动机是使用账号订阅额度而不是 API token。 | 其他厂商网页版没有同一前提，不做通用适配器。 |
-| A2 | 登录态与浏览器宿主是**应用级**资源；其中的**临时对话实例**按 Magi 会话隔离。 | 跨项目、跨会话共享登录态；对话隔离避免串上下文。 |
-| A3 | 唯一入口是右栏“新增”菜单第三项 **GPT Web**。 | 右栏是浏览器 guest 唯一合法宿主；不引入隐藏窗口等第二宿主形态。 |
-| A4 | 关闭该 Tab 只关闭视图，不销毁宿主与登录态；进行中的推理不因关闭视图而取消，后台继续；登录态像浏览器缓存一样跨 Magi 重启保留。 | 与现有“关闭浏览器 Tab = 全局关闭”区分；取消推理是 conversation 的显式动作，另设“退出登录 / 清除 Web 数据”。 |
-| A5 | 每个 Magi 会话使用**一条临时对话**并多轮续接；只有新建、重建或失效时才全量重放。 | 默认不采用每轮新建临时对话；上下文保留在 web 侧，增量发送降低延迟与重复消耗。另提供**默认关闭**的「每轮新建对话」开关（§5.6），只用于隔离保留对话上的工具能力丢失。 |
+| A2 | 登录态与浏览器宿主是**应用级**资源；其中的**临时对话实例**按 Magi 会话及其线程隔离。 | 跨项目、跨会话共享登录态；对话隔离避免串上下文，线程维度保证编排者与子代理不共用一条临时对话（R50，§5.6）。 |
+| A3 | 唯一入口是右栏“新增”菜单第三项 **GPT Web**；承载页面仍是右栏内容槽里的 `<webview>`。 | 右栏是浏览器 guest 唯一合法宿主；不引入隐藏窗口等第二宿主形态（应用级内容槽的挂载规则见 A25）。 |
+| A4 | 关闭该 Tab 只关闭视图，不销毁宿主与登录态；进行中的推理不因关闭视图而取消，后台继续；登录态像浏览器缓存一样跨 Magi 重启保留。 | 与现有“关闭浏览器 Tab = 全局关闭”区分；取消推理是 conversation 的显式动作，另设“退出登录 / 清除 Web 数据”。落地规则见 A25。 |
+| A25 | **应用级 Web 内容槽全程挂载（方案 A）**：只要存在应用级 Web 会话，右栏折叠只隐藏不卸载；关闭 GPT Web 视图只从 Tab 条隐藏、保留在 `appTabs`；Desktop Control 为 App 级 owner 提供**不写布局意图、不激活右栏、不抢焦点**的驱动路径。 | 这是对 `docs/browser-runtime-design.md` 的「折叠即卸载」与「关闭 Tab = 全局关闭」两条的**显式例外**，只为应用级 Web 会话引入（§5.1–§5.4）；仍不引入第二宿主形态。理由：`<webview>` guest 随宿主组件卸载而销毁，而自动化命令又会强制激活右栏，两者与 A4/A14 直接冲突（R49）。 |
+| A5 | 每个 Magi 会话的**每条线程**使用**一条临时对话**并多轮续接（编排者与子代理各一条，R50）；只有新建、重建或失效时才全量重放。 | 默认不采用每轮新建临时对话；上下文保留在 web 侧，增量发送降低延迟与重复消耗。另提供**默认关闭**的「每轮新建对话」开关（§5.6），只用于隔离保留对话上的工具能力丢失。 |
 | A6 | Web 模型清单进入现有 `engines`，标明来源为 Web；不建立第二套模型列表。 | 发现结果先返回候选，用户确认后走现有 `upsert_engine`；未登录或登录过期时不得展示 Web 模型。 |
 | A7 | 推理实现为一个 `ModelBridgeClient`（`apiProtocol = chatgpt_web`），不新建消息通道。 | 复用 turn、事件、SSE 与前端渲染；避免第二条写入路径。 |
 | A8 | 工具能力是**产品必需**能力，按 T0 无工具、T2 文本协议、T3 MCP 桥接交付；T3 是目标形态。 | T0 只是中间落地态；没有工具能力就不满足项目级开发。**T1「上下文内联」已按用户决定删除**（R48）：它不能调用工具，只会额外发送工具说明并计入额度消耗，收益为零；编号保留空洞以兼容既有引用。 |
@@ -49,11 +50,11 @@
 | A17 | ChatGPT 自定义连接器由 Magi 在托管浏览器会话中自动配置，用户只确认一次授权说明。 | 用户不需要进入 ChatGPT 设置手动添加；失败 fail closed 并降级。 |
 | A18 | T3 的“同回复续接”与“下一轮回填”是两条一等路径。 | 审批或执行超过挂起时限时走回填是常态，不作为异常兜底。 |
 | A19 | 产品形态与性能优先，**不做兼容**：不迁移、不双读/双写、不版本协商、不保留旧格式运行期分支，也不支持应用降级。 | 唯一硬要求是可重建状态加载路径全函数：读不出来就重建，绝不让 daemon 加载失败。 |
-| A20 | **web 侧不落盘**：不镜像、不缓存、不持久化对话正文与页面副本；Magi canonical 是唯一事实源。 | 从 web 读回并展示的会话记录在 Magi 持久化；只持久化可重建的绑定指针、累计账与前缀指纹（§5.12）；web 侧丢失按正常路径全量重放。 |
+| A20 | **web 侧不落盘**：不镜像、不缓存、不持久化对话正文与页面副本；Magi canonical 是唯一事实源。 | 从 web 读回并展示的会话记录在 Magi 持久化；绑定指针、累计账与前缀指纹只驻 daemon 进程内存（§5.12），重启即重建；web 侧丢失按正常路径全量重放。 |
 | A21 | 应用级 GPT Web 会话使用**带 `persist:` 前缀的专用分区**（`persist:magi-web-model`），登录态才可能跨应用重启保留；宿主侧 partition 白名单与「清理浏览数据」按此调整。 | Electron 中没有 `persist:` 前缀的 partition 是**内存会话**，进程退出即丢；现有 `magi-browser-<id>` 分区不满足 A4。 |
 | A22 | Web 模型的选择入口是**会话内主模型选择器**：清单位于现有 `engines`（唯一注册表），会话通过**会话级主模型覆盖新增的引擎绑定**指向该引擎；Web 引擎条目不写 `llm`，也不写入 provider 连接（`orchestrator` 段的 baseUrl / apiKey）。选择器的强度档位改为**按模型动态**：只展示该引擎 `efforts` 里的取值，不支持的置灰。 | 主对话现为「全局连接基座 + 会话级 `model` / `reasoningEffort` 覆盖」，完全不读 `engines`；不补这条绑定就没有可选入口，或会被迫在 UI 造第二套列表（违反 A6）。现前端 strength 是固定四档，需要改成按模型取值（《实现计划》§6）。 |
 | A23 | 站点适配失败（selector 漂移）与风控 / 验证页同为**引擎级不可用状态**：引擎必须推进到 `site_blocked`（带 `reason`），不得停留在 `available`。 | 否则站点改版后模型看起来可用、每次发送都失败，用户没有任何持续状态可依据。 |
-| A24 | **同一逻辑 Tab 全局只有一个 Primary**（`primary_surfaces` 以 tab 为键），推理只使用承载该 Tab Primary 的窗口；每个窗口各有一份独立的 App 级物理 Surface 集合（同一内容槽内的主页 + 当前会话推理页，§5.2；登录态靠同一 partition 共享）。非 Primary 窗口不复制用于推理的 Surface，显示「本窗口未承载当前推理」并提供「打开主窗口」动作。 | 与 `docs/browser-runtime-design.md` §4.1 的既有 Surface 规则一致；见 §5.3、§5.13。当前产品只创建一个窗口入口，多窗口行为按既有架构规则描述，产品化窗口入口由宿主另行提供。 |
+| A24 | **同一逻辑 Tab 全局只有一个 Primary**（`primary_surfaces` 以 tab 为键），推理只使用承载该 Tab Primary 的窗口；每个窗口各有一份独立的 App 级物理 Surface 集合（同一内容槽内的主页 + 每个活跃对话实例一个推理页，数量 ≤ 并发上限，§5.2；登录态靠同一 partition 共享）。非 Primary 窗口不复制用于推理的 Surface，显示「本窗口未承载当前推理」并提供「打开主窗口」动作。 | 与 `docs/browser-runtime-design.md` §4.1 的既有 Surface 规则一致；见 §5.3、§5.13。当前产品只创建一个窗口入口，多窗口行为按既有架构规则描述，产品化窗口入口由宿主另行提供。 |
 
 ---
 
@@ -96,7 +97,7 @@
 | S4 | 用户想用 Web 账号可用的模型 | Web 模型清单被读出并追加到 Magi 模型列表，明确标注"来自 Web" |
 | S5 | 用户在对话框发消息、选了 Web 引擎 | 消息被送进内置浏览器的 Web 会话，响应增量回流到 Magi 对话展示 |
 | S6（必需） | 用户要用 Web 模型做**真实项目级开发**（读改文件、跑命令、用 MCP / skill），而不是只能聊天 | 工具能力按 §5.7 分档交付；**T3 是目标形态**，T2 是先行档位；不得以"纯文本引擎"作为最终形态结案 |
-| S7（必需） | 用户不想先做任何 ChatGPT 侧配置就想用工具 | 连接器由 Magi 在托管浏览器会话中自动配置（A17）；账号 / 套餐不支持时自动降级为 T2，引擎处说明当前档位、降档原因与额度影响（A15） |
+| S7（必需） | 用户不想进入 ChatGPT 设置手动添加连接器就能用工具 | 连接器这类**站点配置**由 Magi 在托管浏览器会话中自动完成（A17）；OpenAI Tunnel 的 Tunnel 与仅含 Tunnels Read + Use 的 API 密钥仍需用户在自己的 OpenAI 平台创建（Magi 引导，不可代做）；账号 / 套餐不支持或通道前置未满足时自动降级为 T2，引擎处说明当前档位、降档原因与额度影响（A15） |
 
 ### 1.2 非目标
 
@@ -125,22 +126,22 @@
 | Web 引擎 | 由 Web 发现、标注为 Web 来源、由 Web 模型浏览器执行的模型条目（`apiProtocol = chatgpt_web`） |
 | 发现通道 | 读取 Web 侧可用模型清单的只读链路 |
 | 推理通道 | 把 Magi 的一次模型调用转成 Web 会话输入/输出的传输实现（`BrowserWebModelBridgeClient`） |
-| 对话实例 | 由 `Magi 会话 × 引擎 × effort × 上下文 epoch` 唯一确定的 ChatGPT 临时对话；turn 之间复用，工具轮次在同一对话内续接 |
+| 对话实例 | 由 `Magi 会话 × 线程 × 引擎 × effort × 上下文 epoch` 唯一确定的 ChatGPT 临时对话；turn 之间复用，工具轮次在同一对话内续接。线程维度保证编排者与子代理各用一条对话（R50） |
 | 上下文 epoch | 一次「全量重放」的代数。**本功能新增的运行时代数**（既有上下文架构里没有这个概念，最接近的是 `checkpoint_generation`）：压缩安装检查点会同时推进两者，接管、主动重置、空闲释放只推进 epoch。新建对话、压缩重建、主动重置都会推进 epoch；沿用同一对话则为同一 epoch |
-| 推理页面 | 承载对话实例的隐藏页面；同一时间只服务该 Magi 会话的一次调用 |
+| 推理页面 | 承载对话实例的页面；由应用级 Web 内容槽持有，非活动时隐藏保活；同一对话实例同一时间只服务一次调用 |
 | 站点适配层 | 集中维护 ChatGPT 页面 selector、模型菜单映射、effort 映射与完成谓词的唯一模块 |
 | T3 通道 | 让 ChatGPT 连接器回调本机 `magi-web-harness` 的出站通道。两条正式形态：**Magi Connect 设备连接层（优先）** 与 **OpenAI Tunnel（Connect 未就绪时的正式交付）**，见 §5.7.4 |
 | 工具档位 / 工具回路 | 让 Web 模型调用 Magi 工具 / MCP server / skill 的链路。**产品必需**（S6），按 T0 无工具、T2 文本协议回路、T3 MCP 桥接三档交付（§5.7）；T1 已删除 |
-| 挂起式调用 | T3 下 ChatGPT 调用工具时，推理通道先结束本次模型调用、由 loop 执行工具，再在同一个 ChatGPT 回复中续接的机制（§5.7.3） |
-| turn 令牌 | 每次发送生成的一次性能力令牌，T3 桥接工具调用必须携带 |
-| 临时对话 | ChatGPT 的 Temporary Chat，不进入用户的历史记录；每个 Magi 会话一条 |
+| 挂起式调用 | T3 下 ChatGPT 调用工具时，`tools/call` 应答保持挂起，loop 执行工具后再把结果交回，使模型在同一个 ChatGPT 回复内继续写完的机制（§5.7.3） |
+| turn 令牌 | 每次发送生成的一次性能力令牌，T3 桥接工具调用必须携带；只驻 `magi-web-harness` 内存，不落盘、不入 canonical（§5.7.3） |
+| 临时对话 | ChatGPT 的 Temporary Chat，不进入用户的历史记录；每个 Magi 会话的每条线程一条（绑定键见 §5.6） |
 | 全量重放 | 对话实例失效或需重建时，由 Magi 产出自包含的单条上下文并发送 |
 | 重锚 | 在续轮发送中重新附加工具协议、当前任务与关键约束，作为 web 侧意外截断时的保险；正常情况下 Magi 在超出前就压缩并重建 |
 | 对话漂移 | web 侧对话内容与 Magi canonical 不一致的状态；由前缀指纹确定性判定，以 Magi 为准并触发重建 |
-| 累计账 | 对话实例中实际存在的全部内容（已发送 + 已收到）的 o200k 计数累计，作为该会话上下文压力的锚点 |
+| 累计账 | 对话实例中实际存在的全部内容（已发送 + 已收到）的 o200k 计数累计，作为该会话上下文压力的锚点；经 `provider_context` 上报，不写 `ModelResponse.usage`（§5.9.4） |
 | 续轮封装 | 续轮发送时由站点适配层生成的网页端可读文本块：用户增量块、工具结果块（`magi-tool-result` 块）与重锚块；固定文本格式见 §5.6 |
 | 绑定所有权 | 对话实例的 `MagiOwned` / `UserOwned` / `Invalidated` 三态；只有 `MagiOwned` 可续轮 |
-| 绑定存储 | daemon 应用级的单文件存储，保存"绑定键 → 对话实例"的指针与计数（累计账、前缀指纹、所有权状态、账号提示）；可重建，不承载用户资产（§5.12） |
+| 绑定表 | 推理通道在 daemon 进程内持有的应用级内存表，保存「绑定键 → 对话实例」的指针与计数（累计账、前缀指纹、所有权状态、账号提示）；进程重启即重建，不落盘、不承载用户资产（§5.12） |
 | 应用级 | 不属于任何 project/session，不随会话或工作区切换销毁 |
 
 ---
@@ -153,7 +154,8 @@ Magi Desktop（当前产品只创建一个窗口；多窗口按既有 per-tab Pr
 │   ├── 对话区（不变）
 │   └── RightPane
 │       ├── 新增菜单：终端 / 浏览器 / GPT Web  ← 本方案新增第三项
-│       └── 内容槽：GPT Web 主页 + 隐藏的推理页面（<webview>，非活动 Tab 保活）
+│       └── 内容槽（应用级 Web 会话存在时全程挂载，折叠右栏只隐藏不卸载）
+│           └── GPT Web：主页 + 每个活跃对话实例一个推理页面（<webview>，非活动时 hidden 保活）
 ├── Electron Main
 │   ├── guest WebContents / CDP / 下载 / 权限（规则不变）
 │   └── partition persist:magi-web-model（应用级持久分区，A21；登录态持久）
@@ -195,10 +197,11 @@ Magi Desktop（当前产品只创建一个窗口；多窗口按既有 per-tab Pr
 | --- | --- | --- | --- |
 | 登录态（cookie / 存储） | Electron 应用级持久分区 `persist:magi-web-model` | 是 | 现有 `browserPartitionId` 派生出的 `magi-browser-<id>` **没有 `persist:` 前缀，是内存会话，进程退出即丢**；A21 要求应用级会话改用持久分区，并同步 `apps/desktop/src/main/browser-webview-security.ts` 的 partition 白名单、`browser-surface-manager.ts` 的 `configurePartition` 与 `clearBrowsingData` |
 | 应用级会话身份、主页 Tab、URL | daemon BrowserAuthority（app scope） | 是 | 见 §5.3 |
-| 对话实例（临时对话）与其绑定关系 | 推理通道（按 Magi 会话键）+ BrowserAuthority（页面） | 指针与绑定关系持久化在 daemon 应用级绑定存储 | 一个 Magi 会话一条；**只存指针，不镜像 web 侧副本**：页面 URL、DOM、composer 草稿与 ChatGPT 侧历史都不落盘，页面本身按需重建。该存储只承载可重建状态：读不出来即按"无绑定"处理，会话首次使用时新建临时对话并全量重放，不做迁移（A19） |
-| 对话实例的累计账与前缀指纹 | 推理通道 | 随绑定关系一起持久化（同一份应用级绑定存储） | 见 §5.9.4、§5.9.7 |
-| 对话实例的所有权状态（`MagiOwned` / `UserOwned` / `Invalidated`） | 推理通道 | 随绑定关系一起持久化 | 只有 `MagiOwned` 可续轮，见 §5.8 |
+| 对话实例（临时对话）与其绑定关系 | 推理通道（按绑定键）+ BrowserAuthority（页面） | 否（daemon 进程内内存表，§5.12） | 一个绑定键（Magi 会话 × 线程 × 引擎 × effort × epoch）一条；**只存指针，不镜像 web 侧副本**：页面 URL、DOM、composer 草稿与 ChatGPT 侧历史都不落盘，页面本身按需重建。内存表丢失即按"无绑定"处理，会话首次使用时新建临时对话并全量重放（A19） |
+| 对话实例的累计账与前缀指纹 | 推理通道 | 否（同一内存表） | 见 §5.9.4、§5.9.7 |
+| 对话实例的所有权状态（`MagiOwned` / `UserOwned` / `Invalidated`） | 推理通道 | 否（同一内存表） | 只有 `MagiOwned` 可续轮，见 §5.8 |
 | 推理页面 | BrowserAuthority（逻辑）+ Main（物理） | 否 | 由推理通道创建、按需重建 |
+| 应用级 Web 内容槽与推理页面挂载 | App Renderer（窗口级） | 否 | 只要存在应用级 Web 会话就保持挂载；折叠右栏与关闭视图只改可见性（A25、§5.2） |
 | 物理 guest / CDP / 页面 | Electron Main | 否 | 按需物化 |
 | 右栏"存在哪个 Tab" | App Renderer（窗口级存储） | 仅窗口内 | 只存指针，不存浏览器实体 |
 | Web 引擎清单 | settings `engines` | 是 | `origin` 元数据标注来源 |
@@ -213,14 +216,15 @@ Magi Desktop（当前产品只创建一个窗口；多窗口按既有 per-tab Pr
 | 事件 | 行为 |
 | --- | --- |
 | 切换右栏活动 Tab | guest 保活（沿用现有"非活动 Tab 保留页面"规则）；推理不中断 |
-| 切换项目 / 会话 | 应用级 Tab 与推理页面不随会话释放（对现有"跨会话释放当前窗口 guest"规则引入显式例外）；GPT Web Tab 切换到目标会话的对话实例，其他会话的对话实例保留 |
-| 点击该 Tab 的关闭按钮 | 仅移除视图；进行中的推理继续在后台运行，重新打开可看到最新状态；显式取消才停止该 turn；登录态保留 |
+| 切换项目 / 会话 | 应用级 Tab 与推理页面不随会话释放（对现有"跨会话释放当前窗口 guest"规则引入显式例外）；GPT Web Tab 切换到目标会话当前线程的对话实例，其他实例的推理页面继续挂载保活（A25） |
+| 点击该 Tab 的关闭按钮 | 仅隐藏视图（从 Tab 条移除、仍留在 `appTabs` 并保持挂载，A25）：不销毁 guest、不取消推理；重新打开可看到最新状态；显式取消才停止该 turn；登录态保留 |
+| 折叠右栏 | 只要存在应用级 Web 会话，右栏保留挂载、只做视觉隐藏（A25）：不卸载组件、不销毁 guest、推理不中断；无应用级 Web 会话时维持现有折叠即卸载 |
 | `Suspended` 时收到推理调用 | 自动恢复并重新物化页面；GPT Web Tab 在后台回到 Tab 条，不抢焦点 |
 | 关闭主窗口（默认行为） | 主窗口只是隐藏到托盘（宿主 `shouldHideWindowOnClose`），不释放 Surface、不释放应用级 guest，进行中的 Web 推理继续在后台；重新显示窗口即可看到最新状态 |
 | 退出 Magi / 操作系统退出 | shutdown 释放全部窗口与 Surface；进行中的 Web 推理按 turn 中断收口，重启后会话内保留中断记录与原错误码并可重试，不静默续跑 |
 | daemon 重启 | 逻辑会话与主页 URL 恢复，页面按需重新物化；**一律推进上下文 epoch**：现有 Desktop Control 协议没有**带 canonical 消息标识的语义回读**命令（只能读到页面可见文本，无法还原成 Magi 的消息序列），无法重建续轮增量，因此不尝试沿用旧对话，直接由 canonical 全量重放（A20）。代价是重启后首次使用多消耗一条账号消息额度 |
 | 对话实例失效 / 漂移 | 以 Magi canonical 为准全量重建；不尝试修补 web 侧对话 |
-| Desktop 重启 | 新 `desktopEpoch`；登录态保留，页面重新创建 |
+| Desktop 重启 | 新 `desktopEpoch`；登录态保留，页面重新创建；内存绑定表清空，下一次发送按全量重放处理 |
 | 资源回收 `/browser/resources/reclaim` | **默认排除**：`is_reclaimable_tab` 现只看生命周期与租约、没有 owner 维度，需先补 owner 分支，App 级 Tab 一律不可回收；设置 → 浏览器 的页面资源列表对 App 级页面追加常驻说明「Magi 托管的 GPT Web 页面不参与回收，请用『清除数据』处理」，避免出现占用 N/M 却回收 0 个的观感 |
 | 清除 Web 数据 | 显式操作：取消进行中的推理，关闭该应用级会话并清理 partition |
 
@@ -232,12 +236,16 @@ Magi Desktop（当前产品只创建一个窗口；多窗口按既有 per-tab Pr
 - **app 级 Tab 需要独立的容器**：在右栏 store 增加与 `perSession` 并列的顶层 `appTabs`（窗口级、仅进程内）。`perSession` 仍是会话级 Tab 渲染、持久化与恢复的唯一容器；`webSession` 一律不进 `perSession`，因此也**不进入** `tabsForPersist` / `isRestorableTab`（两个白名单只作用于 `perSession`，不要为它加例外）。`activateRightPaneSession` 切换会话时不动 `appTabs`。
 - Tab 的幂等键固定（应用级单例）：同 kind 同 key 再次打开是激活既有 Tab，不新建。
 - 视图显示状态不做窗口级持久化：`appTabs` 由 BrowserAuthority 的 app 级会话在每次连接后投影重建，视图的显示与否只在当前窗口进程内有效。
-- **新增内容组件 `web/src/components/tabs/WebModelTabContent.svelte`**：现有 Browser Tab 的内容槽是「一个 Tab 一个 `<webview>`」，放不下「主页 + 当前会话推理页面」两条受管 guest。新组件在同一内容槽内维护两个宿主（主页 webview + 当前会话推理 webview，其余会话的推理页面不注册 Surface），「主页 / 当前会话的对话实例」切换只是切换可见宿主，不新建页面；该例外同步登记到 `docs/browser-runtime-design.md`。
+- **新增内容组件 `web/src/components/tabs/WebModelTabContent.svelte`**：现有 Browser Tab 的内容槽是「一个 Tab 一个 `<webview>`」，放不下应用级 Web 的多个宿主。新组件在同一内容槽内维护：**一个主页 webview**，加**每个活跃对话实例一个推理页面 webview**（数量 ≤ §5.6 的并发上限，不设预热池）；当前会话当前线程的推理页面显示、其余 `hidden` 保活（沿用非活动 Tab 的既有规则），「主页 / 推理页面」切换只切可见宿主，不新建页面。该例外同步登记到 `docs/browser-runtime-design.md`。
+- **宿主挂载规则（A25，方案 A）**：只要存在应用级 Web 会话，该内容槽与它承载的 guest **不随右栏折叠、也不随关闭视图卸载**。
+  - 折叠右栏 = 右栏组件保留挂载、只做视觉隐藏（`display: none` + `aria-hidden`），不销毁任何 `<webview>`。现状是折叠即卸载组件、连带销毁 guest，必须改。
+  - 关闭该视图 = 从 Tab 条隐藏、仍留在 `appTabs` 并保持挂载，**不调用 `closeBrowserTab`、不发起任何 Authority 关闭命令**。
+  - 只有「退出登录 / 清除 Web 数据」、应用级会话关闭或应用退出才释放这些 guest。
 - 推理页面不单独出现在 Tab 条上，推理进行中显示「Magi 正在使用」提示；查看本身不改变所有权，用户一旦在页面里操作即按 §5.8 进入接管。
-- 对话实例按 Magi 会话隔离：切换会话时 Tab 显示目标会话的对话实例，其他会话实例保留；同一会话的多次 turn 复用同一条对话。
-- **关闭按钮走 A4 语义，且不弹确认**：只做右栏本地隐藏（从 `appTabs` 移除视图），**不调用 `closeBrowserTab`、不发起任何 Authority 关闭命令**，不取消进行中的推理，也不销毁登录态与对话实例。这与现有「关闭浏览器 Tab = 全局关闭」是两个不同的 API 与两种不同的后果。实现落点：现有 `handleTabClose`（`web/src/web/RightPane.svelte`）是**所有 kind 共享**的关闭路径，`browser` 分支会调 `closeBrowserTab`；新增的 `webSession` 分支必须在这条共享路径上分叉，同时 `RightPaneCreationKind`、`tabIcon`、`tabTooltip` 需要补分支（否则图标与提示落到默认值）。
+- 对话实例按绑定键隔离（Magi 会话 × 线程 × 引擎 × effort × epoch）：切换会话时 Tab 显示目标会话当前线程的对话实例，其他实例的页面继续挂载保活；同一对话实例的多次 turn 复用同一条临时对话。
+- **关闭按钮走 A4 / A25 语义，且不弹确认**：只做右栏本地隐藏（从 Tab 条移除、保留在 `appTabs`），不销毁宿主与登录态，不取消进行中的推理。这与现有「关闭浏览器 Tab = 全局关闭」是两个不同的 API 与两种不同的后果。实现落点：现有 `handleTabClose`（`web/src/web/RightPane.svelte`）是**所有 kind 共享**的关闭路径，`browser` 分支会调 `closeBrowserTab`；新增的 `webSession` 分支必须在这条共享路径上分叉，同时 `RightPaneCreationKind`、`tabIcon`、`tabTooltip` 需要补分支（否则图标与提示落到默认值）。
 - **关闭动作要有即时反馈**：点击关闭时给一次性提示「已隐藏视图，推理仍在后台继续」+「停止推理 / 打开视图」两个动作，避免用户以为点了 × 就等于停止（额度按实际发送次数计，§5.10）。「停止推理」复用会话的显式取消路径。
-- **隐藏只在当前窗口进程内有效**：关闭视图即从 `appTabs` 移除该视图；重连或重启后按 S3 由投影恢复为显示，若该会话仍有进行中的推理则同时提示「后台推理中」。用户随时可以从「新增 → GPT Web」再次打开视图。
+- **隐藏只在当前窗口进程内有效**：关闭视图即从 Tab 条隐藏该视图；重连或重启后按 S3 由投影恢复为显示，若该会话仍有进行中的推理则同时提示「后台推理中」。用户随时可以从「新增 → GPT Web」再次打开视图。
 - 关闭视图后必须有后台指示：GPT Web 视图关闭期间，右栏「新增」菜单的 GPT Web 项与「设置 → 浏览器 → GPT Web 模型」分区显示进行中的推理数量（例如「GPT Web（后台推理中 · N）」），并保留一条可点回的入口；会话内该 turn 的运行指示行同时显示「视图已关闭 · 推理继续」与「打开视图」；推理结束或失败后清除。
 - 平台降级：Web / 手机 Web 上该菜单项禁用并给出明确原因，不静默失败。
 
@@ -259,8 +267,9 @@ pub enum BrowserSessionOwner {
 | 孤儿回收 | **只有 `Session` 分支参与孤儿判定**：`reconcile_browser_sessions_with_session_store` 与 `close_browser_session_for_magi_session` 现按 `session_id` 匹配，必须按 owner 分支，否则 App 级会话会在一次对账后被转 `Closed` |
 | 会话关闭 / 工作区切换 | 只关闭会话拥有的 Browser Session；App 级不受影响 |
 | 每会话单会话约束 | 只对 `Session` 分支生效 |
-| 页面构成 | 一个主页 Tab + 推理页面（按需创建，不做预热池，R38）；推理页面只能由推理通道创建、按需重建 |
-| 对话实例隔离 | 绑定键为 `Magi 会话 × 引擎 × effort × 上下文 epoch`，由推理通道维护；不同 Magi 会话、不同引擎或不同 effort 都不共享对话实例 |
+| 页面构成 | 一个主页 Tab + 每个活跃对话实例一个推理页面（按需创建，不做预热池，R38；数量 ≤ 并发上限）；推理页面只能由推理通道创建、按需重建 |
+| 对话实例隔离 | 绑定键为 `Magi 会话 × 线程 × 引擎 × effort × 上下文 epoch`，由推理通道维护；不同 Magi 会话、不同线程、不同引擎或不同 effort 都不共享对话实例（R50） |
+| 驱动路径 | App 级 owner 新增**不激活路径**：目标 Tab 的 Surface 已在当前窗口注册且 content-slot 绑定有效时，命令直接复用该 binding，**不写 `right_pane_visibility` / `active_panel`**；只有 Surface 尚未注册时才物化，且物化不附带激活意图。现有 `requireRenderablePrimaryBinding → ensureBrowserSurface → activateBrowser`（`apps/desktop/src/main/desktop-control-server.ts`、`window-manager.ts`）对 App 级 owner 必须走这条分支，否则每次推理都会抢走右栏（A25、§5.4） |
 | 配额 | 不适用 `MAX_BROWSER_TABS_PER_SESSION`；主页与推理页面计入 `MAX_BROWSER_TABS_TOTAL`；推理页面按需创建（不做预热池），同时存在的数量受 §5.6 的并发上限约束 |
 | 资源回收 | `is_reclaimable_tab` 需补 owner 维度：App 级一律排除，并在设置 → 浏览器 的页面资源列表里说明原因 |
 | Primary / `surfaceRevision` | 沿用现有规则：每个窗口可各有一份物理 Surface，**同一逻辑 Tab 全局只有一个 Primary（`primary_surfaces` 以 tab 为键）**，`surfaceRevision` 单调推进；推理只使用当前 Primary（A24） |
@@ -273,8 +282,9 @@ pub enum BrowserSessionOwner {
 - 应用级会话使用**稳定** `browserSessionId`，并落在**带 `persist:` 前缀的专用分区** `persist:magi-web-model`（A21）：Electron 的 partition 只有带 `persist:` 才落盘，现有 `magi-browser-<id>` 是内存会话，退出即丢。该分区不与其他 Browser Tab 共用，也不参与通用 partition 清理之外的任何隐式回收。
 - 宿主侧同步改动：`apps/desktop/src/main/browser-webview-security.ts` 的 `BROWSER_PARTITION_PATTERN` 需接受应用级持久分区；`browser-surface-manager.ts` 的 `browserPartitionId` / `configurePartition` 需区分应用级分区；**分区注册表（`readPartitionRegistry` / `persistPartitionRegistry`）的分区过滤规则必须同步放行**，否则 `persist:magi-web-model` 会被静默丢弃，导致无 guest 挂载时「清理浏览数据」漏清该分区；`clearBrowsingData` 需支持按应用级分区粒度清除（§5.13 的「清除数据」复用同一个入口，不新增第二个按钮）。
 - 页面仍来自右栏内容槽的 `<webview>`；Main 的安全边界、URL allow-list、popup 决策、下载与权限规则**完全不变**。
-- 「保活但不可见」的推理页面复用现有非活动 Tab 机制；受管 guest 已关闭后台节流（`setBackgroundThrottling(false)`），隐藏时仍可生成与读取。
-- 该 Tab 不随会话关闭被级联释放；窗口关闭仍按现有规则释放该窗口 Surface。
+- **应用级内容槽全程挂载（A25）**：折叠右栏只隐藏右栏容器，不卸载组件、不销毁 guest；关闭视图只在 Tab 条上隐藏该视图。受管 guest 已关闭后台节流（`setBackgroundThrottling(false)`），隐藏期间仍可生成与读取。
+- **不激活驱动路径**：`window-manager.ts` 的 `activateBrowser` 会固定写 `right_pane_visibility: true` 与 `active_panel: browser/<tabId>`，因此现有 `requireRenderablePrimaryBinding` 路径每次命令都会抢走右栏；Main 必须为 App 级 owner 提供 `ensureBrowserSurfaceInBackground`（或等价参数）：Surface 已注册时直接返回 binding，未注册时只物化、不写布局意图。渲染层由 `WebModelTabContent.svelte` 挂载隐藏的 `<webview>` 完成注册，因此常规推理不需要任何激活动作。
+- 该 Tab 不随会话关闭被级联释放；窗口关闭仍按现有规则释放该窗口 Surface（隐藏到托盘不释放，见 §5.1）。
 - **登录弹窗**：现有 popup 单一决策链会阻止命名窗口和带独立窗口特性的弹窗，典型 OAuth 弹窗属于此类。Magi **不向 ChatGPT 页面注入或筛选登录方式**（那是第三方页面的 DOM）；正确做法是：阶段 0 实测邮箱、Google、Microsoft、Apple 等登录方式在该规则下是否可用，把结论写进 Magi 自己的登录提示条，并在 popup 被阻止时在 GPT Web 主页叠加一条**持久提示条**（列出可用方式与替代建议，直到登录成功），避免用户只看到一闪而过的页面内提示。不为登录新增宿主形态或放宽 popup 规则。
 
 ### 5.5 发现通道
@@ -316,19 +326,20 @@ pub enum BrowserSessionOwner {
 
 `BrowserWebModelBridgeClient` 位于 `crates/magi-web-model`，只提供流式 + 可取消语义；非流式 `invoke` 返回显式错误（遵循 trait "不静默降级"的要求）。
 
-**身份绑定（A22）**：`ModelInvocationRequest` 只有 `provider / prompt / messages / tools / tool_choice`，不携带会话身份，绑定键的四个分量按下列路径取得：
+**身份绑定（A22）**：`ModelInvocationRequest` 只有 `provider / prompt / messages / tools / tool_choice`，不携带会话身份，绑定键的五个分量按下列路径取得：
 
 | 分量 | 来源 | 事实核对 |
 | --- | --- | --- |
 | Magi 会话 | 调用方已有的 `session_id` | 既有 |
+| 线程 | 调用方已有的 `thread_id`（编排者为会话主线程，子代理为各自 thread） | 既有概念：上下文架构的锚点键已含 `thread_id`（`docs/context-pressure-compaction-architecture.md` §6.1）。不加这一维时，子代理继承 Web 引擎会与编排者落进同一条临时对话（R50） |
 | 引擎 | **会话级主模型覆盖里的引擎绑定**（`engineId`） | 现状：会话级 `orchestrator` 覆盖只接受 `model` / `reasoningEffort`，主对话解析全程不读 `engines`，因此这个字段是**新增项**，不是既有能力 |
 | effort | 会话级覆盖里的 `reasoningEffort`，取值域由发现结果限定 | 既有字段、新增取值约束 |
 | 上下文 epoch | 推理通道自持的运行时状态 | 不进 DTO |
 
-- 构造 client 的路径是 `resolve_target_for_role` → `build_orchestrator_client` → `resolve_orchestrator_model_config`。这三处都必须改，不能只「保持不变」：① `build_orchestrator_client` 新增 `chatgpt_web` 分支构造 `BrowserWebModelBridgeClient`，**不能返回 `None`**——现有实现在 orchestrator 解析返回 `None` 时会回退到 daemon 注入的 `default_client`（HTTP 模型），那正是"静默降级到其他模型"；② `resolve_orchestrator_model_config` 产出的配置仍会带全局基座的 `baseUrl / apiKey`，`chatgpt_web` 分支必须**忽略**它们、不得因此走 HTTP；③ `RoleTarget::Agent` 显式配 `engineId` 时仍走 `agents[*].engineId → engines[*].llm`，但**角色 `engineId` 为空时会显式继承 orchestrator 模型**，因此子代理会继承 Web 引擎：本方案明确**支持继承**（子代理同样由浏览器 client 承载，沿用同一并发、队列与 epoch 规则），并在子代理创建前置检查里拒绝「继承到的 Web 引擎当前不可用」的情况。
+- 构造 client 的路径是 `resolve_target_for_role` → `build_orchestrator_client` → `resolve_orchestrator_model_config`。这三处都必须改，不能只「保持不变」：① `build_orchestrator_client` 新增 `chatgpt_web` 分支构造 `BrowserWebModelBridgeClient`，**不能返回 `None`**——现有实现在 orchestrator 解析返回 `None` 时会回退到 daemon 注入的 `default_client`（HTTP 模型），那正是"静默降级到其他模型"；② `resolve_orchestrator_model_config` 产出的配置仍会带全局基座的 `baseUrl / apiKey`，`chatgpt_web` 分支必须**忽略**它们、不得因此走 HTTP；③ `RoleTarget::Agent` 显式配 `engineId` 时仍走 `agents[*].engineId → engines[*].llm`，但**角色 `engineId` 为空时会显式继承 orchestrator 模型**，因此子代理会继承 Web 引擎：本方案明确**支持继承**（子代理同样由浏览器 client 承载，沿用同一并发、队列与 epoch 规则），且**子代理使用自己的 `thread_id` 参与绑定键**，与编排者各用一条临时对话，不串行、不互相拆台（R50）；同时在子代理创建前置检查里拒绝「继承到的 Web 引擎当前不可用」的情况。
 - `ModelApiProtocol` 新增 `ChatGptWeb` 变体，`to_http_protocol` / `to_http_model_client` 对它显式返回「非 HTTP 协议」，**不得落入 `openai_chat` 默认分支**；`HttpModelBridgeProtocol` 不新增取值。
 - **上下文 epoch 与工具档位由这个 client 自己维护，不作为 `ModelInvocationRequest` 字段（不扩 DTO）；epoch 同时是绑定键的一部分，随绑定持久化（§5.12）。**
-- 绑定记录（绑定键、页面身份、累计账、前缀指纹、最近一次已接受发送、所有权状态、账号提示）持久化在 daemon **应用级绑定存储**（独立文件，与 `browser/state.json` 同级同 `state_root`，按绑定键索引，随会话删除清理；不写会话 sidecar、不写 settings），读不出来即按「无绑定」重建。写入复用 `magi-api` 的 `RuntimeStatePersistence::save_json`（`crates/magi-api/src/state.rs`）；它不改变 `state-layout` 结构，也不需要推进其版本。
+- 绑定记录（绑定键、页面身份、累计账、前缀指纹、最近一次已接受发送、所有权状态、账号提示）只保存在 daemon 进程内的**应用级内存表**（§5.12）：不落盘、不新增文件、不写会话 sidecar、不写 settings。进程重启即按「无绑定」重建；去重与副作用保护始终以 canonical 的 `turn_id + tool_call_id` 账本为准，不依赖内存表跨重启（R55）。
 - 「最近一次已接受发送」的用途**只有发送去重与崩溃恢复判定**：现有 Desktop Control 协议没有**带 canonical 消息标识的语义回读**命令（只能读到页面可见文本，无法还原成 Magi 的消息序列），因此 daemon / Desktop 重启后**不尝试回读 web 侧历史**，一律推进 epoch 并按 canonical 全量重放（§5.1、§5.9.7）。
 
 对应变更见《实现计划》§6。
@@ -343,10 +354,10 @@ pub enum BrowserSessionOwner {
 
 内部步骤：
 
-1. **取用对话**：按 `Magi 会话 × 引擎 × effort × 上下文 epoch` 查找对话实例；命中则复用其页面，未命中则新建推理页面、导航到 `?temporary-chat=true` 并等待 composer 就绪。
+1. **取用对话**：按绑定键 `<session_id>|<thread_id>|<engine_id>|<effort>|<epoch>` 查找对话实例；命中则复用其页面（已挂载则直接驱动，不激活右栏），未命中则新建推理页面、导航到 `?temporary-chat=true` 并等待 composer 就绪。
 2. **校验档位**：每次提交前复核模型与 effort（用户可能在页面上手动改过）；不一致即把绑定判为 `UserOwned`（§5.8）、推进 epoch 后按"新建"路径全量重放，绝不改用其他模型。
 3. **注入内容**：新建或重建时注入完整上下文；续轮时注入"上次助手回复之后的增量 + 重锚块"。两者都由站点适配层统一渲染，避免各档位各自拼字符串。
-   - **续轮封装**：网页端只能接收 composer 文本、没有 `role` 概念，所以增量一律表示为可读文本块，由站点适配层统一生成：**用户增量块**（Magi 的新用户消息）、**工具结果块**（含 `turn_id`、`tool_call_id`、工具名与结果正文）、**重锚块**。T2 的每个工具轮次与 T3 超时后的回填共用同一封装；对话历史留在网页端，不重复回放，也不发送 `role=tool` 这类网页端无法接收的消息。
+   - **续轮封装**：网页端只能接收 composer 文本、没有 `role` 概念，所以增量一律表示为可读文本块，由站点适配层统一生成：**用户增量块**（Magi 的新用户消息）、**工具结果块**（含 `turn_id`、`tool_call_id`、工具名与结果正文）、**重锚块**（协议与档位、当前任务目标、关键约束，以及**每轮重新生成的 `turn_nonce`**——T2 工具块必须把它原样回带作为 `turn_id`，否则整块忽略，R52）。T2 的每个工具轮次与 T3 超时后的回填共用同一封装；对话历史留在网页端，不重复回放，也不发送 `role=tool` 这类网页端无法接收的消息。
    - 续轮封装的固定格式、定界规则与注入防护由站点适配层唯一实现，literal 契约与字段语义见《实现计划》§7.3；其他层不得自行拼装字符串。
 
    - 定界用 `<<<` / `>>>` 而不是 Markdown 围栏，避免工具结果正文里的反引号破坏解析；块外内容忽略。用户原文与工具结果正文都可能自带定界符或伪造的工具调用块，站点适配层必须用长度前缀包裹正文，并拒绝任何嵌套块（格式与解析规则见《实现计划》§7.3）。
@@ -369,12 +380,12 @@ pub enum BrowserSessionOwner {
 - 对话的可恢复性只影响是否省下一条消息额度，不影响正确性（A20）：临时对话不能跨重启恢复时，daemon / Desktop 重启一律推进 epoch 并按 canonical 全量重放；实测结论只用于定默认空闲阈值。
 - 对话漂移由前缀指纹确定性判定：已发送部分在 Magi 一侧发生变化即推进 epoch；不依赖"工具结果对不上"一类的语义猜测，也不尝试修补 web 侧对话。
 - 引擎设置提供默认关闭的"每轮新建对话"开关：开启后每个 turn 都推进 epoch、按新建路径全量重放，用于隔离保留对话上的工具能力丢失。
-- **不设预热池**：推理页面按需创建，同一会话复用其已有页面。额外的预热 guest 会与 §5.2「一个内容槽只有两条宿主」以及 A3 的单一宿主形态冲突，本方案不做；若后续确有需要，须先补宿主规则并同步 `docs/browser-runtime-design.md`。
+- **不设预热池**：推理页面按需创建，同一绑定键复用其已有页面。同时挂载的推理页面数 = 活跃对话实例数 ≤ 并发上限（§5.2 的内容槽承载规则）；不额外创建预热 guest。
 
 并发与调度：
 
-- 并发单位是**对话实例**，不是页面。
-- 同一对话同一时间只允许一个调用（现有 Worker 按 surface 串行 lane）。
+- 并发单位是**对话实例**，不是页面；每个活跃对话实例都必须有真实挂载的推理页面（内容槽内 `hidden` 保活，A25），因此同时挂载的推理页面数 = 活跃对话实例数 ≤ 并发上限。
+- 同一对话同一时间只允许一个调用（现有 Worker 按 surface 串行 lane）；App 级驱动走不激活路径，不因并发切换右栏可见 Tab（§5.3、§5.4）。
 - 全局并发上限默认 5、可配置；超限的调用排队，并向对应 turn 投影"等待 Web 引擎"状态（A14）。排队不增加同时工作的页面数，因此不会放大账号侧的并行流量。
 - 等待队列有上限（默认 16、可配置）与等待上限（取该 turn 的剩余时限）；队列满或等待超时以明确错误收口（`web_queue_full` / `web_queue_timeout`），不允许无限排队。
 - 出队顺序按到达先后，同一对话实例不插队；等待期间用户取消或 turn 进入终态即从队列移除。
@@ -401,7 +412,7 @@ pub enum BrowserSessionOwner {
 
 **档位价值按消耗衡量（A16）**：Web 引擎存在的理由是使用账号订阅额度，所以档位的核心指标是**完成一个任务消耗的 ChatGPT 消息条数**。T3 的工具往返发生在同一个 ChatGPT 回复内，一个任务通常只消耗 1 条；T2 的每个工具轮次都要发一条新消息，一个 20 步的工具任务接近 20 条，且其中任何一条撞上账号限流都会让任务中断在中间。这是"同回复续接"被列为目标形态、而不是体验优化的原因；T2 的价值在于零组件、零暴露面、可先落地，并且它的发送形态与 T3 的回填路径同构（§5.7.3）。
 
-档位选择：引擎工具能力开启时取当前可用的最高档位——连接器已验证且 T3 通道就绪取 T3，否则 T2；关闭时为 T0。**T3 分两步落地**：v1 先做「立即应答 + 下一轮回填」（不需要挂起与超时对齐，与参考项目的 `codex_tool_call` 等价），v2 再叠加「同回复续接」；v1 已满足项目级开发的正确性要求，v2 只减少额度消耗。**降档不静默**：当前档位、降档原因（账号 / 套餐不支持自定义连接器、连接器自动配置或回读失败、T3 通道未就绪：Tunnel 未创建 / 凭据缺失或无 Tunnels 权限 / `tunnel-client` 校验失败 / Developer Mode 或工作区策略不允许）与额度影响都在引擎与会话内可见。一次调用内不切换档位；档位变化会改变发送形态，因此切换档位时推进上下文 epoch，下一次发送按"新建"路径全量重放。
+档位选择：引擎工具能力开启时取当前可用的最高档位——连接器已验证且 T3 通道就绪取 T3，否则 T2；关闭时为 T0。**T3 只有一种可交付形态：`tools/call` 挂起、工具结果在同一条 ChatGPT 回复内交回**（参考项目的 `codex_tool_call` 即此形态：`tools/call` 阻塞等待，结果回到同一回复，而不是「立即应答 + 下一轮回填」）；审批或执行超过挂起时限时按 §5.7.3 回填到同一对话的下一轮，那是 A18 的一等超时路径，不是另一种交付档位。**只有这条形态满足 A16**：任何「立即应答 + 下一轮回填」的过渡实现，每个工具轮次都要多消耗一条账号消息（与 T2 同价），却要背上 T3 全部组件成本，因此不作为交付档位存在（原「T3 v1」已删除，R53）；实现顺序上可以先打通通道与回填作为内部里程碑，但不得对外宣称 T3 可用。**降档不静默**：当前档位、降档原因（账号 / 套餐不支持自定义连接器、连接器自动配置或回读失败、T3 通道未就绪：Tunnel 未创建 / 凭据缺失或无 Tunnels 权限 / `tunnel-client` 校验失败 / Developer Mode 或工作区策略不允许）与额度影响都在引擎与会话内可见。一次调用内不切换档位；档位变化会改变发送形态，因此切换档位时推进上下文 epoch，下一次发送按"新建"路径全量重放。
 
 #### 5.7.1 T1：已删除
 
@@ -415,20 +426,21 @@ pub enum BrowserSessionOwner {
 
 响应侧：模型用以下块表达工具调用，一次回复可以包含多个块：
 
-````text
-```magi-tool-call
-{"name": "read_file", "arguments": {"path": "src/main.rs"}}
+```text
+~~~magi-tool-call
+{"turn_id": "<本次发送的随机串，取自重锚块>", "name": "read_file", "arguments": {"path": "src/main.rs"}}
+~~~
 ```
-````
 
 | 情况 | 处理 |
 | --- | --- |
 | 无工具块 | `status = Completed`，全文为 `content` |
 | 一个或多个合法块 | 块外文字为 `content`；每块生成一个 `ChatToolCall`；`status = RequiresToolExecution`，由现有 loop 审批与执行 |
-| JSON 不合法 / name 不在 `request.tools` 中 / 块未闭合 | 调用失败，错误码 `web_tool_protocol_invalid`；不追加纠错消息，避免协议污染，由 Magi 侧按失败收口 |
+| JSON 不合法 / name 不在 `request.tools` 中 / 块未闭合 / `turn_id` 缺失或不匹配 | 调用失败，错误码 `web_tool_protocol_invalid`；不追加纠错消息，避免协议污染，由 Magi 侧按失败收口 |
 
 - **`tool_call_id` 由推理通道生成且稳定**：`web-<turn_id>-<block_index>`（按块出现顺序）。`ChatToolCall.id` 是必填字段，且 T3 与《实现计划》§8 的去重账本都以 `turn_id + tool_call_id` 为键；不冻结这条规则，去重、回填与错误码都无法对账。
-- **解析防护**：工具调用块必须携带 `turn_id` 且与本次发送一致，否则整块忽略；块外内容一律不解析为调用；工具结果正文按 §5.6 的包裹规则注入，解析层拒绝任何嵌套定界符。
+- **围栏用 `~~~magi-tool-call`，不用三反引号**：工具参数里常带 Markdown 代码围栏，三反引号会被提前闭合。解析层以行首 `~~~magi-tool-call` 开始、行首 `~~~` 结束，JSON 字符串里的三个波浪号不构成围栏；这一点在阶段 0 用真实模型验证它能稳定遵守（R57）。
+- **解析防护**：工具调用块必须携带 `turn_id` 且与本次发送一致，否则整块忽略；`turn_id` 是**重锚块每轮下发的一次性随机串**（≥128 bit 熵，见 §5.6 与《实现计划》§7.3），模型必须原样回带，Magi 不接受任何其他来源的值；块外内容一律不解析为调用；工具结果正文按 §5.6 的包裹规则注入，解析层拒绝任何嵌套定界符（R52）。
 - **未闭合块有时限**：块开始后在固定窗口（默认 3 个读取周期）内仍未闭合，即以 `web_tool_protocol_invalid` 收口，不写入 canonical。
 
 - **轮数上限**：推理通道统计同一 Magi turn 内已发生的 T2 工具轮次；超过上限即以 `web_tool_round_limit` 明确失败。上限按引擎可配置，默认 20；每个 T2 工具轮次都会多消耗一条 ChatGPT 消息额度，额度敏感场景应取更小值。
@@ -438,7 +450,7 @@ pub enum BrowserSessionOwner {
 
 #### 5.7.3 T3：MCP 桥接回路（目标形态）
 
-**组件**：`magi-web-harness` 是 daemon 内的 MCP 入口，**同一套桥接工具、turn 令牌与去重账本支持两种传输**：① **Streamable HTTP**，**只监听 `127.0.0.1` 的随机高端口**（端口号写入 `state_root` 下的端口文件，供 Connect 的本地转发进程读取）；② **stdio**（`magi-web-harness --stdio`），由 `openai/tunnel-client` 以子进程方式拉起——参考项目的 MCP server 就是 stdio 形态，OpenAI Tunnel 因此不需要本机开放任何端口。两种传输都是**独立入口**：不挂到主 app、不共享鉴权中间件、不暴露任何 `/api/*` 路由。启动失败即禁用 T3 并按 §5.7.0 降档，不隐式重试。T3 通道只指向这个入口，因此经由通道无法访问 daemon 的任何其他路径。本机信任边界与参考项目一致：**同 OS 用户下的其他进程在信任边界之内**，除 turn 令牌外不叠加本机身份校验——这是显式取舍，不是遗漏。
+**组件**：`magi-web-harness` 是 daemon 内的 MCP 入口，**同一套桥接工具、turn 令牌与去重账本支持两种传输**：① **Streamable HTTP**，**只监听 `127.0.0.1` 的随机高端口**（端口号写入 `state_root` 下的端口文件，供 Connect 的本地转发进程读取）；② **stdio**（`magi-web-harness --stdio`），由 `openai/tunnel-client` 以子进程方式拉起——参考项目的 MCP server 就是 stdio 形态，OpenAI Tunnel 因此不需要本机开放任何端口。**stdio 进程只是轻量中继，不自己持有令牌与挂起调用**：它通过**仅当前 OS 用户可访问的本地 socket（Unix domain socket；Windows 下为命名管道）**连接 daemon 内的 harness 会话表，令牌校验、挂起调用与去重账本都在 daemon 侧完成。这条本地 socket 是 stdio 形态唯一的本机接口：不监听 TCP、不写端口文件、不经过任何 HTTP 路由；HTTP 形态才使用 `127.0.0.1` 随机高端口与端口文件（R54）。两种传输都是**独立入口**：不挂到主 app、不共享鉴权中间件、不暴露任何 `/api/*` 路由。启动失败即禁用 T3 并按 §5.7.0 降档，不隐式重试。T3 通道只指向这个入口，因此经由通道无法访问 daemon 的任何其他路径。本机信任边界与参考项目一致：**同 OS 用户下的其他进程在信任边界之内**，除 turn 令牌外不叠加本机身份校验——这是显式取舍，不是遗漏。
 
 **桥接工具**（固定集合，schema 冻结）：
 
@@ -449,7 +461,7 @@ pub enum BrowserSessionOwner {
 
 实际可调用的工具完全由本次 `request.tools` 决定，而它来自 Magi 的 registry 与策略；skill 工具同样在其中。桥接工具 schema 若必须变更，发布新的连接器名称并由 Magi 自动替换配置（用户确认一次），不复用旧连接器。
 
-**turn 令牌**：每次发送生成一个，**≥128 bit 熵、恒定时间比较**，绑定 `(Magi 会话, 引擎, 上下文 epoch, turn_id)`，仅在该回复（含续接与回填）存续期间有效，写入发送的上下文，转终态即撤销；**不得写入日志、UI 或诊断输出**。`magi-web-harness` 依次校验：令牌有效且未撤销 → 所属调用处于可接收状态 → `name` 在该调用的 `request.tools` 中；任一失败都返回 MCP 错误结果，不执行任何东西。令牌是**归属与生命周期绑定**，不是"防止本机其他进程"的屏障。它保证只有 Magi 发出的那个回复能调用工具，即使同一账号在其他地方（例如手机上的 ChatGPT）也启用了该连接器。
+**turn 令牌**：每次发送生成一个，**≥128 bit 熵、恒定时间比较**，绑定 `(Magi 会话, 线程, 引擎, 上下文 epoch, turn_id)`，仅在该回复（含续接与回填）存续期间有效，写入发送的上下文，转终态即撤销；**不得写入日志、UI 或诊断输出**。`magi-web-harness` 依次校验：令牌有效且未撤销 → 所属调用处于可接收状态 → `name` 在该调用的 `request.tools` 中；任一失败都返回 MCP 错误结果，不执行任何东西。令牌是**归属与生命周期绑定**，不是"防止本机其他进程"的屏障。它保证只有 Magi 发出的那个回复能调用工具，即使同一账号在其他地方（例如手机上的 ChatGPT）也启用了该连接器。
 
 **两条一等路径（A18）**：T3 的每一次工具往返有两条收口方式，二者都按正常路径实现与验收，不把任何一条当异常兜底。
 
@@ -458,7 +470,7 @@ pub enum BrowserSessionOwner {
 | 同回复续接 | 工具在挂起时限内执行完成 | `tools/call` 应答回到同一个 ChatGPT 回复，模型继续写完这条回复 | 同一回复，不额外消耗消息 |
 | 下一轮回填 | 审批或执行超过挂起时限、页面状态不确定 | harness 返回 `magi_tool_timeout`，结果用 §5.6 的续轮封装在同一对话的下一轮回填 | 多消耗一条消息 |
 
-走哪条路径由用户侧的实际耗时决定：自动放行的读操作通常走同回复续接，需要人工确认的写操作与命令常常走回填。因此回填是 T3 的常规组成，不是降级兜底；它与 T2 的发送形态同构，可以先行实现。
+走哪条路径由用户侧的实际耗时决定：自动放行的读操作通常走同回复续接，需要人工确认的写操作与命令常常走回填。因此回填是 T3 的常规组成，不是降级兜底；它与 T2 的发送形态同构，可以作为实现顺序上的内部里程碑先行打通，但**它不是可交付档位**：只有同回复续接满足 A16（R53）。
 
 **挂起式调用**：
 
@@ -478,14 +490,14 @@ loop                          BrowserWebModelBridgeClient        magi-web-harnes
 1. **只有 loop 执行工具**。`magi-web-harness` 把每个 `magi_tool_call` 转成 `ChatToolCall`，HTTP 应答保持挂起。
 2. **因果顺序**：返回工具批次前，先确认页面已呈现这些调用之前的正文；本次返回的 `content` 只含该段正文。
 3. **并行调用**：同一时刻到达的调用作为一个批次返回；续接时结果数量必须与批次一致，否则失败。
-4. **续接凭据**：返回时附 `provider_context { provider: "chatgpt_web", kind: "pending_tools", data: { pageId, turnToken, callIds, prefixFingerprint } }`，其中 `prefixFingerprint` 是该临时对话当前持有内容（已发送的消息与本回复已产生的片段）的指纹；loop 原样持久化并在下一次调用时回放（现有语义：`provider_context` 会写入 canonical 并在后续请求中重新带上，见 `crates/magi-conversation-runtime/src/conversation_loop.rs`）。`ModelProviderContext` 的 `provider` / `kind` 是自由字符串、`data` 是无类型 `Value` 且业务运行时只负责持久化（`crates/magi-bridge-client/src/types.rs`），因此 `chatgpt_web` / `pending_tools` 是纯新增取值，不需要改 bridge DTO 或任何 schema；`data` 的字段由适配器自己校验与解释。续接前核对请求中对应前缀的指纹：一致时才从本次请求的 `role=tool` 消息中取出结果交给 harness（这是 Magi 内部 canonical 消息，不发给网页端），继续读取同一回复；不一致（Magi 已压缩、回退或改写已发送部分）时按 §5.9.7 推进 epoch、重建对话实例。
-5. **时限与回填**（A18）：挂起的 MCP 调用必须在 ChatGPT 侧与通道侧的超时之前应答。参考实现给出可直接采用的量级：OpenAI 隧道侧约 2 分钟命令—响应上限、本地 90 秒收口；因此**本地挂起时限默认 90 秒、按引擎可配**，阶段 4 spike 用真实用量复核后回填（《实现计划》§4.3 4.7b）。到时 loop 仍未交回结果（例如用户审批未完成）时，harness 返回 `magi_tool_timeout` 并撤销令牌，**但对话保留**：loop 带着结果发起下一次调用时，推理通道在**同一对话的下一轮**用 §5.6 的续轮封装把工具结果回填，从该处继续，而不是重开对话、重发全量上下文。回填是常规路径，必须在 UI 可见，并按实际发送次数计入额度。去重以 `turn_id + tool_call_id` 执行账本为准：同一调用再次到达（重试、超时后回填、daemon 重启后重放）时直接返回账本中的既有结果，不重复执行；账本随 turn 持久化。
+4. **续接凭据**：返回时附 `provider_context { provider: "chatgpt_web", kind: "pending_tools", data: { pageId, turnTokenRef, callIds, prefixFingerprint } }`。`turnTokenRef` 是令牌的**不可逆引用**（哈希或 harness 侧句柄），只用于把续接请求对回 `magi-web-harness` 内存里的真令牌；**真令牌不进入 `provider_context`**，因为 `provider_context` 会随 canonical 落盘（R59）。其中 `prefixFingerprint` 是该临时对话当前持有内容（已发送的消息与本回复已产生的片段）的指纹；loop 原样持久化并在下一次调用时回放（现有语义：`provider_context` 会写入 canonical 并在后续请求中重新带上，见 `crates/magi-conversation-runtime/src/conversation_loop.rs`）。`ModelProviderContext` 的 `provider` / `kind` 是自由字符串、`data` 是无类型 `Value` 且业务运行时只负责持久化（`crates/magi-bridge-client/src/types.rs`），因此 `chatgpt_web` / `pending_tools` 是纯新增取值，不需要改 bridge DTO 或任何 schema；`data` 的字段由适配器自己校验与解释。续接前核对请求中对应前缀的指纹：一致时才从本次请求的 `role=tool` 消息中取出结果交给 harness（这是 Magi 内部 canonical 消息，不发给网页端），继续读取同一回复；不一致（Magi 已压缩、回退或改写已发送部分）时按 §5.9.7 推进 epoch、重建对话实例。
+5. **时限与回填**（A18）：挂起的 MCP 调用必须在 ChatGPT 侧与通道侧的超时之前应答。参考实现给出可直接采用的量级：OpenAI 隧道侧约 2 分钟命令—响应上限、本地 90 秒收口；因此**本地挂起时限默认 90 秒、按引擎可配**，阶段 4 spike 用真实用量复核后回填（《实现计划》§4.3 4.7b）。到时 loop 仍未交回结果（例如用户审批未完成）时，harness 返回 `magi_tool_timeout` 并撤销令牌，**但对话保留**：loop 带着结果发起下一次调用时，推理通道在**同一对话的下一轮**用 §5.6 的续轮封装把工具结果回填，从该处继续，而不是重开对话、重发全量上下文。回填是常规路径，必须在 UI 可见，并按实际发送次数计入额度。去重以 `turn_id + tool_call_id` 执行账本为准：**T3 的 `tool_call_id` 由 harness 按到达顺序生成（`t3-<turn_id>-<n>`），与 T2 的 `web-<turn_id>-<block_index>` 同构**；去重只针对传输层重试、超时后回填与 daemon 重启后重放这些**同一次调用**，直接返回账本中的既有结果、不重复执行，**禁止按内容哈希去重**——连续两次相同的合法调用（例如连续两次跑同一个测试）是两次真实调用（R58）。账本随 turn 持久化（canonical 事实，不走内存绑定表）。
 6. **turn 结束**：turn 进入终态时，应答全部挂起调用、撤销令牌；**对话保留**给同一 epoch 内的后续 turn。
 7. **挂起期间**：页面与并发名额保持占用。
 
 **连接器配置由 Magi 自动完成（A17）**：自定义连接器本来要求用户进入 ChatGPT 设置手动添加，但承载它的浏览器就是 Magi 托管的会话，所以这一步由站点适配层自动完成：探测账号与套餐是否支持自定义连接器 → 按当前通道写入连接器配置（Magi Connect 的设备地址与凭据，或 OpenAI Tunnel 的 **Tunnel 类型 + 选择用户已创建的 Tunnel + Authentication: None**）→ 回读确认连接器已启用 → 记录 `connectorId`、通道类型与配置版本。用户侧只保留一次说明与确认，不需要进入 ChatGPT 设置（S7）。**通道差异**：OpenAI Tunnel 需要用户先在自己的 OpenAI 账号创建 Tunnel 与仅含 **Tunnels Read + Use** 的 API 密钥（Magi 在设置页引导并显示进度，这一步不可代替用户完成）；Connect 由 Magi 签发设备凭据。配置失败（套餐不支持、站点改版、地址 / 凭据校验不通过、Tunnel 与工作区账号不一致、Developer Mode 或工作区策略不允许）时**必须显式降级为 T2** 并在引擎处说明**具体缺哪一项**，不得假装 T3 可用；该流程只写连接器设置，不改动用户的其他 ChatGPT 设置。
 
-**前置条件不由 Magi 保证**：Developer Mode 是否可用、工作区 / 管理员策略是否允许自定义连接器、OAuth 同意（若需要）、OpenAI Tunnel 是否已创建且 API 密钥具备 Tunnels Read + Use、Connect 是否就绪，任一不满足都 fail closed 并降档，且引擎处必须说明**具体缺哪一项**。参考项目证明这些步骤中存在只能由用户或管理员完成的环节；本方案的"自动配置"仅指 Magi 自动完成**页面操作**。
+**前置条件不由 Magi 保证**：Developer Mode、工作区 / 管理员策略是否允许自定义连接器、OAuth 同意（若需要）、OpenAI Tunnel 是否已创建且 API 密钥具备 Tunnels Read + Use、Connect 是否就绪，任一不满足都 fail closed 并降档，且引擎处必须说明**具体缺哪一项**。**Developer Mode 的归属写死**：由 Magi 在托管浏览器会话中尝试打开并回读确认（与连接器配置同一条页面自动化路径，不要求用户手动进入设置）；打不开或回读不到即视为不可用，fail closed 降档，不自动重试。参考项目证明其余步骤中存在只能由用户或管理员完成的环节（Tunnel 与 API 密钥的创建、工作区策略）；本方案的"自动配置"仅指 Magi 自动完成**页面操作**。
 
 **站点侧确认**：执行授权只由 Magi 审批决定。参考项目要求连接器权限设为「Allow all actions」；Magi 在自动配置时按该形态写入并回读确认，它只决定 ChatGPT 是否把调用送来，**不替代 Magi 自己的审批**。阶段 4 确认 ChatGPT 侧最小拦截设置并写入配置说明。若 ChatGPT 仍弹出确认，默认 fail closed：由用户在右栏处理，超时视为拒绝；用户可显式开启"自动单次允许"，它只对 Magi 连接器的桥接工具点击"单次允许"，从不点击"始终允许"。
 
@@ -517,7 +529,7 @@ T3 需要一条"外部平台能回调本机"的通道。本方案有**两条正�
 - **纯出站**：不暴露公网 IP、不开放入站端口、不需要路由器端口转发，也不需要用户自备域名。
 - **地址稳定**：Tunnel 由 OpenAI 托管，ChatGPT 连接器保存的地址不随本机进程重启变化，因此不存在 Quick Tunnel"每次重启都要重配连接器"的问题。
 - **连接器形态**：ChatGPT 侧新建 **Tunnel 类型**连接器，Authentication 选择 **None**；Tunnel 与 API 密钥必须与 ChatGPT 工作区**同一账号**。
-- **凭据形态**：API 密钥只需 **Tunnels Read + Use**；按参考项目口径以用户私有权限存储、**按文件引用**，绝不进命令行参数、不写日志 / 诊断输出、不进 `state_root` 的绑定存储；可随时吊销。
+- **凭据形态**：API 密钥只需 **Tunnels Read + Use**；按参考项目口径以用户私有权限存储、**按文件引用**，绝不进命令行参数、不写日志 / 诊断输出、不进 `state_root`、不写 settings；可随时吊销。
 - **二进制托管**：`openai/tunnel-client` **固定版本并校验 SHA-256**；仅在启用 T3 且通道就绪时按需启动，随应用退出停止（复用既有 sidecar / 托管模式，不新增常驻服务）。
 - **时限**：隧道侧命令—响应上限约 2 分钟，本地挂起时限必须更早（默认 90 秒，§5.7.3、A18）。
 
@@ -609,8 +621,8 @@ skill 指令本身（`SkillPromptInjection`）在**所有档位**都由 Magi 上
 
 - 每个对话实例维护一本累计账，用 o200k 计数器累加该实例中实际存在的全部内容：新建或重建时发送的完整上下文、每轮的增量、工具结果块与重锚块、Web 模型的可见回复、T3 经桥接工具交回的工具结果，以及协议说明等传输层内容。
 - 多轮续接时必须以累计账为准，不能用 Magi 当前的模型视图估算：Magi 的模型视图会随时间缩减旧工具结果（`model_visible_tool_history_budget_bytes`），而对话里仍是当初发出的完整内容，按视图估算会低于实际占用。
-- 推理通道在每次调用结束时，通过响应的用量字段报告累计账，并标明来源为传输层计数；上下文权威把它作为该对话实例的锚点（新增锚点来源：`ContextMeasurement` 需要新增取值，与 provider 报告区分，压力快照的测量来源显示为估算）。**锚点匹配键必须扩展为含 `epoch`**（既有键为 `provider / model / binding_revision / thread_id / checkpoint_generation`），否则接管、主动重置或空闲释放推进 epoch 后锚点不会失效。锚点键与新增取值的口径要同步写回 `docs/context-pressure-compaction-architecture.md`（§6.1 与 DTO 章节），避免出现第二套事实源。
-- 累计账与前缀指纹随对话实例的绑定关系一起持久化（§5.12）：Web 侧不落盘（A20）；绑定丢失、损坏或 daemon 重启后不再可用时，按「无绑定」处理并推进 epoch 全量重放，不尝试续用旧对话。
+- 累计账的载体是 **`provider_context` 新增 kind**（`provider: "chatgpt_web"`, `kind: "web_ledger"`），**不是 `ModelResponse.usage`**：`usage` 会被 `publish_model_usage_record_for_turn` 当成计费与预算用量写入账本，并进入目标预算与 mission 指标（`crates/magi-conversation-runtime/src/conversation_loop.rs`），与「Web 额度按账号消息条数计、不参与 token 聚合」（§5.11）直接冲突（R51）。`ModelProviderContext` 的 `provider` / `kind` 是自由字符串、`data` 是无类型 `Value`，新增取值不改 bridge DTO、不改任何 schema。上下文权威把它作为该对话实例的锚点（新增锚点来源：`ContextMeasurement` 需要新增取值，与 provider 报告区分，压力快照的测量来源显示为估算）。**锚点匹配键必须扩展为含 `epoch`**（既有键为 `provider / model / binding_revision / thread_id / checkpoint_generation`），否则接管、主动重置或空闲释放推进 epoch 后锚点不会失效。锚点键与新增取值的口径要同步写回 `docs/context-pressure-compaction-architecture.md`（§6.1 与 DTO 章节），避免出现第二套事实源。
+- 累计账与前缀指纹只驻内存（§5.12）：Web 侧不落盘（A20）；进程重启或内存表丢失后按「无绑定」处理并推进 epoch 全量重放，不尝试续用旧对话。
 - ChatGPT 自身的隐藏提示词与连接器 schema 不在累计账中，已包含在实测的可用窗口里；隐藏推理由 `response_reserve` 覆盖（§5.9.5）。
 
 #### 5.9.5 预算与压缩触发（A13）
@@ -630,7 +642,7 @@ skill 指令本身（`SkillPromptInjection`）在**所有档位**都由 Magi 上
   2. 写入后回读发现输入框把文本转成了附件（附件不保证全部进入上下文）；
   3. 页面提示消息或对话过长。
 - 这三种情况都发生在提交之前或提交被拒绝时，没有工具副作用，满足上下文架构"没有副作用才允许重试"的约束；第二次恢复仍失败时，按架构以明确错误收口。
-- **最小分片是重建路径的组成部分**：当压缩后的自包含上下文仍超过 `single_submission_token_budget` 时，推理通道必须按「分段 stage + 逐段回读确认 + commit」发送（参考实现的 `formatChatGptWebMultipartStage/Commit`），否则这类账号的重建路径无解。
+- **最小分片是重建路径的组成部分**：当压缩后的自包含上下文仍超过 `single_submission_token_budget` 时，推理通道必须按「分段 stage + 逐段回读确认 + commit」发送（参考实现的 `formatChatGptWebMultipartStage/Commit`），否则这类账号的重建路径无解。**它是阶段 3 的交付项**（《实现计划》工单 3.13、验收 #31），不是阶段 5 的优化。
 - 完整的分片优化（分片读取、多块上下文的一致性校验）在阶段 5 单独立项。
 
 #### 5.9.7 重建判定
@@ -672,7 +684,7 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 - **无有效探测结果时 fail closed**：应用刚启动、探测进行中或探测失败未归类时，一律按不可见处理，不得用上一次结果占位（§5.5）。
 - **当前会话已绑定一个不可用的 Web 引擎时**：选择器按钮显示该引擎名、不可用原因与「切换其他模型」主行动；发送前同样拒绝。不允许出现「看起来能用、一点就失败」的状态。
 
-- 该设置分区承载全部非 `available` 状态的卡片与主行动：`login_required` →「Web 模型未登录，已隐藏」+「登录 ChatGPT」+「重新发现」；`consent_required` →「确认使用说明」；`desktop_unavailable` →「需要 Magi Desktop」+「了解详情」（沿用现有 `settings.browser.webUnavailable*` 的语气）；`site_blocked` →「打开 GPT Web 主页处理」/「运行诊断」；`quota_exhausted` →「切换其他模型」；`refresh_required` →「刷新 Web 模型」。四个以上的隐藏状态之外不显示该分区。
+- 该设置分区承载全部非 `available` 状态的卡片与主行动：`login_required` →「Web 模型未登录，已隐藏」+「登录 ChatGPT」+「重新发现」；`consent_required` →「确认使用说明」；`desktop_unavailable` →「需要 Magi Desktop」+「了解详情」（沿用现有 `settings.browser.webUnavailable*` 的语气）；`site_blocked` →「打开 GPT Web 主页处理」/「运行诊断」；`quota_exhausted` →「切换其他模型」；`refresh_required` →「刷新 Web 模型」。该分区只在该引擎不处于 `available` 时显示；引擎可用时隐藏整段。
 - 引擎状态同时展示当前工具档位，以及「每轮新建对话」开关是否开启。
 
 首次启用 GPT Web 时展示一次说明并需要用户确认（A9），**触发点固定在「点击 新增 → GPT Web 且尚未确认」这一步**（先确认、再进登录页/主页）。说明内容：本功能自动化操作 ChatGPT 网页，属于非官方用法，可能不符合其服务条款并导致账号受限；上下文（含代码与 skill 内容）会发送给 ChatGPT；T3 会通过 Magi Connect 或 OpenAI Tunnel 通道让 ChatGPT 调用本机工具（ChatGPT 侧显示为自定义连接器），执行前均经 Magi 审批；仓库内容与工具输出可能包含恶意指令，请只在可信工作区中使用。
@@ -685,32 +697,32 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 
 ### 5.12 持久化与存储布局
 
-本方案新增的持久化产物只有**应用级绑定存储**与 **OpenAI Tunnel 的用户凭据引用**两项；其余状态下落要么按 A20 不落盘，要么复用既有事实源。
+本方案新增的持久化产物只有 **OpenAI Tunnel 的用户凭据引用**一项；绑定表只驻内存，其余状态下落要么按 A20 不落盘，要么复用既有事实源。
 
 | 内容 | 位置 | 写入时机 | 读失败时的行为 |
 | --- | --- | --- | --- |
-| 对话绑定记录：绑定键（`Magi 会话 × 引擎 × effort × 上下文 epoch`）、页面标识、累计账、前缀指纹、最近一次已接受发送、所有权状态、账号提示 | `<state_root>/web-model/bindings.json`（新文件，单文件 JSON，带 `schema_version`） | 绑定建立、每次发送被接受、每次回复读回、所有权状态变更 | 解析失败或版本不认识 → 视为「无绑定」并重建为空，不报错（与 §6 同一口径） |
+| 对话绑定记录：绑定键（`Magi 会话 × 线程 × 引擎 × effort × 上下文 epoch`）、页面标识、累计账、前缀指纹、最近一次已接受发送、所有权状态、账号提示 | **daemon 进程内应用级内存表**（不落盘） | 绑定建立、每次发送被接受、每次回复读回、所有权状态变更 | 进程重启即整体重建；没有文件、没有 `schema_version`、没有写放大（R55） |
 | Web 侧副本（页面 URL、DOM、composer 草稿、ChatGPT 侧历史） | 不落盘（A20） | — | — |
 | ChatGPT 登录态（cookie / 站点存储） | Electron 应用级持久分区 `persist:magi-web-model`（A21） | 由 Chromium 管理，随登录 / 登出变化 | 分区丢失等于需要重新登录，不影响 Magi 事实 |
 | 对话内容、工具调用与结果 | daemon canonical event log（既有） | 现有 conversation loop | 既有行为；这是用户资产，不得静默丢弃 |
 | 模型清单、`apiProtocol = chatgpt_web`、`origin` 来源标注 | settings `engines`（既有，Web 引擎不写 `llm`） | 发现后由用户确认后写入 | 既有行为 |
 | 引擎级设置：工具能力开关、「每轮新建对话」开关 | settings `engines` 的引擎条目字段（既有存储） | 用户在设置页修改 | 缺省 = 工具开启、每轮新建对话关闭 |
 | 首次说明的确认状态（consent） | settings（应用级设置，既有存储） | 用户确认一次 | 缺失即视为未确认，引擎为 `consent_required`（§5.11） |
-| OpenAI Tunnel 的 API 密钥与 Tunnel ID | 用户私有权限文件（仅 **Tunnels Read + Use**；按文件引用，不进 `state_root` 绑定存储、不写 settings、不进日志 / 诊断输出） | 用户在「设置 → 浏览器 → GPT Web 模型 → T3 通道」提供 | 缺失或校验失败即 T3 不可用并降级 T2；凭据可吊销 |
+| OpenAI Tunnel 的 API 密钥与 Tunnel ID | 用户私有权限文件（仅 **Tunnels Read + Use**；按文件引用，不进 `state_root`、不写 settings、不进日志 / 诊断输出） | 用户在「设置 → 浏览器 → GPT Web 模型 → T3 通道」提供 | 缺失或校验失败即 T3 不可用并降级 T2；凭据可吊销 |
 | `magi-web-harness` 端口文件 | `<state_root>/web-model/harness.port`（只有 Streamable HTTP 传输需要） | harness 启动时写入 | 读不出来即按未启动重建；stdio 传输不经过该文件 |
 | 引擎当前档位与可用性 | daemon 派生投影（不落盘） | — | 每次按实际探测重新派生（§5.11） |
 
 约定：
 
-- 写入复用 `magi-api` 的 `RuntimeStatePersistence::save_json`（`crates/magi-api/src/state.rs`；原子写沿用 `magi_core::fs_atomic`），文件与 `browser/state.json` 同级、同 `state_root`。该函数当前是 `pub(crate)`：绑定存储的 owner 落在 `magi-api` 内可直接复用；若落在其他 crate，必须先把该函数（或一个等价的 `pub` 包装）提为可见，不允许另起一条写路径。**不新增 `state-layout` 登记项、不推进其版本**：现有 `state-layout` 只有一个版本号标记，没有文件登记表。
-- 绑定键是字符串 `<session_id>|<engine_id>|<effort>|<epoch>`，作为记录的 JSON key；同一会话换引擎、换 effort 或推进 epoch 都会生成新键。
+- **本方案不新增任何持久化文件，也不新增写路径**：绑定表只驻内存，因此不需要复用 `RuntimeStatePersistence::save_json`，不新增 `state-layout` 登记项，也不推进其版本。之所以不落盘：daemon / Desktop 重启一律推进 epoch（§5.1、§5.6、§7.6），落盘内容重启后永远不会被读回，只会带来一套 schema 与写放大（R55）。
+- 绑定键是字符串 `<session_id>|<thread_id>|<engine_id>|<effort>|<epoch>`，作为内存表的 key；换会话、换线程、换引擎、换 effort 或推进 epoch 都会生成新键（R50）。
 - 记录里的页面标识与 `provider_context.pending_tools.pageId` 都只是 BrowserAuthority 逻辑 Tab / 页面的**只读引用**：Surface、Primary、`surfaceRevision` 一律以 BrowserAuthority 为准，引用失效时按 §5.8 推进 epoch 重建，不以记录为准（不得成为 Browser 实体的第二事实源）。
 - 「最近一次已接受发送」只用于**发送去重与崩溃恢复判定**，不用于重建续轮增量：没有带 canonical 消息标识的语义回读命令，重启后一律按「无绑定 + 全量重放」处理（§5.1、§5.9.7）。
-- 「显示即落盘」的边界（C41）：Magi 展示的一切都来自 canonical 且已落盘（助手正文、thinking、工具调用与结果、状态与错误）；不落盘的只有 web 侧副本与 ChatGPT 登录态，以及 OpenAI Tunnel 凭据的明文（只以用户私有权限文件存在，不进本表任何文件）。这不会把 `SessionRuntimeSidecar` / `SessionDurableState` 变成第二写入路径——它们**完全不改**。
+- 「显示即落盘」的边界：Magi 展示的一切都来自 canonical 且已落盘（助手正文、thinking、工具调用与结果、状态与错误）；不落盘的只有 web 侧副本与 ChatGPT 登录态，以及 OpenAI Tunnel 凭据的明文（只以用户私有权限文件存在，不进本表任何文件）。这不会把 `SessionRuntimeSidecar` / `SessionDurableState` 变成第二写入路径——它们**完全不改**。
 - 未收口 turn 的绑定变化允许丢失：恢复后按「无绑定」或上一次已确认状态处理，最多多消耗一条全量消息；**不得因此产生重复的工具副作用**——去重始终以 canonical 的 `turn_id + tool_call_id` 账本为准（§5.7.3）。
-- 会话删除时按绑定键的会话分量清理记录；清理失败只记日志，不阻断会话删除（它只是可重建状态）。
-- 该文件不进入 App Server schema、不进入 settings、不进入会话 sidecar 与 canonical：它承载可重建状态，不属于用户资产，也不允许 UI 直接消费——UI 只读 daemon 的投影。
-- 记录条数随活跃 Web 会话增长，每条只存指针与计数，不存对话正文（正文只在 canonical）。
+- 会话删除时按绑定键的会话分量清理内存记录；它只是可重建状态，清理不影响会话删除。
+- 该内存表不进入 App Server schema、不进入 settings、不进入会话 sidecar 与 canonical：它承载可重建状态，不属于用户资产，也不允许 UI 直接消费——UI 只读 daemon 的投影。
+- 记录条数随活跃 Web 会话增长，每条只存指针与计数，不存对话正文（正文只在 canonical）；进程重启后按需重建。
 
 ### 5.13 交互与状态反馈
 
@@ -730,7 +742,7 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 | 发送 / 等待 / 排队 | turn 运行指示行显示 daemon 投影的阶段文案：「等待 Web 引擎」「浏览器生成中」「排队中 · 当前第 N 位」；排队期间 turn 行提供**取消**入口（取消即出队），接近等待上限时给出预警 | turn 状态 |
 | 关闭视图 | 关闭 GPT Web Tab 只做右栏本地隐藏（A4）：不弹确认、不调用 `closeBrowserTab`，并给一次性即时反馈「已隐藏视图，推理仍在后台继续」+「停止推理 / 打开视图」；隐藏只在当前窗口进程内有效（不做窗口级持久化），重连或重启后按 S3 由投影恢复为显示；若该会话仍有进行中的推理，同时提示「后台推理中」（§5.2） | A4 / §5.2 |
 | 关闭视图后的后台可见性 | 视图关闭期间，「新增」菜单的 GPT Web 项与设置分区显示「GPT Web（后台推理中 · N）」并可点回；会话 turn 行同时显示「视图已关闭 · 推理继续」与「打开视图」；推理结束或失败后清除 | turn 状态 |
-| 三种操作的语义对照 | 折叠右栏 = 保留全部状态与后台推理；关闭 GPT Web Tab = 保留登录态与后台推理、仅隐藏视图；清除数据 = 取消进行中推理 + 登出 + 隐藏模型（二次确认）。该语义沿用 `docs/browser-runtime-design.md` §4.1 既有 Agent Tab 的「只关闭观察视图、不取消任务」先例 | A4 / §5.2 |
+| 三种操作的语义对照 | 折叠右栏 = 保留全部状态与后台推理（应用级内容槽全程挂载、只隐藏不卸载，A25）；关闭 GPT Web Tab = 保留登录态与后台推理、仅隐藏视图；清除数据 = 取消进行中推理 + 登出 + 隐藏模型（二次确认）。该语义沿用 `docs/browser-runtime-design.md` §4.1 既有 Agent Tab 的「只关闭观察视图、不取消任务」先例 | A4 / A25 / §5.2 |
 | 查看 / 接管 | 可从对话或 GPT Web Tab 打开当前会话的临时对话；用户一旦在页面内操作即提示「已接管」，提示同时出现在会话内该 turn 顶部条与 GPT Web Tab 标题条，并附「重置为 Magi 对话」；下一次发送前重建 | `MagiOwned` / `UserOwned` |
 | T3 通道与连接器 | 先显示通道（Magi Connect / OpenAI Tunnel）与状态；OpenAI Tunnel 需要用户创建 Tunnel 与仅含 Tunnels Read + Use 的 API 密钥，Magi 给出引导与进度，**不替用户创建平台资源**。自动配置指**页面操作自动化**：配置中显示「正在为 ChatGPT 配置 Magi 连接器…」并提示 Magi 会短暂操作 ChatGPT 设置页、请勿介入；失败时 fail closed、降级并显示**具体缺哪一项**（Developer Mode / 工作区策略 / OAuth 同意 / Tunnel 未创建 / 凭据缺失或无权限 / `tunnel-client` 校验失败），不显示「T3 可用」 | A17 / §5.7.3 |
 | 清除数据 | 与既有「设置 → 浏览器 → 清理浏览数据」是**同一个操作**，不新增第二个按钮；文案追加「包含 ChatGPT 登录态，Web 模型将被隐藏并需要重新登录」，执行时先取消进行中的 Web 推理，再把 Web 引擎转入 `login_required` 并失效全部绑定 | A4 / A20 / A21 |
@@ -747,13 +759,13 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 
 与「兼容」有关的唯一硬要求属于**启动健壮性**，不是兼容层：
 
-> **加载路径必须是全函数。** 可重建状态（浏览器 durable state、右栏 Tab 指针、Web 对话绑定与其累计账）在文件损坏、字段不认识或 schema 版本不认识时，一律按「无此状态」处理并重建，**绝不能让 daemon 加载失败**；用户资产（会话、canonical 事实、对话历史）相反，永不静默丢弃，也不接受本功能往它们的结构里写任何东西。
+> **加载路径必须是全函数。** 可重建状态（浏览器 durable state、右栏 Tab 指针）在文件损坏、字段不认识或 schema 版本不认识时，一律按「无此状态」处理并重建，**绝不能让 daemon 加载失败**；Web 对话绑定与其累计账只驻内存，进程重启即重建，不产生任何文件。用户资产（会话、canonical 事实、对话历史）相反，永不静默丢弃，也不接受本功能往它们的结构里写任何东西。
 
 后半句正是「不做兼容」的取舍依据：**不往用户资产的结构里塞本功能的状态，就不需要任何字段级兼容开关。**
 
 | 变更 | 结论 |
 | --- | --- |
-| Web 对话绑定与累计账 | 独立存放于 daemon 应用级绑定存储（§5.12）；**不进会话 sidecar**，不写字段迁移。文件缺失或读不出来 = 无绑定，首次使用时新建临时对话并全量重放一次 |
+| Web 对话绑定与累计账 | 只驻 daemon 进程内内存表（§5.12），**不落盘**；不进会话 sidecar、不写字段迁移、不新增文件。进程重启 = 无绑定，首次使用时新建临时对话并全量重放一次 |
 | `BrowserSession.session_id → owner` | **不迁移**：推进 `BROWSER_DURABLE_STATE_SCHEMA_VERSION`，旧记录按「无状态」重建（代价只是几个浏览器 Tab 指针）；加载路径按 §5.3 改为全函数 |
 | 登录态分区（A21） | 分区名固定为 `persist:magi-web-model`，不随 ID 变化，因此不存在需要迁移的旧登录态：旧的 `magi-browser-*` 没有 `persist:` 前缀，本就是内存会话、退出即丢；宿主 partition 白名单与分区注册表过滤器同步放行 |
 | `apiProtocol = chatgpt_web` | 新增值：`ModelApiProtocol` 增 `ChatGptWeb` 变体，`to_http_protocol` / `to_http_model_client` 必须能表达「非 HTTP」（签名改为 `Option` / `Result`）并显式拒绝，**不得落回 `openai_chat`**；`upsert_engine` / `normalize_engine_entry` 按该值保留顶层字段且不回退 |
@@ -773,7 +785,7 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 | 站点 DOM / selector 漂移 | 发现或推理直接失败 | 集中适配层；fail closed；明确错误与诊断；不猜模型 |
 | 登录态是敏感产物 | 账号与隐私风险 | 独立 partition；不导出、不共享、不注入到其他 guest；不暴露给浏览器工具；仅本机可信 Desktop 可用 |
 | 风控与额度 | 账号受限 | 并发上限、排队、不使用规避手段；首次说明中告知 |
-| 多轮对话的上下文持续增长 | 超出网页端上限或被静默截断 | 按累计账计量；到达阈值前压缩并重建；超限映射为 `ContextLengthExceeded` 自动压缩后重建；分片发送单独立项 |
+| 多轮对话的上下文持续增长 | 超出网页端上限或被静默截断 | 按累计账计量；到达阈值前压缩并重建；超限映射为 `ContextLengthExceeded` 自动压缩后重建；重建路径的最小分片是阶段 3 交付项（§5.9.6），完整分片优化单独立项 |
 | 网页端上限被 OpenAI 调整，或超限时静默截断 | 模型丢失上下文而 Magi 不知情 | 上限表随应用更新；按首尾标记法标定；发送前硬校验，绝不依赖超限行为；自检包含一次接近上限的标记回读 |
 | 计数口径与网页端不一致 | 低估导致超出 | Web 引擎绑定 o200k 计数器；阶段 0 复核误差 |
 | Magi 模型视图与对话实际内容不一致 | 低估占用导致超出 | 累计账作为锚点；前缀指纹判定重建 |
@@ -796,8 +808,9 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 | 双事实源 | 状态不一致 | 前端只存指针；模型清单只落 `engines`；对话与工具事实只落 canonical；Web 侧不落盘、不承担持久化（A20），临时对话也不进入用户的 ChatGPT 历史 |
 | 为兼容旧格式保留迁移与运行期分支 | 第二条路径、实现变慢、性能被旧格式拖累 | 明确不做兼容：不写迁移、不做双读 / 双写、不保留运行期分支；可重建状态按 §6 直接丢弃重建；用户资产的结构不被本功能改动（A19） |
 | 把 Web 状态写进带 `deny_unknown_fields` 的用户资产结构 | 新旧版本互读直接失败；每次绑定变化都重写整份会话状态，造成写放大 | Web 对话绑定落在独立的应用级存储；`SessionRuntimeSidecar` / `SessionDurableState` 完全不改 |
-| 可重建状态导致 daemon 加载失败 | 浏览器状态损坏或版本不认识时整个 daemon 起不来 | 加载路径改为全函数：解析失败 / 版本不认识即按"无状态"重建并写回，绝不冒泡为加载错误（§6） |
-| 绑定存储丢失或损坏 | 该会话重新新建临时对话并全量重放，多消耗一条消息额度 | 按 §5.12 读失败即重建；工具副作用不会重复（去重以 canonical 的 `turn_id + tool_call_id` 账本为准）；不影响 canonical 事实 |
+| 可重建状态导致 daemon 加载失败 | 浏览器 durable state 损坏或版本不认识时整个 daemon 起不来 | 加载路径改为全函数：解析失败 / 版本不认识即按"无状态"重建并写回，绝不冒泡为加载错误（§6）；绑定表不落盘，天然不存在这条路径 |
+| 内存绑定表丢失（进程重启） | 该会话重新新建临时对话并全量重放，多消耗一条消息额度 | 内存表没有文件、没有损坏面（§5.12）；工具副作用不会重复（去重以 canonical 的 `turn_id + tool_call_id` 账本为准）；不影响 canonical 事实 |
+| 后台推理与现有宿主模型冲突（R49） | 隐藏页面被强制激活或随折叠卸载，A4/A14 直接落空 | A25：应用级内容槽全程挂载、关闭视图只隐藏；App 级 owner 走不激活驱动路径；同步登记 `docs/browser-runtime-design.md` 例外并单独验收 |
 | 重锚块逐轮重复发送 | 长会话里累积成固定 token 开销 | 重锚块封顶（默认 ≤ `effective_request_limit` 的 5%，§5.6）；正常情况下到阈值前已压缩重建（§5.9.5），重锚只是保险 |
 
 ---
@@ -809,7 +822,7 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 | 问题 | 结论 |
 | --- | --- |
 | App 级会话的配额计量 | 不适用 `MAX_BROWSER_TABS_PER_SESSION`；主页与推理页面计入 `MAX_BROWSER_TABS_TOTAL` |
-| 全局并发上限与推理页面数量 | 并发上限默认 5、可配置，超限排队并投影状态（A14）；推理页面按需创建、不设预热池（R38），同时存在的数量受并发上限约束，具体取值由阶段 0 实测确定 |
+| 全局并发上限与推理页面数量 | 并发上限默认 5、可配置，超限排队并投影状态（A14）；每个活跃对话实例对应一个真实挂载的推理页面（内容槽内 `hidden` 保活，A25），不设预热池（R38），同时存在的数量受并发上限约束，具体取值由阶段 0 实测确定 |
 | 发现结果的刷新时机 | 按 §5.5 的探测触发矩阵；不做 TTL 与周期轮询 |
 | T2 的轮数上限、终止条件与失败呈现 | 每个 Magi turn 默认 20 轮、按引擎可配置；终止条件与失败呈现见 §5.7.2 |
 | 引擎级工具能力开关的默认值与 UI 表达 | 按引擎开关，默认开启；UI 在模型选择与会话中显示当前档位（T0 / T2 / T3）及未达更高档位的原因 |
@@ -830,9 +843,9 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 | 提交 | 页面内 `execCommand("insertText")` + 回读校验；再以逻辑回合标识确认接受 | 新增原子写入命令 + 语义接受判定 |
 | 读取 | 轮询助手回复 DOM 快照 | 累积快照直接喂 `on_delta` |
 | 完成 | 停止控件 + 完成控件 + 文本稳定；工具调用后要求新的稳定答复 | 站点适配层完成谓词 |
-| 会话复用 | 默认复用同一任务的对话、只发增量；可选每轮新对话；压缩后换新对话 | 每个 Magi 会话一条临时对话、多轮续接，按 epoch 重建（A5）；同样提供默认关闭的"每轮新建对话"开关 |
+| 会话复用 | 默认复用同一任务的对话、只发增量；可选每轮新对话；压缩后换新对话 | 每个 Magi 会话的每条线程一条临时对话、多轮续接，按 epoch 重建（A5、R50）；同样提供默认关闭的"每轮新建对话"开关 |
 | 压缩 | 由保留的源对话产出一次性 checkpoint | Magi 现有压缩流程产出摘要，压缩后重建对话实例（A13） |
-| 工具 | stdio MCP server + `openai/tunnel-client` + Tunnel 类型连接器 + 每条消息一个 turn 令牌；以函数调用结束本轮，由 Codex 执行工具，下一次请求续接同一回复 | T2 无需等价物；T3：`magi-web-harness`（HTTP / stdio 两种传输）+ 通道（Magi Connect 优先 / OpenAI Tunnel）+ turn 令牌；同回复续接与下一轮回填都是一等路径（A18） |
+| 工具 | stdio MCP server + `openai/tunnel-client` + Tunnel 类型连接器 + 每条消息一个 turn 令牌；`codex_tool_call` 的 `tools/call` **挂起阻塞**，Codex 执行工具后把结果交回，模型在同一回复内继续写完 | T2 无需等价物；T3：`magi-web-harness`（HTTP / stdio 两种传输）+ 通道（Magi Connect 优先 / OpenAI Tunnel）+ turn 令牌；**同回复续接是唯一交付形态**，下一轮回填是 A18 的超时一等路径；不存在「立即应答」的过渡档位（R53） |
 | 连接器配置 | 用户自行在 ChatGPT 侧添加连接器 / Tunnel（Authentication: None） | 由 Magi 自动完成**页面操作**并回读确认；Tunnel / API 密钥由用户在 OpenAI 平台创建（Magi 引导），Developer Mode、工作区策略、OAuth 同意与通道就绪是前置条件，不满足即 fail closed 并降级（A17、§5.7.3） |
 | 隧道 | `openai/tunnel-client`，固定版本 + SHA-256；纯出站、无公网地址；API 密钥仅 Tunnels Read + Use、按文件引用 | T3 通道的正式形态之一（A10、§5.7.4）；另一形态是 Magi Connect 设备连接层（优先） |
 | 分片发送 | `formatChatGptWebMultipartStage/Commit`：分段 stage（带 sha256）+ 逐段确认 + commit | 只在**重建路径**超过单条提交预算时使用最小分片（§5.9.6）；完整分片另立专项 |
@@ -851,7 +864,7 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 ```mermaid
 flowchart LR
   M["Magi 上下文编译<br/>工具清单 · skill · 重锚块"] -->|"T2 协议说明 + 工具清单"| W["ChatGPT 网页<br/>临时对话"]
-  W -->|"T2 文本块 magi-tool-call"| L["Magi conversation loop"]
+  W -->|"T2 文本块 ~~~magi-tool-call"| L["Magi conversation loop"]
   L -->|"T2 下一轮 magi-tool-result"| W
   L --> E["审批 + 工具运行时<br/>文件 · 命令 · MCP · skill"]
   E -->|"工具结果 + canonical 事实"| L

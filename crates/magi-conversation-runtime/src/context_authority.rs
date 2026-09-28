@@ -39,6 +39,12 @@ const COMPACTION_PROMPT_RESERVE_TOKENS: usize = 768;
 const MIN_COMPACTION_SUMMARY_TOKENS: usize = 1_024;
 /// 摘要上限随窗口放大；长任务的交接事实需要足够空间，不能被固定小预算挤掉。
 const MAX_COMPACTION_SUMMARY_TOKENS: usize = 16_000;
+/// 为摘要消息的固定包装保留的最小预算。摘要输出上限不能只看模型返回正文，
+/// 还必须给 `[context_compaction]` 边界、来源统计和当前请求留出空间。
+const COMPACTION_SUMMARY_WRAPPER_RESERVE_TOKENS: usize = 256;
+/// 极小上下文窗口可能无法在一次摘要请求中同时承载输入和保留尾部；
+/// 允许有限次连续折叠，但绝不把它变成无界重试循环。
+const MAX_COMPACTION_PASSES: usize = 64;
 /// 连续主动压缩失败达到该次数后熔断，直到下一次成功压缩。
 const PROACTIVE_COMPACTION_FAILURE_LIMIT: u32 = 3;
 
@@ -500,49 +506,55 @@ impl<'a> ContextAuthority<'a> {
             };
         }
 
-        let (compacted, split) =
-            match self.compact_if_needed(&history, &decision, request.mode.instructions()) {
-                Ok(Some(result)) => result,
-                Ok(None) => {
-                    if matches!(request.mode, ContextCompactionMode::Manual { .. }) {
-                        // 用户显式请求时必须给出结果：历史已足够短，无需压缩。
-                        let _ = self.notify_compaction(ContextCompactionProgress::Skipped);
-                    }
+        let (compacted, split) = match self.compact_if_needed(
+            &history,
+            &decision,
+            request.additional_token_estimate,
+            previous_checkpoint.is_some(),
+            matches!(request.mode, ContextCompactionMode::Manual { .. }),
+            request.mode.instructions(),
+        ) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                if matches!(request.mode, ContextCompactionMode::Manual { .. }) {
+                    // 用户显式请求时必须给出结果：历史已足够短，无需压缩。
+                    let _ = self.notify_compaction(ContextCompactionProgress::Skipped);
+                }
+                return PreparedThreadHistory {
+                    messages: history,
+                    compaction: None,
+                    terminal: None,
+                };
+            }
+            Err(error) => {
+                if self.cancelled() {
+                    let notification_error = self
+                        .notify_compaction(ContextCompactionProgress::Cancelled)
+                        .err();
+                    tracing::info!(
+                        thread_id = %self.thread_id,
+                        session_id = %self.session_id,
+                        phase = request.phase,
+                        %error,
+                        notification_error = ?notification_error,
+                        "上下文语义压缩已取消"
+                    );
                     return PreparedThreadHistory {
                         messages: history,
                         compaction: None,
-                        terminal: None,
+                        terminal: Some(ContextCompactionTerminal::Cancelled),
                     };
                 }
-                Err(error) => {
-                    if self.cancelled() {
-                        let notification_error = self
-                            .notify_compaction(ContextCompactionProgress::Cancelled)
-                            .err();
-                        tracing::info!(
-                            thread_id = %self.thread_id,
-                            session_id = %self.session_id,
-                            phase = request.phase,
-                            %error,
-                            notification_error = ?notification_error,
-                            "上下文语义压缩已取消"
-                        );
-                        return PreparedThreadHistory {
-                            messages: history,
-                            compaction: None,
-                            terminal: Some(ContextCompactionTerminal::Cancelled),
-                        };
-                    }
-                    return self.compaction_failed(
-                        request.phase,
-                        history,
-                        &decision,
-                        request.additional_token_estimate,
-                        &request.mode,
-                        &error,
-                    );
-                }
-            };
+                return self.compaction_failed(
+                    request.phase,
+                    history,
+                    &decision,
+                    request.additional_token_estimate,
+                    &request.mode,
+                    &error,
+                );
+            }
+        };
 
         if self.cancelled() {
             let terminal = match self.notify_compaction(ContextCompactionProgress::Cancelled) {
@@ -567,6 +579,21 @@ impl<'a> ContextAuthority<'a> {
         let compacted_count = compacted.len();
         let compacted_tokens = estimate_thread_history_tokens(&compacted);
         let request_tokens = compacted_tokens.saturating_add(request.additional_token_estimate);
+        if let Err(error) = validate_compaction_budget(
+            compacted_tokens,
+            request_tokens,
+            decision.target_history_tokens(),
+            decision.context_window_tokens(),
+        ) {
+            return self.compaction_failed(
+                request.phase,
+                history,
+                &decision,
+                request.additional_token_estimate,
+                &request.mode,
+                &error,
+            );
+        }
         let compacted_at = UtcMillis::now();
         let previous_source_count = previous_checkpoint
             .as_ref()
@@ -575,7 +602,7 @@ impl<'a> ContextAuthority<'a> {
         let source_message_count = if previous_source_count == 0 {
             split
         } else {
-            previous_source_count.saturating_add(split.saturating_sub(1))
+            previous_source_count.saturating_add(split)
         };
         let source_message_count = source_message_count.min(raw_transcript.len());
         if request.persist_checkpoint {
@@ -736,6 +763,9 @@ impl<'a> ContextAuthority<'a> {
         &self,
         history: &[ThreadChatMessage],
         decision: &ThreadHistoryCompactionDecision,
+        additional_token_estimate: usize,
+        has_previous_checkpoint: bool,
+        fully_compact: bool,
         instructions: Option<&str>,
     ) -> Result<Option<(Vec<ThreadChatMessage>, usize)>, String> {
         if history.len() <= 1 {
@@ -744,6 +774,12 @@ impl<'a> ContextAuthority<'a> {
         }
         let original_tokens = estimate_thread_history_tokens(history);
         let target_history_tokens = decision.target_history_tokens();
+        let retained_request_target =
+            ContextBudgetPolicy::for_window(decision.context_window_tokens(), None, 0)
+                .retained_history_target_tokens
+                .try_into()
+                .unwrap_or(usize::MAX);
+        let target_history_is_infeasible = additional_token_estimate >= retained_request_target;
         if original_tokens <= target_history_tokens {
             tracing::debug!(
                 reason = decision.reason_label(),
@@ -753,6 +789,75 @@ impl<'a> ContextAuthority<'a> {
             );
             return Ok(None);
         }
+        let mut current_history = history.to_vec();
+        let mut raw_source_message_count = 0usize;
+        let mut first_pass = true;
+        let mut pass_count = 0usize;
+        loop {
+            if pass_count >= MAX_COMPACTION_PASSES {
+                return Err("上下文压缩达到单轮有界次数，仍未落入模型窗口".to_string());
+            }
+            let before_tokens = estimate_thread_history_tokens(&current_history);
+            let Some((compacted, visible_split)) =
+                self.compact_one_pass(&current_history, decision, original_tokens, instructions)?
+            else {
+                return Err("上下文压缩未生成有效候选".to_string());
+            };
+            let compacted_tokens = estimate_thread_history_tokens(&compacted);
+            if compacted_tokens >= before_tokens {
+                return Err(format!(
+                    "上下文压缩未减少历史：{} >= {} token",
+                    compacted_tokens, before_tokens
+                ));
+            }
+            raw_source_message_count = raw_source_message_count.saturating_add(
+                if first_pass && !has_previous_checkpoint {
+                    visible_split
+                } else {
+                    visible_split.saturating_sub(1)
+                },
+            );
+            current_history = compacted;
+            first_pass = false;
+            pass_count += 1;
+            let projected_request_tokens =
+                compacted_tokens.saturating_add(additional_token_estimate);
+            let reached_safe_limit = projected_request_tokens as u64
+                <= compaction_stop_limit_tokens(decision.context_window_tokens());
+            let reached_retained_target = projected_request_tokens <= retained_request_target;
+            if (!fully_compact && reached_safe_limit)
+                || (fully_compact
+                    && (reached_retained_target
+                        || (target_history_is_infeasible && reached_safe_limit)))
+            {
+                break;
+            }
+        }
+        let compacted_tokens = estimate_thread_history_tokens(&current_history);
+        let request_tokens = compacted_tokens.saturating_add(additional_token_estimate);
+        validate_compaction_budget(
+            compacted_tokens,
+            request_tokens,
+            target_history_tokens,
+            decision.context_window_tokens(),
+        )?;
+        if compacted_tokens >= original_tokens {
+            return Err("上下文压缩候选没有小于原始历史".to_string());
+        }
+        return Ok(Some((current_history, raw_source_message_count)));
+    }
+
+    fn compact_one_pass(
+        &self,
+        history: &[ThreadChatMessage],
+        decision: &ThreadHistoryCompactionDecision,
+        original_tokens: usize,
+        instructions: Option<&str>,
+    ) -> Result<Option<(Vec<ThreadChatMessage>, usize)>, String> {
+        if history.len() <= 1 {
+            return Ok(None);
+        }
+        let target_history_tokens = decision.target_history_tokens();
         let summary_model = self.resolve_compaction_model(decision.context_window_tokens())?;
         let summary_target_tokens =
             compaction_summary_target_tokens(target_history_tokens, summary_model.context_window);
@@ -764,21 +869,46 @@ impl<'a> ContextAuthority<'a> {
         else {
             return Err("无法在摘要模型输入预算内选择连续且工具配对完整的历史范围".to_string());
         };
-        let summary = self.build_compaction_message(
-            &summary_model,
-            &history[..split],
+        let tail_tokens = estimate_thread_history_tokens(&history[split..]);
+        let summary_output_limit = compaction_summary_output_limit_tokens(
+            target_history_tokens,
+            tail_tokens,
+            history[..split].len(),
             original_tokens,
-            source_budget,
             summary_target_tokens,
+        )?;
+        self.notify_compaction(ContextCompactionProgress::Started {
+            stage: "history_summary",
+            total_chunks: 1,
+        })?;
+        let source = serialize_compaction_source(&history[..split])?;
+        let summary = self.build_compaction_summary(
+            &summary_model,
+            &source,
+            source_budget,
+            summary_output_limit,
+            0,
+            1,
             instructions,
         )?;
+        self.notify_compaction(ContextCompactionProgress::Advanced {
+            stage: "history_summary",
+            completed_chunks: 1,
+            total_chunks: 1,
+        })?;
+        let content = render_compaction_summary_content(split, original_tokens, &summary);
+        let summary_message = ThreadChatMessage {
+            // 摘要是历史交接数据，不得在回放时获得 system/developer 权威。
+            role: "user".to_string(),
+            content: Some(content),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_context: Vec::new(),
+        };
         let mut compacted = Vec::with_capacity(history.len().saturating_sub(split) + 1);
-        compacted.push(summary);
+        compacted.push(summary_message);
         compacted.extend(history[split..].iter().cloned());
-        if estimate_thread_history_tokens(&compacted) >= original_tokens {
-            self.notify_compaction(ContextCompactionProgress::Skipped)?;
-            return Ok(None);
-        }
         Ok(Some((compacted, split)))
     }
 
@@ -814,65 +944,33 @@ impl<'a> ContextAuthority<'a> {
         })
     }
 
-    fn build_compaction_message(
+    fn build_compaction_summary(
         &self,
         summary_model: &CompactionModel<'a>,
-        compacted_prefix: &[ThreadChatMessage],
-        original_tokens: usize,
+        source: &str,
         source_budget: usize,
-        summary_target_tokens: usize,
+        summary_output_limit_tokens: usize,
+        chunk_index: usize,
+        chunk_count: usize,
         instructions: Option<&str>,
-    ) -> Result<ThreadChatMessage, String> {
-        let compaction_client = summary_model.client.as_dyn();
-        let source = serialize_compaction_source(compacted_prefix)?;
-        if estimate_text_tokens(&source) > source_budget {
+    ) -> Result<String, String> {
+        let source_tokens = estimate_text_tokens(source);
+        if source_tokens > source_budget {
             return Err(format!(
                 "连续压缩范围超过摘要模型输入预算：{} > {} token",
-                estimate_text_tokens(&source),
-                source_budget
+                source_tokens, source_budget
             ));
         }
-        self.notify_compaction(ContextCompactionProgress::Started {
-            stage: "history_summary",
-            total_chunks: 1,
-        })?;
         let summary = self.invoke_compaction_summary(
-            compaction_client,
-            &source,
+            summary_model.client.as_dyn(),
+            source,
             "history_summary",
-            0,
-            1,
-            summary_target_tokens,
+            chunk_index,
+            chunk_count,
+            summary_output_limit_tokens,
             instructions,
         )?;
-        self.notify_compaction(ContextCompactionProgress::Advanced {
-            stage: "history_summary",
-            completed_chunks: 1,
-            total_chunks: 1,
-        })?;
-        let summary = validate_compaction_summary(&summary)?;
-        let content = render_prompt_fragment(
-            PromptFragmentKind::ThreadHistoryBoundary,
-            format!(
-                "[context_compaction]\n\
-这是 Magi 自动生成的当前 thread 早期历史摘要，用于构建模型上下文视图。它是历史事实；如果它与后续保留的完整消息冲突，以后续完整消息为准。\n\
-压缩范围：{} 条消息；压缩前估算 token：{}。\n\
-语义交接摘要：\n{}\n\
-[/context_compaction]",
-                compacted_prefix.len(),
-                original_tokens,
-                summary,
-            ),
-        );
-        Ok(ThreadChatMessage {
-            // 摘要是历史交接数据，不得在回放时获得 system/developer 权威。
-            role: "user".to_string(),
-            content: Some(content),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            provider_context: Vec::new(),
-        })
+        validate_compaction_summary(&summary)
     }
 
     fn notify_compaction(&self, progress: ContextCompactionProgress) -> Result<(), String> {
@@ -901,7 +999,7 @@ impl<'a> ContextAuthority<'a> {
         stage: &str,
         chunk_index: usize,
         chunk_count: usize,
-        summary_target_tokens: usize,
+        summary_output_limit_tokens: usize,
         instructions: Option<&str>,
     ) -> Result<String, String> {
         // 用户补充要求只调整摘要重点，不能改变固定标题结构或把历史当作指令执行。
@@ -921,7 +1019,7 @@ impl<'a> ContextAuthority<'a> {
 不可信历史数据：\n{}",
             chunk_index + 1,
             chunk_count,
-            summary_target_tokens,
+            summary_output_limit_tokens,
             source,
         );
         let request = ModelInvocationRequest {
@@ -950,7 +1048,13 @@ impl<'a> ContextAuthority<'a> {
             .is_cancelled
             .map(|callback| callback as &dyn Fn() -> bool)
             .unwrap_or(&never_cancelled);
-        let response = client.invoke_with_cancellation(request, is_cancelled);
+        let max_output_tokens = u32::try_from(summary_output_limit_tokens)
+            .map_err(|_| "上下文压缩摘要输出预算超过 provider 可表达范围".to_string())?;
+        let response = client.invoke_with_cancellation_and_output_limit(
+            request,
+            max_output_tokens,
+            is_cancelled,
+        );
         let binding = auxiliary_model_usage_binding(UsagePhase::Integration);
         publish_model_usage_record_for_turn(
             self.event_bus,
@@ -977,12 +1081,20 @@ impl<'a> ContextAuthority<'a> {
                     .then(|| "context_compaction_failed".to_string()),
             },
         );
-        response
+        let summary = response
             .map_err(|error| format!("上下文压缩模型调用失败：{error}"))?
             .content
             .map(|content| content.trim().to_string())
             .filter(|content| !content.is_empty())
-            .ok_or_else(|| "上下文压缩模型未返回摘要".to_string())
+            .ok_or_else(|| "上下文压缩模型未返回摘要".to_string())?;
+        let actual_tokens = estimate_text_tokens(&summary);
+        if actual_tokens > summary_output_limit_tokens {
+            return Err(format!(
+                "上下文压缩模型输出超过预算：{} > {} token",
+                actual_tokens, summary_output_limit_tokens
+            ));
+        }
+        Ok(summary)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1100,9 +1212,10 @@ impl<'a> ContextAuthority<'a> {
             } => {
                 if let Some(object) = payload.as_object_mut() {
                     object.insert(
-                        "context_window_tokens".to_string(),
+                        "estimated_prefill_tokens".to_string(),
                         (*estimated_tokens as u64).into(),
                     );
+                    object.insert("context_window_tokens".to_string(), (*token_limit).into());
                     object.insert("token_limit".to_string(), (*token_limit).into());
                     object.insert(
                         "threshold_tokens".to_string(),
@@ -1172,24 +1285,169 @@ fn compaction_summary_target_tokens(
         .min(model_cap)
 }
 
+/// 计算摘要正文可申请的最大输出预算。
+///
+/// `target_history_tokens` 是摘要消息和保留尾部的总预算，不能把它全部交给
+/// provider 的输出参数；摘要消息自身还有固定包装，且当前回合的固定输入已经
+/// 从该目标中扣除。输出预算在调用前收紧，调用后还会用完整消息估算再次校验。
+fn compaction_summary_output_limit_tokens(
+    target_history_tokens: usize,
+    tail_tokens: usize,
+    compacted_prefix_message_count: usize,
+    original_tokens: usize,
+    requested_output_tokens: usize,
+) -> Result<usize, String> {
+    let wrapper_tokens =
+        compaction_summary_message_overhead(compacted_prefix_message_count, original_tokens);
+    // 当单次摘要输入受 provider 窗口限制、尾部暂时仍大于目标时，先允许
+    // 生成一个严格受限的中间摘要；后续压缩轮次会继续收缩尾部。最终轮次
+    // 才把摘要正文和尾部共同限制在 target_history_tokens 内。
+    let available = if tail_tokens
+        .saturating_add(wrapper_tokens)
+        .saturating_add(COMPACTION_SUMMARY_WRAPPER_RESERVE_TOKENS)
+        <= target_history_tokens
+    {
+        target_history_tokens
+            .saturating_sub(tail_tokens)
+            .saturating_sub(wrapper_tokens)
+            .saturating_sub(COMPACTION_SUMMARY_WRAPPER_RESERVE_TOKENS)
+    } else {
+        requested_output_tokens
+            .saturating_sub(wrapper_tokens)
+            .saturating_sub(COMPACTION_SUMMARY_WRAPPER_RESERVE_TOKENS)
+    };
+    let output_limit = requested_output_tokens.min(available);
+    if output_limit < 256 {
+        return Err(format!(
+            "压缩后历史预算不足以容纳结构化摘要：可用 {} token",
+            output_limit
+        ));
+    }
+    Ok(output_limit)
+}
+
+fn compaction_summary_message_overhead(
+    compacted_prefix_message_count: usize,
+    original_tokens: usize,
+) -> usize {
+    estimate_thread_message_tokens(&ThreadChatMessage {
+        role: "user".to_string(),
+        content: Some(render_compaction_summary_content(
+            compacted_prefix_message_count,
+            original_tokens,
+            "",
+        )),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        provider_context: Vec::new(),
+    })
+}
+
+fn render_compaction_summary_content(
+    compacted_prefix_message_count: usize,
+    original_tokens: usize,
+    summary: &str,
+) -> String {
+    render_prompt_fragment(
+        PromptFragmentKind::ThreadHistoryBoundary,
+        format!(
+            "[context_compaction]\n\
+这是 Magi 自动生成的当前 thread 早期历史摘要，用于构建模型上下文视图。它是历史事实；如果它与后续保留的完整消息冲突，以后续保留的完整消息为准。\n\
+压缩范围：{} 条消息；压缩前估算 token：{}。\n\
+语义交接摘要：\n{}\n\
+[/context_compaction]",
+            compacted_prefix_message_count, original_tokens, summary,
+        ),
+    )
+}
+
+/// 压缩候选只有在当前模型的安全请求门禁内才允许安装。
+/// 这条门禁防止摘要模型忽略提示词中的“约 N token”后把超大摘要写进检查点；
+/// 手动压缩在可行时还会继续折叠到保留历史目标。
+fn validate_compaction_budget(
+    compacted_history_tokens: usize,
+    projected_request_tokens: usize,
+    _target_history_tokens: usize,
+    context_window_tokens: u64,
+) -> Result<(), String> {
+    let compaction_stop_limit = compaction_stop_limit_tokens(context_window_tokens);
+    if projected_request_tokens as u64 > compaction_stop_limit {
+        let policy = ContextBudgetPolicy::for_window(context_window_tokens, None, 0);
+        return Err(format!(
+            "压缩后请求仍超过模型压缩门禁：{} > {} token（模型窗口 {}，输出预留 {}）",
+            projected_request_tokens,
+            compaction_stop_limit,
+            policy.context_window_tokens,
+            policy.response_reserve_tokens
+        ));
+    }
+    let _ = compacted_history_tokens;
+    Ok(())
+}
+
+fn compaction_hard_request_limit_tokens(context_window_tokens: u64) -> u64 {
+    let policy = ContextBudgetPolicy::for_window(context_window_tokens, None, 0);
+    if context_window_tokens < 16_000 {
+        // 16K 是可持久化模型窗口的最小配置值；更小的窗口只出现在动态单测
+        // 夹具中，不能把它们的合成预算当成真实 provider 硬上限。
+        return u64::MAX;
+    }
+    // 小于默认输出预留的测试/自定义窗口无法使用“窗口 - 20K”作为硬门禁，
+    // 否则 4K/16K 配置会得到几乎为零的可用上下文。此时窗口本身是唯一可验证
+    // 的上限；正常大窗口仍保留 response reserve 的硬请求预算。
+    if policy.response_reserve_tokens >= policy.context_window_tokens {
+        policy.context_window_tokens
+    } else {
+        policy.hard_request_limit_tokens
+    }
+}
+
+fn compaction_stop_limit_tokens(context_window_tokens: u64) -> u64 {
+    let hard_request_limit = compaction_hard_request_limit_tokens(context_window_tokens);
+    let policy = ContextBudgetPolicy::for_window(context_window_tokens, None, 0);
+    if policy.proactive_threshold_tokens > 1
+        && policy.proactive_threshold_tokens < hard_request_limit
+    {
+        policy.proactive_threshold_tokens.saturating_sub(1)
+    } else {
+        hard_request_limit
+    }
+}
+
 /// 判断“历史 + 本次固定输入”是否仍在当前窗口的硬请求上限内。
 fn request_fits_hard_limit(
     history_tokens: usize,
     additional_token_estimate: usize,
     context_window_tokens: u64,
 ) -> bool {
-    let policy = ContextBudgetPolicy::for_window(context_window_tokens, None, 0);
-    (history_tokens.saturating_add(additional_token_estimate) as u64)
-        <= policy.hard_request_limit_tokens
+    let hard_request_limit = compaction_hard_request_limit_tokens(context_window_tokens);
+    (history_tokens.saturating_add(additional_token_estimate) as u64) <= hard_request_limit
 }
 
 fn serialize_compaction_source(history: &[ThreadChatMessage]) -> Result<String, String> {
-    history
+    serialize_compaction_source_range(history, 0, history.len())
+}
+
+fn serialize_compaction_source_range(
+    history: &[ThreadChatMessage],
+    start: usize,
+    end: usize,
+) -> Result<String, String> {
+    if start > end || end > history.len() {
+        return Err(format!(
+            "无效的连续压缩范围：{}..{}（历史长度 {}）",
+            start,
+            end,
+            history.len()
+        ));
+    }
+    history[start..end]
         .iter()
         .enumerate()
         .map(|(index, message)| {
             serde_json::to_string(message)
-                .map(|serialized| format!("message_index={index}\n{serialized}"))
+                .map(|serialized| format!("message_index={}\n{serialized}", start + index))
                 .map_err(|error| format!("序列化待压缩上下文失败：{error}"))
         })
         .collect::<Result<Vec<_>, _>>()
@@ -1611,14 +1869,14 @@ fn choose_thread_history_compaction_split(
     (initial_split..history.len())
         .find(|split| keeps_target_tail(split) && fits_source_budget(split))
         .or_else(|| {
-            // 摘要模型预算不足时缩小连续前缀，而不是跳过中间历史或头尾拼接。
+            // 摘要模型预算不足时缩小连续压缩前缀，而不是跳过中间历史或头尾拼接。
             (1..initial_split)
                 .rev()
                 .find(|split| keeps_target_tail(split) && fits_source_budget(split))
         })
         .or_else(|| {
-            // 单次消息很大时仍选择最大的完整、工具配对安全前缀；尾部目标可
-            // 暂时偏大，下一轮继续压缩，但绝不发送被静默截断的摘要输入。
+            // 单次消息很大时仍选择最大的完整、工具配对安全前缀；尾部目标可暂时偏大，
+            // 下一次循环继续压缩，但绝不发送超过摘要模型输入预算的摘要请求。
             (1..history.len()).rev().find(|split| {
                 thread_history_tail_is_tool_balanced(&history[*split..])
                     && fits_source_budget(split)
@@ -1631,7 +1889,8 @@ mod tests {
     use super::{
         ContextCompactionProgress, ContextCompactionProgressGate, MAX_COMPACTION_SUMMARY_TOKENS,
         MIN_COMPACTION_SUMMARY_TOKENS, bound_model_visible_tool_results,
-        compaction_summary_target_tokens, serialize_compaction_source, validate_compaction_summary,
+        compaction_summary_output_limit_tokens, compaction_summary_target_tokens,
+        serialize_compaction_source, validate_compaction_budget, validate_compaction_summary,
     };
     use magi_session_store::ThreadChatMessage;
 
@@ -1670,6 +1929,20 @@ mod tests {
             compaction_summary_target_tokens(900, 16_000),
             MIN_COMPACTION_SUMMARY_TOKENS
         );
+    }
+
+    #[test]
+    fn compaction_budget_rejects_candidate_above_selected_model_window() {
+        assert!(validate_compaction_budget(60_000, 240_000, 46_080, 256_000).is_err());
+        assert!(validate_compaction_budget(46_000, 200_000, 46_080, 256_000).is_ok());
+    }
+
+    #[test]
+    fn summary_output_limit_reserves_wrapper_and_tail_budget() {
+        let limit = compaction_summary_output_limit_tokens(46_080, 35_000, 120, 400_000, 15_360)
+            .expect("256K 摘要应有足够的结构化输出预算");
+        assert!(limit < 15_360);
+        assert!(limit >= MIN_COMPACTION_SUMMARY_TOKENS);
     }
 
     #[test]

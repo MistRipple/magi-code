@@ -647,6 +647,20 @@ pub trait ModelBridgeClient: Send + Sync {
         self.invoke(request)
     }
 
+    /// 执行带有输出预算的可取消调用。
+    ///
+    /// 输出预算是压缩等需要严格控制结果尺寸的内部语义。非 HTTP bridge
+    /// 可以沿用旧调用路径，但必须由调用方在安装结果前再次校验实际输出。
+    fn invoke_with_cancellation_and_output_limit(
+        &self,
+        request: ModelInvocationRequest,
+        max_output_tokens: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        let _ = max_output_tokens;
+        self.invoke_with_cancellation(request, is_cancelled)
+    }
+
     /// 流式调用 LLM,每次收到内容或 thinking 增量时调用 `on_delta` 回调并传入已累积快照。
     /// 实现方必须显式声明流式行为:真流式实现接收 SSE 增量,非流式实现必须返回错误而非静默降级。
     fn invoke_streaming(

@@ -200,8 +200,22 @@ impl HttpModelBridgeClient {
         request: &ModelInvocationRequest,
         stream: bool,
     ) -> Result<HttpModelRequest, BridgeClientError> {
+        self.build_http_request_with_output_limit(request, stream, None)
+    }
+
+    fn build_http_request_with_output_limit(
+        &self,
+        request: &ModelInvocationRequest,
+        stream: bool,
+        max_output_tokens: Option<u32>,
+    ) -> Result<HttpModelRequest, BridgeClientError> {
         let mut headers = self.request_headers();
-        let mut params = llm_message_params_from_invocation(request, stream, self.reasoning_effort);
+        let mut params = llm_message_params_from_invocation(
+            request,
+            stream,
+            self.reasoning_effort,
+            max_output_tokens,
+        );
         if matches!(params.tool_choice, Some(ToolChoice::Typed { .. })) {
             match self.forced_tool_choice_capability() {
                 ForcedToolChoiceCapability::Required => {
@@ -1570,36 +1584,16 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         request: ModelInvocationRequest,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        if request.prompt.trim().is_empty() && request.messages.is_none() {
-            return Err(BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::RemoteBusiness,
-                code: Some(-32002),
-                message: "empty prompt".to_string(),
-            });
-        }
-        let http_request = self.build_http_request(&request, false)?;
-        let (accepted_request, status, response_body, _retry_after, fallback_capability) =
-            execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
-                execute_cancellable_http_post_with_retries(
-                    self.provider_request_key(),
-                    request.url,
-                    request.body,
-                    request.headers,
-                    is_cancelled,
-                )
-            })?;
+        self.invoke_cancellable_with_output_limit(request, None, is_cancelled)
+    }
 
-        if !(200..300).contains(&status) {
-            return Err(provider_http_status_error(status, &response_body));
-        }
-        if let Some(capability) = fallback_capability.or_else(|| {
-            capability_from_accepted_tool_choice_request(&accepted_request, self.provider_family())
-        }) {
-            self.mark_forced_tool_choice_capability(capability);
-        }
-        let response =
-            self.parse_success_payload(&response_body, &accepted_request.tool_name_codec)?;
-        Ok(response)
+    fn invoke_with_cancellation_and_output_limit(
+        &self,
+        request: ModelInvocationRequest,
+        max_output_tokens: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        self.invoke_cancellable_with_output_limit(request, Some(max_output_tokens), is_cancelled)
     }
 
     fn invoke_streaming(
@@ -1627,6 +1621,47 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_streaming_observed(request, on_delta, on_retry, is_cancelled)
+    }
+}
+
+impl HttpModelBridgeClient {
+    fn invoke_cancellable_with_output_limit(
+        &self,
+        request: ModelInvocationRequest,
+        max_output_tokens: Option<u32>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        if request.prompt.trim().is_empty() && request.messages.is_none() {
+            return Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32002),
+                message: "empty prompt".to_string(),
+            });
+        }
+        let http_request =
+            self.build_http_request_with_output_limit(&request, false, max_output_tokens)?;
+        let (accepted_request, status, response_body, _retry_after, fallback_capability) =
+            execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
+                execute_cancellable_http_post_with_retries(
+                    self.provider_request_key(),
+                    request.url,
+                    request.body,
+                    request.headers,
+                    is_cancelled,
+                )
+            })?;
+
+        if !(200..300).contains(&status) {
+            return Err(provider_http_status_error(status, &response_body));
+        }
+        if let Some(capability) = fallback_capability.or_else(|| {
+            capability_from_accepted_tool_choice_request(&accepted_request, self.provider_family())
+        }) {
+            self.mark_forced_tool_choice_capability(capability);
+        }
+        let response =
+            self.parse_success_payload(&response_body, &accepted_request.tool_name_codec)?;
+        Ok(response)
     }
 }
 
@@ -1747,6 +1782,7 @@ fn llm_message_params_from_invocation(
     request: &ModelInvocationRequest,
     stream: bool,
     reasoning_effort: Option<ReasoningEffort>,
+    max_output_tokens: Option<u32>,
 ) -> LlmMessageParams {
     let messages = request
         .messages
@@ -1765,7 +1801,7 @@ fn llm_message_params_from_invocation(
         });
     LlmMessageParams {
         messages,
-        max_tokens: None,
+        max_tokens: max_output_tokens,
         temperature: None,
         tools: request.tools.as_ref().map(|tools| {
             tools
@@ -2835,6 +2871,7 @@ mod tests {
                     },
                     false,
                     None,
+                    None,
                 ),
             ),
         };
@@ -2897,6 +2934,7 @@ mod tests {
                         tool_choice: None,
                     },
                     false,
+                    None,
                     None,
                 ),
             ),
@@ -3038,6 +3076,55 @@ mod tests {
             body.get("reasoning_effort").is_none(),
             "未配置推理级别时不得写入 reasoning_effort 字段"
         );
+    }
+
+    #[test]
+    fn compaction_output_limit_is_forwarded_to_provider_request() {
+        let request = ModelInvocationRequest {
+            provider: "context-compaction".to_string(),
+            prompt: "summarize".to_string(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let chat = HttpModelBridgeClient::new_with_protocol(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-test".to_string(),
+            HttpModelBridgeProtocol::ChatCompletions,
+            None,
+        );
+        let chat_body = chat
+            .build_http_request_with_output_limit(&request, false, Some(1_024))
+            .expect("chat request should build")
+            .body;
+        assert_eq!(chat_body["max_tokens"], 1_024);
+
+        let responses = HttpModelBridgeClient::new_with_protocol(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-test".to_string(),
+            HttpModelBridgeProtocol::Responses,
+            None,
+        );
+        let responses_body = responses
+            .build_http_request_with_output_limit(&request, false, Some(1_024))
+            .expect("responses request should build")
+            .body;
+        assert_eq!(responses_body["max_output_tokens"], 1_024);
+
+        let anthropic = HttpModelBridgeClient::new_with_protocol(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "anthropic-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            None,
+        );
+        let anthropic_body = anthropic
+            .build_http_request_with_output_limit(&request, false, Some(1_024))
+            .expect("anthropic request should build")
+            .body;
+        assert_eq!(anthropic_body["max_tokens"], 1_024);
     }
 
     #[test]
