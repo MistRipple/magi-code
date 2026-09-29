@@ -10,6 +10,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 const EVENT_TRANSACTION_SCHEMA_VERSION: u32 = 1;
@@ -41,7 +42,14 @@ pub(crate) struct SessionConversationProjection {
     last_event_seq: u64,
     canonical_turns: Vec<CanonicalTurn>,
     accepted_submissions: Vec<AcceptedSubmissionRecord>,
+    /// 已释放回合：只保留事件游标与 accepted 记录。回合事实在 SessionStore 里另有一份，
+    /// 不活跃的会话没必要在这里再常驻一份完整副本；再次写入该会话前必须从事件目录重放。
+    released: bool,
+    /// 最近一次使用的单调序号，用于只让最近活跃的少数会话保持驻留。
+    last_touched: u64,
 }
+
+static TOUCH_CLOCK: AtomicU64 = AtomicU64::new(1);
 
 impl SessionConversationProjection {
     /// 只读取首个 event segment 的 session 归属，不重放整个事件目录。
@@ -115,6 +123,7 @@ impl SessionConversationProjection {
                 projection.accepted_submissions.push(acceptance.clone());
             }
         }
+        projection.touch();
         Ok(projection)
     }
 
@@ -225,6 +234,11 @@ impl SessionConversationProjection {
         mutations: &[CanonicalTurnMutation],
         acceptance: Option<AcceptedSubmissionRecord>,
     ) -> Result<(Self, Option<CanonicalEventTransaction>), DaemonError> {
+        if self.released {
+            return Err(DaemonError::internal(format!(
+                "canonical projection 的回合已释放，写入前必须先从事件目录重放: {session_id}"
+            )));
+        }
         if mutations.is_empty() {
             return Err(DaemonError::internal(
                 "canonical event transaction 不能为空".to_string(),
@@ -289,7 +303,31 @@ impl SessionConversationProjection {
         self.last_event_seq
     }
 
+    /// 回合是否常驻内存。释放后的投影只能用于读取游标与 accepted 记录。
+    pub(crate) fn is_resident(&self) -> bool {
+        !self.released
+    }
+
+    pub(crate) fn release_canonical_turns(&mut self) {
+        self.canonical_turns = Vec::new();
+        self.released = true;
+    }
+
+    pub(crate) fn touch(&mut self) {
+        self.last_touched = TOUCH_CLOCK.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn last_touched(&self) -> u64 {
+        self.last_touched
+    }
+
+    /// 只有常驻的投影才持有回合。读取已释放投影的回合是调用方的编程错误：
+    /// 静默返回空列表会让写入路径基于错误的前置状态计算事件。
     pub(crate) fn canonical_turns(&self) -> &[CanonicalTurn] {
+        assert!(
+            !self.released,
+            "canonical projection 的回合已释放，读取前必须重放常驻"
+        );
         &self.canonical_turns
     }
 

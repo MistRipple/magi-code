@@ -104,14 +104,63 @@ struct SessionProjectionRemoval {
     kind: SessionProjectionRemovalKind,
 }
 
+/// 已落盘文件内容的摘要。
+///
+/// 缓存只需要回答“这次要写的内容和上次写下的是否一样”，不需要保留全文。全文常驻会让
+/// 内存随全部会话历史的总量线性增长（本仓库实测仅这一项就有 175 MB），完整保存时还要
+/// 整份深拷贝。长度加 64 位哈希足以判定相同内容；误判为相同的概率可忽略，且只会导致跳过
+/// 一次本可幂等重写的写入。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContentDigest {
+    len: usize,
+    hash: u64,
+}
+
+impl ContentDigest {
+    fn of(content: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut hasher);
+        Self {
+            len: content.len(),
+            hash: hasher.finish(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct SessionProjectionCache {
-    snapshots: HashMap<magi_core::SessionId, (PathBuf, String)>,
+    snapshots: HashMap<magi_core::SessionId, (PathBuf, ContentDigest)>,
     pending_removals: HashSet<PathBuf>,
     pending_event_removals: HashSet<PathBuf>,
-    global: Option<(PathBuf, String)>,
-    app_meta: Option<(PathBuf, String)>,
-    workspace_meta: HashMap<String, (PathBuf, String)>,
+    global: Option<(PathBuf, ContentDigest)>,
+    app_meta: Option<(PathBuf, ContentDigest)>,
+    workspace_meta: HashMap<String, (PathBuf, ContentDigest)>,
+}
+
+/// 事件回放缓存里同时保持回合驻留的会话数上限。
+///
+/// 回合事实在 SessionStore 里已有一份；缓存只需要让最近写入过的少数会话保持驻留以便
+/// 增量追加事件，其余会话只留事件游标与 accepted 记录。
+const MAX_RESIDENT_EVENT_PROJECTIONS: usize = 6;
+
+fn trim_resident_event_projections(
+    cache: &mut HashMap<magi_core::SessionId, SessionConversationProjection>,
+) {
+    let mut resident = cache
+        .iter()
+        .filter(|(_, projection)| projection.is_resident())
+        .map(|(session_id, projection)| (session_id.clone(), projection.last_touched()))
+        .collect::<Vec<_>>();
+    if resident.len() <= MAX_RESIDENT_EVENT_PROJECTIONS {
+        return;
+    }
+    resident.sort_by(|left, right| right.1.cmp(&left.1));
+    for (session_id, _) in resident.into_iter().skip(MAX_RESIDENT_EVENT_PROJECTIONS) {
+        if let Some(projection) = cache.get_mut(&session_id) {
+            projection.release_canonical_turns();
+        }
+    }
 }
 
 const STATE_LAYOUT_VERSION: u32 = 2;
@@ -294,7 +343,7 @@ impl StateRepository {
         // projection 全文与对话事件，绝不能为此整体克隆一份再替换：那会让每次切换会话的代价与全部
         // 会话历史的总量成正比（本仓库实测 300 MB 级，单次导航 1–2 秒纯用于克隆与释放）。
         // 这里只记录很小的待应用变更，等事务提交成功后再就地写入缓存；失败时缓存原样不动。
-        let mut pending_snapshot: Option<(SessionId, (PathBuf, String))> = None;
+        let mut pending_snapshot: Option<(SessionId, (PathBuf, ContentDigest))> = None;
         let mut rebuilt_event_cache = None;
         let mut writes = Vec::new();
 
@@ -349,7 +398,7 @@ impl StateRepository {
                     path: path.clone(),
                     content: content.clone(),
                 });
-                pending_snapshot = Some((session_id.clone(), (path, content)));
+                pending_snapshot = Some((session_id.clone(), (path, ContentDigest::of(&content))));
                 rebuilt_event_cache = Some(next_event_cache);
             }
         }
@@ -362,18 +411,19 @@ impl StateRepository {
                     DaemonError::internal(format!("session current state 不是 UTF-8: {error}"))
                 })
             })?;
+        let current_digest = ContentDigest::of(&current_content);
         if cache
             .global
             .as_ref()
-            .map(|(_, previous)| previous != &current_content)
+            .map(|(_, previous)| previous != &current_digest)
             .unwrap_or(true)
         {
             writes.push(SessionProjectionWrite {
                 path: current_path.clone(),
-                content: current_content.clone(),
+                content: current_content,
             });
         }
-        let next_global = (current_path, current_content);
+        let next_global = (current_path, current_digest);
 
         let transaction = SessionProjectionTransaction {
             schema_version: SESSION_PROJECTION_TRANSACTION_SCHEMA_VERSION,
@@ -567,7 +617,7 @@ impl StateRepository {
         let mut cache = SessionProjectionCache::default();
         let mut event_cache = HashMap::new();
         let mut event_accepted_submissions = Vec::new();
-        let mut loaded_snapshots = HashMap::<magi_core::SessionId, String>::new();
+        let mut loaded_snapshots = HashSet::<magi_core::SessionId>::new();
         let workspace_root_by_id = workspace_roots.iter().cloned().collect::<HashMap<_, _>>();
         let mut roots = vec![(String::new(), self.state_root.clone())];
         roots.extend(workspace_roots.iter().cloned());
@@ -629,7 +679,7 @@ impl StateRepository {
                             expected_path.display()
                         )));
                     }
-                    if loaded_snapshots.contains_key(&session_id) {
+                    if loaded_snapshots.contains(&session_id) {
                         let previous_path = cache
                             .snapshots
                             .get(&session_id)
@@ -718,9 +768,11 @@ impl StateRepository {
                             record,
                         );
                     }
-                    loaded_snapshots.insert(session_id.clone(), content.clone());
+                    loaded_snapshots.insert(session_id.clone());
                     event_cache.insert(session_id.clone(), event_projection);
-                    cache.snapshots.insert(session_id, (path, content));
+                    cache
+                        .snapshots
+                        .insert(session_id, (path, ContentDigest::of(&content)));
                 }
             }
 
@@ -732,9 +784,10 @@ impl StateRepository {
                     let content = fs::read_to_string(&meta_path)?;
                     let meta: SessionDurableState = serde_json::from_str(&content)?;
                     durable.notifications.extend(meta.notifications);
+                    let digest = ContentDigest::of(&content);
                     cache
                         .workspace_meta
-                        .insert(workspace_id.clone(), (meta_path, content));
+                        .insert(workspace_id.clone(), (meta_path, digest));
                 }
             }
         }
@@ -832,7 +885,7 @@ impl StateRepository {
                     ))
                 })?;
             durable.current_session_id = current;
-            cache.global = Some((current_path, content));
+            cache.global = Some((current_path, ContentDigest::of(&content)));
         }
 
         let app_meta_path = self.state_root.join("session-app-meta.json");
@@ -840,7 +893,7 @@ impl StateRepository {
             let content = fs::read_to_string(&app_meta_path)?;
             let meta: SessionDurableState = serde_json::from_str(&content)?;
             durable.notifications.extend(meta.notifications);
-            cache.app_meta = Some((app_meta_path, content));
+            cache.app_meta = Some((app_meta_path, ContentDigest::of(&content)));
         }
 
         if validate_current
@@ -855,6 +908,11 @@ impl StateRepository {
             )));
         }
 
+        // 回合事实已交给 SessionStore；事件缓存此后只保留游标与 accepted 记录，
+        // 会话再次写入时才从事件目录重放常驻。
+        for projection in event_cache.values_mut() {
+            projection.release_canonical_turns();
+        }
         *self
             .session_projection_cache
             .lock()
@@ -2595,22 +2653,27 @@ impl StateRepository {
         )?;
         let mut next_durable = durable.clone();
         let event_root = self.session_event_root(session_id);
-        let event_projection = match event_cache.get(session_id) {
+        let mut event_projection = match event_cache.get(session_id) {
             Some(projection) => projection.clone(),
             None => SessionConversationProjection::load(&event_root, session_id)?,
         };
-        let memory_canonical =
-            serde_json::to_value(&next_durable.canonical_turns).map_err(DaemonError::from)?;
-        let authoritative =
-            serde_json::to_value(event_projection.canonical_turns()).map_err(DaemonError::from)?;
-        if !allow_canonical_event_advance
-            && !json_values_semantically_equal(&memory_canonical, &authoritative)
-        {
-            return Err(DaemonError::internal(format!(
-                "session projection 不能反向生成 canonical 事实: {session_id}"
-            )));
+        // 已释放回合的会话自载入以来没有追加过任何事件（追加会先重放常驻），SessionStore 里的
+        // 回合与事件重放结果等价，直接使用 `durable` 携带的回合，不必为了保存而重放整段历史。
+        if event_projection.is_resident() {
+            let memory_canonical =
+                serde_json::to_value(&next_durable.canonical_turns).map_err(DaemonError::from)?;
+            let authoritative = serde_json::to_value(event_projection.canonical_turns())
+                .map_err(DaemonError::from)?;
+            if !allow_canonical_event_advance
+                && !json_values_semantically_equal(&memory_canonical, &authoritative)
+            {
+                return Err(DaemonError::internal(format!(
+                    "session projection 不能反向生成 canonical 事实: {session_id}"
+                )));
+            }
+            next_durable.canonical_turns = event_projection.canonical_turns().to_vec();
+            event_projection.touch();
         }
-        next_durable.canonical_turns = event_projection.canonical_turns().to_vec();
         let snapshot = SessionProjectionSnapshot {
             canonical_event_seq: event_projection.last_event_seq(),
             durable: next_durable,
@@ -2747,7 +2810,7 @@ impl StateRepository {
                 .snapshots
                 .get(&session_id)
                 .filter(|(previous_path, _)| previous_path == &path)
-                .map(|(_, content)| content.clone());
+                .map(|(_, digest)| digest.clone());
             let session_durable = durable.durable_state_for_session(&session_id);
             let (built_path, content) = self.build_session_projection_content(
                 &session_durable,
@@ -2758,10 +2821,11 @@ impl StateRepository {
                 partial_snapshot,
             )?;
             debug_assert_eq!(built_path, path);
-            if previous.as_deref() != Some(content.as_str()) {
+            let digest = ContentDigest::of(&content);
+            if previous.as_ref() != Some(&digest) {
                 writes.push(SessionProjectionWrite {
                     path: path.clone(),
-                    content: content.clone(),
+                    content,
                 });
             }
             if let Some((old_path, _)) = next_cache.snapshots.get(&session_id)
@@ -2775,7 +2839,7 @@ impl StateRepository {
             }
             next_cache
                 .snapshots
-                .insert(session_id, (path.clone(), content));
+                .insert(session_id, (path.clone(), digest));
         }
 
         if !partial_snapshot {
@@ -2802,18 +2866,19 @@ impl StateRepository {
         let current_content = String::from_utf8(current_content).map_err(|error| {
             DaemonError::internal(format!("session current state 不是 UTF-8: {error}"))
         })?;
+        let current_digest = ContentDigest::of(&current_content);
         if next_cache
             .global
             .as_ref()
-            .map(|(_, previous)| previous != &current_content)
+            .map(|(_, previous)| previous != &current_digest)
             .unwrap_or(true)
         {
             writes.push(SessionProjectionWrite {
                 path: current_path.clone(),
-                content: current_content.clone(),
+                content: current_content,
             });
         }
-        next_cache.global = Some((current_path, current_content));
+        next_cache.global = Some((current_path, current_digest));
 
         if !partial_snapshot {
             let app_meta = SessionDurableState {
@@ -2836,18 +2901,19 @@ impl StateRepository {
             let app_meta_content = String::from_utf8(app_meta_content).map_err(|error| {
                 DaemonError::internal(format!("session app meta 不是 UTF-8: {error}"))
             })?;
+            let app_meta_digest = ContentDigest::of(&app_meta_content);
             if next_cache
                 .app_meta
                 .as_ref()
-                .map(|(_, previous)| previous != &app_meta_content)
+                .map(|(_, previous)| previous != &app_meta_digest)
                 .unwrap_or(true)
             {
                 writes.push(SessionProjectionWrite {
                     path: app_meta_path.clone(),
-                    content: app_meta_content.clone(),
+                    content: app_meta_content,
                 });
             }
-            next_cache.app_meta = Some((app_meta_path, app_meta_content));
+            next_cache.app_meta = Some((app_meta_path, app_meta_digest));
         }
 
         if !partial_snapshot {
@@ -2872,20 +2938,21 @@ impl StateRepository {
                 let content = String::from_utf8(content).map_err(|error| {
                     DaemonError::internal(format!("workspace meta 不是 UTF-8: {error}"))
                 })?;
+                let digest = ContentDigest::of(&content);
                 if next_cache
                     .workspace_meta
                     .get(workspace_id)
-                    .map(|(_, previous)| previous != &content)
+                    .map(|(_, previous)| previous != &digest)
                     .unwrap_or(true)
                 {
                     writes.push(SessionProjectionWrite {
                         path: path.clone(),
-                        content: content.clone(),
+                        content,
                     });
                 }
                 next_cache
                     .workspace_meta
-                    .insert(workspace_id.clone(), (path, content));
+                    .insert(workspace_id.clone(), (path, digest));
             }
         }
 
@@ -2967,8 +3034,10 @@ impl StateRepository {
             for (session_id, projection) in next_event_cache {
                 event_cache.insert(session_id, projection);
             }
+            trim_resident_event_projections(&mut event_cache);
         } else {
             *cache = next_cache;
+            trim_resident_event_projections(&mut next_event_cache);
             *event_cache = next_event_cache;
         }
 
@@ -3293,12 +3362,14 @@ impl StateRepository {
             .lock()
             .expect("session event cache lock poisoned");
         let event_root = self.session_event_root(session_id);
-        let projection = match cache.get(session_id) {
-            Some(projection) => projection.clone(),
-            None => SessionConversationProjection::load(&event_root, session_id)?,
-        };
-        let next_sequence = projection.last_event_seq().saturating_add(1).max(1);
-        cache.insert(session_id.clone(), projection);
+        // 只需要事件游标，已释放回合的投影同样有效。
+        if !cache.contains_key(session_id) {
+            let projection = SessionConversationProjection::load(&event_root, session_id)?;
+            cache.insert(session_id.clone(), projection);
+        }
+        let next_sequence = cache
+            .get(session_id)
+            .map_or(1, |projection| projection.last_event_seq().saturating_add(1).max(1));
         Ok(next_sequence)
     }
 
@@ -3521,15 +3592,22 @@ impl StateRepository {
             .lock()
             .expect("session event cache lock poisoned");
         let event_root = self.session_event_root(session_id);
-        let projection =
-            match cache.get(session_id) {
-                Some(projection) => projection.clone(),
-                None => SessionConversationProjection::load(&event_root, session_id).map_err(
-                    |error| DomainError::Persistence {
-                        message: error.to_string(),
-                    },
-                )?,
-            };
+        // 已释放回合（或从未载入）的会话在写入前从事件目录重放常驻；已常驻的直接借用，
+        // 不再为每个事件先整体克隆一份回合。
+        if !cache
+            .get(session_id)
+            .is_some_and(SessionConversationProjection::is_resident)
+        {
+            let loaded = SessionConversationProjection::load(&event_root, session_id).map_err(
+                |error| DomainError::Persistence {
+                    message: error.to_string(),
+                },
+            )?;
+            cache.insert(session_id.clone(), loaded);
+        }
+        let projection = cache
+            .get(session_id)
+            .expect("projection was made resident above");
         let next = match acceptance.as_ref() {
             Some(acceptance) => projection.append_transaction_with_acceptance(
                 &event_root,
@@ -3542,7 +3620,10 @@ impl StateRepository {
         .map_err(|error| DomainError::Persistence {
             message: error.to_string(),
         })?;
+        let mut next = next;
+        next.touch();
         cache.insert(session_id.clone(), next);
+        trim_resident_event_projections(&mut cache);
         if let Some(acceptance) = acceptance {
             let mut accepted = self
                 .event_accepted_submissions
@@ -6052,5 +6133,153 @@ mod tests {
         assert!(!state_root.join("state-layout.json").exists());
 
         let _ = fs::remove_dir_all(state_root);
+    }
+
+    fn resident_event_projections(repository: &StateRepository) -> usize {
+        repository
+            .session_event_cache
+            .lock()
+            .expect("event cache")
+            .values()
+            .filter(|projection| projection.is_resident())
+            .count()
+    }
+
+    fn append_test_tool_item(
+        session_store: &SessionStore,
+        session_id: &SessionId,
+        turn_id: &str,
+        item_id: &str,
+        item_seq: usize,
+    ) {
+        session_store
+            .upsert_current_turn_item_for_turn(
+                session_id,
+                Some(turn_id),
+                magi_session_store::ActiveExecutionTurnItem {
+                    item_id: item_id.to_string(),
+                    item_seq,
+                    kind: "tool_call_result".to_string(),
+                    status: "completed".to_string(),
+                    source: "worker".to_string(),
+                    title: Some("工具".to_string()),
+                    content: Some("工具卡片".to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: Some(format!("call-{item_id}")),
+                    tool_name: Some("file_read".to_string()),
+                    tool_status: Some("completed".to_string()),
+                    tool_arguments: Some("{}".to_string()),
+                    tool_result: Some("{\"ok\":true}".to_string()),
+                    tool_error: None,
+                    request_id: None,
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    metadata: Default::default(),
+                    timeline_entry_id: None,
+                    source_thread_id: magi_core::ThreadId::new("thread-main-default"),
+                },
+            )
+            .expect("tool item should append through the canonical event writer");
+    }
+
+    #[test]
+    fn restored_event_projections_release_turns_and_reload_on_the_next_write() {
+        let state_root = unique_temp_dir("magi-event-projection-release");
+        let session_id = SessionId::new("event-projection-release");
+        {
+            let repository = StateRepository::new(state_root.clone());
+            let (session_store, turn_id, _task_id) =
+                accepted_session_store("event-projection-release", None, 10);
+            install_test_event_authority(&repository, &session_store);
+            append_test_tool_item(&session_store, &session_id, &turn_id, "item-before", 5);
+            repository
+                .save_session_projection_state(
+                    &session_store.durable_state(),
+                    &session_store.execution_sidecar_store_state(),
+                )
+                .expect("initial projection should save");
+        }
+
+        // 重启：所有会话的事件回放结果只保留游标，不常驻完整回合。
+        let repository = StateRepository::new(state_root.clone());
+        let (durable, sidecars) = repository
+            .load_session_projections(&[])
+            .expect("projections should restore");
+        assert_eq!(resident_event_projections(&repository), 0);
+        assert_eq!(
+            repository
+                .canonical_event_next_sequence(&session_id)
+                .expect("cursor is available without resident turns")
+                > 1,
+            true
+        );
+        let session_store =
+            SessionStore::from_persisted_parts(durable, sidecars).expect("store should restore");
+        session_store.install_canonical_event_writer(Arc::new(repository.clone()));
+        let restored_turn = session_store.canonical_turns_for_session(&session_id);
+        let turn_id = restored_turn[0].turn_id.clone();
+
+        // 完整保存直接使用 SessionStore 的回合，不为冷会话重放事件目录。
+        repository
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("full save with released projections");
+        assert_eq!(resident_event_projections(&repository), 0);
+
+        // 下一次写入才从事件目录重放常驻，并且事实不丢。
+        append_test_tool_item(&session_store, &session_id, &turn_id, "item-after", 6);
+        assert_eq!(resident_event_projections(&repository), 1);
+        repository
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("save after resident append");
+
+        let reloaded = StateRepository::new(state_root.clone());
+        let (durable, _) = reloaded
+            .load_session_projections(&[])
+            .expect("reload after append");
+        let item_ids = durable
+            .canonical_turns
+            .iter()
+            .flat_map(|turn| turn.items.iter().map(|item| item.item_id.as_str()))
+            .collect::<Vec<_>>();
+        assert!(item_ids.contains(&"item-before"), "{item_ids:?}");
+        assert!(item_ids.contains(&"item-after"), "{item_ids:?}");
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn resident_event_projections_are_capped_to_the_most_recently_used() {
+        let mut cache = HashMap::new();
+        for index in 0..(MAX_RESIDENT_EVENT_PROJECTIONS + 4) {
+            let session_id = SessionId::new(format!("resident-cap-{index}"));
+            let mut projection = SessionConversationProjection::default();
+            projection.touch();
+            cache.insert(session_id, projection);
+        }
+        trim_resident_event_projections(&mut cache);
+        let resident = cache
+            .iter()
+            .filter(|(_, projection)| projection.is_resident())
+            .map(|(session_id, _)| session_id.as_str().to_string())
+            .collect::<HashSet<_>>();
+        assert_eq!(resident.len(), MAX_RESIDENT_EVENT_PROJECTIONS);
+        // 释放的是最早使用的那几个。
+        for index in 4..(MAX_RESIDENT_EVENT_PROJECTIONS + 4) {
+            assert!(resident.contains(&format!("resident-cap-{index}")));
+        }
+    }
+
+    #[test]
+    fn content_digest_distinguishes_content_and_length() {
+        assert_eq!(ContentDigest::of("同一份内容"), ContentDigest::of("同一份内容"));
+        assert_ne!(ContentDigest::of("a"), ContentDigest::of("b"));
+        assert_ne!(ContentDigest::of("a"), ContentDigest::of("a "));
     }
 }
