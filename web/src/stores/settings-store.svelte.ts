@@ -3894,7 +3894,20 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return () => unsubscribe();
   });
 
+  // 设置视图保活后，每次重新显示时刷新只读数据。配置本身由 SSE 推送与
+  // settingsBootstrapSnapshot 驱动，不在这里强制覆盖，避免冲掉用户改到一半的表单。
+  function refreshOnShow() {
+    void loadExecutionStats().catch((e) => {
+      console.error("[SettingsPanel] 刷新执行统计失败:", e);
+    });
+    if (activeTab === "tools") {
+      void hydrateCommandEnvironment();
+      void hydrateSkillInventory();
+    }
+  }
+
   return {
+    refreshOnShow,
     get clientKind() {
       return clientKind;
     },

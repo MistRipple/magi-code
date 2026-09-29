@@ -3,7 +3,8 @@
   import App from '../App.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
-  import MagiIcon from '../components/MagiIcon.svelte';
+  import NotificationCenter from '../components/NotificationCenter.svelte';
+  import SidebarFooter from '../components/SidebarFooter.svelte';
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
   import {
@@ -22,6 +23,8 @@
     addToast,
     advanceWorkspaceSessionProjectionCursor,
     canApplyWorkspaceSessionProjectionCursor,
+    getState,
+    getUnreadNotificationCount,
     messagesState,
     replaceWorkspaceSessionProjection,
     replacePersonalSessionProjection,
@@ -46,6 +49,13 @@
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { normalizeRustBootstrapPayload } from '../shared/bridges/rust-daemon-contract';
   import { i18n } from '../stores/i18n.svelte';
+  import {
+    closeSettings,
+    installShellPopoverDismiss,
+    mountSettings,
+    shellUi,
+    togglePopover,
+  } from '../stores/shell-ui.svelte';
   import type { EditContentKind, Session } from '../types/message';
   import { resolveFilePreviewScope } from '../lib/file-preview-scope';
   import { isHtmlFile } from '../lib/file-preview-utils';
@@ -182,6 +192,7 @@ import {
     left: number;
     top: number;
     placement: 'above' | 'below';
+    align: 'start' | 'end';
   };
   let sidebarTooltip = $state<SidebarTooltipState | null>(null);
   let sidebarTooltipTarget = $state<HTMLElement | null>(null);
@@ -251,11 +262,11 @@ import {
   type ProjectFileTreeProps = {
     rootPath: string;
     workspaceId: string;
-    title?: string;
-    titlePath?: string;
+    showHidden?: boolean;
     selectedFilePath?: string | null;
     onFileSelect?: (selection: WorkspaceFileSelection) => void;
   };
+  type ProjectFileTreeHandle = { refresh: () => Promise<void> };
   type RightPaneProps = {
     workspaceRoot: string;
     overlay?: boolean;
@@ -277,7 +288,11 @@ import {
     disabled?: boolean;
   };
 
-  let ProjectFileTreeComponent = $state<Component<ProjectFileTreeProps> | null>(null);
+  let SettingsPanelComponent = $state<Component<{ active: boolean; onClose: () => void }> | null>(null);
+  let settingsPanelLoad: Promise<void> | null = null;
+  let ProjectFileTreeComponent = $state<Component<ProjectFileTreeProps, ProjectFileTreeHandle> | null>(null);
+  let projectFileTreeHandle = $state<ProjectFileTreeHandle | null>(null);
+  let fileTreeShowHidden = $state(false);
   let RightPaneComponent = $state<Component<RightPaneProps> | null>(null);
   let WebFolderPickerComponent = $state<Component<WebFolderPickerProps> | null>(null);
   let htmlBrowserOpenRequest = $state<HtmlBrowserOpenRequest | null>(null);
@@ -285,6 +300,18 @@ import {
   let projectFileTreeLoad: Promise<void> | null = null;
   let rightPaneLoad: Promise<void> | null = null;
   let webFolderPickerLoad: Promise<void> | null = null;
+
+  function loadSettingsPanel(): Promise<void> {
+    if (SettingsPanelComponent) return Promise.resolve();
+    settingsPanelLoad ??= import('../components/SettingsPanel.svelte')
+      .then((module) => {
+        SettingsPanelComponent = module.default;
+      })
+      .finally(() => {
+        settingsPanelLoad = null;
+      });
+    return settingsPanelLoad;
+  }
 
   function loadProjectFileTree(): Promise<void> {
     if (ProjectFileTreeComponent) return Promise.resolve();
@@ -1719,9 +1746,16 @@ import {
     }
   }
 
-  async function refreshWorkspaces(): Promise<void> {
+  /**
+   * `silent` 用于用户主动刷新：列表已有内容时不切回加载态、不收起已展开的工作区，
+   * 并重读所有已展开工作区的会话。首次加载和断线恢复仍走完整重建。
+   */
+  async function refreshWorkspaces(options: { silent?: boolean } = {}): Promise<void> {
     const requestSeq = ++workspaceListRequestSeq;
-    loading = true;
+    const silent = options.silent === true && workspaces.length > 0;
+    if (!silent) {
+      loading = true;
+    }
     loadError = '';
     agentBaseUrl = resolveAgentBaseUrl();
     try {
@@ -1740,7 +1774,11 @@ import {
           workspaceSessionCursorByWorkspace.delete(workspaceId);
         }
       }
-      expandedWorkspaceIds = {};
+      expandedWorkspaceIds = silent
+        ? Object.fromEntries(
+          Object.entries(expandedWorkspaceIds).filter(([workspaceId]) => nextWorkspaceIds.has(workspaceId)),
+        )
+        : {};
       // 首次启动时 bootstrap 尚未返回，工作区列表的 isActive 只是工作区管理状态，
       // 不能抢先作为会话导航真值。否则会发起显式 workspace bootstrap，覆盖 daemon
       // 已持久化的最后会话选择。首次会话加载统一等待 bootstrap 权威状态。
@@ -1749,7 +1787,9 @@ import {
       }
       selectedWorkspaceId = resolveBackendWorkspaceSelection(next);
       if (selectedWorkspaceId) {
-        expandedWorkspaceIds = { [selectedWorkspaceId]: true };
+        expandedWorkspaceIds = silent
+          ? { ...expandedWorkspaceIds, [selectedWorkspaceId]: true }
+          : { [selectedWorkspaceId]: true };
         const selectedWorkspace = next.find((workspace) => workspace.workspaceId === selectedWorkspaceId);
         const preserveDraftSession = messagesState.bootstrapped
           && !currentBootstrapSessionIdForWorkspace(selectedWorkspaceId);
@@ -1760,6 +1800,13 @@ import {
             selectedWorkspaceId,
             workspacePathForId(selectedWorkspaceId),
           );
+        }
+      }
+      if (silent) {
+        for (const workspace of next) {
+          if (workspace.workspaceId !== selectedWorkspaceId && expandedWorkspaceIds[workspace.workspaceId]) {
+            void loadWorkspaceSessionsForSidebar(workspace);
+          }
         }
       }
     } catch (error) {
@@ -1774,6 +1821,111 @@ import {
       }
     }
   }
+
+  // 设置与工作台是同级视图，切换的是"显示哪一个"，不是打开/关闭一个层：
+  // - 设置视图在应用就绪后的空闲时预创建，之后一直保活，进入是瞬时的；
+  // - 工作台被换下时不卸载：侧栏不再参与布局，主区域整体移到屏幕外但保持真实尺寸
+  //   （右栏的 `<webview>` guest 需要真实布局尺寸才能保持注册与后台推理）。
+  let workbenchContentElement = $state<HTMLElement | null>(null);
+  let workbenchAwaySize = $state<{ width: number; height: number } | null>(null);
+
+  // 必须在 DOM 更新前测量：切换后主区域立刻离开网格流，届时已量不到它的真实尺寸。
+  $effect.pre(() => {
+    if (!shellUi.settingsOpen) return;
+    untrack(() => {
+      const rect = workbenchContentElement?.getBoundingClientRect();
+      if (rect && rect.width > 0 && rect.height > 0) {
+        workbenchAwaySize = { width: rect.width, height: rect.height };
+      }
+    });
+  });
+
+  let settingsWasOpen = false;
+  $effect(() => {
+    const open = shellUi.settingsOpen;
+    if (open) {
+      settingsWasOpen = true;
+      untrack(() => {
+        if (sidebarIsDrawer) sidebarOpen = false;
+        clearSidebarTooltip();
+      });
+      void loadSettingsPanel().catch((error) => {
+        console.error('[WebWorkbenchShell] 设置页加载失败:', error);
+        closeSettings();
+        addToast('error', i18n.t('app.featureLoadFailed'));
+      });
+      return;
+    }
+    if (!settingsWasOpen) return;
+    settingsWasOpen = false;
+    workbenchAwaySize = null;
+    void tick().then(() => {
+      if (!sidebarIsDrawer) {
+        document.querySelector<HTMLElement>('[data-testid="sidebar-settings"]')?.focus({ preventScroll: true });
+      }
+    });
+  });
+
+  // 应用就绪后，在空闲时预加载并预创建设置视图。
+  $effect(() => {
+    if (!messagesState.bootstrapped || shellUi.settingsMounted) return;
+    const schedule = window.requestIdleCallback
+      ? (callback: () => void) => window.requestIdleCallback(callback, { timeout: 4000 })
+      : (callback: () => void) => window.setTimeout(callback, 1500);
+    const cancel = window.cancelIdleCallback
+      ? (handle: number) => window.cancelIdleCallback(handle)
+      : (handle: number) => window.clearTimeout(handle);
+    const handle = schedule(() => {
+      void loadSettingsPanel()
+        .then(() => mountSettings())
+        .catch((error) => console.warn('[WebWorkbenchShell] 设置页预加载失败:', error));
+    });
+    return () => cancel(handle);
+  });
+
+  /** 侧栏唯一的手动刷新：项目树（工作区/会话）与文件树一起重读，保留展开状态。 */
+  let sidebarRefreshing = $state(false);
+  async function refreshSidebar(): Promise<void> {
+    if (sidebarRefreshing) return;
+    sidebarRefreshing = true;
+    try {
+      await Promise.all([
+        refreshWorkspaces({ silent: true }),
+        refreshPersonalSessions(),
+        sidebarMode === 'files' ? projectFileTreeHandle?.refresh() : undefined,
+      ]);
+    } finally {
+      sidebarRefreshing = false;
+    }
+  }
+
+  const appState = getState();
+  const hasCurrentSession = $derived(Boolean(messagesState.currentSessionId?.trim()));
+  const unreadNotificationCount = $derived.by(() => getUnreadNotificationCount());
+  const currentSessionIsEmpty = $derived(
+    hasCurrentSession && (appState.threadMessages?.length ?? 0) === 0,
+  );
+  const newSessionDisabled = $derived(
+    workspaceActionPending || messagesState.sessionHydrating || currentSessionIsEmpty,
+  );
+  const newSessionTitle = $derived(
+    currentSessionIsEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'),
+  );
+
+  // 有当前工作区就在其中新建草稿，否则新建个人会话；已在空会话上时不重复新建。
+  function openNewSession(): void {
+    if (newSessionDisabled) return;
+    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
+    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
+    if (workspaceId && workspacePath) {
+      navigateSession({ kind: 'draft', scope: 'workspace', workspaceId, workspacePath });
+    } else {
+      navigateSession({ kind: 'draft', scope: 'personal' });
+    }
+    if (sidebarIsDrawer) sidebarOpen = false;
+  }
+
+  let notificationBellElement = $state<HTMLElement | null>(null);
 
   async function registerWorkspaceRoot(rootPath: string): Promise<void> {
     const registration = await registerAgentWorkspace(rootPath);
@@ -2389,11 +2541,14 @@ import {
     const tooltipGap = 6;
     const placement = rect.bottom + 40 <= window.innerHeight || rect.top < 40 ? 'below' : 'above';
     const top = placement === 'below' ? rect.bottom + tooltipGap : rect.top - tooltipGap;
+    // 默认让提示右缘对齐目标右缘；贴左的目标（如底部设置）改为左缘对齐，避免溢出窗口。
+    const align = target.dataset.tooltipAlign === 'start' ? 'start' : 'end';
+    const anchorX = align === 'start' ? rect.left : rect.right;
     const left = Math.min(
-      Math.max(rect.right, viewportPadding),
+      Math.max(anchorX, viewportPadding),
       Math.max(viewportPadding, window.innerWidth - viewportPadding),
     );
-    sidebarTooltip = { text, left, top, placement };
+    sidebarTooltip = { text, left, top, placement, align };
   }
 
   function scheduleSidebarTooltipPosition(): void {
@@ -2823,6 +2978,8 @@ import {
         requestRightPaneVisibility(false);
       }
     };
+    // 先于 handlePanelEscape 注册：弹出面板消费 Escape 后，抽屉与右栏不再连带关闭。
+    const stopPopoverDismiss = installShellPopoverDismiss();
     window.addEventListener('resize', handleResize);
     window.addEventListener('scroll', handleSidebarTooltipViewportChange, true);
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
@@ -2844,6 +3001,7 @@ import {
     void refreshWorkspaces();
     void refreshPersonalSessions();
     return () => {
+      stopPopoverDismiss();
       desktopDropDisposed = true;
       stopDesktopFileDrop?.();
       desktopDropIndicator = null;
@@ -2916,6 +3074,8 @@ import {
   <aside
     bind:this={sidebarElement}
     class="sidebar"
+    class:workbench-view--away={shellUi.settingsOpen}
+    inert={shellUi.settingsOpen}
     class:sidebar--open={sidebarIsDrawer && sidebarOpen}
     onpointerover={handleSidebarTooltipPointerOver}
     onpointerout={handleSidebarTooltipPointerOut}
@@ -2923,41 +3083,46 @@ import {
     onfocusout={handleSidebarTooltipFocusOut}
   >
     <div class="sidebar-header">
-      <div class="sidebar-toolbar">
-        <div class="sidebar-brand" aria-label="Magi">
-          <MagiIcon size={30} />
-          <span class="sidebar-brand-name">Magi</span>
-        </div>
-        <div class="sidebar-header-tools">
-          <button
-            class="theme-toggle-btn"
-            type="button"
-            data-tooltip={themeToggleTitle}
-            aria-label={themeToggleTitle}
-            data-theme-id={appearanceRuntime.activeTheme?.id || ''}
-            data-theme-mode={appearanceRuntime.mode}
-            onclick={toggleWebTheme}
-          >
-            <Icon name={themeIconName} size={14} />
-          </button>
-          <button class="sidebar-icon-btn" type="button" data-testid="sidebar-refresh" onclick={() => void refreshWorkspaces()} data-tooltip={i18n.t('common.refresh')}>
-            <Icon name="refresh" size={14} />
-          </button>
-          <button class="sidebar-icon-btn" type="button" onclick={openAddWorkspaceDialog} disabled={workspaceActionPending || !!loadError} data-tooltip={i18n.t('web.selectFolder')}>
-            <Icon name="folder" size={14} />
-          </button>
-          {#if sidebarIsDrawer}
-            <button
-              class="sidebar-icon-btn sidebar-drawer-close"
-              type="button"
-              onclick={() => { sidebarOpen = false; }}
-              data-tooltip={i18n.t('web.closeSidebar')}
-              aria-label={i18n.t('web.closeSidebar')}
-            >
-              <Icon name="x" size={14} />
-            </button>
+      <button
+        type="button"
+        class="sidebar-nav-item"
+        data-testid="sidebar-new-session"
+        title={newSessionTitle}
+        disabled={newSessionDisabled}
+        onclick={openNewSession}
+      >
+        <Icon name="edit" size={14} />
+        <span>{i18n.t('header.newSession')}</span>
+      </button>
+      <div class="sidebar-header-tools">
+        <button
+          bind:this={notificationBellElement}
+          type="button"
+          class="btn-icon btn-icon--md btn-icon--badged"
+          class:btn-icon--active={shellUi.popover === 'notifications'}
+          data-shell-popover="notifications"
+          data-testid="sidebar-notifications"
+          data-tooltip={shellUi.popover === 'notifications' ? undefined : i18n.t('notification.buttonTitle')}
+          aria-label={i18n.t('notification.buttonTitle')}
+          aria-expanded={shellUi.popover === 'notifications'}
+          onclick={() => togglePopover('notifications')}
+        >
+          <Icon name="bell" size={14} />
+          {#if unreadNotificationCount > 0}
+            <span class="btn-icon__badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
           {/if}
-        </div>
+        </button>
+        {#if sidebarIsDrawer}
+          <button
+            class="btn-icon btn-icon--md"
+            type="button"
+            onclick={() => { sidebarOpen = false; }}
+            data-tooltip={i18n.t('web.closeSidebar')}
+            aria-label={i18n.t('web.closeSidebar')}
+          >
+            <Icon name="x" size={14} />
+          </button>
+        {/if}
       </div>
     </div>
 
@@ -2968,7 +3133,7 @@ import {
     >
       {#if sidebarMode === 'projects'}
         <section class="sidebar-section sidebar-section--workspaces">
-        <div class="section-title-row section-title-row--sticky">
+        <div class="section-title-row">
           <button
             type="button"
             class="section-title-toggle"
@@ -2983,19 +3148,43 @@ import {
               <Icon name="chevronDown" size={11} />
             </span>
           </button>
-          <button
-            type="button"
-            class="sidebar-icon-btn sidebar-icon-btn--compact"
-            data-tooltip={i18n.t('web.projectFiles')}
-            data-sidebar-mode="files"
-            aria-label={i18n.t('web.projectFiles')}
-            onpointerdown={applySidebarModeFromEvent}
-            onclick={applySidebarModeFromEvent}
-          >
-            <Icon name="list" size={13} />
-          </button>
+          <div class="section-title-tools">
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm"
+              class:sidebar-refreshing={sidebarRefreshing}
+              data-testid="sidebar-refresh"
+              data-tooltip={i18n.t('common.refresh')}
+              aria-label={i18n.t('common.refresh')}
+              disabled={sidebarRefreshing}
+              onclick={() => void refreshSidebar()}
+            >
+              <Icon name="refresh" size={13} />
+            </button>
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm"
+              data-tooltip={i18n.t('web.selectFolder')}
+              aria-label={i18n.t('web.selectFolder')}
+              disabled={workspaceActionPending || !!loadError}
+              onclick={openAddWorkspaceDialog}
+            >
+              <Icon name="folder" size={13} />
+            </button>
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm"
+              data-tooltip={i18n.t('web.projectFiles')}
+              data-sidebar-mode="files"
+              aria-label={i18n.t('web.projectFiles')}
+              onpointerdown={applySidebarModeFromEvent}
+              onclick={applySidebarModeFromEvent}
+            >
+              <Icon name="list" size={13} />
+            </button>
+          </div>
         </div>
-        <div id="workspace-section-content">
+        <div id="workspace-section-content" class:sidebar-section-content--collapsed={workspacesCollapsed}>
         {#if !workspacesCollapsed}
         {#if loading}
           <div class="sidebar-empty">{i18n.t('common.loading')}</div>
@@ -3041,7 +3230,7 @@ import {
                   </button>
                   <button
                     type="button"
-                    class="workspace-new-session-btn"
+                    class="btn-icon btn-icon--sm row-action"
                     data-tooltip={i18n.t('web.newWorkspaceSessionTitle')}
                     title={i18n.t('web.newWorkspaceSessionTitle')}
                     aria-label={i18n.t('web.newWorkspaceSessionAria', { name: workspace.name })}
@@ -3055,7 +3244,7 @@ import {
                   </button>
                   <button
                     type="button"
-                    class="workspace-remove-btn"
+                    class="btn-icon btn-icon--sm btn-icon--danger row-action"
                     title={i18n.t('web.removeWorkspaceTitle')}
                     aria-label={i18n.t('web.removeWorkspaceAria', { name: workspace.name })}
                     onclick={(event) => {
@@ -3063,7 +3252,7 @@ import {
                       openRemoveWorkspaceDialog(workspace);
                     }}
                   >
-                    ×
+                    <Icon name="x" size={12} />
                   </button>
                 </div>
                 {#if expandedWorkspaceIds[workspace.workspaceId]}
@@ -3107,7 +3296,7 @@ import {
                                   />
                                   <button
                                     type="button"
-                                    class="session-rename-action session-rename-save"
+                                    class="btn-icon btn-icon--sm"
                                     title={i18n.t('header.saveSessionName')}
                                     aria-label={i18n.t('header.saveSessionName')}
                                     disabled={renamingSessionId === session.id}
@@ -3117,7 +3306,7 @@ import {
                                   </button>
                                   <button
                                     type="button"
-                                    class="session-rename-action"
+                                    class="btn-icon btn-icon--sm"
                                     title={i18n.t('header.cancelSessionRename')}
                                     aria-label={i18n.t('header.cancelSessionRename')}
                                     disabled={renamingSessionId === session.id}
@@ -3155,7 +3344,7 @@ import {
                               <div class="session-actions">
                                 <button
                                   type="button"
-                                  class="session-action-btn session-rename-btn"
+                                  class="btn-icon btn-icon--sm"
                                   title={i18n.t('header.renameSession')}
                                   aria-label={i18n.t('header.renameSession')}
                                   onclick={(event) => {
@@ -3167,7 +3356,7 @@ import {
                                 </button>
                                 <button
                                   type="button"
-                                  class="session-action-btn session-delete-btn"
+                                  class="btn-icon btn-icon--sm btn-icon--danger"
                                   title={i18n.t('header.deleteSession')}
                                   aria-label={i18n.t('header.deleteSession')}
                                   onclick={(event) => {
@@ -3194,26 +3383,56 @@ import {
         </section>
       {:else}
         <section class="sidebar-section sidebar-section--file-tree-mode">
-        <div class="file-tree-mode-header section-title-row--sticky">
+        <div class="section-title-row">
           <button
             type="button"
-            class="file-tree-back-btn"
+            class="section-title-toggle file-tree-back"
             title={i18n.t('web.projectFilesBack')}
             aria-label={i18n.t('web.projectFilesBack')}
             data-sidebar-mode="projects"
             onpointerdown={applySidebarModeFromEvent}
             onclick={applySidebarModeFromEvent}
           >
-            <Icon name="chevron-right" size={12} />
-            <span>{i18n.t('web.projectFilesBack')}</span>
+            <span class="file-tree-back-chevron" aria-hidden="true">
+              <Icon name="chevronDown" size={11} />
+            </span>
+            <span class="section-title" title={selectedWorkspace?.rootPath || ''}>
+              {selectedWorkspace?.name || i18n.t('web.projectFiles')}
+            </span>
           </button>
+          <div class="section-title-tools">
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm"
+              class:sidebar-refreshing={sidebarRefreshing}
+              data-testid="sidebar-refresh"
+              data-tooltip={i18n.t('common.refresh')}
+              aria-label={i18n.t('common.refresh')}
+              disabled={sidebarRefreshing || !selectedWorkspace?.rootPath}
+              onclick={() => void refreshSidebar()}
+            >
+              <Icon name="refresh" size={13} />
+            </button>
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm"
+              class:btn-icon--active={fileTreeShowHidden}
+              data-tooltip={i18n.t('web.projectFilesShowHidden')}
+              aria-label={i18n.t('web.projectFilesShowHidden')}
+              aria-pressed={fileTreeShowHidden}
+              disabled={!selectedWorkspace?.rootPath}
+              onclick={() => { fileTreeShowHidden = !fileTreeShowHidden; }}
+            >
+              <Icon name={fileTreeShowHidden ? 'eye' : 'eye-slash'} size={13} />
+            </button>
+          </div>
         </div>
         {#if ProjectFileTreeComponent}
           <ProjectFileTreeComponent
+            bind:this={projectFileTreeHandle}
             rootPath={selectedWorkspace?.rootPath || ''}
             workspaceId={selectedWorkspaceId}
-            title={selectedWorkspace?.name || i18n.t('web.projectFiles')}
-            titlePath={selectedWorkspace?.rootPath || ''}
+            showHidden={fileTreeShowHidden}
             selectedFilePath={activeCodeTabFilePath}
             onFileSelect={(selection) => handleFileSelect(selection.pathRef, {
               displayPath: selection.displayPath,
@@ -3227,8 +3446,8 @@ import {
       {/if}
 
       {#if sidebarMode === 'projects'}
-      <section class="recent-sessions-section">
-        <div class="section-title-row recent-sessions-header section-title-row--sticky">
+      <section class="recent-sessions-section" class:recent-sessions-section--after-collapsed={workspacesCollapsed}>
+        <div class="section-title-row recent-sessions-header">
           <button
             type="button"
             class="section-title-toggle"
@@ -3243,17 +3462,18 @@ import {
               <Icon name="chevronDown" size={11} />
             </span>
           </button>
-          <button
-            type="button"
-            class="sidebar-icon-btn sidebar-icon-btn--compact recent-session-new-btn"
-            data-tooltip={i18n.t('web.newPersonalSessionTitle')}
-            title={i18n.t('web.newPersonalSessionTitle')}
-            aria-label={i18n.t('web.newPersonalSessionTitle')}
-            disabled={workspaceActionPending || messagesState.sessionHydrating}
-            onclick={openPersonalDraft}
-          >
-            <Icon name="plus" size={13} />
-          </button>
+          <div class="section-title-tools">
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm"
+              data-tooltip={i18n.t('web.newPersonalSessionTitle')}
+              aria-label={i18n.t('web.newPersonalSessionTitle')}
+              disabled={workspaceActionPending || messagesState.sessionHydrating}
+              onclick={openPersonalDraft}
+            >
+              <Icon name="plus" size={13} />
+            </button>
+          </div>
         </div>
         {#if !recentSessionsCollapsed}
           <div id="recent-session-content">
@@ -3269,8 +3489,8 @@ import {
                     <div class="session-rename-editor">
                       <div class="session-rename-controls">
                         <input bind:this={sessionRenameInput} bind:value={sessionRenameDraft} class:invalid={Boolean(sessionRenameError)} class="session-rename-input" maxlength={SESSION_NAME_MAX_CHARS} aria-label={i18n.t('header.renameSession')} oninput={() => { sessionRenameError = ''; }} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void savePersonalSessionRename(session); } else if (event.key === 'Escape') { event.preventDefault(); cancelSessionRename(); } }} />
-                        <button type="button" class="session-rename-action session-rename-save" title={i18n.t('header.saveSessionName')} onclick={() => void savePersonalSessionRename(session)}><Icon name="check" size={12} /></button>
-                        <button type="button" class="session-rename-action" title={i18n.t('header.cancelSessionRename')} onclick={cancelSessionRename}><Icon name="x" size={12} /></button>
+                        <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.saveSessionName')} onclick={() => void savePersonalSessionRename(session)}><Icon name="check" size={12} /></button>
+                        <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.cancelSessionRename')} onclick={cancelSessionRename}><Icon name="x" size={12} /></button>
                       </div>
                       {#if sessionRenameError}<span class="session-rename-error">{sessionRenameError}</span>{/if}
                     </div>
@@ -3281,8 +3501,8 @@ import {
                       <span class="session-meta"><span class="session-msg-count">{session.messageCount ?? 0}</span><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span></span>
                     </button>
                     <div class="session-actions">
-                      <button type="button" class="session-action-btn session-rename-btn" title={i18n.t('header.renameSession')} onclick={() => void beginPersonalSessionRename(session)}><Icon name="pencil" size={12} /></button>
-                      <button type="button" class="session-action-btn session-delete-btn" title={i18n.t('header.deleteSession')} onclick={() => openPersonalDeleteSessionDialog(session)}><Icon name="delete" size={12} /></button>
+                      <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.renameSession')} onclick={() => void beginPersonalSessionRename(session)}><Icon name="pencil" size={12} /></button>
+                      <button type="button" class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('header.deleteSession')} onclick={() => openPersonalDeleteSessionDialog(session)}><Icon name="delete" size={12} /></button>
                     </div>
                   {/if}
                 </div>
@@ -3294,6 +3514,14 @@ import {
       </section>
       {/if}
     </div>
+
+    <SidebarFooter
+      themeIcon={themeIconName}
+      themeTitle={themeToggleTitle}
+      themeId={appearanceRuntime.activeTheme?.id || ''}
+      themeMode={appearanceRuntime.mode}
+      onToggleTheme={toggleWebTheme}
+    />
 
     <div
       class="sidebar-resize-handle"
@@ -3310,13 +3538,28 @@ import {
     <div
       class="sidebar-tooltip"
       class:sidebar-tooltip--above={sidebarTooltip.placement === 'above'}
+      class:sidebar-tooltip--start={sidebarTooltip.align === 'start'}
       style={`left:${sidebarTooltip.left}px;top:${sidebarTooltip.top}px;`}
       role="tooltip"
     >{sidebarTooltip.text}</div>
   {/if}
 
+  <NotificationCenter
+    open={shellUi.popover === 'notifications'}
+    onOpenChange={(open) => { shellUi.popover = open ? 'notifications' : null; }}
+    anchor={notificationBellElement}
+    boundary={sidebarElement}
+    flyout={!sidebarIsDrawer}
+  />
+
   <main
+    bind:this={workbenchContentElement}
     class="workbench-content"
+    class:workbench-content--away={shellUi.settingsOpen}
+    style={shellUi.settingsOpen && workbenchAwaySize
+      ? `--away-width:${workbenchAwaySize.width}px;--away-height:${workbenchAwaySize.height}px;`
+      : undefined}
+    inert={shellUi.settingsOpen}
     class:workbench-content--drawer-dimmed={sidebarIsDrawer && sidebarOpen}
     aria-hidden={sidebarIsDrawer && sidebarOpen ? 'true' : 'false'}
   >
@@ -3375,6 +3618,19 @@ import {
       {/if}
     </div>
   </main>
+
+  <!-- 设置视图：与侧栏、主区域同级。预创建后保活，仅切换显示；
+       设置数据按工作区作用域，切换工作区时重建，避免保活后显示旧工作区的配置。 -->
+  {#if shellUi.settingsMounted && SettingsPanelComponent}
+    {#key messagesState.currentWorkspaceId ?? ''}
+      <SettingsPanelComponent active={shellUi.settingsOpen} onClose={closeSettings} />
+    {/key}
+  {:else if shellUi.settingsOpen}
+    <div class="settings-loading" role="status">
+      <Icon name="loader" size={22} />
+      <span>{i18n.t('common.loading')}</span>
+    </div>
+  {/if}
 </div>
 
 {#if workspaceOnboardingState.open}
@@ -3443,6 +3699,8 @@ import {
   .web-workbench-shell {
     display: grid;
     grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr);
+    /* 明确的单行占满高度：视图（工作台或设置）切换时行高不依赖内容撑开。 */
+    grid-template-rows: minmax(0, 1fr);
     gap: var(--shell-gap, 8px);
     height: 100%;
     width: 100%;
@@ -3473,6 +3731,9 @@ import {
     min-height: 0;
     cursor: col-resize;
     touch-action: none;
+    /* 桌面端三栏直接相连：这条拖动轨道（宽度属于布局契约，不能改）不能透出壁纸，
+       必须用和相邻面板相同的主题材质填满，只留中间一条 1px 分隔线。 */
+    background: var(--magi-surface-main);
   }
 
   .desktop-right-pane-resize-handle::before {
@@ -3486,7 +3747,8 @@ import {
   }
 
   .desktop-right-pane-resize-handle:hover {
-    background: color-mix(in srgb, var(--primary) 8%, transparent);
+    /* 悬停提示叠在材质之上，不替换掉材质底。 */
+    box-shadow: inset 0 0 0 100vmax color-mix(in srgb, var(--primary) 8%, transparent);
   }
 
   .desktop-right-pane-column {
@@ -3572,73 +3834,63 @@ import {
 
   .sidebar-header {
     display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-    flex-shrink: 0;
-  }
-
-  .sidebar-toolbar {
-    display: flex;
+    flex-direction: row;
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
+    flex-shrink: 0;
   }
 
-  .sidebar-brand {
+  /* 侧栏导航条目：与下方工作区、会话共用同一套行视觉，而不是独立按钮。 */
+  .sidebar-nav-item {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
+    flex: 1;
     min-width: 0;
+    height: 30px;
+    padding: 0 var(--space-2);
+    border: none;
+    border-radius: var(--radius-md);
+    background: transparent;
     color: var(--foreground);
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    text-align: left;
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
   }
 
-  .sidebar-brand-name {
-    font-size: 17px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
+  .sidebar-nav-item :global(svg) {
+    flex-shrink: 0;
+    color: var(--foreground-muted);
+  }
+
+  .sidebar-nav-item:hover:not(:disabled) {
+    background: var(--surface-hover);
+  }
+
+  .sidebar-nav-item:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 1px;
+  }
+
+  .sidebar-nav-item:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   .sidebar-header-tools {
     display: flex;
     align-items: center;
     gap: var(--space-1);
-  }
-
-  .sidebar-icon-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: var(--radius-md);
-    border: none;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
     flex-shrink: 0;
-    position: relative;
   }
 
-  .sidebar-icon-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
 
-  .sidebar-icon-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
 
-  .sidebar-icon-btn :global(svg) {
-    pointer-events: none;
-  }
 
-  .sidebar-icon-btn--compact {
-    width: 24px;
-    height: 24px;
-    border-radius: var(--radius-sm);
-  }
+
 
   /* Tooltip 挂载在 Shell 顶层，不能再由 sidebar-navigation-scroll 的
      overflow 或中间面板的绘制顺序裁剪。 */
@@ -3664,6 +3916,14 @@ import {
     transform: translate(-100%, -100%);
   }
 
+  .sidebar-tooltip--start {
+    transform: none;
+  }
+
+  .sidebar-tooltip--start.sidebar-tooltip--above {
+    transform: translateY(-100%);
+  }
+
   .session-meta,
   .sidebar-empty {
     color: var(--foreground-muted);
@@ -3684,40 +3944,14 @@ import {
     to { transform: rotate(360deg); }
   }
 
-  .theme-toggle-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: var(--radius-md);
-    border: none;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-    flex-shrink: 0;
-  }
 
-  .theme-toggle-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
 
-  .theme-toggle-btn[data-theme-id='builtin.light'],
-  .theme-toggle-btn[data-theme-id='builtin.dark'] {
-    color: var(--primary);
-  }
 
-  .theme-toggle-btn:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-  }
 
   .sidebar-section {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--space-1);
   }
 
   .sidebar-navigation-scroll {
@@ -3725,7 +3959,8 @@ import {
     flex: 1;
     min-height: 0;
     flex-direction: column;
-    gap: var(--space-3);
+    /* 分区间距由分区自己按展开/折叠状态决定，容器不再统一撑开。 */
+    gap: 0;
     overflow-y: auto;
     overflow-x: hidden;
     overscroll-behavior: contain;
@@ -3750,23 +3985,15 @@ import {
     color: var(--foreground);
   }
 
+  /* 分区标题随内容滚动，不做粘性遮挡层：不带自己的底色，
+     与侧栏共用同一种主题材质（壁纸、半透明主题下不会出现色块）。 */
   .section-title-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
-  }
-
-  .section-title-row--sticky {
-    position: sticky;
-    top: 0;
-    z-index: 3;
     min-height: 28px;
     padding: 2px 0;
-    /* 标题是滚动内容的遮挡层，使用主题基色而不是半透明面板材质，
-       避免下方工作区/会话行透出来造成文字串层。 */
-    background: var(--magi-canvas, var(--background));
-    box-shadow: 0 1px 0 var(--border-subtle);
   }
 
   .section-title {
@@ -3783,40 +4010,9 @@ import {
     overflow: visible;
   }
 
-  .file-tree-mode-header {
-    display: flex;
-    align-items: center;
-    padding-bottom: 2px;
-  }
 
-  .file-tree-back-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    align-self: flex-start;
-    max-width: 100%;
-    height: 28px;
-    padding: 0 8px 0 6px;
-    border: none;
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
 
-  .file-tree-back-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
 
-  .file-tree-back-btn :global(svg) {
-    transform: rotate(180deg);
-    flex-shrink: 0;
-    pointer-events: none;
-  }
 
   .sidebar-section--file-tree-mode :global(.project-file-tree) {
     flex: 1;
@@ -3893,25 +4089,25 @@ import {
   }
 
   .recent-sessions-section {
+    display: flex;
     flex: 0 0 auto;
-    padding-top: var(--space-2);
-    border-top: 1px solid color-mix(in srgb, var(--border-subtle) 70%, transparent);
+    flex-direction: column;
+    gap: var(--space-1);
+    /* 上一个分区展开时留出呼吸；上一个分区折叠时两个标题应像相邻的列表项。 */
+    margin-top: var(--space-4);
   }
 
-  .recent-session-new-btn {
-    opacity: 0.72;
-    pointer-events: auto;
-    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+  .recent-sessions-section--after-collapsed {
+    margin-top: 0;
   }
 
-  .recent-session-new-btn:focus-visible {
-    opacity: 1;
+  /* 折叠后内容容器为空，不能再作为 flex 子项撑出标题下方的间隙。 */
+  .sidebar-section-content--collapsed {
+    display: none;
   }
 
-  .recent-session-new-btn:disabled {
-    opacity: 0.35;
-    pointer-events: none;
-  }
+
+
 
   .section-title-toggle {
     display: inline-flex;
@@ -4003,12 +4199,103 @@ import {
     background: color-mix(in srgb, var(--surface-hover) 60%, transparent);
   }
 
-  .workspace-row:hover .workspace-new-session-btn,
-  .workspace-row:hover .workspace-remove-btn,
-  .workspace-new-session-btn:focus-visible,
-  .workspace-remove-btn:focus-visible {
+  /* 行内操作：默认隐藏，仅悬停该行或该按钮获得键盘可见焦点时出现。
+     不用 focus-within：鼠标点击后行会保留焦点，操作不能因此持续显示。 */
+  .row-action {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .workspace-row:hover .row-action,
+  .row-action:focus-visible {
     opacity: 1;
     pointer-events: auto;
+  }
+
+  .workspace-row:hover .row-action:disabled {
+    opacity: 0.35;
+  }
+
+  .workspace-row .row-action:last-child {
+    margin-right: 4px;
+  }
+
+  /* 分区标题行右侧的工具组：平时收敛，悬停标题行或聚焦其中按钮时出现。 */
+  .section-title-tools {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+  }
+
+  .section-title-row:hover .section-title-tools,
+  .section-title-row:focus-within .section-title-tools,
+  .section-title-tools:has(.btn-icon--active) {
+    opacity: 1;
+  }
+
+  /* 文件树模式的标题：左侧箭头兼任“返回项目”，名称保持原大小写。 */
+  .file-tree-back {
+    flex: 1;
+    justify-content: flex-start;
+  }
+
+  .file-tree-back .section-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .file-tree-back-chevron {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transform: rotate(90deg);
+  }
+
+  /* 工作台被设置视图换下：侧栏不再参与布局；主区域整体移出可见区域，但保持真实尺寸
+     与渲染（不卸载、不塌缩、不 display:none）：右栏的 <webview> guest 需要真实布局
+     尺寸才能保持注册，后台推理和 Browser 状态都依赖它。与折叠右栏的 --background 同一思路。 */
+  .workbench-view--away {
+    display: none;
+  }
+
+  /* 双类名：必须压过后面 .workbench-content 的 position: relative。 */
+  .workbench-content.workbench-content--away {
+    position: fixed;
+    top: 0;
+    left: -20000px;
+    width: var(--away-width, 100vw);
+    height: var(--away-height, 100vh);
+    pointer-events: none;
+  }
+
+  .settings-loading {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--magi-surface-main);
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
+  }
+
+  .settings-loading :global(svg) {
+    animation: sidebar-recovery-spin 1s linear infinite;
+  }
+
+  .sidebar-refreshing :global(svg) {
+    animation: sidebar-recovery-spin 0.9s linear infinite;
   }
 
   .workspace-header-btn {
@@ -4072,53 +4359,12 @@ import {
     margin-top: 2px;
   }
 
-  .workspace-new-session-btn,
-  .workspace-remove-btn {
-    width: 22px;
-    height: 22px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    font-size: 14px;
-    line-height: 1;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
-    flex-shrink: 0;
-  }
 
-  .workspace-new-session-btn {
-    color: var(--foreground-muted);
-  }
 
-  .workspace-new-session-btn:hover {
-    color: var(--foreground);
-    background: var(--surface-hover);
-  }
 
-  .workspace-new-session-btn:disabled {
-    cursor: default;
-    color: var(--foreground-muted);
-  }
 
-  .workspace-row:hover .workspace-new-session-btn:disabled,
-  .workspace-new-session-btn:focus-visible:disabled {
-    opacity: 0.35;
-  }
 
-  .workspace-remove-btn {
-    margin-right: 4px;
-  }
 
-  .workspace-remove-btn:hover {
-    color: var(--error);
-    background: color-mix(in srgb, var(--error) 10%, transparent);
-  }
 
   .session-list--nested {
     gap: 1px;
@@ -4319,32 +4565,8 @@ import {
     transition: opacity var(--transition-fast);
   }
 
-  .session-action-btn,
-  .session-rename-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-    flex-shrink: 0;
-  }
 
-  .session-rename-btn:hover,
-  .session-rename-save:hover {
-    color: var(--info);
-    background: color-mix(in srgb, var(--info) 12%, transparent);
-  }
 
-  .session-delete-btn:hover {
-    color: var(--error);
-    background: color-mix(in srgb, var(--error) 12%, transparent);
-  }
 
   .session-rename-editor {
     display: flex;
@@ -4390,7 +4612,7 @@ import {
     line-height: 1.25;
   }
 
-  .session-rename-action:disabled,
+  .session-rename-controls :global(.btn-icon:disabled),
   .session-rename-input:disabled {
     cursor: wait;
     opacity: 0.55;
@@ -4463,6 +4685,8 @@ import {
     z-index: 2;
   }
 
+  /* 桌面端：侧栏 / 中栏 / 右栏（或设置页）直接相连并贴住窗口边缘，
+     面板之间不留缝隙，只靠 1px 分隔线。 */
   .web-workbench-shell--desktop {
     gap: 0;
     padding: 0;
@@ -4654,26 +4878,27 @@ import {
       gap: var(--space-2);
     }
 
-    .file-tree-back-btn {
-      height: 34px;
-      font-size: var(--text-base);
-    }
-
-    .workspace-new-session-btn,
-    .workspace-remove-btn {
-      width: 28px;
-      height: 28px;
+    /* 触控设备没有悬停：行内操作与标题工具常驻，目标放大。 */
+    .row-action,
+    .section-title-tools {
       opacity: 1;
       pointer-events: auto;
     }
 
-    .workspace-new-session-btn:disabled {
+    .row-action:disabled {
       opacity: 0.35;
     }
 
-    .sidebar-drawer-close {
+    .row-action,
+    .section-title-tools :global(.btn-icon),
+    .sidebar-header-tools :global(.btn-icon) {
       width: 36px;
       height: 36px;
+    }
+
+    .sidebar-nav-item {
+      height: 40px;
+      font-size: var(--text-base);
     }
 
     .workspace-tree {
@@ -4681,13 +4906,9 @@ import {
       gap: var(--space-3);
     }
 
-    .sidebar-header,
-    .sidebar-section {
-      background: color-mix(in srgb, var(--foreground) 3%, var(--vscode-sideBar-secondaryBackground, var(--background)));
-    }
-
+    /* 抽屉本身已有不透明底；头部、分区、选中项只叠透明色，不再各带一块底色。 */
     .session-item.active {
-      background: color-mix(in srgb, var(--info) 10%, var(--vscode-sideBar-secondaryBackground, var(--background)));
+      background: color-mix(in srgb, var(--info) 10%, transparent);
     }
 
     .workspace-header-btn,

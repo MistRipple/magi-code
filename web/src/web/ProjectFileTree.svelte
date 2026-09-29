@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import FileTypeIcon from '../components/FileTypeIcon.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -12,19 +12,18 @@
   interface Props {
     rootPath: string;
     workspaceId: string;
-    title?: string;
-    titlePath?: string;
+    /** 是否显示隐藏文件；由侧栏标题行的开关持有，树只负责按它加载。 */
+    showHidden?: boolean;
     selectedFilePath?: string | null;
     onFileSelect?: (selection: { pathRef: string; displayPath: string; name: string }) => void;
   }
 
-  let { rootPath, workspaceId, title = '', titlePath = '', selectedFilePath = null, onFileSelect }: Props = $props();
+  let { rootPath, workspaceId, showHidden = false, selectedFilePath = null, onFileSelect }: Props = $props();
 
   let expandedDirPaths = $state<Set<string>>(new Set());
   let dirCache = $state<Map<string, DirectoryEntry[]>>(new Map());
   let loadingDirPaths = $state<Set<string>>(new Set());
   let dirErrors = $state<Map<string, string>>(new Map());
-  let showHidden = $state(false);
   let loadedTreeKey = $state('');
   let selectedPathRef = $state('');
   let treeElement = $state<HTMLElement | null>(null);
@@ -183,22 +182,37 @@
     void loadDirectory(pathRef);
   }
 
-  function refreshRoot(): void {
-    resetTree();
-    void loadDirectory(undefined, { force: true });
+  /**
+   * 重新读取根目录和所有已展开目录，保留用户的展开状态；
+   * 目录已不存在（如切分支后）的展开项在重读失败后被收起。
+   */
+  export async function refresh(): Promise<void> {
+    if (!rootPath?.trim()) return;
+    const treeKey = loadedTreeKey;
+    const directories = [undefined, ...expandedDirPaths];
+    await Promise.all(directories.map((pathRef) => loadDirectory(pathRef, { force: true })));
+    if (treeKey !== loadedTreeKey) return;
+    const stillValid = new Set([...expandedDirPaths].filter((pathRef) => !dirErrors.has(pathRef)));
+    if (stillValid.size !== expandedDirPaths.size) {
+      expandedDirPaths = stillValid;
+    }
   }
 
   // 工作区内容变更（如切分支）后刷新文件树，避免停留在旧分支的目录结构。
   onMount(() => {
-    const handleWorkspaceContentChanged = () => refreshRoot();
+    const handleWorkspaceContentChanged = () => void refresh();
     window.addEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
     return () => window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
   });
 
-  function toggleHiddenFiles(): void {
-    showHidden = !showHidden;
-    refreshRoot();
-  }
+  // 隐藏文件开关变化时按新条件重读，展开状态不丢。
+  let appliedShowHidden = untrack(() => showHidden);
+  $effect(() => {
+    const next = showHidden;
+    if (next === appliedShowHidden) return;
+    appliedShowHidden = next;
+    untrack(() => void refresh());
+  });
 
   function handleEntryClick(entry: DirectoryEntry): void {
     if (entry.isDirectory) {
@@ -215,36 +229,6 @@
 </script>
 
 <div class="project-file-tree" data-workspace-id={workspaceId} bind:this={treeElement}>
-  <div class="file-tree-heading-row">
-    <div class="file-tree-heading" title={titlePath || rootPath}>
-      <Icon name="folder" size={12} />
-      <span>{title || i18n.t('web.projectFiles')}</span>
-    </div>
-    <div class="file-tree-toolbar">
-      <button
-        type="button"
-        class="file-tree-tool"
-        onclick={refreshRoot}
-        title={i18n.t('web.projectFilesRefresh')}
-        aria-label={i18n.t('web.projectFilesRefresh')}
-        disabled={!rootPath || rootLoading}
-      >
-        <Icon name="refresh" size={12} />
-      </button>
-      <button
-        type="button"
-        class="file-tree-tool"
-        class:active={showHidden}
-        onclick={toggleHiddenFiles}
-        title={i18n.t('web.projectFilesShowHidden')}
-        aria-label={i18n.t('web.projectFilesShowHidden')}
-        disabled={!rootPath || rootLoading}
-      >
-        <Icon name={showHidden ? 'eye' : 'eye-slash'} size={12} />
-      </button>
-    </div>
-  </div>
-
   {#if !rootPath}
     <div class="file-tree-empty">{i18n.t('web.projectFilesNoWorkspace')}</div>
   {:else if rootLoading && rootEntries.length === 0}
@@ -318,71 +302,6 @@
     flex-direction: column;
     gap: var(--space-2);
     min-height: 0;
-  }
-
-  .file-tree-heading-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-2);
-    min-height: 28px;
-    flex-shrink: 0;
-  }
-
-  .file-tree-heading {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    font-weight: var(--font-semibold);
-  }
-
-  .file-tree-heading span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .file-tree-heading :global(svg) {
-    flex-shrink: 0;
-    color: var(--foreground-muted);
-  }
-
-  .file-tree-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: var(--space-1);
-    flex-shrink: 0;
-  }
-
-  .file-tree-tool {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .file-tree-tool:hover:not(:disabled),
-  .file-tree-tool.active {
-    background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
-    color: var(--foreground);
-  }
-
-  .file-tree-tool:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
   }
 
   .file-tree-list {

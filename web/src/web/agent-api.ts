@@ -25,6 +25,7 @@ import type {
   SessionSuggestionsResponseDto,
   SkillsLibraryResponseDto,
   MessagesResponseDto,
+  VersionHandshakeDto,
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
@@ -1037,6 +1038,12 @@ export function browserClientPlatform(): BrowserClientPlatform {
     return 'mobile-web';
   }
   return 'web';
+}
+
+/** 后端版本握手：产品版本与构建标识（关于页展示用）。 */
+export async function getAgentVersion(): Promise<VersionHandshakeDto> {
+  const response = await getTransport().request(agentUrl('/version'), { cache: 'no-store' });
+  return parseAgentJson<VersionHandshakeDto>(response, 'load version');
 }
 
 export async function getBrowserCapabilities(sessionId?: string): Promise<BrowserCapabilitiesSnapshot> {

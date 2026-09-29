@@ -190,11 +190,11 @@
 </script>
 
 {#if desktopRuntime && currentVersion}
-  <div class="header-update-status" data-update-phase={phase} aria-live="polite">
-    <span class="header-update-action-slot">
+  <div class="update-status" data-update-phase={phase} aria-live="polite">
+    <span class="update-status-action-slot">
       <button
         type="button"
-        class={`header-update-action header-update-action--${actionPresentation.tone}`}
+        class={`btn-icon btn-icon--md update-status-action update-status-action--${actionPresentation.tone}`}
         aria-label={actionTitle}
         title={actionTitle}
         aria-busy={phase === 'checking' || phase === 'downloading' || phase === 'installing'}
@@ -202,16 +202,16 @@
         onclick={activateAction}
       >
         {#if actionPresentation.progress}
-          <span class="header-update-progress">
+          <span class="update-status-progress">
             <svg
-              class="header-update-progress-ring"
-              class:header-update-progress-ring--indeterminate={progress?.percent === undefined}
+              class="update-status-progress-ring"
+              class:update-status-progress-ring--indeterminate={progress?.percent === undefined}
               viewBox="0 0 20 20"
               aria-hidden="true"
             >
-              <circle class="header-update-progress-track" cx="10" cy="10" r="8" pathLength="100"></circle>
+              <circle class="update-status-progress-track" cx="10" cy="10" r="8" pathLength="100"></circle>
               <circle
-                class="header-update-progress-value"
+                class="update-status-progress-value"
                 cx="10"
                 cy="10"
                 r="8"
@@ -220,24 +220,24 @@
               ></circle>
             </svg>
             {#if progress?.percent !== undefined}
-              <span class="header-update-progress-percent">{progress.percent}</span>
+              <span class="update-status-progress-percent">{progress.percent}</span>
             {/if}
           </span>
         {:else}
           <Icon
             name={actionPresentation.icon}
             size={14}
-            class={`header-update-action-icon${actionPresentation.spinning ? ' header-update-action-icon--spinning' : ''}`}
+            class={`update-status-action-icon${actionPresentation.spinning ? ' update-status-action-icon--spinning' : ''}`}
           />
         {/if}
       </button>
     </span>
-    <span class="header-update-version">v{currentVersion}</span>
+    <span class="update-status-version">v{currentVersion}</span>
   </div>
 {/if}
 
 <style>
-  .header-update-status {
+  .update-status {
     display: inline-flex;
     align-items: center;
     gap: 1px;
@@ -245,9 +245,9 @@
     min-width: 0;
   }
 
-  .header-update-version {
+  .update-status-version {
     flex: 0 0 auto;
-    height: 32px;
+    height: var(--btn-height-md);
     padding: 0 4px;
     display: inline-flex;
     align-items: center;
@@ -257,90 +257,70 @@
     white-space: nowrap;
   }
 
-  .header-update-action-slot {
+  .update-status-action-slot {
     display: inline-flex;
-    width: 32px;
-    height: 32px;
-    align-items: center;
-    justify-content: center;
-    flex: 0 0 32px;
+    flex: 0 0 auto;
   }
 
-  .header-update-action {
-    position: relative;
-    display: inline-flex;
-    width: 32px;
-    height: 32px;
-    align-items: center;
-    justify-content: center;
-    flex: 0 0 32px;
-    padding: 0;
-    border: 0;
-    border-radius: var(--radius-md);
-    background: transparent;
+  /* 尺寸、圆角、hover 由全局 .btn-icon 提供，这里只表达更新阶段的色调。 */
+  .update-status-action {
     color: var(--update-tone);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
   }
 
-  .header-update-action--idle {
+  .update-status-action--idle {
     --update-tone: var(--foreground-muted);
   }
 
-  .header-update-action--checking {
+  .update-status-action--checking {
     --update-tone: var(--primary);
   }
 
-  .header-update-action--latest {
+  .update-status-action--latest {
     --update-tone: var(--success, #16a34a);
   }
 
-  .header-update-action--available {
+  .update-status-action--available {
     --update-tone: var(--warning, #d97706);
   }
 
-  .header-update-action--downloading {
+  .update-status-action--downloading {
     --update-tone: var(--color-codex, var(--info, #3b82f6));
   }
 
-  .header-update-action--ready {
+  .update-status-action--ready {
     --update-tone: var(--success, #16a34a);
   }
 
-  .header-update-action--installing {
+  .update-status-action--installing {
     --update-tone: var(--color-orchestrator, #8b5cf6);
   }
 
-  .header-update-action--error {
+  .update-status-action--error {
     --update-tone: var(--error, #dc2626);
   }
 
-  .header-update-action:hover:not([aria-disabled='true']) {
-    background: var(--surface-hover);
-  }
-
-  .header-update-action--idle:hover:not([aria-disabled='true']) {
+  .update-status-action--idle:hover:not([aria-disabled='true']) {
     color: var(--foreground);
   }
 
-  .header-update-action[aria-disabled='true'] {
+  .update-status-action[aria-disabled='true'] {
     cursor: default;
     opacity: 0.86;
   }
 
-  :global(.header-update-action-icon) {
+  :global(.update-status-action-icon) {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     transform-origin: center;
   }
 
-  :global(.header-update-action-icon--spinning) {
+  :global(.update-status-action-icon--spinning) {
     will-change: transform;
-    animation: header-update-action-spin 0.8s linear infinite;
+    animation: update-status-action-spin 0.8s linear infinite;
   }
 
-  .header-update-progress {
+  .update-status-progress {
     position: relative;
     display: inline-flex;
     width: 20px;
@@ -349,7 +329,7 @@
     justify-content: center;
   }
 
-  .header-update-progress-ring {
+  .update-status-progress-ring {
     width: 20px;
     height: 20px;
     flex: 0 0 20px;
@@ -357,33 +337,33 @@
     transform: rotate(-90deg);
   }
 
-  .header-update-progress-track,
-  .header-update-progress-value {
+  .update-status-progress-track,
+  .update-status-progress-value {
     fill: none;
     stroke-width: 2;
   }
 
-  .header-update-progress-track {
+  .update-status-progress-track {
     stroke: color-mix(in srgb, currentColor 20%, transparent);
   }
 
-  .header-update-progress-value {
+  .update-status-progress-value {
     stroke: currentColor;
     stroke-linecap: round;
     stroke-dasharray: 100;
     transition: stroke-dashoffset 160ms linear;
   }
 
-  .header-update-progress-ring--indeterminate {
-    animation: header-update-progress-spin 0.8s linear infinite;
+  .update-status-progress-ring--indeterminate {
+    animation: update-status-progress-spin 0.8s linear infinite;
   }
 
-  .header-update-progress-ring--indeterminate .header-update-progress-value {
+  .update-status-progress-ring--indeterminate .update-status-progress-value {
     stroke-dasharray: 28 72;
     stroke-dashoffset: 0 !important;
   }
 
-  .header-update-progress-percent {
+  .update-status-progress-percent {
     position: absolute;
     inset: 0;
     display: flex;
@@ -397,13 +377,13 @@
     pointer-events: none;
   }
 
-  @keyframes header-update-action-spin {
+  @keyframes update-status-action-spin {
     to {
       transform: rotate(360deg);
     }
   }
 
-  @keyframes header-update-progress-spin {
+  @keyframes update-status-progress-spin {
     from {
       transform: rotate(-90deg);
     }
@@ -413,7 +393,7 @@
   }
 
   @media (max-width: 768px) {
-    .header-update-status {
+    .update-status {
       gap: 1px;
     }
   }

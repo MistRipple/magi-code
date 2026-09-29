@@ -137,27 +137,27 @@ assert.doesNotMatch(
 );
 assert.match(
   shellSource,
-  /class="workspace-new-session-btn"[\s\S]*?disabled=\{workspaceActionPending \|\| messagesState\.sessionHydrating\}[\s\S]*?event\.stopPropagation\(\)[\s\S]*?openWorkspaceDraft\(workspace\)[\s\S]*?<Icon name="plus"/,
+  /class="btn-icon btn-icon--sm row-action"[\s\S]*?disabled=\{workspaceActionPending \|\| messagesState\.sessionHydrating\}[\s\S]*?event\.stopPropagation\(\)[\s\S]*?openWorkspaceDraft\(workspace\)[\s\S]*?<Icon name="plus"/,
   '工作空间行必须提供不会触发展开的加号按钮，并在工作区操作或会话加载期间禁用',
 );
 assert.match(
   shellSource,
-  /\.workspace-row:hover \.workspace-new-session-btn,[\s\S]*?\.workspace-row:hover \.workspace-remove-btn[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
+  /\.workspace-row:hover \.row-action,[\s\S]*?\.row-action:focus-visible[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
   '桌面端工作空间右侧操作必须仅在行悬停时出现',
 );
 assert.doesNotMatch(
   shellSource,
-  /\.workspace-row:focus-within \.workspace-(?:new-session|remove)-btn/,
+  /\.workspace-row:focus-within \.row-action/,
   '鼠标点击后不能因工作空间行保留焦点而持续显示右侧操作',
 );
 assert.match(
   shellSource,
-  /\.workspace-new-session-btn:focus-visible,[\s\S]*?\.workspace-remove-btn:focus-visible[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
+  /\.row-action:focus-visible\s*\{[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
   '键盘导航时仍必须单独显示当前获得可见焦点的操作按钮',
 );
 assert.match(
   shellSource,
-  /@media \(max-width: 900px\)[\s\S]*?\.workspace-new-session-btn[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
+  /@media \(max-width: 900px\)[\s\S]*?\.row-action,[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
   '抽屉和窄屏布局必须常显工作空间新会话按钮',
 );
 assert.match(
@@ -242,7 +242,7 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function refreshWorkspaces\(\): Promise<void> \{[\s\S]*?workspaces = next;[\s\S]*?sessionsByWorkspace = Object\.fromEntries[\s\S]*?if \(!messagesState\.bootstrapped\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?selectedWorkspaceId = resolveBackendWorkspaceSelection\(next\)/,
+  /async function refreshWorkspaces\(options: \{ silent\?: boolean \} = \{\}\): Promise<void> \{[\s\S]*?workspaces = next;[\s\S]*?sessionsByWorkspace = Object\.fromEntries[\s\S]*?if \(!messagesState\.bootstrapped\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?selectedWorkspaceId = resolveBackendWorkspaceSelection\(next\)/,
   '工作区列表先到达时必须等待无作用域 bootstrap 恢复最后会话，不能按 isActive 抢先触发工作区切换',
 );
 assert.match(

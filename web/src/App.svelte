@@ -71,14 +71,10 @@
     }
   }
 
-  // 设置面板是否打开
-  let settingsOpen = $state(false);
   let EditsPanelComponent = $state<Component | null>(null);
   let KnowledgePanelComponent = $state<Component | null>(null);
-  let SettingsPanelComponent = $state<Component<{ onClose: () => void }> | null>(null);
   let editsPanelLoad: Promise<void> | null = null;
   let knowledgePanelLoad: Promise<void> | null = null;
-  let settingsPanelLoad: Promise<void> | null = null;
 
   function loadEditsPanel(): Promise<void> {
     if (EditsPanelComponent) return Promise.resolve();
@@ -104,18 +100,6 @@
     return knowledgePanelLoad;
   }
 
-  function loadSettingsPanel(): Promise<void> {
-    if (SettingsPanelComponent) return Promise.resolve();
-    settingsPanelLoad ??= import('./components/SettingsPanel.svelte')
-      .then((module) => {
-        SettingsPanelComponent = module.default;
-      })
-      .finally(() => {
-        settingsPanelLoad = null;
-      });
-    return settingsPanelLoad;
-  }
-
   // 启动连接状态：启动数据尚未就绪时显示等待提示
   const isBootstrapping = $derived(!messagesState.bootstrapped);
   let bootstrapConnectionFailed = $state(false);
@@ -124,21 +108,6 @@
     setCurrentTopTab(tab);
   }
 
-  function openSettings() {
-    settingsOpen = true;
-    void loadSettingsPanel().catch((error) => {
-      console.error('[App] 设置面板加载失败:', error);
-      settingsOpen = false;
-      addToast('error', i18n.t('app.featureLoadFailed'));
-    });
-  }
-
-  function closeSettings() {
-    settingsOpen = false;
-  }
-
-  // Settings 是 App Renderer 的全局阻塞层。它不靠 z-index 压过原生
-  // 原生窗口外壳，而是通过统一契约让当前 Browser Tab 先退出内容槽。
   onMount(() => {
     const focusAppRenderer = () => {
       if (window.magiDesktop?.focusApp) {
@@ -360,9 +329,7 @@
 
 <div class="app-container">
   <!-- 顶部标题栏 + 导航栏 -->
-  <Header
-    onOpenSettings={openSettings}
-  >
+  <Header>
     <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
   </Header>
 
@@ -407,14 +374,6 @@
     </div>
   </div>
 
-  <!-- 设置面板（覆盖层） -->
-  {#if settingsOpen}
-    {#if SettingsPanelComponent}
-      <SettingsPanelComponent onClose={closeSettings} />
-    {:else}
-      <div class="lazy-settings-loading" role="status"><Icon name="loader" size={22} /><span>{i18n.t('common.loading')}</span></div>
-    {/if}
-  {/if}
   <!-- Toast 通知容器 -->
   <ToastContainer />
 </div>
@@ -438,30 +397,18 @@
     position: relative;
   }
 
-  .lazy-panel-loading,
-  .lazy-settings-loading {
+  .lazy-panel-loading {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: var(--space-2);
+    width: 100%;
+    height: 100%;
     color: var(--foreground-muted);
     font-size: var(--text-sm);
   }
 
-  .lazy-panel-loading {
-    width: 100%;
-    height: 100%;
-  }
-
-  .lazy-settings-loading {
-    position: fixed;
-    inset: 0;
-    z-index: 1000;
-    background: var(--background);
-  }
-
-  .lazy-panel-loading :global(svg),
-  .lazy-settings-loading :global(svg) {
+  .lazy-panel-loading :global(svg) {
     animation: bootstrap-spin 1s linear infinite;
   }
 

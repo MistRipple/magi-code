@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { access, readFile } from 'node:fs/promises';
 
+const settingsTabs = await readFile(new URL('../src/lib/settings-tabs.ts', import.meta.url), 'utf8');
 const [mainWeb, runtime, desktopAppearance, desktopMain, desktopPreload, desktopWindowManager, appearanceContract, client, settingsPanel, settingsAppearance, modal, modelConfigForm, enginePicker, knowledgePanel, runtimeStatePanel, settingsRules, settingsTools, webFolderPicker, workbenchShell, header, globalCss, settingsCss, bridge] = await Promise.all([
   readFile(new URL('../src/main-web.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/runtime.ts', import.meta.url), 'utf8'),
@@ -58,10 +59,10 @@ assert.match(client, /themes\/import[\s\S]*?themes\/\$\{encodeURIComponent\(them
 assert.match(client, /document\.body\.append\(anchor\)[\s\S]*?setTimeout\([\s\S]*?revokeObjectURL/, '主题导出必须等待浏览器接管下载后再释放 Blob URL');
 assert.match(settingsPanel, /SettingsAppearanceTab[\s\S]*?activeTab === 'appearance'/, '外观必须是设置中的一级导航');
 assert.ok(
-  settingsPanel.indexOf("onclick={() => store.activeTab = 'stats'}")
-    < settingsPanel.indexOf("onclick={() => store.activeTab = 'appearance'}")
-    && settingsPanel.indexOf("onclick={() => store.activeTab = 'appearance'}")
-      < settingsPanel.indexOf("onclick={() => store.activeTab = 'project'}"),
+  settingsTabs.indexOf("id: 'stats'")
+    < settingsTabs.indexOf("id: 'appearance'")
+    && settingsTabs.indexOf("id: 'appearance'")
+      < settingsTabs.indexOf("id: 'project'"),
   '外观导航必须位于统计之后、项目之前，DOM 与键盘焦点顺序保持一致',
 );
 assert.match(settingsAppearance, /createAppearanceTheme[\s\S]*?updateAppearanceTheme[\s\S]*?deleteAppearanceTheme/, '自定义与导入主题必须具备完整生命周期');
@@ -78,7 +79,11 @@ assert.match(globalCss, /\.btn-icon[\s\S]*?\.btn[\s\S]*?\.form-input[\s\S]*?\.fo
 assert.match(settingsAppearance, /btn btn--primary[\s\S]*?form-input[\s\S]*?control-color[\s\S]*?control-range/, '主题页必须复用全局按钮、表单、颜色和范围控件');
 assert.match(globalCss, /\[data-magi-surface\][\s\S]*?var\(--magi-wallpaper-image\)[\s\S]*?background-attachment: scroll, fixed/, '独立窗口必须通过全局材质 primitive 复用同一视口背景');
 assert.match(modal, /data-magi-surface="window"/, '通用 Modal 必须接入统一窗口材质');
-assert.match(settingsPanel, /magi-settings-layout" data-magi-surface="window"/, '设置窗口必须接入统一窗口材质');
+assert.match(
+  settingsPanel,
+  /\.settings-nav\s*\{[\s\S]*?background:\s*var\(--magi-surface-sidebar\);[\s\S]*?\.settings-main\s*\{[\s\S]*?background:\s*var\(--magi-surface-main\);/,
+  '设置页与工作台同级，导航与内容必须复用侧栏和主区域的主题材质，而不是自带一层窗口材质'
+);
 assert.match(settingsAppearance, /theme-editor" data-magi-surface="window"[\s\S]*?confirm-dialog" data-magi-surface="critical"/, '主题编辑与关键确认必须使用对应语义材质');
 assert.match(modelConfigForm, /model-dropdown"[\s\S]*?data-magi-surface="popover"/, '模型选择浮层必须接入统一悬浮材质');
 assert.match(modelConfigForm, /function portalToBody[\s\S]*?document\.body\.appendChild\(node\)/, '模型选择浮层必须挂载到页面根层，不能受设置窗口坐标系与裁切影响');

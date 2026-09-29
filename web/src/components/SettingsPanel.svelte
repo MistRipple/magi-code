@@ -8,6 +8,7 @@ import SettingsToolsTab from './SettingsToolsTab.svelte';
 import SettingsBrowserTab from './SettingsBrowserTab.svelte';
 import SettingsProjectTab from './SettingsProjectTab.svelte';
 import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
+import { tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
 import Toggle from './Toggle.svelte';
@@ -17,200 +18,159 @@ import {
   } from '../web/agent-api';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
+import { SETTINGS_TABS } from '../lib/settings-tabs';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   
   interface Props {
+    /** 当前是否显示。设置与工作台是同级视图：不显示时保活，只是不参与布局。 */
+    active: boolean;
     onClose?: () => void;
   }
   
-  let { onClose }: Props = $props();
+  let { active, onClose }: Props = $props();
 
   const store = useSettingsStore({
     onClose: () => onClose?.(),
   });
 
+  const activeTabDefinition = $derived(
+    SETTINGS_TABS.find((tab) => tab.id === store.activeTab) ?? SETTINGS_TABS[0],
+  );
+
+  // 返回要先等待保存队列与清理完成（见 store.closeSettings）；期间禁用，避免重复触发。
+  let leaving = $state(false);
+  async function goBack(): Promise<void> {
+    if (leaving) return;
+    leaving = true;
+    try {
+      await store.closeSettings();
+    } finally {
+      leaving = false;
+    }
+  }
+
+  function isTextEntry(target: EventTarget | null): boolean {
+    return target instanceof HTMLElement
+      && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+  }
+
+  // Esc = 返回，但要把 Esc 让给更内层的东西：嵌套弹窗（自行拦截）、打开的下拉列表、正在输入的控件。
+  function handleWindowKeydown(event: KeyboardEvent): void {
+    if (!active || event.key !== 'Escape' || event.defaultPrevented) return;
+    if (Object.values(store.modelDropdownOpen).some(Boolean)) {
+      store.closeAllModelDropdowns();
+      event.preventDefault();
+      return;
+    }
+    if (isTextEntry(event.target)) return;
+    event.preventDefault();
+    void goBack();
+  }
+
+  // 每次重新显示：刷新只读数据，并把焦点放到当前分类，键盘用户可以直接继续。
+  // 首次创建时（预挂载在后台）不抢焦点。
+  let navElement = $state<HTMLElement | null>(null);
+  let wasActive = false;
+  $effect(() => {
+    const nowActive = active;
+    if (nowActive && !wasActive) {
+      untrack(() => {
+        store.refreshOnShow();
+      });
+      void tick().then(() => {
+        navElement?.querySelector<HTMLElement>('[aria-current="page"]')?.focus({ preventScroll: true });
+      });
+    }
+    wasActive = nowActive;
+  });
+
 </script>
 
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="settings-overlay">
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="magi-settings-layout" data-magi-surface="window" onclick={(e) => e.stopPropagation()}>
-    <!-- 左侧导航 -->
-    <aside class="settings-sidebar">
-      <div class="sidebar-header">
-        <span class="settings-title">{i18n.t('settings.title')}</span>
-      </div>
-      <nav class="sidebar-nav">
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'model'}
-          aria-label={i18n.t('settings.zone.quickStart')}
-          onclick={() => store.activeTab = 'model'}
-        >
-          <Icon name="model" size={16} />
-          <span>{i18n.t('settings.zone.quickStart')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'tools'}
-          aria-label={i18n.t('settings.zone.capabilities')}
-          onclick={() => store.activeTab = 'tools'}
-        >
-          <Icon name="tools" size={16} />
-          <span>{i18n.t('settings.zone.capabilities')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'browser'}
-          aria-label={i18n.t('settings.zone.browser')}
-          onclick={() => store.activeTab = 'browser'}
-        >
-          <Icon name="globe" size={16} />
-          <span>{i18n.t('settings.zone.browser')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'agents'}
-          aria-label={i18n.t('settings.zone.roles')}
-          onclick={() => store.activeTab = 'agents'}
-        >
-          <Icon name="bot" size={16} />
-          <span>{i18n.t('settings.zone.roles')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'rules'}
-          aria-label={i18n.t('settings.zone.preferences')}
-          onclick={() => store.activeTab = 'rules'}
-        >
-          <Icon name="shield" size={16} />
-          <span>{i18n.t('settings.zone.preferences')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'stats'}
-          aria-label={i18n.t('settings.zone.usage')}
-          onclick={() => store.activeTab = 'stats'}
-        >
-          <Icon name="stats" size={16} />
-          <span>{i18n.t('settings.zone.usage')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'appearance'}
-          aria-label={i18n.t('settings.zone.appearance')}
-          onclick={() => store.activeTab = 'appearance'}
-        >
-          <Icon name="sparkles" size={16} />
-          <span>{i18n.t('settings.zone.appearance')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'project'}
-          aria-label={i18n.t('settings.zone.project')}
-          onclick={() => store.activeTab = 'project'}
-        >
-          <Icon name="git-branch" size={16} />
-          <span>{i18n.t('settings.zone.project')}</span>
-        </button>
-      </nav>
-      <div class="sidebar-footer">
-        {#if store.userInfo && store.clientKind === 'vscode'}
-          <div class="logout-section">
-            <span class="user-info-text" title={store.userInfo}>{store.userInfo}</span>
-            <button class="btn btn--secondary btn--sm" onclick={store.logout}>{i18n.t('settings.logout')}</button>
-          </div>
-        {/if}
-      </div>
-    </aside>
+<svelte:window onkeydown={handleWindowKeydown} />
 
-    <!-- 右侧内容区 -->
-    <main class="settings-main">
-      <header class="main-header">
-        <div class="header-breadcrumbs">
-          {#if store.activeTab === 'appearance'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.appearance')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.appearanceDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'model'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.quickStart')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.quickStartDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'tools'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.capabilities')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.capabilitiesDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'browser'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.browser')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.browserDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'rules'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.preferences')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.preferencesDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'stats'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.usage')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.usageDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'agents'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.roles')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.rolesDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'project'}
-            <div class="header-title-group">
-              <h2>{i18n.t('settings.zone.project')}</h2>
-              <span class="header-description">{i18n.t('settings.zone.projectDesc')}</span>
-            </div>
-          {/if}
+<!-- 设置与工作台是同级视图：这里不是叠加层。不显示时 display:none 保活（分类、滚动、未保存内容都保留）。 -->
+<div
+  class="settings-page"
+  class:settings-page--away={!active}
+  inert={!active}
+  role="region"
+  aria-label={i18n.t('settings.title')}
+  data-testid="settings-page"
+>
+  <!-- 左侧：设置导航（与侧栏同宽、同材质，视觉上像侧栏切换成了设置导航） -->
+  <aside class="settings-nav" bind:this={navElement}>
+    <button
+      type="button"
+      class="settings-back"
+      data-testid="settings-back"
+      disabled={leaving}
+      onclick={() => void goBack()}
+    >
+      <Icon name="chevron-left" size={14} />
+      <span>{i18n.t('settings.back')}</span>
+    </button>
+    <div class="settings-nav-caption" aria-hidden="true">{i18n.t('settings.title')}</div>
+    <nav class="settings-nav-list" aria-label={i18n.t('settings.title')}>
+      {#each SETTINGS_TABS as tab (tab.id)}
+        <button
+          type="button"
+          class="settings-nav-item"
+          class:active={store.activeTab === tab.id}
+          aria-current={store.activeTab === tab.id ? 'page' : undefined}
+          data-testid={`settings-nav-${tab.id}`}
+          onclick={() => store.activeTab = tab.id}
+        >
+          <Icon name={tab.icon} size={15} />
+          <span>{i18n.t(tab.titleKey)}</span>
+        </button>
+      {/each}
+    </nav>
+    {#if store.userInfo && store.clientKind === 'vscode'}
+      <div class="settings-nav-footer">
+        <span class="user-info-text" title={store.userInfo}>{store.userInfo}</span>
+        <button class="btn btn--secondary btn--sm" onclick={store.logout}>{i18n.t('settings.logout')}</button>
+      </div>
+    {/if}
+  </aside>
+
+  <!-- 右侧：当前分类的页面 -->
+  <main class="settings-main">
+    <header class="main-header">
+      <div class="header-breadcrumbs">
+        <div class="header-title-group">
+          <h2>{i18n.t(activeTabDefinition.titleKey)}</h2>
+          <span class="header-description">{i18n.t(activeTabDefinition.descKey)}</span>
         </div>
-        <div class="header-actions">
-          <div class="locale-selector">
-            <button
-              class="locale-btn"
-              class:active={i18n.locale === 'zh-CN'}
-              onclick={async () => {
-                i18n.setLocale('zh-CN');
-                await updateAgentRuntimeSetting('locale', 'zh-CN');
-                await store.reloadRoleTemplates();
-              }}
-            >
-              {i18n.t('settings.locale.zhCN')}
-            </button>
-            <button
-              class="locale-btn"
-              class:active={i18n.locale === 'en-US'}
-              onclick={async () => {
-                i18n.setLocale('en-US');
-                await updateAgentRuntimeSetting('locale', 'en-US');
-                await store.reloadRoleTemplates();
-              }}
-            >
-              {i18n.t('settings.locale.enUS')}
-            </button>
-          </div>
-          <button class="btn-icon btn-icon--sm close-btn" onclick={store.closeSettings} title={i18n.t('settings.closeSettings')}>
-            <Icon name="close" size={14} />
+      </div>
+      <div class="header-actions">
+        <div class="locale-selector">
+          <button
+            class="locale-btn"
+            class:active={i18n.locale === 'zh-CN'}
+            onclick={async () => {
+              i18n.setLocale('zh-CN');
+              await updateAgentRuntimeSetting('locale', 'zh-CN');
+              await store.reloadRoleTemplates();
+            }}
+          >
+            {i18n.t('settings.locale.zhCN')}
+          </button>
+          <button
+            class="locale-btn"
+            class:active={i18n.locale === 'en-US'}
+            onclick={async () => {
+              i18n.setLocale('en-US');
+              await updateAgentRuntimeSetting('locale', 'en-US');
+              await store.reloadRoleTemplates();
+            }}
+          >
+            {i18n.t('settings.locale.enUS')}
           </button>
         </div>
-      </header>
+      </div>
+    </header>
 
       <!-- Tab 内容区域 -->
       <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelDropdowns(); }}>
@@ -248,7 +208,6 @@ import { getAgentColor } from '../lib/agent-colors';
       {/if}
     </div>
   </main>
-</div>
 </div>
 <!-- 输入对话框 -->
 {#if store.showInputDialog}
@@ -760,17 +719,6 @@ import { getAgentColor } from '../lib/agent-colors';
      Settings Panel - 优化后的样式
      ============================================ */
 
-  /* 基础面板布局 */
-  .settings-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: var(--z-modal);
-    animation: fadeIn var(--duration-fast) var(--ease-out);
-  }
 
   .locale-selector {
     display: flex;
@@ -804,12 +752,6 @@ import { getAgentColor } from '../lib/agent-colors';
 
   .locale-btn + .locale-btn {
     border-left: 1px solid var(--border);
-  }
-
-  .settings-title {
-    font-size: var(--text-xl);
-    font-weight: var(--font-bold);
-    color: var(--foreground);
   }
 
 
@@ -1224,12 +1166,6 @@ import { getAgentColor } from '../lib/agent-colors';
   .skill-library-actions { flex-shrink: 0; align-self: center; }
 
   @media (max-width: 720px) {
-    .settings-overlay {
-      align-items: stretch;
-      justify-content: stretch;
-      background: var(--overlay-heavy);
-    }
-
     .skill-library-search-row {
       grid-template-columns: 1fr 1fr;
     }
@@ -1245,113 +1181,179 @@ import { getAgentColor } from '../lib/agent-colors';
 
   }
 
-    /* Custom Layout CSS - UX/UI Fix */
-    .magi-settings-layout {
-      position: relative;
-      border-radius: 12px;
-      width: 90vw;
-      max-width: 1050px;
-      height: 800px;
-      max-height: 800px;
-      display: flex;
-      flex-direction: row;
-      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.2);
-      border: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
-      overflow: hidden;
-      animation: magiSettingsIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    /* 设置页：铺满工作台（侧栏 + 中栏）区域的整页视图，不是弹窗。
+       与外壳共用同一套网格：导航列与侧栏同宽同材质，视觉上像侧栏切换成了设置导航。
+       只用 opacity 做入场，不引入 transform，避免嵌套弹窗的 fixed 定位被改写参照系。 */
+    .settings-page {
+      /* 与工作台同级：占据外壳网格的整行（侧栏 + 中栏）。工作台被换下时它已不在网格流里，
+         所以这里是正常的网格子项，不是叠加层，也不需要 z-index 或不透明底。 */
+      grid-column: 1 / -1;
+      grid-row: 1;
+      display: grid;
+      grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr);
+      gap: var(--shell-gap, 8px);
+      min-width: 0;
+      min-height: 0;
+      animation: settingsPageIn var(--duration-fast, 150ms) var(--ease-out, ease-out);
     }
 
-    .settings-sidebar {
-      width: 140px;
-      background: color-mix(in srgb, var(--magi-surface-dialog) 92%, var(--foreground) 8%);
-      border-right: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
-      display: flex;
-      flex-direction: column;
-      padding: 20px 0;
-      flex-shrink: 0;
+    .settings-page--away {
+      display: none;
     }
 
-    .sidebar-header {
-      padding: 0 24px 24px;
-      border-bottom: 1px solid transparent;
-    }
-    .sidebar-header .settings-title {
-      font-size: 18px;
-      font-weight: 600;
-      color: var(--vscode-foreground);
-    }
+    /* 桌面端：设置页也在整体内容框里，导航与页面之间不留缝隙，只有一条分隔线。
+       窄屏（≤900px）设置页上下堆叠，沿用下面的移动端规则。 */
+    @media (min-width: 901px) {
+      :global(.web-workbench-shell--desktop) .settings-page {
+        gap: 0;
+      }
 
-    .sidebar-nav {
-      display: flex;
-      flex-direction: column;
-      flex: 1;
-      padding: 16px 12px;
-      gap: 4px;
-    }
+      :global(.web-workbench-shell--desktop) .settings-nav {
+        border: 0;
+        border-right: 1px solid var(--border);
+        border-radius: 0;
+      }
 
-    .sidebar-nav .nav-item {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 10px 16px;
-      border: none;
-      background: transparent;
-      border-radius: 8px;
-      color: var(--vscode-foreground);
-      font-size: 14px;
-      font-weight: 500;
-      cursor: pointer;
-      opacity: 0.7;
-      transition: all 0.2s ease;
-      text-align: left;
-    }
-
-    @media (hover: hover) {
-      .sidebar-nav .nav-item:hover {
-        background: var(--vscode-list-hoverBackground, rgba(0, 0, 0, 0.04));
-        opacity: 1;
+      :global(.web-workbench-shell--desktop) .settings-main {
+        border: 0;
+        border-radius: 0;
       }
     }
 
-    .sidebar-nav .nav-item.active {
-      background: var(--vscode-list-activeSelectionBackground, rgba(0, 0, 0, 0.08));
-      color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
-      opacity: 1;
-      font-weight: 600;
-    }
-
-    .sidebar-footer {
-      padding: 16px 24px;
-      margin-top: auto;
+    .settings-nav {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: var(--space-1);
+      min-height: 0;
+      padding: var(--space-4);
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      background: var(--magi-surface-sidebar);
+    }
+
+    /* 返回与侧栏里的“新建会话”同尺寸同位置，是这一列的第一行。 */
+    .settings-back {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      flex-shrink: 0;
+      height: 30px;
+      padding: 0 var(--space-2);
+      border: none;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--foreground);
+      font-size: var(--text-sm);
+      font-weight: var(--font-medium);
+      text-align: left;
+      cursor: pointer;
+      transition: background var(--transition-fast);
+    }
+
+    .settings-back :global(svg) {
+      flex-shrink: 0;
+      color: var(--foreground-muted);
+    }
+
+    .settings-back:hover:not(:disabled) {
+      background: var(--surface-hover);
+    }
+
+    .settings-back:disabled {
+      opacity: 0.5;
+      cursor: progress;
+    }
+
+    .settings-nav-caption {
+      flex-shrink: 0;
+      padding: var(--space-4) var(--space-2) var(--space-1);
+      color: var(--foreground-muted);
+      font-size: var(--text-sm);
+      font-weight: var(--font-semibold);
+      letter-spacing: 0.04em;
+    }
+
+    .settings-nav-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .settings-nav-item {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      flex-shrink: 0;
+      height: 34px;
+      padding: 0 var(--space-3);
+      border: none;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--foreground-muted);
+      font-size: var(--text-sm);
+      text-align: left;
+      white-space: nowrap;
+      cursor: pointer;
+      transition: background var(--transition-fast), color var(--transition-fast);
+    }
+
+    .settings-nav-item :global(svg) {
+      flex-shrink: 0;
+    }
+
+    .settings-nav-item:hover {
+      background: var(--surface-hover);
+      color: var(--foreground);
+    }
+
+    .settings-nav-item.active {
+      background: color-mix(in srgb, var(--surface-selected) 78%, transparent);
+      color: var(--foreground);
+      font-weight: var(--font-medium);
+    }
+
+    .settings-back:focus-visible,
+    .settings-nav-item:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 1px;
+    }
+
+    .settings-nav-footer {
+      margin-top: auto;
+      padding-top: var(--space-4);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-3);
     }
 
     .settings-main {
-      flex: 1;
       display: flex;
       flex-direction: column;
       min-width: 0;
       min-height: 0;
-      background: transparent;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      background: var(--magi-surface-main);
     }
 
+    /* 大窗口下表单不无限拉宽：内容限制在 960px 居中，页头与内容对齐。 */
     .main-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 20px 32px;
-      border-bottom: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
-      background: transparent;
-      z-index: 10;
+      gap: var(--space-4);
+      flex-shrink: 0;
+      padding: 18px max(28px, calc((100% - 960px) / 2));
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
     }
 
     .header-breadcrumbs h2 {
       margin: 0;
       font-size: 18px;
       font-weight: 600;
-      color: var(--vscode-foreground);
+      color: var(--foreground);
       white-space: nowrap;
     }
 
@@ -1383,19 +1385,23 @@ import { getAgentColor } from '../lib/agent-colors';
     }
 
     .scroll-content {
-      padding: 20px; /* 压缩内边距 */
+      padding: 20px max(28px, calc((100% - 960px) / 2));
       overflow: hidden;
       flex: 1;
       display: flex;
       flex-direction: column;
-      gap: 0; /* 移除巨大的间隔，由组件内部控制 */
+      gap: 0; /* 间隔由各分类组件内部控制 */
       min-width: 0;
       min-height: 0;
     }
 
-  @keyframes magiSettingsIn {
-    from { opacity: 0; transform: scale(0.96) translateY(10px); }
-    to { opacity: 1; transform: scale(1) translateY(0); }
+  @keyframes settingsPageIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .settings-page { animation: none; }
   }
 
   /* =========================================
@@ -1404,50 +1410,74 @@ import { getAgentColor } from '../lib/agent-colors';
 
   /* 统一主行动按钮 (Buttons) */
   
-  @media (max-width: 768px) {
-    .settings-sidebar {
-      width: 64px;
-      padding: 16px 0;
+  /* 窄屏：外壳去掉外边距，设置页变成整页——顶部是返回与横向滚动的分类，下面是内容。 */
+  @media (max-width: 900px) {
+    .settings-page {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 0;
+      background: var(--magi-surface-main);
     }
-    .sidebar-header {
-      padding: 0 0 16px;
-      display: flex;
-      justify-content: center;
-    }
-    .sidebar-header .settings-title {
-      display: none;
-    }
-    .sidebar-nav {
-      padding: 16px 8px;
-    }
-    .sidebar-nav .nav-item {
-      justify-content: center;
-      padding: 12px;
-    }
-    .sidebar-nav .nav-item span {
-      display: none;
-    }
-    .magi-settings-layout {
-      width: 100vw;
-      height: 100vh;
-      height: 100dvh;
-      max-width: none;
-      max-height: none;
+
+    .settings-nav {
+      flex-direction: column;
+      gap: var(--space-2);
+      padding: calc(var(--space-3) + env(safe-area-inset-top, 0px)) var(--space-3) var(--space-3);
+      overflow: visible;
+      border: none;
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
       border-radius: 0;
     }
-    .main-header {
-      padding: 16px 20px;
+
+    .settings-back {
+      height: 40px;
     }
+
+    .settings-nav-caption {
+      display: none;
+    }
+
+    .settings-nav-list {
+      flex-direction: row;
+      gap: var(--space-2);
+      overflow-x: auto;
+      scrollbar-width: none;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .settings-nav-list::-webkit-scrollbar {
+      display: none;
+    }
+
+    .settings-nav-item {
+      height: 36px;
+      padding: 0 var(--space-4);
+      border-radius: var(--radius-full);
+    }
+
+    .settings-nav-footer {
+      display: none;
+    }
+
+    .settings-main {
+      border: none;
+      border-radius: 0;
+    }
+
+    .main-header {
+      padding: 14px 16px;
+    }
+
     .scroll-content {
       padding: 16px !important;
       padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)) !important;
       gap: 24px !important;
     }
+
     .header-actions .locale-selector .locale-btn {
       padding: 4px 8px;
       font-size: 12px;
     }
-
   }
 
   @media (max-width: 480px) {

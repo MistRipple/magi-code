@@ -6,7 +6,8 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 const appSource = fs.readFileSync(path.resolve('src/App.svelte'), 'utf8');
 const statusSource = fs.readFileSync(path.resolve('src/components/DesktopUpdateStatus.svelte'), 'utf8');
 const settingsSource = fs.readFileSync(path.resolve('src/components/SettingsPanel.svelte'), 'utf8');
-const headerSource = fs.readFileSync(path.resolve('src/components/Header.svelte'), 'utf8');
+const footerSource = fs.readFileSync(path.resolve('src/components/SidebarFooter.svelte'), 'utf8');
+const projectTabSource = fs.readFileSync(path.resolve('src/components/SettingsProjectTab.svelte'), 'utf8');
 const updaterSource = fs.readFileSync(path.resolve('src/lib/desktop-updater.ts'), 'utf8');
 const updaterStoreSource = fs.readFileSync(path.resolve('src/stores/desktop-updater.svelte.ts'), 'utf8');
 const desktopMainSource = fs.readFileSync(path.resolve('../apps/desktop/src/main/update-manager.ts'), 'utf8');
@@ -22,26 +23,36 @@ assert.match(statusSource, /currentVersion/, 'desktop header must show the curre
 assert.match(statusSource, /startDesktopUpdater/, 'desktop header must own the single updater lifecycle');
 assert.match(statusSource, /downloadDesktopUpdate/, 'desktop header must expose download action');
 assert.match(statusSource, /restartWithDesktopUpdate/, 'desktop header must expose restart action');
-assert.match(headerSource, /DesktopUpdateStatus/, 'desktop header must mount the update status control');
-assert.doesNotMatch(statusSource, /header-update-popover|toggleOpen|role="dialog"/, 'desktop header update actions must not open a popup');
+assert.match(footerSource, /<DesktopUpdateStatus/, 'sidebar footer must mount the update status control');
+assert.match(
+  projectTabSource,
+  /^(?=[\s\S]*desktopUpdaterState)(?=[\s\S]*checkForDesktopUpdate)(?=[\s\S]*downloadDesktopUpdate)(?=[\s\S]*restartWithDesktopUpdate)(?=[\s\S]*retryDesktopUpdate)/,
+  'the project tab version details must project the shared updater state machine',
+);
+assert.doesNotMatch(
+  projectTabSource,
+  /startDesktopUpdater|checkDesktopUpdate\(|setInterval|setTimeout/,
+  'the project tab must not own an updater lifecycle or timers; the sidebar footer owns the single lifecycle',
+);
+assert.doesNotMatch(statusSource, /update-status-popover|toggleOpen|role="dialog"/, 'desktop header update actions must not open a popup');
 assert.match(
   statusSource,
-  /header-update-action--\$\{actionPresentation\.tone\}/,
+  /update-status-action--\$\{actionPresentation\.tone\}/,
   'each updater phase must use a dedicated action color',
 );
 assert.match(
   statusSource,
-  /<span class="header-update-action-slot">[\s\S]*<button[\s\S]*header-update-action[\s\S]*<\/button>[\s\S]*<span class="header-update-version">/,
+  /<span class="update-status-action-slot">[\s\S]*<button[\s\S]*update-status-action[\s\S]*<\/button>[\s\S]*<span class="update-status-version">/,
   '更新按钮必须固定在版本号之前，避免状态变化挤压后续顶部操作',
 );
 assert.match(
   statusSource,
-  /\.header-update-action-slot[\s\S]*?width: 32px[\s\S]*?flex: 0 0 32px/,
-  '顶部更新动作槽必须保持固定图标宽度，状态切换时版本号不得移动',
+  /class=\{`btn-icon btn-icon--md update-status-action /,
+  '更新动作必须复用统一的固定尺寸图标按钮，状态切换时版本号不得移动',
 );
 assert.doesNotMatch(
   statusSource,
-  /header-update-action--expanded|header-update-action-label|expanded:\s*(?:true|false)/,
+  /update-status-action--expanded|update-status-action-label|expanded:\s*(?:true|false)/,
   '顶部更新动作不得扩展为文字卡片',
 );
 assert.match(
@@ -61,12 +72,12 @@ assert.match(
 );
 assert.match(
   statusSource,
-  /name=\{actionPresentation\.icon\}[\s\S]*actionPresentation\.spinning[\s\S]*header-update-action-icon--spinning/,
+  /name=\{actionPresentation\.icon\}[\s\S]*actionPresentation\.spinning[\s\S]*update-status-action-icon--spinning/,
   '手动检查更新时必须直接旋转刷新图标，而不是只显示鼠标等待状态',
 );
 assert.match(
   statusSource,
-  /:global\(\.header-update-action-icon--spinning\)[\s\S]*header-update-action-spin/,
+  /:global\(\.update-status-action-icon--spinning\)[\s\S]*update-status-action-spin/,
   '检查更新中必须为刷新图标绑定稳定的旋转动画',
 );
 assert.match(
@@ -96,22 +107,22 @@ assert.match(
 );
 assert.match(
   statusSource,
-  /header-update-progress-ring[\s\S]*?header-update-progress-track[\s\S]*?header-update-progress-value/,
+  /update-status-progress-ring[\s\S]*?update-status-progress-track[\s\S]*?update-status-progress-value/,
   '下载过程必须使用轨道与进度弧线组成的真正环形进度条',
 );
 assert.match(
   statusSource,
-  /header-update-progress-value[\s\S]*?stroke-dasharray: 100[\s\S]*?stroke-dashoffset/,
+  /update-status-progress-value[\s\S]*?stroke-dasharray: 100[\s\S]*?stroke-dashoffset/,
   '可计算下载进度时必须通过环形弧线长度表达百分比',
 );
 assert.match(
   statusSource,
-  /header-update-progress-percent[\s\S]*?progress\.percent/,
+  /update-status-progress-percent[\s\S]*?progress\.percent/,
   '纯图标状态下仍必须在进度环中心展示下载百分比',
 );
 assert.doesNotMatch(
   statusSource,
-  /header-update-action--(?:available|downloading|ready|installing|error)[\s\S]*?background:\s*color-mix/,
+  /update-status-action--(?:available|downloading|ready|installing|error)[\s\S]*?background:\s*color-mix/,
   '更新状态不得使用常驻卡片背景包裹图标',
 );
 const progressMarkup = statusSource.match(
@@ -124,12 +135,12 @@ assert.doesNotMatch(
 );
 assert.match(
   statusSource,
-  /header-update-progress-ring--indeterminate[\s\S]*?header-update-progress-spin/,
+  /update-status-progress-ring--indeterminate[\s\S]*?update-status-progress-spin/,
   '只有无法计算百分比时才允许环形进度弧线自行旋转',
 );
 assert.doesNotMatch(
   statusSource,
-  /header-update-action-spinner-ring|header-update-action-spinner/,
+  /update-status-action-spinner-ring|update-status-action-spinner/,
   '更新按钮不得再维护独立加载环，避免图标状态与动画状态分离',
 );
 assert.doesNotMatch(

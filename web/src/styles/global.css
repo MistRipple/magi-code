@@ -654,6 +654,51 @@ pre code {
   cursor: not-allowed;
 }
 
+.btn-icon:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+
+/* 展开态 / 选中态：面板开关、弹出层触发器共用。 */
+.btn-icon--active {
+  background: var(--surface-active);
+  color: var(--foreground);
+}
+
+/* 需要叠加数量或状态点的图标按钮。 */
+.btn-icon--badged {
+  position: relative;
+}
+
+.btn-icon__badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: var(--radius-full);
+  background: var(--error);
+  color: var(--primary-foreground);
+  font-size: 9px;
+  font-weight: var(--font-bold);
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.btn-icon__dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--error);
+  box-shadow: 0 0 0 2px var(--magi-surface-sidebar, var(--background));
+  pointer-events: none;
+}
+
 .btn-icon--danger:hover {
   background: var(--error-muted) !important;
   color: var(--error) !important;

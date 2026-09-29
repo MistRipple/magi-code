@@ -18,6 +18,30 @@ const rightPaneSource = await readFile(
   new URL('../src/web/RightPane.svelte', import.meta.url),
   'utf8',
 );
+const shellUiSource = await readFile(
+  new URL('../src/stores/shell-ui.svelte.ts', import.meta.url),
+  'utf8',
+);
+const sidebarFooterSource = await readFile(
+  new URL('../src/components/SidebarFooter.svelte', import.meta.url),
+  'utf8',
+);
+const projectFileTreeSource = await readFile(
+  new URL('../src/web/ProjectFileTree.svelte', import.meta.url),
+  'utf8',
+);
+const globalStyleSource = await readFile(
+  new URL('../src/styles/global.css', import.meta.url),
+  'utf8',
+);
+const settingsPanelSource = await readFile(
+  new URL('../src/components/SettingsPanel.svelte', import.meta.url),
+  'utf8',
+);
+const settingsTabsSource = await readFile(
+  new URL('../src/lib/settings-tabs.ts', import.meta.url),
+  'utf8',
+);
 const topTabsSource = await readFile(
   new URL('../src/components/TopTabs.svelte', import.meta.url),
   'utf8',
@@ -74,8 +98,18 @@ assert.doesNotMatch(
 );
 assert.match(
   appSource,
-  /import\('\.\/components\/EditsPanel\.svelte'\)[\s\S]*?import\('\.\/components\/KnowledgePanel\.svelte'\)[\s\S]*?import\('\.\/components\/SettingsPanel\.svelte'\)/,
-  '变更、知识和设置面板必须按可见状态动态加载',
+  /import\('\.\/components\/EditsPanel\.svelte'\)[\s\S]*?import\('\.\/components\/KnowledgePanel\.svelte'\)/,
+  '变更和知识面板必须按可见状态动态加载',
+);
+assert.match(
+  workbenchShellSource,
+  /import\('\.\.\/components\/SettingsPanel\.svelte'\)/,
+  '设置页由外壳按打开状态动态加载',
+);
+assert.doesNotMatch(
+  workbenchShellSource,
+  /import\s+SettingsPanel\s+from/,
+  '设置页不得进入外壳的静态依赖图',
 );
 assert.doesNotMatch(
   workbenchShellSource,
@@ -316,10 +350,10 @@ assert.match(
   '非 Git 工作区不得渲染仓库管理区域，但仍必须保留变更中心本身',
 );
 
-assert.match(
+assert.doesNotMatch(
   headerSource,
-  /\.header-more-menu\s*\{[\s\S]*?background:\s*var\(--dropdown-bg\);/,
-  '顶部更多菜单必须使用不透明的下拉菜单背景，不能使用透明表面层',
+  /header-more|compactActions|header-notification|header-settings|DesktopUpdateStatus|newSession/,
+  '顶部栏只保留远程访问与右栏开关；通知、设置、更新、新建会话已归位到侧栏，不得再留第二个入口或溢出菜单',
 );
 assert.match(
   headerSource,
@@ -343,13 +377,187 @@ assert.doesNotMatch(
 );
 assert.match(
   headerSource,
-  /class="header-menu-item header-mobile-menu-item"[\s\S]*?setNotificationOpen\(true\)/,
-  '手机端更多菜单必须提供通知入口',
+  /header-sidebar-toggle[\s\S]*?sidebarUnavailable && unreadNotificationCount > 0[\s\S]*?btn-icon__dot/,
+  '侧栏不可见时，未读通知必须在侧栏开关上保留提示点',
 );
 assert.match(
-  headerSource,
-  /header-more-unread-dot/,
-  '手机端通知收起后必须在更多按钮保留未读提示',
+  workbenchShellSource,
+  /data-testid="sidebar-notifications"[\s\S]*?togglePopover\('notifications'\)/,
+  '通知入口必须在侧栏顶部，并通过统一的弹出层状态开关',
+);
+assert.match(
+  workbenchShellSource,
+  /<NotificationCenter[\s\S]*?anchor=\{notificationBellElement\}[\s\S]*?boundary=\{sidebarElement\}[\s\S]*?flyout=\{!sidebarIsDrawer\}/,
+  '通知面板必须挂在 Shell 顶层并以触发按钮与侧栏为定位依据，不能被侧栏滚动区裁剪',
+);
+assert.match(
+  notificationCenterSource,
+  /\.notification-panel\s*\{[\s\S]*?position:\s*fixed;/,
+  '通知面板必须使用 fixed 定位，避免受侧栏 overflow 与层叠上下文影响',
+);
+assert.match(
+  shellUiSource,
+  /export type ShellPopover = 'notifications' \| 'lan';[\s\S]*?installShellPopoverDismiss/,
+  '弹出面板必须共用同一份互斥状态与关闭规则',
+);
+assert.match(
+  workbenchShellSource,
+  /data-testid="sidebar-new-session"[\s\S]*?onclick=\{openNewSession\}/,
+  '新建会话入口必须位于侧栏顶部',
+);
+assert.match(
+  sidebarFooterSource,
+  /data-testid="sidebar-settings"[\s\S]*?data-testid="sidebar-theme-toggle"[\s\S]*?<DesktopUpdateStatus/,
+  '设置、主题切换与更新状态必须位于侧栏底部固定行',
+);
+assert.match(
+  workbenchShellSource,
+  /<SidebarFooter[\s\S]*?<\/div>\s*<\/aside>|<SidebarFooter[\s\S]*?sidebar-resize-handle/,
+  '侧栏底部固定行必须位于滚动区之外',
+);
+assert.match(
+  workbenchShellSource,
+  /async function refreshSidebar\(\)[\s\S]*?refreshWorkspaces\(\{ silent: true \}\)[\s\S]*?refreshPersonalSessions\(\)[\s\S]*?projectFileTreeHandle\?\.refresh\(\)/,
+  '侧栏唯一刷新必须同时刷新工作区、个人会话与文件树',
+);
+assert.doesNotMatch(
+  projectFileTreeSource,
+  /file-tree-heading|file-tree-tool|refreshRoot/,
+  '文件树不得保留自己的标题行与刷新按钮，刷新和隐藏文件开关由侧栏标题行统一提供',
+);
+assert.doesNotMatch(
+  `${workbenchShellSource}\n${headerSource}\n${sidebarFooterSource}`,
+  /sidebar-icon-btn|theme-toggle-btn|header-action-btn|workspace-new-session-btn|workspace-remove-btn|session-action-btn|session-rename-action/,
+  '图标按钮只能有 .btn-icon 一套实现，不得重新引入局部按钮样式',
+);
+assert.doesNotMatch(
+  settingsPanelSource,
+  /settings-overlay|magi-settings-layout|position:\s*fixed;[\s\S]{0,80}inset:\s*0;[\s\S]{0,120}rgba\(0, 0, 0, 0\.5\)/,
+  '设置是整页视图而不是弹窗：不得保留遮罩、固定尺寸窗口与入场缩放',
+);
+assert.match(
+  settingsPanelSource,
+  /\.settings-page\s*\{[\s\S]*?grid-column:\s*1 \/ -1;[\s\S]*?grid-row:\s*1;/,
+  '设置页与工作台同级：作为正常的网格子项占据整行（侧栏 + 中栏），不是叠加层',
+);
+assert.doesNotMatch(
+  settingsPanelSource,
+  /\.settings-page\s*\{[^}]*\n\s*(?:position:\s*(?:absolute|fixed)|z-index:)/,
+  '设置页不得靠绝对定位或 z-index 盖在工作台上',
+);
+assert.match(
+  settingsPanelSource,
+  /class:settings-page--away=\{!active\}[\s\S]*?inert=\{!active\}/,
+  '设置视图不显示时必须保活（display:none + inert），而不是卸载',
+);
+assert.match(
+  settingsPanelSource,
+  /\.settings-page--away\s*\{\s*display:\s*none;/,
+  '设置视图不显示时不得参与布局',
+);
+assert.match(
+  settingsPanelSource,
+  /refreshOnShow[\s\S]*?tick\(\)/,
+  '设置视图每次重新显示都要刷新只读数据并归位焦点',
+);
+assert.match(
+  workbenchShellSource,
+  /requestIdleCallback[\s\S]*?mountSettings\(\)/,
+  '设置视图必须在应用就绪后的空闲时预创建，而不是等到点击才渲染',
+);
+assert.match(
+  workbenchShellSource,
+  /\{#key messagesState\.currentWorkspaceId[\s\S]*?<SettingsPanelComponent active=\{shellUi\.settingsOpen\}/,
+  '保活的设置视图必须按工作区作用域重建，避免显示旧工作区的配置',
+);
+assert.match(
+  workbenchShellSource,
+  /\.workbench-content\.workbench-content--away\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?left:\s*-20000px;[\s\S]*?width:\s*var\(--away-width/,
+  '工作台被换下时主区域必须整体移出屏幕并保持真实尺寸（右栏 webview guest 需要真实布局尺寸）',
+);
+assert.match(
+  workbenchShellSource,
+  /\$effect\.pre\([\s\S]*?getBoundingClientRect\(\)[\s\S]*?workbenchAwaySize/,
+  '必须在 DOM 更新前测量主区域尺寸，切换后它已离开网格流',
+);
+assert.doesNotMatch(
+  settingsPanelSource,
+  /@keyframes settingsPageIn[\s\S]{0,120}transform/,
+  '设置页入场只能用 opacity，transform 会改写嵌套弹窗 fixed 定位的参照系',
+);
+assert.match(
+  settingsPanelSource,
+  /data-testid="settings-back"[\s\S]*?goBack[\s\S]*?settings\.back/,
+  '设置页必须提供返回入口，取代原来的关闭按钮',
+);
+assert.doesNotMatch(
+  settingsPanelSource,
+  /close-btn|settings\.closeSettings\}\)\}>\s*<Icon name="close"/,
+  '设置页头部不得保留关闭按钮，退出统一为返回',
+);
+assert.match(
+  settingsPanelSource,
+  /async function goBack[\s\S]*?await store\.closeSettings\(\)/,
+  '返回必须走 store.closeSettings，保证规则落盘、保存队列清空与未保存引擎清理',
+);
+assert.match(
+  settingsPanelSource,
+  /handleWindowKeydown[\s\S]*?closeAllModelDropdowns[\s\S]*?isTextEntry[\s\S]*?goBack/,
+  'Esc 返回必须先让给下拉列表与正在输入的控件',
+);
+assert.match(
+  settingsPanelSource,
+  /\{#each SETTINGS_TABS as tab/,
+  '设置导航必须由唯一的分类清单生成',
+);
+const projectTabSource = await readFile(
+  new URL('../src/components/SettingsProjectTab.svelte', import.meta.url),
+  'utf8',
+);
+assert.doesNotMatch(
+  projectTabSource,
+  /MagiIcon|MagiWordmark|<img/,
+  '项目页不再展示 Logo 图片',
+);
+assert.match(
+  projectTabSource,
+  /^(?=[\s\S]*data-testid="about-version")(?=[\s\S]*class="about-popover")(?=[\s\S]*onkeydown=\{handleVersionKeydown\})/,
+  '项目页必须提供可点击的版本号，详情以浮层展示，且 Esc 只关闭浮层',
+);
+assert.match(
+  projectTabSource,
+  /event\.key === 'Escape' && detailsOpen[\s\S]*?event\.stopPropagation\(\)/,
+  '版本浮层的 Esc 必须阻止冒泡，避免同时触发设置页“返回”',
+);
+assert.match(
+  workbenchShellSource,
+  /\{#key messagesState\.currentWorkspaceId/,
+  '保活的设置视图必须按工作区作用域重建',
+);
+assert.match(
+  settingsTabsSource,
+  /SETTINGS_TABS[\s\S]*'model'[\s\S]*'tools'[\s\S]*'browser'[\s\S]*'agents'[\s\S]*'rules'[\s\S]*'stats'[\s\S]*'appearance'[\s\S]*'project'/,
+  '设置分类清单必须覆盖全部八个分类',
+);
+assert.match(
+  workbenchShellSource,
+  /<SettingsPanelComponent active=\{shellUi\.settingsOpen\} onClose=\{closeSettings\}/,
+  '设置页必须由外壳层挂载，与侧栏、主区域同级',
+);
+assert.match(
+  workbenchShellSource,
+  /class="sidebar"[\s\S]*?inert=\{shellUi\.settingsOpen\}[\s\S]*?class="workbench-content"[\s\S]*?inert=\{shellUi\.settingsOpen\}/,
+  '被换下的侧栏与主区域必须不可交互，但不能卸载（草稿、滚动、流式输出、Browser 状态都要保留）',
+);
+assert.doesNotMatch(
+  appSource,
+  /SettingsPanel|settingsOpen/,
+  'App 不再持有设置层',
+);
+assert.match(
+  globalStyleSource,
+  /\.btn-icon--active[\s\S]*?\.btn-icon__badge[\s\S]*?\.btn-icon__dot/,
+  '统一图标按钮必须提供选中态、数量角标与状态点',
 );
 assert.match(
   headerSource,
@@ -378,7 +586,7 @@ assert.doesNotMatch(
 );
 assert.match(
   headerSource,
-  /class="btn-icon header-action-btn header-right-pane-btn"[\s\S]*?onclick=\{toggleRightPane\}/,
+  /class="btn-icon btn-icon--lg header-btn header-right-pane-btn"[\s\S]*?onclick=\{toggleRightPane\}/,
   '右栏开关必须作为 Header 右侧图标组的一员常驻渲染',
 );
 assert.doesNotMatch(
@@ -426,10 +634,10 @@ assert.doesNotMatch(
   /right-pane-collapse-btn/,
   '右栏内部不得保留第二套折叠按钮',
 );
-assert.match(
+assert.doesNotMatch(
   workbenchShellSource,
-  /(?:import MagiWordmark[\s\S]*?<MagiWordmark\s*\/>|import MagiIcon[\s\S]*?<div class="sidebar-brand" aria-label="Magi">[\s\S]*?<MagiIcon size=\{30\}\s*\/>[\s\S]*?<span class="sidebar-brand-name">Magi<\/span>)/,
-  '产品标识应保留在左侧面板顶部，不能因清理应用 Header 而一并删除',
+  /MagiIcon|MagiWordmark|sidebar-brand/,
+  '侧栏顶部不再展示产品标识，由“新会话”与通知入口占据顶部',
 );
 assert.match(
   settingsAgentsSource,

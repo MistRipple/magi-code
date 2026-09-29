@@ -18,9 +18,42 @@
   interface Props {
     open: boolean;
     onOpenChange: (open: boolean) => void;
+    /** 触发按钮：面板顶部与它所在行对齐。 */
+    anchor: HTMLElement | null;
+    /** 触发按钮所在的侧栏：面板贴着它的右缘飞出。 */
+    boundary: HTMLElement | null;
+    /** 侧栏常驻时飞出到内容区；侧栏是抽屉时右侧没有空间，改为全宽面板。 */
+    flyout: boolean;
   }
 
-  let { open, onOpenChange }: Props = $props();
+  let { open, onOpenChange, anchor, boundary, flyout }: Props = $props();
+
+  const VIEWPORT_MARGIN = 12;
+  const FLYOUT_GAP = 8;
+  const MAX_PANEL_HEIGHT = 560;
+  let panelStyle = $state('');
+
+  // 侧栏常驻：贴侧栏右缘、与触发行顶部对齐，向内容区飞出；
+  // 侧栏是抽屉：退化为触发行下方的全宽面板，不遮住触发行。
+  function updatePlacement(): void {
+    if (!anchor) return;
+    const anchorRect = anchor.getBoundingClientRect();
+    const boundaryRect = boundary?.getBoundingClientRect();
+    if (flyout && boundaryRect) {
+      const top = Math.max(VIEWPORT_MARGIN, anchorRect.top);
+      panelStyle = `left:${boundaryRect.right + FLYOUT_GAP}px;top:${top}px;max-height:${Math.min(MAX_PANEL_HEIGHT, window.innerHeight - top - VIEWPORT_MARGIN)}px;`;
+      return;
+    }
+    const top = anchorRect.bottom + FLYOUT_GAP;
+    panelStyle = `left:${VIEWPORT_MARGIN}px;right:${VIEWPORT_MARGIN}px;width:auto;top:${top}px;max-height:${Math.min(MAX_PANEL_HEIGHT, window.innerHeight - top - VIEWPORT_MARGIN)}px;`;
+  }
+
+  $effect(() => {
+    if (!open) return;
+    updatePlacement();
+    window.addEventListener('resize', updatePlacement);
+    return () => window.removeEventListener('resize', updatePlacement);
+  });
   let activeFilter = $state<'all' | 'unresolved' | 'resolved'>('all');
   let wasOpen = $state(false);
   let expandedNotificationIds = $state<Set<string>>(new Set());
@@ -165,7 +198,12 @@
 
 <div class="notification-center">
   {#if open}
-    <div class="notification-panel" data-magi-surface="popover">
+    <div
+      class="notification-panel"
+      data-magi-surface="popover"
+      data-shell-popover="notifications"
+      style={panelStyle}
+    >
       <div class="panel-header">
         <span class="panel-title">{i18n.t('notification.title')}</span>
         <div class="panel-actions">
@@ -317,17 +355,14 @@
   }
 
   .notification-panel {
-    position: absolute;
-    top: 100%;
-    right: 0;
-    margin-top: var(--space-2, 4px);
-    width: min(480px, calc(100vw - 24px));
-    max-height: min(420px, calc(100vh - 72px));
+    position: fixed;
+    width: min(440px, calc(100vw - 24px));
+    max-height: min(560px, calc(100vh - 24px));
     background: var(--dropdown-bg);
     border: 1px solid var(--border);
     border-radius: var(--radius-md, 6px);
     box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,0.3));
-    z-index: var(--z-dropdown, 100);
+    z-index: var(--z-popover);
     overflow: hidden;
     display: flex;
     flex-direction: column;

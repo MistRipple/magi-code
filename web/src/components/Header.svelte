@@ -1,15 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getState, getUnreadNotificationCount, messagesState } from '../stores/messages.svelte';
-  import { showFeedback } from '../lib/notifications';
-  import { ensureArray } from '../lib/utils';
+  import { getUnreadNotificationCount } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
-  import NotificationCenter from './NotificationCenter.svelte';
   import LanAccessPanel from './LanAccessPanel.svelte';
-  import DesktopUpdateStatus from './DesktopUpdateStatus.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getWebSidebarContext } from '../web/sidebar-context';
-  import { navigateSession } from '../shared/session-navigation.svelte';
+  import { closePopover, shellUi, togglePopover } from '../stores/shell-ui.svelte';
   import {
     rightPaneState,
     getRightPaneState,
@@ -18,12 +14,10 @@
 
   import type { Snippet } from 'svelte';
   interface Props {
-    onOpenSettings?: () => void;
     children?: Snippet;
   }
 
-  let { onOpenSettings, children }: Props = $props();
-  const appState = getState();
+  let { children }: Props = $props();
   // Web 外壳通过 context 统一处理布局；无 context 时仍可直接切换 store 中的面板状态。
   const webSidebar = getWebSidebarContext();
   const currentRightPane = $derived(getRightPaneState(rightPaneState.activeScopeKey));
@@ -36,136 +30,17 @@
       : currentRightPane.collapsed,
   );
 
-  type HeaderPanel = 'notifications' | 'more' | 'lan';
-  let activeHeaderPanel = $state<HeaderPanel | null>(null);
-
-  let headerBar: HTMLElement | null = $state(null);
-  let headerCenter: HTMLElement | null = $state(null);
-  let headerActions: HTMLElement | null = $state(null);
-  let sidebarToggle: HTMLButtonElement | null = $state(null);
-  let compactActions = $state(false);
-  let fullActionsWidth = 0;
-  let compactActionsWidthReduction = 0;
-  let headerLayoutFrame = 0;
-
-  const HEADER_COMPACT_RESTORE_HYSTERESIS_PX = 24;
-
-  function cssPixels(value: string): number {
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-
-  function isViewportNarrow(): boolean {
-    return typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches;
-  }
-
-  function scheduleHeaderLayoutMeasurement() {
-    if (headerLayoutFrame || typeof requestAnimationFrame === 'undefined') return;
-    headerLayoutFrame = requestAnimationFrame(() => {
-      headerLayoutFrame = 0;
-      measureHeaderLayout();
-    });
-  }
-
-  function measureHeaderLayout() {
-    const viewportNarrow = isViewportNarrow();
-    if (!headerBar || !headerCenter || !headerActions || viewportNarrow) {
-      if (viewportNarrow && compactActions) {
-        compactActions = false;
-        compactActionsWidthReduction = 0;
-      }
-      return;
-    }
-
-    const headerStyle = getComputedStyle(headerBar);
-    const contentWidth = Math.max(
-      0,
-      headerBar.clientWidth
-        - cssPixels(headerStyle.paddingLeft)
-        - cssPixels(headerStyle.paddingRight),
-    );
-    const sidebarStyle = sidebarToggle ? getComputedStyle(sidebarToggle) : null;
-    const sidebarWidth = sidebarToggle
-      ? sidebarToggle.getBoundingClientRect().width + cssPixels(sidebarStyle?.marginRight ?? '0')
-      : 0;
-    const centerContent = headerCenter.firstElementChild;
-    const centerWidth = centerContent instanceof HTMLElement ? centerContent.scrollWidth : 0;
-    const actionsWidth = headerActions.scrollWidth;
-
-    if (!compactActions) {
-      fullActionsWidth = actionsWidth;
-      compactActionsWidthReduction = 0;
-    } else if (compactActionsWidthReduction === 0 && fullActionsWidth > actionsWidth) {
-      compactActionsWidthReduction = fullActionsWidth - actionsWidth;
-    }
-
-    const measuredFullActionsWidth = compactActions
-      ? actionsWidth + compactActionsWidthReduction
-      : (fullActionsWidth || actionsWidth);
-    const requiredFullWidth = sidebarWidth + centerWidth + measuredFullActionsWidth;
-    const shouldCompact = requiredFullWidth > contentWidth + 1;
-
-    if (shouldCompact && !compactActions) {
-      fullActionsWidth = actionsWidth;
-      compactActions = true;
-      return;
-    }
-
-    if (compactActions) {
-      const restoreWidth = requiredFullWidth + HEADER_COMPACT_RESTORE_HYSTERESIS_PX;
-      if (contentWidth >= restoreWidth) {
-        compactActions = false;
-      }
-    }
-  }
-
-  // 只有“已有当前会话且该会话为空”时才禁止重复新建；草稿态不要求先绑定工作区。
-  const hasCurrentSession = $derived.by(() => Boolean(messagesState.currentSessionId?.trim()));
+  const sidebarUnavailable = $derived(
+    Boolean(webSidebar && (webSidebar.hidden || (webSidebar.isDrawer && !webSidebar.drawerOpen))),
+  );
+  // 通知入口在侧栏内；侧栏不可见时，未读提示必须仍能在侧栏开关上被看到。
   const unreadNotificationCount = $derived.by(() => getUnreadNotificationCount());
-  const isCurrentSessionEmpty = $derived(
-    ensureArray(appState.threadMessages).length === 0
+  const sidebarToggleTitle = $derived(
+    i18n.t(sidebarUnavailable ? 'web.expandSidebar' : 'web.collapseSidebar'),
   );
-  const newSessionDisabled = $derived(
-    messagesState.sessionHydrating
-      || (hasCurrentSession && isCurrentSessionEmpty)
-  );
-  const newSessionTitle = $derived(
-    hasCurrentSession && isCurrentSessionEmpty
-      ? i18n.t('header.currentSessionEmpty')
-      : i18n.t('header.newSession')
-  );
-
-  // 新建会话
-  function newSession() {
-    showFeedback('info', '正在打开新会话面板...', {
-      source: 'session-management',
-      duration: 1800,
-    });
-    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
-    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
-    if (!workspaceId || !workspacePath) {
-      navigateSession({ kind: 'draft', scope: 'personal' });
-      return;
-    }
-    navigateSession({ kind: 'draft', scope: 'workspace', workspaceId, workspacePath });
-  }
-
-  // 打开设置
-  function openSettings() {
-    activeHeaderPanel = null;
-    onOpenSettings?.();
-  }
-
-  function openRemoteAccess() {
-    activeHeaderPanel = 'lan';
-  }
-
-  function setNotificationOpen(open: boolean) {
-    activeHeaderPanel = open ? 'notifications' : null;
-  }
 
   function toggleRightPane() {
-    activeHeaderPanel = null;
+    closePopover();
     if (webSidebar) {
       webSidebar.toggleRightPane();
       return;
@@ -174,91 +49,56 @@
   }
 
   onMount(() => {
-    const closeHeaderPanel = (event: PointerEvent) => {
-      const target = event.target instanceof Element ? event.target : null;
-      if (!target?.closest('.header-actions')) {
-        activeHeaderPanel = null;
-      }
-    };
-    const closeHeaderPanelOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        activeHeaderPanel = null;
-      }
-    };
-    window.addEventListener('pointerdown', closeHeaderPanel);
-    window.addEventListener('keydown', closeHeaderPanelOnEscape);
-
     const desktop = window.magiDesktop?.surface === 'app' ? window.magiDesktop : undefined;
     const applyDesktopSnapshot = (snapshot: MagiDesktopWindowSnapshot) => {
       desktopRightPaneVisible = snapshot.layout.rightPaneVisible;
     };
     void desktop?.getSnapshot().then(applyDesktopSnapshot).catch(() => undefined);
     const stopDesktopSnapshot = desktop?.onSnapshot(applyDesktopSnapshot);
-
-    scheduleHeaderLayoutMeasurement();
-
-    let resizeObserver: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== 'undefined') {
-      resizeObserver = new ResizeObserver(() => scheduleHeaderLayoutMeasurement());
-      if (headerBar) resizeObserver.observe(headerBar);
-      if (headerCenter) resizeObserver.observe(headerCenter);
-      if (headerCenter?.firstElementChild) resizeObserver.observe(headerCenter.firstElementChild);
-      if (headerActions) resizeObserver.observe(headerActions);
-      if (sidebarToggle) resizeObserver.observe(sidebarToggle);
-    }
-
-    return () => {
-      window.removeEventListener('pointerdown', closeHeaderPanel);
-      window.removeEventListener('keydown', closeHeaderPanelOnEscape);
-      stopDesktopSnapshot?.();
-      resizeObserver?.disconnect();
-      if (headerLayoutFrame) {
-        cancelAnimationFrame(headerLayoutFrame);
-        headerLayoutFrame = 0;
-      }
-    };
+    return () => stopDesktopSnapshot?.();
   });
-
 </script>
 
-<header class="header-bar" class:header-bar--compact={compactActions} bind:this={headerBar}>
+<header class="header-bar">
   {#if webSidebar}
     <button
       type="button"
-      class="header-sidebar-toggle"
-      bind:this={sidebarToggle}
-      aria-label={i18n.t(webSidebar.hidden || (webSidebar.isDrawer && !webSidebar.drawerOpen) ? 'web.expandSidebar' : 'web.collapseSidebar')}
-      title={i18n.t(webSidebar.hidden || (webSidebar.isDrawer && !webSidebar.drawerOpen) ? 'web.expandSidebar' : 'web.collapseSidebar')}
+      class="btn-icon btn-icon--lg btn-icon--badged header-btn header-sidebar-toggle"
+      aria-label={sidebarToggleTitle}
+      title={sidebarToggleTitle}
       onclick={() => webSidebar.toggle()}
     >
       <Icon name="sidebar-toggle" size={14} />
+      {#if sidebarUnavailable && unreadNotificationCount > 0}
+        <span class="btn-icon__dot" aria-hidden="true"></span>
+      {/if}
     </button>
   {/if}
-  <div class="header-center" bind:this={headerCenter}>
+  <div class="header-center">
     {@render children?.()}
   </div>
 
-  <!-- 右侧操作按钮 -->
-  <div class="header-actions" bind:this={headerActions}>
-    <DesktopUpdateStatus />
-    <button class="btn-icon header-action-btn" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
-      <Icon name="plus" size={14} />
-    </button>
+  <div class="header-actions">
+    <div class="header-popover-anchor" data-shell-popover="lan">
+      <button
+        type="button"
+        class="btn-icon btn-icon--lg header-btn"
+        class:btn-icon--active={shellUi.popover === 'lan'}
+        onclick={() => togglePopover('lan')}
+        title={i18n.t('lanAccess.title')}
+        aria-label={i18n.t('lanAccess.title')}
+        aria-expanded={shellUi.popover === 'lan'}
+      >
+        <Icon name="qrcode" size={14} />
+      </button>
+      <LanAccessPanel
+        visible={shellUi.popover === 'lan'}
+        onClose={() => closePopover('lan')}
+      />
+    </div>
     <button
-      class="btn-icon header-action-btn header-notification-btn"
-      class:active={activeHeaderPanel === 'notifications'}
-      onclick={() => setNotificationOpen(activeHeaderPanel !== 'notifications')}
-      title={i18n.t('notification.buttonTitle')}
-      aria-label={i18n.t('notification.buttonTitle')}
-      aria-expanded={activeHeaderPanel === 'notifications'}
-    >
-      <Icon name="bell" size={14} />
-      {#if unreadNotificationCount > 0}
-        <span class="header-action-badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
-      {/if}
-    </button>
-    <button
-      class="btn-icon header-action-btn header-right-pane-btn"
+      type="button"
+      class="btn-icon btn-icon--lg header-btn header-right-pane-btn"
       onclick={toggleRightPane}
       title={i18n.t(rightPaneCollapsed ? 'rightPane.expand' : 'rightPane.collapse')}
       aria-label={i18n.t(rightPaneCollapsed ? 'rightPane.expand' : 'rightPane.collapse')}
@@ -266,73 +106,6 @@
     >
       <Icon name="sidebar-toggle" size={14} class="right-pane-toggle-icon" />
     </button>
-    <div class="header-remote-wrapper">
-      <button
-        class="btn-icon header-action-btn header-remote-btn"
-        class:active={activeHeaderPanel === 'lan'}
-        onclick={openRemoteAccess}
-        title={i18n.t('lanAccess.title')}
-        aria-label={i18n.t('lanAccess.title')}
-        aria-expanded={activeHeaderPanel === 'lan'}
-      >
-        <Icon name="qrcode" size={14} />
-      </button>
-      <LanAccessPanel
-        visible={activeHeaderPanel === 'lan'}
-        onClose={() => { activeHeaderPanel = null; }}
-      />
-    </div>
-    <button
-      class="btn-icon header-action-btn header-settings-btn"
-      onclick={openSettings}
-      title={i18n.t('header.settings')}
-      aria-label={i18n.t('header.settings')}
-    >
-      <Icon name="settings" size={14} />
-    </button>
-    <div class="header-more-wrapper">
-      <button
-        class="btn-icon header-action-btn"
-        class:active={activeHeaderPanel === 'more' || activeHeaderPanel === 'lan'}
-        class:header-mobile-active={activeHeaderPanel === 'notifications'}
-        onclick={(event) => {
-          event.stopPropagation();
-          activeHeaderPanel = activeHeaderPanel === 'more' ? null : 'more';
-        }}
-        title={i18n.t('header.more')}
-        aria-label={i18n.t('header.more')}
-        aria-expanded={activeHeaderPanel === 'more'}
-      >
-        <Icon name="more-horizontal" size={14} />
-        {#if unreadNotificationCount > 0}
-          <span class="header-more-unread-dot" aria-hidden="true"></span>
-        {/if}
-      </button>
-      {#if activeHeaderPanel === 'more'}
-        <div class="header-more-menu" data-magi-surface="popover">
-          <div class="header-menu-section-label">{i18n.t('header.more')}</div>
-          <button class="header-menu-item header-mobile-menu-item" type="button" onclick={() => setNotificationOpen(true)}>
-            <Icon name="bell" size={14} />
-            <span>{i18n.t('notification.title')}</span>
-            {#if unreadNotificationCount > 0}
-              <span class="header-menu-badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
-            {/if}
-          </button>
-          <button class="header-menu-item" type="button" onclick={openRemoteAccess}>
-            <Icon name="qrcode" size={14} />
-            <span>{i18n.t('lanAccess.title')}</span>
-          </button>
-          <button class="header-menu-item" type="button" onclick={openSettings}>
-            <Icon name="settings" size={14} />
-            <span>{i18n.t('header.settings')}</span>
-          </button>
-        </div>
-      {/if}
-    </div>
-    <NotificationCenter
-      open={activeHeaderPanel === 'notifications'}
-      onOpenChange={setNotificationOpen}
-    />
   </div>
 </header>
 
@@ -366,28 +139,16 @@
     flex: 1;
     min-width: 0;
     justify-content: center;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .header-center::-webkit-scrollbar {
+    display: none;
   }
 
   .header-sidebar-toggle {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 32px;
     margin-right: 6px;
-    padding: 0;
-    border: 1px solid transparent;
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    flex-shrink: 0;
-    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
-  }
-  .header-sidebar-toggle:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-    border-color: var(--border);
   }
 
   .header-actions {
@@ -399,152 +160,16 @@
     position: relative;
   }
 
-  .header-more-wrapper {
+  .header-popover-anchor {
     position: relative;
     display: inline-flex;
-  }
-
-  .header-remote-wrapper {
-    position: relative;
-    display: inline-flex;
-  }
-
-  .header-action-btn {
-    position: relative;
-    width: 32px;
-    height: 32px;
-    flex: 0 0 32px;
-  }
-
-  .header-action-btn.active {
-    background: var(--surface-active);
-    color: var(--foreground);
   }
 
   :global(.right-pane-toggle-icon) {
     transform: scaleX(-1);
   }
 
-  .header-action-badge {
-    position: absolute;
-    top: -2px;
-    right: -2px;
-    min-width: 14px;
-    height: 14px;
-    padding: 0 3px;
-    border-radius: var(--radius-full);
-    background: var(--error);
-    color: var(--primary-foreground);
-    font-size: 9px;
-    font-weight: var(--font-bold);
-    line-height: 14px;
-    text-align: center;
-    pointer-events: none;
-  }
-
-  .header-more-unread-dot {
-    display: none;
-    position: absolute;
-    top: 5px;
-    right: 5px;
-    width: 6px;
-    height: 6px;
-    border-radius: var(--radius-full);
-    background: var(--error);
-    box-shadow: 0 0 0 2px var(--glass-bg);
-  }
-
-  .header-more-menu {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    z-index: var(--z-popover);
-    width: 196px;
-    padding: 6px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--dropdown-bg);
-    box-shadow: var(--shadow-lg);
-  }
-
-  .header-more-menu button {
-    width: 100%;
-    height: 34px;
-    padding: 0 9px;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    cursor: pointer;
-  }
-
-  .header-menu-section-label {
-    padding: 5px 9px 6px;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    line-height: 16px;
-  }
-
-  .header-menu-item {
-    flex: 0 0 34px;
-  }
-
-  .header-more-menu button:hover {
-    background: var(--surface-hover);
-  }
-
-  .header-more-menu .header-mobile-menu-item {
-    display: none;
-  }
-
-  /* 中间工作区变窄时，按真实可用宽度收起低频入口。 */
-  .header-bar--compact .header-notification-btn,
-  .header-bar--compact .header-remote-btn,
-  .header-bar--compact .header-settings-btn {
-    display: none;
-  }
-
-  .header-bar--compact .header-more-wrapper {
-    display: inline-flex;
-  }
-
-  .header-bar--compact .header-more-unread-dot {
-    display: block;
-  }
-
-  .header-bar--compact .header-more-menu .header-mobile-menu-item {
-    display: flex;
-  }
-
-  .header-bar--compact .header-center {
-    overflow-x: auto;
-    scrollbar-width: none;
-    -webkit-overflow-scrolling: touch;
-  }
-
-  .header-bar--compact .header-center::-webkit-scrollbar {
-    display: none;
-  }
-
-  .header-menu-badge {
-    min-width: 18px;
-    height: 18px;
-    margin-left: auto;
-    padding: 0 5px;
-    border-radius: var(--radius-full);
-    background: var(--error);
-    color: var(--primary-foreground);
-    font-size: 10px;
-    line-height: 18px;
-    text-align: center;
-  }
-
-  /* 移动端：低频入口收进更多菜单，顶部保持单行三段式。 */
+  /* 移动端：顶部保持单行三段式，触控目标放大。 */
   @media (max-width: 768px) {
     .header-bar {
       display: grid;
@@ -565,11 +190,9 @@
       justify-self: end;
     }
 
-    .header-sidebar-toggle,
-    .header-action-btn {
+    .header-btn {
       width: 38px;
       height: 38px;
-      flex-basis: 38px;
     }
 
     .header-center {
@@ -581,42 +204,8 @@
       scrollbar-width: none;
     }
 
-    .header-center::-webkit-scrollbar {
-      display: none;
-    }
-
-    .header-notification-btn {
-      display: none;
-    }
-
-    .header-remote-btn,
-    .header-settings-btn {
-      display: none;
-    }
-
-    .header-remote-wrapper {
+    .header-popover-anchor {
       position: static;
     }
-
-    .header-more-unread-dot {
-      display: block;
-    }
-
-    .header-action-btn.header-mobile-active {
-      background: var(--surface-active);
-      color: var(--foreground);
-    }
-
-    .header-more-menu .header-mobile-menu-item {
-      display: flex;
-    }
   }
-
-  @media (min-width: 769px) {
-    .header-more-wrapper {
-      display: none;
-    }
-  }
-
-  /* 使用全局 .btn-icon 样式，这里只覆盖必要的 */
 </style>
