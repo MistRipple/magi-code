@@ -219,6 +219,76 @@ fn terminal_item_status_for_canonical_turn_status(
     }
 }
 
+/// 两条消息是否占据 projection 里的同一个“槽位”。
+///
+/// 同一个槽位的消息随 canonical item 演进而变化：assistant 文本在流式期间逐步变长、
+/// 工具调用的“结果未知”占位在结果落盘后被真实结果替换。因此不能用全等比较：
+/// - tool 消息按 `tool_call_id` 对应；
+/// - 带 tool_calls 的 assistant 消息按调用 id 序列对应；
+/// - 其余消息角色相同，且一方的正文是另一方的前缀（流式增长）。
+fn same_thread_message_slot(left: &ThreadChatMessage, right: &ThreadChatMessage) -> bool {
+    if left.role != right.role {
+        return false;
+    }
+    if left.role == "tool" {
+        return left.tool_call_id == right.tool_call_id;
+    }
+    if !left.tool_calls.is_empty() || !right.tool_calls.is_empty() {
+        return left.tool_calls.len() == right.tool_calls.len()
+            && left
+                .tool_calls
+                .iter()
+                .zip(&right.tool_calls)
+                .all(|(a, b)| a.id == b.id);
+    }
+    let left_text = left.content.as_deref().unwrap_or_default();
+    let right_text = right.content.as_deref().unwrap_or_default();
+    left_text.starts_with(right_text) || right_text.starts_with(left_text)
+}
+
+/// 把 canonical projection 合并进 thread 已有历史，结果对同一 projection 幂等。
+///
+/// 已有历史 = [没有 canonical 对应物的前缀] + [projection 较早版本的有序子序列，中间可能夹着
+/// 恢复流程插入的消息]。命中的消息换成 projection 的最新版本，未命中的保持原位，projection
+/// 中尚未出现的尾部追加在最后。
+pub(super) fn merge_thread_history_with_projection(
+    existing: &[ThreadChatMessage],
+    projected: Vec<ThreadChatMessage>,
+) -> Vec<ThreadChatMessage> {
+    let Some(first) = projected.first() else {
+        return existing.to_vec();
+    };
+    // projection 的起点可能出现在已有历史的多个位置；取能对齐最多消息的那个。
+    let mut best_start = existing.len();
+    let mut best_matched = 0usize;
+    for (start, message) in existing.iter().enumerate() {
+        if !same_thread_message_slot(message, first) {
+            continue;
+        }
+        let mut matched = 0usize;
+        for candidate in &existing[start..] {
+            if matched < projected.len() && same_thread_message_slot(candidate, &projected[matched])
+            {
+                matched += 1;
+            }
+        }
+        if matched > best_matched {
+            best_matched = matched;
+            best_start = start;
+        }
+    }
+    let mut merged = existing.to_vec();
+    let mut next = 0usize;
+    for message in &mut merged[best_start..] {
+        if next < projected.len() && same_thread_message_slot(message, &projected[next]) {
+            *message = projected[next].clone();
+            next += 1;
+        }
+    }
+    merged.extend(projected.into_iter().skip(next));
+    merged
+}
+
 fn canonical_current_turn_item_kind(kind: &str) -> DomainResult<CanonicalTurnItemKind> {
     match kind {
         "user_message" => Ok(CanonicalTurnItemKind::UserMessage),
@@ -2834,39 +2904,10 @@ impl SessionStore {
         if projected.is_empty() {
             return Ok(0);
         }
-        // 迁移中的旧 thread 可能已经有一段没有 canonical 对应物的历史。保留
-        // 这段历史作为 prefix，并在 canonical projection 尚未成为 suffix 时追加
-        // 新事实；重复重建会命中 prefix/suffix 判断，不会不断复制消息。
-        let projected = if thread.message_history == projected
-            || projected.starts_with(&thread.message_history)
-        {
-            projected
-        } else if thread.message_history.ends_with(&projected) {
-            thread.message_history.clone()
-        } else {
-            let existing = &thread.message_history;
-            // canonical tool call 在工具执行前会先投影一个“结果未知”的 marker；
-            // 结果落盘后必须替换该 marker，而不是把同一个 call 再追加一遍。
-            let interrupted_marker_index = existing.iter().position(|message| {
-                message.content.as_deref().is_some_and(|content| {
-                    content.contains("canonical_projection_missing_tool_result")
-                })
-            });
-            if let Some(marker_index) = interrupted_marker_index {
-                let assistant_index = marker_index.saturating_sub(1);
-                let mut merged = existing[..assistant_index].to_vec();
-                merged.extend(projected);
-                merged
-            } else {
-                let overlap = (1..=existing.len().min(projected.len()))
-                    .rev()
-                    .find(|overlap| existing[existing.len() - overlap..] == projected[..*overlap])
-                    .unwrap_or(0);
-                let mut merged = existing.clone();
-                merged.extend(projected.into_iter().skip(overlap));
-                merged
-            }
-        };
+        // 迁移中的旧 thread 可能已经有一段没有 canonical 对应物的历史，恢复流程也可能在
+        // 历史里插入 canonical 没有的消息。合并必须幂等：同一份 projection 无论重建多少
+        // 次，历史都不能再增长（流式输出期间每个 token 都会触发一次重建）。
+        let projected = merge_thread_history_with_projection(&thread.message_history, projected);
         let target = state
             .thread_registry
             .iter_mut()

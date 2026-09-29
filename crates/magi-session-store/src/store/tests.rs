@@ -6157,3 +6157,150 @@ fn thread_registry_retires_on_session_retirement() {
             .all(|thread| thread.status == ExecutionThreadStatus::Retired)
     );
 }
+
+#[test]
+fn rebuilding_thread_projection_while_assistant_text_streams_does_not_duplicate_history() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-thread-stream-rebuild");
+    store
+        .create_session(session_id.clone(), "Thread Stream Rebuild")
+        .expect("session should be creatable");
+    let (_mission_id, thread_id) =
+        store.ensure_session_mission(&session_id, UtcMillis(1), || {
+            MissionId::new("mission-thread-stream-rebuild")
+        });
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-thread-stream-rebuild", "running", 10),
+    );
+    let mut user = test_turn_item("user-thread-stream", "分析当前项目");
+    user.item_seq = 1;
+    user.source_thread_id = thread_id.clone();
+    store
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-thread-stream-rebuild"), user)
+        .expect("user item should upsert");
+
+    let full_text = "我先建立项目结构图，再抽样读取关键文件验证架构。";
+    let chars = full_text.chars().collect::<Vec<_>>();
+    let mut lengths = Vec::new();
+    for step in 1..=chars.len() {
+        let mut assistant = test_turn_item("assistant-thread-stream", "");
+        assistant.kind = "assistant_stream".to_string();
+        assistant.source = "assistant".to_string();
+        assistant.status = "running".to_string();
+        assistant.item_seq = 2;
+        assistant.content = Some(chars[..step].iter().collect());
+        assistant.source_thread_id = thread_id.clone();
+        store
+            .upsert_current_turn_item_for_turn(
+                &session_id,
+                Some("turn-thread-stream-rebuild"),
+                assistant,
+            )
+            .expect("assistant item should upsert");
+        store
+            .rebuild_thread_message_projection(&thread_id, UtcMillis(100 + step as u64))
+            .expect("projection should rebuild");
+        lengths.push(store.thread_message_history(&thread_id).len());
+    }
+
+    let history = store.thread_message_history(&thread_id);
+    assert_eq!(
+        lengths.iter().copied().max(),
+        Some(2),
+        "流式输出期间反复重建，历史长度必须稳定在 user + assistant: {lengths:?}"
+    );
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].content.as_deref(), Some(full_text));
+}
+
+fn thread_message(role: &str, content: &str) -> ThreadChatMessage {
+    ThreadChatMessage {
+        role: role.to_string(),
+        content: Some(content.to_string()),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        provider_context: Vec::new(),
+    }
+}
+
+fn thread_tool_call(call_id: &str) -> ThreadChatMessage {
+    ThreadChatMessage {
+        role: "assistant".to_string(),
+        content: None,
+        images: Vec::new(),
+        tool_calls: vec![ThreadChatToolCall {
+            id: call_id.to_string(),
+            kind: "function".to_string(),
+            function: ThreadChatToolFunction {
+                name: "file_read".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }],
+        tool_call_id: None,
+        provider_context: Vec::new(),
+    }
+}
+
+fn thread_tool_result(call_id: &str, content: &str) -> ThreadChatMessage {
+    ThreadChatMessage {
+        role: "tool".to_string(),
+        content: Some(content.to_string()),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: Some(call_id.to_string()),
+        provider_context: Vec::new(),
+    }
+}
+
+#[test]
+fn thread_history_merge_is_idempotent_and_keeps_non_canonical_messages() {
+    use super::sidecar::merge_thread_history_with_projection as merge;
+
+    let projection = vec![
+        thread_message("user", "分析项目"),
+        thread_tool_call("call-1"),
+        thread_tool_result("call-1", "结果一"),
+        thread_message("assistant", "完成"),
+    ];
+
+    // 没有 canonical 对应物的前缀保留在最前面，重复合并不再增长。
+    let legacy = vec![thread_message("user", "旧迁移消息")];
+    let once = merge(&legacy, projection.clone());
+    assert_eq!(once.len(), 1 + projection.len());
+    assert_eq!(once[0], legacy[0]);
+    assert_eq!(merge(&once, projection.clone()), once);
+
+    // 工具结果尚未落盘时的占位，在真实结果到达后被替换而不是追加。
+    let pending = vec![
+        thread_message("user", "分析项目"),
+        thread_tool_call("call-1"),
+        thread_tool_result("call-1", "canonical_projection_missing_tool_result"),
+    ];
+    let resolved = merge(&pending, projection.clone());
+    assert_eq!(resolved, projection);
+
+    // 流式输出：assistant 文本变长时原地更新。
+    let streaming = vec![thread_message("user", "分析项目"), thread_message("assistant", "完")];
+    assert_eq!(merge(&streaming, projection[..1].to_vec()).len(), 2);
+    let grown = vec![thread_message("user", "分析项目"), thread_message("assistant", "完成了")];
+    let merged = merge(&streaming, grown.clone());
+    assert_eq!(merged, grown);
+
+    // 恢复流程在历史中间插入的消息保持原位，且反复合并不再复制后续内容。
+    let with_inserted = vec![
+        thread_message("user", "分析项目"),
+        thread_tool_call("call-1"),
+        thread_message("system", "恢复流程插入"),
+        thread_tool_result("call-1", "结果一"),
+    ];
+    let first = merge(&with_inserted, projection.clone());
+    assert_eq!(first.len(), projection.len() + 1);
+    assert!(first.iter().any(|message| message.role == "system"));
+    assert_eq!(merge(&first, projection.clone()), first);
+
+    // 空 projection 不改动已有历史。
+    assert_eq!(merge(&legacy, Vec::new()), legacy);
+}
