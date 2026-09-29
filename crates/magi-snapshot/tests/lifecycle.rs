@@ -935,3 +935,59 @@ async fn revert_preflight_rejects_unrestorable_batch_without_partial_writes() {
         "revert must preflight the whole batch before touching any file"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_projection_reuses_diff_and_refreshes_when_content_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let session = mgr
+        .start_session("s-diff-cache".into(), root.clone())
+        .await
+        .unwrap();
+
+    fs::write(root.join("a.txt"), "one\nTWO\n").unwrap();
+    session.reconcile().unwrap();
+    let first = session.pending_changes().unwrap();
+    let again = session.pending_changes().unwrap();
+    assert_eq!(first[0].unified_diff, again[0].unified_diff);
+    assert!(first[0].unified_diff.as_deref().unwrap().contains("+TWO"));
+
+    fs::write(root.join("a.txt"), "one\nTHREE\n").unwrap();
+    session.reconcile().unwrap();
+    let changed = session.pending_changes().unwrap();
+    let diff = changed[0].unified_diff.as_deref().unwrap();
+    assert!(diff.contains("+THREE") && !diff.contains("+TWO"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconcile_skips_stat_clean_files_but_still_detects_real_edits() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("stable.txt"), "same").unwrap();
+    fs::write(root.join("edited.txt"), "before").unwrap();
+    // 让两个文件都越过 racy 窗口，走 stat 快速路径。
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for name in ["stable.txt", "edited.txt"] {
+        fs::File::options()
+            .write(true)
+            .open(root.join(name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    let mgr = SnapshotManager::new();
+    let session = mgr.start_session("s-stat-clean".into(), root.clone()).await.unwrap();
+    session.reconcile().unwrap();
+    assert!(session.pending_changes().unwrap().is_empty());
+
+    // 内容与大小都变了：即使旧 mtime 被沿用之外的常规写入，也必须被发现。
+    fs::write(root.join("edited.txt"), "after!").unwrap();
+    session.reconcile().unwrap();
+    let pending = session.pending_changes().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].path, "edited.txt");
+}

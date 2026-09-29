@@ -27,5 +27,6 @@ pub use read_model::{
     RuntimeWorkQueueSummary, SessionRuntimeBranchSummaryEntry, SessionRuntimeBudgetEntry,
     SessionRuntimeSummaryEntry, SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnSummaryEntry,
     SessionRuntimeUsageObservation, TaskRuntimeSummaryEntry, ToolRuntimeSummaryEntry,
-    WorkerRuntimeSummaryEntry, WorkspaceRuntimeSummaryEntry, latest_usage_observations_from_ledger,
+    WorkerRuntimeSummaryEntry, WorkspaceRuntimeSummaryEntry, latest_usage_observation_for_session,
+    latest_usage_observations_from_ledger,
 };

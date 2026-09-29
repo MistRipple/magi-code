@@ -21,12 +21,15 @@
     },
   });
 
+  // 文件引用识别挂在 rawtext（叶子文本）上，而不是 text：
+  // 紧凑列表项的 text token 带有嵌套的行内 token（加粗、行内代码、链接），
+  // text 必须交给默认实现去渲染这些子节点，否则列表里的 **加粗** 和 `代码` 会显示成原始符号。
   const renderers = {
     code: MdCodeBlock,
     codespan: MdCodeSpan,
     link: MdLink,
     image: MdImage,
-    text: MdText,
+    rawtext: MdText,
   };
 
   const options = {

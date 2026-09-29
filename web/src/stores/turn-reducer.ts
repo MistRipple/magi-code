@@ -194,6 +194,15 @@ function findCanonicalTurnIndex(state: CanonicalTurnReducerState, event: Canonic
   ));
 }
 
+function isHistoryCompacted(item: CanonicalTurnItem): boolean {
+  const compaction = item.metadata?.historyCompaction;
+  return (
+    typeof compaction === 'object'
+    && compaction !== null
+    && (compaction as Record<string, unknown>).resultTruncated === true
+  );
+}
+
 function mergeCanonicalTurnItem(
   items: CanonicalTurnItem[],
   incoming: CanonicalTurnItem,
@@ -222,6 +231,20 @@ function mergeCanonicalTurnItem(
   const next = cloneTurnItem(incoming);
   if (valuesEqual(existing, next)) {
     return { items, changed: false };
+  }
+  // 历史分页会把超长工具输出折叠后下发；同一版本的完整副本与折叠副本只差“信息量”，
+  // 不是事实冲突：保留信息更完整的一份，且不因先后到达顺序而报错。
+  if (
+    existing.itemVersion !== undefined
+    && incoming.itemVersion === existing.itemVersion
+    && isHistoryCompacted(existing) !== isHistoryCompacted(incoming)
+  ) {
+    if (isHistoryCompacted(incoming)) {
+      return { items, changed: false };
+    }
+    const merged = [...items];
+    merged[existingIndex] = next;
+    return { items: merged, changed: true };
   }
   if (
     existing.itemVersion !== undefined

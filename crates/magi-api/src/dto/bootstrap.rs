@@ -4,7 +4,10 @@ use crate::{
         runtime_read_model_dto_for_session_with_usage, runtime_read_model_dto_with_usage,
     },
     errors::ApiError,
-    public_canonical::{public_canonical_turn, public_event_envelope},
+    public_canonical::{
+        HISTORY_PAGE_BYTE_BUDGET, history_page_canonical_turn, public_event_envelope,
+        trim_history_page_to_budget,
+    },
     state::ApiState,
 };
 use magi_core::{SessionId, UtcMillis};
@@ -260,7 +263,7 @@ impl BootstrapDto {
             canonical_turns: session_projection
                 .canonical_turns
                 .into_iter()
-                .map(public_canonical_turn)
+                .map(history_page_canonical_turn)
                 .filter(|turn| !turn.items.is_empty())
                 .collect(),
             workspaces: workspace_projection.workspaces,
@@ -301,6 +304,9 @@ impl BootstrapDto {
                 .saturating_sub(BOOTSTRAP_CANONICAL_TURN_PAGE_SIZE);
             self.canonical_turns = self.canonical_turns.split_off(start);
         }
+        let canonical_has_more_before =
+            trim_history_page_to_budget(&mut self.canonical_turns, HISTORY_PAGE_BYTE_BUDGET)
+                || canonical_has_more_before;
         self.canonical_before_cursor = self
             .canonical_turns
             .first()

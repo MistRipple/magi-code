@@ -771,6 +771,72 @@ fn session_projection_persistence_serializes_snapshot_and_write_transactions() {
 }
 
 #[test]
+fn navigation_persistence_hands_over_only_the_target_session_slice() {
+    let store = SessionStore::new();
+    let target = SessionId::new("session-navigation-target");
+    let other = SessionId::new("session-navigation-other");
+    store
+        .create_session(target.clone(), "Navigation target")
+        .expect("target session should create");
+    store
+        .create_session(other.clone(), "Navigation other")
+        .expect("other session should create");
+    store.append_timeline_entry(
+        target.clone(),
+        TimelineEntryKind::UserMessage,
+        "目标会话的事实",
+    );
+    store.append_timeline_entry(
+        other.clone(),
+        TimelineEntryKind::UserMessage,
+        "其它会话的事实，导航不应该拿到",
+    );
+    store
+        .select_current_session(&target)
+        .expect("target should be selectable");
+
+    // 只交出当前指针与目标会话的切片，不克隆其它会话的任何数据。
+    let (current, session_ids, timeline_sessions) = store
+        .persist_navigation_projection_with(Some(&target), |durable, sidecars| {
+            assert!(sidecars.runtime_sidecars.iter().all(|s| s.session_id == target));
+            Ok::<_, ()>((
+                durable.current_session_id.clone(),
+                durable
+                    .sessions
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect::<Vec<_>>(),
+                durable
+                    .timeline
+                    .iter()
+                    .map(|entry| entry.session_id.clone())
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .expect("navigation persistence should run");
+    assert_eq!(current, Some(target.clone()));
+    assert_eq!(session_ids, vec![target.clone()]);
+    assert!(!timeline_sessions.is_empty());
+    assert!(timeline_sessions.iter().all(|id| id == &target));
+
+    // 草稿导航：没有目标会话，只带当前指针，其余为空。
+    store.clear_current_session();
+    let (current, sessions_len, timeline_len) = store
+        .persist_navigation_projection_with(None, |durable, sidecars| {
+            assert!(sidecars.runtime_sidecars.is_empty());
+            Ok::<_, ()>((
+                durable.current_session_id.clone(),
+                durable.sessions.len(),
+                durable.timeline.len(),
+            ))
+        })
+        .expect("draft navigation persistence should run");
+    assert_eq!(current, None);
+    assert_eq!(sessions_len, 0);
+    assert_eq!(timeline_len, 0);
+}
+
+#[test]
 fn persistence_callback_holds_projection_snapshot_until_write_finishes() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-persistence-recapture");

@@ -1,6 +1,7 @@
 import type {
   CanonicalTurn,
   CanonicalTurnEvent,
+  CanonicalTurnItem,
 } from '../shared/protocol/canonical-turn';
 import { normalizeCanonicalTurnStrict } from '../shared/protocol/canonical-turn';
 import type { SessionTimelineProjection } from '../types/message';
@@ -442,6 +443,70 @@ export function prependCanonicalSessionTurns(
 
 function compareCanonicalTurnOrder(left: CanonicalTurn, right: CanonicalTurn): number {
   return left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId);
+}
+
+/** 服务端历史窗口折叠掉的 turn 内更早条目信息；未折叠的 turn 返回 null。 */
+export interface TurnHistoryWindow {
+  omittedItemCount: number;
+  beforeItemSeq: number;
+}
+
+export function readTurnHistoryWindow(turn: CanonicalTurn | undefined): TurnHistoryWindow | null {
+  const value = turn?.metadata?.historyWindow;
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const omittedItemCount = record.omittedItemCount;
+  const beforeItemSeq = record.beforeItemSeq;
+  if (typeof omittedItemCount !== 'number' || typeof beforeItemSeq !== 'number' || omittedItemCount < 1) {
+    return null;
+  }
+  return { omittedItemCount, beforeItemSeq };
+}
+
+/**
+ * 把 turn 内更早的一段条目合并回同一个 turn。turn 仍是分页单位；这里只补齐窗口折叠掉的
+ * 步骤，按 itemId 去重，并据服务端返回更新（或清除）折叠标记。
+ */
+export function mergeEarlierCanonicalTurnItems(input: {
+  sessionId: string;
+  turnId: string;
+  items: CanonicalTurnItem[];
+  hasMoreBefore: boolean;
+  beforeItemSeq: number | null;
+  omittedItemCount: number;
+}): SessionTimelineProjection | null {
+  const sessionId = normalizeSessionId(input.sessionId);
+  if (!sessionId || turnStoreState.reducer.sessionId !== sessionId) {
+    return null;
+  }
+  const turn = turnStoreState.reducer.turns.find((candidate) => candidate.turnId === input.turnId);
+  if (!turn) {
+    return null;
+  }
+  const known = new Set(turn.items.map((item) => item.itemId));
+  const merged = [
+    ...turn.items,
+    ...input.items.filter((item) => !known.has(item.itemId)),
+  ].sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId));
+  const metadata = { ...(turn.metadata ?? {}) };
+  if (input.hasMoreBefore && input.beforeItemSeq !== null && input.omittedItemCount > 0) {
+    metadata.historyWindow = {
+      omittedItemCount: input.omittedItemCount,
+      beforeItemSeq: input.beforeItemSeq,
+    };
+  } else {
+    delete metadata.historyWindow;
+  }
+  turnStoreState.reducer = {
+    ...turnStoreState.reducer,
+    turns: turnStoreState.reducer.turns.map((candidate) => (
+      candidate.turnId === input.turnId ? { ...candidate, items: merged, metadata } : candidate
+    )),
+  };
+  turnStoreState.lastError = null;
+  return publishProjection();
 }
 
 export function clearCanonicalSessionTurns(sessionId?: string): void {

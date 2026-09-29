@@ -13,7 +13,7 @@ use magi_core::{
     EventId, GoalId, MissionId, SessionId, ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens,
 };
 use magi_event_bus::{
-    EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
+    EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observation_for_session,
 };
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
@@ -398,10 +398,11 @@ pub fn publish_context_usage_update(
     let context_window = context_window_override
         .unwrap_or_else(|| resolve_model_context_window(settings_store, resolved_model))
         .max(1);
-    let previous_anchor = latest_usage_observations_from_ledger(
-        &event_bus.audit_usage_ledger_snapshot().usage_entries,
-    )
-    .remove(&session_id.to_string())
+    // 每次上下文压力更新都会走这里：读锁内按会话过滤扫描，不克隆整本账本。
+    let previous_anchor = event_bus
+        .with_audit_usage_ledger(|ledger| {
+            latest_usage_observation_for_session(&ledger.usage_entries, session_id.as_str())
+        })
     .filter(|observation| {
         observation
             .resolved_model

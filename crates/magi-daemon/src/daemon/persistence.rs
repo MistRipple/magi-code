@@ -290,8 +290,12 @@ impl StateRepository {
             .session_event_cache
             .lock()
             .expect("session event cache lock poisoned");
-        let mut next_cache = cache.clone();
-        let mut next_event_cache = event_cache.clone();
+        // 导航只提交一个当前指针（以及在目标会话 projection 缺失时补一份）。缓存里保存着全部会话的
+        // projection 全文与对话事件，绝不能为此整体克隆一份再替换：那会让每次切换会话的代价与全部
+        // 会话历史的总量成正比（本仓库实测 300 MB 级，单次导航 1–2 秒纯用于克隆与释放）。
+        // 这里只记录很小的待应用变更，等事务提交成功后再就地写入缓存；失败时缓存原样不动。
+        let mut pending_snapshot: Option<(SessionId, (PathBuf, String))> = None;
+        let mut rebuilt_event_cache = None;
         let mut writes = Vec::new();
 
         match (durable.current_session_id.as_ref(), target_session_id) {
@@ -309,23 +313,30 @@ impl StateRepository {
         }
 
         if let Some(session_id) = target_session_id {
-            let target = durable.durable_state_for_session(session_id);
-            let session = target.sessions.first().ok_or_else(|| {
-                DaemonError::internal(format!(
-                    "导航目标 session 不存在，拒绝写入 current 指针: {session_id}"
-                ))
-            })?;
+            let session = durable
+                .sessions
+                .iter()
+                .find(|session| &session.session_id == session_id)
+                .ok_or_else(|| {
+                    DaemonError::internal(format!(
+                        "导航目标 session 不存在，拒绝写入 current 指针: {session_id}"
+                    ))
+                })?;
             let path = self.session_projection_path(
                 session_id,
                 session.workspace_id.as_deref(),
                 &workspace_roots,
             )?;
             if !path.exists() {
+                // 只有需要补建缺失的 projection 时才切出目标会话的完整状态。
+                let target = durable.durable_state_for_session(session_id);
                 let sidecar = sidecars
                     .runtime_sidecars
                     .iter()
                     .find(|sidecar| sidecar.session_id == *session_id)
                     .cloned();
+                // 极少发生：补建缺失的 projection 需要构造对话事件，只有这时才克隆事件缓存。
+                let mut next_event_cache = event_cache.clone();
                 let (path, content) = self.build_session_projection_content(
                     &target,
                     sidecar,
@@ -338,9 +349,8 @@ impl StateRepository {
                     path: path.clone(),
                     content: content.clone(),
                 });
-                next_cache
-                    .snapshots
-                    .insert(session_id.clone(), (path, content));
+                pending_snapshot = Some((session_id.clone(), (path, content)));
+                rebuilt_event_cache = Some(next_event_cache);
             }
         }
 
@@ -352,7 +362,7 @@ impl StateRepository {
                     DaemonError::internal(format!("session current state 不是 UTF-8: {error}"))
                 })
             })?;
-        if next_cache
+        if cache
             .global
             .as_ref()
             .map(|(_, previous)| previous != &current_content)
@@ -363,7 +373,7 @@ impl StateRepository {
                 content: current_content.clone(),
             });
         }
-        next_cache.global = Some((current_path, current_content));
+        let next_global = (current_path, current_content);
 
         let transaction = SessionProjectionTransaction {
             schema_version: SESSION_PROJECTION_TRANSACTION_SCHEMA_VERSION,
@@ -373,8 +383,14 @@ impl StateRepository {
         };
         self.commit_session_projection_transaction_locked(&transaction, &workspace_roots)?;
         self.ensure_state_layout_marker_locked()?;
-        *cache = next_cache;
-        *event_cache = next_event_cache;
+        // 事务已提交：就地应用两处小变更，不替换整份缓存。
+        if let Some((session_id, snapshot)) = pending_snapshot {
+            cache.snapshots.insert(session_id, snapshot);
+        }
+        cache.global = Some(next_global);
+        if let Some(next_event_cache) = rebuilt_event_cache {
+            *event_cache = next_event_cache;
+        }
         Ok(())
     }
 
@@ -941,15 +957,11 @@ impl StateRepository {
         let state = self.load_workspace_durable_state()?;
         let mut roots = HashMap::new();
         for workspace in state.workspaces {
-            let root = workspace.native_root_path();
-            magi_workspace::verify_or_create_workspace_identity(&root, &workspace.workspace_id)
-                .map_err(|error| {
-                    DaemonError::internal(format!(
-                        "校验工作区稳定身份失败 {}: {error}",
-                        root.display()
-                    ))
-                })?;
-            roots.insert(workspace.workspace_id.to_string(), root);
+            // 工作区稳定身份只在启动恢复时校验；这里位于每次保存与会话导航的热路径。
+            roots.insert(
+                workspace.workspace_id.to_string(),
+                workspace.native_root_path(),
+            );
         }
         Ok(roots)
     }

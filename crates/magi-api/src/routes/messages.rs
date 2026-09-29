@@ -4,19 +4,28 @@ use axum::{
     routing::get,
 };
 use magi_core::UtcMillis;
-use magi_session_store::{CanonicalTurn, SessionRecord, TimelineEntry};
+use magi_session_store::{CanonicalTurn, CanonicalTurnItem, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{
     parse_session_id, require_session_record_in_scope, resolve_explicit_session_scope,
 };
 use crate::{
-    dto::SessionScopeKindDto, errors::ApiError, public_canonical::public_canonical_turn,
+    dto::SessionScopeKindDto,
+    errors::ApiError,
+    public_canonical::{
+        HISTORY_PAGE_BYTE_BUDGET, history_page_canonical_item, history_page_canonical_turn,
+        public_canonical_turn_item,
+        trim_history_page_to_budget,
+    },
     state::ApiState,
 };
 
 pub fn routes() -> Router<ApiState> {
-    Router::new().route("/messages", get(get_messages))
+    Router::new()
+        .route("/messages", get(get_messages))
+        .route("/messages/item", get(get_message_item))
+        .route("/messages/turn-items", get(get_turn_items))
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,10 +100,18 @@ async fn get_messages(
             canonical_limit,
         )
         .ok_or_else(|| ApiError::InvalidInput("canonical turn 游标不存在".to_string()))?;
-    let canonical_turns = canonical_turns
+    let mut canonical_turns = canonical_turns
         .into_iter()
-        .map(public_canonical_turn)
-        .collect();
+        .map(history_page_canonical_turn)
+        .collect::<Vec<_>>();
+    let canonical_trimmed =
+        trim_history_page_to_budget(&mut canonical_turns, HISTORY_PAGE_BYTE_BUDGET);
+    let canonical_has_more_before = canonical_has_more_before || canonical_trimmed;
+    let canonical_before_cursor = if canonical_trimmed {
+        canonical_turns.first().map(|turn| turn.turn_id.clone())
+    } else {
+        canonical_before_cursor
+    };
     let before_cursor = page.first().map(|entry| entry.entry_id.clone());
 
     Ok(Json(MessagesResponseDto {
@@ -108,6 +125,117 @@ async fn get_messages(
         before_cursor,
         canonical_has_more_before,
         canonical_before_cursor,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MessageItemQuery {
+    scope: SessionScopeKindDto,
+    session_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    turn_id: String,
+    item_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageItemResponseDto {
+    item: CanonicalTurnItem,
+}
+
+/// 取回单个 canonical item 的完整事实。历史分页会截断超长工具输出，用户展开时由这里补全。
+async fn get_message_item(
+    State(state): State<ApiState>,
+    Query(query): Query<MessageItemQuery>,
+) -> Result<Json<MessageItemResponseDto>, ApiError> {
+    let scope = resolve_explicit_session_scope(
+        &state,
+        query.scope,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
+    let sid = parse_session_id(query.session_id.as_deref())?;
+    let session = require_session_record_in_scope(&state, &sid, &scope)?;
+    let item = state
+        .session_store
+        .canonical_turn_for_session_turn_id(&session.session_id, &query.turn_id)
+        .and_then(|turn| {
+            turn.items
+                .into_iter()
+                .find(|item| item.item_id == query.item_id)
+        })
+        .ok_or_else(|| ApiError::InvalidInput("消息条目不存在".to_string()))?;
+    Ok(Json(MessageItemResponseDto {
+        item: public_canonical_turn_item(item),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TurnItemsQuery {
+    scope: SessionScopeKindDto,
+    session_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    turn_id: String,
+    before_item_seq: usize,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnItemsResponseDto {
+    turn_id: String,
+    items: Vec<CanonicalTurnItem>,
+    /// 更早是否还有未下发的条目；`before_item_seq` 是下一次请求的游标。
+    has_more_before: bool,
+    before_item_seq: Option<usize>,
+    omitted_item_count: usize,
+}
+
+/// 补齐被历史窗口折叠的 turn 内更早条目。turn 仍是分页单位，这里只是回合内的向前翻页。
+async fn get_turn_items(
+    State(state): State<ApiState>,
+    Query(query): Query<TurnItemsQuery>,
+) -> Result<Json<TurnItemsResponseDto>, ApiError> {
+    let scope = resolve_explicit_session_scope(
+        &state,
+        query.scope,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
+    let sid = parse_session_id(query.session_id.as_deref())?;
+    let session = require_session_record_in_scope(&state, &sid, &scope)?;
+    let mut turn = state
+        .session_store
+        .canonical_turn_for_session_turn_id(&session.session_id, &query.turn_id)
+        .ok_or_else(|| ApiError::InvalidInput("消息回合不存在".to_string()))?;
+    turn.normalize();
+    // 用户消息始终随窗口下发，不参与向前翻页。
+    let mut older = turn
+        .items
+        .into_iter()
+        .filter(|item| {
+            item.item_seq < query.before_item_seq
+                && item.kind != magi_session_store::CanonicalTurnItemKind::UserMessage
+        })
+        .collect::<Vec<_>>();
+    let limit = query.limit.unwrap_or(150).clamp(1, 300);
+    let split = older.len().saturating_sub(limit);
+    let page = older.split_off(split);
+    let omitted_item_count = older.len();
+    Ok(Json(TurnItemsResponseDto {
+        turn_id: query.turn_id,
+        before_item_seq: page.first().map(|item| item.item_seq),
+        has_more_before: omitted_item_count > 0,
+        omitted_item_count,
+        items: page.into_iter().map(history_page_canonical_item).collect(),
     }))
 }
 
@@ -677,5 +805,227 @@ mod tests {
                 .expect("tool error should be string")
                 .contains("sk-[redacted]")
         );
+    }
+
+    #[tokio::test]
+    async fn messages_truncates_long_tool_output_and_item_endpoint_returns_full_text() {
+        let session_id = SessionId::new("session-messages-long-tool");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "长工具输出",
+                Some("workspace-messages-long-tool".to_string()),
+            )
+            .expect("session should create");
+        let coordinator = SessionTurnCoordinator::new();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &store,
+            &coordinator,
+            &session_id,
+            "turn-long-tool",
+            1,
+            UtcMillis(1),
+            "running",
+            "请读取文件",
+        );
+        let long_output = "x".repeat(20_000);
+        magi_conversation_runtime::CanonicalTurnEventSink::for_store(&store, None)
+            .upsert_item_sidecar(
+                &session_id,
+                Some("turn-long-tool"),
+                magi_session_store::ActiveExecutionTurnItem {
+                    item_id: "turn-item-long-tool".to_string(),
+                    item_seq: 2,
+                    kind: "tool_call_result".to_string(),
+                    status: "completed".to_string(),
+                    source: "worker".to_string(),
+                    title: Some("读取文件".to_string()),
+                    content: Some("工具卡片".to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: Some("tool-call-long".to_string()),
+                    tool_name: Some("file_read".to_string()),
+                    tool_status: Some("completed".to_string()),
+                    tool_arguments: Some(serde_json::json!({ "path": "a.txt" }).to_string()),
+                    tool_result: Some(serde_json::json!({ "content": long_output }).to_string()),
+                    tool_error: None,
+                    request_id: None,
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    metadata: Default::default(),
+                    timeline_entry_id: None,
+                    source_thread_id: ThreadId::new("thread-long-tool"),
+                },
+            )
+            .expect("tool item should upsert");
+        let state = test_state(store);
+        register_workspace(&state, "workspace-messages-long-tool");
+
+        let page = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/messages?scope=workspace&workspaceId=workspace-messages-long-tool&sessionId=session-messages-long-tool")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let body = read_json_response(page).await;
+        let item = body["canonicalTurns"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "tool_call")
+            .expect("tool item should exist")
+            .clone();
+        assert_eq!(
+            item["tool"]["result"]["content"].as_str().unwrap().chars().count(),
+            crate::public_canonical::HISTORY_TOOL_RESULT_STRING_LIMIT
+        );
+        assert_eq!(item["metadata"]["historyCompaction"]["resultTruncated"], true);
+        assert_eq!(item["metadata"]["historyCompaction"]["omittedChars"], 20_000 - 2 * 1024);
+
+        let full = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/messages/item?scope=workspace&workspaceId=workspace-messages-long-tool&sessionId=session-messages-long-tool&turnId=turn-long-tool&itemId=turn-item-long-tool")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(full.status(), StatusCode::OK);
+        let full_body = read_json_response(full).await;
+        assert_eq!(
+            full_body["item"]["tool"]["result"]["content"].as_str().unwrap().len(),
+            20_000
+        );
+    }
+
+    #[tokio::test]
+    async fn long_turn_is_windowed_and_older_items_are_fetched_by_item_cursor() {
+        let session_id = SessionId::new("session-messages-long-turn");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "超长回合",
+                Some("workspace-messages-long-turn".to_string()),
+            )
+            .expect("session should create");
+        let coordinator = SessionTurnCoordinator::new();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &store,
+            &coordinator,
+            &session_id,
+            "turn-long",
+            1,
+            UtcMillis(1),
+            "running",
+            "请分析项目",
+        );
+        let total_tools = crate::public_canonical::HISTORY_TURN_ITEM_WINDOW * 2 + 20;
+        let sink = magi_conversation_runtime::CanonicalTurnEventSink::for_store(&store, None);
+        for index in 0..total_tools {
+            sink.upsert_item_sidecar(
+                &session_id,
+                Some("turn-long"),
+                magi_session_store::ActiveExecutionTurnItem {
+                    item_id: format!("turn-item-tool-{index:04}"),
+                    item_seq: 10 + index,
+                    kind: "tool_call_result".to_string(),
+                    status: "completed".to_string(),
+                    source: "worker".to_string(),
+                    title: Some("读取文件".to_string()),
+                    content: Some("工具卡片".to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: Some(format!("tool-call-{index:04}")),
+                    tool_name: Some("file_read".to_string()),
+                    tool_status: Some("completed".to_string()),
+                    tool_arguments: Some(serde_json::json!({ "path": "a.txt" }).to_string()),
+                    tool_result: Some(serde_json::json!({ "content": "ok" }).to_string()),
+                    tool_error: None,
+                    request_id: None,
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    metadata: Default::default(),
+                    timeline_entry_id: None,
+                    source_thread_id: ThreadId::new("thread-long-turn"),
+                },
+            )
+            .expect("tool item should upsert");
+        }
+        let state = test_state(store);
+        register_workspace(&state, "workspace-messages-long-turn");
+        let base = "scope=workspace&workspaceId=workspace-messages-long-turn&sessionId=session-messages-long-turn";
+
+        let page = read_json_response(
+            routes()
+                .with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/messages?{base}"))
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("route should respond"),
+        )
+        .await;
+        let turn = &page["canonicalTurns"][0];
+        let window = crate::public_canonical::HISTORY_TURN_ITEM_WINDOW;
+        let items = turn["items"].as_array().unwrap();
+        assert!(items.len() <= window + 1, "窗口只带最新条目和用户消息");
+        assert!(items.iter().any(|item| item["kind"] == "user_message"));
+        let history_window = &turn["metadata"]["historyWindow"];
+        let before_seq = history_window["beforeItemSeq"].as_u64().expect("window cursor") as usize;
+        let omitted = history_window["omittedItemCount"].as_u64().expect("omitted count") as usize;
+        assert!(omitted > 0);
+
+        let mut seen = items
+            .iter()
+            .map(|item| item["itemId"].as_str().unwrap().to_string())
+            .collect::<std::collections::HashSet<_>>();
+        let mut cursor = Some(before_seq);
+        let mut guard = 0;
+        while let Some(before) = cursor {
+            guard += 1;
+            assert!(guard < 10, "向前翻页必须收敛");
+            let older = read_json_response(
+                routes()
+                    .with_state(state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!(
+                                "/messages/turn-items?{base}&turnId=turn-long&beforeItemSeq={before}"
+                            ))
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("route should respond"),
+            )
+            .await;
+            for item in older["items"].as_array().unwrap() {
+                assert!(
+                    item["itemSeq"].as_u64().unwrap() < before as u64,
+                    "只返回游标之前的条目"
+                );
+                seen.insert(item["itemId"].as_str().unwrap().to_string());
+            }
+            cursor = if older["hasMoreBefore"] == true {
+                older["beforeItemSeq"].as_u64().map(|seq| seq as usize)
+            } else {
+                None
+            };
+        }
+        let expected = crate::public_canonical::HISTORY_TURN_ITEM_WINDOW * 2 + 20 + 1;
+        assert!(seen.len() >= expected, "窗口加向前翻页必须补齐整个回合: {} < {expected}", seen.len());
     }
 }

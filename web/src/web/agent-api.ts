@@ -1892,6 +1892,62 @@ export async function getAgentSessionMessages(options: {
   }
 }
 
+export interface TurnItemsPageDto {
+  turnId: string;
+  items: unknown[];
+  hasMoreBefore: boolean;
+  beforeItemSeq: number | null;
+  omittedItemCount: number;
+}
+
+/** 补齐被历史窗口折叠的 turn 内更早条目（回合内向前翻页）。 */
+export async function getAgentTurnItems(options: {
+  sessionId: string;
+  turnId: string;
+  beforeItemSeq: number;
+  limit?: number;
+}): Promise<TurnItemsPageDto> {
+  try {
+    const query = buildBoundQueryWithOverride(
+      {
+        turnId: options.turnId,
+        beforeItemSeq: String(options.beforeItemSeq),
+        ...(options.limit ? { limit: String(options.limit) } : {}),
+      },
+      { sessionId: options.sessionId.trim() },
+    );
+    const response = await getTransport().request(agentUrl('/api/messages/turn-items', query));
+    return await parseAgentJson<TurnItemsPageDto>(response, 'load earlier turn items');
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(i18n.t('bridge.agentUnreachable'));
+    }
+    throw error;
+  }
+}
+
+/** 取回单个 canonical item 的完整事实（历史分页会截断超长工具输出）。 */
+export async function getAgentMessageItem(options: {
+  sessionId: string;
+  turnId: string;
+  itemId: string;
+}): Promise<CanonicalTurnItem> {
+  try {
+    const query = buildBoundQueryWithOverride(
+      { turnId: options.turnId, itemId: options.itemId },
+      { sessionId: options.sessionId.trim() },
+    );
+    const response = await getTransport().request(agentUrl('/api/messages/item', query));
+    const payload = await parseAgentJson<{ item: CanonicalTurnItem }>(response, 'load message item');
+    return payload.item;
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(i18n.t('bridge.agentUnreachable'));
+    }
+    throw error;
+  }
+}
+
 async function postWorkspaceBoundJson<T>(
   pathname: string,
   payload: Record<string, unknown>,

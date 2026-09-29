@@ -208,7 +208,7 @@ function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'runni
   return 'pending';
 }
 
-function valueToDisplayText(value: unknown): string | undefined {
+export function valueToDisplayText(value: unknown): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
@@ -222,7 +222,21 @@ function valueToDisplayText(value: unknown): string | undefined {
   }
 }
 
-function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus): ContentBlock {
+function readTruncatedResultOmittedChars(item: CanonicalTurnItem): number | undefined {
+  const compaction = item.metadata?.historyCompaction;
+  if (!compaction || typeof compaction !== 'object') {
+    return undefined;
+  }
+  const record = compaction as Record<string, unknown>;
+  if (record.resultTruncated !== true) {
+    return undefined;
+  }
+  return typeof record.omittedChars === 'number' ? record.omittedChars : 0;
+}
+
+function buildToolBlock(item: CanonicalTurnItem, tool: CanonicalToolCall): ContentBlock {
+  const status = item.status;
+  const omittedChars = readTruncatedResultOmittedChars(item);
   const toolStatus = statusToToolStatus(status);
   const resultText = valueToDisplayText(tool.result);
   const errorText = tool.error || (toolStatus === 'error' ? resultText : undefined);
@@ -237,6 +251,16 @@ function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus
       status: toolStatus,
       result: toolStatus === 'error' ? undefined : resultText,
       error: errorText,
+      ...(omittedChars !== undefined
+        ? {
+            truncatedResult: {
+              sessionId: item.sessionId,
+              turnId: item.turnId,
+              itemId: item.itemId,
+              omittedChars,
+            },
+          }
+        : {}),
     },
   };
 }
@@ -284,7 +308,7 @@ function buildMessageBlocks(
     if (fileChangeBlocks.length > 0) {
       return fileChangeBlocks;
     }
-    return [buildToolBlock(item.tool, item.status)];
+    return [buildToolBlock(item, item.tool)];
   }
   return undefined;
 }

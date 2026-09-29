@@ -2809,8 +2809,11 @@ impl ApiState {
     pub fn ledger_usage_observations(
         &self,
     ) -> std::collections::BTreeMap<String, magi_event_bus::SessionRuntimeUsageObservation> {
-        let snapshot = self.event_bus.audit_usage_ledger_snapshot();
-        latest_usage_observations_from_ledger(&snapshot.usage_entries)
+        // 回放本身按 (observed_at, sequence) 取最新，与条目顺序和去重无关，
+        // 所以直接在读锁内扫描，不必克隆整本账本（bootstrap 每次都会走这里）。
+        self.event_bus.with_audit_usage_ledger(|ledger| {
+            latest_usage_observations_from_ledger(&ledger.usage_entries)
+        })
     }
 
     pub fn audit_usage_ledger_dto(&self) -> AuditUsageLedgerDto {
@@ -2877,13 +2880,14 @@ impl ApiState {
         let skills_config = public_skills_config_section(object_section(&snapshot, "skillsConfig"));
         let public_mcp_servers = public_mcp_servers_section(&snapshot);
         let audit_ledger = self.audit_usage_ledger_dto();
-        let safeguard_audit_count = self
-            .event_bus
-            .audit_usage_ledger_snapshot()
-            .audit_entries
-            .iter()
-            .filter(|entry| entry.event_type == "security.safety.evaluated")
-            .count();
+        // 只统计数量：读锁内直接扫描，不克隆整本账本。
+        let safeguard_audit_count = self.event_bus.with_audit_usage_ledger(|ledger| {
+            ledger
+                .audit_entries
+                .iter()
+                .filter(|entry| entry.event_type == "security.safety.evaluated")
+                .count()
+        });
         serde_json::json!({
             "workerConfigs": object_section(&snapshot, "workers"),
             "orchestratorConfig": object_section(&snapshot, "orchestrator"),
@@ -3766,8 +3770,9 @@ impl ApiState {
             self.persist_workspace_durable_state_for_api()?;
             return Ok(());
         };
+        // 导航只需要当前指针与目标会话的切片，不能走会整体克隆全部会话历史的通用入口。
         self.session_store
-            .persist_projection_with(|durable, sidecars| {
+            .persist_navigation_projection_with(target_session_id.as_ref(), |durable, sidecars| {
                 persist(
                     durable,
                     sidecars,

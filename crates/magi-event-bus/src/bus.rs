@@ -143,8 +143,23 @@ impl InMemoryEventBus {
             .normalize()
     }
 
+    /// 在读锁内只读访问账本，不克隆。账本可能有数万条、数十 MB 的 JSON 负载，
+    /// 只需要统计或扫描时必须用它，不要为此调用会整本克隆的 `audit_usage_ledger_snapshot`。
+    pub fn with_audit_usage_ledger<R>(&self, read: impl FnOnce(&AuditUsageLedgerSnapshot) -> R) -> R {
+        let ledger = self
+            .audit_usage_ledger
+            .read()
+            .expect("event bus audit/usage ledger read lock poisoned");
+        read(&ledger)
+    }
+
+    /// 账本状态只需要计数与下一序号，直接在读锁内统计。
+    ///
+    /// 此前这里先克隆并去重排序整本账本再取两个计数，而 bootstrap（每次切换会话都会走）
+    /// 会多次间接调用它，账本一大就把 CPU 和内存吃满。存活账本在导入时已经规范化，
+    /// 运行中只追加带唯一 event_id 的新条目，且 `record_event` 持续维护 `next_sequence`，
+    /// 所以原始计数与规范化后的结果一致。
     pub fn audit_usage_ledger_status(&self) -> AuditUsageLedgerStatus {
-        let snapshot = self.audit_usage_ledger_snapshot();
         let persistence_path = self
             .audit_usage_ledger_path
             .read()
@@ -155,7 +170,9 @@ impl InMemoryEventBus {
             .read()
             .expect("event bus audit/usage ledger error read lock poisoned")
             .clone();
-        snapshot.status(persistence_path.as_deref(), last_persist_error)
+        self.with_audit_usage_ledger(|ledger| {
+            ledger.status(persistence_path.as_deref(), last_persist_error)
+        })
     }
 
     pub fn export_audit_usage_ledger_json(&self) -> Result<String, AuditUsageLedgerError> {
@@ -465,6 +482,27 @@ mod tests {
             read_model.meta.ledger.readiness.is_ready,
             runtime_ledger.readiness.is_ready
         );
+    }
+
+    #[test]
+    fn 账本状态直接在读锁内统计且与规范化快照一致() {
+        let bus = InMemoryEventBus::new(8);
+        bus.publish(event(EventCategory::Audit, "tool.invoked", 1));
+        bus.publish(event(EventCategory::Usage, "model.usage.recorded", 2));
+        bus.publish(event(EventCategory::Usage, "tool.usage.recorded", 3));
+        bus.publish(event(EventCategory::Domain, "session.updated", 4));
+
+        // 状态不再克隆整本账本，但数值必须与规范化后的快照完全一致。
+        let status = bus.audit_usage_ledger_status();
+        let snapshot = bus.audit_usage_ledger_snapshot();
+        assert_eq!(status.audit_count, snapshot.audit_count());
+        assert_eq!(status.usage_count, snapshot.usage_count());
+        assert_eq!(status.next_sequence, snapshot.next_sequence);
+        assert_eq!((status.audit_count, status.usage_count), (1, 2));
+
+        // 只读访问器看到的就是存活账本本身。
+        let counted = bus.with_audit_usage_ledger(|ledger| ledger.usage_entries.len());
+        assert_eq!(counted, 2);
     }
 
     #[test]

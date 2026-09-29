@@ -56,8 +56,34 @@ pub fn runtime_read_model_dto_with_usage(
     task_store: Option<&TaskStore>,
     ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
 ) -> RuntimeReadModelDto {
+    runtime_read_model_dto_inner(
+        runtime_read_model,
+        session_sidecar_exports,
+        workspace_sidecar_exports,
+        audit_usage_ledger,
+        task_store,
+        ledger_usage_observations,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_read_model_dto_inner(
+    runtime_read_model: RuntimeReadModelInput,
+    session_sidecar_exports: &[SessionRuntimeSidecarExport],
+    workspace_sidecar_exports: &[WorkspaceRecoverySidecarExport],
+    audit_usage_ledger: AuditUsageLedgerDto,
+    task_store: Option<&TaskStore>,
+    ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
+    include_turn_detail: bool,
+) -> RuntimeReadModelDto {
     let mut runtime_read_model = runtime_read_model;
-    merge_session_sidecars(&mut runtime_read_model, session_sidecar_exports, task_store);
+    merge_session_sidecars(
+        &mut runtime_read_model,
+        session_sidecar_exports,
+        task_store,
+        include_turn_detail,
+    );
     merge_workspace_sidecars(&mut runtime_read_model, workspace_sidecar_exports);
     backfill_session_usage_observations(&mut runtime_read_model, ledger_usage_observations);
     merge_session_budgets(&mut runtime_read_model);
@@ -95,13 +121,16 @@ pub fn runtime_read_model_dto_for_session_with_usage(
         .cloned()
         .collect::<Vec<_>>();
 
-    runtime_read_model_dto_with_usage(
+    // 当前回合的逐条明细（含每个工具的参数与结果）已由 canonicalTurns 承载，bootstrap
+    // 不再重复构造一份运行态副本，否则单个大回合会让首屏成本翻倍。
+    runtime_read_model_dto_inner(
         runtime_read_model,
         &scoped_sidecars,
         workspace_sidecar_exports,
         audit_usage_ledger,
         task_store,
         ledger_usage_observations,
+        false,
     )
 }
 
@@ -222,6 +251,7 @@ fn merge_session_sidecars(
     runtime_read_model: &mut RuntimeReadModelInput,
     session_sidecar_exports: &[SessionRuntimeSidecarExport],
     task_store: Option<&TaskStore>,
+    include_turn_detail: bool,
 ) {
     for export in session_sidecar_exports {
         let session_id = export.session_id.to_string();
@@ -325,7 +355,7 @@ fn merge_session_sidecars(
         {
             clear_session_runtime_live_ids(entry);
         }
-        if let Some(turn) = export.current_turn.as_ref() {
+        if include_turn_detail && let Some(turn) = export.current_turn.as_ref() {
             let completed_at = turn.completed_at;
             entry.current_turn = Some(SessionRuntimeTurnSummaryEntry {
                 turn_id: turn.turn_id.clone(),

@@ -16,7 +16,9 @@ await withGoldenViteServer(async (server) => {
   const blockRegistry = await server.ssrLoadModule('/src/lib/block-registry.ts');
   const conversationPresentation = await server.ssrLoadModule('/src/lib/conversation-presentation.ts');
   const markdownUrl = await server.ssrLoadModule('/src/lib/markdown-url.ts');
+  const turnStore = await server.ssrLoadModule('/src/stores/turn-store.svelte.ts');
   runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, conversationPresentation, markdownUrl);
+  assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
 
@@ -102,6 +104,8 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertInterruptedTurnIsTerminalAndKeepsRecoveryNotice(reducer, projection, canonicalProtocol);
   assertBlockedTurnRemainsRecoverable(canonicalProtocol);
   assertSingleThinkingProjectsAsGroup(reducer, projection);
+  assertTruncatedToolResultCarriesHistoryRef(reducer, projection);
+  assertCompactedAndFullItemsOfSameVersionAreCompatible(reducer);
   assertContinuousThinkingProjectsAsOneGroup(reducer, projection);
   assertModelRoundsKeepThinkingGroupsSeparate(reducer, projection);
   assertThinkingGroupRespectsVisibleAndOwnerBoundaries(reducer, projection);
@@ -203,6 +207,101 @@ function assertMalformedMessageBlocksDoNotBreakPresentation(conversationPresenta
     'process',
     'malformed legacy message blocks must be ignored by presentation classification',
   );
+}
+
+function assertTruncatedToolResultCarriesHistoryRef(reducer, projection) {
+  const c = baseCase('truncated-tool-result', 'session-golden-truncated-tool', 'turn-golden-truncated-tool', 11_705);
+  const truncated = item(c, 1, 'tool-truncated', 'tool_call', 'completed', {
+    title: 'shell_exec',
+    tool: { callId: 'call-truncated', name: 'shell_exec', arguments: { command: 'cat big' }, result: { stdout: 'head' } },
+    metadata: { historyCompaction: { resultTruncated: true, omittedChars: 1234 } },
+  });
+  const complete = tool(c, 2, 'tool-complete', 'call-complete', 'echo ok', 'completed', { stdout: 'ok' });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [truncated, complete])]);
+  const blocks = projection
+    .buildCanonicalTimelineProjection(state)
+    .artifacts.flatMap((artifact) => artifact.message.blocks ?? [])
+    .filter((block) => block.type === 'tool_call');
+  const byId = new Map(blocks.map((block) => [block.toolCall.id, block.toolCall]));
+  assert.deepEqual(
+    byId.get('call-truncated')?.truncatedResult,
+    { sessionId: c.sessionId, turnId: c.turnId, itemId: truncated.itemId, omittedChars: 1234 },
+    '历史分页截断过的工具输出必须携带按需取回完整 item 的引用',
+  );
+  assert.equal(byId.get('call-complete')?.truncatedResult, undefined, '完整输出不应出现取回引用');
+}
+
+function assertCompactedAndFullItemsOfSameVersionAreCompatible(reducer) {
+  const c = baseCase('compacted-full-merge', 'session-golden-compacted-merge', 'turn-golden-compacted-merge', 11_706);
+  const build = (result, compacted) => {
+    const built = item(c, 1, 'tool-merge', 'tool_call', 'completed', {
+      title: 'shell_exec',
+      itemVersion: 3,
+      tool: { callId: 'call-merge', name: 'shell_exec', arguments: { command: 'cat big' }, result },
+      ...(compacted ? { metadata: { historyCompaction: { resultTruncated: true, omittedChars: 90 } } } : {}),
+    });
+    return built;
+  };
+  const compact = build({ stdout: 'head' }, true);
+  const full = build({ stdout: 'head-and-the-rest' }, false);
+  const upsert = (state, incoming, seq) =>
+    reducer.reduceCanonicalTurnEvent(state, event(c, seq, 'turn_item_upsert', {
+      turn: turn(c, 'completed', [incoming]),
+      item: incoming,
+    }));
+
+  // 先收到折叠副本，再收到同版本完整副本：完整副本替换折叠副本，且不报错。
+  let state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [compact])]);
+  let result = upsert(state, full, 1);
+  assert.equal(result.error, undefined, '同版本完整副本不应被当作事实冲突');
+  assert.equal(result.state.turns[0].items[0].tool.result.stdout, 'head-and-the-rest');
+
+  // 先有完整副本，再收到折叠副本：保留完整副本。
+  state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [full])]);
+  result = upsert(state, compact, 1);
+  assert.equal(result.error, undefined, '同版本折叠副本不应被当作事实冲突');
+  assert.equal(result.state.turns[0].items[0].tool.result.stdout, 'head-and-the-rest');
+}
+
+function assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore) {
+  const c = baseCase('windowed-turn', 'session-golden-windowed-turn', 'turn-golden-windowed-turn', 11_707);
+  const question = user(c, 1, '分析项目');
+  const late = tool(c, 30, 'tool-late', 'call-late', 'echo late', 'completed', { stdout: 'late' });
+  const windowed = turn(c, 'completed', [question, late]);
+  windowed.metadata = { ...(windowed.metadata ?? {}), historyWindow: { omittedItemCount: 2, beforeItemSeq: 30 } };
+  turnStore.replaceCanonicalSessionTurns(c.sessionId, [windowed]);
+  assert.deepEqual(
+    turnStore.readTurnHistoryWindow(turnStore.turnStoreState.reducer.turns[0]),
+    { omittedItemCount: 2, beforeItemSeq: 30 },
+  );
+
+  const early1 = tool(c, 10, 'tool-early-1', 'call-early-1', 'echo one', 'completed', { stdout: 'one' });
+  const early2 = tool(c, 20, 'tool-early-2', 'call-early-2', 'echo two', 'completed', { stdout: 'two' });
+  const merge = (items, hasMoreBefore, beforeItemSeq, omittedItemCount) => turnStore.mergeEarlierCanonicalTurnItems({
+    sessionId: c.sessionId,
+    turnId: c.turnId,
+    items,
+    hasMoreBefore,
+    beforeItemSeq,
+    omittedItemCount,
+  });
+
+  // 第一段：还有更早的条目，折叠标记随服务端游标更新。
+  assert.ok(merge([early2], true, 20, 1));
+  let current = turnStore.turnStoreState.reducer.turns[0];
+  assert.deepEqual(current.items.map((item) => item.itemSeq), [1, 20, 30], '更早条目按 itemSeq 合并回同一个 turn');
+  assert.deepEqual(turnStore.readTurnHistoryWindow(current), { omittedItemCount: 1, beforeItemSeq: 20 });
+
+  // 最后一段：重复条目按 itemId 去重，折叠标记清除。
+  assert.ok(merge([early1, early2], false, null, 0));
+  current = turnStore.turnStoreState.reducer.turns[0];
+  assert.deepEqual(current.items.map((item) => item.itemSeq), [1, 10, 20, 30]);
+  assert.equal(turnStore.readTurnHistoryWindow(current), null, '补齐后不应再出现折叠提示');
+
+  // 不属于当前会话的合并必须被忽略。
+  assert.equal(turnStore.mergeEarlierCanonicalTurnItems({
+    sessionId: 'session-other', turnId: c.turnId, items: [], hasMoreBefore: false, beforeItemSeq: null, omittedItemCount: 0,
+  }), null);
 }
 
 function assertSingleThinkingProjectsAsGroup(reducer, projection) {

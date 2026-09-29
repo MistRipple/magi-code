@@ -2707,12 +2707,33 @@ fn is_orchestrator_usage_payload(payload: &serde_json::Value) -> bool {
 pub fn latest_usage_observations_from_ledger(
     usage_entries: &[crate::AuditUsageLedgerEntry],
 ) -> BTreeMap<String, SessionRuntimeUsageObservation> {
+    latest_usage_observations_filtered(usage_entries, None)
+}
+
+/// 只取某一个会话的最近一次用量观测值。
+///
+/// 先按会话过滤再解析负载，不会为其它会话的条目付出解析代价；每次模型调用与
+/// 上下文压力更新都会走这里，账本越大越明显。
+pub fn latest_usage_observation_for_session(
+    usage_entries: &[crate::AuditUsageLedgerEntry],
+    session_id: &str,
+) -> Option<SessionRuntimeUsageObservation> {
+    latest_usage_observations_filtered(usage_entries, Some(session_id)).remove(session_id)
+}
+
+fn latest_usage_observations_filtered(
+    usage_entries: &[crate::AuditUsageLedgerEntry],
+    only_session: Option<&str>,
+) -> BTreeMap<String, SessionRuntimeUsageObservation> {
     let mut latest: BTreeMap<String, ((u64, u64), SessionRuntimeUsageObservation)> =
         BTreeMap::new();
     for entry in usage_entries {
         let Some(session_id) = entry.context.session_id.as_ref() else {
             continue;
         };
+        if only_session.is_some_and(|wanted| session_id.as_str() != wanted) {
+            continue;
+        }
         let Some(observation) = usage_observation_from_payload(&entry.event_type, &entry.payload)
         else {
             continue;
@@ -3755,6 +3776,24 @@ mod tests {
         // timestamp 700 wins；上下文压力只取 20_000 input，不混入 completion token。
         assert_eq!(observation.context_window_tokens, 20_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
+    }
+
+    #[test]
+    fn latest_usage_observation_for_session_matches_the_full_replay_for_that_session() {
+        let entries = vec![
+            usage_ledger_entry("session-a", 7, 20_000, 1_000, "gpt-5-codex", 700),
+            usage_ledger_entry("session-a", 3, 5_000, 500, "gpt-5-codex", 300),
+            usage_ledger_entry("session-b", 9, 40_000, 2_000, "gpt-5-codex", 900),
+        ];
+        let full = latest_usage_observations_from_ledger(&entries);
+        for session_id in ["session-a", "session-b"] {
+            let single = latest_usage_observation_for_session(&entries, session_id)
+                .expect("session should have an observation");
+            let expected = full.get(session_id).expect("full replay has the session");
+            assert_eq!(single.context_window_tokens, expected.context_window_tokens);
+            assert_eq!(single.observed_at, expected.observed_at);
+        }
+        assert!(latest_usage_observation_for_session(&entries, "session-missing").is_none());
     }
 
     #[test]

@@ -26,12 +26,82 @@ export type ConversationTranslate = (
   vars?: Record<string, string | number>,
 ) => string;
 
+/** 过程标题只是一行预览，超长内容截断；完整内容由展开后的正文承担。 */
+const PROCESS_LABEL_MAX_CHARS = 160;
+/** 展开后仍以单行紧凑形态呈现的过程文字上限（超过则按完整正文渲染）。 */
+const COMPACT_EVENT_MAX_CHARS = 90;
+
+/**
+ * 把 Markdown 收敛成一行可读预览：只去掉语法标记，保留词内的连字符/下划线、
+ * 路径与数字，不在标点两侧凭空插入空格。代码块整体略过，链接保留可读文字。
+ */
 function plainText(value: string): string {
-  return value
+  const preview = value
     .replace(/```[\s\S]*?```/gu, ' ')
-    .replace(/[`*_>#-]/gu, ' ')
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/gu, '$1')
+    .replace(/^[ \t]*(?:[-:| ]+\|[-:| ]*)$/gmu, ' ')
+    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gmu, '')
+    .replace(/^[ \t]*>[ \t]?/gmu, '')
+    .replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]+/gmu, '')
+    .replace(/(\*\*|__|~~)(?=\S)([\s\S]*?\S)\1/gu, '$2')
+    .replace(/`([^`]*)`/gu, '$1')
+    .replace(/\|/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim();
+  return preview.length > PROCESS_LABEL_MAX_CHARS
+    ? `${preview.slice(0, PROCESS_LABEL_MAX_CHARS - 1)}…`
+    : preview;
+}
+
+/** 工具调用、工具结果和文件变更：它们永远属于过程，不是回答。 */
+export function isToolLikeMessage(message: Message): boolean {
+  return message.type === 'tool_call'
+    || (message.blocks || []).some((block) => (
+      Boolean(block)
+        && typeof block === 'object'
+        && (block.type === 'tool_call' || block.type === 'tool_result' || block.type === 'file_change')
+    ));
+}
+
+/**
+ * 这条助手消息是否是本轮的最终输出。
+ * 明确的 final/error 标记优先。轮次耗时元数据会附着在本轮最后一条可渲染消息上——
+ * 一轮以工具调用结束（没有文字回答）时，那条消息就是工具调用——所以凭耗时判断最终输出
+ * 时必须排除工具与思考消息，否则它会被提升到过程之外，以原始卡片风格混进摘要视图。
+ */
+export function isConversationFinalMessage(message: Message): boolean {
+  const outputKind = typeof message.metadata?.assistantOutputKind === 'string'
+    ? message.metadata.assistantOutputKind.trim()
+    : '';
+  if (outputKind === 'final' || outputKind === 'error') return true;
+  if (isToolLikeMessage(message) || message.type === 'thinking') return false;
+  return typeof message.metadata?.responseDurationMs === 'number';
+}
+
+function rawMessageText(message: Message): string {
+  if (typeof message.content === 'string' && message.content.trim()) return message.content;
+  for (const block of message.blocks || []) {
+    if (block && typeof block === 'object' && block.type === 'text'
+      && typeof block.content === 'string' && block.content.trim()) {
+      return block.content;
+    }
+  }
+  return '';
+}
+
+/**
+ * 这条过程消息是否能被“一行标题/一行紧凑文字”完整表达。
+ * 只有短小的纯文字才算：含换行、代码、表格、列表、标题、思考块、文件变更或超长内容，
+ * 都必须展开后按完整正文渲染，不能被压平成一行而丢失结构。
+ */
+export function isCompactProcessEvent(message: Message): boolean {
+  if (message.type === 'thinking') return false;
+  const blocks = message.blocks || [];
+  if (blocks.some((block) => block && typeof block === 'object' && block.type !== 'text')) return false;
+  const raw = rawMessageText(message).trim();
+  if (!raw) return true;
+  if (raw.length > COMPACT_EVENT_MAX_CHARS || raw.includes('\n')) return false;
+  return !/```|^\s*(?:#{1,6}\s|>\s|[-*+]\s|\d+[.)]\s)|\|.*\|/u.test(raw);
 }
 
 export function resolveConversationProcessLabel(
@@ -266,6 +336,32 @@ export function resolveConversationToolGroupLabel(
   return `${label}${translate('messageList.turnDisclosure.toolGroupFailureSuffix', { count: errorCount })}`;
 }
 
+export type ConversationPhaseDetailEntry =
+  | { kind: 'compact'; entry: Extract<ConversationPhaseEntry, { kind: 'event' }> }
+  | { kind: 'rich'; entry: Extract<ConversationPhaseEntry, { kind: 'event' }> }
+  | { kind: 'tool-group'; entry: Extract<ConversationPhaseEntry, { kind: 'tool-group' }> };
+
+/**
+ * 阶段展开后需要额外展示的内容。标题已经完整表达的首条短文字不再重复，
+ * 其余短文字保持紧凑行，带结构的长内容按完整正文渲染，工具组沿用工具卡片。
+ * 结果为空说明展开没有更多信息，此时阶段只是一行静态标题。
+ */
+export function resolveConversationPhaseDetails(
+  phase: ConversationPhase,
+): ConversationPhaseDetailEntry[] {
+  const details: ConversationPhaseDetailEntry[] = [];
+  phase.entries.forEach((entry, index) => {
+    if (entry.kind === 'tool-group') {
+      details.push({ kind: 'tool-group', entry });
+      return;
+    }
+    const compact = isCompactProcessEvent(entry.item.message);
+    if (compact && index === 0) return;
+    details.push({ kind: compact ? 'compact' : 'rich', entry });
+  });
+  return details;
+}
+
 export function resolveConversationPhaseSummary(
   phase: ConversationPhase,
   translate: ConversationTranslate,
@@ -301,6 +397,17 @@ export function buildConversationDisclosureBlocks(
   };
 
   for (const entry of entries) {
+    if (entry.kind === 'event' && entry.item.message.type === 'system-notice') {
+      // 系统通知（如上下文压缩）不是模型的一段工作：它独占一行，
+      // 不能成为阶段标题，也不能把后面的工具组归到自己名下。
+      flushPhase();
+      blocks.push({
+        kind: 'phase',
+        phase: { key: `phase:${entry.key}`, entries: [entry] },
+      });
+      continue;
+    }
+
     if (entry.kind === 'event') {
       // 工具执行后再次出现文字，表示进入下一段模型工作；
       // 连续的文字更新仍属于同一个阶段。

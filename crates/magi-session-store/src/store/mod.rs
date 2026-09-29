@@ -679,6 +679,49 @@ impl SessionStore {
         persist(&durable, &sidecars)
     }
 
+    /// 会话导航专用的持久化事务：只把“当前指针 + 目标会话的切片 + 目标会话的 sidecar”交给回调。
+    ///
+    /// `persist_projection_with` 会把全部会话的全部历史整体深拷贝一份，切换会话的代价因此与
+    /// 所有会话历史的总量成正比（工具调用负载里的 JSON 也会被逐层克隆）。导航只提交一个当前指针，
+    /// 不需要其它会话的任何数据。锁序与 `persist_projection_with` 完全一致。
+    pub fn persist_navigation_projection_with<T, E>(
+        &self,
+        target_session_id: Option<&SessionId>,
+        persist: impl FnMut(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _persistence_guard = self
+            .durable_persistence_lock
+            .lock()
+            .expect("session durable persistence lock poisoned");
+        let _canonical_guard = self
+            .canonical_commit_barrier
+            .write()
+            .expect("session canonical commit barrier poisoned");
+        let mut persist = persist;
+        let state = self.state.read().expect("session state read lock poisoned");
+        let durable = match target_session_id {
+            Some(session_id) => {
+                let mut slice = state.durable_state_for_session(session_id);
+                slice.current_session_id = state.current_session_id.clone();
+                slice
+            }
+            None => SessionDurableState {
+                current_session_id: state.current_session_id.clone(),
+                ..SessionDurableState::default()
+            },
+        };
+        let sidecars = SessionExecutionSidecarStoreState {
+            runtime_sidecars: state
+                .execution_sidecar_store
+                .runtime_sidecars
+                .iter()
+                .filter(|sidecar| target_session_id.is_some_and(|target| sidecar.session_id == *target))
+                .cloned()
+                .collect(),
+        };
+        persist(&durable, &sidecars)
+    }
+
     /// 安装 session 生命周期 observer。每个 store 同一时间只挂一个 observer，
     /// magi-api 启动时由 wiring 层装配；后挂的会替换前一个。
     pub fn set_lifecycle_observer(&self, observer: Arc<dyn SessionLifecycleObserver>) {

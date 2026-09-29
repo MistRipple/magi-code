@@ -6,12 +6,15 @@
     durationMs: number;
     completedAt?: number | null;
     hasContent?: boolean;
+    /** 摘要风格的轮次标题已经显示耗时时关闭，避免同一数字在标题和底部各出现一次。 */
+    showDuration?: boolean;
   }
 
   let {
     durationMs,
     completedAt = null,
     hasContent = false,
+    showDuration = true,
   }: Props = $props();
 
   const normalizedDurationMs = $derived(Math.max(0, durationMs));
@@ -29,9 +32,13 @@
 
 <div class="message-runtime-footer completed" class:has-content={hasContent}>
   <span class="message-runtime-text">
-    {i18n.t('messageItem.responseDurationLabel')} {durationLabel}
-    {#if normalizedCompletedAt !== null}
-      · {formatTraceableTime(normalizedCompletedAt)}
+    {#if showDuration}
+      {i18n.t('messageItem.responseDurationLabel')} {durationLabel}
+      {#if normalizedCompletedAt !== null}
+        · {formatTraceableTime(normalizedCompletedAt)}
+      {/if}
+    {:else if normalizedCompletedAt !== null}
+      {formatTraceableTime(normalizedCompletedAt)}
     {/if}
   </span>
 </div>

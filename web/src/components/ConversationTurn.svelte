@@ -3,6 +3,13 @@
   import type { FilePreviewScope } from '../lib/file-reference';
   import type { Message, TimelineRenderItem } from '../types/message';
   import { untrack } from 'svelte';
+  import { normalizeCanonicalTurnItemStrict } from '../shared/protocol/canonical-turn';
+  import { getAgentTurnItems } from '../web/agent-api';
+  import {
+    mergeEarlierCanonicalTurnItems,
+    readTurnHistoryWindow,
+    turnStoreState,
+  } from '../stores/turn-store.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import MessageItem from './MessageItem.svelte';
@@ -16,6 +23,8 @@
   } from '../lib/conversation-presentation';
   import {
     buildConversationDisclosureBlocks,
+    isConversationFinalMessage,
+    isToolLikeMessage,
     type ConversationDisclosureBlock,
     type ConversationStreamEntry,
   } from '../lib/conversation-disclosure';
@@ -58,22 +67,6 @@
     return typeof value === 'string' ? value.trim() : '';
   }
 
-  function isToolLikeMessage(message: Message): boolean {
-    return message.type === 'tool_call'
-      || (message.blocks || []).some((block) => (
-        Boolean(block)
-          && typeof block === 'object'
-          && (block.type === 'tool_call' || block.type === 'tool_result' || block.type === 'file_change')
-      ));
-  }
-
-  function isFinalMessage(message: Message): boolean {
-    const outputKind = metadataString(message, 'assistantOutputKind');
-    return outputKind === 'final'
-      || outputKind === 'error'
-      || typeof message.metadata?.responseDurationMs === 'number';
-  }
-
   function isUsefulFinalCandidate(message: Message): boolean {
     if (isToolLikeMessage(message) || message.type === 'thinking') return false;
     if (message.type === 'error' || message.type === 'result' || message.type === 'text') return true;
@@ -90,9 +83,44 @@
     );
   }
 
+  // 超长 turn 在历史页里只带最新一段条目；被折叠的更早步骤在这里按需向前补齐。
+  const canonicalTurn = $derived(turnStoreState.reducer.turns.find((turn) => turn.turnId === turnId));
+  const historyWindow = $derived(readTurnHistoryWindow(canonicalTurn));
+  let loadingEarlier = $state(false);
+  let loadEarlierFailed = $state(false);
+
+  async function loadEarlierSteps() {
+    const window = historyWindow;
+    const sessionId = canonicalTurn?.sessionId;
+    if (!window || !sessionId || loadingEarlier) return;
+    loadingEarlier = true;
+    loadEarlierFailed = false;
+    try {
+      const page = await getAgentTurnItems({
+        sessionId,
+        turnId,
+        beforeItemSeq: window.beforeItemSeq,
+      });
+      mergeEarlierCanonicalTurnItems({
+        sessionId,
+        turnId,
+        items: page.items.map((item, index) => (
+          normalizeCanonicalTurnItemStrict(item, `turnItems[${index}]`)
+        )),
+        hasMoreBefore: page.hasMoreBefore === true,
+        beforeItemSeq: typeof page.beforeItemSeq === 'number' ? page.beforeItemSeq : null,
+        omittedItemCount: page.omittedItemCount,
+      });
+    } catch {
+      loadEarlierFailed = true;
+    } finally {
+      loadingEarlier = false;
+    }
+  }
+
   const userItems = $derived(items.filter((item) => item.message.type === 'user_input'));
   const assistantItems = $derived(items.filter((item) => item.message.type !== 'user_input'));
-  const explicitFinalItems = $derived(assistantItems.filter((item) => isFinalMessage(item.message)));
+  const explicitFinalItems = $derived(assistantItems.filter((item) => isConversationFinalMessage(item.message)));
   const finalItems = $derived.by(() => {
     if (explicitFinalItems.length > 0) return explicitFinalItems;
     for (let index = assistantItems.length - 1; index >= 0; index -= 1) {
@@ -222,7 +250,12 @@
     if (!isLive) return '';
     for (let index = disclosureBlocks.length - 1; index >= 0; index -= 1) {
       const block = disclosureBlocks[index];
-      if (block.kind === 'phase') return block.phase.key;
+      // 系统通知独占的“阶段”只是一行静态说明，不是正在进行的模型工作。
+      if (block.kind === 'phase' && !block.phase.entries.every(
+        (entry) => entry.kind === 'event' && entry.item.message.type === 'system-notice',
+      )) {
+        return block.phase.key;
+      }
     }
     return '';
   });
@@ -269,6 +302,18 @@
   {:else if durationLabel}
     <div class="turn-status-header">
       <span class="turn-disclosure-label">{disclosureLabel}</span>
+    </div>
+  {/if}
+
+  {#if historyWindow}
+    <div class="turn-earlier-steps" data-testid="turn-earlier-steps">
+      <span>{i18n.t('conversationTurn.earlierStepsHidden', { count: historyWindow.omittedItemCount })}</span>
+      <button type="button" class="turn-earlier-steps-load" disabled={loadingEarlier} onclick={loadEarlierSteps}>
+        {loadingEarlier ? i18n.t('messageList.loadingOlder') : i18n.t('conversationTurn.loadEarlierSteps')}
+      </button>
+      {#if loadEarlierFailed}
+        <span class="turn-earlier-steps-error">{i18n.t('conversationTurn.loadEarlierStepsFailed')}</span>
+      {/if}
     </div>
   {/if}
 
@@ -341,8 +386,9 @@
     />
   {/each}
 
-  {#if !isLive && durationMs !== null}
-    <TurnRuntimeSummary durationMs={durationMs} {completedAt} />
+  <!-- 耗时已经显示在轮次标题上；底部只补充完成时间，不再把同一个耗时重复一遍。 -->
+  {#if !isLive && durationMs !== null && completedAt !== null}
+    <TurnRuntimeSummary durationMs={durationMs} {completedAt} showDuration={false} />
   {/if}
 </article>
 
@@ -407,6 +453,33 @@
   .turn-disclosure-chevron.rotated {
     transform: rotate(90deg);
     color: var(--foreground);
+  }
+
+  .turn-earlier-steps {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+  }
+
+  .turn-earlier-steps-load {
+    color: var(--primary);
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    font: inherit;
+  }
+
+  .turn-earlier-steps-load:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  .turn-earlier-steps-error {
+    color: var(--error);
   }
 
   .turn-stream {

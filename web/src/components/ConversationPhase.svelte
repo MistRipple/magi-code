@@ -3,11 +3,13 @@
   import type { FilePreviewScope } from '../lib/file-reference';
   import type { TimelineRenderItem } from '../types/message';
   import {
+    resolveConversationPhaseDetails,
     resolveConversationPhaseSummary,
     type ConversationPhase as ConversationPhaseModel,
   } from '../lib/conversation-disclosure';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
+  import MessageItem from './MessageItem.svelte';
   import ConversationProcessRow from './ConversationProcessRow.svelte';
   import ConversationToolGroup from './ConversationToolGroup.svelte';
 
@@ -48,6 +50,10 @@
   );
   // 进行中也保留当前阶段的具体摘要，状态点单独表达“正在执行”。
   const headerLabel = $derived(summary);
+  // 标题已经完整表达的阶段（例如一句短文字）展开后没有更多信息：
+  // 只显示静态标题，不给一个点开后什么都不多的箭头。
+  const details = $derived(resolveConversationPhaseDetails(phase));
+  const expandable = $derived(details.length > 0);
 
   function toggle(): void {
     manualOverride = true;
@@ -57,47 +63,67 @@
 
 <section
   class="conversation-phase"
-  class:expanded
+  class:expanded={expanded && expandable}
   class:active
   data-conversation-phase={phase.key}
   data-conversation-phase-state={active ? 'active' : 'completed'}
 >
-  <button
-    type="button"
-    class="conversation-phase-header"
-    aria-expanded={expanded}
-    aria-controls={contentId}
-    onclick={toggle}
-  >
-    <span class="conversation-phase-chevron" class:rotated={expanded}>
-      <Icon name="chevron-right" size={12} />
-    </span>
-    <span class="conversation-phase-label" title={summary}>{headerLabel}</span>
-    {#if active}
-      <span class="conversation-phase-live" aria-label={i18n.t('messageList.turnDisclosure.processing')}>
-        <span class="conversation-phase-live-dot"></span>
+  {#if expandable}
+    <button
+      type="button"
+      class="conversation-phase-header"
+      aria-expanded={expanded}
+      aria-controls={contentId}
+      onclick={toggle}
+    >
+      <span class="conversation-phase-chevron" class:rotated={expanded}>
+        <Icon name="chevron-right" size={12} />
       </span>
-    {/if}
-  </button>
+      <span class="conversation-phase-label" title={summary}>{headerLabel}</span>
+      {#if active}
+        <span class="conversation-phase-live" aria-label={i18n.t('messageList.turnDisclosure.processing')}>
+          <span class="conversation-phase-live-dot"></span>
+        </span>
+      {/if}
+    </button>
+  {:else}
+    <div class="conversation-phase-header conversation-phase-header--static">
+      <span class="conversation-phase-marker" aria-hidden="true"></span>
+      <span class="conversation-phase-label" title={summary}>{headerLabel}</span>
+      {#if active}
+        <span class="conversation-phase-live" aria-label={i18n.t('messageList.turnDisclosure.processing')}>
+          <span class="conversation-phase-live-dot"></span>
+        </span>
+      {/if}
+    </div>
+  {/if}
 
-  {#if expanded}
+  {#if expanded && expandable}
     <div class="conversation-phase-content" id={contentId}>
-      {#each phase.entries as entry (entry.key)}
-        {#if entry.kind === 'event'}
-          <div class="turn-process-entry">
-            <ConversationProcessRow item={entry.item} />
-          </div>
-        {:else}
-          <div class="turn-process-entry">
+      {#each details as detail (detail.entry.key)}
+        <div class="turn-process-entry">
+          {#if detail.kind === 'compact'}
+            <ConversationProcessRow item={detail.entry.item} />
+          {:else if detail.kind === 'rich'}
+            <!-- 带结构的过程内容（Markdown、表格、代码、思考）按完整正文渲染，不压平成一行 -->
+            <MessageItem
+              message={detail.entry.item.message}
+              {readOnly}
+              {displayContext}
+              filePreviewScope={filePreviewScopeForItem(detail.entry.item)}
+              onContinueInterrupted={continueInterruptedSession}
+              hideResponseDuration
+            />
+          {:else}
             <ConversationToolGroup
-              items={entry.items}
+              items={detail.entry.items}
               {readOnly}
               {displayContext}
               {filePreviewScopeForItem}
               {continueInterruptedSession}
             />
-          </div>
-        {/if}
+          {/if}
+        </div>
       {/each}
     </div>
   {/if}
@@ -135,6 +161,34 @@
     outline: 1px solid color-mix(in srgb, var(--primary) 72%, transparent);
     outline-offset: 2px;
     border-radius: var(--radius-sm);
+  }
+
+  .conversation-phase-header--static {
+    cursor: default;
+  }
+
+  .conversation-phase-header--static:hover {
+    color: var(--foreground-muted);
+  }
+
+  /* 与过程行同款的中性节点，保证静态标题与可展开标题左侧对齐。 */
+  .conversation-phase-marker {
+    position: relative;
+    flex: 0 0 12px;
+    width: 12px;
+    height: 18px;
+  }
+
+  .conversation-phase-marker::before {
+    content: '';
+    position: absolute;
+    top: 7px;
+    left: 4px;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.52;
   }
 
   .conversation-phase-chevron {
@@ -194,6 +248,11 @@
 
   .turn-process-entry {
     min-width: 0;
+  }
+
+  /* 完整渲染的过程正文与紧凑行对齐：去掉助手消息自带的横向内边距。 */
+  .turn-process-entry :global(.message-item.assistant) {
+    padding-inline: 0;
   }
 
   @keyframes conversation-phase-pulse {

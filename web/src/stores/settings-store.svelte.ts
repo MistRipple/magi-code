@@ -299,7 +299,7 @@ export interface LibrarySkill {
   enabled?: boolean;
 }
 
-function createSettingsStore(props: { onClose?: () => void }) {
+function createSettingsStore(props: { onClose?: () => void; isActive?: () => boolean }) {
   const isWebMode = isWebAgentMode();
   type SettingsBootstrapScope = "core" | "full";
 
@@ -309,6 +309,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   let { onClose }: Props = props;
   const clientKind = getClientKind();
+
+  // 设置视图会在后台保活。它不可见时不能做统计这类重活：执行统计接口要遍历整本
+  // 审计/用量账本，而 executionStatsUpdate 会随每次模型用量推送，后台每推一次就重算一次，
+  // 会和正在进行的对话争抢 daemon。不可见时只记“过期”，重新显示时再补一次。
+  const isSettingsActive = () => props.isActive?.() ?? true;
+  let executionStatsStale = false;
+  let mcpAutoConnectStale = false;
 
   // 当前激活的 Tab
   let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "browser" | "rules" | "project">(
@@ -3417,7 +3424,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
           : undefined,
       };
     });
-    void connectEnabledMcpServers();
+    // 应用 settings-bootstrap 时会顺带重连所有已启用的 MCP 服务。设置视图保活后，
+    // 应用每次切换会话都会刷新 bootstrap，不可见时如果照旧重连，每次切换都会白白
+    // 握手一遍全部 MCP 服务。不可见时只记“过期”，重新显示时再补一次。
+    if (isSettingsActive()) {
+      void connectEnabledMcpServers();
+    } else {
+      mcpAutoConnectStale = true;
+    }
   }
 
   async function connectEnabledMcpServers(): Promise<void> {
@@ -3874,6 +3888,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
       // 执行统计更新（SSE 推送）
       if (dataType === "executionStatsUpdate") {
+        if (!isSettingsActive()) {
+          executionStatsStale = true;
+          return;
+        }
         void loadExecutionStats().catch((error) => {
           console.error("[SettingsPanel] 刷新执行统计失败:", error);
         });
@@ -3882,24 +3900,36 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
     // 初始化请求数据
     void requestSettingsBootstrap().then(() => hydrateSkillInventory());
-    loadExecutionStats()
-      .catch((e) => {
-        console.error("[SettingsPanel] 获取执行统计失败:", e);
-        notifySettingsError(
-          i18n.t("settings.toast.action.fetchExecutionStats"),
-          e,
-        );
-      });
+    if (isSettingsActive()) {
+      loadExecutionStats()
+        .catch((e) => {
+          console.error("[SettingsPanel] 获取执行统计失败:", e);
+          notifySettingsError(
+            i18n.t("settings.toast.action.fetchExecutionStats"),
+            e,
+          );
+        });
+    } else {
+      executionStatsStale = true;
+    }
 
     return () => unsubscribe();
   });
 
   // 设置视图保活后，每次重新显示时刷新只读数据。配置本身由 SSE 推送与
   // settingsBootstrapSnapshot 驱动，不在这里强制覆盖，避免冲掉用户改到一半的表单。
+  // 统计只在确实过期（后台错过了推送）或正停在统计页时才重算。
   function refreshOnShow() {
-    void loadExecutionStats().catch((e) => {
-      console.error("[SettingsPanel] 刷新执行统计失败:", e);
-    });
+    if (mcpAutoConnectStale) {
+      mcpAutoConnectStale = false;
+      void connectEnabledMcpServers();
+    }
+    if (executionStatsStale || activeTab === "stats") {
+      executionStatsStale = false;
+      void loadExecutionStats().catch((e) => {
+        console.error("[SettingsPanel] 刷新执行统计失败:", e);
+      });
+    }
     if (activeTab === "tools") {
       void hydrateCommandEnvironment();
       void hydrateSkillInventory();
@@ -4303,7 +4333,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 export type SettingsStore = ReturnType<typeof createSettingsStore>;
 
 export function useSettingsStore(
-  props: { onClose?: () => void },
+  props: { onClose?: () => void; isActive?: () => boolean },
 ): SettingsStore {
   return createSettingsStore(props);
 }

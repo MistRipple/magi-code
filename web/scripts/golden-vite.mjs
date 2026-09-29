@@ -7,6 +7,8 @@ export async function withGoldenViteServer(callback, options = {}) {
   const server = await createServer({
     root: options.root ?? webRoot,
     configFile: options.configFile ?? false,
+    ...(options.plugins ? { plugins: options.plugins } : {}),
+    ...(options.ssr ? { ssr: options.ssr } : {}),
     logLevel: 'silent',
     server: { middlewareMode: true },
   });

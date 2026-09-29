@@ -32,6 +32,8 @@ import { SETTINGS_TABS } from '../lib/settings-tabs';
 
   const store = useSettingsStore({
     onClose: () => onClose?.(),
+    // 保活期间不可见时，存储不做统计这类重活（见 settings-store 中的说明）。
+    isActive: () => active,
   });
 
   const activeTabDefinition = $derived(

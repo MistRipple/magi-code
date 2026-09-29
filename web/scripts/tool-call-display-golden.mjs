@@ -132,8 +132,23 @@ assert.match(
 );
 assert.match(
   conversationTurnSource,
-  /import TurnRuntimeSummary from '\.\/TurnRuntimeSummary\.svelte';[\s\S]*?\{#if !isLive && durationMs !== null\}[\s\S]*?<TurnRuntimeSummary durationMs=\{durationMs\} \{completedAt\} \/>/,
-  '摘要模式必须在最终结果底部复用原始模式的耗时与完成时间组件',
+  /import TurnRuntimeSummary from '\.\/TurnRuntimeSummary\.svelte';[\s\S]*?\{#if !isLive && durationMs !== null && completedAt !== null\}[\s\S]*?<TurnRuntimeSummary durationMs=\{durationMs\} \{completedAt\} showDuration=\{false\} \/>/,
+  '摘要模式在最终结果底部复用原始模式的时间组件，但耗时已在轮次标题上显示，底部只补充完成时间，不得重复耗时',
+);
+assert.match(
+  await readFile(new URL('../src/components/TurnRuntimeSummary.svelte', import.meta.url), 'utf8'),
+  /showDuration\?: boolean;[\s\S]*?\{#if showDuration\}[\s\S]*?responseDurationLabel[\s\S]*?\{:else if normalizedCompletedAt !== null\}/,
+  '时间组件必须支持只显示完成时间，原始模式默认仍显示耗时与完成时间',
+);
+assert.match(
+  await readFile(new URL('../src/components/MarkdownRenderer.svelte', import.meta.url), 'utf8'),
+  /rawtext:\s*MdText/,
+  '文件引用识别必须挂在 rawtext 上，text 交给默认渲染器递归渲染嵌套行内 token',
+);
+assert.doesNotMatch(
+  await readFile(new URL('../src/components/MarkdownRenderer.svelte', import.meta.url), 'utf8'),
+  /\btext:\s*MdText/,
+  '不得再用自定义 text 渲染器拦截紧凑列表项，否则列表里的加粗与行内代码会显示成原始符号',
 );
 assert.match(
   conversationToolGroupSource,

@@ -16,7 +16,7 @@ use magi_bridge_client::{
 use magi_core::{EventId, SessionId, ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens};
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeUsageObservation,
-    latest_usage_observations_from_ledger,
+    latest_usage_observation_for_session,
 };
 use magi_session_store::{
     SessionStore, ThreadChatMessage, ThreadContextCheckpoint, ThreadFileFactVersion,
@@ -1753,8 +1753,10 @@ fn latest_session_usage_observation(
     event_bus: &InMemoryEventBus,
     session_id: &SessionId,
 ) -> Option<SessionRuntimeUsageObservation> {
-    let snapshot = event_bus.audit_usage_ledger_snapshot();
-    latest_usage_observations_from_ledger(&snapshot.usage_entries).remove(&session_id.to_string())
+    // 每次构建上下文都会走这里：读锁内按会话过滤扫描，不克隆整本账本。
+    event_bus.with_audit_usage_ledger(|ledger| {
+        latest_usage_observation_for_session(&ledger.usage_entries, session_id.as_str())
+    })
 }
 
 fn thread_history_fingerprint(history: &[ThreadChatMessage]) -> String {

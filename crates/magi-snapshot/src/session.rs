@@ -35,6 +35,15 @@ pub struct SnapshotSession {
     active_tool_ctxs: RwLock<HashMap<String, ToolHookCtx>>,
     path_filter: SnapshotPathFilter,
     watcher_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 路径 → 上一次算出的 unified diff。变更列表每次请求都会重投影，行级 diff
+    /// 是其中最重的部分；新旧文本完全一致时直接复用，内容变化则自然失效。
+    diff_cache: std::sync::Mutex<HashMap<String, CachedDiff>>,
+}
+
+struct CachedDiff {
+    old: String,
+    new: String,
+    diff: String,
 }
 
 impl SnapshotSession {
@@ -142,6 +151,7 @@ impl SnapshotSession {
             active_tool_ctxs: RwLock::new(HashMap::new()),
             path_filter,
             watcher_task: tokio::sync::Mutex::new(None),
+            diff_cache: std::sync::Mutex::new(HashMap::new()),
         });
 
         // baseline 不存在时（首次启动），执行首次扫描并填充。
@@ -445,6 +455,35 @@ impl SnapshotSession {
         Ok(())
     }
 
+    /// 普通文件的大小与修改时间都与账本记录一致，且修改时间已过 racy 窗口时，内容必然没变，
+    /// 对账可以跳过读取与哈希。全树对账因此只为真正变化的文件付出内容读取成本，而不是随
+    /// 工作区总字节数增长。
+    fn is_stat_clean(&self, abs: &Path, rel: &str) -> bool {
+        const RACY_WINDOW_MS: u64 = 2_000;
+        let Ok(stat) = std::fs::symlink_metadata(abs) else {
+            return false;
+        };
+        if !stat.is_file() {
+            return false;
+        }
+        let Some(mtime) = crate::scan::mtime_ms(&stat) else {
+            return false;
+        };
+        if mtime.saturating_add(RACY_WINDOW_MS) >= now_ms() {
+            return false;
+        }
+        self.current
+            .read()
+            .expect("current poisoned")
+            .get(rel)
+            .is_some_and(|recorded| {
+                recorded.error.is_none()
+                    && recorded.symlink.is_none()
+                    && recorded.size == stat.len()
+                    && recorded.mtime_ms == Some(mtime)
+            })
+    }
+
     /// 全树对账：在工具执行批次结束后调用，兜住 watcher 漏掉的事件。
     pub fn reconcile(&self) -> SnapshotResult<()> {
         let respect = self.workspace_root.join(".git").is_dir();
@@ -459,6 +498,9 @@ impl SnapshotSession {
                 continue;
             }
             seen.insert(rel.clone());
+            if self.is_stat_clean(&abs, &rel) {
+                continue;
+            }
             self.record_upsert(
                 &abs,
                 SourceKind::External,
@@ -681,7 +723,35 @@ impl SnapshotSession {
 
         let mut out = collapse_renames(primary, &baseline.entries, &current);
         out.sort_by(|a, b| a.path.cmp(&b.path));
+        let live: std::collections::HashSet<&str> =
+            out.iter().map(|change| change.path.as_str()).collect();
+        self.diff_cache
+            .lock()
+            .expect("diff_cache poisoned")
+            .retain(|path, _| live.contains(path.as_str()));
         Ok(out)
+    }
+
+    fn cached_unified_diff(&self, path: &str, old: &str, new: &str) -> String {
+        if let Some(hit) = self
+            .diff_cache
+            .lock()
+            .expect("diff_cache poisoned")
+            .get(path)
+            .filter(|cached| cached.old == old && cached.new == new)
+        {
+            return hit.diff.clone();
+        }
+        let diff = unified_diff_text(path, old, new);
+        self.diff_cache.lock().expect("diff_cache poisoned").insert(
+            path.to_string(),
+            CachedDiff {
+                old: old.to_string(),
+                new: new.to_string(),
+                diff: diff.clone(),
+            },
+        );
+        diff
     }
 
     fn project(
@@ -739,9 +809,9 @@ impl SnapshotSession {
                 }
             }
             unified_diff = match (&original_content, &preview_content) {
-                (Some(o), Some(n)) => Some(unified_diff_text(&path, o, n)),
-                (Some(o), None) => Some(unified_diff_text(&path, o, "")),
-                (None, Some(n)) => Some(unified_diff_text(&path, "", n)),
+                (Some(o), Some(n)) => Some(self.cached_unified_diff(&path, o, n)),
+                (Some(o), None) => Some(self.cached_unified_diff(&path, o, "")),
+                (None, Some(n)) => Some(self.cached_unified_diff(&path, "", n)),
                 (None, None) => None,
             };
         } else if matches!(content_kind, ContentKind::LargeText)

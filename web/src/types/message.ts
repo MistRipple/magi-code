@@ -316,6 +316,8 @@ export interface ToolCall {
   status: ToolCallStatus;
   result?: string;
   error?: string;
+  /** 历史分页只带了超长输出的开头；由此引用向服务端按需取回完整 item。 */
+  truncatedResult?: { sessionId: string; turnId: string; itemId: string; omittedChars: number };
   standardized?: StandardizedToolResult;
   durationMs?: number;
   startTime?: number;
