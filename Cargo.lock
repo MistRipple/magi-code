@@ -1418,6 +1418,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-mcp-server"
+version = "3.0.51"
+dependencies = [
+ "axum",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "magi-memory-store"
 version = "3.0.51"
 dependencies = [

@@ -238,6 +238,15 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 3. 用 MCP 官方调试客户端验证 `tools/list` / `tools/call`、挂起与超时、取消。
 任一不成立回到本文重新决策。
 
+**阶段 0 代码核对结果（2026-09-30，读代码，未跑真实客户端）**
+
+| 验证项 | 结论 | 依据与影响 |
+| --- | --- | --- |
+| 工具执行能否脱离模型 turn | **可以** | `magi-tool-runtime::ToolRegistry::execute_with_policy(input, context, policy)` 只需要 `ToolExecutionContext`（会话、工作区、工作目录、访问档）与 `ToolExecutionPolicy`（允许 / 拒绝路径、工具名、命令模式），不依赖 Task 或 turn。MCP 服务直接以它为执行入口。 |
+| 审批能否复用 | **注册表可以复用，等待逻辑要新写** | `ToolApprovalRegistry::request_with_arguments` / `resolve` 把 `task_id`、`turn_id` 当不透明字符串使用，可以用 `external:<token_ref>` 形式的合成标识；但现有等待循环 `await_task_tool_approval`（`tool_batch.rs`）是私有函数，并强依赖“会话当前活动 turn + Task 仍在运行”。MCP 服务需要自己的等待循环，存活判据改为“令牌仍有效且连接未断”。外部审批只支持 `allow_once` / `deny`，不使用 `allow_for_turn`。 |
+| 审批在界面里怎么出现 | **缺口，需要新增全局入口** | 现有审批查询与解析接口按会话作用域（`GET /session/tool-approvals?sessionId=…`）；外部工具会话不是用户当前打开的会话，审批会看不见。需要一个跨会话的“待审批”入口（通知中心 / 全局待办），并把外部审批标明来源客户端。这是阶段 2 的必做项。 |
+| 变更账本对外部写入 | **待验证** | 变更账本以会话为单位；外部写入需要在外部工具会话下建立对应的快照会话，阶段 1–2 中用真实写入验证。 |
+
 ### 阶段 1：本机 stdio + 令牌（只读优先）
 令牌创建 / 存储 / 吊销、stdio 中继、`read_only` 工具集、路径校验、审计、外部工具会话。
 **验收**：Claude Desktop 或 Cursor 通过 stdio 连接，能列出并调用只读工具；越权路径、符号链接逃逸、无令牌、过期令牌都被拒绝；审计可查。
