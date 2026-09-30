@@ -19,6 +19,7 @@ magi-appearance = { path = "../magi-appearance" }
 magi-agent-role = { path = "../magi-agent-role" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-browser-authority = { path = "../magi-browser-authority" }
+magi-web-model = { path = "../magi-web-model" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-core = { path = "../magi-core" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }

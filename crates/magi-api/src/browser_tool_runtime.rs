@@ -105,8 +105,8 @@ impl BrowserToolRuntimeDependencies {
                 payload,
             )
             .with_context(EventContext {
-                workspace_id: session.workspace_id.clone(),
-                session_id: Some(session.session_id.clone()),
+                workspace_id: session.owner_workspace_id().cloned(),
+                session_id: session.magi_session_id().cloned(),
                 ..EventContext::default()
             }),
         );
@@ -737,7 +737,7 @@ impl BrowserToolRuntimeDependencies {
             .session_for_magi_session(session_id)
             .cloned();
         if let Some(session) = current {
-            if session.workspace_id.as_ref() != workspace_id {
+            if session.owner_workspace_id() != workspace_id {
                 return Err(BrowserToolError::new(
                     "browser_workspace_scope_mismatch",
                     "浏览器会话与当前工作区不匹配",
@@ -751,8 +751,10 @@ impl BrowserToolRuntimeDependencies {
         let session = self.mutate(|authority| {
             authority.create_session(CreateBrowserSession {
                 browser_session_id: browser_session_id.clone(),
-                workspace_id: workspace_id.cloned(),
-                session_id: session_id.clone(),
+                owner: magi_browser_authority::BrowserSessionOwner::Session {
+                    session_id: session_id.clone(),
+                    workspace_id: workspace_id.cloned(),
+                },
                 profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
                 now: UtcMillis::now(),
             })?;
@@ -2714,8 +2716,10 @@ mod tests {
             authority
                 .create_session(CreateBrowserSession {
                     browser_session_id: foreign_browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id: foreign_session_id,
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: foreign_session_id,
+                        workspace_id: None,
+                    },
                     profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
                     now: UtcMillis(2),
                 })
@@ -2730,7 +2734,7 @@ mod tests {
             authority
                 .create_tab(CreateBrowserTab {
                     tab_id: foreign_tab_id.clone(),
-                    browser_session_id: foreign_browser_session_id,
+                    browser_session_id: foreign_browser_session_id.clone(),
                     url: "about:blank".to_string(),
                     now: UtcMillis(4),
                 })
@@ -2772,8 +2776,10 @@ mod tests {
         authority
             .create_session(CreateBrowserSession {
                 browser_session_id: browser_session_id.clone(),
-                workspace_id: Some(workspace_id),
-                session_id,
+                owner: magi_browser_authority::BrowserSessionOwner::Session {
+                    session_id,
+                    workspace_id: Some(workspace_id),
+                },
                 profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
                 now: UtcMillis(2),
             })

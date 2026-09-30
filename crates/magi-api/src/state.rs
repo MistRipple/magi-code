@@ -1230,6 +1230,34 @@ fn spawn_browser_control_sync(client: BrowserHostClient, control: BrowserSurface
     }
 }
 
+/// 最近一次 GPT Web 只读探测的结论。
+///
+/// 会话内模型选择器**只**按它决定是否投影 Web 引擎（§5.5 fail closed、
+/// §5.11 可用性）：没有探测结论、结论未归类、或结论是登录失效一类时一律不投影，
+/// 绝不用上一次结果占位。它只驻 daemon 进程内存，不落盘（A20、§5.12）。
+#[derive(Clone, Debug)]
+pub struct WebModelProbeSnapshot {
+    /// 单次探测状态：`ok` / `refresh_required` / `login_required` /
+    /// `site_blocked` / `quota_exhausted` / `desktop_unavailable` / `consent_required`。
+    pub status: String,
+    pub reason: Option<String>,
+    pub account_hint: String,
+    pub limits_revision: String,
+    /// 本次探测读到的候选引擎 id；只有同时存在于 `settings.engines` 的才进选择器。
+    pub engine_ids: Vec<String>,
+    pub probed_at: u64,
+}
+
+impl WebModelProbeSnapshot {
+    /// 该状态是否允许把 Web 引擎投影到会话内模型选择器。
+    ///
+    /// `ok` 与 `refresh_required` 可见（后者置灰不可发送）；其余状态只在
+    /// 「设置 → 浏览器 → GPT Web 模型」显示状态与主行动（§5.11）。
+    pub fn is_visible_in_picker(&self) -> bool {
+        matches!(self.status.as_str(), "ok" | "refresh_required")
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub service_info: ServiceInfo,
@@ -1285,6 +1313,12 @@ pub struct ApiState {
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
+    /// T3 通道装配（harness 本机入口 + OpenAI Tunnel 托管，§5.7.3 / §5.7.4）。
+    /// harness 会话、turn 令牌与通道状态都只驻进程内存（A20、§5.12）。
+    pub web_model_harness: Arc<crate::web_model_harness::WebModelHarnessRuntime>,
+    /// 最近一次 GPT Web 只读探测的结论：Web 引擎是否投影到会话内模型选择器的
+    /// 唯一判据（§5.5 fail closed、§5.11）。只驻内存，daemon 重启即清空。
+    web_model_probe: Arc<RwLock<Option<WebModelProbeSnapshot>>>,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
     /// Session Turn 的单一生命周期所有者。只保存轻量身份与 attempt，不复制正文。
@@ -1636,6 +1670,85 @@ fn default_browser_authority(state_root: &Path) -> Result<BrowserAuthority, Brow
     Ok(authority)
 }
 
+/// Web 推理页是 daemon 进程内的绑定表和页面副本，不能作为 BrowserAuthority 的
+/// 可恢复事实落盘。主页仍然是应用级 durable Tab；只有由绑定键派生的推理页在重启
+/// 时被丢弃，下一次发送才会走「无绑定 + 全量重放」路径（A20）。
+const WEB_MODEL_INFERENCE_TAB_PREFIX: &str = "web-model-page-";
+
+fn is_web_model_inference_tab(tab_id: &magi_core::BrowserTabId) -> bool {
+    tab_id.as_str().starts_with(WEB_MODEL_INFERENCE_TAB_PREFIX)
+}
+
+fn strip_transient_web_model_tabs(mut durable: BrowserDurableState) -> (BrowserDurableState, bool) {
+    let app_session_ids = durable
+        .sessions
+        .iter()
+        .filter(|session| session.owner.is_app())
+        .map(|session| session.browser_session_id.clone())
+        .collect::<HashSet<_>>();
+    let removed_tab_ids = durable
+        .tabs
+        .iter()
+        .filter(|tab| {
+            app_session_ids.contains(&tab.browser_session_id)
+                && is_web_model_inference_tab(&tab.tab_id)
+        })
+        .map(|tab| tab.tab_id.clone())
+        .collect::<HashSet<_>>();
+    if removed_tab_ids.is_empty() {
+        return (durable, false);
+    }
+
+    durable.sessions.iter_mut().for_each(|session| {
+        session
+            .tab_ids
+            .retain(|tab_id| !removed_tab_ids.contains(tab_id))
+    });
+    durable
+        .tabs
+        .retain(|tab| !removed_tab_ids.contains(&tab.tab_id));
+    durable
+        .annotations
+        .retain(|annotation| !removed_tab_ids.contains(&annotation.tab_id));
+    (durable, true)
+}
+
+fn browser_durable_state_for_persistence(authority: &BrowserAuthority) -> BrowserDurableState {
+    strip_transient_web_model_tabs(authority.durable_state()).0
+}
+
+fn parse_browser_durable_state(bytes: &[u8]) -> Result<BrowserDurableState, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "browser durable state 必须是 JSON object".to_string())?;
+    // BrowserDurableState 的顶层结构故意在这里做严格校验。BrowserAuthority 的
+    // domain DTO 复用于多条协议边界，不能把 serde 默认忽略未知字段的行为当成
+    // A19 的兼容策略；未知结构必须落入「无状态重建」，不能半恢复半丢字段。
+    const KNOWN_FIELDS: [&str; 6] = [
+        "schema_version",
+        "revision",
+        "profiles",
+        "sessions",
+        "tabs",
+        "annotations",
+    ];
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !KNOWN_FIELDS.iter().any(|known| known == key))
+    {
+        return Err(format!("unknown browser durable state field: {unknown}"));
+    }
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+/// 加载浏览器 durable state。
+///
+/// 按 A19 约定，这是**全函数**：浏览器状态只是可重建的 Tab 指针，文件结构不认识、
+/// schema 版本不认识或内容非法时一律按「无状态」重建并覆盖写回（返回 `true`），
+/// 不让 daemon 起不来，也不把浏览器能力置于 Failed。Electron partition 里的
+/// 登录态不受影响，用户重新打开页面即可。
 fn load_browser_authority(
     state_root: &Path,
 ) -> Result<(BrowserAuthority, bool), Box<dyn std::error::Error + Send + Sync>> {
@@ -1647,14 +1760,40 @@ fn load_browser_authority(
         }
         Err(error) => return Err(Box::new(error)),
     };
-    let durable: BrowserDurableState = serde_json::from_slice(&bytes)?;
-    let needs_upgrade =
-        durable.schema_version != magi_browser_authority::BROWSER_DURABLE_STATE_SCHEMA_VERSION;
-    let mut authority = BrowserAuthority::restore_durable(durable, UtcMillis::now())?;
+    let (restored, stripped_transient_tabs) = match parse_browser_durable_state(&bytes) {
+        Ok(durable) => {
+            let (durable, stripped) = strip_transient_web_model_tabs(durable);
+            (
+                BrowserAuthority::restore_durable(durable, UtcMillis::now()),
+                stripped,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "浏览器持久状态无法解析，按无状态重建并覆盖写回"
+            );
+            return Ok((default_browser_authority(state_root)?, true));
+        }
+    };
+    let mut authority = match restored {
+        Ok(authority) => authority,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "浏览器持久状态无法恢复，按无状态重建并覆盖写回"
+            );
+            return Ok((default_browser_authority(state_root)?, true));
+        }
+    };
+    let mut needs_persist = stripped_transient_tabs;
     if authority
         .profile(&BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID))
         .is_none()
     {
+        needs_persist = true;
         authority.register_profile(BrowserProfile {
             profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
             kind: BrowserProfileKind::ManagedDefault,
@@ -1663,7 +1802,7 @@ fn load_browser_authority(
             updated_at: UtcMillis::now(),
         })?;
     }
-    Ok((authority, needs_upgrade))
+    Ok((authority, needs_persist))
 }
 
 fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
@@ -1704,6 +1843,135 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
             ApiError::InternalAssemblyError(error.to_string())
         }
         _ => ApiError::InvalidInput(error.to_string()),
+    }
+}
+
+impl ApiState {
+    /// 记录一次只读探测结论（唯一投影来源，§5.11）。
+    pub(crate) fn record_web_model_probe(&self, snapshot: WebModelProbeSnapshot) {
+        *self
+            .web_model_probe
+            .write()
+            .expect("web model probe lock poisoned") = Some(snapshot);
+    }
+
+    /// 清除探测结论（退出登录、清除 Web 数据）：立即隐藏 Web 模型（§5.13）。
+    pub(crate) fn forget_web_model_probe(&self) {
+        *self
+            .web_model_probe
+            .write()
+            .expect("web model probe lock poisoned") = None;
+    }
+
+    pub(crate) fn web_model_probe_snapshot(&self) -> Option<WebModelProbeSnapshot> {
+        self.web_model_probe
+            .read()
+            .expect("web model probe lock poisoned")
+            .clone()
+    }
+
+    /// 会话内主模型选择器看到的 Web 引擎投影（A22、§5.13）。
+    ///
+    /// 只投影 daemon 已确认可用的引擎：没有有效探测结论、未确认首次说明、或引擎不在
+    /// 本次探测候选里，都不出现。工具档位与降档原因也在这里算好，前端只负责展示
+    /// （§5.7.0、A15）。
+    pub fn web_model_picker_engines(&self) -> Vec<serde_json::Value> {
+        let Some(probe) = self.web_model_probe_snapshot() else {
+            return Vec::new();
+        };
+        if !probe.is_visible_in_picker() {
+            return Vec::new();
+        }
+        if !crate::routes::browser::web_model_consent_confirmed(self) {
+            return Vec::new();
+        }
+        let channel = self.web_model_harness.channel().get();
+        let registry = load_registry_engines(self);
+        registry
+            .into_iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(serde_json::Value::as_str)?;
+                let is_web = entry
+                    .get("apiProtocol")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("chatgpt_web"));
+                if !is_web || !probe.engine_ids.iter().any(|candidate| candidate == id) {
+                    return None;
+                }
+                let tools_enabled = entry
+                    .get("toolsEnabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                let connector_configured = entry
+                    .get("origin")
+                    .and_then(|origin| origin.get("connector"))
+                    .is_some_and(|connector| !connector.is_null());
+                let account_hint = entry
+                    .get("origin")
+                    .and_then(|origin| origin.get("accountHint"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let refresh_required = probe.status == "refresh_required"
+                    || (probe.account_hint != "unknown"
+                        && account_hint != "unknown"
+                        && account_hint != probe.account_hint);
+                // 档位：工具关闭 = T0；连接器已配置且通道就绪 = T3；其余 T2（A15）。
+                let (tool_tier, degraded_reason) = if !tools_enabled {
+                    ("t0", serde_json::Value::Null)
+                } else if connector_configured && channel.ready {
+                    ("t3", serde_json::Value::Null)
+                } else if connector_configured {
+                    (
+                        "t2",
+                        serde_json::json!({
+                            "code": channel.code,
+                            "detail": channel.detail,
+                        }),
+                    )
+                } else {
+                    (
+                        "t2",
+                        serde_json::json!({
+                            "code": "connector_not_configured",
+                            "detail": "尚未为 ChatGPT 配置 Magi 连接器；T3 需要连接器与 T3 通道就绪",
+                        }),
+                    )
+                };
+                let mut value = entry;
+                let object = value.as_object_mut()?;
+                object.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(
+                        if refresh_required {
+                            "refresh_required"
+                        } else if connector_configured && channel.ready {
+                            "available"
+                        } else {
+                            "tool_degraded"
+                        }
+                        .to_string(),
+                    ),
+                );
+                object.insert(
+                    "toolTier".to_string(),
+                    serde_json::Value::String(tool_tier.to_string()),
+                );
+                object.insert("toolTierDegradedReason".to_string(), degraded_reason);
+                object.insert(
+                    "accountHint".to_string(),
+                    serde_json::Value::String(probe.account_hint.clone()),
+                );
+                object.insert("limitsRevision".to_string(), serde_json::Value::String(probe.limits_revision.clone()));
+                object.insert("probedAt".to_string(), serde_json::Value::from(probe.probed_at));
+                if let Some(reason) = probe.reason.as_ref() {
+                    object.insert(
+                        "reason".to_string(),
+                        serde_json::Value::String(reason.clone()),
+                    );
+                }
+                Some(value)
+            })
+            .collect()
     }
 }
 
@@ -1818,6 +2086,8 @@ impl ApiState {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
+            web_model_harness: Arc::new(crate::web_model_harness::WebModelHarnessRuntime::new()),
+            web_model_probe: Arc::new(RwLock::new(None)),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry,
             turn_coordinator,
@@ -2545,8 +2815,13 @@ impl ApiState {
             .snapshot()
             .sessions
             .into_iter()
+            // App 级会话不属于任何 Magi 会话，只按 owner 的 Session 分支参与孤儿判定
+            // （设计基线 §5.3）。
             .filter(|session| {
-                session.lifecycle.is_open() && !active_session_ids.contains(&session.session_id)
+                session.lifecycle.is_open()
+                    && session
+                        .magi_session_id()
+                        .is_some_and(|session_id| !active_session_ids.contains(session_id))
             })
             .map(|session| session.browser_session_id)
             .collect::<Vec<_>>();
@@ -3182,11 +3457,12 @@ impl ApiState {
         let Some(state_root) = persistence.state_root() else {
             return Ok(());
         };
-        let durable = self
-            .browser_authority
-            .lock()
-            .expect("browser authority lock poisoned")
-            .durable_state();
+        let durable = browser_durable_state_for_persistence(
+            &self
+                .browser_authority
+                .lock()
+                .expect("browser authority lock poisoned"),
+        );
         persistence.save_json(&state_root.join("browser/state.json"), &durable)
     }
 
@@ -5163,8 +5439,10 @@ mod tests {
                 })?;
                 authority.create_session(magi_browser_authority::CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: Some(workspace_id.clone()),
-                    session_id: session_id.clone(),
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: session_id.clone(),
+                        workspace_id: Some(workspace_id.clone()),
+                    },
                     profile_id: profile_id.clone(),
                     now,
                 })?;
@@ -6063,6 +6341,282 @@ mod tests {
         assert_eq!(tools[0]["runtimeStatus"], serde_json::json!("ready"));
         assert_eq!(tools[1]["runtimeStatus"], serde_json::json!("unknown"));
         assert_eq!(tools[2]["runtimeStatus"], serde_json::json!("unknown"));
+    }
+
+    fn browser_persistence_for_test(state_root: &Path) -> Arc<RuntimeStatePersistence> {
+        Arc::new(RuntimeStatePersistence::new(
+            state_root,
+            state_root.join("workspaces.json"),
+            state_root.join("knowledge.json"),
+        ))
+    }
+
+    fn state_for_browser_persistence_test(state_root: &Path) -> ApiState {
+        ApiState::new(
+            "magi-browser-persistence-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(browser_persistence_for_test(state_root))
+    }
+
+    #[test]
+    fn corrupted_or_unknown_browser_durable_state_is_rebuilt_and_overwritten() {
+        for (name, contents) in [
+            (
+                "corrupted",
+                br##"{"schema_version":7,"profiles":["##.to_vec(),
+            ),
+            (
+                "unknown-version",
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 999,
+                    "revision": 12,
+                    "profiles": [],
+                    "sessions": [],
+                    "tabs": [],
+                    "annotations": []
+                }))
+                .expect("unknown browser schema should serialize"),
+            ),
+            (
+                "unknown-field",
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": magi_browser_authority::BROWSER_DURABLE_STATE_SCHEMA_VERSION,
+                    "revision": 12,
+                    "profiles": [],
+                    "sessions": [],
+                    "tabs": [],
+                    "annotations": [],
+                    "future_field": true
+                }))
+                .expect("unknown browser field should serialize"),
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("browser state root should create");
+            let browser_path = root.path().join("browser/state.json");
+            fs::create_dir_all(browser_path.parent().expect("browser parent should exist"))
+                .expect("browser directory should create");
+            fs::write(&browser_path, contents).expect("fixture should write");
+
+            let state = state_for_browser_persistence_test(root.path());
+            let persisted: BrowserDurableState = serde_json::from_slice(
+                &fs::read(&browser_path).expect("rebuilt browser state should be written"),
+            )
+            .unwrap_or_else(|error| panic!("{name}: rebuilt browser state should parse: {error}"));
+
+            assert_eq!(
+                persisted.schema_version,
+                magi_browser_authority::BROWSER_DURABLE_STATE_SCHEMA_VERSION,
+                "{name}: rebuilt state must use the current schema"
+            );
+            assert!(
+                persisted.sessions.is_empty(),
+                "{name}: state must rebuild empty"
+            );
+            assert_ne!(
+                state.browser_host_status().status,
+                BrowserHostStatus::Failed,
+                "{name}: browser recovery must not enter Failed"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_restart_drops_web_bindings_and_transient_inference_tabs_but_keeps_home_tab() {
+        let root = tempfile::tempdir().expect("browser state root should create");
+        let state = state_for_browser_persistence_test(root.path());
+        let now = UtcMillis(100);
+        let app_session_id = magi_core::BrowserSessionId::new("browser-session-app-restart");
+        let home_tab_id = magi_core::BrowserTabId::new("browser-tab-web-model-home");
+        let inference_tab_id = magi_core::BrowserTabId::new("web-model-page-restart-epoch-1");
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.create_session(magi_browser_authority::CreateBrowserSession {
+                    browser_session_id: app_session_id.clone(),
+                    owner: magi_browser_authority::BrowserSessionOwner::App,
+                    profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
+                    now,
+                })?;
+                authority.transition_session(
+                    &app_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    now,
+                )?;
+                authority.create_tab(magi_browser_authority::CreateBrowserTab {
+                    tab_id: home_tab_id.clone(),
+                    browser_session_id: app_session_id.clone(),
+                    url: magi_web_model::chatgpt_web_home_url(),
+                    now,
+                })?;
+                authority.transition_tab(
+                    &home_tab_id,
+                    magi_browser_authority::BrowserTabLifecycle::Ready,
+                    now,
+                )?;
+                authority.create_tab(magi_browser_authority::CreateBrowserTab {
+                    tab_id: inference_tab_id.clone(),
+                    browser_session_id: app_session_id.clone(),
+                    url: magi_web_model::chatgpt_web_temporary_chat_url(),
+                    now,
+                })?;
+                authority.transition_tab(
+                    &inference_tab_id,
+                    magi_browser_authority::BrowserTabLifecycle::Ready,
+                    now,
+                )?;
+                Ok(())
+            })
+            .expect("app session and web tabs should create");
+        state
+            .persist_browser_durable_state()
+            .expect("browser state should persist");
+
+        // This is the restart boundary: bindings are intentionally not loaded from any file,
+        // and the durable BrowserAuthority input contains only the app/home pointer after the
+        // next state is constructed.
+        let restarted = state_for_browser_persistence_test(root.path());
+        let authority = restarted
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold");
+        let app_session = authority
+            .app_session()
+            .expect("app session should survive restart");
+        assert_eq!(app_session.browser_session_id, app_session_id);
+        assert!(
+            authority.tab(&home_tab_id).is_some(),
+            "home tab must survive restart"
+        );
+        assert!(
+            authority.tab(&inference_tab_id).is_none(),
+            "transient Web inference page must not be reused after restart"
+        );
+        drop(authority);
+
+        let persisted: BrowserDurableState = serde_json::from_slice(
+            &fs::read(root.path().join("browser/state.json"))
+                .expect("state should remain readable"),
+        )
+        .expect("state after restart should parse");
+        assert!(
+            persisted
+                .tabs
+                .iter()
+                .all(|tab| tab.tab_id != inference_tab_id),
+            "restart persistence must not reintroduce the transient inference page"
+        );
+        assert!(
+            !root.path().join("web-model-bindings.json").exists(),
+            "Web binding table must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_browser_session_is_excluded_from_magi_close_and_reconciliation() {
+        let state = ApiState::new(
+            "magi-browser-owner-scope-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let now = UtcMillis(200);
+        let profile_id = BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID);
+        let app_session_id = magi_core::BrowserSessionId::new("browser-session-app-owner-scope");
+        let orphan_session_id = SessionId::new("session-browser-owner-scope-orphan");
+        let orphan_browser_session_id =
+            magi_core::BrowserSessionId::new("browser-session-magi-owner-scope-orphan");
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: tempfile::tempdir()
+                        .expect("browser profile fixture should create")
+                        .keep(),
+                    created_at: now,
+                    updated_at: now,
+                })?;
+                authority.create_session(magi_browser_authority::CreateBrowserSession {
+                    browser_session_id: app_session_id.clone(),
+                    owner: magi_browser_authority::BrowserSessionOwner::App,
+                    profile_id: profile_id.clone(),
+                    now,
+                })?;
+                authority.transition_session(
+                    &app_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    now,
+                )?;
+                authority.create_session(magi_browser_authority::CreateBrowserSession {
+                    browser_session_id: orphan_browser_session_id.clone(),
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: orphan_session_id.clone(),
+                        workspace_id: None,
+                    },
+                    profile_id,
+                    now,
+                })?;
+                authority.transition_session(
+                    &orphan_browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    now,
+                )?;
+                Ok(())
+            })
+            .expect("app and Magi browser sessions should create");
+
+        assert_eq!(
+            state
+                .reconcile_browser_sessions_with_session_store()
+                .expect("reconciliation should succeed"),
+            1,
+            "only the orphaned Magi-owned session should reconcile"
+        );
+        {
+            let authority = state
+                .browser_authority
+                .lock()
+                .expect("browser authority lock should hold");
+            assert_eq!(
+                authority
+                    .app_session()
+                    .expect("app session must survive reconciliation")
+                    .lifecycle,
+                BrowserSessionLifecycle::Ready
+            );
+            assert_eq!(
+                authority
+                    .session(&orphan_browser_session_id)
+                    .expect("orphan session should remain as a closed record")
+                    .lifecycle,
+                BrowserSessionLifecycle::Closed
+            );
+        }
+
+        assert!(
+            state
+                .close_browser_session_for_magi_session(&SessionId::new("session-app-owner-scope"))
+                .await
+                .expect("closing an unrelated Magi session should succeed")
+                .is_none(),
+            "App-owned browser session must not match Magi session close"
+        );
+        assert_eq!(
+            state
+                .browser_authority
+                .lock()
+                .expect("browser authority lock should hold")
+                .app_session()
+                .expect("app session must survive close")
+                .lifecycle,
+            BrowserSessionLifecycle::Ready
+        );
     }
 
     #[test]

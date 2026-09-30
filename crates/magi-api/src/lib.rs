@@ -28,11 +28,17 @@ pub mod tunnel;
 #[cfg(test)]
 mod turn_harness;
 mod turn_service;
+mod web_model_driver;
+mod web_model_harness;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
+pub use web_model_driver::{HostWebModelPageDriver, WebModelHostFactory};
+pub use web_model_harness::{
+    WEB_MODEL_TUNNEL_SECTION, WebModelHarnessRuntime, WebModelTunnelConfig, WebModelTunnelStatus,
+};
 pub fn schedule_restored_session_task_dispatches(state: ApiState) {
     routes::schedule_restored_session_task_dispatches(state);
 }

@@ -980,7 +980,10 @@ async fn reconcile_skips_stat_clean_files_but_still_detects_real_edits() {
     }
 
     let mgr = SnapshotManager::new();
-    let session = mgr.start_session("s-stat-clean".into(), root.clone()).await.unwrap();
+    let session = mgr
+        .start_session("s-stat-clean".into(), root.clone())
+        .await
+        .unwrap();
     session.reconcile().unwrap();
     assert!(session.pending_changes().unwrap().is_empty());
 

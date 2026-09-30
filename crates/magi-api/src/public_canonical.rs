@@ -560,7 +560,8 @@ mod tests {
             .insert("providerContext".to_string(), json!([{ "data": "x" }]));
         item.metadata
             .insert("toolCalls".to_string(), json!([{ "id": "call" }]));
-        item.metadata.insert("requestId".to_string(), json!("req-1"));
+        item.metadata
+            .insert("requestId".to_string(), json!("req-1"));
         let public = public_canonical_turn_item(item);
         assert!(!public.metadata.contains_key("providerContext"));
         assert!(!public.metadata.contains_key("toolCalls"));

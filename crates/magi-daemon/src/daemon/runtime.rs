@@ -1972,6 +1972,34 @@ impl DaemonRuntime {
             },
             self.state_root.clone(),
         );
+        // GPT Web 引擎的 client 工厂：宿主实现把驱动映射到 Desktop 宿主命令。
+        // 应用级浏览器会话按需创建，因此这里只装配共享引用，不固定会话 id。
+        let web_model_factory: Option<Arc<dyn magi_web_model::WebModelClientFactory>> = {
+            let browser_dependencies = state.browser_tool_runtime_dependencies();
+            match magi_api::WebModelHostFactory::new(
+                Arc::clone(&browser_dependencies.host_client),
+                Arc::clone(&browser_dependencies.authority),
+            ) {
+                Ok(factory) => {
+                    state
+                        .web_model_harness
+                        .set_bindings(Arc::clone(factory.bindings()));
+                    state
+                        .web_model_harness
+                        .set_runtime(Arc::clone(factory.runtime()));
+                    Some(Arc::new(factory))
+                }
+                Err(error) => {
+                    // 失败关闭：拿不到 o200k 词表时不装配 Web 引擎，而不是退回通用估算。
+                    warn!(error = %error, "GPT Web 引擎的计数器不可用，Web 引擎将不可用");
+                    None
+                }
+            }
+        };
+        let mut llm_task_dispatcher = llm_task_dispatcher;
+        if let Some(factory) = web_model_factory {
+            llm_task_dispatcher = llm_task_dispatcher.with_web_model_client_factory(factory);
+        }
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())

@@ -197,6 +197,44 @@ pub(super) fn start_controller(state: &ApiState, lifecycle: &BrowserHostControll
         return;
     };
 
+    // T3 的通道配置只保存用户提供的引用（Tunnel id 与凭据文件路径），运行态
+    // 不落盘。daemon 重启后必须从 settings 重新装配 harness / tunnel；否则首个
+    // Web turn 会在通道仍是默认 `none` 时静默降到 T2，用户必须再次打开设置页
+    // 才能恢复 T3。这条恢复只启动用户已经明确配置过的通道，不替用户创建
+    // Tunnel，也不读取或记录凭据内容。
+    if let Some(state_root) = state
+        .runtime_persistence()
+        .and_then(|persistence| persistence.state_root().map(|root| root.to_path_buf()))
+    {
+        let raw = state
+            .settings_store
+            .get_section(magi_api::WEB_MODEL_TUNNEL_SECTION);
+        if !raw.is_null() {
+            match serde_json::from_value::<magi_api::WebModelTunnelConfig>(raw) {
+                Ok(config) => {
+                    let harness = state.web_model_harness.clone();
+                    handle.spawn(async move {
+                        match harness.configure(&state_root, Some(config)).await {
+                            Ok(status) if !status.ready => tracing::warn!(
+                                code = %status.code,
+                                "恢复 GPT Web T3 通道失败，继续以 T2 档位运行"
+                            ),
+                            Ok(_) => tracing::info!("已恢复 GPT Web T3 通道"),
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "恢复 GPT Web T3 通道失败，继续以 T2 档位运行"
+                            ),
+                        }
+                    });
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "GPT Web T3 通道配置无法解析，继续以 T2 档位运行"
+                ),
+            }
+        }
+    }
+
     let state = state.clone();
     handle.spawn(monitor_desktop_parent_process(
         state.clone(),
@@ -623,8 +661,8 @@ fn restore_browser_sessions(state: &ApiState) -> Result<(), String> {
                 }),
             )
             .with_context(EventContext {
-                workspace_id: restored.workspace_id,
-                session_id: Some(restored.session_id),
+                workspace_id: restored.owner_workspace_id().cloned(),
+                session_id: restored.magi_session_id().cloned(),
                 ..EventContext::default()
             }),
         );
@@ -1098,8 +1136,9 @@ fn browser_tab_context(state: &ApiState, tab_id: &BrowserTabId) -> Option<Browse
     let tab = authority.tab(tab_id)?;
     let session = authority.session(&tab.browser_session_id)?;
     Some(BrowserTabContext {
-        workspace_id: session.workspace_id.clone(),
-        session_id: session.session_id.clone(),
+        workspace_id: session.owner_workspace_id().cloned(),
+        // 应用级（GPT Web）Tab 不属于任何 Magi 会话，不参与会话级事件投影。
+        session_id: session.magi_session_id()?.clone(),
     })
 }
 
@@ -1251,22 +1290,26 @@ fn suspend_browser_sessions_for_host_disconnect(state: &ApiState) -> Vec<Browser
                 "browser.session.status_changed",
                 serde_json::json!({
                     "browser_session_id": interrupted_session.browser_session_id,
-                    "session_id": interrupted_session.session_id,
-                    "workspace_id": interrupted_session.workspace_id,
+                    "session_id": interrupted_session.magi_session_id(),
+                    "workspace_id": interrupted_session.owner_workspace_id(),
                     "lifecycle": interrupted_session.lifecycle,
                     "reason": "browser_host_unavailable",
                     "revision": interrupted_session.revision,
                 }),
             )
             .with_context(EventContext {
-                workspace_id: interrupted_session.workspace_id.clone(),
-                session_id: Some(interrupted_session.session_id.clone()),
+                workspace_id: interrupted_session.owner_workspace_id().cloned(),
+                session_id: interrupted_session.magi_session_id().cloned(),
                 ..EventContext::default()
             }),
         );
+        let Some(session_id) = browser_session.magi_session_id() else {
+            // 应用级会话没有归属会话与 Lease 执行边界。
+            continue;
+        };
         state.revoke_browser_execution_resources(
-            Some(&browser_session.session_id),
-            browser_session.workspace_id.as_ref(),
+            Some(session_id),
+            browser_session.owner_workspace_id(),
             None,
             BrowserLeaseEndReason::RuntimeUnavailable,
         );
@@ -1279,9 +1322,13 @@ fn suspend_browser_sessions_for_host_disconnect(state: &ApiState) -> Vec<Browser
 fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
     let sessions = suspend_browser_sessions_for_host_disconnect(state);
     for browser_session in sessions {
+        // 应用级（GPT Web）会话没有归属会话与 Turn，不参与 Turn 收口。
+        let Some(session_id) = browser_session.magi_session_id().cloned() else {
+            continue;
+        };
         let Some(current_turn) = state
             .session_store
-            .runtime_sidecar(&browser_session.session_id)
+            .runtime_sidecar(&session_id)
             .and_then(|sidecar| sidecar.current_turn)
         else {
             continue;
@@ -1294,18 +1341,16 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
         }
         let owned_goal = state
             .session_store
-            .active_goal_for_execution_owner(&browser_session.session_id, &current_turn.turn_id)
+            .active_goal_for_execution_owner(&session_id, &current_turn.turn_id)
             .is_some();
         let request_id = request_id_for_turn(&current_turn);
-        let active_chain = state
-            .session_store
-            .active_execution_chain(&browser_session.session_id);
+        let active_chain = state.session_store.active_execution_chain(&session_id);
         if let Some(chain) = active_chain.as_ref()
             && let Some(manager) = state.runner_manager()
             && let Err(error) = manager.kill_tree(chain.root_task_id.as_str())
         {
             tracing::warn!(
-                session_id = %browser_session.session_id,
+                session_id = %session_id,
                 task_id = %chain.root_task_id,
                 ?error,
                 "daemon 关闭时终止浏览器执行树失败"
@@ -1316,33 +1361,31 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
         let settled = if active_chain.is_some() {
             state
                 .turn_event_sink()
-                .interrupt_turn_by_daemon_restart(&browser_session.session_id)
+                .interrupt_turn_by_daemon_restart(&session_id)
         } else {
-            state
-                .turn_event_sink()
-                .cancel_turn(&browser_session.session_id)
+            state.turn_event_sink().cancel_turn(&session_id)
         };
         match settled {
             Ok(Some(_)) => {
                 state
                     .turn_coordinator()
-                    .close_session_turn_input(&browser_session.session_id, &current_turn.turn_id);
+                    .close_session_turn_input(&session_id, &current_turn.turn_id);
                 if owned_goal {
                     match state
                         .session_store
-                        .pause_active_goal_for_diversion(&browser_session.session_id)
+                        .pause_active_goal_for_diversion(&session_id)
                     {
                         Ok(Some((_goal, Some(plan)))) => magi_plan::publish_plan_event(
                             &state.event_bus,
                             magi_plan::plan_event_type(&plan),
                             &plan,
-                            browser_session.workspace_id.as_ref(),
+                            browser_session.owner_workspace_id(),
                             None,
                             None,
                         ),
                         Ok(Some((_, None))) | Ok(None) => {}
                         Err(error) => tracing::warn!(
-                            session_id = %browser_session.session_id,
+                            session_id = %session_id,
                             ?error,
                             "daemon 关闭时暂停 Goal 与计划失败"
                         ),
@@ -1350,7 +1393,7 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
                 }
                 if let Err(error) = state.persist_session_state_checkpoint("daemon_shutdown") {
                     tracing::warn!(
-                        session_id = %browser_session.session_id,
+                        session_id = %session_id,
                         ?error,
                         "daemon 关闭时 session 状态持久化失败"
                     );
@@ -1359,29 +1402,29 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
                     EventEnvelope::domain(
                         EventId::new(format!(
                             "event-browser-turn-interrupted-{}-{}",
-                            browser_session.session_id,
+                            session_id,
                             UtcMillis::now().0
                         )),
                         "session.turn.interrupted",
                         serde_json::json!({
-                            "session_id": browser_session.session_id,
+                            "session_id": &session_id,
                             "request_id": request_id,
-                            "workspace_id": browser_session.workspace_id,
+                            "workspace_id": browser_session.owner_workspace_id(),
                             "turn_id": current_turn.turn_id,
                             "interrupted": true,
                             "reason": "daemon_shutdown",
                         }),
                     )
                     .with_context(EventContext {
-                        workspace_id: browser_session.workspace_id.clone(),
-                        session_id: Some(browser_session.session_id.clone()),
+                        workspace_id: browser_session.owner_workspace_id().cloned(),
+                        session_id: Some(session_id.clone()),
                         ..EventContext::default()
                     }),
                 );
             }
             Ok(None) => {}
             Err(error) => tracing::warn!(
-                session_id = %browser_session.session_id,
+                session_id = %session_id,
                 ?error,
                 "daemon 关闭时中断活动 Turn 失败"
             ),
@@ -1491,8 +1534,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id: SessionId::new("session-node-selection"),
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: SessionId::new("session-node-selection"),
+                        workspace_id: None,
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -1668,8 +1713,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id: SessionId::new("session-restore"),
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: SessionId::new("session-restore"),
+                        workspace_id: None,
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -1730,8 +1777,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id: SessionId::new("session-reconnect"),
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: SessionId::new("session-reconnect"),
+                        workspace_id: None,
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -1792,8 +1841,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id: SessionId::new("session-page-update"),
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: SessionId::new("session-page-update"),
+                        workspace_id: None,
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -1971,8 +2022,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: Some(workspace_id.clone()),
-                    session_id: session_id.clone(),
+                    owner: magi_browser_authority::BrowserSessionOwner::Session {
+                        session_id: session_id.clone(),
+                        workspace_id: Some(workspace_id.clone()),
+                    },
                     profile_id: profile_id.clone(),
                     now: UtcMillis(1),
                 })?;

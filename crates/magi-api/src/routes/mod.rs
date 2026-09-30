@@ -1,7 +1,7 @@
 mod agent_run_actions;
 mod agent_runs;
 mod appearance;
-mod browser;
+pub(crate) mod browser;
 mod changes_files_tunnel;
 mod dispatch_flow;
 mod file_site;

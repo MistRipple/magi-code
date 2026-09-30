@@ -798,7 +798,12 @@ fn navigation_persistence_hands_over_only_the_target_session_slice() {
     // 只交出当前指针与目标会话的切片，不克隆其它会话的任何数据。
     let (current, session_ids, timeline_sessions) = store
         .persist_navigation_projection_with(Some(&target), |durable, sidecars| {
-            assert!(sidecars.runtime_sidecars.iter().all(|s| s.session_id == target));
+            assert!(
+                sidecars
+                    .runtime_sidecars
+                    .iter()
+                    .all(|s| s.session_id == target)
+            );
             Ok::<_, ()>((
                 durable.current_session_id.clone(),
                 durable
@@ -6165,10 +6170,9 @@ fn rebuilding_thread_projection_while_assistant_text_streams_does_not_duplicate_
     store
         .create_session(session_id.clone(), "Thread Stream Rebuild")
         .expect("session should be creatable");
-    let (_mission_id, thread_id) =
-        store.ensure_session_mission(&session_id, UtcMillis(1), || {
-            MissionId::new("mission-thread-stream-rebuild")
-        });
+    let (_mission_id, thread_id) = store.ensure_session_mission(&session_id, UtcMillis(1), || {
+        MissionId::new("mission-thread-stream-rebuild")
+    });
     accept_test_turn(
         &store,
         &session_id,
@@ -6283,9 +6287,15 @@ fn thread_history_merge_is_idempotent_and_keeps_non_canonical_messages() {
     assert_eq!(resolved, projection);
 
     // 流式输出：assistant 文本变长时原地更新。
-    let streaming = vec![thread_message("user", "分析项目"), thread_message("assistant", "完")];
+    let streaming = vec![
+        thread_message("user", "分析项目"),
+        thread_message("assistant", "完"),
+    ];
     assert_eq!(merge(&streaming, projection[..1].to_vec()).len(), 2);
-    let grown = vec![thread_message("user", "分析项目"), thread_message("assistant", "完成了")];
+    let grown = vec![
+        thread_message("user", "分析项目"),
+        thread_message("assistant", "完成了"),
+    ];
     let merged = merge(&streaming, grown.clone());
     assert_eq!(merged, grown);
 

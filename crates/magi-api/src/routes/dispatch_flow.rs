@@ -684,7 +684,7 @@ async fn prepare_session_task_dispatch(
         accepted.created_session,
         accepted.request.orchestrator_session_config.as_ref(),
     )? {
-        super::settings::save_orchestrator_session_override_for_session(
+        super::settings::save_initial_orchestrator_session_override_for_new_session(
             state,
             &accepted.session_id,
             &config,

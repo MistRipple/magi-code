@@ -2727,11 +2727,20 @@ async fn submit_conversation_session_turn(
     // Conversation 也支持请求级主模型覆盖；先持久化会话模型身份，再接纳
     // canonical Turn，确保后台执行读取到与 accepted 请求一致的 Provider 配置。
     if let Some(config) = request.orchestrator_session_config.as_ref() {
-        if let Err(error) = super::settings::save_orchestrator_session_override_for_session(
-            &state,
-            &session_id,
-            config,
-        ) {
+        let save_result = if created_session {
+            super::settings::save_initial_orchestrator_session_override_for_new_session(
+                &state,
+                &session_id,
+                config,
+            )
+        } else {
+            super::settings::save_orchestrator_session_override_for_session(
+                &state,
+                &session_id,
+                config,
+            )
+        };
+        if let Err(error) = save_result {
             if created_session {
                 let _ = state
                     .rollback_created_session_after_navigation_lock(
@@ -2936,6 +2945,17 @@ async fn submit_conversation_session_turn(
         Some(&turn_id),
         None,
     );
+    // GPT Web 的模型本身没有 HTTP provider 可替代；当用户在引擎级设置中开启
+    // 工具（默认开启）时，即使这次输入被分类为普通 Chat，也必须把 Magi 的
+    // 工具面交给 conversation loop。否则主线 Chat 会永远按 T0 运行，Web
+    // 引擎只能纯对话，且 T2/T3 永远不会有机会生效。
+    let use_tools = magi_conversation_runtime::model_config::orchestrator_web_engine_settings(
+        &state.settings_store,
+        Some(&session_id),
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|settings| settings.tool_enabled);
     let execution_request = SessionTurnExecutionRequest {
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
@@ -2943,7 +2963,7 @@ async fn submit_conversation_session_turn(
         prompt: request.trimmed_text().unwrap_or_else(|| message.clone()),
         images,
         context_references,
-        use_tools: false,
+        use_tools,
         access_profile: request.requested_access_profile(),
         skill_name: None,
         request_id: Some(request_id),

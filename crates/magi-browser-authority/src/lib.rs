@@ -27,8 +27,8 @@ pub use domain::{
     BrowserAnnotationStatus, BrowserControlLease, BrowserDeviceType,
     BrowserElementAnnotationAnchor, BrowserLeaseEndReason, BrowserLeaseLifecycle,
     BrowserLeaseSelector, BrowserNormalizedRect, BrowserProfile, BrowserProfileKind,
-    BrowserRegionAnnotationAnchor, BrowserSession, BrowserSessionLifecycle, BrowserTab,
-    BrowserTabLifecycle, BrowserViewport, BrowserViewportMode, GoalControlBinding,
+    BrowserRegionAnnotationAnchor, BrowserSession, BrowserSessionLifecycle, BrowserSessionOwner,
+    BrowserTab, BrowserTabLifecycle, BrowserViewport, BrowserViewportMode, GoalControlBinding,
 };
 pub use error::BrowserAuthorityError;
 pub use host_client::{

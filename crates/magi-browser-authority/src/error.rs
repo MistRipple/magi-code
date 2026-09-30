@@ -19,6 +19,10 @@ pub enum BrowserAuthorityError {
         session_id: magi_core::SessionId,
         browser_session_id: BrowserSessionId,
     },
+    #[error("an open app-scoped browser session already exists: {browser_session_id}")]
+    AppSessionAlreadyExists {
+        browser_session_id: BrowserSessionId,
+    },
     #[error("browser session does not exist: {0}")]
     UnknownSession(BrowserSessionId),
     #[error("browser tab already exists: {0}")]

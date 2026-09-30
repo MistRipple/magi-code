@@ -16,9 +16,9 @@ use magi_browser_authority::{
     BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
     BrowserHostControlUpdate, BrowserHostHitTest, BrowserHostRect, BrowserHostStatus,
     BrowserNavigation, BrowserNormalizedRect, BrowserRegionAnnotationAnchor, BrowserSession,
-    BrowserSessionLifecycle, BrowserSurfaceControlSnapshot, BrowserTab, BrowserTabLifecycle,
-    BrowserViewport, CreateBrowserSession, CreateBrowserTab, MAX_BROWSER_TABS_TOTAL,
-    validate_browser_navigation_url,
+    BrowserSessionLifecycle, BrowserSessionOwner, BrowserSurfaceControlSnapshot, BrowserTab,
+    BrowserTabLifecycle, BrowserViewport, CreateBrowserSession, CreateBrowserTab,
+    MAX_BROWSER_TABS_TOTAL, validate_browser_navigation_url,
 };
 use magi_core::{
     BrowserAnnotationId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, SessionId,
@@ -43,6 +43,11 @@ const BROWSER_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 const BROWSER_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BROWSER_SURFACE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const BROWSER_SURFACE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// `restore_page`/`ensure_surface` 只保证物理 guest 已物化，不保证 Chromium
+/// 已经完成这一代文档的导航。GPT Web 探测是只读操作，可以在这段交接窗口
+/// 内安全重试；写入和提交路径不能复用这条重试策略（避免重放副作用）。
+const WEB_MODEL_PROBE_RETRIES: usize = 8;
+const WEB_MODEL_PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -60,6 +65,29 @@ pub fn routes() -> Router<ApiState> {
                 .delete(clear_desktop_connection),
         )
         .route("/browser/sessions", post(create_session))
+        .route(
+            "/browser/sessions/app",
+            get(get_app_session).post(create_app_session),
+        )
+        .route("/browser/web-models/discover", post(discover_web_models))
+        .route(
+            "/browser/web-models/ensure-home",
+            post(ensure_web_model_home_surface),
+        )
+        .route(
+            "/browser/web-models/consent",
+            post(confirm_web_model_consent),
+        )
+        .route(
+            "/browser/web-models/tunnel",
+            get(get_web_model_tunnel).post(configure_web_model_tunnel),
+        )
+        .route("/browser/web-models/runtime", get(get_web_model_runtime))
+        .route("/browser/web-models/reset", post(reset_web_models))
+        .route(
+            "/browser/web-models/reset-conversation",
+            post(reset_web_model_conversation),
+        )
         .route("/browser/sessions/current", get(get_current_session))
         .route("/browser/sessions/{browser_session_id}", get(get_session))
         .route(
@@ -614,10 +642,14 @@ async fn reclaim_browser_resources(
             });
             continue;
         }
+        // 应用级（GPT Web）页面一律不参与资源回收（设计基线 §5.3）。
+        let Some(session_id) = resource.session_id.clone() else {
+            continue;
+        };
         targets.push(BrowserReclaimTarget {
             tab_id: resource.tab_id.clone(),
             browser_session_id: resource.browser_session_id.clone(),
-            session_id: resource.session_id.clone(),
+            session_id,
             workspace_id: resource.workspace_id.clone(),
         });
     }
@@ -711,16 +743,22 @@ fn browser_resources_response(state: &ApiState) -> BrowserResourcesResponse {
     let mut tabs = Vec::new();
 
     for session in authority.snapshot().sessions {
-        let session_running = session_records
-            .get(&session.session_id)
+        // App 级（GPT Web）会话没有归属的 Magi 会话：不参与会话运行态统计，
+        // 也不能被当成可回收对象；它只在列表里带一条常驻说明。
+        let session_magi_id = session.magi_session_id().cloned();
+        let session_running = session_magi_id
+            .as_ref()
+            .and_then(|session_id| session_records.get(session_id))
             .and_then(|record| state.session_store.runtime_sidecar(&record.session_id))
             .as_ref()
             .map(|sidecar| session_running_task_count(Some(sidecar)))
             .unwrap_or_default()
             > 0;
-        let is_current_session = current_session_id.as_ref() == Some(&session.session_id);
+        let is_current_session = session_magi_id
+            .as_ref()
+            .is_some_and(|session_id| current_session_id.as_ref() == Some(session_id));
         let active_tab_id = authority.active_tab(&session.browser_session_id);
-        for tab_id in session.tab_ids {
+        for tab_id in session.tab_ids.clone() {
             let Some(tab) = authority.tab(&tab_id) else {
                 continue;
             };
@@ -745,14 +783,16 @@ fn browser_resources_response(state: &ApiState) -> BrowserResourcesResponse {
             } else {
                 Some("not_reclaimable".to_string())
             };
-            let session_title = session_records
-                .get(&session.session_id)
+            let session_title = session_magi_id
+                .as_ref()
+                .and_then(|session_id| session_records.get(session_id))
                 .map(|record| record.title.clone());
             tabs.push(BrowserResourceTabResponse {
                 tab_id: tab.tab_id.clone(),
                 browser_session_id: tab.browser_session_id.clone(),
-                session_id: session.session_id.clone(),
-                workspace_id: session.workspace_id.clone(),
+                session_id: session_magi_id.clone(),
+                workspace_id: session.owner_workspace_id().cloned(),
+                scope: session.owner_kind().to_string(),
                 session_title,
                 lifecycle: tab.lifecycle,
                 url: tab.url.clone(),
@@ -824,8 +864,10 @@ struct CurrentBrowserSessionResponse {
 #[serde(rename_all = "camelCase")]
 struct BrowserSessionResponse {
     browser_session_id: BrowserSessionId,
+    /// `session` 或 `app`：应用级（GPT Web）会话不属于任何 Magi 会话。
+    owner: String,
     workspace_id: Option<WorkspaceId>,
-    session_id: SessionId,
+    session_id: Option<SessionId>,
     profile_id: BrowserProfileId,
     lifecycle: BrowserSessionLifecycle,
     active_tab_id: Option<BrowserTabId>,
@@ -844,8 +886,10 @@ struct BrowserSessionResponse {
 struct BrowserResourceTabResponse {
     tab_id: BrowserTabId,
     browser_session_id: BrowserSessionId,
-    session_id: SessionId,
+    /// 应用级 Tab 没有归属会话，前端据此展示常驻说明。
+    session_id: Option<SessionId>,
     workspace_id: Option<WorkspaceId>,
+    scope: String,
     session_title: Option<String>,
     lifecycle: BrowserTabLifecycle,
     url: String,
@@ -1154,8 +1198,8 @@ async fn create_session(
         publish_browser_event(
             &state,
             "browser.session.closed",
-            closed.workspace_id.as_ref(),
-            &closed.session_id,
+            closed.owner_workspace_id(),
+            require_session_scope(&closed)?,
             serde_json::json!({
                 "browser_session_id": closed.browser_session_id,
                 "lifecycle": closed.lifecycle,
@@ -1173,8 +1217,10 @@ async fn create_session(
     let session = state.mutate_browser_authority(|authority| {
         authority.create_session(CreateBrowserSession {
             browser_session_id: browser_session_id.clone(),
-            workspace_id: workspace_id.clone(),
-            session_id: session_id.clone(),
+            owner: BrowserSessionOwner::Session {
+                session_id: session_id.clone(),
+                workspace_id: workspace_id.clone(),
+            },
             profile_id: BrowserProfileId::new("browser-profile-default"),
             now,
         })?;
@@ -1195,6 +1241,859 @@ async fn create_session(
         StatusCode::CREATED,
         Json(browser_session_response(&state, session)?),
     ))
+}
+
+/// 应用级（GPT Web）浏览器会话的固定主页 Tab 标识。
+///
+/// 全局只有一个应用级会话，因此主页 Tab 用一个稳定 id；推理页面由推理通道
+/// 按需创建，不在这里创建（设计基线 §5.3）。
+pub const WEB_MODEL_HOME_TAB_ID: &str = "browser-tab-web-model-home";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateAppBrowserSessionRequest {
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EnsureWebModelHomeRequest {
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAppBrowserSessionResponse {
+    session: BrowserSessionResponse,
+    created: bool,
+}
+
+/// `GET /browser/sessions/app`：只读读取应用级（GPT Web）浏览器会话。
+///
+/// 与 `POST` 的关键区别：**不创建**。应用级会话只在用户主动打开 GPT Web 视图
+/// 或设置页连接时创建；窗口启动、项目 / 会话切换必须能在不产生会话的前提下
+/// 判断「是否存在应用级会话」，否则每次启动都会连带创建一个后台 ChatGPT 主页。
+/// 会话不存在或已失效时返回 `session = null`。
+async fn get_app_session(
+    State(state): State<ApiState>,
+) -> Result<Json<CurrentBrowserSessionResponse>, ApiError> {
+    let session = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .app_session()
+        .filter(|session| session.lifecycle != BrowserSessionLifecycle::Failed)
+        .cloned();
+    let session = session
+        .map(|session| browser_session_response(&state, session))
+        .transpose()?;
+    Ok(Json(CurrentBrowserSessionResponse { session }))
+}
+
+/// `POST /browser/sessions/app`：取得应用级（GPT Web）浏览器会话。
+///
+/// 应用级会话全局唯一、id 持久稳定、使用固定持久分区 `persist:magi-web-model`，
+/// 不属于任何 Magi 会话或工作区，因此**不暴露给会话的 `browser_*` 工具**。
+/// 已经存在时直接返回既有会话（`created = false`），不新建——否则会留下无主
+/// 会话与多余的物理 Surface（设计基线 §5.3、《实现计划》§7.5）。
+async fn create_app_session(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateAppBrowserSessionRequest>,
+) -> Result<(StatusCode, Json<CreateAppBrowserSessionResponse>), ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
+    let existing = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .app_session()
+        .is_some_and(|session| session.lifecycle != BrowserSessionLifecycle::Failed);
+    let session = ensure_app_browser_session(&state)?;
+    let status = if existing {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(CreateAppBrowserSessionResponse {
+            session: browser_session_response(&state, session)?,
+            created: !existing,
+        }),
+    ))
+}
+
+/// 取得或创建应用级浏览器会话（幂等）。
+///
+/// 全局唯一、id 持久稳定；已存在且未失败时直接复用，绝不反复新建。
+/// 创建时同时建立固定主页 Tab（设计基线 §5.3、《实现计划》§7.5）。
+fn ensure_app_browser_session(state: &ApiState) -> Result<BrowserSession, ApiError> {
+    let existing = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .app_session()
+        .cloned();
+    if let Some(existing) = existing {
+        if existing.lifecycle != BrowserSessionLifecycle::Failed {
+            ensure_app_home_tab(state, &existing.browser_session_id)?;
+            return Ok(existing);
+        }
+        // 失败会话不能复用：它的 Tab 已经没有对应的 Browser Host 页面。
+        state.mutate_browser_authority(|authority| {
+            authority.transition_session(
+                &existing.browser_session_id,
+                BrowserSessionLifecycle::Closed,
+                UtcMillis::now(),
+            )
+        })?;
+    }
+
+    let now = UtcMillis::now();
+    let browser_session_id = BrowserSessionId::new(format!(
+        "browser-session-app-{}-{}",
+        now.0,
+        BROWSER_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let session = state.mutate_browser_authority(|authority| {
+        authority.create_session(CreateBrowserSession {
+            browser_session_id: browser_session_id.clone(),
+            owner: BrowserSessionOwner::App,
+            profile_id: BrowserProfileId::new("browser-profile-default"),
+            now,
+        })?;
+        authority.transition_session(&browser_session_id, BrowserSessionLifecycle::Ready, now)
+    })?;
+    ensure_app_home_tab(state, &browser_session_id)?;
+    Ok(session)
+}
+
+/// 保证应用级会话的固定主页 Tab 存在且可用。
+///
+/// 主页固定在 GPT Web 入口；推理页面由推理通道按需创建，不在这里创建。
+fn ensure_app_home_tab(
+    state: &ApiState,
+    browser_session_id: &BrowserSessionId,
+) -> Result<BrowserTab, ApiError> {
+    let tab_id = BrowserTabId::new(WEB_MODEL_HOME_TAB_ID);
+    let existing = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .tab(&tab_id)
+        .cloned();
+    if let Some(existing) = existing {
+        if existing.browser_session_id != *browser_session_id {
+            return Err(ApiError::Conflict(
+                "GPT Web 主页 Tab 归属了另一应用级浏览器会话".to_string(),
+            ));
+        }
+        if existing.lifecycle != BrowserTabLifecycle::Closed {
+            return Ok(existing);
+        }
+        // 应用级主页使用固定逻辑 id。清理或旧版本恢复可能留下 Closed 行，
+        // 不能把它当作仍可驱动的主页返回，否则 GET/POST 会得到空 tabs，
+        // Renderer 也无法重新挂载 guest。Authority 只允许在这里按新导航代次
+        // 重开该固定主页，迟到的旧 Surface 会因 revision 被拒绝。
+        let now = UtcMillis::now();
+        return state.mutate_browser_authority(|authority| {
+            authority.reopen_closed_tab(
+                browser_session_id,
+                &tab_id,
+                magi_web_model::chatgpt_web_home_url(),
+                now,
+            )
+        });
+    }
+    let now = UtcMillis::now();
+    state.mutate_browser_authority(|authority| {
+        authority.create_tab(CreateBrowserTab {
+            tab_id: tab_id.clone(),
+            browser_session_id: browser_session_id.clone(),
+            url: magi_web_model::chatgpt_web_home_url(),
+            now,
+        })?;
+        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, now)
+    })
+}
+
+/// 首次说明的确认状态所在的应用级设置 section（设计基线 §5.12）。
+///
+/// 单独成 section，不与其他浏览器设置共写同一个对象：`update_browser_capability_settings`
+/// 会整体替换 `browser` section，共用一个键会让两处写入互相清除。
+const WEB_MODEL_SETTINGS_SECTION: &str = "webModel";
+
+pub(crate) fn web_model_consent_confirmed(state: &ApiState) -> bool {
+    state
+        .settings_store
+        .get_section(WEB_MODEL_SETTINGS_SECTION)
+        .get("consentConfirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `POST /browser/web-models/consent`：记录一次性的首次使用说明确认。
+async fn confirm_web_model_consent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<DiscoverWebModelsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
+    state
+        .settings_store
+        .update_section(WEB_MODEL_SETTINGS_SECTION, |value| {
+            if !value.is_object() {
+                *value = Value::Object(serde_json::Map::new());
+            }
+            let object = value.as_object_mut().expect("value is an object");
+            object.insert("consentConfirmed".to_string(), Value::Bool(true));
+            object.insert("confirmedAt".to_string(), Value::from(UtcMillis::now().0));
+        })
+        .map_err(crate::errors::settings_persistence_error)?;
+    Ok(Json(serde_json::json!({ "consentConfirmed": true })))
+}
+
+/// `GET /browser/web-models/tunnel`：T3 通道状态。
+///
+/// 只暴露状态与「具体缺哪一项」，**不含任何凭据内容**（§5.7.4、§5.12）。
+async fn get_web_model_tunnel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::web_model_harness::WebModelTunnelStatus>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    Ok(Json(state.web_model_harness.status()))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfigureWebModelTunnelRequest {
+    /// 显式清除配置（关闭 T3）。
+    #[serde(default)]
+    clear: bool,
+    #[serde(default)]
+    tunnel_id: String,
+    /// 仅含 Tunnels Read + Use 的 API 密钥文件路径（引用，不是密钥本身）。
+    #[serde(default)]
+    credential_file: String,
+    #[serde(default)]
+    client_binary: Option<String>,
+    #[serde(default)]
+    client_sha256: Option<String>,
+}
+
+/// `POST /browser/web-models/tunnel`：保存凭据引用并按需启动 / 停止通道。
+///
+/// 落盘的只有**引用**（Tunnel id 与凭据文件路径）；API 密钥值始终只在用户自己的
+/// 文件里，不进 settings、不进日志、不进诊断输出（§5.12）。
+async fn configure_web_model_tunnel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ConfigureWebModelTunnelRequest>,
+) -> Result<Json<crate::web_model_harness::WebModelTunnelStatus>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let config = if request.clear {
+        None
+    } else {
+        Some(crate::web_model_harness::WebModelTunnelConfig {
+            tunnel_id: request.tunnel_id.trim().to_string(),
+            credential_file: request.credential_file.trim().to_string(),
+            client_binary: request
+                .client_binary
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            client_sha256: request
+                .client_sha256
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        })
+    };
+    let stored = match config.as_ref() {
+        Some(config) => serde_json::to_value(config)
+            .map_err(|error| ApiError::internal_assembly("序列化 T3 通道配置失败", error))?,
+        None => Value::Null,
+    };
+    state
+        .settings_store
+        .set_section(crate::web_model_harness::WEB_MODEL_TUNNEL_SECTION, stored)
+        .map_err(crate::errors::settings_persistence_error)?;
+    let state_root = state
+        .runtime_persistence()
+        .and_then(|persistence| persistence.state_root().map(|root| root.to_path_buf()))
+        .ok_or_else(|| {
+            ApiError::internal_assembly("缺少状态根", "无法启动 T3 通道，请检查 daemon 数据目录")
+        })?;
+    let status = state
+        .web_model_harness
+        .configure(&state_root, config)
+        .await
+        .map_err(|error| ApiError::internal_assembly("配置 T3 通道失败", error))?;
+    Ok(Json(status))
+}
+
+/// `POST /browser/web-models/reset`：退出登录 / 清除 Web 数据后的收口。
+///
+/// 顺序固定：先撤销在飞回复，再失效投影（Web 模型立即从选择器消失），最后停通道。
+/// 「清理浏览数据」本身仍走既有入口，本路由只做 daemon 侧收口（§5.13）。
+async fn reset_web_models(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    state.web_model_harness.revoke_turns();
+    state.forget_web_model_probe();
+    state.web_model_harness.stop_tunnel().await;
+    Ok(Json(serde_json::json!({ "status": "login_required" })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResetWebModelConversationRequest {
+    #[serde(default)]
+    session_id: String,
+    /// 线程 id：顶层编排者用 `orchestrator`，子代理用它的 task id（§5.12 绑定键）。
+    #[serde(default)]
+    thread_id: String,
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
+}
+
+/// `POST /browser/web-models/reset-conversation`：把某条会话 / 线程的临时对话
+/// 退回「Magi 所有」——推进绑定 epoch，下一次发送按新建路径全量重放（§5.8）。
+///
+/// 这是「重置为 Magi 对话」的唯一实现：它只动进程内绑定指针，不写 canonical、
+/// 不改 settings、不重放内容，因此不存在第二条写入路径（A19、A20）。
+async fn reset_web_model_conversation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ResetWebModelConversationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
+    let session_id = request.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "重置 Web 对话需要 sessionId".to_string(),
+        ));
+    }
+    let Some(bindings) = state.web_model_harness.bindings() else {
+        // 绑定表由 daemon 装配；拿不到就是 Web 引擎不可用，明确失败而不是假装成功。
+        return Err(ApiError::InvalidInput(
+            "Web 引擎当前不可用，无法重置对话".to_string(),
+        ));
+    };
+    let released = bindings.release_session(&session_id);
+    // 旧实例退场：运行态投影与挂起工具调用跟着一起清掉，不在 UI 留下幽灵条目。
+    state.web_model_harness.registry().forget_session(&session_id);
+    if let Some(runtime) = state.web_model_harness.runtime() {
+        runtime.forget_session(&session_id);
+    }
+    Ok(Json(serde_json::json!({
+        "status": "reset",
+        "released": released,
+    })))
+}
+
+/// 顶层编排线程的绑定线程 id（与推理通道构造 `WebModelInvocationSpec` 时一致）。
+const DEFAULT_WEB_MODEL_THREAD_ID: &str = "orchestrator";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebModelRuntimeQuery {
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// `GET /browser/web-models/runtime`：只读读取在飞 Web turn 的阶段、排队位置与
+/// 账号消息计数（《实现计划》§3.12、§5.1）。
+///
+/// 这是**投影**而不是业务事实：它只反映当前 daemon 进程内存里的调度状态，
+/// 进程重启即清空；正文、工具调用与终态仍只在 canonical 里（A20、R55）。
+/// 引擎长期可用性由 `POST /browser/web-models/discover` 的结果与设置分区展示，
+/// 两者不得互相替代（§8）。
+async fn get_web_model_runtime(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<WebModelRuntimeQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, query.client_platform)?;
+    let session_filter = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let entries = state
+        .web_model_harness
+        .runtime()
+        .map(|runtime| runtime.snapshot(session_filter))
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "entries": entries,
+        "quota": web_model_quota_notice(&state),
+    })))
+}
+
+/// 账号额度提示（A16）：Web 引擎不参与 token 聚合，只按实际发送条数计量。
+///
+/// 提示的是「本地观察到的发送条数」，不是账号侧的真实剩余额度——后者只有
+/// ChatGPT 页面自己知道，Magi 不猜也不伪造成计费数据。
+fn web_model_quota_notice(state: &ApiState) -> Value {
+    let entries = state
+        .web_model_harness
+        .runtime()
+        .map(|runtime| runtime.snapshot(None))
+        .unwrap_or_default();
+    let sent_messages = entries.iter().map(|entry| entry.sent_messages).sum::<u64>();
+    serde_json::json!({
+        "sentMessages": sent_messages,
+        "countedBy": "web_model_sends",
+        "excludedFromTokenBudget": true,
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiscoverWebModelsRequest {
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebModelEngineDraft {
+    id: String,
+    display_name: String,
+    api_protocol: &'static str,
+    context_window_tokens: u64,
+    efforts: Vec<String>,
+    tools_enabled: bool,
+    new_chat_per_turn: bool,
+    origin: WebModelEngineOrigin,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebModelEngineOrigin {
+    kind: &'static str,
+    browser_session_id: String,
+    discovered_at: u64,
+    account_hint: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoverWebModelsResponse {
+    /// 本次探测结果，不等于引擎的长期状态（《实现计划》§7.1 映射表）。
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    account_hint: String,
+    limits_revision: String,
+    site_revision: String,
+    composer_char_limit: Option<u64>,
+    engines: Vec<WebModelEngineDraft>,
+}
+
+impl DiscoverWebModelsResponse {
+    /// 归一化为 daemon 的可用性投影来源（§5.11）。
+    fn to_probe_snapshot(&self) -> crate::state::WebModelProbeSnapshot {
+        crate::state::WebModelProbeSnapshot {
+            status: self.status.to_string(),
+            reason: self.reason.clone(),
+            account_hint: self.account_hint.clone(),
+            limits_revision: self.limits_revision.clone(),
+            engine_ids: self
+                .engines
+                .iter()
+                .map(|engine| engine.id.clone())
+                .collect(),
+            probed_at: UtcMillis::now().0,
+        }
+    }
+
+    fn status_only(status: &'static str, reason: Option<&str>) -> Self {
+        Self {
+            status,
+            reason: reason.map(str::to_string),
+            account_hint: "unknown".to_string(),
+            limits_revision: String::new(),
+            site_revision: String::new(),
+            composer_char_limit: None,
+            engines: Vec::new(),
+        }
+    }
+}
+
+/// `POST /browser/web-models/discover`：只读探测，只返回候选，不落库。
+///
+/// 失败一律 fail closed：未登录或登录过期时 `status = login_required` 且
+/// `engines = []`，绝不用上一次缓存的 Web 模型列表冒充可用结果（设计基线 §5.5）。
+///
+/// 探测结论同时写成 daemon 的**可用性投影来源**（§5.11）：会话内模型选择器只认
+/// 它。单次 `failed` 不改变引擎状态，因此不覆盖上一条结论（《实现计划》§7.1）。
+async fn discover_web_models(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<DiscoverWebModelsRequest>,
+) -> Result<Json<DiscoverWebModelsResponse>, ApiError> {
+    let response = run_web_model_discovery(&state, &headers, request.client_platform).await?;
+    if response.status != "failed" {
+        state.record_web_model_probe(response.to_probe_snapshot());
+    }
+    Ok(Json(response))
+}
+
+/// `POST /browser/web-models/ensure-home`：只物化应用级 GPT Web 主页。
+///
+/// 应用级会话在 daemon / Desktop 重启后会保留逻辑 Tab，但真实 `<webview>`
+/// 需要等 Renderer 内容槽重新挂载后才能注册。右栏组件在完成挂载后调用这条
+/// 路径，恢复主页而不改变右栏可见性或活动面板；它不是发现接口，也不要求用户
+/// 已确认 Web 模型说明，因此打开 GPT Web Tab 后未登录用户仍能正常看到登录页。
+async fn ensure_web_model_home_surface(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<EnsureWebModelHomeRequest>,
+) -> Result<Json<BrowserSessionResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
+    let client = require_browser_host(&state)?;
+    let session = ensure_app_browser_session(&state)?;
+    let tab = ensure_app_home_tab(&state, &session.browser_session_id)?;
+    let tab_id = tab.tab_id.clone();
+
+    let result = require_host_success(
+        client
+            .request(BrowserHostCommand::RestorePage {
+                tab_id: tab_id.clone(),
+                browser_session_id: tab.browser_session_id.clone(),
+                initial_url: magi_web_model::chatgpt_web_home_url(),
+                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
+                navigation_revision: tab.navigation_revision,
+                snapshot_revision: tab.snapshot_revision,
+                allow_page_eviction: false,
+            })
+            .await,
+        "恢复 GPT Web 主页失败",
+    )?;
+    let BrowserHostCommandResult::PageState(page_state) = result else {
+        return Err(ApiError::InternalAssemblyError(
+            "恢复 GPT Web 主页结果缺少页面状态".to_string(),
+        ));
+    };
+
+    state.mutate_browser_authority(|authority| {
+        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis::now())?;
+        authority.apply_host_page_state(
+            &tab_id,
+            page_state.navigation_revision,
+            page_state.url,
+            page_state.origin,
+            page_state.title,
+            UtcMillis::now(),
+        )
+    })?;
+
+    let session = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .app_session()
+        .cloned()
+        .ok_or_else(|| ApiError::Conflict("GPT Web 应用级会话在恢复期间消失".to_string()))?;
+    Ok(Json(browser_session_response(&state, session)?))
+}
+
+/// 探测主体。探测结论的投影与归一化都在这里，路由层只补一次状态写入。
+async fn run_web_model_discovery(
+    state: &ApiState,
+    headers: &HeaderMap,
+    client_platform: Option<BrowserClientPlatform>,
+) -> Result<DiscoverWebModelsResponse, ApiError> {
+    require_desktop_browser_capability(state, headers, client_platform)?;
+
+    if !web_model_consent_confirmed(state) {
+        return Ok(DiscoverWebModelsResponse::status_only(
+            "consent_required",
+            None,
+        ));
+    }
+
+    let Some(client) = state.browser_host_client() else {
+        return Ok(DiscoverWebModelsResponse::status_only(
+            "desktop_unavailable",
+            None,
+        ));
+    };
+
+    let session = ensure_app_browser_session(state)?;
+    let tab = ensure_app_home_tab(state, &session.browser_session_id)?;
+    let tab_id = tab.tab_id.clone();
+
+    // 只读探测前先保证页面真实存在：恢复主页 Tab，再等待它绑定当前窗口内容槽。
+    let restored = client
+        .request(BrowserHostCommand::RestorePage {
+            tab_id: tab_id.clone(),
+            browser_session_id: tab.browser_session_id.clone(),
+            initial_url: magi_web_model::chatgpt_web_home_url(),
+            logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
+            navigation_revision: tab.navigation_revision,
+            snapshot_revision: tab.snapshot_revision,
+            allow_page_eviction: false,
+        })
+        .await;
+    if restored.is_err() {
+        return Ok(DiscoverWebModelsResponse::status_only(
+            "failed",
+            Some("surface_unavailable"),
+        ));
+    }
+
+    // `restore_page` 后页面可能正好经历一次 guest / Worker / navigation
+    // binding 交接。探测只读且无副作用，允许在这个窗口内重新读取当前
+    // binding；写入和提交路径不走这里，避免把副作用命令自动重放。
+    let mut probe_value = None;
+    let mut last_probe_reason = "probe_failed".to_string();
+    for attempt in 0..=WEB_MODEL_PROBE_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(WEB_MODEL_PROBE_RETRY_DELAY).await;
+        }
+
+        let surface = tokio::time::timeout(
+            BROWSER_SURFACE_WAIT_TIMEOUT,
+            client.request(BrowserHostCommand::EnsureSurface {
+                tab_id: tab_id.clone(),
+            }),
+        )
+        .await;
+        let Ok(Ok(reply)) = surface else {
+            last_probe_reason = "surface_unavailable".to_string();
+            continue;
+        };
+        let Some(BrowserHostCommandResult::SurfaceBinding(binding)) =
+            succeeded_result(reply.response.outcome)
+        else {
+            last_probe_reason = "surface_unavailable".to_string();
+            continue;
+        };
+        // 应用级 Surface 也走不激活路径：探测不抢用户的右栏（A25）。
+        let accepted = state.mutate_browser_authority(|authority| {
+            let (accepted, _, _) =
+                authority.accept_primary_surface(binding.clone(), UtcMillis::now())?;
+            Ok(accepted)
+        })?;
+        if !accepted {
+            last_probe_reason = "probe_browser_surface_stale".to_string();
+            continue;
+        }
+
+        let probe = client
+            .request(BrowserHostCommand::WebModelProbe {
+                tab_id: tab_id.clone(),
+            })
+            .await;
+        let Ok(reply) = probe else {
+            last_probe_reason = "probe_failed".to_string();
+            continue;
+        };
+        let outcome = reply.response.outcome;
+        match outcome {
+            BrowserHostCommandOutcome::Succeeded(result) => {
+                if let BrowserHostCommandResult::Json { value } = *result {
+                    probe_value = Some(value);
+                    break;
+                }
+                last_probe_reason = "probe_result_invalid".to_string();
+            }
+            BrowserHostCommandOutcome::Failed(error)
+            | BrowserHostCommandOutcome::Indeterminate(error) => {
+                tracing::warn!(
+                    attempt,
+                    code = %error.code,
+                    diagnostic = ?error.diagnostic,
+                    "GPT Web 模型探测命令失败",
+                );
+                last_probe_reason = format!("probe_{}", error.code);
+                if !retryable_web_model_probe_error(&error.code, &error.message) {
+                    break;
+                }
+            }
+            BrowserHostCommandOutcome::Cancelled => {
+                last_probe_reason = "probe_cancelled".to_string();
+                break;
+            }
+        }
+    }
+    let Some(value) = probe_value else {
+        return Ok(DiscoverWebModelsResponse::status_only(
+            "failed",
+            Some(&last_probe_reason),
+        ));
+    };
+
+    Ok(normalize_discovery_probe(
+        &value,
+        session.browser_session_id.as_str(),
+    ))
+}
+
+/// 只允许对物理 Surface 交接错误重试 Web 模型探测。selector 漂移、登录过期、
+/// 风控页和站点业务错误必须立即返回，不能通过重试掩盖真实诊断。
+fn retryable_web_model_probe_error(code: &str, message: &str) -> bool {
+    matches!(
+        code,
+        "browser_surface_stale"
+            | "browser_surface_not_found"
+            | "browser_surface_content_unavailable"
+            | "browser_cdp_session_stale"
+            | "browser_debugger_detached"
+            | "browser_worker_rebind_stale"
+    ) || message.contains("browser_surface_stale")
+        || message.contains("browser_cdp_session_stale")
+        || message.contains("browser_debugger_detached")
+        || message.contains("browser_worker_rebind_stale")
+}
+
+/// 把站点探测的原始结果归一化为发现响应。
+///
+/// 只吃站点适配层的事实，不猜模型、不读缓存：`signed_out` → `login_required` 且
+/// `engines = []`；`blocked` → `site_blocked`（A23）。
+fn normalize_discovery_probe(value: &Value, browser_session_id: &str) -> DiscoverWebModelsResponse {
+    let login_state = value
+        .get("login_state")
+        .and_then(Value::as_str)
+        .unwrap_or("signed_out");
+    let account_hint = value
+        .get("account_hint")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let limits_revision = value
+        .get("limits_revision")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let site_revision = value
+        .get("site_revision")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let composer_char_limit = value.get("composer_char_limit").and_then(Value::as_u64);
+
+    if login_state == "blocked" {
+        return DiscoverWebModelsResponse {
+            status: "site_blocked",
+            reason: Some("risk_page".to_string()),
+            account_hint,
+            limits_revision,
+            site_revision,
+            composer_char_limit,
+            engines: Vec::new(),
+        };
+    }
+    if login_state != "signed_in" {
+        return DiscoverWebModelsResponse {
+            status: "login_required",
+            account_hint,
+            limits_revision,
+            site_revision,
+            composer_char_limit,
+            reason: None,
+            engines: Vec::new(),
+        };
+    }
+    // selector 漂移：登录着却读不到任何模型菜单，必须是显式失败而不是空列表。
+    let Some(models) = value.get("models").and_then(Value::as_array) else {
+        return DiscoverWebModelsResponse {
+            status: "site_blocked",
+            reason: Some("selectors_drift".to_string()),
+            account_hint,
+            limits_revision,
+            site_revision,
+            composer_char_limit,
+            engines: Vec::new(),
+        };
+    };
+    if models.is_empty() {
+        return DiscoverWebModelsResponse {
+            status: "site_blocked",
+            reason: Some("selectors_drift".to_string()),
+            account_hint,
+            limits_revision,
+            site_revision,
+            composer_char_limit,
+            engines: Vec::new(),
+        };
+    }
+
+    let discovered_at = UtcMillis::now().0;
+    let engines = models
+        .iter()
+        .filter_map(|model| {
+            let family = model.get("family").and_then(Value::as_str)?;
+            let engine_id = magi_web_model::web_model_engine_id(family);
+            let efforts = model
+                .get("efforts")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some(WebModelEngineDraft {
+                id: engine_id,
+                display_name: model
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(family)
+                    .to_string(),
+                api_protocol: "chatgpt_web",
+                context_window_tokens: model
+                    .get("context_window_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                efforts,
+                tools_enabled: true,
+                new_chat_per_turn: false,
+                origin: WebModelEngineOrigin {
+                    kind: "web",
+                    browser_session_id: browser_session_id.to_string(),
+                    discovered_at,
+                    account_hint: account_hint.clone(),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    if engines.is_empty() {
+        return DiscoverWebModelsResponse {
+            status: "site_blocked",
+            reason: Some("selectors_drift".to_string()),
+            account_hint,
+            limits_revision,
+            site_revision,
+            composer_char_limit,
+            engines: Vec::new(),
+        };
+    }
+    DiscoverWebModelsResponse {
+        status: "ok",
+        reason: None,
+        account_hint,
+        limits_revision,
+        site_revision,
+        composer_char_limit,
+        engines,
+    }
+}
+
+/// 从 Host 命令结果中取出成功值；失败 / 取消都归一为 `None`。
+fn succeeded_result(outcome: BrowserHostCommandOutcome) -> Option<BrowserHostCommandResult> {
+    match outcome {
+        BrowserHostCommandOutcome::Succeeded(result) => Some(*result),
+        _ => None,
+    }
 }
 
 async fn get_session(
@@ -1229,7 +2128,7 @@ async fn get_current_session(
         .lock()
         .expect("browser authority lock poisoned")
         .session_for_magi_session(&session_id)
-        .filter(|session| session.workspace_id == workspace_id)
+        .filter(|session| session.owner_workspace_id() == workspace_id.as_ref())
         .cloned();
     let session = session
         .map(|session| browser_session_response(&state, session))
@@ -1283,8 +2182,8 @@ async fn close_session(
     publish_browser_event(
         &state,
         "browser.session.status_changed",
-        closed.workspace_id.as_ref(),
-        &closed.session_id,
+        closed.owner_workspace_id(),
+        require_session_scope(&closed)?,
         serde_json::json!({
             "browser_session_id": closed.browser_session_id,
             "lifecycle": closed.lifecycle,
@@ -1375,8 +2274,8 @@ async fn create_tab(
     publish_browser_event(
         &state,
         "browser.tab.created",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "browser_session_id": browser_session_id,
             "tab_id": tab_id,
@@ -1389,8 +2288,8 @@ async fn create_tab(
     // 右栏选择器和主窗口布局不会被网络导航或 Renderer 首次布局阻塞。
     let state_for_host = state.clone();
     let created_response = created.clone();
-    let workspace_id = session.workspace_id.clone();
-    let session_id = session.session_id.clone();
+    let workspace_id = session.owner_workspace_id().cloned();
+    let session_id = require_session_scope(&session)?.clone();
     let browser_session_id_for_host = browser_session_id.clone();
     let tab_id_for_host = tab_id.clone();
     let initial_url = request.initial_url;
@@ -1544,8 +2443,8 @@ async fn set_active_tab(
     publish_browser_event(
         &state,
         "browser.tab.focused",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "browser_session_id": browser_session_id,
             "tab_id": tab_id,
@@ -1609,7 +2508,7 @@ async fn list_annotations(
 ) -> Result<Json<Vec<BrowserAnnotationResponse>>, ApiError> {
     let tab_id = BrowserTabId::new(tab_id);
     let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, &session.session_id)?;
+    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
     let annotations = state
         .browser_authority
         .lock()
@@ -1727,7 +2626,7 @@ async fn create_annotation(
     };
     let screenshot_artifact_id = persist_browser_annotation_screenshot(
         &state,
-        &session.session_id,
+        require_session_scope(&session)?,
         &tab.tab_id,
         screenshot_clip,
         &tab_id,
@@ -1771,8 +2670,8 @@ async fn create_annotation(
     publish_browser_event(
         &state,
         "browser.annotation.created",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "annotation_id": annotation.annotation_id,
             "tab_id": annotation.tab_id,
@@ -1985,8 +2884,8 @@ async fn update_annotation_status(
     publish_browser_event(
         &state,
         "browser.annotation.status_changed",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "annotation_id": updated.annotation_id,
             "tab_id": updated.tab_id,
@@ -2027,8 +2926,8 @@ async fn update_annotation_comment(
     publish_browser_event(
         &state,
         "browser.annotation.updated",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "annotation_id": updated.annotation_id,
             "tab_id": updated.tab_id,
@@ -2057,7 +2956,7 @@ async fn annotation_artifact(
             .ok_or_else(|| {
                 ApiError::not_found("浏览器会话不存在", annotation.browser_session_id.as_str())
             })?;
-        if browser_session.session_id != session_id {
+        if browser_session.magi_session_id() != Some(&session_id) {
             return Err(ApiError::NotFound("浏览器标记不存在".to_string()));
         }
         annotation
@@ -2093,7 +2992,7 @@ async fn activate_tab(
     require_desktop_browser_capability(&state, &headers, None)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, &session.session_id)?;
+    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
     let mut tab = state
         .mutate_browser_authority(|authority| prepare_browser_tab_activation(authority, &tab_id))?;
     // Host 的真实 Surface 只有在右栏 Renderer 已经切换到目标 Browser Tab
@@ -2103,8 +3002,8 @@ async fn activate_tab(
     publish_browser_event(
         &state,
         "browser.tab.activation_requested",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "browser_session_id": session.browser_session_id,
             "tab_id": tab_id,
@@ -2142,8 +3041,8 @@ async fn activate_tab(
     publish_browser_event(
         &state,
         "browser.tab.activated",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "browser_session_id": session.browser_session_id,
             "tab_id": tab_id,
@@ -2176,8 +3075,8 @@ async fn close_tab(
     publish_browser_event(
         &state,
         "browser.tab.closed",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "browser_session_id": tab.browser_session_id,
             "tab_id": tab_id,
@@ -2224,7 +3123,7 @@ async fn navigate_tab(
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, &session.session_id)?;
+    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
     let action = request.action.trim();
     let navigation = match action {
         "url" => {
@@ -2306,8 +3205,8 @@ async fn navigate_tab(
     publish_browser_event(
         &state,
         "browser.tab.updated",
-        session.workspace_id.as_ref(),
-        &session.session_id,
+        session.owner_workspace_id(),
+        require_session_scope(&session)?,
         serde_json::json!({
             "browser_session_id": session.browser_session_id,
             "tab_id": tab.tab_id,
@@ -2349,7 +3248,7 @@ async fn screenshot_tab(
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, &session.session_id)?;
+    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
     let reply = require_browser_host(&state)?
         .request(BrowserHostCommand::Screenshot {
             tab_id,
@@ -2540,7 +3439,7 @@ async fn ensure_user_control_for_ui(
     session: &BrowserSession,
     tab_id: &BrowserTabId,
 ) -> Result<BrowserSurfaceControlSnapshot, ApiError> {
-    ensure_browser_ui_ready(state, &session.session_id)?;
+    ensure_browser_ui_ready(state, require_session_scope(session)?)?;
     // Authority 的短临界区与 Session/Host 的异步等待分开。这里不能由调用方
     // 先持有 browser_control_lock 再进入 interrupt_session_turn，否则关闭
     // 会话的固定顺序（session turn -> browser control）会与用户接管互锁。
@@ -2563,13 +3462,13 @@ async fn ensure_user_control_for_ui(
     if !revoked.is_empty() {
         if let Err(error) = super::sessions::interrupt_session_turn_for_browser_takeover(
             state,
-            &session.session_id,
-            session.workspace_id.as_ref(),
+            require_session_scope(&session)?,
+            session.owner_workspace_id(),
         )
         .await
         {
             tracing::warn!(
-                session_id = %session.session_id,
+                session_id = %session.magi_session_id().map(|id| id.as_str()).unwrap_or("app"),
                 ?error,
                 "浏览器用户操作后收口当前 Turn 失败，控制 fence 仍保持生效"
             );
@@ -2592,8 +3491,8 @@ async fn ensure_user_control_for_ui(
         publish_browser_event(
             state,
             "browser.control.changed",
-            session.workspace_id.as_ref(),
-            &session.session_id,
+            session.owner_workspace_id(),
+            require_session_scope(&session)?,
             serde_json::json!({
                 "browser_session_id": session.browser_session_id,
                 "tab_id": control.tab_id,
@@ -2778,10 +3677,14 @@ fn browser_session_response(
         })
         .collect();
     let active_tab_id = authority.active_tab(&session.browser_session_id).cloned();
+    let owner = session.owner_kind().to_string();
+    let owner_workspace_id = session.owner_workspace_id().cloned();
+    let magi_session_id = session.magi_session_id().cloned();
     Ok(BrowserSessionResponse {
         browser_session_id: session.browser_session_id,
-        workspace_id: session.workspace_id,
-        session_id: session.session_id,
+        owner,
+        workspace_id: owner_workspace_id,
+        session_id: magi_session_id,
         profile_id: session.profile_id,
         lifecycle: session.lifecycle,
         active_tab_id,
@@ -2823,6 +3726,16 @@ fn host_command_succeeded(outcome: &BrowserHostCommandOutcome) -> bool {
     matches!(outcome, BrowserHostCommandOutcome::Succeeded(_))
 }
 
+/// 会话作用域的 Magi 会话身份。
+///
+/// App 级（GPT Web）会话不属于任何 Magi 会话，`browser_*` 路由一律不暴露它
+/// （设计基线 §5.3：浏览器工具与 UI 检查都不得读到已登录页面）。
+fn require_session_scope(session: &BrowserSession) -> Result<&SessionId, ApiError> {
+    session.magi_session_id().ok_or_else(|| {
+        ApiError::not_found("浏览器会话不存在", "应用级浏览器会话不支持会话作用域操作")
+    })
+}
+
 fn publish_browser_event(
     state: &ApiState,
     event_type: &str,
@@ -2850,6 +3763,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{
+        Json,
         body::to_bytes,
         extract::{Path, Query, State},
         http::{HeaderMap, StatusCode, header::USER_AGENT},
@@ -2857,8 +3771,8 @@ mod tests {
     use magi_browser_authority::{
         BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor, BrowserAnnotationKind,
         BrowserAnnotationStatus, BrowserHostRect, BrowserProfile, BrowserProfileKind,
-        BrowserRegionAnnotationAnchor, BrowserSessionLifecycle, BrowserTabLifecycle,
-        BrowserViewport, CreateBrowserSession, CreateBrowserTab,
+        BrowserRegionAnnotationAnchor, BrowserSessionLifecycle, BrowserSessionOwner,
+        BrowserTabLifecycle, BrowserViewport, CreateBrowserSession, CreateBrowserTab,
     };
     use magi_core::{
         BrowserAnnotationId, BrowserProfileId, BrowserSessionId, BrowserTabId, SessionId,
@@ -2872,12 +3786,13 @@ mod tests {
     use super::{
         AnnotationArtifactQuery, BrowserAnnotationAnchorResponse, BrowserClientPlatform,
         BrowserElementAnnotationAnchorResponse, BrowserRegionAnnotationAnchorResponse,
-        BrowserTabActivation, DesktopConnectionClearRequest, DesktopConnectionRequest,
-        ReclaimBrowserResourcesRequest, annotation_artifact, apply_browser_tab_activation,
-        browser_platform_capabilities, browser_resources_response, browser_session_response,
-        clear_desktop_connection, finish_browser_tab_creation, normalize_hit_bounds,
-        prepare_browser_tab_activation, reclaim_browser_resources, register_desktop_connection,
-        require_desktop_browser_capability, resolve_browser_annotation_context,
+        BrowserTabActivation, CreateAppBrowserSessionRequest, DesktopConnectionClearRequest,
+        DesktopConnectionRequest, ReclaimBrowserResourcesRequest, annotation_artifact,
+        apply_browser_tab_activation, browser_platform_capabilities, browser_resources_response,
+        browser_session_response, clear_desktop_connection, create_app_session,
+        finish_browser_tab_creation, normalize_hit_bounds, prepare_browser_tab_activation,
+        reclaim_browser_resources, register_desktop_connection, require_desktop_browser_capability,
+        resolve_browser_annotation_context,
     };
     use crate::{
         errors::ApiError,
@@ -2941,8 +3856,12 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: Some(WorkspaceId::new("workspace-browser-annotation-current")),
-                    session_id: current_session_id.clone(),
+                    owner: BrowserSessionOwner::Session {
+                        session_id: current_session_id.clone(),
+                        workspace_id: Some(WorkspaceId::new(
+                            "workspace-browser-annotation-current",
+                        )),
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -3534,8 +4453,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id,
+                    owner: BrowserSessionOwner::Session {
+                        session_id,
+                        workspace_id: None,
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -3709,8 +4630,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id: session_id.clone(),
+                    owner: BrowserSessionOwner::Session {
+                        session_id: session_id.clone(),
+                        workspace_id: None,
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -3909,6 +4832,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_browser_session_is_singleton_with_a_stable_id_and_home_tab() {
+        let state = capability_test_state("browser-app-session-test");
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: BrowserProfileId::new("browser-profile-default"),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: tempfile::tempdir()
+                        .expect("app session profile should create")
+                        .keep(),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })
+            })
+            .expect("browser profile should register");
+        let headers = desktop_request_headers(&state);
+
+        let (status, Json(first)) = create_app_session(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateAppBrowserSessionRequest::default()),
+        )
+        .await
+        .expect("app session should create");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(first.created);
+        assert_eq!(first.session.owner, "app");
+        // 应用级会话不属于任何 Magi 会话或工作区。
+        assert!(first.session.session_id.is_none());
+        assert!(first.session.workspace_id.is_none());
+
+        let (status, Json(second)) = create_app_session(
+            State(state.clone()),
+            headers,
+            Json(CreateAppBrowserSessionRequest::default()),
+        )
+        .await
+        .expect("app session should be reused");
+        assert_eq!(status, StatusCode::OK);
+        assert!(!second.created);
+        assert_eq!(
+            second.session.browser_session_id,
+            first.session.browser_session_id
+        );
+        // 应用级会话固定带一个主页 Tab，且固定在 GPT Web 入口。
+        assert_eq!(second.session.tabs.len(), 1);
+        assert_eq!(
+            second.session.tabs[0].url,
+            magi_web_model::chatgpt_web_home_url()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_browser_session_sessions_are_not_visible_to_session_browser_routes() {
+        let state = capability_test_state("browser-app-session-scope-test");
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: BrowserProfileId::new("browser-profile-default"),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: tempfile::tempdir()
+                        .expect("app session profile should create")
+                        .keep(),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })
+            })
+            .expect("browser profile should register");
+        let headers = desktop_request_headers(&state);
+        let Json(created) = create_app_session(
+            State(state.clone()),
+            headers,
+            Json(CreateAppBrowserSessionRequest::default()),
+        )
+        .await
+        .expect("app session should create")
+        .1;
+
+        // 应用级会话不参与任何会话的浏览器会话解析。
+        let authority = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned");
+        assert!(
+            authority
+                .session_for_magi_session(&SessionId::new("session-app-scope"))
+                .is_none()
+        );
+        let resource = authority
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.browser_session_id == created.session.browser_session_id)
+            .expect("app session should exist");
+        assert!(resource.is_app_scope());
+    }
+
+    #[tokio::test]
     async fn reclaim_resources_closes_inactive_tab_even_without_browser_host() {
         let state = ApiState::new(
             "browser-resource-reclaim-test",
@@ -3935,8 +4956,10 @@ mod tests {
                 })?;
                 authority.create_session(CreateBrowserSession {
                     browser_session_id: browser_session_id.clone(),
-                    workspace_id: None,
-                    session_id: session_id.clone(),
+                    owner: BrowserSessionOwner::Session {
+                        session_id: session_id.clone(),
+                        workspace_id: None,
+                    },
                     profile_id,
                     now: UtcMillis(1),
                 })?;
@@ -4001,4 +5024,84 @@ mod tests {
             BrowserTabLifecycle::Closed
         );
     }
+    fn discovery_probe_with_signed_in_account() -> serde_json::Value {
+        serde_json::json!({
+            "site_revision": "chatgpt-web-2",
+            "login_state": "signed_in",
+            "composer_available": true,
+            "composer_char_limit": 1050000,
+            "account_hint": "plus",
+            "limits_revision": "rev-1",
+            "models": [
+                {
+                    "family": "gpt-5",
+                    "display_name": "GPT-5",
+                    "efforts": ["low", "medium", "high"],
+                    "default_effort": "medium",
+                    "context_window_tokens": 90000,
+                    "single_submission_token_budget": 28000,
+                    "response_reserve": 12000,
+                    "tokenizer_revision": "o200k"
+                }
+            ],
+            "connector_support": false,
+            "connector_settings_reachable": false
+        })
+    }
+
+    #[test]
+    fn discovery_requires_login_and_returns_no_engines_when_signed_out() {
+        // 未登录 / 登录过期必须 fail closed：不得用上一次缓存的 Web 模型列表冒充结果。
+        let probe = discovery_probe_with_signed_in_account();
+        let mut signed_out = probe.clone();
+        signed_out["login_state"] = serde_json::Value::String("signed_out".to_string());
+        let response = super::normalize_discovery_probe(&signed_out, "browser-session-app-1-0");
+        assert_eq!(response.status, "login_required");
+        assert!(response.engines.is_empty());
+    }
+
+    #[test]
+    fn discovery_maps_risk_page_to_site_blocked() {
+        let mut blocked = discovery_probe_with_signed_in_account();
+        blocked["login_state"] = serde_json::Value::String("blocked".to_string());
+        let response = super::normalize_discovery_probe(&blocked, "browser-session-app-1-0");
+        assert_eq!(response.status, "site_blocked");
+        assert_eq!(response.reason.as_deref(), Some("risk_page"));
+        assert!(response.engines.is_empty());
+    }
+
+    #[test]
+    fn discovery_reports_selector_drift_instead_of_empty_list() {
+        // 登录着却读不到模型菜单是显式失败，不是“没有模型”。
+        let mut drifted = discovery_probe_with_signed_in_account();
+        drifted["models"] = serde_json::Value::Array(vec![]);
+        let response = super::normalize_discovery_probe(&drifted, "browser-session-app-1-0");
+        assert_eq!(response.status, "site_blocked");
+        assert_eq!(response.reason.as_deref(), Some("selectors_drift"));
+        assert!(response.engines.is_empty());
+    }
+
+    #[test]
+    fn discovery_builds_namespaced_web_engines_without_llm() {
+        let probe = discovery_probe_with_signed_in_account();
+        let response = super::normalize_discovery_probe(&probe, "browser-session-app-1-0");
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.account_hint, "plus");
+        assert_eq!(response.limits_revision, "rev-1");
+        assert_eq!(response.composer_char_limit, Some(1_050_000));
+        assert_eq!(response.engines.len(), 1);
+        let engine = &response.engines[0];
+        assert_eq!(engine.id, "chatgpt-web/gpt-5");
+        assert_eq!(engine.api_protocol, "chatgpt_web");
+        assert_eq!(engine.context_window_tokens, 90_000);
+        assert_eq!(engine.origin.kind, "web");
+        assert_eq!(engine.origin.browser_session_id, "browser-session-app-1-0");
+        assert_eq!(engine.origin.account_hint, "plus");
+        let value = serde_json::to_value(engine).expect("engine draft serializes");
+        assert!(
+            value.get("llm").is_none(),
+            "Web 引擎不写 llm：写入会让它被规范化成 openai_chat（A22）"
+        );
+    }
+
 }

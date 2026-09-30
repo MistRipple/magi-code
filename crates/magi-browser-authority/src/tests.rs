@@ -9,9 +9,9 @@ use crate::{
     AcquireBrowserLease, BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor,
     BrowserAnnotationKind, BrowserAuthority, BrowserDeviceType, BrowserDurableState,
     BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserProfile, BrowserProfileKind,
-    BrowserSessionLifecycle, BrowserSurfaceBinding, BrowserTabLifecycle, BrowserViewport,
-    CreateBrowserSession, CreateBrowserTab, GoalControlBinding, MAX_BROWSER_TABS_TOTAL,
-    ValidateBrowserNodeSelection, ValidateBrowserWrite,
+    BrowserSessionLifecycle, BrowserSessionOwner, BrowserSurfaceBinding, BrowserTabLifecycle,
+    BrowserViewport, CreateBrowserSession, CreateBrowserTab, GoalControlBinding,
+    MAX_BROWSER_TABS_TOTAL, ValidateBrowserNodeSelection, ValidateBrowserWrite,
 };
 
 fn at(value: u64) -> UtcMillis {
@@ -47,8 +47,10 @@ fn ready_session_with_ids(
     authority
         .create_session(CreateBrowserSession {
             browser_session_id: browser_session_id.clone(),
-            workspace_id: Some(WorkspaceId::new("workspace-1")),
-            session_id: SessionId::new(session_id),
+            owner: BrowserSessionOwner::Session {
+                session_id: SessionId::new(session_id),
+                workspace_id: Some(WorkspaceId::new("workspace-1")),
+            },
             profile_id: profile_id(),
             now: at(2),
         })
@@ -312,31 +314,27 @@ fn active_browser_tab_is_runtime_focus_and_does_not_persist() {
 }
 
 #[test]
-fn previous_durable_schema_without_tab_order_is_migrated() {
+fn unknown_durable_schema_version_is_rejected_without_migration() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);
     let browser_session_id = ready_session(&mut authority);
-    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    let _tab_id = ready_tab(&mut authority, &browser_session_id);
 
-    let mut value =
-        serde_json::to_value(authority.durable_state()).expect("state should serialize");
-    value["schema_version"] = serde_json::json!(4);
-    value["tabs"][0]
-        .as_object_mut()
-        .expect("tab should be an object")
-        .remove("order");
-    let legacy: BrowserDurableState =
-        serde_json::from_value(value).expect("legacy state should decode");
-
-    let restored =
-        BrowserAuthority::restore_durable(legacy, at(7)).expect("legacy state should restore");
-    let tab = restored
-        .snapshot()
-        .tabs
-        .into_iter()
-        .find(|tab| tab.tab_id == tab_id)
-        .expect("tab should survive migration");
-    assert_eq!(tab.order, 0);
+    let value = serde_json::to_value(authority.durable_state()).expect("state should serialize");
+    // A19：不做版本迁移。旧版本与未知版本一样被判为不可恢复，由加载方按
+    // 「无状态」重建并覆盖写回，而不是走迁移分支。
+    for version in [4, crate::BROWSER_DURABLE_STATE_SCHEMA_VERSION - 1] {
+        let mut value = value.clone();
+        value["schema_version"] = serde_json::json!(version);
+        let durable: BrowserDurableState =
+            serde_json::from_value(value).expect("durable state should decode");
+        let error = BrowserAuthority::restore_durable(durable, at(7))
+            .expect_err("unknown schema version must be rejected");
+        assert!(matches!(
+            error,
+            crate::BrowserAuthorityError::InvalidSnapshot(_)
+        ));
+    }
 }
 
 #[test]
@@ -1454,4 +1452,146 @@ fn annotation_sequence_is_persisted_with_the_tab() {
     let durable = authority.durable_state();
     assert_eq!(durable.tabs[0].annotation_sequence, 1);
     assert_eq!(durable.annotations.len(), 1);
+}
+
+fn ready_app_session(
+    authority: &mut BrowserAuthority,
+    browser_session_id: &str,
+) -> BrowserSessionId {
+    let browser_session_id = BrowserSessionId::new(browser_session_id);
+    authority
+        .create_session(CreateBrowserSession {
+            browser_session_id: browser_session_id.clone(),
+            owner: BrowserSessionOwner::App,
+            profile_id: profile_id(),
+            now: at(2),
+        })
+        .expect("app session should create");
+    authority
+        .transition_session(&browser_session_id, BrowserSessionLifecycle::Ready, at(3))
+        .expect("app session should become ready");
+    browser_session_id
+}
+
+#[test]
+fn app_scoped_session_is_globally_unique() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let first = ready_app_session(&mut authority, "browser-session-app-1");
+    assert_eq!(authority.app_session_id(), Some(&first));
+
+    let error = authority
+        .create_session(CreateBrowserSession {
+            browser_session_id: BrowserSessionId::new("browser-session-app-2"),
+            owner: BrowserSessionOwner::App,
+            profile_id: profile_id(),
+            now: at(4),
+        })
+        .expect_err("a second open app session must be rejected");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::AppSessionAlreadyExists { .. }
+    ));
+}
+
+#[test]
+fn app_scoped_session_is_invisible_to_magi_session_lookup_and_survives_roundtrip() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let app_session_id = ready_app_session(&mut authority, "browser-session-app");
+    // 应用级会话不属于任何 Magi 会话，不能冒充某个会话的浏览器会话。
+    assert!(
+        authority
+            .session_for_magi_session(&SessionId::new("session-1"))
+            .is_none()
+    );
+
+    let restored = BrowserAuthority::restore_durable(authority.durable_state(), at(7))
+        .expect("state should restore");
+    let restored_session = restored
+        .app_session()
+        .expect("app session should survive the durable roundtrip");
+    assert_eq!(restored_session.browser_session_id, app_session_id);
+    assert!(restored_session.is_app_scope());
+    assert_eq!(restored_session.owner_kind(), "app");
+    assert!(restored_session.magi_session_id().is_none());
+}
+
+#[test]
+fn duplicate_app_scoped_sessions_in_snapshot_are_rejected() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let _ = ready_app_session(&mut authority, "browser-session-app-1");
+    let mut snapshot = authority.snapshot();
+    let mut duplicate = snapshot
+        .sessions
+        .first()
+        .expect("app session should exist")
+        .clone();
+    duplicate.browser_session_id = BrowserSessionId::new("browser-session-app-2");
+    snapshot.sessions.push(duplicate);
+
+    let error = BrowserAuthority::restore(snapshot, at(9))
+        .expect_err("two open app sessions must be rejected");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::InvalidSnapshot(_)
+    ));
+}
+
+#[test]
+fn app_scoped_tabs_ignore_per_session_quota_and_are_never_reclaimable() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_app_session(&mut authority, "browser-session-app");
+    for index in 0..(crate::MAX_BROWSER_TABS_PER_SESSION + 1) {
+        let tab_id = BrowserTabId::new(format!("browser-tab-app-{index}"));
+        authority
+            .create_tab(CreateBrowserTab {
+                tab_id: tab_id.clone(),
+                browser_session_id: browser_session_id.clone(),
+                url: "about:blank".to_string(),
+                now: at(10),
+            })
+            .expect("app tab beyond the per-session quota should create");
+        authority
+            .transition_tab(&tab_id, BrowserTabLifecycle::Suspended, at(11))
+            .expect("app tab should suspend");
+        // 主页与推理页面常驻：应用级页面不参与资源回收。
+        assert!(!authority.is_reclaimable_tab(&tab_id, at(12)));
+    }
+}
+
+#[test]
+fn app_scoped_session_rejects_session_scoped_lease_owner() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_app_session(&mut authority, "browser-session-app");
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+
+    let error = authority
+        .acquire_lease(AcquireBrowserLease {
+            lease_id: BrowserLeaseId::new("lease-app-scope"),
+            tab_id: tab_id.clone(),
+            surface_id: surface_id(),
+            owner: ExecutionOwnership {
+                session_id: Some(SessionId::new("session-1")),
+                workspace_id: Some(WorkspaceId::new("workspace-1")),
+                ..ExecutionOwnership::default()
+            },
+            turn_id: "turn-app-scope".to_string(),
+            goal_binding: None,
+            acquired_at: at(7),
+            expires_at: at(70),
+        })
+        .expect_err("a session-scoped owner must not lease an app-scoped tab");
+    assert!(matches!(
+        error,
+        crate::BrowserAuthorityError::OwnershipMismatch {
+            field: "session_id"
+        }
+    ));
 }

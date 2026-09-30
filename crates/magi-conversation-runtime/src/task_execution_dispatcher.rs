@@ -9,8 +9,9 @@ use crate::{
     conversation_loop::{self, ConversationLoopRequest},
     execution_admission::ExecutionAdmissionPermit,
     model_config::{
-        NormalizedModelConfig, configured_role_engine_model_config,
-        resolve_orchestrator_model_config,
+        NormalizedModelConfig, OrchestratorWebEngineSettings, configured_role_engine_model_config,
+        orchestrator_web_engine_settings, resolve_orchestrator_model_config, role_bound_engine_id,
+        role_engine_is_chatgpt_web, web_engine_settings,
     },
     prompt_utils::{
         CURRENT_TASK_PRIORITY_NOTE, REFERENCE_CONTEXT_PRIORITY_NOTE, SKILL_PROMPT_PRIORITY_NOTE,
@@ -139,6 +140,10 @@ pub struct LlmTaskDispatcher {
     result_receiver: Arc<EventBasedResultReceiver>,
     completion_notifier: Option<Arc<TaskCompletionNotifier>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
+    /// Web 引擎（GPT Web）的 client 工厂，由 daemon 装配宿主实现。
+    ///
+    /// 未装配时命中 Web 引擎会失败关闭（不退回 HTTP 模型，A19、§5.6）。
+    web_model_client_factory: Option<Arc<dyn magi_web_model::WebModelClientFactory>>,
     /// 按设置事实源代际复用角色模型客户端。HTTP 连接池由 bridge-client 继续统一持有，
     /// 这里只避免每个 Turn 重复解析配置和构造同一角色包装器。
     model_client_cache: Arc<Mutex<HashMap<String, Arc<dyn ModelBridgeClient>>>>,
@@ -345,16 +350,46 @@ pub enum RoleTarget<'a> {
 /// - `Ok(Some(client))`：成功解析出 client；
 /// - `Ok(None)`：目标未配置（按 target 含义视作正常的"跳过"或"继承"信号）；
 /// - `Err(msg)`：配置存在但字段非法时返回，调用方应失败，避免替代模型掩盖坏配置。
+/// 顶层会话（编排者）的线程 id。
+///
+/// 线程维度是 Web 引擎绑定键的一部分（R50）：编排者与每个子代理各用一条
+/// ChatGPT 临时对话，绝不复用同一条。
+pub const ORCHESTRATOR_THREAD_ID: &str = "orchestrator";
+
+/// Web 引擎解析上下文：浏览器 client 工厂 + 本次调用的线程 id。
+///
+/// 只有真正解析到 Web 引擎时才需要；HTTP 引擎路径完全不受影响。
+#[derive(Clone)]
+pub struct WebModelResolutionContext {
+    pub factory: Arc<dyn magi_web_model::WebModelClientFactory>,
+    pub thread_id: String,
+}
+
 pub fn resolve_target_for_role(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
     target: RoleTarget<'_>,
     session_id: Option<&SessionId>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
+    resolve_target_for_role_with_web(settings_store, default_client, target, session_id, None)
+}
+
+/// 与 [`resolve_target_for_role`] 同一条解析路径，额外允许解析 Web 引擎。
+///
+/// 未提供 [`WebModelResolutionContext`] 时，命中 Web 引擎**失败关闭**：宁可返回
+/// 明确错误，也不退回 HTTP 模型（A19、§5.6）。之所以不改变既有函数签名，是为了
+/// 让不涉及 Web 引擎的调用方（辅助模型、标题精修等）保持原样。
+pub fn resolve_target_for_role_with_web(
+    settings_store: Option<&Arc<SettingsStore>>,
+    default_client: Option<Arc<dyn ModelBridgeClient>>,
+    target: RoleTarget<'_>,
+    session_id: Option<&SessionId>,
+    web: Option<&WebModelResolutionContext>,
+) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     match target {
         RoleTarget::Orchestrator => {
             if let Some(store) = settings_store
-                && let Some(client) = build_orchestrator_client(store, session_id)?
+                && let Some(client) = build_orchestrator_client(store, session_id, web)?
             {
                 return Ok(Some(client));
             }
@@ -370,6 +405,17 @@ pub fn resolve_target_for_role(
             let Some(store) = settings_store else {
                 return Ok(None);
             };
+            if role_engine_is_chatgpt_web(store, role_id) {
+                let client = build_web_engine_client(
+                    store,
+                    session_id,
+                    web,
+                    role_bound_engine_id(store, role_id)
+                        .ok_or_else(|| format!("角色 {role_id} 未绑定模型引擎"))?,
+                    None,
+                )?;
+                return Ok(Some(client));
+            }
             let Some(role_model) = configured_role_engine_model_config(store, role_id)? else {
                 return Ok(None);
             };
@@ -411,11 +457,52 @@ fn build_client_from_section(
 fn build_orchestrator_client(
     settings_store: &Arc<SettingsStore>,
     session_id: Option<&SessionId>,
+    web: Option<&WebModelResolutionContext>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     let normalized = resolve_orchestrator_model_config(settings_store, session_id)?;
+    if normalized.is_chatgpt_web() {
+        let settings = orchestrator_web_engine_settings(settings_store, session_id)?
+            .ok_or_else(|| "会话绑定的 Web 引擎已失效".to_string())?;
+        let engine_id = settings.engine_id.clone();
+        let client =
+            build_web_engine_client(settings_store, session_id, web, engine_id, Some(settings))?;
+        return Ok(Some(client));
+    }
     Ok(normalized
         .to_http_model_client()
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>))
+}
+
+/// 构造 Web 引擎 client。所有 Web 引擎路径都必须经过这里，保证绑定键的
+/// 四个不变量（会话 × 线程 × 引擎 × effort）被闭包进 client（R50）。
+fn build_web_engine_client(
+    settings_store: &Arc<SettingsStore>,
+    session_id: Option<&SessionId>,
+    web: Option<&WebModelResolutionContext>,
+    engine_id: String,
+    settings: Option<OrchestratorWebEngineSettings>,
+) -> Result<Arc<dyn ModelBridgeClient>, String> {
+    let web = web.ok_or_else(|| {
+        "Web 引擎需要浏览器 client 工厂，但当前运行时未装配（不允许退回 HTTP 模型）".to_string()
+    })?;
+    let settings = match settings {
+        Some(settings) => settings,
+        None => web_engine_settings(settings_store, &engine_id, None)?
+            .ok_or_else(|| format!("引擎 {engine_id} 不是 Web 引擎"))?,
+    };
+    let session_value = session_id
+        .map(|id| id.as_str().to_string())
+        .unwrap_or_default();
+    let spec = magi_web_model::WebModelInvocationSpec {
+        session_id: session_value.clone(),
+        project_id: session_value,
+        thread_id: web.thread_id.clone(),
+        engine_id: magi_web_model::WEB_MODEL_ENGINE_ID.to_string(),
+        effort: settings.effort,
+        mode: magi_web_model::WebConversationMode::Temporary,
+        remote_conversation_id: None,
+    };
+    web.factory.build_web_model_client(spec)
 }
 
 /// daemon 未注入 [`ContextBudget`] 时，为最小运行时和测试构造提供的默认预算。
@@ -478,6 +565,7 @@ impl LlmTaskDispatcher {
             result_receiver,
             completion_notifier: None,
             model_bridge_client: None,
+            web_model_client_factory: None,
             model_client_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_definition_cache: Arc::new(Mutex::new(HashMap::new())),
             dispatch_quiesce: Arc::new(DispatchQuiesceState::default()),
@@ -510,6 +598,15 @@ impl LlmTaskDispatcher {
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
         self.model_bridge_client = Some(client);
+        self
+    }
+
+    /// 注入 Web 引擎的 client 工厂（宿主实现，见 `magi-api` 的 `WebModelHostFactory`）。
+    pub fn with_web_model_client_factory(
+        mut self,
+        factory: Arc<dyn magi_web_model::WebModelClientFactory>,
+    ) -> Self {
+        self.web_model_client_factory = Some(factory);
         self
     }
 
@@ -836,7 +933,7 @@ impl LlmTaskDispatcher {
             });
         let extraction_text = format!("{timeline_text}\n\n{output_text}");
         let Some(client) = self
-            .resolve_target_cached(settings_store, RoleTarget::Auxiliary, None)
+            .resolve_target_cached(settings_store, RoleTarget::Auxiliary, None, "")
             .ok()
             .flatten()
         else {
@@ -950,7 +1047,7 @@ impl LlmTaskDispatcher {
         workspace_id: &Option<WorkspaceId>,
     ) {
         let Some(client) = self
-            .resolve_target_cached(settings_store, RoleTarget::Auxiliary, None)
+            .resolve_target_cached(settings_store, RoleTarget::Auxiliary, None, "")
             .ok()
             .flatten()
         else {
@@ -2100,13 +2197,16 @@ impl LlmTaskDispatcher {
         settings_store: Option<&Arc<SettingsStore>>,
         target: RoleTarget<'_>,
         session_id: Option<&SessionId>,
+        thread_id: &str,
     ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
+        let web = self.web_resolution_context(thread_id);
         let Some(settings_store) = settings_store else {
-            return resolve_target_for_role(
+            return resolve_target_for_role_with_web(
                 settings_store,
                 self.model_bridge_client.clone(),
                 target,
                 session_id,
+                web.as_ref(),
             );
         };
         let target_label = match target {
@@ -2114,10 +2214,13 @@ impl LlmTaskDispatcher {
             RoleTarget::Auxiliary => "auxiliary".to_string(),
             RoleTarget::Agent { role_id } => format!("agent:{role_id}"),
         };
+        // 线程维度进入缓存键：Web 引擎的绑定键含线程（R50），少了它子代理与
+        // 编排者会共用同一个 client，也就共用同一条 ChatGPT 临时对话。
         let cache_key = format!(
-            "{}\u{001f}{}\u{001f}{}",
+            "{}\u{001f}{}\u{001f}{}\u{001f}{}",
             target_label,
             session_id.map(SessionId::as_str).unwrap_or_default(),
+            thread_id,
             settings_store.revision(),
         );
         if let Some(client) = self
@@ -2129,11 +2232,12 @@ impl LlmTaskDispatcher {
         {
             return Ok(Some(client));
         }
-        let resolved = resolve_target_for_role(
+        let resolved = resolve_target_for_role_with_web(
             Some(settings_store),
             self.model_bridge_client.clone(),
             target,
             session_id,
+            web.as_ref(),
         )?;
         if let Some(client) = resolved.as_ref() {
             self.model_client_cache
@@ -2142,6 +2246,16 @@ impl LlmTaskDispatcher {
                 .insert(cache_key, client.clone());
         }
         Ok(resolved)
+    }
+
+    /// 构造本次解析的 Web 引擎上下文；未装配工厂时返回 `None`（命中 Web 引擎即失败关闭）。
+    fn web_resolution_context(&self, thread_id: &str) -> Option<WebModelResolutionContext> {
+        self.web_model_client_factory
+            .as_ref()
+            .map(|factory| WebModelResolutionContext {
+                factory: Arc::clone(factory),
+                thread_id: thread_id.to_string(),
+            })
     }
 
     fn resolve_model_client_for_task(
@@ -2156,6 +2270,12 @@ impl LlmTaskDispatcher {
             .filter(|role| !role.is_empty())
             .or_else(|| task.and_then(|task| task_role_id(Some(task))));
 
+        // 线程维度：顶层会话是编排者线程，每个子代理任务各用一个线程 id，
+        // 保证它们不会共用同一条 ChatGPT 临时对话（R50）。
+        let thread_id = task
+            .map(|task| task.task_id.as_str().to_string())
+            .unwrap_or_else(|| ORCHESTRATOR_THREAD_ID.to_string());
+
         // 有 role_id 时走 RoleTarget::Agent，让 resolve_target_for_role 统一处理:
         //   - 角色未配置 engineId → Ok(None) → 显式继承 orchestrator
         //   - 角色已配置 engineId → 只使用该角色模型，失败直接暴露
@@ -2165,13 +2285,19 @@ impl LlmTaskDispatcher {
                 settings_store,
                 RoleTarget::Agent { role_id },
                 session_id,
+                &thread_id,
             )?
         {
             return Ok(client);
         }
 
-        self.resolve_target_cached(settings_store, RoleTarget::Orchestrator, session_id)?
-            .ok_or_else(|| "model bridge client 未配置".to_string())
+        self.resolve_target_cached(
+            settings_store,
+            RoleTarget::Orchestrator,
+            session_id,
+            &thread_id,
+        )?
+        .ok_or_else(|| "model bridge client 未配置".to_string())
     }
 
     fn skill_prompt_instructions(&self, skill_name: Option<&str>) -> Option<String> {
@@ -2226,7 +2352,15 @@ impl LlmTaskDispatcher {
             Some(&request.session_id),
         ) {
             Ok(client) => client,
-            Err(_) => {
+            Err(error) => {
+                // 解析失败的原文只进日志（用户可见信息仍走下面的公共文案）：
+                // 没有它「模型服务请求失败」无法定位到底是缺引擎、缺绑定还是缺工厂。
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    turn_id = %request.turn_id,
+                    %error,
+                    "会话主模型客户端解析失败"
+                );
                 let owns_active_plan = self
                     .session_store
                     .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
@@ -3092,6 +3226,165 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// 只记录输入并返回固定 client 的测试工厂（不断言真实浏览器行为）。
+    struct RecordingWebFactory {
+        specs: std::sync::Mutex<Vec<magi_web_model::WebModelInvocationSpec>>,
+    }
+
+    impl RecordingWebFactory {
+        fn new() -> Self {
+            Self {
+                specs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn specs(&self) -> Vec<magi_web_model::WebModelInvocationSpec> {
+            self.specs.lock().expect("spec 锁").clone()
+        }
+    }
+
+    impl magi_web_model::WebModelClientFactory for RecordingWebFactory {
+        fn build_web_model_client(
+            &self,
+            spec: magi_web_model::WebModelInvocationSpec,
+        ) -> Result<Arc<dyn ModelBridgeClient>, String> {
+            self.specs.lock().expect("spec 锁").push(spec);
+            Ok(Arc::new(FailingAuxiliaryClient))
+        }
+    }
+
+    /// 会话绑定 Web 引擎的 settings store（引擎条目不写 `llm`）。
+    fn web_engine_store(session_id: &SessionId) -> Arc<SettingsStore> {
+        let store = Arc::new(SettingsStore::new());
+        store
+            .set_section(
+                "engines",
+                serde_json::json!([
+                    {
+                        "id": "chatgpt-web/gpt-5",
+                        "displayName": "GPT-5 (Web)",
+                        "apiProtocol": "chatgpt_web",
+                        "model": "gpt-5",
+                        "contextWindowTokens": 120_000,
+                        "efforts": ["low", "medium", "high"],
+                        "toolsEnabled": true,
+                        "newChatPerTurn": false,
+                    }
+                ]),
+            )
+            .expect("写入 engines");
+        store
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-orch",
+                    "model": "global-model",
+                    "apiProtocol": "openai_chat",
+                }),
+            )
+            .expect("写入 orchestrator");
+        store
+            .set_session_section(
+                session_id,
+                "orchestrator",
+                serde_json::json!({
+                    "engineId": "chatgpt-web/gpt-5",
+                    "reasoningEffort": "high",
+                }),
+            )
+            .expect("写入会话级覆盖");
+        store
+    }
+
+    #[test]
+    fn web_engine_binding_builds_client_from_the_web_factory_with_thread_dimension() {
+        let session_id = SessionId::new("session-web");
+        let store = web_engine_store(&session_id);
+        let factory = Arc::new(RecordingWebFactory::new());
+        let context = WebModelResolutionContext {
+            factory: Arc::clone(&factory) as Arc<dyn magi_web_model::WebModelClientFactory>,
+            thread_id: ORCHESTRATOR_THREAD_ID.to_string(),
+        };
+        let resolved = resolve_target_for_role_with_web(
+            Some(&store),
+            None,
+            RoleTarget::Orchestrator,
+            Some(&session_id),
+            Some(&context),
+        )
+        .expect("Web 引擎应当解析成功");
+        assert!(
+            resolved.is_some(),
+            "绑定 Web 引擎时不得回退到 default_client"
+        );
+        let specs = factory.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].engine_id, "chatgpt-web/gpt-5");
+        assert_eq!(specs[0].effort, "high");
+        assert_eq!(specs[0].session_id, "session-web");
+        assert_eq!(specs[0].thread_id, ORCHESTRATOR_THREAD_ID);
+    }
+
+    #[test]
+    fn web_engine_binding_fails_closed_without_a_factory() {
+        let session_id = SessionId::new("session-web");
+        let store = web_engine_store(&session_id);
+        let error = match resolve_target_for_role_with_web(
+            Some(&store),
+            None,
+            RoleTarget::Orchestrator,
+            Some(&session_id),
+            None,
+        ) {
+            Ok(_) => panic!("缺少工厂时命中 Web 引擎必须失败关闭"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("不允许退回 HTTP 模型"),
+            "错误必须说明失败关闭而不是静默降级：{error}"
+        );
+    }
+
+    #[test]
+    fn http_engine_binding_is_unaffected_by_the_web_path() {
+        let session_id = SessionId::new("session-http");
+        let store = Arc::new(SettingsStore::new());
+        store
+            .set_section(
+                "engines",
+                serde_json::json!([
+                    {
+                        "id": "sonnet-4-5",
+                        "displayName": "Sonnet 4.5",
+                        "llm": {
+                            "baseUrl": "https://api.example.com/v1",
+                            "apiKey": "sk-engine",
+                            "model": "claude-sonnet-4-5",
+                            "apiProtocol": "openai_chat",
+                        },
+                    }
+                ]),
+            )
+            .expect("写入 engines");
+        store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                serde_json::json!({ "engineId": "sonnet-4-5" }),
+            )
+            .expect("写入会话级覆盖");
+        let resolved = resolve_target_for_role_with_web(
+            Some(&store),
+            None,
+            RoleTarget::Orchestrator,
+            Some(&session_id),
+            None,
+        )
+        .expect("HTTP 引擎绑定应当可用");
+        assert!(resolved.is_some());
+    }
 
     struct FailingAuxiliaryClient;
 

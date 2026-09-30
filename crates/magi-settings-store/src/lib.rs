@@ -400,10 +400,11 @@ fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool
     if section == "orchestrator" {
         return canonicalize_global_orchestrator_section(value);
     }
-    if section == ORCHESTRATOR_SESSION_DEFAULTS_SECTION
-        || (is_session_section_key(section) && section.ends_with(":orchestrator"))
-    {
-        return canonicalize_session_orchestrator_section(value);
+    if section == ORCHESTRATOR_SESSION_DEFAULTS_SECTION {
+        return canonicalize_session_orchestrator_section(value, false);
+    }
+    if is_session_section_key(section) && section.ends_with(":orchestrator") {
+        return canonicalize_session_orchestrator_section(value, true);
     }
     if section == "auxiliary"
         || section == "imageGeneration"
@@ -428,13 +429,26 @@ fn canonicalize_global_orchestrator_section(value: &mut Value) -> bool {
     changed
 }
 
-fn canonicalize_session_orchestrator_section(value: &mut Value) -> bool {
+/// 会话级编排模型覆盖。
+///
+/// `engineId` 是会话级主模型绑定的引擎选择（A22）：它决定该会话是否由内置浏览器
+/// 里的 GPT Web 引擎承载。所有会话 section 写入路径都会经过这里，若在这里被剥离，
+/// 用户选中的 Web 引擎会在持久化时静默消失、重启即失效且不报错。
+///
+/// `allow_engine_binding` 区分两种 section：会话级覆盖允许引擎绑定；
+/// `ORCHESTRATOR_SESSION_DEFAULTS_SECTION`（新会话默认值）不允许——引擎绑定是
+/// 会话级事实，不得成为跨会话默认值。
+fn canonicalize_session_orchestrator_section(
+    value: &mut Value,
+    allow_engine_binding: bool,
+) -> bool {
     let Some(object) = value.as_object_mut() else {
         return false;
     };
     let mut changed = false;
     object.retain(|key, _| {
-        let keep = matches!(key.as_str(), "model" | "reasoningEffort");
+        let keep = matches!(key.as_str(), "model" | "reasoningEffort")
+            || (allow_engine_binding && key == "engineId");
         if !keep {
             changed = true;
         }
@@ -1077,5 +1091,56 @@ mod tests {
             store.get_session_section(&session_b, "orchestrator")["model"],
             json!("model-b")
         );
+    }
+    #[test]
+    fn session_orchestrator_section_keeps_engine_binding() {
+        // A22：会话级主模型覆盖的引擎绑定决定该会话是否由 GPT Web 引擎承载。
+        // 所有会话 section 写入路径都经过这里，剥离它会让用户选中的引擎静默失效。
+        let store = SettingsStore::new();
+        let session = SessionId::new("session-engine");
+        store
+            .set_session_section(
+                &session,
+                "orchestrator",
+                json!({"model": "gpt-5", "reasoningEffort": "high", "engineId": "chatgpt-web/gpt-5"}),
+            )
+            .unwrap();
+        let stored = store.get_session_section(&session, "orchestrator");
+        assert_eq!(stored["engineId"], json!("chatgpt-web/gpt-5"));
+        assert_eq!(stored["model"], json!("gpt-5"));
+        assert_eq!(stored["reasoningEffort"], json!("high"));
+    }
+
+    #[test]
+    fn session_orchestrator_section_drops_unknown_keys() {
+        let store = SettingsStore::new();
+        let session = SessionId::new("session-unknown");
+        store
+            .set_session_section(
+                &session,
+                "orchestrator",
+                json!({"model": "gpt-5", "engineId": "chatgpt-web/gpt-5", "baseUrl": "https://x"}),
+            )
+            .unwrap();
+        let stored = store.get_session_section(&session, "orchestrator");
+        assert_eq!(stored["model"], json!("gpt-5"));
+        assert_eq!(stored["engineId"], json!("chatgpt-web/gpt-5"));
+        assert!(stored.get("baseUrl").is_none());
+    }
+
+    #[test]
+    fn orchestrator_session_defaults_never_keep_engine_binding() {
+        // 引擎绑定是会话级事实，不得成为新会话的跨会话默认值。
+        let store = SettingsStore::new();
+        store
+            .set_section(
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                json!({"model": "gpt-5", "reasoningEffort": "high", "engineId": "chatgpt-web/gpt-5"}),
+            )
+            .unwrap();
+        let stored = store.get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION);
+        assert_eq!(stored["model"], json!("gpt-5"));
+        assert_eq!(stored["reasoningEffort"], json!("high"));
+        assert!(stored.get("engineId").is_none());
     }
 }

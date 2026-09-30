@@ -1,0 +1,18 @@
+[package]
+name = "magi-web-model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+axum.workspace = true
+magi-bridge-client = { path = "../magi-bridge-client" }
+
+[[bin]]
+name = "magi-web-harness"
+path = "src/bin/magi_web_harness.rs"

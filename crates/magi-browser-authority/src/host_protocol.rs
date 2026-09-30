@@ -236,7 +236,75 @@ pub enum BrowserHostCommand {
         surface_id: String,
         control: BrowserHostControlUpdate,
     },
+    /// ChatGPT 站点只读探测：登录态、账号能力、模型菜单、effort、连接器支持性。
+    ///
+    /// 只读、不写页面、不下单、不改变用户当前会话状态；只由发现通道使用，
+    /// 不进入模型可见的浏览器工具目录（设计基线 §5.5、C10）。
+    WebModelProbe {
+        tab_id: BrowserTabId,
+    },
+    /// 站点内原子纯文本写入 + 回读校验（设计基线 §5.6 步骤 3）。
+    ///
+    /// 不复用 `Type`：后者走 CDP `Input.insertText`，没有回读校验，对长文本的
+    /// contenteditable 富文本编辑器不可靠。回读不一致或内容被站点转成附件即失败，
+    /// 由调用方映射为 `ContextLengthExceeded`（§5.9.6）。
+    WebWriteText {
+        tab_id: BrowserTabId,
+        selector: String,
+        text: String,
+        mode: BrowserWebWriteMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect_text_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    /// 站点短轮询观察：返回单次快照，`revision` 单调递增供调用方判断内容变化。
+    ///
+    /// 长等待会占住该 Surface 的命令 lane，因此观察必须短轮询（§5.6 末）。
+    WebObserve {
+        tab_id: BrowserTabId,
+        selector: String,
+        fields: Vec<BrowserWebObserveField>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attribute: Option<String>,
+    },
+    /// 提交 composer：把输入交给站点，并回读输入框是否已清空。
+    ///
+    /// 「是否被接受」不以本命令返回成功为准，而由 `WebTurnState` 的消息计数
+    /// 证据判定（设计基线 §5.6 步骤 4）。
+    WebSubmit {
+        tab_id: BrowserTabId,
+    },
+    /// 回合语义状态：生成中标志、助手与思考文本、消息计数。
+    ///
+    /// 站点适配层给出原始语义信号与单次快照；「文本稳定且无生成标志」的
+    /// 完成谓词由推理通道叠加两个读取周期判定（设计基线 §5.6 步骤 6）。
+    WebTurnState {
+        tab_id: BrowserTabId,
+    },
+    /// 中断 GPT Web 页面当前生成；只影响网页侧生成，不关闭逻辑 Tab。
+    WebCancelGeneration {
+        tab_id: BrowserTabId,
+    },
     Shutdown,
+}
+
+/// `WebWriteText` 的写入模式：整段替换或追加到现有文本之后。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserWebWriteMode {
+    Replace,
+    Append,
+}
+
+/// `WebObserve` 可以回读的字段集合。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserWebObserveField {
+    Text,
+    Html,
+    Existence,
+    Attribute,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

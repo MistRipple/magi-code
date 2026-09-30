@@ -74,6 +74,14 @@ fn orchestrator_connection_section_request(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
     let mut config = model_settings_section_request(request)?;
+    // GPT Web 只能作为会话级 `engines[*]` + `engineId` 绑定使用，不能写进
+    // 全局 orchestrator。否则新会话会继承一个没有 HTTP 连接、也没有临时对话
+    // 所属关系的 Web 配置，破坏 A22/A26 的单向会话边界。
+    if is_chatgpt_web_engine(&config) {
+        return Err(ApiError::InvalidInput(
+            "GPT Web 只能在空白 Magi 会话中作为会话级模型选择，不能保存为全局主模型".to_string(),
+        ));
+    }
     if let Some(map) = config.as_object_mut() {
         map.remove("model");
         map.remove("reasoningEffort");
@@ -97,6 +105,23 @@ pub(super) fn orchestrator_session_override_request(
         && !model.is_empty()
     {
         override_config.insert("model".to_string(), Value::String(model.to_string()));
+    }
+    // 引擎绑定（A22）：会话级 `engineId` 是「继承 vs 显式」的唯一字段。
+    // 空串是合法的显式「继承编排模型」写法，必须原样保留，不能当无效输入拒绝；
+    // 否则选择器无法把会话从 Web 引擎切回 provider 模型。
+    if config.contains_key("engineId") {
+        match config.get("engineId") {
+            Some(Value::String(value)) => {
+                override_config.insert(
+                    "engineId".to_string(),
+                    Value::String(value.trim().to_string()),
+                );
+            }
+            Some(_) => {
+                return Err(ApiError::InvalidInput("engineId 必须是字符串".to_string()));
+            }
+            None => {}
+        }
     }
     if config.contains_key("reasoningEffort") {
         match config.get("reasoningEffort") {
@@ -199,6 +224,29 @@ pub(super) fn save_orchestrator_session_override_for_session(
     session_id: &SessionId,
     config: &Value,
 ) -> Result<Option<Value>, ApiError> {
+    save_orchestrator_session_override_for_session_with_policy(state, session_id, config, false)
+}
+
+/// 保存刚创建会话的首条请求所携带的模型绑定。
+///
+/// 任务路由会先写入 canonical 用户消息，再在异步 preparation 阶段保存初始
+/// session 配置。此时普通方向门禁会看到“刚刚写入的第一条消息”，误判为本地
+/// 会话转 Web。调用方必须已经证明这是本次请求创建的新会话；该入口不能用于
+/// 修改已有会话。
+pub(super) fn save_initial_orchestrator_session_override_for_new_session(
+    state: &ApiState,
+    session_id: &SessionId,
+    config: &Value,
+) -> Result<Option<Value>, ApiError> {
+    save_orchestrator_session_override_for_session_with_policy(state, session_id, config, true)
+}
+
+fn save_orchestrator_session_override_for_session_with_policy(
+    state: &ApiState,
+    session_id: &SessionId,
+    config: &Value,
+    allow_new_session_initial_web_binding: bool,
+) -> Result<Option<Value>, ApiError> {
     let request = json!({ "config": config });
     let override_config = orchestrator_session_override_request(&request)?;
     let Some(override_fields) = override_config.as_object() else {
@@ -207,6 +255,16 @@ pub(super) fn save_orchestrator_session_override_for_session(
     if override_fields.is_empty() {
         return Ok(None);
     }
+
+    // 会话转换是单向的（设计基线 A26）：空白会话可以启动 GPT Web；已有本地
+    // canonical 历史的会话不能再把历史导入网页端。Web 会话切回 provider 不会
+    // 进入这里的 Web 分支，因此自然保留 canonical 历史并清除 engineId。
+    ensure_web_session_direction_allowed(
+        state,
+        session_id,
+        override_fields,
+        allow_new_session_initial_web_binding,
+    )?;
 
     let mut next_config = state
         .settings_store
@@ -258,6 +316,74 @@ pub(super) fn save_orchestrator_session_override_for_session(
         }),
     );
     Ok(Some(next_config))
+}
+
+/// 拒绝「已有本地历史 → GPT Web」的会话迁移。
+///
+/// 只把真正的 Web 引擎绑定视为方向切换；清空 `engineId`（Web → provider）
+/// 不受限制。空白会话也不受限制，因为它会在首条消息时成为新的 GPT Web 会话。
+fn ensure_web_session_direction_allowed(
+    state: &ApiState,
+    session_id: &SessionId,
+    override_fields: &Map<String, Value>,
+    allow_new_session_initial_web_binding: bool,
+) -> Result<(), ApiError> {
+    let Some(requested_engine_id) = override_fields
+        .get("engineId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let engines = state.settings_store.get_section("engines");
+    let is_web_engine_id = |engine_id: &str| {
+        engines.as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.trim() == engine_id)
+                    && is_chatgpt_web_engine(entry)
+            })
+        })
+    };
+    let requested_is_web = is_web_engine_id(requested_engine_id);
+    if !requested_is_web {
+        return Ok(());
+    }
+
+    // Web → Web（换模型 / effort）仍是 Web 会话内部操作，不属于本地 → Web
+    // 转换；只有当前会话尚未使用 Web 时才需要拦截。
+    let current_engine_id = state
+        .settings_store
+        .get_session_section(session_id, "orchestrator")
+        .get("engineId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let current_is_web = current_engine_id.as_deref().is_some_and(is_web_engine_id);
+    if current_is_web {
+        return Ok(());
+    }
+
+    if allow_new_session_initial_web_binding {
+        return Ok(());
+    }
+
+    let has_canonical_user_history = state
+        .session_store
+        .session(session_id)
+        .and_then(|session| session.message_count)
+        .is_some_and(|message_count| message_count > 0);
+    if has_canonical_user_history {
+        return Err(ApiError::InvalidInput(
+            "当前本地会话已有历史，暂不支持转为 GPT Web；请新建 GPT Web 会话。GPT Web 会话可以切回本地模型并保留历史".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn require_orchestrator_session_model(
@@ -422,7 +548,13 @@ async fn fetch_model_ids_for_config(
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    match config.api_protocol() {
+    // GPT Web 引擎没有 HTTP 传输，也就没有 HTTP 模型列表接口（A7）。
+    let Some(protocol) = config.api_protocol() else {
+        return Err(ApiError::InvalidInput(
+            "GPT Web 引擎没有 HTTP 模型列表接口".to_string(),
+        ));
+    };
+    match protocol {
         HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => {
             let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
                 .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
@@ -653,12 +785,38 @@ fn default_agent_binding(template_id: &str, order: usize) -> Value {
     })
 }
 
+/// 判定某个引擎条目是否是 GPT Web 引擎（`apiProtocol = chatgpt_web`）。
+fn is_chatgpt_web_engine(entry: &Value) -> bool {
+    entry
+        .get("apiProtocol")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("chatgpt_web"))
+}
+
+/// Web 引擎的顶层字段白名单。
+///
+/// Web 引擎**不写 `llm`**，来源、可用窗口、档位与引擎级开关都落在顶层；这些字段
+/// 一旦被丢弃，`upsert_engine` 就会把已发现的 Web 模型退化成空条目（设计基线 §5.5、
+/// A6、A22）。普通引擎的顶层字段仍只保留 `id / displayName / llm / runtime`。
+const WEB_ENGINE_TOP_LEVEL_FIELDS: &[&str] = &[
+    "apiProtocol",
+    "contextWindowTokens",
+    "efforts",
+    "origin",
+    // 引擎级开关：工具档位（A9）、「每轮新建对话」（§5.6）与 T2 轮数上限
+    // （默认 20；失败卡片「提高轮数上限并重试」写的就是这个字段）。
+    "toolsEnabled",
+    "newChatPerTurn",
+    "toolRoundLimit",
+];
+
 fn normalize_engine_entry(entry: &Value) -> Option<Value> {
     let engine_id = entry
         .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
+    let is_web_engine = is_chatgpt_web_engine(entry);
     let mut normalized = Map::new();
     normalized.insert("id".to_string(), Value::String(engine_id.to_string()));
     normalized.insert(
@@ -673,13 +831,20 @@ fn normalize_engine_entry(entry: &Value) -> Option<Value> {
                 .to_string(),
         ),
     );
-    normalized.insert(
-        "llm".to_string(),
-        entry
-            .get("llm")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new())),
-    );
+    // Web 引擎没有连接字段：不得补空 `llm`，否则 settings-store 的 llm 规范化
+    // 会把它当成普通引擎的连接基座（A22）。
+    if let Some(llm) = entry.get("llm").cloned() {
+        normalized.insert("llm".to_string(), llm);
+    } else if !is_web_engine {
+        normalized.insert("llm".to_string(), Value::Object(Map::new()));
+    }
+    if is_web_engine {
+        for field in WEB_ENGINE_TOP_LEVEL_FIELDS {
+            if let Some(value) = entry.get(*field) {
+                normalized.insert((*field).to_string(), value.clone());
+            }
+        }
+    }
     if let Some(runtime) = entry.get("runtime").cloned() {
         normalized.insert("runtime".to_string(), runtime);
     }
@@ -2009,7 +2174,18 @@ async fn upsert_engine(
             "引擎配置必须使用顶层 id/displayName/llm 字段".to_string(),
         ));
     }
-    if let Some(llm) = request.get("llm") {
+    if is_chatgpt_web_engine(&request) {
+        // Web 引擎没有 HTTP 连接：写入 `llm` 会让它被规范化成 `openai_chat`
+        // 并静默走 HTTP（设计基线 A22，禁止的第二条回退路径）。
+        if request
+            .get("llm")
+            .is_some_and(|llm| llm.as_object().is_some_and(|object| !object.is_empty()))
+        {
+            return Err(ApiError::InvalidInput(
+                "GPT Web 引擎不写 llm（没有 baseUrl / apiKey / model）".to_string(),
+            ));
+        }
+    } else if let Some(llm) = request.get("llm") {
         reject_deprecated_model_config_fields(llm).map_err(ApiError::InvalidInput)?;
         NormalizedModelConfig::from_settings_value(llm).map_err(ApiError::InvalidInput)?;
     }
@@ -2160,22 +2336,63 @@ async fn fetch_models(
     State(state): State<ApiState>,
     Json(request): Json<FetchModelsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (config, target) = parse_fetch_models_config(request)?;
-    let now = UtcMillis::now();
-    let models = fetch_model_ids_for_config(&config).await?;
-    if models.is_empty() {
+    let FetchModelsRequest { config, target } = request;
+    // Web 引擎没有 provider 的 baseUrl/apiKey，也没有 HTTP 模型列表接口。
+    // 当调用方只配置了 GPT Web（这是产品允许的首选用法）时，不能因为既有
+    // provider 列表查询缺少配置而把 Web 引擎一起隐藏。先读取 daemon 的 Web
+    // 投影；只有在没有 Web 候选时，才保持既有 provider 校验与错误语义。
+    let web_engines = matches!(target.as_str(), "orch" | "orchestrator")
+        .then(|| state.web_model_picker_engines())
+        .unwrap_or_default();
+
+    let provider_result = parse_fetch_models_config(FetchModelsRequest {
+        config,
+        target: target.clone(),
+    });
+    let (models, session_defaults) = match provider_result {
+        Ok((config, _)) => match fetch_model_ids_for_config(&config).await {
+            Ok(models) if !models.is_empty() => {
+                let defaults = matches!(target.as_str(), "orch" | "orchestrator")
+                    .then(|| ensure_orchestrator_session_defaults_from_models(&state, &models))
+                    .transpose()?;
+                (models, defaults)
+            }
+            Ok(_) if !web_engines.is_empty() => (Vec::new(), None),
+            Ok(_) => {
+                return Err(ApiError::InvalidInput(
+                    "该 API 不支持模型列表查询，请手动填写模型名".to_string(),
+                ));
+            }
+            Err(error) if !web_engines.is_empty() => {
+                // provider 失败不应阻塞已确认可用的 Web 模型。错误已在
+                // provider 查询函数内按既有口径记录，不能把上游原文回传到 UI。
+                tracing::warn!(error = ?error, "provider 模型列表不可用，继续返回 GPT Web 引擎");
+                (Vec::new(), None)
+            }
+            Err(error) => return Err(error),
+        },
+        Err(_error) if !web_engines.is_empty() => {
+            // 空 provider 配置是 GPT Web-only 的正常状态，不把它当成模型
+            // 选择器整体失败；Web 条目仍然通过同一个 fetch 响应返回。
+            (Vec::new(), None)
+        }
+        Err(error) => return Err(error),
+    };
+
+    if models.is_empty() && web_engines.is_empty() {
         return Err(ApiError::InvalidInput(
             "该 API 不支持模型列表查询，请手动填写模型名".to_string(),
         ));
     }
-
-    let session_defaults = matches!(target.as_str(), "orch" | "orchestrator")
-        .then(|| ensure_orchestrator_session_defaults_from_models(&state, &models))
-        .transpose()?;
+    let now = UtcMillis::now();
+    // 会话内主模型选择器的数据源是「provider 模型列表 ∪ daemon 投影的 Web 引擎条目」
+    // （A22、§5.13）。Web 引擎**不写 provider 连接**，因此不能混进 `models` 里当普通
+    // 模型名；它单独走 `webEngines`，并带上 daemon 算好的可用状态与工具档位。
     Ok(Json(serde_json::json!({
         "success": true,
         "target": target,
         "models": models,
+        "webEngines": web_engines,
         "orchestratorSessionDefaults": session_defaults,
         "requestedAt": now.0,
     })))
@@ -2965,6 +3182,56 @@ mod tests {
             json!({ "model": "model-last-used", "reasoningEffort": "high" })
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn web_only_picker_does_not_require_provider_model_configuration() {
+        let state = test_state();
+        state
+            .settings_store
+            .set_section("webModel", json!({ "consentConfirmed": true }))
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "chatgpt-web/gpt-5",
+                    "displayName": "GPT-5 (Web)",
+                    "apiProtocol": "chatgpt_web",
+                    "contextWindowTokens": 90000,
+                    "efforts": ["medium"],
+                    "toolsEnabled": false,
+                    "origin": {
+                        "kind": "web",
+                        "browserSessionId": "browser-app",
+                        "accountHint": "plus"
+                    }
+                }]),
+            )
+            .unwrap();
+        state.record_web_model_probe(crate::state::WebModelProbeSnapshot {
+            status: "ok".to_string(),
+            reason: None,
+            account_hint: "plus".to_string(),
+            limits_revision: "limits-v1".to_string(),
+            engine_ids: vec!["chatgpt-web/gpt-5".to_string()],
+            probed_at: 1,
+        });
+
+        let response = fetch_models(
+            State(state),
+            Json(FetchModelsRequest {
+                config: json!({}),
+                target: "orch".to_string(),
+            }),
+        )
+        .await
+        .expect("GPT Web-only model picker should not need provider config")
+        .0;
+
+        assert_eq!(response["models"], json!([]));
+        assert_eq!(response["webEngines"][0]["id"], json!("chatgpt-web/gpt-5"));
     }
 
     #[tokio::test]
@@ -3980,6 +4247,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_engine_entry_preserves_web_engine_shape() {
+        // Web 引擎不写 llm：来源、可用窗口、档位与开关都在顶层，必须原样保留，
+        // 且不得被补成空 llm（那会让它退回 openai_chat 规范化路径，A22）。
+        let normalized = normalize_engine_entry(&json!({
+            "id": "chatgpt-web/gpt-5",
+            "displayName": "GPT-5 (Web)",
+            "apiProtocol": "chatgpt_web",
+            "contextWindowTokens": 90000,
+            "efforts": ["low", "medium", "high"],
+            "toolsEnabled": true,
+            "newChatPerTurn": false,
+            "origin": {
+                "kind": "web",
+                "browserSessionId": "browser-session-app-1-0",
+                "discoveredAt": 0
+            }
+        }))
+        .expect("web engine should normalize");
+
+        assert!(normalized.get("llm").is_none());
+        assert_eq!(normalized["apiProtocol"], json!("chatgpt_web"));
+        assert_eq!(normalized["contextWindowTokens"], json!(90000));
+        assert_eq!(normalized["efforts"], json!(["low", "medium", "high"]));
+        assert_eq!(normalized["toolsEnabled"], json!(true));
+        assert_eq!(normalized["newChatPerTurn"], json!(false));
+        assert_eq!(normalized["origin"]["kind"], json!("web"));
+        assert_eq!(
+            normalized["origin"]["browserSessionId"],
+            json!("browser-session-app-1-0")
+        );
+    }
+
+    #[test]
+    fn normalize_engine_entry_keeps_empty_llm_for_plain_engines() {
+        let normalized = normalize_engine_entry(&json!({
+            "id": "plain-engine",
+            "displayName": "Plain",
+        }))
+        .expect("engine should normalize");
+        assert_eq!(normalized["llm"], json!({}));
+    }
+
     #[tokio::test]
     async fn registry_engine_upsert_rejects_legacy_engine_wrappers() {
         let state = test_state();
@@ -4861,6 +5171,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_orchestrator_config_rejects_chatgpt_web_as_global_model() {
+        let state = test_state();
+        let error = save_orchestrator_config(
+            State(state.clone()),
+            Json(json!({
+                "config": {
+                    "apiProtocol": "chatgpt_web",
+                    "model": "gpt-5"
+                }
+            })),
+        )
+        .await
+        .expect_err("GPT Web 不得写入全局 orchestrator");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("不能保存为全局主模型"), "{message}");
+            }
+            other => panic!("全局 GPT Web 配置应被拒绝，实际为 {other:?}"),
+        }
+        assert!(
+            state.settings_store.get_section("orchestrator").is_null(),
+            "拒绝全局 GPT Web 配置时不得污染 orchestrator"
+        );
+    }
+
+    #[tokio::test]
     async fn save_image_generation_config_persists_canonical_model_fields() {
         let state = test_state();
         let response = save_image_generation_config(
@@ -5242,6 +5579,148 @@ mod tests {
             "只切换模型时默认值必须保留原会话推理强度"
         );
         assert!(saved.get("modelSwitchPending").is_none());
+    }
+
+    #[test]
+    fn local_session_with_history_cannot_switch_to_web_engine() {
+        let state = test_state();
+        let session_id = SessionId::new("session-local-to-web-rejected");
+        state
+            .session_store
+            .create_session(session_id.clone(), "本地会话")
+            .expect("local session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "已有本地历史",
+        );
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "chatgpt-web/gpt-5",
+                    "displayName": "GPT-5 (Web)",
+                    "apiProtocol": "chatgpt_web"
+                }]),
+            )
+            .unwrap();
+
+        let error = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+        )
+        .expect_err("已有本地历史的会话不能切入 Web");
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("暂不支持转为 GPT Web"), "{message}");
+                assert!(message.contains("新建 GPT Web 会话"), "{message}");
+            }
+            other => panic!("方向限制应当是输入错误，实际为 {other:?}"),
+        }
+        assert_eq!(
+            state
+                .settings_store
+                .get_session_section(&session_id, "orchestrator"),
+            Value::Null,
+            "拒绝方向切换时不得写入会话配置"
+        );
+    }
+
+    #[test]
+    fn newly_created_session_can_bind_web_after_first_canonical_user_item() {
+        let state = test_state();
+        let session_id = SessionId::new("session-web-initial-after-canonical");
+        state
+            .session_store
+            .create_session(session_id.clone(), "首条 Web 请求")
+            .expect("session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "本次新会话的首条消息",
+        );
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "chatgpt-web/gpt-5",
+                    "displayName": "GPT-5 (Web)",
+                    "apiProtocol": "chatgpt_web"
+                }]),
+            )
+            .unwrap();
+
+        save_initial_orchestrator_session_override_for_new_session(
+            &state,
+            &session_id,
+            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+        )
+        .expect("the first request of a newly created session may bind Web")
+        .expect("initial Web binding should produce a session override");
+        assert_eq!(
+            state
+                .settings_store
+                .get_session_section(&session_id, "orchestrator")["engineId"],
+            json!("chatgpt-web/gpt-5")
+        );
+    }
+
+    #[test]
+    fn empty_session_can_start_web_and_web_session_can_switch_back_to_local() {
+        let state = test_state();
+        let session_id = SessionId::new("session-web-direction");
+        state
+            .session_store
+            .create_session(session_id.clone(), "Web 会话")
+            .expect("session should create");
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "chatgpt-web/gpt-5",
+                    "displayName": "GPT-5 (Web)",
+                    "apiProtocol": "chatgpt_web"
+                }]),
+            )
+            .unwrap();
+
+        save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+        )
+        .expect("空白会话应允许启动 Web")
+        .expect("Web 绑定应产生会话覆盖");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "Web 历史",
+        );
+
+        let local = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "engineId": "", "model": "local-model" }),
+        )
+        .expect("Web 会话切回本地不应被方向限制")
+        .expect("本地切换应返回会话覆盖");
+        assert_eq!(local["engineId"], json!(""));
+        assert_eq!(local["model"], json!("local-model"));
+
+        let reverse = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+        )
+        .expect_err("切回本地后不能再次转回 Web");
+        assert!(
+            matches!(&reverse, ApiError::InvalidInput(message) if message.contains("暂不支持转为 GPT Web")),
+            "反向转换错误应明确说明方向限制：{reverse:?}"
+        );
     }
 
     #[test]

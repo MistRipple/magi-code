@@ -715,7 +715,9 @@ impl SessionStore {
                 .execution_sidecar_store
                 .runtime_sidecars
                 .iter()
-                .filter(|sidecar| target_session_id.is_some_and(|target| sidecar.session_id == *target))
+                .filter(|sidecar| {
+                    target_session_id.is_some_and(|target| sidecar.session_id == *target)
+                })
                 .cloned()
                 .collect(),
         };

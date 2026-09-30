@@ -2,15 +2,16 @@ use std::collections::{HashMap, HashSet};
 
 use magi_core::{
     BrowserAnnotationId, BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId,
-    ExecutionOwnership, SessionId, UtcMillis, WorkspaceId,
+    ExecutionOwnership, SessionId, UtcMillis,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationStatus, BrowserAuthorityError,
     BrowserControlLease, BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserLeaseSelector,
-    BrowserProfile, BrowserSession, BrowserSessionLifecycle, BrowserSurfaceBinding, BrowserTab,
-    BrowserTabLifecycle, GoalControlBinding, normalize_browser_page_state,
+    BrowserProfile, BrowserSession, BrowserSessionLifecycle, BrowserSessionOwner,
+    BrowserSurfaceBinding, BrowserTab, BrowserTabLifecycle, GoalControlBinding,
+    normalize_browser_page_state,
 };
 
 /// 单个 Magi 会话允许保留的逻辑 Browser Tab 数量。
@@ -21,8 +22,7 @@ pub const MAX_BROWSER_TABS_TOTAL: usize = 64;
 #[derive(Clone, Debug)]
 pub struct CreateBrowserSession {
     pub browser_session_id: BrowserSessionId,
-    pub workspace_id: Option<WorkspaceId>,
-    pub session_id: SessionId,
+    pub owner: BrowserSessionOwner,
     pub profile_id: BrowserProfileId,
     pub now: UtcMillis,
 }
@@ -184,9 +184,12 @@ impl BrowserDurableTab {
     }
 }
 
-pub const BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 6;
-const PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 5;
-const LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 4;
+/// 浏览器 durable state 的当前 schema 版本。
+///
+/// 按 A19 约定：**不做版本迁移**。`BrowserSession.session_id` 被
+/// `BrowserSession.owner` 取代时直接推进版本；旧版本或结构不认识的文件由
+/// `load_browser_authority` 按「无状态」重建并覆盖写回。
+pub const BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 7;
 
 #[derive(Clone, Debug, Default)]
 pub struct BrowserAuthority {
@@ -239,10 +242,23 @@ impl BrowserAuthority {
         self.sessions.get(browser_session_id)
     }
 
+    /// 只匹配 `Session` 分支：应用级会话不属于任何 Magi 会话。
     pub fn session_for_magi_session(&self, session_id: &SessionId) -> Option<&BrowserSession> {
+        self.sessions.values().find(|session| {
+            session.owner.matches_magi_session(session_id) && session.lifecycle.is_open()
+        })
+    }
+
+    /// 应用级（GPT Web）会话全局唯一；不存在时返回 `None`。
+    pub fn app_session(&self) -> Option<&BrowserSession> {
         self.sessions
             .values()
-            .find(|session| &session.session_id == session_id && session.lifecycle.is_open())
+            .find(|session| session.owner.is_app() && session.lifecycle.is_open())
+    }
+
+    pub fn app_session_id(&self) -> Option<&BrowserSessionId> {
+        self.app_session()
+            .map(|session| &session.browser_session_id)
     }
 
     pub fn tab(&self, tab_id: &BrowserTabId) -> Option<&BrowserTab> {
@@ -395,6 +411,15 @@ impl BrowserAuthority {
         let Some(tab) = self.tabs.get(tab_id) else {
             return false;
         };
+        // 应用级（GPT Web）页面不参与资源回收：它的登录态与后台推理都需要常驻，
+        // 只能通过「清除数据」显式处理（设计基线 §5.3）。
+        if self
+            .sessions
+            .get(&tab.browser_session_id)
+            .is_some_and(|session| session.owner.is_app())
+        {
+            return false;
+        }
         matches!(
             tab.lifecycle,
             BrowserTabLifecycle::Suspended | BrowserTabLifecycle::Crashed
@@ -678,16 +703,26 @@ impl BrowserAuthority {
                 input.browser_session_id,
             ));
         }
-        if let Some(existing) = self.session_for_magi_session(&input.session_id) {
-            return Err(BrowserAuthorityError::OpenSessionAlreadyExists {
-                session_id: input.session_id,
-                browser_session_id: existing.browser_session_id.clone(),
-            });
+        match &input.owner {
+            BrowserSessionOwner::Session { session_id, .. } => {
+                if let Some(existing) = self.session_for_magi_session(session_id) {
+                    return Err(BrowserAuthorityError::OpenSessionAlreadyExists {
+                        session_id: session_id.clone(),
+                        browser_session_id: existing.browser_session_id.clone(),
+                    });
+                }
+            }
+            BrowserSessionOwner::App => {
+                if let Some(existing) = self.app_session() {
+                    return Err(BrowserAuthorityError::AppSessionAlreadyExists {
+                        browser_session_id: existing.browser_session_id.clone(),
+                    });
+                }
+            }
         }
         let session = BrowserSession {
             browser_session_id: input.browser_session_id,
-            workspace_id: input.workspace_id,
-            session_id: input.session_id,
+            owner: input.owner,
             profile_id: input.profile_id,
             lifecycle: BrowserSessionLifecycle::Creating,
             tab_ids: Vec::new(),
@@ -761,7 +796,11 @@ impl BrowserAuthority {
             return Err(BrowserAuthorityError::TabAlreadyExists(input.tab_id));
         }
         let session = self.require_ready_session(&input.browser_session_id)?;
-        if self.live_tab_count_for_session(session) >= MAX_BROWSER_TABS_PER_SESSION {
+        // 应用级（GPT Web）会话不适用每会话上限：它承载主页与每个活跃对话实例的
+        // 推理页面，只受 `MAX_BROWSER_TABS_TOTAL` 约束（设计基线 §5.3）。
+        if !session.owner.is_app()
+            && self.live_tab_count_for_session(session) >= MAX_BROWSER_TABS_PER_SESSION
+        {
             return Err(BrowserAuthorityError::SessionTabLimitReached {
                 browser_session_id: input.browser_session_id.clone(),
                 limit: MAX_BROWSER_TABS_PER_SESSION,
@@ -802,6 +841,73 @@ impl BrowserAuthority {
         session.tab_ids.push(tab.tab_id.clone());
         session.revision = session.revision.saturating_add(1);
         session.updated_at = input.now;
+        self.bump_revision();
+        Ok(tab)
+    }
+
+    /// Reopen a previously closed logical Tab without changing its stable id.
+    ///
+    /// The app-scoped GPT Web home Tab deliberately has a fixed id. A UI/session
+    /// cleanup can leave the durable row in `Closed` while the app session stays
+    /// open; treating that row as if it were still usable makes the next
+    /// `ensure_app_session` return an empty session and strands the persisted
+    /// Chromium partition. Reopening is restricted to an existing closed row
+    /// owned by the requested ready session and starts a fresh navigation
+    /// generation so stale Surface events cannot be accepted.
+    pub fn reopen_closed_tab(
+        &mut self,
+        browser_session_id: &BrowserSessionId,
+        tab_id: &BrowserTabId,
+        url: String,
+        now: UtcMillis,
+    ) -> Result<BrowserTab, BrowserAuthorityError> {
+        let _session = self.require_ready_session(browser_session_id)?;
+        let existing = self
+            .tabs
+            .get(tab_id)
+            .cloned()
+            .ok_or_else(|| BrowserAuthorityError::UnknownTab(tab_id.clone()))?;
+        if existing.browser_session_id != *browser_session_id {
+            return Err(BrowserAuthorityError::TabSessionMismatch {
+                tab_id: tab_id.clone(),
+                browser_session_id: browser_session_id.clone(),
+            });
+        }
+        if existing.lifecycle != BrowserTabLifecycle::Closed {
+            return Err(BrowserAuthorityError::InvalidTabTransition {
+                from: existing.lifecycle,
+                to: BrowserTabLifecycle::Creating,
+            });
+        }
+        if self.live_tab_count() >= MAX_BROWSER_TABS_TOTAL {
+            return Err(BrowserAuthorityError::GlobalTabLimitReached {
+                limit: MAX_BROWSER_TABS_TOTAL,
+            });
+        }
+
+        let tab = self
+            .tabs
+            .get_mut(tab_id)
+            .expect("closed tab was validated before reopening");
+        tab.lifecycle = BrowserTabLifecycle::Creating;
+        tab.url = url;
+        tab.origin = None;
+        tab.title.clear();
+        tab.display_label = None;
+        tab.navigation_revision = tab.navigation_revision.saturating_add(1);
+        tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
+        tab.updated_at = now;
+        let tab = tab.clone();
+
+        let session = self
+            .sessions
+            .get_mut(browser_session_id)
+            .expect("ready session was validated before reopening");
+        if !session.tab_ids.iter().any(|candidate| candidate == tab_id) {
+            session.tab_ids.push(tab_id.clone());
+        }
+        session.revision = session.revision.saturating_add(1);
+        session.updated_at = now;
         self.bump_revision();
         Ok(tab)
     }
@@ -1171,7 +1277,7 @@ impl BrowserAuthority {
         input: ValidateBrowserNodeSelection<'_>,
     ) -> Result<(), BrowserAuthorityError> {
         let browser_session = self.require_ready_session(input.browser_session_id)?;
-        if &browser_session.session_id != input.session_id {
+        if !browser_session.owner.matches_magi_session(input.session_id) {
             return Err(BrowserAuthorityError::SessionMagiSessionMismatch {
                 browser_session_id: input.browser_session_id.clone(),
                 session_id: input.session_id.clone(),
@@ -1509,28 +1615,20 @@ impl BrowserAuthority {
         state: BrowserDurableState,
         now: UtcMillis,
     ) -> Result<Self, BrowserAuthorityError> {
-        if state.schema_version != BROWSER_DURABLE_STATE_SCHEMA_VERSION
-            && state.schema_version != PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION
-            && state.schema_version != LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION
-        {
+        if state.schema_version != BROWSER_DURABLE_STATE_SCHEMA_VERSION {
             return Err(BrowserAuthorityError::InvalidSnapshot(format!(
                 "unsupported browser durable state schema: {}",
                 state.schema_version
             )));
         }
         let BrowserDurableState {
-            schema_version,
+            schema_version: _,
             revision,
             profiles,
             sessions,
-            mut tabs,
+            tabs,
             annotations,
         } = state;
-        if schema_version == PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION
-            || schema_version == LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION
-        {
-            migrate_legacy_tab_order(&mut tabs, &sessions);
-        }
         Self::restore(
             BrowserAuthoritySnapshot {
                 revision,
@@ -1962,47 +2060,6 @@ impl BrowserAuthority {
     }
 }
 
-fn migrate_legacy_tab_order(tabs: &mut [BrowserDurableTab], sessions: &[BrowserSession]) {
-    let mut ordered_tab_ids = HashSet::new();
-    let mut next_order_by_session = HashMap::<BrowserSessionId, u32>::new();
-
-    for session in sessions {
-        let next_order = session.tab_ids.len().try_into().unwrap_or(u32::MAX);
-        next_order_by_session.insert(session.browser_session_id.clone(), next_order);
-        for (order, tab_id) in session.tab_ids.iter().enumerate() {
-            if let Some(tab) = tabs.iter_mut().find(|tab| &tab.tab_id == tab_id) {
-                tab.order = order.try_into().unwrap_or(u32::MAX);
-                ordered_tab_ids.insert(tab_id.clone());
-            }
-        }
-    }
-
-    let mut unassigned_tab_indices = tabs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, tab)| (!ordered_tab_ids.contains(&tab.tab_id)).then_some(index))
-        .collect::<Vec<_>>();
-    unassigned_tab_indices.sort_by(|left, right| {
-        let left_tab = &tabs[*left];
-        let right_tab = &tabs[*right];
-        left_tab
-            .browser_session_id
-            .as_str()
-            .cmp(right_tab.browser_session_id.as_str())
-            .then_with(|| left_tab.created_at.cmp(&right_tab.created_at))
-            .then_with(|| left_tab.tab_id.as_str().cmp(right_tab.tab_id.as_str()))
-    });
-
-    for index in unassigned_tab_indices {
-        let tab = &mut tabs[index];
-        let next_order = next_order_by_session
-            .entry(tab.browser_session_id.clone())
-            .or_default();
-        tab.order = *next_order;
-        *next_order = next_order.saturating_add(1);
-    }
-}
-
 fn annotation_snapshot_revision(anchor: &BrowserAnnotationAnchor) -> u64 {
     match anchor {
         BrowserAnnotationAnchor::Element(anchor) => anchor.snapshot_revision,
@@ -2025,42 +2082,75 @@ fn validate_lease_owner(
     owner: &ExecutionOwnership,
     session: &BrowserSession,
 ) -> Result<(), BrowserAuthorityError> {
-    let session_id =
-        owner
-            .session_id
-            .as_ref()
-            .ok_or(BrowserAuthorityError::MissingOwnershipField {
-                field: "session_id",
-            })?;
-    if session_id != &session.session_id {
-        return Err(BrowserAuthorityError::OwnershipMismatch {
-            field: "session_id",
-        });
+    match &session.owner {
+        BrowserSessionOwner::Session {
+            session_id,
+            workspace_id,
+        } => {
+            let provided =
+                owner
+                    .session_id
+                    .as_ref()
+                    .ok_or(BrowserAuthorityError::MissingOwnershipField {
+                        field: "session_id",
+                    })?;
+            if provided != session_id {
+                return Err(BrowserAuthorityError::OwnershipMismatch {
+                    field: "session_id",
+                });
+            }
+            if &owner.workspace_id != workspace_id {
+                return Err(BrowserAuthorityError::OwnershipMismatch {
+                    field: "workspace_id",
+                });
+            }
+            Ok(())
+        }
+        // 应用级会话不属于任何 Magi 会话或工作区：带会话身份的调用方不能占用它。
+        BrowserSessionOwner::App => {
+            if owner.session_id.is_some() {
+                return Err(BrowserAuthorityError::OwnershipMismatch {
+                    field: "session_id",
+                });
+            }
+            if owner.workspace_id.is_some() {
+                return Err(BrowserAuthorityError::OwnershipMismatch {
+                    field: "workspace_id",
+                });
+            }
+            Ok(())
+        }
     }
-    if owner.workspace_id != session.workspace_id {
-        return Err(BrowserAuthorityError::OwnershipMismatch {
-            field: "workspace_id",
-        });
-    }
-    Ok(())
 }
 
 fn validate_open_session_uniqueness(
     sessions: &HashMap<BrowserSessionId, BrowserSession>,
 ) -> Result<(), BrowserAuthorityError> {
     let mut seen = HashMap::<SessionId, BrowserSessionId>::new();
+    let mut app_session: Option<BrowserSessionId> = None;
     for session in sessions
         .values()
         .filter(|session| session.lifecycle.is_open())
     {
-        if let Some(existing) = seen.insert(
-            session.session_id.clone(),
-            session.browser_session_id.clone(),
-        ) {
-            return Err(BrowserAuthorityError::InvalidSnapshot(format!(
-                "Magi session {} has multiple open browser sessions: {} and {}",
-                session.session_id, existing, session.browser_session_id
-            )));
+        match &session.owner {
+            BrowserSessionOwner::Session { session_id, .. } => {
+                if let Some(existing) =
+                    seen.insert(session_id.clone(), session.browser_session_id.clone())
+                {
+                    return Err(BrowserAuthorityError::InvalidSnapshot(format!(
+                        "Magi session {} has multiple open browser sessions: {} and {}",
+                        session_id, existing, session.browser_session_id
+                    )));
+                }
+            }
+            BrowserSessionOwner::App => {
+                if let Some(existing) = app_session.replace(session.browser_session_id.clone()) {
+                    return Err(BrowserAuthorityError::InvalidSnapshot(format!(
+                        "multiple open app-scoped browser sessions: {} and {}",
+                        existing, session.browser_session_id
+                    )));
+                }
+            }
         }
     }
     Ok(())

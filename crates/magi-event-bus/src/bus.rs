@@ -145,7 +145,10 @@ impl InMemoryEventBus {
 
     /// 在读锁内只读访问账本，不克隆。账本可能有数万条、数十 MB 的 JSON 负载，
     /// 只需要统计或扫描时必须用它，不要为此调用会整本克隆的 `audit_usage_ledger_snapshot`。
-    pub fn with_audit_usage_ledger<R>(&self, read: impl FnOnce(&AuditUsageLedgerSnapshot) -> R) -> R {
+    pub fn with_audit_usage_ledger<R>(
+        &self,
+        read: impl FnOnce(&AuditUsageLedgerSnapshot) -> R,
+    ) -> R {
         let ledger = self
             .audit_usage_ledger
             .read()

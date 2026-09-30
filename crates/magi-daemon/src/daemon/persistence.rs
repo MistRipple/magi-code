@@ -3367,9 +3367,9 @@ impl StateRepository {
             let projection = SessionConversationProjection::load(&event_root, session_id)?;
             cache.insert(session_id.clone(), projection);
         }
-        let next_sequence = cache
-            .get(session_id)
-            .map_or(1, |projection| projection.last_event_seq().saturating_add(1).max(1));
+        let next_sequence = cache.get(session_id).map_or(1, |projection| {
+            projection.last_event_seq().saturating_add(1).max(1)
+        });
         Ok(next_sequence)
     }
 
@@ -3598,11 +3598,12 @@ impl StateRepository {
             .get(session_id)
             .is_some_and(SessionConversationProjection::is_resident)
         {
-            let loaded = SessionConversationProjection::load(&event_root, session_id).map_err(
-                |error| DomainError::Persistence {
-                    message: error.to_string(),
-                },
-            )?;
+            let loaded =
+                SessionConversationProjection::load(&event_root, session_id).map_err(|error| {
+                    DomainError::Persistence {
+                        message: error.to_string(),
+                    }
+                })?;
             cache.insert(session_id.clone(), loaded);
         }
         let projection = cache
@@ -6278,7 +6279,10 @@ mod tests {
 
     #[test]
     fn content_digest_distinguishes_content_and_length() {
-        assert_eq!(ContentDigest::of("同一份内容"), ContentDigest::of("同一份内容"));
+        assert_eq!(
+            ContentDigest::of("同一份内容"),
+            ContentDigest::of("同一份内容")
+        );
         assert_ne!(ContentDigest::of("a"), ContentDigest::of("b"));
         assert_ne!(ContentDigest::of("a"), ContentDigest::of("a "));
     }

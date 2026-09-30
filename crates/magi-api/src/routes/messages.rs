@@ -15,8 +15,7 @@ use crate::{
     errors::ApiError,
     public_canonical::{
         HISTORY_PAGE_BYTE_BUDGET, history_page_canonical_item, history_page_canonical_turn,
-        public_canonical_turn_item,
-        trim_history_page_to_budget,
+        public_canonical_turn_item, trim_history_page_to_budget,
     },
     state::ApiState,
 };
@@ -882,11 +881,21 @@ mod tests {
             .expect("tool item should exist")
             .clone();
         assert_eq!(
-            item["tool"]["result"]["content"].as_str().unwrap().chars().count(),
+            item["tool"]["result"]["content"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
             crate::public_canonical::HISTORY_TOOL_RESULT_STRING_LIMIT
         );
-        assert_eq!(item["metadata"]["historyCompaction"]["resultTruncated"], true);
-        assert_eq!(item["metadata"]["historyCompaction"]["omittedChars"], 20_000 - 2 * 1024);
+        assert_eq!(
+            item["metadata"]["historyCompaction"]["resultTruncated"],
+            true
+        );
+        assert_eq!(
+            item["metadata"]["historyCompaction"]["omittedChars"],
+            20_000 - 2 * 1024
+        );
 
         let full = routes()
             .with_state(state)
@@ -901,7 +910,10 @@ mod tests {
         assert_eq!(full.status(), StatusCode::OK);
         let full_body = read_json_response(full).await;
         assert_eq!(
-            full_body["item"]["tool"]["result"]["content"].as_str().unwrap().len(),
+            full_body["item"]["tool"]["result"]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
             20_000
         );
     }
@@ -984,8 +996,12 @@ mod tests {
         assert!(items.len() <= window + 1, "窗口只带最新条目和用户消息");
         assert!(items.iter().any(|item| item["kind"] == "user_message"));
         let history_window = &turn["metadata"]["historyWindow"];
-        let before_seq = history_window["beforeItemSeq"].as_u64().expect("window cursor") as usize;
-        let omitted = history_window["omittedItemCount"].as_u64().expect("omitted count") as usize;
+        let before_seq = history_window["beforeItemSeq"]
+            .as_u64()
+            .expect("window cursor") as usize;
+        let omitted = history_window["omittedItemCount"]
+            .as_u64()
+            .expect("omitted count") as usize;
         assert!(omitted > 0);
 
         let mut seen = items
@@ -1026,6 +1042,10 @@ mod tests {
             };
         }
         let expected = crate::public_canonical::HISTORY_TURN_ITEM_WINDOW * 2 + 20 + 1;
-        assert!(seen.len() >= expected, "窗口加向前翻页必须补齐整个回合: {} < {expected}", seen.len());
+        assert!(
+            seen.len() >= expected,
+            "窗口加向前翻页必须补齐整个回合: {} < {expected}",
+            seen.len()
+        );
     }
 }

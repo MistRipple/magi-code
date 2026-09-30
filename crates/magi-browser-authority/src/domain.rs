@@ -69,12 +69,73 @@ impl BrowserSessionLifecycle {
     }
 }
 
+/// Browser Session 的归属作用域。
+///
+/// `Session` 与 Magi 会话保持同一作用域：个人会话没有伪造的 workspace。
+/// `App` 是应用级唯一会话（GPT Web 模型），不属于任何会话或工作区，
+/// 全局唯一、ID 持久稳定，登录态落在固定持久分区里。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrowserSessionOwner {
+    Session {
+        session_id: SessionId,
+        workspace_id: Option<WorkspaceId>,
+    },
+    App,
+}
+
+impl BrowserSessionOwner {
+    pub fn magi_session_id(&self) -> Option<&SessionId> {
+        match self {
+            Self::Session { session_id, .. } => Some(session_id),
+            Self::App => None,
+        }
+    }
+
+    pub fn workspace_id(&self) -> Option<&WorkspaceId> {
+        match self {
+            Self::Session { workspace_id, .. } => workspace_id.as_ref(),
+            Self::App => None,
+        }
+    }
+
+    pub fn is_app(&self) -> bool {
+        matches!(self, Self::App)
+    }
+
+    pub fn matches_magi_session(&self, session_id: &SessionId) -> bool {
+        matches!(self, Self::Session { session_id: owned, .. } if owned == session_id)
+    }
+}
+
+impl BrowserSession {
+    /// 该会话所属的 Magi 会话；应用级会话返回 `None`。
+    pub fn magi_session_id(&self) -> Option<&SessionId> {
+        self.owner.magi_session_id()
+    }
+
+    /// 该会话所属的工作区；应用级会话返回 `None`。
+    pub fn owner_workspace_id(&self) -> Option<&WorkspaceId> {
+        self.owner.workspace_id()
+    }
+
+    pub fn is_app_scope(&self) -> bool {
+        self.owner.is_app()
+    }
+
+    /// 归属作用域的技术标识：`session` 或 `app`。
+    pub fn owner_kind(&self) -> &'static str {
+        match self.owner {
+            BrowserSessionOwner::Session { .. } => "session",
+            BrowserSessionOwner::App => "app",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSession {
     pub browser_session_id: BrowserSessionId,
-    /// 浏览器归属与 Magi 会话保持同一作用域：个人会话没有伪造的 workspace。
-    pub workspace_id: Option<WorkspaceId>,
-    pub session_id: SessionId,
+    pub owner: BrowserSessionOwner,
     pub profile_id: BrowserProfileId,
     pub lifecycle: BrowserSessionLifecycle,
     pub tab_ids: Vec<BrowserTabId>,
