@@ -8,7 +8,7 @@
 //! 任何一步失败都以 MCP 工具错误返回，后续步骤不执行；网络与本机客户端走同一条管线。
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -124,8 +124,13 @@ pub struct InvocationOutcome {
 pub trait ToolBackend: Send + Sync {
     fn schemas(&self) -> &dyn ToolSchemaProvider;
 
-    /// 该工具的参数里有哪些路径访问；由宿主用现有的路径声明能力给出。
-    fn path_requests(&self, internal_name: &str, arguments: &Value) -> Vec<PathRequest>;
+    /// 该工具的参数里有哪些路径访问；由宿主用现有的路径声明能力给出（相对路径按工作区根解析）。
+    fn path_requests(
+        &self,
+        internal_name: &str,
+        arguments: &Value,
+        workspace_root: &Path,
+    ) -> Vec<PathRequest>;
 
     fn invoke<'a>(&'a self, invocation: ToolInvocation) -> BoxFuture<'a, InvocationOutcome>;
 }
@@ -310,7 +315,7 @@ impl McpServer {
         };
         let requests = self
             .backend
-            .path_requests(mapping.internal_name, &arguments);
+            .path_requests(mapping.internal_name, &arguments, &root);
         let resolved_paths = match guard.check_all(&requests) {
             Ok(paths) => paths,
             Err(violation) => {
@@ -405,7 +410,12 @@ mod tests {
             static SCHEMAS: Schemas = Schemas;
             &SCHEMAS
         }
-        fn path_requests(&self, internal_name: &str, arguments: &Value) -> Vec<PathRequest> {
+        fn path_requests(
+            &self,
+            internal_name: &str,
+            arguments: &Value,
+            _workspace_root: &Path,
+        ) -> Vec<PathRequest> {
             let access = if internal_name == "file_read" {
                 PathAccess::Read
             } else {

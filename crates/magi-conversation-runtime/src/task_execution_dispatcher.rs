@@ -2164,19 +2164,7 @@ impl LlmTaskDispatcher {
         &self,
         settings_store: Option<&Arc<SettingsStore>>,
     ) -> Option<magi_safety_gate::SafetyGate> {
-        let settings_rules = settings_store
-            .map(|store| store.get_section("safeguardConfig"))
-            .and_then(|raw| {
-                raw.get("rules")
-                    .map(magi_safety_gate::rules_from_settings_value)
-            })
-            .unwrap_or_default();
-        let rules = magi_safety_gate::merge_rules_with_builtin_defaults(settings_rules);
-        if rules.is_empty() {
-            None
-        } else {
-            Some(magi_safety_gate::SafetyGate::new(rules))
-        }
+        safety_gate_from_settings(settings_store)
     }
 
     fn execution_settings_snapshot(&self) -> Option<Arc<SettingsStore>> {
@@ -3209,6 +3197,26 @@ async fn record_dispatch_join_outcome(
                 error: direct_error,
             },
         );
+    }
+}
+
+/// S8：依据 settings 快照构造 SafetyGate（用户规则与内置默认规则合并）。
+/// Task 执行与外部（MCP）调用共用，保证两条入口的拦截规则一致。
+pub fn safety_gate_from_settings(
+    settings_store: Option<&Arc<SettingsStore>>,
+) -> Option<magi_safety_gate::SafetyGate> {
+    let settings_rules = settings_store
+        .map(|store| store.get_section("safeguardConfig"))
+        .and_then(|raw| {
+            raw.get("rules")
+                .map(magi_safety_gate::rules_from_settings_value)
+        })
+        .unwrap_or_default();
+    let rules = magi_safety_gate::merge_rules_with_builtin_defaults(settings_rules);
+    if rules.is_empty() {
+        None
+    } else {
+        Some(magi_safety_gate::SafetyGate::new(rules))
     }
 }
 

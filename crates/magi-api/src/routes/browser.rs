@@ -1584,7 +1584,10 @@ async fn reset_web_model_conversation(
     };
     let released = bindings.release_session(&session_id);
     // 旧实例退场：运行态投影与挂起工具调用跟着一起清掉，不在 UI 留下幽灵条目。
-    state.web_model_harness.registry().forget_session(&session_id);
+    state
+        .web_model_harness
+        .registry()
+        .forget_session(&session_id);
     if let Some(runtime) = state.web_model_harness.runtime() {
         runtime.forget_session(&session_id);
     }
@@ -5103,5 +5106,4 @@ mod tests {
             "Web 引擎不写 llm：写入会让它被规范化成 openai_chat（A22）"
         );
     }
-
 }

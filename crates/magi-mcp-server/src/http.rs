@@ -230,7 +230,7 @@ mod tests {
             static SCHEMAS: Schemas = Schemas;
             &SCHEMAS
         }
-        fn path_requests(&self, _: &str, _: &Value) -> Vec<PathRequest> {
+        fn path_requests(&self, _: &str, _: &Value, _: &std::path::Path) -> Vec<PathRequest> {
             Vec::new()
         }
         fn invoke<'a>(&'a self, _: ToolInvocation) -> BoxFuture<'a, InvocationOutcome> {

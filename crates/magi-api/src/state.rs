@@ -2978,6 +2978,11 @@ impl ApiState {
         session.workspace_id.as_deref().map(WorkspaceId::new)
     }
 
+    /// 外部（MCP）工具调用复用与会话内 agent 相同的工具注册表。
+    pub(crate) fn tool_registry(&self) -> Option<&ToolRegistry> {
+        self.tool_registry.as_ref()
+    }
+
     pub(crate) fn workspace_root_path(
         &self,
         workspace_id: &Option<WorkspaceId>,

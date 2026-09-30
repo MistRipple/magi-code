@@ -74,6 +74,7 @@ pub use skill_custom_tool_surface::{
     tool_execution_policy_scope,
 };
 pub use task_completion_notifier::{TaskCompletionNotification, TaskCompletionNotifier};
+pub use task_execution_dispatcher::safety_gate_from_settings;
 pub use task_helpers::{
     GoalModeLifecycleState, TaskTurnVisibility, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
