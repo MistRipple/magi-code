@@ -4057,6 +4057,7 @@ mod tests {
                 workspace_id: Some(workspace_id.to_string()),
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![magi_session_store::TimelineEntry {
                 entry_id: "timeline-context-prompt".to_string(),

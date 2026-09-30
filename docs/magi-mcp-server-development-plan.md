@@ -38,6 +38,14 @@
 
 **第一批工具（已核对存在于工具运行时）：** `magi.fs.read` / `write` / `patch` / `apply_patch` / `mkdir` / `move` / `copy` / `remove`、`magi.search.text` / `semantic`、`magi.shell.exec`。`magi.git.*` 与 `magi.changes.*` **尚未核对**，不在目录里（WP9）。
 
+### 2.1.1 宿主侧已完成（2026-09-30）
+
+| 工作包 | 提交 | 交付 | 关键结论 |
+| --- | --- | --- | --- |
+| WP1 | `fad1dc91` | `magi-conversation-runtime::external_tool`：`execute_external_tool_call`、`external_tool_policy`；`tool_batch` 判定改为按 `TaskPolicy` 入参（`policy_tool_decision`、`policy_tool_preflight_decision`） | **Magi 的 `Restricted` 档本身允许工作区内写入，不会返回 `NeedsApproval`。** 所以“写入要人工确认”完全由 MCP 层 `Profile::decide` 负责，本入口只负责放行 / 拒绝与执行。工具还要求 `workspace_id` 存在（否则返回 `workspace_required`）。 |
+| WP2 | `924c5c78` | `external_approval`：`await_external_tool_approval`、`cancel_external_approvals`、`external_approval_task_id` | 每次调用用独立合成 turn（`external:<token_id>:<call_id>`），拒绝记忆不跨调用；吊销令牌调用 `cancel_external_approvals` 让等待方以“已取消”收口。 |
+| WP3（部分） | 见下一提交 | `SessionKind::{User, ExternalTool}` 与 `SessionStore::create_external_tool_session`（不抢占当前会话、不写时间线）；`ExternalToolCall.snapshot` 钩子接入变更账本 | 账本钩子已在入口内对改写路径做 before/after；**会话列表对外部会话的过滤与侧栏独立分区尚未做**（WP4 / WP7），在此之前外部会话会出现在会话列表里。 |
+
 ### 2.2 未完成（按工作包，见 §4）
 宿主适配（外部工具执行入口与审批）、外部工具会话、daemon 集成与令牌持久化、stdio 中继、设置页、跨会话待审批入口、审计展示、真实客户端验收、网络模式、OAuth、GPT Web 接入、安全评审。
 

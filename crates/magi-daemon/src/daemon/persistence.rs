@@ -4801,6 +4801,7 @@ mod tests {
                 workspace_id: Some("workspace-persisted".to_string()),
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-persisted-user".to_string(),

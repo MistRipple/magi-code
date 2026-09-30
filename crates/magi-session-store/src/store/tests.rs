@@ -489,6 +489,64 @@ fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
 }
 
 #[test]
+fn external_tool_session_does_not_take_over_current_session_and_round_trips_kind() {
+    let store = SessionStore::new();
+    let user_id = SessionId::new("session-user");
+    store
+        .create_session(user_id.clone(), "User")
+        .expect("user session should create");
+
+    let external = store
+        .create_external_tool_session(
+            SessionId::new("session-external"),
+            "cursor · demo",
+            "workspace-1".to_string(),
+        )
+        .expect("external session should create");
+
+    assert_eq!(external.kind, crate::SessionKind::ExternalTool);
+    assert_eq!(
+        store.current_session().expect("current session").session_id,
+        user_id,
+        "外部工具会话不得抢占用户当前会话"
+    );
+    assert!(
+        store
+            .create_external_tool_session(
+                SessionId::new("session-external"),
+                "dup",
+                "workspace-1".to_string(),
+            )
+            .is_err()
+    );
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        SessionExecutionSidecarStoreState::default(),
+    )
+    .expect("持久化恢复应成功");
+    let kinds = restored
+        .sessions()
+        .into_iter()
+        .map(|session| (session.session_id.to_string(), session.kind))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(kinds["session-external"], crate::SessionKind::ExternalTool);
+    assert_eq!(kinds["session-user"], crate::SessionKind::User);
+    let user_json = serde_json::to_value(
+        restored
+            .sessions()
+            .into_iter()
+            .find(|session| session.session_id == user_id)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        user_json.get("kind").is_none(),
+        "用户会话不写 kind，旧数据格式不变"
+    );
+}
+
+#[test]
 fn selecting_current_session_is_durable_without_changing_business_history() {
     let store = SessionStore::new();
     let first_session_id = SessionId::new("session-select-first");

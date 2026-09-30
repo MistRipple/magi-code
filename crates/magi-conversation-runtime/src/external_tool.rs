@@ -10,11 +10,13 @@
 
 use std::path::Path;
 
+use magi_bridge_client::{ChatToolCall, ChatToolFunction};
 use magi_core::{
     AccessProfile, CollaborationMode, ExecutionResultStatus, SessionId, TaskPolicy, TaskTier,
     ToolCallId, WorkspaceId,
 };
 use magi_event_bus::InMemoryEventBus;
+use magi_snapshot::{ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry,
     canonical_builtin_tool_name,
@@ -24,6 +26,7 @@ use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::tool_batch::{
     SafetyEvaluationAuditContext, policy_tool_preflight_decision, publish_safety_evaluation_audit,
 };
+use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
 use crate::tool_execution_policy_scope;
 use crate::tool_result_utils::{approval_resume_contract_failure, approval_resume_is_safe};
 
@@ -39,6 +42,9 @@ pub struct ExternalToolCall<'a> {
     pub workspace_id: Option<&'a WorkspaceId>,
     pub workspace_root: &'a Path,
     pub access_profile: AccessProfile,
+    /// 该外部会话的变更账本钩子。写入类工具执行前后由它对改写路径拍 hash，
+    /// 使外部改动进入待处理变更并可批准 / 回退；只读调用传 `None` 亦可。
+    pub snapshot: Option<&'a dyn ToolHook>,
 }
 
 /// 为外部调用合成策略快照：只允许访问工作区根，`.magi` 永远拒绝。
@@ -178,7 +184,27 @@ pub fn execute_external_tool_call(
             browser_capability_snapshot: None,
             browser_execution_id: None,
         };
+        let mut hook_ctx = ToolHookCtx {
+            tool_call_id: call.call_id.to_string(),
+            worker_id: None,
+            execution_group_id: None,
+            declared_paths: derive_declared_paths(&ChatToolCall {
+                id: call.call_id.to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: canonical.as_str().to_string(),
+                    arguments: call.arguments_json.to_string(),
+                },
+            }),
+        };
+        if let Some(hook) = call.snapshot {
+            hook.before_tool(&hook_ctx);
+        }
         let output = registry.execute_with_policy(input, context, &tool_policy);
+        append_result_declared_paths(&mut hook_ctx.declared_paths, &output.payload);
+        if let Some(hook) = call.snapshot {
+            hook.after_tool(&hook_ctx);
+        }
         (output.payload, output.status)
     };
 
@@ -216,6 +242,7 @@ mod tests {
             workspace_id: None,
             workspace_root: root,
             access_profile: profile,
+            snapshot: None,
         }
     }
 
@@ -299,5 +326,103 @@ mod tests {
             );
             assert_eq!(status, ExecutionResultStatus::Rejected, "{path}");
         }
+    }
+
+    struct StubWriteTool;
+
+    impl magi_tool_runtime::BuiltinTool for StubWriteTool {
+        fn name(&self) -> &'static str {
+            "file_write"
+        }
+
+        fn execute(
+            &self,
+            _tool_call_id: &ToolCallId,
+            _input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            serde_json::json!({ "tool": "file_write", "status": "succeeded" }).to_string()
+        }
+
+        fn spec(&self) -> magi_tool_runtime::BuiltinToolSpec {
+            magi_tool_runtime::BuiltinToolSpec {
+                name: "file_write".to_string(),
+                risk_level: magi_core::RiskLevel::Low,
+                approval_requirement: magi_core::ApprovalRequirement::None,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingHook {
+        events: std::sync::Mutex<Vec<(String, Vec<std::path::PathBuf>)>>,
+    }
+
+    impl ToolHook for RecordingHook {
+        fn before_tool(&self, ctx: &ToolHookCtx) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(("before".into(), ctx.declared_paths.clone()));
+        }
+
+        fn after_tool(&self, ctx: &ToolHookCtx) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(("after".into(), ctx.declared_paths.clone()));
+        }
+    }
+
+    #[test]
+    fn write_runs_inside_the_ledger_hook_and_rejected_write_does_not() {
+        let (bus, mut reg) = registry();
+        reg.register_builtin(std::sync::Arc::new(StubWriteTool));
+        let session = SessionId::new("s");
+        let root = Path::new("/work/space");
+        let workspace = WorkspaceId::new("ws-1");
+        let hook = RecordingHook::default();
+        let args = r#"{"path":"/work/space/a.txt","content":"x"}"#;
+        let mut write_call = call(
+            "file_write",
+            args,
+            root,
+            AccessProfile::Restricted,
+            &session,
+        );
+        write_call.snapshot = Some(&hook);
+        write_call.workspace_id = Some(&workspace);
+
+        // Magi 的 Restricted 档本身允许工作区内写入，“是否需要人工确认”由 MCP 层的
+        // 权限档决策负责，本入口不重复询问。
+        let (_, status) = execute_external_tool_call(&bus, &reg, None, &write_call, true);
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let declared = vec![std::path::PathBuf::from("/work/space/a.txt")];
+        assert_eq!(
+            *hook.events.lock().unwrap(),
+            vec![
+                ("before".to_string(), declared.clone()),
+                ("after".to_string(), declared)
+            ]
+        );
+
+        let outside = r#"{"path":"/etc/evil","content":"x"}"#;
+        let mut rejected_call = call(
+            "file_write",
+            outside,
+            root,
+            AccessProfile::Restricted,
+            &session,
+        );
+        let rejected_hook = RecordingHook::default();
+        rejected_call.snapshot = Some(&rejected_hook);
+        rejected_call.workspace_id = Some(&workspace);
+        let (_, status) = execute_external_tool_call(&bus, &reg, None, &rejected_call, true);
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        assert!(
+            rejected_hook.events.lock().unwrap().is_empty(),
+            "被拒绝的调用不得触碰账本"
+        );
     }
 }

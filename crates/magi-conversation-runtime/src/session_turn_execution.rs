@@ -6284,6 +6284,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![
                 TimelineEntry {
@@ -6513,6 +6514,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns: vec![CanonicalTurn {
@@ -6627,6 +6629,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns: vec![CanonicalTurn {
@@ -6809,6 +6812,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns,

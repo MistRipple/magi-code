@@ -8,8 +8,9 @@ mod tests;
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
     CanonicalTurn, NotificationContext, NotificationRecord, NotificationScope,
-    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionPlan,
-    SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
+    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionKind,
+    SessionPlan, SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry,
+    TimelineEntryKind,
 };
 use magi_core::{
     DomainError, DomainResult, SessionId, SessionLifecycleStatus, Task, ThreadId, UtcMillis,
@@ -827,6 +828,7 @@ impl SessionStore {
             workspace_id: workspace_id.clone(),
             last_completed_at: None,
             last_viewed_at: None,
+            kind: Default::default(),
         };
         state.sessions.push(session.clone());
         state.current_session_id = Some(session_id.clone());
@@ -840,6 +842,48 @@ impl SessionStore {
         drop(state);
         if let Some(observer) = self.lifecycle_observer() {
             observer.on_session_created(&session_id, workspace_id.as_deref());
+        }
+        Ok(session)
+    }
+
+    /// 创建外部工具会话（Magi MCP 服务为外部令牌建立）。
+    ///
+    /// 与用户会话的区别：不抢占用户当前选中的会话，不写“会话已创建”时间线；
+    /// 会话只承载外部调用、审批与变更。
+    pub fn create_external_tool_session(
+        &self,
+        session_id: SessionId,
+        title: impl Into<String>,
+        workspace_id: String,
+    ) -> DomainResult<SessionRecord> {
+        let created_at = UtcMillis::now();
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(DomainError::AlreadyExists { entity: "session" });
+        }
+        let session = SessionRecord {
+            session_id: session_id.clone(),
+            title: title.into(),
+            status: SessionLifecycleStatus::Active,
+            created_at,
+            updated_at: created_at,
+            message_count: None,
+            workspace_id: Some(workspace_id.clone()),
+            last_completed_at: None,
+            last_viewed_at: None,
+            kind: SessionKind::ExternalTool,
+        };
+        state.sessions.push(session.clone());
+        drop(state);
+        if let Some(observer) = self.lifecycle_observer() {
+            observer.on_session_created(&session_id, Some(workspace_id.as_str()));
         }
         Ok(session)
     }

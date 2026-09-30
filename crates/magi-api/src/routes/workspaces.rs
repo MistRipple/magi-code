@@ -1145,6 +1145,7 @@ mod tests {
                 workspace_id: Some(workspace_a_id.to_string()),
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns: Vec::new(),

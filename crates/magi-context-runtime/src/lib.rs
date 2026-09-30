@@ -596,6 +596,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-session-1".to_string(),
@@ -777,6 +778,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: (1..=3)
                 .map(|i| TimelineEntry {
@@ -1034,6 +1036,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-exec-1".to_string(),
@@ -1585,6 +1588,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![
                 TimelineEntry {
