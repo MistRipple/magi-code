@@ -122,6 +122,8 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 | `magi.changes.approve`、`magi.changes.revert` | 变更账本的批准 / 回退 | `edit` | 否（逐次确认） |
 | `magi.shell.exec` | `shell_exec` | `exec` | 否（逐次确认，并受现有安全闸约束） |
 
+> **第一批实现范围（已在 `crates/magi-mcp-server` 落地）：** 只包含已在工具运行时核对过存在的工具——`magi.fs.read`、`magi.fs.write`、`magi.fs.patch`、`magi.fs.apply_patch`、`magi.fs.mkdir`、`magi.fs.move`、`magi.fs.copy`、`magi.fs.remove`、`magi.search.text`、`magi.search.semantic`、`magi.shell.exec`。上表中的 `magi.git.*` 与 `magi.changes.*` 需要先核对现有 git 与变更账本能力的对外形态，核对后再加入目录；在此之前不对外暴露。
+
 > `magi.changes.*` 是**新增的对外封装**（对应现有变更账本能力），需要在实现阶段核对其在会话之外的可调用性；其余工具映射到现有工具运行时。
 
 **第一版不开放：** 子代理（`agent_*`）、下游 MCP 代理（`mcp.<server>.*`）、Skill 可执行工具（`skill.<skill>.*`）、浏览器工具（`magi.browser.*`）、任何管理面（M8）。后续开放时必须单独评审，并遵守：只暴露有类型化 handler 的能力，GPT Web 宿主永远不可作为目标。
@@ -246,6 +248,8 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 | 审批能否复用 | **注册表可以复用，等待逻辑要新写** | `ToolApprovalRegistry::request_with_arguments` / `resolve` 把 `task_id`、`turn_id` 当不透明字符串使用，可以用 `external:<token_ref>` 形式的合成标识；但现有等待循环 `await_task_tool_approval`（`tool_batch.rs`）是私有函数，并强依赖“会话当前活动 turn + Task 仍在运行”。MCP 服务需要自己的等待循环，存活判据改为“令牌仍有效且连接未断”。外部审批只支持 `allow_once` / `deny`，不使用 `allow_for_turn`。 |
 | 审批在界面里怎么出现 | **缺口，需要新增全局入口** | 现有审批查询与解析接口按会话作用域（`GET /session/tool-approvals?sessionId=…`）；外部工具会话不是用户当前打开的会话，审批会看不见。需要一个跨会话的“待审批”入口（通知中心 / 全局待办），并把外部审批标明来源客户端。这是阶段 2 的必做项。 |
 | 变更账本对外部写入 | **待验证** | 变更账本以会话为单位；外部写入需要在外部工具会话下建立对应的快照会话，阶段 1–2 中用真实写入验证。 |
+
+> **进度（2026-09-30，分支 `feature/magi-mcp`）：** 阶段 1 的纯逻辑部分已完成并有 35 个测试——令牌、权限档决策表、工具目录、路径守卫、调用管线、Streamable HTTP（Host / Origin / 认证 / 协议版本）。**尚未完成：** 宿主适配（把 `ToolBackend` 接到工具运行时与审批注册表）、stdio 中继与本地 socket、令牌持久化与设置页、跨会话待审批入口、外部工具会话。
 
 ### 阶段 1：本机 stdio + 令牌（只读优先）
 令牌创建 / 存储 / 吊销、stdio 中继、`read_only` 工具集、路径校验、审计、外部工具会话。
