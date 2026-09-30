@@ -63,8 +63,9 @@ npm run desktop:dev
 - [Magi 对话响应链路性能开发与验收计划](./conversation-response-performance-plan.md)：发送接纳、后台准备、模型连接复用、流式增量写回、前端渲染和桌面端性能验收基线。
 - [用户自定义子代理角色设计方案](./custom-worker-role-design.md)：在现有 Worker 体系中统一支持用户角色的创建、注册、调度、导入和导出。
 - [用户自定义子代理角色开发计划](./custom-worker-role-development-plan.md)：按阶段记录实现、验证和最终提交状态。
-- [Magi Web 模型浏览器设计基线](./web-model-browser-design.md)：**未实现的最终设计基线**（固定决策 A1–A24）；应用级 GPT Web 浏览器会话与登录态持久化、Web 模型发现与内置浏览器模型传输的设计结论、状态所有权、工具档位（T0 / T2 / T3；T1 已删除）、T3 通道（Magi Connect 优先 / OpenAI Tunnel 正式交付）与上下文一致性边界。
-- [Magi Web 模型浏览器实现计划](./web-model-browser-product-implementation-plan.md)：阶段划分、阶段 0 实测、文件级工单、接口契约、错误码、验收与代码索引。
+- [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
+- [Magi MCP 服务设计](./magi-mcp-server-design.md)：**设计基线（未实现）**；Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、git、变更账本等工具；令牌与权限档、审批、路径限制、审计，以及本机 stdio / 回环 HTTP / Cloudflare 网络模式的分期方案；GPT Web 的工具能力是它的一个客户端。
+- [Magi Web 模型浏览器设计基线](./web-model-browser-design.md) 与 [实现计划](./web-model-browser-product-implementation-plan.md)：历史方案，仅用于追溯决策，不作为当前实现依据。
 
 ## 用户场景与产品要求
 

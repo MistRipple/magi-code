@@ -1,7 +1,7 @@
 # Magi Web 模型浏览器 · 设计基线
 
 > 状态：**最终设计基线**（未实现）。设计结论、状态所有权、上下文一致性与安全边界以本文为准；阶段划分、实测清单、接口草案、错误码、验收与代码索引见《[实现计划](./web-model-browser-product-implementation-plan.md)》。
-> 更新日期：2026-09-28（**第五轮源码复核后定版**）。历史轮次：第一轮 R1–R21、第二轮 R22–R35、第三轮 R36–R46；第四轮为用户裁决 **R47「A10 改判：Connect 优先、未就绪时以 OpenAI Tunnel 正式交付」** 与 **R48「删除 T1」**；第五轮按源码事实修正 **R49 后台可驱动宿主（方案 A）**、**R50 绑定键加 thread**、**R51 累计账不走 `ModelResponse.usage`**、**R52 重锚块下发每次发送的随机串**、**R53 删除 T3 v1**、**R54 stdio 中继经本地 socket 连 daemon**、**R55 绑定表只驻内存**、**R56 最小分片排进阶段 3**、**R57 工具调用块改长围栏**、**R58 T3 `tool_call_id` 与去重口径**、**R59 `pending_tools` 不存明文令牌**，以及一致性修复 R60–R62。修改依据见《实现计划》附录 B。
+> 更新日期：2026-09-30（**第五轮源码复核后定版，补充单向会话转换**）。历史轮次：第一轮 R1–R21、第二轮 R22–R35、第三轮 R36–R46；第四轮为用户裁决 **R47「A10 改判：Connect 优先、未就绪时以 OpenAI Tunnel 正式交付」** 与 **R48「删除 T1」**；第五轮按源码事实修正 **R49 后台可驱动宿主（方案 A）**、**R50 绑定键加 thread**、**R51 累计账不走 `ModelResponse.usage`**、**R52 重锚块下发每次发送的随机串**、**R53 删除 T3 v1**、**R54 stdio 中继经本地 socket 连 daemon**、**R55 绑定表只驻内存**、**R56 最小分片排进阶段 3**、**R57 工具调用块改长围栏**、**R58 T3 `tool_call_id` 与去重口径**、**R59 `pending_tools` 不存明文令牌**，以及一致性修复 R60–R62；本轮用户补充 **R63「只允许 GPT Web 会话 → Magi 本地会话，不实现本地历史 → GPT Web」**。修改依据见《实现计划》附录 B。
 > 相关文档：[工程约束与运行入口](./README.md)、[内置浏览器完整设计](./browser-runtime-design.md)、[上下文压力与压缩架构](./context-pressure-compaction-architecture.md)、[Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)、[Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)
 >
 > 参考实现：[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)。本文只借鉴其已验证的机制思路，不照搬形态，不引入其代码或运行时依赖。
@@ -52,9 +52,10 @@
 | A19 | 产品形态与性能优先，**不做兼容**：不迁移、不双读/双写、不版本协商、不保留旧格式运行期分支，也不支持应用降级。 | 唯一硬要求是可重建状态加载路径全函数：读不出来就重建，绝不让 daemon 加载失败。 |
 | A20 | **web 侧不落盘**：不镜像、不缓存、不持久化对话正文与页面副本；Magi canonical 是唯一事实源。 | 从 web 读回并展示的会话记录在 Magi 持久化；绑定指针、累计账与前缀指纹只驻 daemon 进程内存（§5.12），重启即重建；web 侧丢失按正常路径全量重放。 |
 | A21 | 应用级 GPT Web 会话使用**带 `persist:` 前缀的专用分区**（`persist:magi-web-model`），登录态才可能跨应用重启保留；宿主侧 partition 白名单与「清理浏览数据」按此调整。 | Electron 中没有 `persist:` 前缀的 partition 是**内存会话**，进程退出即丢；现有 `magi-browser-<id>` 分区不满足 A4。 |
-| A22 | Web 模型的选择入口是**会话内主模型选择器**：清单位于现有 `engines`（唯一注册表），会话通过**会话级主模型覆盖新增的引擎绑定**指向该引擎；Web 引擎条目不写 `llm`，也不写入 provider 连接（`orchestrator` 段的 baseUrl / apiKey）。选择器的强度档位改为**按模型动态**：只展示该引擎 `efforts` 里的取值，不支持的置灰。 | 主对话现为「全局连接基座 + 会话级 `model` / `reasoningEffort` 覆盖」，完全不读 `engines`；不补这条绑定就没有可选入口，或会被迫在 UI 造第二套列表（违反 A6）。现前端 strength 是固定四档，需要改成按模型取值（《实现计划》§6）。 |
+| A22 | Web 模型仍使用**会话内主模型选择器**，清单位于现有 `engines`（唯一注册表），但会话转换是单向的：**新会话草稿可以选择 Web；已有本地历史的会话不得选择 Web；已有 Web 历史的会话可以切回 provider 本地模型，切回后不再转回 Web**。Web 引擎条目不写 `llm`，也不写入 provider 连接（`orchestrator` 段的 baseUrl / apiKey）；`chatgpt_web` 也不能保存为全局 `orchestrator`。选择器的强度档位按模型动态取值，不支持的置灰。 | 主对话通过会话级 `engineId` 绑定 Web 引擎；已有本地 canonical 用户消息时，设置路由和前端都拒绝本地 → Web，避免实现本地历史的全量导入、双向迁移和额外上下文重放。Web → 本地只清除 `engineId`、保留 canonical 历史，复用现有 provider 模型路径；`engineId` 不进入 `ORCHESTRATOR_SESSION_DEFAULTS_SECTION`。 |
 | A23 | 站点适配失败（selector 漂移）与风控 / 验证页同为**引擎级不可用状态**：引擎必须推进到 `site_blocked`（带 `reason`），不得停留在 `available`。 | 否则站点改版后模型看起来可用、每次发送都失败，用户没有任何持续状态可依据。 |
 | A24 | **同一逻辑 Tab 全局只有一个 Primary**（`primary_surfaces` 以 tab 为键），推理只使用承载该 Tab Primary 的窗口；每个窗口各有一份独立的 App 级物理 Surface 集合（同一内容槽内的主页 + 每个活跃对话实例一个推理页，数量 ≤ 并发上限，§5.2；登录态靠同一 partition 共享）。非 Primary 窗口不复制用于推理的 Surface，显示「本窗口未承载当前推理」并提供「打开主窗口」动作。 | 与 `docs/browser-runtime-design.md` §4.1 的既有 Surface 规则一致；见 §5.3、§5.13。当前产品只创建一个窗口入口，多窗口行为按既有架构规则描述，产品化窗口入口由宿主另行提供。 |
+| A26 | **会话转换只做单向：GPT Web 会话 → Magi 本地会话**。Web 会话的用户消息、助手回复、thinking、工具调用与结果照常写入 Magi canonical；用户可以在该会话内切回本地模型继续，不丢历史。已有本地会话不支持把历史导入 GPT Web，也不支持「本地会话 → Web 会话」迁移。 | Web 临时对话的上下文重放、账号消息消耗和工具协议只对从空白草稿**首次启动**的 Web 会话负责；首次在空白草稿选择 Web 是“创建 Web 会话”，不是本地会话转换。不新增本地历史搬运、双向迁移、第二套会话结构，也不提供本地历史导入按钮。实现上沿用现有会话级 `engineId`：已有本地历史的会话禁选 Web；Web 会话切到 provider 模型即完成单向转本地（A20、A22），切回后不能再转回 Web。 |
 
 ---
 
@@ -95,7 +96,8 @@
 | S2 | 用户切换项目 / 会话 | 该会话与登录态仍然可用，不需要重新登录、不需要重新绑定 |
 | S3 | 用户重开 Magi | 再次点击该项，登录态仍在（等价于"浏览器没有清理缓存"），直接进入可用页面 |
 | S4 | 用户想用 Web 账号可用的模型 | Web 模型清单被读出并追加到 Magi 模型列表，明确标注"来自 Web" |
-| S5 | 用户在对话框发消息、选了 Web 引擎 | 消息被送进内置浏览器的 Web 会话，响应增量回流到 Magi 对话展示 |
+| S5 | 用户在新建的 GPT Web 会话中发消息、选了 Web 引擎 | 消息被送进内置浏览器的 Web 临时会话，响应增量回流到 Magi 对话并持久化；已有本地历史的会话不接受 Web 引擎 |
+| S5.1 | 用户希望把 Web 会话交给本地模型继续 | 在同一 Magi 会话内选择 provider 模型；已有 Web 消息保持在 canonical，下一轮由本地模型继续 |
 | S6（必需） | 用户要用 Web 模型做**真实项目级开发**（读改文件、跑命令、用 MCP / skill），而不是只能聊天 | 工具能力按 §5.7 分档交付；**T3 是目标形态**，T2 是先行档位；不得以"纯文本引擎"作为最终形态结案 |
 | S7（必需） | 用户不想进入 ChatGPT 设置手动添加连接器就能用工具 | 连接器这类**站点配置**由 Magi 在托管浏览器会话中自动完成（A17）；OpenAI Tunnel 的 Tunnel 与仅含 Tunnels Read + Use 的 API 密钥仍需用户在自己的 OpenAI 平台创建（Magi 引导，不可代做）；账号 / 套餐不支持或通道前置未满足时自动降级为 T2，引擎处说明当前档位、降档原因与额度影响（A15） |
 
@@ -105,6 +107,7 @@
 - 不为 Web / 手机 Web 伪造可接管的浏览器。真实内置浏览器只在 Magi Desktop 存在（`require_desktop_browser_capability`）；无头 daemon 同样不提供。
 - 不使用截图、canvas、iframe 或原生浮层投影网页内容（`docs/browser-runtime-design.md` §3.1、§10）。
 - 不把 ChatGPT 对话历史当作事实源。对话在 Magi 会话内复用，但 Magi canonical 始终是唯一权威：web 侧一旦截断或漂移，以 Magi 记录为准并走重建路径。
+- 不支持把已有 Magi 本地会话的历史迁移到 GPT Web；本地会话 → Web 会话的双向转换暂不实现。只有从空白会话启动 Web，或把已有 Web 会话切回本地模型（A26）。
 - 不在 web 侧持久化任何状态：不镜像、不缓存临时对话副本，也不把它当作可恢复资源；web 侧丢失按正常路径处理（A20）。
 - 不进入用户的 ChatGPT 历史记录：使用临时对话；临时对话的内容仍由 OpenAI 处理。
 - 不在 UI 层建立第二套消息、模型或浏览器事实源。
@@ -114,7 +117,7 @@
 
 ### 1.3 一句话概括
 
-**Web 模型浏览器是应用级的浏览器资源；模型清单靠"发现通道"读取、落进现有 `engines`；模型调用靠"推理通道"实现为一个 `ModelBridgeClient`；工具能力与推理通道解耦、按 T0 / T2 / T3 分档交付，且是必需能力（S6）；其中只有 T3 需要 MCP 与对外通道（Magi Connect 优先，Connect 未就绪时以 OpenAI Tunnel 正式交付）；任何档位的工具都只由 Magi 现有 conversation loop 执行。**
+**Web 模型浏览器是应用级的浏览器资源；模型清单靠"发现通道"读取、落进现有 `engines`；从空白会话启动的 Web 推理靠"推理通道"实现为一个 `ModelBridgeClient`，Web 会话消息同步写入 Magi canonical 并可单向切回本地模型；不做本地历史导入 Web；工具能力与推理通道解耦、按 T0 / T2 / T3 分档交付，且是必需能力（S6）；其中只有 T3 需要 MCP 与对外通道（Magi Connect 优先，Connect 未就绪时以 OpenAI Tunnel 正式交付）；任何档位的工具都只由 Magi 现有 conversation loop 执行。**
 
 ---
 
@@ -224,6 +227,8 @@ Magi Desktop（当前产品只创建一个窗口；多窗口按既有 per-tab Pr
 | 退出 Magi / 操作系统退出 | shutdown 释放全部窗口与 Surface；进行中的 Web 推理按 turn 中断收口，重启后会话内保留中断记录与原错误码并可重试，不静默续跑 |
 | daemon 重启 | 逻辑会话与主页 URL 恢复，页面按需重新物化；**一律推进上下文 epoch**：现有 Desktop Control 协议没有**带 canonical 消息标识的语义回读**命令（只能读到页面可见文本，无法还原成 Magi 的消息序列），无法重建续轮增量，因此不尝试沿用旧对话，直接由 canonical 全量重放（A20）。代价是重启后首次使用多消耗一条账号消息额度 |
 | 对话实例失效 / 漂移 | 以 Magi canonical 为准全量重建；不尝试修补 web 侧对话 |
+| Web 会话切回本地模型 | 保留该 Magi 会话的全部 canonical 历史，清除会话级 Web `engineId`；释放该会话 Web 绑定的推理页面，下一轮走既有 provider client。该方向是唯一支持的会话转换 |
+| 本地会话选择 Web 模型 | 仅当会话仍为空（尚无 canonical 用户消息）时允许作为“新建 GPT Web 会话”选择；已有本地历史由 daemon 与 UI 一致拒绝，不做历史导入 |
 | Desktop 重启 | 新 `desktopEpoch`；登录态保留，页面重新创建；内存绑定表清空，下一次发送按全量重放处理 |
 | 资源回收 `/browser/resources/reclaim` | **默认排除**：`is_reclaimable_tab` 现只看生命周期与租约、没有 owner 维度，需先补 owner 分支，App 级 Tab 一律不可回收；设置 → 浏览器 的页面资源列表对 App 级页面追加常驻说明「Magi 托管的 GPT Web 页面不参与回收，请用『清除数据』处理」，避免出现占用 N/M 却回收 0 个的观感 |
 | 清除 Web 数据 | 显式操作：取消进行中的推理，关闭该应用级会话并清理 partition |
@@ -344,7 +349,9 @@ pub enum BrowserSessionOwner {
 
 对应变更见《实现计划》§6。
 
-**对话选择**
+**对话选择与单向转换**
+
+本地会话的方向在首次产生用户消息后固定：空白草稿可以从 Magi 输入区选择 Web 并成为 GPT Web 会话；这一步是启动新 Web 会话，不是“本地会话 → Web 会话”转换。已有本地 canonical 历史的会话不能再选择 Web。GPT Web 会话是唯一例外，允许单向切回 provider；其所有消息仍由 Magi canonical 持久化，用户选择 provider 模型后只是清除会话级 `engineId`，历史不丢失、下一轮由本地模型继续；切回后不再转回 Web。全局 `orchestrator` 连接配置也不接受 `chatgpt_web`，避免 Web 模型脱离会话绑定成为新会话默认值。**不实现本地历史 → Web 的迁移或转换**，因此不会把本地会话历史重新拼装发送到网页端。
 
 | 情况 | 行为 |
 | --- | --- |
@@ -666,7 +673,7 @@ skill 指令本身（`SkillPromptInjection`）在**所有档位**都由 Magi 上
 
 ### 5.11 可用性
 
-daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是否出现在会话内主模型选择器，由 daemon 的可用性投影决定，前端不得自行根据本地状态猜测**：
+daemon 派生并投影 Web 引擎的登录、站点与档位状态，UI 只负责展示；**Web 模型的可用性与常规可见性由 daemon 投影决定，前端不得自行猜测**。在此基础上，A26 的「已有本地历史禁止导入 Web」是会话方向的独立门禁，前端可据当前 canonical/session 投影提前置灰，daemon 保存入口仍必须再次校验：
 
 | 状态 | 条件 | 行为 |
 | --- | --- | --- |
@@ -736,7 +743,7 @@ daemon 派生并投影 Web 引擎状态，UI 只负责展示；**Web 模型是�
 | 登录提示条 | Magi 不向 ChatGPT 登录页注入或筛选方式；在 GPT Web 主页叠加提示条，列出阶段 0 实测可用的方式，并说明「使用其他方式时弹窗会被内置浏览器阻止」；popup 被阻止时追加持久提示条直到登录成功 | popup 规则 |
 | 登录 / 登出 / 换号 | 登录成功后自动发现；登出或换号立即隐藏 Web 模型、失效绑定；Magi 不提供「切换账号」，需在 GPT Web 主页登出；登出 ≠ 清除数据（不删除 Magi 会话记录） | login_required / Invalidated |
 | 模型发现 | 「设置 → 浏览器 → GPT Web 模型」提供「连接 / 刷新 Web 模型」并展示候选，确认后写入 `engines`；未登录不展示旧列表；无有效探测结果时 fail closed（§5.5） | discovery |
-| 模型选择（会话内） | Web 引擎并入**会话内主模型选择器**，带「来自 Web」标识、账号提示与当前工具档位。现在选择器只列 provider `/settings/models/fetch` 返回的模型名、与 `engines` 无关；改为「provider 模型列表 ∪ daemon 投影的 Web 引擎条目」，Web 条目不写 provider 连接。选择写入会话的主模型覆盖（引擎绑定 + effort）。**注意现有语义**：写入会话 section 的同时会同步更新新会话默认值（`ORCHESTRATOR_SESSION_DEFAULTS_SECTION`），因此必须决定 `engineId` 是否允许进入默认值——默认**不允许**，避免新会话继承一个可能不可用的 Web 引擎。强度档位按该引擎 `efforts` 动态渲染、不支持置灰；切换强度会重建 Web 侧对话并多消耗 1 条账号消息；已选引擎不可用时按钮置灰并提供「切换其他模型」 | `origin=web` + 状态投影（A22） |
+| 模型选择（会话内） | Web 引擎并入**会话内主模型选择器**，带「来自 Web」标识、账号提示与当前工具档位。选择器数据源为「provider `/settings/models/fetch` 模型 ∪ daemon 投影的 Web 引擎」；Web 条目不写 provider 连接。**新会话草稿可选 Web；已有本地历史的会话中 Web 条目显示不可选并说明“暂不支持本地会话转 Web”**；当前 Web 会话选择 provider 模型即单向转本地，canonical 历史保留。选择写入会话的主模型覆盖（引擎绑定 + effort），`engineId` 不同步进 `ORCHESTRATOR_SESSION_DEFAULTS_SECTION`。强度档位按该引擎 `efforts` 动态渲染、不支持置灰；切换强度会重建 Web 侧对话并多消耗 1 条账号消息；已选引擎不可用时按钮置灰并提供「切换其他模型」 | `origin=web` + 状态投影（A22、A26） |
 | 工具档位徽标 | **选择器条目与会话 turn 运行指示行各一处**，取值覆盖 T0 / T2 / T3；降档必须在两处同时显示原因与额度影响 | A15 / §5.7.0 |
 | 额度提示 | 选择 / 使用 Web 模型时说明消耗 ChatGPT 账号额度、不计入会话预算；会话内显示本次任务已消耗的账号消息条数 | §5.10 |
 | 发送 / 等待 / 排队 | turn 运行指示行显示 daemon 投影的阶段文案：「等待 Web 引擎」「浏览器生成中」「排队中 · 当前第 N 位」；排队期间 turn 行提供**取消**入口（取消即出队），接近等待上限时给出预警 | turn 状态 |
