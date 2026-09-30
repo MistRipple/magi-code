@@ -9,6 +9,7 @@ mod errors;
 pub mod git_tool_runtime;
 mod host_paths;
 pub mod mcp_config;
+mod mcp_runtime;
 mod mcp_service;
 mod model_config;
 mod performance;
