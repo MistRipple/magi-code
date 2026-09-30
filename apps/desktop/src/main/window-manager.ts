@@ -13,6 +13,7 @@ import type {
   BrowserDownloadRuntimeSnapshot,
   BrowserDisplaySizeInput,
   BrowserSurfaceManager,
+  BrowserSurfaceRuntimeSnapshot,
 } from "./browser-surface-manager.js";
 import { secureBrowserWebviewAttachment } from "./browser-webview-security.js";
 import { DesktopWindowReadiness } from "./desktop-window-readiness.js";
@@ -71,6 +72,15 @@ function resolveWindowTitle(sessionTitle: string): string {
   return normalized || DEFAULT_WINDOW_TITLE;
 }
 
+/**
+ * 应用级（GPT Web）Surface 等待 Renderer 内容槽注册的上限。
+ *
+ * 必须明显小于 daemon 侧 `BROWSER_SURFACE_WAIT_TIMEOUT`（5 s），这样 Renderer
+ * 迟到时命令以「未注册」收口，由调用方重试，而不是把 5 s 预算耗在超时上。
+ */
+const APP_LEVEL_CONTENT_SLOT_WAIT_MILLIS = 4_000;
+const APP_LEVEL_CONTENT_SLOT_POLL_MILLIS = 50;
+
 export interface DesktopWindowSnapshot {
   desktopEpoch: string;
   windowId: string;
@@ -84,6 +94,14 @@ export interface DesktopWindowSnapshot {
   } | null;
   activeBrowserNavigationRevision: number | null;
   activeBrowserDownloads: BrowserDownloadRuntimeSnapshot[];
+  /**
+   * 本窗口内每个 Browser Tab 的承载身份（含没有激活意图的应用级 Tab）。
+   *
+   * 会话级 Tab 仍以 `layout.activeSurfaceId` 为准；应用级 GPT Web 会话不允许
+   * 写激活意图（A25、R49），只能靠这份清单拿到 `surfaceId` 与
+   * `navigationRevision` 才能注册 `<webview>`。
+   */
+  browserSurfaces: BrowserSurfaceRuntimeSnapshot[];
 }
 
 export class WindowManager {
@@ -305,6 +323,8 @@ export class WindowManager {
         ),
       activeBrowserDownloads:
         this.#surfaceManager.browserDownloadSnapshotsForWindow(windowId),
+      browserSurfaces:
+        this.#surfaceManager.browserSurfaceSnapshotsForWindow(windowId),
     };
   }
 
@@ -436,6 +456,87 @@ export class WindowManager {
     } finally {
       readiness.cancel();
     }
+  }
+
+  /**
+   * App 级（GPT Web）Surface 的后台驱动路径（设计基线 A25 / R49）。
+   *
+   * 与 `ensureBrowserSurface` 的唯一区别是**不写任何布局意图**：不设置
+   * `right_pane_visibility`、不切 `active_panel`、不推进 activation generation，
+   * 因此不会抢走右栏，也不会把当前 Tab 切到 GPT Web。
+   *
+   * Surface 已注册时直接返回既有 primary binding；未注册时只物化。
+   * Renderer 侧的应用级内容槽全程挂载（A25），所以常规推理不需要任何
+   * 激活动作即能完成 guest 注册。
+   */
+  async ensureBrowserSurfaceInBackground(
+    input: BrowserSurfaceActivationInput,
+  ): Promise<BrowserSurfaceBinding | null> {
+    const record = this.requireWindow(input.windowId);
+    const materialized = await this.materializeBrowserSurfaceInBackground(input);
+    if (
+      materialized &&
+      this.#surfaceManager.isContentSlotBoundBinding(materialized)
+    ) {
+      return materialized;
+    }
+    // 逻辑 Surface 由这次 materialize 建立，但真正的 guest 来自 Renderer 的
+    // 应用级内容槽。内容槽全程挂载（A25），注册只是异步到达，因此这里必须有
+    // 有界等待：否则每次探测/推理都要靠调用方重试才能命中同一份 Surface。
+    const deadline = Date.now() + APP_LEVEL_CONTENT_SLOT_WAIT_MILLIS;
+    for (;;) {
+      if (record.closed) throw new Error("desktop_window_closed");
+      const ready = this.#surfaceManager.primaryBindingForTabInWindow(
+        input.tabId,
+        input.windowId,
+      );
+      if (ready && this.#surfaceManager.isContentSlotBoundBinding(ready)) {
+        return ready;
+      }
+      if (Date.now() >= deadline) return ready;
+      await new Promise((resolve) => {
+        setTimeout(resolve, APP_LEVEL_CONTENT_SLOT_POLL_MILLIS);
+      });
+    }
+  }
+
+  /**
+   * Desktop Control 的应用级页面物化入口。
+   *
+   * App Web 的推理页面由 daemon 的 `create_page` 创建，主页仍需要后续真实
+   * Renderer 入口接入同一条后台物化路径；无论调用方是谁，这里都绝不写
+   * `active_panel`、右栏可见性或窗口焦点。
+   */
+  async materializeBrowserSurfaceInBackground(
+    input: BrowserSurfaceActivationInput,
+  ): Promise<BrowserSurfaceBinding | null> {
+    const record = this.requireWindow(input.windowId);
+    const existing = this.#surfaceManager.primaryBindingForTabInWindow(
+      input.tabId,
+      input.windowId,
+    );
+    if (existing && this.#surfaceManager.isContentSlotBoundBinding(existing)) {
+      // Renderer 重建或新 guest 注册后，逻辑 Surface 可能已经存在但窗口没有
+      // 收到那一代快照。后台路径不能依赖布局变化来发布 app-level identity。
+      this.publishSnapshot(record);
+      return existing;
+    }
+    const binding = await this.#surfaceManager.materialize({
+      windowId: input.windowId,
+      tabId: input.tabId,
+      browserSessionId: input.browserSessionId,
+      initialUrl: input.url,
+      navigationRevision: input.navigationRevision,
+      viewport: input.viewport,
+      awaitPageLoad: false,
+      reannouncePrimary: true,
+    });
+    if (record.closed) throw new Error("desktop_window_closed");
+    // materialize 先建立逻辑 Surface，再等待 Renderer 内容槽注册真实 guest。
+    // 这里必须立刻广播快照，否则 App Renderer 永远拿不到 browserSurfaces，
+    // 也就无法创建 <webview> 来完成后续注册；该广播不改变任何布局意图。
+    this.publishSnapshot(record);
+    return binding;
   }
 
   async waitForBrowserSurface(input: {
@@ -935,12 +1036,38 @@ export class WindowManager {
   }
 
   private applyLayout(record: DesktopWindowRecord): DesktopWindowSnapshot {
-    const snapshot = this.snapshot(record.windowId);
+    const snapshot = this.publishSnapshot(record);
     // BrowserWindow 的直属 Renderer 自动填满客户区。真实 Chromium guest
     // 是右栏 DOM 的子节点，窗口布局事务不再维护任何原生子 View 几何。
+    return snapshot;
+  }
+
+  /**
+   * 发布当前窗口的完整运行时快照，而不触碰窗口布局。
+   *
+   * App 级 GPT Web 的后台 materialize 需要在没有 `active_panel` 或右栏可见性
+   * 变化时，把新建的 `browserSurfaces` 投影给 Renderer；因此快照发布必须成为
+   * 独立事务，而不能隐含在 `applyLayout` 的布局事务里。
+   */
+  private publishSnapshot(record: DesktopWindowRecord): DesktopWindowSnapshot {
+    const snapshot = this.snapshot(record.windowId);
     this.resolveBrowserSurfaceReadiness(record);
     this.#onSnapshot(snapshot);
     return snapshot;
+  }
+
+  /**
+   * Browser Surface Primary / 导航身份变化时，向所有窗口重发快照。
+   *
+   * `browserSurfaces` 不是布局 reducer 的字段：Primary 在窗口间迁移、应用级
+   * 页面导航或 guest 重绑都可能改变它，但不会产生 layoutRevision。若只给事件
+   * 来源窗口回推，旧窗口会继续持有过期身份并尝试注册已不再是 Primary 的 guest。
+   */
+  publishSnapshots(): void {
+    for (const record of this.#records.values()) {
+      if (record.closed || record.window.isDestroyed()) continue;
+      this.publishSnapshot(record);
+    }
   }
 
   private reconcileActiveBrowserSurface(record: DesktopWindowRecord): void {

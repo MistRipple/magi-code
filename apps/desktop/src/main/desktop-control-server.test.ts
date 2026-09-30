@@ -431,6 +431,104 @@ test("ensure_surface 在逻辑 Surface 尚未绑定 guest 时等待并返回真�
   }
 });
 
+test("GPT Web ensure_surface 只走后台物化，不激活右栏", async () => {
+  const appSurface = {
+    ...bindingForTab("tab-web-model"),
+    browser_context_id: "browser-session-app-1759000000000-0",
+  };
+  let foregroundCalls = 0;
+  let backgroundCalls = 0;
+  let backgroundInput: unknown = null;
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    bindings: [appSurface],
+    primaryTabId: appSurface.tab_id,
+    ensureBrowserSurface: async () => {
+      foregroundCalls += 1;
+    },
+    ensureBrowserSurfaceInBackground: async (input) => {
+      backgroundCalls += 1;
+      backgroundInput = input;
+    },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(
+      client,
+      (message) => message.request_id === "ensure-web-model-surface",
+    );
+    client.send(JSON.stringify(request("ensure-web-model-surface", {
+      type: "ensure_surface",
+      payload: { tab_id: appSurface.tab_id },
+    })));
+    const response = await responsePromise;
+    assert.equal(response.outcome?.status, "succeeded");
+    assert.equal(backgroundCalls, 1);
+    assert.equal(foregroundCalls, 0);
+    assert.deepEqual(backgroundInput, {
+      windowId: appSurface.window_id,
+      tabId: appSurface.tab_id,
+      browserSessionId: appSurface.browser_context_id,
+      url: "https://example.test/",
+      navigationRevision: appSurface.navigation_revision,
+      viewport: { mode: "auto" },
+    });
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
+test("Primary 在后台物化期间换到另一窗口时拒绝旧窗口 binding", async () => {
+  const firstWindow = {
+    ...bindingForTab("tab-window-race"),
+    window_id: "window-1",
+    browser_context_id: "browser-session-app-1759000000000-0",
+  };
+  const secondWindow = {
+    ...bindingForTab("tab-window-race"),
+    window_id: "window-2",
+    surface_id: "surface-window-2",
+    browser_context_id: firstWindow.browser_context_id,
+  };
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    bindings: [firstWindow, secondWindow],
+    primaryTabId: firstWindow.tab_id,
+    primaryWindowId: firstWindow.window_id,
+    switchPrimaryWindowOnEnsure: secondWindow.window_id,
+    ensureBrowserSurfaceInBackground: async () => undefined,
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(
+      client,
+      (message) => message.request_id === "ensure-window-race",
+    );
+    client.send(JSON.stringify(request("ensure-window-race", {
+      type: "ensure_surface",
+      payload: { tab_id: firstWindow.tab_id },
+    })));
+    const response = await responsePromise;
+    assert.equal(response.outcome?.status, "failed");
+    assert.match(
+      JSON.stringify(response.outcome),
+      /browser_surface_window_stale/u,
+    );
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("Host 重新连接时重放当前 Primary Surface，重启后自动化仍有权威 Tab 身份", async () => {
   const primary = bindingForTab("tab-primary");
   const background = bindingForTab("tab-background");
@@ -853,12 +951,15 @@ function createControlServer(
   options: {
     bindings?: BrowserSurfaceBinding[];
     primaryTabId?: string;
+    primaryWindowId?: string;
+    switchPrimaryWindowOnEnsure?: string;
     bindingAvailable?: () => boolean;
     materialize?: (input: unknown) => Promise<BrowserSurfaceBinding>;
     recordForBinding?: () => { getURL: () => string; getTitle: () => string };
     navigate?: (binding: BrowserSurfaceBinding, navigation: unknown) => Promise<unknown>;
     stopNavigation?: (binding: BrowserSurfaceBinding) => Promise<unknown>;
     ensureBrowserSurface?: (input: unknown) => Promise<void>;
+    ensureBrowserSurfaceInBackground?: (input: unknown) => Promise<void>;
     onConnectionState?: (connected: boolean) => void;
     onHostControlReleased?: () => void;
   } = {},
@@ -870,14 +971,33 @@ function createControlServer(
   const socketPath = join(socketRoot, `magi-dc-${process.pid}-${socketSequence++}.sock`);
   const bindings = options.bindings ?? [binding];
   let primaryTabId = options.primaryTabId ?? binding.tab_id;
+  let primaryWindowId = options.primaryWindowId
+    ?? bindings.find((candidate) => candidate.tab_id === primaryTabId)?.window_id
+    ?? binding.window_id;
   const surfaceManager = {
     primaryBindingForTab: (tabId: string) => (
       options.bindingAvailable?.() !== false
-        ? bindings.find((candidate) => candidate.tab_id === tabId && candidate.tab_id === primaryTabId) ?? null
+        ? bindings.find((candidate) => (
+          candidate.tab_id === tabId
+          && candidate.tab_id === primaryTabId
+          && candidate.window_id === primaryWindowId
+        )) ?? null
+        : null
+    ),
+    primaryBindingForTabInWindow: (tabId: string, windowId: string) => (
+      options.bindingAvailable?.() !== false
+        ? bindings.find((candidate) => (
+          candidate.tab_id === tabId
+          && candidate.window_id === windowId
+          && candidate.tab_id === primaryTabId
+          && candidate.window_id === primaryWindowId
+        )) ?? null
         : null
     ),
     activationInputForTab: (tabId: string) => {
-      const candidate = bindings.find((item) => item.tab_id === tabId);
+      const candidate = bindings.find((item) => (
+        item.tab_id === tabId && item.window_id === primaryWindowId
+      )) ?? bindings.find((item) => item.tab_id === tabId);
       if (!candidate) return null;
       return {
         windowId: candidate.window_id,
@@ -927,6 +1047,16 @@ function createControlServer(
       }
       primaryTabId = input.tabId;
     },
+    ...(options.ensureBrowserSurfaceInBackground
+      ? {
+          ensureBrowserSurfaceInBackground: async (input: unknown) => {
+            await options.ensureBrowserSurfaceInBackground!(input);
+            if (options.switchPrimaryWindowOnEnsure) {
+              primaryWindowId = options.switchPrimaryWindowOnEnsure;
+            }
+          },
+        }
+      : {}),
     handshake: () => handshake,
     ...(options.onConnectionState ? { onConnectionState: options.onConnectionState } : {}),
   });

@@ -32,6 +32,7 @@ import type {
   BrowserSurfaceEvent,
   BrowserSurfaceManager,
 } from "./browser-surface-manager.js";
+import { isWebModelBrowserSession } from "./web-model-session.js";
 
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -61,6 +62,16 @@ type EnsureBrowserSurface = (
   input: BrowserSurfaceActivationInput,
 ) => Promise<unknown>;
 
+/**
+ * App 级（GPT Web）Surface 的后台物化路径：不写布局意图、不抢右栏。
+ * 生产由 WindowManager 注入；缺省回退到激活路径只用于测试装配。
+ */
+type EnsureBrowserSurfaceInBackground = EnsureBrowserSurface;
+
+type MaterializeBrowserSurfaceInBackground = (
+  input: BrowserSurfaceActivationInput,
+) => Promise<BrowserSurfaceBinding | null>;
+
 interface AnnotationProjection {
   revision: number;
   annotations: unknown[];
@@ -73,6 +84,8 @@ export class DesktopControlServer {
   readonly #worker: AutomationWorker;
   readonly #waitForActiveWindow: (signal?: AbortSignal) => Promise<string>;
   readonly #ensureBrowserSurface: EnsureBrowserSurface;
+  readonly #ensureBrowserSurfaceInBackground: EnsureBrowserSurfaceInBackground;
+  readonly #materializeBrowserSurfaceInBackground: MaterializeBrowserSurfaceInBackground;
   readonly #handshake: () => DesktopBrowserHandshake;
   readonly #onConnectionState: ((connected: boolean) => void) | undefined;
   readonly #queues = new Map<string, ResourceQueue>();
@@ -114,6 +127,8 @@ export class DesktopControlServer {
     worker: AutomationWorker;
     waitForActiveWindow: (signal?: AbortSignal) => Promise<string>;
     ensureBrowserSurface: EnsureBrowserSurface;
+    ensureBrowserSurfaceInBackground?: EnsureBrowserSurfaceInBackground;
+    materializeBrowserSurfaceInBackground?: MaterializeBrowserSurfaceInBackground;
     handshake: () => DesktopBrowserHandshake;
     onConnectionState?: (connected: boolean) => void;
   }) {
@@ -123,6 +138,17 @@ export class DesktopControlServer {
     this.#worker = input.worker;
     this.#waitForActiveWindow = input.waitForActiveWindow;
     this.#ensureBrowserSurface = input.ensureBrowserSurface;
+    this.#ensureBrowserSurfaceInBackground =
+      input.ensureBrowserSurfaceInBackground ?? input.ensureBrowserSurface;
+    this.#materializeBrowserSurfaceInBackground =
+      input.materializeBrowserSurfaceInBackground ??
+      ((surfaceInput) =>
+        this.#surfaceManager.materialize({
+          ...surfaceInput,
+          initialUrl: surfaceInput.url,
+          awaitPageLoad: false,
+          reannouncePrimary: true,
+        }));
     this.#handshake = input.handshake;
     this.#onConnectionState = input.onConnectionState;
   }
@@ -588,10 +614,19 @@ export class DesktopControlServer {
         durationMs: Math.round(performance.now() - startedAt),
       });
     } catch (cause) {
+      const failure = normalizeError(cause);
+      // 只记录命令类型与归一化错误码/文案：这是断链排查的第一现场，
+      // 不打印请求载荷（可能含页面文本或凭据）。
+      console.warn("[DesktopControlServer] Browser command failed", {
+        requestId: command.request.request_id,
+        command: command.request.command.type,
+        durationMs: Math.round(performance.now() - startedAt),
+        error: failure.message,
+      });
       if (!command.connection.closed && !command.cancellationRequested) {
         this.sendEnvelope(
           command.connection,
-          failedResponse(command.request.request_id, normalizeError(cause)),
+          failedResponse(command.request.request_id, failure),
         );
       }
     } finally {
@@ -791,22 +826,36 @@ export class DesktopControlServer {
         const current = this.#surfaceManager.primaryBindingForTab(
           command.payload.tab_id,
         );
+        const currentPrimary = this.#surfaceManager.activationInputForTab(
+          command.payload.tab_id,
+        );
         // 创建/恢复是资源物化阶段，不能等待 Renderer 内容槽。新建 Tab 的
         // Renderer 记录只有在这个响应返回后才会出现；如果这里调用
         // ensureBrowserSurface，就会形成“等待内容槽 -> 内容槽等待创建响应”
         // 的环路，并让新 Tab 无故卡住一整个内容槽超时周期。
         const windowId =
-          current?.window_id ?? (await this.#waitForActiveWindow(signal));
-        const binding = await this.#surfaceManager.materialize({
+          current?.window_id ??
+          currentPrimary?.windowId ??
+          (await this.#waitForActiveWindow(signal));
+        const materializeInput: BrowserSurfaceActivationInput = {
           windowId,
           tabId: command.payload.tab_id,
           browserSessionId: command.payload.browser_session_id,
-          initialUrl: command.payload.initial_url,
+          url: command.payload.initial_url,
           navigationRevision: command.payload.navigation_revision,
           viewport: command.payload.logical_viewport,
+        };
+        const materializeOptions = {
+          ...materializeInput,
+          initialUrl: materializeInput.url,
           awaitPageLoad: false,
           reannouncePrimary: true,
-        });
+        };
+        const binding = isWebModelBrowserSession(
+          command.payload.browser_session_id,
+        )
+          ? await this.#materializeBrowserSurfaceInBackground(materializeInput)
+          : await this.#surfaceManager.materialize(materializeOptions);
         // create_page 只负责登记逻辑 Browser Tab。真正的 guest 由右栏
         // <webview> 随后注册；此阶段不能等待或伪造 WebContents binding。
         const contents = binding
@@ -1110,9 +1159,19 @@ export class DesktopControlServer {
   ): Promise<BrowserSurfaceBinding> {
     const activation = this.#surfaceManager.activationInputForTab(tabId);
     if (!activation) throw new Error("browser_surface_not_found");
-    await this.#ensureBrowserSurface(activation);
+    // App 级（GPT Web）走后台物化：不写 right_pane_visibility / active_panel，
+    // 不切用户的右栏，也不抢焦点（A25、R49）。会话级 Tab 维持原有激活语义。
+    if (isWebModelBrowserSession(activation.browserSessionId)) {
+      await this.#ensureBrowserSurfaceInBackground(activation);
+    } else {
+      await this.#ensureBrowserSurface(activation);
+    }
     await this.waitForSurfaceRebind(tabId);
-    const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
+    const binding = requirePrimaryBinding(
+      this.#surfaceManager,
+      tabId,
+      activation.windowId,
+    );
     if (!this.#surfaceManager.isContentSlotBoundBinding(binding)) {
       throw new Error("browser_surface_content_slot_unavailable");
     }
@@ -1218,9 +1277,16 @@ function isPageStateInteraction(command: BrowserHostCommand): boolean {
   );
 }
 
-function requirePrimaryBinding(manager: BrowserSurfaceManager, tabId: string) {
+function requirePrimaryBinding(
+  manager: BrowserSurfaceManager,
+  tabId: string,
+  windowId?: string,
+) {
   const binding = manager.primaryBindingForTab(tabId);
   if (!binding) throw new Error("browser_surface_not_found");
+  if (windowId && binding.window_id !== windowId) {
+    throw new Error("browser_surface_window_stale");
+  }
   return binding;
 }
 

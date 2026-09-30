@@ -67,3 +67,25 @@ test("非空白初始导航在 guest 创建前被拒绝", () => {
     reason: "browser_webview_initial_url_invalid",
   });
 });
+
+test("应用级 GPT Web 固定持久分区被放行", () => {
+  const decision = secureBrowserWebviewAttachment(
+    {},
+    { src: "about:blank", partition: "persist:magi-web-model" },
+  );
+  assert.deepEqual(decision, { allowed: true, reason: null });
+});
+
+test("其它 persist 分区仍然被拒绝", () => {
+  for (const partition of ["persist:magi-web-model-2", "persist:web-model", "magi-web-model"]) {
+    const decision = secureBrowserWebviewAttachment(
+      {},
+      { src: "about:blank", partition },
+    );
+    assert.deepEqual(
+      decision,
+      { allowed: false, reason: "browser_webview_partition_invalid" },
+      `partition ${partition} 不应被放行`,
+    );
+  }
+});

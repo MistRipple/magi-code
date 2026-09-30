@@ -1,7 +1,14 @@
 import type { WebPreferences } from "electron";
+import { WEB_MODEL_PARTITION } from "./web-model-session.js";
 
 const BROWSER_PARTITION_PATTERN = /^magi-browser-[A-Za-z0-9._-]+$/u;
-
+/**
+ * 应用级 GPT Web 会话的固定持久分区。
+ *
+ * Electron 中只有带 `persist:` 前缀的 partition 才会落盘；现有
+ * `magi-browser-<id>` 是内存会话，进程退出即丢登录态（设计基线 A21）。
+ * 该分区名与应用级 `browserSessionId` 无关，因此 id 变化不影响登录态。
+ */
 export interface BrowserWebviewAttachmentDecision {
   allowed: boolean;
   reason: "browser_webview_initial_url_invalid" | "browser_webview_partition_invalid" | null;
@@ -18,7 +25,11 @@ export function secureBrowserWebviewAttachment(
   if (params.src !== "about:blank") {
     return { allowed: false, reason: "browser_webview_initial_url_invalid" };
   }
-  if (!BROWSER_PARTITION_PATTERN.test(params.partition ?? "")) {
+  const partition = params.partition ?? "";
+  if (
+    !BROWSER_PARTITION_PATTERN.test(partition) &&
+    partition !== WEB_MODEL_PARTITION
+  ) {
     return { allowed: false, reason: "browser_webview_partition_invalid" };
   }
 

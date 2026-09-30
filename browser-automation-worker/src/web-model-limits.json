@@ -1,0 +1,50 @@
+{
+  "revision": "uncalibrated-2026-09-29",
+  "note": "阶段 0 标定前只有参考项目量级的初值；标定后整体替换本文件并推进 revision。字段语义见设计基线 §5.9.2。",
+  "defaults": {
+    "input_token_budget": 41000,
+    "composer_char_limit": 210000,
+    "single_submission_token_budget": 16000,
+    "response_reserve": 8000,
+    "tokenizer_revision": "o200k",
+    "limit_behaviour": "error"
+  },
+  "entries": [
+    {
+      "account_hint": "free",
+      "family": "*",
+      "effort": "*",
+      "connector": false,
+      "input_token_budget": 32000,
+      "composer_char_limit": 210000,
+      "single_submission_token_budget": 16000,
+      "response_reserve": 8000,
+      "tokenizer_revision": "o200k",
+      "limit_behaviour": "error"
+    },
+    {
+      "account_hint": "plus",
+      "family": "*",
+      "effort": "*",
+      "connector": false,
+      "input_token_budget": 90000,
+      "composer_char_limit": 1050000,
+      "single_submission_token_budget": 28000,
+      "response_reserve": 12000,
+      "tokenizer_revision": "o200k",
+      "limit_behaviour": "error"
+    },
+    {
+      "account_hint": "pro",
+      "family": "*",
+      "effort": "*",
+      "connector": false,
+      "input_token_budget": 112000,
+      "composer_char_limit": 1050000,
+      "single_submission_token_budget": 32000,
+      "response_reserve": 16000,
+      "tokenizer_revision": "o200k",
+      "limit_behaviour": "error"
+    }
+  ]
+}

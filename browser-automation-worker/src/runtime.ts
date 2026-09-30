@@ -14,6 +14,21 @@ import type {
 import { isAllowedBrowserChildTarget } from "@magi/desktop-browser-contracts";
 import { CdpClient } from "./cdp-client.js";
 import { INSTALL_PAGE_RUNTIME, MAGI_AUTOMATION_WORLD } from "./page-script.js";
+import { lookupWebModelLimits, loadWebModelLimits } from "./web-model-limits.js";
+import { firstTextDivergence } from "./web-model-site.js";
+import {
+  INSTALL_WEB_MODEL_ADAPTER,
+  WEB_MODEL_SITE_REVISION,
+  composerTextDigest,
+  composerTextReadbackMatches,
+  contentEditableBlockBoundaryVariant,
+  isSupportedChatGptOrigin,
+  normalizeComposerText,
+  normalizeWebModelProbe,
+  normalizeWebModelTurnState,
+  type WebModelRawSnapshot,
+  type WebModelRawTurnState,
+} from "./web-model-site.js";
 
 interface PageRuntimeState {
   binding: BrowserSurfaceBinding;
@@ -243,6 +258,243 @@ export class BrowserAutomationRuntime {
             payload: { value: await this.devtools(binding, command.payload.operation, command.payload.arguments) },
           },
         };
+      case "web_model_probe": {
+        await this.ensureWebModelAdapter(binding);
+        const raw = await this.evaluate<WebModelRawSnapshot>(
+          binding,
+          "globalThis.__magiWebModel.probe()",
+        );
+        if (!isRawWebModelSnapshot(raw)) {
+          throw protocolFailure(
+            "web_model_probe_result_invalid",
+            "页面适配器返回的模型探测快照缺少稳定的 origin / composer / modelItems 字段",
+          );
+        }
+        const probe = normalizeWebModelProbe(raw);
+        if (!isSupportedChatGptOrigin(raw.origin)) {
+          throw protocolFailure(
+            "web_model_site_origin_invalid",
+            `站点 origin 不受支持：${raw.origin || "<empty>"}；仅允许 chatgpt.com 或 chat.openai.com`,
+          );
+        }
+        if (probe.loginState === "signed_in" && probe.models.length === 0) {
+          throw protocolFailure(
+            "web_model_selectors_drift",
+            `GPT Web 已登录但未发现可识别模型：${probe.diagnostic ?? "model_items_unrecognized"}`,
+          );
+        }
+        // 上限表随应用发布、由本层回传，daemon 不再维护第二份数据（§5.9.2）。
+        const limits = loadWebModelLimits();
+        const models = probe.models.map((model) => {
+          const entry = lookupWebModelLimits(limits, {
+            accountHint: probe.accountHint,
+            family: model.family,
+          });
+          return {
+            family: model.family,
+            display_name: model.displayName,
+            efforts: model.efforts,
+            default_effort: model.defaultEffort,
+            context_window_tokens: entry.inputTokenBudget,
+            single_submission_token_budget: entry.singleSubmissionTokenBudget,
+            response_reserve: entry.responseReserve,
+            tokenizer_revision: entry.tokenizerRevision,
+          };
+        });
+        return {
+          result: {
+            type: "json",
+            payload: {
+              value: {
+                site_revision: probe.siteRevision,
+                login_state: probe.loginState,
+                composer_available: probe.composerAvailable,
+                composer_char_limit: probe.composerCharLimit
+                  ?? lookupWebModelLimits(limits, { accountHint: probe.accountHint, family: "*" }).composerCharLimit,
+                account_hint: probe.accountHint,
+                limits_revision: limits.revision,
+                models,
+                connector_support: probe.connectorSupport,
+                connector_settings_reachable: raw.connectorSettingsFound,
+              },
+            },
+          },
+        };
+      }
+      case "web_write_text": {
+        await this.ensureWebModelAdapter(binding);
+        const { selector, text, mode, expect_text_digest: expectDigest } = command.payload;
+        const timeoutMs = normalizeWebCommandTimeout(command.payload.timeout_ms);
+        const expectedText = normalizeComposerText(text);
+        const observed = await this.evaluate<{
+          text: string;
+          charCount: number;
+          becameAttachment: boolean;
+        }>(
+          binding,
+          `globalThis.__magiWebModel.writeText(${JSON.stringify({
+            selector,
+            text,
+            mode,
+            timeout_ms: timeoutMs,
+          })})`,
+        );
+        if (
+          !observed
+          || typeof observed.text !== "string"
+          || typeof observed.charCount !== "number"
+          || !Number.isSafeInteger(observed.charCount)
+          || observed.charCount < 0
+          || typeof observed.becameAttachment !== "boolean"
+        ) {
+          throw protocolFailure(
+            "web_write_text_result_invalid",
+            "页面适配器未返回完整的 text / charCount / becameAttachment 回读事实",
+          );
+        }
+        const digest = composerTextDigest(observed.text);
+        // 写入与回读用同一归一化与摘要；未给期望摘要时退回语义比对，
+        // 绝不把「命令返回成功」当成「内容已正确进入输入框」。
+        const observedText = normalizeComposerText(observed.text);
+        const expectedTextDigest = composerTextDigest(expectedText);
+        const expectedChars = Array.from(expectedText);
+        const observedChars = Array.from(observedText);
+        const observedSuffix = observedChars
+          .slice(Math.max(0, observedChars.length - expectedChars.length))
+          .join("");
+        const tailMatched = mode === "append"
+          && (expectedText.length === 0
+            || observedText.endsWith(expectedText)
+            || observedText.endsWith(contentEditableBlockBoundaryVariant(expectedText)));
+        const digestMatched = expectDigest === undefined
+          || expectDigest === null
+          || digest === expectDigest
+          || (mode === "append" && expectedTextDigest === expectDigest);
+        const confirmed = !observed.becameAttachment
+          && (mode === "append" ? tailMatched : composerTextReadbackMatches(expectedText, observedText))
+          && digestMatched;
+        // 未确认时只带分歧位置与两侧长度：诊断需要定位站点改写了什么，
+        // 但不需要（也不应该）把整段正文复制进日志。
+        const mismatch = confirmed
+          ? null
+          : firstTextDivergence(
+            expectedText,
+            mode === "append"
+              ? observedSuffix
+              : observedText,
+          );
+        return {
+          result: {
+            type: "json",
+            payload: {
+              value: {
+                confirmed,
+                digest,
+                char_count: observed.charCount,
+                became_attachment: observed.becameAttachment,
+                mismatch,
+                diagnostic: confirmed
+                  ? null
+                  : observed.becameAttachment
+                    ? "content_became_attachment"
+                    : !digestMatched
+                      ? "digest_mismatch"
+                    : mode === "append" && !tailMatched
+                      ? "append_suffix_mismatch"
+                      : "composer_readback_mismatch",
+              },
+            },
+          },
+        };
+      }
+      case "web_observe": {
+        await this.ensureWebModelAdapter(binding);
+        const payload = command.payload;
+        const observed = await this.evaluate<{
+          revision: number;
+          nodes: Array<Record<string, unknown>>;
+        }>(
+          binding,
+          `globalThis.__magiWebModel.observe(${JSON.stringify({
+            selector: payload.selector,
+            fields: payload.fields,
+            attribute: payload.attribute ?? null,
+          })})`,
+        );
+        if (!isWebObserveResult(observed)) {
+          throw protocolFailure(
+            "web_observe_result_invalid",
+            "页面适配器返回的观察结果缺少 revision 或 nodes",
+          );
+        }
+        // selector 不可达不报错：页面脚本返回 found:false，完成谓词由调用方判定。
+        return { result: { type: "json", payload: { value: observed } } };
+      }
+      case "web_submit": {
+        await this.ensureWebModelAdapter(binding);
+        // 提交只负责「把输入交给站点并观察输入框是否清空」；是否被接受由
+        // `web_turn_state` 的消息计数证据判定，不以返回成功为准（§5.6 步骤 4）。
+        const submitted = await this.evaluate<{
+          submitted: boolean;
+          composer_empty: boolean;
+          reason: string | null;
+        }>(binding, "globalThis.__magiWebModel.submit()");
+        if (!isWebSubmitResult(submitted)) {
+          throw protocolFailure(
+            "web_submit_result_invalid",
+            "页面适配器返回的提交结果缺少 submitted / composer_empty / reason",
+          );
+        }
+        return { result: { type: "json", payload: { value: submitted } } };
+      }
+      case "web_turn_state": {
+        await this.ensureWebModelAdapter(binding);
+        const raw = await this.evaluate<WebModelRawTurnState>(
+          binding,
+          "globalThis.__magiWebModel.turnState()",
+        );
+        if (!isRawWebModelTurnState(raw)) {
+          throw protocolFailure(
+            "web_turn_state_result_invalid",
+            "页面适配器返回的回合状态缺少登录、消息计数或助手正文事实",
+          );
+        }
+        const state = normalizeWebModelTurnState(raw);
+        return {
+          result: {
+            type: "json",
+            payload: {
+              value: {
+                site_revision: state.siteRevision,
+                login_state: state.loginState,
+                blocked: state.blocked,
+                generating: state.generating,
+                composer_found: state.composerFound,
+                user_message_count: state.userMessageCount,
+                assistant_message_count: state.assistantMessageCount,
+                assistant_text: state.assistantText,
+                thinking_text: state.thinkingText,
+              },
+            },
+          },
+        };
+      }
+      case "web_cancel_generation": {
+        await this.ensureWebModelAdapter(binding);
+        const cancelled = await this.evaluate<boolean>(
+          binding,
+          "globalThis.__magiWebModel.cancelGeneration()",
+        );
+        if (typeof cancelled !== "boolean") {
+          throw protocolFailure("web_cancel_result_invalid", "页面适配器返回的取消结果不是 boolean");
+        }
+        return {
+          result: {
+            type: "json",
+            payload: { value: { cancelled } },
+          },
+        };
+      }
       case "ping":
         return { result: { type: "pong", payload: { monotonic_millis: Math.floor(performance.now()) } } };
       default:
@@ -403,6 +655,44 @@ export class BrowserAutomationRuntime {
     } catch (cause) {
       if (page.executionContextId === world.executionContextId) page.executionContextId = null;
       throw cause;
+    }
+  }
+
+  /**
+   * 惰性安装 ChatGPT 站点适配器（幂等）。
+   *
+   * 与页面自动化运行时同处一个 isolated world，但只在真正用到站点适配命令时
+   * 安装，普通浏览器工具不会承担这份脚本成本。
+   */
+  private async ensureWebModelAdapter(binding: BrowserSurfaceBinding): Promise<void> {
+    const origin = await this.evaluate<string>(binding, "location.origin");
+    if (!isSupportedChatGptOrigin(origin)) {
+      throw protocolFailure(
+        "web_model_site_origin_invalid",
+        `当前页面不是受支持的 ChatGPT Web origin：${origin || "<empty>"}`,
+      );
+    }
+    const installed = await this.evaluate<boolean>(
+      binding,
+      `Boolean(globalThis.__magiWebModel
+        && globalThis.__magiWebModel.adapter_epoch === ${JSON.stringify(WEB_MODEL_SITE_REVISION)}
+        && ["probe", "writeText", "observe", "submit", "turnState", "cancelGeneration"]
+          .every((name) => typeof globalThis.__magiWebModel[name] === "function"))`,
+    );
+    if (installed) return;
+    await this.evaluate(binding, INSTALL_WEB_MODEL_ADAPTER);
+    const verified = await this.evaluate<boolean>(
+      binding,
+      `Boolean(globalThis.__magiWebModel
+        && globalThis.__magiWebModel.adapter_epoch === ${JSON.stringify(WEB_MODEL_SITE_REVISION)}
+        && ["probe", "writeText", "observe", "submit", "turnState", "cancelGeneration"]
+          .every((name) => typeof globalThis.__magiWebModel[name] === "function"))`,
+    );
+    if (!verified) {
+      throw protocolFailure(
+        "web_model_adapter_missing",
+        "ChatGPT Web 页面适配器安装后未暴露完整命令集合",
+      );
     }
   }
 
@@ -1883,10 +2173,85 @@ function normalizeError(cause: unknown) {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isRawWebModelSnapshot(value: unknown): value is WebModelRawSnapshot {
+  return isRecord(value)
+    && typeof value.origin === "string"
+    && typeof value.path === "string"
+    && typeof value.blocked === "boolean"
+    && typeof value.composerFound === "boolean"
+    && (value.composerCharLimit === null
+      || (typeof value.composerCharLimit === "number"
+        && Number.isSafeInteger(value.composerCharLimit)
+        && value.composerCharLimit >= 0))
+    && typeof value.conversationFound === "boolean"
+    && typeof value.modelMenuFound === "boolean"
+    && Array.isArray(value.modelItems)
+    && value.modelItems.every((item) => isRecord(item)
+      && typeof item.label === "string"
+      && typeof item.checked === "boolean"
+      && Array.isArray(item.efforts)
+      && item.efforts.every((effort) => typeof effort === "string")
+      && (item.modelId === undefined || item.modelId === null || typeof item.modelId === "string")
+      && (item.defaultEffort === undefined || item.defaultEffort === null || typeof item.defaultEffort === "string"))
+    && (value.accountHint === null || typeof value.accountHint === "string")
+    && typeof value.connectorSettingsFound === "boolean";
+}
+
+function isWebObserveResult(value: unknown): value is { revision: number; nodes: Array<Record<string, unknown>> } {
+  return isRecord(value)
+    && typeof value.revision === "number"
+    && Number.isSafeInteger(value.revision)
+    && value.revision >= 0
+    && Array.isArray(value.nodes)
+    && value.nodes.every((node) => isRecord(node) && typeof node.found === "boolean");
+}
+
+function isWebSubmitResult(value: unknown): value is {
+  submitted: boolean;
+  composer_empty: boolean;
+  reason: string | null;
+} {
+  return isRecord(value)
+    && typeof value.submitted === "boolean"
+    && typeof value.composer_empty === "boolean"
+    && (value.reason === null || typeof value.reason === "string");
+}
+
+function isRawWebModelTurnState(value: unknown): value is WebModelRawTurnState {
+  return isRecord(value)
+    && typeof value.origin === "string"
+    && typeof value.path === "string"
+    && typeof value.blocked === "boolean"
+    && typeof value.generating === "boolean"
+    && typeof value.conversation_found === "boolean"
+    && typeof value.composer_found === "boolean"
+    && typeof value.user_message_count === "number"
+    && Number.isSafeInteger(value.user_message_count)
+    && value.user_message_count >= 0
+    && typeof value.assistant_message_count === "number"
+    && Number.isSafeInteger(value.assistant_message_count)
+    && value.assistant_message_count >= 0
+    && typeof value.assistant_text === "string"
+    && typeof value.thinking_text === "string"
+    && (value.account_hint === null || typeof value.account_hint === "string");
+}
+
 function protocolFailure(code: string, message: string): Error {
   const error = new Error(`${code}:${message}`);
   error.name = "BrowserAutomationError";
   return error;
+}
+
+function normalizeWebCommandTimeout(value: number | null | undefined): number {
+  if (value === undefined || value === null) return 250;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw protocolFailure("web_command_timeout_invalid", "timeout_ms must be a non-negative integer");
+  }
+  return value;
 }
 
 async function withTraceTimeout(promise: Promise<void>): Promise<void> {

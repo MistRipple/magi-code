@@ -158,6 +158,72 @@ function consoleCommand(): BrowserHostCommand {
   };
 }
 
+interface WebScriptResponses {
+  probe?: Record<string, unknown>;
+  write?: Record<string, unknown>;
+  observe?: Record<string, unknown>;
+  submit?: Record<string, unknown>;
+  turnState?: Record<string, unknown>;
+  cancel?: boolean;
+  origin?: string;
+}
+
+function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
+  let adapterInstalled = false;
+  let observeCalls = 0;
+  return new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") {
+      adapterInstalled = false;
+      return { executionContextId: 1 };
+    }
+    if (method !== "Runtime.evaluate") return {};
+    const expression = String(params.expression ?? "");
+    if (expression.includes("globalThis.__magiWebModel =")) {
+      adapterInstalled = true;
+      return { result: { value: null } };
+    }
+    if (expression === "location.origin") {
+      return { result: { value: responses.origin ?? "https://chatgpt.com" } };
+    }
+    if (expression.includes("globalThis.__magiWebModel") && expression.includes("adapter_epoch")) {
+      return { result: { value: adapterInstalled } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.probe()")) {
+      return { result: { value: responses.probe ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.writeText(")) {
+      return { result: { value: responses.write ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.observe(")) {
+      observeCalls += 1;
+      const observed = responses.observe ?? { nodes: [{ found: false }] };
+      return {
+        result: {
+          value: {
+            ...observed,
+            revision: observed.revision === undefined ? observeCalls : Number(observed.revision),
+          },
+        },
+      };
+    }
+    if (expression.includes("globalThis.__magiWebModel.submit()")) {
+      return { result: { value: responses.submit ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.turnState()")) {
+      return { result: { value: responses.turnState ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.cancelGeneration()")) {
+      return { result: { value: responses.cancel ?? false } };
+    }
+    return { result: { value: null } };
+  });
+}
+
+function webCommand(type: BrowserHostCommand["type"], payload: Record<string, unknown>): BrowserHostCommand {
+  return { type, payload } as BrowserHostCommand;
+}
+
 test("Lighthouse 只附着 iframe/Worker，页面型和未知 Target 永远不会产生子会话", async () => {
   assert.equal(isAllowedBrowserChildTarget(undefined), false);
   assert.equal(isAllowedBrowserChildTarget({}), false);
@@ -1866,4 +1932,186 @@ test("Heap 快照按 Chrome 的连续 edge 数组索引解析对象关系", asyn
     : null;
   assert.equal(dominatorValue?.nodes?.length, 2);
   assert.equal(dominatorValue?.nodes?.find((node) => node.id === 1)?.immediate_dominator, 0);
+});
+
+test("GPT Web 模型发现只投影已登录且可识别的菜单，并保留上限表字段", async () => {
+  const port = webScriptedPort({
+    probe: {
+      origin: "https://chatgpt.com",
+      path: "/?temporary-chat=true",
+      blocked: false,
+      composerFound: true,
+      composerCharLimit: null,
+      conversationFound: true,
+      modelMenuFound: true,
+      modelItems: [{
+        label: "GPT-5",
+        modelId: "gpt-5",
+        checked: true,
+        efforts: ["low", "medium", "high"],
+        defaultEffort: "medium",
+      }],
+      accountHint: "Plus",
+      connectorSettingsFound: false,
+    },
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("web-probe", binding, webCommand("web_model_probe", {
+    tab_id: binding.tab_id,
+  }));
+  assert.equal(result.outcome.status, "succeeded");
+  const value = result.outcome.payload.type === "json"
+    ? result.outcome.payload.payload.value as Record<string, any>
+    : null;
+  assert.equal(value?.login_state, "signed_in");
+  assert.equal(value?.account_hint, "plus");
+  assert.equal(value?.models?.[0]?.family, "gpt-5");
+  assert.equal(value?.models?.[0]?.default_effort, "medium");
+  assert.equal(typeof value?.models?.[0]?.context_window_tokens, "number");
+  assert.equal(value?.models?.[0]?.tokenizer_revision, "o200k");
+});
+
+test("GPT Web 模型发现遇到菜单 selector 漂移时失败并给出诊断", async () => {
+  const port = webScriptedPort({
+    probe: {
+      origin: "https://chatgpt.com",
+      path: "/",
+      blocked: false,
+      composerFound: true,
+      composerCharLimit: null,
+      conversationFound: true,
+      modelMenuFound: false,
+      modelItems: [],
+      accountHint: null,
+      connectorSettingsFound: false,
+    },
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("web-probe-drift", binding, webCommand("web_model_probe", {
+    tab_id: binding.tab_id,
+  }));
+  assert.equal(result.outcome.status, "failed");
+  if (result.outcome.status === "failed") {
+    assert.equal(result.outcome.payload.code, "web_model_selectors_drift");
+    assert.match(result.outcome.payload.message, /model_menu_selector_missing/u);
+  }
+});
+
+test("web_write_text 使用 snake_case payload、遵守 timeout_ms，并返回安全回读诊断", async () => {
+  const port = webScriptedPort({
+    write: { text: "站点改写后的内容", charCount: 8, becameAttachment: false },
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("web-write", binding, webCommand("web_write_text", {
+    tab_id: binding.tab_id,
+    selector: "@composer",
+    text: "期望内容",
+    mode: "replace",
+    timeout_ms: 17,
+  }));
+  assert.equal(result.outcome.status, "succeeded");
+  const value = result.outcome.payload.type === "json"
+    ? result.outcome.payload.payload.value as Record<string, any>
+    : null;
+  assert.equal(value?.confirmed, false);
+  assert.equal(value?.diagnostic, "composer_readback_mismatch");
+  assert.equal(typeof value?.mismatch?.index, "number");
+  const expression = port.requests
+    .filter((request) => request.method === "Runtime.evaluate")
+    .map((request) => String(request.params.expression))
+    .find((expression) => expression.includes("__magiWebModel.writeText("));
+  assert.match(expression ?? "", /timeout_ms/iu);
+  assert.doesNotMatch(expression ?? "", /timeoutMs/iu);
+});
+
+test("web_observe 对不可达 selector 返回 found:false 且 revision 每次递增", async () => {
+  const port = webScriptedPort({ observe: { nodes: [{ found: false }] } });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const command = webCommand("web_observe", {
+    tab_id: binding.tab_id,
+    selector: "@assistantMessage",
+    fields: ["existence"],
+  });
+  const first = await runtime.execute("web-observe-1", binding, command);
+  const second = await runtime.execute("web-observe-2", binding, command);
+  assert.equal(first.outcome.status, "succeeded");
+  assert.equal(second.outcome.status, "succeeded");
+  const firstValue = first.outcome.payload.type === "json" ? first.outcome.payload.payload.value as Record<string, any> : null;
+  const secondValue = second.outcome.payload.type === "json" ? second.outcome.payload.payload.value as Record<string, any> : null;
+  assert.deepEqual(firstValue?.nodes, [{ found: false }]);
+  assert.equal(firstValue?.revision, 1);
+  assert.equal(secondValue?.revision, 2);
+});
+
+test("web_submit、web_turn_state 和取消命令保留流式回读的消息计数与正文", async () => {
+  const port = webScriptedPort({
+    submit: { submitted: true, composer_empty: true, reason: null },
+    turnState: {
+      origin: "https://chatgpt.com",
+      path: "/?temporary-chat=true",
+      blocked: false,
+      generating: true,
+      conversation_found: true,
+      composer_found: true,
+      user_message_count: 2,
+      assistant_message_count: 2,
+      assistant_text: "~~~magi-tool-call\\n{\\\"turn_id\\\":\\\"nonce\\\"}\\n~~~",
+      thinking_text: "正在思考",
+      account_hint: "Plus",
+    },
+    cancel: true,
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const submit = await runtime.execute("web-submit", binding, webCommand("web_submit", {
+    tab_id: binding.tab_id,
+  }));
+  assert.equal(submit.outcome.status, "succeeded");
+  const state = await runtime.execute("web-state", binding, webCommand("web_turn_state", {
+    tab_id: binding.tab_id,
+  }));
+  assert.equal(state.outcome.status, "succeeded");
+  const stateValue = state.outcome.payload.type === "json"
+    ? state.outcome.payload.payload.value as Record<string, any>
+    : null;
+  assert.equal(stateValue?.login_state, "signed_in");
+  assert.equal(stateValue?.generating, true);
+  assert.equal(stateValue?.user_message_count, 2);
+  assert.match(String(stateValue?.assistant_text), /magi-tool-call/u);
+  const cancelled = await runtime.execute("web-cancel", binding, webCommand("web_cancel_generation", {
+    tab_id: binding.tab_id,
+  }));
+  assert.equal(cancelled.outcome.status, "succeeded");
+});
+
+test("同一临时对话多轮复用页面适配器，导航代次变化后重新安装", async () => {
+  const port = webScriptedPort({
+    turnState: {
+      origin: "https://chatgpt.com",
+      path: "/?temporary-chat=true",
+      blocked: false,
+      generating: false,
+      conversation_found: true,
+      composer_found: true,
+      user_message_count: 1,
+      assistant_message_count: 1,
+      assistant_text: "第一轮",
+      thinking_text: "",
+      account_hint: "Plus",
+    },
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const stateCommand = webCommand("web_turn_state", { tab_id: binding.tab_id });
+  await runtime.execute("multi-turn-1", binding, stateCommand);
+  await runtime.execute("multi-turn-2", binding, stateCommand);
+  const nextBinding = { ...binding, navigation_revision: binding.navigation_revision + 1 };
+  await runtime.execute(
+    "multi-turn-after-navigation",
+    nextBinding,
+    webCommand("web_turn_state", { tab_id: nextBinding.tab_id }),
+  );
+  const installCount = port.requests.filter((request) =>
+    request.method === "Runtime.evaluate"
+    && String(request.params.expression).includes("globalThis.__magiWebModel ="),
+  ).length;
+  assert.equal(installCount, 2);
 });

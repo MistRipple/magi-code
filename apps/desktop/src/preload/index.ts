@@ -151,6 +151,8 @@ contextBridge.exposeInMainWorld("magiDesktop", {
   restartBrowserAutomation: () =>
     ipcRenderer.invoke("magi-desktop:restart-browser-automation"),
   clearBrowserData: () => ipcRenderer.invoke("magi-desktop:clear-browser-data"),
+  clearWebModelData: () =>
+    ipcRenderer.invoke("magi-desktop:clear-web-model-data"),
   checkForUpdates: () => ipcRenderer.invoke("magi-desktop:check-for-updates"),
   downloadUpdate: () => ipcRenderer.invoke("magi-desktop:download-update"),
   installUpdate: () => ipcRenderer.invoke("magi-desktop:install-update"),

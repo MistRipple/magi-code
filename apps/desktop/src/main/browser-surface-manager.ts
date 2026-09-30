@@ -30,6 +30,10 @@ import {
 import { BrowserSurfaceRegistry } from "./browser-surface-registry.js";
 import { matchesNavigationRevision } from "./browser-navigation-revision.js";
 import {
+  browserPartitionForSession,
+  WEB_MODEL_PARTITION,
+} from "./web-model-session.js";
+import {
   isChromiumErrorPageUrl,
   normalizeNavigableUrl,
   resolveBrowserPageTitle,
@@ -61,6 +65,16 @@ export interface BrowserInspectedNodeContext {
   bounds: { x: number; y: number; width: number; height: number } | null;
   page_url: string;
   page_title: string;
+}
+
+/**
+ * 窗口内某个 Browser Tab 的承载身份投影（见 `browserSurfaceSnapshotsForWindow`）。
+ */
+export interface BrowserSurfaceRuntimeSnapshot {
+  tabId: string;
+  browserSessionId: string;
+  surfaceId: string;
+  navigationRevision: number;
 }
 
 export interface BrowserDownloadRuntimeSnapshot {
@@ -876,9 +890,7 @@ export class BrowserSurfaceManager {
     if (!host || host.isDestroyed() || guest.hostWebContents !== host) {
       throw new Error("browser_embedded_webview_host_invalid");
     }
-    const expectedSession = session.fromPartition(record.partitionId, {
-      cache: false,
-    });
+    const expectedSession = browserSessionForPartition(record.partitionId);
     if (guest.session !== expectedSession) {
       throw new Error("browser_embedded_webview_partition_invalid");
     }
@@ -1025,6 +1037,34 @@ export class BrowserSurfaceManager {
       : null;
   }
 
+  /**
+   * 本窗口内所有承载当前 primary Surface 的 Tab 身份。
+   *
+   * 会话级 Browser Tab 的承载身份来自窗口布局的 `activeSurfaceId`（活动面板），
+   * 但应用级 GPT Web 会话**没有、也不许有**激活意图（A25、R49）。Renderer 的
+   * `<webview>` 注册必须先知道 `tabId → surfaceId + navigationRevision`，因此
+   * 这里按窗口投影一份只读清单，让应用级内容槽能在不激活右栏的前提下完成注册。
+   *
+   * 只包含逻辑身份字段：不返回 WebContents、partition 或任何页面内容。
+   */
+  browserSurfaceSnapshotsForWindow(
+    windowId: string,
+  ): BrowserSurfaceRuntimeSnapshot[] {
+    return [...this.#surfaces.values()]
+      .filter(
+        (record) =>
+          record.windowId === windowId &&
+          !record.closed &&
+          this.#surfaces.isPrimary(record),
+      )
+      .map((record) => ({
+        tabId: record.tabId,
+        browserSessionId: record.browserSessionId,
+        surfaceId: record.surfaceId,
+        navigationRevision: record.navigationRevision,
+      }));
+  }
+
   browserDownloadSnapshotsForWindow(
     windowId: string,
   ): BrowserDownloadRuntimeSnapshot[] {
@@ -1095,6 +1135,23 @@ export class BrowserSurfaceManager {
   primaryBindingForTab(tabId: string): BrowserSurfaceBinding | null {
     const record = this.#surfaces.primaryForTab(tabId);
     return record && !record.closed && record.contents
+      ? this.binding(record)
+      : null;
+  }
+
+  /**
+   * 返回指定窗口承载的 Primary binding。
+   *
+   * `primaryBindingForTab` 是全局逻辑 Tab 查询；后台 GPT Web 驱动还必须把
+   * `windowId` 纳入校验，否则多窗口下可能把另一窗口的 guest 绑定返回给当前
+   * 内容槽（A24）。
+   */
+  primaryBindingForTabInWindow(
+    tabId: string,
+    windowId: string,
+  ): BrowserSurfaceBinding | null {
+    const record = this.#surfaces.primaryForTab(tabId);
+    return record && record.windowId === windowId && !record.closed && record.contents
       ? this.binding(record)
       : null;
   }
@@ -2710,15 +2767,16 @@ export class BrowserSurfaceManager {
     // 不能只依赖当前进程已经创建过 guest 的 partition。浏览器
     // 会话由 daemon 持久化，应用重启后未激活的 Tab 仍然拥有同一磁盘上下文，
     // 清理数据必须覆盖这些会话，否则“清理成功”会变成空操作。
+    // 应用级持久分区必须无条件纳入清理：它可能还没有 guest 挂载，
+    // 也可能因为注册表尚未落盘而不在已知集合里（设计基线 §5.13）。
     const partitions = new Set([
+      WEB_MODEL_PARTITION,
       ...this.#knownPartitions,
       ...this.#configuredPartitions,
     ]);
     await Promise.all(
       [...partitions].map(async (partitionId) => {
-        const browserSession = session.fromPartition(partitionId, {
-          cache: false,
-        });
+        const browserSession = browserSessionForPartition(partitionId);
         await Promise.all([
           browserSession.clearCache(),
           browserSession.clearStorageData(),
@@ -2738,6 +2796,39 @@ export class BrowserSurfaceManager {
           DEFAULT_NAVIGATION_TIMEOUT_MS,
         );
       }),
+    );
+  }
+
+  /**
+   * 只清应用级 GPT Web 分区（设计基线 §5.13、实现计划 3.11）。
+   *
+   * 与 `clearBrowsingData` 的区别是**不动**其他 `magi-browser-*` 分区：那些分区
+   * 属于用户各自的浏览器 Tab，站点登录态不能被本功能的清理静默牵连。重载也只
+   * 针对应用级分区里的 guest，其他 Tab 的页面不重新加载。
+   */
+  async clearWebModelBrowsingData(): Promise<void> {
+    // 这里只清 GPT Web 的持久分区。不要调用全局 `clearDownloads()`：普通
+    // Browser Tab 的下载记录不属于 GPT Web，清理登录态不应牵连用户资产。
+    const browserSession = browserSessionForPartition(WEB_MODEL_PARTITION);
+    await Promise.all([
+      browserSession.clearCache(),
+      browserSession.clearStorageData(),
+    ]);
+    await Promise.all(
+      [...this.#surfaces.values()]
+        .filter((record) => record.partitionId === WEB_MODEL_PARTITION)
+        .map((record) => {
+          const contents = record.contents;
+          if (record.closed || !contents || contents.isDestroyed())
+            return Promise.resolve();
+          return this.runNavigationAction(
+            record,
+            "reload",
+            contents.getURL() || "about:blank",
+            () => contents.reloadIgnoringCache(),
+            DEFAULT_NAVIGATION_TIMEOUT_MS,
+          );
+        }),
     );
   }
 
@@ -3648,7 +3739,9 @@ export class BrowserSurfaceManager {
       this.#partitionRegistryPath,
       this.#knownPartitions,
     );
-    const browserSession = session.fromPartition(partitionId, { cache: false });
+    // 应用级持久分区保留 HTTP 缓存（登录态与站点资源按浏览器语义落盘）；
+    // 普通浏览器 Tab 沿用 cache:false 的内存会话语义。
+    const browserSession = browserSessionForPartition(partitionId);
     browserSession.setPermissionCheckHandler(() => false);
     browserSession.setPermissionRequestHandler(
       (_webContents, _permission, callback) => {
@@ -6002,8 +6095,26 @@ function safeOrigin(value: string): string | null {
 }
 
 function browserPartitionId(browserSessionId: string): string {
-  const safe = browserSessionId.replace(/[^A-Za-z0-9._-]/gu, "_");
-  return `magi-browser-${safe}`;
+  return browserPartitionForSession(browserSessionId);
+}
+
+/**
+ * Keep the session lookup policy identical at creation, guest registration and
+ * data clearing. In particular, never open the fixed Web Model partition as an
+ * in-memory session just because a caller supplied `cache: false`.
+ */
+function browserSessionForPartition(partitionId: string) {
+  return partitionId.startsWith("persist:")
+    ? session.fromPartition(partitionId)
+    : session.fromPartition(partitionId, { cache: false });
+}
+
+/** 持久分区（应用级）与内存会话分区（普通 Tab）的注册表过滤规则。 */
+function isKnownBrowserPartition(entry: string): boolean {
+  return (
+    entry === WEB_MODEL_PARTITION ||
+    /^magi-browser-[A-Za-z0-9._-]+$/u.test(entry)
+  );
 }
 
 function readPartitionRegistry(path: string | null): string[] {
@@ -6013,8 +6124,7 @@ function readPartitionRegistry(path: string | null): string[] {
     if (!Array.isArray(value)) return [];
     return value.filter(
       (entry): entry is string =>
-        typeof entry === "string" &&
-        /^magi-browser-[A-Za-z0-9._-]+$/u.test(entry),
+        typeof entry === "string" && isKnownBrowserPartition(entry),
     );
   } catch {
     return [];
@@ -6098,16 +6208,21 @@ function sameFrame(
 
 function frameIdentity(value: unknown): NavigationFrameIdentity | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const frame = value as { processId?: unknown; routingId?: unknown };
-  if (
-    !Number.isSafeInteger(frame.processId) ||
-    !Number.isSafeInteger(frame.routingId)
-  )
+  // Electron 的 WebFrameMain 在 renderer 被销毁后，读取 processId / routingId
+  // 也可能抛出（而不是返回 undefined）。导航事件允许迟到到达，不能让这个
+  // 失效身份把 Main 进程打进 uncaughtException；按“无身份”处理即可由后续
+  // generation / WebContents 校验继续丢弃旧事件。
+  try {
+    const frame = value as { processId?: unknown; routingId?: unknown };
+    const processId = frame.processId;
+    const routingId = frame.routingId;
+    if (!Number.isSafeInteger(processId) || !Number.isSafeInteger(routingId)) {
+      return null;
+    }
+    return { processId: processId as number, routingId: routingId as number };
+  } catch {
     return null;
-  return {
-    processId: frame.processId as number,
-    routingId: frame.routingId as number,
-  };
+  }
 }
 
 function isForbiddenChildPageTarget(value: unknown): boolean {

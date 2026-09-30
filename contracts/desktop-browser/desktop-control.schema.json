@@ -439,6 +439,64 @@
         "normalized_y": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
+    "webModelProbePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
+    "webWriteTextPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "selector", "text", "mode"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "selector": { "type": "string", "minLength": 1 },
+        "text": { "type": "string" },
+        "mode": { "enum": ["replace", "append"] },
+        "expect_text_digest": {
+          "oneOf": [{ "type": "string" }, { "type": "null" }]
+        },
+        "timeout_ms": {
+          "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+        }
+      }
+    },
+    "webObservePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "selector", "fields"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "selector": { "type": "string", "minLength": 1 },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["text", "html", "existence", "attribute"] }
+        },
+        "attribute": {
+          "oneOf": [{ "type": "string" }, { "type": "null" }]
+        }
+      }
+    },
+    "webSubmitPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
+    "webTurnStatePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
+    "webCancelGenerationPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
     "updateControlPayload": {
       "type": "object",
       "additionalProperties": false,
@@ -1290,6 +1348,60 @@
           "properties": {
             "type": { "const": "update_control" },
             "payload": { "$ref": "#/$defs/updateControlPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_model_probe" },
+            "payload": { "$ref": "#/$defs/webModelProbePayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_write_text" },
+            "payload": { "$ref": "#/$defs/webWriteTextPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_observe" },
+            "payload": { "$ref": "#/$defs/webObservePayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_submit" },
+            "payload": { "$ref": "#/$defs/webSubmitPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_turn_state" },
+            "payload": { "$ref": "#/$defs/webTurnStatePayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_cancel_generation" },
+            "payload": { "$ref": "#/$defs/webCancelGenerationPayload" }
           }
         },
         {

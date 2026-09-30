@@ -286,6 +286,76 @@ export type BrowserHostCommand =
         control: BrowserControlUpdate;
       };
     }
+  /**
+   * ChatGPT 站点只读探测（发现通道，设计基线 §5.5）。
+   *
+   * 只读页面事实（登录态、composer、模型菜单、账号能力、连接器支持性），
+   * 绝不写页面；不进入模型可见的浏览器工具目录（C10）。
+   */
+  | {
+      type: "web_model_probe";
+      payload: { tab_id: BrowserTabId };
+    }
+  /**
+   * 站点内原子纯文本写入 + 回读校验（设计基线 §5.6 步骤 3）。
+   *
+   * 不复用 `type`（它走 CDP `Input.insertText`，没有回读校验，且对长文本的
+   * contenteditable 富文本编辑器不可靠）。回读不一致或内容被站点转成附件即失败。
+   */
+  | {
+      type: "web_write_text";
+      payload: {
+        tab_id: BrowserTabId;
+        selector: string;
+        text: string;
+        mode: "replace" | "append";
+        expect_text_digest?: string | null;
+        timeout_ms?: number | null;
+      };
+    }
+  /**
+   * 站点短轮询观察（设计基线 §5.6 末）。
+   *
+   * 返回单次快照；`revision` 单调递增，供推理通道判断内容是否变化。长等待会占住
+   * 该 Surface 的命令 lane，因此观察必须短轮询，不复用 `wait_for`。
+   */
+  | {
+      type: "web_observe";
+      payload: {
+        tab_id: BrowserTabId;
+        selector: string;
+        fields: Array<"text" | "html" | "existence" | "attribute">;
+        attribute?: string | null;
+      };
+    }
+  /**
+   * 提交 composer（设计基线 §5.6 步骤 4）。
+   *
+   * 只负责把输入交给站点并回读输入框是否清空；「是否被接受」由
+   * `web_turn_state` 的消息计数证据判定，不以命令返回成功为准。
+   */
+  | {
+      type: "web_submit";
+      payload: { tab_id: BrowserTabId };
+    }
+  /**
+   * 回合语义状态（设计基线 §5.6 步骤 4–6）。
+   *
+   * 站点适配层给出原始语义信号（生成中标志、助手文本、消息计数、隐藏推理）；
+   * 「文本稳定且无生成标志」的完成谓词由推理通道跨两个读取周期叠加判定。
+   */
+  | {
+      type: "web_turn_state";
+      payload: { tab_id: BrowserTabId };
+    }
+  /**
+   * 中断当前 GPT Web 页面生成，不改变页面 / Tab 身份。
+   * 取消 Magi turn 时必须显式停止网页侧生成，不能只停止 daemon 轮询。
+   */
+  | {
+      type: "web_cancel_generation";
+      payload: { tab_id: BrowserTabId };
+    }
   | { type: "shutdown" };
 
 export interface BrowserHostRequestEnvelope {
@@ -300,6 +370,81 @@ export interface BrowserCommandError {
   recoverable: boolean;
   side_effect_started: boolean;
   diagnostic?: string | null;
+}
+
+/** `web_model_probe` 的归一化结果（只读探测，设计基线 §5.5）。 */
+export interface BrowserWebModelProbe {
+  /** 站点适配层结构版本；selector 漂移时由实现推进（A23）。 */
+  site_revision: string;
+  login_state: "signed_in" | "signed_out" | "blocked";
+  /** 登录态判定需要两项证据：会话有效与临时对话输入框可用（§5.5）。 */
+  composer_available: boolean;
+  /** 单条字符上限：站点自身给出的值优先，否则用随应用发布的上限表（§5.9.2）。 */
+  composer_char_limit: number | null;
+  account_hint: "plus" | "pro" | "free" | "unknown";
+  /** 上限表版本；随应用更新，daemon 据此判定 `refresh_required`。 */
+  limits_revision: string;
+  models: Array<{
+    family: string;
+    display_name: string;
+    efforts: string[];
+    default_effort: string | null;
+    /** 该族的可用输入窗口，来自上限表（§5.9.2），写入引擎顶层字段。 */
+    context_window_tokens: number;
+    /** 单条提交的 token 预算；小于窗口的部分账号依赖阶段 3 的最小分片（§5.9.6）。 */
+    single_submission_token_budget: number;
+    /** 该档位的输出与隐藏推理预留（§5.9.5）。 */
+    response_reserve: number;
+    tokenizer_revision: string;
+  }>;
+  connector_support: boolean;
+  connector_settings_reachable: boolean;
+}
+
+/** `web_write_text` 的回读校验结果（§5.6 步骤 3）。 */
+export interface BrowserWebWriteTextResult {
+  confirmed: boolean;
+  digest: string;
+  char_count: number;
+  /** 站点把内容转成附件时不保证全部进入上下文（§5.9.6）。 */
+  became_attachment: boolean;
+}
+
+/** `web_observe` 的单次快照（§5.6 末）。 */
+export interface BrowserWebObserveResult {
+  revision: number;
+  nodes: Array<{
+    found: boolean;
+    text?: string;
+    html?: string;
+    attributes?: Record<string, string>;
+  }>;
+}
+
+/** `web_submit` 的提交结果（§5.6 步骤 4）。 */
+export interface BrowserWebSubmitResult {
+  submitted: boolean;
+  /** 提交后输入框是否已清空；未清空说明站点未接受这次提交。 */
+  composer_empty: boolean;
+  reason: "composer_missing" | "composer_empty" | null;
+}
+
+/** `web_turn_state` 的回合语义状态（§5.6 步骤 4–6）。 */
+export interface BrowserWebTurnStateResult {
+  site_revision: string;
+  login_state: "signed_in" | "signed_out" | "blocked";
+  /** 风险 / 验证页。 */
+  blocked: boolean;
+  /** 生成中标志；完成判定要求它为 false。 */
+  generating: boolean;
+  composer_found: boolean;
+  /** 提交是否被接受以用户消息计数为准（步骤 4）。 */
+  user_message_count: number;
+  assistant_message_count: number;
+  /** 最后一条助手消息的可见文本；流式回调以它的累积快照为准。 */
+  assistant_text: string;
+  /** 隐藏推理文本，映射到 `thinking`。 */
+  thinking_text: string;
 }
 
 export type BrowserCommandResult =

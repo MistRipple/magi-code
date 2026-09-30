@@ -160,6 +160,13 @@ export class AutomationWorker {
         env: {
           MAGI_BROWSER_WORKER_EPOCH: this.#workerEpoch,
           ...(this.#uploadRoot ? { MAGI_BROWSER_UPLOAD_ROOT: this.#uploadRoot } : {}),
+          // The production adapter accepts only ChatGPT origins. The DOM
+          // acceptance harness uses a loopback fixture through this explicit
+          // process-level override; propagate it to the isolated Worker,
+          // whose environment is otherwise intentionally allowlisted.
+          ...(process.env.MAGI_WEB_MODEL_ORIGIN
+            ? { MAGI_WEB_MODEL_ORIGIN: process.env.MAGI_WEB_MODEL_ORIGIN }
+            : {}),
         },
       });
     } catch (cause) {

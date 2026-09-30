@@ -49,6 +49,17 @@ const rightPaneSource = readFileSync(
   new URL("../../../../web/src/web/RightPane.svelte", import.meta.url),
   "utf8",
 );
+const webModelTabSource = readFileSync(
+  new URL(
+    "../../../../web/src/components/tabs/WebModelTabContent.svelte",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const webModelSessionSource = readFileSync(
+  new URL("./web-model-session.ts", import.meta.url),
+  "utf8",
+);
 
 function normalizeSourceWhitespace(value: string): string {
   return value.replace(/\s+/gu, " ");
@@ -252,6 +263,105 @@ test("Webview 注册严格绑定当前窗口、Browser Session、导航代次和
     schemaSource,
     /renderer_geometry|begin-right-pane-resize|end-right-pane-resize/u,
   );
+});
+
+test("A21 固定持久 partition 在创建、注册表和清理路径使用同一策略", () => {
+  assert.match(webModelSessionSource, /WEB_MODEL_PARTITION = "persist:magi-web-model"/u);
+  assert.match(
+    webModelSessionSource,
+    /isWebModelBrowserSession\(browserSessionId\)[\s\S]*?return WEB_MODEL_PARTITION/u,
+  );
+  assert.match(
+    normalizedSource,
+    /browserPartitionId\(browserSessionId: string\): string[\s\S]*?return browserPartitionForSession\(browserSessionId\)/u,
+  );
+  assert.match(
+    normalizedSource,
+    /function browserSessionForPartition\(partitionId: string\)[\s\S]*?partitionId\.startsWith\("persist:"\)[\s\S]*?session\.fromPartition\(partitionId\)[\s\S]*?session\.fromPartition\(partitionId, \{ cache: false \}\)/u,
+  );
+  assert.match(
+    normalizedSource,
+    /const partitions = new Set\(\[[\s\S]*?WEB_MODEL_PARTITION[\s\S]*?#knownPartitions/u,
+  );
+  assert.match(normalizedSource, /entry === WEB_MODEL_PARTITION/u);
+  const clearWebModelStart = source.indexOf(
+    "async clearWebModelBrowsingData(): Promise<void>",
+  );
+  const clearWebModelEnd = source.indexOf(
+    "private surfaceForTab(",
+    clearWebModelStart,
+  );
+  assert.ok(clearWebModelStart >= 0 && clearWebModelEnd > clearWebModelStart);
+  const clearWebModel = normalizeSourceWhitespace(
+    source.slice(clearWebModelStart, clearWebModelEnd),
+  );
+  assert.match(
+    clearWebModel,
+    /browserSessionForPartition\(WEB_MODEL_PARTITION\)/u,
+  );
+  assert.match(clearWebModel, /record\.partitionId === WEB_MODEL_PARTITION/u);
+  assert.doesNotMatch(clearWebModel, /this\.clearDownloads\(\)|clearBrowsingData\(/u);
+});
+
+test("A24 多窗口同一逻辑 Tab 只接受当前 Primary 的窗口身份", () => {
+  assert.match(
+    normalizedSource,
+    /primaryBindingForTabInWindow\([\s\S]*?record\.windowId === windowId[\s\S]*?record\.contents/u,
+  );
+  assert.match(
+    normalizedWindowManagerSource,
+    /primaryBindingForTabInWindow\([\s\S]*?input\.tabId[\s\S]*?input\.windowId/u,
+  );
+  assert.match(
+    normalizeSourceWhitespace(desktopControlServerSource),
+    /const binding = requirePrimaryBinding\([\s\S]*?tabId,[\s\S]*?activation\.windowId/u,
+  );
+  assert.match(
+    normalizeSourceWhitespace(desktopControlServerSource),
+    /if \(windowId && binding\.window_id !== windowId\)[\s\S]*?browser_surface_window_stale/u,
+  );
+});
+
+test("A25 后台 materialize 先发布 browserSurfaces，且不写右栏激活意图", () => {
+  const start = windowManagerSource.indexOf(
+    "async ensureBrowserSurfaceInBackground(",
+  );
+  const end = windowManagerSource.indexOf(
+    "async waitForBrowserSurface(",
+    start,
+  );
+  assert.ok(start >= 0 && end > start);
+  const background = normalizeSourceWhitespace(
+    windowManagerSource.slice(start, end),
+  );
+  assert.match(background, /this\.publishSnapshot\(record\)/u);
+  assert.match(background, /this\.#surfaceManager\.materialize\(/u);
+  assert.doesNotMatch(background, /reduceWindowLayout|setActivationGeneration|activateBrowser/u);
+  assert.doesNotMatch(background, /\.focus\(/u);
+  const publishStart = normalizedWindowManagerSource.indexOf(
+    "private publishSnapshot(record: DesktopWindowRecord)",
+  );
+  const publish = normalizedWindowManagerSource.slice(publishStart);
+  assert.match(publish, /const snapshot = this\.snapshot\(record\.windowId\)/u);
+  assert.match(publish, /this\.#onSnapshot\(snapshot\)/u);
+});
+
+test("page_updated 后向所有窗口重发应用级 Surface 导航身份", () => {
+  const normalizedIndexSource = normalizeSourceWhitespace(indexSource);
+  assert.match(
+    normalizedIndexSource,
+    /event\.type === "primary_changed" \|\| event\.type === "primary_closed" \|\| event\.type === "page_updated"[\s\S]*?windowManager\?\.publishSnapshots\(\)/u,
+  );
+});
+
+test("A25 多宿主与隐藏右栏只改变可见性，不卸载 App Web guest", () => {
+  const normalizedWebModel = normalizeSourceWhitespace(webModelTabSource);
+  assert.match(normalizedWebModel, /#each primaryWindow \? hosts : \[\] as host \(host\.tabId\)/u);
+  assert.match(normalizedWebModel, /BrowserTabContent[\s\S]*surfaceScope="app"/u);
+  assert.match(normalizedWebModel, /class:host--offscreen=\{!hostVisible\(host\.tabId\)\}/u);
+  assert.match(normalizedWebModel, /\.web-model-content--offscreen[\s\S]*transform: translate3d\(-20000px, 0, 0\)/u);
+  assert.match(normalizedWebModel, /\.host--offscreen[\s\S]*transform: translate3d\(-20000px, 0, 0\)/u);
+  assert.doesNotMatch(normalizedWebModel, /display:\s*none\s*;/u);
 });
 
 test("重新激活 Browser Tab 使用 Main Surface 的当前导航代次", () => {

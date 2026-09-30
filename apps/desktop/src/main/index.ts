@@ -170,6 +170,17 @@ if (singleInstance) {
             );
           }
           if (
+            event.type === "primary_changed" ||
+            event.type === "primary_closed" ||
+            event.type === "page_updated"
+          ) {
+            // Primary 迁移不一定改变任一窗口的 layoutRevision，但会改变
+            // `browserSurfaces` 的窗口投影；页面导航还会推进
+            // `navigationRevision`。所有窗口都要收到新快照，否则旧窗口会
+            // 继续用已经失效的 Surface/导航身份注册 App guest。
+            windowManager?.publishSnapshots();
+          }
+          if (
             event.type === "download" &&
             !["completed", "cancelled", "interrupted"].includes(event.state)
           ) {
@@ -251,6 +262,10 @@ if (singleInstance) {
         worker,
         waitForActiveWindow: (signal) => manager.waitForActiveWindow(signal),
         ensureBrowserSurface: (input) => manager.ensureBrowserSurface(input),
+        ensureBrowserSurfaceInBackground: (input) =>
+          manager.ensureBrowserSurfaceInBackground(input),
+        materializeBrowserSurfaceInBackground: (input) =>
+          manager.materializeBrowserSurfaceInBackground(input),
         handshake: () => handshake(worker!),
         onConnectionState: (connected) => {
           desktopControlConnected = connected;
@@ -621,6 +636,11 @@ function registerIpc(): void {
   handleIpc("magi-desktop:clear-browser-data", async (event) => {
     trustedAppSender(event.sender.id);
     await surfaceManager!.clearBrowsingData();
+  });
+  handleIpc("magi-desktop:clear-web-model-data", async (event) => {
+    trustedAppSender(event.sender.id);
+    // 只清应用级 GPT Web 分区：其他浏览器 Tab 的站点数据不受影响（§5.13）。
+    await surfaceManager!.clearWebModelBrowsingData();
   });
   handleIpc("magi-desktop:check-for-updates", (event) => {
     trustedAppSender(event.sender.id);
