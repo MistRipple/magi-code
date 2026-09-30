@@ -1115,6 +1115,338 @@ export async function createBrowserSession(
   return parseAgentJson<BrowserSessionSnapshot>(response, 'create browser session');
 }
 
+/**
+ * 取得应用级（GPT Web）浏览器会话（`POST /browser/sessions/app`）。
+ *
+ * 应用级会话全局唯一、id 持久稳定；已存在时服务端直接返回既有会话
+ * （`created = false`），不新建，避免留下无主会话与多余物理 Surface。
+ */
+export async function createAppBrowserSession(): Promise<{
+  session: BrowserSessionSnapshot;
+  created: boolean;
+}> {
+  const response = await getTransport().request(agentUrl('/api/browser/sessions/app'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
+  });
+  return parseAgentJson<{ session: BrowserSessionSnapshot; created: boolean }>(
+    response,
+    'create app browser session',
+  );
+}
+
+/**
+ * 只读读取应用级（GPT Web）浏览器会话（`GET /browser/sessions/app`）。
+ *
+ * **不创建**会话：未打开过 GPT Web 视图时返回 `null`。窗口启动与项目 / 会话
+ * 切换用它投影 `appTabs` 与内容槽宿主（A25 / §5.2），不能改用 POST，
+ * 否则每次启动都会连带创建后台 ChatGPT 主页。
+ */
+export async function getAppBrowserSession(): Promise<BrowserSessionSnapshot | null> {
+  const response = await getTransport().request(agentUrl('/api/browser/sessions/app'), {
+    method: 'GET',
+  });
+  const payload = await parseAgentJson<{ session: BrowserSessionSnapshot | null }>(
+    response,
+    'get app browser session',
+  );
+  return payload.session ?? null;
+}
+
+/**
+ * 重新物化应用级 GPT Web 主页的真实 Desktop Surface。
+ *
+ * 逻辑会话会跨 daemon / Desktop 重启恢复，但 `<webview>` 属于当前 Renderer，
+ * 因此重启后必须在应用级内容槽挂载完成后显式走一次不激活的恢复路径。
+ */
+export async function ensureWebModelHomeSurface(): Promise<BrowserSessionSnapshot> {
+  const response = await getTransport().request(
+    agentUrl('/api/browser/web-models/ensure-home'),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
+    },
+  );
+  return parseAgentJson<BrowserSessionSnapshot>(response, 'ensure web model home surface');
+}
+
+/**
+ * 发现通道的接口状态（《实现计划》§7.1）。这是**这一次探测**的结果，
+ * 不等于引擎的长期状态（设计基线 §5.11 的唯一枚举在 daemon 投影）。
+ */
+export type WebModelDiscoveryStatus =
+  | 'ok'
+  | 'login_required'
+  | 'consent_required'
+  | 'desktop_unavailable'
+  | 'refresh_required'
+  | 'site_blocked'
+  | 'quota_exhausted'
+  | 'tool_degraded'
+  | 'failed';
+
+/** Web 引擎草稿。它只是候选，落库仍走既有 `engines` 写入路径。 */
+export interface WebModelEngineDraft {
+  id: string;
+  displayName: string;
+  apiProtocol: 'chatgpt_web';
+  contextWindowTokens: number;
+  efforts: string[];
+  toolsEnabled: boolean;
+  newChatPerTurn: boolean;
+  toolRoundLimit?: number;
+  origin: {
+    kind: 'web';
+    browserSessionId: string;
+    discoveredAt: number;
+    accountHint: string;
+  };
+}
+
+export interface WebModelDiscoveryResponse {
+  status: WebModelDiscoveryStatus;
+  reason?: string | null;
+  accountHint: string;
+  limitsRevision: string;
+  siteRevision: string;
+  composerCharLimit?: number | null;
+  engines: WebModelEngineDraft[];
+}
+
+/**
+ * `POST /browser/web-models/discover`：只读探测，只返回候选，不落库。
+ *
+ * 未登录 / 登录过期时服务端返回 `login_required` 且 `engines = []`；
+ * 调用方不得用上一次结果占位（设计基线 §5.5）。
+ */
+export async function discoverWebModels(): Promise<WebModelDiscoveryResponse> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/discover'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
+  });
+  return parseAgentJson<WebModelDiscoveryResponse>(response, 'discover web models');
+}
+
+/**
+ * T3 通道状态（`GET /browser/web-models/tunnel`，设计基线 §5.7.4）。
+ *
+ * 只有状态与「具体缺哪一项」，**不含任何凭据内容**：API 密钥始终留在用户自己的
+ * 凭据文件里，Magi 只保存引用。
+ */
+export interface WebModelTunnelStatus {
+  channel: string;
+  ready: boolean;
+  code: string;
+  detail: string;
+  tunnelId: string;
+  credentialFile: string;
+  listenerUrl?: string | null;
+  portFile?: string | null;
+  localEndpoint?: string | null;
+}
+
+export interface WebModelTunnelConfigRequest {
+  /** 显式清除配置（关闭 T3）。 */
+  clear?: boolean;
+  tunnelId?: string;
+  /** 仅含 Tunnels Read + Use 的 API 密钥文件路径（引用，不是密钥本身）。 */
+  credentialFile?: string;
+  clientBinary?: string;
+  clientSha256?: string;
+}
+
+export interface WebModelDiagnosticsResponse {
+  checkedAt: number;
+  discovery: WebModelDiscoveryResponse | null;
+  tunnel: WebModelTunnelStatus | null;
+  runtime: WebModelRuntimeResponse | null;
+  errors: {
+    discovery?: string;
+    tunnel?: string;
+    runtime?: string;
+  };
+}
+
+/** `GET /browser/web-models/tunnel`：只读读取当前 T3 通道状态。 */
+export async function getWebModelTunnel(): Promise<WebModelTunnelStatus> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/tunnel'), {
+    method: 'GET',
+    headers: { 'content-type': 'application/json' },
+  });
+  return parseAgentJson<WebModelTunnelStatus>(response, 'load web model tunnel');
+}
+
+/** `POST /browser/web-models/tunnel`：保存凭据引用并按需启动 / 停止通道。 */
+export async function configureWebModelTunnel(
+  request: WebModelTunnelConfigRequest,
+): Promise<WebModelTunnelStatus> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/tunnel'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      clear: Boolean(request.clear),
+      tunnelId: request.tunnelId ?? '',
+      credentialFile: request.credentialFile ?? '',
+      clientBinary: request.clientBinary ?? null,
+      clientSha256: request.clientSha256 ?? null,
+    }),
+  });
+  return parseAgentJson<WebModelTunnelStatus>(response, 'configure web model tunnel');
+}
+
+/**
+ * 一次在飞 Web turn 的阶段投影（《实现计划》§3.12）。
+ *
+ * 这只是当前 daemon 进程内存里的调度事实：进程重启即清空；正文、工具调用与
+ * 终态仍只在 canonical 里（A20、R55）。
+ */
+export interface WebModelRuntimeEntry {
+  bindingKey: string;
+  sessionId: string;
+  threadId: string;
+  engineId: string;
+  effort: string;
+  epoch: number;
+  pageId?: string | null;
+  stage: 'waiting_engine' | 'generating' | 'finished';
+  /** 是否仍有在飞 turn；完成条目可保留用于额度 / 所有权投影。 */
+  active: boolean;
+  queuePosition: number | null;
+  /** 这条对话实例已经向账号发出的消息条数（A16）。 */
+  sentMessages: number;
+  lastSentTokens: number;
+  /** 对话实例所有权（§5.8）：`user_owned` / `invalidated` 表示需要提示接管。 */
+  ownership: 'magi_owned' | 'user_owned' | 'invalidated' | null;
+  updatedAtMs: number;
+}
+
+/**
+ * 账号额度提示（A16）。
+ *
+ * Web 引擎不参与 token 聚合：这里只报「本地观察到的发送条数」，不是账号侧真实
+ * 剩余额度，也不是计费数据。
+ */
+export interface WebModelQuota {
+  sentMessages: number;
+  countedBy: string;
+  excludedFromTokenBudget: boolean;
+}
+
+export interface WebModelRuntimeResponse {
+  entries: WebModelRuntimeEntry[];
+  quota: WebModelQuota | null;
+}
+
+/**
+ * `GET /browser/web-models/runtime`：只读读取在飞 turn 的阶段、排队位置与发送计数。
+ *
+ * 无会话过滤时返回全部会话；用于会话内阶段投影与额度展示，不参与业务事实。
+ */
+export async function getWebModelRuntime(sessionId = ''): Promise<WebModelRuntimeResponse> {
+  const query = sessionId.trim()
+    ? `?sessionId=${encodeURIComponent(sessionId.trim())}&clientPlatform=${encodeURIComponent(browserClientPlatform())}`
+    : `?clientPlatform=${encodeURIComponent(browserClientPlatform())}`;
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/web-models/runtime${query}`),
+    { method: 'GET' },
+  );
+  const payload = await parseAgentJson<WebModelRuntimeResponse>(response, 'load web model runtime');
+  return {
+    entries: Array.isArray(payload.entries) ? payload.entries : [],
+    quota: payload.quota ?? null,
+  };
+}
+
+/**
+ * 阶段 5 自检聚合：把发现、T3 通道和进程内运行态的当前快照放在同一个
+ * 前端诊断结果中。每个子路由独立收口，单个探测失败不能抹掉另外两类事实。
+ */
+export async function getWebModelDiagnostics(): Promise<WebModelDiagnosticsResponse> {
+  const [discoveryResult, tunnelResult, runtimeResult] = await Promise.allSettled([
+    discoverWebModels(),
+    getWebModelTunnel(),
+    getWebModelRuntime(),
+  ]);
+  const errors: WebModelDiagnosticsResponse['errors'] = {};
+  const errorText = (reason: unknown): string => (
+    reason instanceof Error && reason.message.trim()
+      ? reason.message.trim()
+      : String(reason || 'unknown error')
+  );
+  const discovery = discoveryResult.status === 'fulfilled'
+    ? discoveryResult.value
+    : (errors.discovery = errorText(discoveryResult.reason), null);
+  const tunnel = tunnelResult.status === 'fulfilled'
+    ? tunnelResult.value
+    : (errors.tunnel = errorText(tunnelResult.reason), null);
+  const runtime = runtimeResult.status === 'fulfilled'
+    ? runtimeResult.value
+    : (errors.runtime = errorText(runtimeResult.reason), null);
+  return {
+    checkedAt: Date.now(),
+    discovery,
+    tunnel,
+    runtime,
+    errors,
+  };
+}
+
+/**
+ * `POST /browser/web-models/reset`：退出登录 / 清除 Web 数据后的 daemon 侧收口。
+ *
+ * 顺序固定：先撤销在飞回复，再失效投影（Web 模型立即从选择器消失），最后停通道。
+ * 「清理浏览数据」本身走 Desktop 入口，本调用只负责 daemon 侧。
+ */
+export async function resetWebModels(): Promise<{ status: string }> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/reset'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
+  });
+  return parseAgentJson<{ status: string }>(response, 'reset web models');
+}
+
+/**
+ * `POST /browser/web-models/reset-conversation`：「重置为 Magi 对话」（§5.8）。
+ *
+ * 只推进该会话 / 线程的绑定 epoch：下一次发送按新建路径全量重放。它不写
+ * canonical、不改 settings，也不影响其他线程（子代理各有一条临时对话）。
+ */
+export async function resetWebModelConversation(
+  sessionId: string,
+  threadId = '',
+): Promise<{ status: string; epoch: number }> {
+  const response = await getTransport().request(
+    agentUrl('/api/browser/web-models/reset-conversation'),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId,
+        threadId,
+        clientPlatform: browserClientPlatform(),
+      }),
+    },
+  );
+  return parseAgentJson<{ status: string; epoch: number }>(
+    response,
+    'reset web model conversation',
+  );
+}
+
+/** 记录一次性的首次使用说明确认（A9）。 */
+export async function confirmWebModelConsent(): Promise<{ consentConfirmed: boolean }> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/consent'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
+  });
+  return parseAgentJson<{ consentConfirmed: boolean }>(response, 'confirm web model consent');
+}
+
 export async function materializeSession(
   workspaceId?: string | null,
   workspacePath?: string,

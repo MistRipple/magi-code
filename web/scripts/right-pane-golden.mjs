@@ -213,5 +213,46 @@ await withGoldenViteServer(async (server) => {
   );
   assert.doesNotMatch(browserSource, /transform:\s*scale\(|object-fit:\s*(?:fill|cover)/u);
 
+  // 应用级 GPT Web Tab（A2 / A4 / A25、设计基线 §5.2）
+  assert.equal(rightPane.rightPaneState.appTabs.length, 0);
+  rightPane.activateRightPaneSession('workspace-golden', 'session-golden');
+  const homeHost = {
+    tabId: 'browser-tab-web-model-home',
+    lifecycle: 'ready',
+    url: 'https://chatgpt.com/',
+    navigationRevision: 3,
+  };
+  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
+  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
+  assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
+  assert.equal(rightPane.appWebModelTab().kind, 'webSession');
+  // 应用级 Tab 不得进入会话级容器，否则会被持久化并在切换会话时丢失。
+  const sessionPane = rightPane.getRightPaneState('session-golden');
+  assert.equal(
+    sessionPane.openTabs.some((tab) => tab.kind === 'webSession'),
+    false,
+  );
+  // 关闭按钮只隐藏视图：保留挂载、保留对话实例指针，不取消推理。
+  rightPane.hideWebModelTabView();
+  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
+  assert.equal(rightPane.appWebModelTab().payload.viewHidden, true);
+  assert.equal(rightPane.rightPaneState.activeAppTabId, null);
+  // 重新打开是激活既有视图，不新建。
+  rightPane.activateWebModelTab();
+  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
+  assert.equal(rightPane.appWebModelTab().payload.viewHidden, false);
+  assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
+  // 切换项目 / 会话不动 appTabs（A2）。
+  rightPane.activateRightPaneSession('workspace-other', 'session-other');
+  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
+  assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
+  // 幂等：同 kind 同 key 只激活既有视图。
+  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
+  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
+  // 应用级会话消失时释放视图指针。
+  rightPane.synchronizeWebModelAppSession(null, null);
+  assert.equal(rightPane.rightPaneState.appTabs.length, 0);
+  assert.equal(rightPane.rightPaneState.activeAppTabId, null);
+
   console.log('right pane golden replay passed');
 });

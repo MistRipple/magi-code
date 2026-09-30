@@ -25,6 +25,7 @@
     type AgentSettingsBootstrapSnapshot,
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
+  import type { PickerWebEngineDto } from '../shared/rust-backend-types';
   import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
@@ -231,6 +232,14 @@
   let pickerSavingModel = $state<string | null>(null);
   let pickerSavingReasoning = $state<ReasoningEffort | null>(null);
   let pickerModels = $state<string[]>([]);
+  /**
+   * 从 Web 加载的引擎（`apiProtocol = chatgpt_web`，A22）。
+   *
+   * 与 provider 模型名并列展示在会话内主模型选择器里：选择它们会把会话绑定到
+   * 引擎（`engineId`），而不是改写 provider 连接。清单来自 daemon 的引擎注册表
+   * 投影，前端不保留第二份 Web 模型列表（A6）。
+   */
+  let pickerWebEngines = $state<PickerWebEngineDto[]>([]);
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
   let pickerModelsConfigKey = '';
@@ -243,6 +252,21 @@
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
   const mainModelReady = $derived.by(() => currentPickerModel.trim().length > 0);
+  /** 会话级引擎绑定（A22）：非空表示当前会话由某个引擎承载（当前只有 Web 引擎）。 */
+  const currentPickerEngineId = $derived.by(() => readOrchestratorEngineId());
+  const currentPickerWebEngine = $derived.by(() => (
+    pickerWebEngines.find((engine) => engine.id === currentPickerEngineId) ?? null
+  ));
+  const currentSessionUsesWebEngine = $derived.by(() => (
+    currentPickerEngineId.trim().startsWith('chatgpt-web/')
+  ));
+  const canSelectPickerWebEngine = $derived.by(() => (
+    isDraftSession || !currentSessionHasCanonicalHistory || currentSessionUsesWebEngine
+  ));
+  /** 按钮上的显示名：Web 引擎用引擎显示名，其余仍用 provider 模型名。 */
+  const currentPickerLabel = $derived.by(() => (
+    currentPickerWebEngine?.displayName?.trim() || currentPickerModel
+  ));
   const currentPickerReasoningEffort = $derived.by(() => readOrchestratorReasoningEffort());
   const currentPickerReasoningLabel = $derived.by(() => reasoningEffortLabel(currentPickerReasoningEffort));
   // 上下文用量圆环数据：直接取 orchestrator runtime 快照里的 budgetState。
@@ -284,6 +308,24 @@
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const isDraftSession = $derived.by(() => !currentSessionId?.trim());
+  /**
+   * 会话方向边界（设计基线 A26）。已有本地 canonical 历史时不提供“导入 Web”
+   * 的 UI 路径；daemon 保存入口还会再次校验，避免直接调用 API 绕过限制。
+   */
+  const currentSessionHasCanonicalHistory = $derived.by(() => {
+    const sessionId = currentSessionId?.trim() || '';
+    if (!sessionId) return false;
+    // 与 daemon 的 A26 门禁保持同一口径：只有 canonical 用户消息计数才
+    // 决定“已有本地历史”。不要用 timeline projection 的 artifacts 数量推断，
+    // 因为其中可能包含通知、状态或非用户条目，导致 UI 比后端过早禁用 Web。
+    const sessionProjections = [
+      messagesState.workspaceSessionProjection.sessions,
+      messagesState.personalSessionProjection.sessions,
+    ];
+    return sessionProjections.some((sessions) => sessions.some((session) => (
+      session.id === sessionId && Number(session.messageCount ?? 0) > 0
+    )));
+  });
   const isPersonalSession = $derived.by(() => (
     !currentWorkspaceId?.trim()
     && !currentWorkspacePath?.trim()
@@ -1391,6 +1433,16 @@
       if (detail.status !== 'failed' || !draft || !composerIsPristineForSubmissionRecovery()) return;
       restoreComposerSubmissionDraft(draft);
     }
+    function handleOpenWebModelPicker(): void {
+      if (sessionInputLocked || isInteractionBlocking) return;
+      pickerOpen = true;
+      if (!pickerLoadedOnce && !pickerLoading) {
+        void loadPickerModels();
+      }
+    }
+    function handleFocusWebModelComposer(): void {
+      queueMicrotask(focusEditor);
+    }
     function handlePickerOutsidePointerDown(event: PointerEvent) {
       const target = event.target;
       if (workspacePickerOpen && !(target instanceof Element && target.closest('.ia-workspace-wrap'))) {
@@ -1432,6 +1484,8 @@
     window.addEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
     window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
     window.addEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
+    window.addEventListener('magi:webModelOpenModelPicker', handleOpenWebModelPicker);
+    window.addEventListener('magi:webModelFocusComposer', handleFocusWebModelComposer);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     window.addEventListener('storage', handleStoredAccessProfileChange);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -1445,6 +1499,8 @@
       window.removeEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
       window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
       window.removeEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
+      window.removeEventListener('magi:webModelOpenModelPicker', handleOpenWebModelPicker);
+      window.removeEventListener('magi:webModelFocusComposer', handleFocusWebModelComposer);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -1868,6 +1924,16 @@
     );
   }
 
+  /**
+   * 会话级引擎绑定（A22）。空串代表「继承 provider 连接」，不是错误值：
+   * settings 侧的空串等价于显式解绑（`canonicalize_session_orchestrator_section`）。
+   */
+  function readOrchestratorEngineId(): string {
+    const config = getCurrentOrchestratorSessionConfigSnapshot();
+    const value = config.engineId;
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
   function readOrchestratorReasoningEffort(): ReasoningEffort {
     return resolveOrchestratorReasoningEffort(
       getCurrentOrchestratorSessionConfigSnapshot(),
@@ -1878,6 +1944,36 @@
   function reasoningEffortLabel(value: ReasoningEffort): string {
     const match = reasoningOptions.find((option) => option.value === value);
     return match ? i18n.t(match.labelKey) : '';
+  }
+
+  /**
+   * Web 引擎的强度档位按引擎取值域渲染，其余置灰（A22）。
+   * 非 Web 引擎（provider 模型）保持既有四档行为不变。
+   */
+  /** 只有 daemon 判为可用的 Web 引擎可选；剩余状态必须先在设置里刷新。 */
+  function pickerWebEngineUsable(engine: PickerWebEngineDto): boolean {
+    const status = (engine.status ?? 'available').trim();
+    return status === 'available' || status === 'tool_degraded';
+  }
+
+  function pickerWebEngineStatusText(engine: PickerWebEngineDto): string {
+    if (!canSelectPickerWebEngine) {
+      return i18n.t('input.mainModelPicker.webLocalSessionBlocked');
+    }
+    if (pickerWebEngineUsable(engine)) {
+      return engine.toolTier ? i18n.t(`webModel.toolTier.${engine.toolTier}`) : engine.id;
+    }
+    return engine.status === 'refresh_required'
+      ? i18n.t('webModel.status.refreshRequired')
+      : i18n.t('webModel.status.failed');
+  }
+
+  function pickerEffortSupported(value: ReasoningEffort): boolean {
+    const engine = currentPickerWebEngine;
+    if (!engine) return true;
+    const efforts = Array.isArray(engine.efforts) ? engine.efforts : [];
+    if (efforts.length === 0) return true;
+    return efforts.includes(value);
   }
 
   function objectRecord(value: unknown): Record<string, unknown> {
@@ -1999,12 +2095,10 @@
       return;
     }
     const loadPromise = (async () => {
-      const orchestratorConfig = getOrchestratorConfigSnapshot();
-      if (!orchestratorConfig) {
-        pickerError = i18n.t('input.modelPickerNotReady');
-        pickerLoading = false;
-        return;
-      }
+      // GPT Web 是独立的模型来源，不要求用户先配置 provider 的
+      // baseUrl/apiKey。空配置仍通过同一个 models/fetch 响应取回 daemon
+      // 投影的 Web 引擎；有 provider 配置时则同时返回两类模型。
+      const orchestratorConfig = getOrchestratorConfigSnapshot() ?? {};
       const configKey = orchestratorModelListConfigKey(orchestratorConfig);
       if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModels.length > 0) {
         return;
@@ -2017,6 +2111,9 @@
           'orch',
         );
         pickerModels = Array.isArray(payload.models) ? payload.models : [];
+        // Web 引擎只来自 daemon 的可用性投影（A22、§5.13）：未登录、未确认说明或
+        // 引擎不在本次探测候选里时这里就是空数组，前端不保留上一次的旧列表。
+        pickerWebEngines = Array.isArray(payload.webEngines) ? payload.webEngines : [];
         applyOrchestratorSessionDefaults(
           objectRecord(payload.orchestratorSessionDefaults),
         );
@@ -2048,7 +2145,9 @@
   async function selectPickerModel(model: string) {
     const normalizedModel = model.trim();
     if (!normalizedModel) return;
-    if (normalizedModel === currentPickerModel) {
+    // Web 引擎的 `model` 是其族名，可能与 provider 列表中的模型同名；
+    // 只要仍有 Web `engineId`，点击 provider 条目就必须继续执行单向 Web → 本地。
+    if (normalizedModel === currentPickerModel && !currentPickerEngineId) {
       pickerOpen = false;
       return;
     }
@@ -2063,7 +2162,7 @@
       messagesState.draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
         messagesState.draftOrchestratorSessionConfig,
         reasoningEffort,
-        { model: normalizedModel },
+        { model: normalizedModel, engineId: '' },
       );
       pickerError = null;
       pickerOpen = false;
@@ -2071,10 +2170,11 @@
     }
     pickerSavingModel = normalizedModel;
     pickerError = null;
+    // 选择 provider 模型即显式解绑引擎：否则用户以为切走了，实际仍由 Web 引擎承载。
     const nextSessionConfig = withOrchestratorReasoningEffort(
       getOrchestratorSessionConfigSnapshot(),
       reasoningEffort,
-      { model: normalizedModel },
+      { model: normalizedModel, engineId: '' },
     );
     try {
       const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, binding);
@@ -2092,6 +2192,85 @@
       pickerOpen = false;
     } catch (error) {
       console.warn('[InputArea] 保存主线模型失败:', error);
+      pickerError = i18n.t('input.modelSaveFailed');
+      addToast('error', pickerError);
+    } finally {
+      pickerSavingModel = null;
+    }
+  }
+
+  /**
+   * 选中一个从 Web 加载的引擎（A22）。
+   *
+   * 与选择 provider 模型的区别只有两点：
+   * - 写入会话级 `engineId` 绑定；`model` 写引擎自身的族名（与 daemon 从
+   *   `chatgpt-web/<family>` 推导的值一致），避免会话里残留 provider 模型名；
+   * - 强度收敛到该引擎 `efforts` 的取值域，不支持时落到引擎的第一个可用档位。
+   */
+  async function selectPickerWebEngine(engine: PickerWebEngineDto) {
+    if (!canSelectPickerWebEngine) {
+      const message = i18n.t('input.mainModelPicker.webLocalSessionBlocked');
+      pickerError = message;
+      addToast('warning', message);
+      return;
+    }
+    const engineId = engine.id.trim();
+    if (!engineId) return;
+    if (engineId === currentPickerEngineId) {
+      pickerOpen = false;
+      return;
+    }
+    const family = engineId.startsWith('chatgpt-web/')
+      ? engineId.slice('chatgpt-web/'.length)
+      : (engine.displayName || engineId);
+    const supported = (Array.isArray(engine.efforts) ? engine.efforts : [])
+      .filter((value): value is OrchestratorReasoningEffort => (
+        value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh'
+      ));
+    const currentEffort = readOrchestratorReasoningEffort();
+    const reasoningEffort = supported.length === 0 || supported.includes(currentEffort)
+      ? currentEffort
+      : supported[0];
+    const patch = { engineId, model: family };
+    const sessionId = currentSessionId?.trim() || '';
+    const workspaceId = currentWorkspaceId?.trim() || '';
+    const workspacePath = currentWorkspacePath?.trim() || '';
+    const binding: AgentBindingOverride = workspaceId || workspacePath
+      ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+      : { scope: 'personal', sessionId };
+    if (!sessionId) {
+      messagesState.draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
+        messagesState.draftOrchestratorSessionConfig,
+        reasoningEffort,
+        patch,
+      );
+      pickerError = null;
+      pickerOpen = false;
+      return;
+    }
+    pickerSavingModel = engineId;
+    pickerError = null;
+    const nextSessionConfig = withOrchestratorReasoningEffort(
+      getOrchestratorSessionConfigSnapshot(),
+      reasoningEffort,
+      patch,
+    );
+    try {
+      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, binding);
+      applyLocalOrchestratorSessionConfig(
+        objectRecord(saved.orchestratorSessionConfig),
+        objectRecord(saved.effectiveOrchestratorConfig),
+      );
+      try {
+        await refreshPickerSettingsSnapshot();
+      } catch (error) {
+        console.warn('[InputArea] 切换 Web 引擎后刷新设置快照失败:', error);
+        addToast('warning', i18n.t('input.modelSavedSyncPending'));
+      }
+      addToast('success', i18n.t('input.modelSwitched', { model: engine.displayName || engineId }));
+      pickerOpen = false;
+    } catch (error) {
+      console.warn('[InputArea] 保存 Web 引擎绑定失败:', error);
       pickerError = i18n.t('input.modelSaveFailed');
       addToast('error', pickerError);
     } finally {
@@ -2672,12 +2851,17 @@
             class:configured={currentPickerModel !== ''}
             onclick={togglePicker}
             disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null || pickerSavingReasoning !== null}
-            title={currentPickerModel
-              ? i18n.t('input.mainModelPicker.titleConfigured', { model: currentPickerModel })
+            title={currentPickerLabel
+              ? i18n.t('input.mainModelPicker.titleConfigured', { model: currentPickerLabel })
               : i18n.t('input.mainModelPicker.titleEmpty')}
             aria-expanded={pickerOpen}
           >
-            <span class="ia-picker-btn-label">{currentPickerModel || i18n.t('input.mainModelPicker.buttonEmpty')}</span>
+            <span class="ia-picker-btn-label">{currentPickerLabel || i18n.t('input.mainModelPicker.buttonEmpty')}</span>
+            {#if currentPickerEngineId}
+              <span class="ia-model-web-badge" data-magi-web-engine={currentPickerEngineId}>
+                {i18n.t('webModel.badge.fromWeb')}
+              </span>
+            {/if}
             {#if currentPickerReasoningLabel}
               <span class="ia-model-effort">{currentPickerReasoningLabel}</span>
             {/if}
@@ -2697,7 +2881,11 @@
                       class="ia-effort-option"
                       class:selected={currentPickerReasoningEffort === option.value}
                       onclick={() => void selectPickerReasoningEffort(option.value)}
-                      disabled={pickerSavingReasoning !== null || pickerSavingModel !== null}
+                      disabled={pickerSavingReasoning !== null || pickerSavingModel !== null || !pickerEffortSupported(option.value)}
+                      title={pickerEffortSupported(option.value)
+                        ? undefined
+                        : i18n.t('input.mainModelPicker.webUnsupportedEffort')}
+                      data-magi-effort-supported={pickerEffortSupported(option.value) ? '1' : '0'}
                     >
                       <span>{i18n.t(option.labelKey)}</span>
                       {#if pickerSavingReasoning === option.value}
@@ -2733,7 +2921,7 @@
                       onclick={() => { pickerError = null; loadPickerModels(); }}
                     >{i18n.t('input.mainModelPicker.retry')}</button>
                   </div>
-                {:else if pickerModels.length === 0}
+                {:else if pickerModels.length === 0 && pickerWebEngines.length === 0}
                   <div class="ia-picker-status">{i18n.t('input.mainModelPicker.empty')}</div>
                 {:else}
                   <div class="ia-picker-list">
@@ -2741,19 +2929,58 @@
                       <button
                         type="button"
                         class="ia-picker-item ia-picker-row"
-                        class:selected={currentPickerModel === model}
+                        class:selected={!currentPickerEngineId && currentPickerModel === model}
                         onclick={() => void selectPickerModel(model)}
                         disabled={pickerSavingModel !== null || pickerSavingReasoning !== null}
                       >
                         <span class="ia-picker-item-label">{model}</span>
                         {#if pickerSavingModel === model}
                           <Icon name="loader" size={12} class="spinning" />
-                        {:else if currentPickerModel === model}
+                        {:else if !currentPickerEngineId && currentPickerModel === model}
                           <span class="ia-picker-check">✓</span>
                         {/if}
                       </button>
                     {/each}
                   </div>
+                  {#if pickerWebEngines.length > 0}
+                    <div class="ia-picker-divider"></div>
+                    <div class="ia-picker-header">{i18n.t('input.mainModelPicker.webSection')}</div>
+                    <div class="ia-picker-list">
+                      {#each pickerWebEngines as engine (engine.id)}
+                        <button
+                          type="button"
+                          class="ia-picker-item ia-picker-row"
+                          class:selected={currentPickerEngineId === engine.id}
+                          data-magi-web-engine-row={engine.id}
+                          onclick={() => void selectPickerWebEngine(engine)}
+                          disabled={pickerSavingModel !== null
+                            || pickerSavingReasoning !== null
+                            || !pickerWebEngineUsable(engine)
+                            || !canSelectPickerWebEngine}
+                          title={pickerWebEngineStatusText(engine)}
+                        >
+                          <span class="ia-picker-item-label">{engine.displayName || engine.id}</span>
+                          <span class="ia-model-web-badge">{i18n.t('webModel.badge.fromWeb')}</span>
+                          {#if engine.toolTier}
+                            <span class="ia-model-tier">{engine.toolTier.toUpperCase()}</span>
+                          {/if}
+                          {#if pickerSavingModel === engine.id}
+                            <Icon name="loader" size={12} class="spinning" />
+                          {:else if currentPickerEngineId === engine.id}
+                            <span class="ia-picker-check">✓</span>
+                          {/if}
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+                {/if}
+                {#if currentPickerEngineId}
+                  <p class="ia-picker-notice">{i18n.t('input.mainModelPicker.webNotice')}</p>
+                {/if}
+                {#if pickerWebEngines.length > 0 && !canSelectPickerWebEngine}
+                  <p class="ia-picker-notice ia-picker-notice--warning">
+                    {i18n.t('input.mainModelPicker.webLocalSessionBlocked')}
+                  </p>
                 {/if}
               </div>
             </div>
@@ -3676,6 +3903,35 @@
     color: var(--primary);
     font-size: 13px;
     line-height: 1;
+  }
+  /* Web 引擎的当前工具档位（A15）：与来源标注并列，只做提示，不参与判断。 */
+  .ia-model-tier {
+    flex: 0 0 auto;
+    margin-left: 4px;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    color: var(--foreground-muted);
+  }
+  /* Web 引擎的来源标注（A6 / S4）：与设置分区的 badge 同义，只是尺寸更小。 */
+  .ia-model-web-badge {
+    flex: 0 0 auto;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    line-height: 16px;
+    white-space: nowrap;
+    background: var(--primary-soft, rgba(80, 140, 255, 0.16));
+    color: var(--primary);
+  }
+  .ia-picker-notice {
+    margin: 6px 6px 0;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--foreground-muted);
+  }
+  .ia-picker-notice--warning {
+    color: var(--warning, var(--foreground-muted));
   }
   .ia-picker-divider {
     height: 1px;

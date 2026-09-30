@@ -8,7 +8,7 @@ import SettingsToolsTab from './SettingsToolsTab.svelte';
 import SettingsBrowserTab from './SettingsBrowserTab.svelte';
 import SettingsProjectTab from './SettingsProjectTab.svelte';
 import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
-import { tick, untrack } from 'svelte';
+import { onMount, tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
 import Toggle from './Toggle.svelte';
@@ -19,6 +19,12 @@ import {
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
+import {
+  WEB_MODEL_SETTINGS_READY_EVENT,
+  WEB_MODEL_SETTINGS_REQUEST_EVENT,
+  consumeWebModelSettingsRequest,
+  type WebModelSettingsRequest,
+} from '../web/web-model-actions';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   
@@ -69,6 +75,32 @@ import { SETTINGS_TABS } from '../lib/settings-tabs';
     event.preventDefault();
     void goBack();
   }
+
+  /** 失败卡片动作可在设置页尚未挂载时到达，使用 actions 模块的 pending 请求接住。 */
+  function applyWebModelSettingsRequest(request: WebModelSettingsRequest | null): void {
+    if (!request) return;
+    store.activeTab = 'browser';
+    void tick().then(() => {
+      window.dispatchEvent(new CustomEvent<WebModelSettingsRequest>(
+        WEB_MODEL_SETTINGS_READY_EVENT,
+        { detail: request },
+      ));
+    });
+  }
+
+  onMount(() => {
+    const handleWebModelSettingsRequest = (event: Event) => {
+      applyWebModelSettingsRequest(
+        (event as CustomEvent<WebModelSettingsRequest>).detail ?? null,
+      );
+    };
+    window.addEventListener(WEB_MODEL_SETTINGS_REQUEST_EVENT, handleWebModelSettingsRequest);
+    applyWebModelSettingsRequest(consumeWebModelSettingsRequest());
+    return () => window.removeEventListener(
+      WEB_MODEL_SETTINGS_REQUEST_EVENT,
+      handleWebModelSettingsRequest,
+    );
+  });
 
   // 每次重新显示：刷新只读数据，并把焦点放到当前分类，键盘用户可以直接继续。
   // 首次创建时（预挂载在后台）不抢焦点。

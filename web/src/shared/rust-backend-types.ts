@@ -2,6 +2,8 @@
 // Source of truth for all DTO types returned by the Rust daemon HTTP API.
 // Formerly maintained in support/frontend-contract/src/contracts.ts.
 
+import type { ModelApiProtocol } from './types/agent-types';
+
 export type EventCategory = 'Domain' | 'Audit' | 'Usage' | 'Projection' | 'System';
 
 export interface HealthDto {
@@ -1140,10 +1142,41 @@ export interface AgentTemplateIdRequestDto {
   templateId: string;
 }
 
+/**
+ * 会话内主模型选择器里的 Web 引擎条目（daemon 投影，A22 / §5.13）。
+ *
+ * 只有 daemon 已确认可用的引擎才会出现在这里；可用状态与工具档位由 daemon
+ * 算好，前端不自行推断（§5.7.0、A15）。
+ */
+export interface PickerWebEngineDto {
+  id: string;
+  displayName?: string;
+  apiProtocol?: ModelApiProtocol;
+  contextWindowTokens?: number;
+  efforts?: string[];
+  toolsEnabled?: boolean;
+  newChatPerTurn?: boolean;
+  toolRoundLimit?: number;
+  status?: string;
+  toolTier?: 't0' | 't2' | 't3';
+  toolTierDegradedReason?: { code?: string; detail?: string } | null;
+  accountHint?: string;
+  limitsRevision?: string;
+  reason?: string | null;
+  origin?: {
+    kind?: string;
+    browserSessionId?: string;
+    discoveredAt?: number;
+    accountHint?: string;
+  };
+}
+
 export interface FetchModelsResponseDto {
   success: boolean;
   target: string;
   models: string[];
+  /** Web 引擎由 daemon 单独投影，绝不混进 `models` 当普通模型名（A22）。 */
+  webEngines?: PickerWebEngineDto[];
   orchestratorSessionDefaults?: Record<string, unknown> | null;
   requestedAt: number;
 }

@@ -76,7 +76,11 @@ assert.match(surfaceManager, /guest\.getType\(\) !== "webview"/u);
 assert.match(surfaceManager, /guest\.hostWebContents !== host/u);
 assert.match(
   surfaceManager,
-  /session\.fromPartition\(record\.partitionId,\s*\{\s*cache:\s*false,?\s*\}\)/u,
+  /const expectedSession = browserSessionForPartition\(record\.partitionId\)/u,
+);
+assert.match(
+  surfaceManager,
+  /function browserSessionForPartition\(partitionId: string\)[\s\S]*?partitionId\.startsWith\("persist:"\)[\s\S]*?session\.fromPartition\(partitionId\)/u,
 );
 assert.match(surfaceManager, /setWindowOpenHandler\(\(details\) =>/u);
 assert.match(surfaceManager, /type: "popup_blocked"/u);

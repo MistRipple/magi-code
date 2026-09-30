@@ -8,6 +8,9 @@ export interface ModelFailureDiagnostic {
   stage: string;
   retryable: boolean;
   retryAttempts: number;
+  /** 可选的业务绑定信息；旧 canonical 记录没有这些字段也必须继续可读。 */
+  sessionId?: string;
+  engineId?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -51,5 +54,11 @@ export function parseModelFailureDiagnostic(value: unknown): ModelFailureDiagnos
     stage,
     retryable: record.retryable,
     retryAttempts: Math.floor(retryAttempts),
+    ...(typeof record.sessionId === 'string' && record.sessionId.trim()
+      ? { sessionId: record.sessionId.trim() }
+      : {}),
+    ...(typeof record.engineId === 'string' && record.engineId.trim()
+      ? { engineId: record.engineId.trim() }
+      : {}),
   };
 }

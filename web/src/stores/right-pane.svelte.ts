@@ -14,8 +14,9 @@
  */
 
 import type { BrowserSessionSnapshot } from '../web/agent-api';
+import { isWebModelBrowserSession } from '../shared/web-model';
 
-export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal';
+export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal' | 'webSession';
 
 /** Agent tab payload —— 代理运行 ID，内容由 canonical projection 按 metadata.taskId 过滤运行输出 */
 export interface AgentTabPayload {
@@ -82,6 +83,42 @@ export interface TerminalTabPayload {
   sessionId: string;
 }
 
+/**
+ * 应用级 GPT Web 视图 payload。
+ *
+ * 只承载指针（浏览器会话 id、主页 tab id、视图 id），不承载页面内容：
+ * 页面实体由 BrowserAuthority + Desktop Main 拥有，右栏只保存布局意图
+ * （设计基线 §5.1、§5.6）。
+ */
+export interface WebModelHost {
+  tabId: string;
+  lifecycle: BrowserAuthorityTabProjection['lifecycle'];
+  url: string;
+  navigationRevision: number;
+}
+
+export interface WebModelTabPayload {
+  /** 应用级浏览器会话 id（全局唯一，持久稳定）。 */
+  browserSessionId: string;
+  /** 主页 Tab 的固定 tab id（推理页面由推理通道按需创建）。 */
+  homeTabId: string;
+  /**
+   * 需要挂载的宿主页面：主页 + 每个活跃对话实例一个推理页面。
+   *
+   * 全部宿主**始终挂载**，只有可见性随激活态切换（A25）；不设预热池。
+   */
+  hosts: WebModelHost[];
+  /** 视图幂等键；应用级视图全局单例，同 key 重复打开只激活既有视图。 */
+  viewId: string;
+  /**
+   * 视图是否被用户显式隐藏（A4 / A25）。
+   *
+   * 关闭按钮只置 true：视图从 Tab 条移除，但组件与 guest 保持挂载，
+   * 后台推理不中断。
+   */
+  viewHidden: boolean;
+}
+
 export interface BrowserAuthorityTabProjection {
   tabId: string;
   lifecycle: 'creating' | 'ready' | 'suspended' | 'crashed' | 'closed';
@@ -98,7 +135,7 @@ export interface BrowserAuthoritySessionProjection {
   tabs: BrowserAuthorityTabProjection[];
 }
 
-export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload | TerminalTabPayload;
+export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload | TerminalTabPayload | WebModelTabPayload;
 
 export interface RightPaneTab {
   id: string;
@@ -128,6 +165,21 @@ interface RightPaneRootState {
   /** 当前原始会话 id；展示与调用外部 session API 时使用 */
   activeSessionId: string;
   perSession: Record<string, SessionPaneState>;
+  /**
+   * 应用级（GPT Web）Tab 集合：与 `perSession` 并列的**窗口级、仅进程内**容器
+   * （设计基线 §5.2）。
+   *
+   * `webSession` 一律不进 `perSession`，因此也不进入 `tabsForPersist` /
+   * `isRestorableTab`；切换项目 / 会话（`activateRightPaneSession`）不动它。
+   * 视图的显示与否只在当前窗口进程内有效，连接后由 BrowserAuthority 的
+   * 应用级会话投影重建。
+   */
+  appTabs: RightPaneTab[];
+  /**
+   * 应用级视图的激活态。非 null 表示右栏当前显示的是应用级视图；
+   * 选择任意会话级 Tab 会把它清空。
+   */
+  activeAppTabId: string | null;
 }
 
 const EMPTY_SESSION_STATE: SessionPaneState = {
@@ -369,6 +421,8 @@ export const rightPaneState = $state<RightPaneRootState>({
   perSession: {
     [PERSONAL_SCOPE_KEY]: { ...EMPTY_SESSION_STATE, openTabs: [] },
   },
+  appTabs: [],
+  activeAppTabId: null,
 });
 
 interface PendingDesktopPanelIntent {
@@ -467,6 +521,10 @@ function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
   }
   if (kind === 'terminal') {
     return `terminal:${(payload as TerminalTabPayload).terminalTabId}`;
+  }
+  if (kind === 'webSession') {
+    // 应用级视图全局单例：同 kind 同 key 再次打开只激活既有视图。
+    return `webSession:${(payload as WebModelTabPayload).viewId}`;
   }
   const browserPayload = payload as BrowserTabPayload;
   return `browser:${browserPayload.browserSessionId}:${browserPayload.tabId}`;
@@ -1285,6 +1343,8 @@ function setActiveRightPaneTabInternal(
     return;
   }
   session.activeTabId = tabId;
+  // 选择任意会话级 Tab 即离开应用级视图；应用级 Tab 本身仍保持挂载（A25）。
+  rightPaneState.activeAppTabId = null;
   tab.lastActivatedAt = now();
   if (userInitiated) rememberDesktopPanelIntent(scopeKey, tab);
 }
@@ -1302,6 +1362,204 @@ export function updateRightPaneTabLabel(
   if (tab && tab.label !== normalizedLabel) {
     tab.label = normalizedLabel;
   }
+}
+
+/**
+ * 应用级 GPT Web 视图的幂等键。
+ *
+ * `webSession` 是窗口级单例：同一窗口只维护一个应用级视图，切项目 / 会话
+ * 只切换它显示的对话实例，不重建视图、不释放 guest（A2、A25、§5.2）。
+ */
+export const WEB_MODEL_VIEW_ID = 'app';
+const WEB_MODEL_TAB_ID = `webSession:${WEB_MODEL_VIEW_ID}`;
+
+function ensureWebModelTab(
+  browserSessionId: string,
+  homeHost: WebModelHost,
+): RightPaneTab {
+  const existing = rightPaneState.appTabs.find((tab) => tab.id === WEB_MODEL_TAB_ID);
+  const hosts = homeHost.tabId ? [homeHost] : [];
+  if (existing) {
+    const payload = existing.payload as WebModelTabPayload;
+    // 应用级会话 id 变化（重建）时同步指针；视图本身不销毁。
+    // 重新打开隐藏视图时不能把已经挂载的推理宿主裁成只有主页，
+    // 否则 Svelte 会卸载对应 webview，后台推理会被人为中断。
+    const retainedHosts = new Map(
+      (payload.browserSessionId === browserSessionId ? payload.hosts : [])
+        .map((host) => [host.tabId, host]),
+    );
+    if (homeHost.tabId) retainedHosts.set(homeHost.tabId, homeHost);
+    existing.payload = {
+      ...payload,
+      browserSessionId,
+      homeTabId: homeHost.tabId,
+      hosts: [
+        ...(homeHost.tabId ? [retainedHosts.get(homeHost.tabId)!] : []),
+        ...[...retainedHosts.values()].filter((host) => host.tabId !== homeHost.tabId),
+      ],
+    };
+    return existing;
+  }
+  const tab: RightPaneTab = {
+    id: WEB_MODEL_TAB_ID,
+    kind: 'webSession',
+    label: '',
+    accentToken: null,
+    payload: {
+      browserSessionId,
+      homeTabId: homeHost.tabId,
+      hosts,
+      viewId: WEB_MODEL_VIEW_ID,
+      viewHidden: false,
+    },
+    lastActivatedAt: now(),
+  };
+  rightPaneState.appTabs = [...rightPaneState.appTabs, tab];
+  return tab;
+}
+
+/** 取得当前窗口的应用级视图（不存在则返回 null）。 */
+export function appWebModelTab(): RightPaneTab | null {
+  return rightPaneState.appTabs.find((tab) => tab.id === WEB_MODEL_TAB_ID) ?? null;
+}
+
+/**
+ * 打开（或激活）应用级 GPT Web 视图。
+ *
+ * 幂等：已存在时只清除隐藏标记并激活。**不动 `perSession`**，因此切换项目 /
+ * 会话不会影响它（§5.2）。
+ */
+export function openWebModelTab(
+  browserSessionId: string,
+  homeHost: WebModelHost,
+): RightPaneTab {
+  const tab = ensureWebModelTab(browserSessionId, homeHost);
+  (tab.payload as WebModelTabPayload).viewHidden = false;
+  rightPaneState.activeAppTabId = tab.id;
+  return tab;
+}
+
+/** `webSession` 关闭按钮语义：只隐藏视图，保留挂载与后台推理（A4 / A25）。 */
+export function hideWebModelTabView(): void {
+  const tab = appWebModelTab();
+  if (!tab) return;
+  (tab.payload as WebModelTabPayload).viewHidden = true;
+  if (rightPaneState.activeAppTabId === tab.id) {
+    rightPaneState.activeAppTabId = null;
+  }
+}
+
+/** 从 Tab 条重新显示被隐藏的应用级视图。 */
+export function showWebModelTabView(): void {
+  const tab = appWebModelTab();
+  if (!tab) return;
+  (tab.payload as WebModelTabPayload).viewHidden = false;
+  rightPaneState.activeAppTabId = tab.id;
+}
+
+/** 应用级会话消失（退出登录 / 清除 Web 数据 / 会话关闭）时释放视图指针。 */
+export function clearWebModelTab(): void {
+  rightPaneState.appTabs = rightPaneState.appTabs.filter(
+    (tab) => tab.id !== WEB_MODEL_TAB_ID,
+  );
+  if (rightPaneState.activeAppTabId === WEB_MODEL_TAB_ID) {
+    rightPaneState.activeAppTabId = null;
+  }
+}
+
+/**
+ * 由 BrowserAuthority 的应用级会话投影收敛视图存在性。
+ *
+ * 传入 `null` 表示应用级会话已不存在（清除数据 / 未创建）；此时释放视图指针。
+ * `hosts` 是应用级会话当前的完整宿主集合：**主页 + 每个活跃对话实例一个
+ * 推理页面**（设计基线 §5.2、A25）。宿主集合永远包含主页，顺序由调用方保证；
+ * 宿主数量只由推理通道并发上限约束，视图侧不自行增减。
+ */
+export function synchronizeWebModelAppSession(
+  browserSessionId: string | null | undefined,
+  homeHost: WebModelHost | null | undefined,
+  hosts?: readonly WebModelHost[] | null,
+): void {
+  const normalizedSessionId = typeof browserSessionId === 'string'
+    ? browserSessionId.trim()
+    : '';
+  if (!normalizedSessionId || !homeHost?.tabId) {
+    if (rightPaneState.appTabs.length > 0) clearWebModelTab();
+    return;
+  }
+  // 旧版曾把应用级会话快照误投影进当前会话的 `perSession`。应用级 Browser
+  // Tab 从产品上不允许出现在会话面板里；在收到权威 app 投影时一次性清理
+  // 这类进程内残留，避免用户看到多个同名“ChatGPT”标签，也避免旧标签继续
+  // 驱动同一个 guest。正常路径不会命中，但这是必要的运行时收敛而不是兼容
+  // 第二套状态源。
+  for (const pane of Object.values(rightPaneState.perSession)) {
+    const filtered = pane.openTabs.filter((tab) => {
+      if (tab.kind !== 'browser') return true;
+      const browserSessionId = (tab.payload as BrowserTabPayload).browserSessionId;
+      return !isWebModelBrowserSession(browserSessionId);
+    });
+    if (filtered.length === pane.openTabs.length) continue;
+    pane.openTabs = filtered;
+    if (pane.activeTabId && !filtered.some((tab) => tab.id === pane.activeTabId)) {
+      pane.activeTabId = filtered[0]?.id ?? null;
+    }
+  }
+  const tab = ensureWebModelTab(normalizedSessionId, homeHost);
+  if (hosts) updateWebModelTabHosts(tab, hosts);
+}
+
+/**
+ * 收敛应用级内容槽的宿主集合（主页 + 推理页面）。
+ *
+ * 不调用者可以只投影主页（`createWebModelPane`）；后台驱动路径创建的推理页面
+ * 必须由 `GET /browser/sessions/app` 的投影追加进来，否则 `<webview>` guest
+ * 不存在，App 级命令拿不到 content-slot binding（A25）。
+ */
+export function updateWebModelHosts(hosts: readonly WebModelHost[]): void {
+  const tab = appWebModelTab();
+  if (!tab) return;
+  updateWebModelTabHosts(tab, hosts);
+}
+
+function updateWebModelTabHosts(tab: RightPaneTab, hosts: readonly WebModelHost[]): void {
+  const payload = tab.payload as WebModelTabPayload;
+  const homeTabId = payload.homeTabId;
+  const deduped = new Map<string, WebModelHost>();
+  for (const host of hosts) {
+    if (!host?.tabId || deduped.has(host.tabId)) continue;
+    deduped.set(host.tabId, { ...host });
+  }
+  const nextHosts: WebModelHost[] = [];
+  const home = deduped.get(homeTabId);
+  if (home) {
+    nextHosts.push(home);
+    deduped.delete(homeTabId);
+  }
+  nextHosts.push(...deduped.values());
+  const changed =
+    nextHosts.length !== payload.hosts.length
+    || nextHosts.some((host, index) => {
+      const current = payload.hosts[index];
+      return (
+        !current
+        || current.tabId !== host.tabId
+        || current.lifecycle !== host.lifecycle
+        || current.url !== host.url
+        || current.navigationRevision !== host.navigationRevision
+      );
+    });
+  if (changed) {
+    payload.hosts = nextHosts;
+  }
+}
+
+/** 显式激活应用级视图（Tab 条点击 / 后台入口）。 */
+export function activateWebModelTab(): void {
+  const tab = appWebModelTab();
+  if (!tab) return;
+  (tab.payload as WebModelTabPayload).viewHidden = false;
+  rightPaneState.activeAppTabId = tab.id;
+  tab.lastActivatedAt = now();
 }
 
 /** 清理某个 session 的所有 tab 状态（在 session 关闭/重置时调用） */

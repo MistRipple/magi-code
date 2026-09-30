@@ -4,6 +4,10 @@
   import { i18n } from '../stores/i18n.svelte';
   import { onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
+  import {
+    dispatchWebModelAction,
+    webModelFailureAction,
+  } from '../web/web-model-actions';
 
   interface Props {
     failure: ModelFailureDiagnostic | ToolCallFailureDiagnostic;
@@ -13,6 +17,13 @@
   let copied = $state(false);
   let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * Web 引擎错误的主行动（§8、§9.2 #23）。
+   *
+   * 只有错误码映射到明确动作时才渲染按钮：没有动作的错误不得显示一个点了
+   * 没用的入口。
+   */
+  const webAction = $derived(webModelFailureAction(failure.code));
   const isToolCallFailure = $derived(failure.schemaVersion === 'tool-call-failure.v1');
   const isUnavailableTool = $derived(
     isToolCallFailure
@@ -64,6 +75,20 @@
       ? i18n.t('messageItem.modelFailure.retryable')
       : i18n.t('messageItem.modelFailure.actionRequired');
   });
+
+  function runWebAction(): void {
+    if (!webAction) return;
+    dispatchWebModelAction({
+      kind: webAction.kind,
+      failureCode: failure.code,
+      ...(!isToolCallFailure && (failure as ModelFailureDiagnostic).sessionId
+        ? { sessionId: (failure as ModelFailureDiagnostic).sessionId }
+        : {}),
+      ...(!isToolCallFailure && (failure as ModelFailureDiagnostic).engineId
+        ? { engineId: (failure as ModelFailureDiagnostic).engineId }
+        : {}),
+    });
+  }
 
   async function copyFailure(): Promise<void> {
     const text = [
@@ -131,6 +156,17 @@
       <dd><code>{failure.code}</code></dd>
     </div>
   </dl>
+
+  {#if webAction}
+    <div class="model-failure-actions">
+      <button
+        type="button"
+        class="model-failure-action"
+        data-web-model-action={webAction.kind}
+        onclick={runWebAction}
+      >{i18n.t(webAction.labelKey)}</button>
+    </div>
+  {/if}
 
   <div class="model-failure-diagnostic">
     <span>{i18n.t('messageItem.modelFailure.diagnostic')}</span>
@@ -224,6 +260,29 @@
   .model-failure-facts code {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
+  }
+
+  .model-failure-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+
+  .model-failure-action {
+    padding: 4px 12px;
+    border: 1px solid color-mix(in srgb, var(--error) 42%, var(--border));
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    cursor: pointer;
+  }
+
+  .model-failure-action:hover,
+  .model-failure-action:focus-visible {
+    background: var(--background-hover);
   }
 
   .model-failure-diagnostic {

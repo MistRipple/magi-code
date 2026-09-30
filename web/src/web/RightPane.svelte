@@ -6,6 +6,7 @@
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
   import BrowserTabContent from '../components/tabs/BrowserTabContent.svelte';
   import TerminalTabContent from '../components/tabs/TerminalTabContent.svelte';
+  import WebModelTabContent from '../components/tabs/WebModelTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { highlightCode } from '../lib/code-highlighter';
   import {
@@ -36,9 +37,14 @@
     type AgentTabPayload,
     type BrowserTabPayload,
     type TerminalTabPayload,
+    type WebModelTabPayload,
+    type WebModelHost,
     openBrowserTab,
     synchronizeBrowserSessionSnapshot,
     openTerminalTab,
+    openWebModelTab,
+    hideWebModelTabView,
+    activateWebModelTab,
   } from '../stores/right-pane.svelte';
   import {
     AgentApiError,
@@ -46,6 +52,8 @@
     closeTerminalSession,
     createBrowserSession,
     createBrowserTab,
+    createAppBrowserSession,
+    discoverWebModels,
     getBrowserCapabilities,
     materializeSession,
     getAgentChangeDiff,
@@ -56,6 +64,17 @@
     type BrowserCapabilitiesSnapshot,
   } from './agent-api';
   import { loadBrowserAuthoritySession } from './browser-authority-coordinator';
+  import { WEB_MODEL_HOME_TAB_ID } from '../shared/web-model';
+  import {
+    webModelActivePageId,
+    webModelActiveTurnCount,
+  } from '../stores/web-model-runtime.svelte';
+  import { openSettings } from '../stores/shell-ui.svelte';
+  import {
+    WEB_MODEL_ACTION_EVENT,
+    requestWebModelSettings,
+    type WebModelActionDetail,
+  } from './web-model-actions';
 
   type HtmlBrowserOpenRequest = {
     requestId: number;
@@ -85,6 +104,23 @@
   const paneScopeKey = $derived(rightPaneState.activeScopeKey);
   const paneState = $derived(getRightPaneState(paneScopeKey));
   const openTabs = $derived(paneState.openTabs);
+  /**
+   * 应用级 GPT Web Tab 集合：窗口级、仅进程内，不随会话切换释放（A2、A25）。
+   * `webSession` 一律不进 `perSession`，因此也不进 `tabsForPersist` /
+   * `isRestorableTab`。
+   */
+  const appPaneTabs = $derived(rightPaneState.appTabs);
+  const activeAppTab = $derived(
+    appPaneTabs.find((tab) => tab.id === rightPaneState.activeAppTabId) ?? null,
+  );
+  /** Tab 条只展示未被显式隐藏的应用级视图（关闭按钮只隐藏，不销毁，A4）。 */
+  const visibleAppTabs = $derived(
+    appPaneTabs.filter((tab) => !(tab.payload as WebModelTabPayload).viewHidden),
+  );
+  const visiblePaneTabs = $derived([...openTabs, ...visibleAppTabs]);
+  const effectiveActiveTabId = $derived(
+    rightPaneState.activeAppTabId ?? paneState.activeTabId,
+  );
   let tabStripElement: HTMLDivElement | undefined;
 
   $effect(() => {
@@ -125,6 +161,14 @@
     !isPublicTunnelAccess()
       && rightPaneState.activeSessionId.trim(),
   ));
+  /**
+   * 应用级 GPT Web 视图与内置浏览器共享同一 Desktop-only 能力判定
+   * （`canCreateBrowserPane`）；非 Desktop 上禁用并给出原因，不静默消失。
+   */
+  const canCreateWebModelPane = $derived(canCreateBrowserPane);
+  const webModelDisabledReason = $derived(
+    i18n.t(desktopSurface ? 'browser.error.internalUnavailable' : 'browser.error.desktopRequired'),
+  );
 
   function applyBrowserCapabilities(snapshot: BrowserCapabilitiesSnapshot): void {
     browserCapabilities = snapshot;
@@ -168,9 +212,12 @@
       });
     };
     window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+    // 失败卡片的主行动（§8）：宿主在这里，卡片只派发动作，不复制宿主状态。
+    window.addEventListener(WEB_MODEL_ACTION_EVENT, handleWebModelFailureAction);
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+      window.removeEventListener(WEB_MODEL_ACTION_EVENT, handleWebModelFailureAction);
       domAddPaneMenuOpen = false;
     };
   });
@@ -346,22 +393,147 @@
     });
   }
 
-  type RightPaneCreationKind = 'browser' | 'terminal';
+  /**
+   * 处理 Web 模型失败卡片派发的主行动（§8、§9.2 #23）。
+   *
+   * 每个分支都只做「一次显式动作 + 一条真实结果提示」：探测类动作把 daemon
+   * 的返回原样报出来，不假装成功；登录 / 主页动作走与「新增 → GPT Web」完全
+   * 相同的入口，因此不会出现第二条创建路径。
+   */
+  async function handleWebModelFailureAction(event: Event): Promise<void> {
+    const detail = (event as CustomEvent<WebModelActionDetail>).detail;
+    if (!detail?.kind) return;
+    switch (detail.kind) {
+      case 'openView':
+        await createWebModelPane();
+        return;
+      case 'runDiagnostics': {
+        try {
+          // 与设置页的连接动作保持同一前置：没有应用级主页 guest 时，探测
+          // 只能得到 Desktop 不可用，不能把一次性动作误报成 selector 漂移。
+          await createAppBrowserSession();
+          const result = await discoverWebModels();
+          const summary = result.reason
+            ? `${result.status} · ${result.reason}`
+            : result.status;
+          addToast(result.status === 'ok' ? 'success' : 'warning', summary, undefined, { forceVisible: true });
+        } catch (error) {
+          console.warn('[RightPane] Web 模型自检失败:', error);
+          addToast('error', i18n.t('settings.browser.webModel.loadFailed'), undefined, { forceVisible: true });
+        }
+        return;
+      }
+      case 'openTunnelSettings': {
+        openSettings();
+        requestWebModelSettings({ focus: 'tunnel' });
+        return;
+      }
+      case 'openSettings': {
+        openSettings();
+        requestWebModelSettings({ focus: 'diagnostics' });
+        return;
+      }
+      case 'switchModel':
+        window.dispatchEvent(new CustomEvent('magi:webModelOpenModelPicker'));
+        return;
+      case 'raiseRoundLimit': {
+        openSettings();
+        requestWebModelSettings({ focus: 'roundLimit', engineId: detail.engineId });
+        return;
+      }
+      case 'retry':
+        // 发送失败后，InputArea 会按既有 submission-settled 事实恢复草稿；这里
+        // 只把焦点交回 composer，不自动重放副作用或创建第二条提交路径。
+        window.dispatchEvent(new CustomEvent('magi:webModelFocusComposer'));
+        return;
+    }
+  }
+
+  let creatingWebModelPane = $state(false);
+
+  /**
+   * 打开应用级 GPT Web 视图（S1–S3）。
+   *
+   * 未登录时 ChatGPT 主页自身会显示登录页；登录态由 `persist:magi-web-model`
+   * 持久分区跨重启保留（A4、A21）。这里只负责取得稳定会话身份并把视图接进右栏，
+   * 不注入或改写 ChatGPT 页面。
+   */
+  async function createWebModelPane(): Promise<void> {
+    if (creatingWebModelPane) return;
+    if (!canCreateWebModelPane) {
+      addToast('warning', webModelDisabledReason, undefined, { forceVisible: true });
+      return;
+    }
+    creatingWebModelPane = true;
+    try {
+      const { session } = await createAppBrowserSession();
+      const home = session.tabs.find((tab) => tab.tabId === WEB_MODEL_HOME_TAB_ID)
+        ?? session.tabs[0];
+      if (!home) {
+        addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+        return;
+      }
+      const homeHost: WebModelHost = {
+        tabId: home.tabId,
+        lifecycle: home.lifecycle,
+        url: home.url,
+        navigationRevision: home.navigationRevision,
+      };
+      openWebModelTab(session.browserSessionId, homeHost);
+    } catch (error) {
+      console.warn('[RightPane] 打开 GPT Web 视图失败:', error);
+      addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+    } finally {
+      creatingWebModelPane = false;
+    }
+  }
+
+  /**
+   * 「GPT Web（后台推理中 · N）」（§9.3 #10）。
+   *
+   * N 取内容槽里除主页之外的宿主数（§5.2 不设预热池，每个宿主就是一个活跃
+   * 对话实例）；视图被隐藏时这个数字仍然可见，用户据此点回视图。
+   */
+  /**
+   * 只按 daemon 的 active 运行态显示后台推理数量。
+   *
+   * 内容槽里可能暂时保留 creating/ready 宿主，或 Authority 中存在已经
+   * suspended 的可恢复页面；它们都不是“正在推理”，不能被计入徽标。
+   */
+  const webModelRunningBadgeCount = $derived(webModelActiveTurnCount());
+
+  type RightPaneCreationKind = 'browser' | 'terminal' | 'webSession';
+  /**
+   * 「新增」菜单**始终渲染三项**，用 `enabled` + `disabledReason` 表达不可用
+   * （设计基线 §5.2）：现有实现让 browser 项在不可用时整项不渲染，等于在
+   * Web / 手机 Web 上功能完全消失且没有解释。
+   */
   const addablePaneKinds = $derived([
     {
       kind: 'terminal' as const,
       label: i18n.t('rightPane.addPanelTerminal'),
       icon: 'terminal' as const,
       enabled: canCreateTerminalPane,
+      disabledReason: i18n.t('rightPane.addPanelTerminalDisabled'),
     },
-    ...(canCreateBrowserPane ? [{
+    {
       kind: 'browser' as const,
       label: i18n.t('rightPane.addPanelBrowser'),
       icon: 'globe' as const,
-      enabled: true,
-    }] : []),
+      enabled: canCreateBrowserPane,
+      disabledReason: webModelDisabledReason,
+    },
+    {
+      kind: 'webSession' as const,
+      label: webModelRunningBadgeCount > 0
+        ? i18n.t('rightPane.addPanelWebModelRunning', { count: webModelRunningBadgeCount })
+        : i18n.t('rightPane.addPanelWebModel'),
+      icon: 'globe' as const,
+      enabled: canCreateWebModelPane,
+      disabledReason: i18n.t('rightPane.addPanelWebModelDisabled'),
+    },
   ]);
-  const canOpenAddPaneMenu = $derived(addablePaneKinds.some((item) => item.enabled));
+  const canOpenAddPaneMenu = $derived(addablePaneKinds.length > 0);
 
   function toggleAddPaneMenu(): void {
     if (!canOpenAddPaneMenu) return;
@@ -378,12 +550,21 @@
       await createBrowserPane();
       return;
     }
+    if (kind === 'webSession') {
+      await createWebModelPane();
+      return;
+    }
     createTerminalPane();
   }
   const activeTab = $derived.by<RightPaneTab | null>(() => {
     // Tab 条与内容区必须从同一份根状态解析当前 Tab。不要透过 paneState/openTabs
     // 的派生引用再做二次缓存，否则同一轮内新增 Tab 并激活时可能出现 Tab 条已更新、
     // 内容区仍读取旧 activeTab 的撕裂状态。
+    const appTabId = rightPaneState.activeAppTabId;
+    if (appTabId) {
+      const appTab = rightPaneState.appTabs.find((tab) => tab.id === appTabId);
+      if (appTab) return appTab;
+    }
     const scopeKey = rightPaneState.activeScopeKey;
     const state = scopeKey ? rightPaneState.perSession[scopeKey] : undefined;
     const activeTabId = state?.activeTabId;
@@ -904,16 +1085,21 @@
 
   function tabLabel(tab: RightPaneTab): string {
     if (tab.kind === 'terminal') return i18n.t('terminalPanel.title');
+    if (tab.kind === 'webSession') return i18n.t('rightPane.webModelTabLabel');
     return tab.label;
   }
 
   function tabIcon(tab: RightPaneTab): 'file-text' | 'chevron-right' | 'globe' | 'terminal' {
     if (tab.kind === 'code') return 'file-text';
     if (tab.kind === 'browser') return 'globe';
+    if (tab.kind === 'webSession') return 'globe';
     return tab.kind === 'terminal' ? 'terminal' : 'chevron-right';
   }
 
   function tabTooltip(tab: RightPaneTab): string {
+    if (tab.kind === 'webSession') {
+      return i18n.t('rightPane.webModelTabTooltip');
+    }
     if (tab.kind === 'code') {
       const payload = tab.payload as CodeTabPayload;
       return payload.displayPath || payload.filepath;
@@ -949,12 +1135,23 @@
 
   function handleTabClick(tabId: string) {
     if (recentlyDragged()) return;
+    if (appPaneTabs.some((tab) => tab.id === tabId)) {
+      activateWebModelTab();
+      return;
+    }
     setActiveRightPaneTab(paneScopeKey, tabId);
   }
 
   function handleTabClose(event: MouseEvent, tabId: string) {
     event.stopPropagation();
     if (recentlyDragged()) return;
+    if (appPaneTabs.some((tab) => tab.id === tabId)) {
+      // A4 / A25：关闭 GPT Web 视图只做右栏本地隐藏——不销毁宿主与登录态、
+      // 不发起任何 Authority 关闭命令、不取消进行中的推理，也不弹确认。
+      hideWebModelTabView();
+      addToast('info', i18n.t('webModel.close.hiddenNotice'), undefined, { forceVisible: true });
+      return;
+    }
     const tab = openTabs.find((item) => item.id === tabId);
     closeTab(paneScopeKey, tabId);
     if (tab?.kind === 'browser') {
@@ -1074,8 +1271,8 @@
       onpointerup={handleTabsPointerEnd}
       onpointercancel={handleTabsPointerEnd}
     >
-      {#each openTabs as tab (tab.id)}
-        {@const isActive = tab.id === paneState.activeTabId}
+      {#each visiblePaneTabs as tab (tab.id)}
+        {@const isActive = tab.id === effectiveActiveTabId}
         {@const accent = tabAccent(tab)}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
@@ -1148,10 +1345,14 @@
             class="right-pane-add-menu-item"
             role="menuitem"
             disabled={!item.enabled}
+            title={item.enabled ? item.label : item.disabledReason}
             onclick={() => chooseAddPane(item.kind)}
           >
             <Icon name={item.icon} size={14} />
             <span>{item.label}</span>
+            {#if !item.enabled}
+              <span class="right-pane-add-menu-reason">{item.disabledReason}</span>
+            {/if}
           </button>
         {/each}
       </div>
@@ -1200,6 +1401,7 @@
     class:right-pane-body--code={codeMode}
     class:right-pane-body--browser={activeTab?.kind === 'browser'}
     class:right-pane-body--terminal={activeTab?.kind === 'terminal'}
+    class:right-pane-body--web-model={activeTab?.kind === 'webSession'}
   >
     {#each openTabs as tab (tab.id)}
       {#if tab.kind === 'browser'}
@@ -1222,6 +1424,28 @@
           />
         </div>
       {/if}
+    {/each}
+
+    {#each appPaneTabs as appTab (appTab.id)}
+      {@const appPayload = appTab.payload as WebModelTabPayload}
+      {@const activeWebModelPageId = webModelActivePageId(
+        rightPaneState.activeSessionId,
+        undefined,
+        appPayload.hosts.map((host) => host.tabId),
+      )}
+      <!-- 应用级内容槽**始终挂载**（A25）：折叠右栏与关闭视图只改可见性，
+           不卸载组件、不销毁 guest，后台推理不中断。 -->
+      <WebModelTabContent
+        browserSessionId={appPayload.browserSessionId}
+        hosts={appPayload.hosts}
+        activeHostTabId={activeWebModelPageId ?? appPayload.hosts[0]?.tabId ?? null}
+        active={activeAppTab?.id === appTab.id && !appPayload.viewHidden}
+        workspaceId={rightPaneState.activeWorkspaceId}
+        workspacePath={workspaceRoot}
+        sessionId={rightPaneState.activeSessionId}
+        desktopSurface={desktopSurface}
+        onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, appTab.id, label)}
+      />
     {/each}
 
     {#if !activeTab}
@@ -1248,6 +1472,8 @@
       />
     {:else if activeTab.kind === 'browser'}
       <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
+    {:else if activeTab.kind === 'webSession'}
+      <!-- WebModelTabContent 已在上方的内容槽中始终挂载；这里同样不能进入文件预览分支。 -->
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
     {:else if previewError}
@@ -1502,6 +1728,12 @@
     background: var(--surface-hover);
   }
 
+  .right-pane-add-menu-reason {
+    margin-left: auto;
+    color: var(--muted-foreground);
+    font-size: var(--text-xs);
+  }
+
   .right-pane-add-menu-item:disabled {
     opacity: 0.45;
     cursor: default;
@@ -1743,6 +1975,15 @@
 
   .right-pane-body--terminal {
     display: flex;
+    overflow: hidden;
+    padding: 0;
+  }
+
+  .right-pane-body--web-model {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
     overflow: hidden;
     padding: 0;
   }

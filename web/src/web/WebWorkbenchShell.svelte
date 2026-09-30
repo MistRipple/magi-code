@@ -88,6 +88,7 @@
     loadBrowserAuthoritySession,
     prepareBrowserAuthorityForDesktop,
   } from './browser-authority-coordinator';
+  import { projectWebModelAppSession } from './web-model-session-projection';
   import {
     agentBindingWorkspaceId,
     agentBindingWorkspacePath,
@@ -471,6 +472,19 @@ import {
     rightPaneOpenForLayout,
   );
   const inlineRightPaneVisible = $derived(!desktopAppSurface && rightPaneVisible);
+  /**
+   * 存在应用级 GPT Web 视图时，右栏容器必须**全程挂载**（设计基线 A25）：
+   * 折叠右栏只做视觉隐藏，不卸载组件、不销毁 `<webview>` guest、不中断后台推理。
+   * 这是对「折叠即卸载」的唯一显式例外，只由应用级视图触发。
+   */
+  const appWebModelMounted = $derived(rightPaneState.appTabs.length > 0);
+  /**
+   * 应用级 GPT Web 会话的兜底投影周期。
+   *
+   * 推理页面由推理通道按需创建，桌面控制路径不一定发布 Authority 事件；
+   * 该轮询只是只读 `GET`，用来保证宿主 guest 与 Authority 最终一致。
+   */
+  const WEB_MODEL_PROJECTION_INTERVAL_MS = 2000;
   const panelVisibility = $derived(resolvePanelVisibility({
     sidebarDrawer: sidebarIsDrawer,
     sidebarPreferredOpen: !sidebarCollapsed,
@@ -508,6 +522,11 @@ import {
   function currentDesktopPanelTarget(): DesktopPanelTarget {
     const scopeKey = rightPaneState.activeScopeKey;
     const pane = getRightPaneState(scopeKey);
+    // 应用级 GPT Web 视图走「不激活」驱动路径（A25）：它不写
+    // `right_pane_visibility` / `active_panel`，因此这里不产生任何面板意图。
+    if (rightPaneState.activeAppTabId) {
+      return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
+    }
     const activeTab = pane.activeTabId
       ? pane.openTabs.find((tab) => tab.id === pane.activeTabId) ?? null
       : null;
@@ -523,6 +542,10 @@ import {
         browserSessionId: browser.browserSessionId,
         browser,
       };
+    }
+    if (activeTab.kind === 'webSession') {
+      // 防御分支：应用级视图不应出现在 perSession 容器里。
+      return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
     }
     return {
       scopeKey,
@@ -714,7 +737,10 @@ import {
         sidebarMode = 'projects';
       });
     }
-    if (inlineRightPaneVisible || (desktopAppSurface && desktopRightPaneVisible)) {
+    if (
+      inlineRightPaneVisible
+      || (desktopAppSurface && (desktopRightPaneVisible || appWebModelMounted))
+    ) {
       void loadRightPane().catch((error) => {
         console.error('[WebWorkbenchShell] 右侧面板加载失败:', error);
         addToast('error', i18n.t('app.featureLoadFailed'));
@@ -811,6 +837,9 @@ import {
   function synchronizeBrowserProjectionFromAuthorityEvent(event: Event): void {
     const detail = (event as CustomEvent<BrowserAuthorityEventDetail>).detail;
     if (!detail || typeof detail !== 'object') return;
+    // 应用级会话的 Tab（含推理页面）不属于任何 Magi 会话的 perSession 容器，
+    // 必须走独立投影，否则推理页面没有宿主 guest。
+    synchronizeWebModelSessionProjection();
     const browserSessionIds = browserSessionIdsForAuthorityEvent(detail);
     for (const browserSessionId of browserSessionIds) {
       void loadBrowserAuthoritySession(browserSessionId, (snapshot) => {
@@ -826,6 +855,29 @@ import {
         console.warn('[WebWorkbenchShell] 同步浏览器权威投影失败:', error);
       });
     }
+  }
+
+  /**
+   * 应用级 GPT Web 会话投影（A25 / §5.2）。
+   *
+   * Authority 事件、窗口启动与低频兜底轮询都走这一条路径：`appTabs` 与内容槽
+   * 宿主集合只能由 daemon 的只读投影重建，视图侧不自行发明宿主，也不因为
+   * 折叠右栏 / 关闭视图而释放 guest。
+   */
+  let webModelProjectionInFlight = false;
+  function synchronizeWebModelSessionProjection(): void {
+    // 应用级 GPT Web 只存在于 Magi Desktop：daemon 对非 Desktop 客户端固定返回 501，
+    // 在 Web / 手机 Web 上轮询只会持续产生失败请求和告警，还会占用浏览器连接。
+    if (!desktopAppSurface) return;
+    if (webModelProjectionInFlight) return;
+    webModelProjectionInFlight = true;
+    void projectWebModelAppSession()
+      .catch((error) => {
+        console.warn('[WebWorkbenchShell] 投影应用级 GPT Web 会话失败:', error);
+      })
+      .finally(() => {
+        webModelProjectionInFlight = false;
+      });
   }
 
   function resolveBackendWorkspaceSelection(nextWorkspaces: AgentWorkspaceSummary[]): string {
@@ -2765,6 +2817,11 @@ import {
 
   $effect(() => {
     if (!desktopAppSurface || !desktopSnapshot || !window.magiDesktop) return;
+    // 应用级 GPT Web 视图没有 Desktop active_panel 身份。它可能只是把
+    // 当前右栏内容槽移到后台，但 Main 仍必须保留用户最近一次确认的面板；
+    // 这里若把 app 视图编码成 kind:null，下面就会误发 activatePanel(null)，
+    // 清掉用户当前面板并把焦点交回 App Renderer（A25 / R49）。
+    if (rightPaneState.activeAppTabId) return;
     void desktopPanelActivationEpoch;
     const recoveryRevision = desktopRuntimeRecoveryRevision;
     const target = currentDesktopPanelTarget();
@@ -3000,8 +3057,19 @@ import {
       });
     void refreshWorkspaces();
     void refreshPersonalSessions();
+    // 启动即投影一次：重启后 GPT Web 视图与宿主由 Authority 恢复（§5.1）。
+    synchronizeWebModelSessionProjection();
+    // 推理页面由推理通道在应用级会话里按需创建，桌面控制路径不一定发布
+    // Authority 事件，因此保留低频兜底轮询；`GET` 只读、不创建会话。
+    const webModelProjectionTimer = desktopAppSurface
+      ? window.setInterval(
+          synchronizeWebModelSessionProjection,
+          WEB_MODEL_PROJECTION_INTERVAL_MS,
+        )
+      : null;
     return () => {
       stopPopoverDismiss();
+      if (webModelProjectionTimer !== null) window.clearInterval(webModelProjectionTimer);
       desktopDropDisposed = true;
       stopDesktopFileDrop?.();
       desktopDropIndicator = null;
@@ -3592,17 +3660,22 @@ import {
             }
           }}
         />
-      {:else if desktopAppSurface && desktopRightPaneVisible && RightPaneComponent}
-        <div
-          class="desktop-right-pane-resize-handle"
-          role="separator"
-          aria-orientation="vertical"
-          title={i18n.t('web.filePreviewResizeReset')}
-          onpointerdown={startDesktopRightPaneResize}
-          ondblclick={resetDesktopRightPaneWidth}
-        ></div>
+      {:else if desktopAppSurface && RightPaneComponent && (desktopRightPaneVisible || appWebModelMounted)}
+        {#if desktopRightPaneVisible}
+          <div
+            class="desktop-right-pane-resize-handle"
+            role="separator"
+            aria-orientation="vertical"
+            title={i18n.t('web.filePreviewResizeReset')}
+            onpointerdown={startDesktopRightPaneResize}
+            ondblclick={resetDesktopRightPaneWidth}
+          ></div>
+        {/if}
         <div
           class="desktop-right-pane-column"
+          class:desktop-right-pane-column--background={!desktopRightPaneVisible}
+          hidden={!desktopRightPaneVisible && !appWebModelMounted}
+          aria-hidden={!desktopRightPaneVisible}
         >
           <RightPaneComponent
             workspaceRoot={selectedWorkspace?.rootPath || ''}
@@ -3759,6 +3832,26 @@ import {
     width: 100%;
     min-width: 0;
     min-height: 0;
+  }
+
+  /* 折叠右栏时只做视觉隐藏：应用级 GPT Web 视图必须保持挂载（A25）。 */
+  .desktop-right-pane-column[hidden] {
+    display: none;
+  }
+
+  /*
+    承载应用级 GPT Web 会话时，折叠右栏只能把这一列**移出可见区域**，
+    不能卸载或塌缩：`<webview>` guest 需要真实布局尺寸才能注册，注册是后台
+    推理的唯一入口（A25、R49）。`position: fixed` 让它离开网格流，因此折叠后
+    的可见布局与既有 golden 完全一致。
+  */
+  .desktop-right-pane-column--background {
+    position: fixed;
+    top: 0;
+    left: -20000px;
+    width: var(--desktop-right-pane-width, 480px);
+    height: 100vh;
+    pointer-events: none;
   }
 
 

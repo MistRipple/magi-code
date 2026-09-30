@@ -76,7 +76,7 @@ import type {
   ModelEngine,
   AgentBinding,
 } from "../shared/types/registry-types";
-import type { LLMConfig, ModelApiProtocol } from "../shared/types/agent-types";
+import type { HttpModelApiProtocol, LLMConfig } from "../shared/types/agent-types";
 import type { ModelStatus, ModelStatusMap, ModelStatusType } from "../types/message";
 import {
   getModelStatus,
@@ -111,7 +111,7 @@ export interface TextModelRule {
 export interface BaseModelFormConfig {
   baseUrl: string;
   urlMode: UrlMode;
-  apiProtocol: ModelApiProtocol;
+  apiProtocol: HttpModelApiProtocol;
   apiKey: string;
   model: string;
   contextWindowTokens?: number;
@@ -129,7 +129,7 @@ type ModelConfigTarget = "orch" | "comp" | "vision" | "image" | "worker";
 type BaseModelConfigPayload = Record<string, unknown> & {
   baseUrl: string;
   urlMode: UrlMode;
-  apiProtocol: ModelApiProtocol;
+  apiProtocol: HttpModelApiProtocol;
   apiKey: string;
   model: string;
 };
@@ -441,7 +441,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     return value === "full" ? "full" : "standard";
   }
 
-  function normalizeModelApiProtocol(value: unknown): ModelApiProtocol {
+  function normalizeModelApiProtocol(value: unknown): HttpModelApiProtocol {
     if (value === "openai_responses") return "openai_responses";
     if (value === "anthropic_messages") return "anthropic_messages";
     return "openai_chat";

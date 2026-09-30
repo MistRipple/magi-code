@@ -7,6 +7,7 @@
     browserScreenshotUrl,
     browserClientPlatform,
     getBrowserSession,
+    getAppBrowserSession,
     isReferenceableBrowserAnnotation,
     navigateBrowserTab,
     type BrowserAnnotationSnapshot,
@@ -23,6 +24,7 @@
   import { synchronizeBrowserSessionSnapshot } from '../../stores/right-pane.svelte';
   import type { MessageBrowserNodeSelection } from '../../types/message';
   import { normalizeOptionalDomNodeId } from '@magi/desktop-browser-contracts';
+  import { browserPartitionForSession } from '../../shared/web-model';
 
   interface Props {
     browserSessionId: string;
@@ -33,6 +35,16 @@
     sessionId?: string;
     onTitleChange?: (label: string) => void;
     desktopSurface?: boolean;
+    /**
+     * 承载身份来源（A25、R49）。
+     *
+     * - `session`（默认）：会话级 Browser Tab，承载身份来自窗口布局的活动指针
+     *   （`activePanelKind` / `activeTabId` / `activeSurfaceId`），注册前必须先
+     *   激活右栏——这正是既有语义。
+     * - `app`：应用级 GPT Web 宿主。它**不允许**写任何激活意图，因此身份只能来自
+     *   窗口快照的 `browserSurfaces` 投影；注册、显隐都不再依赖活动面板。
+     */
+    surfaceScope?: 'session' | 'app';
   }
 
   // 消息链路的节点上下文是唯一契约；Renderer 只补充 Chromium 返回的
@@ -113,7 +125,9 @@
     sessionId,
     onTitleChange,
     desktopSurface = false,
+    surfaceScope = 'session',
   }: Props = $props();
+  const appLevelSurface = $derived(surfaceScope === 'app');
   // Browser Tab 的运行通道由右栏宿主显式决定。Desktop 使用主 Renderer
   // 直接承载 Electron <webview>；Main 只负责控制 guest 的生命周期和 CDP，
   // 不参与右栏几何计算。
@@ -182,6 +196,7 @@
   let refreshGeneration = 0;
   let desktopSurfaceSyncGeneration = 0;
   let activeBrowserIdentityKey = '';
+  let lastAppSurfaceKey = '';
   let activeDownloads = $state<MagiDesktopBrowserDownloadSnapshot[]>([]);
   const anchorToken = $derived(tabId.replace(/[^A-Za-z0-9_-]/gu, '_'));
   const toolbarAnchorName = $derived(`--magi-browser-toolbar-${anchorToken}`);
@@ -243,18 +258,42 @@
     return downloads[downloads.length - 1] ?? null;
   });
   const externalUrl = $derived(normalizeExternalWebUrl(activeTab?.url || address));
+  /**
+   * 应用级宿主的承载身份：只认窗口快照里的 Surface 清单，不认活动面板。
+   *
+   * 清单由 Main 按窗口投影（`browserSurfaceSnapshotsForWindow`），在逻辑 Surface
+   * 建立后即出现，因此 Renderer 能在不激活右栏的前提下完成 guest 注册。
+   */
+  const appSurfaceIdentity = $derived.by<BrowserInspectIdentity | null>(() => {
+    if (!desktopRuntime || !appLevelSurface) return null;
+    const entry = desktopSnapshot?.browserSurfaces?.find((item) => item.tabId === tabId) ?? null;
+    if (!entry) return null;
+    return {
+      tabId,
+      surfaceId: entry.surfaceId,
+      navigationRevision: entry.navigationRevision,
+    };
+  });
   const browserSurfaceAvailable = $derived(
     desktopRuntime
-      && desktopSnapshot?.layout.rightPaneVisible === true
-      && desktopSnapshot?.layout.activePanelKind === 'browser'
-      && desktopSnapshot.layout.activeTabId === tabId
-      && Boolean(desktopSnapshot?.layout.activeSurfaceId)
-      && webviewRegistered,
+      && webviewRegistered
+      && (
+        appLevelSurface
+          ? Boolean(appSurfaceIdentity)
+          : (
+            desktopSnapshot?.layout.rightPaneVisible === true
+            && desktopSnapshot?.layout.activePanelKind === 'browser'
+            && desktopSnapshot.layout.activeTabId === tabId
+            && Boolean(desktopSnapshot?.layout.activeSurfaceId)
+          )
+      ),
   );
   // activeSurfaceId 是 Main 为当前 Browser Tab 分配的逻辑页面身份。它不是
   // Authority/Worker 握手状态，也不会因页面刷新或右栏拖动而重置。
   const browserReady = $derived(browserSurfaceAvailable);
   const activeBrowserIdentity = $derived.by<BrowserInspectIdentity | null>(() => {
+    // 应用级宿主不参与活动面板语义：身份来自窗口快照的只读投影。
+    if (appLevelSurface) return appSurfaceIdentity;
     const tab = activeTab;
     const surfaceId = desktopSnapshot?.layout.activeSurfaceId;
     const navigationRevision = desktopSnapshot?.activeBrowserNavigationRevision;
@@ -299,9 +338,7 @@
     return i18n.t('browser.status.connecting');
   });
 
-  function browserPartitionForSession(id: string): string {
-    return `magi-browser-${id.replace(/[^A-Za-z0-9._-]/gu, '_')}`;
-  }
+
 
   function currentBrowserDisplaySize(): MagiDesktopBrowserDisplaySize | null {
     const slot = browserSurfaceSlot;
@@ -370,7 +407,18 @@
     const desktop = window.magiDesktop;
     const identity = activeBrowserIdentity;
     const view = browserWebview;
-    if (!desktop || !identity || !view) return;
+    if (!desktop || !view) return;
+    if (!identity) {
+      // 应用级宿主必须先拿到窗口快照里的 Surface 身份；Main 只在逻辑 Surface
+      // 建立后才会把它投影出来，所以这里主动拉一次并在有界次数内重试，
+      // 不依赖任何激活动作（A25、R49）。
+      if (appLevelSurface) {
+        webviewRegistrationAttempts += 1;
+        void synchronizeDesktopSurface();
+        scheduleWebviewRegistration(Math.min(250, 40 + webviewRegistrationAttempts * 5));
+      }
+      return;
+    }
     let webContentsId: number;
     try {
       webContentsId = view.getWebContentsId();
@@ -444,16 +492,26 @@
     const generation = ++refreshGeneration;
     if (initialLoad) loading = true;
     try {
-      const next = await getBrowserSession(expectedSessionId);
+      // 应用级 GPT Web 会话不属于任何 Magi 会话；它必须通过专用的
+      // `/browser/sessions/app` 读取入口，不能把 app scope 误送进会话级
+      // Browser API。后者会按设计拒绝并显示“浏览器会话不存在”。
+      const next = appLevelSurface
+        ? await getAppBrowserSession()
+        : await getBrowserSession(expectedSessionId);
+      if (!next) {
+        throw new Error('browser_app_session_not_found');
+      }
       if (generation !== refreshGeneration || expectedSessionId !== browserSessionId || expectedTabId !== tabId) return;
       snapshot = next;
       // BrowserAuthority 事件可能发生在会话导航完成之前，导致 App 层错过该事件。
       // 当前 Browser Tab 自己拿到的完整权威快照必须回写同一个右栏投影入口，
       // 否则本地仍停留在 creating，尽管 authority 和 Main Surface 已经 ready。
-      synchronizeBrowserSessionSnapshot(next, workspacePath, {
-        workspaceId,
-        sessionId,
-      });
+      if (!appLevelSurface) {
+        synchronizeBrowserSessionSnapshot(next, workspacePath, {
+          workspaceId,
+          sessionId,
+        });
+      }
       const nextTab = next.tabs.find((candidate) => candidate.tabId === expectedTabId && candidate.lifecycle !== 'closed');
       const nextUrl = nextTab?.url ?? '';
       if (initialLoad || !addressEditing) address = nextUrl;
@@ -775,6 +833,20 @@
       ))
       .slice(-8);
     activeDownloads = [...terminalDownloads, ...next.activeBrowserDownloads];
+    if (appLevelSurface && !webviewRegistered) {
+      // 应用级宿主的 Surface 身份只可能从这份快照投影到达。身份变化（首次出现
+      // 或代次推进）时重置重试计数并立刻注册；同一个身份不变时不重置，避免
+      // 注册持续失败时无界重试。
+      const entry = next.browserSurfaces?.find((item) => item.tabId === tabId) ?? null;
+      const entryKey = entry
+        ? `${entry.surfaceId}\u0000${entry.navigationRevision}`
+        : '';
+      if (entryKey && entryKey !== lastAppSurfaceKey) {
+        lastAppSurfaceKey = entryKey;
+        webviewRegistrationAttempts = 0;
+      }
+      scheduleWebviewRegistration();
+    }
     if (next.layout.activeTabId !== tabId || !next.activeBrowserViewport) return;
     const viewport = next.activeBrowserViewport;
     localViewportMode = viewport.mode;

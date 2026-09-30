@@ -24,6 +24,19 @@ interface MagiDesktopWindowLayoutSnapshot {
   rightPaneBounds: MagiDesktopRectangle | null;
 }
 
+/**
+ * 窗口内某个 Browser Tab 的承载身份。
+ *
+ * 会话级 Tab 仍以 `layout` 的活动指针为准；应用级 GPT Web 会话不允许写激活
+ * 意图（A25），只能靠这份清单拿到 `surfaceId` 与 `navigationRevision`。
+ */
+interface MagiDesktopBrowserSurfaceSnapshot {
+  tabId: string;
+  browserSessionId: string;
+  surfaceId: string;
+  navigationRevision: number;
+}
+
 interface MagiDesktopWindowSnapshot {
   desktopEpoch: string;
   windowId: string;
@@ -33,6 +46,7 @@ interface MagiDesktopWindowSnapshot {
   activeBrowserDisplayMetrics: MagiDesktopBrowserDisplayMetrics | null;
   activeBrowserNavigationRevision: number | null;
   activeBrowserDownloads: MagiDesktopBrowserDownloadSnapshot[];
+  browserSurfaces: MagiDesktopBrowserSurfaceSnapshot[];
 }
 
 interface MagiDesktopBrowserDisplayMetrics {
@@ -283,6 +297,12 @@ interface MagiDesktopBridge {
   getBrowserComponentInfo(): Promise<MagiDesktopBrowserComponentSnapshot>;
   restartBrowserAutomation(): Promise<MagiDesktopBrowserComponentSnapshot>;
   clearBrowserData(): Promise<void>;
+  /**
+   * 只清应用级 GPT Web 持久分区（登录态）。
+   *
+   * 与 `clearBrowserData` 的区别是不动其他浏览器 Tab 的站点数据（§5.13）。
+   */
+  clearWebModelData(): Promise<void>;
   checkForUpdates(): Promise<MagiDesktopUpdateSnapshot>;
   downloadUpdate(): Promise<MagiDesktopUpdateSnapshot>;
   installUpdate(): Promise<never>;

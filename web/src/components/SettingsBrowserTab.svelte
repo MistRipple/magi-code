@@ -16,6 +16,7 @@
     checkForDesktopUpdate,
     desktopUpdaterState,
   } from '../stores/desktop-updater.svelte';
+  import SettingsWebModelSection from './SettingsWebModelSection.svelte';
 
   type DesktopAction = 'refresh-components' | 'restart-automation' | 'clear-data' | 'check-updates';
 
@@ -656,6 +657,8 @@
         </div>
       </section>
     {/if}
+
+    <SettingsWebModelSection {isDesktop} />
   </div>
 </div>
 
