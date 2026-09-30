@@ -16,6 +16,7 @@ pub mod dispatch_submission;
 mod driver;
 pub mod execution_admission;
 pub mod execution_chain_recovery;
+pub mod external_tool;
 mod mailbox;
 pub mod model_config;
 pub mod model_context_window;

@@ -403,29 +403,29 @@ pub fn publish_context_usage_update(
         .with_audit_usage_ledger(|ledger| {
             latest_usage_observation_for_session(&ledger.usage_entries, session_id.as_str())
         })
-    .filter(|observation| {
-        observation
-            .resolved_model
-            .as_deref()
-            .is_none_or(|model| model == resolved_model)
-    })
-    .filter(|observation| {
-        observation
-            .thread_id
-            .as_deref()
-            .is_none_or(|thread| thread_id.is_some_and(|current| current.as_str() == thread))
-    })
-    .filter(|observation| {
-        observation
-            .checkpoint_generation
-            .is_none_or(|generation| generation == checkpoint_generation)
-    })
-    .filter(|observation| {
-        observation
-            .context_window_limit_tokens
-            .is_none_or(|window| window == context_window)
-    })
-    .and_then(|observation| observation.provider_context_tokens);
+        .filter(|observation| {
+            observation
+                .resolved_model
+                .as_deref()
+                .is_none_or(|model| model == resolved_model)
+        })
+        .filter(|observation| {
+            observation
+                .thread_id
+                .as_deref()
+                .is_none_or(|thread| thread_id.is_some_and(|current| current.as_str() == thread))
+        })
+        .filter(|observation| {
+            observation
+                .checkpoint_generation
+                .is_none_or(|generation| generation == checkpoint_generation)
+        })
+        .filter(|observation| {
+            observation
+                .context_window_limit_tokens
+                .is_none_or(|window| window == context_window)
+        })
+        .and_then(|observation| observation.provider_context_tokens);
     let projected_tokens = token_used.max(previous_anchor.unwrap_or_default());
     let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
     let remaining_tokens = context_window.saturating_sub(projected_tokens);
