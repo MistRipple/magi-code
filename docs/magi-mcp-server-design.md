@@ -229,6 +229,7 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 #### 10.2.2 内置 Skill 与向导边界
 
 - 内置 Skill 与用户安装的 Skill 走同一套机制：说明文件写入 `state_root/builtin-skills/<id>/SKILL.md`，并在 `skillsConfig.instructionSkills` 登记普通条目（可停用、可在输入框用 `/` 唤起），条目带 `builtin: true`。**可以停用，不能删除**：`/settings/skills/remove` 拒绝移除内置条目，整体保存配置时漏掉的内置条目会被补回，启动时也会补齐，设置页不显示删除按钮而显示“内置”标记。安装记录在 `builtin-skills/.installed.json`，版本不变就不重写说明文件；Magi 升级带来新版本时才刷新说明文件并保留用户的启停选择（`crates/magi-api/src/builtin_skills.rs`）。
+- **选了技能，本轮才能按技能行事**（两处根因修复）：普通对话路径此前把所选技能写死成 `None`，技能说明从未交给模型，现在会带上并记在用户消息上；声明了 `allowed_tools`（`config.json`）的技能被选中时，本轮改走带工具的 Execute 路由（不创建任务），并且**只开放声明的工具**。`magi-cloudflare-tunnel` 只声明 `browser_navigate / snapshot / click / type / fill_form / press / wait_for / scroll / tabs`，不含 `evaluate / network / console`，也不含文件与命令工具。只带技能、未声明工具的技能仍走普通对话（既有设计）。GPT Web 会话把消息原样交给网页，不应用技能。
 - 向导**不代做**：注册账号、邮箱与人机验证、登录与双重验证、付款方式、把域名 NS 交给 Cloudflare，都由用户本人完成。
 - 向导**不接触令牌**：Cloudflare 隧道页面会显示带令牌的安装命令，Skill 明确要求不截图、不读取页面文字、不复制，由用户自己复制后粘贴到 Magi 设置页，令牌因此不进入模型上下文和会话记录。
 - 向导的页面导航依赖 Cloudflare 控制台当前的界面，改版后需要更新 Skill 文字；命名隧道的后端逻辑不依赖页面结构。

@@ -1,0 +1,14 @@
+{
+  "description": "协助配置 Cloudflare 命名隧道，让 Magi MCP 的公网地址固定、重启后不变",
+  "allowed_tools": [
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_fill_form",
+    "browser_press",
+    "browser_wait_for",
+    "browser_scroll",
+    "browser_tabs"
+  ]
+}

@@ -1383,16 +1383,56 @@ fn decide_session_turn_with_task_planner(
             task_evidence: Vec::new(),
         });
     }
-    let decision = normalize_session_turn_decision(
+    let mut decision = normalize_session_turn_decision(
         local_session_turn_intent_decision(request, has_recoverable_chain),
         request,
     );
+    // 技能声明了要用的工具（allowed_tools，如配置向导要用内置浏览器）时，这一轮必须带工具执行；
+    // 普通对话轮次没有工具，技能就只剩口头说明，做不了它要做的事。
+    if matches!(decision.route, SessionTurnRouteDto::Chat)
+        && decision.reason_code.as_deref() == Some("plain_chat")
+        && selected_skill_requires_tools(state, request)
+    {
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.tool_intent = Some(
+            request
+                .trimmed_text()
+                .unwrap_or_else(|| request.timeline_message(None)),
+        );
+        decision.reason_code = Some("skill_requires_tools".to_string());
+        decision.route_reason =
+            Some("用户选择的技能声明了需要使用的工具，本轮带工具执行。".to_string());
+    }
     if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
         return Err(ApiError::InvalidInput(
             "当前会话没有可继续的执行链".to_string(),
         ));
     }
     Ok(decision)
+}
+
+/// 用户选的技能是否声明了需要使用的工具（config.json 的 `allowed_tools`）。
+fn selected_skill_requires_tools(state: &ApiState, request: &SessionTurnRequestDto) -> bool {
+    let Some(requested) = request
+        .skill_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(runtime) = state.skill_runtime.as_ref() else {
+        return false;
+    };
+    let registry = runtime.registry();
+    let magi_skill_runtime::SkillIdResolution::Found(skill_id) =
+        registry.resolve_skill_id(requested)
+    else {
+        return false;
+    };
+    registry
+        .get(&skill_id)
+        .is_some_and(|skill| skill.restrict_standard_tools && !skill.allowed_tools.is_empty())
 }
 
 /// 本条消息的目标会话是否使用 GPT Web 引擎：已有会话读会话设置，新会话首条消息读请求里携带的引擎配置。
@@ -2840,6 +2880,20 @@ async fn submit_conversation_session_turn(
             &context_references,
         ),
     );
+    // 用户在输入框里用 `/` 选的技能：即使这一轮走的是不带工具的普通对话，技能说明也要作为
+    // 本轮上下文交给模型，并记在用户消息上（与主线 Turn 一致）。
+    let skill_name = request
+        .skill_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(skill_name) = skill_name.as_ref() {
+        metadata.insert(
+            "skillName".to_string(),
+            serde_json::Value::String(skill_name.clone()),
+        );
+    }
     if let Some(command) = request.command.as_ref() {
         // 命令轮次的用户 item 只用于展示和审计，历史重建据此排除，不进入模型上下文。
         metadata.insert(
@@ -3001,7 +3055,7 @@ async fn submit_conversation_session_turn(
         context_references,
         use_tools: false,
         access_profile: request.requested_access_profile(),
-        skill_name: None,
+        skill_name,
         request_id: Some(request_id),
         user_message_id: Some(user_message_id.clone()),
         placeholder_message_id: request.placeholder_message_id(),
@@ -7475,6 +7529,66 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_that_declares_tools_runs_the_turn_with_tools_while_other_skills_stay_on_chat() {
+        let registry = magi_skill_runtime::SkillRegistry::new();
+        let skill =
+            |id: &str, restrict: bool, tools: Vec<String>| magi_skill_runtime::SkillDefinition {
+                skill_id: id.to_string(),
+                title: id.to_string(),
+                instruction: "说明".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "local".to_string(),
+                    tags: vec![],
+                },
+                restrict_standard_tools: restrict,
+                allowed_tools: tools,
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            };
+        registry.register(skill("wizard", true, vec!["browser_navigate".to_string()]));
+        registry.register(skill("plain-style", false, vec![]));
+        let state = test_state().with_skill_runtime(std::sync::Arc::new(
+            magi_skill_runtime::SkillRuntime::new(registry),
+        ));
+
+        let mut with_tools = session_turn_request("带我配置");
+        with_tools.skill_name = Some("wizard".to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &with_tools).unwrap();
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("skill_requires_tools")
+        );
+        assert!(
+            decision.execution_goal.is_none(),
+            "不创建任务，只是带工具执行"
+        );
+        assert!(decision.task_evidence.is_empty());
+
+        let mut plain = session_turn_request("帮我润色这段说明");
+        plain.skill_name = Some("plain-style".to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &plain).unwrap();
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+
+        // 没有技能或技能未注册：保持普通对话。
+        let none = session_turn_request("带我配置");
+        assert!(matches!(
+            decide_session_turn_with_task_planner(&state, &none)
+                .unwrap()
+                .route,
+            SessionTurnRouteDto::Chat
+        ));
+        let mut unknown = session_turn_request("带我配置");
+        unknown.skill_name = Some("missing".to_string());
+        assert!(matches!(
+            decide_session_turn_with_task_planner(&state, &unknown)
+                .unwrap()
+                .route,
+            SessionTurnRouteDto::Chat
+        ));
+    }
+
+    #[test]
     fn instruction_skill_alone_stays_on_regular_chat_route() {
         let state = test_state();
         let mut request = session_turn_request("");
@@ -7536,6 +7650,41 @@ mod tests {
         assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
         assert!(decision.execution_goal.is_some());
         assert!(!decision.task_evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_skill_picked_for_a_plain_chat_turn_reaches_the_turn_instead_of_being_dropped() {
+        let state = test_state();
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/turn",
+            serde_json::json!({
+                "scope": "personal",
+                "text": "带我配置",
+                "skillName": " magi-cloudflare-tunnel ",
+                "requestId": "request-skill-chat",
+                "userMessageId": "message-skill-chat",
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["route"], "chat", "只带技能的普通文本仍走普通对话路由");
+
+        let turn = state
+            .session_store
+            .canonical_turn_for_request_id("request-skill-chat")
+            .expect("turn should be accepted");
+        let user = turn
+            .items
+            .iter()
+            .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+            .expect("user item");
+        assert_eq!(
+            user.metadata.get("skillName").and_then(Value::as_str),
+            Some("magi-cloudflare-tunnel"),
+            "所选技能必须记在这一轮上并交给执行，而不是被对话路径丢弃"
+        );
     }
 
     #[tokio::test]

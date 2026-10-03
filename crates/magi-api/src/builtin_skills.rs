@@ -20,13 +20,17 @@ struct BuiltinSkill {
     version: u32,
     description: &'static str,
     body: &'static str,
+    /// 技能的 `config.json`：声明它要用的工具。带这个声明的技能被选中时，本轮带工具执行，
+    /// 并且只开放声明的这些工具。
+    config: &'static str,
 }
 
 const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
     id: "magi-cloudflare-tunnel",
-    version: 1,
+    version: 2,
     description: "协助配置 Cloudflare 命名隧道，让 Magi MCP 的公网地址固定、重启后不变",
     body: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/SKILL.md"),
+    config: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/config.json"),
 }];
 
 const INSTALLED_FILE: &str = ".installed.json";
@@ -50,6 +54,7 @@ pub fn install_builtin_skills(store: &SettingsStore, state_root: &Path) -> std::
         }
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("SKILL.md"), skill.body)?;
+        std::fs::write(dir.join("config.json"), skill.config)?;
         upsert_entry(store, skill, &dir)?;
         installed.insert(skill.id.to_string(), skill.version);
         changed = true;
@@ -232,6 +237,55 @@ mod tests {
         let entry = &unmarked["instructionSkills"][0];
         assert!(is_builtin(entry));
         assert_eq!(entry["enabled"], false, "启停以提交的为准");
+    }
+
+    #[test]
+    fn an_installed_builtin_skill_is_loaded_into_the_skill_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        install_builtin_skills(&store, dir.path()).unwrap();
+        let registry = crate::skill_loader::load_skills_into_registry(&store);
+        let skill = registry
+            .get("magi-cloudflare-tunnel")
+            .expect("内置技能必须出现在技能注册表里，斜杠选中后才有内容可注入");
+        assert!(skill.instruction.contains("命名隧道"));
+    }
+
+    #[test]
+    fn the_cloudflare_skill_declares_only_the_browser_tools_it_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        install_builtin_skills(&store, dir.path()).unwrap();
+        let registry = crate::skill_loader::load_skills_into_registry(&store);
+        let skill = registry.get("magi-cloudflare-tunnel").unwrap();
+        assert!(skill.restrict_standard_tools, "声明了工具就只开放这些工具");
+        for needed in [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+        ] {
+            assert!(
+                skill.allowed_tools.iter().any(|tool| tool == needed),
+                "{needed}"
+            );
+        }
+        // 不开放执行脚本 / 读网络与控制台 / 文件与命令工具，避免读到控制台里的令牌或改动本机。
+        for forbidden in [
+            "browser_evaluate",
+            "browser_network",
+            "browser_console",
+            "file_write",
+            "shell_exec",
+        ] {
+            assert!(
+                !skill.allowed_tools.iter().any(|tool| tool == forbidden),
+                "{forbidden}"
+            );
+        }
+        let builtin = &BUILTIN_SKILLS[0];
+        let parsed: Value = serde_json::from_str(builtin.config).unwrap();
+        assert!(parsed["allowed_tools"].is_array());
     }
 
     #[test]
