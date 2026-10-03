@@ -885,7 +885,10 @@ impl WebModelPageDriver for HostWebModelPageDriver {
                             .iter()
                             .filter_map(|item| {
                                 Some(SavedConversationEntry {
-                                    conversation_id: item.get("conversation_id")?.as_str()?.to_string(),
+                                    conversation_id: item
+                                        .get("conversation_id")?
+                                        .as_str()?
+                                        .to_string(),
                                     title: item.get("title")?.as_str()?.to_string(),
                                     updated_at: item
                                         .get("updated_at")
@@ -1048,7 +1051,10 @@ impl HostWebModelPageDriver {
 }
 
 fn connector_settings_url() -> String {
-    format!("{}/settings/plugins-settings", magi_web_model::chatgpt_web_origin())
+    format!(
+        "{}/settings/plugins-settings",
+        magi_web_model::chatgpt_web_origin()
+    )
 }
 
 fn connector_directory_url() -> String {
@@ -1248,11 +1254,15 @@ mod tests {
     #[test]
     fn only_surface_handoff_errors_count_as_a_possibly_submitted_message() {
         // 点击提交后页面内路由换代：命令可能已经生效，不能当作「消息未被接受」。
-        assert!(is_surface_handoff("browser_surface_stale: binding is older than the current navigation"));
+        assert!(is_surface_handoff(
+            "browser_surface_stale: binding is older than the current navigation"
+        ));
         assert!(is_surface_handoff("browser_cdp_session_stale"));
         assert!(is_surface_handoff("browser_navigation_superseded"));
         // 页面脚本自己的失败（例如提交按钮被禁用）才是明确的拒绝。
-        assert!(!is_surface_handoff("web_submit_unavailable:submit button is disabled"));
+        assert!(!is_surface_handoff(
+            "web_submit_unavailable:submit button is disabled"
+        ));
         assert!(!is_surface_handoff("web_composer_selection_unavailable"));
     }
 }

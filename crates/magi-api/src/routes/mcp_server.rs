@@ -1,17 +1,17 @@
 //! Magi MCP 服务的管理路由（开关、令牌、配置片段）。
 //!
 //! 管理面只对可信本机入口开放：经公网隧道到达的请求一律拒绝，网络客户端只能使用 MCP 入口本身，
-//! 不能创建或吊销令牌（设计 M8）。令牌原文只在创建响应里出现一次，列表与状态不含哈希。
+//! 不能创建、查看或吊销令牌（设计 M8）。列表与状态不含哈希和原文；原文只通过本机的“查看原文”接口取得。
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::HeaderMap,
-    routing::{delete, get, post},
+    routing::{get, patch, post},
 };
 use magi_conversation_runtime::ToolApprovalDecision;
 use magi_core::WorkspaceId;
-use magi_mcp_server::{AttributionMode, IssueTokenRequest, Profile, TokenRecord};
+use magi_mcp_server::{AttributionMode, IssueTokenRequest, Profile, TokenPatch, TokenRecord};
 use serde::{Deserialize, Serialize};
 
 use super::is_public_tunnel_request;
@@ -29,7 +29,12 @@ pub fn routes() -> Router<ApiState> {
         .route("/mcp-server/network", post(set_network))
         .route("/mcp-server/tokens", post(create_token))
         .route("/mcp-server/tokens/revoke-all", post(revoke_all))
-        .route("/mcp-server/tokens/{token_id}", delete(revoke_token))
+        .route(
+            "/mcp-server/tokens/{token_id}",
+            patch(update_token).delete(revoke_token),
+        )
+        .route("/mcp-server/tokens/{token_id}/secret", get(view_secret))
+        .route("/mcp-server/tokens/{token_id}/rotate", post(rotate_token))
         .route("/mcp-server/config-snippets", get(config_snippets))
         .route("/mcp-server/approvals", get(list_approvals))
         .route("/mcp-server/approvals/resolve", post(resolve_approval))
@@ -70,10 +75,12 @@ struct TokenDto {
     revoked_at_ms: Option<u64>,
     last_used_at_ms: Option<u64>,
     active: bool,
+    /// 是否可以重新查看原文（旧版本创建的令牌没有保存原文，只能重新生成）。
+    has_secret: bool,
 }
 
 impl TokenDto {
-    fn from_record(record: &TokenRecord, now_ms: u64) -> Self {
+    fn from_record(state: &ApiState, record: &TokenRecord, now_ms: u64) -> Self {
         Self {
             token_id: record.token_id.clone(),
             prefix: record.prefix.clone(),
@@ -87,6 +94,7 @@ impl TokenDto {
             revoked_at_ms: record.revoked_at_ms,
             last_used_at_ms: record.last_used_at_ms,
             active: record.is_active(now_ms),
+            has_secret: state.mcp_service.token_has_secret(&record.token_id),
         }
     }
 }
@@ -111,7 +119,7 @@ async fn status_response(state: &ApiState) -> StatusResponse {
             .mcp_service
             .list_tokens()
             .iter()
-            .map(|record| TokenDto::from_record(record, now))
+            .map(|record| TokenDto::from_record(state, record, now))
             .collect(),
     }
 }
@@ -191,6 +199,34 @@ struct CreateTokenRequest {
     allow_network: bool,
 }
 
+/// 创建与编辑共用的权限校验：高风险权限档要显式确认，网络令牌不得高于 `edit`。
+fn validate_scope(
+    profile: Profile,
+    network: bool,
+    confirm_high_risk: bool,
+) -> Result<(), ApiError> {
+    let high_risk = matches!(profile, Profile::EditTrusted | Profile::Exec);
+    if high_risk && !confirm_high_risk {
+        return Err(ApiError::InvalidInput(
+            "免确认写入与命令执行权限需要显式确认风险".to_string(),
+        ));
+    }
+    if network && high_risk {
+        return Err(ApiError::InvalidInput(
+            "允许网络访问的令牌权限档不能高于“编辑”（写入前需要确认）".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 有效期天数换算为毫秒；`0` 表示不过期。
+fn ttl_days_to_ms(days: u32) -> Option<u64> {
+    match days {
+        0 => None,
+        days => Some(u64::from(days) * DAY_MS),
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateTokenResponse {
@@ -211,21 +247,12 @@ async fn create_token(
     {
         return Err(ApiError::InvalidInput("工作区不存在".to_string()));
     }
-    if matches!(request.profile, Profile::EditTrusted | Profile::Exec) && !request.confirm_high_risk
-    {
-        return Err(ApiError::InvalidInput(
-            "免确认写入与命令执行权限需要显式确认风险".to_string(),
-        ));
-    }
-    if request.allow_network && matches!(request.profile, Profile::EditTrusted | Profile::Exec) {
-        return Err(ApiError::InvalidInput(
-            "允许网络访问的令牌权限档不能高于“编辑”（写入前需要确认）".to_string(),
-        ));
-    }
-    let ttl_ms = match request.ttl_days.unwrap_or(DEFAULT_TOKEN_TTL_DAYS) {
-        0 => None,
-        days => Some(u64::from(days) * DAY_MS),
-    };
+    validate_scope(
+        request.profile,
+        request.allow_network,
+        request.confirm_high_risk,
+    )?;
+    let ttl_ms = ttl_days_to_ms(request.ttl_days.unwrap_or(DEFAULT_TOKEN_TTL_DAYS));
     let issued = state
         .mcp_service
         .issue_token(IssueTokenRequest {
@@ -240,8 +267,179 @@ async fn create_token(
         .await
         .map_err(runtime_error)?;
     Ok(Json(CreateTokenResponse {
-        token: TokenDto::from_record(&issued.record, now_ms()),
+        token: TokenDto::from_record(&state, &issued.record, now_ms()),
         secret: issued.secret.clone(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateTokenRequest {
+    #[serde(default)]
+    client_name: Option<String>,
+    #[serde(default)]
+    profile: Option<Profile>,
+    /// 从现在起重新计算的有效期天数；`0` 表示不过期。缺省不改。
+    #[serde(default)]
+    ttl_days: Option<u32>,
+    #[serde(default)]
+    allow_network: Option<bool>,
+    /// 把权限档改成免确认写入或命令执行时必须显式确认风险。
+    #[serde(default)]
+    confirm_high_risk: bool,
+}
+
+/// 编辑令牌的名称、权限档、有效期与网络开关。工作区和归属方式不可改，原文不变，下一次调用起生效。
+async fn update_token(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(token_id): Path<String>,
+    Json(request): Json<UpdateTokenRequest>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    require_local(&headers)?;
+    let current = state
+        .mcp_service
+        .list_tokens()
+        .into_iter()
+        .find(|record| record.token_id == token_id)
+        .ok_or_else(|| ApiError::not_found("令牌不存在", &token_id))?;
+    if current.attribution != AttributionMode::External {
+        return Err(ApiError::InvalidInput(
+            "GPT Web 内部令牌由系统管理，不能编辑".to_string(),
+        ));
+    }
+    let profile = request.profile.unwrap_or(current.profile);
+    let network = request.allow_network.unwrap_or(current.network);
+    // 只在权限档真的被改成高风险档时才要求确认；没改权限档的编辑不重复确认。
+    let confirmed = request.confirm_high_risk || profile == current.profile;
+    validate_scope(profile, network, confirmed)?;
+    let updated = state
+        .mcp_service
+        .update_token(
+            &state,
+            &token_id,
+            TokenPatch {
+                client_name: request.client_name,
+                profile: request.profile,
+                expires_at_ms: request
+                    .ttl_days
+                    .map(|days| ttl_days_to_ms(days).map(|ms| now_ms().saturating_add(ms))),
+                network: request.allow_network,
+            },
+        )
+        .await
+        .map_err(runtime_error)?;
+    audit_management(
+        &state,
+        &updated,
+        "token.update",
+        Some(describe_update(&current, &updated)),
+    );
+    Ok(Json(status_response(&state).await))
+}
+
+/// 审计里的“旧值 → 新值”摘要，只含配置，不含原文。
+fn describe_update(before: &TokenRecord, after: &TokenRecord) -> String {
+    let mut changes = Vec::new();
+    if before.client_name != after.client_name {
+        changes.push(format!(
+            "name: {} → {}",
+            before.client_name, after.client_name
+        ));
+    }
+    if before.profile != after.profile {
+        changes.push(format!(
+            "profile: {:?} → {:?}",
+            before.profile, after.profile
+        ));
+    }
+    if before.network != after.network {
+        changes.push(format!("network: {} → {}", before.network, after.network));
+    }
+    if before.expires_at_ms != after.expires_at_ms {
+        changes.push(format!(
+            "expiresAtMs: {:?} → {:?}",
+            before.expires_at_ms, after.expires_at_ms
+        ));
+    }
+    if changes.is_empty() {
+        "no change".to_string()
+    } else {
+        changes.join("; ")
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretResponse {
+    secret: String,
+}
+
+fn audit_management(state: &ApiState, record: &TokenRecord, action: &str, detail: Option<String>) {
+    state
+        .mcp_service
+        .audit()
+        .record(crate::mcp_runtime::AuditEntry {
+            token_id: record.token_id.clone(),
+            client_name: record.client_name.clone(),
+            workspace_id: record.workspace_id.clone(),
+            tool: action.to_string(),
+            requires_approval: false,
+            paths: Vec::new(),
+            outcome: "succeeded".to_string(),
+            detail,
+            at_ms: now_ms(),
+        });
+}
+
+fn find_token(state: &ApiState, token_id: &str) -> Result<TokenRecord, ApiError> {
+    state
+        .mcp_service
+        .list_tokens()
+        .into_iter()
+        .find(|record| record.token_id == token_id)
+        .ok_or_else(|| ApiError::not_found("令牌不存在", token_id))
+}
+
+/// 重新查看令牌原文。令牌属于用户本机数据，只要是本机入口就可以查看，每次查看记入审计。
+async fn view_secret(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(token_id): Path<String>,
+) -> Result<Json<SecretResponse>, ApiError> {
+    require_local(&headers)?;
+    let record = find_token(&state, &token_id)?;
+    let secret = state.mcp_service.token_secret(&token_id).ok_or_else(|| {
+        ApiError::Conflict(
+            "该令牌没有保存原文（创建于旧版本、已吊销或已过期），请重新生成".to_string(),
+        )
+    })?;
+    audit_management(&state, &record, "token.view_secret", None);
+    Ok(Json(SecretResponse { secret }))
+}
+
+/// 重新生成令牌原文：旧原文立即失效，客户端需要换成新的。
+async fn rotate_token(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(token_id): Path<String>,
+) -> Result<Json<CreateTokenResponse>, ApiError> {
+    require_local(&headers)?;
+    let current = find_token(&state, &token_id)?;
+    if current.attribution != AttributionMode::External {
+        return Err(ApiError::InvalidInput(
+            "GPT Web 内部令牌由系统管理，不能重新生成".to_string(),
+        ));
+    }
+    let (record, secret) = state
+        .mcp_service
+        .rotate_token(&state, &token_id)
+        .await
+        .map_err(runtime_error)?;
+    audit_management(&state, &record, "token.rotate", None);
+    Ok(Json(CreateTokenResponse {
+        token: TokenDto::from_record(&state, &record, now_ms()),
+        secret,
     }))
 }
 
@@ -279,58 +477,129 @@ async fn revoke_all(
 #[serde(rename_all = "camelCase")]
 struct ConfigSnippets {
     url: Option<String>,
-    /// 令牌以占位符出现；已有令牌原文不会被回显。
+    /// 配置里的服务名（带上客户端名，避免多套配置互相覆盖）。
+    server_name: String,
+    /// 带令牌的配置里是否已经填入真实原文；否则是 `<MAGI_MCP_TOKEN>` 占位符。
+    secret_filled: bool,
+    /// HTTP 配置（Cursor、Claude Code 等）。
     http_json: Option<serde_json::Value>,
-    /// stdio 配置（Claude Desktop、Cursor 等本机客户端）。令牌通过环境变量提供。
+    /// stdio 配置（Claude Desktop 等本机客户端）：命令是 daemon 自带的 `mcp-relay` 中继。
     stdio_json: Option<serde_json::Value>,
+    /// Claude Code 的一行命令。
+    claude_cli: Option<String>,
     /// 公网地址的客户端配置（网络模式运行时）。地址每次开启都会变。
     remote_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnippetsQuery {
+    /// 指定令牌时，配置里直接填入该令牌的原文（本机、可重新查看的令牌）。
+    #[serde(default)]
+    token_id: Option<String>,
+}
+
+/// 配置里的服务名：`magi-` + 客户端名里的字母数字（中文等保留），其余折叠成 `-`。
+fn server_name_for(client_name: &str) -> String {
+    let mut slug = String::new();
+    for ch in client_name.trim().chars() {
+        if ch.is_alphanumeric() {
+            slug.extend(ch.to_lowercase());
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "magi".to_string()
+    } else {
+        format!("magi-{slug}")
+    }
+}
+
+/// daemon 自己的可执行文件就是 stdio 中继（`mcp-relay` 子命令）。
+fn relay_command() -> String {
+    std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "magi-daemon-app".to_string())
 }
 
 async fn config_snippets(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Query(query): Query<SnippetsQuery>,
 ) -> Result<Json<ConfigSnippets>, ApiError> {
     require_local(&headers)?;
     let status = state.mcp_service.status().await;
-    let url = status.url;
-    let http_json = url.as_ref().map(|url| {
+    let (server_name, secret) = match query.token_id.as_deref() {
+        Some(token_id) => {
+            let record = find_token(&state, token_id)?;
+            let secret = state.mcp_service.token_secret(token_id);
+            if secret.is_some() {
+                audit_management(&state, &record, "token.view_secret", None);
+            }
+            (server_name_for(&record.client_name), secret)
+        }
+        None => ("magi".to_string(), None),
+    };
+    let secret_filled = secret.is_some();
+    let token = secret.unwrap_or_else(|| "<MAGI_MCP_TOKEN>".to_string());
+    Ok(Json(build_snippets(
+        server_name,
+        &token,
+        secret_filled,
+        status.url,
+        status.stdio_endpoint.as_deref(),
+        status.network.mcp_url.as_deref(),
+    )))
+}
+
+fn build_snippets(
+    server_name: String,
+    token: &str,
+    secret_filled: bool,
+    url: Option<String>,
+    stdio_endpoint: Option<&str>,
+    remote_url: Option<&str>,
+) -> ConfigSnippets {
+    let bearer = format!("Bearer {token}");
+    let http_for = |url: &str| {
         serde_json::json!({
             "mcpServers": {
-                "magi": {
+                server_name.as_str(): {
                     "url": url,
-                    "headers": { "Authorization": "Bearer <MAGI_MCP_TOKEN>" }
+                    "headers": { "Authorization": bearer }
                 }
             }
         })
-    });
-    let stdio_json = status.stdio_endpoint.as_ref().map(|endpoint| {
+    };
+    let http_json = url.as_deref().map(http_for);
+    let stdio_json = stdio_endpoint.map(|endpoint| {
         serde_json::json!({
             "mcpServers": {
-                "magi": {
-                    "command": "magi-mcp",
-                    "args": ["--stdio", "--endpoint", endpoint],
-                    "env": { "MAGI_MCP_TOKEN": "<MAGI_MCP_TOKEN>" }
+                server_name.as_str(): {
+                    "command": relay_command(),
+                    "args": ["mcp-relay", "--stdio", "--endpoint", endpoint],
+                    "env": { "MAGI_MCP_TOKEN": token }
                 }
             }
         })
     });
-    let remote_json = status.network.mcp_url.as_ref().map(|url| {
-        serde_json::json!({
-            "mcpServers": {
-                "magi": {
-                    "url": url,
-                    "headers": { "Authorization": "Bearer <MAGI_MCP_TOKEN>" }
-                }
-            }
-        })
+    let claude_cli = url.as_deref().map(|url| {
+        format!(
+            "claude mcp add --transport http {server_name} {url} --header \"Authorization: {bearer}\""
+        )
     });
-    Ok(Json(ConfigSnippets {
+    let remote_json = remote_url.map(http_for);
+    ConfigSnippets {
         url,
+        server_name,
+        secret_filled,
         http_json,
         stdio_json,
+        claude_cli,
         remote_json,
-    }))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -620,6 +889,247 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    async fn create(state: &ApiState, body: serde_json::Value) -> (String, String) {
+        let (status, created) = call(state, "POST", "/mcp-server/tokens", body, false).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        (
+            created["token"]["tokenId"].as_str().unwrap().to_string(),
+            created["secret"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_token_secret_can_be_viewed_again_until_the_token_is_revoked() {
+        let (state, _dir) = state_with_workspace();
+        let (token_id, secret) = create(
+            &state,
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "exec", "confirmHighRisk": true}),
+        )
+        .await;
+        let path = format!("/mcp-server/tokens/{token_id}/secret");
+        let (status, viewed) = call(&state, "GET", &path, serde_json::json!({}), false).await;
+        assert_eq!(status, StatusCode::OK, "{viewed}");
+        assert_eq!(viewed["secret"], secret, "任何权限档都可以重新查看");
+        let (_, listed) = call(
+            &state,
+            "GET",
+            "/mcp-server/status",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(listed["tokens"][0]["hasSecret"], true);
+        assert!(!listed.to_string().contains(&secret), "列表仍不回显原文");
+        assert!(
+            state
+                .mcp_service
+                .audit()
+                .recent(10, Some(&token_id))
+                .iter()
+                .any(|entry| entry.tool == "token.view_secret"),
+            "每次查看原文都进审计"
+        );
+
+        let (status, _) = call(
+            &state,
+            "DELETE",
+            &format!("/mcp-server/tokens/{token_id}"),
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&state, "GET", &path, serde_json::json!({}), false).await;
+        assert_eq!(status, StatusCode::CONFLICT, "吊销后原文被清除");
+    }
+
+    #[tokio::test]
+    async fn editing_a_token_keeps_the_secret_and_enforces_the_same_risk_rules_as_creation() {
+        let (state, _dir) = state_with_workspace();
+        let (token_id, secret) = create(
+            &state,
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "edit"}),
+        )
+        .await;
+        let path = format!("/mcp-server/tokens/{token_id}");
+        // 改名 + 有效期不动权限档：不需要风险确认。
+        let (status, body) = call(
+            &state,
+            "PATCH",
+            &path,
+            serde_json::json!({"clientName": "Cursor 主机", "ttlDays": 0}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tokens"][0]["clientName"], "Cursor 主机");
+        assert!(
+            body["tokens"][0]["expiresAtMs"].is_null(),
+            "ttlDays=0 不过期"
+        );
+        let audited = state.mcp_service.audit().recent(10, Some(&token_id));
+        let update = audited
+            .iter()
+            .find(|entry| entry.tool == "token.update")
+            .unwrap();
+        let detail = update.detail.clone().unwrap();
+        assert!(detail.contains("name: cursor → Cursor 主机"), "{detail}");
+        assert!(!detail.contains(&secret), "审计不含原文");
+        assert_eq!(
+            state.mcp_service.token_secret(&token_id).as_deref(),
+            Some(secret.as_str())
+        );
+
+        // 升到高风险权限档需要确认。
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &path,
+            serde_json::json!({"profile": "exec"}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = call(
+            &state,
+            "PATCH",
+            &path,
+            serde_json::json!({"profile": "exec", "confirmHighRisk": true}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tokens"][0]["profile"], "exec");
+        // 高风险权限档不能同时开放网络；反过来开放网络的令牌也不能升到高风险档。
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &path,
+            serde_json::json!({"allowNetwork": true}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &path,
+            serde_json::json!({"profile": "edit", "allowNetwork": true}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &path,
+            serde_json::json!({"profile": "exec", "confirmHighRisk": true}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // 工作区不可改（字段被拒绝），未知令牌 404。
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &path,
+            serde_json::json!({"workspaceId": "ws-2"}),
+            false,
+        )
+        .await;
+        assert!(status.is_client_error());
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            "/mcp-server/tokens/nope",
+            serde_json::json!({"clientName": "x"}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rotating_replaces_the_secret_and_the_old_one_stops_authenticating() {
+        let (state, _dir) = state_with_workspace();
+        let (token_id, old_secret) = create(
+            &state,
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "edit"}),
+        )
+        .await;
+        let (status, rotated) = call(
+            &state,
+            "POST",
+            &format!("/mcp-server/tokens/{token_id}/rotate"),
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rotated}");
+        let new_secret = rotated["secret"].as_str().unwrap().to_string();
+        assert_ne!(new_secret, old_secret);
+        assert_eq!(state.mcp_service.token_secret(&token_id), Some(new_secret));
+    }
+
+    #[tokio::test]
+    async fn snippets_are_per_client_with_the_real_secret_and_a_working_stdio_command() {
+        let (state, _dir) = state_with_workspace();
+        let (token_id, secret) = create(
+            &state,
+            serde_json::json!({"clientName": "Cursor Work", "workspaceId": "ws-1", "profile": "edit"}),
+        )
+        .await;
+        let (status, generic) = call(
+            &state,
+            "GET",
+            "/mcp-server/config-snippets",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(generic["serverName"], "magi");
+        assert_eq!(generic["secretFilled"], false);
+        assert!(!generic.to_string().contains(&secret));
+
+        let (status, snippets) = call(
+            &state,
+            "GET",
+            &format!("/mcp-server/config-snippets?tokenId={token_id}"),
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(snippets["serverName"], "magi-cursor-work");
+        assert_eq!(snippets["secretFilled"], true);
+        // 服务没启动时没有地址，片段正文为空；正文由纯函数构造，下面直接验证。
+        let built = build_snippets(
+            "magi-cursor-work".to_string(),
+            &secret,
+            true,
+            Some("http://127.0.0.1:1/mcp".to_string()),
+            Some("/tmp/magi.sock"),
+            None,
+        );
+        let json = serde_json::to_string(&built).unwrap();
+        assert!(json.contains(&format!("Bearer {secret}")));
+        assert_eq!(
+            built.stdio_json.as_ref().unwrap()["mcpServers"]["magi-cursor-work"]["args"][0],
+            "mcp-relay"
+        );
+        assert!(
+            built
+                .claude_cli
+                .unwrap()
+                .starts_with("claude mcp add --transport http magi-cursor-work ")
+        );
+        assert_eq!(server_name_for("  ///  "), "magi");
+        assert_eq!(server_name_for("我的 Claude"), "magi-我的-claude");
+        let _ = relay_command();
     }
 
     #[test]

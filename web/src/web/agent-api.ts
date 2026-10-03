@@ -3763,6 +3763,8 @@ export interface McpServerToken {
   revokedAtMs: number | null;
   lastUsedAtMs: number | null;
   active: boolean;
+  /** 是否可以重新查看原文（旧版本创建的令牌只能重新生成）。 */
+  hasSecret: boolean;
 }
 
 export interface McpServerNetworkStatus {
@@ -3805,10 +3807,26 @@ export interface McpServerCreateTokenResponse {
   token: McpServerToken;
 }
 
+export interface McpServerUpdateTokenRequest {
+  clientName?: string;
+  profile?: McpServerProfile;
+  /** 从现在起重新计算的有效期天数；0 表示不过期。缺省不改。 */
+  ttlDays?: number;
+  allowNetwork?: boolean;
+  /** 把权限档改成免确认写入或命令执行时必须显式确认风险。 */
+  confirmHighRisk?: boolean;
+}
+
 export interface McpServerConfigSnippets {
   url: string | null;
+  /** 配置里的服务名（带上客户端名，多套配置互不覆盖）。 */
+  serverName: string;
+  /** 配置里是否已填入令牌原文；否则是 <MAGI_MCP_TOKEN> 占位符。 */
+  secretFilled: boolean;
   httpJson: Record<string, unknown> | null;
   stdioJson: Record<string, unknown> | null;
+  /** Claude Code 的一行命令。 */
+  claudeCli: string | null;
   remoteJson: Record<string, unknown> | null;
 }
 
@@ -3839,7 +3857,7 @@ export interface McpServerAuditEntry {
 async function mcpServerJson<T>(
   path: string,
   action: string,
-  init?: { method?: 'GET' | 'POST' | 'DELETE'; body?: unknown },
+  init?: { method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'; body?: unknown },
 ): Promise<T> {
   const response = await getTransport().request(agentUrl(path), {
     method: init?.method ?? 'GET',
@@ -3895,8 +3913,39 @@ export function revokeAllMcpServerTokens(): Promise<McpServerStatus> {
   });
 }
 
-export function getMcpServerConfigSnippets(): Promise<McpServerConfigSnippets> {
-  return mcpServerJson('/api/mcp-server/config-snippets', 'load mcp server config snippets');
+export function updateMcpServerToken(
+  tokenId: string,
+  request: McpServerUpdateTokenRequest,
+): Promise<McpServerStatus> {
+  return mcpServerJson(
+    `/api/mcp-server/tokens/${encodeURIComponent(tokenId)}`,
+    'update mcp server token',
+    { method: 'PATCH', body: request },
+  );
+}
+
+export async function getMcpServerTokenSecret(tokenId: string): Promise<string> {
+  const result = await mcpServerJson<{ secret: string }>(
+    `/api/mcp-server/tokens/${encodeURIComponent(tokenId)}/secret`,
+    'view mcp server token secret',
+  );
+  return result.secret;
+}
+
+export function rotateMcpServerToken(tokenId: string): Promise<McpServerCreateTokenResponse> {
+  return mcpServerJson(
+    `/api/mcp-server/tokens/${encodeURIComponent(tokenId)}/rotate`,
+    'rotate mcp server token',
+    { method: 'POST', body: {} },
+  );
+}
+
+export function getMcpServerConfigSnippets(tokenId?: string): Promise<McpServerConfigSnippets> {
+  const suffix = tokenId ? `?tokenId=${encodeURIComponent(tokenId)}` : '';
+  return mcpServerJson(
+    `/api/mcp-server/config-snippets${suffix}`,
+    'load mcp server config snippets',
+  );
 }
 
 export async function listMcpServerApprovals(): Promise<McpServerApproval[]> {

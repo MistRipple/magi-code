@@ -248,7 +248,9 @@ async fn materialize_session(
     // 新建会话会同时写入 session 记录和 current 指针；这里用完整 projection
     // 提交这次实体创建，确保旧 projection、sidecar 和 current 在同一个持久化事务中
     // 收口。导航专用写入只适合已有实体，不能把新实体的回滚留在旧文件之外。
-    if let Err(error) = state.persist_session_projection_for_sessions_for_api(std::slice::from_ref(&session_id)) {
+    if let Err(error) =
+        state.persist_session_projection_for_sessions_for_api(std::slice::from_ref(&session_id))
+    {
         let original_message = error.message().to_string();
         return Err(
             match state
@@ -849,7 +851,9 @@ pub(crate) async fn submit_session_turn_internal(
             .await?;
             let (entry_id, user_message_item_id) = user_message;
             finalize_continue_session(state.clone(), accepted.clone());
-            state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(&accepted.session_id))?;
+            state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(
+                &accepted.session_id,
+            ))?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
             Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
                 session_id: accepted.session_id,
@@ -3026,7 +3030,10 @@ async fn submit_conversation_session_turn(
     // 之前只有任务路线接了这一步，聊天路线（包括 GPT Web 会话）创建的会话永远叫「新会话」。
     // 已保存的 GPT Web 对话之后仍以 ChatGPT 的标题为准（见 `record_saved_web_progress`）。
     if created_session {
-        if let Some(first_message) = request.trimmed_text().filter(|text| !text.trim().is_empty()) {
+        if let Some(first_message) = request
+            .trimmed_text()
+            .filter(|text| !text.trim().is_empty())
+        {
             crate::session_title::spawn_new_session_title_refinement(
                 &state,
                 &session_id,
@@ -3767,7 +3774,9 @@ pub(crate) fn record_active_goal_turn_failure(
     if !stopped_by_current_turn {
         return;
     }
-    if let Err(error) = state.persist_session_projection_for_sessions(std::slice::from_ref(&session_id)) {
+    if let Err(error) =
+        state.persist_session_projection_for_sessions(std::slice::from_ref(&session_id))
+    {
         tracing::warn!(
             session_id = %session_id,
             goal_id = %goal.goal_id,
@@ -3802,7 +3811,8 @@ async fn schedule_goal_continuation_turn_if_idle(
             .mark_goal_continuation_waiting(&session_id, &goal.goal_id, "goal_plan_not_runnable")
             .is_ok()
         {
-            let _ = state.persist_session_projection_for_sessions(std::slice::from_ref(&session_id));
+            let _ =
+                state.persist_session_projection_for_sessions(std::slice::from_ref(&session_id));
         }
         return;
     }
@@ -5184,7 +5194,9 @@ async fn execute_session_continue(
     )
     .await?;
     finalize_continue_session(state.clone(), accepted.clone());
-    state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(&accepted.session_id))?;
+    state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(
+        &accepted.session_id,
+    ))?;
     let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
     let event = EventEnvelope::domain(
         event_id.clone(),
@@ -5233,7 +5245,9 @@ fn finalize_continue_session(state: ApiState, accepted: SessionContinueAccepted)
     // 所有 tier 的 dispatch 驱动统一交给后台 RunnerManager：runner 已在
     // `continue_execution_chain` 中重新启动；终态由 TaskCompletionNotifier 收口。
 
-    if let Err(error) = state.persist_session_projection_for_sessions(std::slice::from_ref(&accepted.session_id)) {
+    if let Err(error) =
+        state.persist_session_projection_for_sessions(std::slice::from_ref(&accepted.session_id))
+    {
         tracing::error!(
             session_id = %accepted.session_id,
             root_task_id = %accepted.root_task_id,
@@ -5795,7 +5809,9 @@ async fn clear_notifications(
         validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
     let context = notification_context(&scope, session_id.clone());
     let affected = state.sessions_with_notifications_in_context(&context);
-    state.session_store.clear_notifications_for_context(&context);
+    state
+        .session_store
+        .clear_notifications_for_context(&context);
     state.persist_session_projection_for_sessions_for_api(&affected)?;
     Ok(Json(build_notifications_response(
         &state,

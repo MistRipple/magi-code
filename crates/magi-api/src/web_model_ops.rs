@@ -194,14 +194,20 @@ impl magi_web_model::WebImageSink for ApiImageSink {
                     .personal_session_execution_root_path(&SessionId::new(session_id))
             });
         let digest = Sha256::digest(&image.bytes);
-        let name: String = digest.iter().take(6).map(|byte| format!("{byte:02x}")).collect();
+        let name: String = digest
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let relative = format!("generated-images/web-{name}.{extension}");
         let target = root.join(&relative);
         if !target.exists() {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| format!("创建目录失败：{error}"))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("创建目录失败：{error}"))?;
             }
-            std::fs::write(&target, &image.bytes).map_err(|error| format!("写入图片失败：{error}"))?;
+            std::fs::write(&target, &image.bytes)
+                .map_err(|error| format!("写入图片失败：{error}"))?;
         }
         Ok(relative)
     }
@@ -420,7 +426,10 @@ impl ApiState {
             }
             WebModelPageTarget::ApiKeys => {
                 driver
-                    .open_page(SLOT_PAGE_ID, &magi_web_model::openai_platform_api_keys_url())
+                    .open_page(
+                        SLOT_PAGE_ID,
+                        &magi_web_model::openai_platform_api_keys_url(),
+                    )
                     .await
             }
         }

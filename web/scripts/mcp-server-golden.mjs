@@ -37,6 +37,22 @@ for (const route of [
   assert.ok(agentApi.includes(route), `agent-api 缺少 ${route}`);
 }
 assert.match(agentApi, /encodeURIComponent\(tokenId\)/);
+assert.match(agentApi, /\/secret`/, 'agent-api 缺少查看原文');
+assert.match(agentApi, /\/rotate`/, 'agent-api 缺少重新生成');
+assert.match(agentApi, /method: 'PATCH', body: request/, 'agent-api 缺少编辑令牌');
+assert.match(agentApi, /config-snippets\$\{suffix\}/, '配置片段需要支持按令牌取');
+
+// ── 令牌可重新查看 / 编辑 / 重新生成；旧令牌没有原文时只能重新生成 ─────────────
+assert.match(section, /getMcpServerTokenSecret\(token\.tokenId\)/);
+assert.match(section, /token\.hasSecret/);
+assert.match(section, /data-mcp-token-legacy/);
+assert.match(section, /rotateMcpServerToken\(token\.tokenId\)/);
+assert.match(section, /window\.confirm\(i18n\.t\('mcpServer\.token\.rotateConfirm'/);
+// 编辑：高风险档要确认；升到高风险档时网络一并关闭；工作区不可改
+assert.match(section, /confirmHighRisk: editNeedsConfirm \? editConfirmHighRisk : undefined/);
+assert.match(section, /const network = editHighRisk \? false : editNetwork/);
+assert.doesNotMatch(section, /updateMcpServerToken\([^)]*workspaceId/);
+assert.match(section, /viewingSecret = null/, '收起后原文必须丢弃');
 
 // ── 高风险权限档必须显式确认 ─────────────────────────────────────────────────
 assert.match(section, /HIGH_RISK_PROFILES[\s\S]*'edit_trusted'[\s\S]*'exec'/);

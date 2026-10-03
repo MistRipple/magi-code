@@ -3875,11 +3875,7 @@ impl ApiState {
     ) -> Result<(), ApiError> {
         self.persist_session_projection_for_sessions(session_ids)
             .map_err(|error| {
-                public_runtime_persistence_error(
-                    "session",
-                    SESSION_PERSISTENCE_PUBLIC_ERROR,
-                    error,
-                )
+                public_runtime_persistence_error("session", SESSION_PERSISTENCE_PUBLIC_ERROR, error)
             })
     }
 
@@ -3902,7 +3898,6 @@ impl ApiState {
         }
         session_ids
     }
-
 
     pub(crate) fn rename_session_with_persistence_for_api(
         &self,

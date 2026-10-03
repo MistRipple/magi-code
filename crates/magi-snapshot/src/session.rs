@@ -891,6 +891,46 @@ impl SnapshotSession {
         Ok(applied)
     }
 
+    /// 这些路径里，「该会话最后一次工具写入之后又被别的来源改过」的那些。
+    ///
+    /// `revert` 把文件直接还原成本会话的 baseline，不看文件现在是谁写的：两个客户端先后改了同一个
+    /// 文件时，回退先改的那个会把后改的修改静默抹掉。需要保护这种场景的调用方（例如外部 MCP 客户端
+    /// 的变更回退）先用它检查，非空就应拒绝并让用户确认。判断依据是追加式 ChangeLog 里该路径最新
+    /// 事件的来源：不是本会话的工具写入（`Tool`），说明有人在它之后改了这个文件。
+    pub fn paths_modified_outside_tools(&self, paths: &[String]) -> SnapshotResult<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 先把磁盘现状并入账本，别人刚做的修改才看得见。
+        self.reconcile()?;
+        let paths = self.expand_rename_pairs(paths)?;
+        let events = self.events.read_all()?;
+        let mut latest_source = HashMap::<String, SourceKind>::new();
+        for event in &events {
+            let Some(path) = event
+                .after
+                .as_ref()
+                .map(|meta| meta.path.clone())
+                .or_else(|| event.before.as_ref().map(|meta| meta.path.clone()))
+            else {
+                continue;
+            };
+            latest_source.insert(path, event.source);
+        }
+        let mut modified = paths
+            .into_iter()
+            .filter(|path| {
+                matches!(
+                    latest_source.get(path),
+                    Some(SourceKind::External | SourceKind::Watcher)
+                )
+            })
+            .collect::<Vec<_>>();
+        modified.sort();
+        modified.dedup();
+        Ok(modified)
+    }
+
     /// 把 paths 还原到 baseline 状态。
     pub fn revert(&self, paths: &[String]) -> SnapshotResult<usize> {
         let pending = self.pending_changes()?;

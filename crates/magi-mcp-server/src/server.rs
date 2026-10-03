@@ -172,6 +172,46 @@ impl AuditSink for NoopAudit {
     fn record(&self, _event: AuditEvent) {}
 }
 
+/// 同一个客户端同时进行的 `tools/call` 上限（含正在等待人工审批的调用）。回环请求同样生效：
+/// 本机一个失控的客户端不应该能无限并发地占用工具运行时和审批队列。
+pub const MAX_CONCURRENT_CALLS_PER_CLIENT: usize = 8;
+
+/// 按客户端（令牌）计数的并发调用。守卫析构时归还名额。
+#[derive(Default)]
+struct InFlightCalls(std::sync::Mutex<std::collections::HashMap<String, usize>>);
+
+struct InFlightGuard {
+    calls: Arc<InFlightCalls>,
+    client: String,
+}
+
+impl InFlightCalls {
+    fn acquire(self: &Arc<Self>, client: &str) -> Option<InFlightGuard> {
+        let mut counts = self.0.lock().expect("in-flight counter poisoned");
+        let count = counts.entry(client.to_string()).or_insert(0);
+        if *count >= MAX_CONCURRENT_CALLS_PER_CLIENT {
+            return None;
+        }
+        *count += 1;
+        Some(InFlightGuard {
+            calls: Arc::clone(self),
+            client: client.to_string(),
+        })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut counts = self.calls.0.lock().expect("in-flight counter poisoned");
+        if let Some(count) = counts.get_mut(&self.client) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.client);
+            }
+        }
+    }
+}
+
 pub struct McpServer {
     name: String,
     version: String,
@@ -179,6 +219,7 @@ pub struct McpServer {
     workspaces: Arc<dyn WorkspaceResolver>,
     attribution: Arc<dyn AttributionResolver>,
     audit: Arc<dyn AuditSink>,
+    in_flight: Arc<InFlightCalls>,
 }
 
 impl McpServer {
@@ -195,6 +236,7 @@ impl McpServer {
             workspaces,
             attribution: Arc::new(ExternalOnlyAttribution),
             audit: Arc::new(NoopAudit),
+            in_flight: Arc::new(InFlightCalls::default()),
         }
     }
 
@@ -316,6 +358,17 @@ impl McpServer {
             ));
         }
 
+        // 并发上限：占住名额直到本次调用结束（含等待审批的时间）。
+        let Some(_in_flight) = self.in_flight.acquire(&principal.token_id) else {
+            return Ok(deny(
+                format!(
+                    "该客户端同时进行的调用已达上限（{MAX_CONCURRENT_CALLS_PER_CLIENT} 个），请等当前调用完成后再试"
+                ),
+                Vec::new(),
+                false,
+            ));
+        };
+
         let attribution = match self.attribution.resolve(principal) {
             Ok(target) => target,
             Err(AttributionRefusal(reason)) => return Ok(deny(reason, Vec::new(), false)),
@@ -408,6 +461,7 @@ mod tests {
     use crate::catalog::ToolSchema;
     use crate::path_guard::PathAccess;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     struct Schemas;
     impl ToolSchemaProvider for Schemas {
@@ -806,5 +860,87 @@ mod tests {
         assert!(cut.starts_with("汉字"));
         assert!(cut.contains("输出已截断"));
         assert_eq!(truncate_with_notice("short".to_string(), 100), "short");
+    }
+
+    /// 调用会一直挂起直到被放行的后端，用来占住并发名额。
+    #[derive(Default)]
+    struct BlockingBackend {
+        gate: tokio::sync::Notify,
+    }
+
+    impl ToolBackend for BlockingBackend {
+        fn schemas(&self) -> &dyn ToolSchemaProvider {
+            static SCHEMAS: Schemas = Schemas;
+            &SCHEMAS
+        }
+        fn path_requests(&self, _: &str, _: &Value, _: &Path) -> Vec<PathRequest> {
+            Vec::new()
+        }
+        fn invoke<'a>(&'a self, _invocation: ToolInvocation) -> BoxFuture<'a, InvocationOutcome> {
+            Box::pin(async move {
+                self.gate.notified().await;
+                InvocationOutcome {
+                    text: "ok".to_string(),
+                    is_error: false,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn one_client_cannot_exceed_its_concurrent_call_limit_but_others_are_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend::default());
+        let server = Arc::new(McpServer::new(
+            "magi-mcp",
+            "test",
+            backend.clone(),
+            Arc::new(Root(dir.path().to_path_buf())),
+        ));
+        let busy = principal(Profile::ReadOnly);
+        let mut pending = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CALLS_PER_CLIENT {
+            let server = Arc::clone(&server);
+            let busy = busy.clone();
+            pending.push(tokio::spawn(async move {
+                server
+                    .handle(&busy, call("magi.fs.read", json!({})), 1)
+                    .await
+            }));
+        }
+        // 等所有调用都占住名额。
+        for _ in 0..200 {
+            if server.in_flight.0.lock().unwrap().get("tok-1").copied()
+                == Some(MAX_CONCURRENT_CALLS_PER_CLIENT)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let refused = server
+            .handle(&busy, call("magi.fs.read", json!({})), 1)
+            .await
+            .unwrap();
+        assert!(is_error(&refused), "{refused}");
+        assert!(refused.to_string().contains("已达上限"), "{refused}");
+
+        // 另一个客户端不受影响（这里只验证没有被计数挡住：它同样会挂起，所以限时等待）。
+        let mut other = busy.clone();
+        other.token_id = "tok-2".to_string();
+        let other_call = tokio::time::timeout(
+            Duration::from_millis(100),
+            server.handle(&other, call("magi.fs.read", json!({})), 1),
+        )
+        .await;
+        assert!(other_call.is_err(), "其他客户端的调用应正常进入后端而不是被拒绝");
+
+        // 放行后名额归还，新的调用又能进入。
+        backend.gate.notify_waiters();
+        for task in pending {
+            let response = task.await.unwrap().unwrap();
+            assert!(!is_error(&response), "{response}");
+        }
+        assert!(server.in_flight.0.lock().unwrap().is_empty(), "名额必须全部归还");
     }
 }

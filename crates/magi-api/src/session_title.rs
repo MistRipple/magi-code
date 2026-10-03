@@ -75,15 +75,14 @@ async fn refine_new_session_title_and_publish(
     let generation_state = state.clone();
     let generation_session_id = session_id.clone();
     let refined_title = tokio::task::spawn_blocking(move || {
-        let client =
-            magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role(
-                Some(&generation_state.settings_store),
-                None,
-                magi_conversation_runtime::task_execution_dispatcher::RoleTarget::Auxiliary,
-                None,
-            )
-            .ok()
-            .flatten();
+        let client = magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role(
+            Some(&generation_state.settings_store),
+            None,
+            magi_conversation_runtime::task_execution_dispatcher::RoleTarget::Auxiliary,
+            None,
+        )
+        .ok()
+        .flatten();
         let Some(client) = client else {
             tracing::debug!(
                 session_id = %generation_session_id,

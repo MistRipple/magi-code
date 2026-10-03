@@ -104,6 +104,20 @@ pub enum TokenError {
     EmptyClientName,
     #[error("工作区不能为空")]
     EmptyWorkspace,
+    #[error("令牌不存在")]
+    NotFound,
+    #[error("令牌已吊销，不能再修改")]
+    Revoked,
+}
+
+/// 编辑令牌的补丁。`None` 表示不改；不含原文，编辑从不更换原文。
+#[derive(Clone, Debug, Default)]
+pub struct TokenPatch {
+    pub client_name: Option<String>,
+    pub profile: Option<Profile>,
+    /// `Some(None)` 表示改为不过期；`Some(Some(t))` 表示在 `t`（毫秒时间戳）过期。
+    pub expires_at_ms: Option<Option<u64>>,
+    pub network: Option<bool>,
 }
 
 /// 令牌哈希。原文本身有 256 位随机熵，因此不需要慢速 KDF。
@@ -193,6 +207,60 @@ impl TokenStore {
             .expect("token store poisoned")
             .push(record.clone());
         Ok(IssuedToken { record, secret })
+    }
+
+    /// 编辑令牌。已吊销的令牌不可编辑。返回编辑前后的记录，调用方据此判断是否收紧了权限。
+    /// 原文不变，所以客户端无需重新配置；下一次调用起按新记录生效（每次请求都重新认证）。
+    pub fn update(
+        &self,
+        token_id: &str,
+        patch: TokenPatch,
+        now_ms: u64,
+    ) -> Result<(TokenRecord, TokenRecord), TokenError> {
+        let mut records = self.records.lock().expect("token store poisoned");
+        let record = records
+            .iter_mut()
+            .find(|record| record.token_id == token_id)
+            .ok_or(TokenError::NotFound)?;
+        if record.revoked_at_ms.is_some() {
+            return Err(TokenError::Revoked);
+        }
+        let name = match &patch.client_name {
+            Some(name) if name.trim().is_empty() => return Err(TokenError::EmptyClientName),
+            Some(name) => Some(name.trim().to_string()),
+            None => None,
+        };
+        let before = record.clone();
+        if let Some(name) = name {
+            record.client_name = name;
+        }
+        if let Some(profile) = patch.profile {
+            record.profile = profile;
+        }
+        if let Some(expires) = patch.expires_at_ms {
+            record.expires_at_ms = expires;
+        }
+        if let Some(network) = patch.network {
+            record.network = network;
+        }
+        let _ = now_ms;
+        Ok((before, record.clone()))
+    }
+
+    /// 重新生成原文：旧原文立即失效，其余配置不变。返回新原文。
+    pub fn rotate(&self, token_id: &str) -> Result<(TokenRecord, String), TokenError> {
+        let mut records = self.records.lock().expect("token store poisoned");
+        let record = records
+            .iter_mut()
+            .find(|record| record.token_id == token_id)
+            .ok_or(TokenError::NotFound)?;
+        if record.revoked_at_ms.is_some() {
+            return Err(TokenError::Revoked);
+        }
+        let secret = format!("{TOKEN_PREFIX}{}", random_hex(32)?);
+        record.prefix = secret.chars().take(DISPLAY_PREFIX_LEN).collect();
+        record.hash = hash_secret(&secret);
+        Ok((record.clone(), secret))
     }
 
     /// 校验令牌原文。失败统一返回 `AuthError::Invalid`。
@@ -371,5 +439,80 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn update_changes_scope_without_changing_the_secret_and_rejects_revoked_tokens() {
+        let store = TokenStore::new();
+        let issued = store.issue(request(Profile::ReadOnly), 1_000).unwrap();
+        let id = issued.record.token_id.clone();
+
+        let (before, after) = store
+            .update(
+                &id,
+                TokenPatch {
+                    client_name: Some("  Claude Desktop ".to_string()),
+                    profile: Some(Profile::Edit),
+                    expires_at_ms: Some(Some(9_000)),
+                    network: Some(true),
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(before.profile, Profile::ReadOnly);
+        assert_eq!(after.client_name, "Claude Desktop");
+        assert_eq!(after.profile, Profile::Edit);
+        assert_eq!(after.expires_at_ms, Some(9_000));
+        assert!(after.network);
+        // 原文不变：仍用创建时的原文认证，且读到的是新的权限档。
+        let authenticated = store.authenticate(&issued.secret, 3_000).unwrap();
+        assert_eq!(authenticated.profile, Profile::Edit);
+
+        // 改为不过期；空名称被拒绝。
+        let (_, never) = store
+            .update(
+                &id,
+                TokenPatch {
+                    expires_at_ms: Some(None),
+                    ..TokenPatch::default()
+                },
+                4_000,
+            )
+            .unwrap();
+        assert_eq!(never.expires_at_ms, None);
+        assert!(matches!(
+            store.update(
+                &id,
+                TokenPatch {
+                    client_name: Some("   ".to_string()),
+                    ..TokenPatch::default()
+                },
+                4_000
+            ),
+            Err(TokenError::EmptyClientName)
+        ));
+
+        store.revoke(&id, 5_000);
+        assert!(matches!(
+            store.update(&id, TokenPatch::default(), 6_000),
+            Err(TokenError::Revoked)
+        ));
+        assert!(matches!(
+            store.update("missing", TokenPatch::default(), 6_000),
+            Err(TokenError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn rotate_replaces_the_secret_and_keeps_everything_else() {
+        let store = TokenStore::new();
+        let issued = store.issue(request(Profile::Edit), 1_000).unwrap();
+        let (record, new_secret) = store.rotate(&issued.record.token_id).unwrap();
+        assert_ne!(new_secret, issued.secret);
+        assert_eq!(record.profile, Profile::Edit);
+        assert_eq!(record.workspace_id, "workspace-a");
+        assert!(store.authenticate(&issued.secret, 2_000).is_err(), "旧原文立即失效");
+        assert!(store.authenticate(&new_secret, 2_000).is_ok());
+        assert!(!serde_json::to_string(&store.records()).unwrap().contains(&new_secret));
     }
 }

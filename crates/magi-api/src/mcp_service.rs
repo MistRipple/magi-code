@@ -328,6 +328,12 @@ impl ApiToolBackend {
                 if paths.is_empty() {
                     return error_outcome("paths 不能为空");
                 }
+                // 先查冲突再请求审批：不要让用户批准一个注定被拒绝的回退。
+                match check_revert_conflicts(snapshot.clone(), paths.clone()).await {
+                    Ok(None) => {}
+                    Ok(Some(message)) => return error_outcome(message),
+                    Err(message) => return error_outcome(message),
+                }
                 if invocation.requires_approval {
                     let state = self.state.clone();
                     let tokens = self.tokens.clone();
@@ -354,13 +360,20 @@ impl ApiToolBackend {
                         Err(_) => return error_outcome("审批等待意外中断"),
                     }
                 }
+                // 审批等待期间文件可能又被改过，落盘前再确认一次。
+                match check_revert_conflicts(snapshot.clone(), paths.clone()).await {
+                    Ok(None) => {}
+                    Ok(Some(message)) => return error_outcome(message),
+                    Err(message) => return error_outcome(message),
+                }
                 let reverted = tokio::task::spawn_blocking(move || snapshot.revert(&paths)).await;
                 match reverted {
                     Ok(Ok(count)) => InvocationOutcome {
                         text: serde_json::json!({ "reverted": count }).to_string(),
                         is_error: false,
                     },
-                    _ => error_outcome("回退失败"),
+                    Ok(Err(error)) => error_outcome(format!("回退失败: {error}")),
+                    Err(_) => error_outcome("回退失败"),
                 }
             }
             _ => error_outcome("未知的变更工具"),
@@ -513,6 +526,26 @@ fn approval_summary(invocation: &ToolInvocation, root: &Path) -> String {
     } else {
         format!("{}: {}", invocation.public_name, paths.join(", "))
     }
+}
+
+/// 回退前检查：这些文件在本会话最后一次工具写入之后有没有被别的来源（用户或其他客户端）改过。
+/// 有则拒绝，避免把别人后来的修改静默抹掉；`Ok(None)` 表示可以回退。
+async fn check_revert_conflicts(
+    snapshot: Arc<magi_snapshot::SnapshotSession>,
+    paths: Vec<String>,
+) -> Result<Option<String>, String> {
+    let modified =
+        tokio::task::spawn_blocking(move || snapshot.paths_modified_outside_tools(&paths))
+            .await
+            .map_err(|_| "回退检查意外中断".to_string())?
+            .map_err(|error| format!("回退检查失败: {error}"))?;
+    if modified.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "拒绝回退：这些文件在该客户端最后一次写入之后又被其他来源（用户或其他客户端）修改过，回退会抹掉那些修改：{}。请先用 magi.fs.read 查看现状，确认后手动处理。",
+        modified.join("、")
+    )))
 }
 
 fn revert_paths(arguments: &Value) -> Vec<String> {
@@ -697,13 +730,15 @@ impl ApiToolBackend {
     }
 }
 
-
 /// GPT Web 槽位发起的调用按设置里的授权方式处理；其他来源（外部令牌）一律每次询问。
 fn slot_approval_mode(
     state: &ApiState,
     invocation: &ToolInvocation,
 ) -> crate::web_model_channel::WebApprovalMode {
-    if matches!(invocation.attribution, AttributionTarget::WebSlotTurn { .. }) {
+    if matches!(
+        invocation.attribution,
+        AttributionTarget::WebSlotTurn { .. }
+    ) {
         effective_approval_mode(state.web_model.approval_mode(), invocation.class)
     } else {
         crate::web_model_channel::WebApprovalMode::Ask
@@ -718,9 +753,10 @@ fn effective_approval_mode(
 ) -> crate::web_model_channel::WebApprovalMode {
     use crate::web_model_channel::WebApprovalMode;
     match (mode, class) {
-        (WebApprovalMode::Always, magi_mcp_server::ToolClass::Destructive | magi_mcp_server::ToolClass::Exec) => {
-            WebApprovalMode::Ask
-        }
+        (
+            WebApprovalMode::Always,
+            magi_mcp_server::ToolClass::Destructive | magi_mcp_server::ToolClass::Exec,
+        ) => WebApprovalMode::Ask,
         (mode, _) => mode,
     }
 }
@@ -852,7 +888,8 @@ fn run_blocking(
     );
     // Magi 自己的安全规则要求授权（例如 SafetyGate 对敏感操作）时，补一次人工确认后重入。
     if result.1 == ExecutionResultStatus::NeedsApproval && !granted {
-        if slot_approval_mode(state, invocation) == crate::web_model_channel::WebApprovalMode::Deny {
+        if slot_approval_mode(state, invocation) == crate::web_model_channel::WebApprovalMode::Deny
+        {
             return error_outcome(WEB_APPROVAL_DENIED_BY_SETTING);
         }
         if let Err((payload, _)) = approve(&format!("{call_id}-safety")) {
@@ -1321,6 +1358,52 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(f.root.join("keep.txt")).unwrap(),
             "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_is_refused_when_someone_else_changed_the_file_after_this_client() {
+        let f = fixture(Profile::Edit, Duration::from_secs(10));
+        std::fs::write(f.root.join("shared.txt"), "original").unwrap();
+
+        let approver = resolve_pending(
+            &f.state,
+            &f.token_id,
+            magi_conversation_runtime::ToolApprovalDecision::AllowOnce,
+        );
+        let written = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"path": "shared.txt", "content": "client A was here"}),
+            ),
+        )
+        .await;
+        approver.join().unwrap();
+        assert!(!is_error(&written), "{written}");
+
+        // 另一个客户端（或用户）随后改了同一个文件。
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(f.root.join("shared.txt"), "client B overwrote this, longer").unwrap();
+
+        // 在检查阶段就被拒绝，不需要审批：没有挂起的审批可供处理。
+        let reverted = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.changes.revert",
+                serde_json::json!({"paths": ["shared.txt"]}),
+            ),
+        )
+        .await;
+        assert!(is_error(&reverted), "{reverted}");
+        assert!(reverted.to_string().contains("拒绝回退"), "{reverted}");
+        assert!(reverted.to_string().contains("shared.txt"), "{reverted}");
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("shared.txt")).unwrap(),
+            "client B overwrote this, longer",
+            "别人的修改不能被回退抹掉"
         );
     }
 

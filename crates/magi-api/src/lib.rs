@@ -12,7 +12,6 @@ pub mod mcp_config;
 mod mcp_runtime;
 mod mcp_service;
 mod mcp_tunnel;
-mod tunnel_client_install;
 mod model_config;
 mod performance;
 mod public_canonical;
@@ -29,6 +28,7 @@ mod task_dispatch;
 pub mod task_turn_finalize;
 mod terminal_runtime;
 pub mod tunnel;
+mod tunnel_client_install;
 #[cfg(test)]
 mod turn_harness;
 mod turn_service;

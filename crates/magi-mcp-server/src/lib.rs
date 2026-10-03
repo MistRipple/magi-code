@@ -28,5 +28,6 @@ pub use server::{
     ToolInvocation, WorkspaceResolver,
 };
 pub use token::{
-    AttributionMode, AuthError, IssueTokenRequest, IssuedToken, TokenRecord, TokenStore,
+    AttributionMode, AuthError, IssueTokenRequest, IssuedToken, TokenError, TokenPatch,
+    TokenRecord, TokenStore,
 };

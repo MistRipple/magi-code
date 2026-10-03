@@ -18,7 +18,9 @@ use magi_mcp_server::http::{HttpConfig, HttpState, router};
 use magi_mcp_server::local_socket::{
     LocalSocketServer, local_endpoint_for, serve_local_socket, serve_local_socket_with_auth,
 };
-use magi_mcp_server::{IssueTokenRequest, IssuedToken, TokenRecord, TokenStore};
+use magi_mcp_server::{
+    IssueTokenRequest, IssuedToken, Profile, TokenPatch, TokenRecord, TokenStore,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -28,6 +30,9 @@ use crate::mcp_tunnel::{QuickTunnelProvider, TunnelProvider, host_of_public_url}
 use crate::state::ApiState;
 
 const LOOPBACK: &str = "127.0.0.1";
+
+/// 令牌原文文件名（与 `mcp-server.json` 同目录）。
+const SECRETS_FILE: &str = "mcp-token-secrets.json";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum McpRuntimeError {
@@ -225,6 +230,9 @@ pub(crate) struct McpServiceRuntime {
     slot_socket: AsyncMutex<Option<LocalSocketServer>>,
     path: Option<PathBuf>,
     tokens: Arc<TokenStore>,
+    /// 令牌原文（token_id → 原文），与校验用的哈希分开存放在 `mcp-token-secrets.json`（0600），
+    /// 只服务于「重新查看 / 复制」，不参与校验，也不进审计、日志和备份导出。
+    secrets: Mutex<std::collections::HashMap<String, String>>,
     control: AsyncMutex<Control>,
     persist_lock: Mutex<()>,
 }
@@ -244,6 +252,7 @@ impl McpServiceRuntime {
             slot_socket: AsyncMutex::new(None),
             path: None,
             tokens: Arc::new(TokenStore::new()),
+            secrets: Mutex::new(Default::default()),
             control: AsyncMutex::new(Control::default()),
             persist_lock: Mutex::new(()),
         }
@@ -264,6 +273,23 @@ impl McpServiceRuntime {
         };
         let audit = McpAuditLog::load(path.with_file_name("mcp-audit.jsonl"));
         let tokens = Arc::new(TokenStore::from_records(persisted.tokens));
+        // 原文只保留仍然有效的令牌；旧版本创建的令牌没有原文，保持「无法查看」。
+        let now = now_ms();
+        let active_ids = tokens
+            .records()
+            .into_iter()
+            .filter(|record| record.is_active(now))
+            .map(|record| record.token_id)
+            .collect::<std::collections::HashSet<_>>();
+        let secrets = std::fs::read(path.with_file_name(SECRETS_FILE))
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<std::collections::HashMap<String, String>>(&bytes).ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(token_id, _)| active_ids.contains(token_id))
+            .collect();
         Self {
             audit,
             tunnel: QuickTunnelProvider::shared(),
@@ -272,6 +298,7 @@ impl McpServiceRuntime {
             slot_socket: AsyncMutex::new(None),
             path: Some(path),
             tokens,
+            secrets: Mutex::new(secrets),
             control: AsyncMutex::new(Control {
                 enabled: persisted.enabled,
                 port: persisted.port,
@@ -303,6 +330,32 @@ impl McpServiceRuntime {
         .map_err(|error| McpRuntimeError::Persist(error.to_string()))?;
         write_private_atomic(path, &body)
             .map_err(|error| McpRuntimeError::Persist(error.to_string()))
+    }
+
+    fn persist_secrets(&self) -> Result<(), McpRuntimeError> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let body = {
+            let secrets = self.secrets.lock().expect("mcp secrets lock poisoned");
+            serde_json::to_vec_pretty(&*secrets)
+                .map_err(|error| McpRuntimeError::Persist(error.to_string()))?
+        };
+        write_private_atomic(&path.with_file_name(SECRETS_FILE), &body)
+            .map_err(|error| McpRuntimeError::Persist(error.to_string()))
+    }
+
+    /// 忘掉这些令牌的原文（吊销后不可再查看）。
+    fn forget_secrets(&self, token_ids: &[String]) {
+        {
+            let mut secrets = self.secrets.lock().expect("mcp secrets lock poisoned");
+            for token_id in token_ids {
+                secrets.remove(token_id);
+            }
+        }
+        if let Err(error) = self.persist_secrets() {
+            tracing::warn!(%error, "清理已吊销令牌的原文失败");
+        }
     }
 
     pub(crate) async fn status(&self) -> McpServiceStatus {
@@ -633,7 +686,97 @@ impl McpServiceRuntime {
             self.tokens.revoke(&issued.record.token_id, now_ms());
             return Err(error);
         }
+        self.secrets
+            .lock()
+            .expect("mcp secrets lock poisoned")
+            .insert(issued.record.token_id.clone(), issued.secret.clone());
+        if let Err(error) = self.persist_secrets() {
+            // 原文存不下来用户就没法再查看它：不让这样的令牌生效。
+            self.tokens.revoke(&issued.record.token_id, now_ms());
+            self.forget_secrets(std::slice::from_ref(&issued.record.token_id));
+            let _ = self.persist(control.enabled, control.port);
+            return Err(error);
+        }
         Ok(issued)
+    }
+
+    /// 令牌原文（重新查看 / 复制）。已吊销、已过期、或创建于旧版本而没有原文的令牌返回 `None`。
+    pub(crate) fn token_secret(&self, token_id: &str) -> Option<String> {
+        let now = now_ms();
+        let active = self
+            .tokens
+            .records()
+            .iter()
+            .any(|record| record.token_id == token_id && record.is_active(now));
+        if !active {
+            return None;
+        }
+        self.secrets
+            .lock()
+            .expect("mcp secrets lock poisoned")
+            .get(token_id)
+            .cloned()
+    }
+
+    /// 令牌当前是否有可查看的原文（列表用，不返回原文）。
+    pub(crate) fn token_has_secret(&self, token_id: &str) -> bool {
+        self.secrets
+            .lock()
+            .expect("mcp secrets lock poisoned")
+            .contains_key(token_id)
+    }
+
+    /// 编辑令牌：不更换原文，下一次调用起生效。收紧权限时，该令牌挂起的审批立即作废。
+    pub(crate) async fn update_token(
+        &self,
+        state: &ApiState,
+        token_id: &str,
+        patch: TokenPatch,
+    ) -> Result<TokenRecord, McpRuntimeError> {
+        let control = self.control.lock().await;
+        let (before, after) = self
+            .tokens
+            .update(token_id, patch, now_ms())
+            .map_err(|error| McpRuntimeError::Token(error.to_string()))?;
+        if let Err(error) = self.persist(control.enabled, control.port) {
+            // 没落盘就不能让修改只活在内存里：改回去。
+            let _ = self.tokens.update(
+                token_id,
+                TokenPatch {
+                    client_name: Some(before.client_name.clone()),
+                    profile: Some(before.profile),
+                    expires_at_ms: Some(before.expires_at_ms),
+                    network: Some(before.network),
+                },
+                now_ms(),
+            );
+            return Err(error);
+        }
+        if narrows_access(&before, &after) {
+            cancel_pending(state, token_id);
+        }
+        Ok(after)
+    }
+
+    /// 重新生成原文：旧原文立即失效，其余配置不变，挂起的审批作废。返回新原文。
+    pub(crate) async fn rotate_token(
+        &self,
+        state: &ApiState,
+        token_id: &str,
+    ) -> Result<(TokenRecord, String), McpRuntimeError> {
+        let control = self.control.lock().await;
+        let (record, secret) = self
+            .tokens
+            .rotate(token_id)
+            .map_err(|error| McpRuntimeError::Token(error.to_string()))?;
+        self.persist(control.enabled, control.port)?;
+        self.secrets
+            .lock()
+            .expect("mcp secrets lock poisoned")
+            .insert(token_id.to_string(), secret.clone());
+        self.persist_secrets()?;
+        cancel_pending(state, token_id);
+        Ok((record, secret))
     }
 
     /// 吊销一个令牌，并取消它所有待审批。返回是否存在该令牌。
@@ -646,6 +789,7 @@ impl McpServiceRuntime {
         let revoked = self.tokens.revoke(token_id, now_ms());
         cancel_pending(state, token_id);
         self.persist(control.enabled, control.port)?;
+        self.forget_secrets(&[token_id.to_string()]);
         Ok(revoked)
     }
 
@@ -662,6 +806,7 @@ impl McpServiceRuntime {
             cancel_pending(state, id);
         }
         self.persist(control.enabled, control.port)?;
+        self.forget_secrets(&ids);
         Ok(count)
     }
 
@@ -684,8 +829,26 @@ impl McpServiceRuntime {
             cancel_pending(state, id);
         }
         self.persist(control.enabled, control.port)?;
+        self.forget_secrets(&ids);
         Ok(count)
     }
+}
+
+/// 这次编辑有没有收紧该令牌的权限（降权、关闭公网、缩短有效期）。收紧时挂起的审批按旧权限发起，
+/// 不能继续等；单纯放宽（例如从只读升到编辑）不需要作废。
+fn narrows_access(before: &TokenRecord, after: &TokenRecord) -> bool {
+    let profile_narrowed = before.profile != after.profile
+        && !matches!(
+            (before.profile, after.profile),
+            (Profile::ReadOnly, _) | (Profile::Edit, Profile::EditTrusted | Profile::Exec)
+        );
+    let network_narrowed = before.network && !after.network;
+    let expiry_narrowed = match (before.expires_at_ms, after.expires_at_ms) {
+        (None, Some(_)) => true,
+        (Some(old), Some(new)) => new < old,
+        _ => false,
+    };
+    profile_narrowed || network_narrowed || expiry_narrowed
 }
 
 fn cancel_pending(state: &ApiState, token_id: &str) {
@@ -1092,5 +1255,106 @@ mod tests {
         // 网络模式不持久化：重启后关闭。
         let restarted = McpServiceRuntime::load(path);
         assert!(!restarted.status().await.network.enabled);
+    }
+    #[tokio::test]
+    async fn secrets_live_in_their_own_private_file_and_vanish_with_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-server.json");
+        let state = state();
+        let runtime = McpServiceRuntime::load(path.clone());
+        let issued = runtime.issue_token(request()).await.unwrap();
+        let token_id = issued.record.token_id.clone();
+
+        let secrets_path = dir.path().join(SECRETS_FILE);
+        assert!(
+            std::fs::read_to_string(&secrets_path)
+                .unwrap()
+                .contains(&issued.secret)
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(&issued.secret)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&secrets_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "原文文件必须是用户私有权限");
+        }
+
+        // 重启后仍可重新查看。
+        let restarted = McpServiceRuntime::load(path.clone());
+        assert_eq!(
+            restarted.token_secret(&token_id).as_deref(),
+            Some(issued.secret.as_str())
+        );
+
+        // 吊销后原文立即清除，文件里也不再有。
+        assert!(restarted.revoke(&state, &token_id).await.unwrap());
+        assert!(restarted.token_secret(&token_id).is_none());
+        assert!(
+            !std::fs::read_to_string(&secrets_path)
+                .unwrap()
+                .contains(&issued.secret)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_created_before_secrets_were_kept_cannot_be_viewed_but_can_be_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-server.json");
+        let state = state();
+        let runtime = McpServiceRuntime::load(path.clone());
+        let issued = runtime.issue_token(request()).await.unwrap();
+        // 模拟旧版本：没有原文文件。
+        std::fs::remove_file(dir.path().join(SECRETS_FILE)).unwrap();
+
+        let legacy = McpServiceRuntime::load(path);
+        let token_id = issued.record.token_id.clone();
+        assert!(!legacy.token_has_secret(&token_id));
+        assert!(legacy.token_secret(&token_id).is_none());
+        let (_, fresh) = legacy.rotate_token(&state, &token_id).await.unwrap();
+        assert_ne!(fresh, issued.secret);
+        assert_eq!(legacy.token_secret(&token_id), Some(fresh));
+    }
+
+    #[test]
+    fn only_narrowing_edits_count_as_narrowing_access() {
+        let base = || {
+            let store = TokenStore::default();
+            store
+                .issue(
+                    IssueTokenRequest {
+                        profile: Profile::Edit,
+                        network: true,
+                        ttl_ms: Some(10_000),
+                        ..request()
+                    },
+                    0,
+                )
+                .unwrap()
+                .record
+        };
+        let before = base();
+        let mut widened = before.clone();
+        widened.profile = Profile::Exec;
+        assert!(!narrows_access(&before, &widened), "升权限不取消挂起审批");
+        let mut narrowed = before.clone();
+        narrowed.profile = Profile::ReadOnly;
+        assert!(narrows_access(&before, &narrowed));
+        let mut offline = before.clone();
+        offline.network = false;
+        assert!(narrows_access(&before, &offline));
+        let mut shorter = before.clone();
+        shorter.expires_at_ms = Some(5_000);
+        assert!(narrows_access(&before, &shorter));
+        let mut renamed = before.clone();
+        renamed.client_name = "other".to_string();
+        assert!(!narrows_access(&before, &renamed));
     }
 }

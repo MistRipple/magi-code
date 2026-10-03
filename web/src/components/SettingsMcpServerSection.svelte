@@ -3,8 +3,8 @@
    * 「设置 → 能力 → Magi MCP 服务」分区。
    *
    * 只展示 daemon 的事实：服务是否运行、令牌列表、待确认调用与审计记录都来自
-   * `/api/mcp-server/*`。令牌原文只在创建响应里出现一次，这里不落任何存储，
-   * 关闭提示卡后即丢弃。
+   * `/api/mcp-server/*`。令牌原文由 daemon 在本机保存，需要时通过“查看配置”重新取回；
+   * 这里不落任何浏览器存储，收起面板或关闭提示卡后即丢弃。
    */
   import { onMount } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -14,13 +14,16 @@
     createMcpServerToken,
     getMcpServerConfigSnippets,
     getMcpServerStatus,
+    getMcpServerTokenSecret,
     listMcpServerApprovals,
     listMcpServerAudit,
     resolveMcpServerApproval,
     revokeAllMcpServerTokens,
     revokeMcpServerToken,
+    rotateMcpServerToken,
     setMcpServerEnabled,
     setMcpServerNetwork,
+    updateMcpServerToken,
     type McpServerApproval,
     type McpServerAuditEntry,
     type McpServerConfigSnippets,
@@ -52,12 +55,38 @@
   let freshSecret = $state('');
   let copiedKey = $state('');
 
+  /** 展开“查看配置”的令牌：原文与带原文的配置都来自 daemon，收起即丢弃。 */
+  let viewingTokenId = $state('');
+  let viewingSecret = $state<string | null>(null);
+  let viewingSnippets = $state<McpServerConfigSnippets | null>(null);
+
+  /** 正在编辑的令牌。工作区创建后不可改。 */
+  let editingTokenId = $state('');
+  let editName = $state('');
+  let editProfile = $state<McpServerProfile>('edit');
+  let editNetwork = $state(false);
+  let editTtl = $state('');
+  let editConfirmHighRisk = $state(false);
+
   const workspaces = $derived(composerWorkspaceState.workspaces);
   const needsConfirm = $derived(HIGH_RISK_PROFILES.includes(profile));
   const hasNetworkToken = $derived(
     (status?.tokens ?? []).some((token) => token.network && token.active),
   );
   const networkTunnelStatus = $derived(status?.network.status ?? 'stopped');
+  const editingToken = $derived(
+    (status?.tokens ?? []).find((token) => token.tokenId === editingTokenId) ?? null,
+  );
+  const editNeedsConfirm = $derived(
+    HIGH_RISK_PROFILES.includes(editProfile) && editProfile !== editingToken?.profile,
+  );
+  const editHighRisk = $derived(HIGH_RISK_PROFILES.includes(editProfile));
+  const canSaveEdit = $derived(
+    !busy
+      && editName.trim() !== ''
+      && (editTtl.trim() === '' || /^\d+$/.test(editTtl.trim()))
+      && (!editNeedsConfirm || editConfirmHighRisk),
+  );
   const canCreate = $derived(
     !busy
       && clientName.trim() !== ''
@@ -144,7 +173,84 @@
   function revoke(token: McpServerToken): Promise<void> {
     return act(async () => {
       status = await revokeMcpServerToken(token.tokenId);
+      if (viewingTokenId === token.tokenId) toggleViewOff();
+      if (editingTokenId === token.tokenId) editingTokenId = '';
       await refresh();
+    });
+  }
+
+  function toggleViewOff(): void {
+    viewingTokenId = '';
+    viewingSecret = null;
+    viewingSnippets = null;
+  }
+
+  async function loadView(token: McpServerToken): Promise<void> {
+    viewingSecret = null;
+    viewingSnippets = null;
+    if (token.hasSecret) {
+      viewingSecret = await getMcpServerTokenSecret(token.tokenId);
+    }
+    if (status?.running) {
+      viewingSnippets = await getMcpServerConfigSnippets(token.tokenId);
+    }
+  }
+
+  function toggleView(token: McpServerToken): Promise<void> {
+    if (viewingTokenId === token.tokenId) {
+      viewingTokenId = '';
+      viewingSecret = null;
+      viewingSnippets = null;
+      return Promise.resolve();
+    }
+    viewingTokenId = token.tokenId;
+    return act(() => loadView(token));
+  }
+
+  function startEdit(token: McpServerToken): void {
+    editingTokenId = token.tokenId;
+    editName = token.clientName;
+    editProfile = token.profile;
+    editNetwork = token.network;
+    editTtl = '';
+    editConfirmHighRisk = false;
+  }
+
+  function cancelEdit(): void {
+    editingTokenId = '';
+  }
+
+  function saveEdit(): Promise<void> {
+    const token = editingToken;
+    if (!token) return Promise.resolve();
+    return act(async () => {
+      const ttl = editTtl.trim();
+      // 高风险权限档不能同时开放公网：升到高风险档时一并关掉。
+      const network = editHighRisk ? false : editNetwork;
+      status = await updateMcpServerToken(token.tokenId, {
+        clientName: editName.trim() !== token.clientName ? editName.trim() : undefined,
+        profile: editProfile !== token.profile ? editProfile : undefined,
+        allowNetwork: network !== token.network ? network : undefined,
+        ttlDays: ttl === '' ? undefined : Number(ttl),
+        confirmHighRisk: editNeedsConfirm ? editConfirmHighRisk : undefined,
+      });
+      editingTokenId = '';
+      await refresh();
+      const updated = status?.tokens.find((entry) => entry.tokenId === token.tokenId);
+      if (updated && viewingTokenId === token.tokenId) await loadView(updated);
+    });
+  }
+
+  function rotate(token: McpServerToken): Promise<void> {
+    if (!window.confirm(i18n.t('mcpServer.token.rotateConfirm', { client: token.clientName }))) {
+      return Promise.resolve();
+    }
+    return act(async () => {
+      const rotated = await rotateMcpServerToken(token.tokenId);
+      freshSecret = rotated.secret;
+      await refresh();
+      const updated = status?.tokens.find((entry) => entry.tokenId === token.tokenId);
+      if (updated && viewingTokenId === token.tokenId) await loadView(updated);
     });
   }
 
@@ -152,6 +258,8 @@
     if (!window.confirm(i18n.t('mcpServer.token.revokeAllConfirm'))) return Promise.resolve();
     return act(async () => {
       status = await revokeAllMcpServerTokens();
+      toggleViewOff();
+      editingTokenId = '';
       await refresh();
     });
   }
@@ -173,6 +281,18 @@
     } catch {
       /* 剪贴板不可用时用户仍可手动选择文本 */
     }
+  }
+
+  function snippetEntries(
+    source: McpServerConfigSnippets,
+  ): { key: string; label: string; text: string }[] {
+    const entries: { key: string; label: string; text: string }[] = [];
+    const json = (value: Record<string, unknown>) => JSON.stringify(value, null, 2);
+    if (source.httpJson) entries.push({ key: 'http', label: i18n.t('mcpServer.snippets.http'), text: json(source.httpJson) });
+    if (source.stdioJson) entries.push({ key: 'stdio', label: i18n.t('mcpServer.snippets.stdio'), text: json(source.stdioJson) });
+    if (source.claudeCli) entries.push({ key: 'cli', label: i18n.t('mcpServer.snippets.claudeCli'), text: source.claudeCli });
+    if (source.remoteJson) entries.push({ key: 'remote', label: i18n.t('mcpServer.snippets.remote'), text: json(source.remoteJson) });
+    return entries;
   }
 
   function workspaceName(id: string): string {
@@ -359,12 +479,94 @@
             </div>
             {#if token.active}
               <div class="action-row">
+                <button type="button" data-mcp-token-view={token.tokenId} disabled={busy} onclick={() => void toggleView(token)}>
+                  {viewingTokenId === token.tokenId ? i18n.t('mcpServer.token.hide') : i18n.t('mcpServer.token.view')}
+                </button>
+                <button type="button" data-mcp-token-edit={token.tokenId} disabled={busy || token.attribution !== 'external'} onclick={() => startEdit(token)}>
+                  {i18n.t('mcpServer.token.edit')}
+                </button>
+                <button type="button" disabled={busy || token.attribution !== 'external'} onclick={() => void rotate(token)}>
+                  {i18n.t('mcpServer.token.rotate')}
+                </button>
                 <button type="button" class="danger" disabled={busy} onclick={() => void revoke(token)}>
                   {i18n.t('mcpServer.token.revoke')}
                 </button>
               </div>
             {/if}
           </li>
+          {#if viewingTokenId === token.tokenId}
+            <li class="detail" data-mcp-token-detail={token.tokenId}>
+              {#if viewingSecret}
+                <div class="snippet-head">
+                  <span class="row-title">{i18n.t('mcpServer.token.secret')}</span>
+                  <button type="button" onclick={() => void copy(`secret-${token.tokenId}`, viewingSecret ?? '')}>
+                    {copiedKey === `secret-${token.tokenId}` ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
+                  </button>
+                </div>
+                <code class="secret" data-mcp-token-secret="1">{viewingSecret}</code>
+              {:else}
+                <p class="meta" data-mcp-token-legacy="1">{i18n.t('mcpServer.token.noSecret')}</p>
+              {/if}
+              {#if viewingSnippets}
+                <p class="meta">{i18n.t('mcpServer.snippets.perClientHint', { name: viewingSnippets.serverName })}</p>
+                {#each snippetEntries(viewingSnippets) as entry (entry.key)}
+                  <div class="snippet">
+                    <div class="snippet-head">
+                      <span class="row-title">{entry.label}</span>
+                      <button type="button" onclick={() => void copy(`${entry.key}-${token.tokenId}`, entry.text)}>
+                        {copiedKey === `${entry.key}-${token.tokenId}` ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
+                      </button>
+                    </div>
+                    <pre>{entry.text}</pre>
+                  </div>
+                {/each}
+              {:else if !status?.running}
+                <p class="meta">{i18n.t('mcpServer.snippets.needStart')}</p>
+              {/if}
+            </li>
+          {/if}
+          {#if editingTokenId === token.tokenId}
+            <li class="detail" data-mcp-token-edit-form={token.tokenId}>
+              <form class="create-form edit-form" onsubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
+                <label class="field">
+                  <span>{i18n.t('mcpServer.token.clientName')}</span>
+                  <input bind:value={editName} maxlength="60" data-mcp-edit-name="1" />
+                </label>
+                <p class="meta">{i18n.t('mcpServer.token.editWorkspaceFixed', { workspace: workspaceName(token.workspaceId) })}</p>
+                <label class="field">
+                  <span>{i18n.t('mcpServer.token.profile')}</span>
+                  <select bind:value={editProfile} data-mcp-edit-profile="1">
+                    {#each PROFILES as option (option)}
+                      <option value={option}>{i18n.t(`mcpServer.token.profile.${option}`)}</option>
+                    {/each}
+                  </select>
+                </label>
+                <label class="field">
+                  <span>{i18n.t('mcpServer.token.editTtl')}</span>
+                  <input bind:value={editTtl} inputmode="numeric" placeholder={i18n.t('mcpServer.token.editTtlKeep')} data-mcp-edit-ttl="1" />
+                </label>
+                {#if !editHighRisk}
+                  <label class="switch-line">
+                    <input type="checkbox" bind:checked={editNetwork} />
+                    <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
+                  </label>
+                {:else if token.network}
+                  <p class="meta">{i18n.t('mcpServer.token.editNetworkDropped')}</p>
+                {/if}
+                {#if editNeedsConfirm}
+                  <label class="switch-line risk">
+                    <input type="checkbox" bind:checked={editConfirmHighRisk} />
+                    <span>{i18n.t('mcpServer.token.confirmHighRisk')}</span>
+                  </label>
+                {/if}
+                <p class="meta">{i18n.t('mcpServer.token.editEffect')}</p>
+                <div class="action-row">
+                  <button type="submit" class="primary-action" disabled={!canSaveEdit}>{i18n.t('mcpServer.token.save')}</button>
+                  <button type="button" onclick={cancelEdit}>{i18n.t('mcpServer.token.cancel')}</button>
+                </div>
+              </form>
+            </li>
+          {/if}
         {/each}
       </ul>
       {#if status.tokens.some((token) => token.active)}
@@ -435,22 +637,16 @@
       <p class="meta">{i18n.t('mcpServer.snippets.needStart')}</p>
     {:else}
       <p class="meta">{i18n.t('mcpServer.snippets.hint')}</p>
-      {#each [
-        { key: 'http', label: i18n.t('mcpServer.snippets.http'), value: snippets.httpJson },
-        { key: 'stdio', label: i18n.t('mcpServer.snippets.stdio'), value: snippets.stdioJson },
-        { key: 'remote', label: i18n.t('mcpServer.snippets.remote'), value: snippets.remoteJson },
-      ] as entry (entry.key)}
-        {#if entry.value}
-          <div class="snippet">
-            <div class="snippet-head">
-              <span class="row-title">{entry.label}</span>
-              <button type="button" onclick={() => void copy(entry.key, JSON.stringify(entry.value, null, 2))}>
-                {copiedKey === entry.key ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
-              </button>
-            </div>
-            <pre>{JSON.stringify(entry.value, null, 2)}</pre>
+      {#each snippetEntries(snippets) as entry (entry.key)}
+        <div class="snippet">
+          <div class="snippet-head">
+            <span class="row-title">{entry.label}</span>
+            <button type="button" onclick={() => void copy(entry.key, entry.text)}>
+              {copiedKey === entry.key ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
+            </button>
           </div>
-        {/if}
+          <pre>{entry.text}</pre>
+        </div>
       {/each}
     {/if}
   </div>
@@ -570,6 +766,18 @@
     padding: 8px 10px;
     border-radius: 8px;
     background: var(--surface-muted, rgba(127, 127, 127, 0.08));
+  }
+
+  .rows li.detail {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    margin-left: 12px;
+  }
+
+  .edit-form {
+    padding-top: 0;
+    border-top: none;
   }
 
   .rows li.inactive {

@@ -15,12 +15,36 @@ const RELEASE_BASE: &str = "https://github.com/openai/tunnel-client/releases/dow
 
 /// 固定的发布包：`(os, arch, SHA-256)`。摘要来自该版本发布的 `SHA256SUMS.txt`。
 const PINNED: &[(&str, &str, &str)] = &[
-    ("darwin", "amd64", "9dcae1e2fb121287e73271edb7b853dda52aa86b7bfca1df91bc275371261bdb"),
-    ("darwin", "arm64", "b2cae3aa9df45b4c2fe9b1d700ebacce39f9feb6a6b46b86e6499f9a51bf72ff"),
-    ("linux", "amd64", "8c836dc5d68d68b663d9a5c5b28ff9fa780d9f7a3fffb1c306880b8f32fab5f1"),
-    ("linux", "arm64", "c51bfd883fc22e3445494a03c0179875176564bde470661b308fd83af5d01abb"),
-    ("windows", "amd64", "3b53133a1e24d43f63088d843860cb1701a4c3ed6390de2e19f69089e43bddc1"),
-    ("windows", "arm64", "571e0d59ed9e86d1b105dc34f3267865f654de6968b01efd7c847f0af657d11d"),
+    (
+        "darwin",
+        "amd64",
+        "9dcae1e2fb121287e73271edb7b853dda52aa86b7bfca1df91bc275371261bdb",
+    ),
+    (
+        "darwin",
+        "arm64",
+        "b2cae3aa9df45b4c2fe9b1d700ebacce39f9feb6a6b46b86e6499f9a51bf72ff",
+    ),
+    (
+        "linux",
+        "amd64",
+        "8c836dc5d68d68b663d9a5c5b28ff9fa780d9f7a3fffb1c306880b8f32fab5f1",
+    ),
+    (
+        "linux",
+        "arm64",
+        "c51bfd883fc22e3445494a03c0179875176564bde470661b308fd83af5d01abb",
+    ),
+    (
+        "windows",
+        "amd64",
+        "3b53133a1e24d43f63088d843860cb1701a4c3ed6390de2e19f69089e43bddc1",
+    ),
+    (
+        "windows",
+        "arm64",
+        "571e0d59ed9e86d1b105dc34f3267865f654de6968b01efd7c847f0af657d11d",
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +118,8 @@ pub(crate) async fn install(state_root: &Path) -> Result<PathBuf, String> {
         return Ok(binary);
     }
     let (os, arch) = platform().ok_or("当前平台没有可用的 tunnel-client 发布包")?;
-    let artifact = pinned_artifact_for(os, arch).ok_or("当前平台没有可用的 tunnel-client 发布包")?;
+    let artifact =
+        pinned_artifact_for(os, arch).ok_or("当前平台没有可用的 tunnel-client 发布包")?;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
         .timeout(std::time::Duration::from_secs(600))
@@ -177,8 +202,16 @@ mod tests {
     fn every_pinned_platform_has_a_https_url_and_a_sha256() {
         for (os, arch, sha) in PINNED {
             let artifact = pinned_artifact_for(os, arch).expect("pinned");
-            assert!(artifact.url.starts_with("https://github.com/openai/tunnel-client/"));
-            assert!(artifact.url.contains(&format!("-v{TUNNEL_CLIENT_VERSION}-{os}-{arch}.zip")));
+            assert!(
+                artifact
+                    .url
+                    .starts_with("https://github.com/openai/tunnel-client/")
+            );
+            assert!(
+                artifact
+                    .url
+                    .contains(&format!("-v{TUNNEL_CLIENT_VERSION}-{os}-{arch}.zip"))
+            );
             assert_eq!(sha.len(), 64);
             assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
         }
@@ -206,7 +239,10 @@ mod tests {
         let target = dir.path().join("v1").join(binary_name());
         let zip = zip_with(&[
             ("tunnel-client-v1/README.md", b"docs"),
-            (&format!("tunnel-client-v1/{}", binary_name()), b"binary-bytes"),
+            (
+                &format!("tunnel-client-v1/{}", binary_name()),
+                b"binary-bytes",
+            ),
         ]);
         extract_binary_from_zip(&zip, &target).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"binary-bytes");
@@ -216,7 +252,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o111, 0o111);
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o111,
+                0o111
+            );
         }
     }
 
@@ -241,7 +280,10 @@ mod tests {
         let target = managed_binary_path(dir.path());
         extract_binary_from_zip(&bytes, &target).unwrap();
         assert!(is_installed(&target));
-        let output = std::process::Command::new(&target).arg("--version").output().unwrap();
+        let output = std::process::Command::new(&target)
+            .arg("--version")
+            .output()
+            .unwrap();
         assert!(String::from_utf8_lossy(&output.stdout).contains(TUNNEL_CLIENT_VERSION));
     }
 }

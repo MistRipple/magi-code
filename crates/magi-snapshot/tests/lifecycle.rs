@@ -994,3 +994,45 @@ async fn reconcile_skips_stat_clean_files_but_still_detects_real_edits() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].path, "edited.txt");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_rewritten_by_someone_else_is_reported_before_it_can_be_reverted() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("shared.txt"), "original").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let session_a = mgr
+        .start_session("s-guard-a".into(), root.clone())
+        .await
+        .unwrap();
+
+    // A 用工具改了文件：之后回退它是安全的。
+    let ctx = ToolHookCtx {
+        tool_call_id: "call-a".into(),
+        worker_id: None,
+        execution_group_id: Some("group-a".into()),
+        declared_paths: vec![PathBuf::from("shared.txt")],
+    };
+    session_a.before_tool(&ctx);
+    fs::write(root.join("shared.txt"), "written by client A").unwrap();
+    session_a.after_tool(&ctx);
+    assert!(
+        session_a
+            .paths_modified_outside_tools(&["shared.txt".into()])
+            .unwrap()
+            .is_empty(),
+        "只有本会话自己的工具写过，不是冲突"
+    );
+
+    // 另一个客户端随后又改了同一个文件（对 A 来说是工具之外的来源）。
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(root.join("shared.txt"), "rewritten by client B, longer").unwrap();
+    assert_eq!(
+        session_a
+            .paths_modified_outside_tools(&["shared.txt".into(), "untouched.txt".into()])
+            .unwrap(),
+        vec!["shared.txt".to_string()],
+        "A 的最后一次写入之后文件被改过，回退前必须能查出来"
+    );
+}

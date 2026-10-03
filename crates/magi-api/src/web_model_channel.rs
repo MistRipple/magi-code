@@ -271,7 +271,9 @@ impl WebModelChannelRuntime {
                 .and_then(|config| config.tool_profile.clone())
                 .unwrap_or_else(|| "edit".to_string()),
             approval_mode: match WebApprovalMode::parse(
-                config.as_ref().and_then(|config| config.approval_mode.as_deref()),
+                config
+                    .as_ref()
+                    .and_then(|config| config.approval_mode.as_deref()),
             ) {
                 WebApprovalMode::Ask => "ask",
                 WebApprovalMode::Always => "always",
@@ -301,7 +303,9 @@ impl WebModelChannelRuntime {
         approval_mode: Option<String>,
     ) -> WebModelTunnelConfig {
         let mut guard = self.lock();
-        let config = guard.config.get_or_insert_with(WebModelTunnelConfig::default);
+        let config = guard
+            .config
+            .get_or_insert_with(WebModelTunnelConfig::default);
         if let Some(profile) = tool_profile {
             config.tool_profile = Some(profile);
         }
@@ -385,7 +389,9 @@ impl WebModelChannelRuntime {
             self.launch_generation.fetch_add(1, Ordering::SeqCst) + 1
         };
         // 密钥或 Tunnel id 不全：不下载任何东西，直接报告缺哪一项。
-        let config = self.configured().filter(WebModelTunnelConfig::is_configured);
+        let config = self
+            .configured()
+            .filter(WebModelTunnelConfig::is_configured);
         if config.is_none() || !self.has_api_key() {
             self.refresh_channel_status();
             return Ok(self.status());
@@ -422,7 +428,10 @@ impl WebModelChannelRuntime {
             return;
         }
         self.lock().phase = None;
-        let Some(config) = self.configured().filter(WebModelTunnelConfig::is_configured) else {
+        let Some(config) = self
+            .configured()
+            .filter(WebModelTunnelConfig::is_configured)
+        else {
             self.refresh_channel_status();
             return;
         };
@@ -620,15 +629,24 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
     #[test]
     fn approval_mode_defaults_to_asking_and_policy_updates_apply_without_a_restart() {
         assert_eq!(WebApprovalMode::parse(None), WebApprovalMode::Ask);
-        assert_eq!(WebApprovalMode::parse(Some("whatever")), WebApprovalMode::Ask);
-        assert_eq!(WebApprovalMode::parse(Some("always")), WebApprovalMode::Always);
+        assert_eq!(
+            WebApprovalMode::parse(Some("whatever")),
+            WebApprovalMode::Ask
+        );
+        assert_eq!(
+            WebApprovalMode::parse(Some("always")),
+            WebApprovalMode::Always
+        );
         assert_eq!(WebApprovalMode::parse(Some("deny")), WebApprovalMode::Deny);
 
         let runtime = WebModelChannelRuntime::new();

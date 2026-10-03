@@ -83,10 +83,19 @@ pub fn routes() -> Router<ApiState> {
         .route("/browser/web-models/runtime", get(get_web_model_runtime))
         .route("/browser/web-models/reset", post(reset_web_models))
         .route("/browser/web-models/stop", post(stop_web_model))
-        .route("/browser/web-models/navigate", post(navigate_web_model_page))
+        .route(
+            "/browser/web-models/navigate",
+            post(navigate_web_model_page),
+        )
         .route("/browser/web-models/reload", post(reload_web_model_page))
-        .route("/browser/web-models/tunnel/api-key", get(reveal_web_model_api_key))
-        .route("/browser/web-models/tunnel/policy", post(set_web_model_tool_policy))
+        .route(
+            "/browser/web-models/tunnel/api-key",
+            get(reveal_web_model_api_key),
+        )
+        .route(
+            "/browser/web-models/tunnel/policy",
+            post(set_web_model_tool_policy),
+        )
         .route(
             "/browser/web-models/connector",
             get(get_web_connector).post(configure_web_connector),
@@ -1492,9 +1501,8 @@ async fn configure_web_model_tunnel(
                 }
             },
             approval_mode: Some(
-                parse_approval_mode(request.approval_mode.as_deref())?.unwrap_or_else(|| {
-                    state.web_model.status().approval_mode
-                }),
+                parse_approval_mode(request.approval_mode.as_deref())?
+                    .unwrap_or_else(|| state.web_model.status().approval_mode),
             ),
         })
     };
@@ -1572,10 +1580,9 @@ async fn reveal_web_model_api_key(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_desktop_browser_capability(&state, &headers, None)?;
-    let api_key = state
-        .web_model
-        .reveal_api_key()
-        .ok_or_else(|| ApiError::not_found("尚未保存运行时 API 密钥", "web-model-tunnel-api-key"))?;
+    let api_key = state.web_model.reveal_api_key().ok_or_else(|| {
+        ApiError::not_found("尚未保存运行时 API 密钥", "web-model-tunnel-api-key")
+    })?;
     Ok(Json(serde_json::json!({ "apiKey": api_key })))
 }
 
