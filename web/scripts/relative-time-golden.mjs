@@ -10,7 +10,11 @@ await withGoldenViteServer(async (server) => {
   assert.equal(module.formatRelativeTime(now - 2 * 3600_000, now, 'zh-CN'), '2 小时');
   assert.equal(module.formatRelativeTime(now - 3 * 86400_000, now, 'zh-CN'), '3 天');
   assert.equal(module.formatRelativeTime(now - 31 * 86400_000, now, 'en-US'), 'Aug 19');
-  assert.equal(module.formatRelativeTime(now + 60_000, now, 'en-US'), 'Sep 19');
+  // 取整过的「当前时间」会比正在更新的会话旧几秒：这不是未来，仍显示「刚刚」。
+  assert.equal(module.formatRelativeTime(now + 14_000, now, 'zh-CN'), '刚刚');
+  assert.equal(module.formatRelativeTime(now + 60_000, now, 'en-US'), 'just now');
+  // 明显超前才是异常，退回绝对日期。
+  assert.equal(module.formatRelativeTime(now + 120_000, now, 'en-US'), 'Sep 19');
 });
 
 console.log('relative time golden checks passed');
