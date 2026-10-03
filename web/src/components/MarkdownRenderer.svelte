@@ -1,6 +1,8 @@
 <script lang="ts">
   import { setContext } from 'svelte';
   import SvelteMarkdown from '@humanspeak/svelte-markdown';
+  import { markedKatex, KatexRenderer } from '@humanspeak/svelte-markdown/extensions';
+  import 'katex/dist/katex.min.css';
   import MdCodeBlock from './renderers/MdCodeBlock.svelte';
   import MdCodeSpan from './renderers/MdCodeSpan.svelte';
   import MdLink from './renderers/MdLink.svelte';
@@ -30,7 +32,13 @@
     link: MdLink,
     image: MdImage,
     rawtext: MdText,
+    // 公式：GPT Web 回复里的 $…$ / $$…$$ 以及模型自己输出的 TeX。不渲染的话 `\,`、`_`、`*` 会被当成 Markdown 语法吃掉。
+    inlineKatex: KatexRenderer,
+    blockKatex: KatexRenderer,
   };
+
+  // 行内 $…$ 默认关闭（防止和金额冲突）；开启后仍使用「闭合 $ 后面不能紧跟数字」的边界规则，`$5,000` 不会被误判。
+  const extensions = [markedKatex({ singleDollarInline: true })];
 
   const options = {
     breaks: true,
@@ -42,5 +50,6 @@
   {source}
   {renderers}
   {options}
+  {extensions}
   sanitizeUrl={sanitizeMarkdownUrl}
 />

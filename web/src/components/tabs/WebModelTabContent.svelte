@@ -1,30 +1,35 @@
 <script lang="ts">
   /**
-   * 应用级 GPT Web 内容槽（设计基线 A25、§5.2）。
+   * 应用级 GPT Web 内容槽。
    *
    * 与普通 Browser Tab 的关键区别：
-   * - 同一内容槽承载**多个宿主**：一个主页 + 每个活跃对话实例一个推理页面
-   *   （数量 ≤ 并发上限，不设预热池）；
-   * - 所有宿主**始终挂载**：折叠右栏与关闭视图只改可见性，不卸载组件、
-   *   不销毁任何 `<webview>`，因此后台推理不中断；
+   * - 同一内容槽只承载一个应用级 WebView；临时/已保存对话都复用它；
+   * - 宿主**始终挂载**：折叠右栏与关闭视图只改可见性，不卸载组件、
+   *   不销毁 `<webview>`，因此后台推理不中断；
    * - 分区、注册与尺寸同步全部复用 `BrowserTabContent` 的既有实现，
    *   不引入第二套 guest 生命周期。
    */
   import BrowserTabContent from './BrowserTabContent.svelte';
+  import Icon from '../Icon.svelte';
   import { i18n } from '../../stores/i18n.svelte';
   import { addToast } from '../../stores/messages.svelte';
   import { tick } from 'svelte';
   import {
     ensureWebModelHomeSurface,
-    resetWebModelConversation,
-    resetWebModels,
+    navigateWebModelPage,
+    reloadWebModelPage,
     type BrowserTabLifecycle,
+    type WebModelPageTarget,
   } from '../../web/agent-api';
   import {
-    webModelRuntimeEntries,
+    webModelActiveTurnCount,
+    markWebModelStoppedByUser,
+    webModelProbeStatus,
+    webModelStoppedByUser,
     webModelSentMessages,
-    webModelTakeoverPending,
+    webModelSlotOwner,
   } from '../../stores/web-model-runtime.svelte';
+  import { goToSlotOwnerSession, reconnectWebModel, runWebModelProbe, webModelAutoProbeAllowed } from '../../web/web-model-session-projection';
 
   export interface WebModelHost {
     tabId: string;
@@ -44,14 +49,6 @@
     workspacePath?: string;
     sessionId?: string;
     desktopSurface?: boolean;
-    /**
-     * 当前窗口是否承载应用级推理（A24 / §5.13）。
-     *
-     * 产品目前只创建一个窗口入口，因此默认 `true`；宿主补上第二个窗口入口后，
-     * 非 Primary 窗口传 `false`，这里显示「打开主窗口继续」而不是复制第二份
-     * 用于推理的 Surface。
-     */
-    primaryWindow?: boolean;
     onTitleChange?: (label: string) => void;
   }
 
@@ -64,7 +61,6 @@
     workspacePath,
     sessionId,
     desktopSurface,
-    primaryWindow = true,
     onTitleChange,
   }: Props = $props();
 
@@ -72,31 +68,158 @@
     return active && tabId === activeHostTabId;
   }
 
-  let busy = $state(false);
   let actionError = $state('');
   let homeSurfaceKey = $state('');
   let homeSurfaceInFlight = false;
+  /** 恢复失败后的退避：持续失败时不能随每次投影刷新都重试。 */
+  let homeSurfaceRetryAfter = 0;
+  /** 单槽位：是否有 GPT Web 推理正在后台进行（视图被隐藏时仍然可见）。 */
+  const running = $derived(webModelActiveTurnCount() > 0);
+  /** 当前槽位被哪个会话占用；占用者不是当前会话时提示「被其他会话占用」。 */
+  const slotOwnerSessionId = $derived(webModelSlotOwner()?.sessionId ?? '');
   /**
-   * 后台推理中的对话实例数量。
-   *
-   * 内容槽里除主页外每个宿主就是一个活跃对话实例（§5.2 不设预热池，空闲页面会被
-   * 释放），因此这个数量就是「正在后台继续的推理页面」数，不需要第二份计数事实。
-   */
-  const runningHostCount = $derived(
-    sessionId
-      ? webModelRuntimeEntries(sessionId).filter((entry) => entry.active !== false).length
-      : 0,
-  );
-  /**
-   * 该会话已发出的账号消息条数（A16）。
+   * 该会话已发出的账号消息条数。
    *
    * 口径是「真实发送次数」，不是 token：Web 引擎不参与会话 token 预算，
-   * 因此这里单独展示并显式标注（§5.1、§9.3 #14）。
+   * 因此这里单独展示并显式标注。
    */
   const sentMessages = $derived(sessionId ? webModelSentMessages(sessionId) : 0);
-  /** 已接管提示：绑定转成 user_owned / invalidated 时显示（§5.8）。 */
-  const takeoverPending = $derived(sessionId ? webModelTakeoverPending(sessionId) : false);
-  const canAct = $derived(Boolean(desktopSurface) && active && !busy);
+  /**
+   * 标题栏的「检查连接」：用户打开标签、看到页面是登录状态就直接开始使用——这里一键确认 Magi 与页面
+   * 的连接是否真的成功，不成功就重新对齐 / 重连。只重新登记并读取当前页面，不导航、不改变对话。
+   */
+  let checking = $state(false);
+  async function checkConnection(): Promise<void> {
+    if (checking) return;
+    checking = true;
+    actionError = '';
+    try {
+      let result = await runWebModelProbe();
+      if (result.status === 'failed' || result.status === 'desktop_unavailable') {
+        // 连接未成功：重新物化 / 对齐页面绑定，仍失败则重启自动化 worker 重连。
+        await ensureWebModelHomeSurface().catch(() => undefined);
+        result = await reconnectWebModel();
+      }
+      addToast(
+        result.status === 'ok' ? 'success' : 'warning',
+        i18n.t(`webModel.check.result.${result.status}`),
+        undefined,
+        { forceVisible: true },
+      );
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    } finally {
+      checking = false;
+    }
+  }
+  const connectionStatus = $derived(webModelProbeStatus());
+  const homeUrl = $derived(hosts[0]?.url ?? '');
+  const homeHost = $derived.by(() => {
+    try {
+      return new URL(homeUrl).host;
+    } catch {
+      return '';
+    }
+  });
+  /**
+   * 顶部快捷地址：对话页 / OpenAI 平台 Tunnels / Runtime API keys。当前停在哪一页，就只显示另外两个，
+   * 用户不必找地址，也不用离开 GPT Web 标签（登录态共用同一个页面）。
+   */
+  const PAGE_TARGETS: WebModelPageTarget[] = ['chat', 'tunnels', 'api_keys'];
+  const currentPageTarget = $derived.by((): WebModelPageTarget | null => {
+    try {
+      const url = new URL(homeUrl);
+      if (url.hostname === 'platform.openai.com') {
+        if (url.pathname.includes('/tunnels')) return 'tunnels';
+        if (url.pathname.includes('/api-keys')) return 'api_keys';
+        return null;
+      }
+      return 'chat';
+    } catch {
+      return null;
+    }
+  });
+  const quickTargets = $derived(PAGE_TARGETS.filter((target) => target !== currentPageTarget));
+  let navigating = $state(false);
+  async function goToPage(target: WebModelPageTarget): Promise<void> {
+    if (navigating) return;
+    navigating = true;
+    actionError = '';
+    try {
+      await navigateWebModelPage(target);
+      // 状态芯片跟着页面走：切页后立刻重新探测（daemon 探测自带页面加载等待），不等自动防抖探测。
+      void runWebModelProbe().catch(() => undefined);
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    } finally {
+      navigating = false;
+    }
+  }
+  /**
+   * 手动刷新：页面卡住或加载失败（`browser_navigation_timeout`）时，标题栏没有任何地址栏 / 刷新入口，
+   * 用户只能重启应用。刷新只重新加载当前页面，不换页面、不改变对话，所以进行中也可用。
+   */
+  let reloading = $state(false);
+  async function reloadPage(): Promise<void> {
+    if (reloading) return;
+    reloading = true;
+    actionError = '';
+    try {
+      await reloadWebModelPage();
+      void runWebModelProbe().catch(() => undefined);
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    } finally {
+      reloading = false;
+    }
+  }
+  const ownerTitle = $derived(webModelSlotOwner()?.sessionTitle?.trim() || '');
+  /** 同一时刻只显示一条提示：错误 > 未登录 > 只读（占用）。 */
+  const notice = $derived.by((): { kind: 'error' | 'login' | 'readonly'; text: string; action?: { label: string; run: () => void } } | null => {
+    if (actionError) return { kind: 'error', text: actionError };
+    if (showLoginHint) return { kind: 'login', text: i18n.t('webModel.login.hint') };
+    if (readOnlyForOtherOwner) {
+      return {
+        kind: 'readonly',
+        text: i18n.t('webModel.slot.readOnlyOther', { session: ownerTitle ? `「${ownerTitle}」` : '' }),
+        action: {
+          label: i18n.t('webModel.slot.goToOwner'),
+          run: () => {
+            const owner = webModelSlotOwner();
+            if (owner) goToSlotOwnerSession(owner);
+          },
+        },
+      };
+    }
+    return null;
+  });
+
+  /** 非拥有者会话打开 GPT Web 只能查看：页面只读并显示当前占用者。 */
+  const readOnlyForOtherOwner = $derived(
+    Boolean(slotOwnerSessionId) && slotOwnerSessionId !== (sessionId?.trim() || ''),
+  );
+  /** 未登录时的持久提示条：直到登录成功（探测结论变化）才消失。 */
+  const showLoginHint = $derived(webModelProbeStatus() === 'login_required');
+
+  /**
+   * 登录完成后自动重新探测：用户在页面里登录后，页面会导航；对主页宿主的 URL / 导航代次变化
+   * 做防抖探测，让选择器入口在登录后自动出现，不必再回设置页手点。只读探测，且推理进行中不做。
+   */
+  let loginProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    const home = hosts[0];
+    if (!home || !desktopSurface || !active) return;
+    void `${home.url}\u0000${home.navigationRevision}`;
+    if (loginProbeTimer) clearTimeout(loginProbeTimer);
+    loginProbeTimer = setTimeout(() => {
+      loginProbeTimer = null;
+      if (webModelActiveTurnCount() > 0 || !webModelAutoProbeAllowed()) return;
+      void runWebModelProbe().catch(() => {});
+    }, 2000);
+    return () => {
+      if (loginProbeTimer) clearTimeout(loginProbeTimer);
+    };
+  });
 
   /**
    * 恢复后主页 Tab 只有逻辑身份，真实 guest 要等本组件挂载完成后才存在。
@@ -104,10 +227,14 @@
    * 的 activate，否则打开 GPT Web 会抢走用户当前右栏。
    */
   $effect(() => {
-    if (!desktopSurface || !primaryWindow || !browserSessionId || homeSurfaceInFlight) return;
+    // 「停止 / 退出」之后页面保持销毁，直到用户再次打开 GPT Web 视图。
+    if (active) markWebModelStoppedByUser(false);
+    else if (webModelStoppedByUser()) return;
+    if (!desktopSurface || !browserSessionId || homeSurfaceInFlight) return;
+    if (Date.now() < homeSurfaceRetryAfter) return;
     const home = hosts.find((host) => host.tabId.endsWith('web-model-home')) ?? hosts[0];
     if (!home) return;
-    const key = `${browserSessionId}\u0000${home.tabId}\u0000${home.navigationRevision}`;
+    const key = `${browserSessionId}\u0000${home.tabId}\u0000${home.navigationRevision}\u0000${home.lifecycle}`;
     if (key === homeSurfaceKey) return;
     homeSurfaceInFlight = true;
     void tick()
@@ -118,6 +245,7 @@
       .catch((error) => {
         // 组件会在下一次 Authority / Desktop 快照变化后再次尝试；一次
         // 恢复失败不能让 GPT Web Tab 永久停在 about:blank。
+        homeSurfaceRetryAfter = Date.now() + 5000;
         console.warn('[WebModelTab] 恢复 GPT Web 主页失败:', error);
       })
       .finally(() => {
@@ -125,51 +253,6 @@
       });
   });
 
-  /** 「重置为 Magi 对话」（§5.8、工单 3.11）：只推进当前线程的绑定 epoch。 */
-  async function resetConversation(): Promise<void> {
-    const id = sessionId?.trim() || '';
-    if (!id || busy) return;
-    const confirmText = `${i18n.t('webModel.reset.confirmTitle')}\n${i18n.t('webModel.reset.confirmBody')}`;
-    if (typeof window !== 'undefined' && !window.confirm(confirmText)) return;
-    busy = true;
-    actionError = '';
-    try {
-      await resetWebModelConversation(id);
-      addToast('success', i18n.t('webModel.reset.done'));
-    } catch (error) {
-      actionError = error instanceof Error ? error.message : String(error);
-      console.warn('[WebModelTab] 重置 Web 对话失败:', error);
-    } finally {
-      busy = false;
-    }
-  }
-
-  /**
-   * 「清除数据」（工单 3.11）：先让 daemon 撤销在飞回复并隐藏 Web 模型，再按应用级
-   * 分区粒度清登录态。顺序固定，不能反过来——否则清理期间还会有渲染请求落进旧页面。
-   */
-  async function clearData(): Promise<void> {
-    if (busy) return;
-    const desktop = window.magiDesktop;
-    const confirmText = i18n.t('webModel.clearData.confirmBody');
-    if (!desktop?.clearWebModelData) {
-      addToast('warning', i18n.t('settings.browser.webModel.needDesktop'));
-      return;
-    }
-    if (typeof window !== 'undefined' && !window.confirm(confirmText)) return;
-    busy = true;
-    actionError = '';
-    try {
-      await resetWebModels();
-      await desktop.clearWebModelData();
-      addToast('success', i18n.t('webModel.clearData.done'));
-    } catch (error) {
-      actionError = error instanceof Error ? error.message : String(error);
-      console.warn('[WebModelTab] 清除 GPT Web 数据失败:', error);
-    } finally {
-      busy = false;
-    }
-  }
 </script>
 
 <div
@@ -177,15 +260,35 @@
   class:web-model-content--offscreen={!active}
   data-web-model-session={browserSessionId}
   aria-hidden={!active}
+  style:--wm-top={notice ? '72px' : '36px'}
 >
-  <!--
-    应用级动作条：只放「后台推理中」这个共享事实与两个显式动作（§5.8、工单 3.11）。
-    它不复制任何 daemon 事实：数量由内容槽里的宿主数派生，动作全部是显式命令。
-  -->
+  <!-- 应用级标题栏：只放共享事实（后台推理 / 发送条数 / 连接状态）与两个显式动作。「清除数据」是
+       破坏性操作，只在设置里提供，不放在随手可点的标题栏。 -->
   <div class="web-model-bar" data-magi-surface="toolbar">
-    {#if runningHostCount > 0}
-      <span class="bar-status" data-web-model-running-count={runningHostCount}>
-        {i18n.t('webModel.background.running')} · {runningHostCount}
+    <!-- 只读地址：让用户确认页面在 chatgpt.com 上，不可编辑、不可前进后退或刷新。 -->
+    <span class="bar-address" title={homeUrl}><Icon name="globe" size={12} />{homeHost}</span>
+    <button
+      type="button"
+      class="bar-action bar-icon"
+      data-web-model-reload="1"
+      disabled={!desktopSurface || reloading}
+      title={i18n.t('webModel.reload.title')}
+      aria-label={i18n.t('webModel.reload.title')}
+      onclick={() => void reloadPage()}
+    ><Icon name="refresh" size={12} /></button>
+    {#each quickTargets as target (target)}
+      <button
+        type="button"
+        class="bar-action bar-link"
+        data-web-model-goto={target}
+        disabled={!desktopSurface || navigating || running}
+        title={i18n.t(`webModel.nav.${target}.title`)}
+        onclick={() => void goToPage(target)}
+      >{i18n.t(`webModel.nav.${target}.label`)}</button>
+    {/each}
+    {#if running}
+      <span class="bar-status" data-web-model-running="1">
+        {i18n.t('webModel.background.running')}
       </span>
     {/if}
     {#if sentMessages > 0}
@@ -194,46 +297,48 @@
       </span>
     {/if}
     <span class="bar-spacer"></span>
+    <span
+      class="bar-conn"
+      class:ok={connectionStatus === 'ok'}
+      class:bad={connectionStatus !== 'ok' && connectionStatus !== 'unknown'}
+      data-web-model-connection={connectionStatus}
+      title={i18n.t('webModel.check.title')}
+    >
+      <span class="bar-conn-dot"></span>{i18n.t(`webModel.check.state.${connectionStatus}`)}
+    </span>
     <button
       type="button"
       class="bar-action"
-      disabled={!canAct || !sessionId}
-      title={i18n.t('webModel.action.resetConversation')}
-      onclick={() => void resetConversation()}
-    >{i18n.t('webModel.action.resetConversation')}</button>
-    <button
-      type="button"
-      class="bar-action"
-      data-web-model-clear-data="1"
-      disabled={!canAct}
-      title={i18n.t('webModel.action.clearData')}
-      onclick={() => void clearData()}
-    >{i18n.t('webModel.action.clearData')}</button>
+      data-web-model-check="1"
+      disabled={!desktopSurface || checking}
+      title={i18n.t('webModel.check.title')}
+      onclick={() => void checkConnection()}
+    >{checking ? i18n.t('webModel.check.checking') : i18n.t('webModel.check.action')}</button>
   </div>
-  {#if actionError}
-    <p class="bar-error" role="alert">{actionError}</p>
-  {/if}
-  {#if takeoverPending}
-    <p class="bar-notice" data-web-model-takeover="1" role="status">
-      {i18n.t('webModel.takeover.notice')}
+  <!-- 提示独占一行并把网页内容整体下移：不再盖在页面自带的工具栏上。 -->
+  {#if notice}
+    <p
+      class="bar-notice"
+      class:bar-notice--error={notice.kind === 'error'}
+      data-web-model-notice={notice.kind}
+      role={notice.kind === 'error' ? 'alert' : 'status'}
+    >
+      <span class="bar-notice-text">{notice.text}</span>
+      {#if notice.action}
+        <button type="button" class="bar-action" onclick={notice.action.run}>{notice.action.label}</button>
+      {/if}
     </p>
   {/if}
-  {#if !primaryWindow}
-    <!--
-      非 Primary 窗口不复制用于推理的 Surface（A24）：只提示去哪里继续。
-      宿主目前只有一个窗口入口，这段在出现第二个入口前不会被渲染。
-    -->
-    <p class="bar-notice bar-notice--secondary" role="status">
-      {i18n.t('webModel.window.secondaryOnly')}
-    </p>
-  {/if}
-  {#each primaryWindow ? hosts : [] as host (host.tabId)}
+  {#each hosts as host (host.tabId)}
     <div
       class="host"
       class:active={hostVisible(host.tabId)}
       class:host--offscreen={!hostVisible(host.tabId)}
       aria-hidden={!hostVisible(host.tabId)}
     >
+      {#if readOnlyForOtherOwner}
+        <div class="host-readonly-shield" aria-hidden="true"></div>
+      {/if}
       <BrowserTabContent
         browserSessionId={browserSessionId}
         tabId={host.tabId}
@@ -251,7 +356,7 @@
 
 <style>
   /* 内容槽与每个宿主都绝对定位于 RightPane 的 `.right-pane-body`。
-     折叠右栏与关闭视图只改 `hidden`，不卸载组件（A25）。 */
+     折叠右栏与关闭视图只改 `hidden`，不卸载组件。 */
   .web-model-content {
     position: absolute;
     inset: 0;
@@ -262,7 +367,7 @@
   }
 
   /*
-    隐藏必须是「移出可见区域」，不能是 `display: none`（A25、R49）。
+    隐藏必须是「移出可见区域」，不能是 `display: none`。
     appenders：`<webview>` guest 只有在宿主有真实布局尺寸时才能完成注册，
     注册是后台推理的唯一入口；同时离屏保留也让进行中的生成不中断。
   */
@@ -280,11 +385,22 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    height: 26px;
+    height: 36px;
     padding: 0 8px;
     font-size: 11px;
     background: var(--surface-muted, rgba(127, 127, 127, 0.08));
     border-bottom: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.18));
+  }
+
+  .bar-address {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.75;
   }
 
   .bar-spacer {
@@ -300,17 +416,74 @@
     font-variant-numeric: tabular-nums;
   }
 
+
   .bar-notice {
     position: absolute;
-    top: 26px;
-    left: 8px;
-    right: 8px;
-    z-index: 2;
+    top: 36px;
+    left: 0;
+    right: 0;
+    z-index: 3;
+    box-sizing: border-box;
+    height: 36px;
     margin: 0;
-    padding: 2px 0;
+    padding: 4px 8px;
+    overflow: hidden;
     font-size: 11px;
-    color: var(--foreground-muted);
-    background: var(--surface-muted, rgba(127, 127, 127, 0.08));
+    line-height: 14px;
+    color: var(--foreground);
+    background: var(--accent-soft, rgba(80, 140, 255, 0.16));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .bar-notice-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .bar-notice .bar-action {
+    flex: none;
+  }
+
+  .bar-notice--error {
+    color: var(--danger, #c53f4f);
+  }
+
+  /* 只读：盖住宿主，拦截所有指针交互（页面仍可见，便于查看占用中的对话）。 */
+  .host-readonly-shield {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    cursor: not-allowed;
+  }
+
+  .bar-conn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    opacity: 0.8;
+    white-space: nowrap;
+  }
+
+  .bar-conn-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--foreground-muted, rgba(127, 127, 127, 0.6));
+  }
+
+  .bar-conn.ok .bar-conn-dot {
+    background: var(--success, #2f9e63);
+  }
+
+  .bar-conn.bad .bar-conn-dot {
+    background: var(--warning, #d9962b);
   }
 
   .bar-action {
@@ -322,25 +495,26 @@
     cursor: pointer;
   }
 
+  .bar-link {
+    flex: none;
+  }
+
+  .bar-icon {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 6px;
+  }
   .bar-action:disabled {
     cursor: default;
     opacity: 0.45;
   }
 
-  .bar-error {
-    position: absolute;
-    top: 26px;
-    left: 8px;
-    right: 8px;
-    z-index: 2;
-    margin: 0;
-    font-size: 11px;
-    color: var(--danger, #c53f4f);
-  }
 
   .host {
     position: absolute;
-    top: 26px;
+    top: var(--wm-top, 36px);
     left: 0;
     right: 0;
     bottom: 0;
@@ -351,7 +525,7 @@
   }
 
   /* 非当前显示宿主同样只离屏，不卸载、不塌缩尺寸：每个活跃对话实例都要
-     保持可注册、可继续生成（§5.2 多宿主、A25）。 */
+     保持可注册、可继续生成。 */
   .host--offscreen {
     transform: translate3d(-20000px, 0, 0);
     pointer-events: none;

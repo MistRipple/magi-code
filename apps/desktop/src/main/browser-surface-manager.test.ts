@@ -356,7 +356,7 @@ test("page_updated 后向所有窗口重发应用级 Surface 导航身份", () =
 
 test("A25 多宿主与隐藏右栏只改变可见性，不卸载 App Web guest", () => {
   const normalizedWebModel = normalizeSourceWhitespace(webModelTabSource);
-  assert.match(normalizedWebModel, /#each primaryWindow \? hosts : \[\] as host \(host\.tabId\)/u);
+  assert.match(normalizedWebModel, /#each hosts as host \(host\.tabId\)/u);
   assert.match(normalizedWebModel, /BrowserTabContent[\s\S]*surfaceScope="app"/u);
   assert.match(normalizedWebModel, /class:host--offscreen=\{!hostVisible\(host\.tabId\)\}/u);
   assert.match(normalizedWebModel, /\.web-model-content--offscreen[\s\S]*transform: translate3d\(-20000px, 0, 0\)/u);
@@ -1068,4 +1068,15 @@ test("截图和 DOM 选择都来自同一真实 Chromium WebContents", () => {
   assert.doesNotMatch(source, /capturePage\(|startScreencast|drawImage\(/u);
   assert.match(browserTabSource, /magi:browserScreenshotCaptured/u);
   assert.match(browserTabSource, /magi:browserNodeSelected/u);
+});
+
+test("等待视口提交的循环每轮让出事件循环、过期提交重新排程且有重试上限", () => {
+  const start = source.indexOf("private async waitForViewportCommit(");
+  const end = source.indexOf("private scheduleViewportCommit(", start);
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end);
+  assert.match(body, /setImmediate\(resolve\)/u);
+  assert.match(body, /MAX_VIEWPORT_COMMIT_WAIT_ATTEMPTS/u);
+  assert.match(body, /commit\.state === "ready" &&\s*!this\.isViewportCommitInputCurrent/u);
+  assert.match(body, /commit\.state === "invalidated" \|\|\s*commit\.state === "superseded"/u);
 });

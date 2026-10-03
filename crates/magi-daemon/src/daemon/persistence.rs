@@ -612,6 +612,7 @@ impl StateRepository {
         validate_current: bool,
     ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
         self.recover_session_projection_transaction(workspace_roots)?;
+        self.restore_quarantined_session_events(workspace_roots)?;
         let mut durable = SessionDurableState::default();
         let mut sidecars = SessionExecutionSidecarStoreState::default();
         let mut cache = SessionProjectionCache::default();
@@ -961,7 +962,11 @@ impl StateRepository {
 
     /// 校验事件目录都有已恢复的 session 归属。首次 accepted 持久化可能在事件写入后、
     /// projection 写入前崩溃；此时 accepted journal 会先把 session 恢复进内存，再调用
-    /// 本方法确认该孤立目录确实有 WAL 归属。其余未知目录一律按状态损坏处理。
+    /// 本方法确认该孤立目录确实有 WAL 归属。
+    ///
+    /// 没有任何归属的事件目录（典型来源：用户删除了工作区目录，其下会话的 projection 随之消失，
+    /// 事件日志却留在全局 `session-events`）**不阻止启动**：整目录移到 `orphaned-session-events/`
+    /// 隔离保留（只移动，不删除），启动日志给出告警。工作区本身按空白工作区加载。
     pub(crate) fn validate_session_event_log_coverage(
         &self,
         durable: &SessionDurableState,
@@ -984,6 +989,7 @@ impl StateRepository {
             .session_event_cache
             .lock()
             .expect("session event cache lock poisoned");
+        let mut unowned = Vec::new();
         for entry in fs::read_dir(&event_parent)? {
             let entry = entry?;
             let path = entry.path();
@@ -993,18 +999,100 @@ impl StateRepository {
                     path.display()
                 )));
             }
-            let session_id = expected.get(&path).ok_or_else(|| {
-                DaemonError::internal(format!(
-                    "canonical event 目录没有 session 或 accepted WAL 归属: {}",
-                    path.display()
-                ))
-            })?;
+            let Some(session_id) = expected.get(&path) else {
+                unowned.push(path);
+                continue;
+            };
             if !event_cache.contains_key(session_id) {
                 return Err(DaemonError::internal(format!(
                     "canonical event 目录未包含在本次恢复结果中: {}",
                     path.display()
                 )));
             }
+        }
+        drop(event_cache);
+        self.quarantine_unowned_session_events(unowned)
+    }
+
+    /// 被隔离的无归属事件日志所在目录。
+    fn orphaned_session_events_root(&self) -> PathBuf {
+        self.state_root.join("orphaned-session-events")
+    }
+
+    /// 工作区目录复原后，把它的会话事件日志从隔离区移回原位。
+    ///
+    /// 会话投影（全局或工作区 `.magi/session-projections`）重新出现，而同名事件日志只在隔离区时，
+    /// 说明这个会话的数据又回来了：必须在加载投影之前归位，否则投影会因缺少 canonical 事件而无法
+    /// 加载。只移动、不覆盖；`session-events` 下已有同名目录时保持原样。
+    fn restore_quarantined_session_events(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+    ) -> Result<(), DaemonError> {
+        let quarantine_root = self.orphaned_session_events_root();
+        if !quarantine_root.is_dir() {
+            return Ok(());
+        }
+        let event_parent = self.state_root.join("session-events");
+        let mut projection_roots = vec![self.session_projection_root()];
+        projection_roots.extend(
+            workspace_roots
+                .iter()
+                .map(|(_, root)| root.join(".magi").join("session-projections")),
+        );
+        for projection_root in projection_roots {
+            let Ok(entries) = fs::read_dir(&projection_root) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem() else {
+                    continue;
+                };
+                let quarantined = quarantine_root.join(stem);
+                let target = event_parent.join(stem);
+                if !quarantined.is_dir() || target.exists() {
+                    continue;
+                }
+                fs::create_dir_all(&event_parent)?;
+                fs::rename(&quarantined, &target)?;
+                Self::sync_parent_directory(&quarantined);
+                Self::sync_parent_directory(&target);
+                tracing::info!(
+                    session_events = %stem.to_string_lossy(),
+                    "会话数据已复原，事件日志已从隔离区归位"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 把没有任何归属的事件目录整体移到 `orphaned-session-events/`（只移动，不删除）。
+    fn quarantine_unowned_session_events(&self, unowned: Vec<PathBuf>) -> Result<(), DaemonError> {
+        if unowned.is_empty() {
+            return Ok(());
+        }
+        let quarantine_root = self.orphaned_session_events_root();
+        fs::create_dir_all(&quarantine_root)?;
+        for path in unowned {
+            let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let mut target = quarantine_root.join(&name);
+            if target.exists() {
+                target = quarantine_root.join(format!("{name}-{}", magi_core::UtcMillis::now().0));
+            }
+            fs::rename(&path, &target)?;
+            Self::sync_parent_directory(&path);
+            Self::sync_parent_directory(&target);
+            tracing::warn!(
+                session_events = %name,
+                quarantined_to = %target.display(),
+                "会话事件日志没有对应的会话（工作区或会话数据已被删除），已隔离保留，不影响启动"
+            );
         }
         Ok(())
     }
@@ -4801,6 +4889,7 @@ mod tests {
                 workspace_id: Some("workspace-persisted".to_string()),
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-persisted-user".to_string(),
@@ -5527,7 +5616,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_event_log_without_acceptance_is_rejected_by_coverage() {
+    fn unowned_event_log_is_quarantined_instead_of_blocking_startup() {
         let state_root = unique_temp_dir("magi-canonical-event-orphan");
         let repository = StateRepository::new(state_root.clone());
         let (session_store, _, _) = accepted_session_store("canonical-event-orphan", None, 56);
@@ -5549,9 +5638,104 @@ mod tests {
         repository
             .validate_session_event_log_coverage(&session_store.durable_state())
             .expect("accepted WAL-restored session should own its event log");
+        // 会话数据（例如其工作区被用户删除）已经不在时，事件日志不能阻止启动：
+        // 整目录移到隔离区保留，不删除。
+        let event_root = repository.session_event_root(&session_id);
         repository
             .validate_session_event_log_coverage(&SessionDurableState::default())
-            .expect_err("unknown orphan event log must fail recovery");
+            .expect("unowned event log must be quarantined, not fail startup");
+        assert!(!event_root.exists());
+        let quarantined = state_root
+            .join("orphaned-session-events")
+            .join(event_root.file_name().expect("event root has a name"));
+        assert!(quarantined.is_dir(), "event data must be preserved");
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn renaming_one_session_persists_only_that_session_and_survives_a_reload() {
+        let state_root = unique_temp_dir("magi-rename-incremental");
+        let repository = StateRepository::new(state_root.clone());
+        let (session_store, _, _) = accepted_session_store("rename-target", None, 61);
+        let session_id = SessionId::new("rename-target");
+        install_test_event_authority(&repository, &session_store);
+        repository
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("initial projection should persist");
+
+        // 与 daemon 装配里的 Rename 持久化回调相同：只提交被重命名的会话。
+        let renamed = session_store
+            .rename_session_with_persistence(&session_id, "咖啡店创意命名", |durable, sidecars| {
+                repository.save_session_projection_state_for_sessions(
+                    durable,
+                    sidecars,
+                    std::slice::from_ref(&session_id),
+                )
+            })
+            .expect("rename should persist");
+        assert_eq!(renamed.title, "咖啡店创意命名");
+
+        let reloaded = StateRepository::new(state_root.clone());
+        let (restored, _) = reloaded
+            .load_session_projections(&[])
+            .expect("renamed projection must load");
+        let title = restored
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .map(|session| session.title.clone());
+        assert_eq!(title.as_deref(), Some("咖啡店创意命名"));
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn restored_session_data_brings_its_quarantined_event_log_back() {
+        let state_root = unique_temp_dir("magi-quarantine-restore");
+        let repository = StateRepository::new(state_root.clone());
+        let (session_store, _, _) = accepted_session_store("quarantine-restore", None, 57);
+        let session_id = SessionId::new("quarantine-restore");
+        install_test_event_authority(&repository, &session_store);
+        repository
+            .save_session_projection_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+            )
+            .expect("session checkpoint should persist");
+        let projection_path = repository
+            .session_projection_root()
+            .join(StateRepository::session_projection_file_name(&session_id));
+        let parked = state_root.join("parked-projection.json");
+
+        // 工作区被删除：投影消失，事件日志被隔离。
+        fs::rename(&projection_path, &parked).expect("projection should be parked");
+        repository
+            .validate_session_event_log_coverage(&SessionDurableState::default())
+            .expect("unowned event log is quarantined");
+        let event_root = repository.session_event_root(&session_id);
+        assert!(!event_root.exists());
+
+        // 目录复原：投影回来，下一次加载前事件日志自动归位，会话完整恢复。
+        fs::rename(&parked, &projection_path).expect("projection should be restored");
+        let reloaded = StateRepository::new(state_root.clone());
+        let (restored, _) = reloaded
+            .load_session_projections(&[])
+            .expect("restored projection must load with its event log");
+        assert_eq!(restored.sessions.len(), 1);
+        assert!(event_root.is_dir());
+        assert!(
+            !state_root
+                .join("orphaned-session-events")
+                .join(event_root.file_name().expect("event root has a name"))
+                .exists()
+        );
+        reloaded
+            .validate_session_event_log_coverage(&restored)
+            .expect("restored session owns its event log");
 
         let _ = fs::remove_dir_all(state_root);
     }

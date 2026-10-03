@@ -552,6 +552,8 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Tracing.recordClockSyncMarker",
 ]);
 
+/** 等待视口提交时允许的重新排程次数；超过即判定 Surface 生命周期已过期。 */
+const MAX_VIEWPORT_COMMIT_WAIT_ATTEMPTS = 50;
 const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 15_000;
 const SCREENSHOT_CDP_COMMAND_TIMEOUT_MS = 10_000;
 const SCREENSHOT_READINESS_TIMEOUT_MS = 5_000;
@@ -909,6 +911,9 @@ export class BrowserSurfaceManager {
       return this.binding(record);
     }
     record.contents = guest;
+    // 新的物理 guest 取代旧 guest（Renderer 刷新 / 右栏重建）：Authority 把「相同 surface_revision 但
+    // 不同 WebContents」视为另一块物理页面并拒绝，导致页面永远绑不上。每次绑定新 guest 都推进修订号。
+    record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);
     // 内置浏览器自动化在右栏隐藏、应用失焦和 Renderer 重建后仍需读取
     // Chromium 合成帧。Electron 会把 backgroundThrottling 传播到宿主
     // compositor；对受管 guest 关闭节流，避免新 guest 的首帧永久挂起。
@@ -1683,11 +1688,24 @@ export class BrowserSurfaceManager {
   private async waitForViewportCommit(
     record: BrowserSurfaceRecord,
   ): Promise<void> {
-    while (!record.closed) {
+    // 等待最新视口提交落定。每一轮都必须让出事件循环并有重试上限：当前提交已经
+    // invalidated / superseded，或已 ready 但输入（导航代、debugger 代、显示尺寸）过期时，
+    // 如果不重新排程就原地 continue，await 一个已结算的 Promise 只产生微任务，主进程会被
+    // 一个永不让出的循环占满，整个客户端卡死。
+    for (let attempt = 0; !record.closed; attempt += 1) {
+      if (attempt > MAX_VIEWPORT_COMMIT_WAIT_ATTEMPTS) break;
+      if (attempt > 0)
+        await new Promise<void>((resolve) => setImmediate(resolve));
       const contents = record.contents;
       if (!contents || contents.isDestroyed()) break;
       let commit = record.viewportLifecycle.current;
-      if (!commit) {
+      if (
+        !commit ||
+        commit.state === "invalidated" ||
+        commit.state === "superseded" ||
+        (commit.state === "ready" &&
+          !this.isViewportCommitInputCurrent(record, commit))
+      ) {
         commit = this.scheduleViewportCommit(record);
         if (!commit) return;
       }

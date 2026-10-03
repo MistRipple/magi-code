@@ -497,6 +497,48 @@
       "required": ["tab_id"],
       "properties": { "tab_id": { "$ref": "#/$defs/id" } }
     },
+    "webSavedConversationsPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
+    "webSavedMessagesPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
+    "webReadImagePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "source", "offset", "length"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "source": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "offset": { "type": "integer", "minimum": 0 },
+        "length": { "type": "integer", "minimum": 1, "maximum": 786432 }
+      }
+    },
+    "webConnectorStatusPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "name"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1 }
+      }
+    },
+    "webConfigureConnectorPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "name", "tunnel_id"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1 },
+        "tunnel_id": { "type": "string", "minLength": 1 }
+      }
+    },
     "updateControlPayload": {
       "type": "object",
       "additionalProperties": false,
@@ -1402,6 +1444,51 @@
           "properties": {
             "type": { "const": "web_cancel_generation" },
             "payload": { "$ref": "#/$defs/webCancelGenerationPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_saved_conversations" },
+            "payload": { "$ref": "#/$defs/webSavedConversationsPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_saved_messages" },
+            "payload": { "$ref": "#/$defs/webSavedMessagesPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_read_image" },
+            "payload": { "$ref": "#/$defs/webReadImagePayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_connector_status" },
+            "payload": { "$ref": "#/$defs/webConnectorStatusPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_configure_connector" },
+            "payload": { "$ref": "#/$defs/webConfigureConnectorPayload" }
           }
         },
         {

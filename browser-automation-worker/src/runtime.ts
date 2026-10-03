@@ -14,7 +14,6 @@ import type {
 import { isAllowedBrowserChildTarget } from "@magi/desktop-browser-contracts";
 import { CdpClient } from "./cdp-client.js";
 import { INSTALL_PAGE_RUNTIME, MAGI_AUTOMATION_WORLD } from "./page-script.js";
-import { lookupWebModelLimits, loadWebModelLimits } from "./web-model-limits.js";
 import { firstTextDivergence } from "./web-model-site.js";
 import {
   INSTALL_WEB_MODEL_ADAPTER,
@@ -22,6 +21,8 @@ import {
   composerTextDigest,
   composerTextReadbackMatches,
   contentEditableBlockBoundaryVariant,
+  isOpenAiPlatformOrigin,
+  openAiPlatformProbe,
   isSupportedChatGptOrigin,
   normalizeComposerText,
   normalizeWebModelProbe,
@@ -259,6 +260,24 @@ export class BrowserAutomationRuntime {
           },
         };
       case "web_model_probe": {
+        // 标签页停在 OpenAI 平台页面时不安装 ChatGPT 适配器，只报告页面类型。
+        if (isOpenAiPlatformOrigin(await this.evaluate<string>(binding, "location.origin"))) {
+          const platform = openAiPlatformProbe();
+          return {
+            result: {
+              type: "json",
+              payload: {
+                value: {
+                  site_revision: platform.siteRevision,
+                  login_state: platform.loginState,
+                  composer_available: platform.composerAvailable,
+                  page_kind: platform.pageKind,
+                  account_hint: platform.accountHint,
+                },
+              },
+            },
+          };
+        }
         await this.ensureWebModelAdapter(binding);
         const raw = await this.evaluate<WebModelRawSnapshot>(
           binding,
@@ -267,7 +286,7 @@ export class BrowserAutomationRuntime {
         if (!isRawWebModelSnapshot(raw)) {
           throw protocolFailure(
             "web_model_probe_result_invalid",
-            "页面适配器返回的模型探测快照缺少稳定的 origin / composer / modelItems 字段",
+            "页面适配器返回的探测快照缺少稳定的 origin / composer / conversation 字段",
           );
         }
         const probe = normalizeWebModelProbe(raw);
@@ -277,30 +296,6 @@ export class BrowserAutomationRuntime {
             `站点 origin 不受支持：${raw.origin || "<empty>"}；仅允许 chatgpt.com 或 chat.openai.com`,
           );
         }
-        if (probe.loginState === "signed_in" && probe.models.length === 0) {
-          throw protocolFailure(
-            "web_model_selectors_drift",
-            `GPT Web 已登录但未发现可识别模型：${probe.diagnostic ?? "model_items_unrecognized"}`,
-          );
-        }
-        // 上限表随应用发布、由本层回传，daemon 不再维护第二份数据（§5.9.2）。
-        const limits = loadWebModelLimits();
-        const models = probe.models.map((model) => {
-          const entry = lookupWebModelLimits(limits, {
-            accountHint: probe.accountHint,
-            family: model.family,
-          });
-          return {
-            family: model.family,
-            display_name: model.displayName,
-            efforts: model.efforts,
-            default_effort: model.defaultEffort,
-            context_window_tokens: entry.inputTokenBudget,
-            single_submission_token_budget: entry.singleSubmissionTokenBudget,
-            response_reserve: entry.responseReserve,
-            tokenizer_revision: entry.tokenizerRevision,
-          };
-        });
         return {
           result: {
             type: "json",
@@ -309,17 +304,83 @@ export class BrowserAutomationRuntime {
                 site_revision: probe.siteRevision,
                 login_state: probe.loginState,
                 composer_available: probe.composerAvailable,
-                composer_char_limit: probe.composerCharLimit
-                  ?? lookupWebModelLimits(limits, { accountHint: probe.accountHint, family: "*" }).composerCharLimit,
+                page_kind: probe.pageKind,
                 account_hint: probe.accountHint,
-                limits_revision: limits.revision,
-                models,
-                connector_support: probe.connectorSupport,
-                connector_settings_reachable: raw.connectorSettingsFound,
               },
             },
           },
         };
+      }
+      case "web_saved_conversations": {
+        await this.ensureWebModelAdapter(binding);
+        const value = await this.evaluate<unknown>(binding, "globalThis.__magiWebModel.savedConversations()");
+        if (!isSavedConversationsResult(value)) {
+          throw protocolFailure(
+            "web_saved_conversations_result_invalid",
+            "页面适配器返回的已保存对话列表缺少 conversation_id / title",
+          );
+        }
+        return { result: { type: "json", payload: { value } } };
+      }
+      case "web_saved_messages": {
+        await this.ensureWebModelAdapter(binding);
+        const value = await this.evaluate<unknown>(binding, "globalThis.__magiWebModel.savedMessages()");
+        if (!isSavedMessagesResult(value)) {
+          throw protocolFailure(
+            "web_saved_messages_result_invalid",
+            "页面适配器返回的已保存对话消息缺少 role / text / remote_id",
+          );
+        }
+        return { result: { type: "json", payload: { value } } };
+      }
+      case "web_read_image": {
+        await this.ensureWebModelAdapter(binding);
+        const value = await this.evaluate<unknown>(
+          binding,
+          `globalThis.__magiWebModel.readImage(${JSON.stringify({
+            source: command.payload.source,
+            offset: command.payload.offset,
+            length: command.payload.length,
+          })})`,
+        );
+        if (!isImageChunkResult(value)) {
+          throw protocolFailure(
+            "web_read_image_result_invalid",
+            "页面适配器返回的图片分块缺少 mime / total / offset / data_base64 / done",
+          );
+        }
+        return { result: { type: "json", payload: { value } } };
+      }
+      case "web_connector_status": {
+        await this.ensureWebModelAdapter(binding);
+        const value = await this.evaluate<unknown>(
+          binding,
+          `globalThis.__magiWebModel.connectorStatus(${JSON.stringify({ name: command.payload.name })})`,
+        );
+        if (!isConnectorStatusResult(value)) {
+          throw protocolFailure(
+            "web_connector_status_result_invalid",
+            "页面适配器返回的连接器状态缺少 supported / exists / enabled",
+          );
+        }
+        return { result: { type: "json", payload: { value } } };
+      }
+      case "web_configure_connector": {
+        await this.ensureWebModelAdapter(binding);
+        const value = await this.evaluate<unknown>(
+          binding,
+          `globalThis.__magiWebModel.configureConnector(${JSON.stringify({
+            name: command.payload.name,
+            tunnel_id: command.payload.tunnel_id,
+          })})`,
+        );
+        if (!isConfigureConnectorResult(value)) {
+          throw protocolFailure(
+            "web_configure_connector_result_invalid",
+            "页面适配器返回的连接器配置结果缺少 configured / confirmed_enabled",
+          );
+        }
+        return { result: { type: "json", payload: { value } } };
       }
       case "web_write_text": {
         await this.ensureWebModelAdapter(binding);
@@ -474,6 +535,8 @@ export class BrowserAutomationRuntime {
                 assistant_message_count: state.assistantMessageCount,
                 assistant_text: state.assistantText,
                 thinking_text: state.thinkingText,
+                last_message_role: state.lastMessageRole,
+                last_message_text: state.lastMessageText,
               },
             },
           },
@@ -513,10 +576,16 @@ export class BrowserAutomationRuntime {
     }
     if (current && !samePhysicalBinding(current.binding, binding)) {
       this.wakeDialogWaiters(current);
-      throw protocolFailure("browser_surface_stale", "binding does not match the current physical Surface");
+      throw protocolFailure(
+        "browser_surface_stale",
+        `binding does not match the current physical Surface (${describePhysicalDifference(current.binding, binding)})`,
+      );
     }
     if (current && current.binding.navigation_revision > binding.navigation_revision) {
-      throw protocolFailure("browser_surface_stale", "binding is older than the current navigation");
+      throw protocolFailure(
+        "browser_surface_stale",
+        `binding is older than the current navigation (worker ${current.binding.navigation_revision} > host ${binding.navigation_revision})`,
+      );
     }
     const sameSurface = Boolean(
       current
@@ -585,15 +654,24 @@ export class BrowserAutomationRuntime {
     const page = this.page(binding);
     if (page.cdpDomainsReady) return;
     if (!page.cdpDomainsPromise) {
-      page.cdpDomainsPromise = Promise.all([
+      // 握手进行期间文档可能导航：`page()` 会为新代次重建页面状态并继承这个在途 Promise。
+      // 因此完成 / 失败后必须清掉“当前持有它的所有页面状态”，否则一次导航竞态里被拒绝的
+      // Promise 会永久留在新页面状态上，之后每条命令都会立刻重复同一个 `browser_surface_stale`。
+      const holders = () => [page, this.currentPage(binding.surface_id)];
+      const handshake: Promise<void> = Promise.all([
         this.#cdp.send(binding, "Page.enable"),
         this.#cdp.send(binding, "Runtime.enable"),
         this.#cdp.send(binding, "Network.enable"),
       ]).then(() => {
-        page.cdpDomainsReady = true;
+        for (const holder of holders()) {
+          if (holder && samePhysicalBinding(holder.binding, binding)) holder.cdpDomainsReady = true;
+        }
       }).finally(() => {
-        page.cdpDomainsPromise = null;
+        for (const holder of holders()) {
+          if (holder?.cdpDomainsPromise === handshake) holder.cdpDomainsPromise = null;
+        }
       });
+      page.cdpDomainsPromise = handshake;
     }
     await page.cdpDomainsPromise;
   }
@@ -2130,6 +2208,31 @@ function samePhysicalBinding(left: BrowserSurfaceBinding, right: BrowserSurfaceB
     && left.browser_context_id === right.browser_context_id;
 }
 
+function isImageChunkResult(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const chunk = value as Record<string, unknown>;
+  return typeof chunk.mime === "string"
+    && Number.isSafeInteger(chunk.total) && (chunk.total as number) >= 0
+    && Number.isSafeInteger(chunk.offset) && (chunk.offset as number) >= 0
+    && typeof chunk.data_base64 === "string"
+    && typeof chunk.done === "boolean";
+}
+
+function describePhysicalDifference(left: BrowserSurfaceBinding, right: BrowserSurfaceBinding): string {
+  const fields = [
+    "desktop_epoch",
+    "window_id",
+    "surface_id",
+    "surface_revision",
+    "tab_id",
+    "web_contents_id",
+    "target_id",
+    "browser_context_id",
+  ] as const;
+  const differing = fields.filter((field) => left[field] !== right[field]);
+  return differing.map((field) => `${field}: ${String(left[field])} -> ${String(right[field])}`).join(", ");
+}
+
 async function waitWithSignal(milliseconds: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) throw new Error("browser_command_cancelled");
   await new Promise<void>((resolve, reject) => {
@@ -2183,22 +2286,47 @@ function isRawWebModelSnapshot(value: unknown): value is WebModelRawSnapshot {
     && typeof value.path === "string"
     && typeof value.blocked === "boolean"
     && typeof value.composerFound === "boolean"
-    && (value.composerCharLimit === null
-      || (typeof value.composerCharLimit === "number"
-        && Number.isSafeInteger(value.composerCharLimit)
-        && value.composerCharLimit >= 0))
     && typeof value.conversationFound === "boolean"
-    && typeof value.modelMenuFound === "boolean"
-    && Array.isArray(value.modelItems)
-    && value.modelItems.every((item) => isRecord(item)
-      && typeof item.label === "string"
-      && typeof item.checked === "boolean"
-      && Array.isArray(item.efforts)
-      && item.efforts.every((effort) => typeof effort === "string")
-      && (item.modelId === undefined || item.modelId === null || typeof item.modelId === "string")
-      && (item.defaultEffort === undefined || item.defaultEffort === null || typeof item.defaultEffort === "string"))
-    && (value.accountHint === null || typeof value.accountHint === "string")
-    && typeof value.connectorSettingsFound === "boolean";
+    && (value.accountHint === null || typeof value.accountHint === "string");
+}
+
+function isSavedConversationsResult(value: unknown): boolean {
+  return isRecord(value)
+    && Array.isArray(value.conversations)
+    && value.conversations.every((item) => isRecord(item)
+      && typeof item.conversation_id === "string"
+      && item.conversation_id.length > 0
+      && typeof item.title === "string"
+      && (item.updated_at === null || typeof item.updated_at === "string"));
+}
+
+function isSavedMessagesResult(value: unknown): boolean {
+  return isRecord(value)
+    && (value.conversation_id === null || typeof value.conversation_id === "string")
+    && (value.title === null || typeof value.title === "string")
+    && Array.isArray(value.messages)
+    && value.messages.every((item) => isRecord(item)
+      && (item.role === "user" || item.role === "assistant")
+      && typeof item.text === "string"
+      && (item.remote_id === null || typeof item.remote_id === "string"))
+    && (value.last_message_id === null || typeof value.last_message_id === "string")
+    && (value.updated_at === null || typeof value.updated_at === "string");
+}
+
+function isConnectorStatusResult(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.supported === "boolean"
+    && typeof value.exists === "boolean"
+    && typeof value.enabled === "boolean"
+    && (value.tool_count === null || (typeof value.tool_count === "number" && Number.isSafeInteger(value.tool_count)))
+    && (value.reason === null || typeof value.reason === "string");
+}
+
+function isConfigureConnectorResult(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.configured === "boolean"
+    && typeof value.confirmed_enabled === "boolean"
+    && (value.reason === null || typeof value.reason === "string");
 }
 
 function isWebObserveResult(value: unknown): value is { revision: number; nodes: Array<Record<string, unknown>> } {
@@ -2237,6 +2365,10 @@ function isRawWebModelTurnState(value: unknown): value is WebModelRawTurnState {
     && value.assistant_message_count >= 0
     && typeof value.assistant_text === "string"
     && typeof value.thinking_text === "string"
+    && (value.last_message_role === null
+      || value.last_message_role === "user"
+      || value.last_message_role === "assistant")
+    && (value.last_message_text === null || typeof value.last_message_text === "string")
     && (value.account_hint === null || typeof value.account_hint === "string");
 }
 

@@ -4,6 +4,7 @@
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
   import NotificationCenter from '../components/NotificationCenter.svelte';
+  import ExternalApprovalTray from '../components/ExternalApprovalTray.svelte';
   import SidebarFooter from '../components/SidebarFooter.svelte';
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
@@ -473,7 +474,7 @@ import {
   );
   const inlineRightPaneVisible = $derived(!desktopAppSurface && rightPaneVisible);
   /**
-   * 存在应用级 GPT Web 视图时，右栏容器必须**全程挂载**（设计基线 A25）：
+   * 存在应用级 GPT Web 视图时，右栏容器必须**全程挂载**：
    * 折叠右栏只做视觉隐藏，不卸载组件、不销毁 `<webview>` guest、不中断后台推理。
    * 这是对「折叠即卸载」的唯一显式例外，只由应用级视图触发。
    */
@@ -522,7 +523,7 @@ import {
   function currentDesktopPanelTarget(): DesktopPanelTarget {
     const scopeKey = rightPaneState.activeScopeKey;
     const pane = getRightPaneState(scopeKey);
-    // 应用级 GPT Web 视图走「不激活」驱动路径（A25）：它不写
+    // 应用级 GPT Web 视图走「不激活」驱动路径：它不写
     // `right_pane_visibility` / `active_panel`，因此这里不产生任何面板意图。
     if (rightPaneState.activeAppTabId) {
       return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
@@ -858,7 +859,7 @@ import {
   }
 
   /**
-   * 应用级 GPT Web 会话投影（A25 / §5.2）。
+   * 应用级 GPT Web 会话投影。
    *
    * Authority 事件、窗口启动与低频兜底轮询都走这一条路径：`appTabs` 与内容槽
    * 宿主集合只能由 daemon 的只读投影重建，视图侧不自行发明宿主，也不因为
@@ -2820,7 +2821,7 @@ import {
     // 应用级 GPT Web 视图没有 Desktop active_panel 身份。它可能只是把
     // 当前右栏内容槽移到后台，但 Main 仍必须保留用户最近一次确认的面板；
     // 这里若把 app 视图编码成 kind:null，下面就会误发 activatePanel(null)，
-    // 清掉用户当前面板并把焦点交回 App Renderer（A25 / R49）。
+    // 清掉用户当前面板并把焦点交回 App Renderer。
     if (rightPaneState.activeAppTabId) return;
     void desktopPanelActivationEpoch;
     const recoveryRevision = desktopRuntimeRecoveryRevision;
@@ -3057,7 +3058,7 @@ import {
       });
     void refreshWorkspaces();
     void refreshPersonalSessions();
-    // 启动即投影一次：重启后 GPT Web 视图与宿主由 Authority 恢复（§5.1）。
+    // 启动即投影一次：重启后 GPT Web 视图与宿主由 Authority 恢复。
     synchronizeWebModelSessionProjection();
     // 推理页面由推理通道在应用级会话里按需创建，桌面控制路径不一定发布
     // Authority 事件，因此保留低频兜底轮询；`GET` 只读、不创建会话。
@@ -3612,6 +3613,8 @@ import {
     >{sidebarTooltip.text}</div>
   {/if}
 
+  <ExternalApprovalTray />
+
   <NotificationCenter
     open={shellUi.popover === 'notifications'}
     onOpenChange={(open) => { shellUi.popover = open ? 'notifications' : null; }}
@@ -3834,7 +3837,7 @@ import {
     min-height: 0;
   }
 
-  /* 折叠右栏时只做视觉隐藏：应用级 GPT Web 视图必须保持挂载（A25）。 */
+  /* 折叠右栏时只做视觉隐藏：应用级 GPT Web 视图必须保持挂载。 */
   .desktop-right-pane-column[hidden] {
     display: none;
   }
@@ -3842,7 +3845,7 @@ import {
   /*
     承载应用级 GPT Web 会话时，折叠右栏只能把这一列**移出可见区域**，
     不能卸载或塌缩：`<webview>` guest 需要真实布局尺寸才能注册，注册是后台
-    推理的唯一入口（A25、R49）。`position: fixed` 让它离开网格流，因此折叠后
+    推理的唯一入口。`position: fixed` 让它离开网格流，因此折叠后
     的可见布局与既有 golden 完全一致。
   */
   .desktop-right-pane-column--background {

@@ -48,6 +48,8 @@ const BROWSER_SURFACE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// 内安全重试；写入和提交路径不能复用这条重试策略（避免重放副作用）。
 const WEB_MODEL_PROBE_RETRIES: usize = 8;
 const WEB_MODEL_PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const WEB_MODEL_PROBE_PAGE_LOAD_RETRIES: usize = 40;
+const WEB_MODEL_PROBE_PAGE_LOAD_DELAY: Duration = Duration::from_millis(500);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -69,14 +71,10 @@ pub fn routes() -> Router<ApiState> {
             "/browser/sessions/app",
             get(get_app_session).post(create_app_session),
         )
-        .route("/browser/web-models/discover", post(discover_web_models))
+        .route("/browser/web-models/probe", post(probe_web_model))
         .route(
             "/browser/web-models/ensure-home",
             post(ensure_web_model_home_surface),
-        )
-        .route(
-            "/browser/web-models/consent",
-            post(confirm_web_model_consent),
         )
         .route(
             "/browser/web-models/tunnel",
@@ -84,9 +82,26 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/browser/web-models/runtime", get(get_web_model_runtime))
         .route("/browser/web-models/reset", post(reset_web_models))
+        .route("/browser/web-models/stop", post(stop_web_model))
+        .route("/browser/web-models/navigate", post(navigate_web_model_page))
+        .route("/browser/web-models/reload", post(reload_web_model_page))
+        .route("/browser/web-models/tunnel/api-key", get(reveal_web_model_api_key))
+        .route("/browser/web-models/tunnel/policy", post(set_web_model_tool_policy))
         .route(
-            "/browser/web-models/reset-conversation",
-            post(reset_web_model_conversation),
+            "/browser/web-models/connector",
+            get(get_web_connector).post(configure_web_connector),
+        )
+        .route(
+            "/browser/web-models/saved",
+            get(list_web_saved_conversations),
+        )
+        .route(
+            "/browser/web-models/saved/bind",
+            post(bind_web_saved_conversation),
+        )
+        .route(
+            "/browser/web-models/saved/sync",
+            post(sync_web_saved_conversation),
         )
         .route("/browser/sessions/current", get(get_current_session))
         .route("/browser/sessions/{browser_session_id}", get(get_session))
@@ -642,7 +657,7 @@ async fn reclaim_browser_resources(
             });
             continue;
         }
-        // 应用级（GPT Web）页面一律不参与资源回收（设计基线 §5.3）。
+        // 应用级（GPT Web）页面一律不参与资源回收。
         let Some(session_id) = resource.session_id.clone() else {
             continue;
         };
@@ -1246,7 +1261,7 @@ async fn create_session(
 /// 应用级（GPT Web）浏览器会话的固定主页 Tab 标识。
 ///
 /// 全局只有一个应用级会话，因此主页 Tab 用一个稳定 id；推理页面由推理通道
-/// 按需创建，不在这里创建（设计基线 §5.3）。
+/// 按需创建，不在这里创建。
 pub const WEB_MODEL_HOME_TAB_ID: &str = "browser-tab-web-model-home";
 
 #[derive(Debug, Default, Deserialize)]
@@ -1297,7 +1312,7 @@ async fn get_app_session(
 /// 应用级会话全局唯一、id 持久稳定、使用固定持久分区 `persist:magi-web-model`，
 /// 不属于任何 Magi 会话或工作区，因此**不暴露给会话的 `browser_*` 工具**。
 /// 已经存在时直接返回既有会话（`created = false`），不新建——否则会留下无主
-/// 会话与多余的物理 Surface（设计基线 §5.3、《实现计划》§7.5）。
+/// 会话与多余的物理 Surface。
 async fn create_app_session(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1328,7 +1343,7 @@ async fn create_app_session(
 /// 取得或创建应用级浏览器会话（幂等）。
 ///
 /// 全局唯一、id 持久稳定；已存在且未失败时直接复用，绝不反复新建。
-/// 创建时同时建立固定主页 Tab（设计基线 §5.3、《实现计划》§7.5）。
+/// 创建时同时建立固定主页 Tab。
 fn ensure_app_browser_session(state: &ApiState) -> Result<BrowserSession, ApiError> {
     let existing = state
         .browser_authority
@@ -1419,94 +1434,68 @@ fn ensure_app_home_tab(
     })
 }
 
-/// 首次说明的确认状态所在的应用级设置 section（设计基线 §5.12）。
+/// `GET /browser/web-models/tunnel`：工具通道状态。
 ///
-/// 单独成 section，不与其他浏览器设置共写同一个对象：`update_browser_capability_settings`
-/// 会整体替换 `browser` section，共用一个键会让两处写入互相清除。
-const WEB_MODEL_SETTINGS_SECTION: &str = "webModel";
-
-pub(crate) fn web_model_consent_confirmed(state: &ApiState) -> bool {
-    state
-        .settings_store
-        .get_section(WEB_MODEL_SETTINGS_SECTION)
-        .get("consentConfirmed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-/// `POST /browser/web-models/consent`：记录一次性的首次使用说明确认。
-async fn confirm_web_model_consent(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(request): Json<DiscoverWebModelsRequest>,
-) -> Result<Json<Value>, ApiError> {
-    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
-    state
-        .settings_store
-        .update_section(WEB_MODEL_SETTINGS_SECTION, |value| {
-            if !value.is_object() {
-                *value = Value::Object(serde_json::Map::new());
-            }
-            let object = value.as_object_mut().expect("value is an object");
-            object.insert("consentConfirmed".to_string(), Value::Bool(true));
-            object.insert("confirmedAt".to_string(), Value::from(UtcMillis::now().0));
-        })
-        .map_err(crate::errors::settings_persistence_error)?;
-    Ok(Json(serde_json::json!({ "consentConfirmed": true })))
-}
-
-/// `GET /browser/web-models/tunnel`：T3 通道状态。
-///
-/// 只暴露状态与「具体缺哪一项」，**不含任何凭据内容**（§5.7.4、§5.12）。
+/// 只暴露状态与「具体缺哪一项」，**不含任何凭据内容**。
 async fn get_web_model_tunnel(
     State(state): State<ApiState>,
     headers: HeaderMap,
-) -> Result<Json<crate::web_model_harness::WebModelTunnelStatus>, ApiError> {
+) -> Result<Json<crate::web_model_channel::WebModelTunnelStatus>, ApiError> {
     require_desktop_browser_capability(&state, &headers, None)?;
-    Ok(Json(state.web_model_harness.status()))
+    Ok(Json(state.web_model.status()))
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConfigureWebModelTunnelRequest {
-    /// 显式清除配置（关闭 T3）。
+    /// 显式清除配置（连同已保存的 API 密钥）。
     #[serde(default)]
     clear: bool,
     #[serde(default)]
     tunnel_id: String,
-    /// 仅含 Tunnels Read + Use 的 API 密钥文件路径（引用，不是密钥本身）。
+    /// 运行时 API 密钥（仅含 Tunnels Read + Use）。留空表示沿用已保存的密钥；
+    /// Magi 把它写进用户私有文件，之后永不返回。
     #[serde(default)]
-    credential_file: String,
+    api_key: Option<String>,
+    /// 连接器权限档：`read_only` / `edit` / `edit_trusted`（没有 `exec`）。
     #[serde(default)]
-    client_binary: Option<String>,
+    tool_profile: Option<String>,
+    /// 授权方式：`ask` / `always` / `deny`。缺省沿用当前设置。
     #[serde(default)]
-    client_sha256: Option<String>,
+    approval_mode: Option<String>,
 }
 
-/// `POST /browser/web-models/tunnel`：保存凭据引用并按需启动 / 停止通道。
+/// `POST /browser/web-models/tunnel`：保存配置并在后台准备 / 启动通道。
 ///
-/// 落盘的只有**引用**（Tunnel id 与凭据文件路径）；API 密钥值始终只在用户自己的
-/// 文件里，不进 settings、不进日志、不进诊断输出（§5.12）。
+/// settings 里只落 Tunnel id 与权限档；API 密钥由 Magi 写进 state root 下的私有文件，
+/// 不进 settings、不进日志、不进诊断输出，也不会出现在任何响应里。
 async fn configure_web_model_tunnel(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<ConfigureWebModelTunnelRequest>,
-) -> Result<Json<crate::web_model_harness::WebModelTunnelStatus>, ApiError> {
+) -> Result<Json<crate::web_model_channel::WebModelTunnelStatus>, ApiError> {
     require_desktop_browser_capability(&state, &headers, None)?;
     let config = if request.clear {
         None
     } else {
-        Some(crate::web_model_harness::WebModelTunnelConfig {
+        Some(crate::web_model_channel::WebModelTunnelConfig {
             tunnel_id: request.tunnel_id.trim().to_string(),
-            credential_file: request.credential_file.trim().to_string(),
-            client_binary: request
-                .client_binary
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            client_sha256: request
-                .client_sha256
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            tool_profile: match request.tool_profile.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(profile @ ("read_only" | "edit" | "edit_trusted")) => {
+                    Some(profile.to_string())
+                }
+                Some(_) => {
+                    return Err(ApiError::InvalidInput(
+                        "连接器权限档只能是 read_only、edit 或 edit_trusted".to_string(),
+                    ));
+                }
+            },
+            approval_mode: Some(
+                parse_approval_mode(request.approval_mode.as_deref())?.unwrap_or_else(|| {
+                    state.web_model.status().approval_mode
+                }),
+            ),
         })
     };
     let stored = match config.as_ref() {
@@ -1516,86 +1505,249 @@ async fn configure_web_model_tunnel(
     };
     state
         .settings_store
-        .set_section(crate::web_model_harness::WEB_MODEL_TUNNEL_SECTION, stored)
+        .set_section(crate::web_model_channel::WEB_MODEL_TUNNEL_SECTION, stored)
         .map_err(crate::errors::settings_persistence_error)?;
-    let state_root = state
-        .runtime_persistence()
-        .and_then(|persistence| persistence.state_root().map(|root| root.to_path_buf()))
-        .ok_or_else(|| {
-            ApiError::internal_assembly("缺少状态根", "无法启动 T3 通道，请检查 daemon 数据目录")
-        })?;
     let status = state
-        .web_model_harness
-        .configure(&state_root, config)
+        .web_model
+        .clone()
+        .configure(&state, config, request.api_key)
         .await
-        .map_err(|error| ApiError::internal_assembly("配置 T3 通道失败", error))?;
+        .map_err(ApiError::InvalidInput)?;
     Ok(Json(status))
+}
+
+fn parse_approval_mode(value: Option<&str>) -> Result<Option<String>, ApiError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(mode @ ("ask" | "always" | "deny")) => Ok(Some(mode.to_string())),
+        Some(_) => Err(ApiError::InvalidInput(
+            "授权方式只能是 ask（每次询问）、always（始终授权）或 deny（拒绝）".to_string(),
+        )),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetWebModelToolPolicyRequest {
+    #[serde(default)]
+    tool_profile: Option<String>,
+    #[serde(default)]
+    approval_mode: Option<String>,
+}
+
+/// `POST /browser/web-models/tunnel/policy`：只改权限档 / 授权方式，下一次工具调用就生效，
+/// 不重启通道（身份与归属每次调用现算，不缓存）。
+async fn set_web_model_tool_policy(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<SetWebModelToolPolicyRequest>,
+) -> Result<Json<crate::web_model_channel::WebModelTunnelStatus>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let tool_profile = match request.tool_profile.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(profile @ ("read_only" | "edit" | "edit_trusted")) => Some(profile.to_string()),
+        Some(_) => {
+            return Err(ApiError::InvalidInput(
+                "连接器权限档只能是 read_only、edit 或 edit_trusted".to_string(),
+            ));
+        }
+    };
+    let approval_mode = parse_approval_mode(request.approval_mode.as_deref())?;
+    let config = state.web_model.update_policy(tool_profile, approval_mode);
+    let stored = serde_json::to_value(&config)
+        .map_err(|error| ApiError::internal_assembly("序列化 GPT Web 工具策略失败", error))?;
+    state
+        .settings_store
+        .set_section(crate::web_model_channel::WEB_MODEL_TUNNEL_SECTION, stored)
+        .map_err(crate::errors::settings_persistence_error)?;
+    Ok(Json(state.web_model.status()))
+}
+
+/// `GET /browser/web-models/tunnel/api-key`：设置里的「显示」按钮。
+///
+/// 完整密钥只经这一条桌面端专用接口返回（公网隧道来源会被 `require_desktop_browser_capability`
+/// 拒绝）；状态接口只给末 4 位的遮罩预览。
+async fn reveal_web_model_api_key(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let api_key = state
+        .web_model
+        .reveal_api_key()
+        .ok_or_else(|| ApiError::not_found("尚未保存运行时 API 密钥", "web-model-tunnel-api-key"))?;
+    Ok(Json(serde_json::json!({ "apiKey": api_key })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NavigateWebModelPageRequest {
+    target: crate::web_model_ops::WebModelPageTarget,
+}
+
+/// `POST /browser/web-models/navigate`：GPT Web 标签页顶部的快捷地址。
+///
+/// 目标只能是白名单枚举（对话页 / OpenAI 平台 Tunnels / Runtime API keys），不接受任意地址；
+/// 槽位被会话占用时拒绝（409），不打断进行中的对话。
+async fn navigate_web_model_page(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<NavigateWebModelPageRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    state
+        .open_web_model_page(request.target)
+        .await
+        .map_err(crate::web_model_ops::web_model_api_error)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// `POST /browser/web-models/reload`：GPT Web 标签页的手动刷新（当前页面重新加载）。
+async fn reload_web_model_page(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    state
+        .reload_web_model_page()
+        .await
+        .map_err(crate::web_model_ops::web_model_api_error)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 /// `POST /browser/web-models/reset`：退出登录 / 清除 Web 数据后的收口。
 ///
 /// 顺序固定：先撤销在飞回复，再失效投影（Web 模型立即从选择器消失），最后停通道。
-/// 「清理浏览数据」本身仍走既有入口，本路由只做 daemon 侧收口（§5.13）。
+/// 「清理浏览数据」本身仍走既有入口，本路由只做 daemon 侧收口。
 async fn reset_web_models(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_desktop_browser_capability(&state, &headers, None)?;
-    state.web_model_harness.revoke_turns();
+    // 清除登录态 / 页面数据也必须释放 daemon 内存中的单槽位，并取消在飞推理。
     state.forget_web_model_probe();
-    state.web_model_harness.stop_tunnel().await;
+    state.stop_web_model().await;
+    state.web_model.stop_tunnel(&state).await;
     Ok(Json(serde_json::json!({ "status": "login_required" })))
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ResetWebModelConversationRequest {
-    #[serde(default)]
-    session_id: String,
-    /// 线程 id：顶层编排者用 `orchestrator`，子代理用它的 task id（§5.12 绑定键）。
-    #[serde(default)]
-    thread_id: String,
+struct WebModelClientRequest {
     #[serde(default)]
     client_platform: Option<BrowserClientPlatform>,
 }
 
-/// `POST /browser/web-models/reset-conversation`：把某条会话 / 线程的临时对话
-/// 退回「Magi 所有」——推进绑定 epoch，下一次发送按新建路径全量重放（§5.8）。
+/// `POST /browser/web-models/stop`：设置里的“停止”与 Tab 里的“退出”。
 ///
-/// 这是「重置为 Magi 对话」的唯一实现：它只动进程内绑定指针，不写 canonical、
-/// 不改 settings、不重放内容，因此不存在第二条写入路径（A19、A20）。
-async fn reset_web_model_conversation(
+/// 取消进行中的推理、销毁物理页面、释放单槽位；登录态保留。这是显式释放 GPT Web 的唯一入口
+/// （关闭右栏只隐藏，不走这里）。
+async fn stop_web_model(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<ResetWebModelConversationRequest>,
+    Json(request): Json<WebModelClientRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
-    let session_id = request.session_id.trim().to_string();
-    if session_id.is_empty() {
-        return Err(ApiError::InvalidInput(
-            "重置 Web 对话需要 sessionId".to_string(),
-        ));
-    }
-    let Some(bindings) = state.web_model_harness.bindings() else {
-        // 绑定表由 daemon 装配；拿不到就是 Web 引擎不可用，明确失败而不是假装成功。
-        return Err(ApiError::InvalidInput(
-            "Web 引擎当前不可用，无法重置对话".to_string(),
-        ));
-    };
-    let released = bindings.release_session(&session_id);
-    // 旧实例退场：运行态投影与挂起工具调用跟着一起清掉，不在 UI 留下幽灵条目。
-    state.web_model_harness.registry().forget_session(&session_id);
-    if let Some(runtime) = state.web_model_harness.runtime() {
-        runtime.forget_session(&session_id);
-    }
+    state.stop_web_model().await;
+    Ok(Json(serde_json::json!({ "status": "stopped" })))
+}
+
+/// `GET /browser/web-models/connector`：只读检查 ChatGPT 侧 Magi 连接器。
+async fn get_web_connector(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let status = state
+        .web_connector_status()
+        .await
+        .map_err(crate::web_model_ops::web_model_api_error)?;
     Ok(Json(serde_json::json!({
-        "status": "reset",
-        "released": released,
+        "supported": status.supported,
+        "exists": status.exists,
+        "enabled": status.enabled,
+        "toolCount": status.tool_count,
+        "reason": status.reason,
     })))
 }
 
-/// 顶层编排线程的绑定线程 id（与推理通道构造 `WebModelInvocationSpec` 时一致）。
-const DEFAULT_WEB_MODEL_THREAD_ID: &str = "orchestrator";
+/// `POST /browser/web-models/connector`：在 ChatGPT 中创建 / 启用 Magi 连接器（显式用户动作）。
+async fn configure_web_connector(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WebModelClientRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
+    let outcome = state
+        .configure_web_connector()
+        .await
+        .map_err(crate::web_model_ops::web_model_api_error)?;
+    Ok(Json(serde_json::json!({
+        "configured": outcome.configured,
+        "confirmedEnabled": outcome.confirmed_enabled,
+        "reason": outcome.reason,
+    })))
+}
+
+/// `GET /browser/web-models/saved`：已保存对话列表（只读）。
+async fn list_web_saved_conversations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let entries = state
+        .list_web_saved_conversations()
+        .await
+        .map_err(crate::web_model_ops::web_model_api_error)?;
+    Ok(Json(serde_json::json!({ "conversations": entries })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BindWebSavedConversationRequest {
+    session_id: String,
+    conversation_id: String,
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
+}
+
+/// `POST /browser/web-models/saved/bind`：把已保存的 ChatGPT 对话绑定到空白会话并单向导入历史。
+async fn bind_web_saved_conversation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<BindWebSavedConversationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
+    let session_id = SessionId::new(request.session_id.trim());
+    let binding = state
+        .bind_saved_web_conversation(&session_id, request.conversation_id.trim())
+        .await
+        .map_err(crate::web_model_ops::web_model_api_error)?;
+    Ok(Json(serde_json::json!({ "binding": binding })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncWebSavedConversationRequest {
+    session_id: String,
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
+}
+
+/// `POST /browser/web-models/saved/sync`：手动重新同步已保存对话（Web → Magi）。
+async fn sync_web_saved_conversation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<SyncWebSavedConversationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
+    let session_id = SessionId::new(request.session_id.trim());
+    let imported = state
+        .sync_saved_web_conversation(&session_id)
+        .await
+        .map_err(crate::web_model_ops::web_model_api_error)?;
+    Ok(Json(serde_json::json!({ "importedExchanges": imported })))
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1607,12 +1759,12 @@ struct WebModelRuntimeQuery {
 }
 
 /// `GET /browser/web-models/runtime`：只读读取在飞 Web turn 的阶段、排队位置与
-/// 账号消息计数（《实现计划》§3.12、§5.1）。
+/// 账号消息计数。
 ///
 /// 这是**投影**而不是业务事实：它只反映当前 daemon 进程内存里的调度状态，
-/// 进程重启即清空；正文、工具调用与终态仍只在 canonical 里（A20、R55）。
-/// 引擎长期可用性由 `POST /browser/web-models/discover` 的结果与设置分区展示，
-/// 两者不得互相替代（§8）。
+/// 进程重启即清空；正文、工具调用与终态仍只在 canonical 里。
+/// 引擎长期可用性由 `POST /browser/web-models/probe` 的结果与设置分区展示，
+/// 两者不得互相替代。
 async fn get_web_model_runtime(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1625,10 +1777,41 @@ async fn get_web_model_runtime(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let entries = state
-        .web_model_harness
+        .web_model
         .runtime()
         .map(|runtime| runtime.snapshot(session_filter))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        // 占用的唯一事实是槽位表：运行态条目只是投影，槽位已释放 / 换了拥有者时不得继续展示。
+        .filter(|entry| {
+            state
+                .web_model
+                .bindings()
+                .and_then(|slots| slots.owner())
+                .is_some_and(|owner| owner.session_id == entry.session_id)
+        })
+        .map(|entry| {
+            // 占用提示要显示会话名称而不是内部 id：标题是 daemon 的会话事实，这里只投影。
+            let title = state
+                .session_store
+                .session(&magi_core::SessionId::new(entry.session_id.as_str()))
+                .map(|session| session.title)
+                .filter(|title| !title.trim().is_empty());
+            let mut value = serde_json::to_value(&entry).unwrap_or(Value::Null);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("sessionTitle".to_string(), Value::from(title));
+                // 占用者所在项目：前端据此「转到该会话」。
+                let owner_project = state
+                    .web_model
+                    .bindings()
+                    .and_then(|slots| slots.owner())
+                    .map(|owner| owner.project_id)
+                    .filter(|project| !project.trim().is_empty());
+                object.insert("workspaceId".to_string(), Value::from(owner_project));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "entries": entries,
         "quota": web_model_quota_notice(&state),
@@ -1641,7 +1824,7 @@ async fn get_web_model_runtime(
 /// ChatGPT 页面自己知道，Magi 不猜也不伪造成计费数据。
 fn web_model_quota_notice(state: &ApiState) -> Value {
     let entries = state
-        .web_model_harness
+        .web_model
         .runtime()
         .map(|runtime| runtime.snapshot(None))
         .unwrap_or_default();
@@ -1655,102 +1838,67 @@ fn web_model_quota_notice(state: &ApiState) -> Value {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DiscoverWebModelsRequest {
+struct ProbeWebModelRequest {
     #[serde(default)]
     client_platform: Option<BrowserClientPlatform>,
 }
 
+/// 单次只读探测的归一化结论。**只有登录与页面可用性**：不读取、不复制网页的模型菜单。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WebModelEngineDraft {
-    id: String,
-    display_name: String,
-    api_protocol: &'static str,
-    context_window_tokens: u64,
-    efforts: Vec<String>,
-    tools_enabled: bool,
-    new_chat_per_turn: bool,
-    origin: WebModelEngineOrigin,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WebModelEngineOrigin {
-    kind: &'static str,
-    browser_session_id: String,
-    discovered_at: u64,
-    account_hint: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscoverWebModelsResponse {
-    /// 本次探测结果，不等于引擎的长期状态（《实现计划》§7.1 映射表）。
+struct ProbeWebModelResponse {
+    /// `ok` / `login_required` / `site_blocked` / `selectors_drift` / `desktop_unavailable` / `failed`。
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     account_hint: String,
-    limits_revision: String,
     site_revision: String,
-    composer_char_limit: Option<u64>,
-    engines: Vec<WebModelEngineDraft>,
 }
 
-impl DiscoverWebModelsResponse {
-    /// 归一化为 daemon 的可用性投影来源（§5.11）。
-    fn to_probe_snapshot(&self) -> crate::state::WebModelProbeSnapshot {
-        crate::state::WebModelProbeSnapshot {
-            status: self.status.to_string(),
-            reason: self.reason.clone(),
-            account_hint: self.account_hint.clone(),
-            limits_revision: self.limits_revision.clone(),
-            engine_ids: self
-                .engines
-                .iter()
-                .map(|engine| engine.id.clone())
-                .collect(),
-            probed_at: UtcMillis::now().0,
-        }
-    }
-
+impl ProbeWebModelResponse {
     fn status_only(status: &'static str, reason: Option<&str>) -> Self {
         Self {
             status,
             reason: reason.map(str::to_string),
             account_hint: "unknown".to_string(),
-            limits_revision: String::new(),
             site_revision: String::new(),
-            composer_char_limit: None,
-            engines: Vec::new(),
+        }
+    }
+
+    /// 归一化为 daemon 的可用性投影来源。
+    fn to_probe_snapshot(&self) -> crate::state::WebModelProbeSnapshot {
+        crate::state::WebModelProbeSnapshot {
+            status: self.status.to_string(),
+            account_hint: self.account_hint.clone(),
+            probed_at: UtcMillis::now().0,
         }
     }
 }
 
-/// `POST /browser/web-models/discover`：只读探测，只返回候选，不落库。
+/// `POST /browser/web-models/probe`：只读探测登录与页面可用性。
 ///
-/// 失败一律 fail closed：未登录或登录过期时 `status = login_required` 且
-/// `engines = []`，绝不用上一次缓存的 Web 模型列表冒充可用结果（设计基线 §5.5）。
-///
-/// 探测结论同时写成 daemon 的**可用性投影来源**（§5.11）：会话内模型选择器只认
-/// 它。单次 `failed` 不改变引擎状态，因此不覆盖上一条结论（《实现计划》§7.1）。
-async fn discover_web_models(
+/// 失败一律 fail closed：未登录或登录过期时 `status = login_required`，GPT Web 入口随之消失，
+/// 绝不用上一次的结论冒充可用。单次 `failed`（命令层失败）不改变入口状态，因此不覆盖上一条结论。
+async fn probe_web_model(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<DiscoverWebModelsRequest>,
-) -> Result<Json<DiscoverWebModelsResponse>, ApiError> {
-    let response = run_web_model_discovery(&state, &headers, request.client_platform).await?;
-    if response.status != "failed" {
+    Json(request): Json<ProbeWebModelRequest>,
+) -> Result<Json<ProbeWebModelResponse>, ApiError> {
+    let response = run_web_model_probe(&state, &headers, request.client_platform).await?;
+    // 平台页面的探测不代表 ChatGPT 的可用性，不覆盖引擎可见性的结论。
+    if response.status != "failed" && response.status != "platform_page" {
         state.record_web_model_probe(response.to_probe_snapshot());
     }
     Ok(Json(response))
 }
 
-/// `POST /browser/web-models/ensure-home`：只物化应用级 GPT Web 主页。
+/// `POST /browser/web-models/ensure-home`：只物化应用级 GPT Web 宿主。
 ///
 /// 应用级会话在 daemon / Desktop 重启后会保留逻辑 Tab，但真实 `<webview>`
 /// 需要等 Renderer 内容槽重新挂载后才能注册。右栏组件在完成挂载后调用这条
-/// 路径，恢复主页而不改变右栏可见性或活动面板；它不是发现接口，也不要求用户
-/// 已确认 Web 模型说明，因此打开 GPT Web Tab 后未登录用户仍能正常看到登录页。
+/// 路径，**只确保当前逻辑页面的物理宿主存在**，不把页面导航回主页；否则每次
+/// GPT Web 临时/已保存对话的 URL 或导航代次变化都会被 UI 投影覆盖，表现为
+/// “发送后对话消失”。它不是发现接口，也不要求用户已确认 Web 模型说明。
 async fn ensure_web_model_home_surface(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1762,36 +1910,45 @@ async fn ensure_web_model_home_surface(
     let tab = ensure_app_home_tab(&state, &session.browser_session_id)?;
     let tab_id = tab.tab_id.clone();
 
+    // daemon 重启后 Authority 与 Desktop 页面的导航代次可能不一致，先重新对齐绑定。
+    if tab.lifecycle == BrowserTabLifecycle::Ready {
+        state.resync_web_home_surface().await;
+    }
+
+    // 重启或「停止 / 退出」之后逻辑 Tab 是 suspended，Desktop 里已经没有它的 Surface：
+    // EnsureSurface 只能找到已物化的 Surface，所以先走恢复路径（打开登录态主页），
+    // 不能让 Renderer 在一个不存在的 Surface 上无限重试。
+    if tab.lifecycle != BrowserTabLifecycle::Ready {
+        state
+            .restore_web_home_page()
+            .await
+            .map_err(crate::web_model_ops::web_model_api_error)?;
+    }
+
     let result = require_host_success(
         client
-            .request(BrowserHostCommand::RestorePage {
+            .request(BrowserHostCommand::EnsureSurface {
                 tab_id: tab_id.clone(),
-                browser_session_id: tab.browser_session_id.clone(),
-                initial_url: magi_web_model::chatgpt_web_home_url(),
-                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
-                navigation_revision: tab.navigation_revision,
-                snapshot_revision: tab.snapshot_revision,
-                allow_page_eviction: false,
             })
             .await,
-        "恢复 GPT Web 主页失败",
+        "物化 GPT Web 宿主失败",
     )?;
-    let BrowserHostCommandResult::PageState(page_state) = result else {
+    let BrowserHostCommandResult::SurfaceBinding(binding) = result else {
         return Err(ApiError::InternalAssemblyError(
-            "恢复 GPT Web 主页结果缺少页面状态".to_string(),
+            "物化 GPT Web 宿主结果缺少 Surface binding".to_string(),
         ));
     };
 
     state.mutate_browser_authority(|authority| {
-        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis::now())?;
-        authority.apply_host_page_state(
-            &tab_id,
-            page_state.navigation_revision,
-            page_state.url,
-            page_state.origin,
-            page_state.title,
-            UtcMillis::now(),
-        )
+        let (accepted, _, _) = authority.accept_primary_surface(binding, UtcMillis::now())?;
+        if !accepted {
+            return Err(
+                magi_browser_authority::BrowserAuthorityError::PrimarySurfaceUnavailable(
+                    tab_id.clone(),
+                ),
+            );
+        }
+        Ok(())
     })?;
 
     let session = state
@@ -1804,23 +1961,16 @@ async fn ensure_web_model_home_surface(
     Ok(Json(browser_session_response(&state, session)?))
 }
 
-/// 探测主体。探测结论的投影与归一化都在这里，路由层只补一次状态写入。
-async fn run_web_model_discovery(
+/// 探测主体。
+async fn run_web_model_probe(
     state: &ApiState,
     headers: &HeaderMap,
     client_platform: Option<BrowserClientPlatform>,
-) -> Result<DiscoverWebModelsResponse, ApiError> {
+) -> Result<ProbeWebModelResponse, ApiError> {
     require_desktop_browser_capability(state, headers, client_platform)?;
 
-    if !web_model_consent_confirmed(state) {
-        return Ok(DiscoverWebModelsResponse::status_only(
-            "consent_required",
-            None,
-        ));
-    }
-
     let Some(client) = state.browser_host_client() else {
-        return Ok(DiscoverWebModelsResponse::status_only(
+        return Ok(ProbeWebModelResponse::status_only(
             "desktop_unavailable",
             None,
         ));
@@ -1830,34 +1980,43 @@ async fn run_web_model_discovery(
     let tab = ensure_app_home_tab(state, &session.browser_session_id)?;
     let tab_id = tab.tab_id.clone();
 
-    // 只读探测前先保证页面真实存在：恢复主页 Tab，再等待它绑定当前窗口内容槽。
-    let restored = client
-        .request(BrowserHostCommand::RestorePage {
-            tab_id: tab_id.clone(),
-            browser_session_id: tab.browser_session_id.clone(),
-            initial_url: magi_web_model::chatgpt_web_home_url(),
-            logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
-            navigation_revision: tab.navigation_revision,
-            snapshot_revision: tab.snapshot_revision,
-            allow_page_eviction: false,
-        })
-        .await;
-    if restored.is_err() {
-        return Ok(DiscoverWebModelsResponse::status_only(
-            "failed",
-            Some("surface_unavailable"),
-        ));
-    }
+    // 只读探测前只确保当前页面的真实 Surface 存在，不能再次 RestorePage。
+    // RestorePage 会按 initial_url 启动导航；当唯一 WebView 已经进入临时或已保存
+    // 对话时，这会把用户正在使用的网页上下文重置成主页。
 
     // `restore_page` 后页面可能正好经历一次 guest / Worker / navigation
     // binding 交接。探测只读且无副作用，允许在这个窗口内重新读取当前
     // binding；写入和提交路径不走这里，避免把副作用命令自动重放。
+    // 与 Desktop 页面重新对齐绑定（daemon 重启后导航代次可能不一致），否则探测会一直 stale。
+    state.resync_web_home_surface().await;
     let mut probe_value = None;
     let mut last_probe_reason = "probe_failed".to_string();
-    for attempt in 0..=WEB_MODEL_PROBE_RETRIES {
-        if attempt > 0 {
-            tokio::time::sleep(WEB_MODEL_PROBE_RETRY_DELAY).await;
+    let mut attempt = 0usize;
+    let mut seen_page_loading = false;
+    loop {
+        // 页面刚物化 / 刚跳转时 origin 还是 null：这是「还没加载好」不是失败，多等一会儿（约 20 秒）；
+        // 其他交接类错误仍只重试几次，真实失败要尽快如实报告。
+        // 粘性：页面在加载期间错误会在「origin 尚未就绪」和「绑定刚交接」之间来回切换，
+        // 只要见过页面在加载，就一直按页面加载的窗口等。
+        seen_page_loading |= last_probe_reason.contains("web_model_site_origin_invalid");
+        let waiting_for_page = seen_page_loading;
+        let limit = if waiting_for_page {
+            WEB_MODEL_PROBE_PAGE_LOAD_RETRIES
+        } else {
+            WEB_MODEL_PROBE_RETRIES
+        };
+        if attempt > limit {
+            break;
         }
+        if attempt > 0 {
+            tokio::time::sleep(if waiting_for_page {
+                WEB_MODEL_PROBE_PAGE_LOAD_DELAY
+            } else {
+                WEB_MODEL_PROBE_RETRY_DELAY
+            })
+            .await;
+        }
+        attempt += 1;
 
         let surface = tokio::time::timeout(
             BROWSER_SURFACE_WAIT_TIMEOUT,
@@ -1876,7 +2035,7 @@ async fn run_web_model_discovery(
             last_probe_reason = "surface_unavailable".to_string();
             continue;
         };
-        // 应用级 Surface 也走不激活路径：探测不抢用户的右栏（A25）。
+        // 应用级 Surface 也走不激活路径：探测不抢用户的右栏。
         let accepted = state.mutate_browser_authority(|authority| {
             let (accepted, _, _) =
                 authority.accept_primary_surface(binding.clone(), UtcMillis::now())?;
@@ -1925,16 +2084,13 @@ async fn run_web_model_discovery(
         }
     }
     let Some(value) = probe_value else {
-        return Ok(DiscoverWebModelsResponse::status_only(
+        return Ok(ProbeWebModelResponse::status_only(
             "failed",
             Some(&last_probe_reason),
         ));
     };
 
-    Ok(normalize_discovery_probe(
-        &value,
-        session.browser_session_id.as_str(),
-    ))
+    Ok(normalize_probe(&value))
 }
 
 /// 只允许对物理 Surface 交接错误重试 Web 模型探测。selector 漂移、登录过期、
@@ -1942,7 +2098,8 @@ async fn run_web_model_discovery(
 fn retryable_web_model_probe_error(code: &str, message: &str) -> bool {
     matches!(
         code,
-        "browser_surface_stale"
+        "web_model_site_origin_invalid"
+            | "browser_surface_stale"
             | "browser_surface_not_found"
             | "browser_surface_content_unavailable"
             | "browser_cdp_session_stale"
@@ -1954,11 +2111,9 @@ fn retryable_web_model_probe_error(code: &str, message: &str) -> bool {
         || message.contains("browser_worker_rebind_stale")
 }
 
-/// 把站点探测的原始结果归一化为发现响应。
-///
-/// 只吃站点适配层的事实，不猜模型、不读缓存：`signed_out` → `login_required` 且
-/// `engines = []`；`blocked` → `site_blocked`（A23）。
-fn normalize_discovery_probe(value: &Value, browser_session_id: &str) -> DiscoverWebModelsResponse {
+/// 把站点探测的原始结果归一化：只吃站点适配层的登录事实，不猜、不读缓存。
+/// `signed_out` → `login_required`；`blocked` → `site_blocked`；已登录但 composer 不可用 → `selectors_drift`。
+fn normalize_probe(value: &Value) -> ProbeWebModelResponse {
     let login_state = value
         .get("login_state")
         .and_then(Value::as_str)
@@ -1968,123 +2123,33 @@ fn normalize_discovery_probe(value: &Value, browser_session_id: &str) -> Discove
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let limits_revision = value
-        .get("limits_revision")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     let site_revision = value
         .get("site_revision")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let composer_char_limit = value.get("composer_char_limit").and_then(Value::as_u64);
-
-    if login_state == "blocked" {
-        return DiscoverWebModelsResponse {
-            status: "site_blocked",
-            reason: Some("risk_page".to_string()),
-            account_hint,
-            limits_revision,
-            site_revision,
-            composer_char_limit,
-            engines: Vec::new(),
-        };
-    }
-    if login_state != "signed_in" {
-        return DiscoverWebModelsResponse {
-            status: "login_required",
-            account_hint,
-            limits_revision,
-            site_revision,
-            composer_char_limit,
-            reason: None,
-            engines: Vec::new(),
-        };
-    }
-    // selector 漂移：登录着却读不到任何模型菜单，必须是显式失败而不是空列表。
-    let Some(models) = value.get("models").and_then(Value::as_array) else {
-        return DiscoverWebModelsResponse {
-            status: "site_blocked",
-            reason: Some("selectors_drift".to_string()),
-            account_hint,
-            limits_revision,
-            site_revision,
-            composer_char_limit,
-            engines: Vec::new(),
-        };
+    let composer_available = value
+        .get("composer_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 不在对话页（插件、设置等二级页面）时没有输入框是正常的：会话有效即可用，
+    // 真正发送前驱动会先回到对话页。
+    let off_chat_page = value.get("page_kind").and_then(Value::as_str) == Some("other");
+    // 标签页停在 OpenAI 平台页面（Tunnels / API keys）：不是对话页，登录态与引擎可用性不由它判断。
+    let on_platform_page = value.get("page_kind").and_then(Value::as_str) == Some("platform");
+    let (status, reason) = match login_state {
+        _ if on_platform_page => ("platform_page", None),
+        "blocked" => ("site_blocked", Some("risk_page".to_string())),
+        "signed_in" if composer_available || off_chat_page => ("ok", None),
+        // 登录着却找不到输入框：站点改版，必须是显式失败。
+        "signed_in" => ("selectors_drift", Some("composer_missing".to_string())),
+        _ => ("login_required", None),
     };
-    if models.is_empty() {
-        return DiscoverWebModelsResponse {
-            status: "site_blocked",
-            reason: Some("selectors_drift".to_string()),
-            account_hint,
-            limits_revision,
-            site_revision,
-            composer_char_limit,
-            engines: Vec::new(),
-        };
-    }
-
-    let discovered_at = UtcMillis::now().0;
-    let engines = models
-        .iter()
-        .filter_map(|model| {
-            let family = model.get("family").and_then(Value::as_str)?;
-            let engine_id = magi_web_model::web_model_engine_id(family);
-            let efforts = model
-                .get("efforts")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Some(WebModelEngineDraft {
-                id: engine_id,
-                display_name: model
-                    .get("display_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(family)
-                    .to_string(),
-                api_protocol: "chatgpt_web",
-                context_window_tokens: model
-                    .get("context_window_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                efforts,
-                tools_enabled: true,
-                new_chat_per_turn: false,
-                origin: WebModelEngineOrigin {
-                    kind: "web",
-                    browser_session_id: browser_session_id.to_string(),
-                    discovered_at,
-                    account_hint: account_hint.clone(),
-                },
-            })
-        })
-        .collect::<Vec<_>>();
-    if engines.is_empty() {
-        return DiscoverWebModelsResponse {
-            status: "site_blocked",
-            reason: Some("selectors_drift".to_string()),
-            account_hint,
-            limits_revision,
-            site_revision,
-            composer_char_limit,
-            engines: Vec::new(),
-        };
-    }
-    DiscoverWebModelsResponse {
-        status: "ok",
-        reason: None,
+    ProbeWebModelResponse {
+        status,
+        reason,
         account_hint,
-        limits_revision,
         site_revision,
-        composer_char_limit,
-        engines,
     }
 }
 
@@ -3729,7 +3794,7 @@ fn host_command_succeeded(outcome: &BrowserHostCommandOutcome) -> bool {
 /// 会话作用域的 Magi 会话身份。
 ///
 /// App 级（GPT Web）会话不属于任何 Magi 会话，`browser_*` 路由一律不暴露它
-/// （设计基线 §5.3：浏览器工具与 UI 检查都不得读到已登录页面）。
+/// 。
 fn require_session_scope(session: &BrowserSession) -> Result<&SessionId, ApiError> {
     session.magi_session_id().ok_or_else(|| {
         ApiError::not_found("浏览器会话不存在", "应用级浏览器会话不支持会话作用域操作")
@@ -5024,84 +5089,79 @@ mod tests {
             BrowserTabLifecycle::Closed
         );
     }
-    fn discovery_probe_with_signed_in_account() -> serde_json::Value {
+    fn signed_in_probe() -> serde_json::Value {
         serde_json::json!({
-            "site_revision": "chatgpt-web-2",
+            "site_revision": "chatgpt-web-4",
             "login_state": "signed_in",
             "composer_available": true,
-            "composer_char_limit": 1050000,
             "account_hint": "plus",
-            "limits_revision": "rev-1",
-            "models": [
-                {
-                    "family": "gpt-5",
-                    "display_name": "GPT-5",
-                    "efforts": ["low", "medium", "high"],
-                    "default_effort": "medium",
-                    "context_window_tokens": 90000,
-                    "single_submission_token_budget": 28000,
-                    "response_reserve": 12000,
-                    "tokenizer_revision": "o200k"
-                }
-            ],
-            "connector_support": false,
-            "connector_settings_reachable": false
         })
     }
 
     #[test]
-    fn discovery_requires_login_and_returns_no_engines_when_signed_out() {
-        // 未登录 / 登录过期必须 fail closed：不得用上一次缓存的 Web 模型列表冒充结果。
-        let probe = discovery_probe_with_signed_in_account();
-        let mut signed_out = probe.clone();
+    fn probe_requires_login_and_hides_the_engine_when_signed_out() {
+        // 未登录 / 登录过期必须 fail closed：不得用上一次缓存的结论冒充可用。
+        let mut signed_out = signed_in_probe();
         signed_out["login_state"] = serde_json::Value::String("signed_out".to_string());
-        let response = super::normalize_discovery_probe(&signed_out, "browser-session-app-1-0");
+        let response = super::normalize_probe(&signed_out);
         assert_eq!(response.status, "login_required");
-        assert!(response.engines.is_empty());
+        assert!(!response.to_probe_snapshot().is_visible_in_picker());
     }
 
     #[test]
-    fn discovery_maps_risk_page_to_site_blocked() {
-        let mut blocked = discovery_probe_with_signed_in_account();
+    fn probe_maps_the_risk_page_to_site_blocked() {
+        let mut blocked = signed_in_probe();
         blocked["login_state"] = serde_json::Value::String("blocked".to_string());
-        let response = super::normalize_discovery_probe(&blocked, "browser-session-app-1-0");
+        let response = super::normalize_probe(&blocked);
         assert_eq!(response.status, "site_blocked");
         assert_eq!(response.reason.as_deref(), Some("risk_page"));
-        assert!(response.engines.is_empty());
+        assert!(!response.to_probe_snapshot().is_visible_in_picker());
     }
 
     #[test]
-    fn discovery_reports_selector_drift_instead_of_empty_list() {
-        // 登录着却读不到模型菜单是显式失败，不是“没有模型”。
-        let mut drifted = discovery_probe_with_signed_in_account();
-        drifted["models"] = serde_json::Value::Array(vec![]);
-        let response = super::normalize_discovery_probe(&drifted, "browser-session-app-1-0");
-        assert_eq!(response.status, "site_blocked");
-        assert_eq!(response.reason.as_deref(), Some("selectors_drift"));
-        assert!(response.engines.is_empty());
+    fn probe_on_a_secondary_page_without_a_composer_is_still_signed_in() {
+        // 插件、设置等二级页面没有输入框是正常的：会话有效就可用，不是改版也不是未登录。
+        let mut secondary = signed_in_probe();
+        secondary["composer_available"] = serde_json::Value::Bool(false);
+        secondary["page_kind"] = serde_json::Value::String("other".to_string());
+        let response = super::normalize_probe(&secondary);
+        assert_eq!(response.status, "ok");
+        assert!(response.reason.is_none());
     }
 
     #[test]
-    fn discovery_builds_namespaced_web_engines_without_llm() {
-        let probe = discovery_probe_with_signed_in_account();
-        let response = super::normalize_discovery_probe(&probe, "browser-session-app-1-0");
+    fn probe_on_an_openai_platform_page_is_neutral_and_never_recorded() {
+        // 标签页停在 Tunnels / API keys 页：既不是登录，也不是改版，更不能覆盖引擎可见性。
+        let mut platform = signed_in_probe();
+        platform["login_state"] = serde_json::Value::String("signed_out".to_string());
+        platform["composer_available"] = serde_json::Value::Bool(false);
+        platform["page_kind"] = serde_json::Value::String("platform".to_string());
+        let response = super::normalize_probe(&platform);
+        assert_eq!(response.status, "platform_page");
+        assert!(response.reason.is_none());
+    }
+
+    #[test]
+    fn probe_reports_selector_drift_when_signed_in_without_a_composer() {
+        // 登录着却找不到输入框是显式失败，不是“可用”。
+        let mut drifted = signed_in_probe();
+        drifted["composer_available"] = serde_json::Value::Bool(false);
+        let response = super::normalize_probe(&drifted);
+        assert_eq!(response.status, "selectors_drift");
+        assert_eq!(response.reason.as_deref(), Some("composer_missing"));
+        assert!(!response.to_probe_snapshot().is_visible_in_picker());
+    }
+
+    #[test]
+    fn probe_of_a_signed_in_page_only_reports_login_and_never_a_model_list() {
+        let response = super::normalize_probe(&signed_in_probe());
         assert_eq!(response.status, "ok");
         assert_eq!(response.account_hint, "plus");
-        assert_eq!(response.limits_revision, "rev-1");
-        assert_eq!(response.composer_char_limit, Some(1_050_000));
-        assert_eq!(response.engines.len(), 1);
-        let engine = &response.engines[0];
-        assert_eq!(engine.id, "chatgpt-web/gpt-5");
-        assert_eq!(engine.api_protocol, "chatgpt_web");
-        assert_eq!(engine.context_window_tokens, 90_000);
-        assert_eq!(engine.origin.kind, "web");
-        assert_eq!(engine.origin.browser_session_id, "browser-session-app-1-0");
-        assert_eq!(engine.origin.account_hint, "plus");
-        let value = serde_json::to_value(engine).expect("engine draft serializes");
+        assert!(response.to_probe_snapshot().is_visible_in_picker());
+        let value = serde_json::to_value(&response).expect("probe response serializes");
         assert!(
-            value.get("llm").is_none(),
-            "Web 引擎不写 llm：写入会让它被规范化成 openai_chat（A22）"
+            value.get("engines").is_none() && value.get("models").is_none(),
+            "探测结论里不得出现网页的模型菜单"
         );
     }
-
 }

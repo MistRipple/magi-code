@@ -222,6 +222,11 @@ await withGoldenViteServer(async (server) => {
     url: 'https://chatgpt.com/',
     navigationRevision: 3,
   };
+  // 启动 / 重启时由 daemon 投影挂载宿主：标签默认隐藏，右栏保持为空，直到用户主动打开。
+  rightPane.synchronizeWebModelAppSession('browser-session-app-1-0', homeHost, [homeHost]);
+  assert.equal(rightPane.rightPaneState.appTabs.length, 1);
+  assert.equal(rightPane.appWebModelTab().payload.viewHidden, true);
+  assert.equal(rightPane.rightPaneState.activeAppTabId, null);
   rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
   assert.equal(rightPane.rightPaneState.appTabs.length, 1);
   assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
@@ -243,6 +248,25 @@ await withGoldenViteServer(async (server) => {
   assert.equal(rightPane.appWebModelTab().payload.viewHidden, false);
   assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
   // 切换项目 / 会话不动 appTabs（A2）。
+  // 草稿里打开了右栏，发出第一条消息得到真实会话 id 后右栏必须保持展开，标签也跟过去。
+  rightPane.activateRightPaneSession('workspace-draft', '__draft__');
+  rightPane.setRightPaneCollapsed(rightPane.rightPaneState.activeScopeKey, false);
+  rightPane.activateRightPaneSession('workspace-draft', 'session-adopted');
+  assert.equal(
+    rightPane.getRightPaneState('workspace-draft\u0000session-adopted').collapsed,
+    false,
+    'adopting a real session id must not collapse the right pane the user had open',
+  );
+  assert.equal(
+    rightPane.rightPaneState.perSession['workspace-draft\u0000__draft__'],
+    undefined,
+    'the draft scope is released after its pane moves to the adopted session',
+  );
+  // 从未展开过的草稿仍然沿用折叠，不会凭空打开。
+  rightPane.activateRightPaneSession('workspace-draft-closed', '__draft__');
+  rightPane.activateRightPaneSession('workspace-draft-closed', 'session-closed');
+  assert.equal(rightPane.getRightPaneState('workspace-draft-closed\u0000session-closed').collapsed, true);
+
   rightPane.activateRightPaneSession('workspace-other', 'session-other');
   assert.equal(rightPane.rightPaneState.appTabs.length, 1);
   assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');

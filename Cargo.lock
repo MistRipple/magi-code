@@ -1151,9 +1151,11 @@ dependencies = [
  "magi-git",
  "magi-governance",
  "magi-knowledge-store",
+ "magi-mcp-server",
  "magi-memory-store",
  "magi-mission-metrics",
  "magi-orchestrator",
+ "magi-permissions",
  "magi-plan",
  "magi-process",
  "magi-runtime-state",
@@ -1182,6 +1184,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
@@ -1239,6 +1242,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
  "url",
 ]
 
@@ -1359,6 +1363,7 @@ name = "magi-daemon-app"
 version = "3.0.51"
 dependencies = [
  "magi-daemon",
+ "magi-mcp-server",
  "magi-process",
  "magi-runtime-state",
  "tokio",
@@ -1415,6 +1420,22 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "magi-mcp-server"
+version = "3.0.51"
+dependencies = [
+ "axum",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -1619,7 +1640,6 @@ dependencies = [
 name = "magi-web-model"
 version = "3.0.51"
 dependencies = [
- "axum",
  "magi-bridge-client",
  "serde",
  "serde_json",

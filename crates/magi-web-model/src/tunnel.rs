@@ -1,13 +1,13 @@
-//! OpenAI Tunnel 通道托管（设计基线 §5.7.4、实现计划 4.9）。
+//! OpenAI Tunnel 通道托管（最终开发基线 §8.3）。
 //!
 //! 职责与硬约束：
 //! - 按需启动 `openai/tunnel-client`（**固定版本 + SHA-256 校验**），由它以 **stdio**
-//!   拉起 `magi-web-harness --stdio`；随应用退出停止，不常驻；
+//!   拉起 `magi-daemon-app mcp-relay --stdio --slot`（Magi MCP 服务的槽位端点中继）；随应用退出停止，不常驻；
 //! - 凭据是 OpenAI 平台 API 密钥（仅 **Tunnels Read + Use**），**按文件引用**，
 //!   绝不进命令行参数 / 日志 / 诊断输出 —— 本模块只传递文件路径，永不读取内容；
 //! - 缺失、校验失败、凭据缺失一律 **fail closed**：返回带「具体缺哪一项」的状态，
-//!   由上层把引擎降级为 T2，绝不假装 T3 可用；
-//! - 只做进程托管，不含协议与鉴权（那是 harness 与连接器的事）。
+//!   由上层报告「无项目工具」，绝不假装可用；
+//! - 只做进程托管，不含协议与鉴权（那是 Magi MCP 服务与连接器的事）。
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,18 +36,21 @@ const TUNNEL_STARTUP_GRACE: std::time::Duration = TUNNEL_CONNECT_TIMEOUT;
 /// Keep this value next to the argument/status contract so a future client
 /// upgrade cannot silently change the JSON shape while the old parser still
 /// reports a ready tunnel.
-pub const TUNNEL_CLIENT_VERSION: &str = "0.0.12";
+pub const TUNNEL_CLIENT_VERSION: &str = "0.0.15";
 
 /// tunnel-client 的启动参数模板占位符。
 pub const PLACEHOLDER_TUNNEL_ID: &str = "{tunnel_id}";
 pub const PLACEHOLDER_CREDENTIAL_FILE: &str = "{credential_file}";
-pub const PLACEHOLDER_HARNESS_BINARY: &str = "{harness_binary}";
+pub const PLACEHOLDER_MCP_BINARY: &str = "{mcp_binary}";
 pub const PLACEHOLDER_LOCAL_ENDPOINT: &str = "{local_endpoint}";
 pub const PLACEHOLDER_PROFILE_NAME: &str = "{profile_name}";
 pub const PLACEHOLDER_PROFILE_DIR: &str = "{profile_dir}";
 pub const PLACEHOLDER_ALIAS: &str = "{alias}";
 pub const PLACEHOLDER_CLIENT_BINARY: &str = "{client_binary}";
 pub const PLACEHOLDER_MCP_COMMAND: &str = "{mcp_command}";
+
+/// 中继由 daemon 可执行文件的子命令提供（`magi-daemon-app mcp-relay ...`）。
+pub const MCP_RELAY_SUBCOMMAND: &str = "mcp-relay";
 
 /// 通道托管配置。
 #[derive(Clone, Debug)]
@@ -60,9 +63,9 @@ pub struct TunnelRuntimeConfig {
     pub credential_file: PathBuf,
     /// 用户在自己的 OpenAI 账号创建的 Tunnel id。
     pub tunnel_id: String,
-    /// `magi-web-harness` 可执行文件（stdio 中继）。
-    pub harness_binary: PathBuf,
-    /// daemon 侧本地 socket / 命名管道端点。
+    /// 提供 `mcp-relay` 子命令的可执行文件（即 daemon 自己；stdio 中继，连接 daemon 的槽位端点）。
+    pub mcp_binary: PathBuf,
+    /// daemon 侧 GPT Web 槽位端点（本地 socket / 命名管道）。
     pub local_endpoint: PathBuf,
     /// tunnel-client 本地 runtime profile 目录。
     pub profile_dir: PathBuf,
@@ -76,7 +79,7 @@ pub struct TunnelRuntimeConfig {
 
 impl TunnelRuntimeConfig {
     /// 按参考项目形态给出默认参数：通过 `runtimes connect` 注册一个由
-    /// tunnel-client 托管的 runtime，并让它以 MCP stdio 拉起 harness。
+    /// tunnel-client 托管的 runtime，并让它以 MCP stdio 拉起 `magi-daemon-app mcp-relay --slot`。
     pub fn default_launch_args() -> Vec<String> {
         vec![
             "runtimes".to_string(),
@@ -109,10 +112,7 @@ impl TunnelRuntimeConfig {
                         PLACEHOLDER_CREDENTIAL_FILE,
                         &self.credential_file.to_string_lossy(),
                     )
-                    .replace(
-                        PLACEHOLDER_HARNESS_BINARY,
-                        &self.harness_binary.to_string_lossy(),
-                    )
+                    .replace(PLACEHOLDER_MCP_BINARY, &self.mcp_binary.to_string_lossy())
                     .replace(
                         PLACEHOLDER_LOCAL_ENDPOINT,
                         &self.local_endpoint.to_string_lossy(),
@@ -135,9 +135,11 @@ impl TunnelRuntimeConfig {
     /// parser-safe quoting，不读取或内联密钥。
     pub fn mcp_command(&self) -> String {
         [
-            self.harness_binary.to_string_lossy().into_owned(),
+            self.mcp_binary.to_string_lossy().into_owned(),
+            MCP_RELAY_SUBCOMMAND.to_string(),
             "--stdio".to_string(),
-            "--local-socket".to_string(),
+            "--slot".to_string(),
+            "--endpoint".to_string(),
             self.local_endpoint.to_string_lossy().into_owned(),
         ]
         .into_iter()
@@ -481,17 +483,9 @@ impl TunnelManager {
         let mut command = std::process::Command::new(&self.config.client_binary);
         command
             .args(["runtimes", "cleanup"])
-            // Scope the inventory to the profile owned by this Magi
-            // instance.  The tunnel client can have several profiles (and
-            // several runtimes with the same alias) on one machine; probing
-            // an unscoped inventory can therefore report another user's
-            // runtime as our T3 channel.  Keep the exact profile selectors
-            // used by `runtimes connect` so status and lifecycle have one
-            // identity boundary.
-            .arg("--profile")
-            .arg(&self.config.profile_name)
-            .arg("--profile-dir")
-            .arg(&self.config.profile_dir)
+            // tunnel-client 0.0.15 的 `cleanup` / `stop` 不再接受 profile 选择器，清单是整个
+            // 本机 state root 的。身份边界因此只剩 Magi 独占的 runtime 别名：解析时只认
+            // 与别名**完全相等**的条目，缺失或重名一律按未就绪处理（见 `parse_runtime_status`）。
             .arg("--json")
             .env_remove("OPENAI_API_KEY")
             .env_remove("CONTROL_PLANE_API_KEY")
@@ -689,7 +683,7 @@ impl TunnelManager {
         None
     }
 
-    /// 停止通道（应用退出、用户关闭 T3）。
+    /// 停止通道（应用退出、用户清除配置）。
     pub async fn stop(&self) {
         let _lifecycle = self.lifecycle.lock().await;
         let should_stop = {
@@ -699,11 +693,7 @@ impl TunnelManager {
         if should_stop {
             let mut command = Command::new(&self.config.client_binary);
             command
-                .args(["runtimes", "stop", &self.config.alias, "--profile"])
-                .arg(&self.config.profile_name)
-                .args(["--profile-dir"])
-                .arg(&self.config.profile_dir)
-                .arg("--json");
+                .args(["runtimes", "stop", &self.config.alias, "--json"]);
             command.stdin(Stdio::null());
             command.stdout(Stdio::null());
             command.stderr(Stdio::null());
@@ -736,6 +726,15 @@ fn valid_tunnel_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(test)]
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// 校验文件 SHA-256（hex，大小写不敏感）。
 pub fn verify_sha256(path: &Path, expected_hex: &str) -> bool {
     use sha2::{Digest, Sha256};
@@ -759,7 +758,7 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "magi-web-model-tunnel-{tag}-{}",
-            crate::protocol::sha256_hex(&format!(
+            sha256_hex(&format!(
                 "{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -778,8 +777,8 @@ mod tests {
             expected_client_sha256: None,
             credential_file: dir.join("api-key"),
             tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".into(),
-            harness_binary: dir.join("magi-web-harness"),
-            local_endpoint: dir.join("harness.sock"),
+            mcp_binary: dir.join("magi-mcp"),
+            local_endpoint: dir.join("slot.sock"),
             profile_dir: dir.join("profile"),
             profile_name: "magi-web-model".into(),
             alias: "magi-web-model".into(),
@@ -808,9 +807,9 @@ mod tests {
             args.iter()
                 .any(|arg| { arg == &format!("file:{}", dir.join("api-key").to_string_lossy()) })
         );
-        assert!(args.iter().any(|a| a.contains("magi-web-harness")));
+        assert!(args.iter().any(|a| a.contains("magi-mcp")));
         assert!(args.iter().any(|a| a.contains("runtimes")));
-        assert!(args.iter().any(|a| a.contains("harness.sock")));
+        assert!(args.iter().any(|a| a.contains("slot.sock")));
         // 参数里只出现凭据文件路径，不出现任何秘密内容。
         assert!(!args.iter().any(|a| a.contains("sk-")));
         let _ = std::fs::remove_dir_all(&dir);
@@ -819,12 +818,12 @@ mod tests {
     #[test]
     fn mcp_command_uses_tunnel_client_quoting_for_paths_with_spaces() {
         let mut config = config(Path::new("/tmp/magi tunnel"));
-        config.harness_binary = PathBuf::from("/tmp/magi harness/bin");
+        config.mcp_binary = PathBuf::from("/tmp/magi harness/bin");
         config.local_endpoint = PathBuf::from("/tmp/magi socket.sock");
         let command = config.mcp_command();
         assert_eq!(
             command,
-            "\"/tmp/magi harness/bin\" \"--stdio\" \"--local-socket\" \"/tmp/magi socket.sock\""
+            "\"/tmp/magi harness/bin\" \"mcp-relay\" \"--stdio\" \"--slot\" \"--endpoint\" \"/tmp/magi socket.sock\""
         );
         assert!(
             !command.contains("'"),
@@ -1056,7 +1055,7 @@ mod tests {
         let dir = temp_dir("status-command");
         let mut config = config(&dir);
         let script = r#"#!/bin/sh
-        if [ "$1" = "runtimes" ] && [ "$2" = "cleanup" ] && [ "$3" = "--profile" ] && [ "$5" = "--profile-dir" ] && [ "$7" = "--json" ]; then
+        if [ "$1" = "runtimes" ] && [ "$2" = "cleanup" ] && [ "$3" = "--json" ]; then
   printf '{"entries":[{"alias":"magi-web-model","runtime_state":"ready","live_runtime":{"system":{"pid":99}}}]}'
   exit 0
 fi
@@ -1064,7 +1063,7 @@ if [ "$1" = "runtimes" ] && [ "$2" = "connect" ]; then
   printf '{"running":true,"healthy":true,"ready":true,"pid":98}'
   exit 0
 fi
-if [ "$1" = "runtimes" ] && [ "$2" = "stop" ] && [ "$4" = "--profile" ] && [ "$6" = "--profile-dir" ] && [ "$8" = "--json" ]; then
+if [ "$1" = "runtimes" ] && [ "$2" = "stop" ] && [ "$3" = "magi-web-model" ] && [ "$4" = "--json" ]; then
   exit 0
 fi
 exit 17

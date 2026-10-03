@@ -140,12 +140,10 @@ pub enum SessionProjectionPersistMode {
     Navigation {
         target_session_id: Option<SessionId>,
     },
-    Delete {
-        deleted_session_id: SessionId,
-        replacement_session_id: Option<SessionId>,
-    },
-    Rename {
-        session_id: SessionId,
+    /// 只有这些会话的内容发生了变化（新建 / 重命名 / 删除后的替代会话 / 通知 / 续跑……）：
+    /// 只重新序列化并提交它们，其余会话沿用已落盘的版本；不再保留的会话由持久化层按会话列表清理。
+    Sessions {
+        session_ids: Vec<SessionId>,
     },
 }
 
@@ -1232,29 +1230,21 @@ fn spawn_browser_control_sync(client: BrowserHostClient, control: BrowserSurface
 
 /// 最近一次 GPT Web 只读探测的结论。
 ///
-/// 会话内模型选择器**只**按它决定是否投影 Web 引擎（§5.5 fail closed、
-/// §5.11 可用性）：没有探测结论、结论未归类、或结论是登录失效一类时一律不投影，
-/// 绝不用上一次结果占位。它只驻 daemon 进程内存，不落盘（A20、§5.12）。
+/// 会话内模型选择器**只**按它决定是否投影固定的 GPT Web 入口（§9、W18）：没有探测结论、
+/// 或结论不是“已登录可用”时一律不投影，绝不用上一次结果占位。它只驻 daemon 进程内存，不落盘。
 #[derive(Clone, Debug)]
 pub struct WebModelProbeSnapshot {
-    /// 单次探测状态：`ok` / `refresh_required` / `login_required` /
-    /// `site_blocked` / `quota_exhausted` / `desktop_unavailable` / `consent_required`。
+    /// 单次探测状态：`ok` / `login_required` / `site_blocked` / `selectors_drift` /
+    /// `desktop_unavailable`。
     pub status: String,
-    pub reason: Option<String>,
     pub account_hint: String,
-    pub limits_revision: String,
-    /// 本次探测读到的候选引擎 id；只有同时存在于 `settings.engines` 的才进选择器。
-    pub engine_ids: Vec<String>,
     pub probed_at: u64,
 }
 
 impl WebModelProbeSnapshot {
-    /// 该状态是否允许把 Web 引擎投影到会话内模型选择器。
-    ///
-    /// `ok` 与 `refresh_required` 可见（后者置灰不可发送）；其余状态只在
-    /// 「设置 → 浏览器 → GPT Web 模型」显示状态与主行动（§5.11）。
+    /// 该状态是否允许把 GPT Web 入口投影到会话内模型选择器（只有已登录且页面可用）。
     pub fn is_visible_in_picker(&self) -> bool {
-        matches!(self.status.as_str(), "ok" | "refresh_required")
+        self.status == "ok"
     }
 }
 
@@ -1313,9 +1303,11 @@ pub struct ApiState {
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
-    /// T3 通道装配（harness 本机入口 + OpenAI Tunnel 托管，§5.7.3 / §5.7.4）。
-    /// harness 会话、turn 令牌与通道状态都只驻进程内存（A20、§5.12）。
-    pub web_model_harness: Arc<crate::web_model_harness::WebModelHarnessRuntime>,
+    /// GPT Web 工具通道（OpenAI Tunnel 托管 + 槽位端点装配）。通道状态与槽位只驻进程内存。
+    pub web_model: Arc<crate::web_model_channel::WebModelChannelRuntime>,
+    /// 统一 Magi MCP 服务。GPT Web、OpenAI Tunnel 与其他 MCP 客户端都只能
+    /// 通过这一份服务进入工具运行时，不能再创建 GPT Web 专用的第二条工具链。
+    pub(crate) mcp_service: Arc<crate::mcp_runtime::McpServiceRuntime>,
     /// 最近一次 GPT Web 只读探测的结论：Web 引擎是否投影到会话内模型选择器的
     /// 唯一判据（§5.5 fail closed、§5.11）。只驻内存，daemon 重启即清空。
     web_model_probe: Arc<RwLock<Option<WebModelProbeSnapshot>>>,
@@ -1870,11 +1862,10 @@ impl ApiState {
             .clone()
     }
 
-    /// 会话内主模型选择器看到的 Web 引擎投影（A22、§5.13）。
+    /// 会话内主模型选择器看到的 GPT Web 入口（W18）。
     ///
-    /// 只投影 daemon 已确认可用的引擎：没有有效探测结论、未确认首次说明、或引擎不在
-    /// 本次探测候选里，都不出现。工具档位与降档原因也在这里算好，前端只负责展示
-    /// （§5.7.0、A15）。
+    /// 未登录或探测未完成时为空；登录后只有**一个固定入口** `chatgpt-web/default`，不复制网页的模型菜单。
+    /// 工具能力单独投影：它是可选增强，通道不可用时入口照常可用，只是没有项目工具并说明缺什么。
     pub fn web_model_picker_engines(&self) -> Vec<serde_json::Value> {
         let Some(probe) = self.web_model_probe_snapshot() else {
             return Vec::new();
@@ -1882,96 +1873,25 @@ impl ApiState {
         if !probe.is_visible_in_picker() {
             return Vec::new();
         }
-        if !crate::routes::browser::web_model_consent_confirmed(self) {
-            return Vec::new();
-        }
-        let channel = self.web_model_harness.channel().get();
-        let registry = load_registry_engines(self);
-        registry
-            .into_iter()
-            .filter_map(|entry| {
-                let id = entry.get("id").and_then(serde_json::Value::as_str)?;
-                let is_web = entry
-                    .get("apiProtocol")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| value.eq_ignore_ascii_case("chatgpt_web"));
-                if !is_web || !probe.engine_ids.iter().any(|candidate| candidate == id) {
-                    return None;
-                }
-                let tools_enabled = entry
-                    .get("toolsEnabled")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true);
-                let connector_configured = entry
-                    .get("origin")
-                    .and_then(|origin| origin.get("connector"))
-                    .is_some_and(|connector| !connector.is_null());
-                let account_hint = entry
-                    .get("origin")
-                    .and_then(|origin| origin.get("accountHint"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                let refresh_required = probe.status == "refresh_required"
-                    || (probe.account_hint != "unknown"
-                        && account_hint != "unknown"
-                        && account_hint != probe.account_hint);
-                // 档位：工具关闭 = T0；连接器已配置且通道就绪 = T3；其余 T2（A15）。
-                let (tool_tier, degraded_reason) = if !tools_enabled {
-                    ("t0", serde_json::Value::Null)
-                } else if connector_configured && channel.ready {
-                    ("t3", serde_json::Value::Null)
-                } else if connector_configured {
-                    (
-                        "t2",
-                        serde_json::json!({
-                            "code": channel.code,
-                            "detail": channel.detail,
-                        }),
-                    )
-                } else {
-                    (
-                        "t2",
-                        serde_json::json!({
-                            "code": "connector_not_configured",
-                            "detail": "尚未为 ChatGPT 配置 Magi 连接器；T3 需要连接器与 T3 通道就绪",
-                        }),
-                    )
-                };
-                let mut value = entry;
-                let object = value.as_object_mut()?;
-                object.insert(
-                    "status".to_string(),
-                    serde_json::Value::String(
-                        if refresh_required {
-                            "refresh_required"
-                        } else if connector_configured && channel.ready {
-                            "available"
-                        } else {
-                            "tool_degraded"
-                        }
-                        .to_string(),
-                    ),
-                );
-                object.insert(
-                    "toolTier".to_string(),
-                    serde_json::Value::String(tool_tier.to_string()),
-                );
-                object.insert("toolTierDegradedReason".to_string(), degraded_reason);
-                object.insert(
-                    "accountHint".to_string(),
-                    serde_json::Value::String(probe.account_hint.clone()),
-                );
-                object.insert("limitsRevision".to_string(), serde_json::Value::String(probe.limits_revision.clone()));
-                object.insert("probedAt".to_string(), serde_json::Value::from(probe.probed_at));
-                if let Some(reason) = probe.reason.as_ref() {
-                    object.insert(
-                        "reason".to_string(),
-                        serde_json::Value::String(reason.clone()),
-                    );
-                }
-                Some(value)
+        let channel = self.web_model.channel().get();
+        let tools = if channel.ready {
+            serde_json::json!({ "available": true })
+        } else {
+            serde_json::json!({
+                "available": false,
+                "code": "web_tunnel_unavailable",
+                "detail": channel.detail,
             })
-            .collect()
+        };
+        vec![serde_json::json!({
+            "id": magi_web_model::WEB_MODEL_ENGINE_ID,
+            "displayName": "GPT Web",
+            "apiProtocol": "chatgpt_web",
+            "origin": { "kind": "web", "accountHint": probe.account_hint },
+            "status": "available",
+            "tools": tools,
+            "probedAt": probe.probed_at,
+        })]
     }
 }
 
@@ -2086,7 +2006,8 @@ impl ApiState {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
-            web_model_harness: Arc::new(crate::web_model_harness::WebModelHarnessRuntime::new()),
+            web_model: Arc::new(crate::web_model_channel::WebModelChannelRuntime::new()),
+            mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
             web_model_probe: Arc::new(RwLock::new(None)),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry,
@@ -2978,6 +2899,11 @@ impl ApiState {
         session.workspace_id.as_deref().map(WorkspaceId::new)
     }
 
+    /// 外部（MCP）工具调用复用与会话内 agent 相同的工具注册表。
+    pub(crate) fn tool_registry(&self) -> Option<&ToolRegistry> {
+        self.tool_registry.as_ref()
+    }
+
     pub(crate) fn workspace_root_path(
         &self,
         workspace_id: &Option<WorkspaceId>,
@@ -3398,6 +3324,11 @@ impl ApiState {
             .state_root()
             .map(load_browser_authority)
             .transpose();
+        if let Some(state_root) = persistence.state_root() {
+            self.mcp_service = Arc::new(crate::mcp_runtime::McpServiceRuntime::load(
+                state_root.join("mcp-server.json"),
+            ));
+        }
         self.runtime_persistence = Some(persistence);
         if let Some(persistence) = self.runtime_persistence.clone() {
             let store = self.knowledge_store.clone();
@@ -3435,6 +3366,15 @@ impl ApiState {
             }
         }
         self
+    }
+
+    /// daemon 组装完工具运行时后调用。已显式开启的 MCP 服务在重启后恢复，
+    /// 失败只保留可诊断的关闭状态，不阻塞主 daemon 启动。
+    pub fn start_mcp_service_if_enabled(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            state.mcp_service.start_if_enabled(&state).await;
+        });
     }
 
     pub fn with_canonical_event_next_sequence_provider(
@@ -3905,11 +3845,64 @@ impl ApiState {
             })
     }
 
-    pub fn persist_session_projection_for_api(&self) -> Result<(), ApiError> {
-        self.persist_session_projection().map_err(|error| {
-            public_runtime_persistence_error("session", SESSION_PERSISTENCE_PUBLIC_ERROR, error)
-        })
+    /// 只提交指定会话的 projection（以及 current 指针等全局小文件）。
+    ///
+    /// `persist_session_projection` 每次都要重新序列化**全部**会话的历史来比对摘要，会话越多越慢
+    /// （本仓库实测新建一个会话要 14 秒），而且是在会话存储的锁内执行，会让整个 daemon 卡住。
+    /// 已知只有哪几个会话变了时，都应该用这个。
+    pub fn persist_session_projection_for_sessions(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<(), ApiError> {
+        let Some(persist) = &self.session_projection_persist else {
+            return Ok(());
+        };
+        self.session_store
+            .persist_sessions_projection_with(session_ids, |durable, sidecars| {
+                persist(
+                    durable,
+                    sidecars,
+                    SessionProjectionPersistMode::Sessions {
+                        session_ids: session_ids.to_vec(),
+                    },
+                )
+            })
     }
+
+    pub fn persist_session_projection_for_sessions_for_api(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<(), ApiError> {
+        self.persist_session_projection_for_sessions(session_ids)
+            .map_err(|error| {
+                public_runtime_persistence_error(
+                    "session",
+                    SESSION_PERSISTENCE_PUBLIC_ERROR,
+                    error,
+                )
+            })
+    }
+
+    /// 在这个通知上下文里可见的通知，分别属于哪些会话。
+    ///
+    /// 通知操作（已读 / 清除 / 删除 / 解决）只会改动「在该上下文可见」的通知；会话级通知存放在
+    /// 所属会话的 projection 里，应用级和项目级通知存放在各自的 meta 文件里。所以操作前取一次
+    /// 这个集合，就知道要重新提交哪些会话，其余会话不用动。
+    pub(crate) fn sessions_with_notifications_in_context(
+        &self,
+        context: &magi_session_store::NotificationContext,
+    ) -> Vec<SessionId> {
+        let mut session_ids = Vec::new();
+        for notification in self.session_store.notifications_for_context(context) {
+            if let Some(session_id) = notification.session_id {
+                if !session_ids.contains(&session_id) {
+                    session_ids.push(session_id);
+                }
+            }
+        }
+        session_ids
+    }
+
 
     pub(crate) fn rename_session_with_persistence_for_api(
         &self,
@@ -3923,8 +3916,8 @@ impl ApiState {
                     persist(
                         durable,
                         sidecars,
-                        SessionProjectionPersistMode::Rename {
-                            session_id: session_id.clone(),
+                        SessionProjectionPersistMode::Sessions {
+                            session_ids: vec![session_id.clone()],
                         },
                     )
                 } else {
@@ -4015,20 +4008,14 @@ impl ApiState {
         })
     }
 
-    pub fn persist_runtime_durable_state(&self) -> Result<(), ApiError> {
-        // session projection 的 workspace 路径依赖已落盘的 workspace 注册事实；
-        // 先写 workspace 可避免恢复失败回滚时把刚注册的 workspace 误判为悬空引用。
-        self.persist_workspace_durable_state()?;
-        self.persist_session_projection()?;
-        self.persist_knowledge_state()?;
-        self.persist_session_git_contexts()?;
-        Ok(())
-    }
-
-    pub fn persist_runtime_durable_state_for_api(&self) -> Result<(), ApiError> {
-        // 保持 workspace 注册事实先于引用它的 session projection 落盘。
+    /// 运行态整体持久化：先 workspace 注册事实，再引用它的 session projection（只提交指定会话），
+    /// 最后 knowledge。保持 workspace 先于引用它的 session projection 落盘。
+    pub fn persist_runtime_durable_state_for_sessions_for_api(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<(), ApiError> {
         self.persist_workspace_durable_state_for_api()?;
-        self.persist_session_projection_for_api()?;
+        self.persist_session_projection_for_sessions_for_api(session_ids)?;
         self.persist_knowledge_state_for_api()?;
         Ok(())
     }
@@ -4529,6 +4516,8 @@ impl ApiState {
                 .unbind_session_after_lifecycle_lock(session_id)
                 .await;
         }
+        // 会话持有 GPT Web 槽位时一并释放，避免槽位悬挂在已不存在的会话上。
+        self.release_web_slot_for_session(session_id).await;
         self.close_browser_session_for_magi_session(session_id)
             .await?;
         self.terminal_sessions
@@ -4597,9 +4586,8 @@ impl ApiState {
                         persist(
                             durable,
                             sidecars,
-                            SessionProjectionPersistMode::Delete {
-                                deleted_session_id: session_id.clone(),
-                                replacement_session_id: replacement_session_id.clone(),
+                            SessionProjectionPersistMode::Sessions {
+                                session_ids: replacement_session_id.iter().cloned().collect(),
                             },
                         )
                     } else {
@@ -4636,7 +4624,9 @@ impl ApiState {
             .sessions()
             .into_iter()
             .filter(|session| {
-                &session.session_id != session_id && session.workspace_id == target_workspace
+                &session.session_id != session_id
+                    && session.workspace_id == target_workspace
+                    && session.kind.is_user()
             })
             .max_by(|left, right| {
                 left.updated_at
@@ -7102,7 +7092,7 @@ mod tests {
 
         assert_public_persistence_error(
             state
-                .persist_session_projection_for_api()
+                .persist_session_projection_for_sessions_for_api(&[])
                 .expect_err("session persistence should fail"),
             SESSION_PERSISTENCE_PUBLIC_ERROR,
         );

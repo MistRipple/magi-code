@@ -7,6 +7,7 @@ mod dispatch_flow;
 mod file_site;
 mod goals;
 mod knowledge;
+mod mcp_server;
 mod mcp_skills_repos;
 mod messages;
 mod session_scope;
@@ -299,6 +300,7 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(appearance::routes())
         .merge(browser::routes())
         .merge(mcp_skills_repos::routes())
+        .merge(mcp_server::routes())
         .merge(changes_files_tunnel::routes())
         .merge(file_site::routes())
         .merge(agent_run_actions::routes())

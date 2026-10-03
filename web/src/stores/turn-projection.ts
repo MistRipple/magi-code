@@ -697,10 +697,14 @@ function buildMessage(
       ...(agentChildStatus ? { agentChildStatus } : {}),
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
+      // 轮次状态也属于渲染输入：轮次从 pending 变为终态时，没有变化的条目（例如用户消息）
+      // 的 `turnStatus` 随之改变，版本号不含它就会沿用缓存里的旧状态，整轮被误判为「进行中」。
       renderRevision: [
         item.itemVersion ?? 0,
         item.updatedAt,
         item.status,
+        turn.status,
+        turn.completedAt ?? 0,
         content.length,
         blocks?.length ?? 0,
         valueToDisplayText(item.tool?.result)?.length ?? 0,
@@ -1195,6 +1199,9 @@ function reuseEquivalentArtifact(
     && previous.cardStreamSeq === artifact.cardStreamSeq
     && previous.messageIds.length === artifact.messageIds.length
     && previous.messageIds.every((id, index) => id === artifact.messageIds[index])
+    // 条目自己没变、所属轮次的状态变了（pending → 终态）时，不能沿用旧产物：它的
+    // `turnStatus` 会让整轮一直被判成「进行中」。渲染版本号已包含轮次状态与完成时间。
+    && previous.message.metadata?.renderRevision === artifact.message.metadata?.renderRevision
   ) {
     return previous;
   }

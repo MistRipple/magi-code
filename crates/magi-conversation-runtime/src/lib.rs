@@ -16,6 +16,8 @@ pub mod dispatch_submission;
 mod driver;
 pub mod execution_admission;
 pub mod execution_chain_recovery;
+pub mod external_approval;
+pub mod external_tool;
 mod mailbox;
 pub mod model_config;
 pub mod model_context_window;
@@ -47,6 +49,7 @@ mod turn;
 pub mod turn_contract;
 pub mod turn_stream_buffer;
 pub mod usage_recording;
+pub mod web_history_import;
 
 pub use builtin_tool_schema::{
     internal_builtin_tool_rejection_payload, public_builtin_tool_definitions,
@@ -72,6 +75,7 @@ pub use skill_custom_tool_surface::{
     tool_execution_policy_scope,
 };
 pub use task_completion_notifier::{TaskCompletionNotification, TaskCompletionNotifier};
+pub use task_execution_dispatcher::safety_gate_from_settings;
 pub use task_helpers::{
     GoalModeLifecycleState, TaskTurnVisibility, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,

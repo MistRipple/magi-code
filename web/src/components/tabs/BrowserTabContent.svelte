@@ -10,6 +10,7 @@
     getAppBrowserSession,
     isReferenceableBrowserAnnotation,
     navigateBrowserTab,
+    reloadWebModelPage,
     type BrowserAnnotationSnapshot,
     type BrowserAnnotationSelection,
     type BrowserDeviceType,
@@ -1119,6 +1120,16 @@
     if (!tab || !browserReady) return;
     addressEditing = false;
     clearNodeInspection();
+    if (appLevelSurface) {
+      // 应用级（GPT Web）页面不属于任何 Magi 会话，会话作用域的导航接口一律拒绝；
+      // 失败面板的「重试」只能走应用级刷新。
+      if (action !== 'reload') return;
+      void run(async () => {
+        await reloadWebModelPage();
+        await refreshSession();
+      });
+      return;
+    }
     void run(async () => {
       const updated = await navigateBrowserTab(tab.tabId, action, action === 'url' ? address : undefined);
       address = updated.url;
@@ -1654,6 +1665,10 @@
   class="browser-pane"
   aria-label={i18n.t('browser.pane.label')}
 >
+  <!-- 应用级 GPT Web 不渲染这条工具栏：前进 / 后退 / 刷新 / 改网址会让临时对话上下文丢失或让页面离开
+       ChatGPT，视口 / 元素选取 / 截图 / 标注属于 agent 浏览器工具，对它没有意义。GPT Web 的标题栏
+       （WebModelTabContent）统一承担只读地址、连接状态与显式动作。 -->
+  {#if !appLevelSurface}
   <div
     bind:this={browserToolbar}
     class="browser-toolbar"
@@ -1722,6 +1737,7 @@
       <span class="record-status" role="status">{activeTab ? i18n.t('browser.status.recordOnly') : i18n.t('browser.status.noTab')}</span>
     {/if}
   </div>
+  {/if}
 
   {#if tooltipText}
     <div

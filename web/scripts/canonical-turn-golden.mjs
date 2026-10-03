@@ -92,6 +92,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore);
   assertWorkspaceSessionCatalogRejectsLatePreAcceptanceSnapshot(messagesStore);
   assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
+  assertDraftFirstTurnThatEndsImmediatelyIsSettled(dataHandlers, messagesStore);
   assertSameSessionBootstrapRestoresCompletedAssistant(dataHandlers, messagesStore);
   assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
@@ -144,6 +145,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
   assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol);
   assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection);
+  assertIncrementalTerminalTurnRefreshesUnchangedItems(reducer, projection);
   assertCanonicalModelFailurePreservesServerDiagnostic(canonicalProtocol);
   assertCanonicalStreamGapRequestsRecovery(reducer);
   assertCanonicalBlocksProjectToFirstClassCards(reducer, projection);
@@ -799,6 +801,29 @@ function assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol) {
     }),
     undefined,
     'canonical parser must reject payloads without eventId/eventSeq/occurredAt',
+  );
+}
+
+function assertIncrementalTerminalTurnRefreshesUnchangedItems(reducer, projection) {
+  const c = baseCase('incremental-terminal-status', 'session-golden-incremental-terminal', 'turn-golden-incremental-terminal', 12_400);
+  const userItem = user(c, 1, '你好');
+  userItem.itemVersion = 1;
+  const runningState = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'running', [userItem])]);
+  const runningProjection = projection.buildCanonicalTimelineProjection(runningState);
+  assert.equal(
+    findArtifactByTurnItemId(runningProjection, userItem.itemId).message.metadata?.turnStatus,
+    'running',
+  );
+  const failedState = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'failed', [userItem])]);
+  const failedProjection = projection.updateCanonicalTimelineProjection(
+    runningProjection,
+    failedState,
+    [c.turnId],
+  );
+  assert.equal(
+    findArtifactByTurnItemId(failedProjection, userItem.itemId).message.metadata?.turnStatus,
+    'failed',
+    'unchanged items must follow the turn into its terminal status, otherwise the turn header stays live',
   );
 }
 
@@ -2110,6 +2135,69 @@ function assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers
     imageMetadata.images,
     'live canonical image must enter the message projection without requiring refresh',
   );
+  messagesStore.setCurrentSessionId(null);
+}
+
+/**
+ * 新建会话的首条消息：本地提交挂在草稿名下，轮次却在会话 id 回填之前就已经结束（秒失败 / 很短的回复）。
+ * 终态必须照样结算——否则「响应中」永远残留，并被后面新建的会话继承。
+ */
+function assertDraftFirstTurnThatEndsImmediatelyIsSettled(dataHandlers, messagesStore) {
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-draft-fast';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-draft-fast';
+  messagesStore.setCurrentSessionId(null);
+  messagesStore.clearAllMessages({ persist: false, resetTimelineView: true, resetPanelState: true });
+
+  const c = baseCase('draft-fast-terminal', 'session-golden-draft-fast', 'turn-golden-draft-fast', 12400);
+  const requestId = 'request-draft-fast-terminal';
+  beginGoldenLocalSubmission(messagesStore, { requestId, sessionId: null, content: '秒失败的首条消息' });
+  assert.equal(messagesStore.messagesState.isProcessing, true, '提交后进入处理中');
+
+  const userItem = user(c, 1, '秒失败的首条消息');
+  userItem.metadata = { requestId };
+  const failed = assistantText(c, 2, 'assistant-draft-fast-failed', '模型服务暂时不可用。', 'failed');
+  const terminalTurn = turn(c, 'failed', [userItem, failed], { completedAt: c.turnSeq + 120, responseDurationMs: 120 });
+  const terminalEvent = event(c, 1, 'turn_completed', { turn: terminalTurn, item: failed });
+  // 终态事件先于会话 id 回填：processingStateChanged(forced) 的会话 id 已经是真实会话。
+  dataHandlers.handleUnifiedData({
+    id: 'golden-draft-fast-forced-terminal',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq,
+    updatedAt: c.turnSeq,
+    data: {
+      dataType: 'processingStateChanged',
+      payload: {
+        isProcessing: false,
+        transitionKind: 'forced',
+        sessionId: c.sessionId,
+        requestId,
+      },
+    },
+  });
+  dataHandlers.handleUnifiedData({
+    id: 'golden-draft-fast-canonical-terminal',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq,
+    updatedAt: c.turnSeq,
+    data: {
+      dataType: 'sessionTurnCanonicalEventUpdated',
+      payload: { sessionId: c.sessionId, canonicalEvent: terminalEvent },
+    },
+  });
+
+  assert.equal(messagesStore.messagesState.currentSessionId, c.sessionId, '会话 id 应已回填');
+  assert.equal(messagesStore.messagesState.isProcessing, false, '秒结束的首轮必须结算，不能残留「响应中」');
+  assert.equal(messagesStore.messagesState.pendingRequests.size, 0, '不能残留待结算请求');
   messagesStore.setCurrentSessionId(null);
 }
 

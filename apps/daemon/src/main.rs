@@ -54,8 +54,24 @@ fn is_product_entry_executable() -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("magi"))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// `magi-daemon-app mcp-relay ...`：GPT Web 的 OpenAI Tunnel 以 stdio 拉起的 MCP 中继。
+/// 复用 daemon 自己的可执行文件，避免再单独分发一个 `magi-mcp`。必须在 tokio 运行时之前分流，
+/// 中继自己持有运行时。
+const MCP_RELAY_SUBCOMMAND: &str = "mcp-relay";
+
+fn main() -> Result<process::ExitCode, Box<dyn std::error::Error>> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some(MCP_RELAY_SUBCOMMAND) {
+        return Ok(magi_mcp_server::relay_cli::run_relay_cli(&args[1..]));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_daemon())?;
+    Ok(process::ExitCode::SUCCESS)
+}
+
+async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)

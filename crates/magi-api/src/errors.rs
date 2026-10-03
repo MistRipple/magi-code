@@ -26,6 +26,8 @@ pub enum ApiError {
     RecoveryNotFound(String),
     /// 通用资源不存在
     NotFound(String),
+    /// 请求来源无权执行该操作（例如只允许本机应用访问的管理面）
+    Forbidden(String),
     /// 模型或外部执行器调用失败
     ModelInvocationFailed(String),
     /// 内部组装错误（bootstrap / projection / sidecar 合并等）
@@ -117,6 +119,7 @@ impl ApiError {
             ApiError::SessionNotFound(_) => "SESSION_NOT_FOUND",
             ApiError::RecoveryNotFound(_) => "RECOVERY_NOT_FOUND",
             ApiError::NotFound(_) => "NOT_FOUND",
+            ApiError::Forbidden(_) => "FORBIDDEN",
             ApiError::ModelInvocationFailed(_) => "MODEL_INVOCATION_FAILED",
             ApiError::InternalAssemblyError(_) => "INTERNAL_ASSEMBLY_ERROR",
             ApiError::Conflict(_) => "CONFLICT",
@@ -134,6 +137,7 @@ impl ApiError {
             ApiError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::RecoveryNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::ModelInvocationFailed(_) => StatusCode::BAD_GATEWAY,
             ApiError::InternalAssemblyError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
@@ -152,6 +156,7 @@ impl ApiError {
             ApiError::SessionNotFound(message) => message,
             ApiError::RecoveryNotFound(message) => message,
             ApiError::NotFound(message) => message,
+            ApiError::Forbidden(message) => message,
             ApiError::ModelInvocationFailed(message) => message,
             ApiError::InternalAssemblyError(message) => message,
             ApiError::Conflict(message) => message,

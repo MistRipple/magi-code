@@ -263,6 +263,14 @@ async fn remove_workspace(
         .deregister(&workspace_id)
         .map_err(|e| ApiError::internal_assembly("工作区移除失败", e))?;
     state.persist_workspace_durable_state_for_api()?;
+    // 工作区移除后，其下 MCP 令牌与待审批一并失效。
+    if let Err(error) = state
+        .mcp_service
+        .revoke_workspace(&state, workspace_id.as_str())
+        .await
+    {
+        tracing::warn!(%error, %workspace_id, "工作区移除后吊销 MCP 令牌失败");
+    }
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
@@ -1145,6 +1153,7 @@ mod tests {
                 workspace_id: Some(workspace_a_id.to_string()),
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns: Vec::new(),

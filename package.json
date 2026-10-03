@@ -27,7 +27,6 @@
     "test:permission-ledger": "node scripts/derive-magi-permission-ledger-golden.mjs",
     "test:trajectory-ledger": "node scripts/derive-magi-trajectory-ledger-golden.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
-    "test:web-model-dom": "node scripts/verify-web-model-dom.mjs",
     "test:real-provider-performance": "node scripts/verify-real-provider-performance.mjs",
     "release:guard": "npm run browser-tool-catalog:check && npm run protocol:check && node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs",
     "protocol:generate": "node scripts/generate-app-server-protocol.mjs",

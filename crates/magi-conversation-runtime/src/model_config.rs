@@ -630,11 +630,12 @@ pub fn resolve_orchestrator_model_config(
     // 只读该引擎，绝不叠加全局 base——否则用户选中的 Web 引擎会被 HTTP 模型顶替，
     // 或反过来让 Web 引擎拿到不相干的连接配置。
     if let Some(engine_id) = orchestrator_engine_id(settings_store, session_id) {
-        let entry = engine_entry(settings_store, &engine_id)
-            .ok_or_else(|| format!("会话绑定的模型引擎不存在：{engine_id}"))?;
-        let mut config = if is_chatgpt_web_engine_entry(&entry) {
-            chatgpt_web_engine_config(&entry, &engine_id)?
+        let mut config = if magi_web_model::is_chatgpt_web_engine_id(&engine_id) {
+            // GPT Web 是固定入口，不在引擎注册表里：引擎 id 命名空间就是它的全部事实。
+            chatgpt_web_engine_config(&engine_id)
         } else {
+            let entry = engine_entry(settings_store, &engine_id)
+                .ok_or_else(|| format!("会话绑定的模型引擎不存在：{engine_id}"))?;
             let llm = entry
                 .get("llm")
                 .cloned()
@@ -691,120 +692,40 @@ pub fn role_engine_is_chatgpt_web(
     let Some(binding) = role_engine_binding(settings_store, role_id) else {
         return false;
     };
-    engine_entry(settings_store, &binding.engine_id)
-        .is_some_and(|entry| is_chatgpt_web_engine_entry(&entry))
+    magi_web_model::is_chatgpt_web_engine_id(&binding.engine_id)
 }
 
-/// Web 引擎的会话级运行期开关（§3.10）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OrchestratorWebEngineSettings {
-    pub engine_id: String,
-    pub effort: String,
-    /// 工具能力开关，默认开启（A9）。
-    pub tool_enabled: bool,
-    /// 「每轮新建对话」，默认关闭（§5.6）。
-    pub new_chat_per_turn: bool,
-    pub tool_round_limit: u32,
-    /// 连接器是否已由站点适配层配置并回读确认（`origin.connector`，§5.7.3）。
-    ///
-    /// 没配置连接器时 T3 不可能成立，因此**请求档位**直接落 T2；配置了连接器才
-    /// 请求 T3，由宿主按通道就绪状态决定是否真的走 T3（A15）。
-    pub connector_configured: bool,
+/// 会话级 Web 对话绑定所在的会话 section（W11、§3.1）：只存模式与远端引用，
+/// 不存任何网页上下文。读不出来就当作“临时对话”。
+pub const SESSION_WEB_CONVERSATION_SECTION: &str = "webConversation";
+
+/// 读取会话的 Web 对话绑定；缺失或无法解析时是未绑定的临时对话。
+pub fn session_web_conversation_binding(
+    settings_store: &magi_settings_store::SettingsStore,
+    session_id: &SessionId,
+) -> magi_web_model::WebConversationBinding {
+    serde_json::from_value(
+        settings_store.get_session_section(session_id, SESSION_WEB_CONVERSATION_SECTION),
+    )
+    .unwrap_or_else(|_| magi_web_model::WebConversationBinding::temporary())
 }
 
-/// 读取会话级 Web 引擎的引擎级开关；未绑定引擎或绑定的是 HTTP 引擎时返回 `None`。
-pub fn orchestrator_web_engine_settings(
+/// 会话绑定的 GPT Web 入口 id；会话没有绑定 Web 引擎时返回 `None`。
+///
+/// GPT Web 没有会话级运行期开关：模型与强度由网页自己选，工具能力只取决于 MCP 通道，
+/// 工具轮数、“每轮新建对话”都不存在（W1、W8、W16）。
+pub fn orchestrator_web_engine_id(
     settings_store: &magi_settings_store::SettingsStore,
     session_id: Option<&SessionId>,
-) -> Result<Option<OrchestratorWebEngineSettings>, String> {
-    let Some(engine_id) = orchestrator_engine_id(settings_store, session_id) else {
-        return Ok(None);
-    };
-    let config = resolve_orchestrator_model_config(settings_store, session_id)?;
-    let effort = config.reasoning_effort_label().map(str::to_string);
-    web_engine_settings(settings_store, &engine_id, effort)
+) -> Option<String> {
+    orchestrator_engine_id(settings_store, session_id)
+        .filter(|engine_id| magi_web_model::is_chatgpt_web_engine_id(engine_id))
 }
 
-/// 按显式引擎 id 读取 Web 引擎开关。
-///
-/// 两个调用方各自提供 effort：编排者来自会话级覆盖，角色来自角色绑定配置。
-pub fn web_engine_settings(
-    settings_store: &magi_settings_store::SettingsStore,
-    engine_id: &str,
-    effort: Option<String>,
-) -> Result<Option<OrchestratorWebEngineSettings>, String> {
-    let entry = engine_entry(settings_store, engine_id)
-        .ok_or_else(|| format!("模型引擎不存在：{engine_id}"))?;
-    if !is_chatgpt_web_engine_entry(&entry) {
-        return Ok(None);
-    }
-    Ok(Some(OrchestratorWebEngineSettings {
-        engine_id: engine_id.trim().to_string(),
-        effort: effort
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
-        tool_enabled: entry
-            // 引擎级工具开关的字段名只有 `toolsEnabled`：settings 写入路径、
-            // daemon 可用性投影与前端引擎条目都用它。读另一个名字等于让开关
-            // 静默失效（A9、§5.7.0）。
-            .get("toolsEnabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true),
-        new_chat_per_turn: entry
-            .get("newChatPerTurn")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        tool_round_limit: entry
-            .get("toolRoundLimit")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_WEB_TOOL_ROUND_LIMIT),
-        connector_configured: entry
-            .get("origin")
-            .and_then(|origin| origin.get("connector"))
-            .is_some_and(|connector| !connector.is_null()),
-    }))
-}
-
-/// Web 引擎的 T2 轮数上限默认值，与 `magi-web-model` 的 client 默认保持一致。
-pub const DEFAULT_WEB_TOOL_ROUND_LIMIT: u32 = 20;
-
-/// 引擎条目是否是 GPT Web 引擎（`apiProtocol = chatgpt_web`，不写 `llm`）。
-pub fn is_chatgpt_web_engine_entry(entry: &serde_json::Value) -> bool {
-    entry.get("apiProtocol").and_then(serde_json::Value::as_str) == Some("chatgpt_web")
-}
-
-/// Web 引擎条目的顶层字段就是它的运行时配置（A22：不写 `llm`）。
-///
-/// `contextWindowTokens` 由发现通道把站点上限写进引擎顶层，是上下文预算的输入。
-fn chatgpt_web_engine_config(
-    entry: &serde_json::Value,
-    engine_id: &str,
-) -> Result<serde_json::Value, String> {
-    let family = engine_id
-        .strip_prefix("chatgpt-web/")
-        .unwrap_or(engine_id)
-        .to_string();
-    let mut config = serde_json::Map::new();
-    config.insert(
-        "apiProtocol".to_string(),
-        serde_json::Value::String("chatgpt_web".to_string()),
-    );
-    config.insert(
-        "model".to_string(),
-        serde_json::Value::String(string_field(entry, "model").unwrap_or(family)),
-    );
-    if let Some(tokens) = entry
-        .get("contextWindowTokens")
-        .and_then(serde_json::Value::as_u64)
-    {
-        config.insert(
-            "contextWindowTokens".to_string(),
-            serde_json::Value::from(tokens),
-        );
-    }
-    Ok(serde_json::Value::Object(config))
+/// Web 入口没有 HTTP 连接配置：只有协议标签与（占位的）模型名。
+fn chatgpt_web_engine_config(engine_id: &str) -> serde_json::Value {
+    let family = engine_id.strip_prefix("chatgpt-web/").unwrap_or(engine_id);
+    serde_json::json!({ "apiProtocol": "chatgpt_web", "model": family })
 }
 
 pub fn ensure_orchestrator_reasoning_effort(config: &mut serde_json::Value) {
@@ -990,68 +911,60 @@ mod tests {
     }
 
     #[test]
-    fn session_engine_binding_resolves_a_web_engine_without_llm() {
+    fn session_engine_binding_resolves_the_fixed_web_entry_without_llm_or_registry() {
         let store = magi_settings_store::SettingsStore::new();
-        let session_id = SessionId::new("session-web-binding");
-        store
-            .set_section(
-                "engines",
-                json!([
-                    {
-                        "id": "chatgpt-web/gpt-5",
-                        "displayName": "GPT-5 (Web)",
-                        "apiProtocol": "chatgpt_web",
-                        "model": "gpt-5",
-                        "contextWindowTokens": 120_000,
-                        "efforts": ["low", "medium", "high"],
-                        "toolsEnabled": true,
-                        "newChatPerTurn": false,
-                    }
-                ]),
-            )
-            .expect("写入 engines");
-        // 全局 base 必须被完全忽略：Web 引擎没有连接凭据，也不允许借用别的连接。
-        store
-            .set_section(
-                "orchestrator",
-                json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-orch",
-                    "model": "global-model",
-                    "apiProtocol": "openai_chat",
-                }),
-            )
-            .expect("写入 orchestrator");
+        let session_id = SessionId::new("session-web-engine");
+        // 注册表里没有任何 Web 条目：固定入口只由引擎 id 命名空间决定。
         store
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({ "engineId": "chatgpt-web/gpt-5", "reasoningEffort": "high" }),
+                json!({ "engineId": "chatgpt-web/default", "reasoningEffort": "high" }),
             )
             .expect("写入会话级覆盖");
-
         let config = resolve_orchestrator_model_config(&store, Some(&session_id))
-            .expect("会话绑定的 Web 引擎应当可解析");
+            .expect("固定的 Web 入口应当解析成功");
         assert!(
             config.is_chatgpt_web(),
             "绑定 Web 引擎后协议必须是 chatgpt_web"
         );
-        assert!(
-            config.to_http_model_client().is_none(),
-            "Web 引擎不得派生出任何 HTTP 传输"
-        );
+        assert!(config.to_http_model_client().is_none());
         assert_eq!(config.provider(), "chatgpt_web");
-        assert_eq!(config.reasoning_effort_label(), Some("high"));
-        assert_eq!(config.context_window_tokens(), Some(120_000));
+        assert_eq!(
+            orchestrator_web_engine_id(&store, Some(&session_id)).as_deref(),
+            Some("chatgpt-web/default")
+        );
+        // 绑定默认是临时对话；已保存对话只存远端引用。
+        assert_eq!(
+            session_web_conversation_binding(&store, &session_id).mode,
+            magi_web_model::WebConversationMode::Temporary
+        );
+        store
+            .set_session_section(
+                &session_id,
+                SESSION_WEB_CONVERSATION_SECTION,
+                serde_json::to_value(magi_web_model::WebConversationBinding::saved("conv-1"))
+                    .unwrap(),
+            )
+            .expect("写入绑定");
+        let binding = session_web_conversation_binding(&store, &session_id);
+        assert_eq!(binding.mode, magi_web_model::WebConversationMode::Saved);
+        assert_eq!(binding.remote_conversation_id.as_deref(), Some("conv-1"));
+    }
 
-        let settings = orchestrator_web_engine_settings(&store, Some(&session_id))
-            .expect("读取 Web 引擎开关")
-            .expect("绑定的是 Web 引擎");
-        assert_eq!(settings.engine_id, "chatgpt-web/gpt-5");
-        assert_eq!(settings.effort, "high");
-        assert!(settings.tool_enabled);
-        assert!(!settings.new_chat_per_turn);
-        assert_eq!(settings.tool_round_limit, DEFAULT_WEB_TOOL_ROUND_LIMIT);
+    #[test]
+    fn a_local_session_never_reports_a_web_engine() {
+        let store = magi_settings_store::SettingsStore::new();
+        let session_id = SessionId::new("session-local");
+        assert!(orchestrator_web_engine_id(&store, Some(&session_id)).is_none());
+        store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({ "engineId": "engine-http", "model": "m" }),
+            )
+            .unwrap();
+        assert!(orchestrator_web_engine_id(&store, Some(&session_id)).is_none());
     }
 
     #[test]
@@ -1073,7 +986,7 @@ mod tests {
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({ "engineId": "chatgpt-web/does-not-exist" }),
+                json!({ "engineId": "engine-does-not-exist" }),
             )
             .expect("写入会话级覆盖");
         let error = resolve_orchestrator_model_config(&store, Some(&session_id))

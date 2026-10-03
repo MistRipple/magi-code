@@ -211,6 +211,12 @@ impl ModelFailureDiagnostic {
 }
 
 fn model_failure_is_user_retryable(code: &str) -> bool {
+    if code.starts_with("web_") || code.starts_with("magi_tool_") {
+        return magi_web_model::WebModelErrorCode::ALL
+            .into_iter()
+            .find(|candidate| candidate.code() == code)
+            .is_some_and(|candidate| candidate.user_retryable());
+    }
     !matches!(
         code,
         "model_auth_failed"
@@ -232,6 +238,15 @@ pub(crate) struct ModelInvocationErrorClassification {
 pub(crate) fn classify_model_invocation_error(
     raw_error: &str,
 ) -> ModelInvocationErrorClassification {
+    // GPT Web 的错误码由桥接层放在消息前缀：保留原码让前端映射主行动，
+    // 且**绝不**自动重试（重试会重复向账号发消息）。
+    if let Some(web_code) = magi_web_model::WebModelErrorCode::find_in(raw_error) {
+        return ModelInvocationErrorClassification {
+            code: web_code.code(),
+            public_message: web_code.public_message(),
+            retryable_before_output: false,
+        };
+    }
     let normalized = raw_error.to_ascii_lowercase();
     if contains_context_limit_error(&normalized) {
         return ModelInvocationErrorClassification {
@@ -645,5 +660,21 @@ mod tests {
             ),
             PUBLIC_MODEL_INVALID_IMAGE_INPUT_MESSAGE
         );
+    }
+
+    #[test]
+    fn web_model_errors_keep_their_code_and_are_never_auto_retried() {
+        let busy = classify_model_invocation_error(
+            "桥接调用失败[RemoteBusiness]: web_session_busy: GPT Web 正被会话 s1 占用",
+        );
+        assert_eq!(busy.code, "web_session_busy");
+        assert!(!busy.retryable_before_output);
+        let timeout =
+            classify_model_invocation_error("web_turn_timeout: ChatGPT Web 回复在时限内未完成");
+        assert_eq!(timeout.code, "web_turn_timeout");
+        assert!(!timeout.retryable_before_output, "超时后重试会重复发送消息");
+        assert!(model_failure_is_user_retryable("web_send_rejected"));
+        assert!(!model_failure_is_user_retryable("web_turn_timeout"));
+        assert!(!model_failure_is_user_retryable("web_context_lost"));
     }
 }

@@ -1910,12 +1910,13 @@ impl DaemonRuntime {
                             sidecars,
                             target_session_id.as_ref(),
                         ),
-                    SessionProjectionPersistMode::Delete { .. } => {
-                        repository.save_session_projection_state(durable, sidecars)
-                    }
-                    SessionProjectionPersistMode::Rename { .. } => {
-                        repository.save_session_projection_state(durable, sidecars)
-                    }
+                    // 已知只有哪几个会话变了（新建 / 重命名 / 删除后的替代会话 / 通知 / 续跑……）时只提交它们。
+                    // 不能走全量快照：全量保存要重新序列化全部会话和回合（本仓库实测 5–14 秒），而这一步
+                    // 是在会话存储的锁里执行的——所有读会话的工作线程都会被它挡住，整个异步运行时随之冻住，
+                    // Electron 等不到心跳回包就会断开浏览器控制连接，正在进行的 GPT Web 回合也跟着失败。
+                    // 被删会话的文件由持久化层按「不再保留」的会话列表清理。
+                    SessionProjectionPersistMode::Sessions { session_ids } => repository
+                        .save_session_projection_state_for_sessions(durable, sidecars, &session_ids),
                 };
                 result.map_err(|error| {
                     ApiError::internal_assembly("session projection 持久化失败", error)
@@ -1982,16 +1983,25 @@ impl DaemonRuntime {
             ) {
                 Ok(factory) => {
                     state
-                        .web_model_harness
+                        .web_model
                         .set_bindings(Arc::clone(factory.bindings()));
                     state
-                        .web_model_harness
+                        .web_model
                         .set_runtime(Arc::clone(factory.runtime()));
-                    Some(Arc::new(factory))
+                    state
+                        .web_model
+                        .set_driver(Arc::clone(factory.driver()));
+                    // 槽位的 turn 结束 / 释放要取消该槽位遗留的外部待审批。
+                    state.install_web_slot_hooks();
+                    Some(Arc::new(
+                        factory
+                            .with_saved_sink(state.web_saved_sink())
+                            .with_image_sink(state.web_image_sink()),
+                    ))
                 }
                 Err(error) => {
-                    // 失败关闭：拿不到 o200k 词表时不装配 Web 引擎，而不是退回通用估算。
-                    warn!(error = %error, "GPT Web 引擎的计数器不可用，Web 引擎将不可用");
+                    // 失败关闭：宿主驱动装配失败时不装配 Web 引擎。
+                    warn!(error = %error, "GPT Web 宿主驱动不可用，Web 引擎将不可用");
                     None
                 }
             }
@@ -2076,6 +2086,10 @@ impl DaemonRuntime {
         if let Some(probe_config) = direct_http_probe_config {
             state = state.with_direct_http_model_probe(probe_config);
         }
+
+        // MCP 服务必须在工具注册表、审批注册表和会话存储全部装配后再恢复；
+        // 它是独立监听入口，不挂到主 HTTP Router，但共享同一个 ApiState 事实源。
+        state.start_mcp_service_if_enabled();
 
         // 把 SnapshotManager 桥接到 session-store 生命周期事件。生产路径必装；
         // 测试可用 ApiState::new 直接构造而不调用此函数，惰性初始化仍可用。

@@ -9,6 +9,10 @@ mod errors;
 pub mod git_tool_runtime;
 mod host_paths;
 pub mod mcp_config;
+mod mcp_runtime;
+mod mcp_service;
+mod mcp_tunnel;
+mod tunnel_client_install;
 mod model_config;
 mod performance;
 mod public_canonical;
@@ -28,17 +32,19 @@ pub mod tunnel;
 #[cfg(test)]
 mod turn_harness;
 mod turn_service;
+mod web_model_channel;
 mod web_model_driver;
-mod web_model_harness;
+pub mod web_model_ops;
+pub mod web_slot_mcp;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
-pub use web_model_driver::{HostWebModelPageDriver, WebModelHostFactory};
-pub use web_model_harness::{
-    WEB_MODEL_TUNNEL_SECTION, WebModelHarnessRuntime, WebModelTunnelConfig, WebModelTunnelStatus,
+pub use web_model_channel::{
+    WEB_MODEL_TUNNEL_SECTION, WebModelChannelRuntime, WebModelTunnelConfig, WebModelTunnelStatus,
 };
+pub use web_model_driver::{HostWebModelPageDriver, WebModelHostFactory};
 pub fn schedule_restored_session_task_dispatches(state: ApiState) {
     routes::schedule_restored_session_task_dispatches(state);
 }

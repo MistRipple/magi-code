@@ -61,6 +61,13 @@ export interface VisionBuiltinTextModelRule {
   examples: string[];
 }
 
+export interface WebConversationProjection {
+  mode: 'temporary' | 'saved';
+  remoteTitle?: string | null;
+  syncState: 'unbound' | 'pending' | 'active' | 'stale' | 'deleted' | 'conflict';
+  hasRemoteConversation: boolean;
+}
+
 export interface SettingsBootstrapPayload {
   scope: 'personal' | 'workspace';
   workspaceId?: string | null;
@@ -70,6 +77,8 @@ export interface SettingsBootstrapPayload {
   orchestratorConfig: Record<string, unknown>;
   orchestratorSessionDefaults?: Record<string, unknown>;
   orchestratorSessionConfig?: Record<string, unknown>;
+  /** GPT Web 会话的对话绑定投影（daemon 事实，只读展示）；非 GPT Web 会话为 null。 */
+  webConversation?: WebConversationProjection | null;
   effectiveOrchestratorConfig?: Record<string, unknown>;
   auxiliaryConfig: Record<string, unknown>;
   visionConfig: Record<string, unknown>;

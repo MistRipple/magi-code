@@ -1143,32 +1143,19 @@ export interface AgentTemplateIdRequestDto {
 }
 
 /**
- * 会话内主模型选择器里的 Web 引擎条目（daemon 投影，A22 / §5.13）。
+ * 会话内主模型选择器里的 GPT Web 入口（daemon 投影，W18）。
  *
- * 只有 daemon 已确认可用的引擎才会出现在这里；可用状态与工具档位由 daemon
- * 算好，前端不自行推断（§5.7.0、A15）。
+ * 登录后只有一个固定入口 `chatgpt-web/default`，不复制网页的模型菜单；未登录或探测失败时
+ * 不出现。工具能力是可选增强：通道不可用时入口照常可用，`tools.available=false` 并说明缺什么。
  */
 export interface PickerWebEngineDto {
   id: string;
   displayName?: string;
   apiProtocol?: ModelApiProtocol;
-  contextWindowTokens?: number;
-  efforts?: string[];
-  toolsEnabled?: boolean;
-  newChatPerTurn?: boolean;
-  toolRoundLimit?: number;
   status?: string;
-  toolTier?: 't0' | 't2' | 't3';
-  toolTierDegradedReason?: { code?: string; detail?: string } | null;
-  accountHint?: string;
-  limitsRevision?: string;
-  reason?: string | null;
-  origin?: {
-    kind?: string;
-    browserSessionId?: string;
-    discoveredAt?: number;
-    accountHint?: string;
-  };
+  tools?: { available: boolean; code?: string; detail?: string };
+  origin?: { kind?: string; accountHint?: string };
+  probedAt?: number;
 }
 
 export interface FetchModelsResponseDto {
@@ -1489,17 +1476,6 @@ export interface SessionSuggestionDto {
 
 export interface SessionSuggestionGroupDto {
   suggestions: SessionSuggestionDto[];
-}
-
-export interface SessionSuggestionsResponseDto {
-  groups: SessionSuggestionGroupDto[];
-}
-
-export interface GenerateSessionSuggestionsRequestDto extends Record<string, unknown> {
-  locale?: string | null;
-  count?: number;
-  requestedGroups?: number;
-  excludePrompts?: string[];
 }
 
 export interface MessagesResponseDto {

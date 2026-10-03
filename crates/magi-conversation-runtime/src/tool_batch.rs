@@ -3061,7 +3061,12 @@ fn task_policy_tool_decision(
     requested_tool_name: &str,
     arguments: &str,
 ) -> Option<ToolPreflightDecision> {
-    task_policy_tool_decision_with_workspace_root(task, requested_tool_name, arguments, None)
+    policy_tool_decision(
+        task.policy_snapshot.as_ref()?,
+        requested_tool_name,
+        arguments,
+        None,
+    )
 }
 
 fn task_tool_preflight_decision(
@@ -3071,18 +3076,29 @@ fn task_tool_preflight_decision(
     arguments: &str,
     workspace_root_path: Option<&PathBuf>,
 ) -> Option<ToolPreflightDecision> {
-    let task_policy_decision = task_policy_tool_decision_with_workspace_root(
-        task,
+    policy_tool_preflight_decision(
+        task.policy_snapshot.as_ref(),
+        safety_gate,
         requested_tool_name,
         arguments,
         workspace_root_path,
-    );
+    )
+}
+
+pub(crate) fn policy_tool_preflight_decision(
+    policy_snapshot: Option<&TaskPolicy>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    requested_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
+) -> Option<ToolPreflightDecision> {
+    let task_policy_decision = policy_snapshot.and_then(|policy| {
+        policy_tool_decision(policy, requested_tool_name, arguments, workspace_root_path)
+    });
     // S8：SafetyGate 语义判定。它和 TaskPolicy 都属于执行前判定：
     // HardBlock 必须压过常规风险拦截，TaskPolicy 的 Rejected 也不能被 SafetyGate
     // 的 NeedsApproval 降级。
-    let access_profile = task
-        .policy_snapshot
-        .as_ref()
+    let access_profile = policy_snapshot
         .map(magi_core::TaskPolicy::effective_access_profile)
         .unwrap_or_default();
     let safety_gate_decision = safety_gate.and_then(|gate| {
@@ -3091,13 +3107,29 @@ fn task_tool_preflight_decision(
     select_preflight_decision(task_policy_decision, safety_gate_decision)
 }
 
+#[cfg(test)]
 fn task_policy_tool_decision_with_workspace_root(
     task: &magi_core::Task,
     requested_tool_name: &str,
     arguments: &str,
     workspace_root_path: Option<&PathBuf>,
 ) -> Option<ToolPreflightDecision> {
-    let policy_snapshot = task.policy_snapshot.as_ref()?;
+    policy_tool_decision(
+        task.policy_snapshot.as_ref()?,
+        requested_tool_name,
+        arguments,
+        workspace_root_path,
+    )
+}
+
+/// 按策略快照做访问档判定。Task 执行与外部（MCP）调用共用这一份判定，
+/// 外部调用使用合成的 `TaskPolicy`，不需要构造 Task。
+pub(crate) fn policy_tool_decision(
+    policy_snapshot: &TaskPolicy,
+    requested_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
+) -> Option<ToolPreflightDecision> {
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
     // no_tools 是 PermissionEngine 三维之外的全局开关，本层先单独拦截。

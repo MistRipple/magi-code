@@ -1,6 +1,6 @@
 # Magi MCP 服务 · 设计基线
 
-> 状态：**设计基线（未实现）**。本文定义 Magi 对外提供的**标准 MCP 服务端**：任何支持 MCP 的客户端（Claude Desktop、Cursor、Cline、ChatGPT 连接器等）都可以连接它，在 Magi 已注册的工作区里使用 Magi 的工具（文件创建 / 编辑 / 删除、搜索、git、变更账本等），审批、审计与变更记录仍由 Magi 负责。
+> 状态：**本机模式（回环 HTTP + stdio）与网络模式（仅 Cloudflare Quick Tunnel，地址每次开启都会变）已实现，GPT Web 侧接入接口就绪**；进度与偏差见《[开发计划](./magi-mcp-server-development-plan.md)》§2.1.1。本文定义 Magi 对外提供的**标准 MCP 服务端**：任何支持 MCP 的客户端（Claude Desktop、Cursor、Cline、ChatGPT 连接器等）都可以连接它，在 Magi 已注册的工作区里使用 Magi 的工具（文件创建 / 编辑 / 删除、搜索、git、变更账本等），审批、审计与变更记录仍由 Magi 负责。
 > 更新日期：2026-09-30。
 > 相关文档：[GPT Web 开发文档](./web-model-browser-development.md)（其工具能力是本服务的一个客户端）、[工程约束与运行入口](./README.md)、[Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)、[内置浏览器完整设计](./browser-runtime-design.md)。
 
@@ -29,7 +29,7 @@ Magi 目前只是 MCP **客户端**（Magi 去调用别人的工具）。本文�
 | M5 | **归属模式是令牌属性：** `external`（默认）与 `follow_web_slot`（仅 GPT Web 连接器使用）。服务端只有一套实现。 | 见 §5、§12。 |
 | M6 | **外部客户端的调用记录在“外部工具会话”里。** 每个令牌对应一个由 Magi 管理的会话（类型为外部工具），复用既有的审批、变更账本、审计与 canonical。不为外部调用另建第二套账。 | Magi 的变更批准 / 回退、快照恢复都以会话为单位。 |
 | M7 | **令牌只对绑定的已注册工作区有效。** 路径必须规范化并限制在工作区根内，拒绝符号链接逃逸；永远不可访问 Magi 状态目录、个人会话目录、凭据与系统敏感路径。 | 防止越权读写。 |
-| M8 | **不暴露管理面：** 设置、模型与密钥、令牌管理、隧道与连接器配置、GPT Web 宿主、子代理、下游 MCP 代理，第一版均不作为工具开放。 | 最小暴露面；能力只增不减地逐步开放。 |
+| M8 | **不暴露管理面：** 设置、模型与密钥、令牌管理、隧道与连接器配置、GPT Web 宿主、子代理，均不作为工具开放；下游 MCP 工具与 Skill handler 作为网关目录的一部分开放，但按 `Destructive` 每次确认。 | 最小暴露面；管理面永不开放，业务能力经审批开放。 |
 | M9 | **网络模式必须显式开启，且默认关闭。** 开启前展示风险说明；令牌泄露等价于对该工作区的读写（如已授予写入与执行则等价于远程执行）。提供一键“撤销全部令牌并停止隧道”。 | 明确后果、可立即止损。 |
 | M10 | **MCP 服务的监听端口与隧道入口独立于 Magi 主应用。** 不挂到主 app、不共享其鉴权中间件、不暴露任何 `/api/*` 路由；不复用 Magi 现有“远程访问”隧道的用户会话路由与访问令牌。 | 现有远程访问是给 Magi Web / 手机用的，认证与路由边界不同。 |
 | M11 | **不做兼容。** 不为旧版本保留分支；令牌与外部会话属于新数据，读不出来就视为无令牌，绝不让 daemon 加载失败。 | 沿用既有基线。 |
@@ -47,7 +47,7 @@ Magi 目前只是 MCP **客户端**（Magi 去调用别人的工具）。本文�
 
 **非目标**
 - 不做 MCP 客户端的托管与发现（Magi 已有的客户端能力不变）。
-- 不开放管理面（M8）、不开放子代理与下游 MCP 代理。
+- 不开放管理面（M8）与子代理；下游 MCP 与 Skill 以网关目录项开放，每次调用确认。
 - 不为网络客户端提供“默认写入 / 默认执行”。
 - 不支持匿名访问：没有令牌一律拒绝，包括本机 HTTP。
 - 不承诺兼容所有 MCP 客户端的所有可选特性；核心只依赖标准 `tools/list` / `tools/call`。
@@ -74,7 +74,7 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 ```
 
 - 服务端是**薄的协议与策略层**，不复制工具实现：调用最终交给现有的工具运行时与 loop 执行，审批走现有审批链，变更进现有变更账本。
-- 传输实现沿用现有 `magi-web-model/src/harness/` 里的 Streamable HTTP、stdio 与本地 socket 中继；这部分代码应从 GPT Web 专用形态上移为通用形态（§13）。
+- 传输实现位于 `crates/magi-mcp-server`：Streamable HTTP、stdio 与本地 socket 中继（原 GPT Web 专用 harness 已上移并删除，§13）。
 
 ---
 
@@ -122,9 +122,13 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 | `magi.changes.approve`、`magi.changes.revert` | 变更账本的批准 / 回退 | `edit` | 否（逐次确认） |
 | `magi.shell.exec` | `shell_exec` | `exec` | 否（逐次确认，并受现有安全闸约束） |
 
+> **第一批实现范围（已在 `crates/magi-mcp-server` 落地）：** 只包含已在工具运行时核对过存在的工具——`magi.fs.read`、`magi.fs.write`、`magi.fs.patch`、`magi.fs.apply_patch`、`magi.fs.mkdir`、`magi.fs.move`、`magi.fs.copy`、`magi.fs.remove`、`magi.search.text`、`magi.search.semantic`、`magi.shell.exec`。上表中的 `magi.git.*` 与 `magi.changes.*` 需要先核对现有 git 与变更账本能力的对外形态，核对后再加入目录；在此之前不对外暴露。
+
 > `magi.changes.*` 是**新增的对外封装**（对应现有变更账本能力），需要在实现阶段核对其在会话之外的可调用性；其余工具映射到现有工具运行时。
 
-**第一版不开放：** 子代理（`agent_*`）、下游 MCP 代理（`mcp.<server>.*`）、Skill 可执行工具（`skill.<skill>.*`）、浏览器工具（`magi.browser.*`）、任何管理面（M8）。后续开放时必须单独评审，并遵守：只暴露有类型化 handler 的能力，GPT Web 宿主永远不可作为目标。
+**目录组成（网关）：** 除上面的静态精选名外，目录还包含**项目允许的**动态内置工具 `magi.<name>`、下游 MCP 工具 `mcp.<model_tool_name>` 与 Skill handler `skill.<name>`。下游 MCP 中非只读的工具与 Skill 一律按 `Destructive` 处理（每次都需用户确认）；GPT Web 槽位端点与外部客户端共用同一个目录、按各自权限档过滤（槽位没有 `exec`）。
+
+**永不开放：** 依赖会话上下文的工具（agent / goal / plan / memory / context / browser / image）、子代理、任何管理面（M8）；GPT Web 宿主永远不可作为目标。
 
 `tools/list` 按令牌生成：只包含该令牌权限档允许的工具，目录在令牌生命周期内固定；权限档或工作区变化时使旧连接失效并要求重连（或发送 `tools/list_changed`），客户端不支持可靠刷新时以重连为准。
 
@@ -206,13 +210,63 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 
 ## 12. 与 GPT Web 的关系
 
-- 两者并列：GPT Web 的收发同步不依赖本服务；本服务不依赖 GPT Web。
-- GPT Web 想使用 Magi 工具时，在 ChatGPT 侧把本服务配置成连接器（Magi 可在托管浏览器里自动配置并回读确认，见 GPT Web 文档 §8）。
-- 该连接器使用的令牌：归属模式 `follow_web_slot`，工作区取自槽位建立时拥有者会话的项目，权限档由用户在配置时选择（默认 `edit`）。
-  - 调用只在槽位拥有者有**进行中的 turn**时接受，并作为普通工具项内联写入该 turn 的 canonical；没有进行中的 turn、槽位已释放或被其他会话占用时一律拒绝。
-  - 槽位释放（停止 / 退出 / 切到本地 / 会话删除）即令该令牌失效；再次使用 GPT Web 时重新生成，避免旧连接被复用。
-- 本服务的其他能力（令牌、权限档、审批、路径限制、审计）对该连接器完全同样生效。
-- **已知取舍**（继承自 GPT Web 文档）：`follow_web_slot` 下归属由“单槽位 + 进行中的 turn”确定，不由消息里的令牌绑定；同一账号在别处（如手机上的 ChatGPT）恰好在此期间调用会被归入该 turn。审批不可绕过，写入类默认需要确认。
+两者并列：GPT Web 的收发同步不依赖本服务；本服务不依赖 GPT Web。GPT Web 想使用 Magi 工具时，经 OpenAI Tunnel 把本服务的**槽位端点**配置成 ChatGPT 连接器（Magi 可在托管浏览器里按用户的显式动作自动配置并回读，见 GPT Web 文档 §8）。本服务的权限档、审批、路径限制、审计对该连接器同样生效。
+
+**已知取舍**：`follow_web_slot` 下归属由“单槽位 + 进行中的 turn”确定，不由消息里的令牌绑定；同一账号在别处（如手机上的 ChatGPT）恰好在此期间调用会被归入该 turn。审批不可绕过，写入类默认需要确认。
+
+### 12.1 槽位端点（无令牌）
+
+GPT Web 的项目工具只有一条路：ChatGPT 连接器 → OpenAI Tunnel → `magi-daemon-app mcp-relay --stdio --slot`（daemon 自己的子命令）→ daemon 的**槽位端点**（本地 socket，仅当前 OS 用户可访问）。槽位端点**不签发、不接受令牌**：调用方身份与归属每个请求都从唯一的槽位表（`magi_web_model::WebSlotTable`）派生。
+
+| | 外部客户端（令牌） | GPT Web（槽位端点） |
+| --- | --- | --- |
+| 认证 | Bearer 令牌（设置页创建 / 吊销） | 无令牌；端点 = 当前 OS 用户的本地 socket |
+| 工作区 | 令牌绑定的工作区 | **槽位拥有者会话的项目**（W17） |
+| 调用归属 | 令牌自己的外部工具会话 | 拥有者会话里**唯一进行中的 turn**（`follow_web_slot`，W9） |
+| 审批出现在 | 全局“外部客户端请求确认”托盘 | 拥有者会话的普通授权托盘（审批挂在该会话上） |
+| 工具写入 | 外部工具会话的账本 | 拥有者会话 canonical 时间线里的**正式工具条目**（`ExternalToolItemWriter`） |
+| 没有进行中的 turn / 槽位已释放 | — | 所有调用一律拒绝；已建立的连接下一条请求即失败 |
+| 权限档 | 用户创建令牌时选择（可含 `exec`） | 设置里选的连接器权限档：`read_only` / `edit` / `edit_trusted`，**没有 `exec`** |
+
+槽位在 turn 结束、被释放（停止 / 退出 / 切换到本地 / 清除数据 / 会话删除）时通过 `WebSlotTable::set_end_hook` 取消该槽位遗留的待审批，等待中的调用以“已取消”收口，不会补执行。
+
+### 12.2 工具目录
+
+槽位端点向模型暴露**项目允许的全部可用工具**，不是一个手写白名单：
+
+- 静态精选名：`magi.fs.*`、`magi.search.*`、`magi.git.*`（只读）、`magi.changes.list/revert`、`magi.shell.exec`（仅非槽位客户端的 `exec` 档）；
+- 动态内置工具：`magi.<name>`，来自当前项目的内置工具注册表；
+- 下游 MCP：`mcp.<model_tool_name>`；
+- Skill：`skill.<name>` handler。
+
+排除：依赖会话上下文的工具（agent / goal / plan / memory / context / browser / image）永远不暴露。下游 MCP 中非只读工具与 Skill 一律按 `Destructive` 处理，**每次都需要用户确认**。同一个目录对所有客户端按权限档过滤，Web 槽位只是没有 `exec`。
+
+### 12.3 连接器与通道
+
+- 通道配置在设置 → 浏览器 → GPT Web：Tunnel id、运行时 API 密钥（粘贴后由 Magi 存进 state root 下的私有文件，之后不再显示）、工具权限档。`tunnel-client` 由 Magi 自动下载（固定版本，发布包 SHA-256 固定在代码里，校验通过才安装并记录解压后摘要供每次启动复核），失败 fail-closed 并报告原因。详见 GPT Web 文档 §8.3。
+- GPT Web 通道的 stdio 中继是 daemon 可执行文件的 `mcp-relay` 子命令，不依赖单独分发的 `magi-mcp`；外部 MCP 客户端使用的 `magi-mcp` 开发期用 `cargo build -p magi-mcp-server --bin magi-mcp` 构建（尚未纳入桌面安装包）。
+- 通道不可用（`web_tunnel_unavailable`）**不是 turn 失败**：GPT Web 仍可纯对话，会话只是没有项目工具，选择器入口显示“无工具”，设置页说明缺什么。
+- Magi 公网隧道（Cloudflare Quick Tunnel 的 MCP 网络模式）是**外部 agent 的入口**，不用于 GPT Web 槽位：GPT Web 只走 OpenAI Tunnel。
+
+### 12.4 代码地图
+
+| 职责 | 位置 |
+| --- | --- |
+| 槽位表、占用 / 释放 / 结束钩子 | `crates/magi-web-model/src/binding.rs` |
+| 槽位身份与归属解析 | `crates/magi-api/src/web_slot_mcp.rs` |
+| 网关目录（静态 + 动态 + 下游 MCP + Skill） | `crates/magi-mcp-server/src/catalog.rs`、`crates/magi-api/src/mcp_service.rs` |
+| 外部工具会话、审批、规范工具条目 | `crates/magi-conversation-runtime/src/{external_tool,external_approval,session_writeback}.rs` |
+| OpenAI Tunnel 托管与通道状态 | `crates/magi-web-model/src/tunnel.rs`、`crates/magi-api/src/web_model_channel.rs` |
+| 已保存对话 / 停止 / 释放 | `crates/magi-api/src/web_model_ops.rs` |
+
+### 12.5 验证
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p magi-mcp-server -p magi-api web_slot
+node scripts/verify-mcp-server.mjs --base <daemon> --mcp-bin target/debug/magi-mcp   # 外部客户端端到端
+```
+
+仍需真实环境验证（不能被自动化替代）：ChatGPT 连接器对 Tunnel stdio 的实际握手、单次 `tools/call` 的等待上限（审批默认 90 秒超时，若连接器更短则需做成可配置）、连接器自动配置的页面选择器。
 
 ---
 
@@ -220,7 +274,7 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 
 | 现有部分 | 处理 |
 | --- | --- |
-| `crates/magi-web-model/src/harness/`（http、stdio、mcp、tunnel）与 `crates/magi-api/src/web_model_harness.rs` | **上移并通用化**：抽出为独立的 MCP 服务模块（建议独立 crate），去掉 GPT Web 专有的“turn 令牌参数”与“通用 inventory / call 包装”；GPT Web 只作为其 `follow_web_slot` 客户端 |
+| `crates/magi-web-model/src/harness/`（http、stdio、mcp、tunnel）与 `crates/magi-api/src/web_model_harness.rs` | **已完成**：上移为独立 crate `magi-mcp-server`，旧 harness 与 `web_model_harness.rs` 已删除（状态字段现名 `ApiState::web_model`）；GPT Web 只作为其槽位端点客户端 |
 | `crates/magi-api/src/tunnel.rs`（`TunnelManager`，cloudflared 托管） | **复用托管能力**，新增独立入口规则与命名隧道的令牌引用；不复用其用户会话路由与访问令牌 |
 | 工具运行时、权限、安全闸、审批链（`magi-tool-runtime`、`magi-permissions`、`magi-safety-gate`、`magi-governance`） | **复用**，作为唯一执行 owner；需核对其在“无模型 turn”下的可调用性 |
 | `magi-snapshot` 变更账本、审计账本、canonical | **复用**；新增 `magi.changes.*` 对外封装 |
@@ -238,6 +292,17 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 3. 用 MCP 官方调试客户端验证 `tools/list` / `tools/call`、挂起与超时、取消。
 任一不成立回到本文重新决策。
 
+**阶段 0 代码核对结果（2026-09-30，读代码，未跑真实客户端）**
+
+| 验证项 | 结论 | 依据与影响 |
+| --- | --- | --- |
+| 工具执行能否脱离模型 turn | **可以** | `magi-tool-runtime::ToolRegistry::execute_with_policy(input, context, policy)` 只需要 `ToolExecutionContext`（会话、工作区、工作目录、访问档）与 `ToolExecutionPolicy`（允许 / 拒绝路径、工具名、命令模式），不依赖 Task 或 turn。MCP 服务直接以它为执行入口。 |
+| 审批能否复用 | **注册表可以复用，等待逻辑要新写** | `ToolApprovalRegistry::request_with_arguments` / `resolve` 把 `task_id`、`turn_id` 当不透明字符串使用，可以用 `external:<token_ref>` 形式的合成标识；但现有等待循环 `await_task_tool_approval`（`tool_batch.rs`）是私有函数，并强依赖“会话当前活动 turn + Task 仍在运行”。MCP 服务需要自己的等待循环，存活判据改为“令牌仍有效且连接未断”。外部审批只支持 `allow_once` / `deny`，不使用 `allow_for_turn`。 |
+| 审批在界面里怎么出现 | **缺口，需要新增全局入口** | 现有审批查询与解析接口按会话作用域（`GET /session/tool-approvals?sessionId=…`）；外部工具会话不是用户当前打开的会话，审批会看不见。需要一个跨会话的“待审批”入口（通知中心 / 全局待办），并把外部审批标明来源客户端。这是阶段 2 的必做项。 |
+| 变更账本对外部写入 | **待验证** | 变更账本以会话为单位；外部写入需要在外部工具会话下建立对应的快照会话，阶段 1–2 中用真实写入验证。 |
+
+> **进度（2026-10-01，分支 `feature/magi-mcp`）：** 本机模式（阶段 1–3）已实现：宿主适配、外部工具会话与账本、审批、令牌持久化（`state_root/mcp-server.json`，**不经 settings**）、固定回环端口、stdio 中继（`magi-mcp`）、设置页、跨会话待审批托盘、审计、只读 git 与 `magi.changes.{list,revert}`；已用真实 daemon 与真实中继二进制端到端验证。网络模式（Quick Tunnel、按需激活、仅网络令牌、退避与限流）已在真实隧道上验证；GPT Web 槽位端点已接线（见 §12）。**未做：** 命名隧道 / Tailscale / 托管发放（决策：只用 Quick Tunnel）、OAuth、第三方客户端兼容验证、外部会话的用户查看入口。
+
 ### 阶段 1：本机 stdio + 令牌（只读优先）
 令牌创建 / 存储 / 吊销、stdio 中继、`read_only` 工具集、路径校验、审计、外部工具会话。
 **验收**：Claude Desktop 或 Cursor 通过 stdio 连接，能列出并调用只读工具；越权路径、符号链接逃逸、无令牌、过期令牌都被拒绝；审计可查。
@@ -252,7 +317,7 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 **验收**：远端客户端经隧道可用同一套工具；撤销令牌与停止隧道立即生效；未开启网络模式时公网不可达。
 
 ### 阶段 4：接入 GPT Web
-`follow_web_slot` 令牌、连接器自动配置、槽位释放使令牌失效。真实通道 spike：ChatGPT 连接器对 `tools/list` 与挂起 `tools/call` 的实际行为。
+`follow_web_slot` 槽位端点、连接器自动配置、槽位释放使身份消失。真实通道 spike：ChatGPT 连接器对 `tools/list` 与挂起 `tools/call` 的实际行为。
 **验收**：见 GPT Web 文档 §13 阶段 3。
 
 ### 检查命令
@@ -274,42 +339,3 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 | 外部会话在会话列表里造成噪音 | 用户困惑 | 独立类型呈现，可折叠 / 归档 |
 | 归属 `follow_web_slot` 的误归属 | 别处同账号调用被归入 Web turn | 审批不可绕过；写入类默认确认；记录为已知取舍 |
 | 范围蔓延 | 与 GPT Web 工作并行导致失控 | 分期严格按门槛推进；先本机后网络；管理面与代理类工具第一版不开放 |
-
----
-
-## 16. 与 GPT Web 线的并行开发约定
-
-MCP 服务与 GPT Web 在概念上互不依赖，可以并行开发；两条线只在少数共用文件和一个接口边界上相交，按下面约定推进。
-
-### 16.1 分支与工作树
-- GPT Web 线：功能分支 `codex/gpt-web-model`（当前工作区所在分支）。
-- MCP 线：独立分支 `feature/magi-mcp`，使用**单独的 git 工作树**（与主工作区目录分开），不在同一个工作区里并行改文件。
-- MCP 线从 GPT Web 线**已提交**的快照派生；之后各自提交，合并顺序见 §16.5。
-
-### 16.2 文件归属
-
-| 区域 | 归属 | 约定 |
-| --- | --- | --- |
-| 新 crate `crates/magi-mcp-server`（协议、令牌、策略、目录、路径校验、审计、传输） | MCP 线 | GPT Web 线不改 |
-| `crates/magi-web-model/src/harness/*`、`crates/magi-api/src/web_model_harness.rs` | **冻结**：GPT Web 线不再新增功能，只允许修复；MCP 线稳定后用**一次原子提交**迁移到通用形态 | 迁移前两线都不在原位置做结构性改动 |
-| GPT Web 收发、槽位、存活判定、界面、`client.rs` 精简、`binding.rs` 精简 | GPT Web 线 | MCP 线不改 |
-| 设置页“MCP 服务”分区、`/mcp/*` 路由前缀与新文件 | MCP 线 | 新文件、新前缀，不改 GPT Web 的旧设置分区与 `browser.rs` 中的隧道、consent 路由（这些由 GPT Web 线负责删除） |
-| `state.rs`、`routes/mod.rs`、`settings-store`、会话模型 | 共用热点 | 各自只加一处最小挂载点；小提交，先合先赢，后合方 rebase |
-| 工具运行时入口（是否可脱离模型 turn 执行）、外部工具会话类型 | MCP 线 | 改动区域与 GPT Web 线撤回的计数器改动不同，冲突时以后合方处理 |
-
-### 16.3 接口边界
-MCP 核心对外只暴露三样东西，GPT Web 线只依赖它们：
-1. **令牌与客户端存储 API**：创建、吊销、按令牌解析范围与归属模式。
-2. **工具执行入口**：外部调用的执行与审批入口（阶段 0 验证其形态）。
-3. **归属策略接口** `CallAttribution`：`external`（默认实现，归到外部工具会话）与 `follow_web_slot`（由 GPT Web 线实现，返回槽位拥有者进行中的 turn，或拒绝）。
-
-GPT Web 线现在就可以对着这个接口写桩与测试，不必等 MCP 线完成。
-
-### 16.4 GPT Web 线在 MCP 就绪前的做法
-- 阶段 0–2（收发、槽位、存活判定、界面、会话规则）与 MCP 完全无关，正常推进。
-- 阶段 3（工具）等待 MCP 本机阶段（本文阶段 1–2）完成后再接入；之前该 Web 会话一律“没有项目工具”，并显示原因。
-
-### 16.5 合并顺序
-1. GPT Web 线先完成拆分提交并稳定（当前快照即基线）。
-2. MCP 线在自己的分支完成阶段 0–2 后，先合并 harness 迁移（原子提交），再合并其余。
-3. GPT Web 阶段 3 在 MCP 阶段 2 合并之后开始。

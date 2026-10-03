@@ -54,24 +54,15 @@ pub(crate) fn spawn_new_session_title_refinement(
     let session_id = session_id.clone();
     let first_message = first_message.to_string();
     let placeholder_title = placeholder_title.to_string();
-    let thread_session_id = session_id.clone();
-    let _ = std::thread::Builder::new()
-        .name(format!("magi-session-title-{}", session_id))
-        .spawn(move || {
-            runtime_handle.block_on(refine_new_session_title_and_publish(
-                state,
-                thread_session_id,
-                first_message,
-                placeholder_title,
-            ));
-        })
-        .map_err(|error| {
-            tracing::warn!(
-                session_id = %session_id,
-                ?error,
-                "辅助模型会话标题线程启动失败"
-            );
-        });
+    // 辅助模型调用是同步阻塞的 HTTP：必须放进阻塞线程池（见 `refine_new_session_title_and_publish`），
+    // 不能在「独立线程 + Handle::block_on」里直接执行——那样会让整个异步运行时冻住数秒，
+    // 期间 Electron 收不到心跳回包而断开浏览器控制连接，正在进行的 GPT Web 回合随之失败。
+    runtime_handle.spawn(refine_new_session_title_and_publish(
+        state,
+        session_id,
+        first_message,
+        placeholder_title,
+    ));
 }
 
 async fn refine_new_session_title_and_publish(
@@ -80,40 +71,48 @@ async fn refine_new_session_title_and_publish(
     first_message: String,
     placeholder_title: String,
 ) -> bool {
-    let Some(client) =
-        magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role(
-            Some(&state.settings_store),
-            None,
-            magi_conversation_runtime::task_execution_dispatcher::RoleTarget::Auxiliary,
-            None,
+    // 解析辅助模型、构造用量上下文、同步 HTTP 调用都在阻塞线程池里完成。
+    let generation_state = state.clone();
+    let generation_session_id = session_id.clone();
+    let refined_title = tokio::task::spawn_blocking(move || {
+        let client =
+            magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role(
+                Some(&generation_state.settings_store),
+                None,
+                magi_conversation_runtime::task_execution_dispatcher::RoleTarget::Auxiliary,
+                None,
+            )
+            .ok()
+            .flatten();
+        let Some(client) = client else {
+            tracing::debug!(
+                session_id = %generation_session_id,
+                "辅助模型未配置，跳过会话标题精修"
+            );
+            return None;
+        };
+        let workspace_id = generation_state
+            .session_store
+            .session(&generation_session_id)
+            .and_then(|session| generation_state.session_workspace_id(&session));
+        let usage_context = workspace_id
+            .as_ref()
+            .map(|workspace_id| SessionTitleUsageContext {
+                event_bus: generation_state.event_bus.as_ref(),
+                settings_store: &generation_state.settings_store,
+                workspace_id,
+            });
+        generate_new_session_title(
+            client,
+            generation_state.session_store.clone(),
+            generation_session_id.clone(),
+            first_message,
+            usage_context,
         )
-        .ok()
-        .flatten()
-    else {
-        tracing::debug!(
-            session_id = %session_id,
-            "辅助模型未配置，跳过会话标题精修"
-        );
-        return false;
-    };
-    let workspace_id = state
-        .session_store
-        .session(&session_id)
-        .and_then(|session| state.session_workspace_id(&session));
-    let usage_context = workspace_id
-        .as_ref()
-        .map(|workspace_id| SessionTitleUsageContext {
-            event_bus: state.event_bus.as_ref(),
-            settings_store: &state.settings_store,
-            workspace_id,
-        });
-    let refined_title = generate_new_session_title(
-        client,
-        state.session_store.clone(),
-        session_id.clone(),
-        first_message,
-        usage_context,
-    );
+    })
+    .await
+    .ok()
+    .flatten();
     let Some(title) = refined_title else {
         return false;
     };
@@ -173,45 +172,6 @@ pub(crate) fn publish_session_title_updated(
         ..EventContext::default()
     });
     state.event_bus.publish(event);
-}
-
-/// 同步执行一次会话标题精修。
-///
-/// 调用方负责在合适的位置 fire-and-forget 包装（参考 `submit_regular_session_turn` 中的接线）：
-/// 该函数会发起一次阻塞式 LLM 调用，应放到独立线程，避免阻塞 HTTP 请求处理线程。
-pub fn refine_new_session_title(
-    client: Arc<dyn ModelBridgeClient>,
-    session_store: Arc<SessionStore>,
-    session_id: SessionId,
-    first_message: String,
-    placeholder_title: String,
-) -> Option<String> {
-    refine_new_session_title_inner(
-        client,
-        session_store,
-        session_id,
-        first_message,
-        placeholder_title,
-        None,
-    )
-}
-
-fn refine_new_session_title_inner(
-    client: Arc<dyn ModelBridgeClient>,
-    session_store: Arc<SessionStore>,
-    session_id: SessionId,
-    first_message: String,
-    placeholder_title: String,
-    usage_context: Option<SessionTitleUsageContext<'_>>,
-) -> Option<String> {
-    let title = generate_new_session_title(
-        client,
-        session_store.clone(),
-        session_id.clone(),
-        first_message,
-        usage_context,
-    )?;
-    rename_session_if_placeholder(&session_store, &session_id, &placeholder_title, title)
 }
 
 fn generate_new_session_title(
@@ -327,43 +287,6 @@ fn normalize_title(raw: &str) -> Option<String> {
     Some(title)
 }
 
-fn rename_session_if_placeholder(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    placeholder_title: &str,
-    title: String,
-) -> Option<String> {
-    match session_store.session(session_id).map(|record| record.title) {
-        Some(current) if current == placeholder_title => {}
-        Some(other) => {
-            tracing::debug!(
-                session_id = %session_id,
-                current = %other,
-                "会话标题已被改动，跳过辅助模型精修"
-            );
-            return None;
-        }
-        None => {
-            tracing::debug!(
-                session_id = %session_id,
-                "会话已不存在，跳过辅助模型精修"
-            );
-            return None;
-        }
-    }
-    match session_store.rename_session(session_id, title.clone()) {
-        Ok(_) => Some(title),
-        Err(err) => {
-            tracing::warn!(
-                session_id = %session_id,
-                ?err,
-                "会话标题写回失败"
-            );
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +361,29 @@ mod tests {
         assert_eq!(normalize_title("`title`").as_deref(), Some("title"));
     }
 
+    /// 生产路径的同一组合：先让辅助模型生成标题，再仅在标题仍是占位时写回。
+    fn refine_in_test(
+        client: Arc<dyn ModelBridgeClient>,
+        store: Arc<SessionStore>,
+        session_id: SessionId,
+        first_message: String,
+        placeholder_title: String,
+    ) -> Option<String> {
+        let title = generate_new_session_title(
+            client,
+            store.clone(),
+            session_id.clone(),
+            first_message,
+            None,
+        )?;
+        match store.session(&session_id).map(|record| record.title) {
+            Some(current) if current == placeholder_title => {}
+            _ => return None,
+        }
+        store.rename_session(&session_id, title.clone()).ok()?;
+        Some(title)
+    }
+
     #[test]
     fn normalize_title_rejects_empty_and_oversize() {
         assert!(normalize_title("   ").is_none());
@@ -447,13 +393,13 @@ mod tests {
     }
 
     #[test]
-    fn refine_new_session_title_rewrites_placeholder_on_success() {
+    fn refined_title_rewrites_placeholder_on_success() {
         let store = Arc::new(SessionStore::new());
         let placeholder = "对话首条消息很长很长";
         let session_id = seed_session(&store, placeholder);
         let client = StubAuxiliaryClient::ok_with_content("“重构 Mission 模型 ”");
 
-        let refined_title = refine_new_session_title(
+        let refined_title = refine_in_test(
             client,
             store.clone(),
             session_id.clone(),
@@ -467,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn refine_new_session_title_skips_when_user_already_renamed() {
+    fn refined_title_skips_when_user_already_renamed() {
         let store = Arc::new(SessionStore::new());
         let placeholder = "原始消息内容";
         let session_id = seed_session(&store, placeholder);
@@ -476,7 +422,7 @@ mod tests {
             .expect("rename");
         let client = StubAuxiliaryClient::ok_with_content("辅助模型生成标题");
 
-        let refined_title = refine_new_session_title(
+        let refined_title = refine_in_test(
             client,
             store.clone(),
             session_id.clone(),
@@ -490,13 +436,13 @@ mod tests {
     }
 
     #[test]
-    fn refine_new_session_title_skips_on_client_error() {
+    fn refined_title_skips_on_client_error() {
         let store = Arc::new(SessionStore::new());
         let placeholder = "占位标题内容长一些";
         let session_id = seed_session(&store, placeholder);
         let client = StubAuxiliaryClient::err();
 
-        let refined_title = refine_new_session_title(
+        let refined_title = refine_in_test(
             client,
             store.clone(),
             session_id.clone(),
@@ -510,13 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn refine_new_session_title_uses_auxiliary_for_short_messages() {
+    fn refined_title_uses_auxiliary_for_short_messages() {
         let store = Arc::new(SessionStore::new());
         let placeholder = "短消息";
         let session_id = seed_session(&store, placeholder);
         let client = StubAuxiliaryClient::ok_with_content("日常问候");
 
-        let refined_title = refine_new_session_title(
+        let refined_title = refine_in_test(
             client,
             store.clone(),
             session_id.clone(),

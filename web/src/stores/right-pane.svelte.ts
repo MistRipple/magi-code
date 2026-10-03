@@ -88,7 +88,7 @@ export interface TerminalTabPayload {
  *
  * 只承载指针（浏览器会话 id、主页 tab id、视图 id），不承载页面内容：
  * 页面实体由 BrowserAuthority + Desktop Main 拥有，右栏只保存布局意图
- * （设计基线 §5.1、§5.6）。
+ * 。
  */
 export interface WebModelHost {
   tabId: string;
@@ -102,16 +102,12 @@ export interface WebModelTabPayload {
   browserSessionId: string;
   /** 主页 Tab 的固定 tab id（推理页面由推理通道按需创建）。 */
   homeTabId: string;
-  /**
-   * 需要挂载的宿主页面：主页 + 每个活跃对话实例一个推理页面。
-   *
-   * 全部宿主**始终挂载**，只有可见性随激活态切换（A25）；不设预热池。
-   */
+  /** 应用级唯一 WebView 宿主；临时/已保存对话都在此页面内切换。 */
   hosts: WebModelHost[];
   /** 视图幂等键；应用级视图全局单例，同 key 重复打开只激活既有视图。 */
   viewId: string;
   /**
-   * 视图是否被用户显式隐藏（A4 / A25）。
+   * 视图是否被用户显式隐藏。
    *
    * 关闭按钮只置 true：视图从 Tab 条移除，但组件与 guest 保持挂载，
    * 后台推理不中断。
@@ -167,7 +163,7 @@ interface RightPaneRootState {
   perSession: Record<string, SessionPaneState>;
   /**
    * 应用级（GPT Web）Tab 集合：与 `perSession` 并列的**窗口级、仅进程内**容器
-   * （设计基线 §5.2）。
+   * 。
    *
    * `webSession` 一律不进 `perSession`，因此也不进入 `tabsForPersist` /
    * `isRestorableTab`；切换项目 / 会话（`activateRightPaneSession`）不动它。
@@ -229,6 +225,8 @@ function rightPaneStorage(): Storage | null {
 function normalizeWorkspaceId(workspaceId: string | null | undefined): string {
   return typeof workspaceId === 'string' ? workspaceId.trim() : '';
 }
+
+const DRAFT_SESSION_ID = '__draft__';
 
 function normalizeSessionId(sessionId: string | null | undefined): string {
   return typeof sessionId === 'string' ? sessionId.trim() : '';
@@ -673,6 +671,9 @@ export function activateRightPaneSession(
   const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
   const normalizedSessionId = normalizeSessionId(sessionId);
   const scopeKey = paneScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  const previousScopeKey = rightPaneState.activeScopeKey;
+  const previousWasDraft = normalizeSessionId(rightPaneState.activeSessionId) === DRAFT_SESSION_ID;
+  const targetIsNew = !rightPaneState.perSession[scopeKey];
   if (normalizedWorkspaceId && normalizedSessionId) {
     migrateWorkspacePaneIntoSession(normalizedWorkspaceId, scopeKey);
   }
@@ -680,6 +681,35 @@ export function activateRightPaneSession(
   rightPaneState.activeSessionId = normalizedSessionId;
   rightPaneState.activeScopeKey = scopeKey;
   ensureSession(scopeKey);
+  // 草稿里发出第一条消息后才得到真实会话 id，作用域键随之改变：新会话必须沿用用户刚才看到的右栏
+  // （展开状态、已打开的标签），不能落回「默认折叠」——否则右栏会在发送的瞬间自己关掉。
+  if (
+    targetIsNew
+    && previousWasDraft
+    && normalizedSessionId !== ''
+    && normalizedSessionId !== DRAFT_SESSION_ID
+    && previousScopeKey
+    && previousScopeKey !== scopeKey
+  ) {
+    inheritDraftPane(previousScopeKey, scopeKey);
+  }
+}
+
+/** 把草稿作用域的右栏状态整体交给刚得到真实 id 的会话；草稿作用域随之释放。 */
+function inheritDraftPane(draftScopeKey: string, targetScopeKey: string): void {
+  const draft = rightPaneState.perSession[draftScopeKey];
+  const target = rightPaneState.perSession[targetScopeKey];
+  if (!draft || !target) return;
+  const mergedTabs = [...target.openTabs];
+  for (const tab of draft.openTabs) {
+    if (!mergedTabs.some((existing) => existing.id === tab.id)) mergedTabs.push(tab);
+  }
+  target.openTabs = mergedTabs;
+  if (draft.activeTabId && mergedTabs.some((tab) => tab.id === draft.activeTabId)) {
+    target.activeTabId = draft.activeTabId;
+  }
+  target.collapsed = draft.collapsed;
+  delete rightPaneState.perSession[draftScopeKey];
 }
 
 /** 读取某个 session 的面板状态（响应式引用）；空 sessionId 或未初始化时返回空快照 */
@@ -1343,7 +1373,7 @@ function setActiveRightPaneTabInternal(
     return;
   }
   session.activeTabId = tabId;
-  // 选择任意会话级 Tab 即离开应用级视图；应用级 Tab 本身仍保持挂载（A25）。
+  // 选择任意会话级 Tab 即离开应用级视图；应用级 Tab 本身仍保持挂载。
   rightPaneState.activeAppTabId = null;
   tab.lastActivatedAt = now();
   if (userInitiated) rememberDesktopPanelIntent(scopeKey, tab);
@@ -1368,7 +1398,7 @@ export function updateRightPaneTabLabel(
  * 应用级 GPT Web 视图的幂等键。
  *
  * `webSession` 是窗口级单例：同一窗口只维护一个应用级视图，切项目 / 会话
- * 只切换它显示的对话实例，不重建视图、不释放 guest（A2、A25、§5.2）。
+ * 只切换它显示的对话实例，不重建视图、不释放 guest。
  */
 export const WEB_MODEL_VIEW_ID = 'app';
 const WEB_MODEL_TAB_ID = `webSession:${WEB_MODEL_VIEW_ID}`;
@@ -1382,21 +1412,11 @@ function ensureWebModelTab(
   if (existing) {
     const payload = existing.payload as WebModelTabPayload;
     // 应用级会话 id 变化（重建）时同步指针；视图本身不销毁。
-    // 重新打开隐藏视图时不能把已经挂载的推理宿主裁成只有主页，
-    // 否则 Svelte 会卸载对应 webview，后台推理会被人为中断。
-    const retainedHosts = new Map(
-      (payload.browserSessionId === browserSessionId ? payload.hosts : [])
-        .map((host) => [host.tabId, host]),
-    );
-    if (homeHost.tabId) retainedHosts.set(homeHost.tabId, homeHost);
     existing.payload = {
       ...payload,
       browserSessionId,
       homeTabId: homeHost.tabId,
-      hosts: [
-        ...(homeHost.tabId ? [retainedHosts.get(homeHost.tabId)!] : []),
-        ...[...retainedHosts.values()].filter((host) => host.tabId !== homeHost.tabId),
-      ],
+      hosts: homeHost.tabId ? [homeHost] : [],
     };
     return existing;
   }
@@ -1410,7 +1430,9 @@ function ensureWebModelTab(
       homeTabId: homeHost.tabId,
       hosts,
       viewId: WEB_MODEL_VIEW_ID,
-      viewHidden: false,
+      // 宿主随 daemon 投影挂载（后台推理 / 登录态恢复需要它存在），但标签只在用户主动
+      // 「新增 → GPT Web」或点击入口时出现：右栏默认保持为空。
+      viewHidden: true,
     },
     lastActivatedAt: now(),
   };
@@ -1427,7 +1449,7 @@ export function appWebModelTab(): RightPaneTab | null {
  * 打开（或激活）应用级 GPT Web 视图。
  *
  * 幂等：已存在时只清除隐藏标记并激活。**不动 `perSession`**，因此切换项目 /
- * 会话不会影响它（§5.2）。
+ * 会话不会影响它。
  */
 export function openWebModelTab(
   browserSessionId: string,
@@ -1439,7 +1461,7 @@ export function openWebModelTab(
   return tab;
 }
 
-/** `webSession` 关闭按钮语义：只隐藏视图，保留挂载与后台推理（A4 / A25）。 */
+/** `webSession` 关闭按钮语义：只隐藏视图，保留挂载与后台推理。 */
 export function hideWebModelTabView(): void {
   const tab = appWebModelTab();
   if (!tab) return;
@@ -1471,9 +1493,7 @@ export function clearWebModelTab(): void {
  * 由 BrowserAuthority 的应用级会话投影收敛视图存在性。
  *
  * 传入 `null` 表示应用级会话已不存在（清除数据 / 未创建）；此时释放视图指针。
- * `hosts` 是应用级会话当前的完整宿主集合：**主页 + 每个活跃对话实例一个
- * 推理页面**（设计基线 §5.2、A25）。宿主集合永远包含主页，顺序由调用方保证；
- * 宿主数量只由推理通道并发上限约束，视图侧不自行增减。
+ * `hosts` 只包含应用级唯一 WebView 主页宿主。临时/已保存会话不创建额外页面。
  */
 export function synchronizeWebModelAppSession(
   browserSessionId: string | null | undefined,
@@ -1509,11 +1529,7 @@ export function synchronizeWebModelAppSession(
 }
 
 /**
- * 收敛应用级内容槽的宿主集合（主页 + 推理页面）。
- *
- * 不调用者可以只投影主页（`createWebModelPane`）；后台驱动路径创建的推理页面
- * 必须由 `GET /browser/sessions/app` 的投影追加进来，否则 `<webview>` guest
- * 不存在，App 级命令拿不到 content-slot binding（A25）。
+ * 收敛应用级内容槽的唯一 WebView 宿主。
  */
 export function updateWebModelHosts(hosts: readonly WebModelHost[]): void {
   const tab = appWebModelTab();

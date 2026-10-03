@@ -8,8 +8,9 @@ mod tests;
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
     CanonicalTurn, NotificationContext, NotificationRecord, NotificationScope,
-    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionPlan,
-    SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
+    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionKind,
+    SessionPlan, SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry,
+    TimelineEntryKind,
 };
 use magi_core::{
     DomainError, DomainResult, SessionId, SessionLifecycleStatus, Task, ThreadId, UtcMillis,
@@ -222,8 +223,9 @@ pub(crate) fn cmp_sessions_newest_first(
         .then_with(|| right.session_id.as_str().cmp(left.session_id.as_str()))
 }
 
-fn prepare_session_deletion(
-    state: &mut SessionStoreState,
+/// 删除前的只读校验。返回「被删的是不是 current」。
+fn check_session_deletion(
+    state: &SessionStoreState,
     session_id: &SessionId,
     replacement_session_id: Option<&SessionId>,
 ) -> DomainResult<bool> {
@@ -231,8 +233,7 @@ fn prepare_session_deletion(
         .sessions
         .iter()
         .find(|session| &session.session_id == session_id)
-        .ok_or(DomainError::NotFound { entity: "session" })?
-        .clone();
+        .ok_or(DomainError::NotFound { entity: "session" })?;
     let deleting_current = state.current_session_id.as_ref() == Some(session_id);
 
     if !deleting_current && replacement_session_id.is_some() {
@@ -259,6 +260,15 @@ fn prepare_session_deletion(
             });
         }
     }
+    Ok(deleting_current)
+}
+
+fn prepare_session_deletion(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    replacement_session_id: Option<&SessionId>,
+) -> DomainResult<bool> {
+    let deleting_current = check_session_deletion(state, session_id, replacement_session_id)?;
 
     state
         .sessions
@@ -288,6 +298,55 @@ fn prepare_session_deletion(
         state.current_session_id = replacement_session_id.cloned();
     }
     Ok(removed_sidecar)
+}
+
+/// 只含「全部会话记录 + 全部通知 + 指定会话的切片」的 durable 视图。
+///
+/// 持久化层按会话增量提交时，只会重新序列化被点名的会话；其余会话只需要出现在会话列表里
+/// （用来判断哪些会话「不再保留」），不需要它们的历史。整份 `durable_state()` 要把所有会话的所有
+/// 回合、工具调用逐层深拷贝，代价随历史总量增长（本仓库实测每次 0.3–0.6 秒，且在写锁里）。
+fn durable_slice_for_sessions(
+    state: &SessionStoreState,
+    session_ids: &[SessionId],
+) -> SessionDurableState {
+    let mut durable = SessionDurableState {
+        current_session_id: state.current_session_id.clone(),
+        sessions: state.sessions.clone(),
+        notifications: state.notifications.clone(),
+        ..SessionDurableState::default()
+    };
+    let mut included = Vec::<&SessionId>::new();
+    for session_id in session_ids {
+        if included.contains(&session_id) {
+            continue;
+        }
+        included.push(session_id);
+        let slice = state.durable_state_for_session(session_id);
+        durable.timeline.extend(slice.timeline);
+        durable.canonical_turns.extend(slice.canonical_turns);
+        durable.goals.extend(slice.goals);
+        durable.plans.extend(slice.plans);
+        durable.thread_registry.extend(slice.thread_registry);
+        durable
+            .thread_context_checkpoints
+            .extend(slice.thread_context_checkpoints);
+    }
+    durable
+}
+
+fn sidecars_for_sessions(
+    state: &SessionStoreState,
+    session_ids: &[SessionId],
+) -> SessionExecutionSidecarStoreState {
+    SessionExecutionSidecarStoreState {
+        runtime_sidecars: state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .filter(|sidecar| session_ids.contains(&sidecar.session_id))
+            .cloned()
+            .collect(),
+    }
 }
 
 fn prepare_session_rename(
@@ -679,6 +738,27 @@ impl SessionStore {
         persist(&durable, &sidecars)
     }
 
+    /// 已知只有这几个会话发生变化时的持久化事务：回调拿到的是「全部会话记录 + 全部通知 + 这几个会话
+    /// 的切片 + 它们的 sidecar」，而不是整份深拷贝。锁序与 `persist_projection_with` 完全一致。
+    pub fn persist_sessions_projection_with<T, E>(
+        &self,
+        session_ids: &[SessionId],
+        persist: impl FnOnce(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _persistence_guard = self
+            .durable_persistence_lock
+            .lock()
+            .expect("session durable persistence lock poisoned");
+        let _canonical_guard = self
+            .canonical_commit_barrier
+            .write()
+            .expect("session canonical commit barrier poisoned");
+        let state = self.state.read().expect("session state read lock poisoned");
+        let durable = durable_slice_for_sessions(&state, session_ids);
+        let sidecars = sidecars_for_sessions(&state, session_ids);
+        persist(&durable, &sidecars)
+    }
+
     /// 会话导航专用的持久化事务：只把“当前指针 + 目标会话的切片 + 目标会话的 sidecar”交给回调。
     ///
     /// `persist_projection_with` 会把全部会话的全部历史整体深拷贝一份，切换会话的代价因此与
@@ -827,6 +907,7 @@ impl SessionStore {
             workspace_id: workspace_id.clone(),
             last_completed_at: None,
             last_viewed_at: None,
+            kind: Default::default(),
         };
         state.sessions.push(session.clone());
         state.current_session_id = Some(session_id.clone());
@@ -840,6 +921,48 @@ impl SessionStore {
         drop(state);
         if let Some(observer) = self.lifecycle_observer() {
             observer.on_session_created(&session_id, workspace_id.as_deref());
+        }
+        Ok(session)
+    }
+
+    /// 创建外部工具会话（Magi MCP 服务为外部令牌建立）。
+    ///
+    /// 与用户会话的区别：不抢占用户当前选中的会话，不写“会话已创建”时间线；
+    /// 会话只承载外部调用、审批与变更。
+    pub fn create_external_tool_session(
+        &self,
+        session_id: SessionId,
+        title: impl Into<String>,
+        workspace_id: String,
+    ) -> DomainResult<SessionRecord> {
+        let created_at = UtcMillis::now();
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(DomainError::AlreadyExists { entity: "session" });
+        }
+        let session = SessionRecord {
+            session_id: session_id.clone(),
+            title: title.into(),
+            status: SessionLifecycleStatus::Active,
+            created_at,
+            updated_at: created_at,
+            message_count: None,
+            workspace_id: Some(workspace_id.clone()),
+            last_completed_at: None,
+            last_viewed_at: None,
+            kind: SessionKind::ExternalTool,
+        };
+        state.sessions.push(session.clone());
+        drop(state);
+        if let Some(observer) = self.lifecycle_observer() {
+            observer.on_session_created(&session_id, Some(workspace_id.as_str()));
         }
         Ok(session)
     }
@@ -912,6 +1035,18 @@ impl SessionStore {
         sessions
     }
 
+    /// 读取单个会话的当前权威记录，供应用级能力（例如 GPT Web Gateway）
+    /// 将工具调用绑定回会话所属工作区。返回副本，不暴露内部锁。
+    pub fn session_record(&self, session_id: &SessionId) -> Option<SessionRecord> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        state
+            .sessions
+            .iter()
+            .find(|session| &session.session_id == session_id)
+            .cloned()
+            .map(|session| with_session_message_count(session, &state.timeline))
+    }
+
     pub fn rename_session(
         &self,
         session_id: &SessionId,
@@ -951,22 +1086,36 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
-        let mut candidate = state.clone();
-        let Some(updated) = prepare_session_rename(&mut candidate, session_id, &new_title)
+        // 原地修改，持久化失败再回滚：重命名只动一条会话记录和一条 timeline，不需要把整个
+        // 状态（所有会话的所有回合）深拷贝成候选再替换。
+        let previous = state
+            .sessions
+            .iter()
+            .find(|session| &session.session_id == session_id)
+            .cloned()
+            .ok_or(SessionMutationTransactionError::Domain(
+                DomainError::NotFound { entity: "session" },
+            ))?;
+        let timeline_len = state.timeline.len();
+        let Some(updated) = prepare_session_rename(&mut state, session_id, &new_title)
             .map_err(SessionMutationTransactionError::Domain)?
         else {
-            return candidate
-                .sessions
-                .into_iter()
-                .find(|session| &session.session_id == session_id)
-                .ok_or(SessionMutationTransactionError::Domain(
-                    DomainError::NotFound { entity: "session" },
-                ));
+            return Ok(previous);
         };
-        let durable = candidate.durable_state();
-        let sidecars = candidate.execution_sidecar_store.clone();
-        persist(&durable, &sidecars).map_err(SessionMutationTransactionError::Persistence)?;
-        *state = candidate;
+        let session_ids = std::slice::from_ref(session_id);
+        let durable = durable_slice_for_sessions(&state, session_ids);
+        let sidecars = sidecars_for_sessions(&state, session_ids);
+        if let Err(error) = persist(&durable, &sidecars) {
+            if let Some(session) = state
+                .sessions
+                .iter_mut()
+                .find(|session| &session.session_id == session_id)
+            {
+                *session = previous;
+            }
+            state.timeline.truncate(timeline_len);
+            return Err(SessionMutationTransactionError::Persistence(error));
+        }
         Ok(updated)
     }
 
@@ -1028,15 +1177,28 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
-        let mut candidate = state.clone();
-        let removed_sidecar =
-            prepare_session_deletion(&mut candidate, session_id, replacement_session_id)
+        // 先只读校验，再用「删除之后」的视图持久化，成功后才真正删除：不需要整份克隆候选状态，
+        // 也不需要回滚。视图里没有被删会话，持久化层据此移除它的文件；替代会话（若有）整段提交。
+        let deleting_current =
+            check_session_deletion(&state, session_id, replacement_session_id)
                 .map_err(SessionMutationTransactionError::Domain)?;
-        let durable = candidate.durable_state();
-        let sidecars = candidate.execution_sidecar_store.clone();
+        let replacement_ids: Vec<SessionId> = replacement_session_id.cloned().into_iter().collect();
+        let mut durable = durable_slice_for_sessions(&state, &replacement_ids);
+        durable
+            .sessions
+            .retain(|session| &session.session_id != session_id);
+        durable
+            .notifications
+            .retain(|notification| notification.session_id.as_ref() != Some(session_id));
+        if deleting_current {
+            durable.current_session_id = replacement_session_id.cloned();
+        }
+        let sidecars = sidecars_for_sessions(&state, &replacement_ids);
         persist(&durable, &sidecars).map_err(SessionMutationTransactionError::Persistence)?;
 
-        *state = candidate;
+        let removed_sidecar =
+            prepare_session_deletion(&mut state, session_id, replacement_session_id)
+                .map_err(SessionMutationTransactionError::Domain)?;
         drop(state);
         if removed_sidecar {
             self.mark_sidecar_dirty_for_session(

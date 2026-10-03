@@ -182,6 +182,7 @@ import type {
 } from '../../types/message';
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
+import { MCP_APPROVALS_CHANGED_EVENT } from '../../lib/mcp-server-events';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 const pendingBridgeMessages: ClientBridgeMessage[] = [];
@@ -1990,6 +1991,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   // 授权请求与授权结果都通过同一事件流进入前端。这里刷新会话级授权投影，
   // 让主会话和子代理共用一个待处理托盘，不依赖轮询或“重新打开会话”才能看到按钮。
   if (eventType === 'tool.approval.requested' || eventType === 'tool.approval.resolved') {
+    // 外部 MCP 客户端的确认不属于当前会话，走跨会话托盘，不能刷新当前会话的授权投影。
+    if (event.payload?.external === true) {
+      window.dispatchEvent(new CustomEvent(MCP_APPROVALS_CHANGED_EVENT));
+      return;
+    }
     refreshCurrentSessionToolApprovals(eventType);
     return;
   }

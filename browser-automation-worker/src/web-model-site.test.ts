@@ -9,11 +9,12 @@ import {
   INSTALL_WEB_MODEL_ADAPTER,
   isSupportedChatGptOrigin,
   normalizeComposerText,
-  normalizeModelFamily,
   normalizeWebModelProbe,
   normalizeWebModelTurnState,
   type WebModelRawSnapshot,
   type WebModelRawTurnState,
+  isOpenAiPlatformOrigin,
+  openAiPlatformProbe,
 } from "./web-model-site.js";
 
 function snapshot(overrides: Partial<WebModelRawSnapshot> = {}): WebModelRawSnapshot {
@@ -22,12 +23,8 @@ function snapshot(overrides: Partial<WebModelRawSnapshot> = {}): WebModelRawSnap
     path: "/",
     blocked: false,
     composerFound: true,
-    composerCharLimit: null,
     conversationFound: true,
-    modelMenuFound: true,
-    modelItems: [],
     accountHint: null,
-    connectorSettingsFound: false,
     ...overrides,
   };
 }
@@ -74,21 +71,6 @@ test("写入分歧诊断只暴露位置、码点和长度，不复制正文", ()
   });
 });
 
-test("normalizeModelFamily 只识别站点真实模型族", () => {
-  assert.equal(normalizeModelFamily("ChatGPT"), "chatgpt");
-  assert.equal(normalizeModelFamily("ChatGPT 适用于快速任务和回答"), "chatgpt");
-  assert.equal(normalizeModelFamily("ChatGPT Business 助力高效工作"), null);
-  assert.equal(normalizeModelFamily("GPT-5 Thinking"), "gpt-5-thinking");
-  assert.equal(normalizeModelFamily("GPT-5.6 Sol"), "gpt-5.6-sol");
-  assert.equal(normalizeModelFamily("GPT-5.5"), "gpt-5.5");
-  assert.equal(normalizeModelFamily("GPT-5"), "gpt-5");
-  assert.equal(normalizeModelFamily("GPT-4o"), "gpt-4o");
-  assert.equal(normalizeModelFamily("o4-mini"), "o4-mini");
-  assert.equal(normalizeModelFamily("GPT-Next Preview"), "gpt-next-preview");
-  assert.equal(normalizeModelFamily("o5-mini"), "o5-mini");
-  assert.equal(normalizeModelFamily("随便一个名字"), null);
-});
-
 test("站点 origin 必须是受支持的 ChatGPT Web origin", () => {
   assert.equal(isSupportedChatGptOrigin("https://chatgpt.com"), true);
   assert.equal(isSupportedChatGptOrigin("https://chat.openai.com"), true);
@@ -96,99 +78,27 @@ test("站点 origin 必须是受支持的 ChatGPT Web origin", () => {
   assert.equal(isSupportedChatGptOrigin("https://chatgpt.com.evil.test"), false);
 });
 
-test("当前 ChatGPT 模型菜单档位快照可直接投影到 Web 引擎", () => {
-  const probe = normalizeWebModelProbe(snapshot({
-    accountHint: "Plus",
-    modelItems: [
-      { label: "GPT-5.6 Sol", checked: true, efforts: ["low", "medium", "high"] },
-      { label: "GPT-5.5", checked: false, efforts: ["low", "medium", "high"] },
-    ],
-  }));
-  assert.deepEqual(probe.models.map((model) => model.family), ["gpt-5.6-sol", "gpt-5.5"]);
-  assert.deepEqual(probe.models[0]?.efforts, ["low", "medium", "high"]);
+test("探测只回答登录与页面可用性：两项证据都在才算已登录", () => {
+  const ok = normalizeWebModelProbe(snapshot({ accountHint: "plus" }));
+  assert.equal(ok.loginState, "signed_in");
+  assert.equal(ok.composerAvailable, true);
+  assert.equal(ok.accountHint, "plus");
+  assert.equal(ok.diagnostic, null);
+  // 探测结果里没有任何网页模型菜单相关字段（W18）。
+  assert.deepEqual(Object.keys(ok).sort(), ["accountHint", "composerAvailable", "diagnostic", "loginState", "pageKind", "siteRevision"]);
+
+  assert.equal(normalizeWebModelProbe(snapshot({ composerFound: false })).loginState, "signed_out");
+  assert.equal(normalizeWebModelProbe(snapshot({ composerFound: false })).diagnostic, "composer_selector_missing");
+  assert.equal(normalizeWebModelProbe(snapshot({ conversationFound: false })).loginState, "signed_out");
+  assert.equal(normalizeWebModelProbe(snapshot({ conversationFound: false })).diagnostic, "conversation_selector_missing");
+  assert.equal(normalizeWebModelProbe(snapshot({ blocked: true })).loginState, "blocked");
 });
 
-test("未登录时探测结果没有模型，且状态为 signed_out", () => {
-  // 登录态需要两项证据：会话有效 + composer 可用（设计基线 §5.5）。
-  const noComposer = normalizeWebModelProbe(snapshot({ composerFound: false }));
-  assert.equal(noComposer.loginState, "signed_out");
-  assert.deepEqual(noComposer.models, []);
-
-  const noConversation = normalizeWebModelProbe(snapshot({ conversationFound: false }));
-  assert.equal(noConversation.loginState, "signed_out");
-  assert.deepEqual(noConversation.models, []);
-});
-
-test("未登录时即使读到了模型菜单也不返回模型", () => {
-  const probe = normalizeWebModelProbe(snapshot({
-    composerFound: false,
-    modelItems: [{ label: "GPT-5", checked: true, efforts: ["medium"] }],
-  }));
+test("不受支持的 origin 永远不算登录", () => {
+  const probe = normalizeWebModelProbe(snapshot({ origin: "https://chatgpt.com.evil.test" }));
   assert.equal(probe.loginState, "signed_out");
-  assert.deepEqual(probe.models, [], "未登录不得用缓存列表冒充可用结果");
-});
-
-test("风控页判定为 blocked 且不返回模型", () => {
-  const probe = normalizeWebModelProbe(snapshot({
-    blocked: true,
-    modelItems: [{ label: "GPT-5", checked: true, efforts: ["medium"] }],
-  }));
-  assert.equal(probe.loginState, "blocked");
-  assert.deepEqual(probe.models, []);
-});
-
-test("已登录时按站点菜单归一化模型族与档位", () => {
-  const probe = normalizeWebModelProbe(snapshot({
-    accountHint: "Plus",
-    connectorSettingsFound: true,
-    composerCharLimit: 1_050_000,
-    modelItems: [
-      { label: "GPT-5 Thinking", checked: true, efforts: ["medium", "high"], defaultEffort: "medium" },
-      { label: "GPT-4o", checked: false, efforts: [] },
-    ],
-  }));
-  assert.equal(probe.loginState, "signed_in");
-  assert.equal(probe.accountHint, "plus");
-  assert.equal(probe.composerCharLimit, 1_050_000);
-  assert.equal(probe.connectorSupport, true);
-  assert.deepEqual(probe.models.map((model) => model.family), ["gpt-5-thinking", "gpt-4o"]);
-  const [thinking, chat] = probe.models;
-  assert.ok(thinking && chat);
-  assert.deepEqual(thinking.efforts, ["medium", "high"]);
-  // 菜单没有给出档位时不能猜测站点能力；GPT-4o 仍可作为无 effort 的模型发现。
-  assert.deepEqual(chat.efforts, []);
-  assert.equal(thinking.defaultEffort, "medium");
-  assert.equal(chat.defaultEffort, null);
-});
-
-test("模型族按 family 去重，并且不凭档位顺序猜 default_effort", () => {
-  const probe = normalizeWebModelProbe(snapshot({
-    modelItems: [
-      { label: "GPT-5", checked: true, efforts: ["high", "medium"], defaultEffort: null },
-      { label: "GPT-5 (recommended)", checked: false, efforts: ["low", "medium"] },
-    ],
-  }));
-  assert.equal(probe.diagnostic, null);
-  assert.deepEqual(probe.models, [{
-    family: "gpt-5",
-    displayName: "GPT-5",
-    efforts: ["low", "medium", "high"],
-    defaultEffort: null,
-  }]);
-});
-
-test("已登录但模型菜单或模型标签不可识别时给出 selector 漂移诊断", () => {
-  const menuMissing = normalizeWebModelProbe(snapshot({ modelMenuFound: false }));
-  assert.equal(menuMissing.loginState, "signed_in");
-  assert.equal(menuMissing.diagnostic, "model_menu_selector_missing");
-  assert.deepEqual(menuMissing.models, []);
-
-  const labelsMissing = normalizeWebModelProbe(snapshot({
-    modelItems: [{ label: "Temporary chat", checked: false, efforts: [] }],
-  }));
-  assert.equal(labelsMissing.loginState, "signed_in");
-  assert.equal(labelsMissing.diagnostic, "model_items_unrecognized");
-  assert.deepEqual(labelsMissing.models, []);
+  assert.equal(probe.composerAvailable, false);
+  assert.equal(probe.diagnostic, "site_origin_unsupported");
 });
 
 test("回合登录态需要 conversation 与可用 composer 两项证据", () => {
@@ -203,6 +113,8 @@ test("回合登录态需要 conversation 与可用 composer 两项证据", () =>
     assistant_message_count: 0,
     assistant_text: "",
     thinking_text: "",
+    last_message_role: null,
+    last_message_text: null,
     account_hint: null,
   };
   assert.equal(normalizeWebModelTurnState(raw).loginState, "signed_out");
@@ -210,7 +122,10 @@ test("回合登录态需要 conversation 与可用 composer 两项证据", () =>
 });
 
 test("页面适配器字符串包含命令所需的原子写入、观察和回合读取接口", () => {
-  for (const method of ["probe", "writeText", "observe", "submit", "turnState", "cancelGeneration"]) {
+  for (const method of [
+    "probe", "writeText", "observe", "submit", "turnState", "cancelGeneration",
+    "savedConversations", "savedMessages", "connectorStatus", "configureConnector",
+  ]) {
     assert.match(INSTALL_WEB_MODEL_ADAPTER, new RegExp(`\\b${method}\\b`));
   }
   assert.match(INSTALL_WEB_MODEL_ADAPTER, /found: false/u);
@@ -219,6 +134,10 @@ test("页面适配器字符串包含命令所需的原子写入、观察和回�
   assert.match(INSTALL_WEB_MODEL_ADAPTER, /textWithLineBreaks/u);
   assert.match(INSTALL_WEB_MODEL_ADAPTER, /generating:/u);
   assert.match(INSTALL_WEB_MODEL_ADAPTER, /assistant_text:/u);
+  // 页面脚本里不再有网页模型菜单的发现逻辑。
+  assert.doesNotMatch(INSTALL_WEB_MODEL_ADAPTER, /modelMenu|modelItems|effortValues/u);
+  // 删除只按 conversation_id 精确匹配，不按标题。
+  assert.match(INSTALL_WEB_MODEL_ADAPTER, /entry\.id === conversationId/u);
 });
 
 test("适配器在未知 / 空 DOM 上安装后返回明确的未登录探测结果", async () => {
@@ -230,6 +149,9 @@ test("适配器在未知 / 空 DOM 上安装后返回明确的未登录探测结
   };
   const context: Record<string, unknown> = {
     document,
+    // 页面脚本里的等待在空 DOM 上会一直等到超时：测试里把所有延迟压成 0。
+    setTimeout: (callback: () => void) => setTimeout(callback, 0),
+    clearTimeout,
     location: { origin: "https://chatgpt.com", pathname: "/", search: "" },
     getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
     globalThis: undefined,
@@ -238,18 +160,340 @@ test("适配器在未知 / 空 DOM 上安装后返回明确的未登录探测结
   runInNewContext(INSTALL_WEB_MODEL_ADAPTER, context);
   const adapter = context.__magiWebModel as {
     probe: () => Promise<WebModelRawSnapshot>;
+    savedConversations: () => { conversations: unknown[] };
+    savedMessages: () => { conversation_id: string | null; messages: unknown[] };
+    connectorStatus: (input: { name: string }) => Promise<{ supported: boolean; reason: string | null }>;
     observe: (input: { selector: string; fields: string[]; attribute: null }) => { revision: number; nodes: Array<Record<string, unknown>> };
   };
   const probe = await adapter.probe();
   assert.equal(probe.composerFound, false);
   assert.equal(probe.conversationFound, false);
+  // 空 DOM：没有历史、不是已保存对话页面、没有连接器入口——都是明确的“没有”，不猜测。
+  assert.deepEqual(JSON.parse(JSON.stringify(adapter.savedConversations())), { conversations: [] });
+  const messages = adapter.savedMessages();
+  assert.equal(messages.conversation_id, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(messages.messages)), []);
+  assert.equal((await adapter.connectorStatus({ name: "Magi" })).supported, false);
   const observed = adapter.observe({ selector: "@assistantMessage", fields: ["existence"], attribute: null });
   assert.equal(observed.revision, 1);
   assert.equal(observed.nodes.length, 1);
   assert.equal(observed.nodes[0]?.found, false);
 });
 
+test("账号等级只读资料行里文本恰好等于套餐名的叶子节点，忽略用户名和折叠栏的骨架入口", async () => {
+  const leaf = (text: string) => ({ childElementCount: 0, textContent: text });
+  // 折叠侧栏里的资料入口只有头像骨架；带用户名的那一行才有等级。用户名里带 free 字样不能被当成等级。
+  const skeletonButton = {
+    parentElement: { parentElement: { querySelectorAll: () => [leaf("正在加载个人资料")] } },
+  };
+  const labelledButton = {
+    parentElement: {
+      parentElement: { querySelectorAll: () => [leaf("free-man"), { childElementCount: 2, textContent: "free-man Plus" }, leaf("Plus")] },
+    },
+  };
+  const probeWith = async (buttons: unknown[]) => {
+    const context: Record<string, unknown> = {
+      document: {
+        documentElement: { getAttribute: () => null },
+        querySelector: () => null,
+        querySelectorAll: (selector: string) => (selector.includes("个人资料") ? buttons : []),
+        getElementById: () => null,
+      },
+      location: { origin: "https://chatgpt.com", pathname: "/", search: "" },
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+      globalThis: undefined,
+    };
+    context.globalThis = context;
+    runInNewContext(INSTALL_WEB_MODEL_ADAPTER, context);
+    return (context.__magiWebModel as { probe: () => Promise<WebModelRawSnapshot> }).probe();
+  };
+  assert.equal((await probeWith([skeletonButton, labelledButton])).accountHint, "plus");
+  assert.equal((await probeWith([skeletonButton])).accountHint, null);
+});
+
+test("登录态以站点会话为准：停在二级页面不影响，访客态即使有输入框也不算已登录", () => {
+  const secondary = normalizeWebModelProbe(snapshot({
+    path: "/plugins",
+    composerFound: false,
+    conversationFound: false,
+    sessionActive: true,
+  }));
+  assert.equal(secondary.loginState, "signed_in");
+  assert.equal(secondary.composerAvailable, false);
+  assert.equal(secondary.pageKind, "other");
+  assert.equal(secondary.diagnostic, null);
+  // 会话接口说未登录：二级页面、对话页（访客也有输入框）都不能算已登录。
+  assert.equal(normalizeWebModelProbe(snapshot({
+    path: "/plugins", composerFound: false, conversationFound: false, sessionActive: false, accountPresent: true,
+  })).loginState, "signed_out");
+  assert.equal(normalizeWebModelProbe(snapshot({ sessionActive: false })).loginState, "signed_out");
+  // 对话页上缺输入框仍是站点改版，会话有效也不能掩盖。
+  const drift = normalizeWebModelProbe(snapshot({
+    path: "/", composerFound: false, conversationFound: true, sessionActive: true,
+  }));
+  assert.equal(drift.loginState, "signed_in");
+  assert.equal(drift.composerAvailable, false);
+  assert.equal(drift.diagnostic, "composer_selector_missing");
+  assert.equal(drift.pageKind, "chat");
+});
+
+test("停在 OpenAI 平台页面时只报告页面类型，不当成未登录或改版", () => {
+  const platform = openAiPlatformProbe();
+  assert.equal(platform.pageKind, "platform");
+  assert.equal(platform.composerAvailable, false);
+  assert.equal(platform.diagnostic, null);
+  assert.equal(isOpenAiPlatformOrigin("https://platform.openai.com"), true);
+  assert.equal(isOpenAiPlatformOrigin("https://platform.openai.com.evil.example"), false);
+});
+
+test("会话接口没拿到答案时回到页面证据，不把“不知道”当成未登录", () => {
+  const unknown = { sessionActive: null } as const;
+  assert.equal(normalizeWebModelProbe(snapshot({ ...unknown })).loginState, "signed_in");
+  assert.equal(normalizeWebModelProbe(snapshot({
+    ...unknown, path: "/plugins", composerFound: false, conversationFound: false, accountPresent: true,
+  })).loginState, "signed_in");
+  assert.equal(normalizeWebModelProbe(snapshot({
+    ...unknown, path: "/plugins", composerFound: false, conversationFound: false, accountPresent: false,
+  })).loginState, "signed_out");
+  assert.equal(normalizeWebModelProbe(snapshot({
+    ...unknown, composerFound: false,
+  })).loginState, "signed_out");
+});
+
+test("适配器脚本整体可解析，连接器入口按精确名称查找", () => {
+  // 页面脚本是模板字符串里的一大段代码：重复声明、反引号、转义错误都会让整个适配器装不上。
+  assert.doesNotThrow(() => new Function(INSTALL_WEB_MODEL_ADAPTER));
+  assert.match(INSTALL_WEB_MODEL_ADAPTER, /textOf\(element\)\.toLowerCase\(\) === wanted/u);
+});
+
 test("未知账号等级归为 unknown，不猜等级", () => {
   const probe = normalizeWebModelProbe(snapshot({ accountHint: "business" }));
   assert.equal(probe.accountHint, "unknown");
+});
+
+test("文本提取跳过仅供读屏器的隐藏标题，回复正文不带“ChatGPT 说：”", () => {
+  assert.match(INSTALL_WEB_MODEL_ADAPTER, /classList\.contains\('sr-only'\)/u);
+  assert.match(INSTALL_WEB_MODEL_ADAPTER, /classList\.contains\('visually-hidden'\)/u);
+});
+
+// ── DOM → Markdown ──────────────────────────────────────────────────────────
+
+interface FakeNode {
+  nodeType: number;
+  tagName?: string;
+  nodeValue?: string;
+  childNodes: FakeNode[];
+  textContent: string;
+  classList: { contains: (name: string) => boolean };
+  getAttribute: (name: string) => string | null;
+  hasAttribute: (name: string) => boolean;
+}
+
+function text(value: string): FakeNode {
+  return {
+    nodeType: 3,
+    nodeValue: value,
+    childNodes: [],
+    textContent: value,
+    classList: { contains: () => false },
+    getAttribute: () => null,
+    hasAttribute: () => false,
+  };
+}
+
+function el(tag: string, attrs: Record<string, string> = {}, ...children: Array<FakeNode | string>): FakeNode {
+  const nodes = children.map((child) => (typeof child === "string" ? text(child) : child));
+  const classes = (attrs.class ?? "").split(/\s+/u).filter(Boolean);
+  const node = {
+    nodeType: 1,
+    naturalWidth: attrs.__naturalWidth === undefined ? undefined : Number(attrs.__naturalWidth),
+    parentElement: null as unknown,
+    tagName: tag.toUpperCase(),
+    childNodes: nodes,
+    get textContent() {
+      return nodes.map((node) => node.textContent).join("");
+    },
+    classList: { contains: (name: string) => classes.includes(name) },
+    getAttribute: (name: string) => attrs[name] ?? null,
+    hasAttribute: (name: string) => name in attrs,
+  } as FakeNode;
+  for (const child of nodes) (child as unknown as { parentElement: unknown }).parentElement = node;
+  return node;
+}
+
+function markdownAdapter(): (root: FakeNode) => string {
+  const context: Record<string, unknown> = {
+    document: {
+      documentElement: { getAttribute: () => null },
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      getElementById: () => null,
+    },
+    location: { origin: "https://chatgpt.com", pathname: "/", search: "" },
+    URL,
+    getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    globalThis: undefined,
+  };
+  context.globalThis = context;
+  runInNewContext(INSTALL_WEB_MODEL_ADAPTER, context);
+  return (context.__magiWebModel as { markdownOf: (root: FakeNode) => string }).markdownOf;
+}
+
+test("回复还原为 Markdown：标题、行内格式、链接、列表、表格、代码块、引用、来源", () => {
+  const markdownOf = markdownAdapter();
+  const excluded = (tag: string, ...children: Array<FakeNode | string>) =>
+    el(tag, { "data-markdown-copy": "exclude" }, ...children);
+  const root = el(
+    "div",
+    { "data-markdown-text-style": "assistant-message" },
+    el("h2", {}, el("span", {}, "格式测试")),
+    el(
+      "p",
+      {},
+      el("span", {}, "这是 "),
+      el("strong", {}, el("span", {}, "粗体")),
+      el("span", {}, "、"),
+      el("em", {}, el("span", {}, "斜体")),
+      el("span", {}, "、"),
+      el("span", { "data-markdown-copy": "inline-code" }, "foo()"),
+      el("span", {}, " 和 "),
+      el("a", { href: "https://example.com/docs?utm_source=chatgpt.com&q=1" }, el("span", {}, "文档")),
+    ),
+    el(
+      "ol",
+      { start: "1" },
+      el("li", {}, el("span", {}, "第一项")),
+      el(
+        "li",
+        {},
+        el("span", {}, "第二项"),
+        el("ul", {}, el("li", {}, el("span", {}, "子项 A")), el("li", {}, el("span", {}, "子项 B"))),
+      ),
+      el("li", {}, el("span", {}, "第三项")),
+    ),
+    el(
+      "div",
+      { "data-markdown-table": "true" },
+      el(
+        "div",
+        {},
+        el(
+          "table",
+          {},
+          el("thead", {}, el("tr", {}, el("th", {}, "列一"), el("th", {}, "列二"))),
+          el("tbody", {}, el("tr", {}, el("td", {}, "A1"), el("td", {}, "B|1"))),
+        ),
+      ),
+      excluded("div", el("button", {}, "复制")),
+    ),
+    el(
+      "div",
+      { "data-markdown-copy": "code-block" },
+      excluded("div", el("div", {}, "Python"), el("button", {}, "复制代码")),
+      el("div", {}, el("code", {}, el("span", {}, "def foo():\n    return 1\n"))),
+    ),
+    el("blockquote", {}, el("p", {}, "引用一句")),
+    el(
+      "p",
+      {},
+      "见来源",
+      el(
+        "span",
+        { "data-chatgpt-copy-reference": "1" },
+        el(
+          "a",
+          { href: "https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/?utm_source=chatgpt.com" },
+          el("img", { alt: "" }),
+          el("span", {}, "blog.rust-lang.org"),
+        ),
+      ),
+    ),
+  );
+
+  assert.equal(
+    markdownOf(root),
+    [
+      "## 格式测试",
+      "这是 **粗体**、*斜体*、`foo()` 和 [文档](https://example.com/docs?q=1)",
+      "1. 第一项\n2. 第二项\n   - 子项 A\n   - 子项 B\n3. 第三项",
+      "| 列一 | 列二 |\n| --- | --- |\n| A1 | B\\|1 |",
+      "```python\ndef foo():\n    return 1\n```",
+      "> 引用一句",
+      "见来源[blog.rust-lang.org](https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/)",
+    ].join("\n\n"),
+  );
+});
+
+test("回复里的字面 Markdown 符号被转义，链接文字等于地址时输出自动链接，装饰区域不进正文", () => {
+  const markdownOf = markdownAdapter();
+  const root = el(
+    "div",
+    {},
+    el("p", {}, "写作 [OpenAI](", el("a", { href: "https://openai.com?utm_source=chatgpt.com" }, "https://openai.com"), ") 的 a*b_c"),
+    el("p", {}, "# 不是标题"),
+    el("h4", { class: "sr-only" }, "ChatGPT 说："),
+    el("p", {}, el("span", { hidden: "" }, "隐藏"), el("a", { href: "javascript:alert(1)" }, "危险链接")),
+  );
+  assert.equal(
+    markdownOf(root),
+    ["写作 \\[OpenAI\\](<https://openai.com/>) 的 a\\*b\\_c", "\\# 不是标题", "危险链接"].join("\n\n"),
+  );
+});
+
+test("公式还原为 TeX 源码：行内 $…$、独立 $$…$$，MathML 与排版副本不进正文", () => {
+  const markdownOf = markdownAdapter();
+  const rendered = (...parts: Array<FakeNode | string>) => el("span", {}, ...parts);
+  const inlineMath = el(
+    "span",
+    { "data-math-display": "false", "data-math-source": "x^2" },
+    rendered(el("math", {}, el("annotation", {}, "x^2")), rendered("x", el("span", {}, "2"))),
+  );
+  const displayMath = el(
+    "span",
+    { "data-math-display": "true", "data-math-source": "\\int_0^1 x^2\\,dx=\\frac{1}{3}" },
+    rendered(el("math", {}, el("annotation", {}, "\\int_0^1 x^2\\,dx=\\frac{1}{3}")), rendered("∫01x2dx")),
+  );
+  const root = el(
+    "div",
+    {},
+    el("p", {}, el("span", {}, "函数 "), inlineMath, el("span", {}, " 在 "), "区间上"),
+    el("p", {}, "独立公式："),
+    displayMath,
+  );
+  assert.equal(
+    markdownOf(root),
+    ["函数 $x^2$ 在 区间上", "独立公式：", "$$\n\\int_0^1 x^2\\,dx=\\frac{1}{3}\n$$"].join("\n\n"),
+  );
+});
+
+test("生成的图片：画廊里每张图一段，按钮里的图用按钮标签作说明，站点小图标不进正文", () => {
+  const markdownOf = markdownAdapter();
+  const preview = (label: string, src: string) =>
+    el(
+      "button",
+      { "data-testid": "generated-image-preview", "aria-label": label },
+      el("img", { src, __naturalWidth: "1536" }),
+      el("button", { "aria-label": "编辑生成的图像" }, "编辑"),
+    );
+  const root = el(
+    "div",
+    {},
+    el("h4", { class: "sr-only" }, "ChatGPT 说："),
+    el(
+      "div",
+      { "data-testid": "generated-image-gallery" },
+      preview("已生成图像 1", "blob:https://chatgpt.com/aaa"),
+      preview("已生成图像 2", "blob:https://chatgpt.com/bbb"),
+    ),
+    el("button", { "aria-label": "复制图像" }, "复制"),
+    el("p", {}, "来源", el("a", { href: "https://example.com/" }, el("img", { alt: "", src: "https://t0.gstatic.com/f.png", __naturalWidth: "32" }), "example.com")),
+  );
+  assert.equal(
+    markdownOf(root),
+    [
+      "![已生成图像 1](blob:https://chatgpt.com/aaa)",
+      "![已生成图像 2](blob:https://chatgpt.com/bbb)",
+      "来源[example.com](https://example.com/)",
+    ].join("\n\n"),
+  );
 });

@@ -387,11 +387,16 @@ async fn read_host_messages(
                 .await
                 .map_err(|error| BrowserHostClientError::Transport(error.to_string())),
             Ok(Message::Pong(_)) => Ok(()),
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(frame)) => {
+                tracing::warn!(?frame, "Electron Desktop 关闭了浏览器控制连接");
+                break;
+            }
             Ok(Message::Frame(_)) => Ok(()),
             Err(error) => Err(BrowserHostClientError::Transport(error.to_string())),
         };
         if let Err(error) = result {
+            // 读取循环一旦遇到错误就结束整条连接：必须留下原因，否则只能看到随后的「心跳超时」。
+            tracing::warn!(%error, "浏览器控制连接读取失败，连接将关闭");
             if let Some(sender) = handshake_sender.take() {
                 let _ = sender.send(Err(error.clone()));
             }

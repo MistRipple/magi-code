@@ -96,8 +96,10 @@ impl AuditUsageLedgerSnapshot {
         self
     }
 
+    /// 紧凑 JSON。账本会随使用持续增长（已有数万条用量记录、数十 MB），每次刷盘都要整体序列化：
+    /// 缩进输出会让单次刷盘的 CPU 与内存翻倍，直接拖慢整个 daemon（心跳超时、工具调用卡顿）。
     pub fn export_json(&self) -> Result<String, AuditUsageLedgerError> {
-        Ok(serde_json::to_string_pretty(self)?)
+        Ok(serde_json::to_string(self)?)
     }
 
     pub fn import_json(value: &str) -> Result<Self, AuditUsageLedgerError> {

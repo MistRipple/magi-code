@@ -7,6 +7,7 @@
     getBrowserCapabilities,
     getBrowserResources,
     reclaimBrowserResources,
+    resetWebModels,
     updateBrowserSettings,
     type BrowserCapabilitiesSnapshot,
     type BrowserResourceTabSnapshot,
@@ -17,6 +18,7 @@
     desktopUpdaterState,
   } from '../stores/desktop-updater.svelte';
   import SettingsWebModelSection from './SettingsWebModelSection.svelte';
+  import { applyWebModelRuntime, markWebModelStoppedByUser } from '../stores/web-model-runtime.svelte';
 
   type DesktopAction = 'refresh-components' | 'restart-automation' | 'clear-data' | 'check-updates';
 
@@ -232,6 +234,11 @@
         showActionNotice(i18n.t('settings.browser.restartAutomationSucceeded'));
       } else if (action === 'clear-data') {
         if (!window.confirm(i18n.t('settings.browser.clearDataConfirm'))) return;
+        // 通用清理也会清掉 GPT Web 的登录分区：必须先让 daemon 取消在飞回复、释放槽位并隐藏入口，
+        // 否则槽位会悬挂在一个已失效的页面上。顺序与设置里 GPT Web 的「清除数据」一致。
+        await resetWebModels();
+        markWebModelStoppedByUser(true);
+        applyWebModelRuntime(null);
         await desktop.clearBrowserData();
         showActionNotice(i18n.t('settings.browser.clearDataSucceeded'));
       } else {
@@ -422,6 +429,8 @@
         </div>
       {/if}
     </section>
+
+    <SettingsWebModelSection {isDesktop} />
 
     <section class="settings-section browser-resource-section" aria-labelledby="browser-resources-title">
       <div class="section-heading">
@@ -658,7 +667,6 @@
       </section>
     {/if}
 
-    <SettingsWebModelSection {isDesktop} />
   </div>
 </div>
 

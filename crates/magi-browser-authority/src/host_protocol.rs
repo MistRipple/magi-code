@@ -286,6 +286,33 @@ pub enum BrowserHostCommand {
     WebCancelGeneration {
         tab_id: BrowserTabId,
     },
+    /// 读取 ChatGPT 已保存对话列表（侧栏历史）：`conversation_id`、标题、更新时间。只读。
+    WebSavedConversations {
+        tab_id: BrowserTabId,
+    },
+    /// 读取当前已保存对话页面（`/c/<id>`）的远端事实：`conversation_id`、标题、可见消息及其稳定 id。只读。
+    WebSavedMessages {
+        tab_id: BrowserTabId,
+    },
+    /// 分块读取 GPT Web 回复里的一张图片字节（`source` 是页面上某个 `<img>` 的地址，如 `blob:`）。
+    /// 控制通道单条消息有上限，所以按 `offset` / `length` 分块，由调用方拼接。只读。
+    WebReadImage {
+        tab_id: BrowserTabId,
+        source: String,
+        offset: u64,
+        length: u64,
+    },
+    /// 只读检查 ChatGPT 侧是否已有名为 `name` 的 Magi 连接器、是否启用以及能列出的工具数。
+    WebConnectorStatus {
+        tab_id: BrowserTabId,
+        name: String,
+    },
+    /// 在 ChatGPT 设置里为 Magi MCP 创建 / 启用连接器，并回读确认。只写连接器设置，不动其它设置。
+    WebConfigureConnector {
+        tab_id: BrowserTabId,
+        name: String,
+        tunnel_id: String,
+    },
     Shutdown,
 }
 

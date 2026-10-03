@@ -197,39 +197,41 @@ pub(super) fn start_controller(state: &ApiState, lifecycle: &BrowserHostControll
         return;
     };
 
-    // T3 的通道配置只保存用户提供的引用（Tunnel id 与凭据文件路径），运行态
+    // 通道配置只保存 Tunnel id 与权限档（API 密钥在 state root 下的私有文件里），运行态
     // 不落盘。daemon 重启后必须从 settings 重新装配 harness / tunnel；否则首个
     // Web turn 会在通道仍是默认 `none` 时静默降到 T2，用户必须再次打开设置页
     // 才能恢复 T3。这条恢复只启动用户已经明确配置过的通道，不替用户创建
     // Tunnel，也不读取或记录凭据内容。
-    if let Some(state_root) = state
-        .runtime_persistence()
-        .and_then(|persistence| persistence.state_root().map(|root| root.to_path_buf()))
-    {
+    if state.runtime_persistence().is_some() {
         let raw = state
             .settings_store
             .get_section(magi_api::WEB_MODEL_TUNNEL_SECTION);
         if !raw.is_null() {
             match serde_json::from_value::<magi_api::WebModelTunnelConfig>(raw) {
                 Ok(config) => {
-                    let harness = state.web_model_harness.clone();
+                    let state = state.clone();
                     handle.spawn(async move {
-                        match harness.configure(&state_root, Some(config)).await {
+                        match state
+                            .web_model
+                            .clone()
+                            .configure(&state, Some(config), None)
+                            .await
+                        {
                             Ok(status) if !status.ready => tracing::warn!(
                                 code = %status.code,
-                                "恢复 GPT Web T3 通道失败，继续以 T2 档位运行"
+                                "恢复 GPT Web 工具通道失败，该 Web 会话没有项目工具"
                             ),
-                            Ok(_) => tracing::info!("已恢复 GPT Web T3 通道"),
+                            Ok(_) => tracing::info!("已恢复 GPT Web 工具通道"),
                             Err(error) => tracing::warn!(
                                 %error,
-                                "恢复 GPT Web T3 通道失败，继续以 T2 档位运行"
+                                "恢复 GPT Web 工具通道失败，该 Web 会话没有项目工具"
                             ),
                         }
                     });
                 }
                 Err(error) => tracing::warn!(
                     %error,
-                    "GPT Web T3 通道配置无法解析，继续以 T2 档位运行"
+                    "GPT Web 工具通道配置无法解析，该 Web 会话没有项目工具"
                 ),
             }
         }

@@ -13,13 +13,13 @@ pub use models::{
     GoalContinuationState, GoalResumeCheckpoint, GoalRevisionExpectation, GoalStatus,
     InterruptedGoalResumeCheckpoint, NotificationContext, NotificationRecord, NotificationScope,
     SESSION_COMMAND_METADATA_KEY, SessionAcceptanceRecord, SessionDurableState,
-    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionGoal, SessionPlan,
-    SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
-    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState,
-    ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
-    ThreadContextCheckpoint, ThreadFileFactVersion, ThreadModelProviderContext, ThreadVisibility,
-    TimelineEntry, TimelineEntryKind, active_execution_turn_request_id,
-    timeline_entry_visible_text,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionGoal, SessionKind,
+    SessionPlan, SessionProjectionInput, SessionRecord, SessionRuntimeSidecar,
+    SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, SessionSidecarFlushReason,
+    SessionStoreState, ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall,
+    ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
+    ThreadModelProviderContext, ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    active_execution_turn_request_id, timeline_entry_visible_text,
 };
 pub use store::{CanonicalTurnEventWriter, CanonicalTurnMutation};
 pub use store::{

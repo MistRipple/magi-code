@@ -109,6 +109,14 @@ pub(super) async fn accept_session_task_submission_at(
         denied_tools,
         mut user_message_metadata,
     } = input;
+    // 已保存的 GPT Web 对话：接受本轮用户消息前，先把 Web 侧 Magi 尚未同步的内容单向导入。
+    // 同步失败（对话不存在 / 冲突 / 槽位被占用）直接拒绝本轮，不写入用户消息。
+    if let Some(session_id) = request.requested_session_id() {
+        state
+            .sync_saved_web_conversation(&session_id)
+            .await
+            .map_err(crate::web_model_ops::web_model_api_error)?;
+    }
     let request_fingerprint = request
         .request_fingerprint()
         .map_err(ApiError::InvalidInput)?;

@@ -279,8 +279,18 @@ impl InMemoryEventBus {
             return Ok(());
         };
 
-        let snapshot = self.audit_usage_ledger_snapshot();
-        match snapshot.persist_to_path(&path) {
+        // 刷盘发生在回合进行中，账本是数万条、数十 MB 的负载：不能整本克隆再序列化（瞬时内存翻几倍，
+        // 还会把 daemon 拖到心跳超时）。在读锁内直接导出紧凑 JSON，再无锁落盘。
+        let persisted = self
+            .with_audit_usage_ledger(|ledger| ledger.export_json())
+            .and_then(|json| {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                magi_core::fs_atomic::write_atomic(&path, json.as_bytes())?;
+                Ok(())
+            });
+        match persisted {
             Ok(()) => {
                 self.clear_audit_usage_ledger_error();
                 self.mark_audit_usage_ledger_clean(Some(UtcMillis::now()));

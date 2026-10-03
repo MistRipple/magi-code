@@ -92,7 +92,7 @@ await withGoldenViteServer(async (server) => {
       'input.contextRing.usage': `已用 ${params?.value}`,
       'input.contextRing.remaining': `剩余 ${params?.value}`,
       'input.contextRing.limit': `窗口 ${params?.value}`,
-      'input.contextRing.estimated': '响应中，当前为实时估算',
+      'input.contextRing.estimated': '估算值，尚无模型返回的精确用量',
       'input.contextRing.compaction': `最近压缩 ${params?.reason} ${params?.before}->${params?.after}`,
       'input.contextRing.compactionReason.contextWindowPressure': '窗口压力',
       'input.contextRing.compactionReason.estimatedPrefill': '预填估算',
@@ -415,9 +415,9 @@ await withGoldenViteServer(async (server) => {
     };
     assert.deepEqual(
       ring.buildRingDetailItems(input, t)[0],
-      { key: 'measurement', text: '响应中，当前为实时估算' },
+      { key: 'measurement', text: '估算值，尚无模型返回的精确用量' },
     );
-    assert.match(ring.buildRingTooltip(input, t), /实时估算/);
+    assert.match(ring.buildRingTooltip(input, t), /估算值/);
   }
 
   // 场景 12.1：上下文占用属于会话；切换模型只改变窗口上限，不能重置已用量。

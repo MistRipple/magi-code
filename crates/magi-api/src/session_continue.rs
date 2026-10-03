@@ -337,7 +337,10 @@ impl Drop for ContinueRecoveryAttempt<'_> {
                 );
             }
         }
-        if let Err(error) = self.state.persist_runtime_durable_state_for_api() {
+        if let Err(error) = self
+            .state
+            .persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(&self.session_id))
+        {
             tracing::error!(
                 ?error,
                 session_id = %self.session_id,

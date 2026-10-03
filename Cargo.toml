@@ -6,6 +6,7 @@ members = [
   "crates/magi-app-server-protocol",
   "crates/magi-browser-authority",
   "crates/magi-web-model",
+  "crates/magi-mcp-server",
   "crates/magi-process",
   "crates/magi-daemon",
   "crates/magi-api",

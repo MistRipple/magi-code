@@ -1,5 +1,4 @@
-import { generateSessionSuggestions } from '../web/agent-api';
-import type { AgentBindingOverride } from '../web/agent-binding-context';
+import { i18n } from './i18n.svelte';
 import type {
   SessionSuggestionDto,
   SessionSuggestionGroupDto,
@@ -10,52 +9,237 @@ export type SessionSuggestionGroup = SessionSuggestionGroupDto;
 
 export interface SessionSuggestionScope {
   key: string;
-  workspaceId: string;
-  workspacePath: string;
-  sessionId: string;
   locale: string;
 }
 
 interface CachedSuggestionEntry {
   active: SessionSuggestionGroup | null;
-  standby: SessionSuggestionGroup | null;
-  activeInteracted: boolean;
   initialized: boolean;
-  generating: boolean;
-  controller: AbortController | null;
 }
 
-/** 一次生成请求的上限；辅助模型偶发慢响应不应让空状态长期停在骨架屏。 */
-const GENERATE_TIMEOUT_MS = 20_000;
-const SUGGESTIONS_PER_GROUP = 3;
+type BuiltInSuggestionSeed = {
+  category: SessionSuggestion['category'];
+  labelKey: string;
+  promptKey: string;
+};
 
 /**
- * 合规判定由 daemon 独占：后端已做 deny_unknown_fields、分类枚举、长度、
- * Markdown 与重复校验。这里只做协议解包，确认形状可渲染即可，避免前后端
- * 出现两套阈值导致合规建议被静默丢弃。
+ * 新会话的固定建议池。词条放在 i18n 字典中，运行时只做本地抽样，
+ * 因而不会因为网络、daemon 或 auxiliary 模型状态而延迟空状态展示。
  */
-function unwrapGroups(value: unknown): SessionSuggestionGroup[] {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
-  const groups = (value as Record<string, unknown>).groups;
-  if (!Array.isArray(groups)) return [];
-  const unwrapped: SessionSuggestionGroup[] = [];
-  for (const group of groups) {
-    if (!group || typeof group !== 'object' || Array.isArray(group)) continue;
-    const suggestions = (group as Record<string, unknown>).suggestions;
-    if (!Array.isArray(suggestions) || suggestions.length === 0) continue;
-    unwrapped.push({ suggestions: suggestions as SessionSuggestion[] });
+const BUILT_IN_SUGGESTIONS: readonly BuiltInSuggestionSeed[] = [
+  {
+    category: 'understand',
+    labelKey: 'messageList.suggestions.items.projectOverview.label',
+    promptKey: 'messageList.suggestions.items.projectOverview.prompt',
+  },
+  {
+    category: 'understand',
+    labelKey: 'messageList.suggestions.items.architecture.label',
+    promptKey: 'messageList.suggestions.items.architecture.prompt',
+  },
+  {
+    category: 'understand',
+    labelKey: 'messageList.suggestions.items.startingPoint.label',
+    promptKey: 'messageList.suggestions.items.startingPoint.prompt',
+  },
+  {
+    category: 'understand',
+    labelKey: 'messageList.suggestions.items.executionFlow.label',
+    promptKey: 'messageList.suggestions.items.executionFlow.prompt',
+  },
+  {
+    category: 'understand',
+    labelKey: 'messageList.suggestions.items.dependencyMap.label',
+    promptKey: 'messageList.suggestions.items.dependencyMap.prompt',
+  },
+  {
+    category: 'inspect',
+    labelKey: 'messageList.suggestions.items.inspectChanges.label',
+    promptKey: 'messageList.suggestions.items.inspectChanges.prompt',
+  },
+  {
+    category: 'inspect',
+    labelKey: 'messageList.suggestions.items.findRisks.label',
+    promptKey: 'messageList.suggestions.items.findRisks.prompt',
+  },
+  {
+    category: 'inspect',
+    labelKey: 'messageList.suggestions.items.readRelevantCode.label',
+    promptKey: 'messageList.suggestions.items.readRelevantCode.prompt',
+  },
+  {
+    category: 'inspect',
+    labelKey: 'messageList.suggestions.items.checkConventions.label',
+    promptKey: 'messageList.suggestions.items.checkConventions.prompt',
+  },
+  {
+    category: 'inspect',
+    labelKey: 'messageList.suggestions.items.reviewChanges.label',
+    promptKey: 'messageList.suggestions.items.reviewChanges.prompt',
+  },
+  {
+    category: 'plan',
+    labelKey: 'messageList.suggestions.items.makePlan.label',
+    promptKey: 'messageList.suggestions.items.makePlan.prompt',
+  },
+  {
+    category: 'plan',
+    labelKey: 'messageList.suggestions.items.breakDown.label',
+    promptKey: 'messageList.suggestions.items.breakDown.prompt',
+  },
+  {
+    category: 'plan',
+    labelKey: 'messageList.suggestions.items.compareSolutions.label',
+    promptKey: 'messageList.suggestions.items.compareSolutions.prompt',
+  },
+  {
+    category: 'plan',
+    labelKey: 'messageList.suggestions.items.acceptanceCriteria.label',
+    promptKey: 'messageList.suggestions.items.acceptanceCriteria.prompt',
+  },
+  {
+    category: 'plan',
+    labelKey: 'messageList.suggestions.items.edgeCases.label',
+    promptKey: 'messageList.suggestions.items.edgeCases.prompt',
+  },
+  {
+    category: 'execute',
+    labelKey: 'messageList.suggestions.items.implementImprovement.label',
+    promptKey: 'messageList.suggestions.items.implementImprovement.prompt',
+  },
+  {
+    category: 'execute',
+    labelKey: 'messageList.suggestions.items.fixIssue.label',
+    promptKey: 'messageList.suggestions.items.fixIssue.prompt',
+  },
+  {
+    category: 'execute',
+    labelKey: 'messageList.suggestions.items.addTests.label',
+    promptKey: 'messageList.suggestions.items.addTests.prompt',
+  },
+  {
+    category: 'execute',
+    labelKey: 'messageList.suggestions.items.improveDocumentation.label',
+    promptKey: 'messageList.suggestions.items.improveDocumentation.prompt',
+  },
+  {
+    category: 'execute',
+    labelKey: 'messageList.suggestions.items.verifyImplementation.label',
+    promptKey: 'messageList.suggestions.items.verifyImplementation.prompt',
+  },
+  {
+    category: 'record',
+    labelKey: 'messageList.suggestions.items.workLog.label',
+    promptKey: 'messageList.suggestions.items.workLog.prompt',
+  },
+  {
+    category: 'record',
+    labelKey: 'messageList.suggestions.items.changeSummary.label',
+    promptKey: 'messageList.suggestions.items.changeSummary.prompt',
+  },
+  {
+    category: 'record',
+    labelKey: 'messageList.suggestions.items.decisionLog.label',
+    promptKey: 'messageList.suggestions.items.decisionLog.prompt',
+  },
+  {
+    category: 'record',
+    labelKey: 'messageList.suggestions.items.releaseNotes.label',
+    promptKey: 'messageList.suggestions.items.releaseNotes.prompt',
+  },
+  {
+    category: 'record',
+    labelKey: 'messageList.suggestions.items.nextSteps.label',
+    promptKey: 'messageList.suggestions.items.nextSteps.prompt',
+  },
+  {
+    category: 'learn',
+    labelKey: 'messageList.suggestions.items.explainConcept.label',
+    promptKey: 'messageList.suggestions.items.explainConcept.prompt',
+  },
+  {
+    category: 'learn',
+    labelKey: 'messageList.suggestions.items.extractRules.label',
+    promptKey: 'messageList.suggestions.items.extractRules.prompt',
+  },
+  {
+    category: 'learn',
+    labelKey: 'messageList.suggestions.items.explainTradeoffs.label',
+    promptKey: 'messageList.suggestions.items.explainTradeoffs.prompt',
+  },
+  {
+    category: 'learn',
+    labelKey: 'messageList.suggestions.items.explainApi.label',
+    promptKey: 'messageList.suggestions.items.explainApi.prompt',
+  },
+  {
+    category: 'learn',
+    labelKey: 'messageList.suggestions.items.debugApproach.label',
+    promptKey: 'messageList.suggestions.items.debugApproach.prompt',
+  },
+];
+
+export const BUILT_IN_SUGGESTION_COUNT = BUILT_IN_SUGGESTIONS.length;
+
+const SUGGESTIONS_PER_GROUP = 3;
+const SUGGESTION_CATEGORIES: readonly SessionSuggestion['category'][] = [
+  'understand',
+  'inspect',
+  'plan',
+  'execute',
+  'record',
+  'learn',
+];
+
+function localizeSuggestion(seed: BuiltInSuggestionSeed): SessionSuggestion {
+  return {
+    category: seed.category,
+    label: i18n.t(seed.labelKey),
+    prompt: i18n.t(seed.promptKey),
+  };
+}
+
+function shuffle<T>(items: T[]): T[] {
+  for (let index = items.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [items[index], items[swapIndex]] = [items[swapIndex], items[index]];
   }
-  return unwrapped;
+  return items;
+}
+
+function pickSuggestions(excludedPrompts: readonly string[] = []): SessionSuggestion[] {
+  const localized = BUILT_IN_SUGGESTIONS.map(localizeSuggestion);
+  const excluded = new Set(excludedPrompts.map((prompt) => prompt.trim().toLowerCase()));
+  const candidates = localized.filter((suggestion) => (
+    !excluded.has(suggestion.prompt.trim().toLowerCase())
+  ));
+  const selected: SessionSuggestion[] = [];
+  const selectedCategories = shuffle([...SUGGESTION_CATEGORIES]).slice(0, SUGGESTIONS_PER_GROUP);
+
+  for (const category of selectedCategories) {
+    const categoryCandidates = candidates.filter((suggestion) => suggestion.category === category);
+    if (categoryCandidates.length > 0) {
+      selected.push(categoryCandidates[Math.floor(Math.random() * categoryCandidates.length)]);
+    }
+  }
+
+  if (selected.length < SUGGESTIONS_PER_GROUP) {
+    const selectedPrompts = new Set(selected.map((suggestion) => suggestion.prompt));
+    for (const suggestion of shuffle([...candidates])) {
+      if (selectedPrompts.has(suggestion.prompt)) continue;
+      selected.push(suggestion);
+      selectedPrompts.add(suggestion.prompt);
+      if (selected.length === SUGGESTIONS_PER_GROUP) break;
+    }
+  }
+
+  return shuffle(selected).slice(0, SUGGESTIONS_PER_GROUP);
 }
 
 class SessionSuggestionsStore {
   activeGroup = $state<SessionSuggestionGroup | null>(null);
-  standbyGroup = $state<SessionSuggestionGroup | null>(null);
   scopeKey = $state('');
-  generating = $state(false);
-  /** 首次生成尚未落地时为 true，用于渲染骨架而不是空白区域。 */
-  loadingInitial = $state(false);
-  unavailable = $state(false);
 
   readonly suggestionsPerGroup = SUGGESTIONS_PER_GROUP;
 
@@ -66,104 +250,33 @@ class SessionSuggestionsStore {
     if (!entry) {
       entry = {
         active: null,
-        standby: null,
-        activeInteracted: false,
         initialized: false,
-        generating: false,
-        controller: null,
       };
       this.entries.set(scope.key, entry);
     }
-    this.sync(scope.key, entry, true);
     if (!entry.initialized) {
       entry.initialized = true;
-      void this.generate(scope, entry, true);
+      entry.active = { suggestions: pickSuggestions() };
     }
+    this.sync(scope.key, entry);
   }
 
-  markActiveSelected(): void {
-    const entry = this.entries.get(this.scopeKey);
-    if (entry) entry.activeInteracted = true;
-  }
-
-  /** 换一组：备用组已就绪时立即切换，同时后台补下一组；否则直接重新生成。 */
+  /** 换一组：从固定建议池中同步抽取 3 条，排除当前展示的词条。 */
   rotate(scope: SessionSuggestionScope): void {
-    const entry = this.entries.get(scope.key);
-    if (!entry || entry.generating) return;
-    if (entry.standby) {
-      entry.active = entry.standby;
-      entry.standby = null;
-      entry.activeInteracted = true;
-      this.sync(scope.key, entry);
+    let entry = this.entries.get(scope.key);
+    if (!entry) {
+      entry = { active: null, initialized: false };
+      this.entries.set(scope.key, entry);
     }
-    void this.generate(scope, entry, false);
+    const excludedPrompts = entry.active?.suggestions.map((suggestion) => suggestion.prompt) || [];
+    entry.active = { suggestions: pickSuggestions(excludedPrompts) };
+    entry.initialized = true;
+    this.sync(scope.key, entry);
   }
 
-  private sync(scopeKey: string, entry: CachedSuggestionEntry, force = false): void {
-    if (!force && this.scopeKey !== scopeKey) return;
+  private sync(scopeKey: string, entry: CachedSuggestionEntry): void {
     this.scopeKey = scopeKey;
     this.activeGroup = entry.active;
-    this.standbyGroup = entry.standby;
-    this.generating = entry.generating;
-    this.loadingInitial = entry.generating && !entry.active;
-    this.unavailable = !entry.generating && !entry.active;
-  }
-
-  private async generate(
-    scope: SessionSuggestionScope,
-    entry: CachedSuggestionEntry,
-    initial: boolean,
-  ): Promise<void> {
-    if (entry.generating) return;
-    const controller = new AbortController();
-    entry.controller = controller;
-    entry.generating = true;
-    this.sync(scope.key, entry);
-    const timeoutId = setTimeout(() => controller.abort(), GENERATE_TIMEOUT_MS);
-    try {
-      const response = await generateSessionSuggestions(
-        {
-          locale: scope.locale,
-          count: SUGGESTIONS_PER_GROUP,
-          requestedGroups: initial ? 2 : 1,
-          excludePrompts: (entry.active?.suggestions || []).map((suggestion) => suggestion.prompt),
-        },
-        controller.signal,
-        scope.workspaceId || scope.workspacePath
-          ? {
-              scope: 'workspace',
-              workspaceId: scope.workspaceId,
-              workspacePath: scope.workspacePath,
-              sessionId: scope.sessionId,
-            }
-          : ({ scope: 'personal', sessionId: scope.sessionId } satisfies AgentBindingOverride),
-      );
-      if (controller.signal.aborted || this.entries.get(scope.key) !== entry) return;
-      const groups = unwrapGroups(response);
-      if (initial) {
-        if (!entry.activeInteracted && groups[0]) entry.active = groups[0];
-        entry.standby = entry.activeInteracted ? (groups[0] || groups[1] || null) : (groups[1] || null);
-      } else if (groups[0]) {
-        if (entry.active) {
-          entry.standby = groups[0];
-        } else {
-          entry.active = groups[0];
-        }
-      }
-    } catch (error) {
-      // 建议是空状态的增强项，失败不阻断主流程；但必须留下可诊断信号，
-      // 否则辅助模型未配置、超时和返回不合规在界面上无法区分。
-      if (!controller.signal.aborted) {
-        console.warn('[session-suggestions] 会话起步建议生成失败', error);
-      }
-    } finally {
-      clearTimeout(timeoutId);
-      if (this.entries.get(scope.key) === entry) {
-        entry.generating = false;
-        entry.controller = null;
-        this.sync(scope.key, entry);
-      }
-    }
   }
 }
 

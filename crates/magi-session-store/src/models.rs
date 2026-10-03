@@ -32,6 +32,25 @@ pub struct SessionRecord {
     pub last_completed_at: Option<UtcMillis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_viewed_at: Option<UtcMillis>,
+    /// 会话类型。缺省为用户会话，旧数据无需迁移。
+    #[serde(default, skip_serializing_if = "SessionKind::is_user")]
+    pub kind: SessionKind,
+}
+
+/// 会话类型。外部工具会话由 Magi MCP 服务为每个外部令牌创建，
+/// 只承载外部调用、审批与变更，不接受用户发起的模型对话。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    #[default]
+    User,
+    ExternalTool,
+}
+
+impl SessionKind {
+    pub fn is_user(&self) -> bool {
+        matches!(self, Self::User)
+    }
 }
 
 impl SessionRecord {

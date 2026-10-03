@@ -248,7 +248,7 @@ async fn materialize_session(
     // 新建会话会同时写入 session 记录和 current 指针；这里用完整 projection
     // 提交这次实体创建，确保旧 projection、sidecar 和 current 在同一个持久化事务中
     // 收口。导航专用写入只适合已有实体，不能把新实体的回滚留在旧文件之外。
-    if let Err(error) = state.persist_session_projection_for_api() {
+    if let Err(error) = state.persist_session_projection_for_sessions_for_api(std::slice::from_ref(&session_id)) {
         let original_message = error.message().to_string();
         return Err(
             match state
@@ -849,7 +849,7 @@ pub(crate) async fn submit_session_turn_internal(
             .await?;
             let (entry_id, user_message_item_id) = user_message;
             finalize_continue_session(state.clone(), accepted.clone());
-            state.persist_runtime_durable_state_for_api()?;
+            state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(&accepted.session_id))?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
             Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
                 session_id: accepted.session_id,
@@ -1325,6 +1325,12 @@ fn decide_session_turn_with_task_planner(
     if request.command.is_some() {
         return Ok(session_turn_command_decision());
     }
+    // GPT Web 会话的每条消息都是普通对话：原样交给网页，网页自己维护上下文，工具由 ChatGPT 侧经
+    // Magi MCP 使用。不能走任务 / 工具意图路由——那会把「任务上下文 + 多代理规则 + 工具意图」整包
+    // 塞进网页输入框，网页模型会按那些规则行事（反复重做、串话）。
+    if request_targets_web_engine(state, request) {
+        return Ok(web_engine_chat_decision(request));
+    }
     if request.replace_turn_id().is_none()
         && let Some(resume) = user_interrupted_turn_resume(state, request)
     {
@@ -1383,6 +1389,43 @@ fn decide_session_turn_with_task_planner(
         ));
     }
     Ok(decision)
+}
+
+/// 本条消息的目标会话是否使用 GPT Web 引擎：已有会话读会话设置，新会话首条消息读请求里携带的引擎配置。
+fn request_targets_web_engine(state: &ApiState, request: &SessionTurnRequestDto) -> bool {
+    let from_request = request
+        .orchestrator_session_config
+        .as_ref()
+        .and_then(|config| config.get("engineId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
+    from_request
+        || request.requested_session_id().is_some_and(|session_id| {
+            magi_conversation_runtime::model_config::orchestrator_web_engine_id(
+                &state.settings_store,
+                Some(&session_id),
+            )
+            .is_some()
+        })
+}
+
+fn web_engine_chat_decision(request: &SessionTurnRequestDto) -> SessionTurnIntentDecision {
+    SessionTurnIntentDecision {
+        route: SessionTurnRouteDto::Chat,
+        task_title: None,
+        execution_goal: None,
+        task_tier: TaskTier::ExecutionChain,
+        collaboration_mode: requested_collaboration_mode(request),
+        tool_intent: None,
+        forced_tool_name: None,
+        required_tool_chain: Vec::new(),
+        completion_contract: TaskCompletionContract::default(),
+        recovery_checkpoint: None,
+        confidence: 1.0,
+        reason_code: Some("web_engine_chat".to_string()),
+        route_reason: Some("GPT Web 会话的消息原样交给网页，不做任务或工具意图改写。".to_string()),
+        task_evidence: Vec::new(),
+    }
 }
 
 struct UserInterruptedTurnResume {
@@ -2945,17 +2988,6 @@ async fn submit_conversation_session_turn(
         Some(&turn_id),
         None,
     );
-    // GPT Web 的模型本身没有 HTTP provider 可替代；当用户在引擎级设置中开启
-    // 工具（默认开启）时，即使这次输入被分类为普通 Chat，也必须把 Magi 的
-    // 工具面交给 conversation loop。否则主线 Chat 会永远按 T0 运行，Web
-    // 引擎只能纯对话，且 T2/T3 永远不会有机会生效。
-    let use_tools = magi_conversation_runtime::model_config::orchestrator_web_engine_settings(
-        &state.settings_store,
-        Some(&session_id),
-    )
-    .ok()
-    .flatten()
-    .is_some_and(|settings| settings.tool_enabled);
     let execution_request = SessionTurnExecutionRequest {
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
@@ -2963,7 +2995,7 @@ async fn submit_conversation_session_turn(
         prompt: request.trimmed_text().unwrap_or_else(|| message.clone()),
         images,
         context_references,
-        use_tools,
+        use_tools: false,
         access_profile: request.requested_access_profile(),
         skill_name: None,
         request_id: Some(request_id),
@@ -2990,6 +3022,19 @@ async fn submit_conversation_session_turn(
         }),
     };
     schedule_conversation_execution(state.clone(), execution_request, attempt, trace);
+    // 新会话的标题：交给辅助模型根据首条消息精修（未配置辅助模型时静默保留占位标题）。
+    // 之前只有任务路线接了这一步，聊天路线（包括 GPT Web 会话）创建的会话永远叫「新会话」。
+    // 已保存的 GPT Web 对话之后仍以 ChatGPT 的标题为准（见 `record_saved_web_progress`）。
+    if created_session {
+        if let Some(first_message) = request.trimmed_text().filter(|text| !text.trim().is_empty()) {
+            crate::session_title::spawn_new_session_title_refinement(
+                &state,
+                &session_id,
+                &first_message,
+                crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE,
+            );
+        }
+    }
     let session_summary = if created_session {
         state
             .session_store
@@ -3722,7 +3767,7 @@ pub(crate) fn record_active_goal_turn_failure(
     if !stopped_by_current_turn {
         return;
     }
-    if let Err(error) = state.persist_session_projection() {
+    if let Err(error) = state.persist_session_projection_for_sessions(std::slice::from_ref(&session_id)) {
         tracing::warn!(
             session_id = %session_id,
             goal_id = %goal.goal_id,
@@ -3757,7 +3802,7 @@ async fn schedule_goal_continuation_turn_if_idle(
             .mark_goal_continuation_waiting(&session_id, &goal.goal_id, "goal_plan_not_runnable")
             .is_ok()
         {
-            let _ = state.persist_session_projection();
+            let _ = state.persist_session_projection_for_sessions(std::slice::from_ref(&session_id));
         }
         return;
     }
@@ -5139,7 +5184,7 @@ async fn execute_session_continue(
     )
     .await?;
     finalize_continue_session(state.clone(), accepted.clone());
-    state.persist_runtime_durable_state_for_api()?;
+    state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(&accepted.session_id))?;
     let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
     let event = EventEnvelope::domain(
         event_id.clone(),
@@ -5188,7 +5233,7 @@ fn finalize_continue_session(state: ApiState, accepted: SessionContinueAccepted)
     // 所有 tier 的 dispatch 驱动统一交给后台 RunnerManager：runner 已在
     // `continue_execution_chain` 中重新启动；终态由 TaskCompletionNotifier 收口。
 
-    if let Err(error) = state.persist_session_projection() {
+    if let Err(error) = state.persist_session_projection_for_sessions(std::slice::from_ref(&accepted.session_id)) {
         tracing::error!(
             session_id = %accepted.session_id,
             root_task_id = %accepted.root_task_id,
@@ -5400,7 +5445,7 @@ async fn close_session(
         .terminal_sessions
         .close_for_session(session_id.as_str());
     state.release_session_git_execution_lease(&session_id);
-    state.persist_session_projection_for_api()?;
+    state.persist_session_projection_for_sessions_for_api(std::slice::from_ref(&session_id))?;
     publish_session_directory_event(&state, "session.closed", &session_id, workspace_id.as_ref());
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         workspace_id.as_ref().map(WorkspaceId::as_str),
@@ -5679,7 +5724,9 @@ async fn report_incident(
             resolved: false,
         })
         .map_err(|error| ApiError::internal_assembly("记录系统异常失败", error))?;
-    state.persist_session_projection_for_api()?;
+    // 会话级异常存放在所属会话的 projection 里；应用级 / 项目级异常只落到各自的 meta 文件。
+    let affected: Vec<SessionId> = session_id.iter().cloned().collect();
+    state.persist_session_projection_for_sessions_for_api(&affected)?;
     Ok(Json(build_notifications_response(
         &state,
         &scope,
@@ -5698,10 +5745,12 @@ async fn mark_all_notifications_read(
     )?;
     let session_id =
         validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
+    let context = notification_context(&scope, session_id.clone());
+    let affected = state.sessions_with_notifications_in_context(&context);
     state
         .session_store
-        .mark_notifications_handled_for_context(&notification_context(&scope, session_id.clone()));
-    state.persist_session_projection_for_api()?;
+        .mark_notifications_handled_for_context(&context);
+    state.persist_session_projection_for_sessions_for_api(&affected)?;
     Ok(Json(build_notifications_response(
         &state,
         &scope,
@@ -5744,10 +5793,10 @@ async fn clear_notifications(
     )?;
     let session_id =
         validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
-    state
-        .session_store
-        .clear_notifications_for_context(&notification_context(&scope, session_id.clone()));
-    state.persist_session_projection_for_api()?;
+    let context = notification_context(&scope, session_id.clone());
+    let affected = state.sessions_with_notifications_in_context(&context);
+    state.session_store.clear_notifications_for_context(&context);
+    state.persist_session_projection_for_sessions_for_api(&affected)?;
     Ok(Json(build_notifications_response(
         &state,
         &scope,
@@ -5798,17 +5847,16 @@ async fn remove_notification(
     let notification_id = request
         .requested_notification_id()
         .ok_or_else(|| ApiError::InvalidInput("notification_id 不能为空".to_string()))?;
+    let context = notification_context(&scope, session_id.clone());
+    let affected = state.sessions_with_notifications_in_context(&context);
     state
         .session_store
-        .remove_notification_for_context(
-            &notification_context(&scope, session_id.clone()),
-            &notification_id,
-        )
+        .remove_notification_for_context(&context, &notification_id)
         .map_err(|error| match error {
             DomainError::NotFound { .. } => ApiError::not_found("通知不存在", &notification_id),
             other => ApiError::internal_assembly("移除通知失败", other),
         })?;
-    state.persist_session_projection_for_api()?;
+    state.persist_session_projection_for_sessions_for_api(&affected)?;
     Ok(Json(build_notifications_response(
         &state,
         &scope,
@@ -5830,17 +5878,16 @@ async fn resolve_notification(
     let notification_id = request
         .requested_notification_id()
         .ok_or_else(|| ApiError::InvalidInput("notification_id 不能为空".to_string()))?;
+    let context = notification_context(&scope, session_id.clone());
+    let affected = state.sessions_with_notifications_in_context(&context);
     state
         .session_store
-        .resolve_notification_for_context(
-            &notification_context(&scope, session_id.clone()),
-            &notification_id,
-        )
+        .resolve_notification_for_context(&context, &notification_id)
         .map_err(|error| match error {
             DomainError::NotFound { .. } => ApiError::not_found("通知不存在", &notification_id),
             other => ApiError::internal_assembly("解决通知失败", other),
         })?;
-    state.persist_session_projection_for_api()?;
+    state.persist_session_projection_for_sessions_for_api(&affected)?;
     Ok(Json(build_notifications_response(
         &state,
         &scope,
@@ -6644,6 +6691,42 @@ mod tests {
             },
             "命令必须进入请求指纹，避免与同文本普通消息幂等冲突"
         );
+    }
+
+    #[test]
+    fn web_engine_sessions_always_route_as_plain_chat_even_for_tool_like_text() {
+        let state = test_state();
+        let text = "请用 Magi 连接器里的工具依次完成：创建目录 e2e-dir，写入文件，搜索文本，并运行测试修改代码";
+
+        // 本地引擎：这类文本会被分类为需要执行 / 任务。
+        let local = session_turn_request(text);
+        let local_decision = decide_session_turn_with_task_planner(&state, &local).unwrap();
+        assert!(!matches!(local_decision.route, SessionTurnRouteDto::Chat));
+
+        // 新会话首条消息携带 GPT Web 引擎配置：固定普通对话，没有任务标题 / 工具意图改写。
+        let mut first_message = session_turn_request(text);
+        first_message.orchestrator_session_config =
+            Some(serde_json::json!({ "engineId": "chatgpt-web/default" }));
+        let decision = decide_session_turn_with_task_planner(&state, &first_message).unwrap();
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert_eq!(decision.reason_code.as_deref(), Some("web_engine_chat"));
+        assert!(decision.tool_intent.is_none() && decision.execution_goal.is_none());
+
+        // 已有会话：读会话设置里的引擎。
+        let session_id = magi_core::SessionId::new("session-web-routing");
+        state
+            .settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                serde_json::json!({ "engineId": "chatgpt-web/default" }),
+            )
+            .unwrap();
+        let mut existing = session_turn_request(text);
+        existing.session_id = Some(session_id.to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &existing).unwrap();
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert_eq!(decision.reason_code.as_deref(), Some("web_engine_chat"));
     }
 
     #[test]

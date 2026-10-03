@@ -2,6 +2,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
+  import SettingsMcpServerSection from './SettingsMcpServerSection.svelte';
   import type { IconName } from '../lib/icons';
   import {
     getBuiltinToolFallbackLabel,
@@ -1059,6 +1060,7 @@
             {/if}
           </div>
         </div>
+        <SettingsMcpServerSection />
       </div>
     </div>
 </div>

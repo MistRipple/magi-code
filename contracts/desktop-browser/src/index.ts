@@ -287,7 +287,7 @@ export type BrowserHostCommand =
       };
     }
   /**
-   * ChatGPT 站点只读探测（发现通道，设计基线 §5.5）。
+   * ChatGPT 站点只读探测。
    *
    * 只读页面事实（登录态、composer、模型菜单、账号能力、连接器支持性），
    * 绝不写页面；不进入模型可见的浏览器工具目录（C10）。
@@ -297,7 +297,7 @@ export type BrowserHostCommand =
       payload: { tab_id: BrowserTabId };
     }
   /**
-   * 站点内原子纯文本写入 + 回读校验（设计基线 §5.6 步骤 3）。
+   * 站点内原子纯文本写入 + 回读校验。
    *
    * 不复用 `type`（它走 CDP `Input.insertText`，没有回读校验，且对长文本的
    * contenteditable 富文本编辑器不可靠）。回读不一致或内容被站点转成附件即失败。
@@ -314,7 +314,7 @@ export type BrowserHostCommand =
       };
     }
   /**
-   * 站点短轮询观察（设计基线 §5.6 末）。
+   * 站点短轮询观察。
    *
    * 返回单次快照；`revision` 单调递增，供推理通道判断内容是否变化。长等待会占住
    * 该 Surface 的命令 lane，因此观察必须短轮询，不复用 `wait_for`。
@@ -329,7 +329,7 @@ export type BrowserHostCommand =
       };
     }
   /**
-   * 提交 composer（设计基线 §5.6 步骤 4）。
+   * 提交 composer。
    *
    * 只负责把输入交给站点并回读输入框是否清空；「是否被接受」由
    * `web_turn_state` 的消息计数证据判定，不以命令返回成功为准。
@@ -339,7 +339,7 @@ export type BrowserHostCommand =
       payload: { tab_id: BrowserTabId };
     }
   /**
-   * 回合语义状态（设计基线 §5.6 步骤 4–6）。
+   * 回合语义状态。
    *
    * 站点适配层给出原始语义信号（生成中标志、助手文本、消息计数、隐藏推理）；
    * 「文本稳定且无生成标志」的完成谓词由推理通道跨两个读取周期叠加判定。
@@ -355,6 +355,34 @@ export type BrowserHostCommand =
   | {
       type: "web_cancel_generation";
       payload: { tab_id: BrowserTabId };
+    }
+  /** 读取 ChatGPT 已保存对话列表（侧栏历史）。只读。 */
+  | {
+      type: "web_saved_conversations";
+      payload: { tab_id: BrowserTabId };
+    }
+  /** 读取当前已保存对话页面的远端事实（id、标题、可见消息与其稳定 id）。只读。 */
+  | {
+      type: "web_saved_messages";
+      payload: { tab_id: BrowserTabId };
+    }
+  /**
+   * 分块读取 GPT Web 回复里的一张图片（`source` 必须是当前页面上某个 `<img>` 的地址，例如 `blob:`）。
+   * 图片字节只存在于页面里，Main/Worker 控制通道单条消息有上限，所以按块读取，由 daemon 拼接。
+   */
+  | {
+      type: "web_read_image";
+      payload: { tab_id: BrowserTabId; source: string; offset: number; length: number };
+    }
+  /** 只读检查 ChatGPT 侧的 Magi 连接器是否存在 / 启用。 */
+  | {
+      type: "web_connector_status";
+      payload: { tab_id: BrowserTabId; name: string };
+    }
+  /** 创建 / 启用 Magi 连接器并回读确认；只写连接器设置。 */
+  | {
+      type: "web_configure_connector";
+      payload: { tab_id: BrowserTabId; name: string; tunnel_id: string };
     }
   | { type: "shutdown" };
 
@@ -372,45 +400,69 @@ export interface BrowserCommandError {
   diagnostic?: string | null;
 }
 
-/** `web_model_probe` 的归一化结果（只读探测，设计基线 §5.5）。 */
+/** `web_model_probe` 的归一化结果：只有登录与页面可用性，不含网页的模型菜单。 */
 export interface BrowserWebModelProbe {
-  /** 站点适配层结构版本；selector 漂移时由实现推进（A23）。 */
+  /** 站点适配层结构版本；selector 漂移时由实现推进。 */
   site_revision: string;
   login_state: "signed_in" | "signed_out" | "blocked";
-  /** 登录态判定需要两项证据：会话有效与临时对话输入框可用（§5.5）。 */
+  /** 登录态判定需要两项证据：会话有效与输入框可用。 */
   composer_available: boolean;
-  /** 单条字符上限：站点自身给出的值优先，否则用随应用发布的上限表（§5.9.2）。 */
-  composer_char_limit: number | null;
+  /** 当前页面类型：对话页、ChatGPT 二级页面（没有输入框是正常的），或 OpenAI 平台页面。 */
+  page_kind?: "chat" | "other" | "platform";
   account_hint: "plus" | "pro" | "free" | "unknown";
-  /** 上限表版本；随应用更新，daemon 据此判定 `refresh_required`。 */
-  limits_revision: string;
-  models: Array<{
-    family: string;
-    display_name: string;
-    efforts: string[];
-    default_effort: string | null;
-    /** 该族的可用输入窗口，来自上限表（§5.9.2），写入引擎顶层字段。 */
-    context_window_tokens: number;
-    /** 单条提交的 token 预算；小于窗口的部分账号依赖阶段 3 的最小分片（§5.9.6）。 */
-    single_submission_token_budget: number;
-    /** 该档位的输出与隐藏推理预留（§5.9.5）。 */
-    response_reserve: number;
-    tokenizer_revision: string;
-  }>;
-  connector_support: boolean;
-  connector_settings_reachable: boolean;
 }
 
-/** `web_write_text` 的回读校验结果（§5.6 步骤 3）。 */
+/** `web_saved_conversations` 的结果。 */
+export interface BrowserWebSavedConversations {
+  conversations: Array<{
+    conversation_id: string;
+    title: string;
+    updated_at: string | null;
+  }>;
+}
+
+/** `web_saved_messages` 的结果：当前已保存对话页面的远端事实。 */
+export interface BrowserWebSavedMessages {
+  /** 页面不是已保存对话（`/c/<id>`）时为 null。 */
+  conversation_id: string | null;
+  title: string | null;
+  messages: Array<{
+    role: "user" | "assistant";
+    text: string;
+    remote_id: string | null;
+  }>;
+  last_message_id: string | null;
+  updated_at: string | null;
+}
+
+/** `web_connector_status` 的结果。 */
+export interface BrowserWebConnectorStatus {
+  /** 站点是否提供自定义连接器入口（套餐 / 开发者模式）。 */
+  supported: boolean;
+  exists: boolean;
+  enabled: boolean;
+  tool_count: number | null;
+  reason: string | null;
+}
+
+/** `web_configure_connector` 的结果。 */
+export interface BrowserWebConfigureConnectorResult {
+  configured: boolean;
+  /** 配置后回读确认已启用。 */
+  confirmed_enabled: boolean;
+  reason: string | null;
+}
+
+/** `web_write_text` 的回读校验结果。 */
 export interface BrowserWebWriteTextResult {
   confirmed: boolean;
   digest: string;
   char_count: number;
-  /** 站点把内容转成附件时不保证全部进入上下文（§5.9.6）。 */
+  /** 站点把内容转成附件时不保证全部进入上下文。 */
   became_attachment: boolean;
 }
 
-/** `web_observe` 的单次快照（§5.6 末）。 */
+/** `web_observe` 的单次快照。 */
 export interface BrowserWebObserveResult {
   revision: number;
   nodes: Array<{
@@ -421,7 +473,7 @@ export interface BrowserWebObserveResult {
   }>;
 }
 
-/** `web_submit` 的提交结果（§5.6 步骤 4）。 */
+/** `web_submit` 的提交结果。 */
 export interface BrowserWebSubmitResult {
   submitted: boolean;
   /** 提交后输入框是否已清空；未清空说明站点未接受这次提交。 */
@@ -429,7 +481,7 @@ export interface BrowserWebSubmitResult {
   reason: "composer_missing" | "composer_empty" | null;
 }
 
-/** `web_turn_state` 的回合语义状态（§5.6 步骤 4–6）。 */
+/** `web_turn_state` 的回合语义状态。 */
 export interface BrowserWebTurnStateResult {
   site_revision: string;
   login_state: "signed_in" | "signed_out" | "blocked";
@@ -445,6 +497,9 @@ export interface BrowserWebTurnStateResult {
   assistant_text: string;
   /** 隐藏推理文本，映射到 `thinking`。 */
   thinking_text: string;
+  /** 页面当前最后一条可见消息，用于临时 Web 对话存活判定。 */
+  last_message_role: "user" | "assistant" | null;
+  last_message_text: string | null;
 }
 
 export type BrowserCommandResult =

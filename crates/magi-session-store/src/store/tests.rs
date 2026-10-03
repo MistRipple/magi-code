@@ -489,6 +489,64 @@ fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
 }
 
 #[test]
+fn external_tool_session_does_not_take_over_current_session_and_round_trips_kind() {
+    let store = SessionStore::new();
+    let user_id = SessionId::new("session-user");
+    store
+        .create_session(user_id.clone(), "User")
+        .expect("user session should create");
+
+    let external = store
+        .create_external_tool_session(
+            SessionId::new("session-external"),
+            "cursor · demo",
+            "workspace-1".to_string(),
+        )
+        .expect("external session should create");
+
+    assert_eq!(external.kind, crate::SessionKind::ExternalTool);
+    assert_eq!(
+        store.current_session().expect("current session").session_id,
+        user_id,
+        "外部工具会话不得抢占用户当前会话"
+    );
+    assert!(
+        store
+            .create_external_tool_session(
+                SessionId::new("session-external"),
+                "dup",
+                "workspace-1".to_string(),
+            )
+            .is_err()
+    );
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        SessionExecutionSidecarStoreState::default(),
+    )
+    .expect("持久化恢复应成功");
+    let kinds = restored
+        .sessions()
+        .into_iter()
+        .map(|session| (session.session_id.to_string(), session.kind))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(kinds["session-external"], crate::SessionKind::ExternalTool);
+    assert_eq!(kinds["session-user"], crate::SessionKind::User);
+    let user_json = serde_json::to_value(
+        restored
+            .sessions()
+            .into_iter()
+            .find(|session| session.session_id == user_id)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        user_json.get("kind").is_none(),
+        "用户会话不写 kind，旧数据格式不变"
+    );
+}
+
+#[test]
 fn selecting_current_session_is_durable_without_changing_business_history() {
     let store = SessionStore::new();
     let first_session_id = SessionId::new("session-select-first");
@@ -6313,4 +6371,75 @@ fn thread_history_merge_is_idempotent_and_keeps_non_canonical_messages() {
 
     // 空 projection 不改动已有历史。
     assert_eq!(merge(&legacy, Vec::new()), legacy);
+}
+
+#[test]
+fn rename_and_delete_hand_the_persistence_callback_only_the_affected_sessions_history() {
+    let store = SessionStore::new();
+    let target_id = SessionId::new("session-slice-target");
+    let other_id = SessionId::new("session-slice-other");
+    store
+        .create_session(target_id.clone(), "target")
+        .expect("target session should create");
+    store
+        .create_session(other_id.clone(), "other")
+        .expect("other session should create");
+    accept_test_turn(&store, &target_id, test_turn("turn-slice-target", "completed", 10));
+    accept_test_turn(&store, &other_id, test_turn("turn-slice-other", "completed", 20));
+    store
+        .select_current_session(&target_id)
+        .expect("target should be current");
+
+    // 重命名：会话列表是完整的（持久化层靠它判断哪些会话不再保留），但只带被重命名会话的回合。
+    let mut seen = None;
+    store
+        .rename_session_with_persistence(&target_id, "renamed", |durable, _| {
+            seen = Some((
+                durable
+                    .sessions
+                    .iter()
+                    .map(|session| (session.session_id.clone(), session.title.clone()))
+                    .collect::<Vec<_>>(),
+                durable
+                    .canonical_turns
+                    .iter()
+                    .map(|turn| turn.session_id.clone())
+                    .collect::<Vec<_>>(),
+            ));
+            Ok::<_, ()>(())
+        })
+        .expect("rename should persist");
+    let (sessions, turn_owners) = seen.expect("callback ran");
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.contains(&(target_id.clone(), "renamed".to_string())));
+    assert!(turn_owners.iter().all(|owner| owner == &target_id));
+    assert!(!turn_owners.is_empty());
+
+    // 删除：回调看到的是「删除之后」的视图——被删会话不在列表里，current 已指向替代会话，
+    // 替代会话的回合整段在内；回调成功后内存才真正删除。
+    let mut view = None;
+    store
+        .delete_session_with_persistence(&target_id, Some(&other_id), |durable, _| {
+            view = Some((
+                durable
+                    .sessions
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect::<Vec<_>>(),
+                durable.current_session_id.clone(),
+                durable
+                    .canonical_turns
+                    .iter()
+                    .map(|turn| turn.session_id.clone())
+                    .collect::<Vec<_>>(),
+            ));
+            Ok::<_, ()>(())
+        })
+        .expect("delete should persist");
+    let (sessions, current, turn_owners) = view.expect("callback ran");
+    assert_eq!(sessions, vec![other_id.clone()]);
+    assert_eq!(current, Some(other_id.clone()));
+    assert!(turn_owners.iter().all(|owner| owner == &other_id));
+    assert!(store.session(&target_id).is_none());
+    assert_eq!(store.current_session_id(), Some(other_id));
 }

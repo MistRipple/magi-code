@@ -1,11 +1,10 @@
 /**
  * 应用级 GPT Web（Web 模型浏览器）的渲染层常量。
  *
- * 设计依据：设计基线 A21 / A25、§5.2–§5.4。
  * 这里只放渲染层需要的最小事实，不复制 daemon 或站点适配层的任何状态。
  */
 
-/** 应用级 GPT Web 会话的固定持久分区（A21）。 */
+/** 应用级 GPT Web 会话的固定持久分区。 */
 export const WEB_MODEL_PARTITION = 'persist:magi-web-model';
 
 /**

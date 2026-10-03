@@ -10,9 +10,5 @@ thiserror.workspace = true
 sha2.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
-axum.workspace = true
 magi-bridge-client = { path = "../magi-bridge-client" }
 
-[[bin]]
-name = "magi-web-harness"
-path = "src/bin/magi_web_harness.rs"

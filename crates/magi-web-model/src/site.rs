@@ -15,7 +15,7 @@ pub const CHATGPT_WEB_HOME_URL: &str = "https://chatgpt.com/";
 /// 临时对话（Temporary Chat）入口（产品默认值）。
 ///
 /// 对话实例与压缩用的一次性对话都从这里进入：它不进入用户的 ChatGPT 历史记录
-/// （设计基线 A12 / §5.6）。
+/// 。
 pub const CHATGPT_WEB_TEMPORARY_CHAT_URL: &str = "https://chatgpt.com/?temporary-chat=true";
 
 /// 站点 origin 的自动化验收覆盖开关。
@@ -61,6 +61,19 @@ pub fn chatgpt_web_home_url() -> String {
     format!("{}/", chatgpt_web_origin())
 }
 
+/// GPT Web 标签页顶部「快捷地址」可以去的 OpenAI 平台页面：固定白名单，不接受任意地址。
+pub const OPENAI_PLATFORM_ORIGIN: &str = "https://platform.openai.com";
+
+/// OpenAI 平台 Tunnels 管理页（创建 / 查看 Tunnel）。
+pub fn openai_platform_tunnels_url() -> String {
+    format!("{OPENAI_PLATFORM_ORIGIN}/settings/organization/tunnels")
+}
+
+/// OpenAI 平台 Runtime API keys 页（创建仅含 Tunnels Read + Use 的运行时密钥）。
+pub fn openai_platform_api_keys_url() -> String {
+    format!("{OPENAI_PLATFORM_ORIGIN}/settings/organization/api-keys")
+}
+
 /// 临时对话（Temporary Chat）入口。
 pub fn chatgpt_web_temporary_chat_url() -> String {
     format!("{}/?temporary-chat=true", chatgpt_web_origin())
@@ -69,18 +82,37 @@ pub fn chatgpt_web_temporary_chat_url() -> String {
 /// Web 引擎 id 的命名空间前缀。
 ///
 /// 引擎身份固定为 `<命名空间>/<family>`（例如 `chatgpt-web/gpt-5`），避免与用户
-/// 自填模型在身份与用量统计上串味（设计基线 §5.5）。
+/// 自填模型在身份与用量统计上串味。
 pub const WEB_MODEL_ENGINE_ID_NAMESPACE: &str = "chatgpt-web";
 
-/// Magi 只向模型选择器暴露一个 Web 入口；具体模型由 ChatGPT 页面自己选择。
+/// GPT Web 引擎的默认 id。发现到具体模型族时会使用同一命名空间下的
+/// `chatgpt-web/<family>`，这样多个已登录 Web 模型可以在 Magi 中并列展示，
+/// 同时不会与本地/HTTP 引擎混淆。
 pub const WEB_MODEL_ENGINE_ID: &str = "chatgpt-web/default";
 
 /// 由站点模型族构造 Web 引擎 id。
 pub fn web_model_engine_id(family: &str) -> String {
-    if family.trim().is_empty() || family.trim() == "default" {
+    let family = family.trim();
+    if family.is_empty() || family.eq_ignore_ascii_case("default") {
         WEB_MODEL_ENGINE_ID.to_string()
     } else {
-        WEB_MODEL_ENGINE_ID.to_string()
+        let normalized = family
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        if normalized.is_empty() {
+            WEB_MODEL_ENGINE_ID.to_string()
+        } else {
+            format!("{WEB_MODEL_ENGINE_ID_NAMESPACE}/{normalized}")
+        }
     }
 }
 

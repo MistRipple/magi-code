@@ -166,6 +166,10 @@ interface WebScriptResponses {
   turnState?: Record<string, unknown>;
   cancel?: boolean;
   origin?: string;
+  savedConversations?: Record<string, unknown>;
+  savedMessages?: Record<string, unknown>;
+  connectorStatus?: Record<string, unknown>;
+  configureConnector?: Record<string, unknown>;
 }
 
 function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
@@ -215,6 +219,18 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
     }
     if (expression.includes("globalThis.__magiWebModel.cancelGeneration()")) {
       return { result: { value: responses.cancel ?? false } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.savedConversations()")) {
+      return { result: { value: responses.savedConversations ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.savedMessages()")) {
+      return { result: { value: responses.savedMessages ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.connectorStatus(")) {
+      return { result: { value: responses.connectorStatus ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.configureConnector(")) {
+      return { result: { value: responses.configureConnector ?? null } };
     }
     return { result: { value: null } };
   });
@@ -284,6 +300,74 @@ test("Worker 为每个 CDP Surface 显式启用页面、运行时和网络事件
 
   await runtime.execute("call-2", binding, consoleCommand());
   assert.equal(port.methods.length, 3, "同一 Surface 不应为每次工具调用重复启用 CDP 域");
+});
+
+test("域启用握手在导航竞态里被拒绝后，不会把失败永久留在新代次的页面状态上", async () => {
+  class HoldingPort implements ParentPort {
+    #listener: ((event: { data: MainToWorkerMessage }) => void) | null = null;
+    held: Array<Extract<WorkerToMainMessage, { type: "cdp_request" }>> | null = [];
+
+    on(_event: "message", listener: (event: { data: MainToWorkerMessage }) => void): void {
+      this.#listener = listener;
+    }
+
+    postMessage(message: WorkerToMainMessage): void {
+      if (message.type !== "cdp_request") return;
+      if (this.held) {
+        this.held.push(message);
+        return;
+      }
+      this.reply(message, null);
+    }
+
+    reply(message: Extract<WorkerToMainMessage, { type: "cdp_request" }>, error: string | null): void {
+      queueMicrotask(() => {
+        this.#listener?.({
+          data: {
+            type: "cdp_response",
+            call_id: message.call_id,
+            request_id: message.request_id,
+            binding: message.binding,
+            ...(error
+              ? {
+                  error: {
+                    code: "browser_surface_stale",
+                    message: error,
+                    recoverable: true,
+                    side_effect_started: false,
+                    diagnostic: null,
+                  },
+                }
+              : { result: {} }),
+          },
+        });
+      });
+    }
+  }
+
+  const port = new HoldingPort();
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port));
+  const advanced = { ...binding, navigation_revision: binding.navigation_revision + 1 };
+
+  // 握手还在进行时，页面又前进了一个代次：标记投影走独立的调度链，会为新代次重建页面状态
+  // 并继承这个在途握手。
+  const first = runtime.execute("call-1", binding, consoleCommand());
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runtime.execute("call-2", advanced, {
+    type: "set_annotations",
+    payload: { tab_id: binding.tab_id, annotations: [] },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const held = port.held ?? [];
+  port.held = null;
+  assert.equal(held.length, 3);
+  for (const request of held) port.reply(request, "browser_surface_stale");
+  await Promise.all([first, second]);
+
+  // 之后用最新代次重试必须重新握手并成功，而不是立刻重复同一个 browser_surface_stale。
+  const third = await runtime.execute("call-3", advanced, consoleCommand());
+  assert.equal(third.outcome.status, "succeeded");
 });
 
 test("不同 Browser Surface 使用独立的页面运行态和 CDP binding，不串用 Tab 数据", async () => {
@@ -1934,25 +2018,15 @@ test("Heap 快照按 Chrome 的连续 edge 数组索引解析对象关系", asyn
   assert.equal(dominatorValue?.nodes?.find((node) => node.id === 1)?.immediate_dominator, 0);
 });
 
-test("GPT Web 模型发现只投影已登录且可识别的菜单，并保留上限表字段", async () => {
+test("GPT Web 探测只返回登录与页面可用性，不含网页模型菜单", async () => {
   const port = webScriptedPort({
     probe: {
       origin: "https://chatgpt.com",
       path: "/?temporary-chat=true",
       blocked: false,
       composerFound: true,
-      composerCharLimit: null,
       conversationFound: true,
-      modelMenuFound: true,
-      modelItems: [{
-        label: "GPT-5",
-        modelId: "gpt-5",
-        checked: true,
-        efforts: ["low", "medium", "high"],
-        defaultEffort: "medium",
-      }],
       accountHint: "Plus",
-      connectorSettingsFound: false,
     },
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
@@ -1964,37 +2038,95 @@ test("GPT Web 模型发现只投影已登录且可识别的菜单，并保留上
     ? result.outcome.payload.payload.value as Record<string, any>
     : null;
   assert.equal(value?.login_state, "signed_in");
+  assert.equal(value?.composer_available, true);
   assert.equal(value?.account_hint, "plus");
-  assert.equal(value?.models?.[0]?.family, "gpt-5");
-  assert.equal(value?.models?.[0]?.default_effort, "medium");
-  assert.equal(typeof value?.models?.[0]?.context_window_tokens, "number");
-  assert.equal(value?.models?.[0]?.tokenizer_revision, "o200k");
+  assert.equal(value?.models, undefined, "探测结果里不得出现网页的模型菜单");
+  assert.equal(value?.limits_revision, undefined);
 });
 
-test("GPT Web 模型发现遇到菜单 selector 漂移时失败并给出诊断", async () => {
+test("GPT Web 探测在登录着却找不到输入框时报告未登录事实，由 daemon 判为 selectors_drift", async () => {
   const port = webScriptedPort({
     probe: {
       origin: "https://chatgpt.com",
       path: "/",
       blocked: false,
-      composerFound: true,
-      composerCharLimit: null,
+      composerFound: false,
       conversationFound: true,
-      modelMenuFound: false,
-      modelItems: [],
       accountHint: null,
-      connectorSettingsFound: false,
     },
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
   const result = await runtime.execute("web-probe-drift", binding, webCommand("web_model_probe", {
     tab_id: binding.tab_id,
   }));
-  assert.equal(result.outcome.status, "failed");
-  if (result.outcome.status === "failed") {
-    assert.equal(result.outcome.payload.code, "web_model_selectors_drift");
-    assert.match(result.outcome.payload.message, /model_menu_selector_missing/u);
+  assert.equal(result.outcome.status, "succeeded");
+  const value = result.outcome.payload.type === "json"
+    ? result.outcome.payload.payload.value as Record<string, any>
+    : null;
+  assert.equal(value?.login_state, "signed_out");
+  assert.equal(value?.composer_available, false);
+});
+
+test("已保存对话命令只做校验后的透传：列表、消息、精确删除", async () => {
+  const port = webScriptedPort({
+    savedConversations: {
+      conversations: [{ conversation_id: "11111111-1111-1111-1111-111111111111", title: "第一条", updated_at: null }],
+    },
+    savedMessages: {
+      conversation_id: "11111111-1111-1111-1111-111111111111",
+      title: "第一条",
+      messages: [{ role: "user", text: "你好", remote_id: "m1" }, { role: "assistant", text: "你好！", remote_id: "m2" }],
+      last_message_id: "m2",
+      updated_at: null,
+    },
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const json = (result: Awaited<ReturnType<typeof runtime.execute>>) => (
+    result.outcome.status === "succeeded" && result.outcome.payload.type === "json"
+      ? result.outcome.payload.payload.value as Record<string, any>
+      : null
+  );
+  const listed = json(await runtime.execute("saved-list", binding, webCommand("web_saved_conversations", { tab_id: binding.tab_id })));
+  assert.equal(listed?.conversations?.length, 1);
+  const messages = json(await runtime.execute("saved-messages", binding, webCommand("web_saved_messages", { tab_id: binding.tab_id })));
+  assert.equal(messages?.last_message_id, "m2");
+  assert.equal(messages?.messages?.[1]?.role, "assistant");
+});
+
+test("页面适配器返回畸形的已保存对话 / 连接器结果时命令显式失败，不透传", async () => {
+  const port = webScriptedPort({
+    savedConversations: { conversations: [{ conversation_id: "", title: 1 }] },
+    savedMessages: { conversation_id: null, messages: [{ role: "system", text: "x", remote_id: null }] },
+    connectorStatus: { supported: true },
+    configureConnector: { configured: true },
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  for (const [type, payload, code] of [
+    ["web_saved_conversations", {}, "web_saved_conversations_result_invalid"],
+    ["web_saved_messages", {}, "web_saved_messages_result_invalid"],
+    ["web_connector_status", { name: "Magi" }, "web_connector_status_result_invalid"],
+    ["web_configure_connector", { name: "Magi", tunnel_id: "t" }, "web_configure_connector_result_invalid"],
+  ] as const) {
+    const result = await runtime.execute(`bad-${type}`, binding, webCommand(type, { tab_id: binding.tab_id, ...payload }));
+    assert.equal(result.outcome.status, "failed", type);
+    if (result.outcome.status === "failed") assert.equal(result.outcome.payload.code, code);
   }
+});
+
+test("连接器状态与配置命令把页面适配器的回读结果原样返回", async () => {
+  const port = webScriptedPort({
+    connectorStatus: { supported: true, exists: true, enabled: true, tool_count: 14, reason: null },
+    configureConnector: { configured: true, confirmed_enabled: true, reason: null },
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const status = await runtime.execute("connector-status", binding, webCommand("web_connector_status", {
+    tab_id: binding.tab_id, name: "Magi",
+  }));
+  assert.equal(status.outcome.status, "succeeded");
+  const configured = await runtime.execute("connector-configure", binding, webCommand("web_configure_connector", {
+    tab_id: binding.tab_id, name: "Magi", tunnel_id: "tunnel_1",
+  }));
+  assert.equal(configured.outcome.status, "succeeded");
 });
 
 test("web_write_text 使用 snake_case payload、遵守 timeout_ms，并返回安全回读诊断", async () => {
@@ -2057,6 +2189,8 @@ test("web_submit、web_turn_state 和取消命令保留流式回读的消息计�
       assistant_message_count: 2,
       assistant_text: "~~~magi-tool-call\\n{\\\"turn_id\\\":\\\"nonce\\\"}\\n~~~",
       thinking_text: "正在思考",
+      last_message_role: "assistant",
+      last_message_text: "~~~magi-tool-call\\n{\\\"turn_id\\\":\\\"nonce\\\"}\\n~~~",
       account_hint: "Plus",
     },
     cancel: true,
@@ -2096,6 +2230,8 @@ test("同一临时对话多轮复用页面适配器，导航代次变化后重�
       assistant_message_count: 1,
       assistant_text: "第一轮",
       thinking_text: "",
+      last_message_role: "assistant",
+      last_message_text: "第一轮",
       account_hint: "Plus",
     },
   });

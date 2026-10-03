@@ -123,6 +123,20 @@ pub(super) fn orchestrator_session_override_request(
             None => {}
         }
     }
+    // GPT Web 对话方式（临时 / 已保存）：只在会话首条消息之前可以设置，落到会话级
+    // `webConversation` 绑定，不进入 orchestrator section（避免第二份事实）。
+    if let Some(mode) = config.get("webMode") {
+        match mode.as_str().map(str::trim) {
+            Some(mode @ ("temporary" | "saved")) => {
+                override_config.insert("webMode".to_string(), Value::String(mode.to_string()));
+            }
+            _ => {
+                return Err(ApiError::InvalidInput(
+                    "webMode 只能是 temporary 或 saved".to_string(),
+                ));
+            }
+        }
+    }
     if config.contains_key("reasoningEffort") {
         match config.get("reasoningEffort") {
             Some(Value::Null) => {
@@ -180,6 +194,32 @@ pub(super) fn orchestrator_session_defaults(state: &ApiState) -> Value {
         orchestrator_session_override_request(&request).unwrap_or_else(|_| json!({}));
     ensure_session_reasoning_effort(&mut defaults);
     defaults
+}
+
+/// GPT Web 会话的对话绑定投影（只读，供选择器 / 会话头显示方式与同步状态）。
+/// 会话没有绑定 GPT Web 入口时为 `null`；前端不据此推断任何可用性，只展示。
+fn web_conversation_projection(
+    state: &ApiState,
+    session_id: &SessionId,
+    session_orchestrator_config: &Value,
+) -> Value {
+    let is_web = session_orchestrator_config
+        .get("engineId")
+        .and_then(Value::as_str)
+        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
+    if !is_web {
+        return Value::Null;
+    }
+    let binding = magi_conversation_runtime::model_config::session_web_conversation_binding(
+        &state.settings_store,
+        session_id,
+    );
+    json!({
+        "mode": binding.mode,
+        "remoteTitle": binding.remote_title,
+        "syncState": binding.sync_state,
+        "hasRemoteConversation": binding.remote_conversation_id.is_some(),
+    })
 }
 
 fn resolved_orchestrator_session_config(state: &ApiState, session_id: &SessionId) -> Value {
@@ -252,9 +292,22 @@ fn save_orchestrator_session_override_for_session_with_policy(
     let Some(override_fields) = override_config.as_object() else {
         return Ok(None);
     };
+    let mut override_fields = override_fields.clone();
+    let web_mode = override_fields
+        .remove("webMode")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    if let Some(mode) = web_mode.as_deref() {
+        state.set_web_conversation_mode(
+            session_id,
+            mode,
+            &override_fields,
+            allow_new_session_initial_web_binding,
+        )?;
+    }
     if override_fields.is_empty() {
         return Ok(None);
     }
+    let override_fields = &override_fields;
 
     // 会话转换是单向的（设计基线 A26）：空白会话可以启动 GPT Web；已有本地
     // canonical 历史的会话不能再把历史导入网页端。Web 会话切回 provider 不会
@@ -269,6 +322,10 @@ fn save_orchestrator_session_override_for_session_with_policy(
     let mut next_config = state
         .settings_store
         .get_session_section(session_id, "orchestrator");
+    let was_web = next_config
+        .get("engineId")
+        .and_then(Value::as_str)
+        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
     if !next_config.is_object() {
         next_config = json!({});
     }
@@ -291,6 +348,20 @@ fn save_orchestrator_session_override_for_session_with_policy(
             next_defaults,
         )
         .map_err(settings_persistence_error)?;
+    let now_web = next_config
+        .get("engineId")
+        .and_then(Value::as_str)
+        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
+    if was_web && !now_web {
+        // Web → 本地：槽位随会话切走立即释放（W11），本地历史保留。
+        let state = state.clone();
+        let session_id = session_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                state.release_web_slot_for_session(&session_id).await;
+            });
+        }
+    }
     let workspace_id = state
         .session_store
         .session(session_id)
@@ -337,18 +408,8 @@ fn ensure_web_session_direction_allowed(
         return Ok(());
     };
 
-    let engines = state.settings_store.get_section("engines");
-    let is_web_engine_id = |engine_id: &str| {
-        engines.as_array().is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id.trim() == engine_id)
-                    && is_chatgpt_web_engine(entry)
-            })
-        })
-    };
+    // GPT Web 是固定入口 `chatgpt-web/default`：只按引擎 id 命名空间判定，不查引擎注册表。
+    let is_web_engine_id = magi_web_model::is_chatgpt_web_engine_id;
     let requested_is_web = is_web_engine_id(requested_engine_id);
     if !requested_is_web {
         return Ok(());
@@ -793,30 +854,16 @@ fn is_chatgpt_web_engine(entry: &Value) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("chatgpt_web"))
 }
 
-/// Web 引擎的顶层字段白名单。
-///
-/// Web 引擎**不写 `llm`**，来源、可用窗口、档位与引擎级开关都落在顶层；这些字段
-/// 一旦被丢弃，`upsert_engine` 就会把已发现的 Web 模型退化成空条目（设计基线 §5.5、
-/// A6、A22）。普通引擎的顶层字段仍只保留 `id / displayName / llm / runtime`。
-const WEB_ENGINE_TOP_LEVEL_FIELDS: &[&str] = &[
-    "apiProtocol",
-    "contextWindowTokens",
-    "efforts",
-    "origin",
-    // 引擎级开关：工具档位（A9）、「每轮新建对话」（§5.6）与 T2 轮数上限
-    // （默认 20；失败卡片「提高轮数上限并重试」写的就是这个字段）。
-    "toolsEnabled",
-    "newChatPerTurn",
-    "toolRoundLimit",
-];
-
 fn normalize_engine_entry(entry: &Value) -> Option<Value> {
+    // 注册表里只有 HTTP 引擎：Web 条目（含旧版本发现写入的）一律丢弃，读不出来就当不存在。
+    if is_chatgpt_web_engine(entry) {
+        return None;
+    }
     let engine_id = entry
         .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let is_web_engine = is_chatgpt_web_engine(entry);
     let mut normalized = Map::new();
     normalized.insert("id".to_string(), Value::String(engine_id.to_string()));
     normalized.insert(
@@ -831,20 +878,13 @@ fn normalize_engine_entry(entry: &Value) -> Option<Value> {
                 .to_string(),
         ),
     );
-    // Web 引擎没有连接字段：不得补空 `llm`，否则 settings-store 的 llm 规范化
-    // 会把它当成普通引擎的连接基座（A22）。
-    if let Some(llm) = entry.get("llm").cloned() {
-        normalized.insert("llm".to_string(), llm);
-    } else if !is_web_engine {
-        normalized.insert("llm".to_string(), Value::Object(Map::new()));
-    }
-    if is_web_engine {
-        for field in WEB_ENGINE_TOP_LEVEL_FIELDS {
-            if let Some(value) = entry.get(*field) {
-                normalized.insert((*field).to_string(), value.clone());
-            }
-        }
-    }
+    normalized.insert(
+        "llm".to_string(),
+        entry
+            .get("llm")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    );
     if let Some(runtime) = entry.get("runtime").cloned() {
         normalized.insert("runtime".to_string(), runtime);
     }
@@ -1112,6 +1152,10 @@ async fn settings_bootstrap(
                 &session_orchestrator_config,
             );
             object.insert(
+                "webConversation".to_string(),
+                web_conversation_projection(&state, session_id, &session_orchestrator_config),
+            );
+            object.insert(
                 "orchestratorSessionConfig".to_string(),
                 session_orchestrator_config,
             );
@@ -1309,6 +1353,7 @@ async fn save_orchestrator_session_config(
         "saved": true,
         "sessionId": scope.session_id.to_string(),
         "workspaceId": scope.workspace_id().map(|id| id.to_string()),
+        "webConversation": web_conversation_projection(&state, &scope.session_id, &override_config),
         "orchestratorSessionConfig": override_config,
         "effectiveOrchestratorConfig": effective_config,
     })))
@@ -2175,17 +2220,13 @@ async fn upsert_engine(
         ));
     }
     if is_chatgpt_web_engine(&request) {
-        // Web 引擎没有 HTTP 连接：写入 `llm` 会让它被规范化成 `openai_chat`
-        // 并静默走 HTTP（设计基线 A22，禁止的第二条回退路径）。
-        if request
-            .get("llm")
-            .is_some_and(|llm| llm.as_object().is_some_and(|object| !object.is_empty()))
-        {
-            return Err(ApiError::InvalidInput(
-                "GPT Web 引擎不写 llm（没有 baseUrl / apiKey / model）".to_string(),
-            ));
-        }
-    } else if let Some(llm) = request.get("llm") {
+        // GPT Web 入口由登录状态自动提供（固定的 `chatgpt-web/default`），不写入引擎注册表：
+        // 注册表里的条目都是 HTTP 引擎，Web 不是第二种“模型”。
+        return Err(ApiError::InvalidInput(
+            "GPT Web 入口由登录状态自动提供，不能写入模型引擎注册表".to_string(),
+        ));
+    }
+    if let Some(llm) = request.get("llm") {
         reject_deprecated_model_config_fields(llm).map_err(ApiError::InvalidInput)?;
         NormalizedModelConfig::from_settings_value(llm).map_err(ApiError::InvalidInput)?;
     }
@@ -2762,6 +2803,7 @@ mod tests {
             workspace_id: Some(workspace_id.to_string()),
             last_completed_at: None,
             last_viewed_at: None,
+            kind: Default::default(),
         }
     }
 
@@ -3187,40 +3229,14 @@ mod tests {
     #[tokio::test]
     async fn web_only_picker_does_not_require_provider_model_configuration() {
         let state = test_state();
-        state
-            .settings_store
-            .set_section("webModel", json!({ "consentConfirmed": true }))
-            .unwrap();
-        state
-            .settings_store
-            .set_section(
-                "engines",
-                json!([{
-                    "id": "chatgpt-web/gpt-5",
-                    "displayName": "GPT-5 (Web)",
-                    "apiProtocol": "chatgpt_web",
-                    "contextWindowTokens": 90000,
-                    "efforts": ["medium"],
-                    "toolsEnabled": false,
-                    "origin": {
-                        "kind": "web",
-                        "browserSessionId": "browser-app",
-                        "accountHint": "plus"
-                    }
-                }]),
-            )
-            .unwrap();
         state.record_web_model_probe(crate::state::WebModelProbeSnapshot {
             status: "ok".to_string(),
-            reason: None,
             account_hint: "plus".to_string(),
-            limits_revision: "limits-v1".to_string(),
-            engine_ids: vec!["chatgpt-web/gpt-5".to_string()],
             probed_at: 1,
         });
 
         let response = fetch_models(
-            State(state),
+            State(state.clone()),
             Json(FetchModelsRequest {
                 config: json!({}),
                 target: "orch".to_string(),
@@ -3231,7 +3247,25 @@ mod tests {
         .0;
 
         assert_eq!(response["models"], json!([]));
-        assert_eq!(response["webEngines"][0]["id"], json!("chatgpt-web/gpt-5"));
+        let engines = response["webEngines"].as_array().expect("webEngines");
+        assert_eq!(
+            engines.len(),
+            1,
+            "登录后只有一个固定入口，不复制网页模型菜单"
+        );
+        assert_eq!(engines[0]["id"], json!("chatgpt-web/default"));
+        assert_eq!(engines[0]["apiProtocol"], json!("chatgpt_web"));
+        // 通道没配置：入口照常可用，只是没有项目工具并说明缺什么（W8）。
+        assert_eq!(engines[0]["tools"]["available"], json!(false));
+        assert_eq!(engines[0]["tools"]["code"], json!("web_tunnel_unavailable"));
+
+        // 未登录：入口消失，不用旧结论占位。
+        state.record_web_model_probe(crate::state::WebModelProbeSnapshot {
+            status: "login_required".to_string(),
+            account_hint: "unknown".to_string(),
+            probed_at: 2,
+        });
+        assert!(state.web_model_picker_engines().is_empty());
     }
 
     #[tokio::test]
@@ -4248,36 +4282,25 @@ mod tests {
     }
 
     #[test]
-    fn normalize_engine_entry_preserves_web_engine_shape() {
-        // Web 引擎不写 llm：来源、可用窗口、档位与开关都在顶层，必须原样保留，
-        // 且不得被补成空 llm（那会让它退回 openai_chat 规范化路径，A22）。
-        let normalized = normalize_engine_entry(&json!({
-            "id": "chatgpt-web/gpt-5",
-            "displayName": "GPT-5 (Web)",
-            "apiProtocol": "chatgpt_web",
-            "contextWindowTokens": 90000,
-            "efforts": ["low", "medium", "high"],
-            "toolsEnabled": true,
-            "newChatPerTurn": false,
-            "origin": {
-                "kind": "web",
-                "browserSessionId": "browser-session-app-1-0",
-                "discoveredAt": 0
-            }
-        }))
-        .expect("web engine should normalize");
-
-        assert!(normalized.get("llm").is_none());
-        assert_eq!(normalized["apiProtocol"], json!("chatgpt_web"));
-        assert_eq!(normalized["contextWindowTokens"], json!(90000));
-        assert_eq!(normalized["efforts"], json!(["low", "medium", "high"]));
-        assert_eq!(normalized["toolsEnabled"], json!(true));
-        assert_eq!(normalized["newChatPerTurn"], json!(false));
-        assert_eq!(normalized["origin"]["kind"], json!("web"));
-        assert_eq!(
-            normalized["origin"]["browserSessionId"],
-            json!("browser-session-app-1-0")
+    fn normalize_engine_entry_drops_web_engines_and_keeps_http_engines() {
+        // 注册表里只有 HTTP 引擎；Web 条目（含旧版本发现写入的）一律丢弃。
+        assert!(
+            normalize_engine_entry(&json!({
+                "id": "chatgpt-web/default",
+                "displayName": "GPT-5 (Web)",
+                "apiProtocol": "chatgpt_web",
+                "origin": { "kind": "web" }
+            }))
+            .is_none()
         );
+        let http = normalize_engine_entry(&json!({
+            "id": "engine-http",
+            "displayName": "HTTP",
+            "llm": { "baseUrl": "https://example.test", "model": "m" }
+        }))
+        .expect("http engine should normalize");
+        assert_eq!(http["id"], json!("engine-http"));
+        assert!(http.get("apiProtocol").is_none());
     }
 
     #[test]
@@ -5599,7 +5622,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/gpt-5",
+                    "id": "chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5609,7 +5632,7 @@ mod tests {
         let error = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect_err("已有本地历史的会话不能切入 Web");
         match error {
@@ -5646,7 +5669,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/gpt-5",
+                    "id": "chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5656,7 +5679,7 @@ mod tests {
         save_initial_orchestrator_session_override_for_new_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect("the first request of a newly created session may bind Web")
         .expect("initial Web binding should produce a session override");
@@ -5664,7 +5687,7 @@ mod tests {
             state
                 .settings_store
                 .get_session_section(&session_id, "orchestrator")["engineId"],
-            json!("chatgpt-web/gpt-5")
+            json!("chatgpt-web/default")
         );
     }
 
@@ -5681,7 +5704,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/gpt-5",
+                    "id": "chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5691,7 +5714,7 @@ mod tests {
         save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect("空白会话应允许启动 Web")
         .expect("Web 绑定应产生会话覆盖");
@@ -5714,12 +5737,72 @@ mod tests {
         let reverse = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/gpt-5", "model": "gpt-5" }),
+            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect_err("切回本地后不能再次转回 Web");
         assert!(
             matches!(&reverse, ApiError::InvalidInput(message) if message.contains("暂不支持转为 GPT Web")),
             "反向转换错误应明确说明方向限制：{reverse:?}"
+        );
+    }
+
+    #[test]
+    fn web_conversation_mode_is_set_before_the_first_message_and_never_leaks_into_the_orchestrator_section()
+     {
+        let state = test_state();
+        let session_id = SessionId::new("session-web-mode");
+        state
+            .session_store
+            .create_session(session_id.clone(), "Web 方式")
+            .expect("session should create");
+
+        // 没有选择 GPT Web 入口时不能设置对话方式。
+        let rejected = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "webMode": "saved" }),
+        )
+        .expect_err("没有 Web 引擎的会话不能设置对话方式");
+        assert!(matches!(rejected, ApiError::InvalidInput(_)));
+
+        save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "engineId": "chatgpt-web/default", "model": "default", "webMode": "saved" }),
+        )
+        .expect("空白会话可以同时选择入口与已保存方式")
+        .expect("引擎绑定应产生会话覆盖");
+        let binding = magi_conversation_runtime::model_config::session_web_conversation_binding(
+            &state.settings_store,
+            &session_id,
+        );
+        assert_eq!(binding.mode, magi_web_model::WebConversationMode::Saved);
+        assert!(
+            binding.remote_conversation_id.is_none(),
+            "新建已保存对话还没有远端 id"
+        );
+        let orchestrator = state
+            .settings_store
+            .get_session_section(&session_id, "orchestrator");
+        assert!(
+            orchestrator.get("webMode").is_none(),
+            "方式只存在于 webConversation 绑定"
+        );
+
+        // 首条消息之后方式固定。
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "第一条",
+        );
+        let locked = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "webMode": "temporary" }),
+        )
+        .expect_err("首条消息后不能再改方式");
+        assert!(
+            matches!(locked, ApiError::InvalidInput(message) if message.contains("不能再更改"))
         );
     }
 

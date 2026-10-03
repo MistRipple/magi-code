@@ -12,6 +12,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite = "0.29"
+tracing.workspace = true
 url = "2"
 
 [dev-dependencies]

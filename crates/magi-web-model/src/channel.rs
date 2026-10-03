@@ -1,15 +1,14 @@
-//! T3 通道就绪状态（设计基线 §5.7.4、A10；实现计划 4.9）。
+//! 工具通道就绪状态。
 //!
-//! T3 需要一条「外部平台能回调本机」的通道。通道有两条正式形态：Magi Connect
-//! 设备连接层（优先）与 OpenAI Tunnel（Connect 未就绪时的正式交付）。两条形态对
-//! 推理通道只暴露同一件事：**通道现在能不能把 `tools/call` 送到本机 harness**。
+//! 项目工具需要一条「外部平台能回调本机」的通道，正式形态只有 OpenAI Tunnel。它对
+//! 推理通道只暴露一件事：**通道现在能不能把 `tools/call` 送到本机 Magi MCP 服务**。
 //!
 //! 本模块是这件事的唯一载体：
 //! - 通道托管方（daemon 装配层）负责把真实状态写进来；
-//! - 推理通道只读它来决定档位：T3 请求在通道未就绪时**必须降档到 T2**，
-//!   并把「具体缺哪一项」原样带出去，不允许假装 T3 可用（A15、§5.7.0）。
+//! - 选择器与设置只读它：通道未就绪时 GPT Web 仍可纯对话，只是没有项目工具，
+//!   并把「具体缺哪一项」原样带出去（W8）。
 //!
-//! 状态只驻进程内存：它描述的是「此刻能不能用」，不是可持久化事实（A20）。
+//! 状态只驻进程内存：它描述的是「此刻能不能用」，不是可持久化事实。
 
 use std::sync::Mutex;
 
@@ -19,19 +18,19 @@ pub struct WebModelChannelStatus {
     pub ready: bool,
     /// 稳定原因码：`running` / `tunnel_not_configured` / `client_missing` /
     /// `client_checksum_mismatch` / `credential_missing` / `start_failed` /
-    /// `connect_not_ready` / `harness_unavailable`。
+    /// `mcp_unavailable`。
     pub code: String,
     /// 用户可读的「具体缺哪一项」。
     pub detail: String,
 }
 
 impl WebModelChannelStatus {
-    /// 尚未配置任何 T3 通道。
+    /// 尚未配置工具通道。
     pub fn not_configured() -> Self {
         Self {
             ready: false,
             code: "tunnel_not_configured".to_string(),
-            detail: "尚未配置 T3 通道：需要 OpenAI Tunnel（Tunnel 与仅含 Tunnels Read + Use 的 API 密钥）或 Magi Connect 设备连接".to_string(),
+            detail: "尚未配置工具通道：需要 OpenAI Tunnel（Tunnel 与仅含 Tunnels Read + Use 的 API 密钥）".to_string(),
         }
     }
 
@@ -76,12 +75,6 @@ impl WebModelChannelState {
         }
     }
 
-    pub fn with_status(status: WebModelChannelStatus) -> Self {
-        Self {
-            status: Mutex::new(status),
-        }
-    }
-
     pub fn set(&self, status: WebModelChannelStatus) {
         let mut guard = self.status.lock().expect("web model channel lock poisoned");
         *guard = status;
@@ -101,17 +94,17 @@ impl Default for WebModelChannelState {
     }
 }
 
-/// 把 harness/tunnel 侧的托管状态翻译成通道状态。
+/// 把 OpenAI Tunnel 的托管状态翻译成通道状态。
 ///
 /// `Connect` 未就绪时一律以 OpenAI Tunnel 的托管状态为准（A10：Connect 优先，
 /// 未就绪则以 OpenAI Tunnel 正式交付）。
 pub fn status_from_tunnel(
-    tunnel: Option<&crate::harness::TunnelClientStatus>,
+    tunnel: Option<&crate::tunnel::TunnelClientStatus>,
 ) -> WebModelChannelStatus {
     let Some(status) = tunnel else {
         return WebModelChannelStatus::not_configured();
     };
-    use crate::harness::TunnelClientStatus;
+    use crate::tunnel::TunnelClientStatus;
     match status {
         TunnelClientStatus::Running { pid } => {
             WebModelChannelStatus::running(format!("OpenAI Tunnel 运行中（pid {pid}）"))
@@ -123,7 +116,7 @@ pub fn status_from_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::TunnelClientStatus;
+    use crate::tunnel::TunnelClientStatus;
 
     #[test]
     fn a_missing_tunnel_config_is_not_ready() {

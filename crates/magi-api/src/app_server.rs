@@ -1757,8 +1757,10 @@ async fn list_sessions(
         Some(workspace_id) => state.session_store.sessions_for_workspace(workspace_id),
         None => state.session_store.sessions(),
     };
+    // 外部工具会话（Magi MCP 服务为外部令牌建立）不进入用户的会话列表。
     let sessions = sessions
         .into_iter()
+        .filter(|session| session.kind.is_user())
         .map(|session| session_summary(state, session))
         .collect::<Vec<_>>();
     typed_success(
@@ -2353,7 +2355,9 @@ fn parse_subscription_scope(
 
 fn api_error_to_protocol(error: ApiError) -> ErrorObject {
     match error {
-        ApiError::InvalidInput(message) => ErrorObject::new(ERROR_INVALID_PARAMS, message),
+        ApiError::InvalidInput(message) | ApiError::Forbidden(message) => {
+            ErrorObject::new(ERROR_INVALID_PARAMS, message)
+        }
         ApiError::InvalidRequestBody(message) => ErrorObject::new(ERROR_INVALID_PARAMS, message),
         ApiError::SessionNotFound(message) | ApiError::NotFound(message) => {
             ErrorObject::new(ERROR_SESSION_NOT_FOUND, message)

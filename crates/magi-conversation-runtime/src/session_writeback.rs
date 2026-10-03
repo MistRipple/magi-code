@@ -2040,6 +2040,111 @@ fn upsert_session_tool_call_result_item(
     Ok(())
 }
 
+/// 外部（MCP）工具调用在会话当前 Turn 里的内联展示。
+///
+/// GPT Web 的工具由网页模型经 MCP 调用，不经过 Magi 自己的工具循环；它们仍是 Magi 的执行事实，
+/// 必须作为普通工具项写进 canonical 并发布 turn item 事件（W9、§8.4）。写入的 Turn 是会话
+/// **当前进行中的 Turn**：没有进行中的 Turn 时返回错误，调用方应拒绝该调用。
+pub struct ExternalToolItemWriter<'a> {
+    pub session_store: &'a SessionStore,
+    pub event_bus: &'a InMemoryEventBus,
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+}
+
+impl ExternalToolItemWriter<'_> {
+    fn current_turn_id(&self) -> Result<String, String> {
+        self.session_store
+            .runtime_sidecar(self.session_id)
+            .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
+            .ok_or_else(|| format!("会话 {} 当前没有进行中的 Turn", self.session_id))
+    }
+
+    fn source_thread(&self) -> ThreadId {
+        self.session_store
+            .ensure_session_mission(self.session_id, UtcMillis::now(), || {
+                magi_core::MissionId::new(format!("mission-{}", self.session_id))
+            })
+            .1
+    }
+
+    fn write(&self, turn_id: &str, item: ActiveExecutionTurnItem) -> Result<(), String> {
+        let published = upsert_session_turn_item_for_turn(
+            self.session_store,
+            self.session_id,
+            Some(turn_id),
+            item,
+            None,
+        )?
+        .ok_or_else(|| format!("会话 {} 的当前 Turn 已不可写", self.session_id))?;
+        publish_session_turn_item_event(
+            self.event_bus,
+            self.session_id,
+            self.workspace_id,
+            &published,
+        );
+        Ok(())
+    }
+
+    pub fn started(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> Result<(), String> {
+        let turn_id = self.current_turn_id()?;
+        let mut item = session_turn_item(
+            "tool_call_started",
+            "running",
+            Some(tool_name.to_string()),
+            Some(format!("正在调用工具：{tool_name}")),
+            Some(format!("turn-item-tool-{call_id}")),
+            self.source_thread(),
+        );
+        item.source = "tool".to_string();
+        item.tool_call_id = Some(call_id.to_string());
+        item.tool_name = Some(tool_name.to_string());
+        item.tool_status = Some("running".to_string());
+        item.tool_arguments = Some(arguments_json.to_string());
+        self.write(&turn_id, item)
+    }
+
+    pub fn finished(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        result: &str,
+        status: ExecutionResultStatus,
+    ) -> Result<(), String> {
+        let turn_id = self.current_turn_id()?;
+        let mut item = session_turn_item(
+            "tool_call_result",
+            turn_item_status_for_tool_result(status),
+            Some(tool_name.to_string()),
+            Some(summarize_tool_result(result)),
+            Some(format!("turn-item-tool-{call_id}")),
+            self.source_thread(),
+        );
+        item.source = "tool".to_string();
+        item.tool_call_id = Some(call_id.to_string());
+        item.tool_name = Some(tool_name.to_string());
+        item.tool_status = Some(tool_execution_status_label(status).to_string());
+        item.tool_arguments = Some(arguments_json.to_string());
+        item.tool_result = Some(result.to_string());
+        if matches!(
+            status,
+            ExecutionResultStatus::Failed
+                | ExecutionResultStatus::Rejected
+                | ExecutionResultStatus::NeedsApproval
+                | ExecutionResultStatus::Cancelled
+        ) {
+            item.tool_error = Some(result.to_string());
+        }
+        self.write(&turn_id, item)
+    }
+}
+
 #[derive(Clone)]
 struct SessionToolExecutionContext<'a> {
     session_store: &'a SessionStore,

@@ -53,7 +53,7 @@
     createBrowserSession,
     createBrowserTab,
     createAppBrowserSession,
-    discoverWebModels,
+    stopWebModel,
     getBrowserCapabilities,
     materializeSession,
     getAgentChangeDiff,
@@ -65,10 +65,8 @@
   } from './agent-api';
   import { loadBrowserAuthoritySession } from './browser-authority-coordinator';
   import { WEB_MODEL_HOME_TAB_ID } from '../shared/web-model';
-  import {
-    webModelActivePageId,
-    webModelActiveTurnCount,
-  } from '../stores/web-model-runtime.svelte';
+  import { markWebModelStoppedByUser, webModelActiveTurnCount } from '../stores/web-model-runtime.svelte';
+  import { refreshWebModelRuntime, runWebModelProbe } from './web-model-session-projection';
   import { openSettings } from '../stores/shell-ui.svelte';
   import {
     WEB_MODEL_ACTION_EVENT,
@@ -407,18 +405,30 @@
       case 'openView':
         await createWebModelPane();
         return;
-      case 'runDiagnostics': {
+      case 'probe': {
         try {
           // 与设置页的连接动作保持同一前置：没有应用级主页 guest 时，探测
           // 只能得到 Desktop 不可用，不能把一次性动作误报成 selector 漂移。
           await createAppBrowserSession();
-          const result = await discoverWebModels();
+          const result = await runWebModelProbe();
           const summary = result.reason
             ? `${result.status} · ${result.reason}`
             : result.status;
           addToast(result.status === 'ok' ? 'success' : 'warning', summary, undefined, { forceVisible: true });
         } catch (error) {
-          console.warn('[RightPane] Web 模型自检失败:', error);
+          console.warn('[RightPane] GPT Web 自检失败:', error);
+          addToast('error', i18n.t('settings.browser.webModel.loadFailed'), undefined, { forceVisible: true });
+        }
+        return;
+      }
+      case 'releaseSession': {
+        try {
+          await stopWebModel();
+          markWebModelStoppedByUser(true);
+          await refreshWebModelRuntime();
+          addToast('success', i18n.t('webModel.stop.done'), undefined, { forceVisible: true });
+        } catch (error) {
+          console.warn('[RightPane] 释放 GPT Web 失败:', error);
           addToast('error', i18n.t('settings.browser.webModel.loadFailed'), undefined, { forceVisible: true });
         }
         return;
@@ -430,17 +440,12 @@
       }
       case 'openSettings': {
         openSettings();
-        requestWebModelSettings({ focus: 'diagnostics' });
+        requestWebModelSettings({ focus: 'status' });
         return;
       }
       case 'switchModel':
         window.dispatchEvent(new CustomEvent('magi:webModelOpenModelPicker'));
         return;
-      case 'raiseRoundLimit': {
-        openSettings();
-        requestWebModelSettings({ focus: 'roundLimit', engineId: detail.engineId });
-        return;
-      }
       case 'retry':
         // 发送失败后，InputArea 会按既有 submission-settled 事实恢复草稿；这里
         // 只把焦点交回 composer，不自动重放副作用或创建第二条提交路径。
@@ -1428,17 +1433,12 @@
 
     {#each appPaneTabs as appTab (appTab.id)}
       {@const appPayload = appTab.payload as WebModelTabPayload}
-      {@const activeWebModelPageId = webModelActivePageId(
-        rightPaneState.activeSessionId,
-        undefined,
-        appPayload.hosts.map((host) => host.tabId),
-      )}
       <!-- 应用级内容槽**始终挂载**（A25）：折叠右栏与关闭视图只改可见性，
            不卸载组件、不销毁 guest，后台推理不中断。 -->
       <WebModelTabContent
         browserSessionId={appPayload.browserSessionId}
         hosts={appPayload.hosts}
-        activeHostTabId={activeWebModelPageId ?? appPayload.hosts[0]?.tabId ?? null}
+        activeHostTabId={appPayload.hosts[0]?.tabId ?? null}
         active={activeAppTab?.id === appTab.id && !appPayload.viewHidden}
         workspaceId={rightPaneState.activeWorkspaceId}
         workspacePath={workspaceRoot}

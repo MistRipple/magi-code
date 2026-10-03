@@ -6,7 +6,8 @@
 
 use crate::context_authority::{
     ContextAuthority, ContextCompactionMode, ContextCompactionTerminal, ContextPrepareRequest,
-    current_session_file_facts, estimate_chat_messages_tokens, estimate_tool_definition_tokens,
+    PreparedThreadHistory, current_session_file_facts, estimate_chat_messages_tokens,
+    estimate_tool_definition_tokens,
 };
 #[cfg(test)]
 use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
@@ -1006,6 +1007,13 @@ fn run_session_turn_execution_inner(
         .and_then(|config| config.to_usage_llm_config())
         .map(|config| config.model)
         .unwrap_or_default();
+    // GPT Web owns the remote conversation context.  Do not run Magi's context
+    // authority/compaction pipeline for this path: it would spend local work on
+    // a context that is never sent to the page and would make the Web engine
+    // appear to participate in Magi's token-pressure accounting.
+    let web_engine = settings_store
+        .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
+        .is_some_and(|config| config.is_chatgpt_web());
     let current_turn_contains_images = !request.images.is_empty();
     let vision_execution_config = resolve_vision_execution_config(
         settings_store.map(Arc::as_ref),
@@ -1080,34 +1088,42 @@ fn run_session_turn_execution_inner(
         execution_started.elapsed().as_millis(),
         None,
     );
-    let prepared_history = ContextAuthority::new(
-        client,
-        event_bus,
-        session_store,
-        &request.session_id,
-        &request.workspace_id,
-        &orchestrator_thread_id,
-        settings_store,
-    )
-    .with_expected_turn_id(Some(&request.turn_id))
-    .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
-    .prepare(ContextPrepareRequest {
-        recovery_history,
-        phase: compaction_phase,
-        context_window_tokens: effective_context_window,
-        additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
-            .saturating_add(estimate_tool_definition_tokens(tools.as_deref())),
-        persist_checkpoint: vision_execution_config.is_none(),
-        model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
-            vision_execution_config
-                .as_ref()
-                .map(|_| "vision")
-                .unwrap_or("configured"),
-            resolved_context_model.clone(),
-            0,
-        )),
-        mode: compaction_mode,
-    });
+    let prepared_history = if web_engine {
+        PreparedThreadHistory {
+            messages: Vec::new(),
+            compaction: None,
+            terminal: None,
+        }
+    } else {
+        ContextAuthority::new(
+            client,
+            event_bus,
+            session_store,
+            &request.session_id,
+            &request.workspace_id,
+            &orchestrator_thread_id,
+            settings_store,
+        )
+        .with_expected_turn_id(Some(&request.turn_id))
+        .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
+        .prepare(ContextPrepareRequest {
+            recovery_history,
+            phase: compaction_phase,
+            context_window_tokens: effective_context_window,
+            additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
+                .saturating_add(estimate_tool_definition_tokens(tools.as_deref())),
+            persist_checkpoint: vision_execution_config.is_none(),
+            model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
+                vision_execution_config
+                    .as_ref()
+                    .map(|_| "vision")
+                    .unwrap_or("configured"),
+                resolved_context_model.clone(),
+                0,
+            )),
+            mode: compaction_mode,
+        })
+    };
     mark_turn_timing(
         "context_prepare_completed",
         &request,
@@ -1385,6 +1401,7 @@ fn run_session_turn_execution_inner(
                 orchestrator_mission_id: &orchestrator_mission_id,
                 persist_session_state,
                 tool_execution_ledger: &mut tool_execution_ledger,
+                web_engine,
             },
             tool_registry,
             skill_runtime,
@@ -2051,6 +2068,8 @@ struct SessionTurnRoundRuntime<'a> {
     orchestrator_mission_id: &'a magi_core::MissionId,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
     tool_execution_ledger: &'a mut ToolExecutionLedger,
+    /// GPT Web 引擎自己维护网页上下文：Magi 不为它做上下文占用跟踪。
+    web_engine: bool,
 }
 
 struct SessionTurnRoundOutput {
@@ -2218,6 +2237,7 @@ fn stream_session_turn_round(
         orchestrator_mission_id,
         persist_session_state,
         tool_execution_ledger,
+        web_engine,
     } = runtime;
 
     let stream_item_id = if round == 0 {
@@ -2267,7 +2287,7 @@ fn stream_session_turn_round(
         resolved_provider_for_usage_binding(settings_store, usage_binding, &request.session_id);
     let prefill_tokens = estimate_chat_messages_tokens(messages)
         .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
-    let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
+    let context_usage_tracker = (usage_binding.tracks_active_context() && !web_engine).then(|| {
         ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
             event_bus,
             settings_store: settings_store.map(Arc::as_ref),
@@ -6104,6 +6124,7 @@ mod tests {
                 orchestrator_mission_id: &mission_id,
                 persist_session_state: None,
                 tool_execution_ledger: &mut tool_execution_ledger,
+                web_engine: false,
             },
             None,
             None,
@@ -6244,6 +6265,7 @@ mod tests {
                 orchestrator_mission_id: &mission_id,
                 persist_session_state: None,
                 tool_execution_ledger: &mut tool_execution_ledger,
+                web_engine: false,
             },
             None,
             None,
@@ -6284,6 +6306,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: vec![
                 TimelineEntry {
@@ -6513,6 +6536,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns: vec![CanonicalTurn {
@@ -6627,6 +6651,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns: vec![CanonicalTurn {
@@ -6809,6 +6834,7 @@ mod tests {
                 workspace_id: None,
                 last_completed_at: None,
                 last_viewed_at: None,
+                kind: Default::default(),
             }],
             timeline: Vec::new(),
             canonical_turns,

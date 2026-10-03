@@ -21,8 +21,6 @@ import type {
   SessionTurnQueueResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
-  GenerateSessionSuggestionsRequestDto,
-  SessionSuggestionsResponseDto,
   SkillsLibraryResponseDto,
   MessagesResponseDto,
   VersionHandshakeDto,
@@ -323,6 +321,13 @@ function normalizeSettingsBootstrapPayload(
     orchestratorConfig: normalizeSettingsSectionConfig(payload.orchestratorConfig),
     orchestratorSessionDefaults: normalizeSettingsSectionConfig(payload.orchestratorSessionDefaults),
     orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
+    webConversation: (
+      payload.webConversation
+      && typeof payload.webConversation === 'object'
+      && !Array.isArray(payload.webConversation)
+        ? payload.webConversation
+        : null
+    ) as SettingsBootstrapPayload['webConversation'],
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
     visionConfig: normalizeSettingsSectionConfig(payload.visionConfig),
@@ -1173,68 +1178,70 @@ export async function ensureWebModelHomeSurface(): Promise<BrowserSessionSnapsho
 }
 
 /**
- * 发现通道的接口状态（《实现计划》§7.1）。这是**这一次探测**的结果，
- * 不等于引擎的长期状态（设计基线 §5.11 的唯一枚举在 daemon 投影）。
+ * GPT Web 标签页的手动刷新：重新加载唯一页面当前的地址（页面卡住 / 加载失败时使用）。
+ * 不换页面、不改变 Web 对话；地址不可恢复（空白 / 浏览器内部错误页）时回到 ChatGPT 主页。
  */
-export type WebModelDiscoveryStatus =
-  | 'ok'
-  | 'login_required'
-  | 'consent_required'
-  | 'desktop_unavailable'
-  | 'refresh_required'
-  | 'site_blocked'
-  | 'quota_exhausted'
-  | 'tool_degraded'
-  | 'failed';
-
-/** Web 引擎草稿。它只是候选，落库仍走既有 `engines` 写入路径。 */
-export interface WebModelEngineDraft {
-  id: string;
-  displayName: string;
-  apiProtocol: 'chatgpt_web';
-  contextWindowTokens: number;
-  efforts: string[];
-  toolsEnabled: boolean;
-  newChatPerTurn: boolean;
-  toolRoundLimit?: number;
-  origin: {
-    kind: 'web';
-    browserSessionId: string;
-    discoveredAt: number;
-    accountHint: string;
-  };
+export async function reloadWebModelPage(): Promise<void> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/reload'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  });
+  await parseAgentJson<{ status: string }>(response, 'reload web model page');
 }
 
-export interface WebModelDiscoveryResponse {
-  status: WebModelDiscoveryStatus;
-  reason?: string | null;
-  accountHint: string;
-  limitsRevision: string;
-  siteRevision: string;
-  composerCharLimit?: number | null;
-  engines: WebModelEngineDraft[];
+/** GPT Web 标签页顶部快捷地址的目标页面（固定白名单）。 */
+export type WebModelPageTarget = 'chat' | 'tunnels' | 'api_keys';
+
+/**
+ * 把 GPT Web 的唯一页面切到对话页或 OpenAI 平台的固定页面（Tunnels / Runtime API keys）。
+ * 槽位被会话占用时 daemon 返回 409，不打断进行中的对话。
+ */
+export async function navigateWebModelPage(target: WebModelPageTarget): Promise<void> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/navigate'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ target }),
+  });
+  await parseAgentJson<{ status: string }>(response, 'navigate web model page');
 }
 
 /**
- * `POST /browser/web-models/discover`：只读探测，只返回候选，不落库。
+ * 一次只读探测的归一化结论（`POST /browser/web-models/probe`）。
  *
- * 未登录 / 登录过期时服务端返回 `login_required` 且 `engines = []`；
- * 调用方不得用上一次结果占位（设计基线 §5.5）。
+ * 只有登录与页面可用性：Magi 不读取、不复制网页的模型菜单。未登录 / 站点异常时
+ * 选择器里没有 GPT Web 入口，调用方不得用上一次结果占位。
  */
-export async function discoverWebModels(): Promise<WebModelDiscoveryResponse> {
-  const response = await getTransport().request(agentUrl('/api/browser/web-models/discover'), {
+export type WebModelProbeStatus =
+  | 'ok'
+  | 'login_required'
+  | 'site_blocked'
+  | 'selectors_drift'
+  | 'platform_page'
+  | 'desktop_unavailable'
+  | 'failed';
+
+export interface WebModelProbeResponse {
+  status: WebModelProbeStatus;
+  reason?: string | null;
+  accountHint: string;
+  siteRevision: string;
+}
+
+export async function probeWebModel(): Promise<WebModelProbeResponse> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/probe'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
   });
-  return parseAgentJson<WebModelDiscoveryResponse>(response, 'discover web models');
+  return parseAgentJson<WebModelProbeResponse>(response, 'probe web model');
 }
 
 /**
- * T3 通道状态（`GET /browser/web-models/tunnel`，设计基线 §5.7.4）。
+ * OpenAI Tunnel 通道状态（`GET /browser/web-models/tunnel`）。
  *
  * 只有状态与「具体缺哪一项」，**不含任何凭据内容**：API 密钥始终留在用户自己的
- * 凭据文件里，Magi 只保存引用。
+ * 凭据文件里，Magi 只保存引用。通道不可用不影响 GPT Web 对话，只是没有项目工具。
  */
 export interface WebModelTunnelStatus {
   channel: string;
@@ -1242,35 +1249,30 @@ export interface WebModelTunnelStatus {
   code: string;
   detail: string;
   tunnelId: string;
-  credentialFile: string;
-  listenerUrl?: string | null;
-  portFile?: string | null;
-  localEndpoint?: string | null;
+  /** 是否已保存运行时 API 密钥（密钥本身永不返回）。 */
+  hasApiKey: boolean;
+  /** 已保存密钥的遮罩预览（只含末 4 位）；完整密钥只经「显示」接口取得。 */
+  apiKeyPreview?: string | null;
+  toolProfile: string;
+  /** 需要授权的工具调用怎么处理：每次询问 / 始终授权 / 拒绝。 */
+  approvalMode: WebModelApprovalMode;
+  slotEndpoint?: string | null;
 }
+
+export type WebModelToolProfile = 'read_only' | 'edit' | 'edit_trusted';
+
+export type WebModelApprovalMode = 'ask' | 'always' | 'deny';
 
 export interface WebModelTunnelConfigRequest {
-  /** 显式清除配置（关闭 T3）。 */
+  /** 显式清除配置。 */
   clear?: boolean;
   tunnelId?: string;
-  /** 仅含 Tunnels Read + Use 的 API 密钥文件路径（引用，不是密钥本身）。 */
-  credentialFile?: string;
-  clientBinary?: string;
-  clientSha256?: string;
+  /** 仅含 Tunnels Read + Use 的运行时 API 密钥。留空沿用已保存的密钥；由 Magi 存进私有文件，不会回显。 */
+  apiKey?: string;
+  toolProfile?: WebModelToolProfile;
+  approvalMode?: WebModelApprovalMode;
 }
 
-export interface WebModelDiagnosticsResponse {
-  checkedAt: number;
-  discovery: WebModelDiscoveryResponse | null;
-  tunnel: WebModelTunnelStatus | null;
-  runtime: WebModelRuntimeResponse | null;
-  errors: {
-    discovery?: string;
-    tunnel?: string;
-    runtime?: string;
-  };
-}
-
-/** `GET /browser/web-models/tunnel`：只读读取当前 T3 通道状态。 */
 export async function getWebModelTunnel(): Promise<WebModelTunnelStatus> {
   const response = await getTransport().request(agentUrl('/api/browser/web-models/tunnel'), {
     method: 'GET',
@@ -1279,7 +1281,35 @@ export async function getWebModelTunnel(): Promise<WebModelTunnelStatus> {
   return parseAgentJson<WebModelTunnelStatus>(response, 'load web model tunnel');
 }
 
-/** `POST /browser/web-models/tunnel`：保存凭据引用并按需启动 / 停止通道。 */
+/** 设置里的「显示」按钮：取回已保存的完整密钥（仅桌面端可用）。 */
+export async function revealWebModelTunnelApiKey(): Promise<string> {
+  const response = await getTransport().request(
+    agentUrl('/api/browser/web-models/tunnel/api-key'),
+    { method: 'GET', headers: { 'content-type': 'application/json' } },
+  );
+  const body = await parseAgentJson<{ apiKey: string }>(response, 'reveal web model tunnel api key');
+  return body.apiKey;
+}
+
+/** 只改权限档 / 授权方式：下一次工具调用就生效，不重启通道。 */
+export async function setWebModelToolPolicy(policy: {
+  toolProfile?: WebModelToolProfile;
+  approvalMode?: WebModelApprovalMode;
+}): Promise<WebModelTunnelStatus> {
+  const response = await getTransport().request(
+    agentUrl('/api/browser/web-models/tunnel/policy'),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        toolProfile: policy.toolProfile ?? null,
+        approvalMode: policy.approvalMode ?? null,
+      }),
+    },
+  );
+  return parseAgentJson<WebModelTunnelStatus>(response, 'set web model tool policy');
+}
+
 export async function configureWebModelTunnel(
   request: WebModelTunnelConfigRequest,
 ): Promise<WebModelTunnelStatus> {
@@ -1289,46 +1319,36 @@ export async function configureWebModelTunnel(
     body: JSON.stringify({
       clear: Boolean(request.clear),
       tunnelId: request.tunnelId ?? '',
-      credentialFile: request.credentialFile ?? '',
-      clientBinary: request.clientBinary ?? null,
-      clientSha256: request.clientSha256 ?? null,
+      apiKey: request.apiKey?.trim() ? request.apiKey.trim() : null,
+      toolProfile: request.toolProfile ?? null,
+      approvalMode: request.approvalMode ?? null,
     }),
   });
   return parseAgentJson<WebModelTunnelStatus>(response, 'configure web model tunnel');
 }
 
 /**
- * 一次在飞 Web turn 的阶段投影（《实现计划》§3.12）。
- *
- * 这只是当前 daemon 进程内存里的调度事实：进程重启即清空；正文、工具调用与
- * 终态仍只在 canonical 里（A20、R55）。
+ * 单槽位的运行态投影。这只是当前 daemon 进程内存里的调度事实：进程重启即清空；
+ * 正文、工具调用与终态仍只在 canonical 里。
  */
 export interface WebModelRuntimeEntry {
-  bindingKey: string;
   sessionId: string;
+  /** 会话名称（daemon 投影）；缺失时界面回退到通用称呼，不显示内部 id。 */
+  sessionTitle?: string | null;
+  /** 占用者所在项目（个人会话为空）：用于「转到该会话」。 */
+  workspaceId?: string | null;
   threadId: string;
   engineId: string;
-  effort: string;
-  epoch: number;
   pageId?: string | null;
-  stage: 'waiting_engine' | 'generating' | 'finished';
-  /** 是否仍有在飞 turn；完成条目可保留用于额度 / 所有权投影。 */
+  stage: 'generating' | 'finished';
+  /** 是否仍有在飞 turn；完成条目保留用于「当前由哪个会话占用」的投影。 */
   active: boolean;
-  queuePosition: number | null;
-  /** 这条对话实例已经向账号发出的消息条数（A16）。 */
+  /** 这个会话已经向账号发出的消息条数。 */
   sentMessages: number;
-  lastSentTokens: number;
-  /** 对话实例所有权（§5.8）：`user_owned` / `invalidated` 表示需要提示接管。 */
-  ownership: 'magi_owned' | 'user_owned' | 'invalidated' | null;
   updatedAtMs: number;
 }
 
-/**
- * 账号额度提示（A16）。
- *
- * Web 引擎不参与 token 聚合：这里只报「本地观察到的发送条数」，不是账号侧真实
- * 剩余额度，也不是计费数据。
- */
+/** 账号额度提示：只报「本地观察到的发送条数」，不是账号侧真实剩余额度。 */
 export interface WebModelQuota {
   sentMessages: number;
   countedBy: string;
@@ -1340,11 +1360,6 @@ export interface WebModelRuntimeResponse {
   quota: WebModelQuota | null;
 }
 
-/**
- * `GET /browser/web-models/runtime`：只读读取在飞 turn 的阶段、排队位置与发送计数。
- *
- * 无会话过滤时返回全部会话；用于会话内阶段投影与额度展示，不参与业务事实。
- */
 export async function getWebModelRuntime(sessionId = ''): Promise<WebModelRuntimeResponse> {
   const query = sessionId.trim()
     ? `?sessionId=${encodeURIComponent(sessionId.trim())}&clientPlatform=${encodeURIComponent(browserClientPlatform())}`
@@ -1361,44 +1376,8 @@ export async function getWebModelRuntime(sessionId = ''): Promise<WebModelRuntim
 }
 
 /**
- * 阶段 5 自检聚合：把发现、T3 通道和进程内运行态的当前快照放在同一个
- * 前端诊断结果中。每个子路由独立收口，单个探测失败不能抹掉另外两类事实。
- */
-export async function getWebModelDiagnostics(): Promise<WebModelDiagnosticsResponse> {
-  const [discoveryResult, tunnelResult, runtimeResult] = await Promise.allSettled([
-    discoverWebModels(),
-    getWebModelTunnel(),
-    getWebModelRuntime(),
-  ]);
-  const errors: WebModelDiagnosticsResponse['errors'] = {};
-  const errorText = (reason: unknown): string => (
-    reason instanceof Error && reason.message.trim()
-      ? reason.message.trim()
-      : String(reason || 'unknown error')
-  );
-  const discovery = discoveryResult.status === 'fulfilled'
-    ? discoveryResult.value
-    : (errors.discovery = errorText(discoveryResult.reason), null);
-  const tunnel = tunnelResult.status === 'fulfilled'
-    ? tunnelResult.value
-    : (errors.tunnel = errorText(tunnelResult.reason), null);
-  const runtime = runtimeResult.status === 'fulfilled'
-    ? runtimeResult.value
-    : (errors.runtime = errorText(runtimeResult.reason), null);
-  return {
-    checkedAt: Date.now(),
-    discovery,
-    tunnel,
-    runtime,
-    errors,
-  };
-}
-
-/**
- * `POST /browser/web-models/reset`：退出登录 / 清除 Web 数据后的 daemon 侧收口。
- *
- * 顺序固定：先撤销在飞回复，再失效投影（Web 模型立即从选择器消失），最后停通道。
- * 「清理浏览数据」本身走 Desktop 入口，本调用只负责 daemon 侧。
+ * `POST /browser/web-models/reset`：退出登录 / 清除 Web 数据后的 daemon 侧收口
+ * （取消在飞推理、释放槽位、使选择器入口失效）。
  */
 export async function resetWebModels(): Promise<{ status: string }> {
   const response = await getTransport().request(agentUrl('/api/browser/web-models/reset'), {
@@ -1410,41 +1389,94 @@ export async function resetWebModels(): Promise<{ status: string }> {
 }
 
 /**
- * `POST /browser/web-models/reset-conversation`：「重置为 Magi 对话」（§5.8）。
+ * `POST /browser/web-models/stop`：设置里的「停止」与 Tab 里的「退出」。
  *
- * 只推进该会话 / 线程的绑定 epoch：下一次发送按新建路径全量重放。它不写
- * canonical、不改 settings，也不影响其他线程（子代理各有一条临时对话）。
+ * 取消进行中的推理、销毁页面、释放唯一槽位；登录态保留。关闭右栏只隐藏，不走这里。
  */
-export async function resetWebModelConversation(
-  sessionId: string,
-  threadId = '',
-): Promise<{ status: string; epoch: number }> {
-  const response = await getTransport().request(
-    agentUrl('/api/browser/web-models/reset-conversation'),
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        sessionId,
-        threadId,
-        clientPlatform: browserClientPlatform(),
-      }),
-    },
-  );
-  return parseAgentJson<{ status: string; epoch: number }>(
-    response,
-    'reset web model conversation',
-  );
-}
-
-/** 记录一次性的首次使用说明确认（A9）。 */
-export async function confirmWebModelConsent(): Promise<{ consentConfirmed: boolean }> {
-  const response = await getTransport().request(agentUrl('/api/browser/web-models/consent'), {
+export async function stopWebModel(): Promise<{ status: string }> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/stop'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
   });
-  return parseAgentJson<{ consentConfirmed: boolean }>(response, 'confirm web model consent');
+  return parseAgentJson<{ status: string }>(response, 'stop web model');
+}
+
+/** ChatGPT 侧 Magi 连接器的状态 / 配置结果。 */
+export interface WebConnectorStatus {
+  supported: boolean;
+  exists: boolean;
+  enabled: boolean;
+  toolCount?: number | null;
+  reason?: string | null;
+}
+
+export interface WebConnectorConfigResult {
+  configured: boolean;
+  confirmedEnabled: boolean;
+  reason?: string | null;
+}
+
+export async function getWebConnectorStatus(): Promise<WebConnectorStatus> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/connector'), {
+    method: 'GET',
+  });
+  return parseAgentJson<WebConnectorStatus>(response, 'get web connector status');
+}
+
+/** 在 ChatGPT 里创建 / 启用 Magi 连接器。会修改用户的 ChatGPT 连接器设置，调用方必须已确认。 */
+export async function configureWebConnector(): Promise<WebConnectorConfigResult> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/connector'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
+  });
+  return parseAgentJson<WebConnectorConfigResult>(response, 'configure web connector');
+}
+
+/** ChatGPT 侧已保存对话列表里的一项。 */
+export interface WebSavedConversation {
+  conversationId: string;
+  title: string;
+  updatedAt?: string | null;
+}
+
+export async function listWebSavedConversations(): Promise<WebSavedConversation[]> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/saved'), {
+    method: 'GET',
+  });
+  const payload = await parseAgentJson<{ conversations?: WebSavedConversation[] }>(
+    response,
+    'list web saved conversations',
+  );
+  return Array.isArray(payload.conversations) ? payload.conversations : [];
+}
+
+/** 把已保存的 ChatGPT 对话绑定到空白会话并单向导入历史。 */
+export async function bindWebSavedConversation(
+  sessionId: string,
+  conversationId: string,
+): Promise<void> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/saved/bind'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId, conversationId, clientPlatform: browserClientPlatform() }),
+  });
+  await parseAgentJson<unknown>(response, 'bind web saved conversation');
+}
+
+/** 手动重新同步已保存对话（Web → Magi）。 */
+export async function syncWebSavedConversation(sessionId: string): Promise<number> {
+  const response = await getTransport().request(agentUrl('/api/browser/web-models/saved/sync'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId, clientPlatform: browserClientPlatform() }),
+  });
+  const payload = await parseAgentJson<{ importedExchanges?: number }>(
+    response,
+    'sync web saved conversation',
+  );
+  return payload.importedExchanges ?? 0;
 }
 
 export async function materializeSession(
@@ -2837,20 +2869,6 @@ export async function enhanceAgentPrompt(
   );
 }
 
-export async function generateSessionSuggestions(
-  request: GenerateSessionSuggestionsRequestDto = {},
-  signal?: AbortSignal,
-  bindingOverride?: AgentBindingOverride,
-): Promise<SessionSuggestionsResponseDto> {
-  return await postBoundJson<SessionSuggestionsResponseDto>(
-    '/api/prompt/suggestions',
-    request,
-    'generate session suggestions',
-    bindingOverride,
-    signal,
-  );
-}
-
 export interface WorkspaceBranchesResult {
   isRepo: boolean;
   currentBranch: string | null;
@@ -3725,4 +3743,192 @@ export async function revertAgentExecutionGroupChanges(
     'revert execution group changes',
     options,
   );
+}
+
+// ── Magi MCP 服务（对外暴露 Magi 工具的标准 MCP 入口）─────────────────────────
+
+export type McpServerProfile = 'read_only' | 'edit' | 'edit_trusted' | 'exec';
+
+export interface McpServerToken {
+  tokenId: string;
+  prefix: string;
+  clientName: string;
+  workspaceId: string;
+  profile: McpServerProfile;
+  attribution: 'external' | 'follow_web_slot';
+  /** 是否允许经公网隧道使用。 */
+  network: boolean;
+  createdAtMs: number;
+  expiresAtMs: number | null;
+  revokedAtMs: number | null;
+  lastUsedAtMs: number | null;
+  active: boolean;
+}
+
+export interface McpServerNetworkStatus {
+  enabled: boolean;
+  /** stopped / installing / starting / running / error */
+  status: string;
+  publicUrl: string | null;
+  /** 客户端配置用的完整地址。Quick Tunnel 的地址每次开启都会变。 */
+  mcpUrl: string | null;
+  error: string | null;
+}
+
+export interface McpServerStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number | null;
+  url: string | null;
+  stdioEndpoint: string | null;
+  stateRoot: string | null;
+  activeTokens: number;
+  network: McpServerNetworkStatus;
+  tokens: McpServerToken[];
+}
+
+export interface McpServerCreateTokenRequest {
+  clientName: string;
+  workspaceId: string;
+  profile: McpServerProfile;
+  /** 有效期天数；缺省 90，0 表示不过期。 */
+  ttlDays?: number;
+  /** 免确认写入与命令执行必须显式确认风险。 */
+  confirmHighRisk?: boolean;
+  /** 允许经公网隧道使用（权限档不得高于 edit）。 */
+  allowNetwork?: boolean;
+}
+
+export interface McpServerCreateTokenResponse {
+  /** 令牌原文，只在创建这一次出现。 */
+  secret: string;
+  token: McpServerToken;
+}
+
+export interface McpServerConfigSnippets {
+  url: string | null;
+  httpJson: Record<string, unknown> | null;
+  stdioJson: Record<string, unknown> | null;
+  remoteJson: Record<string, unknown> | null;
+}
+
+export interface McpServerApproval {
+  approvalId: string;
+  tokenId: string;
+  clientName: string;
+  tokenPrefix: string;
+  workspaceId: string;
+  toolName: string;
+  summary: string;
+  requestedAtMs: number;
+  expiresAtMs: number;
+}
+
+export interface McpServerAuditEntry {
+  tokenId: string;
+  clientName: string;
+  workspaceId: string;
+  tool: string;
+  requiresApproval: boolean;
+  paths: string[];
+  outcome: 'succeeded' | 'failed' | 'denied';
+  detail: string | null;
+  atMs: number;
+}
+
+async function mcpServerJson<T>(
+  path: string,
+  action: string,
+  init?: { method?: 'GET' | 'POST' | 'DELETE'; body?: unknown },
+): Promise<T> {
+  const response = await getTransport().request(agentUrl(path), {
+    method: init?.method ?? 'GET',
+    headers: { 'content-type': 'application/json' },
+    cache: 'no-store',
+    ...(init?.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+  });
+  return parseAgentJson<T>(response, action);
+}
+
+export function getMcpServerStatus(): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/status', 'load mcp server status');
+}
+
+export function setMcpServerEnabled(enabled: boolean): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/enabled', 'set mcp server enabled', {
+    method: 'POST',
+    body: { enabled },
+  });
+}
+
+export function setMcpServerNetwork(
+  enabled: boolean,
+  confirmRisk: boolean,
+): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/network', 'set mcp server network mode', {
+    method: 'POST',
+    body: { enabled, confirmRisk },
+  });
+}
+
+export function createMcpServerToken(
+  request: McpServerCreateTokenRequest,
+): Promise<McpServerCreateTokenResponse> {
+  return mcpServerJson('/api/mcp-server/tokens', 'create mcp server token', {
+    method: 'POST',
+    body: request,
+  });
+}
+
+export function revokeMcpServerToken(tokenId: string): Promise<McpServerStatus> {
+  return mcpServerJson(
+    `/api/mcp-server/tokens/${encodeURIComponent(tokenId)}`,
+    'revoke mcp server token',
+    { method: 'DELETE' },
+  );
+}
+
+export function revokeAllMcpServerTokens(): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/tokens/revoke-all', 'revoke all mcp server tokens', {
+    method: 'POST',
+    body: {},
+  });
+}
+
+export function getMcpServerConfigSnippets(): Promise<McpServerConfigSnippets> {
+  return mcpServerJson('/api/mcp-server/config-snippets', 'load mcp server config snippets');
+}
+
+export async function listMcpServerApprovals(): Promise<McpServerApproval[]> {
+  const result = await mcpServerJson<{ approvals: McpServerApproval[] }>(
+    '/api/mcp-server/approvals',
+    'load mcp server approvals',
+  );
+  return result.approvals;
+}
+
+export async function resolveMcpServerApproval(
+  approvalId: string,
+  decision: 'allow_once' | 'deny',
+): Promise<McpServerApproval[]> {
+  const result = await mcpServerJson<{ approvals: McpServerApproval[] }>(
+    '/api/mcp-server/approvals/resolve',
+    'resolve mcp server approval',
+    { method: 'POST', body: { approvalId, decision } },
+  );
+  return result.approvals;
+}
+
+export async function listMcpServerAudit(
+  options: { limit?: number; tokenId?: string } = {},
+): Promise<McpServerAuditEntry[]> {
+  const query = new URLSearchParams();
+  if (options.limit) query.set('limit', String(options.limit));
+  if (options.tokenId) query.set('tokenId', options.tokenId);
+  const suffix = query.toString();
+  const result = await mcpServerJson<{ entries: McpServerAuditEntry[] }>(
+    `/api/mcp-server/audit${suffix ? `?${suffix}` : ''}`,
+    'load mcp server audit',
+  );
+  return result.entries;
 }

@@ -64,8 +64,8 @@ npm run desktop:dev
 - [用户自定义子代理角色设计方案](./custom-worker-role-design.md)：在现有 Worker 体系中统一支持用户角色的创建、注册、调度、导入和导出。
 - [用户自定义子代理角色开发计划](./custom-worker-role-development-plan.md)：按阶段记录实现、验证和最终提交状态。
 - [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
-- [Magi MCP 服务设计](./magi-mcp-server-design.md)：**设计基线（未实现）**；Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、git、变更账本等工具；令牌与权限档、审批、路径限制、审计，以及本机 stdio / 回环 HTTP / Cloudflare 网络模式的分期方案；GPT Web 的工具能力是它的一个客户端。
-- [Magi Web 模型浏览器设计基线](./web-model-browser-design.md) 与 [实现计划](./web-model-browser-product-implementation-plan.md)：历史方案，仅用于追溯决策，不作为当前实现依据。
+- [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与权限档、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
+- [Magi MCP 服务开发计划](./magi-mcp-server-development-plan.md)：工作包、进度、与设计的偏差、审查清单与已知缺口。
 
 ## 用户场景与产品要求
 

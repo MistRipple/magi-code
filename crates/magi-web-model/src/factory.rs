@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use magi_bridge_client::ModelBridgeClient;
 
-use crate::binding::{WebConversationMode, WebSlotTable};
+use crate::binding::{WebConversationBinding, WebSlotTable};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebModelInvocationSpec {
@@ -12,9 +12,8 @@ pub struct WebModelInvocationSpec {
     pub project_id: String,
     pub thread_id: String,
     pub engine_id: String,
-    pub effort: String,
-    pub mode: WebConversationMode,
-    pub remote_conversation_id: Option<String>,
+    /// 会话级 Web 对话绑定（临时 / 已保存及远端引用）。
+    pub binding: WebConversationBinding,
 }
 
 pub trait WebModelClientFactory: Send + Sync {

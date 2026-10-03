@@ -572,23 +572,16 @@
     const workspacePath = typeof messagesState.currentWorkspacePath === 'string'
       ? messagesState.currentWorkspacePath.trim()
       : '';
+    const sessionId = currentSessionId;
     const locale = i18n.locale;
     return {
-      key: `${workspaceId || workspacePath || 'personal'}:${locale}:v1`,
-      workspaceId,
-      workspacePath,
-      sessionId: currentSessionId,
+      key: `${workspaceId || workspacePath || 'personal'}:${sessionId || 'draft'}:${locale}:builtin-v1`,
       locale,
     };
   });
   const suggestionItems = $derived(sessionSuggestions.activeGroup?.suggestions || []);
-  const suggestionSkeletonSlots = $derived(
-    sessionSuggestions.loadingInitial
-      ? Array.from({ length: sessionSuggestions.suggestionsPerGroup }, (_, index) => index)
-      : [],
-  );
   const canRotateSuggestions = $derived(
-    !sessionSuggestions.generating && suggestionItems.length > 0,
+    suggestionItems.length > 0,
   );
 
   $effect(() => {
@@ -608,13 +601,11 @@
   }
 
   function rotateSuggestions(): void {
-    if (sessionSuggestions.generating) return;
     sessionSuggestions.rotate(suggestionScope);
   }
 
   function fillComposer(text: string) {
     if (typeof window === 'undefined') return;
-    sessionSuggestions.markActiveSelected();
     window.dispatchEvent(new CustomEvent('magi:fillComposer', { detail: { text } }));
   }
   const panelKey = $derived.by((): keyof ScrollPositions => (displayContext === 'task' ? (taskId || 'task') : 'thread'));
@@ -1727,7 +1718,6 @@
                   <Icon
                     name="refresh"
                     size={14}
-                    class={sessionSuggestions.generating ? 'suggestions-refresh-spinning' : ''}
                   />
                   <span>{i18n.t('messageList.suggestions.refresh')}</span>
                 </button>
@@ -1745,31 +1735,9 @@
                 <span class="suggestion-arrow"><Icon name="chevron-right" size={15} /></span>
               </button>
             {/each}
-            {#each suggestionSkeletonSlots as slot (slot)}
-              <div class="suggestion-card suggestion-card--skeleton" aria-hidden="true">
-                <span class="skeleton-icon"></span>
-                <span class="suggestion-copy">
-                  <span class="skeleton-line skeleton-line--label"></span>
-                  <span class="skeleton-line skeleton-line--text"></span>
-                  <span class="skeleton-line skeleton-line--text skeleton-line--text-short"></span>
-                </span>
-              </div>
-            {/each}
-            {#if sessionSuggestions.loadingInitial}
-              <span class="suggestions-meta" role="status">{i18n.t('messageList.suggestions.loading')}</span>
-            {:else if sessionSuggestions.unavailable}
-              <div class="suggestions-unavailable">
-                <span>{i18n.t('messageList.suggestions.unavailable')}</span>
-                <button type="button" class="suggestions-refresh" onclick={rotateSuggestions}>
-                  <Icon name="refresh" size={14} />
-                  <span>{i18n.t('messageList.suggestions.retry')}</span>
-                </button>
-              </div>
-            {:else if suggestionItems.length > 0}
+            {#if suggestionItems.length > 0}
               <span class="suggestions-meta">
-                {suggestionScope.workspaceId || suggestionScope.workspacePath
-                  ? i18n.t('messageList.suggestions.meta.workspace')
-                  : i18n.t('messageList.suggestions.meta.personal')}
+                {i18n.t('messageList.suggestions.meta.builtin')}
               </span>
             {/if}
           </div>
@@ -1986,21 +1954,12 @@
     opacity: 0.55;
   }
 
-  .suggestions-refresh :global(.suggestions-refresh-spinning) {
-    animation: suggestions-refresh-spin 0.9s linear infinite;
-  }
-
-  @keyframes suggestions-refresh-spin {
-    to { transform: rotate(360deg); }
-  }
-
   .suggestion-card {
     display: flex;
     /* 图标与箭头相对文本块纵向居中，避免固定 margin 造成的视觉错位 */
     align-items: center;
     text-align: left;
     gap: var(--space-3);
-    /* 与 .suggestion-copy 的固定高度一致，让加载骨架与真实卡片占据同一空间。 */
     min-height: 68px;
     padding: var(--space-3);
     border: 1px solid var(--border);
@@ -2012,7 +1971,7 @@
     transition: background var(--transition-fast), border-color var(--transition-fast);
   }
 
-  .suggestion-card:hover:not(.suggestion-card--skeleton) {
+  .suggestion-card:hover {
     background: var(--surface-hover, rgba(255,255,255,0.05));
     border-color: color-mix(in srgb, var(--primary) 34%, var(--border));
   }
@@ -2020,10 +1979,6 @@
   .suggestion-card:focus-visible {
     outline: 1px solid var(--primary);
     outline-offset: 1px;
-  }
-
-  .suggestion-card--skeleton {
-    cursor: default;
   }
 
   .suggestion-icon {
@@ -2044,11 +1999,6 @@
     flex-direction: column;
     justify-content: center;
     min-width: 0;
-  }
-
-  /* 骨架屏保留固定高度，避免加载态与内容态切换时卡片跳动。 */
-  .suggestion-card--skeleton .suggestion-copy {
-    min-height: 52px;
   }
 
   .suggestion-label {
@@ -2078,52 +2028,6 @@
     overflow-wrap: anywhere;
   }
 
-  .skeleton-icon {
-    width: 30px;
-    height: 30px;
-    flex: 0 0 30px;
-    border-radius: 9px;
-    background: var(--surface-2);
-    animation: suggestion-skeleton-pulse 1.6s ease-in-out infinite;
-  }
-
-  .skeleton-line {
-    display: block;
-    height: 9px;
-    border-radius: var(--radius-xs);
-    background: var(--surface-2);
-    animation: suggestion-skeleton-pulse 1.6s ease-in-out infinite;
-  }
-
-  .skeleton-line--label {
-    width: 34%;
-    margin-top: 2px;
-    margin-bottom: 6px;
-  }
-
-  .skeleton-line--text {
-    width: 82%;
-    margin-bottom: 7px;
-  }
-
-  .skeleton-line--text-short {
-    width: 54%;
-    margin-bottom: 0;
-  }
-
-  @keyframes suggestion-skeleton-pulse {
-    0%, 100% { opacity: 0.5; }
-    50% { opacity: 1; }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .skeleton-icon,
-    .skeleton-line,
-    .suggestions-refresh :global(.suggestions-refresh-spinning) {
-      animation: none;
-    }
-  }
-
   .suggestion-arrow {
     display: grid;
     place-items: center;
@@ -2143,16 +2047,6 @@
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     opacity: 0.75;
-  }
-
-  .suggestions-unavailable {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-3);
-    margin-top: var(--space-1);
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
   }
 
   .empty-history-load {
