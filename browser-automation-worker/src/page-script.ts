@@ -440,6 +440,40 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       element.focus({ preventScroll: true });
       return this.target(ref, revision);
     },
+    readValue(ref, revision) {
+      const element = this.resolve(ref, revision);
+      const tag = element.tagName.toLowerCase();
+      if (tag === 'select') return { value: null };
+      if (tag === 'input' || tag === 'textarea') return { value: String(element.value ?? '') };
+      if (element.isContentEditable) return { value: String(element.innerText ?? element.textContent ?? '') };
+      return { value: null };
+    },
+    // 原生输入事件被后台/失焦的 guest 吞掉时的兜底：用与框架一致的方式写入值并派发事件，
+    // 让 React/Vue 等受控组件也能感知。只用于校验发现原生输入没有生效之后。
+    fillValue(ref, revision, text, replace) {
+      const element = this.resolve(ref, revision);
+      const tag = element.tagName.toLowerCase();
+      const value = String(text);
+      if (tag === 'input' || tag === 'textarea') {
+        const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        const next = replace ? value : String(element.value ?? '') + value;
+        if (setter) setter.call(element, next); else element.value = next;
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        return { value: String(element.value ?? '') };
+      }
+      if (element.isContentEditable) {
+        element.focus({ preventScroll: true });
+        if (replace) document.execCommand('selectAll');
+        if (!document.execCommand('insertText', false, value)) {
+          element.textContent = replace ? value : String(element.textContent ?? '') + value;
+          element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        }
+        return { value: String(element.innerText ?? element.textContent ?? '') };
+      }
+      return { value: null };
+    },
     prepareClick(ref, revision, token) {
       const element = this.resolve(ref, revision);
       const guard = { element, observed: false, listener: null };

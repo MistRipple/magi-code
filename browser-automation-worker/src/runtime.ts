@@ -1007,10 +1007,59 @@ export class BrowserAutomationRuntime {
       if (!await this.key(binding, "keyUp", "a", process.platform === "darwin" ? 4 : 2)) return;
       if (!await this.press(binding, "Backspace")) return;
     }
+    const before = replace ? null : await this.elementValue(binding, ref);
     const inserted = await this.#cdp.send(binding, "Input.insertText", { text });
     if (isNativeDialogOpenedResult(inserted)) return;
     if (this.navigationAdvanced(binding)) return;
+    await this.ensureTextApplied(binding, ref, text, replace, before);
     if (submitKey) await this.press(binding, submitKey);
+  }
+
+  /**
+   * 页面里当前的输入值；无法读取（select、非输入元素、引用已失效）返回 null。
+   * 只用于校验，读不到就不做任何额外动作。
+   */
+  private async elementValue(
+    binding: BrowserSurfaceBinding,
+    ref: BrowserSnapshotTarget,
+  ): Promise<string | null> {
+    try {
+      const result = await this.evaluate<{ value: string | null }>(
+        binding,
+        `globalThis.__magiBrowserAutomation.readValue(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)})`,
+      );
+      return typeof result?.value === "string" ? result.value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * `Input.insertText` 在 guest 失去焦点 / 处于后台时会被静默丢弃，命令却仍返回成功，
+   * 模型随后会基于一个根本没填进去的输入框继续操作。写入之后读回校验：没生效就用
+   * 原生 setter + input/change 事件兜底一次；仍然不生效则明确失败，绝不假成功。
+   */
+  private async ensureTextApplied(
+    binding: BrowserSurfaceBinding,
+    ref: BrowserSnapshotTarget,
+    text: string,
+    replace: boolean,
+    before: string | null,
+  ): Promise<void> {
+    if (text.length === 0) return;
+    const applied = (value: string | null) =>
+      value === null || (replace ? value.includes(text) : value !== before && value.includes(text));
+    const current = await this.elementValue(binding, ref);
+    if (applied(current)) return;
+    const filled = await this.evaluate<{ value: string | null }>(
+      binding,
+      `globalThis.__magiBrowserAutomation.fillValue(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)}, ${JSON.stringify(text)}, ${JSON.stringify(replace)})`,
+    );
+    if (applied(typeof filled?.value === "string" ? filled.value : null)) return;
+    throw protocolFailure(
+      "browser_type_not_applied",
+      "the text was not accepted by the target element; take a snapshot and check the field before retrying",
+    );
   }
 
   private async press(binding: BrowserSurfaceBinding, key: string): Promise<boolean> {

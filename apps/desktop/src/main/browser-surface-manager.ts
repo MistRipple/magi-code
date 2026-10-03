@@ -283,6 +283,12 @@ interface NavigationOperation {
   id: number;
   generation: number;
   kind: NavigationKind;
+  /**
+   * 谁发起了这次导航：`command` 是 Magi 的导航命令（loadPage），`page` 是页面自己发起的
+   * （JS 重定向、表单提交、登录跳转等 did-start-navigation）。命令发起的导航如果被页面
+   * 自己的后续导航接管，属于同一条重定向链的延续，而不是失败。
+   */
+  initiator: "command" | "page";
   targetUrl: string | null;
   frame: NavigationFrameIdentity | null;
   createdEventSequence: number;
@@ -559,6 +565,8 @@ const SCREENSHOT_CDP_COMMAND_TIMEOUT_MS = 10_000;
 const SCREENSHOT_READINESS_TIMEOUT_MS = 5_000;
 const CURSOR_CDP_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 120_000;
+/** 命令发起的导航之后，最多跟随多少次页面自己发起的重定向。 */
+const MAX_PAGE_REDIRECT_HOPS = 10;
 const DEBUGGER_RECONNECT_INITIAL_DELAY_MS = 100;
 const DEBUGGER_RECONNECT_MAX_DELAY_MS = 2_000;
 const MAX_INSPECTED_TEXT_LENGTH = 4 * 1024;
@@ -2865,6 +2873,61 @@ export class BrowserSurfaceManager {
     handleBeforeUnload?: "accept" | "dismiss",
     request?: () => Promise<void>,
   ): Promise<void> {
+    const deadline = Date.now() + clampNavigationTimeout(timeoutMs);
+    try {
+      await this.loadPageOnce(
+        record,
+        url,
+        timeoutMs,
+        handleBeforeUnload,
+        request,
+      );
+    } catch (error) {
+      // 页面在加载过程中又自己发起了导航（登录页的 JS 重定向、SSO 跳转）：
+      // 命令发起的那次导航被接管，但用户要的是“打开这个地址并到达最终页面”。
+      // 沿页面发起的重定向链等到最终落地，而不是把它当作失败。
+      if (!isNavigationSupersededError(error)) throw error;
+      await this.followPageInitiatedNavigation(record, deadline, error);
+    }
+  }
+
+  /**
+   * 等待页面自己发起的导航链收敛。只跟随 `initiator === "page"` 的后续导航，
+   * 命令之间互相接管（例如用户或 Agent 又下了新的导航命令）仍然是 superseded。
+   * 总时长受原命令的超时约束，跳数有上限，避免无限重定向把工具链挂住。
+   */
+  private async followPageInitiatedNavigation(
+    record: BrowserSurfaceRecord,
+    deadline: number,
+    superseded: unknown,
+  ): Promise<void> {
+    for (let hop = 0; hop < MAX_PAGE_REDIRECT_HOPS; hop += 1) {
+      const current = record.navigationOperation;
+      if (!current || current.initiator !== "page" || record.closed) {
+        throw superseded;
+      }
+      if (current.completed && current.settled) return;
+      if (current.failed) throw staleSurfaceError("browser_navigation_failed");
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw staleSurfaceError("browser_navigation_timeout");
+      try {
+        await this.waitForNavigationOperation(record, current, remaining);
+        if (current.completed) return;
+      } catch (error) {
+        // 链上又出现了新的页面发起导航：继续跟随；其他原因照常抛出。
+        if (!isNavigationSupersededError(error)) throw error;
+      }
+    }
+    throw superseded;
+  }
+
+  private async loadPageOnce(
+    record: BrowserSurfaceRecord,
+    url: string,
+    timeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS,
+    handleBeforeUnload?: "accept" | "dismiss",
+    request?: () => Promise<void>,
+  ): Promise<void> {
     const contents = record.contents;
     if (record.closed || !contents || contents.isDestroyed()) {
       throw staleSurfaceError("browser_surface_not_found");
@@ -3098,6 +3161,7 @@ export class BrowserSurfaceManager {
     kind: NavigationKind,
     targetUrl: string | null,
     createdEventSequence = this.nextNavigationEventSequence(record),
+    initiator: "command" | "page" = "command",
   ): NavigationOperation {
     const contents = record.contents;
     if (record.closed || !contents || contents.isDestroyed()) {
@@ -3115,6 +3179,7 @@ export class BrowserSurfaceManager {
       id,
       generation: ++record.navigationGeneration,
       kind,
+      initiator,
       targetUrl,
       frame: null,
       createdEventSequence,
@@ -4488,6 +4553,7 @@ export class BrowserSurfaceManager {
           details.isSameDocument ? "in-page" : "document",
           details.url,
           eventSequence,
+          "page",
         );
       }
       if (!operation || !this.isCurrentNavigationOperation(record, operation))
@@ -6187,6 +6253,14 @@ function toError(value: unknown): Error {
   return value instanceof Error
     ? value
     : new Error(typeof value === "string" ? value : String(value));
+}
+
+function isNavigationSupersededError(value: unknown): boolean {
+  return (
+    value instanceof Error &&
+    value.name === "BrowserSurfaceError" &&
+    value.message === "browser_navigation_superseded"
+  );
 }
 
 function isNavigationAbortError(value: unknown): boolean {

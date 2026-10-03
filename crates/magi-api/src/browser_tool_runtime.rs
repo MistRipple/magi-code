@@ -31,6 +31,9 @@ use crate::{
     state::BrowserHostStatusSnapshot,
 };
 
+/// Host 的页面事件追平 Authority 的最多确认次数（见 `ensure_surface`）。
+const SURFACE_SYNC_ATTEMPTS: usize = 6;
+const SURFACE_SYNC_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 const DEFAULT_BROWSER_PROFILE_ID: &str = "browser-profile-default";
 const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 static BROWSER_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -931,43 +934,62 @@ impl BrowserToolRuntimeDependencies {
         self.apply_page_state(&tab.tab_id, page)
     }
 
+    /// 向 Host 取真实 Surface 并让 Authority 接受。
+    ///
+    /// 新建 Tab 后，Renderer 注册 guest 并完成初始加载会让 Host 的导航代次先走到 1，而 Authority
+    /// 里的逻辑 Tab 仍是 0，直到 `page_updated` 事件被应用才追平。这个窗口里
+    /// `accept_primary_surface` 会因代次不相等而返回 false。此时 Surface 已经是真实的，页面上
+    /// 还没有执行任何动作，所以对「Host 领先于 Authority」这一种情形做**有限次**重新确认；
+    /// 其他原因（代次落后、Surface 被替换）仍然立即失败，不做盲目重试。
     async fn ensure_surface(
         &self,
         client: &BrowserHostClient,
         tab_id: &BrowserTabId,
     ) -> Result<BrowserSurfaceBinding, BrowserToolError> {
-        let reply = client
-            .request(BrowserHostCommand::EnsureSurface {
-                tab_id: tab_id.clone(),
-            })
-            .await
-            .map_err(browser_host_client_error)?;
-        let BrowserHostCommandResult::SurfaceBinding(binding) =
-            succeeded_result(reply.response.outcome, "等待浏览器真实 Surface 失败")?
-        else {
-            return Err(BrowserToolError::new(
-                "browser_result_invalid",
-                "浏览器真实 Surface 返回结果无效",
-            ));
-        };
-        if binding.tab_id != *tab_id || binding.web_contents_id == 0 {
-            return Err(BrowserToolError::new(
-                "browser_surface_invalid",
-                "浏览器 Host 返回了无效的真实 Surface 身份",
-            ));
+        for attempt in 1..=SURFACE_SYNC_ATTEMPTS {
+            let reply = client
+                .request(BrowserHostCommand::EnsureSurface {
+                    tab_id: tab_id.clone(),
+                })
+                .await
+                .map_err(browser_host_client_error)?;
+            let BrowserHostCommandResult::SurfaceBinding(binding) =
+                succeeded_result(reply.response.outcome, "等待浏览器真实 Surface 失败")?
+            else {
+                return Err(BrowserToolError::new(
+                    "browser_result_invalid",
+                    "浏览器真实 Surface 返回结果无效",
+                ));
+            };
+            if binding.tab_id != *tab_id || binding.web_contents_id == 0 {
+                return Err(BrowserToolError::new(
+                    "browser_surface_invalid",
+                    "浏览器 Host 返回了无效的真实 Surface 身份",
+                ));
+            }
+            let accepted = self.mutate(|authority| {
+                let (accepted, _, _) =
+                    authority.accept_primary_surface(binding.clone(), UtcMillis::now())?;
+                Ok(accepted)
+            })?;
+            if accepted {
+                return Ok(binding);
+            }
+            let authority_revision = self
+                .authority
+                .lock()
+                .expect("browser authority lock poisoned")
+                .tab(tab_id)
+                .map(|tab| tab.navigation_revision);
+            if !should_resync_surface(authority_revision, binding.navigation_revision, attempt) {
+                break;
+            }
+            tokio::time::sleep(SURFACE_SYNC_DELAY).await;
         }
-        let accepted = self.mutate(|authority| {
-            let (accepted, _, _) =
-                authority.accept_primary_surface(binding.clone(), UtcMillis::now())?;
-            Ok(accepted)
-        })?;
-        if !accepted {
-            return Err(BrowserToolError::new(
-                "browser_surface_stale",
-                "浏览器真实 Surface 在确认前已经变更",
-            ));
-        }
-        Ok(binding)
+        Err(BrowserToolError::new(
+            "browser_surface_stale",
+            "浏览器真实 Surface 在确认前已经变更",
+        ))
     }
 
     async fn prepare_agent_write(
@@ -2538,8 +2560,33 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// Surface 未被接受时是否值得重新向 Host 确认：只有 Host 的导航代次领先于 Authority
+/// （页面事件还没追平）且没有用完次数时才重试；落后、Tab 不存在或次数用尽都不再重试。
+fn should_resync_surface(
+    authority_revision: Option<u64>,
+    host_revision: u64,
+    attempt: usize,
+) -> bool {
+    attempt < SURFACE_SYNC_ATTEMPTS
+        && authority_revision.is_some_and(|revision| host_revision > revision)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn surface_resync_only_when_the_host_is_ahead_and_attempts_remain() {
+        use super::{SURFACE_SYNC_ATTEMPTS, should_resync_surface};
+        // 新建 Tab 的初始加载：Host 已到 1，Authority 还是 0 -> 值得重新确认。
+        assert!(should_resync_surface(Some(0), 1, 1));
+        // Host 落后或相等（真正的 Surface 变更）、Tab 不存在：立即失败，不重试。
+        assert!(!should_resync_surface(Some(3), 2, 1));
+        assert!(!should_resync_surface(Some(2), 2, 1));
+        assert!(!should_resync_surface(None, 5, 1));
+        // 次数用尽后不再重试，避免无限等待。
+        assert!(should_resync_surface(Some(0), 1, SURFACE_SYNC_ATTEMPTS - 1));
+        assert!(!should_resync_surface(Some(0), 1, SURFACE_SYNC_ATTEMPTS));
+    }
+
     use std::sync::{Arc, Mutex, RwLock, atomic::AtomicBool};
 
     use magi_browser_authority::{
