@@ -83,6 +83,8 @@ fn persist_skills_config_object(
     state: &ApiState,
     config: serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), ApiError> {
+    let mut config = config;
+    crate::builtin_skills::protect_builtin_entries(&load_skills_config_object(state), &mut config);
     skill_loader::save_skills_config_object(&state.settings_store, config)
         .map_err(settings_persistence_error)?;
     reload_skill_registry(state);
@@ -2181,6 +2183,14 @@ async fn remove_installed_skill(
                 .as_ref()
                 .and_then(instruction_skill_id)
                 .unwrap_or_else(|| skill_id.to_string());
+            if removed_skill
+                .as_ref()
+                .is_some_and(crate::builtin_skills::is_builtin)
+            {
+                return Err(ApiError::InvalidInput(
+                    "内置技能不能删除，如不需要可以停用".to_string(),
+                ));
+            }
             let removed = remove_instruction_skill_from_list(&mut instruction_skills, skill_id);
             if !removed {
                 return Err(ApiError::not_found("技能未安装", skill_id));
@@ -3621,6 +3631,50 @@ done
             serde_json::json!("example/skill")
         );
         assert!(stored["instructionSkills"][0].get("skillName").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_skill_can_be_disabled_but_never_removed() {
+        let root = tempfile::tempdir().expect("state root should create");
+        let state = test_state();
+        crate::builtin_skills::install_builtin_skills(&state.settings_store, root.path())
+            .expect("builtin skills should install");
+        let id = "magi-cloudflare-tunnel";
+
+        let (status, body) = post_json_with_status(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/remove",
+            serde_json::json!({ "skillId": id, "source": "instruction" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let stored = state.settings_store.get_section("skillsConfig");
+        assert_eq!(stored["instructionSkills"][0]["skillId"], id);
+
+        // 整体保存配置漏掉内置条目时，会被补回。
+        post_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/config/save",
+            serde_json::json!({ "instructionSkills": [] }),
+        )
+        .await;
+        let stored = state.settings_store.get_section("skillsConfig");
+        assert_eq!(stored["instructionSkills"][0]["skillId"], id);
+
+        // 停用是允许的，库列表带有 builtin 标记。
+        let disabled = post_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/toggle",
+            serde_json::json!({ "skillId": id, "enabled": false }),
+        )
+        .await;
+        assert_eq!(disabled["enabled"], serde_json::json!(false));
+        let library = get_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/library",
+        )
+        .await;
+        assert_eq!(library["skills"][0]["builtin"], serde_json::json!(true));
     }
 
     #[tokio::test]

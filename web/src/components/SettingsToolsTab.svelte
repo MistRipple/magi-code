@@ -1036,7 +1036,7 @@
                         onchange={(enabled) => toggleSkill(skill.skillId, enabled)}
                       />
                     {/if}
-                    {#if skill.source !== 'custom' && (skill.updateAvailable || skill.updateStatus === 'local_modified')}
+                    {#if skill.source !== 'custom' && !skill.builtin && (skill.updateAvailable || skill.updateStatus === 'local_modified')}
                       <button class="skill-action-btn primary" onclick={() => updateSkill(skill.skillId)} disabled={skillUpdatingIds.has(skill.skillId)}>
                         <Icon name="refresh" size={13} />
                         <span>{skill.origin === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}</span>
@@ -1047,9 +1047,13 @@
                         <Icon name="refresh" size={13} />
                       </button>
                     {/if}
-                    <button class="skill-action-btn danger" title={i18n.t('settings.tools.delete')} onclick={() => deleteSkill(skill)}>
-                      <Icon name="trash" size={13} />
-                    </button>
+                    {#if skill.builtin}
+                      <span class="skill-builtin-badge" data-skill-builtin="1" title={i18n.t('settings.tools.builtinSkillHint')}>{i18n.t('settings.tools.builtinSkill')}</span>
+                    {:else}
+                      <button class="skill-action-btn danger" title={i18n.t('settings.tools.delete')} onclick={() => deleteSkill(skill)}>
+                        <Icon name="trash" size={13} />
+                      </button>
+                    {/if}
                     {#if skillUpdatingIds.has(skill.skillId)}
                       <span class="skill-row-progress"><Icon name="refresh" size={13} /></span>
                     {/if}
@@ -2050,6 +2054,14 @@
   .skill-desc { margin: 3px 0 0; font-size: 11px; color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .skill-meta { display: flex; gap: 10px; margin-top: 3px; min-width: 0; font-size: 10px; color: var(--foreground-muted); }
   .skill-meta span { min-width: 0; max-width: 38%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .skill-builtin-badge {
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    background: var(--surface-muted, rgba(127, 127, 127, 0.14));
+    opacity: 0.8;
+  }
+
   .skill-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
   .skill-action-btn { min-width: 28px; height: 28px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
   .skill-action-btn:hover { color: var(--foreground); background: rgba(var(--foreground-rgb), 0.05); }

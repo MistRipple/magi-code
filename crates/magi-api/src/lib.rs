@@ -20,6 +20,8 @@ mod scope_binding;
 mod session_activity;
 pub(crate) mod session_continue;
 pub mod session_title;
+pub mod builtin_skills;
+mod mcp_direct;
 pub mod skill_loader;
 mod snapshot_lifecycle;
 mod sse;

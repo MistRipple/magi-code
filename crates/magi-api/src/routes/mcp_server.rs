@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::HeaderMap,
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use magi_conversation_runtime::ToolApprovalDecision;
 use magi_core::WorkspaceId;
@@ -15,7 +15,7 @@ use magi_mcp_server::{AttributionMode, IssueTokenRequest, Profile, TokenPatch, T
 use serde::{Deserialize, Serialize};
 
 use super::is_public_tunnel_request;
-use crate::mcp_runtime::{McpRuntimeError, McpServiceStatus};
+use crate::mcp_runtime::{DirectAccessRequest, McpRuntimeError, McpServiceStatus};
 use crate::{errors::ApiError, state::ApiState};
 
 /// 令牌默认有效期（天）。创建时可改；`0` 表示不过期。
@@ -27,6 +27,12 @@ pub fn routes() -> Router<ApiState> {
         .route("/mcp-server/status", get(get_status))
         .route("/mcp-server/enabled", post(set_enabled))
         .route("/mcp-server/network", post(set_network))
+        .route("/mcp-server/direct", put(set_direct_access))
+        .route(
+            "/mcp-server/named-tunnel",
+            put(set_named_tunnel).delete(clear_named_tunnel),
+        )
+        .route("/mcp-server/named-tunnel/verify", post(verify_named_tunnel))
         .route("/mcp-server/tokens", post(create_token))
         .route("/mcp-server/tokens/revoke-all", post(revoke_all))
         .route(
@@ -38,7 +44,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/mcp-server/config-snippets", get(config_snippets))
         .route("/mcp-server/approvals", get(list_approvals))
         .route("/mcp-server/approvals/resolve", post(resolve_approval))
-        .route("/mcp-server/audit", get(list_audit))
+        .route("/mcp-server/audit", get(list_audit).delete(clear_audit))
 }
 
 fn require_local(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -179,6 +185,145 @@ async fn set_network(
         .await
         .map_err(runtime_error)?;
     Ok(Json(status_response(&state).await))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetDirectAccessRequest {
+    enabled: bool,
+    /// 监听地址，缺省 `0.0.0.0`（所有网卡）。
+    #[serde(default)]
+    bind_host: Option<String>,
+    /// 客户端实际使用的公网域名 / IP。
+    #[serde(default)]
+    public_hosts: Vec<String>,
+    /// 固定监听端口（防火墙需放行）；缺省沿用当前端口。
+    #[serde(default)]
+    port: Option<u16>,
+    /// 开启必须显式确认：直接对公网开放用的是明文 HTTP，令牌在网络上不加密。
+    #[serde(default)]
+    confirm_risk: bool,
+}
+
+/// 直接对公网开放：不经隧道，HTTP 入口改为监听公网地址。
+async fn set_direct_access(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<SetDirectAccessRequest>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    require_local(&headers)?;
+    if request.enabled && !request.confirm_risk {
+        return Err(ApiError::InvalidInput(
+            "直接对公网开放用的是明文 HTTP，令牌在网络上不加密，需要显式确认风险".to_string(),
+        ));
+    }
+    if request.port == Some(0) {
+        return Err(ApiError::InvalidInput(
+            "端口必须在 1–65535 之间".to_string(),
+        ));
+    }
+    state
+        .mcp_service
+        .set_direct_access(
+            &state,
+            DirectAccessRequest {
+                enabled: request.enabled,
+                bind_host: request.bind_host.unwrap_or_else(|| "0.0.0.0".to_string()),
+                public_hosts: request.public_hosts,
+                port: request.port,
+            },
+        )
+        .await
+        .map_err(runtime_error)?;
+    Ok(Json(status_response(&state).await))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetNamedTunnelRequest {
+    hostname: String,
+    /// 隧道令牌，或 Cloudflare 控制台复制的整条 `cloudflared service install <令牌>` 命令。
+    token: String,
+}
+
+/// 保存命名隧道（自己的域名 + 隧道令牌）：地址固定，网络模式开着时 daemon 重启后自动恢复。
+async fn set_named_tunnel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<SetNamedTunnelRequest>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    require_local(&headers)?;
+    state
+        .mcp_service
+        .set_named_tunnel(&request.hostname, &request.token)
+        .await
+        .map_err(runtime_error)?;
+    Ok(Json(status_response(&state).await))
+}
+
+async fn clear_named_tunnel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<StatusResponse>, ApiError> {
+    require_local(&headers)?;
+    state
+        .mcp_service
+        .clear_named_tunnel()
+        .await
+        .map_err(runtime_error)?;
+    Ok(Json(status_response(&state).await))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyNamedTunnelResponse {
+    ok: bool,
+    /// `ok` / `not_configured` / `network_off` / `dns_unresolved` / `tunnel_not_connected` /
+    /// `origin_unreachable` / `unexpected`
+    code: String,
+    http_status: Option<u16>,
+}
+
+/// 从公网访问一次 `https://<域名>/mcp`（不带令牌）：返回 401 说明整条链路（DNS → Cloudflare →
+/// 隧道 → Magi MCP）都通，且入口在要求令牌。
+async fn verify_named_tunnel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<VerifyNamedTunnelResponse>, ApiError> {
+    require_local(&headers)?;
+    let respond = |ok: bool, code: &str, http_status: Option<u16>| {
+        Ok(Json(VerifyNamedTunnelResponse {
+            ok,
+            code: code.to_string(),
+            http_status,
+        }))
+    };
+    let Some(hostname) = state.mcp_service.named_tunnel_hostname() else {
+        return respond(false, "not_configured", None);
+    };
+    let status = state.mcp_service.status().await;
+    if !status.network.enabled || status.network.status != "running" {
+        return respond(false, "network_off", None);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| ApiError::internal_assembly("连通性检查", error))?;
+    match client.get(format!("https://{hostname}/mcp")).send().await {
+        Ok(response) => {
+            let code = response.status().as_u16();
+            match code {
+                401 => respond(true, "ok", Some(code)),
+                // Cloudflare：隧道没有连接（1033）/ 源站不可达。
+                530 | 1033 => respond(false, "tunnel_not_connected", Some(code)),
+                502 | 503 | 504 => respond(false, "origin_unreachable", Some(code)),
+                _ => respond(false, "unexpected", Some(code)),
+            }
+        }
+        Err(error) if error.is_connect() => respond(false, "dns_unresolved", None),
+        Err(_) => respond(false, "unexpected", None),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,8 +632,10 @@ struct ConfigSnippets {
     stdio_json: Option<serde_json::Value>,
     /// Claude Code 的一行命令。
     claude_cli: Option<String>,
-    /// 公网地址的客户端配置（网络模式运行时）。地址每次开启都会变。
+    /// 公网地址的客户端配置（网络模式运行时）。Quick Tunnel 的地址每次开启都会变，命名隧道固定。
     remote_json: Option<serde_json::Value>,
+    /// 公网地址的 Claude Code 一行命令。
+    remote_claude_cli: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,7 +697,11 @@ async fn config_snippets(
         secret_filled,
         status.url,
         status.stdio_endpoint.as_deref(),
-        status.network.mcp_url.as_deref(),
+        status
+            .network
+            .mcp_url
+            .as_deref()
+            .or(status.direct.mcp_url.as_deref()),
     )))
 }
 
@@ -591,6 +742,11 @@ fn build_snippets(
         )
     });
     let remote_json = remote_url.map(http_for);
+    let remote_claude_cli = remote_url.map(|url| {
+        format!(
+            "claude mcp add --transport http {server_name} {url} --header \"Authorization: {bearer}\""
+        )
+    });
     ConfigSnippets {
         url,
         server_name,
@@ -599,6 +755,7 @@ fn build_snippets(
         stdio_json,
         claude_cli,
         remote_json,
+        remote_claude_cli,
     }
 }
 
@@ -715,11 +872,16 @@ async fn resolve_approval(
     }))
 }
 
+/// 调用记录每页最多条数。
+const AUDIT_PAGE_MAX: usize = 200;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AuditQuery {
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
     #[serde(default)]
     token_id: Option<String>,
 }
@@ -728,6 +890,8 @@ struct AuditQuery {
 #[serde(rename_all = "camelCase")]
 struct AuditResponse {
     entries: Vec<crate::mcp_runtime::AuditEntry>,
+    /// 符合过滤条件的总条数，用于分页。
+    total: usize,
 }
 
 async fn list_audit(
@@ -736,13 +900,42 @@ async fn list_audit(
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<AuditResponse>, ApiError> {
     require_local(&headers)?;
-    let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    Ok(Json(AuditResponse {
-        entries: state
+    let limit = query.limit.unwrap_or(50).clamp(1, AUDIT_PAGE_MAX);
+    let (entries, total) =
+        state
             .mcp_service
             .audit()
-            .recent(limit, query.token_id.as_deref()),
-    }))
+            .page(limit, query.offset.unwrap_or(0), query.token_id.as_deref());
+    Ok(Json(AuditResponse { entries, total }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClearAuditQuery {
+    /// 只清理这个令牌的记录；缺省清空全部。
+    #[serde(default)]
+    token_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearAuditResponse {
+    removed: usize,
+}
+
+/// 清理调用记录。记录只用于回看，不参与授权或回退；清理在本机界面里经用户确认后进行。
+async fn clear_audit(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<ClearAuditQuery>,
+) -> Result<Json<ClearAuditResponse>, ApiError> {
+    require_local(&headers)?;
+    let removed = state
+        .mcp_service
+        .audit()
+        .clear(query.token_id.as_deref())
+        .map_err(|error| ApiError::internal_assembly("调用记录", error))?;
+    Ok(Json(ClearAuditResponse { removed }))
 }
 
 #[cfg(test)]
@@ -1113,7 +1306,7 @@ mod tests {
             true,
             Some("http://127.0.0.1:1/mcp".to_string()),
             Some("/tmp/magi.sock"),
-            None,
+            Some("https://mcp.example.com/mcp"),
         );
         let json = serde_json::to_string(&built).unwrap();
         assert!(json.contains(&format!("Bearer {secret}")));
@@ -1127,9 +1320,273 @@ mod tests {
                 .unwrap()
                 .starts_with("claude mcp add --transport http magi-cursor-work ")
         );
+        let remote = built.remote_claude_cli.as_deref().unwrap();
+        assert!(remote.contains("https://mcp.example.com/mcp"), "{remote}");
+        assert!(remote.contains(&format!("Bearer {secret}")));
+        assert_eq!(
+            built.remote_json.as_ref().unwrap()["mcpServers"]["magi-cursor-work"]["url"],
+            "https://mcp.example.com/mcp"
+        );
         assert_eq!(server_name_for("  ///  "), "magi");
         assert_eq!(server_name_for("我的 Claude"), "magi-我的-claude");
         let _ = relay_command();
+    }
+
+    #[tokio::test]
+    async fn named_tunnel_routes_validate_save_and_never_echo_the_token() {
+        use base64::Engine as _;
+        let token = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"a":"acct","t":"11111111-2222-3333-4444-555555555555","s":"c2VjcmV0"}"#);
+        let (state, _dir) = state_with_workspace();
+        let (status, _) = call(
+            &state,
+            "PUT",
+            "/mcp-server/named-tunnel",
+            serde_json::json!({"hostname": "mcp.example.com", "token": "oops"}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, saved) = call(
+            &state,
+            "PUT",
+            "/mcp-server/named-tunnel",
+            serde_json::json!({"hostname": "mcp.example.com", "token": format!("cloudflared service install {token}")}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["network"]["mode"], "named");
+        assert_eq!(saved["network"]["namedHostname"], "mcp.example.com");
+        assert!(!saved.to_string().contains(&token), "接口不得回显隧道令牌");
+
+        // 网络模式没开时，连通性检查不发请求，直接说明原因。
+        let (status, verify) = call(
+            &state,
+            "POST",
+            "/mcp-server/named-tunnel/verify",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(verify["code"], "network_off");
+
+        let (status, cleared) = call(
+            &state,
+            "DELETE",
+            "/mcp-server/named-tunnel",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cleared["network"]["mode"], "quick");
+        let (_, verify) = call(
+            &state,
+            "POST",
+            "/mcp-server/named-tunnel/verify",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(verify["code"], "not_configured");
+    }
+
+    #[tokio::test]
+    async fn audit_is_paged_and_can_be_cleared_per_client_or_entirely() {
+        let (state, _dir) = state_with_workspace();
+        let (a, _) = create(
+            &state,
+            serde_json::json!({"clientName": "a", "workspaceId": "ws-1", "profile": "edit"}),
+        )
+        .await;
+        let (b, _) = create(
+            &state,
+            serde_json::json!({"clientName": "b", "workspaceId": "ws-1", "profile": "edit"}),
+        )
+        .await;
+        for (token, count) in [(&a, 5), (&b, 3)] {
+            for _ in 0..count {
+                let record = find_token(&state, token).unwrap();
+                audit_management(&state, &record, "token.view_secret", None);
+            }
+        }
+        let (status, page) = call(
+            &state,
+            "GET",
+            "/mcp-server/audit?limit=3&offset=0",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total"], 8);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 3);
+        let (_, last) = call(
+            &state,
+            "GET",
+            "/mcp-server/audit?limit=3&offset=6",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(last["entries"].as_array().unwrap().len(), 2);
+        let (_, only_b) = call(
+            &state,
+            "GET",
+            &format!("/mcp-server/audit?tokenId={b}"),
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(only_b["total"], 3);
+
+        let (status, cleared) = call(
+            &state,
+            "DELETE",
+            &format!("/mcp-server/audit?tokenId={b}"),
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cleared["removed"], 3);
+        let (_, rest) = call(
+            &state,
+            "GET",
+            "/mcp-server/audit",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(rest["total"], 5);
+        let (_, all) = call(
+            &state,
+            "DELETE",
+            "/mcp-server/audit",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(all["removed"], 5);
+        let (_, empty) = call(
+            &state,
+            "GET",
+            "/mcp-server/audit",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(empty["total"], 0);
+
+        // 公网来源不能读取或清理。
+        for method in ["GET", "DELETE"] {
+            let (status, _) = call(
+                &state,
+                method,
+                "/mcp-server/audit",
+                serde_json::json!({}),
+                true,
+            )
+            .await;
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_access_requires_risk_confirmation_a_network_token_and_valid_input() {
+        let (state, _dir) = state_with_workspace();
+        let enable = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "enabled": true,
+                "bindHost": "127.0.0.1",
+                "publicHosts": ["203.0.113.5"],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        // 没确认风险。
+        let (status, _) = call(
+            &state,
+            "PUT",
+            "/mcp-server/direct",
+            enable(serde_json::json!({})),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // 没有允许网络使用的令牌。
+        let confirmed = serde_json::json!({"confirmRisk": true});
+        let (status, body) = call(
+            &state,
+            "PUT",
+            "/mcp-server/direct",
+            enable(confirmed.clone()),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        create(
+            &state,
+            serde_json::json!({"clientName": "remote", "workspaceId": "ws-1", "profile": "edit", "allowNetwork": true}),
+        )
+        .await;
+        for bad in [
+            serde_json::json!({"confirmRisk": true, "publicHosts": []}),
+            serde_json::json!({"confirmRisk": true, "publicHosts": ["0.0.0.0"]}),
+            serde_json::json!({"confirmRisk": true, "bindHost": "example.com"}),
+            serde_json::json!({"confirmRisk": true, "port": 0}),
+        ] {
+            let (status, body) = call(
+                &state,
+                "PUT",
+                "/mcp-server/direct",
+                enable(bad.clone()),
+                false,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+        let (status, ok) = call(
+            &state,
+            "PUT",
+            "/mcp-server/direct",
+            enable(confirmed),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ok}");
+        assert_eq!(ok["direct"]["listening"], true);
+        assert_eq!(ok["direct"]["publicHosts"][0], "203.0.113.5");
+
+        // 公网来源不能管理；关闭不需要确认。
+        let (status, _) = call(
+            &state,
+            "PUT",
+            "/mcp-server/direct",
+            serde_json::json!({"enabled": false}),
+            true,
+        )
+        .await;
+        assert!(status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
+        let (status, off) = call(
+            &state,
+            "PUT",
+            "/mcp-server/direct",
+            serde_json::json!({"enabled": false}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(off["direct"]["enabled"], false);
     }
 
     #[test]

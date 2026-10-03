@@ -4,13 +4,20 @@
 //! 认证失败对外统一为 401，不区分原因。只提供 `POST /mcp`：不提供 SSE 与会话续传，
 //! 服务没有需要服务端主动推送的内容。
 //!
+//! **对端地址决定“本机请求”**：监听公网地址（如 `0.0.0.0`）时，来自非回环地址的连接无论
+//! `Host` 写什么都按网络请求处理——只认 `public_hosts` 里的主机名，只接受显式允许网络使用的令牌，
+//! 受限流与失败退避约束，限流来源取真实对端地址（不信任客户端自带的 `X-Forwarded-For` 之类的头）。
+//! 来自回环地址的请求（本机客户端、隧道或同机反向代理）保持原有规则。
+//!
 //! 这是**独立入口**：不挂到 Magi 主应用、不共享其鉴权中间件、不暴露任何 `/api/*` 路由（M10）。
 
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -61,6 +68,9 @@ pub struct HttpState {
     /// 只有 `Host` 命中这里的请求才算“经隧道到达”：它们只接受显式允许网络使用的令牌，
     /// 并受限流与认证失败退避约束。回环请求不受这些限制。
     pub tunnel_hosts: Arc<RwLock<Vec<String>>>,
+    /// 直接对公网开放（监听公网地址）时，客户端使用的主机名 / IP（不含端口）。
+    /// 与 `tunnel_hosts` 一样，命中这里的请求按网络请求处理。
+    pub public_hosts: Arc<RwLock<Vec<String>>>,
     pub limiter: Arc<RateLimiter>,
 }
 
@@ -72,8 +82,26 @@ impl HttpState {
             config,
             clock: Arc::new(system_now_ms),
             tunnel_hosts: Arc::new(RwLock::new(Vec::new())),
+            public_hosts: Arc::new(RwLock::new(Vec::new())),
             limiter: Arc::new(RateLimiter::new()),
         }
+    }
+}
+
+/// 连接的对端 IP。只有用 `into_make_service_with_connect_info` 提供服务时才有；
+/// 没有（例如测试里直接调用路由）时按“本机”处理。
+pub struct Peer(pub Option<IpAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Peer {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
     }
 }
 
@@ -148,28 +176,54 @@ fn bearer_secret(headers: &HeaderMap) -> Option<&str> {
         .filter(|secret| !secret.is_empty())
 }
 
-async fn handle_post(State(state): State<HttpState>, headers: HeaderMap, body: Bytes) -> Response {
-    // 1) Host：防 DNS 重绑定。缺失或不在白名单（回环名称 + 当前隧道主机名）一律拒绝。
+fn host_in(list: &RwLock<Vec<String>>, host: Option<&str>) -> bool {
+    host.is_some_and(|host| {
+        list.read()
+            .expect("host list poisoned")
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    })
+}
+
+/// 同机进程（隧道、反向代理）转交请求时带的真实来源；取不到就退化为统一的 `unknown`。
+fn forwarded_source(headers: &HeaderMap) -> String {
+    ["cf-connecting-ip", "x-forwarded-for"]
+        .iter()
+        .find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(',').next().unwrap_or_default().trim())
+                .filter(|value| !value.is_empty() && value.len() <= 64)
+        })
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+async fn handle_post(
+    State(state): State<HttpState>,
+    Peer(peer): Peer,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // 1) Host：防 DNS 重绑定。缺失或不在白名单一律拒绝。
+    //    对端不是回环地址（直接对公网开放）时，只认公网主机名，回环名称和隧道主机名都不算。
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .map(host_name);
-    let is_loopback_host = host.as_deref().is_some_and(|host| {
-        state
-            .config
-            .allowed_hosts
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(host))
-    });
-    let via_tunnel = !is_loopback_host
+    let remote_peer = peer.is_some_and(|ip| !ip.is_loopback());
+    let is_loopback_host = !remote_peer
         && host.as_deref().is_some_and(|host| {
             state
-                .tunnel_hosts
-                .read()
-                .expect("tunnel hosts poisoned")
+                .config
+                .allowed_hosts
                 .iter()
                 .any(|allowed| allowed.eq_ignore_ascii_case(host))
         });
+    let via_network_host = host_in(&state.public_hosts, host.as_deref())
+        || (!remote_peer && host_in(&state.tunnel_hosts, host.as_deref()));
+    let via_tunnel = !is_loopback_host && via_network_host;
     if !is_loopback_host && !via_tunnel {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -191,14 +245,10 @@ async fn handle_post(State(state): State<HttpState>, headers: HeaderMap, body: B
     // 3) 认证：统一 401，不区分令牌不存在 / 过期 / 已吊销 / 不允许网络使用。
     //    经隧道的请求先过退避检查，再认证；认证失败计入来源的失败次数。
     let now_ms = (state.clock)();
-    let source = via_tunnel.then(|| {
-        headers
-            .get("cf-connecting-ip")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && value.len() <= 64)
-            .unwrap_or("unknown")
-            .to_string()
+    let source = via_tunnel.then(|| match peer {
+        // 直接对公网开放：来源就是真实对端地址，客户端自带的转发头不可信。
+        Some(ip) if remote_peer => ip.to_string(),
+        _ => forwarded_source(&headers),
     });
     if let Some(source) = &source
         && state.limiter.is_locked_out(source, now_ms)
@@ -269,6 +319,7 @@ mod tests {
     use crate::catalog::{ToolSchema, ToolSchemaProvider};
     use crate::path_guard::PathRequest;
     use crate::profile::Profile;
+    use crate::rate_limit::MAX_AUTH_FAILURES as MAX_AUTH_FAILURES_FOR_TEST;
     use crate::server::{
         BoxFuture, InvocationOutcome, ToolBackend, ToolInvocation, WorkspaceResolver,
     };
@@ -460,6 +511,156 @@ mod tests {
             f.router.oneshot(allowed_origin).await.unwrap().status(),
             StatusCode::OK
         );
+    }
+
+    /// 直接对公网开放：本机令牌与网络令牌各一个，公网主机名由测试设置。
+    struct DirectFixture {
+        _dir: tempfile::TempDir,
+        router: Router,
+        local_secret: String,
+        network_secret: String,
+    }
+
+    fn direct_fixture() -> DirectFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = Arc::new(TokenStore::new());
+        let issue = |network: bool| {
+            tokens
+                .issue(
+                    IssueTokenRequest {
+                        client_name: "test".to_string(),
+                        workspace_id: "ws".to_string(),
+                        profile: Profile::Edit,
+                        attribution: AttributionMode::External,
+                        ttl_ms: None,
+                        network,
+                    },
+                    0,
+                )
+                .unwrap()
+                .secret
+        };
+        let (local_secret, network_secret) = (issue(false), issue(true));
+        let server = Arc::new(McpServer::new(
+            "magi-mcp",
+            "test",
+            Arc::new(Backend),
+            Arc::new(Root(dir.path().to_path_buf())),
+        ));
+        let mut state = HttpState::new(server, tokens, HttpConfig::default());
+        state.clock = Arc::new(|| 10);
+        state
+            .public_hosts
+            .write()
+            .unwrap()
+            .push("203.0.113.5".to_string());
+        DirectFixture {
+            _dir: dir,
+            router: router(state),
+            local_secret,
+            network_secret,
+        }
+    }
+
+    fn from_peer(mut request: Request<Body>, peer: &str) -> Request<Body> {
+        let addr: SocketAddr = format!("{peer}:50000").parse().unwrap();
+        request.extensions_mut().insert(ConnectInfo(addr));
+        request
+    }
+
+    #[tokio::test]
+    async fn a_remote_peer_is_a_network_request_whatever_host_it_claims() {
+        let f = direct_fixture();
+        // 公网主机名 + 网络令牌：通过。
+        let ok = f
+            .router
+            .clone()
+            .oneshot(from_peer(
+                post_request(Some(&f.network_secret), "203.0.113.5:8765", LIST),
+                "198.51.100.9",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // 只在本机使用的令牌从公网来：与“令牌不存在”不可区分。
+        let local_token = f
+            .router
+            .clone()
+            .oneshot(from_peer(
+                post_request(Some(&f.local_secret), "203.0.113.5", LIST),
+                "198.51.100.9",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(local_token.status(), StatusCode::UNAUTHORIZED);
+
+        // 公网来的连接自称 Host: 127.0.0.1 / localhost，也不能当作本机请求。
+        for claimed in ["127.0.0.1:8765", "localhost", "[::1]", "other.example.com"] {
+            let response = f
+                .router
+                .clone()
+                .oneshot(from_peer(
+                    post_request(Some(&f.local_secret), claimed, LIST),
+                    "198.51.100.9",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{claimed}");
+        }
+
+        // 回环对端仍按本机规则：本机令牌 + 回环主机名可用。
+        let local = f
+            .router
+            .oneshot(from_peer(
+                post_request(Some(&f.local_secret), "127.0.0.1:8765", LIST),
+                "127.0.0.1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(local.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn remote_auth_failures_are_throttled_per_real_peer_address_not_by_forwarded_headers() {
+        let f = direct_fixture();
+        let attempt = |peer: &str, forwarded: &str| {
+            let mut request = post_request(Some("magi_mcp_wrong"), "203.0.113.5", LIST);
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", HeaderValue::from_str(forwarded).unwrap());
+            from_peer(request, peer)
+        };
+        for index in 0..MAX_AUTH_FAILURES_FOR_TEST {
+            // 客户端每次换一个自称的来源，也算在同一个真实地址上。
+            let response = f
+                .router
+                .clone()
+                .oneshot(attempt("198.51.100.9", &format!("10.0.0.{index}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let locked = f
+            .router
+            .clone()
+            .oneshot(from_peer(
+                post_request(Some(&f.network_secret), "203.0.113.5", LIST),
+                "198.51.100.9",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
+        // 另一个真实地址不受影响。
+        let other = f
+            .router
+            .oneshot(from_peer(
+                post_request(Some(&f.network_secret), "203.0.113.5", LIST),
+                "198.51.100.10",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
     }
 
     #[tokio::test]

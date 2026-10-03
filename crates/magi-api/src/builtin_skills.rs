@@ -1,0 +1,243 @@
+//! 随 Magi 发布的内置 Skill。
+//!
+//! 内置 Skill 与用户安装的 Skill 走同一套机制：说明文件写到 state root 下的目录，并在
+//! `skillsConfig.instructionSkills` 里登记一个普通条目，所以能在设置里启停、在输入框里用 `/` 唤起。
+//! 内置 Skill 可以停用，但**不能删除**：移除请求会被拒绝，整体保存配置时缺失的内置条目会被补回，
+//! 启动时也会补齐。安装记录单独保存在 `builtin-skills/.installed.json`：版本没变就不重写说明文件；
+//! Magi 升级带来新版本时才会更新说明文件，并保留用户的启停选择。
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use magi_settings_store::SettingsStore;
+use serde_json::{Map, Value, json};
+
+use crate::skill_loader::{save_skills_config_object, skills_config_object};
+
+struct BuiltinSkill {
+    id: &'static str,
+    /// 说明文件有改动时递增。
+    version: u32,
+    description: &'static str,
+    body: &'static str,
+}
+
+const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
+    id: "magi-cloudflare-tunnel",
+    version: 1,
+    description: "协助配置 Cloudflare 命名隧道，让 Magi MCP 的公网地址固定、重启后不变",
+    body: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/SKILL.md"),
+}];
+
+const INSTALLED_FILE: &str = ".installed.json";
+
+/// 安装或升级内置 Skill。失败只影响内置 Skill 本身，调用方记日志即可。
+pub fn install_builtin_skills(store: &SettingsStore, state_root: &Path) -> std::io::Result<()> {
+    let root = state_root.join("builtin-skills");
+    let installed_path = root.join(INSTALLED_FILE);
+    let mut installed: HashMap<String, u32> = std::fs::read(&installed_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let mut changed = false;
+    for skill in BUILTIN_SKILLS {
+        let dir = root.join(skill.id);
+        let up_to_date = installed.get(skill.id) == Some(&skill.version)
+            && dir.join("SKILL.md").is_file()
+            && has_entry(store, skill.id);
+        if up_to_date {
+            continue;
+        }
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("SKILL.md"), skill.body)?;
+        upsert_entry(store, skill, &dir)?;
+        installed.insert(skill.id.to_string(), skill.version);
+        changed = true;
+    }
+    if changed {
+        let body = serde_json::to_vec_pretty(&installed)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(installed_path, body)?;
+    }
+    Ok(())
+}
+
+fn has_entry(store: &SettingsStore, skill_id: &str) -> bool {
+    skills_config_object(store)
+        .get("instructionSkills")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("skillId").and_then(Value::as_str) == Some(skill_id) && is_builtin(entry)
+            })
+        })
+}
+
+/// 条目是否是内置 Skill。
+pub fn is_builtin(entry: &Value) -> bool {
+    entry.get("builtin").and_then(Value::as_bool) == Some(true)
+}
+
+/// 整体保存 Skill 配置时保护内置条目：被漏掉的补回，`builtin` 标记不能被去掉（启停选择以提交的为准）。
+pub fn protect_builtin_entries(current: &Map<String, Value>, incoming: &mut Map<String, Value>) {
+    let current_builtin: Vec<&Value> = current
+        .get("instructionSkills")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().filter(|entry| is_builtin(entry)).collect())
+        .unwrap_or_default();
+    if current_builtin.is_empty() {
+        return;
+    }
+    let entries = incoming
+        .entry("instructionSkills".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(entries) = entries.as_array_mut() else {
+        return;
+    };
+    for builtin in current_builtin {
+        let id = builtin.get("skillId").and_then(Value::as_str);
+        match entries
+            .iter_mut()
+            .find(|entry| entry.get("skillId").and_then(Value::as_str) == id)
+        {
+            Some(submitted) => {
+                if let Some(object) = submitted.as_object_mut() {
+                    object.insert("builtin".to_string(), Value::Bool(true));
+                }
+            }
+            None => entries.push(builtin.clone()),
+        }
+    }
+}
+
+fn upsert_entry(store: &SettingsStore, skill: &BuiltinSkill, dir: &Path) -> std::io::Result<()> {
+    let mut config = skills_config_object(store);
+    let mut entries = config
+        .remove("instructionSkills")
+        .and_then(|value| match value {
+            Value::Array(entries) => Some(entries),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let now = magi_core::UtcMillis::now().0;
+    let mut entry = json!({
+        "name": skill.id,
+        "skillId": skill.id,
+        "fullName": skill.id,
+        "directoryPath": dir.to_string_lossy(),
+        "directoryPathRef": magi_core::HostPath::from_path(dir.to_path_buf()).to_path_ref().as_str(),
+        "description": skill.description,
+        "source": "local",
+        "builtin": true,
+        "updatedAt": now,
+    });
+    match entries
+        .iter_mut()
+        .find(|existing| existing.get("skillId").and_then(Value::as_str) == Some(skill.id))
+    {
+        Some(existing) => {
+            // 升级只刷新路径与说明，保留用户对启停的选择。
+            if let (Some(target), Some(source)) = (existing.as_object_mut(), entry.as_object_mut())
+            {
+                for (key, value) in std::mem::take(source) {
+                    target.insert(key, value);
+                }
+            }
+        }
+        None => {
+            entry["installedAt"] = json!(now);
+            entry["enabled"] = json!(true);
+            entries.push(entry);
+        }
+    }
+    config.insert("instructionSkills".to_string(), Value::Array(entries));
+    save_skills_config_object(store, config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_in(dir: &Path) -> SettingsStore {
+        let _ = dir;
+        SettingsStore::new()
+    }
+
+    #[test]
+    fn builtin_skills_are_installed_and_restored_but_the_users_enable_choice_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        install_builtin_skills(&store, dir.path()).unwrap();
+
+        let skill_md = dir
+            .path()
+            .join("builtin-skills/magi-cloudflare-tunnel/SKILL.md");
+        assert!(
+            std::fs::read_to_string(&skill_md)
+                .unwrap()
+                .contains("命名隧道")
+        );
+        let config = skills_config_object(&store);
+        let entries = config["instructionSkills"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["skillId"], "magi-cloudflare-tunnel");
+        assert_eq!(entries[0]["enabled"], true);
+        assert!(is_builtin(&entries[0]));
+
+        // 停用是允许的，再次启动不会改回启用。
+        let mut config = skills_config_object(&store);
+        config["instructionSkills"][0]["enabled"] = json!(false);
+        save_skills_config_object(&store, config).unwrap();
+        install_builtin_skills(&store, dir.path()).unwrap();
+        assert_eq!(
+            skills_config_object(&store)["instructionSkills"][0]["enabled"],
+            false
+        );
+
+        // 条目被弄丢（旧数据、手工改配置）时，启动会补回来。
+        let mut config = skills_config_object(&store);
+        config.insert("instructionSkills".to_string(), json!([]));
+        save_skills_config_object(&store, config).unwrap();
+        install_builtin_skills(&store, dir.path()).unwrap();
+        assert!(has_entry(&store, "magi-cloudflare-tunnel"));
+    }
+
+    #[test]
+    fn saving_the_whole_config_cannot_drop_or_unmark_a_builtin_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        install_builtin_skills(&store, dir.path()).unwrap();
+        let current = skills_config_object(&store);
+
+        let mut dropped = Map::new();
+        dropped.insert(
+            "instructionSkills".to_string(),
+            json!([{ "skillId": "user-skill", "name": "user-skill" }]),
+        );
+        protect_builtin_entries(&current, &mut dropped);
+        let ids: Vec<&str> = dropped["instructionSkills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["skillId"].as_str())
+            .collect();
+        assert_eq!(ids, ["user-skill", "magi-cloudflare-tunnel"]);
+
+        let mut unmarked = Map::new();
+        unmarked.insert(
+            "instructionSkills".to_string(),
+            json!([{ "skillId": "magi-cloudflare-tunnel", "enabled": false }]),
+        );
+        protect_builtin_entries(&current, &mut unmarked);
+        let entry = &unmarked["instructionSkills"][0];
+        assert!(is_builtin(entry));
+        assert_eq!(entry["enabled"], false, "启停以提交的为准");
+    }
+
+    #[test]
+    fn the_skill_never_asks_the_model_to_read_or_type_secrets() {
+        let body = BUILTIN_SKILLS[0].body;
+        assert!(body.contains("不要截图"));
+        assert!(body.contains("绝不要替用户输入账号或密码"));
+    }
+}

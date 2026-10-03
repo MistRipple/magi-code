@@ -3775,6 +3775,22 @@ export interface McpServerNetworkStatus {
   /** 客户端配置用的完整地址。Quick Tunnel 的地址每次开启都会变。 */
   mcpUrl: string | null;
   error: string | null;
+  /** quick：随机地址，重启即失效；named：自己的域名，地址固定。 */
+  mode: 'quick' | 'named';
+  /** 已配置的命名隧道域名（令牌不外露）。 */
+  namedHostname: string | null;
+}
+
+export interface McpServerDirectStatus {
+  enabled: boolean;
+  /** 是否正在监听公网地址。 */
+  listening: boolean;
+  bindHost: string;
+  publicHosts: string[];
+  /** 客户端配置用的完整 MCP 地址（第一个公网地址）。 */
+  mcpUrl: string | null;
+  /** 恢复监听失败等原因；已退回仅本机。 */
+  error: string | null;
 }
 
 export interface McpServerStatus {
@@ -3786,6 +3802,7 @@ export interface McpServerStatus {
   stateRoot: string | null;
   activeTokens: number;
   network: McpServerNetworkStatus;
+  direct: McpServerDirectStatus;
   tokens: McpServerToken[];
 }
 
@@ -3828,6 +3845,8 @@ export interface McpServerConfigSnippets {
   /** Claude Code 的一行命令。 */
   claudeCli: string | null;
   remoteJson: Record<string, unknown> | null;
+  /** 公网地址的 Claude Code 一行命令。 */
+  remoteClaudeCli: string | null;
 }
 
 export interface McpServerApproval {
@@ -3857,7 +3876,7 @@ export interface McpServerAuditEntry {
 async function mcpServerJson<T>(
   path: string,
   action: string,
-  init?: { method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'; body?: unknown },
+  init?: { method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'; body?: unknown },
 ): Promise<T> {
   const response = await getTransport().request(agentUrl(path), {
     method: init?.method ?? 'GET',
@@ -3886,6 +3905,57 @@ export function setMcpServerNetwork(
   return mcpServerJson('/api/mcp-server/network', 'set mcp server network mode', {
     method: 'POST',
     body: { enabled, confirmRisk },
+  });
+}
+
+export interface McpServerDirectRequest {
+  enabled: boolean;
+  /** 监听地址，缺省 0.0.0.0（所有网卡）。 */
+  bindHost?: string;
+  /** 客户端实际使用的公网域名 / IP（不含端口）。 */
+  publicHosts?: string[];
+  /** 固定监听端口（防火墙需放行）；缺省沿用当前端口。 */
+  port?: number;
+  /** 开启必须确认：直接对公网开放用的是明文 HTTP。 */
+  confirmRisk?: boolean;
+}
+
+/** 直接对公网开放（监听公网地址，不经隧道）。 */
+export function setMcpServerDirect(request: McpServerDirectRequest): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/direct', 'set mcp server direct access', {
+    method: 'PUT',
+    body: request,
+  });
+}
+
+export interface McpServerNamedTunnelCheck {
+  ok: boolean;
+  /** ok / not_configured / network_off / dns_unresolved / tunnel_not_connected / origin_unreachable / unexpected */
+  code: string;
+  httpStatus: number | null;
+}
+
+/** 保存命名隧道：域名 + 隧道令牌（或 Cloudflare 复制的整条安装命令）。令牌不会再被返回。 */
+export function saveMcpServerNamedTunnel(
+  hostname: string,
+  token: string,
+): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/named-tunnel', 'save mcp server named tunnel', {
+    method: 'PUT',
+    body: { hostname, token },
+  });
+}
+
+export function clearMcpServerNamedTunnel(): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/named-tunnel', 'clear mcp server named tunnel', {
+    method: 'DELETE',
+  });
+}
+
+export function verifyMcpServerNamedTunnel(): Promise<McpServerNamedTunnelCheck> {
+  return mcpServerJson('/api/mcp-server/named-tunnel/verify', 'verify mcp server named tunnel', {
+    method: 'POST',
+    body: {},
   });
 }
 
@@ -3968,16 +4038,32 @@ export async function resolveMcpServerApproval(
   return result.approvals;
 }
 
-export async function listMcpServerAudit(
-  options: { limit?: number; tokenId?: string } = {},
-): Promise<McpServerAuditEntry[]> {
+export interface McpServerAuditPage {
+  entries: McpServerAuditEntry[];
+  /** 符合过滤条件的总条数，用于分页。 */
+  total: number;
+}
+
+export function listMcpServerAudit(
+  options: { limit?: number; offset?: number; tokenId?: string } = {},
+): Promise<McpServerAuditPage> {
   const query = new URLSearchParams();
   if (options.limit) query.set('limit', String(options.limit));
+  if (options.offset) query.set('offset', String(options.offset));
   if (options.tokenId) query.set('tokenId', options.tokenId);
   const suffix = query.toString();
-  const result = await mcpServerJson<{ entries: McpServerAuditEntry[] }>(
+  return mcpServerJson<McpServerAuditPage>(
     `/api/mcp-server/audit${suffix ? `?${suffix}` : ''}`,
     'load mcp server audit',
   );
-  return result.entries;
+}
+
+/** 清理调用记录：带 tokenId 只清理该客户端的，否则清空全部。 */
+export function clearMcpServerAudit(tokenId?: string): Promise<{ removed: number }> {
+  const suffix = tokenId ? `?tokenId=${encodeURIComponent(tokenId)}` : '';
+  return mcpServerJson<{ removed: number }>(
+    `/api/mcp-server/audit${suffix}`,
+    'clear mcp server audit',
+    { method: 'DELETE' },
+  );
 }

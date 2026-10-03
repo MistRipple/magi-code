@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 const TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE: &str = "tunnel_dependency_unavailable";
 const TUNNEL_ERROR_START_FAILED: &str = "tunnel_start_failed";
 const TUNNEL_ERROR_CONNECTION_LOST: &str = "tunnel_connection_lost";
+const TUNNEL_ERROR_TOKEN_INVALID: &str = "tunnel_token_invalid";
 const CLOUDFLARED_VERSION: &str = "2026.7.1";
 
 #[derive(Clone, Copy)]
@@ -301,6 +302,109 @@ impl TunnelManager {
         }
     }
 
+    /// 启动命名隧道：用 Cloudflare 隧道令牌连接已在控制台配置好的固定域名。
+    ///
+    /// 令牌只通过环境变量交给 cloudflared（不进命令行，`ps` 看不到）；公网地址就是配置的域名，
+    /// 看到 cloudflared 登记了隧道连接才算就绪。令牌无效时 cloudflared 会立即退出，报 `tunnel_token_invalid`。
+    pub async fn start_named(&self, hostname: &str, tunnel_token: &str) -> TunnelState {
+        let mut inner = self.inner.lock().await;
+        if inner.state.status == "running" || inner.state.status == "starting" {
+            return inner.state.clone();
+        }
+        let bin_path = match resolve_cloudflared_path().await {
+            Some(path) => path,
+            None => {
+                inner.state.status = "installing".into();
+                match install_cloudflared().await {
+                    Ok(path) => path,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "cloudflared install failed");
+                        inner.state.status = "error".into();
+                        inner.state.error = Some(TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE.to_string());
+                        return inner.state.clone();
+                    }
+                }
+            }
+        };
+        inner.state.status = "starting".into();
+        inner.state.error = None;
+        inner.state.public_url = None;
+
+        let mut command = tokio_command(&bin_path);
+        command
+            .args(["tunnel", "--no-autoupdate", "run"])
+            .env("TUNNEL_TOKEN", tunnel_token)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match spawn_managed_tokio(&mut command) {
+            Ok(mut child) => {
+                let stderr = child.take_stderr();
+                inner.child = Some(child);
+                let inner_clone = self.inner.clone();
+                let public_url = format!("https://{hostname}");
+                tokio::spawn(async move {
+                    let mut was_connected = false;
+                    let mut token_rejected = false;
+                    if let Some(stderr) = stderr {
+                        let mut lines = BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if is_named_tunnel_token_rejection(&line) {
+                                token_rejected = true;
+                                // 令牌对应的隧道不存在或已撤销时 cloudflared 会无限重试，不会自己退出：
+                                // 在还没连上之前就立刻报错并结束进程，让用户马上看到原因。
+                                let mut inner = inner_clone.lock().await;
+                                if inner.state.status == "starting" {
+                                    if let Some(ref mut child) = inner.child {
+                                        let _ = child.terminate().await;
+                                    }
+                                    inner.child = None;
+                                    inner.state.status = "error".into();
+                                    inner.state.public_url = None;
+                                    inner.state.error =
+                                        Some(TUNNEL_ERROR_TOKEN_INVALID.to_string());
+                                    return;
+                                }
+                            }
+                            if is_named_tunnel_connected(&line) {
+                                let mut inner = inner_clone.lock().await;
+                                if inner.state.status == "starting" {
+                                    inner.state.public_url = Some(public_url.clone());
+                                    inner.state.status = "running".into();
+                                }
+                                was_connected = true;
+                            }
+                        }
+                    }
+                    let mut inner = inner_clone.lock().await;
+                    if inner.child.is_some()
+                        && (inner.state.status == "starting" || inner.state.status == "running")
+                    {
+                        inner.child = None;
+                        inner.state.status = "error".into();
+                        inner.state.public_url = None;
+                        inner.state.error = Some(
+                            if token_rejected {
+                                TUNNEL_ERROR_TOKEN_INVALID
+                            } else if was_connected {
+                                TUNNEL_ERROR_CONNECTION_LOST
+                            } else {
+                                TUNNEL_ERROR_START_FAILED
+                            }
+                            .to_string(),
+                        );
+                    }
+                });
+                inner.state.clone()
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "cloudflared process spawn failed");
+                inner.state.status = "error".into();
+                inner.state.error = Some(TUNNEL_ERROR_START_FAILED.to_string());
+                inner.state.clone()
+            }
+        }
+    }
+
     pub async fn stop(&self) -> TunnelState {
         let mut inner = self.inner.lock().await;
         if let Some(ref mut child) = inner.child {
@@ -498,6 +602,21 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
+/// cloudflared 在隧道连接建立后输出 `Registered tunnel connection`。
+fn is_named_tunnel_connected(line: &str) -> bool {
+    line.contains("Registered tunnel connection")
+}
+
+/// 令牌格式错误或已被撤销时 cloudflared 的提示。
+fn is_named_tunnel_token_rejection(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("tunnel token is not valid")
+        || lower.contains("provided tunnel token")
+        || lower.contains("unauthorized: tunnel not found")
+        || lower.contains("failed to get tunnel")
+        || lower.contains("failed to unmarshal")
+}
+
 fn extract_tunnel_url(line: &str) -> Option<String> {
     // cloudflared 输出格式: ... https://xxx-xxx.trycloudflare.com ...
     let _re_pattern = "https://[a-zA-Z0-9-]+\\.trycloudflare\\.com";
@@ -514,6 +633,22 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_tunnel_ready_and_rejection_lines_are_recognised() {
+        assert!(is_named_tunnel_connected(
+            "2026-10-03T04:00:00Z INF Registered tunnel connection connIndex=0 connection=abc location=hkg01 protocol=quic"
+        ));
+        assert!(!is_named_tunnel_connected(
+            "INF Starting tunnel tunnelID=abc"
+        ));
+        assert!(is_named_tunnel_token_rejection(
+            "Provided Tunnel token is not valid (decoding error)."
+        ));
+        assert!(!is_named_tunnel_token_rejection(
+            "INF Registered tunnel connection"
+        ));
+    }
 
     #[tokio::test]
     async fn public_tunnel_request_requires_current_token() {

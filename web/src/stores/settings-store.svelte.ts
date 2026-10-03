@@ -187,6 +187,8 @@ export interface SkillItem {
   description: string;
   source: "custom" | "instruction";
   origin?: "custom" | "local" | "repository";
+  /** 随 Magi 发布的内置技能：可以停用，不能删除。 */
+  builtin?: boolean;
   repositoryName?: string;
   version?: string;
   availableVersion?: string;
@@ -288,6 +290,7 @@ export interface LibrarySkill {
   installed?: boolean;
   icon?: string;
   localSkillId?: string;
+  builtin?: boolean;
   source?: "local" | "repository";
   installedVersion?: string;
   availableVersion?: string;
@@ -2843,6 +2846,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       installed: raw?.installed === true,
       icon: raw?.icon,
       localSkillId: raw?.localSkillId,
+      builtin: raw?.builtin === true,
       source,
       installedVersion: raw?.version || "",
       availableVersion: raw?.availableVersion || "",
@@ -2881,6 +2885,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
         description: skill.description || "",
         source: "instruction",
         origin: skill.source || "local",
+        builtin: skill.builtin === true,
         repositoryName: skill.repositoryName,
         version: skill.installedVersion,
         availableVersion: skill.availableVersion,
@@ -3649,6 +3654,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
           description: typeof skill.description === "string" ? skill.description : "",
           source: "instruction",
           origin: skill.source === "repository" ? "repository" : "local",
+          builtin: skill.builtin === true,
           repositoryName: typeof skill.repositoryName === "string" ? skill.repositoryName : undefined,
           version: typeof skill.version === "string" ? skill.version : undefined,
           lastCheckedAt: typeof skill.lastCheckedAt === "number" ? skill.lastCheckedAt : undefined,

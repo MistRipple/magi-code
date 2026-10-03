@@ -1370,6 +1370,12 @@ impl DaemonRuntime {
             magi_agent_role::AgentRoleRegistry::load_from_state_root(&self.state_root)
                 .map_err(|error| DaemonError::internal(format!("加载代理角色失败: {error}")))?,
         );
+        // 内置 Skill（如命名隧道配置向导）：失败只记日志，不影响 daemon 启动。
+        if let Err(error) =
+            magi_api::builtin_skills::install_builtin_skills(&settings_store, &self.state_root)
+        {
+            tracing::warn!(%error, "内置 Skill 安装失败");
+        }
         let app_skill_runtime = Arc::new(
             magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store).map_err(
                 |error| DaemonError::internal(format!("规范化 Skill 设置失败: {error}")),
@@ -1916,7 +1922,11 @@ impl DaemonRuntime {
                     // Electron 等不到心跳回包就会断开浏览器控制连接，正在进行的 GPT Web 回合也跟着失败。
                     // 被删会话的文件由持久化层按「不再保留」的会话列表清理。
                     SessionProjectionPersistMode::Sessions { session_ids } => repository
-                        .save_session_projection_state_for_sessions(durable, sidecars, &session_ids),
+                        .save_session_projection_state_for_sessions(
+                            durable,
+                            sidecars,
+                            &session_ids,
+                        ),
                 };
                 result.map_err(|error| {
                     ApiError::internal_assembly("session projection 持久化失败", error)
@@ -1982,15 +1992,9 @@ impl DaemonRuntime {
                 Arc::clone(&browser_dependencies.authority),
             ) {
                 Ok(factory) => {
-                    state
-                        .web_model
-                        .set_bindings(Arc::clone(factory.bindings()));
-                    state
-                        .web_model
-                        .set_runtime(Arc::clone(factory.runtime()));
-                    state
-                        .web_model
-                        .set_driver(Arc::clone(factory.driver()));
+                    state.web_model.set_bindings(Arc::clone(factory.bindings()));
+                    state.web_model.set_runtime(Arc::clone(factory.runtime()));
+                    state.web_model.set_driver(Arc::clone(factory.driver()));
                     // 槽位的 turn 结束 / 释放要取消该槽位遗留的外部待审批。
                     state.install_web_slot_hooks();
                     Some(Arc::new(
