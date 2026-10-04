@@ -397,6 +397,54 @@ fn lease_is_scoped_to_one_tab_and_surface() {
 }
 
 #[test]
+fn user_takeover_hold_blocks_agent_lease_until_user_hands_back() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+    let acquire = |authority: &mut BrowserAuthority, lease: &str, now: u64| {
+        authority.acquire_lease(AcquireBrowserLease {
+            lease_id: BrowserLeaseId::new(lease),
+            tab_id: tab_id.clone(),
+            surface_id: surface_id(),
+            owner: owner(),
+            turn_id: "turn-1".to_string(),
+            goal_binding: None,
+            acquired_at: at(now),
+            expires_at: at(now + 100),
+        })
+    };
+    acquire(&mut authority, "lease-before-takeover", 7).expect("agent lease should acquire");
+
+    authority
+        .take_user_control(&tab_id, &surface_id(), at(8))
+        .expect("user takeover should succeed");
+    authority
+        .hold_user_control(&tab_id)
+        .expect("user takeover hold should record");
+    assert!(authority.user_control_held(&tab_id));
+
+    assert!(
+        matches!(
+            acquire(&mut authority, "lease-during-takeover", 9),
+            Err(crate::BrowserAuthorityError::UserControlHeld(held)) if held == tab_id
+        ),
+        "用户接管期间代理不能自动重新取得控制权"
+    );
+
+    assert!(
+        authority
+            .release_user_control(&tab_id)
+            .expect("hand back should succeed")
+    );
+    assert!(!authority.user_control_held(&tab_id));
+    acquire(&mut authority, "lease-after-hand-back", 10).expect("用户交还后代理可以重新取得控制权");
+}
+
+#[test]
 fn browser_lease_rejects_owner_turn_tab_and_surface_drift() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);

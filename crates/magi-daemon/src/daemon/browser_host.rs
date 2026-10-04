@@ -808,16 +808,18 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             }
         }
         BrowserHostEvent::UserTakeover { binding } => {
+            // 用户直接操作页面后由用户保持控制：代理不能在用户未交还前自动抢回。
             revoke_surface_control(
                 state,
                 &binding,
                 BrowserLeaseEndReason::UserTakeover,
                 "user_takeover",
+                true,
             );
         }
         BrowserHostEvent::ControlRevoked { binding, reason } => {
             let lease_reason = control_revocation_reason(&reason);
-            revoke_surface_control(state, &binding, lease_reason, &reason);
+            revoke_surface_control(state, &binding, lease_reason, &reason, false);
         }
         BrowserHostEvent::PageUpdated {
             binding,
@@ -1099,6 +1101,7 @@ fn revoke_surface_control(
     binding: &magi_browser_authority::BrowserSurfaceBinding,
     lease_reason: BrowserLeaseEndReason,
     reason: &str,
+    hold_user_control: bool,
 ) {
     if !is_current_primary_binding(state, binding) {
         tracing::debug!(
@@ -1116,6 +1119,12 @@ fn revoke_surface_control(
     };
     let revoked =
         state.cancel_browser_surface_control(&binding.tab_id, &binding.surface_id, lease_reason);
+    if hold_user_control
+        && let Err(error) =
+            state.mutate_browser_authority(|authority| authority.hold_user_control(&binding.tab_id))
+    {
+        tracing::warn!(tab_id = %binding.tab_id, ?error, "记录用户接管 Browser Tab 失败");
+    }
     publish_tab_event(
         state,
         "browser.control.revoked",
@@ -1125,6 +1134,7 @@ fn revoke_surface_control(
             "binding": binding,
             "reason": reason,
             "revoked_lease_count": revoked.len(),
+            "user_control_held": hold_user_control,
         }),
     );
 }

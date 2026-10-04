@@ -11,6 +11,7 @@
     isReferenceableBrowserAnnotation,
     navigateBrowserTab,
     reloadWebModelPage,
+    releaseBrowserUserControl,
     type BrowserAnnotationSnapshot,
     type BrowserAnnotationSelection,
     type BrowserDeviceType,
@@ -254,6 +255,25 @@
   const activeTab = $derived.by<BrowserTabSnapshot | null>(() => (
     snapshot?.tabs.find((tab) => tab.tabId === tabId && tab.lifecycle !== 'closed') ?? null
   ));
+  // 用户直接操作页面后由 daemon 保持用户控制；代理在用户交还前不会自动抢回。
+  const userControlHeld = $derived(activeTab?.userControlHeld === true);
+  let handingBackControl = $state(false);
+
+  async function handBackControl(): Promise<void> {
+    if (handingBackControl) return;
+    handingBackControl = true;
+    try {
+      const next = await releaseBrowserUserControl(tabId);
+      snapshot = next;
+      synchronizeBrowserSessionSnapshot(next, workspacePath, { workspaceId, sessionId });
+      actionError = '';
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    } finally {
+      handingBackControl = false;
+    }
+  }
+
   const savedAnnotations = $derived(
     (activeTab?.annotations ?? []).filter((annotation) => (
       isReferenceableBrowserAnnotation(annotation.status)
@@ -1749,6 +1769,11 @@
         <span class="agent-badge-dot" aria-hidden="true"></span>
         <span class="agent-badge-label">{i18n.t('browser.agent.active')}</span>
       </span>
+    {:else if desktopRuntime && userControlHeld}
+      <span class="agent-badge user-held-badge" role="status" aria-live="polite" title={i18n.t('browser.agent.userHeldHint')}>
+        <span class="agent-badge-label">{i18n.t('browser.agent.userHeld')}</span>
+        <button type="button" class="hand-back-button" onclick={() => void handBackControl()} disabled={handingBackControl}>{i18n.t('browser.agent.handBack')}</button>
+      </span>
     {/if}
     {#if desktopRuntime}
       <span class="status-light" class:ready={connectionState === 'ready' && !browserLoading} class:loading={connectionState === 'ready' && browserLoading} class:error={connectionState === 'error'} title={connectionStatusText} role="status"></span>
@@ -1988,6 +2013,9 @@
   .agent-badge-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--primary); animation: agent-badge-pulse 1.4s ease-in-out infinite; }
   @keyframes agent-badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
   @media (prefers-reduced-motion: reduce) { .agent-badge-dot { animation: none; } }
+  .user-held-badge { max-width: 240px; padding-right: 2px; background: var(--warning-muted); color: var(--foreground); }
+  .hand-back-button { flex: 0 0 auto; height: 16px; padding: 0 7px; border: none; border-radius: 9999px; background: var(--primary); color: var(--primary-foreground, #fff); font: inherit; font-size: 10px; cursor: pointer; }
+  .hand-back-button:disabled { opacity: .6; cursor: default; }
   .status-light { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--foreground-muted); }
   .status-light.ready { background: var(--success); }
   .status-light.loading { background: var(--warning); }

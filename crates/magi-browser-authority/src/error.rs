@@ -96,6 +96,8 @@ pub enum BrowserAuthorityError {
     InvalidLeaseExpiry,
     #[error("browser surface already has an active lease: {lease_id}")]
     LeaseConflict { lease_id: BrowserLeaseId },
+    #[error("user is controlling browser tab {0}; agent control must be handed back by the user")]
+    UserControlHeld(BrowserTabId),
     #[error("browser lease is no longer held: {0}")]
     LeaseNotHeld(BrowserLeaseId),
     #[error("browser lease has expired: {0}")]

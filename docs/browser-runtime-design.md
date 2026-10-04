@@ -203,6 +203,9 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 - `surfaceRevision` 隔离同一逻辑 Tab 的 Primary 物理身份；Primary 切换后旧命令不得落到新 Surface。
 - `navigationRevision` 隔离文档；document navigation、Renderer/Target 重建使旧节点、截图和写操作失效，同文档 URL/history 只按真实导航事件推进，不等同于整个 CDP session 销毁。
 - lease fence 隔离写权限；Primary、导航、用户接管、取消或任务终态推进 fence，旧写操作不能在恢复后重放。
+- 用户在页面上直接输入（`user_takeover`）后，Authority 对该 Tab 保持用户控制：代理获取租约返回 `browser_user_in_control`，不会自动抢回；只有用户在浏览器面板点击“交还控制”（`POST /browser/tabs/{tab_id}/control/release`）才解除。该状态是运行态事实，不持久化，Tab 关闭时一并清除。
+
+写命令（`BrowserHostCommand::is_side_effecting`）一旦交给 Desktop，此后的连接断开、重置、取消失败，以及 Desktop 在动作交给 Worker 之后的失败，都只能报告为 `indeterminate`（`side_effect_started=true`），不得报告为可安全重试的失败。
 
 取消在底层命令尚未开始时返回 cancelled；底层写操作已开始且 Electron CDP 无取消句柄时，废弃当前 debugger session，迟到结果只能落到旧 lease/epoch，调用结果不得伪装为成功。超时同样失效当前 debugger session；读操作可以由调用方在取得新 binding 后显式重试，输入、提交、上传等写操作不能自动重放。
 

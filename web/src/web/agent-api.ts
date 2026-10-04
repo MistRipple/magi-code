@@ -982,6 +982,8 @@ export interface BrowserTabSnapshot {
   createdAt: number;
   updatedAt: number;
   annotations: BrowserAnnotationSnapshot[];
+  /** 用户直接操作页面后保持控制；代理需等用户交还才能继续操作该页面。 */
+  userControlHeld?: boolean;
 }
 
 export interface BrowserSessionSnapshot {
@@ -1622,6 +1624,15 @@ export async function activateBrowserTab(tabId: string): Promise<BrowserSessionS
     { method: 'POST' },
   );
   return parseAgentJson<BrowserSessionSnapshot>(response, 'activate browser tab');
+}
+
+/** 用户把页面控制权交还给代理。 */
+export async function releaseBrowserUserControl(tabId: string): Promise<BrowserSessionSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/control/release`),
+    { method: 'POST' },
+  );
+  return parseAgentJson<BrowserSessionSnapshot>(response, 'release browser user control');
 }
 
 /** 同步右侧面板当前选中的 Browser Tab，供 LLM 工具默认目标选择使用。 */

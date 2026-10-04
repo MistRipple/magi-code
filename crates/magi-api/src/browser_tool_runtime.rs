@@ -1155,8 +1155,16 @@ impl BrowserToolRuntimeDependencies {
                 acquired_at: now,
                 expires_at: UtcMillis(now.0.saturating_add(LEASE_TTL.as_millis() as u64)),
             })
-            .map_err(|error| {
-                BrowserToolError::new("browser_control_lease_failed", error.to_string())
+            .map_err(|error| match error {
+                magi_browser_authority::BrowserAuthorityError::UserControlHeld(_) => {
+                    let mut tool_error = BrowserToolError::new(
+                        "browser_user_in_control",
+                        "用户正在直接操作这个浏览器页面，代理的浏览器操作已暂停。不要重试浏览器操作：等待用户在浏览器面板点击“交还控制”，或先继续不依赖该页面的工作并告知用户。",
+                    );
+                    tool_error.requires_user_action = true;
+                    tool_error
+                }
+                other => BrowserToolError::new("browser_control_lease_failed", other.to_string()),
             })?;
         Ok((lease, identity, true))
     }

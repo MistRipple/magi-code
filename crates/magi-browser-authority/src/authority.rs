@@ -209,6 +209,9 @@ pub struct BrowserAuthority {
     /// 但“哪个 Tab 当前被 UI 选中”不能在 daemon 重启后伪造恢复，否则
     /// 浏览器工具会把任务发送到错误的页面。
     active_tabs: HashMap<BrowserSessionId, BrowserTabId>,
+    /// 用户在页面上直接操作而接管的 Tab。接管期间代理不能重新获取控制权，
+    /// 必须由用户显式交还；运行态事实，不进入 durable state。
+    user_control_holds: HashSet<BrowserTabId>,
 }
 
 impl BrowserAuthority {
@@ -991,6 +994,7 @@ impl BrowserAuthority {
                 now,
             );
             self.primary_surfaces.remove(tab_id);
+            self.user_control_holds.remove(tab_id);
             let session = self
                 .sessions
                 .get_mut(&browser_session_id)
@@ -1352,6 +1356,9 @@ impl BrowserAuthority {
         if input.expires_at <= input.acquired_at {
             return Err(BrowserAuthorityError::InvalidLeaseExpiry);
         }
+        if self.user_control_holds.contains(&input.tab_id) {
+            return Err(BrowserAuthorityError::UserControlHeld(input.tab_id));
+        }
         let key = (input.tab_id.clone(), input.surface_id.clone());
         if let Some(lease_id) = self.active_surface_leases.get(&key) {
             return Err(BrowserAuthorityError::LeaseConflict {
@@ -1550,6 +1557,35 @@ impl BrowserAuthority {
                 .ok()
             })
             .collect()
+    }
+
+    /// 用户在页面上直接操作后保持用户控制，直到用户显式交还；调用方负责先撤销代理租约。
+    pub fn hold_user_control(
+        &mut self,
+        tab_id: &BrowserTabId,
+    ) -> Result<(), BrowserAuthorityError> {
+        self.require_tab(tab_id)?;
+        if self.user_control_holds.insert(tab_id.clone()) {
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
+    /// 用户把控制权交还给代理；返回此前是否处于用户接管。
+    pub fn release_user_control(
+        &mut self,
+        tab_id: &BrowserTabId,
+    ) -> Result<bool, BrowserAuthorityError> {
+        self.require_tab(tab_id)?;
+        let released = self.user_control_holds.remove(tab_id);
+        if released {
+            self.bump_revision();
+        }
+        Ok(released)
+    }
+
+    pub fn user_control_held(&self, tab_id: &BrowserTabId) -> bool {
+        self.user_control_holds.contains(tab_id)
     }
 
     pub fn take_user_control(

@@ -128,6 +128,10 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/browser/tabs/{tab_id}", delete(close_tab))
         .route("/browser/tabs/{tab_id}/activate", post(activate_tab))
+        .route(
+            "/browser/tabs/{tab_id}/control/release",
+            post(release_user_control),
+        )
         .route("/browser/tabs/{tab_id}/navigation", post(navigate_tab))
         .route("/browser/tabs/{tab_id}/screenshot", post(screenshot_tab))
         .route(
@@ -972,6 +976,9 @@ struct BrowserTabResponse {
     agent_occupied: bool,
     #[serde(default)]
     control_fence: u64,
+    /// 用户直接操作页面后保持控制，代理需等用户交还。
+    #[serde(default)]
+    user_control_held: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1155,6 +1162,7 @@ impl From<BrowserTab> for BrowserTabResponse {
             surface_id: None,
             agent_occupied: false,
             control_fence: 0,
+            user_control_held: false,
         }
     }
 }
@@ -3159,6 +3167,35 @@ async fn activate_tab(
     Ok(Json(browser_session_response(&state, session)?))
 }
 
+/// 用户在浏览器面板点击“交还控制”：解除用户接管，代理的下一次浏览器操作才能重新取得控制权。
+async fn release_user_control(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(tab_id): Path<String>,
+) -> Result<Json<BrowserSessionResponse>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let tab_id = BrowserTabId::new(tab_id);
+    let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
+    let session_id = require_session_scope(&session)?.clone();
+    let released =
+        state.mutate_browser_authority(|authority| authority.release_user_control(&tab_id))?;
+    let session = browser_tab_scope(&state, &tab_id)?.1;
+    if released {
+        publish_browser_event(
+            &state,
+            "browser.control.released_to_agent",
+            session.owner_workspace_id(),
+            &session_id,
+            serde_json::json!({
+                "browser_session_id": session.browser_session_id,
+                "tab_id": tab_id,
+                "revision": session.revision,
+            }),
+        );
+    }
+    Ok(Json(browser_session_response(&state, session)?))
+}
+
 async fn close_tab(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -3814,6 +3851,7 @@ fn browser_tab_response_from_authority(
     tab: BrowserTab,
 ) -> BrowserTabResponse {
     let mut response = BrowserTabResponse::from(tab.clone());
+    response.user_control_held = authority.user_control_held(&tab.tab_id);
     response.annotations = authority
         .annotations_for_tab(&tab.tab_id)
         .into_iter()
