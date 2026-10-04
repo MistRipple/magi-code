@@ -249,6 +249,17 @@ pub(crate) fn tool_interrupted_before_execution_result(
     )
 }
 
+/// 工具调用当前记录的结果是否仍是“等待授权”：等待中的调用尚未执行，批准后会先改写为
+/// running 再执行，因此中断恢复时不能把它当成“可能已经执行”。
+pub(crate) fn tool_payload_is_awaiting_approval(payload: &Value) -> bool {
+    payload.get("status").and_then(Value::as_str) == Some("awaiting_approval")
+}
+
+pub(crate) fn tool_result_is_awaiting_approval(result: &str) -> bool {
+    serde_json::from_str::<Value>(result)
+        .is_ok_and(|value| tool_payload_is_awaiting_approval(&value))
+}
+
 pub(crate) fn tool_result_is_interrupted_not_started(result: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(result) else {
         return false;

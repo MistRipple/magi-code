@@ -2850,9 +2850,16 @@ impl SessionStore {
                             tool_call_id: None,
                             provider_context: Vec::new(),
                         });
+                        // 等待授权的调用尚未执行（批准后会先改写为 running）；它记录的进度
+                        // 不是工具结果，投影为“中断、未执行”，恢复后可以重新申请授权。
+                        let awaiting_approval = tool.result.as_ref().is_some_and(|result| {
+                            result.get("status").and_then(Value::as_str)
+                                == Some("awaiting_approval")
+                        });
                         let result = tool
                             .result
                             .as_ref()
+                            .filter(|_| !awaiting_approval)
                             .map(value_text)
                             .or_else(|| {
                                 tool.error.as_ref().map(|error| {
@@ -2865,6 +2872,16 @@ impl SessionStore {
                                 })
                             })
                             .unwrap_or_else(|| {
+                                if awaiting_approval {
+                                    return serde_json::json!({
+                                        "tool": tool.name,
+                                        "status": "interrupted",
+                                        "execution": "not_started",
+                                        "reason": "task_interrupted_before_tool_execution_started",
+                                        "message": "本次工具调用在等待授权时中断，尚未执行；如仍有必要，可以重新调用并申请授权。",
+                                    })
+                                    .to_string();
+                                }
                                 let interrupted = matches!(
                                     turn.status,
                                     CanonicalTurnStatus::Cancelled

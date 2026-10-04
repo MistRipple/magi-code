@@ -30,6 +30,7 @@ use crate::tool_result_utils::{
     DeterministicToolFailureTracker, bound_model_visible_tool_history, infer_tool_call_status,
     model_visible_tool_history_budget_bytes, model_visible_tool_result, non_retryable_tool_failure,
     summarize_tool_result, tool_interrupted_before_execution_payload,
+    tool_payload_is_awaiting_approval, tool_result_is_awaiting_approval,
     turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
@@ -369,6 +370,12 @@ fn started_tool_call_ids_for_task_thread(
                 .filter(|item| item.kind == "tool_call_started")
                 .filter(|item| item.task_id.as_ref() == Some(task_id))
                 .filter(|item| item.source_thread_id == *thread_id)
+                .filter(|item| {
+                    !item
+                        .tool_result
+                        .as_deref()
+                        .is_some_and(tool_result_is_awaiting_approval)
+                })
                 .filter_map(|item| item.tool_call_id)
                 .collect()
         })
@@ -408,7 +415,14 @@ fn started_tool_call_ids_for_resumed_turn(
         .map(|turn| {
             turn.items
                 .into_iter()
-                .filter_map(|item| item.tool.map(|tool| tool.call_id))
+                .filter_map(|item| item.tool)
+                .filter(|tool| {
+                    !tool
+                        .result
+                        .as_ref()
+                        .is_some_and(tool_payload_is_awaiting_approval)
+                })
+                .map(|tool| tool.call_id)
                 .collect()
         })
         .unwrap_or_default()

@@ -442,7 +442,14 @@ fn started_tool_call_ids_for_session_thread(
         .flat_map(|turn| turn.items)
         .filter(|item| item.kind == CanonicalTurnItemKind::ToolCall)
         .filter(|item| item.source_thread_id == *thread_id)
-        .filter_map(|item| item.tool.map(|tool| tool.call_id))
+        .filter_map(|item| item.tool)
+        .filter(|tool| {
+            !tool
+                .result
+                .as_ref()
+                .is_some_and(crate::tool_result_utils::tool_payload_is_awaiting_approval)
+        })
+        .map(|tool| tool.call_id)
         .collect()
 }
 
@@ -6629,6 +6636,143 @@ mod tests {
             normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
             Ok(0),
             "重复进入下一轮不得再次插入中断结果"
+        );
+    }
+
+    #[test]
+    fn interrupted_while_awaiting_approval_is_not_treated_as_possibly_executed() {
+        let session_id = SessionId::new("session-awaiting-approval-history");
+        let thread_id = magi_core::ThreadId::new("thread-awaiting-approval-history");
+        let tool_call_id = "call-interrupted-shell".to_string();
+        let tool_arguments = r#"{"command":"rm -rf build"}"#.to_string();
+        let store = SessionStore::from_state(SessionStoreState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![SessionRecord {
+                session_id: session_id.clone(),
+                title: "interrupted tool history".to_string(),
+                status: SessionLifecycleStatus::Active,
+                created_at: ts(900),
+                updated_at: ts(1_100),
+                message_count: None,
+                workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
+                kind: Default::default(),
+            }],
+            timeline: Vec::new(),
+            canonical_turns: vec![CanonicalTurn {
+                session_id: session_id.clone(),
+                turn_id: "turn-interrupted-tool".to_string(),
+                turn_seq: 1_000,
+                accepted_at: ts(1_000),
+                completed_at: Some(ts(1_100)),
+                status: CanonicalTurnStatus::Cancelled,
+                response_duration_ms: Some(100),
+                usage: None,
+                items: vec![CanonicalTurnItem {
+                    session_id: session_id.clone(),
+                    turn_id: "turn-interrupted-tool".to_string(),
+                    turn_seq: 1_000,
+                    item_id: "turn-item-interrupted-tool".to_string(),
+                    item_seq: 2,
+                    kind: CanonicalTurnItemKind::ToolCall,
+                    created_at: ts(1_000),
+                    status: CanonicalTurnItemStatus::Cancelled,
+                    item_version: None,
+                    updated_at: ts(1_100),
+                    title: Some("shell".to_string()),
+                    content: Some("正在调用工具：shell".to_string()),
+                    blocks: Vec::new(),
+                    tool: Some(CanonicalToolCall {
+                        call_id: tool_call_id.clone(),
+                        name: "shell".to_string(),
+                        arguments: Some(serde_json::json!({
+                            "command": "rm -rf build"
+                        })),
+                        result: Some(serde_json::json!({
+                            "tool": "shell",
+                            "status": "awaiting_approval",
+                            "approval_id": "approval-interrupted",
+                        })),
+                        error: None,
+                    }),
+                    worker: None,
+                    source_thread_id: thread_id.clone(),
+                    visibility: CanonicalTurnVisibility::default(),
+                    metadata: HashMap::new(),
+                }],
+                metadata: HashMap::new(),
+            }],
+            notifications: Vec::new(),
+            goals: Vec::new(),
+            plans: Vec::new(),
+            execution_sidecar_store: Default::default(),
+            thread_context_checkpoints: vec![],
+            thread_registry: vec![ExecutionThread {
+                thread_id: thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: magi_core::MissionId::new("mission-interrupted-tool-history"),
+                role_id: ORCHESTRATOR_ROLE_ID.to_string(),
+                worker_instance_id: magi_core::WorkerId::new("worker-interrupted-tool-history"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: ts(900),
+                last_used_at: ts(1_100),
+                observed_context_window_tokens: None,
+                handled_task_ids: Vec::new(),
+                message_history: vec![ThreadChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    images: Vec::new(),
+                    tool_calls: vec![ThreadChatToolCall {
+                        id: tool_call_id,
+                        kind: "function".to_string(),
+                        function: ThreadChatToolFunction {
+                            name: "shell".to_string(),
+                            arguments: tool_arguments.clone(),
+                        },
+                    }],
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                }],
+            }],
+        });
+
+        assert_eq!(
+            normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
+            Ok(1)
+        );
+        let history = store.thread_message_history(&thread_id);
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["assistant", "tool"]
+        );
+        assert!(
+            history[1].content.as_deref().is_some_and(|content| {
+                content.contains(r#""status":"interrupted""#)
+                    && content.contains(r#""execution":"not_started""#)
+            }),
+            "等待授权时中断的调用尚未执行，不能标记为结果未知"
+        );
+        let ledger = crate::tool_execution_ledger::ToolExecutionLedger::from_thread_history(
+            "继续", &history, None,
+        );
+        let retried = magi_bridge_client::ChatToolCall {
+            id: "call-retry".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: "shell".to_string(),
+                arguments: tool_arguments,
+            },
+        };
+        assert!(
+            matches!(
+                ledger.plan(&[retried], None)[0],
+                crate::tool_execution_ledger::ToolCallExecutionDecision::Execute { .. }
+            ),
+            "恢复后同一调用应能重新申请授权并执行，而不是被永久阻止"
         );
     }
 
