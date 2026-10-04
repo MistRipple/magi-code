@@ -485,13 +485,25 @@ fn agent_spawn_failure_payload_for_child(
     instruction: impl Into<String>,
     child_task_id: Option<&TaskId>,
 ) -> String {
+    // 参数问题和容量/注册冲突由主线修正参数或稍后重试即可解决；模型配置、工作区、
+    // Git 和执行链问题主线无法自行修复，必须改由主线完成并告知用户。
+    let retryable = matches!(failure_stage, "input_validation" | "registration");
+    let instruction = instruction.into();
+    let instruction = if retryable {
+        instruction
+    } else {
+        format!(
+            "这不是参数问题，主线无法自行修复：请由主线直接完成这部分工作或改派其他角色，并在最终答复中告诉用户需要处理的问题（{instruction}）"
+        )
+    };
     serde_json::json!({
         "tool": BuiltinToolName::AgentSpawn.as_str(),
         "status": status,
         "error_code": error_code,
         "failure_stage": failure_stage,
+        "retryable": retryable,
         "error": error.into(),
-        "instruction": instruction.into(),
+        "instruction": instruction,
         "diagnostic_ref": format!("tool_call:{}", tool_call.id),
         "child_task_id": child_task_id.map(ToString::to_string),
     })
@@ -678,7 +690,7 @@ fn execute_agent_spawn(
         mission_id: task.mission_id.clone(),
         root_task_id: task.root_task_id.clone(),
         parent_task_id: Some(task.task_id.clone()),
-        kind: preflight.task_kind,
+        kind: magi_core::TaskKind::LocalAgent,
         title: preflight.display_name.clone(),
         goal: preflight.goal.clone(),
         status: TaskStatus::Pending,
@@ -4086,6 +4098,25 @@ mod tests {
             "tool_call:call-agent-spawn-invalid-context"
         );
         assert_eq!(payload["child_task_id"], serde_json::Value::Null);
+        assert_eq!(payload["retryable"], true, "参数错误可由主线修正后重试");
+
+        let runtime_failure: serde_json::Value =
+            serde_json::from_str(&agent_spawn_failure_payload(
+                &tool_call,
+                "rejected",
+                "model_preflight_failed",
+                "model",
+                "代理模型配置不可用",
+                "请检查模型配置后重试。",
+            ))
+            .expect("failure payload should be JSON");
+        assert_eq!(runtime_failure["retryable"], false);
+        assert!(
+            runtime_failure["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("主线直接完成")),
+            "主线无法修复的失败必须指引由主线接管"
+        );
     }
 
     #[test]

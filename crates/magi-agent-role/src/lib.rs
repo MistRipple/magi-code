@@ -103,6 +103,15 @@ pub struct AgentRole {
     pub icon: String,
 }
 
+impl AgentRole {
+    /// 角色在 constraints 中声明 `read-only` 时，运行时以只读访问模式派发该角色。
+    pub fn is_read_only(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(|constraint| constraint.trim().eq_ignore_ascii_case("read-only"))
+    }
+}
+
 fn default_role_version() -> u32 {
     1
 }

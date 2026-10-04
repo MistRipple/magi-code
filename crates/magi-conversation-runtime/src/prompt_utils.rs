@@ -291,6 +291,7 @@ pub fn dynamic_skill_prompt_message(
 pub fn root_multi_agent_mode_prompt(
     mode: magi_core::CollaborationMode,
     limits: &crate::execution_admission::ExecutionAdmissionLimits,
+    roles: &magi_agent_role::AgentRoleRegistry,
 ) -> String {
     let rule = match mode {
         magi_core::CollaborationMode::Auto => ROOT_MULTI_AGENT_MODE_RULE_AUTO,
@@ -299,7 +300,33 @@ pub fn root_multi_agent_mode_prompt(
             return ROOT_MULTI_AGENT_MODE_RULE_DISABLED.to_string();
         }
     };
-    format!("{rule}\n{}", execution_capacity_rule(limits))
+    format!(
+        "{rule}\n{}\n{}",
+        execution_capacity_rule(limits),
+        spawnable_roles_rule(roles)
+    )
+}
+
+/// 可派发角色清单从角色注册表渲染，包含用户自定义角色、各自能力和是否只读。
+fn spawnable_roles_rule(roles: &magi_agent_role::AgentRoleRegistry) -> String {
+    let mut lines = vec!["可派发角色（以本清单为准）：".to_string()];
+    for role_id in roles.spawnable_agent_role_ids() {
+        let Some(role) = roles.get(&role_id) else {
+            continue;
+        };
+        let name = if role.display_name.trim().is_empty() {
+            role_id.clone()
+        } else {
+            role.display_name.trim().to_string()
+        };
+        let access = if role.is_read_only() { "，只读" } else { "" };
+        lines.push(format!(
+            "- {role_id}（{name}{access}）：{}；能力：{}",
+            role.description.trim(),
+            roles.capability_ids_for_role(&role_id).join("、")
+        ));
+    }
+    lines.join("\n")
 }
 
 /// 执行容量说明只从准入控制器的实际上限渲染，提示词中不再写死数字。
@@ -548,9 +575,14 @@ mod tests {
             max_active_tasks_per_role: 4,
             min_available_memory_bytes: 0,
         };
-        let prompt = root_multi_agent_mode_prompt(magi_core::CollaborationMode::Auto, &limits);
+        let roles = magi_agent_role::AgentRoleRegistry::builtin();
+        let prompt =
+            root_multi_agent_mode_prompt(magi_core::CollaborationMode::Auto, &limits, &roles);
         assert!(prompt.contains("全局最多同时运行 3 个执行单元，单个会话 2 个，每个角色 4 个"));
         assert!(!prompt.contains("不设置会话级"));
+        assert!(prompt.contains("- reviewer（Reviewer，只读）"), "{prompt}");
+        assert!(prompt.contains("- executor（Executor）"));
+        assert!(!prompt.contains("- coordinator"), "协调者不是可派发角色");
     }
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
 

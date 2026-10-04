@@ -1049,15 +1049,13 @@ impl BuiltinToolName {
                 - 代理适合处理边界清晰、可并行、不阻塞主线下一步的专项任务\n\
                 - 代理运行中，主线应继续推进不重叠工作；不要空等，也不要重复做已经委派的同一件事\n\n\
                 # 专业能力\n\
-                - capabilities 可省略；省略时运行时自动激活目标角色的默认能力集合；显式传入时至少一项且只能使用目标角色拥有的能力\n\
-                - 能力 id 以 tool_catalog 返回的目标角色 capability_ids 为准，不要使用其他角色或全局清单推测\n\
-                - 能识别专业领域时必须选择对应能力；跨领域任务可以同时激活多项\n\
-                - general_engineering 只用于确实无法归类的通用工程工作，不能替代明确的专业能力\n\n\
+                - capabilities 只能从“可派发角色”清单中目标角色的能力里选择；省略时只激活 general_engineering\n\
+                - 任务明确属于某个领域时显式传入对应能力；跨领域任务可以同时激活多项\n\n\
                 # 执行容量\n\
                 - 容量上限以系统提示中的“执行容量”说明为准；超出时返回 queued，代理已创建并会在有名额后自动开始\n\n\
                 # 访问模式\n\
-                - 子代理继承当前主线由用户选择的访问模式，模型和角色不能自行降级或升级权限\n\
-                - 只读调查、审查和探索要求写入 goal，由代理按任务语义约束行为，不再创建第二套权限状态\n\n\
+                - 子代理继承当前主线由用户选择的访问模式，不能被提升\n\
+                - 声明只读的角色（见“可派发角色”清单）由运行时以只读模式执行，写入类工具会被拒绝；需要修改文件时派发可写角色\n\n\
                 # 何时不用\n\
                 - 1-3 步能自己完成的任务 → 直接做，派发开销不值\n\
                 - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
@@ -1749,7 +1747,7 @@ impl BuiltinToolName {
                 "properties": {
                     "task_name": { "type": "string", "description": "稳定的机器任务名，只允许小写字母、数字和下划线；同一父任务下必须唯一。" },
                     "plan_item_id": { "type": "string", "description": "可选：绑定 update_plan 返回的顶层 itemId。绑定后代理状态会自动同步该计划项。" },
-                    "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。role 已知时可直接调用 agent_spawn，capabilities 省略即可由服务端按角色默认能力补齐。" },
+                    "role": { "type": "string", "description": "可派发角色 id，以系统提示中的“可派发角色”清单为准（含用户自定义角色）。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。" },
                     "capabilities": {
                         "type": "array",
                         "minItems": 1,
@@ -1758,15 +1756,10 @@ impl BuiltinToolName {
                             "type": "string",
                             "minLength": 1
                         },
-                        "description": "可选。本次任务从目标角色拥有的专业能力中激活的能力 id；省略时由服务端使用该角色默认能力集合。目标 role 已明确时优先省略，不要为了查询能力额外调用 tool_catalog。显式传入时只能使用目标角色的 capability_ids，不能把 role 名称当作 capability id。"
+                        "description": "可选。本次任务需要的专业能力 id，只能从“可派发角色”清单中该角色的能力里选择；省略时只激活 general_engineering。任务明确属于某个领域（如 frontend、database、security）时显式传入对应能力。"
                     },
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
-                    "task_kind": {
-                        "type": "string",
-                        "enum": ["work_package", "action", "validation", "repair"],
-                        "description": "新建子任务的类型。省略时默认 action。"
-                    },
                     "context_package": {
                         "type": "object",
                         "description": "子代理启动时唯一的结构化上下文包；禁止传旧 context 字符串。所有文本字段必须直接传 JSON string，不能传对象、数组或 Markdown 键值对；references 可以传空数组。",

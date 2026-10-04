@@ -38,12 +38,13 @@ const AGENT_SPAWN_FIELDS: &[&str] = &[
     "capabilities",
     "display_name",
     "goal",
-    "task_kind",
     "context_package",
     "context",
     "working_dir",
     "parallelism_group",
 ];
+
+const GENERAL_ENGINEERING_CAPABILITY: &str = "general_engineering";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentSpawnPreflightError {
@@ -90,7 +91,6 @@ pub(crate) struct AgentSpawnPreflight {
     pub(crate) capability_ids: Vec<String>,
     pub(crate) display_name: String,
     pub(crate) goal: String,
-    pub(crate) task_kind: TaskKind,
     pub(crate) context_package: AgentContextPackage,
     pub(crate) plan_item_id: Option<magi_core::PlanItemId>,
     pub(crate) parallelism_group: Option<String>,
@@ -181,11 +181,15 @@ pub(crate) fn preflight_agent_spawn(
     }
 
     let role = required_string(object, "role")?;
+    let spawnable_roles = || agent_role_registry.spawnable_agent_role_ids().join("、");
     let Some(role_definition) = agent_role_registry.get(&role) else {
         return Err(AgentSpawnPreflightError::input(
             "agent_role_not_spawnable",
             format!("代理角色不存在: {role}"),
-            "请先使用 tool_catalog 查询可派发角色，再选择有效 role。",
+            format!(
+                "可派发的角色：{}。请从中选择 role 后重新派发。",
+                spawnable_roles()
+            ),
         ));
     };
     if role_definition.coordinator_mode
@@ -197,7 +201,10 @@ pub(crate) fn preflight_agent_spawn(
         return Err(AgentSpawnPreflightError::input(
             "agent_role_not_spawnable",
             format!("角色 {role} 不能作为 LocalAgent 派发目标"),
-            "请从 tool_catalog 返回的 spawnable 角色中重新选择。",
+            format!(
+                "可派发的角色：{}。请从中选择 role 后重新派发。",
+                spawnable_roles()
+            ),
         ));
     }
 
@@ -222,7 +229,6 @@ pub(crate) fn preflight_agent_spawn(
         ));
     }
 
-    let task_kind = parse_task_kind(object)?;
     let plan_item_id =
         optional_nonempty_string(object, "plan_item_id")?.map(magi_core::PlanItemId::new);
     if let Some(item_id) = plan_item_id.as_ref() {
@@ -290,7 +296,7 @@ pub(crate) fn preflight_agent_spawn(
     )?;
 
     let child_policy_snapshot =
-        agent_spawn_child_policy_snapshot(parent_task.policy_snapshot.as_ref());
+        child_policy_for_role(parent_task.policy_snapshot.as_ref(), &role_definition);
     let child_access_profile = child_policy_snapshot.effective_access_profile();
     let child_dependency_ids = agent_spawn_child_dependency_ids(parent_task);
     let child_input_refs = context_package
@@ -306,7 +312,6 @@ pub(crate) fn preflight_agent_spawn(
         capability_ids,
         display_name,
         goal,
-        task_kind,
         context_package,
         plan_item_id,
         parallelism_group,
@@ -436,7 +441,18 @@ fn default_capabilities(
     registry: &magi_agent_role::AgentRoleRegistry,
     role: &str,
 ) -> Result<Vec<String>, AgentSpawnPreflightError> {
-    let defaults = registry.capability_ids_for_role(role);
+    // 省略 capabilities 时只激活通用工程能力：全部能力正文约 15KB，默认全量注入只会
+    // 稀释焦点。需要领域方法时由主线显式传入对应能力。没有通用能力的自定义角色沿用
+    // 角色作者声明的能力集合。
+    let role_capabilities = registry.capability_ids_for_role(role);
+    let defaults = if role_capabilities
+        .iter()
+        .any(|id| id == GENERAL_ENGINEERING_CAPABILITY)
+    {
+        vec![GENERAL_ENGINEERING_CAPABILITY.to_string()]
+    } else {
+        role_capabilities
+    };
     if defaults.is_empty() {
         return Err(AgentSpawnPreflightError::input(
             "invalid_capabilities",
@@ -453,31 +469,6 @@ fn default_capabilities(
                 format!("请检查角色 {role} 的能力配置后重新派发。"),
             )
         })
-}
-
-fn parse_task_kind(
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> Result<TaskKind, AgentSpawnPreflightError> {
-    let Some(value) = object.get("task_kind") else {
-        return Ok(TaskKind::LocalAgent);
-    };
-    let Some(value) = value.as_str() else {
-        return Err(AgentSpawnPreflightError::input(
-            "invalid_arguments",
-            "agent_spawn task_kind 必须是字符串",
-            "请使用 action、validation、repair 或 work_package。",
-        ));
-    };
-    match value.trim().to_ascii_lowercase().as_str() {
-        "action" | "validation" | "repair" | "work_package" | "workpackage" => {
-            Ok(TaskKind::LocalAgent)
-        }
-        other => Err(AgentSpawnPreflightError::input(
-            "invalid_arguments",
-            format!("不支持的 agent_spawn task_kind: {other}"),
-            "请使用 action、validation、repair 或 work_package。",
-        )),
-    }
 }
 
 fn parse_working_dir(
@@ -812,6 +803,19 @@ pub(crate) fn agent_spawn_child_policy_snapshot(parent_policy: Option<&TaskPolic
         .unwrap_or_else(default_agent_spawn_policy)
 }
 
+/// 子代理继承父任务的策略；角色声明只读时由运行时收紧为只读访问模式，写类工具被拒绝、
+/// worktree 以只读方式检出。访问模式只能收紧，不能借角色放宽用户选择的模式。
+fn child_policy_for_role(
+    parent_policy: Option<&TaskPolicy>,
+    role: &magi_agent_role::AgentRole,
+) -> TaskPolicy {
+    let mut policy = agent_spawn_child_policy_snapshot(parent_policy);
+    if role.is_read_only() {
+        policy.access_profile = AccessProfile::ReadOnly;
+    }
+    policy
+}
+
 pub(crate) fn agent_spawn_child_dependency_ids(parent: &Task) -> Vec<TaskId> {
     parent.dependency_ids.clone()
 }
@@ -1041,6 +1045,38 @@ mod tests {
     use super::*;
     use magi_core::{MissionId, SessionId, TaskCompletionContract, TaskRuntimePayload};
     use magi_orchestrator::task_store::TaskStore;
+
+    #[test]
+    fn read_only_roles_run_with_read_only_access_and_writable_roles_inherit() {
+        let roles = magi_agent_role::AgentRoleRegistry::builtin();
+        let mut parent = agent_spawn_child_policy_snapshot(None);
+        parent.access_profile = AccessProfile::FullAccess;
+        let reviewer = roles.get("reviewer").expect("reviewer role");
+        let executor = roles.get("executor").expect("executor role");
+        assert_eq!(
+            child_policy_for_role(Some(&parent), &reviewer).access_profile,
+            AccessProfile::ReadOnly
+        );
+        assert_eq!(
+            child_policy_for_role(Some(&parent), &executor).access_profile,
+            AccessProfile::FullAccess
+        );
+        parent.access_profile = AccessProfile::ReadOnly;
+        assert_eq!(
+            child_policy_for_role(Some(&parent), &executor).access_profile,
+            AccessProfile::ReadOnly,
+            "角色不能放宽用户选择的只读模式"
+        );
+    }
+
+    #[test]
+    fn omitted_capabilities_activate_only_general_engineering() {
+        let roles = magi_agent_role::AgentRoleRegistry::builtin();
+        assert_eq!(
+            default_capabilities(&roles, "executor").expect("defaults"),
+            vec!["general_engineering".to_string()]
+        );
+    }
 
     #[test]
     fn legacy_agent_spawn_context_is_rejected_before_runtime_mutation() {
