@@ -900,6 +900,7 @@ impl BrowserToolRuntimeDependencies {
                 executor,
                 AgentTabTarget::Tab(tab_id.clone()),
             );
+            authority.record_agent_created_tab(executor, tab_id.clone());
             Ok(created)
         })?;
         self.publish_tab_event("browser.tab.created", &created);
@@ -1269,9 +1270,7 @@ impl BrowserToolRuntimeDependencies {
             .lock()
             .expect("browser authority lock poisoned")
             .clone();
-        let value = mutation(&mut candidate).map_err(|error| {
-            BrowserToolError::new("browser_authority_rejected", error.to_string())
-        })?;
+        let value = mutation(&mut candidate).map_err(browser_authority_tool_error)?;
         if let Some(persistence) = self.persistence.as_ref() {
             let state_root = persistence.state_root().ok_or_else(|| {
                 BrowserToolError::new(
@@ -2197,6 +2196,23 @@ impl BrowserToolError {
                 ExecutionResultStatus::Failed
             },
         }
+    }
+}
+
+fn browser_authority_tool_error(
+    error: magi_browser_authority::BrowserAuthorityError,
+) -> BrowserToolError {
+    match error {
+        magi_browser_authority::BrowserAuthorityError::SessionTabLimitReached { limit, .. }
+        | magi_browser_authority::BrowserAuthorityError::GlobalTabLimitReached { limit } => {
+            BrowserToolError::new(
+                "browser_tab_limit_reached",
+                format!(
+                    "浏览器标签页已达到上限（{limit} 个），无法再新开。请用 browser_tabs 关闭不再需要的标签页，或通过 tab_id 复用已有标签页。"
+                ),
+            )
+        }
+        other => BrowserToolError::new("browser_authority_rejected", other.to_string()),
     }
 }
 

@@ -449,6 +449,23 @@ fn closing_an_agent_tab_marks_it_closed_instead_of_retargeting_and_detects_other
             .agent_tab(&browser_session_id, "task:task-main")
             .is_none()
     );
+
+    let child_tab = ready_tab_with_id(&mut authority, &browser_session_id, "browser-tab-child");
+    let closed_child_tab = ready_tab_with_id(
+        &mut authority,
+        &browser_session_id,
+        "browser-tab-child-closed",
+    );
+    authority.record_agent_created_tab("task:task-child", child_tab.clone());
+    authority.record_agent_created_tab("task:task-child", closed_child_tab.clone());
+    authority
+        .transition_tab(&closed_child_tab, BrowserTabLifecycle::Closed, at(10))
+        .expect("child tab should close");
+    assert_eq!(
+        authority.forget_agent_tabs("task:task-child"),
+        vec![child_tab],
+        "子任务结束时只返回它新开且仍未关闭的标签页"
+    );
 }
 
 #[test]

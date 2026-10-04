@@ -215,6 +215,8 @@ pub struct BrowserAuthority {
     /// 每个执行者（主线或某个子任务）在浏览器会话里自己的当前 Tab；运行态事实。
     /// 执行者之间不共享默认目标，避免子代理与主代理争用同一页面。
     agent_tabs: HashMap<(BrowserSessionId, String), AgentTabTarget>,
+    /// 执行者自己新开的 Tab；子任务结束时据此关闭它的中间页面。
+    agent_created_tabs: HashMap<String, Vec<BrowserTabId>>,
 }
 
 /// 执行者的默认浏览器目标。
@@ -984,9 +986,26 @@ impl BrowserAuthority {
             .insert((browser_session_id.clone(), executor.to_string()), target);
     }
 
-    /// 执行者结束后忘记它的默认目标。
-    pub fn forget_agent_tabs(&mut self, executor: &str) {
+    pub fn record_agent_created_tab(&mut self, executor: &str, tab_id: BrowserTabId) {
+        self.agent_created_tabs
+            .entry(executor.to_string())
+            .or_default()
+            .push(tab_id);
+    }
+
+    /// 执行者结束后忘记它的默认目标，返回它新开且仍未关闭的 Tab。
+    pub fn forget_agent_tabs(&mut self, executor: &str) -> Vec<BrowserTabId> {
         self.agent_tabs.retain(|(_, key), _| key != executor);
+        self.agent_created_tabs
+            .remove(executor)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tab_id| {
+                self.tabs
+                    .get(tab_id)
+                    .is_some_and(|tab| tab.lifecycle != BrowserTabLifecycle::Closed)
+            })
+            .collect()
     }
 
     /// Tab 当前是否由指定执行者之外的代理持有有效控制租约。

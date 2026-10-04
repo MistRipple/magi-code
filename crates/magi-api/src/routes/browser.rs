@@ -3205,21 +3205,32 @@ async fn close_tab(
 ) -> Result<StatusCode, ApiError> {
     require_desktop_browser_capability(&state, &headers, None)?;
     let tab_id = BrowserTabId::new(tab_id);
-    let (tab, session) = browser_tab_scope(&state, &tab_id)?;
+    let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
     if state.browser_host_client().is_some()
         && let Err(error) = ensure_user_control_for_ui(&state, &session, &tab_id).await
     {
         tracing::warn!(tab_id = %tab_id, ?error, "关闭浏览器 Tab 时同步用户控制权失败，继续收口逻辑状态");
     }
+    close_browser_tab(&state, &tab_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 关闭一个浏览器 Tab 的唯一路径：先提交逻辑关闭并发布事件，让 Renderer 卸载内容槽，
+/// 再请求 Host 清理物理 guest。用户关闭与任务结束清理共用。
+pub(crate) async fn close_browser_tab(
+    state: &ApiState,
+    tab_id: &BrowserTabId,
+) -> Result<(), ApiError> {
+    let (tab, session) = browser_tab_scope(state, tab_id)?;
     let _control_guard = state.browser_control_lock.lock().await;
     state.mutate_browser_authority(|authority| {
-        authority.transition_tab(&tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
+        authority.transition_tab(tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
     })?;
     // 先发布逻辑关闭事实，让 App Renderer 卸载其 <webview> 内容槽；
     // Host 的 ClosePage 只能清理已经由 Renderer 放弃所有权的物理 guest。
     // 不能反过来在 Renderer 仍持有 guest 时让 Main 直接 close WebContents。
     publish_browser_event(
-        &state,
+        state,
         "browser.tab.closed",
         session.owner_workspace_id(),
         require_session_scope(&session)?,
@@ -3248,7 +3259,7 @@ async fn close_tab(
             ),
         }
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

@@ -2455,12 +2455,33 @@ impl ApiState {
             BrowserLeaseEndReason::TaskFinished,
         );
         let executor = crate::browser_tool_runtime::browser_executor_key_for_task(task_id);
-        if let Err(error) = self.mutate_browser_authority(|authority| {
-            authority.forget_agent_tabs(&executor);
-            Ok(())
-        }) {
-            tracing::warn!(%session_id, %task_id, ?error, "清理任务浏览器默认目标失败");
+        let created_tabs = match self
+            .mutate_browser_authority(|authority| Ok(authority.forget_agent_tabs(&executor)))
+        {
+            Ok(created_tabs) => created_tabs,
+            Err(error) => {
+                tracing::warn!(%session_id, %task_id, ?error, "清理任务浏览器默认目标失败");
+                return;
+            }
+        };
+        // 子代理新开的页面是中间产物，随子任务结束关闭，避免标签页累积到上限；
+        // 主线的页面属于用户可继续查看的结果，保留到用户显式关闭。
+        let is_child_task = self
+            .task_store()
+            .and_then(|task_store| task_store.get_task(task_id))
+            .is_some_and(|task| task.parent_task_id.is_some());
+        if !is_child_task || created_tabs.is_empty() {
+            return;
         }
+        let state = self.clone();
+        spawn_session_turn_work("magi-browser-child-tab-close", async move {
+            for tab_id in created_tabs {
+                if let Err(error) = crate::routes::browser::close_browser_tab(&state, &tab_id).await
+                {
+                    tracing::warn!(%tab_id, ?error, "关闭子任务新开的浏览器标签页失败");
+                }
+            }
+        });
     }
 
     pub fn cancel_execution_resources(
