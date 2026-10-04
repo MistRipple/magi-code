@@ -1,7 +1,7 @@
 //! `agent_spawn` 的唯一创建前预检入口。
 //!
 //! 预检只读取输入、角色注册表、当前执行链、计划、模型和工作区事实，不写入
-//! TaskStore、SessionStore、SpawnGraph、执行注册表或准入队列。只有预检成功后，
+//! TaskStore、SessionStore、执行注册表或准入队列。只有预检成功后，
 //! `tool_batch` 才会生成 child task id 并调用原子注册入口。
 
 use std::{collections::HashSet, path::PathBuf, sync::Arc};

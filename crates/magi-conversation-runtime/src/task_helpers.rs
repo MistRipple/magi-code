@@ -16,6 +16,7 @@ pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
         tool,
         BuiltinToolName::AgentSpawn
             | BuiltinToolName::AgentSend
+            | BuiltinToolName::AgentCancel
             | BuiltinToolName::UpdatePlan
             | BuiltinToolName::MemoryWrite
             | BuiltinToolName::AgentWait

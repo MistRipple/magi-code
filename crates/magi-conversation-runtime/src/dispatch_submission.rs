@@ -5,7 +5,7 @@
 //! import 路径不变。
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
@@ -25,7 +25,6 @@ use magi_session_store::{
     ExecutionThread, SessionPlan, SessionRuntimeSidecar, SessionStore, ThreadChatMessage,
     ThreadContextCheckpoint, TimelineEntryInput, TimelineEntryKind,
 };
-use magi_spawn_graph::SpawnGraph;
 use serde::{Deserialize, Serialize};
 
 use crate::session_thread;
@@ -416,7 +415,6 @@ pub struct DispatchSubmissionRuntime<'a> {
     pub execution_registry: &'a TaskExecutionRegistry,
     pub event_bus: &'a InMemoryEventBus,
     pub agent_role_registry: &'a AgentRoleRegistry,
-    pub spawn_graph: &'a Mutex<SpawnGraph>,
     pub model_bridge_client: Option<&'a Arc<dyn ModelBridgeClient>>,
     pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub workspace_root_path: Option<&'a Path>,
@@ -1937,7 +1935,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-fresh-thread");
         let mission_id = MissionId::new("mission-dispatch-fresh-thread");
         let old_thread_id = magi_core::ThreadId::new("thread-executor-old");
@@ -2012,7 +2009,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -2047,7 +2043,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-orchestrator-thread");
         session_store
             .create_session(session_id.clone(), "coordinator thread")
@@ -2059,7 +2054,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -2141,7 +2135,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-browser-annotation");
         session_store
             .create_session(session_id.clone(), "dispatch browser annotation")
@@ -2204,7 +2197,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: Some(Path::new("/tmp/workspace-dispatch-browser-annotation")),
@@ -2274,7 +2266,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-resume-checkpoint");
         let source_task_id = TaskId::new("task-dispatch-resume-source");
         let now = UtcMillis(2_500);
@@ -2526,7 +2517,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -2580,7 +2570,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-invalid-resume-checkpoint");
         let source_task_id = TaskId::new("task-invalid-resume-source");
         let now = UtcMillis(3_500);
@@ -2780,7 +2769,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -2832,7 +2820,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-exec-chain-tier");
 
         session_store
@@ -2880,7 +2867,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -2924,7 +2910,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-plan-root-binding");
         session_store
             .create_session(session_id.clone(), "plan root binding")
@@ -2993,7 +2978,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3019,7 +3003,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-skill-mainline-role");
 
         session_store
@@ -3067,7 +3050,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3098,7 +3080,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-active-skill");
 
         session_store
@@ -3146,7 +3127,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3180,7 +3160,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-context-reference");
         session_store
             .create_session(session_id.clone(), "dispatch context reference")
@@ -3232,7 +3211,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: Some(&workspace_root),
@@ -3279,7 +3257,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-goal-continuation-dispatch");
         session_store
             .create_session(session_id.clone(), "goal continuation dispatch")
@@ -3339,7 +3316,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3408,7 +3384,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-goal-continuation-pause-race");
         session_store
             .create_session(session_id.clone(), "goal continuation pause race")
@@ -3468,7 +3443,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3555,7 +3529,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-worker-thread-conflict-rollback");
         session_store
             .create_session(session_id.clone(), "worker thread conflict rollback")
@@ -3567,7 +3540,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3783,7 +3755,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-accepted-runner-cleanup");
         session_store
             .create_session(session_id.clone(), "accepted runner cleanup")
@@ -3811,7 +3782,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3900,7 +3870,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-stale-materialize-registry");
         session_store
             .create_session(session_id.clone(), "stale materialize registry")
@@ -3912,7 +3881,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -3973,7 +3941,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-chain-writeback-rollback");
         session_store
             .create_session(session_id.clone(), "chain writeback rollback")
@@ -4001,7 +3968,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,
@@ -4078,7 +4044,6 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-rejected-cleanup-generation");
         session_store
             .create_session(session_id.clone(), "rejected cleanup generation")
@@ -4090,7 +4055,6 @@ mod tests {
             execution_registry: &execution_registry,
             event_bus: &event_bus,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             model_bridge_client: None,
             settings_store: None,
             workspace_root_path: None,

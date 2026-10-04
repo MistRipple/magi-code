@@ -70,7 +70,7 @@ agent_wait
 
 ### 2.3 根因三：创建后才检查模型和 Git 前置条件
 
-当前流程先在 `register_spawned_local_agent_child` 中插入 TaskStore、SpawnGraph、执行计划和 Thread，Worker 真正启动后才解析角色模型和 Git worktree。于是可能出现：
+当前流程先在 `register_spawned_local_agent_child` 中插入 TaskStore、执行计划和 Thread，Worker 真正启动后才解析角色模型和 Git worktree。于是可能出现：
 
 ```text
 agent_spawn 返回 started → 子代理卡片出现 → 模型配置不可用或 worktree 创建失败 → 子代理失败
@@ -81,7 +81,7 @@ agent_spawn 返回 started → 子代理卡片出现 → 模型配置不可用�
 正式规则：
 
 - 派发前预检必须在创建子任务前完成。
-- 预检失败时不得写入 TaskStore、SpawnGraph、执行注册表或 Thread。
+- 预检失败时不得写入 TaskStore、执行注册表或 Thread。
 - 预检成功后才生成 child_task_id 并进入原子注册。
 - 创建后的执行失败仍然允许发生，但必须归类为运行期失败，并通过 `agent_wait` 返回。
 
@@ -168,7 +168,6 @@ preflight_agent_spawn(request: AgentSpawnRequest) -> Result<AgentSpawnPreflight,
 生成 child_task_id
 → 构造 Task
 → 写入 TaskStore
-→ 写入 SpawnGraph
 → 更新 ActiveExecutionChain
 → 写入 TaskExecutionRegistry
 → 创建独占 ExecutionThread
@@ -444,7 +443,7 @@ model_binding_status
 - [x] 接入模型配置预检
 - [x] 接入 Git/workspace 预检
 - [x] 接入容量和资源检查
-- [x] 确保预检失败不产生 Task、Lease、Thread 或 SpawnGraph 边
+- [x] 确保预检失败不产生 Task、Lease 或 Thread
 - [x] 状态：已完成（2026-09-13；preflight 与无副作用拒绝测试通过）
 
 ### 阶段 4：原子注册和运行期状态
@@ -455,7 +454,7 @@ model_binding_status
 - [x] 限制 `agent_spawn` 只能由 root coordinator 发起，Worker 不得递归创建子代理
 - [x] Runner 重启等待 root 维度全部异步 dispatch 退出，避免 LLM 线程和执行计划残留
 - [x] worktree 绑定执行租约，迟到的旧 dispatch 不得清理恢复后的新一轮 worktree
-- [x] 验证容量释放后 queued 任务由 Runner 自动恢复，不重复创建 Task、Thread 或 SpawnGraph 边
+- [x] 验证容量释放后 queued 任务由 Runner 自动恢复，不重复创建 Task 或 Thread
 - [x] 状态：已完成（2026-09-13；TaskRunner、admission、registry 回滚、递归防护、dispatch quiesce 与 worktree 租约测试通过）
 
 ### 阶段 5：agent_wait、改派和前端展示
@@ -575,7 +574,7 @@ model_binding_status
 只有同时满足以下条件，才可以将本方案标记为完成：
 
 - 入口、Schema、预检、原子注册、Runner、agent_wait 和前端使用同一套状态合同；
-- 任何创建前失败都不产生孤儿 Task、Lease、Thread、SpawnGraph 边或 worktree；
+- 任何创建前失败都不产生孤儿 Task、Lease、Thread 或 worktree；
 - 自定义角色和内置角色走完全相同的派发链路；
 - 普通复杂表达不再因为缺少“代理”关键词而失去 coordinator 能力；
 - 明确禁止协作的请求仍然严格单线执行；

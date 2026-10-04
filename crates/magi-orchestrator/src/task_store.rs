@@ -198,9 +198,11 @@ fn child_index_from_tasks(tasks: &HashMap<TaskId, Task>) -> HashMap<TaskId, Vec<
 fn collect_subtree_ids_from_tasks(tasks: &HashMap<TaskId, Task>, root_id: &TaskId) -> Vec<TaskId> {
     let children = child_index_from_tasks(tasks);
     let mut all_ids = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     let mut queue = vec![root_id.clone()];
     while let Some(current) = queue.pop() {
-        if !tasks.contains_key(&current) {
+        // 持久化数据损坏时 parent_task_id 可能成环；遍历必须有界。
+        if !tasks.contains_key(&current) || !visited.insert(current.clone()) {
             continue;
         }
         all_ids.push(current.clone());
@@ -1092,7 +1094,7 @@ impl TaskStore {
             })
             .collect();
 
-        // runnable：pending 且所有依赖已完成。父子编排约束由 SpawnGraph/Coordinator
+        // runnable：pending 且所有依赖已完成。父子编排约束由 Coordinator
         // 管理，TaskStore 只维护最小执行事实。
         leaves
             .into_iter()
@@ -1110,20 +1112,18 @@ impl TaskStore {
     }
 
     fn ancestor_chain_allows_dispatch_inner(task: &Task, tasks: &HashMap<TaskId, Task>) -> bool {
-        // 新执行模型下，父任务调用 agent_spawn 后进入 Running，子任务由后台 runner
-        // 独立推进，因此祖先链允许出现 Running 节点；只有 Pending 祖先
-        // （还没开始执行）才说明该子任务尚不该被调度。父任务的依赖在父任务自身
-        // 进入 Running 前已被 dispatcher 校验过，这里不再重复校验。
+        // 父任务调用 agent_spawn 后保持 Running，子任务由后台 runner 独立推进。
+        // 只有整条祖先链都处于 Running 时子任务才可调度：Pending 祖先说明尚未开始，
+        // 已结束（Completed/Failed/Killed）的祖先说明没有人会再收集这个子任务的结果。
         let mut current = task.parent_task_id.as_ref();
         while let Some(pid) = current {
-            if let Some(parent) = tasks.get(pid) {
-                if parent.status == TaskStatus::Pending {
-                    return false;
-                }
-                current = parent.parent_task_id.as_ref();
-            } else {
-                break;
+            let Some(parent) = tasks.get(pid) else {
+                return false;
+            };
+            if parent.status != TaskStatus::Running {
+                return false;
             }
+            current = parent.parent_task_id.as_ref();
         }
         true
     }
@@ -3128,7 +3128,7 @@ fn is_terminal_status(status: TaskStatus) -> bool {
     )
 }
 
-/// TaskStore 不再限制固定父子层级，具体编排约束交给 SpawnGraph/Coordinator。
+/// TaskStore 不再限制固定父子层级，具体编排约束交给 Coordinator。
 fn is_valid_parent_child_kind(_parent: TaskKind, _child: TaskKind) -> bool {
     true
 }

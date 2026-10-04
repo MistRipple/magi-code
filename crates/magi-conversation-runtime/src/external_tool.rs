@@ -119,6 +119,7 @@ pub fn builtin_exposed_externally(tool: BuiltinToolName) -> bool {
             tool,
             BuiltinToolName::AgentSpawn
                 | BuiltinToolName::AgentSend
+                | BuiltinToolName::AgentCancel
                 | BuiltinToolName::AgentWait
                 | BuiltinToolName::GetGoal
                 | BuiltinToolName::CreateGoal

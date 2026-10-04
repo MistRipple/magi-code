@@ -31,7 +31,6 @@ members = [
   "crates/magi-agent-role",
   "crates/magi-permissions",
   "crates/magi-safety-gate",
-  "crates/magi-spawn-graph",
   "crates/magi-plan",
   "crates/magi-project-memory",
   "crates/magi-mission-metrics",

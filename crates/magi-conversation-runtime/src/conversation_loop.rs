@@ -125,7 +125,6 @@ pub struct ConversationLoopRequest<'a> {
     pub agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
     /// 任务系统 — L5：父子任务拓扑图。S7 协调工具（agent_spawn）
     /// 在 execute_task_tool_call 中拦截时操作此结构。
-    pub spawn_graph: &'a std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     /// 任务系统 — L12：本次轮次的 SafetyGate 快照。`None` 表示当前没有
     /// 启用任何危险模式规则（既无内置也无用户自定义），此时拦截器走 pass-through。
     /// 在 execute_task_tool_call 中工具调用执行前做语义判定。
@@ -734,7 +733,6 @@ fn run_conversation_loop_inner(
         execution_registry,
         conversation_registry,
         agent_role_registry,
-        spawn_graph,
         safety_gate,
         plan_store,
         project_memory,
@@ -2798,7 +2796,6 @@ fn run_conversation_loop_inner(
             session_store,
             execution_registry,
             conversation_registry,
-            spawn_graph,
             safety_gate,
             plan_store,
             project_memory,
@@ -3593,7 +3590,8 @@ fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BT
         let Some(tool_name) = tool_call.get("name").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        if canonical_tool_call_name(tool_name) != "agent_wait" {
+        let tool_name = canonical_tool_call_name(tool_name);
+        if tool_name != "agent_wait" && tool_name != "agent_cancel" {
             continue;
         }
         let Some(result_text) = tool_call.get("result").and_then(serde_json::Value::as_str) else {
@@ -3602,6 +3600,21 @@ fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BT
         let Ok(result_payload) = serde_json::from_str::<serde_json::Value>(result_text) else {
             continue;
         };
+        // 主线主动取消的代理已由主线处置，不需要再通过 agent_wait 收集。
+        if tool_name == "agent_cancel" {
+            if matches!(
+                result_payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                Some("cancelled" | "already_terminal")
+            ) && let Some(child_task_id) = result_payload
+                .get("child_task_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                collected.insert(child_task_id.to_string());
+            }
+            continue;
+        }
         if result_payload
             .get("timed_out")
             .and_then(serde_json::Value::as_bool)
@@ -6730,7 +6743,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -6909,7 +6921,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
@@ -7111,7 +7122,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -7276,7 +7286,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -7774,7 +7783,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -7851,7 +7859,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -7948,7 +7955,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -8223,7 +8229,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -8323,7 +8328,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -8549,7 +8553,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
@@ -8698,7 +8701,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
@@ -8813,7 +8815,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
@@ -8947,7 +8948,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: Some(&project_memory),
@@ -9239,7 +9239,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -9458,7 +9457,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -9589,7 +9587,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -9717,7 +9714,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -9864,7 +9860,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -10044,7 +10039,6 @@ mod tests {
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &conversation_registry,
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
-            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
@@ -10240,7 +10234,6 @@ mod tests {
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
         let execution_registry = TaskExecutionRegistry::default();
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
-        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store(&format!("plan-duplicate-read-{suffix}"));
 
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
@@ -10257,7 +10250,6 @@ mod tests {
             execution_registry: &execution_registry,
             conversation_registry: &conversation_registry,
             agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,

@@ -637,7 +637,6 @@ mod tests {
                     session_store: Arc::clone(&session_store),
                     execution_registry: state.task_execution_registry().clone(),
                     result_receiver: Arc::clone(&result_receiver),
-                    spawn_graph: Arc::clone(&state.spawn_graph),
                     conversation_registry: Arc::clone(&state.conversation_registry),
                     agent_role_registry: Arc::clone(&state.agent_role_registry),
                 },

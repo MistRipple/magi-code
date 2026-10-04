@@ -177,7 +177,6 @@ pub struct LlmTaskDispatcher {
     agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
     /// 任务系统 — L5：父子任务拓扑图。S7 协调器工具 agent_spawn
     /// 需要在 conversation_loop 中读写。设计为构造期必填，避免运行期再做空检查。
-    spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
     /// 任务系统 — L14：workspace 维度的 ProjectMemory 索引。S10 中模型通过
     /// `memory_write` 工具新增/删除项目记忆条目；每次 Turn 起始把 MEMORY.md 视图注入
     /// system prompt，跨 conversation 复用。
@@ -192,7 +191,6 @@ pub struct LlmTaskDispatcherDependencies {
     pub session_store: Arc<SessionStore>,
     pub execution_registry: TaskExecutionRegistry,
     pub result_receiver: Arc<EventBasedResultReceiver>,
-    pub spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
     pub conversation_registry: Arc<ConversationRegistry>,
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
 }
@@ -544,7 +542,6 @@ impl LlmTaskDispatcher {
             session_store,
             execution_registry,
             result_receiver,
-            spawn_graph,
             conversation_registry,
             agent_role_registry,
         } = dependencies;
@@ -577,7 +574,6 @@ impl LlmTaskDispatcher {
             snapshot_manager: None,
             conversation_registry,
             agent_role_registry,
-            spawn_graph,
             project_memory_registry: Arc::new(
                 magi_project_memory::ProjectMemoryRegistry::with_home(mission_state_root.clone()),
             ),
@@ -2604,7 +2600,6 @@ impl LlmTaskDispatcher {
             execution_registry: &self.execution_registry,
             conversation_registry: self.conversation_registry.as_ref(),
             agent_role_registry: self.agent_role_registry.as_ref(),
-            spawn_graph: self.spawn_graph.as_ref(),
             safety_gate: safety_gate.as_ref(),
             plan_store: &plan_store,
             project_memory: project_memory.as_deref(),
@@ -3549,7 +3544,6 @@ mod tests {
                 session_store: Arc::new(SessionStore::new()),
                 execution_registry: TaskExecutionRegistry::default(),
                 result_receiver: Arc::new(EventBasedResultReceiver::new()),
-                spawn_graph: Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
                 conversation_registry: Arc::new(ConversationRegistry::new()),
                 agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             },

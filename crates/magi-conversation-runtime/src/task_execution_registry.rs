@@ -8,7 +8,7 @@
 //! magi-api 不再实现这两个类型，改为 `pub use` 重导出；本模块是任务派发链路的
 //! 唯一所有者。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -20,9 +20,11 @@ use magi_core::{
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ExecutionThread, SessionPlan, SessionStore};
 use magi_settings_store::SettingsStore;
-use magi_spawn_graph::SpawnGraph;
 
 use crate::execution_admission::ExecutionAdmissionController;
+
+/// 同一父任务下同时未结束的直接子代理上限。
+pub const MAX_OPEN_CHILDREN_PER_PARENT: usize = 16;
 use crate::{session_images::SessionTurnImage, session_thread};
 
 pub const DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE: usize = 5;
@@ -80,7 +82,6 @@ impl TaskExecutionPlan {
 
 pub struct SpawnedChildExecutionRequest<'a> {
     pub task_store: &'a TaskStore,
-    pub spawn_graph: &'a Mutex<SpawnGraph>,
     pub session_store: &'a SessionStore,
     pub child_task: &'a Task,
     pub session_id: &'a SessionId,
@@ -140,7 +141,7 @@ pub struct TaskExecutionRegistry {
     plans: Arc<RwLock<HashMap<TaskId, TaskExecutionPlan>>>,
     execution_admission: Arc<ExecutionAdmissionController>,
     agent_spawn_preflight: Arc<RwLock<AgentSpawnPreflightRuntime>>,
-    /// 序列化跨 `TaskStore`、`SpawnGraph`、`SessionStore` 和执行计划的子任务注册。
+    /// 序列化跨 `TaskStore`、`SessionStore` 和执行计划的子任务注册。
     ///
     /// 预检发生在该锁之外，因此注册入口必须再次检查所有依赖唯一性的事实；
     /// 这样并发的两个 `agent_spawn` 即使同时通过预检，也不会产生重复的
@@ -255,7 +256,7 @@ impl TaskExecutionRegistry {
     }
 
     /// 删除一个 session 拥有的全部执行计划，并返回被删除的 TaskId，供上层同步
-    /// 清理 TaskStore 与 SpawnGraph。
+    /// 清理 TaskStore。
     pub fn remove_session(&self, session_id: &SessionId) -> Vec<TaskId> {
         let mut plans = self
             .plans
@@ -325,7 +326,6 @@ impl TaskExecutionRegistry {
     ) -> Result<SpawnedChildExecution, SpawnedChildExecutionError> {
         let SpawnedChildExecutionRequest {
             task_store,
-            spawn_graph,
             session_store,
             child_task,
             session_id,
@@ -408,6 +408,24 @@ impl TaskExecutionRegistry {
                     limit,
                 });
             }
+        }
+
+        // 父子关系只以 TaskStore 为准：同一父任务下仍未结束的直接子代理数量受上限约束，
+        // 已结束的子代理不再占用名额。
+        let open_children = task_store
+            .get_children(&parent_task_id)
+            .iter()
+            .filter(|child| {
+                matches!(
+                    child.status,
+                    magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+                )
+            })
+            .count();
+        if open_children >= MAX_OPEN_CHILDREN_PER_PARENT {
+            return Err(SpawnedChildExecutionError::InvalidState(format!(
+                "父任务 {parent_task_id} 已有 {open_children} 个未结束的子代理，达到上限 {MAX_OPEN_CHILDREN_PER_PARENT}；请先等待或取消已有代理"
+            )));
         }
 
         let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
@@ -519,56 +537,17 @@ impl TaskExecutionRegistry {
         }
         let task_inserted = true;
 
-        let graph_added = match spawn_graph.lock().map_err(|err| {
-            SpawnedChildExecutionError::InvalidState(format!("SpawnGraph mutex poisoned: {err}"))
-        }) {
-            Ok(mut graph) => graph
-                .add_edge(
-                    parent_task_id.clone(),
-                    child_task.task_id.clone(),
-                    child_task.kind,
-                    std::time::SystemTime::now(),
-                )
-                .map(|_| true)
-                .map_err(|error| {
-                    SpawnedChildExecutionError::InvalidState(format!(
-                        "agent_spawn 注册 SpawnGraph 边失败: {error}"
-                    ))
-                }),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = graph_added {
-            return Err(rollback_spawned_local_agent_child(
-                self,
-                task_store,
-                spawn_graph,
-                session_store,
-                session_id,
-                &child_task.task_id,
-                &original_chain,
-                task_inserted,
-                false,
-                false,
-                false,
-                None,
-                None,
-                error,
-            ));
-        }
-
         if let Err(error) =
             session_store.upsert_active_execution_chain(session_id.clone(), chain.clone())
         {
             return Err(rollback_spawned_local_agent_child(
                 self,
                 task_store,
-                spawn_graph,
                 session_store,
                 session_id,
                 &child_task.task_id,
                 &original_chain,
                 task_inserted,
-                true,
                 false,
                 false,
                 None,
@@ -581,13 +560,11 @@ impl TaskExecutionRegistry {
             return Err(rollback_spawned_local_agent_child(
                 self,
                 task_store,
-                spawn_graph,
                 session_store,
                 session_id,
                 &child_task.task_id,
                 &original_chain,
                 task_inserted,
-                true,
                 true,
                 false,
                 None,
@@ -603,13 +580,11 @@ impl TaskExecutionRegistry {
             return Err(rollback_spawned_local_agent_child(
                 self,
                 task_store,
-                spawn_graph,
                 session_store,
                 session_id,
                 &child_task.task_id,
                 &original_chain,
                 task_inserted,
-                true,
                 true,
                 true,
                 None,
@@ -629,13 +604,11 @@ impl TaskExecutionRegistry {
                     return Err(rollback_spawned_local_agent_child(
                         self,
                         task_store,
-                        spawn_graph,
                         session_store,
                         session_id,
                         &child_task.task_id,
                         &original_chain,
                         task_inserted,
-                        true,
                         true,
                         true,
                         Some(&thread),
@@ -651,13 +624,11 @@ impl TaskExecutionRegistry {
                 return Err(rollback_spawned_local_agent_child(
                     self,
                     task_store,
-                    spawn_graph,
                     session_store,
                     session_id,
                     &child_task.task_id,
                     &original_chain,
                     task_inserted,
-                    true,
                     true,
                     true,
                     Some(&thread),
@@ -682,13 +653,11 @@ impl TaskExecutionRegistry {
 fn rollback_spawned_local_agent_child(
     registry: &TaskExecutionRegistry,
     task_store: &TaskStore,
-    spawn_graph: &Mutex<SpawnGraph>,
     session_store: &SessionStore,
     session_id: &SessionId,
     child_task_id: &TaskId,
     original_chain: &magi_session_store::ActiveExecutionChain,
     task_inserted: bool,
-    graph_added: bool,
     session_chain_updated: bool,
     registry_inserted: bool,
     registered_thread: Option<&ExecutionThread>,
@@ -713,16 +682,6 @@ fn rollback_spawned_local_agent_child(
     }
     if registry_inserted && registry.remove(child_task_id).is_none() {
         rollback_errors.push("执行注册表回滚时未找到子任务".to_string());
-    }
-    if graph_added {
-        let mut task_ids = HashSet::new();
-        task_ids.insert(child_task_id.clone());
-        match spawn_graph.lock() {
-            Ok(mut graph) => {
-                graph.remove_tasks(&task_ids);
-            }
-            Err(error) => rollback_errors.push(format!("SpawnGraph 回滚失败: {error}")),
-        }
     }
     if session_chain_updated
         && let Err(error) =
@@ -821,7 +780,6 @@ mod tests {
         use magi_settings_store::SettingsStore;
 
         let task_store = TaskStore::new();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_store = SessionStore::new();
         let registry = TaskExecutionRegistry::default();
         let session_id = SessionId::new("session-atomic-spawn");
@@ -922,7 +880,6 @@ mod tests {
         let registered = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &child,
                 session_id: &session_id,
@@ -942,11 +899,10 @@ mod tests {
             "child task should be inserted by the atomic runtime registration entry"
         );
         assert_eq!(
-            spawn_graph
-                .lock()
-                .expect("spawn graph lock should be available")
-                .parent_of(&child.task_id),
-            Some(&root_task_id)
+            task_store
+                .get_task(&child.task_id)
+                .and_then(|task| task.parent_task_id),
+            Some(root_task_id.clone())
         );
 
         let plan = registry
@@ -998,13 +954,6 @@ mod tests {
         let chain_state_before = format!("{:?}", session_store.active_execution_chain(&session_id));
         let threads_state_before =
             format!("{:?}", session_store.thread_registry_snapshot(&session_id));
-        let graph_state_before = format!(
-            "{:?}",
-            spawn_graph
-                .lock()
-                .expect("spawn graph lock should be available")
-                .all_edges()
-        );
 
         let duplicate_plan = registry
             .get(&child.task_id)
@@ -1018,7 +967,6 @@ mod tests {
         let duplicate_error = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &child,
                 session_id: &session_id,
@@ -1056,17 +1004,6 @@ mod tests {
             threads_state_before,
             "重复注册不得改变 session thread registry"
         );
-        assert_eq!(
-            format!(
-                "{:?}",
-                spawn_graph
-                    .lock()
-                    .expect("spawn graph lock should be available")
-                    .all_edges()
-            ),
-            graph_state_before,
-            "重复注册不得改变 SpawnGraph"
-        );
 
         task_store
             .remove_task(&child.task_id)
@@ -1077,17 +1014,9 @@ mod tests {
         let chain_state_before = format!("{:?}", session_store.active_execution_chain(&session_id));
         let threads_state_before =
             format!("{:?}", session_store.thread_registry_snapshot(&session_id));
-        let graph_state_before = format!(
-            "{:?}",
-            spawn_graph
-                .lock()
-                .expect("spawn graph lock should be available")
-                .all_edges()
-        );
         let registry_duplicate_error = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &child,
                 session_id: &session_id,
@@ -1125,51 +1054,27 @@ mod tests {
             threads_state_before,
             "执行注册表重复注册不得改变 session thread registry"
         );
-        assert_eq!(
-            format!(
-                "{:?}",
-                spawn_graph
-                    .lock()
-                    .expect("spawn graph lock should be available")
-                    .all_edges()
-            ),
-            graph_state_before,
-            "执行注册表重复注册不得改变 SpawnGraph"
-        );
 
-        let graph_conflict_child = test_task(
-            "task-child-graph-conflict",
-            root_task_id.as_str(),
-            &mission_id,
-        );
-        spawn_graph
-            .lock()
-            .expect("spawn graph lock should be available")
-            .add_edge(
-                root_task_id.clone(),
-                graph_conflict_child.task_id.clone(),
-                graph_conflict_child.kind,
-                std::time::SystemTime::now(),
-            )
-            .expect("应先建立用于验证回滚的冲突边");
-        let task_state_before = format!("{:?}", task_store.get_task(&graph_conflict_child.task_id));
-        let plan_state_before = format!("{:?}", registry.get(&graph_conflict_child.task_id));
+        // 同一父任务下未结束的子代理达到上限时拒绝注册，且不写入任何状态。
+        for index in 0..MAX_OPEN_CHILDREN_PER_PARENT {
+            let open_child = test_task(
+                &format!("task-child-open-{index}"),
+                root_task_id.as_str(),
+                &mission_id,
+            );
+            task_store
+                .insert_task(open_child)
+                .expect("未结束子任务应插入");
+        }
+        let fanout_child = test_task("task-child-fanout", root_task_id.as_str(), &mission_id);
         let chain_state_before = format!("{:?}", session_store.active_execution_chain(&session_id));
         let threads_state_before =
             format!("{:?}", session_store.thread_registry_snapshot(&session_id));
-        let graph_state_before = format!(
-            "{:?}",
-            spawn_graph
-                .lock()
-                .expect("spawn graph lock should be available")
-                .all_edges()
-        );
-        let graph_error = registry
+        let fanout_error = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
-                child_task: &graph_conflict_child,
+                child_task: &fanout_child,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
@@ -1179,43 +1084,50 @@ mod tests {
                 execution_root: None,
                 now,
             })
-            .expect_err("SpawnGraph 冲突必须拒绝注册");
+            .expect_err("未结束子代理达到上限时必须拒绝注册");
         assert!(matches!(
-            graph_error,
+            fanout_error,
             SpawnedChildExecutionError::InvalidState(message)
-                if message.contains("SpawnGraph")
+                if message.contains("未结束的子代理")
         ));
-        assert_eq!(
-            format!("{:?}", task_store.get_task(&graph_conflict_child.task_id)),
-            task_state_before,
-            "SpawnGraph 失败后必须回滚 TaskStore"
-        );
-        assert_eq!(
-            format!("{:?}", registry.get(&graph_conflict_child.task_id)),
-            plan_state_before,
-            "SpawnGraph 失败后不得写入执行注册表"
-        );
+        assert!(task_store.get_task(&fanout_child.task_id).is_none());
+        assert!(registry.get(&fanout_child.task_id).is_none());
         assert_eq!(
             format!("{:?}", session_store.active_execution_chain(&session_id)),
             chain_state_before,
-            "SpawnGraph 失败后必须回滚 session active chain"
         );
         assert_eq!(
             format!("{:?}", session_store.thread_registry_snapshot(&session_id)),
             threads_state_before,
-            "SpawnGraph 失败后不得创建 session thread"
         );
-        assert_eq!(
-            format!(
-                "{:?}",
-                spawn_graph
-                    .lock()
-                    .expect("spawn graph lock should be available")
-                    .all_edges()
-            ),
-            graph_state_before,
-            "SpawnGraph 失败后必须保留原有拓扑"
-        );
+
+        // 已结束的子代理不再占用名额，同一父任务可以持续派发新代理。
+        for index in 0..MAX_OPEN_CHILDREN_PER_PARENT {
+            let task_id = TaskId::new(format!("task-child-open-{index}"));
+            let mut finished = task_store
+                .remove_task(&task_id)
+                .expect("移除测试任务应成功")
+                .expect("测试任务应存在");
+            finished.status = TaskStatus::Killed;
+            task_store
+                .insert_task(finished)
+                .expect("已结束子任务应插入");
+        }
+        registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                session_store: &session_store,
+                child_task: &fanout_child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
+                now,
+            })
+            .expect("已结束的子代理不应占用父任务名额");
     }
 
     #[test]
@@ -1270,7 +1182,6 @@ mod tests {
     #[test]
     fn spawned_local_agent_child_registration_allows_five_agents_per_role() {
         let task_store = TaskStore::new();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_store = SessionStore::new();
         let registry = TaskExecutionRegistry::default();
         let session_id = SessionId::new("session-agent-capacity");
@@ -1338,7 +1249,6 @@ mod tests {
                 registry
                     .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                         task_store: &task_store,
-                        spawn_graph: &spawn_graph,
                         session_store: &session_store,
                         child_task: &child,
                         session_id: &session_id,
@@ -1362,7 +1272,6 @@ mod tests {
         let error = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &overflow_child,
                 session_id: &session_id,
@@ -1388,14 +1297,6 @@ mod tests {
             task_store.get_task(&overflow_child.task_id).is_none(),
             "被容量拒绝的子代理不能写入 task_store"
         );
-        assert!(
-            spawn_graph
-                .lock()
-                .expect("spawn graph lock should be available")
-                .parent_of(&overflow_child.task_id)
-                .is_none(),
-            "被容量拒绝的子代理不能写入 spawn_graph"
-        );
 
         let completed_task_id = TaskId::new("task-child-capacity-executor-0");
         task_store
@@ -1414,7 +1315,6 @@ mod tests {
         registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &overflow_child,
                 session_id: &session_id,
@@ -1433,7 +1333,6 @@ mod tests {
     fn spawned_local_agent_child_registration_rolls_back_when_plan_binding_fails() {
         let (
             task_store,
-            spawn_graph,
             session_store,
             registry,
             session_id,
@@ -1478,13 +1377,11 @@ mod tests {
             .active_execution_chain(&session_id)
             .expect("测试执行链应存在");
         let threads_before = session_store.thread_registry_snapshot(&session_id);
-        let graph_before = spawn_graph.lock().expect("SpawnGraph 锁应可用").all_edges();
         let plan_before = plan_store.snapshot().expect("测试计划应存在");
 
         let error = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &child,
                 session_id: &session_id,
@@ -1518,14 +1415,6 @@ mod tests {
             threads_before,
             "计划绑定失败后不得残留执行 thread"
         );
-        assert_eq!(
-            format!(
-                "{:?}",
-                spawn_graph.lock().expect("SpawnGraph 锁应可用").all_edges()
-            ),
-            format!("{:?}", graph_before),
-            "计划绑定失败后不得残留 SpawnGraph 边"
-        );
         let plan_after = plan_store.snapshot().expect("计划应保留");
         assert_eq!(plan_after.task_bindings, plan_before.task_bindings);
         assert_eq!(plan_after.task_statuses, plan_before.task_statuses);
@@ -1535,7 +1424,6 @@ mod tests {
     fn spawned_local_agent_child_registration_rejects_duplicate_canonical_name() {
         let (
             task_store,
-            spawn_graph,
             session_store,
             registry,
             session_id,
@@ -1557,7 +1445,6 @@ mod tests {
         registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &first,
                 session_id: &session_id,
@@ -1583,7 +1470,6 @@ mod tests {
         let error = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &duplicate,
                 session_id: &session_id,
@@ -1608,7 +1494,6 @@ mod tests {
         label: &str,
     ) -> (
         TaskStore,
-        Mutex<SpawnGraph>,
         SessionStore,
         TaskExecutionRegistry,
         SessionId,
@@ -1618,7 +1503,6 @@ mod tests {
         UtcMillis,
     ) {
         let task_store = TaskStore::new();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_store = SessionStore::new();
         let registry = TaskExecutionRegistry::default();
         let session_id = SessionId::new(format!("session-{label}"));
@@ -1677,7 +1561,6 @@ mod tests {
             .expect("测试执行链应创建");
         (
             task_store,
-            spawn_graph,
             session_store,
             registry,
             session_id,
@@ -1692,7 +1575,6 @@ mod tests {
     fn spawned_local_agent_child_registration_uses_role_parallelism_limit() {
         let (
             task_store,
-            spawn_graph,
             session_store,
             registry,
             session_id,
@@ -1710,7 +1592,6 @@ mod tests {
         registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &limited_first,
                 session_id: &session_id,
@@ -1732,7 +1613,6 @@ mod tests {
         let limited_error = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &limited_second,
                 session_id: &session_id,
@@ -1770,7 +1650,6 @@ mod tests {
         registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
-                spawn_graph: &spawn_graph,
                 session_store: &session_store,
                 child_task: &limited_second,
                 session_id: &session_id,
@@ -1793,7 +1672,6 @@ mod tests {
             registry
                 .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                     task_store: &task_store,
-                    spawn_graph: &spawn_graph,
                     session_store: &session_store,
                     child_task: &unlimited_child,
                     session_id: &session_id,

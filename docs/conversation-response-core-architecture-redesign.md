@@ -97,7 +97,7 @@ Coordinator 不得在状态锁内执行外部 IO。模型、工具、Git 和 Tas
 - Task durable commit 完成后，按 `TaskStore -> TaskCompletionNotifier -> Coordinator -> Sink` 通知；不得依赖周期轮询发现完成。
 - 主线 Task 执行器遇到失败时，只能先 durable upsert 失败 item；不得在 TaskStore 终态提交前发布 `Turn failed` 或 canonical terminal event。TaskStore 的 Failed/Killed/Completed 提交后，由 finalizer 收口 Coordinator、资源 settlement，再由 Sink 发布唯一终态快照；sidechain 详情 item 不拥有 root Turn 终态，可以即时展示。
 - Task mutation 临界区不得写 SessionStore、同步磁盘或调用跨域回调。
-- 子代理只有在角色、能力、模型、父任务、容量和 Git 预检全部通过后，才可固化角色快照并原子创建 child task；预检失败不得创建 Task、lease、Thread 或 spawn graph。
+- 子代理只有在角色、能力、模型、父任务、容量和 Git 预检全部通过后，才可固化角色快照并原子创建 child task；预检失败不得创建 Task、lease 或 Thread。
 
 ### 3.4 `CanonicalTurnEventSink`
 

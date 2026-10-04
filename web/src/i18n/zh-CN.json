@@ -1443,6 +1443,7 @@
   "settings.tools.builtin.updateGoal": "更新目标",
   "settings.tools.builtin.agentSpawn": "派发代理",
   "settings.tools.builtin.agentSend": "发送代理消息",
+  "settings.tools.builtin.agentCancel": "取消代理",
   "settings.tools.builtin.agentWait": "等待代理",
   "settings.tools.builtin.contextSearch": "搜索任务上下文",
   "settings.tools.builtin.contextRead": "读取任务上下文",

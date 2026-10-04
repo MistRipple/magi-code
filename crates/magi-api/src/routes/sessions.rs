@@ -11616,17 +11616,6 @@ mod tests {
             )
             .expect("execution plan should register");
         state
-            .spawn_graph
-            .lock()
-            .expect("spawn graph should lock")
-            .add_edge(
-                root_task.task_id.clone(),
-                child_task.task_id.clone(),
-                TaskKind::LocalAgent,
-                std::time::SystemTime::UNIX_EPOCH,
-            )
-            .expect("spawn edge should register");
-        state
             .conversation_registry
             .conversation_for_task(&session_id, &child_task.task_id);
         state
@@ -11677,14 +11666,6 @@ mod tests {
             state
                 .task_execution_registry()
                 .get(&root_task.task_id)
-                .is_none()
-        );
-        assert!(
-            state
-                .spawn_graph
-                .lock()
-                .expect("spawn graph should lock")
-                .edge_for(&child_task.task_id)
                 .is_none()
         );
         assert!(state.conversation_registry.is_empty());

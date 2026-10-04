@@ -613,9 +613,10 @@ fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
 
 fn model_call_scope(tool: BuiltinToolName) -> &'static str {
     match tool {
-        BuiltinToolName::AgentSpawn | BuiltinToolName::AgentSend | BuiltinToolName::AgentWait => {
-            "coordinator_task_only"
-        }
+        BuiltinToolName::AgentSpawn
+        | BuiltinToolName::AgentSend
+        | BuiltinToolName::AgentCancel
+        | BuiltinToolName::AgentWait => "coordinator_task_only",
         BuiltinToolName::ContextSearch
         | BuiltinToolName::ContextRead
         | BuiltinToolName::ContextRequest => "worker_task_only",

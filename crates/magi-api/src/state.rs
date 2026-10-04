@@ -1347,7 +1347,6 @@ pub struct ApiState {
     pub(crate) role_configuration_lock: Arc<Mutex<()>>,
     /// 任务系统 — L5：父子任务关系图，作为 task_dispatch 中
     /// "parent_task_id 散落查询"的统一上层。同一进程共享。
-    pub spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
     session_turn_queue: Arc<Mutex<HashMap<SessionId, VecDeque<QueuedRegularSessionTurn>>>>,
     session_turn_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
     session_change_sync_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
@@ -2118,7 +2117,6 @@ impl ApiState {
             terminal_sessions: crate::terminal_runtime::TerminalSessionManager::default(),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             role_configuration_lock: Arc::new(Mutex::new(())),
-            spawn_graph: Arc::new(Mutex::new(magi_spawn_graph::SpawnGraph::new())),
             session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
             session_turn_locks: Arc::new(Mutex::new(HashMap::new())),
             session_change_sync_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -4208,11 +4206,6 @@ impl ApiState {
         self
     }
 
-    pub fn with_spawn_graph(mut self, graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>) -> Self {
-        self.spawn_graph = graph;
-        self
-    }
-
     pub fn task_store(&self) -> Option<&TaskStore> {
         self.task_store.as_deref()
     }
@@ -4711,10 +4704,6 @@ impl ApiState {
                 })?;
             }
         }
-        self.spawn_graph
-            .lock()
-            .map_err(|error| ApiError::internal_assembly("清理会话 SpawnGraph 失败", error))?
-            .remove_tasks(&task_ids);
         self.conversation_registry.remove_session(session_id);
         self.session_store
             .delete_session_with_persistence(

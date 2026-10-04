@@ -1164,7 +1164,6 @@ dependencies = [
  "magi-settings-store",
  "magi-skill-runtime",
  "magi-snapshot",
- "magi-spawn-graph",
  "magi-tool-runtime",
  "magi-usage-authority",
  "magi-web-model",
@@ -1285,7 +1284,6 @@ dependencies = [
  "magi-settings-store",
  "magi-skill-runtime",
  "magi-snapshot",
- "magi-spawn-graph",
  "magi-tool-runtime",
  "magi-usage-authority",
  "magi-web-model",
@@ -1340,7 +1338,6 @@ dependencies = [
  "magi-settings-store",
  "magi-skill-runtime",
  "magi-snapshot",
- "magi-spawn-graph",
  "magi-tool-runtime",
  "magi-usage-authority",
  "magi-web-model",
@@ -1592,14 +1589,6 @@ dependencies = [
  "tokio",
  "tracing",
  "zstd",
-]
-
-[[package]]
-name = "magi-spawn-graph"
-version = "3.0.51"
-dependencies = [
- "magi-core",
- "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -1802,23 +1802,6 @@ impl DaemonRuntime {
         }
         let stale_task_count = self.reconcile_stale_session_task_chains(task_store.as_ref());
         task_store_requires_checkpoint |= stale_task_count > 0;
-        let (rebuilt_spawn_graph, spawn_graph_report) =
-            magi_spawn_graph::SpawnGraph::rebuild_from_tasks(task_store.all_tasks());
-        if spawn_graph_report.skipped_edges > 0 {
-            warn!(
-                candidate_edges = spawn_graph_report.candidate_edges,
-                restored_edges = spawn_graph_report.restored_edges,
-                skipped_edges = spawn_graph_report.skipped_edges,
-                "从 task-store 重建 SpawnGraph 时跳过了不合法父子边"
-            );
-        } else if spawn_graph_report.restored_edges > 0 {
-            tracing::debug!(
-                restored_edges = spawn_graph_report.restored_edges,
-                closed_edges = spawn_graph_report.closed_edges,
-                "已从 task-store 重建 SpawnGraph"
-            );
-        }
-        let spawn_graph = Arc::new(std::sync::Mutex::new(rebuilt_spawn_graph));
         if restored_accepted_task_count > 0 || task_store_requires_checkpoint {
             accepted_submission_repository
                 .checkpoint_task_store(task_store.as_ref())
@@ -1890,7 +1873,6 @@ impl DaemonRuntime {
             workspace_git_coordinator,
         )
         .with_task_execution_registry(task_execution_registry)
-        .with_spawn_graph(spawn_graph)
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
         .with_runtime_persistence(runtime_persistence)
@@ -1977,7 +1959,6 @@ impl DaemonRuntime {
                 session_store: state.session_store.clone(),
                 execution_registry: state.task_execution_registry().clone(),
                 result_receiver: runner_result_receiver.clone(),
-                spawn_graph: state.spawn_graph.clone(),
                 conversation_registry: state.conversation_registry.clone(),
                 agent_role_registry: state.agent_role_registry.clone(),
             },
@@ -2969,7 +2950,7 @@ done
         }
     }
 
-    fn spawn_graph_restore_task(
+    fn restore_task_fixture(
         task_id: &str,
         root_task_id: &str,
         parent_task_id: Option<&str>,
@@ -3151,7 +3132,7 @@ done
                 },
             )
             .expect("active execution chain should be stored");
-        let mut task = spawn_graph_restore_task(
+        let mut task = restore_task_fixture(
             task_id.as_str(),
             task_id.as_str(),
             None,
@@ -3204,7 +3185,7 @@ done
         let completed_task_id = TaskId::new("task-terminal-thread-completed");
         let running_task_id = TaskId::new("task-terminal-thread-running");
 
-        let mut completed_task = spawn_graph_restore_task(
+        let mut completed_task = restore_task_fixture(
             completed_task_id.as_str(),
             completed_task_id.as_str(),
             None,
@@ -3215,7 +3196,7 @@ done
         task_store
             .insert_task(completed_task)
             .expect("已完成任务应插入");
-        let mut running_task = spawn_graph_restore_task(
+        let mut running_task = restore_task_fixture(
             running_task_id.as_str(),
             running_task_id.as_str(),
             None,
@@ -3308,7 +3289,7 @@ done
                 message_history: Vec::new(),
             })
             .expect("孤儿 root thread 测试数据应注册成功");
-        let mut orphan_task = spawn_graph_restore_task(
+        let mut orphan_task = restore_task_fixture(
             orphan_task_id.as_str(),
             orphan_task_id.as_str(),
             None,
@@ -3317,7 +3298,7 @@ done
         );
         orphan_task.mission_id = mission_id.clone();
         task_store.insert_task(orphan_task).expect("孤立任务应插入");
-        let mut unrelated_task = spawn_graph_restore_task(
+        let mut unrelated_task = restore_task_fixture(
             unrelated_task_id.as_str(),
             unrelated_task_id.as_str(),
             None,
@@ -3563,49 +3544,6 @@ done
             .expect("includeInternal=true should expose process_launch");
         assert_eq!(process_launch["public"], false);
         assert_eq!(process_launch["parametersSchema"]["type"], "object");
-    }
-
-    #[tokio::test]
-    async fn daemon_restore_rebuilds_spawn_graph_from_task_store_checkpoint() {
-        let state_root = temp_state_root("spawn-graph-restore");
-        let repository = StateRepository::new(state_root.clone());
-        let task_store = TaskStore::new();
-        task_store
-            .insert_task(spawn_graph_restore_task(
-                "task-root-spawn-restore",
-                "task-root-spawn-restore",
-                None,
-                TaskStatus::Running,
-                1,
-            ))
-            .expect("根任务应插入");
-        task_store
-            .insert_task(spawn_graph_restore_task(
-                "task-child-spawn-restore",
-                "task-root-spawn-restore",
-                Some("task-root-spawn-restore"),
-                TaskStatus::Pending,
-                2,
-            ))
-            .expect("子任务应插入");
-        repository
-            .checkpoint_task_store(&task_store)
-            .expect("task store checkpoint should be written");
-
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should load task-store checkpoint");
-        let (_router, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
-        let graph = state
-            .spawn_graph
-            .lock()
-            .expect("spawn graph lock should not poison");
-
-        assert_eq!(
-            graph.parent_of(&TaskId::new("task-child-spawn-restore")),
-            Some(&TaskId::new("task-root-spawn-restore")),
-            "daemon restore should rebuild SpawnGraph from persisted Task.parent_task_id"
-        );
     }
 
     #[test]

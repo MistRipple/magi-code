@@ -11,7 +11,6 @@ use magi_core::{
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
-use magi_spawn_graph::SpawnGraph;
 use magi_worker_runtime::{
     WorkerBranchCheckpointState, WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle,
     WorkerExecutionCheckpointCursor, WorkerRuntime, WorkerStage,
@@ -201,10 +200,9 @@ pub fn finalize_terminal_worker_branches(
     Ok(finalized_count)
 }
 
-/// 沿 SpawnGraph 上溯，把恢复 branch 与其祖先链上的可恢复 Failed 任务恢复为 Pending。
+/// 沿 TaskStore 的父任务链上溯，把恢复 branch 与其祖先链上的可恢复 Failed 任务恢复为 Pending。
 pub fn release_resumed_branch_path(
     task_store: &TaskStore,
-    spawn_graph: &std::sync::Mutex<SpawnGraph>,
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
 ) -> Result<(), String> {
@@ -219,12 +217,7 @@ pub fn release_resumed_branch_path(
         if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
             return Err(format!("branch 路径任务不属于当前执行链: {task_id}"));
         }
-        current_task_id = {
-            let graph = spawn_graph
-                .lock()
-                .map_err(|error| format!("SpawnGraph 锁中毒: {error}"))?;
-            graph.parent_of(&task_id).cloned()
-        };
+        current_task_id = task.parent_task_id.clone();
         if task.status == TaskStatus::Failed {
             task_store
                 .reopen_failed_task_for_recovery(&task_id)
@@ -241,7 +234,6 @@ pub fn release_resumed_branch_path(
 /// 调用对已终态任务幂等。
 pub fn fail_resumed_execution_paths(
     task_store: &TaskStore,
-    spawn_graph: &std::sync::Mutex<SpawnGraph>,
     chain: &ActiveExecutionChain,
     branches: &[ActiveExecutionBranch],
 ) -> Result<(), String> {
@@ -266,12 +258,7 @@ pub fn fail_resumed_execution_paths(
             if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
                 return Err(format!("恢复 branch 路径任务不属于当前执行链: {task_id}"));
             }
-            current_task_id = {
-                let graph = spawn_graph
-                    .lock()
-                    .map_err(|error| format!("SpawnGraph 锁中毒: {error}"))?;
-                graph.parent_of(&task_id).cloned()
-            };
+            current_task_id = task.parent_task_id.clone();
         }
     }
     if !task_ids
@@ -602,7 +589,6 @@ mod tests {
     use magi_session_store::{
         ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     };
-    use std::time::SystemTime;
 
     fn task(
         task_id: &str,
@@ -889,15 +875,6 @@ mod tests {
             )
             .expect("lease should grant")
             .expect("lease should be active");
-        let mut graph = SpawnGraph::new();
-        graph
-            .add_edge(
-                root_task_id.clone(),
-                branch_task_id.clone(),
-                TaskKind::LocalAgent,
-                SystemTime::UNIX_EPOCH,
-            )
-            .expect("spawn edge should insert");
         let chain = chain(
             &session_id,
             &mission_id,
@@ -911,20 +888,10 @@ mod tests {
             None,
         );
 
-        fail_resumed_execution_paths(
-            &task_store,
-            &std::sync::Mutex::new(graph),
-            &chain,
-            &chain.branches,
-        )
-        .expect("failure path should close");
-        fail_resumed_execution_paths(
-            &task_store,
-            &std::sync::Mutex::new(SpawnGraph::new()),
-            &chain,
-            &chain.branches,
-        )
-        .expect("repeated failure path should be idempotent");
+        fail_resumed_execution_paths(&task_store, &chain, &chain.branches)
+            .expect("failure path should close");
+        fail_resumed_execution_paths(&task_store, &chain, &chain.branches)
+            .expect("repeated failure path should be idempotent");
         assert_eq!(
             task_store.get_task(&root_task_id).unwrap().status,
             TaskStatus::Failed

@@ -1443,6 +1443,7 @@
   "settings.tools.builtin.updateGoal": "Update Goal",
   "settings.tools.builtin.agentSpawn": "Spawn Agent",
   "settings.tools.builtin.agentSend": "Send Agent Message",
+  "settings.tools.builtin.agentCancel": "Cancel Agent",
   "settings.tools.builtin.agentWait": "Wait Agent",
   "settings.tools.builtin.contextSearch": "Search Task Context",
   "settings.tools.builtin.contextRead": "Read Task Context",

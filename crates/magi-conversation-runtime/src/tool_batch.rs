@@ -9,7 +9,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -70,7 +70,7 @@ const MIN_CREATE_GOAL_TOKEN_BUDGET: u64 = 16_000;
 /// agent_spawn 生成 child task_id 时使用的进程内单调序号。
 ///
 /// 仅靠 `UtcMillis::now()` 在同一毫秒内的多次并行 agent_spawn 会产生重复
-/// child_id，进而触发 SpawnGraph 的边冲突。配合毫秒时间戳一起拼到 task_id
+/// child_id，进而触发 TaskStore 的重复插入。配合毫秒时间戳一起拼到 task_id
 /// 末尾，保证同一进程内绝对唯一。
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
@@ -209,7 +209,6 @@ pub(crate) fn execute_task_tool_call_batch(
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
     conversation_registry: &ConversationRegistry,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
     plan_store: &magi_plan::PlanStore,
     project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
@@ -237,7 +236,6 @@ pub(crate) fn execute_task_tool_call_batch(
             session_store,
             execution_registry,
             conversation_registry,
-            spawn_graph,
             safety_gate,
             plan_store,
             project_memory,
@@ -267,7 +265,6 @@ fn execute_task_tool_call_batch_unchecked(
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
     conversation_registry: &ConversationRegistry,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
     plan_store: &magi_plan::PlanStore,
     project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
@@ -331,7 +328,6 @@ fn execute_task_tool_call_batch_unchecked(
                     session_store,
                     execution_registry,
                     conversation_registry,
-                    spawn_graph,
                     safety_gate,
                     plan_store,
                     project_memory,
@@ -462,7 +458,6 @@ struct CoordinatorToolContext<'a> {
     session_store: &'a SessionStore,
     execution_registry: &'a TaskExecutionRegistry,
     conversation_registry: &'a ConversationRegistry,
-    spawn_graph: &'a Mutex<magi_spawn_graph::SpawnGraph>,
     plan_store: &'a magi_plan::PlanStore,
     task: &'a magi_core::Task,
     session_id: &'a SessionId,
@@ -526,7 +521,6 @@ fn execute_coordinator_tool(
         session_store,
         execution_registry,
         conversation_registry,
-        spawn_graph,
         plan_store,
         task,
         session_id,
@@ -588,7 +582,6 @@ fn execute_coordinator_tool(
                 session_store,
                 execution_registry,
                 conversation_registry,
-                spawn_graph,
                 plan_store,
                 task,
                 session_id,
@@ -603,7 +596,6 @@ fn execute_coordinator_tool(
             execute_agent_wait_with_runtime(
                 AgentWaitRuntime {
                     task_store,
-                    spawn_graph,
                     conversation_registry,
                     session_id,
                     session_threads: &session_threads,
@@ -615,7 +607,6 @@ fn execute_coordinator_tool(
         }
         magi_tool_runtime::BuiltinToolName::AgentSend => execute_agent_send(
             task_store,
-            spawn_graph,
             conversation_registry,
             task,
             session_id,
@@ -623,6 +614,9 @@ fn execute_coordinator_tool(
             &parsed,
             &publish_event,
         ),
+        magi_tool_runtime::BuiltinToolName::AgentCancel => {
+            execute_agent_cancel(task_store, execution_registry, task, tool, &parsed)
+        }
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
 }
@@ -640,7 +634,6 @@ fn execute_agent_spawn(
         session_store,
         execution_registry,
         conversation_registry,
-        spawn_graph,
         plan_store,
         task,
         session_id,
@@ -733,7 +726,6 @@ fn execute_agent_spawn(
     let registered_execution = match execution_registry.register_spawned_local_agent_child(
         SpawnedChildExecutionRequest {
             task_store,
-            spawn_graph,
             session_store,
             child_task: &child,
             session_id,
@@ -882,7 +874,6 @@ fn execute_agent_spawn(
 
 fn execute_agent_send(
     task_store: &TaskStore,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     conversation_registry: &ConversationRegistry,
     parent_task: &magi_core::Task,
     session_id: &SessionId,
@@ -928,17 +919,7 @@ fn execute_agent_send(
     let Some(target_task) = task_store.get_task(&target_task_id) else {
         return context_tool_failure(tool, "target_not_found", "目标代理任务不存在");
     };
-    let graph_scope_matches = spawn_graph
-        .lock()
-        .map(|graph| {
-            graph
-                .parent_of(&target_task_id)
-                .map(|graph_parent| graph_parent == &parent_task.task_id)
-                .unwrap_or(true)
-        })
-        .unwrap_or(false);
     if target_task.parent_task_id.as_ref() != Some(&parent_task.task_id)
-        || !graph_scope_matches
         || target_task.root_task_id != parent_task.root_task_id
         || target_task.mission_id != parent_task.mission_id
         || target_task.workspace_scope != parent_task.workspace_scope
@@ -1932,7 +1913,6 @@ fn enqueue_agent_assignment_message(
 
 struct AgentWaitRuntime<'a> {
     task_store: &'a TaskStore,
-    spawn_graph: &'a Mutex<magi_spawn_graph::SpawnGraph>,
     conversation_registry: &'a ConversationRegistry,
     session_id: &'a SessionId,
     session_threads: &'a [ExecutionThread],
@@ -1952,7 +1932,6 @@ fn execute_agent_wait_with_runtime(
 ) -> (String, ExecutionResultStatus) {
     let AgentWaitRuntime {
         task_store,
-        spawn_graph,
         conversation_registry,
         session_id,
         session_threads,
@@ -1991,9 +1970,10 @@ fn execute_agent_wait_with_runtime(
             ExecutionResultStatus::Rejected,
         );
     }
-    if let Some(task_id) = task_ids.iter().find(|task_id| {
-        !agent_wait_task_is_direct_child(task_store, spawn_graph, parent_task, task_id)
-    }) {
+    if let Some(task_id) = task_ids
+        .iter()
+        .find(|task_id| !agent_wait_task_is_direct_child(task_store, parent_task, task_id))
+    {
         return (
             serde_json::json!({
                 "tool": tool.as_str(),
@@ -2106,7 +2086,6 @@ fn execute_agent_wait_with_runtime(
 #[cfg(test)]
 fn execute_agent_wait(
     task_store: &TaskStore,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     parent_task: &magi_core::Task,
     session_threads: &[ExecutionThread],
     tool: magi_tool_runtime::BuiltinToolName,
@@ -2118,7 +2097,6 @@ fn execute_agent_wait(
     execute_agent_wait_with_runtime(
         AgentWaitRuntime {
             task_store,
-            spawn_graph,
             conversation_registry: &registry,
             session_id: &session_id,
             session_threads,
@@ -2129,26 +2107,100 @@ fn execute_agent_wait(
     )
 }
 
+/// 主线取消自己直接派发的代理：级联终止该代理子树。进程、浏览器租约等执行资源
+/// 由 TaskStore 终态回调统一释放，这里不另走一条清理路径。
+fn execute_agent_cancel(
+    task_store: &TaskStore,
+    execution_registry: &TaskExecutionRegistry,
+    parent_task: &magi_core::Task,
+    tool: magi_tool_runtime::BuiltinToolName,
+    parsed: &serde_json::Value,
+) -> (String, ExecutionResultStatus) {
+    let rejected = |error_code: &str, error: String, instruction: &str| {
+        (
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "rejected",
+                "error_code": error_code,
+                "error": error,
+                "instruction": instruction,
+            })
+            .to_string(),
+            ExecutionResultStatus::Rejected,
+        )
+    };
+    let non_empty = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let (Some(task_id), Some(reason)) = (non_empty("task_id"), non_empty("reason")) else {
+        return rejected(
+            "invalid_arguments",
+            "agent_cancel 需要非空的 task_id 和 reason".to_string(),
+            "请传入 agent_spawn 返回的 child_task_id，并说明取消原因。",
+        );
+    };
+    let child_task_id = TaskId::new(task_id);
+    if !agent_wait_task_is_direct_child(task_store, parent_task, &child_task_id) {
+        return rejected(
+            "scope_mismatch",
+            format!("{child_task_id} 不是当前任务直接派发的代理"),
+            "只能取消当前任务通过 agent_spawn 直接派发的代理。",
+        );
+    }
+    let changed = match crate::task_runner::kill_subtree_in_store(
+        task_store,
+        &execution_registry.execution_admission(),
+        &child_task_id,
+        vec![format!("主线取消：{reason}")],
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            return (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "failed",
+                    "error_code": "cancel_failed",
+                    "child_task_id": child_task_id.to_string(),
+                    "error": error,
+                    "instruction": "取消未完全成功；可稍后用 agent_wait 查看该代理状态。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let child_status = task_store
+        .get_task(&child_task_id)
+        .map(|child| format!("{:?}", child.status).to_ascii_lowercase())
+        .unwrap_or_else(|| "missing".to_string());
+    (
+        serde_json::json!({
+            "tool": tool.as_str(),
+            "status": if changed { "cancelled" } else { "already_terminal" },
+            "child_task_id": child_task_id.to_string(),
+            "child_status": child_status,
+            "reason": reason,
+            "instruction": "该代理已结束，不需要再 agent_wait 它；如仍需要它负责的工作，请改派或由主线接管。",
+        })
+        .to_string(),
+        ExecutionResultStatus::Succeeded,
+    )
+}
+
 fn agent_wait_task_is_direct_child(
     task_store: &TaskStore,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     parent_task: &magi_core::Task,
     child_task_id: &TaskId,
 ) -> bool {
-    let graph_match = spawn_graph
-        .lock()
-        .ok()
-        .and_then(|graph| graph.parent_of(child_task_id).cloned())
-        .as_ref()
-        == Some(&parent_task.task_id);
-    match task_store.get_task(child_task_id) {
-        Some(child) => {
-            let parent_match = child.parent_task_id.as_ref() == Some(&parent_task.task_id);
-            (graph_match || parent_match)
-                && agent_wait_child_execution_scope_matches(parent_task, &child)
-        }
-        None => graph_match,
-    }
+    task_store.get_task(child_task_id).is_some_and(|child| {
+        child.parent_task_id.as_ref() == Some(&parent_task.task_id)
+            && agent_wait_child_execution_scope_matches(parent_task, &child)
+    })
 }
 
 fn agent_wait_child_execution_scope_matches(
@@ -2408,7 +2460,6 @@ fn execute_task_tool_call(
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
     conversation_registry: &ConversationRegistry,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
     plan_store: &magi_plan::PlanStore,
     project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
@@ -2422,7 +2473,7 @@ fn execute_task_tool_call(
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
 ) -> (String, ExecutionResultStatus) {
     // S7-E：协调器工具（agent_spawn）由 orchestration 层拦截，
-    // 不进 BuiltinTool::execute —— 它需要 task_store / spawn_graph / event_bus 等上下文。
+    // 不进 BuiltinTool::execute —— 它需要 task_store / event_bus 等上下文。
     // S9：UpdatePlan 同样在此层拦截，因为它要操作 session 维度的 PlanStore。
     // S10：MemoryWrite 同样在此层拦截，因为它要操作 workspace 维度的 ProjectMemoryStore。
     if let Some(canonical) =
@@ -2442,6 +2493,7 @@ fn execute_task_tool_call(
             canonical,
             magi_tool_runtime::BuiltinToolName::AgentSpawn
                 | magi_tool_runtime::BuiltinToolName::AgentSend
+                | magi_tool_runtime::BuiltinToolName::AgentCancel
                 | magi_tool_runtime::BuiltinToolName::AgentWait
         )
         && task.policy_snapshot.as_ref().is_some_and(|policy| {
@@ -2544,6 +2596,7 @@ fn execute_task_tool_call(
             canonical,
             magi_tool_runtime::BuiltinToolName::AgentSpawn
                 | magi_tool_runtime::BuiltinToolName::AgentSend
+                | magi_tool_runtime::BuiltinToolName::AgentCancel
                 | magi_tool_runtime::BuiltinToolName::AgentWait
         ) {
             return execute_coordinator_tool(
@@ -2554,7 +2607,6 @@ fn execute_task_tool_call(
                     session_store,
                     execution_registry,
                     conversation_registry,
-                    spawn_graph,
                     plan_store,
                     task,
                     session_id,
@@ -3797,7 +3849,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-idempotent-tool-reuse");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let executions = Arc::new(AtomicUsize::new(0));
@@ -3847,7 +3898,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -3893,7 +3943,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -3923,7 +3972,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-explicit-tool-budget");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let executions = Arc::new(AtomicUsize::new(0));
@@ -3955,7 +4003,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -3991,7 +4038,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -4326,7 +4372,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let session_id = SessionId::new("session-read-only-state-tool");
         let workspace_id = Some(WorkspaceId::new("workspace-read-only-state-tool"));
         session_store
@@ -4375,7 +4420,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -4403,7 +4447,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let session_id = SessionId::new("session-goal-tool-state");
         let workspace_id = Some(WorkspaceId::new("workspace-goal-tool-state"));
@@ -4436,7 +4479,6 @@ mod tests {
                 &session_store,
                 &execution_registry,
                 &conversation_registry,
-                &spawn_graph,
                 None,
                 &plan_store,
                 None,
@@ -5505,7 +5547,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
@@ -5637,7 +5678,6 @@ mod tests {
                 &session_store,
                 &execution_registry,
                 &conversation_registry,
-                &spawn_graph,
                 None,
                 &plan_store,
                 None,
@@ -5805,7 +5845,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
@@ -5835,7 +5874,7 @@ mod tests {
                 .to_string(),
             },
         };
-        let progress = Arc::new(Mutex::new(Vec::<ToolExecutionProgress>::new()));
+        let progress = Arc::new(std::sync::Mutex::new(Vec::<ToolExecutionProgress>::new()));
         let captured = Arc::clone(&progress);
         let on_progress = move |update| {
             captured.lock().expect("progress lock").push(update);
@@ -5852,7 +5891,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -5887,7 +5925,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let task = test_task("task-interrupt-batch", "task-interrupt-batch", None);
@@ -5933,7 +5970,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -5980,7 +6016,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
@@ -6014,7 +6049,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -6056,7 +6090,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
@@ -6093,7 +6126,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -6150,7 +6182,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -6202,7 +6233,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
@@ -6263,7 +6293,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,
@@ -6338,7 +6367,6 @@ mod tests {
     fn agent_wait_returns_completed_agent_final_text() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-child",
             "task-agent-wait-root",
@@ -6363,7 +6391,6 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6400,11 +6427,9 @@ mod tests {
             "task-agent-wait-missing-ids",
             None,
         );
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6436,7 +6461,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_wait_reports_missing_direct_child_without_exposing_other_tasks() {
+    fn agent_wait_rejects_unknown_child_without_exposing_other_tasks() {
         let task_store = TaskStore::new();
         let parent = test_task(
             "task-agent-wait-missing-child-root",
@@ -6444,21 +6469,9 @@ mod tests {
             None,
         );
         let missing_child_id = TaskId::new("task-agent-wait-missing-child");
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        spawn_graph
-            .lock()
-            .expect("SpawnGraph 锁应可用")
-            .add_edge(
-                parent.task_id.clone(),
-                missing_child_id.clone(),
-                TaskKind::LocalAgent,
-                std::time::SystemTime::now(),
-            )
-            .expect("缺失子任务的直接边应可建立用于测试");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6468,18 +6481,10 @@ mod tests {
             }),
         );
 
-        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        assert_eq!(status, ExecutionResultStatus::Rejected);
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("agent_wait missing result should be json");
-        assert_eq!(parsed["status"].as_str(), Some("completed"));
-        assert_eq!(
-            parsed["results"][0]["child_status"].as_str(),
-            Some("missing")
-        );
-        assert_eq!(
-            parsed["results"][0]["error_code"].as_str(),
-            Some("agent_task_unavailable")
-        );
+        assert_eq!(parsed["error_code"].as_str(), Some("scope_mismatch"));
         assert!(!payload.contains("foreign"));
     }
 
@@ -6500,12 +6505,10 @@ mod tests {
         task_store
             .insert_task(child.clone())
             .expect("待等待子任务应插入");
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
 
         let started = std::time::Instant::now();
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6544,11 +6547,9 @@ mod tests {
         task_store
             .insert_task(child.clone())
             .expect("已终止子任务应插入");
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6578,7 +6579,6 @@ mod tests {
     fn agent_wait_prefers_thread_transcript_over_task_output_refs() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-thread-child",
             "task-agent-wait-root",
@@ -6614,7 +6614,6 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &session_threads,
             BuiltinToolName::AgentWait,
@@ -6668,7 +6667,6 @@ mod tests {
     fn agent_wait_rejects_task_outside_current_spawn_scope() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut foreign_child = test_task(
             "task-agent-wait-foreign-child",
             "task-other-root",
@@ -6682,7 +6680,6 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6704,7 +6701,6 @@ mod tests {
     fn agent_wait_rejects_same_parent_id_outside_execution_scope() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut foreign_child = test_task(
             "task-agent-wait-same-parent-foreign-scope",
             "task-other-root",
@@ -6719,7 +6715,6 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6737,12 +6732,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_wait_rejects_spawn_graph_edge_with_different_workspace_scope() {
+    fn agent_wait_rejects_direct_child_with_different_workspace_scope() {
         let task_store = TaskStore::new();
         let mut parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
         parent.workspace_scope = Some("/workspace-a".to_string());
         parent.write_scope = Some("/workspace-a/src".to_string());
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-workspace-mismatch",
             "task-agent-wait-root",
@@ -6752,21 +6746,10 @@ mod tests {
         child.write_scope = Some("/workspace-b/src".to_string());
         child.status = TaskStatus::Completed;
         child.output_refs = vec!["workspace mismatched result".to_string()];
-        spawn_graph
-            .lock()
-            .expect("spawn graph lock should be available")
-            .add_edge(
-                parent.task_id.clone(),
-                child.task_id.clone(),
-                child.kind,
-                std::time::SystemTime::now(),
-            )
-            .expect("test spawn graph edge should be accepted");
         task_store.insert_task(child).expect("子任务应插入");
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6787,7 +6770,6 @@ mod tests {
     fn agent_wait_classifies_model_invocation_failure_without_degrading() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-unavailable",
             "task-agent-wait-root",
@@ -6802,7 +6784,6 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6845,7 +6826,6 @@ mod tests {
     fn agent_wait_preserves_non_degradable_agent_failure() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-real-failure",
             "task-agent-wait-root",
@@ -6860,7 +6840,6 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -6892,7 +6871,6 @@ mod tests {
     fn agent_wait_redacts_internal_failure_details_from_failed_agent_output() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-redacted-failure",
             "task-agent-wait-root",
@@ -6910,7 +6888,6 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
-            &spawn_graph,
             &parent,
             &[],
             BuiltinToolName::AgentWait,
@@ -7078,9 +7055,79 @@ mod tests {
     }
 
     #[test]
+    fn agent_cancel_kills_direct_child_subtree_and_rejects_foreign_tasks() {
+        let task_store = TaskStore::new();
+        let registry = TaskExecutionRegistry::default();
+        let parent = test_task("task-cancel-parent", "task-cancel-parent", None);
+        let child = test_task(
+            "task-cancel-child",
+            "task-cancel-parent",
+            Some(parent.task_id.clone()),
+        );
+        let mut queued_sibling = test_task(
+            "task-cancel-sibling",
+            "task-cancel-parent",
+            Some(parent.task_id.clone()),
+        );
+        queued_sibling.status = TaskStatus::Pending;
+        for task in [parent.clone(), child.clone(), queued_sibling.clone()] {
+            task_store.insert_task(task).expect("任务应插入");
+        }
+
+        let (payload, status) = execute_agent_cancel(
+            &task_store,
+            &registry,
+            &parent,
+            BuiltinToolName::AgentCancel,
+            &serde_json::json!({"task_id": child.task_id, "reason": "方向错误"}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("结果应为 JSON");
+        assert_eq!(parsed["status"].as_str(), Some("cancelled"));
+        assert_eq!(parsed["child_status"].as_str(), Some("killed"));
+        let killed = task_store.get_task(&child.task_id).expect("子任务应存在");
+        assert_eq!(killed.status, TaskStatus::Killed);
+        assert!(
+            killed
+                .output_refs
+                .iter()
+                .any(|output| output.contains("方向错误"))
+        );
+        assert_eq!(
+            task_store.get_task(&queued_sibling.task_id).unwrap().status,
+            TaskStatus::Pending,
+            "取消只作用于目标代理"
+        );
+
+        let (payload, _) = execute_agent_cancel(
+            &task_store,
+            &registry,
+            &parent,
+            BuiltinToolName::AgentCancel,
+            &serde_json::json!({"task_id": child.task_id, "reason": "重复取消"}),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("结果应为 JSON");
+        assert_eq!(parsed["status"].as_str(), Some("already_terminal"));
+
+        let (payload, status) = execute_agent_cancel(
+            &task_store,
+            &registry,
+            &child,
+            BuiltinToolName::AgentCancel,
+            &serde_json::json!({"task_id": queued_sibling.task_id, "reason": "越权"}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("结果应为 JSON");
+        assert_eq!(parsed["error_code"].as_str(), Some("scope_mismatch"));
+        assert_eq!(
+            task_store.get_task(&queued_sibling.task_id).unwrap().status,
+            TaskStatus::Pending
+        );
+    }
+
+    #[test]
     fn agent_send_updates_package_revision_and_reaches_running_child() {
         let task_store = TaskStore::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-agent-send");
         let parent = coordinator_task(test_task(
@@ -7116,7 +7163,6 @@ mod tests {
 
         let (payload, status) = execute_agent_send(
             &task_store,
-            &spawn_graph,
             &registry,
             &parent,
             &session_id,
@@ -7141,7 +7187,6 @@ mod tests {
     #[test]
     fn agent_send_rejects_non_direct_child_and_scope_mismatch() {
         let task_store = TaskStore::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-agent-send-scope");
         let parent = coordinator_task(test_task(
@@ -7166,30 +7211,10 @@ mod tests {
         task_store
             .insert_task(grandchild.clone())
             .expect("孙任务应插入");
-        {
-            let mut graph = spawn_graph.lock().expect("SpawnGraph 锁应可用");
-            graph
-                .add_edge(
-                    parent.task_id.clone(),
-                    TaskId::new("task-agent-send-scope-child"),
-                    TaskKind::LocalAgent,
-                    std::time::SystemTime::now(),
-                )
-                .expect("子边应插入");
-            graph
-                .add_edge(
-                    TaskId::new("task-agent-send-scope-child"),
-                    grandchild.task_id.clone(),
-                    TaskKind::LocalAgent,
-                    std::time::SystemTime::now(),
-                )
-                .expect("孙边应插入");
-        }
         registry.open_task_signal_channel(&session_id, &grandchild.task_id);
 
         let (payload, status) = execute_agent_send(
             &task_store,
-            &spawn_graph,
             &registry,
             &parent,
             &session_id,
@@ -7261,11 +7286,9 @@ mod tests {
                     }),
                 )
             });
-            let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
             let (wait_payload, wait_status) = execute_agent_wait_with_runtime(
                 AgentWaitRuntime {
                     task_store: &task_store,
-                    spawn_graph: &spawn_graph,
                     conversation_registry: &registry,
                     session_id: &session_id,
                     session_threads: &[],
@@ -7287,7 +7310,6 @@ mod tests {
 
             let (send_payload, send_status) = execute_agent_send(
                 &task_store,
-                &spawn_graph,
                 &registry,
                 &parent,
                 &session_id,
@@ -7333,7 +7355,6 @@ mod tests {
         let session_store = SessionStore::new();
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let session_id = SessionId::new("session-tool-scope");
@@ -7351,7 +7372,6 @@ mod tests {
             &session_store,
             &execution_registry,
             &conversation_registry,
-            &spawn_graph,
             None,
             &plan_store,
             None,

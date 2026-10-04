@@ -18,7 +18,6 @@ use magi_orchestrator::{
     task_worker_catalog::{WorkerInfo, resolve_task_role},
 };
 use std::{
-    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -219,6 +218,9 @@ impl TaskRunner {
         if let Err(error) = self.expire_stale_leases(root_task_id) {
             return RunCycleOutcome::Error(error);
         }
+        if let Err(error) = self.kill_descendants_of_terminal_tasks(root_task_id) {
+            return RunCycleOutcome::Error(error);
+        }
 
         let active_leases = self.store.collect_active_leases(root_task_id);
         for (task_id, lease_id) in &active_leases {
@@ -413,7 +415,7 @@ impl TaskRunner {
         root_task_id: &TaskId,
         reason: &str,
     ) -> Result<(), String> {
-        let task_ids = self.collect_subtree_ids(root_task_id);
+        let task_ids = self.store.collect_subtree_ids(root_task_id);
         if task_ids.is_empty() {
             return Err(format!("任务树不存在: {root_task_id}"));
         }
@@ -447,51 +449,48 @@ impl TaskRunner {
     }
 
     pub fn kill_task(&self, task_id: &TaskId) -> Result<(), String> {
-        let task = self
-            .store
-            .get_task(task_id)
-            .ok_or_else(|| format!("任务不存在: {task_id}"))?;
-        if matches!(
-            task.status,
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
-        ) {
-            self.execution_admission.remove_queued_task(task_id);
-            return Ok(());
+        if kill_task_in_store(&self.store, &self.execution_admission, task_id, Vec::new())? {
+            self.set_checkpoint_signal();
         }
-        let changed = self
-            .store
-            .revoke_active_lease_and_set_task_terminal(
-                task_id,
-                &task.root_task_id,
-                TaskStatus::Killed,
-                Vec::new(),
-            )
-            .map_err(|error| format!("任务 {task_id} 取消收口失败: {error}"))?;
-        // 未改变说明任务在读取与收口之间已经由自身执行结束；只要它已处于终态，
-        // 终止目标就已达成，不能把这种竞态报告成失败。
-        if !changed
-            && !self.store.get_task(task_id).is_some_and(|current| {
-                matches!(
-                    current.status,
-                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
-                )
-            })
-        {
-            return Err(format!("终止任务 {task_id} 时当前任务租约已失效"));
-        }
-        self.execution_admission.remove_queued_task(task_id);
-        self.set_checkpoint_signal();
         Ok(())
     }
 
     /// 尽力终止整棵任务树：单个任务收口失败不会阻止其余任务被终止，
     /// 所有失败在全部尝试之后合并返回。
     pub fn kill_tree(&self, root_task_id: &TaskId) -> Result<(), String> {
-        let errors = self
-            .collect_subtree_ids(root_task_id)
-            .iter()
-            .filter_map(|task_id| self.kill_task(task_id).err())
-            .collect::<Vec<_>>();
+        let changed = kill_subtree_in_store(
+            &self.store,
+            &self.execution_admission,
+            root_task_id,
+            Vec::new(),
+        )?;
+        if changed {
+            self.set_checkpoint_signal();
+        }
+        Ok(())
+    }
+
+    /// 已结束任务下仍未结束的后代没有人会再收集结果，统一级联终止。
+    ///
+    /// 根任务失败、被终止或在子代理仍运行时完成，都由这里收口整棵子树，
+    /// 不依赖各条结束路径分别记得清理子代理。
+    fn kill_descendants_of_terminal_tasks(&self, root_task_id: &TaskId) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for task_id in self.store.collect_subtree_ids(root_task_id) {
+            let Some(task) = self.store.get_task(&task_id) else {
+                continue;
+            };
+            if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+                continue;
+            }
+            for child in self.store.get_children(&task_id) {
+                if matches!(child.status, TaskStatus::Pending | TaskStatus::Running)
+                    && let Err(error) = self.kill_tree(&child.task_id)
+                {
+                    errors.push(error);
+                }
+            }
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -598,7 +597,7 @@ impl TaskRunner {
     }
 
     fn terminal_state(&self, root_task_id: &TaskId) -> TerminalState {
-        let task_ids = self.collect_subtree_ids(root_task_id);
+        let task_ids = self.store.collect_subtree_ids(root_task_id);
         if task_ids.is_empty() {
             return TerminalState::NotTerminal;
         }
@@ -631,7 +630,8 @@ impl TaskRunner {
     }
 
     fn collect_non_terminal_task_ids(&self, root_task_id: &TaskId) -> Vec<TaskId> {
-        self.collect_subtree_ids(root_task_id)
+        self.store
+            .collect_subtree_ids(root_task_id)
             .into_iter()
             .filter(|task_id| {
                 self.store.get_task(task_id).is_some_and(|task| {
@@ -640,25 +640,6 @@ impl TaskRunner {
             })
             .collect()
     }
-
-    fn collect_subtree_ids(&self, root_task_id: &TaskId) -> Vec<TaskId> {
-        let mut ids = Vec::new();
-        let mut stack = vec![root_task_id.clone()];
-        let mut visited = HashSet::new();
-        while let Some(task_id) = stack.pop() {
-            if !visited.insert(task_id.clone()) {
-                continue;
-            }
-            if self.store.get_task(&task_id).is_none() {
-                continue;
-            }
-            for child in self.store.get_children(&task_id) {
-                stack.push(child.task_id);
-            }
-            ids.push(task_id);
-        }
-        ids
-    }
 }
 
 enum TerminalState {
@@ -666,6 +647,72 @@ enum TerminalState {
     AllCompleted,
     HasFailures(Vec<TaskId>),
     HasKilled(Vec<TaskId>),
+}
+
+/// 终止单个任务：撤销其租约、写入 Killed 终态并移出准入队列。
+///
+/// 返回是否由本次调用改变了任务状态。任务在读取与收口之间自行结束属于正常竞态，
+/// 只要它已处于终态就视为终止目标达成。
+pub(crate) fn kill_task_in_store(
+    store: &TaskStore,
+    admission: &ExecutionAdmissionController,
+    task_id: &TaskId,
+    output_refs: Vec<String>,
+) -> Result<bool, String> {
+    let task = store
+        .get_task(task_id)
+        .ok_or_else(|| format!("任务不存在: {task_id}"))?;
+    if task_status_is_finished(task.status) {
+        admission.remove_queued_task(task_id);
+        return Ok(false);
+    }
+    let changed = store
+        .revoke_active_lease_and_set_task_terminal(
+            task_id,
+            &task.root_task_id,
+            TaskStatus::Killed,
+            output_refs,
+        )
+        .map_err(|error| format!("任务 {task_id} 取消收口失败: {error}"))?;
+    if !changed
+        && !store
+            .get_task(task_id)
+            .is_some_and(|current| task_status_is_finished(current.status))
+    {
+        return Err(format!("终止任务 {task_id} 时当前任务租约已失效"));
+    }
+    admission.remove_queued_task(task_id);
+    Ok(changed)
+}
+
+/// 尽力终止整棵子树：单个任务收口失败不会阻止其余任务被终止，所有失败在全部
+/// 尝试之后合并返回。返回是否有任务状态被本次调用改变。
+pub(crate) fn kill_subtree_in_store(
+    store: &TaskStore,
+    admission: &ExecutionAdmissionController,
+    root_task_id: &TaskId,
+    output_refs: Vec<String>,
+) -> Result<bool, String> {
+    let mut changed = false;
+    let mut errors = Vec::new();
+    for task_id in store.collect_subtree_ids(root_task_id) {
+        match kill_task_in_store(store, admission, &task_id, output_refs.clone()) {
+            Ok(task_changed) => changed |= task_changed,
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(changed)
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+fn task_status_is_finished(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+    )
 }
 
 #[cfg(test)]
@@ -798,6 +845,70 @@ mod tests {
                 "{task_id} 必须被终止"
             );
         }
+    }
+
+    #[test]
+    fn failed_root_kills_running_and_queued_children_instead_of_dispatching_them() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task("task-root-failed", "task-root-failed", None);
+        root.status = TaskStatus::Failed;
+        let mut running_child = test_task(
+            "task-running-orphan",
+            "task-root-failed",
+            Some(root.task_id.clone()),
+        );
+        running_child.status = TaskStatus::Running;
+        let queued_child = test_task(
+            "task-queued-orphan",
+            "task-root-failed",
+            Some(root.task_id.clone()),
+        );
+        for task in [root.clone(), running_child.clone(), queued_child.clone()] {
+            store.insert_task(task).expect("任务应插入");
+        }
+        // 父任务已结束时排队中的子代理不能再被派发；RejectingDispatcher 被调用即报错。
+        let runner = TaskRunner::with_test_result_receiver(
+            Arc::clone(&store),
+            vec![WorkerInfo {
+                worker_id: WorkerId::new("worker-orphan"),
+                role: "executor".to_string(),
+                supported_kinds: vec![TaskKind::LocalAgent],
+                parallelism_limit: None,
+                system_prompt_template: None,
+            }],
+            Arc::new(RejectingDispatcher),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+
+        let outcome = runner.run_cycle(&root.task_id);
+
+        assert!(
+            matches!(outcome, RunCycleOutcome::Error(ref error) if error.contains("任务执行失败")),
+            "根任务失败后应直接收口：{outcome:?}"
+        );
+        for task_id in [&running_child.task_id, &queued_child.task_id] {
+            assert_eq!(
+                store.get_task(task_id).expect("任务应存在").status,
+                TaskStatus::Killed,
+                "{task_id} 必须随失败的根任务一起终止"
+            );
+        }
+    }
+
+    #[test]
+    fn child_of_completed_parent_is_not_runnable() {
+        let store = TaskStore::new();
+        let mut root = test_task("task-root-done", "task-root-done", None);
+        root.status = TaskStatus::Completed;
+        let child = test_task(
+            "task-late-child",
+            "task-root-done",
+            Some(root.task_id.clone()),
+        );
+        store.insert_task(root.clone()).expect("根任务应插入");
+        store.insert_task(child).expect("子任务应插入");
+
+        assert!(store.get_runnable_leaves(&root.task_id).is_empty());
     }
 
     #[test]

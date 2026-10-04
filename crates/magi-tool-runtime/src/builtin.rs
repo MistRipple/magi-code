@@ -252,6 +252,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::UpdateGoal => execute_orchestration_only(self.name, input),
             BuiltinToolName::AgentSpawn
             | BuiltinToolName::AgentSend
+            | BuiltinToolName::AgentCancel
             | BuiltinToolName::AgentWait
             | BuiltinToolName::ContextSearch
             | BuiltinToolName::ContextRead

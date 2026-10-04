@@ -96,6 +96,8 @@ pub enum BuiltinToolName {
     AgentSpawn,
     /// 主线向运行中的子代理发送结构化上下文补充。
     AgentSend,
+    /// 主线取消自己直接派发、尚未结束的子代理，并级联终止其子树。
+    AgentCancel,
     /// 等待一个或多个已派发代理进入终态，并把代理最终答复返回给主线。
     AgentWait,
     /// 子代理检索当前会话与同一执行链中可读取的上下文引用。
@@ -121,7 +123,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 78] = [
+    pub const ALL: [Self; 79] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -194,6 +196,7 @@ impl BuiltinToolName {
         Self::UpdateGoal,
         Self::AgentSpawn,
         Self::AgentSend,
+        Self::AgentCancel,
         Self::AgentWait,
         Self::ContextSearch,
         Self::ContextRead,
@@ -276,6 +279,7 @@ impl BuiltinToolName {
             Self::UpdateGoal => "update_goal",
             Self::AgentSpawn => "agent_spawn",
             Self::AgentSend => "agent_send",
+            Self::AgentCancel => "agent_cancel",
             Self::AgentWait => "agent_wait",
             Self::ContextSearch => "context_search",
             Self::ContextRead => "context_read",
@@ -352,6 +356,7 @@ impl BuiltinToolName {
             Self::GetGoal | Self::CreateGoal | Self::UpdateGoal => "session_goal",
             Self::AgentSpawn
             | Self::AgentSend
+            | Self::AgentCancel
             | Self::AgentWait
             | Self::ContextSearch
             | Self::ContextRead
@@ -435,6 +440,7 @@ impl BuiltinToolName {
             "update_goal" => Some(Self::UpdateGoal),
             "agent_spawn" => Some(Self::AgentSpawn),
             "agent_send" => Some(Self::AgentSend),
+            "agent_cancel" => Some(Self::AgentCancel),
             "agent_wait" => Some(Self::AgentWait),
             "context_search" => Some(Self::ContextSearch),
             "context_read" => Some(Self::ContextRead),
@@ -516,6 +522,7 @@ impl BuiltinToolName {
                 | Self::GitWorktreeRemove
                 | Self::AgentSpawn
                 | Self::AgentSend
+                | Self::AgentCancel
                 | Self::ContextRequest
                 | Self::CreateGoal
                 | Self::UpdateGoal
@@ -643,6 +650,7 @@ impl BuiltinToolName {
             | Self::GitWorktreeRemove
             | Self::AgentSpawn
             | Self::AgentSend
+            | Self::AgentCancel
             | Self::ContextRequest
             | Self::CreateGoal
             | Self::UpdateGoal
@@ -694,6 +702,7 @@ impl BuiltinToolName {
                 | Self::ProcessList
                 | Self::AgentSpawn
                 | Self::AgentSend
+                | Self::AgentCancel
                 | Self::AgentWait
                 | Self::ContextSearch
                 | Self::ContextRead
@@ -735,6 +744,7 @@ impl BuiltinToolName {
             | Self::CreateGoal
             | Self::UpdateGoal
             | Self::AgentSend
+            | Self::AgentCancel
             | Self::AgentWait
             | Self::ContextSearch
             | Self::ContextRead
@@ -1065,6 +1075,9 @@ impl BuiltinToolName {
             }
             Self::AgentSend => {
                 "向当前执行链中自己创建且仍在运行的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增，并在目标代理下一次模型轮次前送达。"
+            }
+            Self::AgentCancel => {
+                "取消当前任务直接派发、尚未结束的代理：终止该代理及其子树，释放其进程、浏览器租约和并发名额。用于代理方向错误、已不再需要或长时间无进展的情况；取消后该代理在 agent_wait 中返回 child_status=killed。"
             }
             Self::AgentWait => {
                 "等待一个或多个已派发代理进入终态，并把代理最终答复作为结构化结果返回给主线。用于收集 agent_spawn 创建的代理结果；不要用轮询式重复调用，只有当下一步依赖代理结果时才调用。\n\n\
@@ -1764,7 +1777,7 @@ impl BuiltinToolName {
                         "required": ["summary", "constraints", "expected_output", "references"]
                     },
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
-                    "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
+                    "parallelism_group": { "type": "string", "description": "可选的并行组名；同一父任务下相同组名的子 agent 互斥执行" }
                 },
                 "required": ["task_name", "role", "display_name", "goal", "context_package"]
             }),
@@ -1788,6 +1801,14 @@ impl BuiltinToolName {
                     }
                 },
                 "required": ["task_id", "message"]
+            }),
+            Self::AgentCancel => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "minLength": 1, "description": "agent_spawn 返回的 child_task_id" },
+                    "reason": { "type": "string", "minLength": 1, "description": "取消原因，会记录到该代理的终态输出中" }
+                },
+                "required": ["task_id", "reason"]
             }),
             Self::AgentWait => serde_json::json!({
                 "type": "object",

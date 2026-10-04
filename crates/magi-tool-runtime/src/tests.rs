@@ -6749,6 +6749,7 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "update_goal",
             "agent_spawn",
             "agent_send",
+            "agent_cancel",
             "agent_wait",
             "context_search",
             "context_read",

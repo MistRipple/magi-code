@@ -1,8 +1,0 @@
-[package]
-name = "magi-spawn-graph"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-magi-core = { path = "../magi-core" }
-thiserror.workspace = true

@@ -228,12 +228,8 @@ impl Drop for ContinueRecoveryAttempt<'_> {
             return;
         }
         if let Some(task_store) = self.state.task_store()
-            && let Err(error) = fail_resumed_execution_paths(
-                task_store,
-                self.state.spawn_graph.as_ref(),
-                &self.chain,
-                &self.branches,
-            )
+            && let Err(error) =
+                fail_resumed_execution_paths(task_store, &self.chain, &self.branches)
         {
             tracing::error!(
                 ?error,
@@ -1151,7 +1147,7 @@ where
         }
     }
     for branch in &branches_to_resume {
-        release_resumed_branch_path(task_store, state.spawn_graph.as_ref(), &chain, branch)
+        release_resumed_branch_path(task_store, &chain, branch)
             .map_err(|msg| ApiError::internal_assembly("继续会话失败", msg))?;
     }
 

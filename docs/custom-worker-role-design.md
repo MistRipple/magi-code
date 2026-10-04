@@ -30,7 +30,7 @@ Magi 是面向软件开发工作的本地多代理协作环境。主 Agent 负�
 - `magi-agent-role` 提供 Markdown role 解析、内置角色和用户角色目录加载；daemon 的实例目录为 `<state_root>/roles`，默认状态根为 `~/.magi`。
 - `ProfessionalCapabilityRegistry` 提供角色能力注册和组合。
 - `AgentBinding` 提供角色到 Engine 的绑定，以及继承主模型的语义。
-- `magi-orchestrator`、`magi-spawn-graph` 和 `magi-worker-runtime` 提供任务分派、父子关系、Worker 生命周期、工具调用和结果回传。
+- `magi-orchestrator` 和 `magi-worker-runtime` 提供任务分派、父子关系（TaskStore 的 `parent_task_id`）、Worker 生命周期、工具调用和结果回传。
 - Agent 设置页已经具备角色列表、角色详情和代理引擎绑定界面。
 
 本次实现收敛了此前的差距：角色注册表、API、前端 registry、Engine 绑定和 spawn 校验现在使用同一份有效角色集合；用户角色的创建、编辑、删除、导入、导出和进程内刷新都进入同一闭环。
@@ -130,7 +130,7 @@ Worker 报告回传主 Agent
 - Engine 绑定解析；
 - Worker 生命周期和并发限制；
 - governance、permissions、safety gate；
-- spawn graph 和结果回传。
+- 父子关系（TaskStore）和结果回传。
 
 ## 6. 产品交互
 
