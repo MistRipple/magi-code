@@ -1081,7 +1081,7 @@ impl BuiltinToolName {
                 - 返回 `status=failed` 时先判断是否可补救；能补救就重派或改派，只有真实阻断时才向用户说明失败"
             }
             Self::AgentSend => {
-                "向当前执行链中自己创建且仍在运行的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增，并在目标代理下一次模型轮次前送达。"
+                "向当前任务直接派发、尚未结束的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增：运行中的代理在下一次模型轮次前收到；排队中的代理在开始执行时随上下文包一起收到。"
             }
             Self::AgentCancel => {
                 "取消当前任务直接派发、尚未结束的代理：终止该代理及其子树，释放其进程、浏览器租约和并发名额。用于代理方向错误、已不再需要或长时间无进展的情况；取消后该代理在 agent_wait 中返回 child_status=killed。"

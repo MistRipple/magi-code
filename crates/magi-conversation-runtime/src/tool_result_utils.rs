@@ -106,11 +106,27 @@ pub fn non_retryable_tool_failure(
 
 /// 单轮对话允许的模型调用轮数上限；任务轮次与对话轮次共用。
 pub(crate) const MAX_MODEL_ROUNDS_PER_TURN: usize = 200;
+/// 单个子代理允许的模型调用轮数上限。子代理负责边界清晰的子任务，超过上限说明
+/// 方向有问题，应尽早把控制权还给主线改派或接管，而不是耗尽整轮预算。
+pub(crate) const MAX_MODEL_ROUNDS_PER_SUBAGENT: usize = 80;
 /// 没有任务策略时同一失败调用允许的重试次数（共尝试 retry + 1 次）。
 pub(crate) const DEFAULT_TOOL_RETRY_LIMIT: u32 = 1;
 
 /// 达到轮数上限时以明确原因结束本轮，避免模型陷入无限循环。
-pub(crate) fn model_round_limit_failure(round: usize) -> Option<DeterministicToolFailure> {
+pub(crate) fn model_round_limit_failure(
+    round: usize,
+    is_subagent: bool,
+) -> Option<DeterministicToolFailure> {
+    if is_subagent {
+        return (round >= MAX_MODEL_ROUNDS_PER_SUBAGENT).then(|| DeterministicToolFailure {
+            summary: format!(
+                "代理已达到 {MAX_MODEL_ROUNDS_PER_SUBAGENT} 次模型调用上限，已停止继续执行。"
+            ),
+            detail: format!(
+                "代理连续进行 {MAX_MODEL_ROUNDS_PER_SUBAGENT} 次模型调用仍未完成，可能陷入了重复操作或任务边界过大。主线应根据已有进展缩小范围后改派，或由主线接管。"
+            ),
+        });
+    }
     (round >= MAX_MODEL_ROUNDS_PER_TURN).then(|| DeterministicToolFailure {
         summary: format!("本轮已达到 {MAX_MODEL_ROUNDS_PER_TURN} 次模型调用上限，已停止继续执行。"),
         detail: format!(
@@ -1019,8 +1035,12 @@ mod tests {
 
     #[test]
     fn model_round_limit_stops_turn_at_shared_cap() {
-        assert!(model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN - 1).is_none());
-        let failure = model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN)
+        assert!(model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN - 1, false).is_none());
+        assert!(model_round_limit_failure(MAX_MODEL_ROUNDS_PER_SUBAGENT - 1, true).is_none());
+        let subagent_failure = model_round_limit_failure(MAX_MODEL_ROUNDS_PER_SUBAGENT, true)
+            .expect("子代理有独立且更低的轮数上限");
+        assert!(subagent_failure.detail.contains("改派"));
+        let failure = model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN, false)
             .expect("达到轮数上限必须以明确原因结束本轮");
         assert!(failure.summary.contains("模型调用上限"));
     }

@@ -976,6 +976,47 @@ fn execute_agent_send(
         estimated_tokens,
         occurred_at: now,
     };
+    // 排队中的代理尚未开始：补充写入其上下文包即可，启动时随上下文包一起渲染进提示词，
+    // 不依赖只在运行期存在的信号通道。
+    if target_task.status == TaskStatus::Pending {
+        let committed = task_store
+            .append_agent_context_supplement(&target_task_id, supplement.clone())
+            .and_then(|package| {
+                task_store.append_agent_context_access(&target_task_id, access.clone())?;
+                Ok(package)
+            });
+        let package = match committed {
+            Ok(package) => package,
+            Err(error) => {
+                return context_tool_failure(tool, "context_persist_failed", error.to_string());
+            }
+        };
+        task_store.notify_runtime_change();
+        publish_event(
+            "task.coordinator.agent_send",
+            serde_json::json!({
+                "parent_task_id": parent_task.task_id,
+                "child_task_id": target_task_id,
+                "package_id": package.package_id,
+                "revision": package.revision,
+                "estimated_tokens": estimated_tokens,
+            }),
+        );
+        return (
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "sent",
+                "task_id": target_task_id.to_string(),
+                "package_id": package.package_id,
+                "revision": package.revision,
+                "estimated_tokens": estimated_tokens,
+                "delivery": "on_start",
+                "instruction": "代理尚在排队，补充上下文会在它开始执行时一并提供。",
+            })
+            .to_string(),
+            ExecutionResultStatus::Succeeded,
+        );
+    }
     let commit =
         conversation_registry.enqueue_task_signal_with(session_id, &target_task_id, || {
             let package =
@@ -1026,6 +1067,7 @@ fn execute_agent_send(
             "package_id": package.package_id,
             "revision": package.revision,
             "estimated_tokens": estimated_tokens,
+            "delivery": "next_model_round",
         })
         .to_string(),
         ExecutionResultStatus::Succeeded,
@@ -7131,6 +7173,73 @@ mod tests {
         let signals = registry.drain_task_signals(&session_id, &child.task_id);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].payload["revision"], 2);
+    }
+
+    #[test]
+    fn agent_send_to_queued_child_is_delivered_with_its_start_context() {
+        let task_store = TaskStore::new();
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-agent-send-queued");
+        let parent = coordinator_task(test_task(
+            "task-agent-send-queued-parent",
+            "task-agent-send-queued-parent",
+            None,
+        ));
+        let mut child = test_task(
+            "task-agent-send-queued-child",
+            "task-agent-send-queued-parent",
+            Some(parent.task_id.clone()),
+        );
+        child.status = TaskStatus::Pending;
+        child.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(AgentContextPackage {
+                package_id: "agent-context-queued".to_string(),
+                revision: 1,
+                parent_task_id: parent.task_id.clone(),
+                summary: "初始任务".to_string(),
+                constraints: Vec::new(),
+                expected_output: "完成检查".to_string(),
+                references: Vec::new(),
+                supplements: Vec::new(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            }),
+            accesses: Vec::new(),
+        };
+        task_store
+            .insert_task(parent.clone())
+            .expect("父任务应插入");
+        task_store.insert_task(child.clone()).expect("子任务应插入");
+        // 不打开信号通道：排队中的代理（例如重启后恢复的）没有运行期通道。
+
+        let (payload, status) = execute_agent_send(
+            &task_store,
+            &registry,
+            &parent,
+            &session_id,
+            BuiltinToolName::AgentSend,
+            &serde_json::json!({
+                "task_id": child.task_id,
+                "message": "补充：只看 src/auth"
+            }),
+            &|_, _| {},
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("json");
+        assert_eq!(parsed["delivery"], "on_start");
+        let stored = task_store.get_task(&child.task_id).unwrap();
+        let package = stored.agent_context_package().unwrap();
+        assert_eq!(package.supplements.len(), 1);
+        assert!(
+            package.render_for_prompt().contains("补充：只看 src/auth"),
+            "代理开始执行时的上下文必须包含排队期间收到的补充"
+        );
+        assert!(
+            registry
+                .drain_task_signals(&session_id, &child.task_id)
+                .is_empty()
+        );
     }
 
     #[test]

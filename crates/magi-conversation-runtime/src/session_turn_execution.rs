@@ -1404,7 +1404,7 @@ fn run_session_turn_execution_inner(
         }
         context_budget_recheck_required = false;
         // 轮数上限与任务轮次共用：达到上限时按终止失败收口，不再继续调用模型。
-        let round_result = match model_round_limit_failure(round) {
+        let round_result = match model_round_limit_failure(round, false) {
             Some(failure) => Err(SessionTurnRoundError::TerminalToolFailure(failure)),
             None => stream_session_turn_round(
                 SessionTurnRoundRuntime {

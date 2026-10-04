@@ -1361,7 +1361,7 @@ fn run_conversation_loop_inner(
 
     let mut pre_output_invocation_recovery_attempts = 0usize;
     'conversation_round: for round in 0usize.. {
-        if let Some(failure) = model_round_limit_failure(round) {
+        if let Some(failure) = model_round_limit_failure(round, is_sidechain) {
             let error = match append_task_error_turn_item(
                 turn_writeback_context,
                 &failure.summary,
@@ -2424,10 +2424,18 @@ fn run_conversation_loop_inner(
                 },
             },
         );
+        // 子代理的用量计入其根任务所属的 Goal 预算；目标模式的行为约束仍只看自身归属。
+        let usage_goal_id = if task.parent_task_id.is_some() {
+            session_store
+                .active_goal_for_execution_owner(session_id, task.root_task_id.as_str())
+                .map(|goal| goal.goal_id)
+        } else {
+            round_goal_id.clone()
+        };
         account_active_goal_usage(
             session_store,
             session_id,
-            round_goal_id.as_ref(),
+            usage_goal_id.as_ref(),
             parsed.usage.as_ref(),
         );
         if let Some(metrics_store) = mission_metrics {
