@@ -3206,7 +3206,8 @@ fn canonical_turn_replay_response(
         "event-session-turn-replay-{}",
         canonical_turn.turn_id
     ));
-    let event_seq = state.event_bus.snapshot().next_sequence;
+    let next_sequence = state.event_bus.snapshot().next_sequence;
+    let event_seq = replay_as_of_sequence(next_sequence);
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id: canonical_turn.session_id.clone(),
         entry_id: format!(
@@ -3216,7 +3217,7 @@ fn canonical_turn_replay_response(
         event_id: event_id.clone(),
         accepted_at: canonical_turn.accepted_at,
         runtime_epoch: state.runtime_epoch().to_string(),
-        event_stream_next_sequence: event_seq,
+        event_stream_next_sequence: next_sequence,
         created_session: false,
         route,
         root_task_id: task_id.clone(),
@@ -3225,7 +3226,8 @@ fn canonical_turn_replay_response(
         user_message_item_id: user_item.as_ref().map(|item| item.item_id.clone()),
     })
     .with_canonical_event("turn_started", Some(canonical_turn), user_item)
-    .with_canonical_event_metadata(event_id, event_seq, UtcMillis::now()))
+    .with_canonical_event_metadata(event_id, event_seq, UtcMillis::now())
+    .with_replayed())
 }
 
 fn queued_turn_replay_response(
@@ -3237,14 +3239,15 @@ fn queued_turn_replay_response(
         "event-session-turn-queued-replay-{}",
         queued.queue_id
     ));
-    let event_sequence = state.event_bus.snapshot().next_sequence;
+    let next_sequence = state.event_bus.snapshot().next_sequence;
+    let event_sequence = replay_as_of_sequence(next_sequence);
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id: queued.session_id.clone(),
         entry_id: queued.queue_id.clone(),
         event_id: event_id.clone(),
         accepted_at: queued.accepted_at,
         runtime_epoch: state.runtime_epoch().to_string(),
-        event_stream_next_sequence: event_sequence,
+        event_stream_next_sequence: next_sequence,
         created_session: false,
         route: queued.route,
         root_task_id: None,
@@ -3253,7 +3256,8 @@ fn queued_turn_replay_response(
         user_message_item_id: queued.request.user_message_id(),
     })
     .with_queued(queued.queue_id.clone(), queue_position)
-    .with_request_identity(queued.request.request_id(), event_sequence))
+    .with_request_identity(queued.request.request_id(), event_sequence)
+    .with_replayed())
 }
 
 fn conversation_turn_replay_response(
@@ -3275,13 +3279,14 @@ fn conversation_turn_replay_response(
         "event-session-turn-conversation-{}",
         canonical_turn.turn_id
     ));
+    let next_sequence = state.event_bus.snapshot().next_sequence;
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id: session_id.clone(),
         entry_id: format!("timeline-{}-{}", session_id, canonical_turn.accepted_at.0),
         event_id: event_id.clone(),
         accepted_at: canonical_turn.accepted_at,
         runtime_epoch: state.runtime_epoch().to_string(),
-        event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
+        event_stream_next_sequence: next_sequence,
         created_session: false,
         route: SessionTurnRouteDto::Chat,
         root_task_id: None,
@@ -3292,9 +3297,16 @@ fn conversation_turn_replay_response(
     .with_canonical_event("turn_started", Some(canonical_turn), canonical_item)
     .with_canonical_event_metadata(
         event_id,
-        state.event_bus.snapshot().next_sequence,
+        replay_as_of_sequence(next_sequence),
         UtcMillis::now(),
-    ))
+    )
+    .with_replayed())
+}
+
+/// 重放响应不对应新发布的事件，它反映的是截至最后一条已发布事件的事实。
+/// 标为下一条实时事件的序号会让客户端随后丢弃那条真实事件。
+fn replay_as_of_sequence(next_sequence: u64) -> u64 {
+    next_sequence.saturating_sub(1)
 }
 
 fn schedule_conversation_execution(

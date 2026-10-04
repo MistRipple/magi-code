@@ -560,7 +560,10 @@ pub struct SessionTurnResponseDto {
     pub request_id: Option<String>,
     pub execution_profile: Option<ExecutionProfile>,
     pub status: Option<CoordinatorTurnStatus>,
+    /// 本响应对应的事件序号；只有确实对应某条已发布事件（或重放的截至序号）时才有值。
     pub event_sequence: Option<u64>,
+    /// 同一 requestId 的重放：返回既有 Turn 或排队位置，没有产生新的提交。
+    pub replayed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_summary: Option<SessionDirectoryEntryDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -645,7 +648,8 @@ impl SessionTurnResponseDto {
                 | SessionTurnRouteDto::Steer => ExecutionProfile::Task,
             }),
             status: Some(CoordinatorTurnStatus::Accepted),
-            event_sequence: Some(event_stream_next_sequence),
+            event_sequence: None,
+            replayed: false,
             session_summary: None,
             root_task_id: root_task_id.map(|task_id| task_id.to_string()),
             action_task_id: action_task_id.map(|task_id| task_id.to_string()),
@@ -679,6 +683,11 @@ impl SessionTurnResponseDto {
     ) -> Self {
         self.request_id = request_id;
         self.event_sequence = Some(event_sequence);
+        self
+    }
+
+    pub fn with_replayed(mut self) -> Self {
+        self.replayed = true;
         self
     }
 

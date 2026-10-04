@@ -1845,151 +1845,12 @@ async fn start_turn(
     start_turn_once(state, request_id, request).await
 }
 
-fn canonical_turn_wire_status(status: magi_session_store::CanonicalTurnStatus) -> &'static str {
-    match status {
-        magi_session_store::CanonicalTurnStatus::Pending => "accepted",
-        magi_session_store::CanonicalTurnStatus::Running => "running",
-        magi_session_store::CanonicalTurnStatus::Blocked => "blocked",
-        magi_session_store::CanonicalTurnStatus::Completed => "completed",
-        magi_session_store::CanonicalTurnStatus::Failed => "failed",
-        magi_session_store::CanonicalTurnStatus::Interrupted
-        | magi_session_store::CanonicalTurnStatus::Cancelled => "cancelled",
-        magi_session_store::CanonicalTurnStatus::Superseded => "cancelled",
-    }
-}
-
-fn event_sequence_for_event_id(state: &ApiState, event_id: &str) -> u64 {
-    let snapshot = state.event_bus.snapshot();
-    snapshot
-        .recent_events
-        .iter()
-        .find(|event| event.event_id.to_string() == event_id)
-        .map(|event| event.sequence)
-        .unwrap_or(snapshot.next_sequence)
-}
-
-fn event_sequence_for_turn(state: &ApiState, turn: &magi_session_store::CanonicalTurn) -> u64 {
-    let snapshot = state.event_bus.snapshot();
-    snapshot
-        .recent_events
-        .iter()
-        .rev()
-        .find(|event| {
-            event.payload.get("turn_id").and_then(Value::as_str) == Some(turn.turn_id.as_str())
-                || event
-                    .payload
-                    .get("canonical_turn")
-                    .and_then(|value| value.get("turnId"))
-                    .and_then(Value::as_str)
-                    == Some(turn.turn_id.as_str())
-        })
-        .map(|event| event.sequence)
-        .unwrap_or(snapshot.next_sequence)
-}
-
 async fn start_turn_once(
     state: &ApiState,
     request_id: RequestId,
     request: crate::dto::SessionTurnRequestDto,
 ) -> magi_app_server_protocol::ServerResponse {
-    if let Some(existing_turn) = request.request_id().as_deref().and_then(|request_id| {
-        state
-            .session_store
-            .canonical_turn_for_request_id(request_id)
-    }) {
-        if !request_matches_canonical_turn(&request, &existing_turn) {
-            return error_response(
-                request_id,
-                ErrorObject::new(
-                    ERROR_REQUEST_CONFLICT,
-                    "requestId 已绑定另一份 Turn，请为新请求生成新的 requestId",
-                )
-                .retryable(false),
-            );
-        }
-        let user_message_item = existing_turn
-            .items
-            .iter()
-            .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage);
-        typed_success_from_json::<TurnStartResult>(
-            request_id,
-            json!({
-                    "kind": "accepted",
-                    "replayed": true,
-                    "requestId": request.request_id(),
-                    "entryId": format!("timeline-{}-{}", existing_turn.session_id, existing_turn.accepted_at.0),
-                    "eventId": format!("event-session-turn-task-{}", existing_turn.turn_id),
-                    "sessionId": existing_turn.session_id,
-                    "turnId": existing_turn.turn_id,
-                    "acceptedAt": existing_turn.accepted_at,
-                    "createdSession": false,
-                    "route": user_message_item.and_then(|item| {
-                        item.metadata.get("route").and_then(Value::as_str)
-                    }),
-                    "executionProfile": existing_turn.metadata.get("executionProfile").and_then(Value::as_str)
-                        .or_else(|| user_message_item.and_then(|item| item.metadata.get("executionProfile").and_then(Value::as_str))),
-                    "status": canonical_turn_wire_status(existing_turn.status),
-                    "eventSequence": event_sequence_for_turn(state, &existing_turn),
-                    "userMessageItemId": user_message_item.map(|item| item.item_id.clone()),
-                    "runtimeEpoch": state.runtime_epoch(),
-                    "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
-                    "canonicalTurn": existing_turn,
-                    "canonicalItem": user_message_item,
-                    "sessionSummary": null,
-                    "queue": null,
-            }),
-            "turn/start",
-        )
-    } else if let Some((queued_turn, queue_position)) = request
-        .request_id()
-        .as_deref()
-        .and_then(|request_id| state.queued_regular_session_turn_for_request_id(request_id))
     {
-        if !request_matches_queued_turn(&request, &queued_turn) {
-            return error_response(
-                request_id,
-                ErrorObject::new(
-                    ERROR_REQUEST_CONFLICT,
-                    "requestId 已绑定另一份排队 Turn，请为新请求生成新的 requestId",
-                )
-                .retryable(false),
-            );
-        }
-        let queue_id = queued_turn.queue_id.clone();
-        let user_message_item_id = queued_turn.request.user_message_id();
-        typed_success_from_json::<TurnStartResult>(
-            request_id,
-            json!({
-                    "kind": "queued",
-                    "replayed": true,
-                    "requestId": queued_turn.request.request_id(),
-                    "entryId": queue_id,
-                    "eventId": format!("event-session-turn-queued-{}", queued_turn.queue_id),
-                    "sessionId": queued_turn.session_id,
-                    "turnId": null,
-                    "acceptedAt": queued_turn.accepted_at,
-                    "route": queued_turn.route,
-                    "executionProfile": if matches!(queued_turn.route, crate::dto::SessionTurnRouteDto::Chat) { "conversation" } else { "task" },
-                    "status": "accepted",
-                    "eventSequence": event_sequence_for_event_id(
-                        state,
-                        &format!("event-session-turn-queued-{}", queued_turn.queue_id),
-                    ),
-                    "createdSession": false,
-                    "userMessageItemId": user_message_item_id,
-                    "runtimeEpoch": state.runtime_epoch(),
-                    "eventStreamNextSequence": state.event_bus.snapshot().next_sequence,
-                    "sessionSummary": null,
-                    "canonicalTurn": null,
-                    "canonicalItem": null,
-                    "queue": {
-                        "queueId": queued_turn.queue_id,
-                        "queuePosition": queue_position,
-                    },
-            }),
-            "turn/start",
-        )
-    } else {
         let business_request_id = request.request_id();
         match TurnService::new(state.clone()).submit(request).await {
             Ok(result) => {
@@ -2030,7 +1891,6 @@ async fn start_turn_once(
                     "kind".to_string(),
                     json!(if queued { "queued" } else { "accepted" }),
                 );
-                object.insert("replayed".to_string(), json!(false));
                 if let Some(request_id) = business_request_id.as_ref() {
                     object.insert("requestId".to_string(), json!(request_id));
                 }
@@ -2054,37 +1914,6 @@ async fn start_turn_once(
             Err(error) => error_response(request_id, api_error_to_protocol(error)),
         }
     }
-}
-
-fn request_matches_canonical_turn(
-    request: &crate::dto::SessionTurnRequestDto,
-    turn: &magi_session_store::CanonicalTurn,
-) -> bool {
-    let Some(user_item) = turn
-        .items
-        .iter()
-        .find(|item| item.kind == magi_session_store::CanonicalTurnItemKind::UserMessage)
-    else {
-        return false;
-    };
-    let Some(request_fingerprint) = request.request_fingerprint().ok() else {
-        return false;
-    };
-    user_item
-        .metadata
-        .get("requestFingerprint")
-        .and_then(Value::as_str)
-        == Some(request_fingerprint.as_str())
-}
-
-fn request_matches_queued_turn(
-    request: &crate::dto::SessionTurnRequestDto,
-    queued: &crate::state::QueuedRegularSessionTurn,
-) -> bool {
-    let Some(request_fingerprint) = request.request_fingerprint().ok() else {
-        return false;
-    };
-    queued.request_fingerprint.as_deref() == Some(request_fingerprint.as_str())
 }
 
 async fn handle_notification(
@@ -2471,111 +2300,6 @@ mod tests {
         assert!(snapshot_requires_resync(&snapshot, 3));
         assert!(!snapshot_requires_resync(&snapshot, 4));
         assert!(!snapshot_requires_resync(&snapshot, 0));
-    }
-
-    #[test]
-    fn queued_turn_replay_requires_the_persisted_complete_request_fingerprint() {
-        let request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
-            "scope": "personal",
-            "text": "inspect browser",
-            "requestId": "request-queued-fingerprint"
-        }))
-        .expect("request should deserialize");
-        let fingerprint = request
-            .request_fingerprint()
-            .expect("request fingerprint should generate");
-        let queued = crate::state::QueuedRegularSessionTurn {
-            request: request.clone(),
-            request_fingerprint: Some(fingerprint),
-            requested_workspace_id: None,
-            accepted_at: UtcMillis(1),
-            route: crate::dto::SessionTurnRouteDto::Chat,
-            task_title: None,
-            execution_goal: None,
-            task_tier: TaskTier::ExecutionChain,
-            collaboration_mode: magi_core::CollaborationMode::Auto,
-            tool_intent: None,
-            forced_tool_name: None,
-            goal_mode: false,
-            required_tool_chain: Vec::new(),
-            completion_contract: TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            session_id: SessionId::new("session-queued-fingerprint"),
-            workspace_id: None,
-            queue_id: "queue-fingerprint".to_string(),
-            retry_count: 0,
-        };
-        assert!(request_matches_queued_turn(&request, &queued));
-
-        let mut changed = request.clone();
-        changed.locale = Some("en-US".to_string());
-        assert!(!request_matches_queued_turn(&changed, &queued));
-
-        let mut without_request_fingerprint = queued;
-        without_request_fingerprint.request_fingerprint = None;
-        assert!(!request_matches_queued_turn(
-            &request,
-            &without_request_fingerprint
-        ));
-    }
-
-    #[test]
-    fn canonical_turn_replay_requires_the_same_complete_request_fingerprint() {
-        let request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
-            "scope": "personal",
-            "text": "inspect browser",
-            "requestId": "request-canonical-fingerprint"
-        }))
-        .expect("request should deserialize");
-        let fingerprint = request
-            .request_fingerprint()
-            .expect("request fingerprint should generate");
-        let session_id = SessionId::new("session-canonical-fingerprint");
-        let turn = CanonicalTurn {
-            session_id: session_id.clone(),
-            turn_id: "turn-canonical-fingerprint".to_string(),
-            turn_seq: 1,
-            accepted_at: UtcMillis(1),
-            completed_at: None,
-            status: CanonicalTurnStatus::Running,
-            response_duration_ms: None,
-            usage: None,
-            items: vec![CanonicalTurnItem {
-                session_id,
-                turn_id: "turn-canonical-fingerprint".to_string(),
-                turn_seq: 1,
-                item_id: "user-canonical-fingerprint".to_string(),
-                item_seq: 0,
-                kind: CanonicalTurnItemKind::UserMessage,
-                created_at: UtcMillis(1),
-                status: CanonicalTurnItemStatus::Completed,
-                item_version: None,
-                updated_at: UtcMillis(1),
-                title: None,
-                content: Some("inspect browser".to_string()),
-                blocks: Vec::new(),
-                tool: None,
-                worker: None,
-                source_thread_id: ThreadId::new("thread-canonical-fingerprint"),
-                visibility: CanonicalTurnVisibility::default(),
-                metadata: HashMap::from([("requestFingerprint".to_string(), json!(fingerprint))]),
-            }],
-            metadata: HashMap::new(),
-        };
-        assert!(request_matches_canonical_turn(&request, &turn));
-
-        let mut changed = request.clone();
-        changed.access_profile = Some(magi_core::AccessProfile::ReadOnly);
-        assert!(!request_matches_canonical_turn(&changed, &turn));
-
-        let mut without_request_fingerprint = turn;
-        without_request_fingerprint.items[0]
-            .metadata
-            .remove("requestFingerprint");
-        assert!(!request_matches_canonical_turn(
-            &request,
-            &without_request_fingerprint
-        ));
     }
 
     #[tokio::test]
