@@ -1,9 +1,37 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import {
+  createWriteStream,
+  mkdirSync,
+  renameSync,
+  statSync,
+  type WriteStream,
+} from "node:fs";
 import { access } from "node:fs/promises";
+import { dirname } from "node:path";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
+const DAEMON_LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+const RECENT_OUTPUT_MAX_CHARS = 4_000;
+
+/**
+ * 崩溃恢复策略：同一时间窗口内的崩溃次数决定指数退避的等待时间，超过上限即熔断，
+ * 不再自动拉起 daemon，交给用户决定重试或退出。
+ */
+export interface DaemonRecoveryPolicy {
+  baseDelayMs: number;
+  maxDelayMs: number;
+  crashWindowMs: number;
+  maxCrashesInWindow: number;
+}
+
+const DEFAULT_RECOVERY_POLICY: DaemonRecoveryPolicy = {
+  baseDelayMs: 500,
+  maxDelayMs: 30_000,
+  crashWindowMs: 5 * 60_000,
+  maxCrashesInWindow: 5,
+};
 const EXTERNAL_HEALTH_POLL_INTERVAL = 500;
 const READY_REGISTRATION_RETRY_BASE_DELAY = 1_000;
 const READY_REGISTRATION_RETRY_MAX_DELAY = 8_000;
@@ -37,7 +65,13 @@ export class ProcessSupervisor {
   readonly #daemonIdentity: DaemonIdentityExpectation;
   readonly #reuseExistingDaemon: boolean;
   readonly #onReady: (() => Promise<void>) | undefined;
+  readonly #onFailed: ((error: Error) => void) | undefined;
   readonly #spawnDaemon: typeof spawn;
+  readonly #logFilePath: string | undefined;
+  readonly #recoveryPolicy: DaemonRecoveryPolicy;
+  #logStream: WriteStream | null = null;
+  #recentOutput = "";
+  #crashTimestamps: number[] = [];
   #daemon: ChildProcess | null = null;
   #stopping = false;
   #ready = false;
@@ -68,7 +102,12 @@ export class ProcessSupervisor {
     environment: NodeJS.ProcessEnv;
     daemonIdentity: DaemonIdentityExpectation;
     onReady?: () => Promise<void>;
+    /** 自动恢复已放弃（恢复耗尽或熔断）时通知宿主，由宿主向用户展示错误。 */
+    onFailed?: (error: Error) => void;
     spawnDaemon?: typeof spawn;
+    /** daemon stdout/stderr 的落盘位置；正式发行版没有可见的控制台。 */
+    logFilePath?: string;
+    recoveryPolicy?: Partial<DaemonRecoveryPolicy>;
   }) {
     this.#daemonPath = input.daemonPath;
     this.#agentOrigin = input.agentOrigin;
@@ -76,7 +115,20 @@ export class ProcessSupervisor {
     this.#daemonIdentity = input.daemonIdentity;
     this.#reuseExistingDaemon = input.environment.MAGI_DESKTOP_REUSE_DAEMON === "1";
     this.#onReady = input.onReady;
+    this.#onFailed = input.onFailed;
     this.#spawnDaemon = input.spawnDaemon ?? spawn;
+    this.#logFilePath = input.logFilePath;
+    this.#recoveryPolicy = { ...DEFAULT_RECOVERY_POLICY, ...input.recoveryPolicy };
+  }
+
+  /** daemon 日志文件位置；未配置时为 null。 */
+  get logFilePath(): string | null {
+    return this.#logFilePath ?? null;
+  }
+
+  /** 最近一段 daemon 输出，用于在启动失败时向用户说明原因。 */
+  get recentOutput(): string {
+    return this.#recentOutput;
   }
 
   start(): Promise<void> {
@@ -95,6 +147,9 @@ export class ProcessSupervisor {
     const signal = controller.signal;
     const generation = ++this.#lifecycleGeneration;
     this.#stopping = false;
+    // 显式启动（包括用户在错误窗口点重试）重新开始计算熔断窗口。
+    this.#crashTimestamps = [];
+    this.#recentOutput = "";
     const startPromise = this.enqueue(() => this.startInternal(generation, signal));
     this.#startPromise = startPromise;
     // 仅附加带拒绝处理的清理分支；不能用裸 finally，否则原始启动
@@ -215,8 +270,16 @@ export class ProcessSupervisor {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    child.stdout?.on("data", (chunk) => process.stdout.write(`[daemon] ${chunk}`));
-    child.stderr?.on("data", (chunk) => process.stderr.write(`[daemon] ${chunk}`));
+    const logStream = this.openLogStream();
+    child.stdout?.on("data", (chunk) => {
+      process.stdout.write(`[daemon] ${chunk}`);
+      logStream?.write(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      process.stderr.write(`[daemon] ${chunk}`);
+      logStream?.write(chunk);
+      this.#recentOutput = `${this.#recentOutput}${chunk}`.slice(-RECENT_OUTPUT_MAX_CHARS);
+    });
     this.#daemon = child;
     const earlyExit = new Promise<never>((_resolve, reject) => {
       child.once("exit", (code, signal) => {
@@ -249,6 +312,22 @@ export class ProcessSupervisor {
 
   private scheduleRecovery(generation: number): void {
     if (this.#recovery || this.#stopping || generation !== this.#lifecycleGeneration) return;
+    const now = Date.now();
+    this.#crashTimestamps = [
+      ...this.#crashTimestamps.filter(
+        (timestamp) => now - timestamp < this.#recoveryPolicy.crashWindowMs,
+      ),
+      now,
+    ];
+    if (this.#crashTimestamps.length > this.#recoveryPolicy.maxCrashesInWindow) {
+      this.#status = "failed";
+      this.reportFailure(
+        new Error(
+          `magi_daemon_crash_loop:${this.#crashTimestamps.length} crashes within ${this.#recoveryPolicy.crashWindowMs}ms`,
+        ),
+      );
+      return;
+    }
     const recovery = this.enqueue(() => this.recover(generation));
     this.#recovery = recovery;
     // recovery 是后台生命周期任务，不能把裸拒绝暴露给 Node 的
@@ -275,7 +354,7 @@ export class ProcessSupervisor {
       // 初始启动路径可能已经在同一生命周期内完成下一次尝试。恢复任务排到
       // lifecycle queue 后必须复用该受管进程，不能再并行拉起第二个 daemon。
       if (this.#daemon && !hasExited(this.#daemon)) return;
-      await delay(attempt * 500, signal);
+      await delay(this.recoveryDelay(attempt), signal);
       try {
         this.#runtimeEpoch = await this.startAttempt(generation, signal);
         this.resetReadyRegistrationRetry();
@@ -293,12 +372,57 @@ export class ProcessSupervisor {
     }
     if (!this.#stopping && generation === this.#lifecycleGeneration) {
       this.#status = "failed";
-      console.error("Magi daemon 恢复失败", errorMessage(lastError));
+      this.reportFailure(new Error(`magi_daemon_recovery_failed:${errorMessage(lastError)}`));
+    }
+  }
+
+  /** 指数退避：窗口内崩溃越多、本轮重试越靠后，等待越久。 */
+  private recoveryDelay(attempt: number): number {
+    const exponent = this.#crashTimestamps.length + attempt - 2;
+    return Math.min(
+      this.#recoveryPolicy.baseDelayMs * 2 ** Math.max(0, exponent),
+      this.#recoveryPolicy.maxDelayMs,
+    );
+  }
+
+  private reportFailure(error: Error): void {
+    console.error("Magi daemon 自动恢复已停止", error.message);
+    try {
+      this.#onFailed?.(error);
+    } catch (callbackError) {
+      console.error("Magi daemon 失败通知处理异常", errorMessage(callbackError));
+    }
+  }
+
+  private openLogStream(): WriteStream | null {
+    const path = this.#logFilePath;
+    if (!path) return null;
+    if (this.#logStream) return this.#logStream;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      try {
+        if (statSync(path).size > DAEMON_LOG_ROTATE_BYTES) renameSync(path, `${path}.1`);
+      } catch {
+        // 日志文件尚不存在。
+      }
+      const stream = createWriteStream(path, { flags: "a" });
+      stream.on("error", (error) => {
+        console.error("写入 daemon 日志失败", errorMessage(error));
+        if (this.#logStream === stream) this.#logStream = null;
+      });
+      stream.write(`\n===== ${new Date().toISOString()} daemon start =====\n`);
+      this.#logStream = stream;
+      return stream;
+    } catch (error) {
+      console.error("打开 daemon 日志失败", errorMessage(error));
+      return null;
     }
   }
 
   private async stopInternal(_generation: number): Promise<void> {
     await this.terminateCurrent();
+    this.#logStream?.end();
+    this.#logStream = null;
     const externalHealthMonitor = this.#externalHealthMonitor;
     await externalHealthMonitor?.catch(() => undefined);
     if (this.#externalHealthMonitor === externalHealthMonitor) {

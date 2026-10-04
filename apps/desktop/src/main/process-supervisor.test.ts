@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ChildProcess, spawn } from "node:child_process";
 import { test } from "node:test";
 import { ProcessSupervisor } from "./process-supervisor.js";
@@ -323,16 +326,105 @@ test("managed daemon restarts after an unexpected exit even when ready flag is t
   }
 });
 
+test("managed daemon crash loop trips the breaker and reports failure instead of restarting forever", async () => {
+  let startupNonce = "";
+  const children: FakeChildProcess[] = [];
+  const failures: Error[] = [];
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(healthPayload({ runtimeEpoch: `runtime-loop-${children.length}`, startupNonce }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const fakeSpawn = ((_command: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+      startupNonce = options.env?.MAGI_DAEMON_START_NONCE ?? "";
+      const child = new FakeChildProcess(20_000 + children.length);
+      children.push(child);
+      return child as unknown as ChildProcess;
+    }) as typeof spawn;
+    const supervisor = new ProcessSupervisor({
+      daemonPath: process.execPath,
+      agentOrigin: `http://127.0.0.1:${address.port}`,
+      environment: {},
+      daemonIdentity: DAEMON_IDENTITY,
+      spawnDaemon: fakeSpawn,
+      onFailed: (error) => failures.push(error),
+      recoveryPolicy: {
+        baseDelayMs: 10,
+        maxDelayMs: 40,
+        crashWindowMs: 60_000,
+        maxCrashesInWindow: 2,
+      },
+    });
+
+    await supervisor.start();
+    for (let crash = 1; crash <= 3; crash += 1) {
+      await waitUntil(() => supervisor.status === "ready" && children.length === crash);
+      children.at(-1)?.exitUnexpectedly(1);
+    }
+
+    await waitUntil(() => failures.length === 1);
+    assert.equal(supervisor.status, "failed");
+    assert.match(failures[0]?.message ?? "", /magi_daemon_crash_loop/);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(children.length, 3, "熔断后不能继续自动拉起 daemon");
+    await supervisor.stop();
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+test("managed daemon startup failure keeps daemon output in the log file and recent output", async () => {
+  const logRoot = mkdtempSync(join(tmpdir(), "magi-daemon-log-"));
+  const logFilePath = join(logRoot, "logs", "daemon.log");
+  try {
+    const fakeSpawn = (() => {
+      const child = new FakeChildProcess(30_000, true);
+      queueMicrotask(() => {
+        child.stderr?.emit("data", Buffer.from("Error: 会话存储无法打开\n"));
+        child.exitUnexpectedly(2);
+      });
+      return child as unknown as ChildProcess;
+    }) as typeof spawn;
+    const supervisor = new ProcessSupervisor({
+      daemonPath: process.execPath,
+      agentOrigin: "http://127.0.0.1:9",
+      environment: {},
+      daemonIdentity: DAEMON_IDENTITY,
+      spawnDaemon: fakeSpawn,
+      logFilePath,
+    });
+
+    await assert.rejects(supervisor.start(), /magi_daemon_start_failed/);
+    assert.equal(supervisor.logFilePath, logFilePath);
+    assert.match(supervisor.recentOutput, /会话存储无法打开/);
+    await supervisor.stop();
+    assert.match(readFileSync(logFilePath, "utf8"), /会话存储无法打开/);
+  } finally {
+    rmSync(logRoot, { recursive: true, force: true });
+  }
+});
+
 class FakeChildProcess extends EventEmitter {
   readonly pid: number;
-  readonly stdout = null;
-  readonly stderr = null;
+  readonly stdout: EventEmitter | null;
+  readonly stderr: EventEmitter | null;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
 
-  constructor(pid: number) {
+  constructor(pid: number, withOutput = false) {
     super();
     this.pid = pid;
+    this.stdout = withOutput ? new EventEmitter() : null;
+    this.stderr = withOutput ? new EventEmitter() : null;
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {

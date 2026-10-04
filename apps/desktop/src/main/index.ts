@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   nativeImage,
@@ -293,6 +294,10 @@ if (singleInstance) {
           buildIdentity: BUILD_IDENTITY,
         },
         onReady: handleDaemonReady,
+        onFailed: (error) => {
+          void handleDaemonRuntimeFailure(error);
+        },
+        logFilePath: join(app.getPath("logs"), "daemon.log"),
         environment: {
           ...process.env,
           MAGI_HOST: "127.0.0.1",
@@ -311,7 +316,7 @@ if (singleInstance) {
             : { MAGI_WEB_DEV: "1", MAGI_WEB_DEV_ROOT: paths.webRoot }),
         },
       });
-      await processSupervisor.start();
+      await startDaemonWithFailurePrompt(processSupervisor);
       // 先让 daemon、桌面控制端点和前端入口全部就绪，再创建唯一桌面窗口。
       // 如果窗口早于 daemon 加载 Renderer，首次 loadURL 会收到 connection refused；
       // 这会留下一个只有原生外框的空白窗口，并把后续 Browser Surface 恢复带入竞态。
@@ -330,6 +335,10 @@ if (singleInstance) {
     })
     .catch(async (error) => {
       console.error("Magi Desktop 启动失败", error);
+      // 用户已在 daemon 错误窗口中选择退出时不再重复提示。
+      if (!(error instanceof DaemonStartupDeclinedError)) {
+        dialog.showErrorBox("Magi 无法启动", describeError(error));
+      }
       await shutdown().catch((cleanupError) => {
         console.error("Magi Desktop 启动清理失败", cleanupError);
       });
@@ -1161,6 +1170,90 @@ function showMainWindow(): void {
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
+}
+
+/** 用户在 daemon 错误窗口中选择退出。 */
+class DaemonStartupDeclinedError extends Error {
+  constructor(cause: unknown) {
+    super(`magi_daemon_startup_declined:${describeError(cause)}`);
+    this.name = "DaemonStartupDeclinedError";
+  }
+}
+
+let daemonFailurePromptOpen = false;
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error ?? "unknown");
+}
+
+/** 启动 daemon；失败时让用户选择重试或退出，而不是无提示地退出应用。 */
+async function startDaemonWithFailurePrompt(
+  supervisor: ProcessSupervisor,
+): Promise<void> {
+  for (;;) {
+    try {
+      await supervisor.start();
+      return;
+    } catch (error) {
+      if (shuttingDown) throw error;
+      if ((await promptDaemonFailure(supervisor, error)) === "exit") {
+        throw new DaemonStartupDeclinedError(error);
+      }
+    }
+  }
+}
+
+async function promptDaemonFailure(
+  supervisor: ProcessSupervisor,
+  error: unknown,
+): Promise<"retry" | "exit"> {
+  const logPath = supervisor.logFilePath;
+  const recentOutput = supervisor.recentOutput.trim().split("\n").slice(-12).join("\n");
+  const detail = [
+    `原因：${describeError(error)}`,
+    recentOutput ? `最近输出：\n${recentOutput}` : "",
+    logPath ? `完整日志：${logPath}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  for (;;) {
+    const { response } = await dialog.showMessageBox({
+      type: "error",
+      title: "Magi",
+      message: "Magi 后台服务无法启动",
+      detail,
+      buttons: ["重试", "打开日志位置", "退出"],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    });
+    if (response === 0) return "retry";
+    if (response === 1 && logPath) {
+      shell.showItemInFolder(logPath);
+      continue;
+    }
+    if (response === 1) continue;
+    return "exit";
+  }
+}
+
+/** daemon 运行期间自动恢复放弃（恢复耗尽或熔断）后由用户决定重试或退出。 */
+async function handleDaemonRuntimeFailure(error: Error): Promise<void> {
+  const supervisor = processSupervisor;
+  if (shuttingDown || daemonFailurePromptOpen || !supervisor) return;
+  daemonFailurePromptOpen = true;
+  try {
+    if ((await promptDaemonFailure(supervisor, error)) === "retry") {
+      await startDaemonWithFailurePrompt(supervisor);
+    } else {
+      app.quit();
+    }
+  } catch (startError) {
+    console.error("Magi daemon 重新启动失败", describeError(startError));
+    app.quit();
+  } finally {
+    daemonFailurePromptOpen = false;
+  }
 }
 
 async function shutdown(): Promise<void> {
