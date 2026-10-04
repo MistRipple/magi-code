@@ -439,30 +439,6 @@ pub enum AccessProfile {
     FullAccess,
 }
 
-/// Root coordinator 的协作策略。
-///
-/// 该字段只表达是否允许当前任务使用子代理，不能再通过 `denied_tools` 或
-/// 用户输入关键词间接推断。`auto` 由 coordinator 根据任务需要自主决定，
-/// `required` 表示用户明确要求真实协作，`disabled` 表示用户明确要求单线执行。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CollaborationMode {
-    #[default]
-    Auto,
-    Required,
-    Disabled,
-}
-
-impl CollaborationMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Required => "required",
-            Self::Disabled => "disabled",
-        }
-    }
-}
-
 impl AccessProfile {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -499,7 +475,6 @@ pub struct TaskPolicy {
     #[serde(default)]
     pub access_profile: AccessProfile,
     #[serde(default)]
-    pub collaboration_mode: CollaborationMode,
     pub allowed_tools: Vec<String>,
     pub denied_tools: Vec<String>,
     pub allowed_paths: Vec<String>,

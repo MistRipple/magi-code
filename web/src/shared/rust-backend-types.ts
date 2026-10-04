@@ -54,7 +54,6 @@ export interface SessionBrowserNodeSelectionDto {
 export type SessionTurnRouteDto =
   | 'chat'
   | 'execute'
-  | 'task'
   | 'continue'
   | 'steer';
 
@@ -66,6 +65,8 @@ export interface SessionTurnRequestDto {
   text?: string | null;
   skillName?: string | null;
   goalMode?: boolean;
+  /** 用户点击“继续”恢复被中断或可恢复的执行。 */
+  resume?: boolean;
   images: SessionTurnImageDto[];
   contextReferences?: Array<{
     kind: 'file' | 'directory';

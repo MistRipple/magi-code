@@ -3917,6 +3917,8 @@ interface ExecuteTaskInput {
   requestId?: string;
   skillName?: string | null;
   goalMode?: boolean;
+  /** 用户点击“继续”恢复被中断或可恢复的执行。 */
+  resume?: boolean;
   command?: SessionTurnCommand | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
@@ -4199,6 +4201,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       skillName,
       locale: i18n.locale,
       goalMode: input.goalMode === true,
+      resume: input.resume === true,
       command,
       images,
       contextReferences,
@@ -4313,9 +4316,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       placeholderMessageId,
       ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
     });
-    const successMessage = turnResult.route === 'task'
-      ? i18n.t('bridge.detail.taskSubmitted')
-      : turnResult.route === 'continue'
+    const successMessage = turnResult.route === 'continue'
         ? i18n.t('bridge.detail.continueSubmitted')
         : i18n.t('bridge.detail.messageSent');
     emitBridgeSuccessToast(
@@ -4459,6 +4460,7 @@ async function continueSessionExecution(): Promise<void> {
   }));
   const accepted = await executeTask({
     text: '继续',
+    resume: true,
     workspaceId: currentWorkspaceId,
     workspacePath: currentWorkspacePath,
     sessionId,

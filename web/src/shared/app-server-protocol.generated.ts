@@ -229,6 +229,7 @@ export interface TurnStartParams {
   skillName?: string | null;
   locale?: string | null;
   goalMode?: boolean;
+  resume?: boolean;
   command?: SessionTurnCommand | null;
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
@@ -331,7 +332,7 @@ export interface CanonicalTurn {
 
 export type TurnStartKind = "accepted" | "queued";
 
-export type TurnStartRoute = "chat" | "execute" | "task" | "continue" | "steer";
+export type TurnStartRoute = "chat" | "execute" | "continue" | "steer";
 
 export interface TurnQueueInfo {
   queueId: string;

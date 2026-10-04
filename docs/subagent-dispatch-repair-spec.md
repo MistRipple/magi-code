@@ -1,6 +1,6 @@
 # Magi 子代理分配稳定性产品级修复方案
 
-- 文档状态：已完成；阶段 0-7 已完成（最后验证：2026-09-14）
+- 文档状态：已完成；阶段 0-7 已完成（最后验证：2026-09-14）。2026-10 的 harness 改造（见 [harness-redesign-plan.md](harness-redesign-plan.md)）删除了 §3.1 的 `collaboration_mode` 与关键词入口判定，以该计划为准
 - 适用范围：Magi 主对话中的 `agent_spawn`、`agent_send`、`agent_wait` 以及子代理 Worker 执行链
 - 目标读者：负责 Rust daemon、conversation runtime、Web 前端和桌面验收的实现 Agent
 - 约束：本方案只收敛到一条正式实现路径，不保留旧关键词开关、旧参数合同或临时兜底实现

@@ -40,7 +40,7 @@ use magi_conversation_runtime::{
 };
 use magi_core::{
     BrowserProfileId, BrowserTabId, DomainError, DomainResult, SessionId, SessionLifecycleStatus,
-    TaskId, TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
+    TaskId, UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
@@ -192,13 +192,6 @@ pub(crate) struct QueuedRegularSessionTurn {
     pub route: SessionTurnRouteDto,
     pub task_title: Option<String>,
     pub execution_goal: Option<String>,
-    pub task_tier: TaskTier,
-    #[serde(default)]
-    pub collaboration_mode: magi_core::CollaborationMode,
-    pub tool_intent: Option<String>,
-    pub forced_tool_name: Option<String>,
-    #[serde(default)]
-    pub goal_mode: bool,
     pub required_tool_chain: Vec<String>,
     #[serde(default)]
     pub completion_contract: magi_core::TaskCompletionContract,
@@ -3634,9 +3627,7 @@ impl ApiState {
                 .is_some_and(|session| session.status == SessionLifecycleStatus::Active);
             let route_is_queueable = matches!(
                 turn.route,
-                SessionTurnRouteDto::Chat
-                    | SessionTurnRouteDto::Execute
-                    | SessionTurnRouteDto::Task
+                SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute
             );
             if session_is_active && route_is_queueable {
                 queues
@@ -5362,6 +5353,7 @@ mod tests {
                 skill_name: None,
                 locale: None,
                 goal_mode: false,
+                resume: false,
                 images: Vec::new(),
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
@@ -5382,11 +5374,6 @@ mod tests {
             route: SessionTurnRouteDto::Chat,
             task_title: None,
             execution_goal: None,
-            task_tier: TaskTier::ExecutionChain,
-            collaboration_mode: magi_core::CollaborationMode::Auto,
-            tool_intent: None,
-            forced_tool_name: None,
-            goal_mode: false,
             required_tool_chain: Vec::new(),
             completion_contract: magi_core::TaskCompletionContract::default(),
             recovery_checkpoint: None,

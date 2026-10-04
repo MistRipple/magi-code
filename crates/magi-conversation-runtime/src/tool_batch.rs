@@ -1909,7 +1909,6 @@ fn default_agent_spawn_policy() -> TaskPolicy {
     TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
         access_profile: magi_core::AccessProfile::Restricted,
-        collaboration_mode: Default::default(),
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
         allowed_paths: Vec::new(),
@@ -2345,38 +2344,6 @@ fn execute_task_tool_call(
     {
         let decision = task_tool_visibility_decision_payload(canonical.as_str(), task);
         return (decision.payload, decision.status);
-    }
-
-    // 协作模式是当前 root task 的结构化策略。工具定义即使仍然可见，
-    // `disabled` 也必须在统一入口拒绝 agent_spawn/agent_send/agent_wait，
-    // 避免被普通安全策略或工具目录过滤改写成其它错误。
-    if let Some(canonical) =
-        magi_tool_runtime::BuiltinToolName::from_name(tool_call.function.name.as_str())
-        && matches!(
-            canonical,
-            magi_tool_runtime::BuiltinToolName::AgentSpawn
-                | magi_tool_runtime::BuiltinToolName::AgentSend
-                | magi_tool_runtime::BuiltinToolName::AgentCancel
-                | magi_tool_runtime::BuiltinToolName::AgentWait
-        )
-        && task.policy_snapshot.as_ref().is_some_and(|policy| {
-            policy.collaboration_mode == magi_core::CollaborationMode::Disabled
-        })
-    {
-        return (
-            serde_json::json!({
-                "tool": canonical.as_str(),
-                "status": "rejected",
-                "error_code": "collaboration_disabled",
-                "failure_stage": "policy",
-                "error": "当前任务已明确禁止子代理协作",
-                "instruction": "请由主线直接完成当前任务，不要改写参数或重复调用协作工具。",
-                "child_task_id": null,
-                "diagnostic_ref": format!("tool_call:{}", tool_call.id),
-            })
-            .to_string(),
-            ExecutionResultStatus::Rejected,
-        );
     }
 
     if let Some(gate) = safety_gate {

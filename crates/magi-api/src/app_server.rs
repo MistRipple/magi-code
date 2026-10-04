@@ -2223,7 +2223,7 @@ mod tests {
     use axum::http::header::USER_AGENT;
     use futures_util::{SinkExt, StreamExt};
     use magi_conversation_runtime::CanonicalTurnEventSink;
-    use magi_core::{EventId, TaskCompletionContract, TaskTier, ThreadId, UtcMillis};
+    use magi_core::{EventId, TaskCompletionContract, ThreadId, UtcMillis};
     use magi_event_bus::EventCategory;
     use magi_governance::GovernanceService;
     use magi_session_store::{
@@ -2465,11 +2465,6 @@ mod tests {
                 route: crate::dto::SessionTurnRouteDto::Chat,
                 task_title: None,
                 execution_goal: None,
-                task_tier: TaskTier::ExecutionChain,
-                collaboration_mode: magi_core::CollaborationMode::Auto,
-                tool_intent: None,
-                forced_tool_name: None,
-                goal_mode: false,
                 required_tool_chain: Vec::new(),
                 completion_contract: TaskCompletionContract::default(),
                 recovery_checkpoint: None,

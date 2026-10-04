@@ -41,7 +41,7 @@ Canonical Turn Log + TaskStore -> Read Models -> SSE / App Server notification
 
 ### 2.1 `conversation`
 
-用于问答、解释、写作、总结和明确允许的会话级只读能力。不得创建 `TaskRun`、root Task、lease、Runner、Git execution context 或 task execution snapshot；可以创建只读的 `context_snapshot_id`，用于固定本轮输入和配置。
+只用于会话命令（如 `/compact`）和 GPT Web 引擎会话。不得创建 `TaskRun`、root Task、lease、Runner、Git execution context 或 task execution snapshot；可以创建只读的 `context_snapshot_id`，用于固定本轮输入和配置。
 
 `ConversationExecutor` 读取冻结的 Conversation History Projection，把历史版本、模型配置、工具目录、技能/MCP、知识上下文和 profile 适用的权限快照固化为 `context_snapshot_id`，然后调用共享 Provider。它不得准备或记录 Git execution context，也不得另写一份模型历史。
 
@@ -53,11 +53,15 @@ Canonical Turn Log + TaskStore -> Read Models -> SSE / App Server notification
 
 ### 2.3 接纳分类
 
-- 纯问答、解释、写作、总结且不要求工作区动作：`conversation`。
-- 读取或修改工作区、执行命令、Git、Goal、计划或子代理：`task`。
-- 同时要求回答和工作区修改：`task`，同一 Turn 关联回答与执行记录。
-- 附件或浏览器引用只用于理解：不因引用本身创建 `TaskRun`。
-- 无法确定是否需要工程动作：选择 `task`，在 `preparing` 阶段说明原因；不得在模型输出后切换 profile。
+接纳只读取结构化输入，不按用户文本中的关键词推断路由、协作模式、必调工具或完成证据：
+
+- 会话命令、GPT Web 引擎会话：`conversation`。
+- 界面“继续”按钮发出的 `resume`：恢复可恢复的执行链，或从用户主动停止的最近一轮检查点继续；两者都没有时拒绝。
+- 目标模式开关 `goalMode`：`task`，要求维护计划并开放 Goal 工具。
+- 其余所有消息：带完整工具面的 `task` 主线。是否读代码、执行命令、建立计划或派发代理，由模型根据任务自行判断；用户明确要求或禁止使用子代理时由模型遵循，运行时不再设置协作模式。
+- 不得在模型输出后切换 profile。
+
+代价：每个会话第一条进入 `task` 的消息会建立工作区快照与 Git 上下文（快照按会话缓存，后续轮次复用）。
 
 Goal、Continue、子代理等待和恢复都是 `TaskRun` 内部行为，不创建第二条普通 Chat 链路。
 

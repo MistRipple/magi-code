@@ -519,6 +519,8 @@ pub struct TurnStartParams {
     #[serde(rename = "goalMode")]
     pub goal_mode: bool,
     #[serde(default)]
+    pub resume: bool,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<SessionTurnCommand>,
     #[serde(default)]
@@ -811,8 +813,6 @@ pub enum TurnStartRoute {
     Chat,
     #[serde(rename = "execute")]
     Execute,
-    #[serde(rename = "task")]
-    Task,
     #[serde(rename = "continue")]
     Continue,
     #[serde(rename = "steer")]

@@ -558,6 +558,12 @@
             <Icon name="edit" size={14} />
           </button>
         {/if}
+        {#if canEdit && onContinueInterrupted}
+          <!-- 用户主动停止的最近一轮：从中断检查点继续，由界面显式发出 resume 请求。 -->
+          <button type="button" class="message-action" onclick={() => onContinueInterrupted?.()} title={i18n.t('messageItem.resumeTitle')}>
+            <Icon name="play" size={14} />
+          </button>
+        {/if}
         {#if copyableText.trim()}
           <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
             <Icon name={copied ? 'check' : 'copy'} size={14} />

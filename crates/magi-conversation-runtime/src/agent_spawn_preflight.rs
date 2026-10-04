@@ -953,7 +953,6 @@ fn default_agent_spawn_policy() -> TaskPolicy {
     TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
         access_profile: AccessProfile::Restricted,
-        collaboration_mode: Default::default(),
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
         allowed_paths: Vec::new(),

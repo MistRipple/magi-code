@@ -2512,6 +2512,7 @@ export async function submitSessionTurn(
     skillName?: string | null;
     locale?: string;
     goalMode?: boolean;
+    resume?: boolean;
     command?: SessionTurnCommand | null;
     images: AgentSessionTurnImagePayload[];
     contextReferences?: Array<{
@@ -2547,6 +2548,7 @@ export async function submitSessionTurn(
         skillName: payload.skillName ?? null,
         locale: payload.locale ?? i18n.locale,
         goalMode: payload.goalMode === true,
+        resume: payload.resume === true,
         command: payload.command ?? null,
         accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,

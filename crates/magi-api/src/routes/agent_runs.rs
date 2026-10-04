@@ -1047,7 +1047,6 @@ mod tests {
         child.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "guided".to_string(),
             access_profile: AccessProfile::ReadOnly,
-            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),

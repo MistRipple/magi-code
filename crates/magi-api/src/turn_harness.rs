@@ -1225,6 +1225,7 @@ impl MagiTurnHarness {
                 skill_name: None,
                 locale: Some("zh-CN".to_string()),
                 goal_mode,
+                resume: false,
                 images: Vec::new(),
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
@@ -1303,6 +1304,7 @@ impl MagiTurnHarness {
                 skill_name: None,
                 locale: Some("zh-CN".to_string()),
                 goal_mode: false,
+                resume: false,
                 images: Vec::new(),
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
@@ -1346,6 +1348,7 @@ impl MagiTurnHarness {
                 skill_name: None,
                 locale: Some("zh-CN".to_string()),
                 goal_mode: false,
+                resume: false,
                 images: Vec::new(),
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
@@ -1386,6 +1389,7 @@ impl MagiTurnHarness {
                 skill_name: None,
                 locale: Some("zh-CN".to_string()),
                 goal_mode: false,
+                resume: false,
                 images: Vec::new(),
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
@@ -2415,156 +2419,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_turn_service_streams_and_projects_without_task() {
-        let harness = MagiTurnHarness::new("harness 流式响应成功");
-        harness
-            .provider
-            .set_completed_response("harness 流式响应成功");
-        let response = harness
-            .submit(
-                None,
-                "请返回流式响应",
-                "harness-request-1",
-                "harness-user-1",
-            )
-            .await
-            .expect("TurnService 应接受普通 Chat");
-        assert_eq!(response.route, crate::dto::SessionTurnRouteDto::Chat);
-        assert_eq!(response.request_id.as_deref(), Some("harness-request-1"));
-        assert_eq!(
-            response.execution_profile,
-            Some(magi_conversation_runtime::ExecutionProfile::Conversation)
-        );
-        let session_id = SessionId::new(response.session_id.clone());
-        let turn_id = response
-            .turn_id
-            .clone()
-            .expect("accepted response should expose turn id");
-        let stream_events = harness
-            .wait_for_first_stream_event(&session_id, &turn_id)
-            .await
-            .into_iter()
-            .filter(|event| event.event_type == "session.turn.item")
-            .filter(|event| event.payload.get("delta").is_some())
-            .collect::<Vec<_>>();
-        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
-        let (task_count, runner_count, snapshot_created, git_context_created) =
-            harness.conversation_runtime_resource_state(&session_id, None);
-        assert_eq!(task_count, 0, "普通 Chat 不得创建 TaskStore 任务记录");
-        assert_eq!(runner_count, 0, "普通 Chat 不得启动 Runner");
-        assert!(!snapshot_created, "普通 Chat 不得物化 Snapshot session");
-        assert!(
-            !git_context_created,
-            "普通 Chat 不得创建 Git execution context"
-        );
-        assert!(
-            harness.state.task_store().is_none(),
-            "普通 Chat 不得装配 TaskStore 或创建 root task"
-        );
-        assert!(
-            harness.state.runner_manager().is_none(),
-            "普通 Chat 不得装配 Runner"
-        );
-        assert!(turn.items.iter().any(|item| {
-            item.kind == CanonicalTurnItemKind::AssistantText
-                && item.content.as_deref() == Some("harness 流式响应成功")
-        }));
-        assert!(!harness.provider.requests().is_empty());
-        assert!(!harness.provider.deltas().is_empty());
-        assert!(
-            !stream_events.is_empty(),
-            "应通过真实 EventBus 发布流式事件"
-        );
-        assert!(
-            stream_events
-                .windows(2)
-                .all(|pair| pair[0].sequence < pair[1].sequence)
-        );
-        let timing = harness.provider.timing();
-        assert!(timing.accepted_returned_ms.is_some());
-        assert!(timing.provider_request_started_ms.is_some());
-        assert!(timing.provider_first_raw_delta_ms.is_some());
-        assert!(timing.provider_first_delta_ms.is_some());
-        assert!(timing.first_stream_event_ms.is_some());
-        assert!(
-            timing
-                .first_stream_event_sequence
-                .is_some_and(|sequence| sequence > 0)
-        );
-        assert!(timing.terminal_observed_ms.is_some());
-        assert!(timing.provider_request_started_ms <= timing.provider_first_delta_ms);
-        assert!(timing.provider_first_raw_delta_ms <= timing.provider_first_delta_ms);
-        assert!(timing.provider_first_delta_ms <= timing.first_stream_event_ms);
-        assert!(timing.first_stream_event_ms <= timing.terminal_observed_ms);
-    }
-
-    #[tokio::test]
-    async fn workspace_conversation_does_not_create_task_runtime_resources() {
-        let harness = MagiTurnHarness::new("工作区普通聊天成功");
-        let workspace_root = tempfile::tempdir().expect("workspace chat root should create");
-        let workspace_id = magi_core::WorkspaceId::new("harness-conversation-workspace");
-        harness
-            .state
-            .workspace_registry
-            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
-            .expect("workspace chat root should register");
-        let session_id = SessionId::new("harness-conversation-workspace-session");
-        harness
-            .state
-            .session_store
-            .create_session_for_workspace(
-                session_id.clone(),
-                "工作区普通聊天",
-                Some(workspace_id.to_string()),
-            )
-            .expect("workspace chat session should create");
-
-        let response = harness
-            .submit_workspace_chat(
-                &session_id,
-                &workspace_id,
-                workspace_root.path(),
-                "只进行普通工作区聊天，不执行工具",
-                "harness-workspace-chat-request",
-                "harness-workspace-chat-user",
-            )
-            .await
-            .expect("workspace Conversation Turn 应被接纳");
-        assert_eq!(response.route, crate::dto::SessionTurnRouteDto::Chat);
-        assert_eq!(
-            response.execution_profile,
-            Some(magi_conversation_runtime::ExecutionProfile::Conversation)
-        );
-        let turn_id = response
-            .turn_id
-            .clone()
-            .expect("workspace chat should have turn");
-        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
-        assert!(turn.items.iter().any(|item| {
-            item.kind == CanonicalTurnItemKind::AssistantText
-                && item.content.as_deref() == Some("工作区普通聊天成功")
-        }));
-
-        let (task_count, runner_count, snapshot_created, git_context_created) =
-            harness.conversation_runtime_resource_state(&session_id, Some(workspace_root.path()));
-        assert_eq!(task_count, 0, "工作区普通 Chat 不得创建 TaskStore 任务记录");
-        assert_eq!(runner_count, 0, "工作区普通 Chat 不得启动 Runner");
-        assert!(
-            !snapshot_created,
-            "工作区普通 Chat 不得物化 Snapshot session"
-        );
-        assert!(
-            !git_context_created,
-            "工作区普通 Chat 不得创建 Git execution context"
-        );
-        assert!(harness.state.task_store().is_none());
-        assert!(harness.state.runner_manager().is_none());
-        assert_eq!(harness.provider.requests().len(), 1);
-    }
-
-    #[tokio::test]
     async fn duplicate_request_replays_and_fingerprint_conflict_is_rejected() {
         let harness = MagiTurnHarness::new("一次执行");
         let first = harness
@@ -2877,7 +2731,7 @@ mod tests {
             .expect("Task Turn 应被真实 TurnService 接纳");
         assert!(matches!(
             response.route,
-            crate::dto::SessionTurnRouteDto::Task | crate::dto::SessionTurnRouteDto::Execute
+            crate::dto::SessionTurnRouteDto::Execute
         ));
         assert_eq!(
             response.execution_profile,

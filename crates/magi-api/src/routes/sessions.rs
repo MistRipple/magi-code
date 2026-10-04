@@ -13,12 +13,11 @@ use magi_conversation_runtime::{
 };
 use magi_conversation_runtime::{
     PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
-    UserSignal, requested_public_builtin_tool_chain, requested_required_tool_chain,
+    UserSignal,
 };
 use magi_core::{
-    AccessProfile, CollaborationMode, DomainError, EventId, MissionId, SessionId,
-    TaskCompletionContract, TaskEvidenceRequirement, TaskRecoveryCheckpoint, TaskTier, UtcMillis,
-    WorkerId, WorkspaceId, public_runtime_excerpt,
+    AccessProfile, DomainError, EventId, MissionId, SessionId, TaskCompletionContract,
+    TaskRecoveryCheckpoint, TaskTier, UtcMillis, WorkerId, WorkspaceId, public_runtime_excerpt,
 };
 use magi_core::{SessionLifecycleStatus, TaskStatus};
 use magi_event_bus::{EventContext, EventEnvelope};
@@ -593,9 +592,9 @@ pub(crate) async fn submit_session_turn_internal(
         )?
     };
     let workspace_id = scope.workspace_id();
-    if request.steer_current_turn && session_turn_requests_explicit_goal_mode(&request) {
+    if request.steer_current_turn && (request.goal_mode || request.resume) {
         return Err(ApiError::InvalidInput(
-            "目标模式必须作为独立执行轮次提交，不能作为当前轮引导".to_string(),
+            "目标模式和继续执行必须作为独立执行轮次提交，不能作为当前轮引导".to_string(),
         ));
     }
     if request.steer_current_turn {
@@ -628,12 +627,8 @@ pub(crate) async fn submit_session_turn_internal(
     {
         return Ok(replay);
     }
-    let decision = decide_session_turn_with_task_planner(&state, &request)?;
-    let canonical_goal_mode = decision.reason_code.as_deref() == Some("goal_mode_request");
-    // 文本明确表达“目标模式”时也必须进入同一个结构化执行契约；否则队列、
-    // 持久化 metadata 和 dispatcher 会继续把它当作普通聊天，造成目标模式只在
-    // 分类器阶段生效的旁路。
-    request.goal_mode = canonical_goal_mode;
+    let decision = decide_session_turn(&state, &request)?;
+    let canonical_goal_mode = request.goal_mode;
     if request.replace_turn_id().is_some()
         && matches!(
             decision.route,
@@ -646,7 +641,7 @@ pub(crate) async fn submit_session_turn_internal(
     }
     if matches!(
         decision.route,
-        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task
+        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute
     ) && let Some(session_id) = request.requested_session_id()
     {
         let session = require_session_record_in_scope(&state, &session_id, &scope)?;
@@ -731,7 +726,7 @@ pub(crate) async fn submit_session_turn_internal(
             )
             .await
         }
-        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task => {
+        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
             submit_mainline_session_turn(
                 state.clone(),
                 request,
@@ -833,19 +828,26 @@ pub(crate) async fn submit_session_turn_internal(
 #[derive(Debug)]
 struct SessionTurnIntentDecision {
     route: SessionTurnRouteDto,
+    /// 从中断检查点继续时沿用原任务的标题与目标；其余主线轮次以用户原文为目标。
     task_title: Option<String>,
     execution_goal: Option<String>,
-    task_tier: TaskTier,
-    collaboration_mode: CollaborationMode,
-    tool_intent: Option<String>,
-    forced_tool_name: Option<String>,
+    /// 只来自结构化契约：目标模式要求维护计划，续做沿用原任务的必调工具链。
     required_tool_chain: Vec<String>,
     completion_contract: TaskCompletionContract,
     recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
-    confidence: f64,
-    reason_code: Option<String>,
-    route_reason: Option<String>,
-    task_evidence: Vec<String>,
+}
+
+impl SessionTurnIntentDecision {
+    fn new(route: SessionTurnRouteDto) -> Self {
+        Self {
+            route,
+            task_title: None,
+            execution_goal: None,
+            required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+        }
+    }
 }
 
 static INCIDENT_NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -893,11 +895,6 @@ fn enqueue_session_turn_response(
         route: decision.route,
         task_title: decision.task_title.clone(),
         execution_goal: decision.execution_goal.clone(),
-        task_tier: decision.task_tier,
-        collaboration_mode: decision.collaboration_mode,
-        tool_intent: decision.tool_intent.clone(),
-        forced_tool_name: decision.forced_tool_name.clone(),
-        goal_mode: decision.reason_code.as_deref() == Some("goal_mode_request"),
         required_tool_chain: decision.required_tool_chain.clone(),
         completion_contract: decision.completion_contract.clone(),
         recovery_checkpoint: decision.recovery_checkpoint.clone(),
@@ -1305,42 +1302,24 @@ fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), 
 }
 
 /// 会话命令不经过意图分类，固定作为 conversation Turn 执行。
+/// 入口决策只读结构化输入：会话命令、GPT Web 引擎、“继续”恢复标志和目标模式开关。
+///
+/// 不再按用户文本中的关键词决定路由、协作模式或必调工具：其余所有消息都进入带工具的
+/// 主线，是否读代码、执行命令、派发代理由模型根据完整工具面自行判断。
 fn session_turn_command_decision() -> SessionTurnIntentDecision {
-    SessionTurnIntentDecision {
-        route: SessionTurnRouteDto::Chat,
-        task_title: None,
-        execution_goal: None,
-        task_tier: TaskTier::ExecutionChain,
-        collaboration_mode: CollaborationMode::Auto,
-        tool_intent: None,
-        forced_tool_name: None,
-        required_tool_chain: Vec::new(),
-        completion_contract: TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        confidence: 1.0,
-        reason_code: Some("session_command".to_string()),
-        route_reason: Some("用户显式选择了会话命令。".to_string()),
-        task_evidence: Vec::new(),
-    }
+    SessionTurnIntentDecision::new(SessionTurnRouteDto::Chat)
 }
 
-fn decide_session_turn_with_task_planner(
+fn decide_session_turn(
     state: &ApiState,
     request: &SessionTurnRequestDto,
 ) -> Result<SessionTurnIntentDecision, ApiError> {
     let requested_session_id = request.requested_session_id();
-    let has_recoverable_chain = requested_session_id
-        .as_ref()
-        .map(|session_id| session_has_recoverable_chain(state, session_id))
-        .unwrap_or(false);
-    let has_claimed_interrupted_recovery =
-        requested_session_id.as_ref().is_some_and(|session_id| {
-            state
-                .session_store
-                .has_claimed_interrupted_recovery(session_id)
-        });
-    let requests_continuation = session_turn_requests_continue_existing_task(request);
-    if has_claimed_interrupted_recovery {
+    if requested_session_id.as_ref().is_some_and(|session_id| {
+        state
+            .session_store
+            .has_claimed_interrupted_recovery(session_id)
+    }) {
         return Err(ApiError::conflict(
             "恢复异常中断会话失败",
             "当前会话的恢复正在启动，请等待本轮恢复完成",
@@ -1349,110 +1328,53 @@ fn decide_session_turn_with_task_planner(
     if request.command.is_some() {
         return Ok(session_turn_command_decision());
     }
-    // GPT Web 会话的每条消息都是普通对话：原样交给网页，网页自己维护上下文，工具由 ChatGPT 侧经
-    // Magi MCP 使用。不能走任务 / 工具意图路由——那会把「任务上下文 + 多代理规则 + 工具意图」整包
-    // 塞进网页输入框，网页模型会按那些规则行事（反复重做、串话）。
+    // GPT Web 会话的每条消息都是普通对话：原样交给网页，网页自己维护上下文，工具由
+    // ChatGPT 侧经 Magi MCP 使用，不能把任务上下文和工具规则塞进网页输入框。
     if request_targets_web_engine(state, request) {
-        return Ok(web_engine_chat_decision(request));
+        return Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Chat));
+    }
+    if request.resume {
+        return decide_resume_turn(state, request);
+    }
+    if request.goal_mode {
+        let mut decision = SessionTurnIntentDecision::new(SessionTurnRouteDto::Chat);
+        decision.required_tool_chain = vec!["update_plan".to_string()];
+        return Ok(decision);
+    }
+    Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute))
+}
+
+/// 用户点击“继续”：优先恢复可恢复的执行链（daemon 中断等），其次从用户主动停止的
+/// 最近一轮检查点继续；两者都没有时拒绝，而不是把“继续”当成普通消息执行。
+fn decide_resume_turn(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+) -> Result<SessionTurnIntentDecision, ApiError> {
+    let Some(session_id) = request.requested_session_id() else {
+        return Err(ApiError::InvalidInput("继续执行需要指定会话".to_string()));
+    };
+    if session_has_recoverable_chain(state, &session_id) {
+        return Ok(SessionTurnIntentDecision::new(
+            SessionTurnRouteDto::Continue,
+        ));
     }
     if request.replace_turn_id().is_none()
         && let Some(resume) = user_interrupted_turn_resume(state, request)
     {
-        return Ok(SessionTurnIntentDecision {
-            route: SessionTurnRouteDto::Execute,
-            task_title: Some(format!("继续: {}", resume.original_user_message)),
-            execution_goal: Some(interrupted_turn_resume_goal(
-                &resume,
-                request.trimmed_text().as_deref().unwrap_or("继续"),
-            )),
-            task_tier: TaskTier::ExecutionChain,
-            collaboration_mode: CollaborationMode::Auto,
-            tool_intent: None,
-            forced_tool_name: None,
-            required_tool_chain: resume.required_tool_chain,
-            completion_contract: resume.completion_contract,
-            recovery_checkpoint: Some(resume.recovery_checkpoint),
-            confidence: 1.0,
-            reason_code: Some("user_interrupted_turn_resume".to_string()),
-            route_reason: Some("用户明确要求从最近一次主动中断的 Turn 检查点继续。".to_string()),
-            task_evidence: Vec::new(),
-        });
-    }
-    // recovery-ready 只表示界面可以提供“继续”操作，不能改变普通消息的语义。
-    // 只有用户明确表达继续意图时才复用旧执行链；否则必须创建新的独立 Turn，
-    // 避免新消息被异常恢复流程吞掉并重新激活已停止的会话。
-    if has_recoverable_chain
-        && requests_continuation
-        && !session_turn_requests_image_generation_by_local_rules(request)
-        && !session_turn_requests_explicit_task_or_agent_mode(request)
-    {
-        return Ok(SessionTurnIntentDecision {
-            route: SessionTurnRouteDto::Continue,
-            task_title: None,
-            execution_goal: None,
-            task_tier: TaskTier::ExecutionChain,
-            collaboration_mode: requested_collaboration_mode(request),
-            tool_intent: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            completion_contract: TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            confidence: 1.0,
-            reason_code: Some("continue_requested".to_string()),
-            route_reason: Some("用户明确要求继续当前可恢复执行链。".to_string()),
-            task_evidence: Vec::new(),
-        });
-    }
-    let mut decision = normalize_session_turn_decision(
-        local_session_turn_intent_decision(request, has_recoverable_chain),
-        request,
-    );
-    // 技能声明了要用的工具（allowed_tools，如配置向导要用内置浏览器）时，这一轮必须带工具执行；
-    // 普通对话轮次没有工具，技能就只剩口头说明，做不了它要做的事。
-    if matches!(decision.route, SessionTurnRouteDto::Chat)
-        && decision.reason_code.as_deref() == Some("plain_chat")
-        && selected_skill_requires_tools(state, request)
-    {
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.tool_intent = Some(
-            request
-                .trimmed_text()
-                .unwrap_or_else(|| request.timeline_message(None)),
-        );
-        decision.reason_code = Some("skill_requires_tools".to_string());
-        decision.route_reason =
-            Some("用户选择的技能声明了需要使用的工具，本轮带工具执行。".to_string());
-    }
-    if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
-        return Err(ApiError::InvalidInput(
-            "当前会话没有可继续的执行链".to_string(),
+        let mut decision = SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute);
+        decision.task_title = Some(format!("继续: {}", resume.original_user_message));
+        decision.execution_goal = Some(interrupted_turn_resume_goal(
+            &resume,
+            request.trimmed_text().as_deref().unwrap_or("继续"),
         ));
+        decision.required_tool_chain = resume.required_tool_chain;
+        decision.completion_contract = resume.completion_contract;
+        decision.recovery_checkpoint = Some(resume.recovery_checkpoint);
+        return Ok(decision);
     }
-    Ok(decision)
-}
-
-/// 用户选的技能是否声明了需要使用的工具（config.json 的 `allowed_tools`）。
-fn selected_skill_requires_tools(state: &ApiState, request: &SessionTurnRequestDto) -> bool {
-    let Some(requested) = request
-        .skill_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-    let Some(runtime) = state.skill_runtime.as_ref() else {
-        return false;
-    };
-    let registry = runtime.registry();
-    let magi_skill_runtime::SkillIdResolution::Found(skill_id) =
-        registry.resolve_skill_id(requested)
-    else {
-        return false;
-    };
-    registry
-        .get(&skill_id)
-        .is_some_and(|skill| skill.restrict_standard_tools && !skill.allowed_tools.is_empty())
+    Err(ApiError::InvalidInput(
+        "当前会话没有可继续的执行".to_string(),
+    ))
 }
 
 /// 本条消息的目标会话是否使用 GPT Web 引擎：已有会话读会话设置，新会话首条消息读请求里携带的引擎配置。
@@ -1473,25 +1395,6 @@ fn request_targets_web_engine(state: &ApiState, request: &SessionTurnRequestDto)
         })
 }
 
-fn web_engine_chat_decision(request: &SessionTurnRequestDto) -> SessionTurnIntentDecision {
-    SessionTurnIntentDecision {
-        route: SessionTurnRouteDto::Chat,
-        task_title: None,
-        execution_goal: None,
-        task_tier: TaskTier::ExecutionChain,
-        collaboration_mode: requested_collaboration_mode(request),
-        tool_intent: None,
-        forced_tool_name: None,
-        required_tool_chain: Vec::new(),
-        completion_contract: TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        confidence: 1.0,
-        reason_code: Some("web_engine_chat".to_string()),
-        route_reason: Some("GPT Web 会话的消息原样交给网页，不做任务或工具意图改写。".to_string()),
-        task_evidence: Vec::new(),
-    }
-}
-
 struct UserInterruptedTurnResume {
     turn_id: String,
     original_user_message: String,
@@ -1504,9 +1407,6 @@ fn user_interrupted_turn_resume(
     state: &ApiState,
     request: &SessionTurnRequestDto,
 ) -> Option<UserInterruptedTurnResume> {
-    if !session_turn_explicitly_resumes_user_interrupted_task(request) {
-        return None;
-    }
     let session_id = request.requested_session_id()?;
     let turn = state
         .session_store
@@ -1568,76 +1468,6 @@ fn user_interrupted_turn_resume(
     })
 }
 
-fn session_turn_explicitly_resumes_user_interrupted_task(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_ascii_punctuation()
-                || matches!(character, '，' | '。' | '！' | '？' | '、' | '；' | '：')
-        })
-        .to_ascii_lowercase();
-    if [
-        "继续",
-        "继续啊",
-        "继续吧",
-        "继续执行",
-        "继续推进",
-        "继续跑",
-        "接着",
-        "接着啊",
-        "接着吧",
-        "接着做",
-        "接着推进",
-        "往下做",
-        "恢复任务",
-        "恢复执行",
-        "继续剩余",
-        "推进剩余",
-        "下一步",
-        "下一阶段",
-        "下个阶段",
-        "resume",
-        "continue",
-        "go on",
-    ]
-    .contains(&normalized.as_str())
-    {
-        return true;
-    }
-
-    let has_resume_action = [
-        "继续",
-        "接着",
-        "恢复",
-        "从刚才",
-        "从上次",
-        "resume",
-        "continue",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let has_interrupted_task_reference = [
-        "刚才",
-        "之前",
-        "上次",
-        "中断",
-        "未完成",
-        "剩余",
-        "原任务",
-        "前面的任务",
-        "previous task",
-        "interrupted task",
-        "unfinished task",
-        "remaining work",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    has_resume_action && has_interrupted_task_reference
-}
-
 fn interrupted_turn_resume_goal(resume: &UserInterruptedTurnResume, current_input: &str) -> String {
     format!(
         "[interrupted-turn-resume]\nsource_turn_id: {}\n原始用户目标：{}\n当前用户输入：{}\n\n这是用户明确要求继续的中断任务。运行时已经把来源任务的持久化模型消息、工具调用和工具结果复制到当前独占 Thread。必须直接继承其中已经成功的工具证据，不要从头重复；没有结果的外部操作必须先检查真实状态。只有原始目标的交付物已经完整产生时才能结束当前任务。",
@@ -1664,1001 +1494,11 @@ fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bo
     })
 }
 
-fn local_session_turn_intent_decision(
-    request: &SessionTurnRequestDto,
-    has_recoverable_chain: bool,
-) -> SessionTurnIntentDecision {
-    let task_text = request
-        .trimmed_text()
-        .unwrap_or_else(|| request.timeline_message(None));
-    let requests_goal_mode = session_turn_requests_explicit_goal_mode(request);
-    let requests_explicit_task_or_agent =
-        session_turn_requests_explicit_task_or_agent_mode(request);
-    let requests_explicit_plan = session_turn_requests_explicit_plan(request);
-    let requests_complex_workspace_analysis =
-        session_turn_requests_complex_workspace_analysis_by_local_rules(request);
-    let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
-        || session_turn_requested_public_builtin_tools(request).is_some();
-    let route = if requests_goal_mode {
-        SessionTurnRouteDto::Chat
-    } else if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
-        SessionTurnRouteDto::Continue
-    } else if requests_explicit_task_or_agent
-        || requests_explicit_plan
-        || requests_complex_workspace_analysis
-    {
-        SessionTurnRouteDto::Task
-    } else if requests_simple_execution
-        || session_turn_requests_execute_by_local_rules(request)
-        || session_turn_requests_task_by_local_rules(request)
-    {
-        SessionTurnRouteDto::Execute
-    } else {
-        SessionTurnRouteDto::Chat
-    };
-    let task_tier = TaskTier::ExecutionChain;
-    let collaboration_mode = requested_collaboration_mode(request);
-    let task_evidence = if requests_complex_workspace_analysis
-        && !requests_explicit_task_or_agent
-        && !requests_explicit_plan
-    {
-        vec!["复杂工作区分析需要结构化执行记录，协作由 root coordinator 自主判断".to_string()]
-    } else if matches!(route, SessionTurnRouteDto::Task) {
-        vec!["用户明确要求任务模式或执行计划".to_string()]
-    } else {
-        Vec::new()
-    };
-    SessionTurnIntentDecision {
-        route,
-        task_title: matches!(route, SessionTurnRouteDto::Task)
-            .then(|| request.mission_title(Some(&task_text))),
-        execution_goal: matches!(route, SessionTurnRouteDto::Task).then_some(task_text.clone()),
-        task_tier,
-        collaboration_mode,
-        tool_intent: matches!(route, SessionTurnRouteDto::Execute).then_some(task_text),
-        forced_tool_name: None,
-        required_tool_chain: Vec::new(),
-        completion_contract: TaskCompletionContract::default(),
-        recovery_checkpoint: None,
-        confidence: 0.9,
-        reason_code: Some(
-            match route {
-                SessionTurnRouteDto::Continue => "continue_requested",
-                SessionTurnRouteDto::Task if requests_complex_workspace_analysis => {
-                    "proactive_collaboration_candidate"
-                }
-                SessionTurnRouteDto::Task => "explicit_task_request",
-                SessionTurnRouteDto::Execute => "tool_request",
-                SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
-                    if requests_goal_mode {
-                        "goal_mode_request"
-                    } else {
-                        "plain_chat"
-                    }
-                }
-            }
-            .to_string(),
-        ),
-        route_reason: Some(
-            match route {
-                SessionTurnRouteDto::Continue => "用户要求继续且存在可恢复链",
-                SessionTurnRouteDto::Task if requests_complex_workspace_analysis => {
-                    "复杂工作区分析需要结构化执行记录，协作由 root coordinator 自主判断"
-                }
-                SessionTurnRouteDto::Task => "用户明确要求任务模式或执行计划",
-                SessionTurnRouteDto::Execute => "用户请求需要工具执行但不需要代理运行记录",
-                SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
-                    if requests_goal_mode {
-                        "用户请求目标模式，由主线会话使用 Goal 工具持续推进"
-                    } else {
-                        "普通对话"
-                    }
-                }
-            }
-            .to_string(),
-        ),
-        task_evidence,
-    }
-}
-
-fn normalize_session_turn_decision(
-    mut decision: SessionTurnIntentDecision,
-    request: &SessionTurnRequestDto,
-) -> SessionTurnIntentDecision {
-    decision.collaboration_mode = requested_collaboration_mode(request);
-    let requested_completion_tool_chain = request
-        .trimmed_text()
-        .as_deref()
-        .map(requested_required_tool_chain)
-        .unwrap_or_default();
-    let requires_diagram_delivery =
-        session_turn_requests_diagram_generation_by_local_rules(request);
-    if session_turn_requests_explicit_goal_mode(request) {
-        decision.route = SessionTurnRouteDto::Chat;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.collaboration_mode = CollaborationMode::Auto;
-        decision.tool_intent = Some(goal_mode_tool_intent(request));
-        decision.forced_tool_name = None;
-        decision.required_tool_chain = vec!["update_plan".to_string()];
-        merge_required_tool_chain(
-            &mut decision.required_tool_chain,
-            requested_completion_tool_chain,
-        );
-        decision.completion_contract = TaskCompletionContract::default();
-        if requires_diagram_delivery {
-            ensure_completion_evidence_requirement(&mut decision, "diagram_render");
-        }
-        decision.recovery_checkpoint = None;
-        decision.confidence = decision.confidence.max(0.95);
-        decision.reason_code = Some("goal_mode_request".to_string());
-        decision.route_reason =
-            Some("用户请求目标模式，由主线会话使用 Goal 工具持续推进。".to_string());
-        decision.task_evidence.clear();
-        return decision;
-    }
-    if !session_turn_requests_explicit_task_or_agent_mode(request) && requires_diagram_delivery {
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.tool_intent = Some(diagram_generation_tool_intent(request));
-        decision.forced_tool_name = None;
-        decision.required_tool_chain.clear();
-        decision.completion_contract = TaskCompletionContract::default()
-            .with_evidence_requirements(vec![TaskEvidenceRequirement::successful_tool_call(
-                "diagram_render",
-            )]);
-        decision.recovery_checkpoint = None;
-        decision.confidence = decision.confidence.max(0.98);
-        decision.reason_code = Some("diagram_generation_request".to_string());
-        decision.route_reason = Some(
-            "用户明确要求生成结构化图表，完成前必须产生 diagram_render 成功证据。".to_string(),
-        );
-        decision.task_evidence.clear();
-    }
-    if !matches!(decision.route, SessionTurnRouteDto::Continue)
-        && session_turn_requests_explicit_task_or_agent_mode(request)
-    {
-        let task_text = request
-            .trimmed_text()
-            .unwrap_or_else(|| request.timeline_message(None));
-        decision.route = SessionTurnRouteDto::Task;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.task_title = decision
-            .task_title
-            .take()
-            .or_else(|| Some(request.mission_title(Some(&task_text))));
-        decision.execution_goal = Some(task_text.clone());
-        decision.tool_intent = None;
-        decision.forced_tool_name = None;
-        decision.required_tool_chain =
-            if session_turn_requests_explicit_agent_collaboration(request) {
-                vec!["agent_spawn".to_string()]
-            } else {
-                Vec::new()
-            };
-        decision.completion_contract = TaskCompletionContract::default();
-        decision.recovery_checkpoint = None;
-        decision.confidence = decision.confidence.max(0.95);
-        decision.reason_code = Some("explicit_task_request".to_string());
-        decision.route_reason =
-            Some("用户明确要求任务化执行，必须创建代理运行记录并由任务执行链处理。".to_string());
-        if decision.task_evidence.is_empty() {
-            decision
-                .task_evidence
-                .push("显式复杂任务/代理编排请求".to_string());
-        }
-    }
-    if !session_turn_requests_explicit_task_or_agent_mode(request)
-        && session_turn_requests_image_generation_by_local_rules(request)
-    {
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.tool_intent = Some(explicit_builtin_tool_intent("image_generate"));
-        decision.forced_tool_name = Some("image_generate".to_string());
-        decision.required_tool_chain.clear();
-        decision.completion_contract = TaskCompletionContract::default();
-        decision.recovery_checkpoint = None;
-        decision.confidence = decision.confidence.max(0.98);
-        decision.reason_code = Some("image_generation_request".to_string());
-        decision.route_reason =
-            Some("用户明确要求生成图片，必须调用 image_generate 并展示真实生成结果。".to_string());
-        decision.task_evidence.clear();
-    }
-    let requests_direct_execution = session_turn_requests_simple_execution_by_local_rules(request)
-        || session_turn_requested_public_builtin_tools(request).is_some();
-    if matches!(decision.route, SessionTurnRouteDto::Task)
-        && !session_turn_requests_explicit_task_or_agent_mode(request)
-        && !session_turn_requests_explicit_plan(request)
-        && requests_direct_execution
-    {
-        let task_text = request
-            .trimmed_text()
-            .unwrap_or_else(|| request.timeline_message(None));
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.tool_intent = Some(task_text);
-        decision.forced_tool_name = None;
-        decision.required_tool_chain.clear();
-        decision.confidence = decision.confidence.max(0.9);
-        decision.reason_code = Some("simple_execution_request".to_string());
-        decision.route_reason =
-            Some("用户请求是小范围一次性执行，不创建代理运行记录。".to_string());
-        decision.task_evidence.clear();
-    }
-    if matches!(decision.route, SessionTurnRouteDto::Task)
-        && !session_turn_task_route_has_creation_evidence(&decision)
-    {
-        decision.route = SessionTurnRouteDto::Chat;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.tool_intent = None;
-        decision.required_tool_chain.clear();
-    }
-    if !matches!(
-        decision.route,
-        SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
-    ) && request
-        .trimmed_text()
-        .as_deref()
-        .map(|text| {
-            session_turn_requests_workspace_inspection_by_local_rules(&text.to_ascii_lowercase())
-        })
-        .unwrap_or(false)
-    {
-        let task_text = request
-            .trimmed_text()
-            .unwrap_or_else(|| request.timeline_message(None));
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.tool_intent = Some(workspace_inspection_tool_intent(&task_text));
-        decision.forced_tool_name = None;
-        decision.required_tool_chain.clear();
-        decision.confidence = decision.confidence.max(0.95);
-        decision.reason_code = Some("workspace_inspection_request".to_string());
-        decision.route_reason =
-            Some("用户请求理解当前工作区，必须通过工具读取真实项目内容后再回答。".to_string());
-        decision.task_evidence.clear();
-    }
-    if !matches!(
-        decision.route,
-        SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
-    ) && let Some(tool_request) = session_turn_requested_public_builtin_tools(request)
-    {
-        match tool_request {
-            RequestedBuiltinTools::Single(tool_name) => {
-                decision.route = SessionTurnRouteDto::Execute;
-                decision.task_title = None;
-                decision.execution_goal = None;
-                decision.task_tier = TaskTier::ExecutionChain;
-                if decision.forced_tool_name.as_deref() != Some(tool_name.as_str()) {
-                    decision.tool_intent = Some(explicit_builtin_tool_intent(&tool_name));
-                    decision.forced_tool_name = Some(tool_name.clone());
-                    decision.required_tool_chain.clear();
-                    decision.route_reason =
-                        Some(format!("用户明确要求调用公开内置工具 {tool_name}。"));
-                }
-                decision.confidence = decision.confidence.max(0.95);
-                decision.reason_code = Some("tool_request".to_string());
-                decision.task_evidence.clear();
-            }
-            RequestedBuiltinTools::Multiple(tool_names) => {
-                decision.route = SessionTurnRouteDto::Execute;
-                decision.task_title = None;
-                decision.execution_goal = None;
-                decision.task_tier = TaskTier::ExecutionChain;
-                decision.tool_intent = Some(multi_builtin_tool_intent(&tool_names));
-                decision.forced_tool_name = None;
-                decision.required_tool_chain =
-                    tool_names.iter().map(|tool| tool.to_string()).collect();
-                decision.confidence = decision.confidence.max(0.95);
-                decision.reason_code = Some("tool_request".to_string());
-                decision.route_reason = Some(format!(
-                    "用户明确要求串联调用多个公开内置工具：{}。",
-                    tool_names.join(", ")
-                ));
-                decision.task_evidence.clear();
-            }
-        }
-    }
-    if matches!(decision.route, SessionTurnRouteDto::Task)
-        && session_turn_requests_explicit_plan(request)
-    {
-        if !decision
-            .required_tool_chain
-            .iter()
-            .any(|tool| tool == "update_plan")
-        {
-            decision
-                .required_tool_chain
-                .insert(0, "update_plan".to_string());
-        } else if let Some(index) = decision
-            .required_tool_chain
-            .iter()
-            .position(|tool| tool == "update_plan")
-            && index != 0
-        {
-            let update_plan = decision.required_tool_chain.remove(index);
-            decision.required_tool_chain.insert(0, update_plan);
-        }
-        decision.route_reason = Some(
-            "用户明确要求执行计划，先由 root coordinator 建立计划，再按计划推进。".to_string(),
-        );
-        if !decision
-            .task_evidence
-            .iter()
-            .any(|evidence| evidence == "用户明确要求先建立执行计划")
-        {
-            decision
-                .task_evidence
-                .push("用户明确要求先建立执行计划".to_string());
-        }
-    }
-    if requires_diagram_delivery {
-        ensure_completion_evidence_requirement(&mut decision, "diagram_render");
-    }
-    if matches!(decision.route, SessionTurnRouteDto::Execute) {
-        merge_required_tool_chain(
-            &mut decision.required_tool_chain,
-            requested_completion_tool_chain,
-        );
-    }
-    if decision.forced_tool_name.as_deref().is_some_and(|forced| {
-        decision
-            .required_tool_chain
-            .first()
-            .is_some_and(|first| first != forced)
-    }) {
-        decision.forced_tool_name = None;
-        decision.tool_intent = Some(multi_builtin_tool_intent(&decision.required_tool_chain));
-    }
-    decision
-}
-
-fn ensure_completion_evidence_requirement(
-    decision: &mut SessionTurnIntentDecision,
-    tool_name: &str,
-) {
-    if decision
-        .completion_contract
-        .evidence_requirements
-        .iter()
-        .any(|requirement| requirement.tool_name() == tool_name)
-    {
-        return;
-    }
-    decision
-        .completion_contract
-        .evidence_requirements
-        .push(TaskEvidenceRequirement::successful_tool_call(tool_name));
-}
-
-fn merge_required_tool_chain(target: &mut Vec<String>, source: Vec<String>) {
-    for tool_name in source {
-        if !target.contains(&tool_name) {
-            target.push(tool_name);
-        }
-    }
-}
-
-fn session_turn_requests_explicit_plan(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    if [
-        "不要计划",
-        "不需要计划",
-        "无需计划",
-        "不用计划",
-        "without a plan",
-        "no plan",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-    {
-        return false;
-    }
-    let has_explicit_plan_phrase = [
-        "任务计划",
-        "执行计划",
-        "任务清单",
-        "拆成",
-        "拆分",
-        "分阶段",
-        "多阶段",
-        "按步骤",
-        "task plan",
-        "execution plan",
-        "task list",
-        "break down",
-        "in phases",
-        "multiple phases",
-        "multi-phase",
-        "in steps",
-        "step by step",
-        "define milestones",
-        "milestone plan",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    has_explicit_plan_phrase
-        || (normalized.contains("计划")
-            && ["制定", "建立", "创建", "列出"]
-                .iter()
-                .any(|marker| normalized.contains(marker)))
-}
-
-fn session_turn_requests_task_by_local_rules(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    [
-        "分析并拆分",
-        "拆分任务",
-        "重新规划",
-        "实现",
-        "开发",
-        "修复",
-        "重构",
-        "收口",
-        "迭代",
-        "推进",
-        "中等任务",
-        "任务编排",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    if session_turn_requests_explicit_task_or_agent_mode(request) {
-        return false;
-    }
-    if session_turn_explicitly_rejects_tool_execution(&normalized) {
-        return false;
-    }
-    let has_direct_work = [
-        "修复",
-        "修改",
-        "改一下",
-        "调整",
-        "更新",
-        "写入",
-        "创建",
-        "删除",
-        "替换",
-        "读取",
-        "查看",
-        "打开",
-        "运行",
-        "执行",
-        "列出",
-        "生成",
-        "画",
-        "绘制",
-        "fix",
-        "edit",
-        "update",
-        "write",
-        "create",
-        "delete",
-        "run",
-        "read",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let has_small_scope = [
-        "简单",
-        "小范围",
-        "一次性",
-        "只",
-        "直接",
-        "顺手",
-        "这个文件",
-        "单文件",
-        "一处",
-        "一行",
-        "错别字",
-        "不用任务",
-        "不要创建任务",
-        "不需要任务",
-        "无需任务",
-        "simple",
-        "one-off",
-        "single file",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    has_direct_work && has_small_scope
-}
-
-fn session_turn_requests_image_generation_by_local_rules(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    let requests_diagram = [
-        "流程图",
-        "架构图",
-        "时序图",
-        "关系图",
-        "拓扑图",
-        "思维导图",
-        "图表",
-        "mermaid",
-        "graphviz",
-        "flowchart",
-        "sequence diagram",
-        "architecture diagram",
-        "chart",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    if requests_diagram {
-        return false;
-    }
-
-    let has_creation_intent = [
-        "生成",
-        "画一个",
-        "画一张",
-        "画幅",
-        "绘制",
-        "创作",
-        "制作",
-        "设计一个",
-        "设计一张",
-        "来一张",
-        "给我一张",
-        "generate ",
-        "create ",
-        "draw ",
-        "make ",
-        "design ",
-        "render ",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let has_image_target = [
-        "图片",
-        "照片",
-        "图像",
-        "插画",
-        "海报",
-        "封面",
-        "壁纸",
-        "头像",
-        "图标",
-        "photo",
-        "image",
-        "picture",
-        "illustration",
-        "poster",
-        "cover",
-        "wallpaper",
-        "avatar",
-        "icon",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-
-    has_creation_intent && has_image_target
-}
-
-fn session_turn_requests_diagram_generation_by_local_rules(
-    request: &SessionTurnRequestDto,
-) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    text_requests_diagram_generation(&text)
-}
-
-fn text_requests_diagram_generation(text: &str) -> bool {
-    let normalized = text.to_ascii_lowercase();
-    let has_creation_intent = [
-        "生成", "画", "绘制", "制作", "创建", "render", "draw", "create", "generate", "make",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let has_diagram_target = [
-        "流程图",
-        "架构图",
-        "时序图",
-        "关系图",
-        "拓扑图",
-        "思维导图",
-        "图表",
-        "mermaid",
-        "graphviz",
-        "flowchart",
-        "sequence diagram",
-        "architecture diagram",
-        "mind map",
-        "chart",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    has_creation_intent && has_diagram_target
-}
-
-fn diagram_generation_tool_intent(request: &SessionTurnRequestDto) -> String {
-    let user_text = request
-        .trimmed_text()
-        .unwrap_or_else(|| request.timeline_message(None));
-    format!(
-        "用户明确要求生成结构化图表：{user_text}。可以先使用其它必要工具理解真实上下文，但最终必须调用 diagram_render 产生可在对话中展示的图表数据；只输出 Markdown、ASCII 图或承诺稍后补充都不构成交付完成。"
-    )
-}
-
-fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    if session_turn_explicitly_rejects_tool_execution(&normalized) {
-        return false;
-    }
-    if session_turn_requests_workspace_inspection_by_local_rules(&normalized) {
-        return true;
-    }
-    [
-        "搜索",
-        "查找",
-        "查询",
-        "读取",
-        "打开",
-        "查看",
-        "执行",
-        "运行",
-        "列出",
-        "画",
-        "绘制",
-        "生成图",
-        "渲染图",
-        "mermaid",
-        "dot",
-        "graphviz",
-        "search",
-        "find",
-        "grep",
-        "rg",
-        "ls",
-        "cat",
-        "git",
-        "npm",
-        "cargo",
-        "test",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-/// 用户明确要求只进行解释或普通聊天时，不能因为“执行/运行”等否定句中的
-/// 动词命中本地规则而升级为 Execute。显式公开工具请求仍由
-/// `requested_public_builtin_tool_chain` 单独解析，并在否定语义下返回空链。
-fn session_turn_explicitly_rejects_tool_execution(normalized: &str) -> bool {
-    [
-        "不执行工具",
-        "不要执行工具",
-        "禁止执行工具",
-        "无需执行工具",
-        "不用执行工具",
-        "不调用工具",
-        "不要调用工具",
-        "禁止调用工具",
-        "无需调用工具",
-        "不用调用工具",
-        "不要使用工具",
-        "禁止使用工具",
-        "无需使用工具",
-        "不用使用工具",
-        "只进行普通聊天",
-        "只进行聊天",
-        "仅进行普通聊天",
-        "仅进行聊天",
-        "只聊天",
-        "仅聊天",
-        "只解释",
-        "仅解释",
-        "do not execute tools",
-        "don't execute tools",
-        "without executing tools",
-        "do not call tools",
-        "don't call tools",
-        "without calling tools",
-        "just chat",
-        "only chat",
-        "just explain",
-        "only explain",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-fn session_turn_requests_workspace_inspection_by_local_rules(normalized: &str) -> bool {
-    let workspace_target = [
-        "当前项目",
-        "当前工程",
-        "当前仓库",
-        "本项目",
-        "本工程",
-        "本仓库",
-        "这个项目",
-        "这个工程",
-        "这个仓库",
-        "项目结构",
-        "仓库结构",
-        "工程结构",
-        "目录结构",
-        "代码结构",
-        "current project",
-        "current repo",
-        "current repository",
-        "current codebase",
-        "this project",
-        "this repo",
-        "this repository",
-        "codebase",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    if !workspace_target {
-        return false;
-    }
-
-    [
-        "分析",
-        "检查",
-        "审查",
-        "查看",
-        "看看",
-        "看下",
-        "读取",
-        "梳理",
-        "总结",
-        "介绍",
-        "说明",
-        "是什么",
-        "有什么",
-        "如何",
-        "analyze",
-        "inspect",
-        "review",
-        "read",
-        "summarize",
-        "explain",
-        "what is",
-        "what's",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-/// 仅把明确表达“完整/全面/系统性”且目标为当前工作区的分析请求升级为
-/// 结构化 root coordinator 任务。普通的“查看/分析一个文件”仍走直接执行，
-/// 避免为了自动协作把所有读取请求都创建成任务。
-fn session_turn_requests_complex_workspace_analysis_by_local_rules(
-    request: &SessionTurnRequestDto,
-) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    if !session_turn_requests_workspace_inspection_by_local_rules(&normalized) {
-        return false;
-    }
-    let complexity_markers = [
-        "完整",
-        "全面",
-        "系统性",
-        "深入",
-        "详细",
-        "综合",
-        "逐项",
-        "端到端",
-        "全量",
-        "thorough",
-        "comprehensive",
-        "deep",
-        "in-depth",
-        "end-to-end",
-        "entire codebase",
-        "whole repository",
-    ];
-    complexity_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-}
-
-fn session_turn_requests_continue_existing_task(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.trim().to_ascii_lowercase();
-    [
-        "继续",
-        "继续推进",
-        "继续执行",
-        "继续跑",
-        "接着",
-        "接着做",
-        "接着推进",
-        "往下做",
-        "恢复任务",
-        "恢复执行",
-        "从刚才",
-        "从上次",
-        "下一步",
-        "下一阶段",
-        "下个阶段",
-        "继续剩余",
-        "推进剩余",
-        "resume",
-        "continue",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-fn session_turn_requests_explicit_goal_mode(request: &SessionTurnRequestDto) -> bool {
-    if request.goal_mode {
-        return true;
-    }
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    normalized.contains("目标模式")
-        || normalized.contains("goal mode")
-        || normalized.contains("goalmode")
-        || normalized.contains("goal 模式")
-        || normalized.contains("goal模式")
-}
-
-fn session_turn_requests_explicit_task_or_agent_mode(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    if session_turn_explicitly_rejects_collaboration(&normalized) {
-        return false;
-    }
-    normalized.contains("复杂任务模式")
-        || normalized.contains("复杂任务")
-        || normalized.contains("深度任务")
-        || normalized.contains("中等任务")
-        || normalized.contains("任务编排")
-        || normalized.contains("任务模式完成")
-        || normalized.contains("以任务模式")
-        || normalized.contains("子任务")
-        || normalized.contains("团队模式")
-        || normalized.contains("团队协作")
-        || normalized.contains("多代理")
-        || normalized.contains("多 agent")
-        || normalized.contains("multi-agent")
-        || normalized.contains("multi agent")
-        || normalized.contains("subagent")
-        || normalized.contains("子 agent")
-        || normalized.contains("子代理")
-        || normalized.contains("分派代理")
-        || normalized.contains("派发代理")
-        || normalized.contains("创建代理")
-        || normalized.contains("agent_spawn")
-}
-
-/// 用户明确要求真实代理协作时，入口将其固化为 root coordinator 的结构化首步。
-/// 这不是从模型文本猜测工具，也不会影响自动协作任务；后者仍由 coordinator 基于
-/// 完整工具面自行判断。这里仅保证用户已经明确提出的产品动作不会被弱工具模型忽略。
-fn session_turn_requests_explicit_agent_collaboration(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    !session_turn_explicitly_rejects_collaboration(&normalized)
-        && [
-            "多代理",
-            "多 agent",
-            "multi-agent",
-            "multi agent",
-            "agent",
-            "subagent",
-            "代理",
-            "子 agent",
-            "子代理",
-            "分派代理",
-            "派发代理",
-            "创建代理",
-            "agent_spawn",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker))
-}
-
-/// 识别用户明确要求单线执行的约束。任务是否需要结构化执行仍由任务复杂度决定；
-/// 协作工具禁用则通过 root task 的 TaskPolicy 固化，避免把“是否建任务”和
-/// “是否允许派发代理”错误耦合。
-fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
-    let rejects_collaboration = [
-        "不要创建",
-        "不创建",
-        "不要使用",
-        "不使用",
-        "无需创建",
-        "无需使用",
-        "不要派发",
-        "不派发",
-        "无需派发",
-        "禁止创建",
-        "禁止使用",
-        "禁止派发",
-        "禁止启动",
-        "不启用",
-        "do not create",
-        "do not use",
-        "do not spawn",
-        "don't create",
-        "don't use",
-        "don't spawn",
-        "without using",
-        "without agents",
-    ]
-    .iter()
-    .any(|prefix| normalized.contains(prefix));
-    rejects_collaboration
-        && [
-            "子代理",
-            "subagent",
-            "agent",
-            "agents",
-            "多代理",
-            "multi-agent",
-            "团队",
-        ]
-        .iter()
-        .any(|term| normalized.contains(term))
-}
-
-fn requested_collaboration_mode(request: &SessionTurnRequestDto) -> CollaborationMode {
-    let normalized = request
-        .trimmed_text()
-        .map(|text| text.to_ascii_lowercase())
-        .unwrap_or_default();
-    if session_turn_explicitly_rejects_collaboration(&normalized) {
-        CollaborationMode::Disabled
-    } else if session_turn_requests_explicit_agent_collaboration(request) {
-        CollaborationMode::Required
-    } else {
-        CollaborationMode::Auto
-    }
-}
-
+/// 主线工具面的结构化裁剪：Goal 工具只在目标模式开放；浏览器工具只在可信桌面连接可用。
 fn session_turn_denied_tools(request: &SessionTurnRequestDto) -> Vec<String> {
-    let explicitly_requests_goal = session_turn_requests_explicit_goal_mode(request);
-    let explicitly_requests_plan = session_turn_requests_explicit_plan(request);
     let mut denied = Vec::new();
-    // 协作模式由 TaskPolicy::collaboration_mode 表达；工具目录保持一致，
-    // disabled 模式由运行时拒绝调用，不能再通过关键词裁剪工具。
-    if !explicitly_requests_goal {
+    if !request.goal_mode {
         denied.extend(["get_goal", "create_goal", "update_goal"].map(str::to_string));
-    }
-    if !explicitly_requests_goal && !explicitly_requests_plan {
-        denied.push("update_plan".to_string());
     }
     if !request.desktop_browser_tools_allowed {
         denied.extend(
@@ -2670,76 +1510,11 @@ fn session_turn_denied_tools(request: &SessionTurnRequestDto) -> Vec<String> {
     denied
 }
 
-enum RequestedBuiltinTools {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-fn session_turn_requested_public_builtin_tools(
-    request: &SessionTurnRequestDto,
-) -> Option<RequestedBuiltinTools> {
-    let tool_names = requested_public_builtin_tool_chain(&request.trimmed_text()?);
-    match tool_names.as_slice() {
-        [] => None,
-        [tool_name] => Some(RequestedBuiltinTools::Single(tool_name.clone())),
-        _ => Some(RequestedBuiltinTools::Multiple(tool_names)),
-    }
-}
-
-fn explicit_builtin_tool_intent(tool_name: &str) -> String {
-    format!(
-        "用户明确要求调用公开内置工具 {tool_name}。必须直接调用 {tool_name} 工具，并从用户原始输入中提取参数；不要创建任务，不要改用其它工具，不要只输出文字说明。工具完成后只基于该工具结果给出简短回复。"
-    )
-}
-
-fn goal_mode_tool_intent(_: &SessionTurnRequestDto) -> String {
+fn goal_mode_tool_intent() -> String {
     let plan_contract = "目标模式强制要求维护计划：必须在本轮推进前调用 update_plan 写入与当前 Goal 绑定的任务状态，并在最终答复前再次确认计划状态；如果权威计划已经完成、取消或存在阻塞步骤，必须随后调用 update_goal 完成或阻塞 Goal；禁止只创建或读取 Goal 后直接回复。";
     format!(
         "用户请求目标模式。必须按主线 Goal 工具推进：先调用 get_goal；若当前会话没有未完成目标，再调用 create_goal 创建完整目标；create_goal 的 token_budget 必须显式传值，用户原文未明确给出 token 预算时传 null，只有用户明确给出预算数值时才传对应整数，禁止自行臆造 1000、4096、16000 等预算。调用 update_plan 时，必须把本轮 get_goal 或 create_goal 返回的 goalId、controlRevision 分别写入 expectedGoalId、expectedGoalControlRevision；没有 Goal 时两者都传 null。{plan_contract} 目标模式仍是主线对话，不要升级成旧任务 Tab 或普通 Execute 路由。"
     )
-}
-
-fn workspace_inspection_tool_intent(user_text: &str) -> String {
-    format!(
-        "用户请求理解当前工作区：{user_text}。优先使用当前 thread 中 fact_state=current 的真实工具事实；只有缺少所需事实、事实标记为 stale，或用户明确要求重新检查时，才使用可用工具读取目录、README、配置或关键源码。不得把历史陈旧内容当作当前事实，也不要声称执行过实际未执行或未复用成功的工具。最终只基于当前有效事实总结。"
-    )
-}
-
-fn multi_builtin_tool_intent(tool_names: &[String]) -> String {
-    format!(
-        "用户明确要求串联调用多个公开内置工具：{}。必须按用户原始输入描述的依赖顺序选择并调用这些工具；每个工具的 path/source/destination/command/query/content/patch/diff 参数必须从对应编号步骤原文提取。如果用户已经指定文件名、目录名或命令，禁止改名为 probe、tmp、placeholder 或其它自造临时名；最终回复只能描述工具实际结果。不要创建任务，不要只输出文字说明。某一步失败时应原位展示失败工具，并基于已执行结果给出简短说明。",
-        tool_names.join(", ")
-    )
-}
-
-fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDecision) -> bool {
-    const MIN_TASK_CONFIDENCE: f64 = 0.72;
-    if decision.confidence < MIN_TASK_CONFIDENCE {
-        return false;
-    }
-    let Some(reason_code) = decision.reason_code.as_deref() else {
-        return false;
-    };
-    if !matches!(
-        reason_code,
-        "explicit_task_request"
-            | "automatic_team_required"
-            | "proactive_collaboration_candidate"
-            | "structured_task_request"
-            | "multi_step_task"
-            | "implementation_or_fix"
-            | "requires_structured_execution"
-            | "image_task"
-    ) {
-        return false;
-    }
-    if decision.task_evidence.is_empty() {
-        return false;
-    }
-    if decision.route_reason.is_none() {
-        return false;
-    }
-    decision.task_title.is_some() || decision.execution_goal.is_some()
 }
 
 struct UserMessageTurnItemInput<'a> {
@@ -3166,8 +1941,8 @@ fn canonical_turn_replay_response(
                 .and_then(|item| item.metadata.get("route").and_then(Value::as_str))
         })
         .map(|route| match route {
-            "execute" => SessionTurnRouteDto::Execute,
-            "task" => SessionTurnRouteDto::Task,
+            // 历史轮次可能记录为 task 路由；任务路由已与执行路由合并。
+            "execute" | "task" => SessionTurnRouteDto::Execute,
             "continue" => SessionTurnRouteDto::Continue,
             "steer" => SessionTurnRouteDto::Steer,
             _ => SessionTurnRouteDto::Chat,
@@ -3179,7 +1954,7 @@ fn canonical_turn_replay_response(
                 .and_then(Value::as_str)
                 == Some("task")
             {
-                SessionTurnRouteDto::Task
+                SessionTurnRouteDto::Execute
             } else {
                 SessionTurnRouteDto::Chat
             }
@@ -3694,26 +2469,9 @@ async fn submit_mainline_session_turn(
     let user_text = request
         .trimmed_text()
         .unwrap_or_else(|| request.timeline_message(None));
-    let goal_mode = decision.reason_code.as_deref() == Some("goal_mode_request");
-    if request.goal_mode != goal_mode {
-        return Err(ApiError::internal_assembly(
-            "收紧目标模式执行契约",
-            "request.goal_mode 与服务端分类结果不一致",
-        ));
-    }
+    let goal_mode = request.goal_mode;
     let execution_goal = if goal_mode {
-        format!(
-            "{}\n\n用户原始输入：{}",
-            goal_mode_tool_intent(&request),
-            user_text
-        )
-    } else if let Some(intent) = decision
-        .tool_intent
-        .as_deref()
-        .map(str::trim)
-        .filter(|intent| !intent.is_empty())
-    {
-        format!("{intent}\n\n用户原始输入：{user_text}")
+        format!("{}\n\n用户原始输入：{}", goal_mode_tool_intent(), user_text)
     } else {
         decision.execution_goal.clone().unwrap_or(user_text.clone())
     };
@@ -3732,13 +2490,6 @@ async fn submit_mainline_session_turn(
         goal_tool_chain.append(&mut required_tool_chain);
         required_tool_chain = goal_tool_chain;
     }
-    if let Some(forced_tool_name) = decision.forced_tool_name.as_deref()
-        && !required_tool_chain
-            .iter()
-            .any(|tool| tool == forced_tool_name)
-    {
-        required_tool_chain.insert(0, forced_tool_name.to_string());
-    }
 
     let (accepted, event_id, canonical_event_seq, canonical_occurred_at) =
         super::accept_session_task_submission_at(
@@ -3752,8 +2503,7 @@ async fn submit_mainline_session_turn(
                     .clone()
                     .or_else(|| Some(request.mission_title(Some(&user_text)))),
                 execution_goal: Some(execution_goal),
-                task_tier: decision.task_tier,
-                collaboration_mode: decision.collaboration_mode,
+                task_tier: TaskTier::ExecutionChain,
                 // Goal mode stays on the mainline Chat route for UX continuity, but its
                 // lifecycle contract requires Goal/Plan tools. Plain Chat alone disables the
                 // tool surface so workspace preparation and tool schemas do not delay text
@@ -4101,31 +2851,16 @@ async fn drain_next_queued_regular_session_turn(
         route: queued.route,
         task_title: queued.task_title.clone(),
         execution_goal: queued.execution_goal.clone(),
-        task_tier: queued.task_tier,
-        collaboration_mode: queued.collaboration_mode,
-        tool_intent: queued.tool_intent.clone(),
-        forced_tool_name: queued.forced_tool_name.clone(),
         required_tool_chain: queued.required_tool_chain.clone(),
         completion_contract: queued.completion_contract.clone(),
         recovery_checkpoint: queued.recovery_checkpoint.clone(),
-        confidence: 1.0,
-        reason_code: Some(
-            if queued.goal_mode {
-                "goal_mode_request"
-            } else {
-                "queued_regular_turn"
-            }
-            .to_string(),
-        ),
-        route_reason: Some("服务端 session 队列出队".to_string()),
-        task_evidence: Vec::new(),
     };
     let queued_request_fingerprint = queued
         .request_fingerprint
         .clone()
         .or_else(|| queued.request.request_fingerprint().ok());
     let queued_route = queued.route;
-    let queued_goal_mode = queued.goal_mode;
+    let queued_goal_mode = queued.request.goal_mode;
     let queued_request = queued.request;
     // 出队时重新验证请求声明的 session scope。排队期间请求结构可能来自持久化
     // 恢复，不能只相信入队时解析出的 workspace_id；否则一个被篡改或失效的
@@ -4158,18 +2893,18 @@ async fn drain_next_queued_regular_session_turn(
                         )),
                     }
                 }
-                SessionTurnRouteDto::Chat
-                | SessionTurnRouteDto::Execute
-                | SessionTurnRouteDto::Task => submit_mainline_session_turn(
-                    state.clone(),
-                    queued_request,
-                    images,
-                    scope.workspace_id(),
-                    queued.accepted_at,
-                    decision,
-                )
-                .await
-                .map(|_| ()),
+                SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
+                    submit_mainline_session_turn(
+                        state.clone(),
+                        queued_request,
+                        images,
+                        scope.workspace_id(),
+                        queued.accepted_at,
+                        decision,
+                    )
+                    .await
+                    .map(|_| ())
+                }
                 SessionTurnRouteDto::Continue | SessionTurnRouteDto::Steer => Err(
                     ApiError::internal_assembly("执行排队 session turn", "不支持的排队 route"),
                 ),
@@ -6117,6 +4852,7 @@ mod tests {
         CanonicalTurnEventSink, execution_admission::ExecutionAdmissionPermit,
         task_execution_registry::TaskExecutionPlan, task_runner_bridge::TaskDispatcher,
     };
+    use magi_core::TaskEvidenceRequirement;
     use magi_core::{
         AbsolutePath, ExecutionOwnership, ExecutionResultStatus, GoalId, MissionId, Task,
         TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind, TaskRuntimePayload, TaskStatus,
@@ -6783,6 +5519,7 @@ mod tests {
             skill_name: None,
             locale: None,
             goal_mode: false,
+            resume: false,
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
@@ -6818,10 +5555,8 @@ mod tests {
         // 命令不经过意图分类，即使参数文本像执行请求也固定走 conversation。
         let mut execution_like = compact_command_request(Some("运行测试并修改代码"));
         execution_like.session_id = Some("session-compact-command".to_string());
-        let decision = decide_session_turn_with_task_planner(&state, &execution_like)
-            .expect("命令应得到固定决策");
+        let decision = decide_session_turn(&state, &execution_like).expect("命令应得到固定决策");
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("session_command"));
 
         assert_eq!(
             request.timeline_message(request.trimmed_text().as_deref()),
@@ -6849,19 +5584,18 @@ mod tests {
         let state = test_state();
         let text = "请用 Magi 连接器里的工具依次完成：创建目录 e2e-dir，写入文件，搜索文本，并运行测试修改代码";
 
-        // 本地引擎：这类文本会被分类为需要执行 / 任务。
+        // 本地引擎：所有普通消息都进入带工具的主线。
         let local = session_turn_request(text);
-        let local_decision = decide_session_turn_with_task_planner(&state, &local).unwrap();
-        assert!(!matches!(local_decision.route, SessionTurnRouteDto::Chat));
+        let local_decision = decide_session_turn(&state, &local).unwrap();
+        assert!(matches!(local_decision.route, SessionTurnRouteDto::Execute));
 
         // 新会话首条消息携带 GPT Web 引擎配置：固定普通对话，没有任务标题 / 工具意图改写。
         let mut first_message = session_turn_request(text);
         first_message.orchestrator_session_config =
             Some(serde_json::json!({ "engineId": "chatgpt-web/default" }));
-        let decision = decide_session_turn_with_task_planner(&state, &first_message).unwrap();
+        let decision = decide_session_turn(&state, &first_message).unwrap();
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("web_engine_chat"));
-        assert!(decision.tool_intent.is_none() && decision.execution_goal.is_none());
+        assert!(decision.task_title.is_none() && decision.execution_goal.is_none());
 
         // 已有会话：读会话设置里的引擎。
         let session_id = magi_core::SessionId::new("session-web-routing");
@@ -6875,9 +5609,8 @@ mod tests {
             .unwrap();
         let mut existing = session_turn_request(text);
         existing.session_id = Some(session_id.to_string());
-        let decision = decide_session_turn_with_task_planner(&state, &existing).unwrap();
+        let decision = decide_session_turn(&state, &existing).unwrap();
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("web_engine_chat"));
     }
 
     #[test]
@@ -6924,11 +5657,6 @@ mod tests {
             route: SessionTurnRouteDto::Chat,
             task_title: None,
             execution_goal: None,
-            task_tier: TaskTier::ExecutionChain,
-            collaboration_mode: CollaborationMode::Auto,
-            tool_intent: None,
-            forced_tool_name: None,
-            goal_mode: false,
             required_tool_chain: Vec::new(),
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
@@ -7008,37 +5736,6 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
-    }
-
-    fn classifier_chat_decision() -> SessionTurnIntentDecision {
-        SessionTurnIntentDecision {
-            route: SessionTurnRouteDto::Chat,
-            task_title: None,
-            execution_goal: None,
-            task_tier: TaskTier::ExecutionChain,
-            collaboration_mode: CollaborationMode::Auto,
-            tool_intent: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            completion_contract: TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            confidence: 0.86,
-            reason_code: Some("plain_chat".to_string()),
-            route_reason: Some("classifier returned chat".to_string()),
-            task_evidence: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn explicit_continue_text_is_detected_before_classifier() {
-        let request = session_turn_request("继续推进刚才未完成的任务");
-
-        assert!(session_turn_requests_continue_existing_task(&request));
-
-        let next_phase_request = session_turn_request("进入下一阶段，继续剩余验收");
-        assert!(session_turn_requests_continue_existing_task(
-            &next_phase_request
-        ));
     }
 
     #[test]
@@ -7186,9 +5883,17 @@ mod tests {
             .interrupt_turn_by_user(&session_id)
             .expect("turn should be cancellable by user");
 
+        // 只有界面显式发出的 resume 请求才从中断检查点继续；文字“继续”本身不触发恢复。
+        let mut typed_continue = session_turn_request("继续");
+        typed_continue.session_id = Some(session_id.to_string());
+        let typed_decision =
+            decide_session_turn(&state, &typed_continue).expect("typed continue is a new turn");
+        assert!(typed_decision.recovery_checkpoint.is_none());
+
         let mut request = session_turn_request("继续");
         request.session_id = Some(session_id.to_string());
-        let decision = decide_session_turn_with_task_planner(&state, &request)
+        request.resume = true;
+        let decision = decide_session_turn(&state, &request)
             .expect("user cancelled turn should resume as a new execution task");
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
@@ -7224,31 +5929,15 @@ mod tests {
                 .is_some_and(|goal| goal.contains("原始用户目标：请先读取真实代码"))
         );
 
-        let mut referential_request = session_turn_request("继续完成刚才未完成的流程图");
-        referential_request.session_id = Some(session_id.to_string());
-        let referential_decision =
-            decide_session_turn_with_task_planner(&state, &referential_request)
-                .expect("referential continue request should resume interrupted turn");
-        assert_eq!(
-            referential_decision
-                .recovery_checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.source_turn_id.as_str()),
-            Some("turn-user-cancelled-resume")
-        );
-
         let mut unrelated_request = session_turn_request("解释一下 Rust 所有权");
         unrelated_request.session_id = Some(session_id.to_string());
-        let unrelated_decision = decide_session_turn_with_task_planner(&state, &unrelated_request)
+        let unrelated_decision = decide_session_turn(&state, &unrelated_request)
             .expect("unrelated request should remain independent");
+        assert!(matches!(
+            unrelated_decision.route,
+            SessionTurnRouteDto::Execute
+        ));
         assert!(unrelated_decision.recovery_checkpoint.is_none());
-
-        let mut next_topic_request = session_turn_request("下一步我们分析一个新问题");
-        next_topic_request.session_id = Some(session_id.to_string());
-        let next_topic_decision =
-            decide_session_turn_with_task_planner(&state, &next_topic_request)
-                .expect("next topic request should remain independent");
-        assert!(next_topic_decision.recovery_checkpoint.is_none());
     }
 
     #[test]
@@ -7343,24 +6032,20 @@ mod tests {
         for text in ["补充一个新的约束", "看看以上内容"] {
             let mut request = session_turn_request(text);
             request.session_id = Some(session_id.to_string());
-            let decision = decide_session_turn_with_task_planner(&state, &request)
+            let decision = decide_session_turn(&state, &request)
                 .expect("recovery-ready session should accept an unrelated new turn");
-            assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-            assert_eq!(decision.reason_code.as_deref(), Some("plain_chat"));
+            assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
         }
 
         let mut continue_request = session_turn_request("继续");
         continue_request.session_id = Some(session_id.to_string());
-        let continue_decision = decide_session_turn_with_task_planner(&state, &continue_request)
+        continue_request.resume = true;
+        let continue_decision = decide_session_turn(&state, &continue_request)
             .expect("explicit continuation should still resume the recovery-ready chain");
         assert!(matches!(
             continue_decision.route,
             SessionTurnRouteDto::Continue
         ));
-        assert_eq!(
-            continue_decision.reason_code.as_deref(),
-            Some("continue_requested")
-        );
     }
 
     #[test]
@@ -7566,171 +6251,6 @@ mod tests {
             threads[0].message_history[1].tool_call_id.as_deref(),
             Some("call-recovered-read")
         );
-    }
-
-    #[test]
-    fn session_turn_routing_does_not_require_model_bridge_for_plain_message() {
-        let state = test_state();
-        let request = session_turn_request("你好，解释一下当前状态");
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("本地路由不应依赖外部模型");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-    }
-
-    #[test]
-    fn image_turn_defaults_to_regular_chat_route() {
-        let state = test_state();
-        let mut request = session_turn_request("识别这张图片");
-        request.images.push(crate::dto::SessionTurnImageDto {
-            name: "paste.png".to_string(),
-            data_url: "data:image/png;base64,AAA".to_string(),
-        });
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("图片会话不应默认升级为任务链");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-    }
-
-    #[test]
-    fn explicit_task_turn_with_image_still_uses_task_route() {
-        let state = test_state();
-        let mut request = session_turn_request("以任务模式分析这张图片并整理成待办");
-        request.images.push(crate::dto::SessionTurnImageDto {
-            name: "paste.png".to_string(),
-            data_url: "data:image/png;base64,AAA".to_string(),
-        });
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("显式任务请求仍应进入任务链");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-    }
-
-    #[test]
-    fn a_skill_that_declares_tools_runs_the_turn_with_tools_while_other_skills_stay_on_chat() {
-        let registry = magi_skill_runtime::SkillRegistry::new();
-        let skill =
-            |id: &str, restrict: bool, tools: Vec<String>| magi_skill_runtime::SkillDefinition {
-                skill_id: id.to_string(),
-                title: id.to_string(),
-                instruction: "说明".to_string(),
-                metadata: magi_skill_runtime::SkillMetadata {
-                    category: "local".to_string(),
-                    tags: vec![],
-                },
-                restrict_standard_tools: restrict,
-                allowed_tools: tools,
-                custom_tool_bindings: vec![],
-                prompt_priority: 50,
-            };
-        registry.register(skill("wizard", true, vec!["browser_navigate".to_string()]));
-        registry.register(skill("plain-style", false, vec![]));
-        let state = test_state().with_skill_runtime(std::sync::Arc::new(
-            magi_skill_runtime::SkillRuntime::new(registry),
-        ));
-
-        let mut with_tools = session_turn_request("带我配置");
-        with_tools.skill_name = Some("wizard".to_string());
-        let decision = decide_session_turn_with_task_planner(&state, &with_tools).unwrap();
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("skill_requires_tools")
-        );
-        assert!(
-            decision.execution_goal.is_none(),
-            "不创建任务，只是带工具执行"
-        );
-        assert!(decision.task_evidence.is_empty());
-
-        let mut plain = session_turn_request("帮我润色这段说明");
-        plain.skill_name = Some("plain-style".to_string());
-        let decision = decide_session_turn_with_task_planner(&state, &plain).unwrap();
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-
-        // 没有技能或技能未注册：保持普通对话。
-        let none = session_turn_request("带我配置");
-        assert!(matches!(
-            decide_session_turn_with_task_planner(&state, &none)
-                .unwrap()
-                .route,
-            SessionTurnRouteDto::Chat
-        ));
-        let mut unknown = session_turn_request("带我配置");
-        unknown.skill_name = Some("missing".to_string());
-        assert!(matches!(
-            decide_session_turn_with_task_planner(&state, &unknown)
-                .unwrap()
-                .route,
-            SessionTurnRouteDto::Chat
-        ));
-    }
-
-    #[test]
-    fn instruction_skill_alone_stays_on_regular_chat_route() {
-        let state = test_state();
-        let mut request = session_turn_request("");
-        request.skill_name = Some("huashu-design".to_string());
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("instruction skill should not require agent run");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("plain_chat"));
-        assert!(
-            decision.task_evidence.is_empty(),
-            "instruction skill 只是 turn 上下文，不是任务创建证据"
-        );
-    }
-
-    #[test]
-    fn instruction_skill_with_plain_text_does_not_create_task_projection() {
-        let state = test_state();
-        let mut request = session_turn_request("帮我润色这段说明");
-        request.skill_name = Some("talk-normal".to_string());
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("plain instruction skill turn should route");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert!(decision.execution_goal.is_none());
-        assert!(decision.task_evidence.is_empty());
-    }
-
-    #[test]
-    fn instruction_skill_keeps_workspace_inspection_on_execute_route() {
-        let state = test_state();
-        let mut request = session_turn_request("分析当前项目");
-        request.skill_name = Some("cn-engineering-standard".to_string());
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("workspace inspection with skill should route to executable chat turn");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("workspace_inspection_request")
-        );
-        assert!(decision.execution_goal.is_none());
-        assert!(decision.task_evidence.is_empty());
-    }
-
-    #[test]
-    fn instruction_skill_with_explicit_task_text_still_uses_task_route() {
-        let state = test_state();
-        let mut request = session_turn_request("以任务模式修复登录问题，完成后运行测试");
-        request.skill_name = Some("cn-engineering-standard".to_string());
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("explicit task text should still create agent run");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert!(decision.execution_goal.is_some());
-        assert!(!decision.task_evidence.is_empty());
     }
 
     #[tokio::test]
@@ -9026,364 +7546,6 @@ mod tests {
     }
 
     #[test]
-    fn keeps_plain_diagram_explanation_as_chat() {
-        let request = session_turn_request("解释一下流程图是什么");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert!(decision.forced_tool_name.is_none());
-        assert!(
-            decision
-                .completion_contract
-                .evidence_requirements
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn diagram_generation_requires_rendered_delivery_evidence() {
-        for prompt in [
-            "画当前项目流程图",
-            "生成一张系统架构图",
-            "create a sequence diagram for login",
-        ] {
-            let request = session_turn_request(prompt);
-            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-            assert!(
-                matches!(decision.route, SessionTurnRouteDto::Execute),
-                "{prompt}"
-            );
-            assert!(decision.forced_tool_name.is_none(), "{prompt}");
-            assert!(decision.required_tool_chain.is_empty(), "{prompt}");
-            assert_eq!(
-                decision.completion_contract.evidence_requirements,
-                [TaskEvidenceRequirement::successful_tool_call(
-                    "diagram_render"
-                )],
-                "{prompt}"
-            );
-            assert!(
-                decision
-                    .tool_intent
-                    .as_deref()
-                    .is_some_and(|intent| intent.contains("只输出 Markdown、ASCII 图")
-                        && intent.contains("diagram_render")),
-                "{prompt}"
-            );
-        }
-    }
-
-    #[test]
-    fn diagram_delivery_contract_is_independent_of_execution_route() {
-        let task_request = session_turn_request("以复杂任务模式分析并画当前项目流程图");
-        let task_decision =
-            normalize_session_turn_decision(classifier_chat_decision(), &task_request);
-        assert!(matches!(task_decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(
-            task_decision.completion_contract.evidence_requirements,
-            [TaskEvidenceRequirement::successful_tool_call(
-                "diagram_render"
-            )]
-        );
-
-        let goal_request = session_turn_request("以目标模式画当前项目流程图");
-        let goal_decision =
-            normalize_session_turn_decision(classifier_chat_decision(), &goal_request);
-        assert!(matches!(goal_decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(
-            goal_decision.reason_code.as_deref(),
-            Some("goal_mode_request")
-        );
-        assert_eq!(
-            goal_decision.completion_contract.evidence_requirements,
-            [TaskEvidenceRequirement::successful_tool_call(
-                "diagram_render"
-            )]
-        );
-    }
-
-    #[test]
-    fn current_project_analysis_routes_to_execute_tools() {
-        let request = session_turn_request("分析当前项目");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert!(decision.tool_intent.is_some());
-        assert!(decision.forced_tool_name.is_none());
-    }
-
-    #[test]
-    fn explicit_no_tool_workspace_chat_stays_on_conversation_route() {
-        for prompt in [
-            "只进行普通工作区聊天，不执行工具",
-            "不要调用工具，只解释当前项目",
-            "only chat about this workspace without calling tools",
-        ] {
-            let request = session_turn_request(prompt);
-            let decision = normalize_session_turn_decision(
-                local_session_turn_intent_decision(&request, false),
-                &request,
-            );
-
-            assert!(
-                matches!(decision.route, SessionTurnRouteDto::Chat),
-                "明确拒绝工具时不得升级为执行路由: {prompt}"
-            );
-            assert_eq!(decision.reason_code.as_deref(), Some("plain_chat"));
-            assert!(decision.tool_intent.is_none());
-        }
-    }
-
-    #[test]
-    fn project_identity_question_routes_to_execute_tools() {
-        let request = session_turn_request("这个项目是什么");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert!(decision.tool_intent.is_some());
-        assert!(decision.forced_tool_name.is_none());
-    }
-
-    #[test]
-    fn normalizes_explicit_public_builtin_tool_to_forced_execution() {
-        let request = session_turn_request("请只调用 file_mkdir 工具创建目录");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("file_mkdir"));
-        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
-        assert!(tool_intent.contains("file_mkdir"));
-        assert!(tool_intent.contains("不要只输出文字说明"));
-    }
-
-    #[test]
-    fn normalizes_product_shell_name_to_forced_execution() {
-        let request = session_turn_request("必须调用 Shell 工具执行 printf ok");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
-        assert_eq!(decision.reason_code.as_deref(), Some("tool_request"));
-    }
-
-    #[test]
-    fn shell_name_in_problem_description_does_not_force_execution() {
-        for prompt in [
-            "Shell 工具是什么？",
-            "分析 Shell 命令执行失败的原因",
-            "不要调用 Shell 工具，只解释方案",
-        ] {
-            let request = session_turn_request(prompt);
-            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-            assert!(decision.forced_tool_name.is_none(), "{prompt}");
-            assert!(decision.required_tool_chain.is_empty(), "{prompt}");
-        }
-    }
-
-    #[test]
-    fn natural_image_generation_request_forces_image_generate() {
-        for prompt in [
-            "画一个乌龟的照片",
-            "生成一张产品封面图片",
-            "请绘制一个蓝色圆形图标",
-            "create an image of a white rabbit",
-        ] {
-            let request = session_turn_request(prompt);
-            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-            assert!(
-                matches!(decision.route, SessionTurnRouteDto::Execute),
-                "{prompt} should route to direct execution"
-            );
-            assert_eq!(
-                decision.forced_tool_name.as_deref(),
-                Some("image_generate"),
-                "{prompt} should force image_generate instead of allowing a text-only claim"
-            );
-            assert!(
-                decision
-                    .tool_intent
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("不要只输出文字说明")
-            );
-        }
-    }
-
-    #[test]
-    fn image_generation_request_overrides_continue_classification() {
-        let request = session_turn_request("继续生成一张蓝色方块图片");
-        let mut classifier_decision = classifier_chat_decision();
-        classifier_decision.route = SessionTurnRouteDto::Continue;
-        classifier_decision.reason_code = Some("continue_requested".to_string());
-
-        let decision = normalize_session_turn_decision(classifier_decision, &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("image_generate"));
-        assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("image_generation_request")
-        );
-    }
-
-    #[test]
-    fn image_generation_detection_does_not_capture_view_or_diagram_requests() {
-        for prompt in [
-            "查看这张图片",
-            "图片保存在哪里",
-            "画一个系统流程图",
-            "生成一张性能趋势图表",
-            "create a sequence diagram for login",
-        ] {
-            let request = session_turn_request(prompt);
-            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-            assert_ne!(
-                decision.forced_tool_name.as_deref(),
-                Some("image_generate"),
-                "{prompt} should not be treated as raster image generation"
-            );
-        }
-    }
-
-    #[test]
-    fn normalizes_multi_builtin_tool_chain_to_required_execution_chain() {
-        let request = session_turn_request(
-            "请依次调用 file_write、file_read、file_patch、diff_preview 和 diagram_render 完成验收",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert!(decision.forced_tool_name.is_none());
-        assert_eq!(
-            decision.required_tool_chain,
-            vec![
-                "file_write".to_string(),
-                "file_read".to_string(),
-                "file_patch".to_string(),
-                "diff_preview".to_string(),
-                "diagram_render".to_string()
-            ]
-        );
-        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
-        assert!(tool_intent.contains("多个公开内置工具"));
-        assert!(tool_intent.contains("file_write"));
-        assert!(tool_intent.contains("file_read"));
-        assert!(tool_intent.contains("file_patch"));
-        assert!(tool_intent.contains("diff_preview"));
-        assert!(tool_intent.contains("diagram_render"));
-        assert!(tool_intent.contains("对应编号步骤原文提取"));
-        assert!(tool_intent.contains("禁止改名为 probe"));
-    }
-
-    #[test]
-    fn diagram_delivery_keeps_real_code_read_as_required_prerequisite() {
-        let request = session_turn_request(
-            "请先读取 README.md 和真实代码，再调用 diagram_render 生成当前项目流程图",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(
-            decision.required_tool_chain,
-            vec!["file_read".to_string(), "diagram_render".to_string()]
-        );
-        assert_eq!(
-            decision.completion_contract.evidence_requirements,
-            [TaskEvidenceRequirement::successful_tool_call(
-                "diagram_render"
-            )]
-        );
-        assert!(decision.forced_tool_name.is_none());
-        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
-        assert!(tool_intent.contains("file_read"));
-        assert!(tool_intent.contains("diagram_render"));
-    }
-
-    #[test]
-    fn normalizes_canonical_public_builtin_tool_to_forced_execution() {
-        let request = session_turn_request("请调用 file_read 工具查看 /tmp/a.txt");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("file_read"));
-    }
-
-    #[test]
-    fn legacy_public_builtin_alias_does_not_force_execution() {
-        let request = session_turn_request("请调用 file_view 工具查看 /tmp/a.txt");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert!(decision.forced_tool_name.is_none());
-        assert!(decision.required_tool_chain.is_empty());
-        assert!(
-            decision.tool_intent.is_none(),
-            "会话路由层不应恢复旧工具别名到 canonical 工具名"
-        );
-    }
-
-    #[test]
-    fn explicit_public_tool_with_fix_word_routes_to_execute_not_task() {
-        let state = test_state();
-        let request = session_turn_request("请调用 file_patch 修复 /tmp/a.txt 中的拼写问题");
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("explicit public tool should route locally");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("file_patch"));
-        assert!(decision.task_evidence.is_empty());
-    }
-
-    #[test]
-    fn simple_one_shot_fix_routes_to_execute_without_task_projection() {
-        let state = test_state();
-        let request = session_turn_request("直接修复这个文件里的错别字，不需要创建任务");
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("simple one-shot work should route locally");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert!(decision.execution_goal.is_none());
-        assert!(decision.task_evidence.is_empty());
-    }
-
-    #[test]
-    fn medium_fix_with_validation_stays_on_direct_execution_path() {
-        let state = test_state();
-        let request = session_turn_request("修复登录流程问题，完成后运行测试并汇总验证结果");
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("medium fix should route locally");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert!(decision.execution_goal.is_none());
-        assert!(decision.task_evidence.is_empty());
-    }
-
-    #[test]
-    fn multi_step_wording_does_not_implicitly_enable_collaboration() {
-        let state = test_state();
-        let request = session_turn_request("修复登录流程问题，并运行测试验证回归结果");
-
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("multi-step execution should route locally");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert!(decision.task_evidence.is_empty());
-        assert_eq!(
-            session_turn_denied_tools(&request),
-            ["get_goal", "create_goal", "update_goal", "update_plan",]
-        );
-    }
-
-    #[test]
     fn web_turn_denies_every_browser_tool_without_affecting_other_tools() {
         let mut request = session_turn_request("检查网页");
         request.desktop_browser_tools_allowed = false;
@@ -9399,155 +7561,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_workspace_analysis_enters_auto_coordinator_without_agent_keyword() {
-        for text in [
-            "完整分析当前项目",
-            "完整检查当前仓库",
-            "全面分析 current codebase and verify the result",
-        ] {
-            let request = session_turn_request(text);
-            let decision = normalize_session_turn_decision(
-                local_session_turn_intent_decision(&request, false),
-                &request,
-            );
-
-            assert!(
-                matches!(decision.route, SessionTurnRouteDto::Task),
-                "完整工作区分析应进入结构化 root coordinator 任务: {text}"
-            );
-            assert_eq!(
-                decision.reason_code.as_deref(),
-                Some("proactive_collaboration_candidate")
-            );
-            assert_eq!(decision.collaboration_mode, CollaborationMode::Auto);
-            assert!(decision.required_tool_chain.is_empty());
-            assert!(!decision.task_evidence.is_empty());
-            assert_eq!(
-                session_turn_denied_tools(&request),
-                ["get_goal", "create_goal", "update_goal", "update_plan",]
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_complex_agent_request_is_task_even_when_shell_tool_is_named() {
-        let request = session_turn_request(
-            "请以复杂任务模式完成，代理必须调用 shell_exec 执行 printf ok，最后总结。",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert!(decision.forced_tool_name.is_none());
-        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
-        assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("explicit_task_request")
-        );
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert!(decision.execution_goal.is_some());
-        assert!(!decision.task_evidence.is_empty());
-    }
-
-    #[test]
-    fn explicit_multi_stage_task_requires_plan_before_execution() {
-        let state = test_state();
-        let request = session_turn_request(
-            "请把这个只读验收任务拆成三个连续执行阶段，先建立任务计划，再按阶段读取并汇总结果。",
-        );
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("multi-stage task should route through execution chain");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(decision.required_tool_chain, vec!["update_plan"]);
-        assert_eq!(
-            decision.route_reason.as_deref(),
-            Some("用户明确要求执行计划，先由 root coordinator 建立计划，再按计划推进。")
-        );
-    }
-
-    #[test]
-    fn incidental_stage_word_stays_direct_execution_without_plan() {
-        let state = test_state();
-        let request =
-            session_turn_request("修复连续会话第一阶段问题，完成后运行测试并汇总验证结果");
-        let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("structured task should route locally");
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert!(
-            !decision
-                .required_tool_chain
-                .iter()
-                .any(|tool| tool == "update_plan"),
-            "描述问题位置的阶段词不应被误判为制定执行计划"
-        );
-    }
-
-    #[test]
-    fn incidental_english_phase_and_step_words_do_not_require_plan() {
-        for text in [
-            "Fix the phase one regression and run the tests",
-            "Fix the failing step parser and summarize the result",
-        ] {
-            let request = session_turn_request(text);
-            assert!(
-                !session_turn_requests_explicit_plan(&request),
-                "incidental phase or step terminology should not require a plan: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_english_plan_phrases_require_plan() {
-        for text in [
-            "Complete this task in phases and verify each result",
-            "Complete this task step by step and report progress",
-            "Create an execution plan with multiple phases",
-        ] {
-            let request = session_turn_request(text);
-            assert!(
-                session_turn_requests_explicit_plan(&request),
-                "explicit plan language should require a plan: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_multi_stage_agent_task_creates_plan_before_agents() {
-        let request = session_turn_request(
-            "请按三阶段执行计划完成多代理验收，先建立计划，再分派代理并汇总结果。",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(
-            decision.required_tool_chain,
-            vec!["update_plan", "agent_spawn"]
-        );
-    }
-
-    #[test]
-    fn explicit_goal_mode_request_stays_on_mainline_even_when_execute_words_are_present() {
-        let request = session_turn_request(
-            "以长期任务目标模式执行稳定性验收，按步骤读取配置并创建 checkpoint。",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert!(decision.forced_tool_name.is_none());
-        assert_eq!(decision.required_tool_chain, vec!["update_plan"]);
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
-        assert!(decision.execution_goal.is_none());
-        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
-        assert!(tool_intent.contains("get_goal"));
-        assert!(tool_intent.contains("create_goal"));
-        assert!(tool_intent.contains("token_budget"));
-        assert!(tool_intent.contains("传 null"));
-        assert!(tool_intent.contains("update_plan"));
-    }
-
-    #[test]
     fn structured_goal_mode_request_does_not_depend_on_prompt_keywords() {
         let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
             "scope": "personal",
@@ -9556,270 +7569,77 @@ mod tests {
             "goalMode": true
         }))
         .expect("structured goal mode request should parse");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+        let decision = decide_session_turn(&test_state(), &request).expect("goal decision");
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
         assert_eq!(decision.required_tool_chain, ["update_plan"]);
+        assert!(goal_mode_tool_intent().contains("create_goal"));
+
+        let mut text_only = request.clone();
+        text_only.goal_mode = false;
+        text_only.text = Some("请用目标模式完成当前产品稳定性验收".to_string());
+        let decision = decide_session_turn(&test_state(), &text_only).expect("plain decision");
         assert!(
-            decision
-                .tool_intent
-                .as_deref()
-                .unwrap_or_default()
-                .contains("create_goal")
+            decision.required_tool_chain.is_empty(),
+            "目标模式只由结构化开关开启，不从文本推断"
         );
     }
 
     #[test]
-    fn explicit_goal_mode_outranks_continue_and_task_routing() {
-        let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
-            "scope": "personal",
-            "text": "继续按多代理任务完成当前目标",
-            "images": [],
-            "goalMode": true
-        }))
-        .expect("structured goal mode request should parse");
-
-        let decision = normalize_session_turn_decision(
-            local_session_turn_intent_decision(&request, true),
-            &request,
-        );
-
-        assert_eq!(decision.route, SessionTurnRouteDto::Chat);
-        assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
-        assert_eq!(decision.required_tool_chain, ["update_plan"]);
-    }
-
-    #[test]
-    fn every_explicit_goal_mode_request_requires_a_plan_checkpoint() {
-        for text in ["完成当前目标", "推进这个 Goal", "继续处理剩余工作"] {
-            let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
-                "scope": "personal",
-                "text": text,
-                "images": [],
-                "goalMode": true
-            }))
-            .expect("goal mode request should parse");
-            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-            assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
-            assert_eq!(decision.required_tool_chain, ["update_plan"], "{text}");
-            assert!(
-                decision
-                    .tool_intent
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("强制要求维护计划")
-            );
-        }
-    }
-
-    #[test]
-    fn structured_goal_mode_outranks_named_builtin_tool_routing() {
-        let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
-            "scope": "personal",
-            "text": "创建两步任务清单，第一步调用 shell_exec 执行 sleep 30，第二步汇总结果",
-            "images": [],
-            "goalMode": true
-        }))
-        .expect("structured goal mode request should parse");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
-        assert!(decision.forced_tool_name.is_none());
-        assert_eq!(decision.required_tool_chain, ["update_plan", "shell_exec"]);
-    }
-
-    #[test]
-    fn mixed_language_goal_mode_keeps_shell_only_contract() {
-        let request = session_turn_request(
-            "设定并推进真实 Goal 模式，用 update_plan 建立步骤；只能用 shell_exec 读取并写入 Demo，不得改用 file_write、apply_patch 或 file_read。",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
-        assert_eq!(decision.required_tool_chain, ["update_plan", "shell_exec"]);
-        assert!(
-            decision
-                .tool_intent
-                .as_deref()
-                .unwrap_or_default()
-                .contains("主线 Goal 工具")
-        );
-    }
-
-    #[test]
-    fn shell_recovery_goal_does_not_require_forbidden_write_tools() {
-        let request = session_turn_request(
-            "设定并推进一个真实 Goal 模式 Shell 权限恢复 Demo。必须按顺序完成：1. 调用 get_goal；2. 调用 create_goal；3. 用 update_plan 建立三个步骤；4. 只能用 shell_exec 完成只读探查；5. 只能用 shell_exec 写入 docs/goal-shell-recovery-demo.md，不得改用 file_write、apply_patch 或其他写工具；6. 用 shell_exec 读取该文件并运行测试；7. 再调用 update_goal 标记 complete。",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert_eq!(decision.reason_code.as_deref(), Some("goal_mode_request"));
-        assert_eq!(decision.required_tool_chain, ["update_plan", "shell_exec"]);
-        for forbidden in ["file_write", "apply_patch", "file_read"] {
-            assert!(
-                !decision
-                    .required_tool_chain
-                    .iter()
-                    .any(|tool| tool == forbidden)
-            );
-        }
-    }
-
-    #[test]
-    fn generic_progress_wording_does_not_implicitly_enable_goal_mode() {
-        let request = session_turn_request("请持续推进性能优化建议的讨论");
-
-        assert!(!session_turn_requests_explicit_goal_mode(&request));
-    }
-
-    #[test]
-    fn explicit_medium_agent_dispatch_request_is_task_even_when_read_words_are_present() {
-        let request = session_turn_request(
-            "请作为中等任务进行角色匹配冒烟：同时派发两个只读代理，explorer display_name「角色目录代理」只做根目录巡检；reviewer display_name「角色配置代理」只读取 package.json。",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert!(decision.forced_tool_name.is_none());
-        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
-        assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("explicit_task_request")
-        );
-    }
-
-    #[test]
-    fn explicit_agent_request_uses_execution_chain() {
-        let request = session_turn_request("请分派代理修复这个明确问题，完成后汇总验证结果。");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
-    }
-
-    #[test]
-    fn multi_agent_test_request_uses_execution_chain() {
-        let request = session_turn_request("进行一个多代理测试");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("explicit_task_request")
-        );
-        assert_eq!(
-            decision.execution_goal.as_deref(),
-            Some("进行一个多代理测试")
-        );
-        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
-    }
-
-    #[test]
-    fn negated_agent_creation_does_not_route_simple_command_to_task_mode() {
-        let request = session_turn_request(
-            "请执行 sleep 2，完成后只回复 SESSION_DONE。不要创建子代理，不要修改文件。",
-        );
-        let decision = normalize_session_turn_decision(
-            local_session_turn_intent_decision(&request, false),
-            &request,
-        );
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.reason_code.as_deref(), Some("tool_request"));
-        assert!(decision.execution_goal.is_none());
-        assert_eq!(
-            session_turn_denied_tools(&request),
-            ["get_goal", "create_goal", "update_goal", "update_plan",]
-        );
-    }
-
-    #[test]
-    fn explicit_subagent_mode_request_is_task_even_without_dispatch_verb() {
+    fn plain_messages_route_to_tool_mainline_without_keyword_contracts() {
+        let state = test_state();
         for text in [
-            "使用 subagent 模式检查当前项目并汇总风险。",
-            "使用子 agent 模式检查当前项目并汇总风险。",
-            "以子代理模式处理这个问题，完成后汇总。",
-            "以多 agent 模式处理这个问题，完成后汇总。",
-            "use subagent mode to inspect this project and summarize risks.",
+            "读一下 AGENTS.md",
+            "帮我配置 HTTP 代理",
+            "这段代码为什么报错",
+            "解释一下 Rust 所有权",
+            "用多个子代理分析当前项目",
+            "不要使用子代理，直接修复",
+            "调用 shell_exec 运行测试",
+            "生成一张项目架构图",
         ] {
             let request = session_turn_request(text);
-            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
+            let decision = decide_session_turn(&state, &request).expect("plain decision");
             assert!(
-                matches!(decision.route, SessionTurnRouteDto::Task),
-                "subagent 模式入口必须创建代理运行记录: {text}"
+                matches!(decision.route, SessionTurnRouteDto::Execute),
+                "{text} 应进入带工具的主线"
             );
-            assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-            assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
-            assert_eq!(
-                decision.reason_code.as_deref(),
-                Some("explicit_task_request")
+            assert!(
+                decision.required_tool_chain.is_empty(),
+                "{text} 不得从文本推断必调工具"
             );
-            assert!(decision.execution_goal.is_some());
-            assert!(!decision.task_evidence.is_empty());
+            assert!(
+                decision
+                    .completion_contract
+                    .evidence_requirements
+                    .is_empty()
+            );
+            let denied = session_turn_denied_tools(&request);
+            assert!(
+                !denied
+                    .iter()
+                    .any(|tool| tool.starts_with("agent_") || tool == "update_plan"),
+                "{text} 的协作与计划工具由模型自行决定是否使用：{denied:?}"
+            );
+            assert!(denied.iter().any(|tool| tool == "create_goal"));
         }
     }
 
     #[test]
-    fn explicit_complex_agent_request_preserves_raw_user_goal_as_execution_goal() {
-        let raw_goal = "【具体任务推进验收】请以复杂任务模式完成，必须由代理在当前工作区创建文件 task-system-e2e.md，文件内容必须包含三行：title: task concrete progress、marker: TASK_E2E、status: completed。创建后代理必须读取该文件验证内容。";
-        let request = session_turn_request(raw_goal);
-        let mut classifier_decision = classifier_chat_decision();
-        classifier_decision.route = SessionTurnRouteDto::Task;
-        classifier_decision.task_title = Some("创建并验证 task-system-e2e.md".to_string());
-        classifier_decision.execution_goal = Some("创建并验证 task-system-e2e.md".to_string());
-        classifier_decision
-            .task_evidence
-            .push("classifier saw a task".to_string());
-
-        let decision = normalize_session_turn_decision(classifier_decision, &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert_eq!(decision.execution_goal.as_deref(), Some(raw_goal));
-    }
-
-    #[test]
-    fn does_not_force_internal_builtin_tool_names() {
-        let request = session_turn_request("请调用 process_launch 启动后台进程");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert!(decision.forced_tool_name.is_none());
-    }
-
-    #[test]
-    fn does_not_force_orchestration_only_builtin_tool_names_to_regular_execute() {
-        for tool_name in ["agent_spawn", "update_plan", "memory_write", "agent_wait"] {
-            let request = session_turn_request(&format!("请调用 {tool_name} 完成这一步"));
-            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-            assert!(
-                !matches!(decision.route, SessionTurnRouteDto::Execute),
-                "{tool_name} 需要任务运行时上下文，不能被普通 Execute 路由强制调用"
-            );
-            assert!(
-                decision.forced_tool_name.is_none(),
-                "{tool_name} 不能成为普通会话 forced tool"
-            );
-        }
-    }
-
-    #[test]
-    fn does_not_treat_substrings_as_explicit_tool_names() {
-        let request = session_turn_request("profile_mkdir 是一个普通变量名");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
-        assert!(decision.forced_tool_name.is_none());
+    fn resume_without_recoverable_execution_is_rejected() {
+        let state = test_state();
+        let session_id = SessionId::new("session-resume-nothing");
+        state
+            .session_store
+            .create_session(session_id.clone(), "没有可继续的执行")
+            .expect("session should create");
+        let mut request = session_turn_request("继续");
+        request.session_id = Some(session_id.to_string());
+        request.resume = true;
+        assert!(matches!(
+            decide_session_turn(&state, &request),
+            Err(ApiError::InvalidInput(message)) if message.contains("没有可继续的执行")
+        ));
     }
 
     #[test]
@@ -10971,7 +8791,7 @@ mod tests {
         assert!(
             state
                 .peek_next_regular_session_turn(&session_id)
-                .is_some_and(|queued| queued.goal_mode),
+                .is_some_and(|queued| queued.request.goal_mode),
             "Goal 模式判定必须随排队消息持久化"
         );
 
@@ -11112,7 +8932,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["route"], "task");
+        assert_eq!(body["route"], "execute");
         assert_eq!(body["queued"], true);
         assert_eq!(body["queuePosition"], 1);
         assert_eq!(body["userMessageItemId"], "user-task-queued-turn");
@@ -11123,7 +8943,7 @@ mod tests {
         let queued = state
             .peek_next_regular_session_turn(&session_id)
             .expect("task turn should be queued with the same session key");
-        assert!(matches!(queued.route, SessionTurnRouteDto::Task));
+        assert!(matches!(queued.route, SessionTurnRouteDto::Execute));
         assert_eq!(
             queued.request.trimmed_text().as_deref(),
             Some("以任务模式整理当前问题并输出修复计划")
@@ -11155,7 +8975,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["route"], "task");
+        assert_eq!(body["route"], "execute");
         assert_eq!(body["userMessageItemId"], "user-task-image-turn");
         assert_eq!(body["canonicalEventKind"], "turn_started");
         assert_eq!(
@@ -11227,7 +9047,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["route"], "task");
+        assert_eq!(body["route"], "execute");
         assert_eq!(
             body["canonicalItem"]["metadata"]["contextReferences"][0]["path"],
             canonical_external_file.display().to_string()
@@ -11251,52 +9071,6 @@ mod tests {
                 .iter()
                 .any(|value| value.contains(&canonical_external_file.display().to_string()))
         );
-    }
-
-    #[tokio::test]
-    async fn multi_stage_task_keeps_plan_and_enforces_no_agent_policy() {
-        let task_store = Arc::new(TaskStore::new());
-        let state = test_state().with_task_store(task_store.clone());
-        let workspace_id = register_workspace(&state, "workspace-no-agent-plan", "no-agent-plan");
-
-        let (status, body) = post_json(
-            state,
-            "/session/turn",
-            serde_json::json!({
-                "scope": "workspace",
-                "workspaceId": workspace_id.to_string(),
-                "text": "请制定并完整执行三阶段只读计划，每完成一个阶段立即更新计划，不派发子代理。",
-                "requestId": "request-no-agent-plan",
-                "userMessageId": "user-no-agent-plan",
-                "placeholderMessageId": "assistant-no-agent-plan"
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["route"], "task");
-        let action_task_id = TaskId::new(
-            body["actionTaskId"]
-                .as_str()
-                .expect("task response should carry actionTaskId"),
-        );
-        let task = task_store
-            .get_task(&action_task_id)
-            .expect("action task should exist");
-        assert_eq!(task.required_tool_chain(), ["update_plan"]);
-        let policy = task.policy_snapshot.expect("task policy should exist");
-        let mut expected_denied_tools = vec![
-            "get_goal".to_string(),
-            "create_goal".to_string(),
-            "update_goal".to_string(),
-        ];
-        expected_denied_tools.extend(
-            BrowserToolKind::ALL
-                .into_iter()
-                .map(|tool| tool.name().to_string()),
-        );
-        assert_eq!(policy.denied_tools, expected_denied_tools);
-        assert_eq!(policy.collaboration_mode, CollaborationMode::Disabled);
     }
 
     #[tokio::test]
@@ -11637,11 +9411,6 @@ mod tests {
                 route: SessionTurnRouteDto::Chat,
                 task_title: None,
                 execution_goal: None,
-                task_tier: TaskTier::ExecutionChain,
-                collaboration_mode: CollaborationMode::Auto,
-                tool_intent: None,
-                forced_tool_name: None,
-                goal_mode: false,
                 required_tool_chain: Vec::new(),
                 completion_contract: TaskCompletionContract::default(),
                 recovery_checkpoint: None,

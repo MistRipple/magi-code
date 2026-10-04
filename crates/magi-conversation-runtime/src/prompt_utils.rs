@@ -186,26 +186,13 @@ fn stable_prompt_hash(value: &str) -> u64 {
         })
 }
 
-const ROOT_MULTI_AGENT_MODE_RULE_AUTO: &str = "\
-多代理模式（当前模式：auto；root coordinator 必须遵守）：\n\
-1. 协作能力由当前任务 TaskPolicy 决定。请根据任务边界、并行收益、独立复核价值和当前容量自主判断是否派发；1-3 步即可完成的工作不要为组队而组队。\n\
-2. 用户明确要求 subagent、子代理、多代理、并行角色或指定代理角色时，视为本轮协作要求，必须通过 agent_spawn 创建真实代理；只要决定协作，也必须提供最小充分的结构化 context_package。capabilities 可省略，目标 role 已知时优先省略，由服务端按角色默认能力补齐；不要为了查询已知角色能力先调用 tool_catalog，不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
-3. 多个互相独立的工作单元应在同一轮发起多次 agent_spawn；需要结果时使用 agent_wait 汇总。所有已创建代理都必须等待到结束或主动 agent_cancel，并在最终答复中整合其结果。\n\
-4. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。context_package 必须直接传 JSON 对象。\n\
+const ROOT_MULTI_AGENT_MODE_RULE: &str = "\
+多代理协作（root coordinator 必须遵守）：\n\
+1. 是否派发代理由你根据任务边界、并行收益和独立复核价值自主判断；1-3 步即可完成的工作直接做，不要为组队而组队。\n\
+2. 用户明确要求使用子代理、多代理或指定角色时，必须通过 agent_spawn 创建真实代理；用户明确要求单线完成时不要派发。不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
+3. 多个互相独立的工作单元在同一轮发起多次 agent_spawn，每次都提供最小充分的结构化 context_package（直接传 JSON 对象）。需要结果时用 agent_wait 收集；所有已创建代理都必须等待到结束或用 agent_cancel 取消，并在最终答复中整合其结果。\n\
+4. 收到 `agent_spawn`、`agent_send`、`agent_cancel`、`agent_wait`、`agent_apply` 定义即可直接调用；`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。\n\
 5. root coordinator 保留主线推进职责；代理需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
-
-const ROOT_MULTI_AGENT_MODE_RULE_REQUIRED: &str = "\
-多代理模式（当前模式：required；root coordinator 必须遵守）：\n\
-1. 用户已明确要求真实代理协作。本任务必须至少成功调用一次 agent_spawn 创建真实子任务，并在最终答复前通过 agent_wait 收集其终态；不得用主线读取、shell_exec 或口头总结替代。\n\
-2. 每次 agent_spawn 都必须提供有效 role 和结构化 context_package；capabilities 可省略，省略时由服务端按目标角色默认能力补齐。目标 role 已知时不要先调用 tool_catalog 查询能力。若调用被 rejected，必须依据 error_code/failure_stage 修正后重新派发，不能伪造 started 或 completed。\n\
-3. 多个独立工作单元应在同一轮发起多次 agent_spawn。\n\
-4. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。";
-
-const ROOT_MULTI_AGENT_MODE_RULE_DISABLED: &str = "\
-多代理模式（当前模式：disabled；root coordinator 必须遵守）：\n\
-1. 用户明确要求单线执行。当前任务禁止调用 agent_spawn、agent_send、agent_wait；运行时会返回 collaboration_disabled，不能通过改写参数或历史消息绕过。\n\
-2. 由主线直接完成当前目标，不能把主线操作描述成代理结果，也不能生成虚假的 child_task_id。\n\
-3. 其他工具仍按 TaskPolicy、SafetyGate 和 workspace 边界执行。";
 
 const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\
 子代理模式（当前模式：worker；worker 必须遵守）：\n\
@@ -289,19 +276,11 @@ pub fn dynamic_skill_prompt_message(
 }
 
 pub fn root_multi_agent_mode_prompt(
-    mode: magi_core::CollaborationMode,
     limits: &crate::execution_admission::ExecutionAdmissionLimits,
     roles: &magi_agent_role::AgentRoleRegistry,
 ) -> String {
-    let rule = match mode {
-        magi_core::CollaborationMode::Auto => ROOT_MULTI_AGENT_MODE_RULE_AUTO,
-        magi_core::CollaborationMode::Required => ROOT_MULTI_AGENT_MODE_RULE_REQUIRED,
-        magi_core::CollaborationMode::Disabled => {
-            return ROOT_MULTI_AGENT_MODE_RULE_DISABLED.to_string();
-        }
-    };
     format!(
-        "{rule}\n{}\n{}",
+        "{ROOT_MULTI_AGENT_MODE_RULE}\n{}\n{}",
         execution_capacity_rule(limits),
         spawnable_roles_rule(roles)
     )
@@ -576,8 +555,7 @@ mod tests {
             min_available_memory_bytes: 0,
         };
         let roles = magi_agent_role::AgentRoleRegistry::builtin();
-        let prompt =
-            root_multi_agent_mode_prompt(magi_core::CollaborationMode::Auto, &limits, &roles);
+        let prompt = root_multi_agent_mode_prompt(&limits, &roles);
         assert!(prompt.contains("全局最多同时运行 3 个执行单元，单个会话 2 个，每个角色 4 个"));
         assert!(!prompt.contains("不设置会话级"));
         assert!(prompt.contains("- reviewer（Reviewer，只读）"), "{prompt}");

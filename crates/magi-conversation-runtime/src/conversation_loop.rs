@@ -1207,7 +1207,7 @@ fn run_conversation_loop_inner(
         &current_session_file_facts(session_store, session_id),
         workspace_root_path.as_deref(),
     );
-    let declared_required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
+    let declared_required_tool_chain = task_required_tool_chain(task);
     let required_evidence_tools = task_required_evidence_tools(task);
     let historical_completion_evidence = if recovery_history {
         successful_tool_evidence_from_thread_history(&thread_history_snapshot)
@@ -2802,7 +2802,6 @@ fn run_conversation_loop_inner(
         }
 
         let mut completed_tool_names_this_round = Vec::new();
-        let mut content_requirement_failures = Vec::new();
         let mut activated_skill_this_round = None;
         let mut deterministic_tool_failure = None;
         let mut terminal_tool_failure = None;
@@ -2842,25 +2841,15 @@ fn run_conversation_loop_inner(
             if !tool_result_execution_was_skipped(&result)
                 && matches!(tool_status, ExecutionResultStatus::Succeeded)
             {
-                if let Some(failure) = validate_task_content_requirements(
-                    task,
-                    &canonical_tool_name,
-                    tool_call,
-                    &result,
-                ) {
-                    content_requirement_failures.push(failure);
-                } else {
-                    completed_tool_names_this_round.push(canonical_tool_name.clone());
-                    completion_evidence.push(TaskCompletionEvidence::SuccessfulToolCall {
-                        call_id: tool_call.id.clone(),
-                        tool_name: canonical_tool_name.clone(),
-                        arguments: serde_json::from_str(&tool_call.function.arguments)
-                            .unwrap_or_else(|_| {
-                                serde_json::Value::String(tool_call.function.arguments.clone())
-                            }),
-                        result: result.clone(),
-                    });
-                }
+                completed_tool_names_this_round.push(canonical_tool_name.clone());
+                completion_evidence.push(TaskCompletionEvidence::SuccessfulToolCall {
+                    call_id: tool_call.id.clone(),
+                    tool_name: canonical_tool_name.clone(),
+                    arguments: serde_json::from_str(&tool_call.function.arguments).unwrap_or_else(
+                        |_| serde_json::Value::String(tool_call.function.arguments.clone()),
+                    ),
+                    result: result.clone(),
+                });
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
             if let Some(failure) = tool_execution_ledger.observe_tool_result(
@@ -3061,19 +3050,6 @@ fn run_conversation_loop_inner(
                 })
         }) {
             evidence_recovery_tool = None;
-        }
-        if !content_requirement_failures.is_empty() {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(format!(
-                    "上一轮工具调用没有满足当前任务的硬性内容要求：{}。请基于当前任务原文重新调用下一个缺失工具，必须逐字保留文件名、marker 和每一行要求。",
-                    content_requirement_failures.join("；")
-                )),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            });
         }
     }
 
@@ -3283,37 +3259,6 @@ fn append_task_runtime_signals(
     }
 }
 
-fn validate_task_content_requirements(
-    task: &Task,
-    tool_name: &str,
-    tool_call: &ChatToolCall,
-    tool_result: &str,
-) -> Option<String> {
-    let required_literals = task_required_content_literals(task);
-    if required_literals.is_empty() {
-        return None;
-    }
-    let observed_content = match tool_name {
-        "file_write" => tool_call_content_argument(tool_call),
-        "file_read" => tool_result_content_field(tool_result),
-        _ => return None,
-    };
-    let missing = required_literals
-        .iter()
-        .filter(|literal| {
-            observed_content
-                .as_deref()
-                .is_none_or(|content| !content.contains(literal.as_str()))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        None
-    } else {
-        Some(format!("{tool_name} 内容缺少 {}", missing.join(", ")))
-    }
-}
-
 fn agent_coordination_recovery_prompt(
     task: &Task,
     task_store: &TaskStore,
@@ -3415,57 +3360,6 @@ fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BT
         }
     }
     collected
-}
-
-fn task_required_content_literals(task: &Task) -> Vec<String> {
-    if task.kind != magi_core::TaskKind::LocalAgent {
-        return Vec::new();
-    }
-    let goal = task.goal.trim();
-    let Some((_, after_anchor)) = goal
-        .split_once("文件内容必须包含")
-        .or_else(|| goal.split_once("content must contain"))
-        .or_else(|| goal.split_once("must contain"))
-    else {
-        return Vec::new();
-    };
-    let requirement = after_anchor
-        .split(['。', '\n'])
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_start_matches(['：', ':'])
-        .trim_start_matches("三行")
-        .trim_start_matches(['：', ':'])
-        .trim();
-    requirement
-        .split(['、', '；', ';'])
-        .map(|part| part.trim().trim_matches(['，', ',', '。', '.']))
-        .filter(|part| part.contains(':'))
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn tool_call_content_argument(tool_call: &ChatToolCall) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-}
-
-fn tool_result_content_field(tool_result: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(tool_result)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
 }
 
 fn tool_result_execution_was_skipped(result: &str) -> bool {
@@ -6100,49 +5994,6 @@ mod tests {
     }
 
     #[test]
-    fn full_action_extracts_required_tool_chain_in_goal_order() {
-        let mut task = make_task_loop_test_task("task-required-tool-chain");
-        task.goal =
-            "按顺序调用：1 shell_exec；2 file_mkdir；3 file_write；4 file_read；5 file_remove"
-                .to_string();
-        task.policy_snapshot = Some(magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::Restricted,
-            collaboration_mode: Default::default(),
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            read_only_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "full".to_string(),
-            retry_limit: 1,
-            validation_profile: Some("required".to_string()),
-            checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::ExecutionChain,
-            background_allowed: false,
-            escalation_conditions: Vec::new(),
-        });
-
-        assert_eq!(
-            task_required_tool_chain(&task, None),
-            vec![
-                "shell_exec".to_string(),
-                "file_mkdir".to_string(),
-                "file_write".to_string(),
-                "file_read".to_string(),
-                "file_remove".to_string()
-            ]
-        );
-
-        task.policy_snapshot.as_mut().expect("policy").command_mode = "read_only".to_string();
-        assert!(
-            task_required_tool_chain(&task, None).is_empty(),
-            "只读阶段即使复述用户目标，也不能强制执行写工具链"
-        );
-    }
-
-    #[test]
     fn strict_goal_mode_tool_chain_repairs_missing_lifecycle_steps() {
         assert_eq!(
             goal_mode_required_tool_chain(
@@ -6271,185 +6122,6 @@ mod tests {
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
             ["shell_exec"]
-        );
-    }
-
-    #[test]
-    fn natural_write_then_read_goal_requires_file_write_before_file_read() {
-        let mut task = make_task_loop_test_task("task-natural-write-read-chain");
-        task.goal =
-            "在工作区创建 probe.txt，写入内容 FULL_ACCESS_OK，再读取该文件验证内容。".to_string();
-        task.policy_snapshot = Some(magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::FullAccess,
-            collaboration_mode: Default::default(),
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            read_only_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "full".to_string(),
-            retry_limit: 1,
-            validation_profile: None,
-            checkpoint_mode: "turn".to_string(),
-            task_tier: TaskTier::ExecutionChain,
-            background_allowed: true,
-            escalation_conditions: Vec::new(),
-        });
-
-        assert_eq!(
-            task_required_tool_chain(&task, None),
-            vec!["file_write".to_string(), "file_read".to_string()]
-        );
-    }
-
-    #[test]
-    fn negated_tool_references_are_not_forced_into_required_chain() {
-        let mut task = make_task_loop_test_task("task-required-tool-chain-negation");
-        task.goal = "只调用 web_fetch 抓取页面。不要调用 shell_exec 或 web_search。".to_string();
-        task.policy_snapshot = Some(magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::Restricted,
-            collaboration_mode: Default::default(),
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            read_only_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "full".to_string(),
-            retry_limit: 1,
-            validation_profile: Some("required".to_string()),
-            checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::ExecutionChain,
-            background_allowed: false,
-            escalation_conditions: Vec::new(),
-        });
-
-        assert_eq!(
-            task_required_tool_chain(&task, None),
-            vec!["web_fetch".to_string()]
-        );
-
-        task.goal = "Only call web_fetch. Do not call shell_exec or web_search.".to_string();
-        assert_eq!(
-            task_required_tool_chain(&task, None),
-            vec!["web_fetch".to_string()]
-        );
-
-        task.goal = "先不要调用 web_search。确认条件后调用 web_search。".to_string();
-        assert_eq!(
-            task_required_tool_chain(&task, None),
-            vec!["web_search".to_string()]
-        );
-    }
-
-    #[test]
-    fn local_agent_infers_file_write_and_read_from_concrete_file_goal() {
-        let mut task = make_task_loop_test_task("task-required-tool-chain-natural-language");
-        task.goal = "请在当前工作区创建文件 task-system-e2e.md，文件内容必须包含 marker: TASK_E2E。创建后读取该文件验证内容。"
-            .to_string();
-        task.policy_snapshot = Some(magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::Restricted,
-            collaboration_mode: Default::default(),
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            read_only_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "full".to_string(),
-            retry_limit: 1,
-            validation_profile: Some("required".to_string()),
-            checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::ExecutionChain,
-            background_allowed: false,
-            escalation_conditions: Vec::new(),
-        });
-
-        assert_eq!(
-            task_required_tool_chain(&task, None),
-            vec!["file_write".to_string(), "file_read".to_string()]
-        );
-    }
-
-    #[test]
-    fn coordinator_task_does_not_convert_orchestration_goal_to_forced_tool_chain() {
-        let registry = magi_agent_role::AgentRoleRegistry::load_default();
-        let mut task = make_task_loop_test_task("task-coordinator-required-tool-chain");
-        task.goal = "先启动两轮 agent_spawn + agent_wait，再汇总各代理结果。".to_string();
-        task.policy_snapshot = Some(magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::Restricted,
-            collaboration_mode: Default::default(),
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            read_only_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "full".to_string(),
-            retry_limit: 1,
-            validation_profile: Some("required".to_string()),
-            checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::ExecutionChain,
-            background_allowed: false,
-            escalation_conditions: Vec::new(),
-        });
-        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
-
-        assert!(
-            task_required_tool_chain(&task, Some(&registry)).is_empty(),
-            "协调器必须保留自适应编排空间，不能被执行叶子的强制工具链锁死"
-        );
-    }
-
-    #[test]
-    fn content_requirement_validation_rejects_marker_typos() {
-        let mut task = make_task_loop_test_task("task-content-requirement");
-        task.goal = "请创建文件 demo.md，文件内容必须包含三行：title: task concrete progress、marker: TASK_E2E_123、status: completed。创建后读取该文件验证内容。"
-            .to_string();
-        let bad_write = ChatToolCall {
-            id: "call-bad-write".to_string(),
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunction {
-                name: "file_write".to_string(),
-                arguments: serde_json::json!({
-                    "path": "/tmp/demo.md",
-                    "content": "title: task concrete progress\nmarker: TASK_EE_123\nstatus: completed\n"
-                })
-                .to_string(),
-            },
-        };
-        let good_write = ChatToolCall {
-            id: "call-good-write".to_string(),
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunction {
-                name: "file_write".to_string(),
-                arguments: serde_json::json!({
-                    "path": "/tmp/demo.md",
-                    "content": "title: task concrete progress\nmarker: TASK_E2E_123\nstatus: completed\n"
-                })
-                .to_string(),
-            },
-        };
-
-        assert_eq!(
-            task_required_content_literals(&task),
-            vec![
-                "title: task concrete progress".to_string(),
-                "marker: TASK_E2E_123".to_string(),
-                "status: completed".to_string()
-            ]
-        );
-        assert!(
-            validate_task_content_requirements(&task, "file_write", &bad_write, "{}")
-                .is_some_and(|failure| failure.contains("marker: TASK_E2E_123"))
-        );
-        assert!(
-            validate_task_content_requirements(&task, "file_write", &good_write, "{}").is_none()
         );
     }
 
@@ -7112,7 +6784,6 @@ mod tests {
         planning.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
-            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -7787,7 +7458,6 @@ mod tests {
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
-            collaboration_mode: Default::default(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),

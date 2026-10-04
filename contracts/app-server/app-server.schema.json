@@ -295,6 +295,12 @@
         "skillName": { "type": ["string", "null"] },
         "locale": { "type": ["string", "null"] },
         "goalMode": { "type": "boolean", "default": false, "x-rust-default": true },
+        "resume": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true,
+          "description": "用户点击“继续”恢复最近一次被中断或可恢复的执行；由界面显式设置，不从文本推断。"
+        },
         "command": {
           "oneOf": [
             { "$ref": "#/$defs/SessionTurnCommand" },
@@ -489,7 +495,7 @@
     },
     "TurnStartRoute": {
       "type": "string",
-      "enum": ["chat", "execute", "task", "continue", "steer"]
+      "enum": ["chat", "execute", "continue", "steer"]
     },
     "TurnQueueInfo": {
       "type": "object",

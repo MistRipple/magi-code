@@ -12,8 +12,7 @@ use std::path::Path;
 
 use magi_bridge_client::{ChatToolCall, ChatToolFunction};
 use magi_core::{
-    AccessProfile, CollaborationMode, ExecutionResultStatus, SessionId, TaskPolicy, TaskTier,
-    ToolCallId, WorkspaceId,
+    AccessProfile, ExecutionResultStatus, SessionId, TaskPolicy, TaskTier, ToolCallId, WorkspaceId,
 };
 use magi_event_bus::InMemoryEventBus;
 use magi_snapshot::{ToolHook, ToolHookCtx};
@@ -61,7 +60,6 @@ pub fn external_tool_policy(access_profile: AccessProfile, workspace_root: &Path
     TaskPolicy {
         autonomy_level: "Supervised".to_string(),
         access_profile,
-        collaboration_mode: CollaborationMode::Disabled,
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
         allowed_paths: vec![workspace_root.to_string_lossy().into_owned()],

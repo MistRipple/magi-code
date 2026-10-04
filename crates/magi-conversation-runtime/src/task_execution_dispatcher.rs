@@ -2031,13 +2031,7 @@ impl LlmTaskDispatcher {
         }
         let registry = Some(self.agent_role_registry.as_ref());
         if task_is_coordinator(Some(task), registry) {
-            let collaboration_mode = task
-                .policy_snapshot
-                .as_ref()
-                .map(|policy| policy.collaboration_mode)
-                .unwrap_or_default();
             return Some(root_multi_agent_mode_prompt(
-                collaboration_mode,
                 self.execution_registry.execution_admission().limits(),
                 self.agent_role_registry.as_ref(),
             ));
@@ -3537,7 +3531,6 @@ mod tests {
             policy_snapshot: Some(TaskPolicy {
                 autonomy_level: "Autonomous".to_string(),
                 access_profile: magi_core::AccessProfile::Restricted,
-                collaboration_mode: Default::default(),
                 allowed_tools: Vec::new(),
                 denied_tools: Vec::new(),
                 allowed_paths: Vec::new(),
@@ -4635,45 +4628,19 @@ mod tests {
         let (coordinator_prompt, _) =
             dispatcher.assemble_prompt(None, &coordinator_task, &session_id, &workspace_id);
         assert!(
-            coordinator_prompt.contains("多代理模式（当前模式：auto"),
-            "root coordinator prompt 必须包含 auto 多代理策略: {coordinator_prompt}"
+            coordinator_prompt.contains("多代理协作（root coordinator 必须遵守）"),
+            "root coordinator prompt 必须包含多代理协作规则: {coordinator_prompt}"
         );
         assert!(
-            coordinator_prompt.contains("用户明确要求 subagent")
+            coordinator_prompt.contains("用户明确要求使用子代理")
                 && coordinator_prompt.contains("必须通过 agent_spawn 创建真实代理"),
             "明确 subagent 请求必须被约束为真实 agent_spawn"
         );
         assert!(
             coordinator_prompt.contains("runtime_internal=true")
-                && coordinator_prompt.contains("这些工具就是当前模型可直接调用的代理工具"),
-            "root coordinator 必须明确知道 runtime_internal 不等于模型不可调用"
+                && coordinator_prompt.contains("可派发角色"),
+            "root coordinator 必须知道代理工具可直接调用以及可派发角色"
         );
-
-        let mut ordinary_task = task_with_role("coordinator", TaskTier::ExecutionChain);
-        ordinary_task
-            .policy_snapshot
-            .as_mut()
-            .expect("policy")
-            .collaboration_mode = magi_core::CollaborationMode::Disabled;
-        let (ordinary_prompt, _) =
-            dispatcher.assemble_prompt(None, &ordinary_task, &session_id, &workspace_id);
-        assert!(ordinary_prompt.contains("多代理模式（当前模式：disabled"));
-        let ordinary_tools = dispatcher
-            .build_tool_definitions(
-                Some(&ordinary_task),
-                None,
-                magi_core::AccessProfile::Restricted,
-                Some(&WorkspaceId::new("test-workspace")),
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-        for visible in ["agent_spawn", "agent_send", "agent_wait"] {
-            assert!(
-                ordinary_tools.iter().any(|name| name == visible),
-                "disabled 模式仍需保留协作工具定义，由运行时统一拒绝 {visible}: {ordinary_tools:?}"
-            );
-        }
 
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
         let (worker_prompt, _) =
@@ -4684,7 +4651,7 @@ mod tests {
             "worker prompt 必须说明自身不能继续分派"
         );
         assert!(
-            !worker_prompt.contains("多代理模式（root coordinator 必须遵守）"),
+            !worker_prompt.contains("多代理协作（root coordinator 必须遵守）"),
             "worker prompt 不能收到 root coordinator 派发策略"
         );
     }

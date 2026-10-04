@@ -193,6 +193,9 @@ pub struct SessionTurnRequestDto {
     pub locale: Option<String>,
     #[serde(default)]
     pub goal_mode: bool,
+    /// 用户点击“继续”恢复最近一次被中断或可恢复的执行；只由界面显式设置。
+    #[serde(default)]
+    pub resume: bool,
     /// 用户显式选择的会话命令（如 `/compact`）；`text` 此时是命令参数。
     #[serde(default)]
     pub command: Option<magi_app_server_protocol::SessionTurnCommand>,
@@ -527,6 +530,11 @@ impl SessionTurnRequestDto {
             "expectedTurnId": normalized.expected_turn_id(),
             "replaceTurnId": normalized.replace_turn_id(),
         });
+        let mut canonical_request = canonical_request;
+        // 只在显式恢复时写入指纹，普通请求的指纹与引入该字段前保持一致。
+        if normalized.resume {
+            canonical_request["resume"] = serde_json::Value::Bool(true);
+        }
         let bytes = serde_json::to_vec(&canonical_request)
             .map_err(|error| format!("序列化 Turn 请求指纹失败: {error}"))?;
         let digest = Sha256::digest(bytes);
@@ -538,8 +546,9 @@ impl SessionTurnRequestDto {
 #[serde(rename_all = "snake_case")]
 pub enum SessionTurnRouteDto {
     Chat,
+    /// 带工具的主线执行。旧版本持久化的排队轮次可能记录为 `task`，任务路由已并入执行路由。
+    #[serde(alias = "task")]
     Execute,
-    Task,
     Continue,
     Steer,
 }
@@ -643,7 +652,6 @@ impl SessionTurnResponseDto {
             execution_profile: Some(match route {
                 SessionTurnRouteDto::Chat => ExecutionProfile::Conversation,
                 SessionTurnRouteDto::Execute
-                | SessionTurnRouteDto::Task
                 | SessionTurnRouteDto::Continue
                 | SessionTurnRouteDto::Steer => ExecutionProfile::Task,
             }),
@@ -802,6 +810,7 @@ mod tests {
             skill_name: None,
             locale: None,
             goal_mode: false,
+            resume: false,
             images: Vec::new(),
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
