@@ -119,6 +119,21 @@ pub struct SessionStore {
     ///
     /// daemon 重启后重新允许尝试压缩；成功安装检查点即清零。
     context_compaction_failures: Arc<Mutex<HashMap<ThreadId, u32>>>,
+    /// 启动时无法加载的会话。原文件保留在磁盘上，这里只记录不可用事实供界面提示；
+    /// 它们不进入会话状态，因此不会被写回或清理。
+    unavailable_sessions: Arc<RwLock<Vec<UnavailableSession>>>,
+}
+
+/// 启动时因持久化文件损坏而无法加载的会话。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnavailableSession {
+    /// 会话 ID；文件损坏到无法读取时由文件名还原。
+    pub session_id: SessionId,
+    /// 所属工作区；全局会话或无法判断时为 None。
+    pub workspace_id: Option<String>,
+    /// 保留在磁盘上的原始文件或目录。
+    pub source_path: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +406,7 @@ impl Default for SessionStore {
             lifecycle_observer: Arc::new(RwLock::new(None)),
             canonical_event_writer: Arc::new(RwLock::new(None)),
             context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
+            unavailable_sessions: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -440,7 +456,26 @@ impl SessionStore {
             lifecycle_observer: Arc::new(RwLock::new(None)),
             canonical_event_writer: Arc::new(RwLock::new(None)),
             context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
+            unavailable_sessions: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn set_unavailable_sessions(&self, sessions: Vec<UnavailableSession>) {
+        *self
+            .unavailable_sessions
+            .write()
+            .expect("unavailable sessions lock poisoned") = sessions;
+    }
+
+    /// 返回指定工作区（None 表示全局）下启动时无法加载的会话。
+    pub fn unavailable_sessions(&self, workspace_id: Option<&str>) -> Vec<UnavailableSession> {
+        self.unavailable_sessions
+            .read()
+            .expect("unavailable sessions lock poisoned")
+            .iter()
+            .filter(|session| session.workspace_id.as_deref() == workspace_id)
+            .cloned()
+            .collect()
     }
 
     pub fn from_persisted_parts(
@@ -1179,9 +1214,8 @@ impl SessionStore {
             .expect("session state write lock poisoned");
         // 先只读校验，再用「删除之后」的视图持久化，成功后才真正删除：不需要整份克隆候选状态，
         // 也不需要回滚。视图里没有被删会话，持久化层据此移除它的文件；替代会话（若有）整段提交。
-        let deleting_current =
-            check_session_deletion(&state, session_id, replacement_session_id)
-                .map_err(SessionMutationTransactionError::Domain)?;
+        let deleting_current = check_session_deletion(&state, session_id, replacement_session_id)
+            .map_err(SessionMutationTransactionError::Domain)?;
         let replacement_ids: Vec<SessionId> = replacement_session_id.cloned().into_iter().collect();
         let mut durable = durable_slice_for_sessions(&state, &replacement_ids);
         durable

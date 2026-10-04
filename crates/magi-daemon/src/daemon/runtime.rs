@@ -1047,6 +1047,7 @@ impl DaemonRuntime {
             .map_err(|error| {
                 DaemonError::internal(format!("恢复 accepted session 事实失败: {error}"))
             })?;
+        session_store.set_unavailable_sessions(state_repository.unavailable_sessions());
         state_repository.validate_session_event_log_coverage(&session_store.durable_state())?;
         let knowledge_store = Arc::new(KnowledgeStore::from_state(
             state_repository.load_knowledge_state()?,

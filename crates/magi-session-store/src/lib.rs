@@ -24,5 +24,5 @@ pub use models::{
 pub use store::{CanonicalTurnEventWriter, CanonicalTurnMutation};
 pub use store::{
     ORCHESTRATOR_ROLE_ID, SESSION_TITLE_MAX_CHARS, SessionMutationTransactionError, SessionStore,
-    TimelineEntryInput,
+    TimelineEntryInput, UnavailableSession,
 };

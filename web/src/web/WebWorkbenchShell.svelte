@@ -3,6 +3,7 @@
   import App from '../App.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
+  import UnavailableSessionList from '../components/UnavailableSessionList.svelte';
   import NotificationCenter from '../components/NotificationCenter.svelte';
   import ExternalApprovalTray from '../components/ExternalApprovalTray.svelte';
   import SidebarFooter from '../components/SidebarFooter.svelte';
@@ -82,6 +83,7 @@
     resolveAgentBaseUrl,
     BROWSER_AUTHORITY_CHANGED_EVENT,
     type AgentConnectionEventDetail,
+    type AgentUnavailableSession,
     type AgentWorkspaceSummary,
   } from './agent-api';
   import {
@@ -159,6 +161,9 @@ import {
   let currentSessionId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
   let recentSessions = $state<Session[]>([]);
+  // 启动时无法加载的会话由 daemon 报告，只读展示，不参与会话导航。
+  let unavailableSessionsByWorkspace = $state<Record<string, AgentUnavailableSession[]>>({});
+  let unavailablePersonalSessions = $state<AgentUnavailableSession[]>([]);
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
   let workspacesCollapsed = $state(readInitialWorkspacesCollapsed());
@@ -1136,6 +1141,7 @@ import {
       });
       if (applied) {
         recentSessions = snapshot.sessions;
+        unavailablePersonalSessions = snapshot.unavailableSessions;
       }
     } catch (error) {
       console.warn('[WebWorkbenchShell] 刷新个人会话失败:', error);
@@ -1246,6 +1252,10 @@ import {
     sessionsByWorkspace = {
       ...sessionsByWorkspace,
       [normalizedWorkspaceId]: snapshot.sessions,
+    };
+    unavailableSessionsByWorkspace = {
+      ...unavailableSessionsByWorkspace,
+      [normalizedWorkspaceId]: snapshot.unavailableSessions,
     };
     return true;
   }
@@ -3441,6 +3451,7 @@ import {
                         {/each}
                       </div>
                     {/if}
+                    <UnavailableSessionList sessions={unavailableSessionsByWorkspace[workspace.workspaceId] ?? []} />
                   </div>
                 {/if}
               </div>
@@ -3578,6 +3589,7 @@ import {
                 {/each}
               </div>
             {/if}
+            <UnavailableSessionList sessions={unavailablePersonalSessions} />
           </div>
         {/if}
       </section>

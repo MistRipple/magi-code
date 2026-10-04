@@ -2840,6 +2840,8 @@
   "web.expandWorkspaces": "展开工作区",
   "web.newPersonalSessionTitle": "在 Magi 空间新建会话",
   "web.noRecentSessions": "暂无最近会话",
+  "web.unavailableSession": "会话无法加载",
+  "web.unavailableSessionDetail": "会话数据已损坏，原文件已保留：{path}\n原因：{reason}",
   "web.collapseRecentSessions": "收起最近会话",
   "web.expandRecentSessions": "展开最近会话",
   "bridge.requestFailed": "请求失败：",

@@ -63,6 +63,32 @@ struct WorkspaceSessionsResponse {
     event_stream_next_sequence: u64,
     workspace: WorkspaceDto,
     sessions: Vec<WorkspaceSessionDto>,
+    unavailable_sessions: Vec<UnavailableSessionDto>,
+}
+
+/// 启动时因持久化文件损坏而无法加载的会话；原文件保留在 `sourcePath`。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnavailableSessionDto {
+    session_id: String,
+    source_path: String,
+    reason: String,
+}
+
+fn unavailable_session_entries(
+    state: &ApiState,
+    workspace_id: Option<&str>,
+) -> Vec<UnavailableSessionDto> {
+    state
+        .session_store
+        .unavailable_sessions(workspace_id)
+        .into_iter()
+        .map(|session| UnavailableSessionDto {
+            session_id: session.session_id.to_string(),
+            source_path: session.source_path,
+            reason: session.reason,
+        })
+        .collect()
 }
 
 /// 个人会话目录与项目会话目录使用同一读模型，但没有 workspace 绑定。
@@ -73,6 +99,7 @@ struct PersonalSessionsResponse {
     runtime_epoch: String,
     event_stream_next_sequence: u64,
     sessions: Vec<WorkspaceSessionDto>,
+    unavailable_sessions: Vec<UnavailableSessionDto>,
 }
 
 fn session_directory_entry(
@@ -107,6 +134,7 @@ async fn personal_sessions(State(state): State<ApiState>) -> Json<PersonalSessio
         runtime_epoch: state.runtime_epoch().to_string(),
         event_stream_next_sequence,
         sessions,
+        unavailable_sessions: unavailable_session_entries(&state, None),
     })
 }
 
@@ -357,6 +385,7 @@ async fn workspace_sessions(
         event_stream_next_sequence,
         workspace: workspace_dto,
         sessions: scoped_sessions,
+        unavailable_sessions: unavailable_session_entries(&state, Some(&scoped_workspace_id)),
     }))
 }
 

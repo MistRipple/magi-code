@@ -91,11 +91,34 @@ export interface AgentSessionSummary {
   preview?: string;
 }
 
+/** 启动时因持久化文件损坏而无法加载的会话；原文件保留在 sourcePath。 */
+export interface AgentUnavailableSession {
+  sessionId: string;
+  sourcePath: string;
+  reason: string;
+}
+
 export interface AgentWorkspaceSessionsSnapshot {
   runtimeEpoch: string;
   eventStreamNextSequence: number;
   workspace: AgentWorkspaceSummary;
   sessions: AgentSessionSummary[];
+  unavailableSessions: AgentUnavailableSession[];
+}
+
+function normalizeUnavailableSessions(value: unknown): AgentUnavailableSession[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const record = entry as Record<string, unknown>;
+    const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : '';
+    if (!sessionId) return [];
+    return [{
+      sessionId,
+      sourcePath: typeof record.sourcePath === 'string' ? record.sourcePath : '',
+      reason: typeof record.reason === 'string' ? record.reason : '',
+    }];
+  });
 }
 
 export interface AgentWorkspacePickResult {
@@ -2160,6 +2183,7 @@ export async function getWorkspaceSessions(
       eventStreamNextSequence?: number;
       workspace?: RawAgentWorkspaceSummary;
       sessions?: RawAgentSessionSummary[];
+      unavailableSessions?: unknown;
     }>(response, 'workspace sessions');
     const sessions = Array.isArray(payload.sessions)
       ? payload.sessions.map((session) => normalizeSessionSummary(session))
@@ -2181,6 +2205,7 @@ export async function getWorkspaceSessions(
         ? normalizeWorkspaceSummary(payload.workspace)
         : findCachedWorkspaceSummary(workspaceId),
       sessions,
+      unavailableSessions: normalizeUnavailableSessions(payload.unavailableSessions),
     };
   } catch (error) {
     if (error instanceof TypeError) {
@@ -2194,12 +2219,14 @@ export async function getPersonalSessions(): Promise<{
   runtimeEpoch: string;
   eventStreamNextSequence: number;
   sessions: AgentSessionSummary[];
+  unavailableSessions: AgentUnavailableSession[];
 }> {
   const response = await getTransport().request(agentUrl('/api/sessions/personal'));
   const payload = await parseAgentJson<{
     runtimeEpoch?: string;
     eventStreamNextSequence?: number;
     sessions?: RawAgentSessionSummary[];
+    unavailableSessions?: unknown;
   }>(response, 'personal sessions');
   const runtimeEpoch = payload.runtimeEpoch?.trim() || '';
   const eventStreamNextSequence = payload.eventStreamNextSequence;
@@ -2210,6 +2237,7 @@ export async function getPersonalSessions(): Promise<{
     runtimeEpoch,
     eventStreamNextSequence: Math.floor(eventStreamNextSequence),
     sessions: Array.isArray(payload.sessions) ? payload.sessions.map(normalizeSessionSummary) : [],
+    unavailableSessions: normalizeUnavailableSessions(payload.unavailableSessions),
   };
 }
 

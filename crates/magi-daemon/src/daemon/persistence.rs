@@ -8,7 +8,7 @@ use magi_knowledge_store::KnowledgeState;
 use magi_orchestrator::task_store::{TaskStore, TaskStoreSnapshot};
 use magi_session_store::{
     CanonicalTurnEventWriter, CanonicalTurnMutation, SessionAcceptanceRecord, SessionDurableState,
-    SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionStore,
+    SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionStore, UnavailableSession,
 };
 use magi_worker_runtime::{WorkerRuntime, WorkerRuntimeDurableSnapshot};
 use magi_workspace::{WorkspaceDurableState, WorkspaceRecoverySidecarStoreState, WorkspaceStore};
@@ -30,6 +30,7 @@ pub(crate) struct StateRepository {
     session_projection_cache: Arc<Mutex<SessionProjectionCache>>,
     session_event_cache: Arc<Mutex<HashMap<magi_core::SessionId, SessionConversationProjection>>>,
     event_accepted_submissions: Arc<Mutex<Vec<AcceptedSubmissionRecord>>>,
+    unavailable_sessions: Arc<Mutex<Vec<UnavailableSession>>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -262,6 +263,7 @@ impl StateRepository {
             session_projection_cache: Arc::new(Mutex::new(SessionProjectionCache::default())),
             session_event_cache: Arc::new(Mutex::new(HashMap::new())),
             event_accepted_submissions: Arc::new(Mutex::new(Vec::new())),
+            unavailable_sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -619,6 +621,7 @@ impl StateRepository {
         let mut event_cache = HashMap::new();
         let mut event_accepted_submissions = Vec::new();
         let mut loaded_snapshots = HashSet::<magi_core::SessionId>::new();
+        let mut unavailable = Vec::<UnavailableSession>::new();
         let workspace_root_by_id = workspace_roots.iter().cloned().collect::<HashMap<_, _>>();
         let mut roots = vec![(String::new(), self.state_root.clone())];
         roots.extend(workspace_roots.iter().cloned());
@@ -636,68 +639,147 @@ impl StateRepository {
                     if path.extension().and_then(|value| value.to_str()) != Some("json") {
                         continue;
                     }
-                    let mut content = fs::read_to_string(&path)?;
-                    let mut snapshot: SessionProjectionSnapshot = serde_json::from_str(&content)
-                        .map_err(|error| {
-                            DaemonError::internal(format!(
-                                "解析 session projection 失败 {}: {error}",
-                                path.display()
-                            ))
-                        })?;
-                    let session_id = Self::validate_session_projection(&snapshot, &path)?;
-                    let session = snapshot
-                        .durable
-                        .sessions
-                        .first()
-                        .expect("projection validation requires one session");
-                    match (workspace_id.is_empty(), session.workspace_id.as_deref()) {
-                        (true, Some(actual_workspace_id)) => {
+                    // 单个会话的投影或事件日志损坏只让该会话不可用：原文件保留在原处，
+                    // 记录原因供界面提示，其余会话照常启动。
+                    let loaded = (|| -> Result<_, DaemonError> {
+                        let mut content = fs::read_to_string(&path)?;
+                        let mut snapshot: SessionProjectionSnapshot =
+                            serde_json::from_str(&content).map_err(|error| {
+                                DaemonError::internal(format!(
+                                    "解析 session projection 失败 {}: {error}",
+                                    path.display()
+                                ))
+                            })?;
+                        let session_id = Self::validate_session_projection(&snapshot, &path)?;
+                        let session = snapshot
+                            .durable
+                            .sessions
+                            .first()
+                            .expect("projection validation requires one session");
+                        match (workspace_id.is_empty(), session.workspace_id.as_deref()) {
+                            (true, Some(actual_workspace_id)) => {
+                                return Err(DaemonError::internal(format!(
+                                    "全局 session projection 包含 workspace 归属，拒绝自动移动: {} ({actual_workspace_id})",
+                                    path.display()
+                                )));
+                            }
+                            (false, Some(actual_workspace_id))
+                                if actual_workspace_id == workspace_id => {}
+                            (false, actual_workspace_id) => {
+                                return Err(DaemonError::internal(format!(
+                                    "workspace session projection 归属与扫描根不一致: expected={workspace_id}, actual={} ({})",
+                                    actual_workspace_id.unwrap_or("<none>"),
+                                    path.display()
+                                )));
+                            }
+                            (true, None) => {}
+                        }
+                        let expected_path = self.session_projection_path(
+                            &session_id,
+                            session.workspace_id.as_deref(),
+                            &workspace_root_by_id,
+                        )?;
+                        if path != expected_path {
                             return Err(DaemonError::internal(format!(
-                                "全局 session projection 包含 workspace 归属，拒绝自动移动: {} ({actual_workspace_id})",
-                                path.display()
+                                "session projection 不在规范归属路径，拒绝自动移动: {} != {}",
+                                path.display(),
+                                expected_path.display()
                             )));
                         }
-                        (false, Some(actual_workspace_id))
-                            if actual_workspace_id == workspace_id => {}
-                        (false, actual_workspace_id) => {
+                        if loaded_snapshots.contains(&session_id) {
+                            let previous_path = cache
+                                .snapshots
+                                .get(&session_id)
+                                .map(|(cached_path, _)| cached_path.display().to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string());
                             return Err(DaemonError::internal(format!(
-                                "workspace session projection 归属与扫描根不一致: expected={workspace_id}, actual={} ({})",
-                                actual_workspace_id.unwrap_or("<none>"),
-                                path.display()
+                                "session {} 存在重复 projection，拒绝自动移动或删除: {} 与 {}，规范路径为 {}",
+                                session_id,
+                                previous_path,
+                                path.display(),
+                                expected_path.display()
                             )));
                         }
-                        (true, None) => {}
+                        let event_root = self.session_event_root(&session_id);
+                        let event_root_existed = event_root.exists();
+                        let mut event_projection =
+                            SessionConversationProjection::load(&event_root, &session_id)?;
+                        if snapshot.canonical_event_seq > event_projection.last_event_seq() {
+                            if !workspace_id.is_empty()
+                                && !event_root_existed
+                                && event_projection.last_event_seq() == 0
+                                && !snapshot.durable.canonical_turns.is_empty()
+                            {
+                                let original_projection_content = content.clone();
+                                (event_projection, content) = self
+                                    .import_workspace_projection_events(
+                                        &mut snapshot,
+                                        &path,
+                                        &original_projection_content,
+                                        &workspace_root_by_id,
+                                    )?;
+                                warn!(
+                                    %session_id,
+                                    projection = %path.display(),
+                                    canonical_event_seq = snapshot.canonical_event_seq,
+                                    "已将可移植工作区 session projection 导入当前 canonical event 状态根"
+                                );
+                            } else {
+                                return Err(DaemonError::internal(format!(
+                                    "session projection 的 canonical event 游标超前: {} > {} ({})",
+                                    snapshot.canonical_event_seq,
+                                    event_projection.last_event_seq(),
+                                    path.display()
+                                )));
+                            }
+                        }
+                        Self::validate_cached_canonical_projection(
+                            &snapshot.durable.canonical_turns,
+                            snapshot.canonical_event_seq,
+                            &event_projection,
+                            &path,
+                        )?;
+                        snapshot.durable.canonical_turns =
+                            event_projection.canonical_turns().to_vec();
+                        // canonical event 是唯一事实源；sidecar 只是执行恢复缓存。
+                        // event 游标相等只说明 durable canonical 已同步，不能证明 sidecar
+                        // 没有停留在较早的活动快照，因此每次恢复都从事件结果重建它。
+                        if let Some(sidecar) = snapshot.sidecar.as_mut() {
+                            SessionStore::rebuild_sidecar_projection_from_canonical(
+                                sidecar,
+                                event_projection.canonical_turns(),
+                            )
+                            .map_err(|error| {
+                                DaemonError::internal(format!(
+                                    "canonical event 无法重建 sidecar projection {}: {error}",
+                                    path.display()
+                                ))
+                            })?;
+                        }
+                        Ok((session_id, snapshot, content, event_projection))
+                    })();
+                    let (session_id, snapshot, content, event_projection) = match loaded {
+                        Ok(loaded) => loaded,
+                        Err(error) => {
+                            unavailable.push(Self::unavailable_session_from_path(
+                                &path,
+                                (!workspace_id.is_empty()).then(|| workspace_id.clone()),
+                                &error,
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Some(sidecar) = snapshot.sidecar {
+                        sidecars.upsert_runtime_sidecar(sidecar);
                     }
-                    let expected_path = self.session_projection_path(
-                        &session_id,
-                        session.workspace_id.as_deref(),
-                        &workspace_root_by_id,
-                    )?;
-                    if path != expected_path {
-                        return Err(DaemonError::internal(format!(
-                            "session projection 不在规范归属路径，拒绝自动移动: {} != {}",
-                            path.display(),
-                            expected_path.display()
-                        )));
+                    durable.append_state_without_current(snapshot.durable);
+                    for record in event_projection.accepted_submissions() {
+                        Self::merge_event_acceptance_into_projection(
+                            &mut durable,
+                            &mut sidecars,
+                            record,
+                        );
                     }
-                    if loaded_snapshots.contains(&session_id) {
-                        let previous_path = cache
-                            .snapshots
-                            .get(&session_id)
-                            .map(|(cached_path, _)| cached_path.display().to_string())
-                            .unwrap_or_else(|| "<unknown>".to_string());
-                        return Err(DaemonError::internal(format!(
-                            "session {} 存在重复 projection，拒绝自动移动或删除: {} 与 {}，规范路径为 {}",
-                            session_id,
-                            previous_path,
-                            path.display(),
-                            expected_path.display()
-                        )));
-                    }
-                    let event_root = self.session_event_root(&session_id);
-                    let event_root_existed = event_root.exists();
-                    let mut event_projection =
-                        SessionConversationProjection::load(&event_root, &session_id)?;
                     event_accepted_submissions.extend(
                         event_projection.accepted_submissions().iter().cloned().map(
                             |mut record| {
@@ -708,67 +790,6 @@ impl StateRepository {
                             },
                         ),
                     );
-                    if snapshot.canonical_event_seq > event_projection.last_event_seq() {
-                        if !workspace_id.is_empty()
-                            && !event_root_existed
-                            && event_projection.last_event_seq() == 0
-                            && !snapshot.durable.canonical_turns.is_empty()
-                        {
-                            let original_projection_content = content.clone();
-                            (event_projection, content) = self.import_workspace_projection_events(
-                                &mut snapshot,
-                                &path,
-                                &original_projection_content,
-                                &workspace_root_by_id,
-                            )?;
-                            warn!(
-                                %session_id,
-                                projection = %path.display(),
-                                canonical_event_seq = snapshot.canonical_event_seq,
-                                "已将可移植工作区 session projection 导入当前 canonical event 状态根"
-                            );
-                        } else {
-                            return Err(DaemonError::internal(format!(
-                                "session projection 的 canonical event 游标超前: {} > {} ({})",
-                                snapshot.canonical_event_seq,
-                                event_projection.last_event_seq(),
-                                path.display()
-                            )));
-                        }
-                    }
-                    Self::validate_cached_canonical_projection(
-                        &snapshot.durable.canonical_turns,
-                        snapshot.canonical_event_seq,
-                        &event_projection,
-                        &path,
-                    )?;
-                    snapshot.durable.canonical_turns = event_projection.canonical_turns().to_vec();
-                    // canonical event 是唯一事实源；sidecar 只是执行恢复缓存。
-                    // event 游标相等只说明 durable canonical 已同步，不能证明 sidecar
-                    // 没有停留在较早的活动快照，因此每次恢复都从事件结果重建它。
-                    if let Some(sidecar) = snapshot.sidecar.as_mut() {
-                        SessionStore::rebuild_sidecar_projection_from_canonical(
-                            sidecar,
-                            event_projection.canonical_turns(),
-                        )
-                        .map_err(|error| {
-                            DaemonError::internal(format!(
-                                "canonical event 无法重建 sidecar projection {}: {error}",
-                                path.display()
-                            ))
-                        })?;
-                    }
-                    if let Some(sidecar) = snapshot.sidecar {
-                        sidecars.upsert_runtime_sidecar(sidecar);
-                    }
-                    durable.append_state_without_current(snapshot.durable.clone());
-                    for record in event_projection.accepted_submissions() {
-                        Self::merge_event_acceptance_into_projection(
-                            &mut durable,
-                            &mut sidecars,
-                            record,
-                        );
-                    }
                     loaded_snapshots.insert(session_id.clone());
                     event_cache.insert(session_id.clone(), event_projection);
                     cache
@@ -809,69 +830,111 @@ impl StateRepository {
                         event_root.display()
                     )));
                 }
-                let session_id =
-                    SessionConversationProjection::read_session_id_from_root(&event_root)?;
-                if self.session_event_root(&session_id) != event_root {
-                    return Err(DaemonError::internal(format!(
-                        "canonical event 目录与 session 归属不一致: {}",
-                        event_root.display()
-                    )));
-                }
-                if event_cache.contains_key(&session_id) {
+                // 投影已判定不可用的会话保留原事件目录，不再按 event-only 会话恢复。
+                if unavailable
+                    .iter()
+                    .any(|session| self.session_event_root(&session.session_id) == event_root)
+                {
                     continue;
                 }
-                let event_projection =
-                    SessionConversationProjection::load(&event_root, &session_id)?;
-                if event_projection.accepted_submissions().is_empty() {
-                    // 没有 accepted 事实时无法从事件本身重建 session 元数据；最终由
-                    // coverage 校验报告该目录确实是损坏的孤立事件日志。
-                    event_cache.insert(session_id, event_projection);
-                    continue;
-                }
-                for record in event_projection.accepted_submissions() {
-                    let mut record = record.clone();
-                    record.session_checkpointed = true;
-                    Self::merge_event_acceptance_into_projection(
-                        &mut durable,
-                        &mut sidecars,
-                        &record,
-                    );
-                    event_accepted_submissions.push(record);
-                }
-                for turn in event_projection.canonical_turns() {
-                    if let Some(existing) = durable
-                        .canonical_turns
-                        .iter()
-                        .find(|existing| existing.turn_id == turn.turn_id)
-                    {
-                        if existing != turn {
-                            return Err(DaemonError::internal(format!(
-                                "canonical event 与 session projection 的 turn 冲突: {}",
-                                turn.turn_id
-                            )));
-                        }
-                    } else {
-                        durable.canonical_turns.push(turn.clone());
+                let loaded = (|| -> Result<_, DaemonError> {
+                    let session_id =
+                        SessionConversationProjection::read_session_id_from_root(&event_root)?;
+                    if self.session_event_root(&session_id) != event_root {
+                        return Err(DaemonError::internal(format!(
+                            "canonical event 目录与 session 归属不一致: {}",
+                            event_root.display()
+                        )));
                     }
+                    if event_cache.contains_key(&session_id) {
+                        return Ok(None);
+                    }
+                    let event_projection =
+                        SessionConversationProjection::load(&event_root, &session_id)?;
+                    if event_projection.accepted_submissions().is_empty() {
+                        return Ok(Some((session_id, event_projection, None)));
+                    }
+                    // 先只读校验并在空容器里构建 sidecar，确认整个会话可恢复后才提交到
+                    // 启动状态，避免损坏会话留下半合并的事实。
+                    let mut staged_durable = SessionDurableState::default();
+                    let mut staged_sidecars = SessionExecutionSidecarStoreState::default();
+                    let mut accepted = Vec::new();
+                    for record in event_projection.accepted_submissions() {
+                        let mut record = record.clone();
+                        record.session_checkpointed = true;
+                        Self::merge_event_acceptance_into_projection(
+                            &mut staged_durable,
+                            &mut staged_sidecars,
+                            &record,
+                        );
+                        accepted.push(record);
+                    }
+                    let mut new_turns = Vec::new();
+                    for turn in event_projection.canonical_turns() {
+                        match durable
+                            .canonical_turns
+                            .iter()
+                            .find(|existing| existing.turn_id == turn.turn_id)
+                        {
+                            Some(existing) if existing != turn => {
+                                return Err(DaemonError::internal(format!(
+                                    "canonical event 与 session projection 的 turn 冲突: {}",
+                                    turn.turn_id
+                                )));
+                            }
+                            Some(_) => {}
+                            None => new_turns.push(turn.clone()),
+                        }
+                    }
+                    let mut sidecar = staged_sidecars.runtime_sidecar(&session_id).ok_or_else(
+                        || {
+                            DaemonError::internal(format!(
+                                "accepted canonical event 缺少 event-only sidecar projection: {}",
+                                event_root.display()
+                            ))
+                        },
+                    )?;
+                    SessionStore::rebuild_sidecar_projection_from_canonical(
+                        &mut sidecar,
+                        event_projection.canonical_turns(),
+                    )
+                    .map_err(|error| {
+                        DaemonError::internal(format!(
+                            "canonical event 无法重建 event-only sidecar projection {}: {error}",
+                            event_root.display()
+                        ))
+                    })?;
+                    Ok(Some((
+                        session_id,
+                        event_projection,
+                        Some((accepted, new_turns, sidecar)),
+                    )))
+                })();
+                match loaded {
+                    Ok(None) => {}
+                    Ok(Some((session_id, event_projection, staged))) => {
+                        // 没有 accepted 事实时无法从事件本身重建 session 元数据；最终由
+                        // coverage 校验报告该目录确实是损坏的孤立事件日志。
+                        if let Some((accepted, new_turns, sidecar)) = staged {
+                            for record in &accepted {
+                                Self::merge_event_acceptance_into_projection(
+                                    &mut durable,
+                                    &mut sidecars,
+                                    record,
+                                );
+                            }
+                            durable.canonical_turns.extend(new_turns);
+                            sidecars.upsert_runtime_sidecar(sidecar);
+                            event_accepted_submissions.extend(accepted);
+                        }
+                        event_cache.insert(session_id, event_projection);
+                    }
+                    Err(error) => unavailable.push(Self::unavailable_session_from_path(
+                        &event_root,
+                        None,
+                        &error,
+                    )),
                 }
-                let mut sidecar = sidecars.runtime_sidecar(&session_id).ok_or_else(|| {
-                    DaemonError::internal(format!(
-                        "accepted canonical event 缺少 event-only sidecar projection: {}",
-                        event_root.display()
-                    ))
-                })?;
-                SessionStore::rebuild_sidecar_projection_from_canonical(
-                    &mut sidecar,
-                    event_projection.canonical_turns(),
-                )
-                .map_err(|error| {
-                    DaemonError::internal(format!(
-                        "canonical event 无法重建 event-only sidecar projection {}: {error}",
-                        event_root.display()
-                    ))
-                })?;
-                sidecars.upsert_runtime_sidecar(sidecar);
-                event_cache.insert(session_id, event_projection);
             }
         }
 
@@ -897,6 +960,22 @@ impl StateRepository {
             cache.app_meta = Some((app_meta_path, ContentDigest::of(&content)));
         }
 
+        // 同一会话已从规范副本成功恢复时，多余的问题副本只保留告警日志，不再把会话
+        // 报告为不可用。
+        unavailable.retain(|session| {
+            !durable
+                .sessions
+                .iter()
+                .any(|loaded| loaded.session_id == session.session_id)
+        });
+        // current 指向的会话已被判定不可用时只清除指针；其余会话照常启动。
+        if durable.current_session_id.as_ref().is_some_and(|current| {
+            unavailable
+                .iter()
+                .any(|session| &session.session_id == current)
+        }) {
+            durable.current_session_id = None;
+        }
         if validate_current
             && let Some(current_session_id) = durable.current_session_id.as_ref()
             && !durable
@@ -926,7 +1005,64 @@ impl StateRepository {
             .event_accepted_submissions
             .lock()
             .expect("event accepted submission cache lock poisoned") = event_accepted_submissions;
+        *self
+            .unavailable_sessions
+            .lock()
+            .expect("unavailable sessions lock poisoned") = unavailable;
         Ok((durable, sidecars))
+    }
+
+    /// 最近一次加载中被判定不可用的会话。
+    pub(crate) fn unavailable_sessions(&self) -> Vec<UnavailableSession> {
+        self.unavailable_sessions
+            .lock()
+            .expect("unavailable sessions lock poisoned")
+            .clone()
+    }
+
+    fn unavailable_session_from_path(
+        path: &Path,
+        workspace_id: Option<String>,
+        error: &DaemonError,
+    ) -> UnavailableSession {
+        let storage_key = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        let session = UnavailableSession {
+            session_id: magi_core::SessionId::new(Self::decode_session_storage_key(storage_key)),
+            workspace_id,
+            source_path: path.display().to_string(),
+            reason: error.to_string(),
+        };
+        warn!(
+            session_id = %session.session_id,
+            path = %session.source_path,
+            reason = %session.reason,
+            "会话持久化文件损坏，已标记为不可用并保留原文件，其余会话继续启动"
+        );
+        session
+    }
+
+    /// `session_projection_file_name` 的逆变换：还原 `%XX` 转义的会话 ID。
+    fn decode_session_storage_key(storage_key: &str) -> String {
+        let bytes = storage_key.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%'
+                && let Some(byte) = storage_key
+                    .get(index + 1..index + 3)
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+        String::from_utf8_lossy(&decoded).into_owned()
     }
 
     fn merge_event_acceptance_into_projection(
@@ -989,6 +1125,18 @@ impl StateRepository {
             .session_event_cache
             .lock()
             .expect("session event cache lock poisoned");
+        // 不可用会话的事件目录是需要保留的原始数据，既不属于已恢复会话，也不能被当成
+        // 孤立日志移走。
+        let unavailable_roots = self
+            .unavailable_sessions()
+            .iter()
+            .flat_map(|session| {
+                [
+                    self.session_event_root(&session.session_id),
+                    PathBuf::from(&session.source_path),
+                ]
+            })
+            .collect::<HashSet<_>>();
         let mut unowned = Vec::new();
         for entry in fs::read_dir(&event_parent)? {
             let entry = entry?;
@@ -998,6 +1146,9 @@ impl StateRepository {
                     "canonical event 根目录包含非 session 目录: {}",
                     path.display()
                 )));
+            }
+            if unavailable_roots.contains(&path) {
+                continue;
             }
             let Some(session_id) = expected.get(&path) else {
                 unowned.push(path);
@@ -1077,7 +1228,9 @@ impl StateRepository {
         let quarantine_root = self.orphaned_session_events_root();
         fs::create_dir_all(&quarantine_root)?;
         for path in unowned {
-            let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned())
+            let Some(name) = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
             else {
                 continue;
             };
@@ -4412,6 +4565,71 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_session_projection_only_makes_that_session_unavailable() {
+        let state_root = unique_temp_dir("magi-session-projection-corrupted");
+        let repository = StateRepository::new(state_root.clone());
+        let store = SessionStore::new();
+        let healthy_id = SessionId::new("session-healthy");
+        let corrupted_id = SessionId::new("session-corrupted");
+        store
+            .create_session(healthy_id.clone(), "healthy")
+            .expect("healthy session should create");
+        store
+            .create_session(corrupted_id.clone(), "corrupted")
+            .expect("corrupted session should create");
+        store
+            .persist_projection_with(|durable, sidecars| {
+                repository.save_session_projection_state(durable, sidecars)
+            })
+            .expect("projections should save");
+        // 模拟合并冲突或写入截断留下的损坏文件。
+        let corrupted_path = repository
+            .session_projection_root()
+            .join(StateRepository::session_projection_file_name(&corrupted_id));
+        fs::write(&corrupted_path, b"{\"version\":2,<<<<<<< HEAD").expect("corrupt projection");
+
+        let restarted = StateRepository::new(state_root.clone());
+        let (restored, _) = restarted
+            .load_session_projections(&[])
+            .expect("单个会话损坏不能阻止其余会话启动");
+
+        assert_eq!(
+            restored
+                .sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>(),
+            vec![healthy_id]
+        );
+        let unavailable = restarted.unavailable_sessions();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].session_id, corrupted_id);
+        assert_eq!(unavailable[0].workspace_id, None);
+        assert_eq!(
+            unavailable[0].source_path,
+            corrupted_path.display().to_string()
+        );
+        assert!(
+            unavailable[0]
+                .reason
+                .contains("解析 session projection 失败")
+        );
+        assert!(
+            restored.current_session_id.as_ref() != Some(&corrupted_id),
+            "current 不能指向不可用会话"
+        );
+        restarted
+            .validate_session_event_log_coverage(&restored)
+            .expect("不可用会话不影响事件日志校验");
+        assert_eq!(
+            fs::read(&corrupted_path).expect("损坏文件必须原地保留"),
+            b"{\"version\":2,<<<<<<< HEAD"
+        );
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn corrupted_durable_state_is_rejected_without_empty_state_recovery() {
         let state_root = unique_temp_dir("magi-durable-state-corrupted");
         let repository = StateRepository::new(state_root.clone());
@@ -4429,7 +4647,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_session_projection_is_rejected_without_deleting_either_copy() {
+    fn duplicate_session_projection_does_not_block_recovery_or_delete_either_copy() {
         let state_root = unique_temp_dir("magi-session-projection-duplicate");
         let duplicate_root = unique_temp_dir("magi-session-projection-duplicate-root");
         let repository = StateRepository::new(state_root.clone());
@@ -4483,14 +4701,17 @@ mod tests {
                 .contains("全局 session projection 包含 workspace 归属")
         );
 
-        let error = repository
+        // 恢复时多余副本只让它自己被忽略：会话从规范副本恢复，两份文件都原样保留。
+        let (restored, _) = repository
             .load_session_projections(&[("duplicate-root".to_string(), duplicate_root.clone())])
-            .expect_err("duplicate projection must reject recovery");
+            .expect("duplicate projection must not block recovery");
         assert!(
-            error
-                .to_string()
-                .contains("全局 session projection 包含 workspace 归属")
+            restored
+                .sessions
+                .iter()
+                .any(|session| session.session_id == session_id)
         );
+        assert!(repository.unavailable_sessions().is_empty());
         assert_eq!(
             fs::read(&canonical_path).expect("canonical projection remains"),
             canonical_content
@@ -5183,9 +5404,19 @@ mod tests {
         fs::remove_dir_all(repository.session_event_root(&session_id))
             .expect("event log should be removed for corruption test");
 
-        StateRepository::new(state_root.clone())
+        let restarted = StateRepository::new(state_root.clone());
+        let (restored, _) = restarted
             .load_session_projections(&[])
-            .expect_err("v2 projection must not recreate missing canonical facts");
+            .expect("缺失事件日志只让该会话不可用");
+        assert!(
+            restored.sessions.is_empty(),
+            "v2 projection must not recreate missing canonical facts"
+        );
+        let unavailable = restarted.unavailable_sessions();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].session_id, session_id);
+        assert!(unavailable[0].reason.contains("canonical event 游标超前"));
+        assert!(!repository.session_event_root(&session_id).exists());
 
         let _ = fs::remove_dir_all(state_root);
     }
@@ -5299,7 +5530,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_projection_identity_mismatch_never_moves_or_deletes_source() {
+    fn workspace_projection_identity_mismatch_is_unavailable_and_never_moves_source() {
         let source_state_root = unique_temp_dir("magi-workspace-mismatch-source");
         let target_state_root = unique_temp_dir("magi-workspace-mismatch-target");
         let workspace_root = unique_temp_dir("magi-workspace-mismatch-project");
@@ -5334,13 +5565,21 @@ mod tests {
         let original_content = fs::read(&projection_path).expect("source projection bytes");
 
         let target_repository = StateRepository::new(target_state_root.clone());
-        let error = target_repository
+        let (restored, _) = target_repository
             .load_session_projections(&[(
                 "workspace-registered".to_string(),
                 workspace_root.clone(),
             )])
-            .expect_err("workspace identity mismatch must fail closed");
-        assert!(error.to_string().contains("归属与扫描根不一致"));
+            .expect("workspace identity mismatch only makes that session unavailable");
+        assert!(restored.sessions.is_empty());
+        let unavailable = target_repository.unavailable_sessions();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].session_id, session_id);
+        assert_eq!(
+            unavailable[0].workspace_id.as_deref(),
+            Some("workspace-registered")
+        );
+        assert!(unavailable[0].reason.contains("归属与扫描根不一致"));
         assert_eq!(
             fs::read(&projection_path).expect("source projection must remain"),
             original_content
@@ -5669,13 +5908,17 @@ mod tests {
 
         // 与 daemon 装配里的 Rename 持久化回调相同：只提交被重命名的会话。
         let renamed = session_store
-            .rename_session_with_persistence(&session_id, "咖啡店创意命名", |durable, sidecars| {
-                repository.save_session_projection_state_for_sessions(
-                    durable,
-                    sidecars,
-                    std::slice::from_ref(&session_id),
-                )
-            })
+            .rename_session_with_persistence(
+                &session_id,
+                "咖啡店创意命名",
+                |durable, sidecars| {
+                    repository.save_session_projection_state_for_sessions(
+                        durable,
+                        sidecars,
+                        std::slice::from_ref(&session_id),
+                    )
+                },
+            )
             .expect("rename should persist");
         assert_eq!(renamed.title, "咖啡店创意命名");
 

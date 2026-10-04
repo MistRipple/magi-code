@@ -2840,6 +2840,8 @@
   "web.expandWorkspaces": "Expand workspaces",
   "web.newPersonalSessionTitle": "New chat in Magi Space",
   "web.noRecentSessions": "No recent chats yet",
+  "web.unavailableSession": "Chat unavailable",
+  "web.unavailableSessionDetail": "Chat data is corrupted; the original file was kept: {path}\nReason: {reason}",
   "web.collapseRecentSessions": "Collapse recent chats",
   "web.expandRecentSessions": "Expand recent chats",
   "bridge.requestFailed": "Request failed: ",
