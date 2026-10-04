@@ -308,7 +308,7 @@ fn browser_artifact_path(
     else {
         return Ok(None);
     };
-    let artifact_root = state_root.join("browser/artifacts");
+    let artifact_root = state_root.join(crate::browser_tool_runtime::BROWSER_ARTIFACT_DIR);
     let path = artifact_root.join(relative);
     let canonical_root = std::fs::canonicalize(&artifact_root)
         .map_err(|error| ApiError::internal_assembly("读取浏览器 artifact 根目录失败", error))?;
@@ -2809,7 +2809,9 @@ async fn persist_browser_annotation_screenshot(
         BROWSER_ANNOTATION_ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     let relative_id = format!("{}/{}", session_id, filename);
-    let path = state_root.join("browser/artifacts").join(&relative_id);
+    let path = state_root
+        .join(crate::browser_tool_runtime::BROWSER_ARTIFACT_DIR)
+        .join(&relative_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| ApiError::internal_assembly("创建浏览器标记截图目录失败", error))?;

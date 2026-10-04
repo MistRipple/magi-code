@@ -1411,7 +1411,7 @@ impl BrowserToolRuntimeDependencies {
                     "浏览器 artifact 根目录不可用",
                 )
             })?
-            .join("browser/artifacts")
+            .join(BROWSER_ARTIFACT_DIR)
             .join(session_id.as_str());
         std::fs::create_dir_all(&root).map_err(|error| {
             BrowserToolError::new("browser_artifact_write_failed", error.to_string())
@@ -1425,6 +1425,9 @@ impl BrowserToolRuntimeDependencies {
         magi_core::fs_atomic::write_atomic(&path, bytes).map_err(|error| {
             BrowserToolError::new("browser_artifact_write_failed", error.to_string())
         })?;
+        if let Some(artifact_root) = root.parent() {
+            prune_browser_artifacts(artifact_root, MAX_BROWSER_ARTIFACT_BYTES);
+        }
         Ok(path.display().to_string())
     }
 
@@ -2193,6 +2196,49 @@ impl BrowserToolError {
             } else {
                 ExecutionResultStatus::Failed
             },
+        }
+    }
+}
+
+/// 浏览器截图等 artifact 相对状态根的目录；按 Magi 会话分子目录。
+pub(crate) const BROWSER_ARTIFACT_DIR: &str = "browser/artifacts";
+/// 所有会话的浏览器 artifact 总量上限；超过时从最旧的文件开始删除。
+const MAX_BROWSER_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 把 artifact 总量收敛到上限以内：按修改时间从旧到新删除，最新写入的文件最后才会被删。
+fn prune_browser_artifacts(artifact_root: &std::path::Path, max_bytes: u64) {
+    let mut files = std::fs::read_dir(artifact_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .flat_map(|session_dir| {
+            std::fs::read_dir(session_dir.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata
+                .is_file()
+                .then(|| (metadata.modified().ok(), metadata.len(), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    let mut total = files.iter().map(|(_, size, _)| *size).sum::<u64>();
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in files {
+        if total <= max_bytes {
+            break;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => total = total.saturating_sub(size),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "清理浏览器 artifact 失败")
+            }
         }
     }
 }

@@ -3441,6 +3441,30 @@ impl ApiState {
         persistence.save_json(&state_root.join("browser/state.json"), &durable)
     }
 
+    /// 会话删除时一并删除它产生的浏览器截图等 artifact。
+    fn remove_browser_artifacts_for_session(&self, session_id: &SessionId) {
+        let Some(state_root) = self
+            .runtime_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.state_root())
+        else {
+            return;
+        };
+        let directory = state_root
+            .join(crate::browser_tool_runtime::BROWSER_ARTIFACT_DIR)
+            .join(session_id.as_str());
+        match std::fs::remove_dir_all(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                %session_id,
+                path = %directory.display(),
+                %error,
+                "删除会话浏览器 artifact 失败"
+            ),
+        }
+    }
+
     pub fn persist_browser_durable_state_for_api(&self) -> Result<(), ApiError> {
         self.persist_browser_durable_state().map_err(|error| {
             public_runtime_persistence_error("browser", BROWSER_PERSISTENCE_PUBLIC_ERROR, error)
@@ -4542,6 +4566,7 @@ impl ApiState {
         self.release_web_slot_for_session(session_id).await;
         self.close_browser_session_for_magi_session(session_id)
             .await?;
+        self.remove_browser_artifacts_for_session(session_id);
         self.terminal_sessions
             .close_for_session(session_id.as_str());
         self.cleanup_session_git_resources(session_id).await;
