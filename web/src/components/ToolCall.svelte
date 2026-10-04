@@ -201,6 +201,7 @@
       'tool_catalog': 'tool',
       'agent_spawn': 'bot',
       'agent_wait': 'hourglass',
+      'agent_apply': 'git-branch',
       'update_plan': 'list',
       'memory_write': 'database',
     };

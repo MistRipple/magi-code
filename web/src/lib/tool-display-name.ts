@@ -59,6 +59,7 @@ const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
   tool_catalog: 'toolCall.displayName.toolCatalog',
   agent_spawn: 'toolCall.displayName.agentSpawn',
   agent_wait: 'toolCall.displayName.agentWait',
+  agent_apply: 'toolCall.displayName.agentApply',
   update_plan: 'toolCall.displayName.updatePlan',
   memory_write: 'toolCall.displayName.memoryWrite',
 };

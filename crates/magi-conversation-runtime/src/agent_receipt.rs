@@ -102,9 +102,15 @@ impl AgentReceipt {
         match child.status {
             TaskStatus::Pending | TaskStatus::Running => None,
             TaskStatus::Completed => {
-                let (final_text, activity) = completed_output(&child.output_refs);
+                let (final_text, activity, workspace) = completed_output(&child.output_refs);
                 let mut payload = base("completed", "completed");
                 payload["activity"] = activity.to_json();
+                if let Some(mut workspace) = workspace {
+                    workspace["instruction"] = json!(
+                        "这些改动已提交到代理分支，尚未进入主线工作树。需要采用时调用 agent_apply(task_id)；不采用时无需处理。"
+                    );
+                    payload["workspace"] = workspace;
+                }
                 Some(Self {
                     payload,
                     final_text: final_text.unwrap_or_else(|| "代理未返回最终答复".to_string()),
@@ -252,14 +258,22 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-/// 完成态 output_refs 中的最终答复与工具执行事实。
-fn completed_output(output_refs: &[String]) -> (Option<String>, AgentActivity) {
+/// 完成态 output_refs 中的最终答复、工具执行事实和可写代理的工作区产出。
+fn completed_output(output_refs: &[String]) -> (Option<String>, AgentActivity, Option<Value>) {
     let mut activity = AgentActivity::default();
     let mut final_text = None;
+    let mut workspace = None;
     for output in output_refs {
-        let Some(blocks) = serde_json::from_str::<Value>(output)
-            .ok()
-            .and_then(|parsed| parsed.get("blocks").and_then(Value::as_array).cloned())
+        let parsed = serde_json::from_str::<Value>(output).ok();
+        if let Some(output) = parsed
+            .as_ref()
+            .and_then(|parsed| parsed.get("agent_workspace"))
+        {
+            workspace = Some(output.clone());
+            continue;
+        }
+        let Some(blocks) =
+            parsed.and_then(|parsed| parsed.get("blocks").and_then(Value::as_array).cloned())
         else {
             if let Some(text) = non_empty(output) {
                 final_text = Some(text);
@@ -286,7 +300,7 @@ fn completed_output(output_refs: &[String]) -> (Option<String>, AgentActivity) {
             }
         }
     }
-    (final_text, activity)
+    (final_text, activity, workspace)
 }
 
 fn observe_tool_call(activity: &mut AgentActivity, tool_call: &Value) {
@@ -440,6 +454,36 @@ mod tests {
             rendered["activity"]["files_changed"],
             json!(["src/lib.rs", "src/new.rs"]),
             "失败的写入不算改动"
+        );
+    }
+
+    #[test]
+    fn completed_receipt_reports_unapplied_workspace_output() {
+        let receipt = AgentReceipt::from_terminal_task(&task(
+            TaskStatus::Completed,
+            vec![
+                "实现完成".to_string(),
+                json!({"agent_workspace": {
+                    "branch": "magi/agent/task-1",
+                    "base": "base-commit",
+                    "head": "head-commit",
+                    "changed_paths": ["src/lib.rs"],
+                }})
+                .to_string(),
+            ],
+        ))
+        .expect("应生成回执");
+        let rendered = render_receipts(vec![receipt], 1024).remove(0);
+        assert_eq!(rendered["result"]["final_text"], "实现完成");
+        assert_eq!(rendered["workspace"]["branch"], "magi/agent/task-1");
+        assert_eq!(
+            rendered["workspace"]["changed_paths"],
+            json!(["src/lib.rs"])
+        );
+        assert!(
+            rendered["workspace"]["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("agent_apply"))
         );
     }
 

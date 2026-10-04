@@ -103,8 +103,127 @@ fn execute_git_tool(
         | "git_worktree_remove" => {
             execute_mutation(deps, tool, &arguments, binding, execution_context)
         }
+        "agent_apply" => execute_agent_apply(deps, tool, &arguments, binding, execution_context),
         _ => rejected(tool, "unknown_git_tool", "未知的结构化 Git 工具"),
     }
+}
+
+/// 把已结束代理分支上的改动应用到主线工作树。
+///
+/// 只应用代理快照基线到代理分支 HEAD 的差异；任一文件无法干净应用时整体拒绝，
+/// 主线工作树保持原样。成功后标记已应用并删除代理分支。
+fn execute_agent_apply(
+    deps: &GitToolRuntimeDependencies,
+    tool: &str,
+    arguments: &Map<String, Value>,
+    binding: GitToolBinding,
+    execution_context: &ToolExecutionContext,
+) -> (String, ExecutionResultStatus) {
+    if execution_context.worker_id.is_some() {
+        return rejected(
+            tool,
+            "agent_git_mutation_forbidden",
+            "只有主线可以把代理改动应用到主工作树",
+        );
+    }
+    let task_id = match required_string(arguments, "task_id") {
+        Ok(value) => value,
+        Err(message) => return rejected(tool, "invalid_input", message),
+    };
+    let Some(worktree) = binding
+        .context
+        .agent_worktrees
+        .iter()
+        .filter(|worktree| worktree.task_id == task_id)
+        .find(|worktree| worktree.result_head.is_some())
+        .cloned()
+    else {
+        return rejected(
+            tool,
+            "agent_output_missing",
+            "该代理没有可应用的改动：它可能没有修改文件、仍在运行，或不是当前会话派发的可写代理",
+        );
+    };
+    if worktree.active {
+        return rejected(
+            tool,
+            "agent_still_running",
+            "代理仍在运行；请先 agent_wait 等它结束",
+        );
+    }
+    let result_head = worktree.result_head.clone().unwrap_or_default();
+    if worktree.applied {
+        return rejected(
+            tool,
+            "agent_output_already_applied",
+            "该代理的改动已经应用到主线工作树",
+        );
+    }
+    let applied_paths = match block_on(deps.git_service.apply_revision_diff(
+        &binding.path,
+        &worktree.base_head,
+        &result_head,
+    )) {
+        Ok(paths) => paths,
+        Err(GitError::ApplyConflict {
+            conflicted_paths,
+            stderr,
+        }) => {
+            return (
+                json!({
+                    "tool": tool,
+                    "status": "rejected",
+                    "ok": false,
+                    "error_code": "apply_conflict",
+                    "error": "代理改动与主线当前工作树冲突，未做任何修改",
+                    "conflicted_paths": conflicted_paths,
+                    "base": worktree.base_head,
+                    "head": result_head,
+                    "branch": worktree.branch,
+                    "stderr": stderr,
+                    "instruction": "主线工作树保持原样。可用 shell_exec 执行 `git diff <base> <head> -- <path>` 查看代理在冲突文件上的改动，再用文件工具手动合并。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Rejected,
+            );
+        }
+        Err(error) => return git_error(tool, error),
+    };
+    if let Err(error) = deps.session_code_contexts.mark_agent_worktree_applied(
+        &binding.session_id,
+        &task_id,
+        &result_head,
+    ) {
+        return failed(tool, "agent_apply_record_failed", error.to_string());
+    }
+    if let Err(message) = persist_contexts(deps) {
+        return failed(tool, "git_context_persist_failed", message);
+    }
+    // 改动已经进入主线工作树，代理分支不再需要；删除失败只影响分支整洁度。
+    let branch_deleted = worktree.branch.as_ref().is_some_and(|branch| {
+        block_on(deps.git_service.branch_delete(
+            &binding.path,
+            magi_git::BranchDeleteOptions {
+                branch: branch.clone(),
+                remote: None,
+                force: true,
+                confirm_force: true,
+                confirm_remote: false,
+                precondition: binding.precondition.clone(),
+            },
+        ))
+        .is_ok()
+    });
+    schedule_code_index_refresh(deps, &binding.workspace_id, &binding.path);
+    succeeded(
+        tool,
+        json!({
+            "task_id": task_id,
+            "applied_paths": applied_paths,
+            "branch": worktree.branch,
+            "branch_deleted": branch_deleted,
+        }),
+    )
 }
 
 struct GitToolBinding {
@@ -713,6 +832,7 @@ fn git_error(tool: &str, error: GitError) -> (String, ExecutionResultStatus) {
         GitError::BranchInUse { .. } => "branch_in_use",
         GitError::ConfirmationRequired { .. } => "confirmation_required",
         GitError::MergeConflict { .. } => "merge_conflict",
+        GitError::ApplyConflict { .. } => "apply_conflict",
         GitError::CommandFailed { .. } => "git_command_failed",
         GitError::Io(_) => "git_io_error",
     };
@@ -732,6 +852,10 @@ fn git_error(tool: &str, error: GitError) -> (String, ExecutionResultStatus) {
         GitError::MergeConflict {
             conflicted_paths, ..
         } => json!({ "conflictedPaths": conflicted_paths }),
+        GitError::ApplyConflict {
+            conflicted_paths,
+            stderr,
+        } => json!({ "conflictedPaths": conflicted_paths, "stderr": stderr }),
         _ => Value::Null,
     };
     (
@@ -828,6 +952,118 @@ mod tests {
         fs::write(root.join("README.md"), "base\n").expect("seed file");
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-m", "base"]);
+    }
+
+    #[test]
+    fn agent_apply_brings_finished_agent_changes_into_main_worktree_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repo");
+        init_repository(&repository);
+        let git_service = Arc::new(magi_git::GitService::new());
+        let contexts = magi_git::SessionCodeContextRegistry::default();
+        let observation = block_on(git_service.observe(&repository)).expect("observe");
+        contexts.accept(
+            "session-agent-apply",
+            "workspace-agent-apply",
+            vec![repository.clone()],
+            &observation,
+        );
+        // 代理从主线快照出发，在自己的分支上新增文件，由运行时提交。
+        let head = git(&repository, &["rev-parse", "HEAD"]);
+        let base = block_on(git_service.snapshot_worktree(&repository, &head)).expect("snapshot");
+        let agent_path = temp.path().join("agent");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "magi/agent/apply",
+                agent_path.to_str().expect("utf8 path"),
+                &base,
+            ],
+        );
+        fs::write(agent_path.join("agent.txt"), "from agent\n").expect("agent write");
+        let result_head = block_on(git_service.commit_all(&agent_path, "magi agent: apply"))
+            .expect("commit")
+            .expect("has changes");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "remove",
+                agent_path.to_str().expect("utf8 path"),
+            ],
+        );
+        contexts
+            .register_agent_worktree(
+                "session-agent-apply",
+                magi_git::AgentWorktreeContext {
+                    task_id: "task-agent-apply".to_string(),
+                    lease_id: Some("lease-agent-apply".to_string()),
+                    worker_id: "worker-agent-apply".to_string(),
+                    path: agent_path.clone(),
+                    mode: magi_git::AgentWorktreeMode::Writable,
+                    base_head: base,
+                    branch: Some("magi/agent/apply".to_string()),
+                    active: false,
+                    result_head: Some(result_head),
+                    changed_paths: vec!["agent.txt".to_string()],
+                    applied: false,
+                },
+            )
+            .expect("register agent worktree");
+        let persistence = Arc::new(RuntimeStatePersistence::new(
+            temp.path().join("state"),
+            temp.path().join("state/workspaces.json"),
+            temp.path().join("state/knowledge.json"),
+        ));
+        let executor = build_git_tool_executor(GitToolRuntimeDependencies {
+            git_service: git_service.clone(),
+            session_code_contexts: contexts.clone(),
+            workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator::default(),
+            event_bus: Arc::new(InMemoryEventBus::new(32)),
+            knowledge_store: Arc::new(magi_knowledge_store::KnowledgeStore::new()),
+            snapshot_manager: Arc::new(magi_snapshot::SnapshotManager::new()),
+            runtime_persistence: persistence,
+            managed_worktree_root: temp.path().join("worktrees"),
+        });
+        let context = ToolExecutionContext {
+            session_id: Some(SessionId::new("session-agent-apply")),
+            workspace_id: Some(WorkspaceId::new("workspace-agent-apply")),
+            working_directory: Some(repository.clone()),
+            access_profile: AccessProfile::Restricted,
+            ..ToolExecutionContext::default()
+        };
+
+        let (payload, status) =
+            executor("agent_apply", r#"{"task_id":"task-agent-apply"}"#, &context);
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+        assert_eq!(
+            fs::read_to_string(repository.join("agent.txt")).expect("applied file"),
+            "from agent\n"
+        );
+        assert_eq!(
+            git(&repository, &["rev-parse", "HEAD"]),
+            head,
+            "应用不产生提交"
+        );
+        assert!(
+            contexts
+                .get("session-agent-apply")
+                .expect("context")
+                .agent_worktrees[0]
+                .applied
+        );
+        assert!(
+            git(&repository, &["branch", "--list", "magi/agent/apply"]).is_empty(),
+            "应用后删除代理分支"
+        );
+
+        let (payload, status) =
+            executor("agent_apply", r#"{"task_id":"task-agent-apply"}"#, &context);
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        assert!(payload.contains("agent_output_already_applied"));
     }
 
     #[test]
@@ -988,6 +1224,9 @@ mod tests {
                     base_head: git(&repository, &["rev-parse", "HEAD"]),
                     branch: Some("magi/agent/running".to_string()),
                     active: true,
+                    result_head: None,
+                    changed_paths: Vec::new(),
+                    applied: false,
                 },
             )
             .expect("register running agent");

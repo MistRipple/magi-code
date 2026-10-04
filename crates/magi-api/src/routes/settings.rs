@@ -3619,6 +3619,7 @@ mod tests {
             "agent_spawn",
             "agent_send",
             "agent_cancel",
+            "agent_apply",
             "agent_wait",
             "context_search",
             "context_read",

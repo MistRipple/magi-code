@@ -428,6 +428,38 @@ impl TaskExecutionRegistry {
             )));
         }
 
+        // 非 Git 工作区没有隔离 worktree，多个可写代理会直接在同一目录互相覆盖；
+        // 同一时间只允许一个可写代理。
+        let writes = |task: &magi_core::Task| {
+            task.policy_snapshot
+                .as_ref()
+                .map(magi_core::TaskPolicy::effective_access_profile)
+                .unwrap_or_default()
+                != magi_core::AccessProfile::ReadOnly
+        };
+        let isolated_by_git = self
+            .agent_spawn_preflight_runtime()
+            .session_code_contexts
+            .as_ref()
+            .and_then(|registry| registry.get(session_id.as_str()))
+            .is_some();
+        if !isolated_by_git
+            && writes(child_task)
+            && task_store
+                .get_children(&parent_task_id)
+                .iter()
+                .any(|child| {
+                    matches!(
+                        child.status,
+                        magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+                    ) && writes(child)
+                })
+        {
+            return Err(SpawnedChildExecutionError::InvalidState(
+                "当前工作区不是 Git 仓库，无法隔离多个可写代理；已有一个可写代理未结束，请等它结束后再派发，或由主线直接完成".to_string(),
+            ));
+        }
+
         let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
         let parent_plan = self.get(&parent_task_id);
         let inherited_turn_id = parent_plan
@@ -1131,6 +1163,51 @@ mod tests {
     }
 
     #[test]
+    fn non_git_workspace_allows_only_one_unfinished_writable_agent() {
+        let (
+            task_store,
+            session_store,
+            registry,
+            session_id,
+            workspace_id,
+            mission_id,
+            root_task_id,
+            now,
+        ) = spawn_fixture("non-git-writer");
+        let register = |child: &Task| {
+            registry.register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                session_store: &session_store,
+                child_task: child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
+                now,
+            })
+        };
+        let first_writer = test_task("task-writer-a", root_task_id.as_str(), &mission_id);
+        register(&first_writer).expect("第一个可写代理应注册");
+        let mut reader = test_task("task-reader", root_task_id.as_str(), &mission_id);
+        let mut read_only_policy =
+            crate::agent_spawn_preflight::agent_spawn_child_policy_snapshot(None);
+        read_only_policy.access_profile = magi_core::AccessProfile::ReadOnly;
+        reader.policy_snapshot = Some(read_only_policy);
+        register(&reader).expect("只读代理不受单写者限制");
+
+        let second_writer = test_task("task-writer-b", root_task_id.as_str(), &mission_id);
+        let error = register(&second_writer).expect_err("第二个可写代理必须被拒绝");
+        assert!(matches!(
+            error,
+            SpawnedChildExecutionError::InvalidState(ref message) if message.contains("不是 Git 仓库")
+        ));
+        assert!(task_store.get_task(&second_writer.task_id).is_none());
+    }
+
+    #[test]
     fn remove_session_drops_every_execution_plan_owned_by_session() {
         let registry = TaskExecutionRegistry::default();
         let session_a = SessionId::new("session-a");
@@ -1241,7 +1318,7 @@ mod tests {
 
         for (role_index, role) in ["executor", "reviewer"].into_iter().enumerate() {
             for instance_index in 0..5 {
-                let child = test_task(
+                let child = read_only_test_task(
                     &format!("task-child-capacity-{role}-{instance_index}"),
                     root_task_id.as_str(),
                     &mission_id,
@@ -1264,7 +1341,7 @@ mod tests {
             }
         }
 
-        let overflow_child = test_task(
+        let overflow_child = read_only_test_task(
             "task-child-capacity-executor-overflow",
             root_task_id.as_str(),
             &mission_id,
@@ -1490,6 +1567,15 @@ mod tests {
         assert!(registry.get(&duplicate.task_id).is_none());
     }
 
+    /// 只读代理不受非 Git 工作区单写者限制，用于只关心容量语义的测试。
+    fn read_only_test_task(task_id: &str, root_task_id: &str, mission_id: &MissionId) -> Task {
+        let mut task = test_task(task_id, root_task_id, mission_id);
+        let mut policy = crate::agent_spawn_preflight::agent_spawn_child_policy_snapshot(None);
+        policy.access_profile = magi_core::AccessProfile::ReadOnly;
+        task.policy_snapshot = Some(policy);
+        task
+    }
+
     fn spawn_fixture(
         label: &str,
     ) -> (
@@ -1584,7 +1670,7 @@ mod tests {
             now,
         ) = spawn_fixture("role-limit");
 
-        let limited_first = test_task(
+        let limited_first = read_only_test_task(
             "task-child-role-limit-0",
             root_task_id.as_str(),
             &mission_id,
@@ -1605,7 +1691,7 @@ mod tests {
             })
             .expect("并发上限为 1 时应允许第一个实例");
 
-        let limited_second = test_task(
+        let limited_second = read_only_test_task(
             "task-child-role-limit-1",
             root_task_id.as_str(),
             &mission_id,
@@ -1664,7 +1750,7 @@ mod tests {
             .expect("前一个受限实例完成后应允许下一个实例");
 
         for index in 0..=DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE {
-            let unlimited_child = test_task(
+            let unlimited_child = read_only_test_task(
                 &format!("task-child-role-unlimited-{index}"),
                 root_task_id.as_str(),
                 &mission_id,

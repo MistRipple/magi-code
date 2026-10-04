@@ -244,9 +244,8 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::GitBranchDelete
             | BuiltinToolName::GitWorktreeList
             | BuiltinToolName::GitWorktreeCreate
-            | BuiltinToolName::GitWorktreeRemove => {
-                execute_git_tool(self.name, input, context, resources)
-            }
+            | BuiltinToolName::GitWorktreeRemove
+            | BuiltinToolName::AgentApply => execute_git_tool(self.name, input, context, resources),
             BuiltinToolName::GetGoal
             | BuiltinToolName::CreateGoal
             | BuiltinToolName::UpdateGoal => execute_orchestration_only(self.name, input),

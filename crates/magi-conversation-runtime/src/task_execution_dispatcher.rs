@@ -294,7 +294,7 @@ impl Drop for AgentWorktreeCleanup {
             return;
         }
         let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.dispatcher.finalize_agent_worktree(
+            let _ = self.dispatcher.finalize_agent_worktree(
                 &self.task,
                 &self.lease_id,
                 &self.session_id,
@@ -794,7 +794,7 @@ impl LlmTaskDispatcher {
             is_sidechain,
         };
         let streaming_entry_id = task_streaming_entry_id(task);
-        let (outcome, context_summary) = self.invoke_llm_with_tools(TaskLlmInvocationInput {
+        let (mut outcome, context_summary) = self.invoke_llm_with_tools(TaskLlmInvocationInput {
             task,
             lease_id,
             session_id: &session_id,
@@ -820,6 +820,17 @@ impl LlmTaskDispatcher {
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
             // 完成通知可能立即推进同一 Session 的队列，因此必须先释放
             // 代理 worktree 与临时资源，再提交 TaskStore durable completion。
+            // 可写代理的产出（分支、提交、改动路径）随完成结果一起提交，作为回执事实。
+            if let Some(workspace_output) = self.finalize_agent_worktree(
+                task,
+                lease_id,
+                &session_id,
+                &workspace_id,
+                is_sidechain,
+            ) && let TaskOutcome::Completed { attempt } = &mut outcome
+            {
+                attempt.output_refs.push(workspace_output.to_string());
+            }
             drop(_worktree_cleanup);
             if should_enrich_session {
                 self.schedule_post_completion_enrichment(
@@ -1575,7 +1586,7 @@ impl LlmTaskDispatcher {
     }
 
     /// 子代理永不直接复用主会话 live worktree：只读任务拿 detached worktree，
-    /// 可写任务拿继承 session base_head 的唯一临时 branch + 独立 worktree。
+    /// 可写任务拿唯一临时 branch + 独立 worktree。两者都从主线工作树当前内容的快照出发。
     fn resolve_task_execution_root(
         &self,
         task: &magi_core::Task,
@@ -1664,6 +1675,11 @@ impl LlmTaskDispatcher {
         };
         let branch = (mode == magi_git::AgentWorktreeMode::Writable)
             .then(|| format!("magi/agent/{task_key}-{allocation_nonce}"));
+        // 子代理从主线工作树的当前内容出发（含未提交改动），而不是会话开始时的 HEAD；
+        // 快照只写对象库，不改动主线的 index、工作树和 ref。
+        let base_head =
+            block_on_git(git_service.snapshot_worktree(&context.git.worktree_path, &base_head))
+                .map_err(|error| format!("生成子代理基线快照失败: {error}"))?;
         let created = block_on_git(git_service.worktree_create(
             &context.git.worktree_path,
             magi_git::WorktreeCreateOptions {
@@ -1685,9 +1701,12 @@ impl LlmTaskDispatcher {
                     worker_id: worker_id.map(ToString::to_string).unwrap_or_default(),
                     path: created.path.clone(),
                     mode,
-                    base_head,
+                    base_head: base_head.clone(),
                     branch: created.branch.clone(),
                     active: true,
+                    result_head: None,
+                    changed_paths: Vec::new(),
+                    applied: false,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -1707,7 +1726,7 @@ impl LlmTaskDispatcher {
                     "task_id": task.task_id,
                     "worker_id": worker_id,
                     "mode": mode,
-                    "base_head": context.git.base_head,
+                    "base_head": base_head,
                     "branch": created.branch,
                     "worktree_path": created.path,
                 }),
@@ -1763,9 +1782,12 @@ impl LlmTaskDispatcher {
 
     /// 子代理模型调用结束后立即结束 worktree 的 active 生命周期。
     ///
-    /// 干净的 detached/writable worktree 都安全移除；writable 对应的 branch 保留，
-    /// 供主对话审阅和 merge。存在未提交改动或安全移除失败时保留目录与分配记录，
-    /// 但标记为 inactive，避免后续任务误认为仍由 worker 占用。绝不使用 force。
+    /// 可写 worktree 中的改动由运行时提交到代理分支并记录产出（分支、提交、改动路径），
+    /// 随后安全移除目录；分支保留，供主线通过 agent_apply 应用。只读 worktree 干净时
+    /// 移除；存在未提交改动或安全移除失败时保留目录与分配记录，但标记为 inactive，
+    /// 避免后续任务误认为仍由 worker 占用。绝不使用 force。
+    ///
+    /// 返回可写代理的产出描述，由调用方写入子任务终态的 output_refs。
     fn finalize_agent_worktree(
         &self,
         task: &magi_core::Task,
@@ -1773,19 +1795,17 @@ impl LlmTaskDispatcher {
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
         is_sidechain: bool,
-    ) {
+    ) -> Option<serde_json::Value> {
         if !is_sidechain {
-            return;
+            return None;
         }
         let (Some(registry), Some(git_service)) = (
             self.session_code_contexts.as_ref(),
             self.git_service.as_ref(),
         ) else {
-            return;
+            return None;
         };
-        let Some(context) = registry.get(session_id.as_str()) else {
-            return;
-        };
+        let context = registry.get(session_id.as_str())?;
         let Some(allocation) = context
             .agent_worktrees
             .iter()
@@ -1796,11 +1816,21 @@ impl LlmTaskDispatcher {
             })
             .cloned()
         else {
-            return;
+            return None;
         };
 
+        let mut workspace_output = None;
+        let mut commit_error = None;
+        if allocation.mode == magi_git::AgentWorktreeMode::Writable && allocation.path.exists() {
+            match self.commit_agent_worktree_output(task, lease_id, session_id, &allocation) {
+                Ok(output) => workspace_output = output,
+                Err(error) => commit_error = Some(error),
+            }
+        }
         let (cleanup_status, retained, cleanup_error) = if !allocation.path.exists() {
             ("already_missing", false, None)
+        } else if let Some(error) = commit_error {
+            ("retained_commit_failed", true, Some(error))
         } else {
             match block_on_git(git_service.observe(&allocation.path)) {
                 Ok(observation) if observation.dirty.has_uncommitted => (
@@ -1841,7 +1871,7 @@ impl LlmTaskDispatcher {
                 %error,
                 "结束 agent worktree 生命周期失败"
             );
-            return;
+            return workspace_output;
         }
         if let Some(persist) = self.session_state_persist_callback.as_deref()
             && let Err(error) = persist("agent_worktree_released")
@@ -1890,6 +1920,55 @@ impl LlmTaskDispatcher {
                 ..EventContext::default()
             }),
         );
+        workspace_output
+    }
+
+    /// 把可写代理 worktree 的改动提交到代理分支并记录产出；没有任何改动时返回 `None`。
+    fn commit_agent_worktree_output(
+        &self,
+        task: &magi_core::Task,
+        lease_id: &LeaseId,
+        session_id: &SessionId,
+        allocation: &magi_git::AgentWorktreeContext,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let (Some(registry), Some(git_service)) = (
+            self.session_code_contexts.as_ref(),
+            self.git_service.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        block_on_git(git_service.commit_all(
+            &allocation.path,
+            &format!("magi agent: {}", task.title.trim()),
+        ))
+        .map_err(|error| format!("提交子代理改动失败: {error}"))?;
+        let head = block_on_git(git_service.observe_ref(&allocation.path))
+            .map_err(|error| format!("读取子代理分支 HEAD 失败: {error}"))?
+            .head
+            .ok_or_else(|| "子代理分支没有 HEAD".to_string())?;
+        let changed_paths =
+            block_on_git(git_service.changed_paths(&allocation.path, &allocation.base_head, &head))
+                .map_err(|error| format!("统计子代理改动失败: {error}"))?;
+        if changed_paths.is_empty() {
+            return Ok(None);
+        }
+        registry
+            .record_agent_worktree_result(
+                session_id.as_str(),
+                task.task_id.as_str(),
+                lease_id.as_str(),
+                head.clone(),
+                changed_paths.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(Some(serde_json::json!({
+            "agent_workspace": {
+                "branch": allocation.branch,
+                "base": allocation.base_head,
+                "head": head,
+                "changed_paths": changed_paths,
+            }
+        })))
     }
 
     fn task_fact_context_parts(&self, task: &magi_core::Task) -> Vec<String> {
@@ -3636,7 +3715,7 @@ mod tests {
         );
     }
 
-    fn git_fixture(path: &std::path::Path, args: &[&str]) {
+    fn git_fixture(path: &std::path::Path, args: &[&str]) -> String {
         let output = magi_process::std_command("git")
             .arg("-C")
             .arg(path)
@@ -3649,6 +3728,7 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[test]
@@ -3815,7 +3895,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_sidechain_worktree_is_retained_but_released_from_active_roots() {
+    fn writable_sidechain_starts_from_main_worktree_and_commits_its_output() {
         let fixture = tempfile::tempdir().expect("fixture root");
         let repository = fixture.path().join("repo");
         std::fs::create_dir_all(&repository).expect("repo directory");
@@ -3826,6 +3906,8 @@ mod tests {
         git_fixture(&repository, &["add", "README.md"]);
         git_fixture(&repository, &["commit", "-m", "base"]);
 
+        // 主线有未提交改动：子代理必须从包含它的快照出发。
+        std::fs::write(repository.join("README.md"), "main uncommitted\n").expect("main edit");
         let git_service = Arc::new(magi_git::GitService::new());
         let observation = block_on_git(git_service.observe(&repository)).expect("observe repo");
         let contexts = magi_git::SessionCodeContextRegistry::default();
@@ -3852,10 +3934,15 @@ mod tests {
             )
             .expect("agent root")
             .expect("agent path");
+        assert_eq!(
+            std::fs::read_to_string(execution_root.join("README.md")).unwrap(),
+            "main uncommitted\n",
+            "子代理应看到主线未提交的改动"
+        );
         std::fs::write(execution_root.join("uncommitted.txt"), "agent output\n")
             .expect("dirty agent output");
 
-        dispatcher.finalize_agent_worktree(
+        let workspace_output = dispatcher.finalize_agent_worktree(
             &task,
             &lease_id,
             &SessionId::new("session-git-agent-dirty"),
@@ -3863,17 +3950,37 @@ mod tests {
             true,
         );
 
-        assert!(execution_root.exists(), "dirty worktree must be retained");
-        assert!(execution_root.join("uncommitted.txt").is_file());
+        let workspace_output = workspace_output.expect("可写代理有改动时应返回产出");
+        assert_eq!(
+            workspace_output["agent_workspace"]["changed_paths"],
+            serde_json::json!(["uncommitted.txt"]),
+            "主线快照里的改动不算代理产出"
+        );
+        assert!(!execution_root.exists(), "提交后的干净 worktree 应移除");
         let context = contexts
             .get("session-git-agent-dirty")
-            .expect("released dirty context");
-        assert!(!context.agent_worktrees[0].active);
+            .expect("released context");
+        let allocation = &context.agent_worktrees[0];
+        assert!(!allocation.active);
+        let head = allocation.result_head.clone().expect("应记录代理分支 HEAD");
+        assert_eq!(
+            allocation.changed_paths,
+            vec!["uncommitted.txt".to_string()]
+        );
+        assert_eq!(
+            git_fixture(&repository, &["show", &format!("{head}:uncommitted.txt")]),
+            "agent output"
+        );
         assert!(
             !context
                 .runtime_workspace_roots
                 .iter()
                 .any(|root| root == &execution_root)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("README.md")).unwrap(),
+            "main uncommitted\n",
+            "主线工作树不受影响"
         );
     }
 

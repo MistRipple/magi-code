@@ -112,6 +112,7 @@ pub(crate) fn is_git_builtin_tool(tool: BuiltinToolName) -> bool {
             | BuiltinToolName::GitWorktreeList
             | BuiltinToolName::GitWorktreeCreate
             | BuiltinToolName::GitWorktreeRemove
+            | BuiltinToolName::AgentApply
     )
 }
 

@@ -167,6 +167,15 @@ pub struct AgentWorktreeContext {
     pub base_head: String,
     pub branch: Option<String>,
     pub active: bool,
+    /// 代理结束时运行时提交其改动后的分支 HEAD；没有改动或未提交时为空。
+    #[serde(default)]
+    pub result_head: Option<String>,
+    /// `base_head..result_head` 之间改动的路径。
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    /// 改动是否已经由主线通过 agent_apply 应用到主工作树。
+    #[serde(default)]
+    pub applied: bool,
 }
 
 impl SessionCodeContext {
@@ -345,6 +354,69 @@ impl SessionCodeContextRegistry {
         context
             .runtime_workspace_roots
             .retain(|root| !same_path(root, &agent_worktree.path));
+        context.context_revision = context.context_revision.saturating_add(1);
+        Ok(context.clone())
+    }
+
+    /// 记录代理结束时提交的产出，供回执和 agent_apply 使用。
+    pub fn record_agent_worktree_result(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        lease_id: &str,
+        result_head: String,
+        changed_paths: Vec<String>,
+    ) -> Result<SessionCodeContext, SessionContextError> {
+        let mut contexts = self
+            .contexts
+            .write()
+            .expect("session code context write lock poisoned");
+        let context = contexts
+            .get_mut(session_id)
+            .ok_or_else(|| SessionContextError::Missing {
+                session_id: session_id.to_string(),
+            })?;
+        let agent_worktree = context
+            .agent_worktrees
+            .iter_mut()
+            .find(|worktree| {
+                worktree.task_id == task_id && worktree.lease_id.as_deref() == Some(lease_id)
+            })
+            .ok_or_else(|| SessionContextError::MissingAgentWorktree {
+                task_id: format!("{task_id} (lease {lease_id})"),
+            })?;
+        agent_worktree.result_head = Some(result_head);
+        agent_worktree.changed_paths = changed_paths;
+        context.context_revision = context.context_revision.saturating_add(1);
+        Ok(context.clone())
+    }
+
+    /// 标记代理产出已应用到主工作树。
+    pub fn mark_agent_worktree_applied(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        result_head: &str,
+    ) -> Result<SessionCodeContext, SessionContextError> {
+        let mut contexts = self
+            .contexts
+            .write()
+            .expect("session code context write lock poisoned");
+        let context = contexts
+            .get_mut(session_id)
+            .ok_or_else(|| SessionContextError::Missing {
+                session_id: session_id.to_string(),
+            })?;
+        let agent_worktree = context
+            .agent_worktrees
+            .iter_mut()
+            .find(|worktree| {
+                worktree.task_id == task_id && worktree.result_head.as_deref() == Some(result_head)
+            })
+            .ok_or_else(|| SessionContextError::MissingAgentWorktree {
+                task_id: task_id.to_string(),
+            })?;
+        agent_worktree.applied = true;
         context.context_revision = context.context_revision.saturating_add(1);
         Ok(context.clone())
     }
@@ -688,6 +760,11 @@ pub enum GitError {
     },
     #[error("高风险操作需要显式二次确认: {operation}")]
     ConfirmationRequired { operation: String },
+    #[error("代理改动无法干净地应用到目标工作树")]
+    ApplyConflict {
+        conflicted_paths: Vec<String>,
+        stderr: String,
+    },
     #[error("合并产生冲突")]
     MergeConflict {
         target: String,
@@ -1311,6 +1388,184 @@ impl GitService {
         worktree_list_unlocked(&observation.repository_root).await
     }
 
+    /// 把 worktree 的当前内容（含未提交和未忽略的未跟踪文件）写成以 `base` 为父的快照提交。
+    ///
+    /// 使用独立的临时 index，不改动调用方的 index、工作树和任何 ref。工作树与 `base`
+    /// 一致时直接返回 `base` 的 commit id。
+    pub async fn snapshot_worktree(
+        &self,
+        worktree_path: &Path,
+        base: &str,
+    ) -> Result<String, GitError> {
+        let base = resolve_revision(worktree_path, base).await?;
+        let index_path = std::env::temp_dir().join(format!(
+            "magi-snapshot-index-{}-{}",
+            std::process::id(),
+            SNAPSHOT_INDEX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let index_env = [("GIT_INDEX_FILE", index_path.as_os_str())];
+        let result = async {
+            ensure_success(
+                "snapshot_read_tree",
+                run_git_with_env(worktree_path, &["read-tree", base.as_str()], &index_env).await?,
+            )?;
+            ensure_success(
+                "snapshot_add",
+                run_git_with_env(worktree_path, &["add", "-A"], &index_env).await?,
+            )?;
+            let tree = ensure_success(
+                "snapshot_write_tree",
+                run_git_with_env(worktree_path, &["write-tree"], &index_env).await?,
+            )?;
+            let base_tree = required_text(
+                worktree_path,
+                &["rev-parse", "--verify", &format!("{base}^{{tree}}")],
+            )
+            .await?;
+            if tree.trim() == base_tree.trim() {
+                return Ok(base.clone());
+            }
+            let identity = runtime_commit_identity();
+            ensure_success(
+                "snapshot_commit_tree",
+                run_git_with_env(
+                    worktree_path,
+                    &[
+                        "commit-tree",
+                        tree.trim(),
+                        "-p",
+                        base.as_str(),
+                        "-m",
+                        "magi: 子代理基线快照",
+                    ],
+                    &identity,
+                )
+                .await?,
+            )
+            .map(|commit| commit.trim().to_string())
+        }
+        .await;
+        let _ = std::fs::remove_file(&index_path);
+        result
+    }
+
+    /// 在代理 worktree 中提交全部改动，返回新的 HEAD；没有改动时返回 `None`。
+    ///
+    /// 这是运行时为保存代理产出做的检查点提交，不运行用户的 Git hook。
+    pub async fn commit_all(
+        &self,
+        worktree_path: &Path,
+        message: &str,
+    ) -> Result<Option<String>, GitError> {
+        ensure_success(
+            "commit_all_add",
+            run_git(worktree_path, &["add", "-A"]).await?,
+        )?;
+        let staged = run_git(worktree_path, &["diff", "--cached", "--quiet"]).await?;
+        if staged.success {
+            return Ok(None);
+        }
+        ensure_success(
+            "commit_all",
+            run_git_with_env(
+                worktree_path,
+                &["commit", "--no-verify", "-q", "-m", message],
+                &runtime_commit_identity(),
+            )
+            .await?,
+        )?;
+        rev_parse(worktree_path, "HEAD").await.map(Some)
+    }
+
+    /// `from..to` 之间改动的路径（重命名按新旧两个路径展开）。
+    pub async fn changed_paths(
+        &self,
+        path: &Path,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let from = resolve_revision(path, from).await?;
+        let to = resolve_revision(path, to).await?;
+        let output = ensure_success(
+            "changed_paths",
+            run_git(
+                path,
+                &["diff", "--name-only", "--no-renames", "-z", &from, &to],
+            )
+            .await?,
+        )?;
+        Ok(output
+            .split('\0')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// 把 `base..head` 的改动应用到目标工作树（不改 index 和 ref）。
+    ///
+    /// 先整体检查，任一文件无法干净应用就返回 `ApplyConflict`，目标工作树保持原样。
+    pub async fn apply_revision_diff(
+        &self,
+        target_worktree: &Path,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let (_guard, observation) = self.lock_and_observe(target_worktree).await?;
+        let base = resolve_revision(&observation.worktree_path, base).await?;
+        let head = resolve_revision(&observation.worktree_path, head).await?;
+        let diff = run_git_bytes(
+            &observation.worktree_path,
+            &[
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-renames",
+                &base,
+                &head,
+            ],
+        )
+        .await?;
+        if !diff.success {
+            return Err(GitError::CommandFailed {
+                operation: "apply_revision_diff_export".to_string(),
+                exit_code: diff.code,
+                stdout: String::new(),
+                stderr: diff.stderr,
+            });
+        }
+        if diff.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        let patch_path = std::env::temp_dir().join(format!(
+            "magi-agent-apply-{}-{}.patch",
+            std::process::id(),
+            SNAPSHOT_INDEX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&patch_path, &diff.stdout)
+            .map_err(|error| GitError::Io(format!("写入代理改动补丁失败: {error}")))?;
+        let patch = patch_path.to_string_lossy().to_string();
+        let result = async {
+            let check = run_git(&observation.worktree_path, &["apply", "--check", &patch]).await?;
+            if !check.success {
+                return Err(GitError::ApplyConflict {
+                    conflicted_paths: apply_error_paths(&check.stderr),
+                    stderr: check.stderr,
+                });
+            }
+            ensure_success(
+                "apply_revision_diff",
+                run_git(&observation.worktree_path, &["apply", &patch]).await?,
+            )?;
+            Ok(())
+        }
+        .await;
+        let _ = std::fs::remove_file(&patch_path);
+        result?;
+        self.changed_paths(&observation.worktree_path, &base, &head)
+            .await
+    }
+
     pub async fn worktree_create(
         &self,
         path: &Path,
@@ -1815,6 +2070,66 @@ async fn run_git(path: &Path, args: &[&str]) -> Result<CommandOutput, GitError> 
     })
 }
 
+static SNAPSHOT_INDEX_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 运行时提交使用固定身份，不依赖用户是否配置 user.name/user.email。
+fn runtime_commit_identity() -> [(&'static str, &'static std::ffi::OsStr); 4] {
+    let name = std::ffi::OsStr::new("Magi Agent");
+    let email = std::ffi::OsStr::new("agent@magi.local");
+    [
+        ("GIT_AUTHOR_NAME", name),
+        ("GIT_AUTHOR_EMAIL", email),
+        ("GIT_COMMITTER_NAME", name),
+        ("GIT_COMMITTER_EMAIL", email),
+    ]
+}
+
+async fn run_git_with_env(
+    path: &Path,
+    args: &[&str],
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> Result<CommandOutput, GitError> {
+    let mut command = tokio_command("git");
+    command.arg("-C").arg(path).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .await
+        .map_err(|error| GitError::Io(error.to_string()))?;
+    Ok(CommandOutput {
+        success: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr)
+            .trim_end_matches(['\r', '\n'])
+            .to_string(),
+    })
+}
+
+/// 从 `git apply` 的错误输出中提取出错路径。
+fn apply_error_paths(stderr: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in stderr.lines() {
+        let path = line
+            .strip_prefix("error: patch failed: ")
+            .and_then(|rest| rest.rsplit_once(':').map(|(path, _)| path))
+            .or_else(|| {
+                line.strip_prefix("error: ")
+                    .and_then(|rest| rest.split_once(": ").map(|(path, _)| path))
+            });
+        if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty())
+            && !paths.iter().any(|existing| existing == path)
+        {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
 async fn run_git_bytes(path: &Path, args: &[&str]) -> Result<BinaryCommandOutput, GitError> {
     let output = tokio_command("git")
         .arg("-C")
@@ -1939,6 +2254,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_includes_uncommitted_work_without_touching_index_or_refs() {
+        let repo = repository();
+        let service = GitService::new();
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            service
+                .snapshot_worktree(repo.path(), &head)
+                .await
+                .expect("clean snapshot"),
+            head,
+            "干净工作树的快照就是 base 本身"
+        );
+
+        fs::write(repo.path().join("README.md"), "edited\n").expect("edit tracked");
+        fs::write(repo.path().join("new.txt"), "untracked\n").expect("write untracked");
+        fs::write(repo.path().join(".gitignore"), "ignored.log\n").expect("write ignore");
+        fs::write(repo.path().join("ignored.log"), "noise\n").expect("write ignored");
+        let status_before = git(repo.path(), &["status", "--porcelain"]);
+
+        let snapshot = service
+            .snapshot_worktree(repo.path(), &head)
+            .await
+            .expect("dirty snapshot");
+
+        assert_ne!(snapshot, head);
+        assert_eq!(
+            git(repo.path(), &["rev-parse", &format!("{snapshot}^")]),
+            head
+        );
+        assert_eq!(
+            git(repo.path(), &["show", &format!("{snapshot}:README.md")]),
+            "edited"
+        );
+        assert_eq!(
+            git(repo.path(), &["show", &format!("{snapshot}:new.txt")]),
+            "untracked"
+        );
+        assert!(
+            magi_process::std_command("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["cat-file", "-e", &format!("{snapshot}:ignored.log")])
+                .status()
+                .is_ok_and(|status| !status.success()),
+            "忽略的文件不进入快照"
+        );
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), head, "HEAD 不变");
+        assert_eq!(
+            git(repo.path(), &["status", "--porcelain"]),
+            status_before,
+            "用户的 index 和工作树不变"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_changes_are_committed_and_applied_atomically() {
+        let repo = repository();
+        let service = GitService::new();
+        // 主线有未提交改动；代理从包含它的快照出发。
+        fs::write(repo.path().join("README.md"), "main edit\n").expect("main edit");
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let base = service
+            .snapshot_worktree(repo.path(), &head)
+            .await
+            .expect("snapshot");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let agent_path = agent_dir.path().join("agent");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "magi/agent/test",
+                agent_path.to_str().unwrap(),
+                &base,
+            ],
+        );
+        assert_eq!(
+            fs::read_to_string(agent_path.join("README.md")).unwrap(),
+            "main edit\n",
+            "代理看得到主线未提交的改动"
+        );
+        assert_eq!(
+            service
+                .commit_all(&agent_path, "nothing")
+                .await
+                .expect("noop commit"),
+            None
+        );
+        fs::write(agent_path.join("feature.rs"), "fn feature() {}\n").expect("agent write");
+        let agent_head = service
+            .commit_all(&agent_path, "magi agent: feature")
+            .await
+            .expect("commit")
+            .expect("should commit");
+        assert_eq!(
+            service
+                .changed_paths(&agent_path, &base, &agent_head)
+                .await
+                .unwrap(),
+            vec!["feature.rs".to_string()]
+        );
+
+        // 主线同时修改了同一文件的同一行 → 冲突时主线保持原样。
+        fs::write(agent_path.join("README.md"), "agent edit\n").expect("agent conflict edit");
+        let conflicting_head = service
+            .commit_all(&agent_path, "magi agent: conflict")
+            .await
+            .unwrap()
+            .unwrap();
+        fs::write(repo.path().join("README.md"), "main later edit\n").expect("main later edit");
+        let error = service
+            .apply_revision_diff(repo.path(), &base, &conflicting_head)
+            .await
+            .expect_err("同一行冲突必须拒绝");
+        assert!(
+            matches!(error, GitError::ApplyConflict { ref conflicted_paths, .. } if conflicted_paths.contains(&"README.md".to_string())),
+            "{error:?}"
+        );
+        assert!(!repo.path().join("feature.rs").exists(), "冲突时不能半应用");
+        assert_eq!(
+            fs::read_to_string(repo.path().join("README.md")).unwrap(),
+            "main later edit\n"
+        );
+
+        // 无冲突的改动应用到主线工作树，不产生提交、不改 index。
+        let applied = service
+            .apply_revision_diff(repo.path(), &base, &agent_head)
+            .await
+            .expect("clean apply");
+        assert_eq!(applied, vec!["feature.rs".to_string()]);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("feature.rs")).unwrap(),
+            "fn feature() {}\n"
+        );
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
     async fn agent_worktrees_are_scoped_by_execution_lease() {
         let repo = repository();
         let service = GitService::new();
@@ -1964,6 +2419,9 @@ mod tests {
                         base_head: observation.head.clone().expect("base head"),
                         branch: None,
                         active: true,
+                        result_head: None,
+                        changed_paths: Vec::new(),
+                        applied: false,
                     },
                 )
                 .expect("register worktree");

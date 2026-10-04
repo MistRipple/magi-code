@@ -616,6 +616,7 @@ fn model_call_scope(tool: BuiltinToolName) -> &'static str {
         BuiltinToolName::AgentSpawn
         | BuiltinToolName::AgentSend
         | BuiltinToolName::AgentCancel
+        | BuiltinToolName::AgentApply
         | BuiltinToolName::AgentWait => "coordinator_task_only",
         BuiltinToolName::ContextSearch
         | BuiltinToolName::ContextRead

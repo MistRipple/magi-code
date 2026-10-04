@@ -98,6 +98,8 @@ pub enum BuiltinToolName {
     AgentSend,
     /// 主线取消自己直接派发、尚未结束的子代理，并级联终止其子树。
     AgentCancel,
+    /// 主线把已完成代理分支上的改动应用到主工作树。
+    AgentApply,
     /// 等待一个或多个已派发代理进入终态，并把代理最终答复返回给主线。
     AgentWait,
     /// 子代理检索当前会话与同一执行链中可读取的上下文引用。
@@ -123,7 +125,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 79] = [
+    pub const ALL: [Self; 80] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -197,6 +199,7 @@ impl BuiltinToolName {
         Self::AgentSpawn,
         Self::AgentSend,
         Self::AgentCancel,
+        Self::AgentApply,
         Self::AgentWait,
         Self::ContextSearch,
         Self::ContextRead,
@@ -280,6 +283,7 @@ impl BuiltinToolName {
             Self::AgentSpawn => "agent_spawn",
             Self::AgentSend => "agent_send",
             Self::AgentCancel => "agent_cancel",
+            Self::AgentApply => "agent_apply",
             Self::AgentWait => "agent_wait",
             Self::ContextSearch => "context_search",
             Self::ContextRead => "context_read",
@@ -357,6 +361,7 @@ impl BuiltinToolName {
             Self::AgentSpawn
             | Self::AgentSend
             | Self::AgentCancel
+            | Self::AgentApply
             | Self::AgentWait
             | Self::ContextSearch
             | Self::ContextRead
@@ -441,6 +446,7 @@ impl BuiltinToolName {
             "agent_spawn" => Some(Self::AgentSpawn),
             "agent_send" => Some(Self::AgentSend),
             "agent_cancel" => Some(Self::AgentCancel),
+            "agent_apply" => Some(Self::AgentApply),
             "agent_wait" => Some(Self::AgentWait),
             "context_search" => Some(Self::ContextSearch),
             "context_read" => Some(Self::ContextRead),
@@ -468,6 +474,7 @@ impl BuiltinToolName {
                 | Self::FileWrite
                 | Self::FilePatch
                 | Self::ApplyPatch
+                | Self::AgentApply
                 | Self::FileRemove
                 | Self::FileMkdir
                 | Self::FileCopy
@@ -507,6 +514,7 @@ impl BuiltinToolName {
             Self::FileWrite
                 | Self::FilePatch
                 | Self::ApplyPatch
+                | Self::AgentApply
                 | Self::FileRemove
                 | Self::FileMkdir
                 | Self::FileCopy
@@ -596,6 +604,7 @@ impl BuiltinToolName {
             Self::FileWrite
                 | Self::FilePatch
                 | Self::ApplyPatch
+                | Self::AgentApply
                 | Self::FileRemove
                 | Self::FileMkdir
                 | Self::FileCopy
@@ -635,6 +644,7 @@ impl BuiltinToolName {
             Self::FileWrite
             | Self::FilePatch
             | Self::ApplyPatch
+            | Self::AgentApply
             | Self::FileRemove
             | Self::FileMkdir
             | Self::FileCopy
@@ -766,6 +776,7 @@ impl BuiltinToolName {
             Self::FileWrite
             | Self::FilePatch
             | Self::ApplyPatch
+            | Self::AgentApply
             | Self::FileCopy
             | Self::FileMove
             | Self::ImageGenerate
@@ -1078,6 +1089,9 @@ impl BuiltinToolName {
             }
             Self::AgentCancel => {
                 "取消当前任务直接派发、尚未结束的代理：终止该代理及其子树，释放其进程、浏览器租约和并发名额。用于代理方向错误、已不再需要或长时间无进展的情况；取消后该代理在 agent_wait 中返回 child_status=killed。"
+            }
+            Self::AgentApply => {
+                "把已完成代理分支上的改动应用到主线工作树。代理从派发时主线工作树的快照出发，运行时在代理结束时把它的改动提交到代理分支；本工具把“快照→代理分支”的差异应用到主线当前工作树，不产生提交、不改 index。任一文件无法干净应用时整体拒绝并返回 conflicted_paths，主线工作树保持原样；此时可用 shell_exec 执行 `git diff <base> <head> -- <path>` 查看代理改动后手动合并。"
             }
             Self::AgentWait => {
                 "等待一个或多个已派发代理结束，并返回每个已结束代理的结构化回执。用于收集 agent_spawn 创建的代理结果；只有下一步依赖代理结果时才调用，不要轮询式重复调用。\n\n\
@@ -1812,6 +1826,13 @@ impl BuiltinToolName {
                     "reason": { "type": "string", "minLength": 1, "description": "取消原因，会记录到该代理的终态输出中" }
                 },
                 "required": ["task_id", "reason"]
+            }),
+            Self::AgentApply => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "minLength": 1, "description": "已完成且 agent_wait 回执中带 workspace 的代理 child_task_id" }
+                },
+                "required": ["task_id"]
             }),
             Self::AgentWait => serde_json::json!({
                 "type": "object",

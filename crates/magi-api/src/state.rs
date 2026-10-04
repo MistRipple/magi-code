@@ -5759,6 +5759,9 @@ mod tests {
                     base_head: observation.head.expect("base head"),
                     branch: created.branch,
                     active: true,
+                    result_head: None,
+                    changed_paths: Vec::new(),
+                    applied: false,
                 },
             )
             .expect("register agent worktree");

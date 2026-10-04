@@ -354,6 +354,7 @@ fn git_error_kind(error: &GitError) -> &'static str {
         GitError::BranchInUse { .. } => "branch_in_use",
         GitError::ConfirmationRequired { .. } => "confirmation_required",
         GitError::MergeConflict { .. } => "merge_conflict",
+        GitError::ApplyConflict { .. } => "apply_conflict",
         GitError::CommandFailed { .. } => "git_command_failed",
         GitError::Io(_) => "git_io_error",
     }
