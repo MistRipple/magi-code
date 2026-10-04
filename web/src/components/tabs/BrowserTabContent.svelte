@@ -47,6 +47,12 @@
      *   窗口快照的 `browserSurfaces` 投影；注册、显隐都不再依赖活动面板。
      */
     surfaceScope?: 'session' | 'app';
+    /**
+     * 会话级 Tab 的后台承载：代理正在使用该页面但它当前不可见（其他会话、其他 Tab
+     * 或右栏已折叠）。与应用级宿主一样只从窗口快照取得承载身份，读取与导航仍走
+     * 会话级接口。
+     */
+    backgroundHost?: boolean;
   }
 
   // 消息链路的节点上下文是唯一契约；Renderer 只补充 Chromium 返回的
@@ -130,8 +136,11 @@
     onTitleChange,
     desktopSurface = false,
     surfaceScope = 'session',
+    backgroundHost = false,
   }: Props = $props();
   const appLevelSurface = $derived(surfaceScope === 'app');
+  // 承载身份是否只来自窗口快照（不依赖活动面板）：应用级宿主与会话级后台承载。
+  const snapshotIdentity = $derived(appLevelSurface || backgroundHost);
   // Browser Tab 的运行通道由右栏宿主显式决定。Desktop 使用主 Renderer
   // 直接承载 Electron <webview>；Main 只负责控制 guest 的生命周期和 CDP，
   // 不参与右栏几何计算。
@@ -204,7 +213,7 @@
   let refreshGeneration = 0;
   let desktopSurfaceSyncGeneration = 0;
   let activeBrowserIdentityKey = '';
-  let lastAppSurfaceKey = '';
+  let lastSnapshotSurfaceKey = '';
   let activeDownloads = $state<MagiDesktopBrowserDownloadSnapshot[]>([]);
   const anchorToken = $derived(tabId.replace(/[^A-Za-z0-9_-]/gu, '_'));
   const toolbarAnchorName = $derived(`--magi-browser-toolbar-${anchorToken}`);
@@ -286,13 +295,13 @@
   });
   const externalUrl = $derived(normalizeExternalWebUrl(activeTab?.url || address));
   /**
-   * 应用级宿主的承载身份：只认窗口快照里的 Surface 清单，不认活动面板。
+   * 快照承载身份：只认窗口快照里的 Surface 清单，不认活动面板。
    *
    * 清单由 Main 按窗口投影（`browserSurfaceSnapshotsForWindow`），在逻辑 Surface
    * 建立后即出现，因此 Renderer 能在不激活右栏的前提下完成 guest 注册。
    */
-  const appSurfaceIdentity = $derived.by<BrowserInspectIdentity | null>(() => {
-    if (!desktopRuntime || !appLevelSurface) return null;
+  const snapshotSurfaceIdentity = $derived.by<BrowserInspectIdentity | null>(() => {
+    if (!desktopRuntime || !snapshotIdentity) return null;
     const entry = desktopSnapshot?.browserSurfaces?.find((item) => item.tabId === tabId) ?? null;
     if (!entry) return null;
     return {
@@ -305,8 +314,8 @@
     desktopRuntime
       && webviewRegistered
       && (
-        appLevelSurface
-          ? Boolean(appSurfaceIdentity)
+        snapshotIdentity
+          ? Boolean(snapshotSurfaceIdentity)
           : (
             desktopSnapshot?.layout.rightPaneVisible === true
             && desktopSnapshot?.layout.activePanelKind === 'browser'
@@ -319,8 +328,8 @@
   // Authority/Worker 握手状态，也不会因页面刷新或右栏拖动而重置。
   const browserReady = $derived(browserSurfaceAvailable);
   const activeBrowserIdentity = $derived.by<BrowserInspectIdentity | null>(() => {
-    // 应用级宿主不参与活动面板语义：身份来自窗口快照的只读投影。
-    if (appLevelSurface) return appSurfaceIdentity;
+    // 快照承载不参与活动面板语义：身份来自窗口快照的只读投影。
+    if (snapshotIdentity) return snapshotSurfaceIdentity;
     const tab = activeTab;
     const surfaceId = desktopSnapshot?.layout.activeSurfaceId;
     const navigationRevision = desktopSnapshot?.activeBrowserNavigationRevision;
@@ -436,10 +445,10 @@
     const view = browserWebview;
     if (!desktop || !view) return;
     if (!identity) {
-      // 应用级宿主必须先拿到窗口快照里的 Surface 身份；Main 只在逻辑 Surface
+      // 快照承载必须先拿到窗口快照里的 Surface 身份；Main 只在逻辑 Surface
       // 建立后才会把它投影出来，所以这里主动拉一次并在有界次数内重试，
       // 不依赖任何激活动作（A25、R49）。
-      if (appLevelSurface) {
+      if (snapshotIdentity) {
         webviewRegistrationAttempts += 1;
         void synchronizeDesktopSurface();
         scheduleWebviewRegistration(Math.min(250, 40 + webviewRegistrationAttempts * 5));
@@ -860,16 +869,16 @@
       ))
       .slice(-8);
     activeDownloads = [...terminalDownloads, ...next.activeBrowserDownloads];
-    if (appLevelSurface && !webviewRegistered) {
-      // 应用级宿主的 Surface 身份只可能从这份快照投影到达。身份变化（首次出现
+    if (snapshotIdentity && !webviewRegistered) {
+      // 快照承载的 Surface 身份只可能从这份快照投影到达。身份变化（首次出现
       // 或代次推进）时重置重试计数并立刻注册；同一个身份不变时不重置，避免
       // 注册持续失败时无界重试。
       const entry = next.browserSurfaces?.find((item) => item.tabId === tabId) ?? null;
       const entryKey = entry
         ? `${entry.surfaceId}\u0000${entry.navigationRevision}`
         : '';
-      if (entryKey && entryKey !== lastAppSurfaceKey) {
-        lastAppSurfaceKey = entryKey;
+      if (entryKey && entryKey !== lastSnapshotSurfaceKey) {
+        lastSnapshotSurfaceKey = entryKey;
         webviewRegistrationAttempts = 0;
       }
       scheduleWebviewRegistration();

@@ -470,7 +470,7 @@ test("新建 Browser Page 只物化 WebContents，不等待可见内容槽", asy
       getURL: () => "https://example.test/",
       getTitle: () => "Example",
     }),
-    ensureBrowserSurface: async () => {
+    ensureBrowserSurfaceInBackground: async () => {
       ensureCalled = true;
       await contentSlotGate;
     },
@@ -499,10 +499,11 @@ test("新建 Browser Page 只物化 WebContents，不等待可见内容槽", asy
   }
 });
 
-test("ensure_surface 在逻辑 Surface 尚未绑定 guest 时等待并返回真实 binding", async () => {
+test("ensure_surface 在逻辑 Surface 尚未绑定 guest 时后台物化、要求保留页面并返回真实 binding", async () => {
   const surface = bindingForTab("tab-await-surface");
   let bindingReady = false;
   let ensureInput: unknown = null;
+  const retained: string[] = [];
   const worker = {
     execute: async () => failedOutcome("unused"),
     forwardSurfaceEvent: () => undefined,
@@ -511,7 +512,8 @@ test("ensure_surface 在逻辑 Surface 尚未绑定 guest 时等待并返回真�
     bindings: [surface],
     primaryTabId: surface.tab_id,
     bindingAvailable: () => bindingReady,
-    ensureBrowserSurface: async (input) => {
+    onRetainForAgent: (tabId) => retained.push(tabId),
+    ensureBrowserSurfaceInBackground: async (input) => {
       ensureInput = input;
       bindingReady = true;
     },
@@ -542,6 +544,7 @@ test("ensure_surface 在逻辑 Surface 尚未绑定 guest 时等待并返回真�
       navigationRevision: surface.navigation_revision,
       viewport: { mode: "auto" },
     });
+    assert.deepEqual(retained, [surface.tab_id], "代理使用的会话页面必须要求 Renderer 后台保留");
   } finally {
     await closeSocket(client);
     await server.close();
@@ -553,9 +556,9 @@ test("GPT Web ensure_surface 只走后台物化，不激活右栏", async () => 
     ...bindingForTab("tab-web-model"),
     browser_context_id: "browser-session-app-1759000000000-0",
   };
-  let foregroundCalls = 0;
   let backgroundCalls = 0;
   let backgroundInput: unknown = null;
+  const retained: string[] = [];
   const worker = {
     execute: async () => failedOutcome("unused"),
     forwardSurfaceEvent: () => undefined,
@@ -563,9 +566,8 @@ test("GPT Web ensure_surface 只走后台物化，不激活右栏", async () => 
   const { server, socketPath } = createControlServer(worker, {
     bindings: [appSurface],
     primaryTabId: appSurface.tab_id,
-    ensureBrowserSurface: async () => {
-      foregroundCalls += 1;
-    },
+    bindingAvailable: () => backgroundCalls > 0,
+    onRetainForAgent: (tabId) => retained.push(tabId),
     ensureBrowserSurfaceInBackground: async (input) => {
       backgroundCalls += 1;
       backgroundInput = input;
@@ -585,7 +587,7 @@ test("GPT Web ensure_surface 只走后台物化，不激活右栏", async () => 
     const response = await responsePromise;
     assert.equal(response.outcome?.status, "succeeded");
     assert.equal(backgroundCalls, 1);
-    assert.equal(foregroundCalls, 0);
+    assert.deepEqual(retained, [], "应用级页面本身全程挂载，不需要代理保留");
     assert.deepEqual(backgroundInput, {
       windowId: appSurface.window_id,
       tabId: appSurface.tab_id,
@@ -600,7 +602,42 @@ test("GPT Web ensure_surface 只走后台物化，不激活右栏", async () => 
   }
 });
 
+test("已绑定内容槽的页面直接复用，不触发物化也不改布局", async () => {
+  const surface = bindingForTab("tab-bound-surface");
+  let ensureCalls = 0;
+  const worker = {
+    execute: async () => failedOutcome("unused"),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    bindings: [surface],
+    primaryTabId: surface.tab_id,
+    ensureBrowserSurfaceInBackground: async () => {
+      ensureCalls += 1;
+    },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(
+      client,
+      (message) => message.request_id === "ensure-bound-surface",
+    );
+    client.send(JSON.stringify(request("ensure-bound-surface", {
+      type: "ensure_surface",
+      payload: { tab_id: surface.tab_id },
+    })));
+    const response = await responsePromise;
+    assert.equal(response.outcome?.status, "succeeded");
+    assert.equal(ensureCalls, 0, "页面已绑定时自动化不能再次物化或改动用户布局");
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("Primary 在后台物化期间换到另一窗口时拒绝旧窗口 binding", async () => {
+  let ensured = false;
   const firstWindow = {
     ...bindingForTab("tab-window-race"),
     window_id: "window-1",
@@ -621,7 +658,10 @@ test("Primary 在后台物化期间换到另一窗口时拒绝旧窗口 binding"
     primaryTabId: firstWindow.tab_id,
     primaryWindowId: firstWindow.window_id,
     switchPrimaryWindowOnEnsure: secondWindow.window_id,
-    ensureBrowserSurfaceInBackground: async () => undefined,
+    bindingAvailable: () => ensured,
+    ensureBrowserSurfaceInBackground: async () => {
+      ensured = true;
+    },
   });
   await server.start();
   const client = await connect(socketPath);
@@ -1075,8 +1115,8 @@ function createControlServer(
     recordForBinding?: () => { getURL: () => string; getTitle: () => string };
     navigate?: (binding: BrowserSurfaceBinding, navigation: unknown) => Promise<unknown>;
     stopNavigation?: (binding: BrowserSurfaceBinding) => Promise<unknown>;
-    ensureBrowserSurface?: (input: unknown) => Promise<void>;
     ensureBrowserSurfaceInBackground?: (input: unknown) => Promise<void>;
+    onRetainForAgent?: (tabId: string) => void;
     onConnectionState?: (connected: boolean) => void;
     onHostControlReleased?: () => void;
   } = {},
@@ -1131,6 +1171,7 @@ function createControlServer(
     bindings: () => bindings,
     isPrimary: (candidate: BrowserSurfaceBinding) => candidate.tab_id === primaryTabId,
     releaseDisconnectedHostControl: () => options.onHostControlReleased?.(),
+    retainForAgent: (tabId: string) => options.onRetainForAgent?.(tabId),
     materialize: options.materialize ?? (async () => binding),
     recordForBinding: options.recordForBinding ?? (() => ({
       getURL: () => "https://example.test/",
@@ -1157,23 +1198,23 @@ function createControlServer(
     surfaceManager,
     worker,
     waitForActiveWindow: async () => binding.window_id,
-    ensureBrowserSurface: async (input) => {
-      if (options.ensureBrowserSurface) {
-        await options.ensureBrowserSurface(input);
-        return;
+    ensureBrowserSurfaceInBackground: async (input) => {
+      if (options.ensureBrowserSurfaceInBackground) {
+        await options.ensureBrowserSurfaceInBackground(input);
+      } else {
+        primaryTabId = input.tabId;
       }
-      primaryTabId = input.tabId;
+      if (options.switchPrimaryWindowOnEnsure) {
+        primaryWindowId = options.switchPrimaryWindowOnEnsure;
+      }
     },
-    ...(options.ensureBrowserSurfaceInBackground
-      ? {
-          ensureBrowserSurfaceInBackground: async (input: unknown) => {
-            await options.ensureBrowserSurfaceInBackground!(input);
-            if (options.switchPrimaryWindowOnEnsure) {
-              primaryWindowId = options.switchPrimaryWindowOnEnsure;
-            }
-          },
-        }
-      : {}),
+    materializeBrowserSurfaceInBackground: async (input) =>
+      surfaceManager.materialize({
+        ...input,
+        initialUrl: input.url,
+        awaitPageLoad: false,
+        reannouncePrimary: true,
+      }),
     handshake: () => handshake,
     ...(options.onConnectionState ? { onConnectionState: options.onConnectionState } : {}),
   });

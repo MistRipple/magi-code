@@ -78,8 +78,8 @@ function resolveWindowTitle(sessionTitle: string): string {
  * 必须明显小于 daemon 侧 `BROWSER_SURFACE_WAIT_TIMEOUT`（5 s），这样 Renderer
  * 迟到时命令以「未注册」收口，由调用方重试，而不是把 5 s 预算耗在超时上。
  */
-const APP_LEVEL_CONTENT_SLOT_WAIT_MILLIS = 4_000;
-const APP_LEVEL_CONTENT_SLOT_POLL_MILLIS = 50;
+const CONTENT_SLOT_REGISTRATION_WAIT_MILLIS = 4_000;
+const CONTENT_SLOT_REGISTRATION_POLL_MILLIS = 50;
 
 export interface DesktopWindowSnapshot {
   desktopEpoch: string;
@@ -442,32 +442,14 @@ export class WindowManager {
     this.resolveBrowserSurfaceReadiness(record);
   }
 
-  async ensureBrowserSurface(
-    input: BrowserSurfaceActivationInput,
-  ): Promise<DesktopWindowSnapshot> {
-    const readiness = this.createBrowserSurfaceReadinessWaiter(
-      input.windowId,
-      input.tabId,
-    );
-    try {
-      await this.activateBrowser(input);
-      await readiness.promise;
-      return this.snapshot(input.windowId);
-    } finally {
-      readiness.cancel();
-    }
-  }
-
   /**
-   * App 级（GPT Web）Surface 的后台驱动路径（设计基线 A25 / R49）。
+   * 自动化取得页面的后台驱动路径（会话级 Tab 与应用级 GPT Web 共用）。
    *
-   * 与 `ensureBrowserSurface` 的唯一区别是**不写任何布局意图**：不设置
-   * `right_pane_visibility`、不切 `active_panel`、不推进 activation generation，
-   * 因此不会抢走右栏，也不会把当前 Tab 切到 GPT Web。
+   * **不写任何布局意图**：不设置 `right_pane_visibility`、不切 `active_panel`、
+   * 不推进 activation generation，因此代理操作不会抢走右栏或切换用户正在看的 Tab。
    *
-   * Surface 已注册时直接返回既有 primary binding；未注册时只物化。
-   * Renderer 侧的应用级内容槽全程挂载（A25），所以常规推理不需要任何
-   * 激活动作即能完成 guest 注册。
+   * Surface 已注册时直接返回既有 primary binding；未注册时只物化并广播快照，
+   * Renderer 按快照把该页面挂载在（可能离屏的）内容槽中完成 guest 注册。
    */
   async ensureBrowserSurfaceInBackground(
     input: BrowserSurfaceActivationInput,
@@ -481,9 +463,9 @@ export class WindowManager {
       return materialized;
     }
     // 逻辑 Surface 由这次 materialize 建立，但真正的 guest 来自 Renderer 的
-    // 应用级内容槽。内容槽全程挂载（A25），注册只是异步到达，因此这里必须有
-    // 有界等待：否则每次探测/推理都要靠调用方重试才能命中同一份 Surface。
-    const deadline = Date.now() + APP_LEVEL_CONTENT_SLOT_WAIT_MILLIS;
+    // 内容槽，注册只是异步到达，因此这里必须有有界等待：否则每次自动化命令都要
+    // 靠调用方重试才能命中同一份 Surface。
+    const deadline = Date.now() + CONTENT_SLOT_REGISTRATION_WAIT_MILLIS;
     for (;;) {
       if (record.closed) throw new Error("desktop_window_closed");
       const ready = this.#surfaceManager.primaryBindingForTabInWindow(
@@ -495,16 +477,13 @@ export class WindowManager {
       }
       if (Date.now() >= deadline) return ready;
       await new Promise((resolve) => {
-        setTimeout(resolve, APP_LEVEL_CONTENT_SLOT_POLL_MILLIS);
+        setTimeout(resolve, CONTENT_SLOT_REGISTRATION_POLL_MILLIS);
       });
     }
   }
 
   /**
-   * Desktop Control 的应用级页面物化入口。
-   *
-   * App Web 的推理页面由 daemon 的 `create_page` 创建，主页仍需要后续真实
-   * Renderer 入口接入同一条后台物化路径；无论调用方是谁，这里都绝不写
+   * Desktop Control 的后台页面物化入口：无论调用方是谁，这里都绝不写
    * `active_panel`、右栏可见性或窗口焦点。
    */
   async materializeBrowserSurfaceInBackground(
@@ -1118,8 +1097,8 @@ export class WindowManager {
       resolvePromise = resolve;
       rejectPromise = reject;
     });
-    // ensureBrowserSurface owns this promise, including activation failure
-    // paths. This handler prevents a concurrent window close from creating an
+    // waitForBrowserSurface owns this promise, including materialization
+    // failure paths. This handler prevents a concurrent window close from creating an
     // unhandled rejection after that path has already returned.
     void promise.catch(() => undefined);
     const finish = (error?: Error): void => {

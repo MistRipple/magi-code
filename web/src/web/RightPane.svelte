@@ -64,7 +64,7 @@
     type BrowserCapabilitiesSnapshot,
   } from './agent-api';
   import { loadBrowserAuthoritySession } from './browser-authority-coordinator';
-  import { WEB_MODEL_HOME_TAB_ID } from '../shared/web-model';
+  import { WEB_MODEL_HOME_TAB_ID, isWebModelBrowserSession } from '../shared/web-model';
   import { markWebModelStoppedByUser, webModelActiveTurnCount } from '../stores/web-model-runtime.svelte';
   import { refreshWebModelRuntime, runWebModelProbe } from './web-model-session-projection';
   import { openSettings } from '../stores/shell-ui.svelte';
@@ -88,6 +88,8 @@
     desktopSurface?: boolean;
     htmlBrowserOpenRequest?: HtmlBrowserOpenRequest | null;
     onHtmlBrowserOpenHandled?: (requestId: number) => void;
+    /** Main 声明的代理正在使用的页面；不可见时在离屏内容槽中保持挂载。 */
+    agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
   }
 
   let {
@@ -96,6 +98,7 @@
     desktopSurface = false,
     htmlBrowserOpenRequest = null,
     onHtmlBrowserOpenHandled,
+    agentRetainedSurfaces = [],
   }: Props = $props();
 
   // ============ Tab 状态 ============
@@ -108,6 +111,58 @@
    * `isRestorableTab`。
    */
   const appPaneTabs = $derived(rightPaneState.appTabs);
+  /**
+   * 右栏承载的全部会话级浏览器页面，按 tabId 键控的唯一列表。
+   *
+   * 当前作用域的 Tab 正常显示；代理在后台使用的页面（Main 的保留清单，应用级
+   * GPT Web 由自己的宿主全程挂载）即使属于其他会话或当前不可见，也留在同一列表
+   * 中离屏挂载。会话切换只改变条目的可见性，不会卸载重建 `<webview>`。
+   */
+  const retainedTabIds = $derived(new Set(
+    agentRetainedSurfaces
+      .filter((surface) => !isWebModelBrowserSession(surface.browserSessionId))
+      .map((surface) => surface.tabId),
+  ));
+  type BrowserHostEntry = {
+    tabId: string;
+    paneTabId: string | null;
+    payload: BrowserTabPayload;
+    visible: boolean;
+  };
+  const browserHosts = $derived.by<BrowserHostEntry[]>(() => {
+    const entries: BrowserHostEntry[] = openTabs
+      .filter((tab) => tab.kind === 'browser')
+      .map((tab) => ({
+        tabId: (tab.payload as BrowserTabPayload).tabId,
+        paneTabId: tab.id,
+        payload: tab.payload as BrowserTabPayload,
+        visible: tab.id === paneState.activeTabId && activeTab?.kind === 'browser',
+      }));
+    for (const surface of agentRetainedSurfaces) {
+      if (!retainedTabIds.has(surface.tabId)) continue;
+      if (entries.some((entry) => entry.tabId === surface.tabId)) continue;
+      const projected = Object.values(rightPaneState.perSession)
+        .flatMap((pane) => pane.openTabs)
+        .find((tab) => (
+          tab.kind === 'browser' && (tab.payload as BrowserTabPayload).tabId === surface.tabId
+        ))?.payload as BrowserTabPayload | undefined;
+      entries.push({
+        tabId: surface.tabId,
+        paneTabId: null,
+        payload: projected ?? {
+          browserSessionId: surface.browserSessionId,
+          tabId: surface.tabId,
+          lifecycle: 'ready',
+          url: 'about:blank',
+          navigationRevision: surface.navigationRevision,
+          agentOccupied: true,
+          sessionId: '',
+        },
+        visible: false,
+      });
+    }
+    return entries;
+  });
   const activeAppTab = $derived(
     appPaneTabs.find((tab) => tab.id === rightPaneState.activeAppTabId) ?? null,
   );
@@ -1408,27 +1463,29 @@
     class:right-pane-body--terminal={activeTab?.kind === 'terminal'}
     class:right-pane-body--web-model={activeTab?.kind === 'webSession'}
   >
-    {#each openTabs as tab (tab.id)}
-      {#if tab.kind === 'browser'}
-        {@const browserPayload = tab.payload as BrowserTabPayload}
-        <div
-          class="right-pane-browser-tab-host"
-          class:active={tab.id === paneState.activeTabId && activeTab?.kind === 'browser'}
-          hidden={tab.id !== paneState.activeTabId || activeTab?.kind !== 'browser'}
-          aria-hidden={tab.id !== paneState.activeTabId || activeTab?.kind !== 'browser'}
-        >
-          <BrowserTabContent
-            browserSessionId={browserPayload.browserSessionId}
-            tabId={browserPayload.tabId}
-            lifecycle={browserPayload.lifecycle}
-            workspaceId={browserPayload.workspaceId}
-            workspacePath={browserPayload.workspacePath}
-            sessionId={browserPayload.sessionId}
-            desktopSurface={desktopSurface}
-            onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, tab.id, label)}
-          />
-        </div>
-      {/if}
+    {#each browserHosts as host (host.tabId)}
+      {@const retainedInBackground = !host.visible && retainedTabIds.has(host.tabId)}
+      <div
+        class="right-pane-browser-tab-host"
+        class:active={host.visible}
+        class:right-pane-browser-tab-host--background={retainedInBackground}
+        hidden={!host.visible && !retainedInBackground}
+        aria-hidden={!host.visible}
+      >
+        <BrowserTabContent
+          browserSessionId={host.payload.browserSessionId}
+          tabId={host.payload.tabId}
+          lifecycle={host.payload.lifecycle}
+          workspaceId={host.payload.workspaceId}
+          workspacePath={host.payload.workspacePath}
+          sessionId={host.payload.sessionId || undefined}
+          desktopSurface={desktopSurface}
+          backgroundHost={retainedInBackground}
+          onTitleChange={(label) => {
+            if (host.paneTabId) updateRightPaneTabLabel(paneScopeKey, host.paneTabId, label);
+          }}
+        />
+      </div>
     {/each}
 
     {#each appPaneTabs as appTab (appTab.id)}
@@ -1622,6 +1679,12 @@
     overflow: hidden;
   }
   .right-pane-browser-tab-host[hidden] { display: none; }
+  /* 后台保留必须是「移出可见区域」而不是 display:none：guest 只有在内容槽有真实
+     布局尺寸时才能注册并持续接收自动化命令。 */
+  .right-pane-browser-tab-host--background {
+    transform: translate3d(-20000px, 0, 0);
+    pointer-events: none;
+  }
 
   /* ============ Tab 条 ============ */
   .right-pane-tabbar {

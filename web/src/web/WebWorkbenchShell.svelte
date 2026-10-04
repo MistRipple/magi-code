@@ -280,6 +280,7 @@ import {
     desktopSurface?: boolean;
     htmlBrowserOpenRequest?: HtmlBrowserOpenRequest | null;
     onHtmlBrowserOpenHandled?: (requestId: number) => void;
+    agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
   };
   type HtmlBrowserOpenRequest = {
     requestId: number;
@@ -484,6 +485,13 @@ import {
    * 这是对「折叠即卸载」的唯一显式例外，只由应用级视图触发。
    */
   const appWebModelMounted = $derived(rightPaneState.appTabs.length > 0);
+  // Main 声明代理正在使用的页面：它们不可见时也必须保持挂载，右栏因此在后台保留。
+  const agentRetainedSurfaces = $derived(
+    desktopSnapshot?.browserSurfaces.filter((surface) => surface.retainedForAgent) ?? [],
+  );
+  const rightPaneBackgroundMounted = $derived(
+    appWebModelMounted || agentRetainedSurfaces.length > 0,
+  );
   /**
    * 应用级 GPT Web 会话的兜底投影周期。
    *
@@ -745,7 +753,7 @@ import {
     }
     if (
       inlineRightPaneVisible
-      || (desktopAppSurface && (desktopRightPaneVisible || appWebModelMounted))
+      || (desktopAppSurface && (desktopRightPaneVisible || rightPaneBackgroundMounted))
     ) {
       void loadRightPane().catch((error) => {
         console.error('[WebWorkbenchShell] 右侧面板加载失败:', error);
@@ -3675,7 +3683,7 @@ import {
             }
           }}
         />
-      {:else if desktopAppSurface && RightPaneComponent && (desktopRightPaneVisible || appWebModelMounted)}
+      {:else if desktopAppSurface && RightPaneComponent && (desktopRightPaneVisible || rightPaneBackgroundMounted)}
         {#if desktopRightPaneVisible}
           <div
             class="desktop-right-pane-resize-handle"
@@ -3689,12 +3697,13 @@ import {
         <div
           class="desktop-right-pane-column"
           class:desktop-right-pane-column--background={!desktopRightPaneVisible}
-          hidden={!desktopRightPaneVisible && !appWebModelMounted}
+          hidden={!desktopRightPaneVisible && !rightPaneBackgroundMounted}
           aria-hidden={!desktopRightPaneVisible}
         >
           <RightPaneComponent
             workspaceRoot={selectedWorkspace?.rootPath || ''}
             desktopSurface={true}
+            agentRetainedSurfaces={agentRetainedSurfaces}
             htmlBrowserOpenRequest={htmlBrowserOpenRequest}
             onHtmlBrowserOpenHandled={(requestId) => {
               if (htmlBrowserOpenRequest?.requestId === requestId) {

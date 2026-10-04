@@ -748,11 +748,15 @@ test("Renderer 重建时物理 guest 独占 CDP 队列和视口提交生命周�
 test("右栏切换只隐藏非活动 Browser Tab，不卸载其 Chromium guest", () => {
   assert.match(
     rightPaneSource,
-    /\{#each openTabs as tab \(tab\.id\)\}[\s\S]*?tab\.kind === 'browser'[\s\S]*?BrowserTabContent/u,
+    /\{#each browserHosts as host \(host\.tabId\)\}[\s\S]*?BrowserTabContent/u,
   );
   assert.match(
     rightPaneSource,
-    /hidden=\{tab\.id !== paneState\.activeTabId \|\| activeTab\?\.kind !== 'browser'\}/u,
+    /visible: tab\.id === paneState\.activeTabId && activeTab\?\.kind === 'browser'/u,
+  );
+  assert.match(
+    rightPaneSource,
+    /hidden=\{!host\.visible && !retainedInBackground\}/u,
   );
   assert.match(
     rightPaneSource,
@@ -1079,4 +1083,67 @@ test("等待视口提交的循环每轮让出事件循环、过期提交重新�
   assert.match(body, /MAX_VIEWPORT_COMMIT_WAIT_ATTEMPTS/u);
   assert.match(body, /commit\.state === "ready" &&\s*!this\.isViewportCommitInputCurrent/u);
   assert.match(body, /commit\.state === "invalidated" \|\|\s*commit\.state === "superseded"/u);
+});
+
+test("P1-12 代理保留集合由 Main 持有，所有控制释放路径都清除并重新发布快照", () => {
+  const setStart = source.indexOf("private setAgentRetained(");
+  const setEnd = source.indexOf("\n  }\n", setStart);
+  assert.ok(setStart >= 0 && setEnd > setStart);
+  assert.match(
+    source.slice(setStart, setEnd),
+    /if \(!changed\) return;[\s\S]*this\.#onAgentRetentionChanged\?\.\(\)/u,
+  );
+  assert.match(
+    normalizedSource,
+    /retainedForAgent: this\.#agentRetainedTabs\.has\(record\.tabId\)/u,
+  );
+  for (const [from, to] of [
+    ["private releaseAgentControlForUserInput(", "private async waitForDebugger("],
+    ["releaseDisconnectedHostControl(): void", "closeWindow(windowId: string): void"],
+    ["closeTab(tabId: string", "releaseDisconnectedHostControl(): void"],
+  ] as const) {
+    const start = source.indexOf(from);
+    const end = source.indexOf(to, start);
+    assert.ok(start >= 0 && end > start, from);
+    assert.match(source.slice(start, end), /this\.setAgentRetained\([^)]*false\)/u, from);
+  }
+  assert.match(
+    normalizedSource,
+    /if \(!record\.agentControlled\) this\.setAgentRetained\(tabId, false\)/u,
+  );
+  assert.match(
+    normalizeSourceWhitespace(indexSource),
+    /onAgentRetentionChanged: \(\) => windowManager\?\.publishSnapshots\(\)/u,
+  );
+});
+
+test("P3-6 自动化驱动路径不写布局，只做后台物化", () => {
+  const start = desktopControlServerSource.indexOf(
+    "private async requireRenderablePrimaryBinding(",
+  );
+  const end = desktopControlServerSource.indexOf("\n  }\n", start);
+  assert.ok(start >= 0 && end > start);
+  const body = desktopControlServerSource.slice(start, end);
+  assert.match(body, /this\.#surfaceManager\.retainForAgent\(tabId\)/u);
+  assert.match(body, /this\.#ensureBrowserSurfaceInBackground\(activation\)/u);
+  assert.doesNotMatch(body, /activateBrowser|right_pane_visibility|active_panel/u);
+  assert.doesNotMatch(windowManagerSource, /async ensureBrowserSurface\(/u);
+});
+
+test("P1-12 右栏浏览器宿主是唯一的 tabId 键控列表，保留页面离屏挂载", () => {
+  const normalizedRightPane = normalizeSourceWhitespace(rightPaneSource);
+  assert.match(normalizedRightPane, /#each browserHosts as host \(host\.tabId\)/u);
+  assert.equal(
+    (rightPaneSource.match(/<BrowserTabContent\b/gu) ?? []).length,
+    1,
+  );
+  assert.match(
+    normalizedRightPane,
+    /class:right-pane-browser-tab-host--background=\{retainedInBackground\}/u,
+  );
+  assert.match(normalizedRightPane, /backgroundHost=\{retainedInBackground\}/u);
+  assert.match(
+    normalizedRightPane,
+    /\.right-pane-browser-tab-host--background \{ transform: translate3d\(-20000px, 0, 0\)/u,
+  );
 });

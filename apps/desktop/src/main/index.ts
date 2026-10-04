@@ -159,6 +159,7 @@ if (singleInstance) {
         onDocumentReady: (binding) => {
           control?.handleSurfaceDocumentReady(binding);
         },
+        onAgentRetentionChanged: () => windowManager?.publishSnapshots(),
         partitionRegistryPath: join(
           app.getPath("userData"),
           "browser-partitions.json",
@@ -262,7 +263,6 @@ if (singleInstance) {
         surfaceManager: surfaces,
         worker,
         waitForActiveWindow: (signal) => manager.waitForActiveWindow(signal),
-        ensureBrowserSurface: (input) => manager.ensureBrowserSurface(input),
         ensureBrowserSurfaceInBackground: (input) =>
           manager.ensureBrowserSurfaceInBackground(input),
         materializeBrowserSurfaceInBackground: (input) =>

@@ -146,7 +146,7 @@ Browser 工具、任务和消息最终都进入同一 Session/Turn/Item 主链�
 
 | 内容类型 | 切换到其他一级 Tab/会话 | Renderer F5 | 完整应用重启 | 显式关闭 Tab |
 | --- | --- | --- | --- | --- |
-| Browser | 同一右栏内隐藏并保活 guest；跨会话释放当前窗口 guest，但保留 Authority 的逻辑 Tab/URL | Authority 重新投影逻辑 Tab，当前窗口注册新 guest；不持久化视口尺寸 | daemon 按逻辑 URL 恢复，新建 Surface/Target；不承诺旧 DOM、表单和内存历史 | 全局关闭逻辑 Tab，释放全部窗口 Surface/Target 和监听器 |
+| Browser | 同一右栏内隐藏并保活 guest；跨会话释放当前窗口 guest，但保留 Authority 的逻辑 Tab/URL。**代理保留页面除外**（§4.4）：仍在代理控制下的页面跨会话离屏保活 | Authority 重新投影逻辑 Tab，当前窗口注册新 guest；不持久化视口尺寸 | daemon 按逻辑 URL 恢复，新建 Surface/Target；不承诺旧 DOM、表单和内存历史 | 全局关闭逻辑 Tab，释放全部窗口 Surface/Target 和监听器 |
 | Terminal | 销毁当前 xterm/WebSocket，Rust PTY 继续运行并缓存最近 2 MiB 输出；切回同 ID 重连 | Desktop 当前 BrowserWindow 的 `sessionStorage` 恢复 Terminal Tab 身份，重连同一 PTY并先重放输出、后发布生命周期 | 不恢复 Terminal Tab；daemon 关闭时终止 PTY | 先从 UI 移除，再调用 DELETE 终止精确 TerminalBinding；会话关闭终止其全部 PTY |
 | Code/Image | 当前视图卸载，保留轻量路径/类型元数据；大文本、diff 和图片 data URL 不写存储 | 从当前窗口 `sessionStorage` 恢复元数据并按权威文件/Artifact 重取 | 不恢复 Desktop 窗口级 Tab；Web 端仍按原 localStorage 规则 | 释放当前视图缓存，不影响其他内容类型 |
 | Agent | 当前视图卸载，任务继续由 canonical task/turn/item 事实驱动 | 从当前窗口 `sessionStorage` 恢复 `agentRunId` 并重建投影 | 不恢复 Desktop 窗口级 Tab；任务事实仍属于会话 | 只关闭观察视图，不取消或终止任务 |
@@ -156,19 +156,30 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 ### 4.3 应用级 Web 模型会话（GPT Web）的显式例外
 
-本节是对本文件既有「折叠即卸载」「关闭 Tab = 全局关闭逻辑 Tab」「每个内容槽只有一个 guest」三条规则的**唯一显式例外**，只为应用级 GPT Web 会话（`webSession`）引入，并以《[Magi GPT Web 最终开发文档](./web-model-browser-development.md)》为实现口径。理由：该会话承载的是应用级、登录态长期保留的 ChatGPT 页面，且推理必须能在视图不可见时继续——而 `<webview>` guest 会随宿主组件卸载而销毁，自动化命令又会强制激活右栏，两者与「后台可驱动」直接冲突。
+本节是对本文件既有「折叠即卸载」「关闭 Tab = 全局关闭逻辑 Tab」「每个内容槽只有一个 guest」三条规则的**唯一显式例外**，只为应用级 GPT Web 会话（`webSession`）引入，并以《[Magi GPT Web 最终开发文档](./web-model-browser-development.md)》为实现口径。理由：该会话承载的是应用级、登录态长期保留的 ChatGPT 页面，且推理必须能在视图不可见时继续——而 `<webview>` guest 会随宿主组件卸载而销毁，与「后台可驱动」直接冲突。
 
 | 关注点 | 规则 |
 | --- | --- |
 | 内容槽与挂载 | 只要存在应用级 Web 宿主，其右栏内容槽（`WebModelTabContent`）**全程挂载**：折叠右栏只做视觉隐藏（`display: none` + `aria-hidden`），不卸载组件、不销毁单一 `<webview>`；无应用级 Web 宿主时，右栏折叠维持本文件既有的「卸载」语义 |
 | 单宿主 / 单槽位 | 同一内容槽内只有**一个 WebView**；主页、临时对话和已保存对话在同一页面内切换。同一时间只允许一个 Magi 会话、一个 Web 对话和一个进行中的 Web turn，不设并发池、排队或接管 |
 | 关闭按钮 | 只从 Tab 条隐藏该视图、保留在应用级 Tab 集合（`appTabs`）并保持挂载：**不调用 `closeBrowserTab`、不发起任何 Authority 关闭命令、不弹确认、不取消进行中的推理**；登录态与后台推理都保留。仅「设置停止 / Tab 退出 / 清除 Web 数据」、显式切到本地或应用退出才释放 guest |
-| 驱动路径 | 应用级 owner 走**不激活路径**：目标 Tab 的 Surface 已在当前窗口注册且 content-slot 绑定有效时，命令直接复用该 binding，**不写 `right_pane_visibility` / `active_panel`**；只有 Surface 尚未注册时才物化，且物化不附带激活意图。Desktop Control 现有 `requireRenderablePrimaryBinding → ensureBrowserSurface → activateBrowser` 对应用级 owner 必须分叉，否则每次推理都会抢走右栏 |
+| 驱动路径 | 应用级 owner 走**不激活路径**：目标 Tab 的 Surface 已在当前窗口注册且 content-slot 绑定有效时，命令直接复用该 binding，**不写 `right_pane_visibility` / `active_panel`**；只有 Surface 尚未注册时才物化，且物化不附带激活意图。该不激活路径已推广为所有浏览器自动化的统一规则（§4.4） |
 | Primary / 多窗口 | 仍遵守 §4.1：同一逻辑 Tab 全局只有一个 Primary，推理只使用承载该 Tab Primary 的窗口；非 Primary 窗口显示「本窗口未承载当前推理，打开主窗口继续」，不复制用于推理的第二份 Surface |
 | 会话隔离与释放 | 该宿主不随项目 / 会话切换释放，也不参与 `/browser/resources/reclaim`（`is_reclaimable_tab` 需补 owner 分支）；槽位 owner、模式和项目范围在内存中固定；「清理浏览数据」按应用级分区粒度执行，执行前先取消进行中的推理并失效绑定 |
 | 登录态 | 使用带 `persist:` 前缀的专用分区 `persist:magi-web-model`（本文件既有的 partition 白名单与 `clearBrowsingData` 规则按此扩展放行），因此登录态可跨应用重启保留 |
 
 除以上各条外，本文件关于显示路径、安全边界、popup、视口、焦点、协议与恢复的全部规则对 `webSession` 同样适用。
+
+### 4.4 自动化不改布局与代理保留页面
+
+浏览器自动化**任何时候都不写布局**：Desktop Control 的驱动路径不写 `right_pane_visibility` / `active_panel`，也不切换用户当前会话或一级 Tab。用户在看什么完全由用户决定；代理只能驱动已在内容槽中注册的 guest。
+
+| 关注点 | 规则 |
+| --- | --- |
+| 保留清单的所有者 | Main（`BrowserSurfaceManager`）持有「代理保留」集合：Desktop Control 驱动会话级页面时把该 Tab 加入集合；代理控制释放（`updateControl` 转为非代理控制）、用户接管、Tab 关闭或宿主断开时移出。集合变化立即重新发布窗口快照，快照中的 `browserSurfaces[].retainedForAgent` 是 Renderer 唯一依据 |
+| Renderer 挂载 | 右栏把当前作用域的浏览器 Tab 与保留页面合并为**同一个按 `tabId` 键控的宿主列表**；不在当前作用域或当前不可见的保留页面离屏挂载（`translate3d(-20000px, 0, 0)`，保持真实布局尺寸以维持 guest 注册），会话切换只改变可见性，不卸载重建 `<webview>`。存在保留页面时右栏列即使折叠也保持后台挂载 |
+| 驱动路径 | 内容槽绑定有效时直接复用；否则只做后台物化（`ensureBrowserSurfaceInBackground`），等待 Renderer 依据快照注册离屏宿主，不附带激活意图 |
+| 释放 | 页面移出保留集合后回到 §4.2 的普通生命周期：不在当前作用域即卸载当前窗口 guest，Authority 逻辑 Tab/URL 保留 |
 
 ## 5. 导航、控制与恢复
 

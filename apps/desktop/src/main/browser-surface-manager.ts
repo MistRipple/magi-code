@@ -75,6 +75,11 @@ export interface BrowserSurfaceRuntimeSnapshot {
   browserSessionId: string;
   surfaceId: string;
   navigationRevision: number;
+  /**
+   * 代理正在使用该页面：Renderer 必须让它的 guest 保持挂载（不可见时离屏），
+   * 不随会话切换、右栏折叠或当前 Tab 切换而卸载。
+   */
+  retainedForAgent: boolean;
 }
 
 export interface BrowserDownloadRuntimeSnapshot {
@@ -679,6 +684,9 @@ function annotationCaptureOverlayExpression(input: {
 export class BrowserSurfaceManager {
   readonly #desktopEpoch: string;
   readonly #surfaces = new BrowserSurfaceRegistry<BrowserSurfaceRecord>();
+  // 代理需要在后台保持挂载的逻辑 Tab；代理控制释放、用户接管或页面关闭时移除。
+  readonly #agentRetainedTabs = new Set<string>();
+  readonly #onAgentRetentionChanged: (() => void) | undefined;
   readonly #configuredPartitions = new Set<string>();
   readonly #knownPartitions = new Set<string>();
   readonly #partitionRegistryPath: string | null;
@@ -700,10 +708,13 @@ export class BrowserSurfaceManager {
     desktopEpoch: string;
     onEvent: (event: BrowserSurfaceEvent) => void;
     onDocumentReady?: (binding: BrowserSurfaceBinding) => void;
+    /** 代理保留集合变化：窗口快照需要重新发布，让 Renderer 及时挂载或释放后台宿主。 */
+    onAgentRetentionChanged?: () => void;
     partitionRegistryPath?: string;
   }) {
     this.#desktopEpoch = input.desktopEpoch;
     this.#onEvent = input.onEvent;
+    this.#onAgentRetentionChanged = input.onAgentRetentionChanged;
     this.#onDocumentReady = input.onDocumentReady;
     this.#partitionRegistryPath = input.partitionRegistryPath?.trim() || null;
     this.#downloadUserDataPath = this.#partitionRegistryPath
@@ -1078,7 +1089,23 @@ export class BrowserSurfaceManager {
         browserSessionId: record.browserSessionId,
         surfaceId: record.surfaceId,
         navigationRevision: record.navigationRevision,
+        retainedForAgent: this.#agentRetainedTabs.has(record.tabId),
       }));
+  }
+
+  /** 代理正在使用该 Tab：要求 Renderer 在它不可见时也保持 guest 挂载。 */
+  retainForAgent(tabId: string): void {
+    this.setAgentRetained(tabId, true);
+  }
+
+  private setAgentRetained(tabId: string, retained: boolean): void {
+    const changed = retained
+      ? !this.#agentRetainedTabs.has(tabId)
+      : this.#agentRetainedTabs.has(tabId);
+    if (!changed) return;
+    if (retained) this.#agentRetainedTabs.add(tabId);
+    else this.#agentRetainedTabs.delete(tabId);
+    this.#onAgentRetentionChanged?.();
   }
 
   browserDownloadSnapshotsForWindow(
@@ -2087,6 +2114,7 @@ export class BrowserSurfaceManager {
     }
     const record = this.requireRecord(surfaceId);
     record.agentControlled = control.mode === "agent";
+    if (!record.agentControlled) this.setAgentRetained(tabId, false);
     // 控制权变更只更新宿主状态；光标绘制依赖页面文档树，不能占用该 Tab
     // 的命令队列。新建 about:blank 尚未完成首帧时 Page.getFrameTree 会等待
     // 到文档建立，若在这里等待会把后续 navigate/viewport 一并锁死。
@@ -2738,6 +2766,7 @@ export class BrowserSurfaceManager {
   }
 
   async closeTab(tabId: string): Promise<void> {
+    this.setAgentRetained(tabId, false);
     const records = [...this.#surfaces.values()].filter(
       (record) => record.tabId === tabId,
     );
@@ -2749,6 +2778,7 @@ export class BrowserSurfaceManager {
    * 不关闭 WebContents、不卸载内容槽，也不改变 Tab 的 URL 或页面状态。
    */
   releaseDisconnectedHostControl(): void {
+    for (const tabId of [...this.#agentRetainedTabs]) this.setAgentRetained(tabId, false);
     for (const record of this.#surfaces.values()) {
       if (record.closed || !record.agentControlled) continue;
       record.agentControlled = false;
@@ -5018,6 +5048,7 @@ export class BrowserSurfaceManager {
   private releaseAgentControlForUserInput(record: BrowserSurfaceRecord): void {
     if (record.closed || !record.agentControlled) return;
     record.agentControlled = false;
+    this.setAgentRetained(record.tabId, false);
     void this.setAgentCursor(record, false, null, null, null).catch(
       () => undefined,
     );

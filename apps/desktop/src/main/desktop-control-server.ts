@@ -59,15 +59,13 @@ interface ResourceQueue {
   running: DesktopControlCommand | null;
 }
 
-type EnsureBrowserSurface = (
+/**
+ * 自动化命令取得页面的唯一路径：后台物化、不写布局意图、不抢右栏，
+ * 由 Renderer 按快照把 guest 挂载在离屏内容槽完成注册。
+ */
+type EnsureBrowserSurfaceInBackground = (
   input: BrowserSurfaceActivationInput,
 ) => Promise<unknown>;
-
-/**
- * App 级（GPT Web）Surface 的后台物化路径：不写布局意图、不抢右栏。
- * 生产由 WindowManager 注入；缺省回退到激活路径只用于测试装配。
- */
-type EnsureBrowserSurfaceInBackground = EnsureBrowserSurface;
 
 type MaterializeBrowserSurfaceInBackground = (
   input: BrowserSurfaceActivationInput,
@@ -84,7 +82,6 @@ export class DesktopControlServer {
   readonly #surfaceManager: BrowserSurfaceManager;
   readonly #worker: AutomationWorker;
   readonly #waitForActiveWindow: (signal?: AbortSignal) => Promise<string>;
-  readonly #ensureBrowserSurface: EnsureBrowserSurface;
   readonly #ensureBrowserSurfaceInBackground: EnsureBrowserSurfaceInBackground;
   readonly #materializeBrowserSurfaceInBackground: MaterializeBrowserSurfaceInBackground;
   readonly #handshake: () => DesktopBrowserHandshake;
@@ -127,9 +124,8 @@ export class DesktopControlServer {
     surfaceManager: BrowserSurfaceManager;
     worker: AutomationWorker;
     waitForActiveWindow: (signal?: AbortSignal) => Promise<string>;
-    ensureBrowserSurface: EnsureBrowserSurface;
-    ensureBrowserSurfaceInBackground?: EnsureBrowserSurfaceInBackground;
-    materializeBrowserSurfaceInBackground?: MaterializeBrowserSurfaceInBackground;
+    ensureBrowserSurfaceInBackground: EnsureBrowserSurfaceInBackground;
+    materializeBrowserSurfaceInBackground: MaterializeBrowserSurfaceInBackground;
     handshake: () => DesktopBrowserHandshake;
     onConnectionState?: (connected: boolean) => void;
   }) {
@@ -138,18 +134,9 @@ export class DesktopControlServer {
     this.#surfaceManager = input.surfaceManager;
     this.#worker = input.worker;
     this.#waitForActiveWindow = input.waitForActiveWindow;
-    this.#ensureBrowserSurface = input.ensureBrowserSurface;
-    this.#ensureBrowserSurfaceInBackground =
-      input.ensureBrowserSurfaceInBackground ?? input.ensureBrowserSurface;
+    this.#ensureBrowserSurfaceInBackground = input.ensureBrowserSurfaceInBackground;
     this.#materializeBrowserSurfaceInBackground =
-      input.materializeBrowserSurfaceInBackground ??
-      ((surfaceInput) =>
-        this.#surfaceManager.materialize({
-          ...surfaceInput,
-          initialUrl: surfaceInput.url,
-          awaitPageLoad: false,
-          reannouncePrimary: true,
-        }));
+      input.materializeBrowserSurfaceInBackground;
     this.#handshake = input.handshake;
     this.#onConnectionState = input.onConnectionState;
   }
@@ -831,8 +818,8 @@ export class DesktopControlServer {
           command.payload.tab_id,
         );
         // 创建/恢复是资源物化阶段，不能等待 Renderer 内容槽。新建 Tab 的
-        // Renderer 记录只有在这个响应返回后才会出现；如果这里调用
-        // ensureBrowserSurface，就会形成“等待内容槽 -> 内容槽等待创建响应”
+        // Renderer 记录只有在这个响应返回后才会出现；如果这里等待
+        // 内容槽注册，就会形成“等待内容槽 -> 内容槽等待创建响应”
         // 的环路，并让新 Tab 无故卡住一整个内容槽超时周期。
         const windowId =
           current?.window_id ??
@@ -1181,12 +1168,15 @@ export class DesktopControlServer {
   ): Promise<BrowserSurfaceBinding> {
     const activation = this.#surfaceManager.activationInputForTab(tabId);
     if (!activation) throw new Error("browser_surface_not_found");
-    // App 级（GPT Web）走后台物化：不写 right_pane_visibility / active_panel，
-    // 不切用户的右栏，也不抢焦点（A25、R49）。会话级 Tab 维持原有激活语义。
-    if (isWebModelBrowserSession(activation.browserSessionId)) {
+    // 自动化永远不改用户的布局：页面已绑定内容槽时直接复用；否则后台物化，并要求
+    // Renderer 让该页面保持挂载（不可见时离屏），用户切换会话、切换 Tab 或折叠右栏
+    // 都不会卸载代理正在使用的页面。
+    if (!isWebModelBrowserSession(activation.browserSessionId)) {
+      this.#surfaceManager.retainForAgent(tabId);
+    }
+    const existing = this.#surfaceManager.primaryBindingForTab(tabId);
+    if (!existing || !this.#surfaceManager.isContentSlotBoundBinding(existing)) {
       await this.#ensureBrowserSurfaceInBackground(activation);
-    } else {
-      await this.#ensureBrowserSurface(activation);
     }
     await this.waitForSurfaceRebind(tabId);
     const binding = requirePrimaryBinding(
