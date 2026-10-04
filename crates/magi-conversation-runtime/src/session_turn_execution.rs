@@ -381,50 +381,74 @@ fn canonical_session_turn_history(
                 .filter(|turn| {
                     turn.turn_id != request.turn_id
                         && turn.accepted_at.0 < accepted_at.0
-                        && turn.status != magi_session_store::CanonicalTurnStatus::Cancelled
+                        // 被编辑取代的轮次不再是事实；用户停止的轮次仍是对话的一部分。
                         && turn.status != magi_session_store::CanonicalTurnStatus::Superseded
                         && !turn.is_session_command()
                 })
-                .flat_map(|turn| turn.items.into_iter())
-                .filter_map(|item| {
-                    let role = match item.kind {
-                        CanonicalTurnItemKind::UserMessage => "user",
-                        CanonicalTurnItemKind::AssistantText => "assistant",
-                        _ => return None,
-                    };
-                    if !item.visibility.renderable {
-                        return None;
-                    }
-                    let is_orchestrator_item = &item.source_thread_id == orchestrator_thread_id;
-                    let is_root_final_item = item.kind == CanonicalTurnItemKind::AssistantText
-                        && item
-                            .metadata
-                            .get("assistantOutputKind")
-                            .and_then(|value| value.as_str())
-                            == Some("final")
-                        && item.worker.as_ref().is_some_and(|worker| {
-                            worker.task_id.is_some()
-                                && worker.worker_id.is_none()
-                                && worker.role_id.is_none()
+                .flat_map(|turn| {
+                    let stopped_by_user =
+                        turn.status == magi_session_store::CanonicalTurnStatus::Cancelled;
+                    let mut messages = turn
+                        .items
+                        .into_iter()
+                        .filter_map(|item| {
+                            let role = match item.kind {
+                                CanonicalTurnItemKind::UserMessage => "user",
+                                CanonicalTurnItemKind::AssistantText => "assistant",
+                                _ => return None,
+                            };
+                            if !item.visibility.renderable {
+                                return None;
+                            }
+                            let is_orchestrator_item =
+                                &item.source_thread_id == orchestrator_thread_id;
+                            let is_root_final_item = item.kind
+                                == CanonicalTurnItemKind::AssistantText
+                                && item
+                                    .metadata
+                                    .get("assistantOutputKind")
+                                    .and_then(|value| value.as_str())
+                                    == Some("final")
+                                && item.worker.as_ref().is_some_and(|worker| {
+                                    worker.task_id.is_some()
+                                        && worker.worker_id.is_none()
+                                        && worker.role_id.is_none()
+                                });
+                            // 普通 session turn 的最终回复由 coordinator task 负责落盘，
+                            // source_thread_id 可能不是 orchestrator thread；它仍是主线事实，
+                            // 必须进入后续回合上下文。带 worker/role 的 sidechain final 继续排除。
+                            if !is_orchestrator_item && !is_root_final_item {
+                                return None;
+                            }
+                            let content = item.content?.trim().to_string();
+                            if content.is_empty() {
+                                return None;
+                            }
+                            Some(ThreadChatMessage {
+                                role: role.to_string(),
+                                content: Some(content),
+                                images: Vec::new(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                provider_context: Vec::new(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    // 用户停止的轮次保留已产生的内容并明确标注，后续“改短一点”之类的
+                    // 指令才有上下文可依，未处理的引导也不会被模型忽略。
+                    if stopped_by_user {
+                        messages.push(ThreadChatMessage {
+                            role: "assistant".to_string(),
+                            content: Some(
+                                "（上面这一轮回复已被用户中断，可能不完整。）".to_string(),
+                            ),
+                            images: Vec::new(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            provider_context: Vec::new(),
                         });
-                    // 普通 session turn 的最终回复由 coordinator task 负责落盘，
-                    // source_thread_id 可能不是 orchestrator thread；它仍是主线事实，
-                    // 必须进入后续回合上下文。带 worker/role 的 sidechain final 继续排除。
-                    if !is_orchestrator_item && !is_root_final_item {
-                        return None;
                     }
-                    let content = item.content?.trim().to_string();
-                    if content.is_empty() {
-                        return None;
-                    }
-                    Some(ThreadChatMessage {
-                        role: role.to_string(),
-                        content: Some(content),
-                        images: Vec::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        provider_context: Vec::new(),
-                    })
+                    messages
                 })
                 .collect::<Vec<_>>()
         })
@@ -6782,7 +6806,7 @@ mod tests {
     }
 
     #[test]
-    fn session_turn_messages_exclude_cancelled_turn_from_model_history() {
+    fn session_turn_messages_keep_user_stopped_turn_with_interruption_marker() {
         let session_id = SessionId::new("session-context-history-cancelled");
         let thread_id = magi_core::ThreadId::new("thread-context-history-cancelled");
         let store = SessionStore::from_state(SessionStoreState {
@@ -6894,10 +6918,15 @@ mod tests {
             .filter_map(|message| message.content.as_deref())
             .collect::<Vec<_>>();
 
+        let stopped_request = contents
+            .iter()
+            .position(|content| content.contains("sleep 20"))
+            .expect("用户停止的轮次必须保留在后续上下文中");
         assert!(
-            contents
+            contents[stopped_request..]
                 .iter()
-                .all(|content| !content.contains("sleep 20") && !content.contains("未被停止"))
+                .any(|content| content.contains("已被用户中断")),
+            "停止的轮次必须明确标注为被用户中断"
         );
         assert_eq!(contents.last().copied(), Some("只回复停止后恢复正常"));
     }
