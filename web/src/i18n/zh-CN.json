@@ -2178,7 +2178,7 @@
   "toolCall.approval.title": "等待操作授权",
   "toolCall.approval.description": "该工具需要你的确认后才能继续。",
   "toolCall.approval.allowOnce": "仅允许本次",
-  "toolCall.approval.allowForTurn": "本轮允许同类操作",
+  "toolCall.approval.allowForTurn": "本轮允许相同操作",
   "toolCall.approval.deny": "拒绝并继续",
   "toolCall.approval.processing": "处理中…",
   "toolCall.approval.resolved": "已提交，正在继续执行",

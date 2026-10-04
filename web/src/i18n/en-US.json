@@ -2178,7 +2178,7 @@
   "toolCall.approval.title": "Waiting for approval",
   "toolCall.approval.description": "This tool needs your confirmation before it can continue.",
   "toolCall.approval.allowOnce": "Allow once",
-  "toolCall.approval.allowForTurn": "Allow similar this turn",
+  "toolCall.approval.allowForTurn": "Allow identical calls this turn",
   "toolCall.approval.deny": "Deny and continue",
   "toolCall.approval.processing": "Processing…",
   "toolCall.approval.resolved": "Submitted; execution is resuming",

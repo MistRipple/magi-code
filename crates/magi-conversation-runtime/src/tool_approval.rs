@@ -31,27 +31,11 @@ pub struct PendingToolApproval {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TurnToolGrant {
-    session_id: SessionId,
-    turn_id: String,
-    tool_name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SessionToolCallFingerprint {
     session_id: SessionId,
     turn_id: String,
     tool_name: String,
     normalized_arguments: String,
-}
-
-fn grant_for(request: &PendingToolApproval) -> TurnToolGrant {
-    TurnToolGrant {
-        session_id: request.session_id.clone(),
-        turn_id: request.turn_id.clone(),
-        tool_name: magi_tool_runtime::canonical_builtin_tool_name(&request.tool_name)
-            .unwrap_or_else(|| request.tool_name.trim().to_ascii_lowercase()),
-    }
 }
 
 fn fingerprint_for(request: &PendingToolApproval, arguments: &str) -> SessionToolCallFingerprint {
@@ -102,7 +86,8 @@ struct ExpiredToolApproval {
 #[derive(Debug, Default)]
 struct ToolApprovalState {
     pending: HashMap<String, PendingApprovalEntry>,
-    turn_tool_grants: HashSet<TurnToolGrant>,
+    /// “本轮允许”只放行参数（规范化后）完全相同的调用；同名工具的其他参数仍需审批。
+    turn_tool_grants: HashSet<SessionToolCallFingerprint>,
     denied_session_tool_calls: HashSet<SessionToolCallFingerprint>,
     expired: HashMap<(SessionId, String), ExpiredToolApproval>,
 }
@@ -198,6 +183,7 @@ impl ToolApprovalRegistry {
             .contains_key(&(session_id.clone(), approval_id.to_string()))
     }
 
+    #[cfg(test)]
     pub fn request(
         &self,
         request: PendingToolApproval,
@@ -210,7 +196,6 @@ impl ToolApprovalRegistry {
         request: PendingToolApproval,
         arguments: &str,
     ) -> Result<ToolApprovalRequestOutcome, String> {
-        let grant = grant_for(&request);
         let fingerprint = fingerprint_for(&request, arguments);
         let mut state = self
             .state
@@ -221,9 +206,9 @@ impl ToolApprovalRegistry {
             session_id != &request.session_id || approval_id != &request.approval_id
         });
         state.turn_tool_grants.retain(|existing| {
-            existing.session_id != grant.session_id || existing.turn_id == grant.turn_id
+            existing.session_id != fingerprint.session_id || existing.turn_id == fingerprint.turn_id
         });
-        if state.turn_tool_grants.contains(&grant) {
+        if state.turn_tool_grants.contains(&fingerprint) {
             return Ok(ToolApprovalRequestOutcome::AlreadyAllowed);
         }
         if state.denied_session_tool_calls.contains(&fingerprint) {
@@ -278,12 +263,12 @@ impl ToolApprovalRegistry {
         if decision == ToolApprovalDecision::Deny {
             state.denied_session_tool_calls.insert(entry.fingerprint);
         } else if decision == ToolApprovalDecision::AllowForTurn {
-            let grant = grant_for(&entry.request);
+            let grant = entry.fingerprint.clone();
             state.turn_tool_grants.insert(grant.clone());
             let matching_approval_ids = state
                 .pending
                 .iter()
-                .filter(|(_, candidate)| grant_for(&candidate.request) == grant)
+                .filter(|(_, candidate)| candidate.fingerprint == grant)
                 .map(|(candidate_id, _)| candidate_id.clone())
                 .collect::<Vec<_>>();
             for candidate_id in matching_approval_ids {
@@ -640,6 +625,48 @@ mod tests {
             registry.request(next_turn).expect("next turn request"),
             ToolApprovalRequestOutcome::Pending(_)
         ));
+    }
+
+    #[test]
+    fn allow_for_turn_only_covers_calls_with_identical_arguments() {
+        let registry = ToolApprovalRegistry::default();
+        let ToolApprovalRequestOutcome::Pending(waiter) = registry
+            .request_with_arguments(request("approval-shell-1"), r#"{"command":"ls"}"#)
+            .expect("request approval")
+        else {
+            panic!("first request must wait");
+        };
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-shell-1",
+                ToolApprovalDecision::AllowForTurn,
+            )
+            .expect("resolve approval");
+        assert_eq!(
+            waiter.decision_rx.recv().expect("receive decision"),
+            ToolApprovalDecision::AllowForTurn
+        );
+
+        // 规范化后相同的参数（空白不同）仍在授权范围内。
+        assert!(matches!(
+            registry
+                .request_with_arguments(request("approval-shell-2"), r#"{ "command" : "ls" }"#)
+                .expect("identical arguments"),
+            ToolApprovalRequestOutcome::AlreadyAllowed
+        ));
+        assert!(
+            matches!(
+                registry
+                    .request_with_arguments(
+                        request("approval-shell-3"),
+                        r#"{"command":"rm -rf build"}"#
+                    )
+                    .expect("different arguments"),
+                ToolApprovalRequestOutcome::Pending(_)
+            ),
+            "本轮允许不能放行同一工具的其他命令"
+        );
     }
 
     #[test]
