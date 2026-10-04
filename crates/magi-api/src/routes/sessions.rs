@@ -4011,7 +4011,12 @@ enum QueuedRegularSessionTurnDrainOutcome {
     Deferred,
     Started,
     RetainedAfterFailure,
+    /// 队首消息不可重试或重试次数耗尽，已移出队列并通知用户，后续消息继续执行。
+    DroppedAfterFailure,
 }
+
+/// 可重试的排队提交失败最多重试的次数；超过后按失败移出队列，不再阻塞后续消息。
+const MAX_QUEUED_SUBMISSION_RETRIES: u8 = 5;
 
 async fn drain_next_queued_regular_session_turn(
     state: ApiState,
@@ -4105,19 +4110,21 @@ async fn drain_next_queued_regular_session_turn(
         Ok(scope) => match queued_request.parsed_images() {
             Ok(images) => match queued_route {
                 SessionTurnRouteDto::Chat if !queued_goal_mode => {
-                    let Some(request_fingerprint) = queued_request_fingerprint else {
-                        return QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure;
-                    };
-                    submit_conversation_session_turn(
-                        state.clone(),
-                        queued_request,
-                        images,
-                        scope.workspace_id(),
-                        queued.accepted_at,
-                        request_fingerprint,
-                    )
-                    .await
-                    .map(|_| ())
+                    match queued_request_fingerprint {
+                        Some(request_fingerprint) => submit_conversation_session_turn(
+                            state.clone(),
+                            queued_request,
+                            images,
+                            scope.workspace_id(),
+                            queued.accepted_at,
+                            request_fingerprint,
+                        )
+                        .await
+                        .map(|_| ()),
+                        None => Err(ApiError::InvalidInput(
+                            "排队消息缺少请求指纹，无法提交".to_string(),
+                        )),
+                    }
                 }
                 SessionTurnRouteDto::Chat
                 | SessionTurnRouteDto::Execute
@@ -4176,7 +4183,8 @@ async fn drain_next_queued_regular_session_turn(
                     return QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure;
                 }
             };
-            if error.queued_submission_is_retryable() {
+            if error.queued_submission_is_retryable() && retry_count < MAX_QUEUED_SUBMISSION_RETRIES
+            {
                 let retry_delay = std::time::Duration::from_secs(
                     u64::from(retry_count).saturating_mul(2).min(60),
                 );
@@ -4195,7 +4203,7 @@ async fn drain_next_queued_regular_session_turn(
                 publish_regular_session_turn_queue_failed_event(
                     &state,
                     &failed_event_session_id,
-                    failed_event_workspace_id,
+                    failed_event_workspace_id.clone(),
                     failed_event_accepted_at,
                     failed_event_route,
                     &failed_event_queue_id,
@@ -4204,6 +4212,25 @@ async fn drain_next_queued_regular_session_turn(
                     retry_count,
                     error.message(),
                 );
+                // 不可重试或重试耗尽的消息不能留在队首阻塞后续消息：移出队列（失败事件
+                // 已告知用户，可重新发送），然后继续执行下一条。
+                if let Err(remove_error) = state
+                    .remove_regular_session_turn(&failed_event_session_id, &failed_event_queue_id)
+                {
+                    tracing::error!(
+                        session_id = %failed_event_session_id,
+                        queue_id = %failed_event_queue_id,
+                        ?remove_error,
+                        "移除失败的排队消息失败"
+                    );
+                    return QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure;
+                }
+                schedule_next_queued_regular_session_turn(
+                    state.clone(),
+                    failed_event_session_id,
+                    failed_event_workspace_id,
+                );
+                return QueuedRegularSessionTurnDrainOutcome::DroppedAfterFailure;
             }
             QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure
         }
@@ -10480,7 +10507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_queued_turn_submission_keeps_head_and_increments_retry_count() {
+    async fn non_retryable_queued_turn_failure_is_dropped_so_later_messages_continue() {
         let state = test_state();
         let workspace_id = register_workspace(
             &state,
@@ -10509,6 +10536,14 @@ mod tests {
         state
             .enqueue_regular_session_turn(queued)
             .expect("queued turn should persist");
+        state
+            .enqueue_regular_session_turn(queued_regular_turn(
+                &session_id,
+                &workspace_id,
+                "queue-after-failure",
+                UtcMillis(202),
+            ))
+            .expect("second queued turn should persist");
 
         assert_eq!(
             drain_next_queued_regular_session_turn(
@@ -10517,14 +10552,16 @@ mod tests {
                 Some(workspace_id),
             )
             .await,
-            QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure,
+            QueuedRegularSessionTurnDrainOutcome::DroppedAfterFailure,
         );
 
-        let retained = state
+        let next = state
             .peek_next_regular_session_turn(&session_id)
-            .expect("failed submission must remain at queue head");
-        assert_eq!(retained.queue_id, "queue-submit-failure");
-        assert_eq!(retained.retry_count, 4);
+            .expect("later queued message must remain");
+        assert_eq!(
+            next.queue_id, "queue-after-failure",
+            "不可重试的失败消息必须移出队首，不能阻塞后续消息"
+        );
         let snapshot = state.event_bus.snapshot();
         let failed_event = snapshot
             .recent_events
