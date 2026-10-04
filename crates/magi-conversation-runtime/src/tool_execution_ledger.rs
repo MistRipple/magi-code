@@ -95,26 +95,24 @@ impl ToolExecutionLedger {
             .rposition(|message| message.role == "user")
             .map(|index| index.saturating_add(1))
             .unwrap_or_default();
-        let mut calls = BTreeMap::<String, (usize, ChatToolCall)>::new();
+        // 按历史顺序回放：写操作会使此前的只读结果失效，顺序不能丢。
+        let mut calls = Vec::<(usize, ChatToolCall)>::new();
         let mut results = BTreeMap::<String, String>::new();
 
         for (message_index, message) in history.iter().enumerate() {
             if message.role == "assistant" {
                 for call in &message.tool_calls {
-                    calls.insert(
-                        call.id.clone(),
-                        (
-                            message_index,
-                            ChatToolCall {
-                                id: call.id.clone(),
-                                kind: call.kind.clone(),
-                                function: magi_bridge_client::ChatToolFunction {
-                                    name: call.function.name.clone(),
-                                    arguments: call.function.arguments.clone(),
-                                },
+                    calls.push((
+                        message_index,
+                        ChatToolCall {
+                            id: call.id.clone(),
+                            kind: call.kind.clone(),
+                            function: magi_bridge_client::ChatToolFunction {
+                                name: call.function.name.clone(),
+                                arguments: call.function.arguments.clone(),
                             },
-                        ),
-                    );
+                        },
+                    ));
                 }
             }
             if message.role == "tool"
@@ -125,9 +123,9 @@ impl ToolExecutionLedger {
             }
         }
 
-        for (call_id, (message_index, tool_call)) in calls {
+        for (message_index, tool_call) in calls {
             let canonical_name = canonical_tool_call_name(&tool_call.function.name);
-            let result = results.get(&call_id);
+            let result = results.get(&tool_call.id);
             let belongs_to_current_turn = message_index >= current_turn_start;
             if result.is_some_and(|result| tool_result_is_interrupted_not_started(result)) {
                 continue;
@@ -138,10 +136,15 @@ impl ToolExecutionLedger {
                     .entry(canonical_name.clone())
                     .or_default() += 1;
             }
+            let is_idempotent_read = is_idempotent_read_tool(&canonical_name, tool_registry);
+            if !is_idempotent_read {
+                // 写操作已经执行（或可能已执行）之后，之前的只读结果都不再代表当前状态。
+                ledger.successful_idempotent_calls.clear();
+            }
 
             let Some(result) = result else {
                 if belongs_to_current_turn
-                    && !is_idempotent_read_tool(&canonical_name, tool_registry)
+                    && !is_idempotent_read
                     && let Some(fingerprint) = tool_call_fingerprint(&tool_call, &canonical_name)
                 {
                     ledger
@@ -154,7 +157,7 @@ impl ToolExecutionLedger {
             if tool_result_is_interrupted(result) {
                 if belongs_to_current_turn
                     && tool_result_is_interrupted_unknown(result)
-                    && !is_idempotent_read_tool(&canonical_name, tool_registry)
+                    && !is_idempotent_read
                     && let Some(fingerprint) = tool_call_fingerprint(&tool_call, &canonical_name)
                 {
                     ledger
@@ -162,8 +165,11 @@ impl ToolExecutionLedger {
                         .insert(fingerprint, interrupted_call_result(&canonical_name));
                 }
             } else if infer_tool_call_status(result) == "success" {
-                if is_idempotent_read_tool(&canonical_name, tool_registry) {
-                    if reusable_result_is_current(&canonical_name, result)
+                if is_idempotent_read {
+                    // 跨轮只允许 file_read 凭内容哈希证明结果仍然有效；git_status、
+                    // search_text 等没有当前性证据的只读结果只在本轮内复用。
+                    if (belongs_to_current_turn || canonical_name == "file_read")
+                        && reusable_result_is_current(&canonical_name, result)
                         && let Some(fingerprint) =
                             tool_call_fingerprint(&tool_call, &canonical_name)
                     {
@@ -299,11 +305,14 @@ impl ToolExecutionLedger {
             .executed_call_counts
             .entry(canonical_name.clone())
             .or_default() += 1;
-        if matches!(result.1, ExecutionResultStatus::Succeeded)
-            && !is_idempotent_read_tool(&canonical_name, None)
+        // 写操作只要实际执行过（失败的命令也可能已改动文件），此前所有只读结果都
+        // 不再代表当前状态；被拒绝或等待审批的调用没有执行，不影响缓存。
+        if !matches!(
+            result.1,
+            ExecutionResultStatus::Rejected | ExecutionResultStatus::NeedsApproval
+        ) && !is_idempotent_read_tool(&canonical_name, None)
         {
-            self.successful_idempotent_calls
-                .retain(|fingerprint, _| fingerprint.tool_name != "file_read");
+            self.successful_idempotent_calls.clear();
             self.current_file_facts.clear();
         }
         if matches!(result.1, ExecutionResultStatus::Succeeded)
@@ -835,6 +844,92 @@ mod tests {
             ledger.plan(&[file_read], None)[0],
             ToolCallExecutionDecision::Execute { .. }
         ));
+    }
+
+    #[test]
+    fn executed_write_invalidates_every_read_only_result_in_same_turn() {
+        let mut ledger = ToolExecutionLedger::default();
+        let search = call("call-search", "search_text", r#"{"pattern":"TODO"}"#);
+        let git_status = call("call-git-status", "git_status", "{}");
+        for read in [&search, &git_status] {
+            let plan = ledger.plan(std::slice::from_ref(read), None);
+            let ToolCallExecutionDecision::Execute { fingerprint } = &plan[0] else {
+                panic!("first read call must execute");
+            };
+            ledger.record_execution(
+                read,
+                fingerprint.as_ref(),
+                &(
+                    r#"{"status":"succeeded","matches":[]}"#.to_string(),
+                    ExecutionResultStatus::Succeeded,
+                ),
+            );
+        }
+        // 失败的命令也可能已经改动了工作区，同样必须让只读结果失效。
+        ledger.record_execution(
+            &call(
+                "call-shell",
+                "shell_exec",
+                r#"{"command":"sed -i s/a/b/ x"}"#,
+            ),
+            None,
+            &("exit 1".to_string(), ExecutionResultStatus::Failed),
+        );
+
+        assert!(
+            ledger
+                .plan(&[search, git_status], None)
+                .iter()
+                .all(|decision| matches!(decision, ToolCallExecutionDecision::Execute { .. })),
+            "写操作之后 search_text / git_status 必须重新执行"
+        );
+    }
+
+    #[test]
+    fn restored_history_reuses_only_current_turn_reads_issued_after_last_write() {
+        let previous_turn_status = call("call-prev-status", "git_status", "{}");
+        let current_search = call("call-search", "search_text", r#"{"pattern":"TODO"}"#);
+        let current_write = call(
+            "call-write",
+            "file_write",
+            r#"{"path":"a.txt","content":"changed"}"#,
+        );
+        let current_listing = call("call-branches", "git_branch_list", "{}");
+        let read_result = r#"{"status":"succeeded","matches":[]}"#.to_string();
+        let mut history = persisted_tool_history(&previous_turn_status, read_result.clone());
+        history.push(ThreadChatMessage {
+            role: "user".to_string(),
+            content: Some("继续修改".to_string()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_context: Vec::new(),
+        });
+        history.extend(persisted_tool_history(&current_search, read_result.clone()));
+        history.extend(persisted_tool_history(
+            &current_write,
+            r#"{"status":"succeeded"}"#.to_string(),
+        ));
+        history.extend(persisted_tool_history(&current_listing, read_result));
+
+        let ledger = ToolExecutionLedger::from_thread_history("继续修改", &history, None);
+        let decisions = ledger.plan(
+            &[previous_turn_status, current_search, current_listing],
+            None,
+        );
+
+        assert!(
+            matches!(decisions[0], ToolCallExecutionDecision::Execute { .. }),
+            "上一轮的 git_status 不能复用到本轮"
+        );
+        assert!(
+            matches!(decisions[1], ToolCallExecutionDecision::Execute { .. }),
+            "写入之前的 search_text 结果已过期"
+        );
+        assert!(
+            matches!(decisions[2], ToolCallExecutionDecision::Reuse { .. }),
+            "写入之后的只读结果仍可复用"
+        );
     }
 
     #[test]
