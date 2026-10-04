@@ -191,15 +191,14 @@ const ROOT_MULTI_AGENT_MODE_RULE_AUTO: &str = "\
 1. 协作能力由当前任务 TaskPolicy 决定。请根据任务边界、并行收益、独立复核价值和当前容量自主判断是否派发；1-3 步即可完成的工作不要为组队而组队。\n\
 2. 用户明确要求 subagent、子代理、多代理、并行角色或指定代理角色时，视为本轮协作要求，必须通过 agent_spawn 创建真实代理；只要决定协作，也必须提供最小充分的结构化 context_package。capabilities 可省略，目标 role 已知时优先省略，由服务端按角色默认能力补齐；不要为了查询已知角色能力先调用 tool_catalog，不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
 3. 多个互相独立的工作单元应在同一轮发起多次 agent_spawn；需要结果时使用 agent_wait 汇总。所有已创建代理都必须等待到结束或主动 agent_cancel，并在最终答复中整合其结果。\n\
-4. 每个角色、会话和全局都有运行容量限制。agent_spawn 返回 queued 时保留 child_task_id，等待资源恢复后继续 agent_wait；rejected 表示没有创建任务，必须根据错误阶段修正请求。\n\
-5. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。context_package 必须直接传 JSON 对象。\n\
-6. root coordinator 保留主线推进职责；代理需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
+4. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。context_package 必须直接传 JSON 对象。\n\
+5. root coordinator 保留主线推进职责；代理需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
 
 const ROOT_MULTI_AGENT_MODE_RULE_REQUIRED: &str = "\
 多代理模式（当前模式：required；root coordinator 必须遵守）：\n\
 1. 用户已明确要求真实代理协作。本任务必须至少成功调用一次 agent_spawn 创建真实子任务，并在最终答复前通过 agent_wait 收集其终态；不得用主线读取、shell_exec 或口头总结替代。\n\
 2. 每次 agent_spawn 都必须提供有效 role 和结构化 context_package；capabilities 可省略，省略时由服务端按目标角色默认能力补齐。目标 role 已知时不要先调用 tool_catalog 查询能力。若调用被 rejected，必须依据 error_code/failure_stage 修正后重新派发，不能伪造 started 或 completed。\n\
-3. 多个独立工作单元应在同一轮发起多次 agent_spawn；queued 表示任务已经创建并等待资源，必须保留 child_task_id 并等待。\n\
+3. 多个独立工作单元应在同一轮发起多次 agent_spawn。\n\
 4. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。";
 
 const ROOT_MULTI_AGENT_MODE_RULE_DISABLED: &str = "\
@@ -289,12 +288,30 @@ pub fn dynamic_skill_prompt_message(
     Some(message)
 }
 
-pub fn root_multi_agent_mode_prompt(mode: magi_core::CollaborationMode) -> String {
-    match mode {
-        magi_core::CollaborationMode::Auto => ROOT_MULTI_AGENT_MODE_RULE_AUTO.to_string(),
-        magi_core::CollaborationMode::Required => ROOT_MULTI_AGENT_MODE_RULE_REQUIRED.to_string(),
-        magi_core::CollaborationMode::Disabled => ROOT_MULTI_AGENT_MODE_RULE_DISABLED.to_string(),
-    }
+pub fn root_multi_agent_mode_prompt(
+    mode: magi_core::CollaborationMode,
+    limits: &crate::execution_admission::ExecutionAdmissionLimits,
+) -> String {
+    let rule = match mode {
+        magi_core::CollaborationMode::Auto => ROOT_MULTI_AGENT_MODE_RULE_AUTO,
+        magi_core::CollaborationMode::Required => ROOT_MULTI_AGENT_MODE_RULE_REQUIRED,
+        magi_core::CollaborationMode::Disabled => {
+            return ROOT_MULTI_AGENT_MODE_RULE_DISABLED.to_string();
+        }
+    };
+    format!("{rule}\n{}", execution_capacity_rule(limits))
+}
+
+/// 执行容量说明只从准入控制器的实际上限渲染，提示词中不再写死数字。
+fn execution_capacity_rule(
+    limits: &crate::execution_admission::ExecutionAdmissionLimits,
+) -> String {
+    format!(
+        "执行容量：全局最多同时运行 {} 个执行单元，单个会话 {} 个，每个角色 {} 个（自定义角色可能设置更低的实例上限）；主线在 agent_wait 期间不占用名额。超出容量时 agent_spawn 返回 queued，表示代理已创建并会在有名额后自动开始，保留 child_task_id 继续 agent_wait；rejected 表示没有创建代理，需按 error_code 修正后再派发。",
+        limits.max_active_tasks,
+        limits.max_active_tasks_per_session,
+        limits.max_active_tasks_per_role
+    )
 }
 
 pub fn subagent_multi_agent_mode_prompt() -> String {
@@ -522,6 +539,19 @@ pub fn normalize_model_stream_preview_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_capacity_rule_is_rendered_from_admission_limits() {
+        let limits = crate::execution_admission::ExecutionAdmissionLimits {
+            max_active_tasks: 3,
+            max_active_tasks_per_session: 2,
+            max_active_tasks_per_role: 4,
+            min_available_memory_bytes: 0,
+        };
+        let prompt = root_multi_agent_mode_prompt(magi_core::CollaborationMode::Auto, &limits);
+        assert!(prompt.contains("全局最多同时运行 3 个执行单元，单个会话 2 个，每个角色 4 个"));
+        assert!(!prompt.contains("不设置会话级"));
+    }
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
 
     #[test]

@@ -583,6 +583,7 @@ fn execute_coordinator_tool(
         magi_tool_runtime::BuiltinToolName::AgentWait => execute_agent_wait_with_runtime(
             AgentWaitRuntime {
                 task_store,
+                admission: &execution_registry.execution_admission(),
                 conversation_registry,
                 session_id,
             },
@@ -802,7 +803,7 @@ fn execute_agent_spawn(
             "thread_id": registered_execution.thread_id.to_string(),
             "execution_chain_ref": registered_execution.execution_chain_ref,
             "model_source": preflight.model_source,
-            "queue_reason": preflight.queue_reason,
+            "queue_reason": registered_execution.queue_reason,
         }),
     );
     enqueue_agent_assignment_message(
@@ -814,7 +815,7 @@ fn execute_agent_spawn(
         now,
     );
 
-    let queue_reason = preflight.queue_reason.clone();
+    let queue_reason = registered_execution.queue_reason.clone();
     let status = if queue_reason.is_some() {
         "queued"
     } else {
@@ -1898,6 +1899,7 @@ fn enqueue_agent_assignment_message(
 
 struct AgentWaitRuntime<'a> {
     task_store: &'a TaskStore,
+    admission: &'a crate::execution_admission::ExecutionAdmissionController,
     conversation_registry: &'a ConversationRegistry,
     session_id: &'a SessionId,
 }
@@ -1925,6 +1927,7 @@ fn execute_agent_wait_with_runtime(
 ) -> (String, ExecutionResultStatus) {
     let AgentWaitRuntime {
         task_store,
+        admission,
         conversation_registry,
         session_id,
     } = runtime;
@@ -1967,6 +1970,8 @@ fn execute_agent_wait_with_runtime(
     }
     let started_at = std::time::Instant::now();
     let mut observed_status_version = task_store.status_change_version();
+    // 等待子代理期间让出执行名额，避免与自己派发的子代理争抢同一批名额。
+    let _waiting = admission.suspend_while_waiting(&parent_task.task_id);
     loop {
         let runtime_signals =
             conversation_registry.drain_task_signals(session_id, &parent_task.task_id);
@@ -2063,6 +2068,7 @@ fn execute_agent_wait(
     execute_agent_wait_with_runtime(
         AgentWaitRuntime {
             task_store,
+            admission: &crate::execution_admission::ExecutionAdmissionController::default(),
             conversation_registry: &registry,
             session_id: &session_id,
         },
@@ -7187,6 +7193,7 @@ mod tests {
             let (wait_payload, wait_status) = execute_agent_wait_with_runtime(
                 AgentWaitRuntime {
                     task_store: &task_store,
+                    admission: &crate::execution_admission::ExecutionAdmissionController::default(),
                     conversation_registry: &registry,
                     session_id: &session_id,
                 },

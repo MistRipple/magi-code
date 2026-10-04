@@ -846,7 +846,7 @@ impl RunnerManager {
             let _restart_guard = self.lock_for_restart(root_task_id).await;
             self.quiesce_for_restart(root_task_id).await;
         }
-        self.execution_admission.remove_queued_session(session_id);
+        self.execution_admission.release_pending_session(session_id);
         root_task_ids.len()
     }
 

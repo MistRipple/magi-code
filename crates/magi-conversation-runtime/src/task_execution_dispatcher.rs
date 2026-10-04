@@ -2036,7 +2036,10 @@ impl LlmTaskDispatcher {
                 .as_ref()
                 .map(|policy| policy.collaboration_mode)
                 .unwrap_or_default();
-            return Some(root_multi_agent_mode_prompt(collaboration_mode));
+            return Some(root_multi_agent_mode_prompt(
+                collaboration_mode,
+                self.execution_registry.execution_admission().limits(),
+            ));
         }
         Some(subagent_multi_agent_mode_prompt())
     }

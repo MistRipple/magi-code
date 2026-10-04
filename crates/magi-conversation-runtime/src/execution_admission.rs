@@ -86,6 +86,40 @@ struct ExecutionAdmissionState {
 struct ActiveExecutionAdmission {
     session_id: Option<SessionId>,
     role: String,
+    phase: AdmissionPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionPhase {
+    /// 子代理注册时预占的名额，Runner 派发时转为 Running。
+    Reserved,
+    Running,
+    /// 正在 agent_wait 等待子代理的协调者：不占用会话、全局和角色名额，
+    /// 否则协调者会和自己派发的子代理抢同一批名额。
+    Waiting,
+}
+
+impl AdmissionPhase {
+    fn occupies_capacity(self) -> bool {
+        !matches!(self, Self::Waiting)
+    }
+}
+
+/// 协调者等待子代理期间的名额让渡；drop 时恢复占用。
+pub struct AdmissionWaitGuard {
+    controller: ExecutionAdmissionController,
+    task_id: TaskId,
+}
+
+impl Drop for AdmissionWaitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.controller.state.lock()
+            && let Some(active) = state.active.get_mut(&self.task_id)
+            && active.phase == AdmissionPhase::Waiting
+        {
+            active.phase = AdmissionPhase::Running;
+        }
+    }
 }
 
 struct ExecutionResourceProbe {
@@ -127,14 +161,94 @@ impl ExecutionAdmissionController {
             .state
             .lock()
             .expect("execution admission lock poisoned");
-        if state.active.contains_key(&task_id) {
-            return Err(ExecutionAdmissionBlocked {
-                reason: format!("任务 {task_id} 已占用执行槽位。"),
+        if let Some(active) = state.active.get_mut(&task_id) {
+            if active.phase != AdmissionPhase::Reserved {
+                return Err(ExecutionAdmissionBlocked {
+                    reason: format!("任务 {task_id} 已占用执行槽位。"),
+                });
+            }
+            // 注册时预占的名额直接转为执行许可。
+            active.phase = AdmissionPhase::Running;
+            return Ok(ExecutionAdmissionPermit {
+                controller: Some(self.clone()),
+                task_id,
             });
         }
+        self.admit_locked(
+            &mut state,
+            task_id.clone(),
+            session_id,
+            role,
+            &resources,
+            AdmissionPhase::Running,
+        )
+        .map(|()| ExecutionAdmissionPermit {
+            controller: Some(self.clone()),
+            task_id,
+        })
+        .map_err(|reason| ExecutionAdmissionBlocked { reason })
+    }
 
-        let reason = self.block_reason(&state, session_id.as_ref(), &role, &resources);
-        if let Some(reason) = reason {
+    pub fn limits(&self) -> &ExecutionAdmissionLimits {
+        &self.limits
+    }
+
+    /// 子代理注册时预占名额。返回 `None` 表示已预占、会立即开始；
+    /// 返回排队原因表示名额不足，任务进入排队，名额空出后由 Runner 准入。
+    ///
+    /// 预占与 `acquire` 共享同一份计数，同一批派发的多个代理不会都被报告为已开始。
+    pub fn reserve(
+        &self,
+        task_id: TaskId,
+        session_id: Option<SessionId>,
+        role: &str,
+    ) -> Option<String> {
+        let resources = self.resource_snapshot();
+        let mut state = self
+            .state
+            .lock()
+            .expect("execution admission lock poisoned");
+        if state.active.contains_key(&task_id) {
+            return None;
+        }
+        self.admit_locked(
+            &mut state,
+            task_id,
+            session_id,
+            role.to_string(),
+            &resources,
+            AdmissionPhase::Reserved,
+        )
+        .err()
+    }
+
+    /// 协调者开始等待子代理：让出名额，guard drop 时恢复。没有执行许可时返回 `None`。
+    pub fn suspend_while_waiting(&self, task_id: &TaskId) -> Option<AdmissionWaitGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("execution admission lock poisoned");
+        let active = state.active.get_mut(task_id)?;
+        if active.phase != AdmissionPhase::Running {
+            return None;
+        }
+        active.phase = AdmissionPhase::Waiting;
+        Some(AdmissionWaitGuard {
+            controller: self.clone(),
+            task_id: task_id.clone(),
+        })
+    }
+
+    fn admit_locked(
+        &self,
+        state: &mut ExecutionAdmissionState,
+        task_id: TaskId,
+        session_id: Option<SessionId>,
+        role: String,
+        resources: &ExecutionResourceSnapshot,
+        phase: AdmissionPhase,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.block_reason(state, session_id.as_ref(), &role, resources) {
             state.queued.insert(
                 task_id.clone(),
                 QueuedExecutionAdmission {
@@ -145,32 +259,18 @@ impl ExecutionAdmissionController {
                     queued_at: UtcMillis::now(),
                 },
             );
-            return Err(ExecutionAdmissionBlocked { reason });
+            return Err(reason);
         }
-
         state.queued.remove(&task_id);
         state.active.insert(
-            task_id.clone(),
-            ActiveExecutionAdmission { session_id, role },
-        );
-        Ok(ExecutionAdmissionPermit {
-            controller: Some(self.clone()),
             task_id,
-        })
-    }
-
-    /// 在不改变排队或活跃状态的前提下检查当前角色是否能够立即取得执行槽位。
-    ///
-    /// `agent_spawn` 预检只能读取这份结果；真正的占用仍由 Runner 在取得任务租约
-    /// 后调用 [`Self::acquire`] 完成。这样预检不会产生没有对应 Task 的 queued 记录，
-    /// 同时 dispatcher 与 Runner 可以共享同一个准入控制器。
-    pub fn preview(&self, session_id: Option<&SessionId>, role: &str) -> Option<String> {
-        let resources = self.resource_snapshot();
-        let state = self
-            .state
-            .lock()
-            .expect("execution admission lock poisoned");
-        self.block_reason(&state, session_id, role, &resources)
+            ActiveExecutionAdmission {
+                session_id,
+                role,
+                phase,
+            },
+        );
+        Ok(())
     }
 
     pub fn snapshot(&self) -> ExecutionAdmissionSnapshot {
@@ -202,20 +302,34 @@ impl ExecutionAdmissionController {
         }
     }
 
-    pub fn remove_queued_task(&self, task_id: &TaskId) {
-        self.state
+    /// 任务不再需要执行（被终止或已结束）：移除排队记录和尚未转为执行许可的预占。
+    pub fn release_pending(&self, task_id: &TaskId) {
+        let mut state = self
+            .state
             .lock()
-            .expect("execution admission lock poisoned")
-            .queued
-            .remove(task_id);
+            .expect("execution admission lock poisoned");
+        state.queued.remove(task_id);
+        if state
+            .active
+            .get(task_id)
+            .is_some_and(|active| active.phase == AdmissionPhase::Reserved)
+        {
+            state.active.remove(task_id);
+        }
     }
 
-    pub fn remove_queued_session(&self, session_id: &SessionId) {
-        self.state
+    pub fn release_pending_session(&self, session_id: &SessionId) {
+        let mut state = self
+            .state
             .lock()
-            .expect("execution admission lock poisoned")
+            .expect("execution admission lock poisoned");
+        state
             .queued
             .retain(|_, queued| queued.session_id.as_deref() != Some(session_id.as_str()));
+        state.active.retain(|_, active| {
+            active.phase != AdmissionPhase::Reserved
+                || active.session_id.as_ref() != Some(session_id)
+        });
     }
 
     fn release(&self, task_id: &TaskId) {
@@ -242,17 +356,21 @@ impl ExecutionAdmissionController {
                 self.limits.min_available_memory_bytes / (1024 * 1024),
             ));
         }
-        if state.active.len() >= self.limits.max_active_tasks {
+        let occupying = || {
+            state
+                .active
+                .values()
+                .filter(|active| active.phase.occupies_capacity())
+        };
+        let active_total = occupying().count();
+        if active_total >= self.limits.max_active_tasks {
             return Some(format!(
                 "全局执行容量已满（{}/{}），任务将在有可用槽位后继续。",
-                state.active.len(),
-                self.limits.max_active_tasks
+                active_total, self.limits.max_active_tasks
             ));
         }
         if let Some(session_id) = session_id {
-            let active_for_session = state
-                .active
-                .values()
+            let active_for_session = occupying()
                 .filter(|active| active.session_id.as_ref() == Some(session_id))
                 .count();
             if active_for_session >= self.limits.max_active_tasks_per_session {
@@ -262,11 +380,7 @@ impl ExecutionAdmissionController {
                 ));
             }
         }
-        let active_for_role = state
-            .active
-            .values()
-            .filter(|active| active.role == role)
-            .count();
+        let active_for_role = occupying().filter(|active| active.role == role).count();
         if active_for_role >= self.limits.max_active_tasks_per_role {
             return Some(format!(
                 "角色 {role} 的全局执行容量已满（{active_for_role}/{}），任务将在有可用槽位后继续。",
@@ -384,7 +498,7 @@ mod tests {
         let _ = controller.acquire(TaskId::new("task-b"), Some(session.clone()), "reviewer");
         assert_eq!(controller.snapshot().queued_task_count, 1);
 
-        controller.remove_queued_session(&session);
+        controller.release_pending_session(&session);
         assert_eq!(controller.snapshot().queued_task_count, 0);
     }
 
@@ -408,21 +522,88 @@ mod tests {
     }
 
     #[test]
-    fn preview_is_read_only_and_does_not_create_queued_entry() {
-        let controller = controller();
-        let session = SessionId::new("session-preview");
-        let _permit = controller
+    fn reservations_count_against_capacity_and_become_the_dispatch_permit() {
+        let controller = ExecutionAdmissionController::new(ExecutionAdmissionLimits {
+            max_active_tasks: 8,
+            max_active_tasks_per_session: 2,
+            max_active_tasks_per_role: 8,
+            min_available_memory_bytes: 0,
+        });
+        let session = SessionId::new("session-reserve");
+        let coordinator = controller
             .acquire(
-                TaskId::new("task-preview-active"),
+                TaskId::new("task-root"),
+                Some(session.clone()),
+                "coordinator",
+            )
+            .expect("coordinator should run");
+
+        // 同一批派发：只有空余名额内的代理被报告为立即开始。
+        assert_eq!(
+            controller.reserve(
+                TaskId::new("task-child-a"),
+                Some(session.clone()),
+                "executor"
+            ),
+            None
+        );
+        let queued = controller
+            .reserve(
+                TaskId::new("task-child-b"),
                 Some(session.clone()),
                 "executor",
             )
-            .expect("active task should acquire capacity");
-        let reason = controller
-            .preview(Some(&session), "reviewer")
-            .expect("preview should report the session limit");
-        assert!(reason.contains("当前会话执行容量已满"));
-        assert_eq!(controller.snapshot().queued_task_count, 0);
+            .expect("second child must queue while the coordinator runs");
+        assert!(queued.contains("当前会话执行容量已满"));
+
+        // 协调者等待子代理时让出名额，排队的代理可以准入。
+        let waiting = controller
+            .suspend_while_waiting(&TaskId::new("task-root"))
+            .expect("running coordinator can wait");
+        let child_b = controller
+            .acquire(
+                TaskId::new("task-child-b"),
+                Some(session.clone()),
+                "executor",
+            )
+            .expect("waiting coordinator must not hold a slot");
+        let child_a = controller
+            .acquire(
+                TaskId::new("task-child-a"),
+                Some(session.clone()),
+                "executor",
+            )
+            .expect("reservation turns into the dispatch permit");
+        assert_eq!(controller.snapshot().active_task_count, 3);
+        drop(waiting);
+
+        drop(child_a);
+        drop(child_b);
+        drop(coordinator);
+        assert_eq!(controller.snapshot().active_task_count, 0);
+    }
+
+    #[test]
+    fn releasing_a_pending_task_frees_its_reservation_but_not_a_running_permit() {
+        let controller = controller();
+        let session = SessionId::new("session-release");
+        assert_eq!(
+            controller.reserve(
+                TaskId::new("task-reserved"),
+                Some(session.clone()),
+                "executor"
+            ),
+            None
+        );
+        controller.release_pending(&TaskId::new("task-reserved"));
+        assert_eq!(controller.snapshot().active_task_count, 0);
+
+        let permit = controller
+            .acquire(TaskId::new("task-running"), Some(session), "executor")
+            .expect("should run");
+        controller.release_pending(&TaskId::new("task-running"));
+        assert_eq!(controller.snapshot().active_task_count, 1);
+        drop(permit);
     }
 
     #[test]

@@ -99,7 +99,6 @@ pub(crate) struct AgentSpawnPreflight {
     pub(crate) child_access_profile: AccessProfile,
     pub(crate) child_dependency_ids: Vec<TaskId>,
     pub(crate) child_input_refs: Vec<String>,
-    pub(crate) queue_reason: Option<String>,
     pub(crate) model_source: Option<String>,
 }
 
@@ -290,7 +289,6 @@ pub(crate) fn preflight_agent_spawn(
         &runtime,
     )?;
 
-    let queue_reason = execution_registry.admission_preview(Some(session_id), &role);
     let child_policy_snapshot =
         agent_spawn_child_policy_snapshot(parent_task.policy_snapshot.as_ref());
     let child_access_profile = child_policy_snapshot.effective_access_profile();
@@ -317,7 +315,6 @@ pub(crate) fn preflight_agent_spawn(
         child_access_profile,
         child_dependency_ids,
         child_input_refs,
-        queue_reason,
         model_source,
     })
 }

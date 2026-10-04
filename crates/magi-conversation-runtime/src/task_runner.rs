@@ -663,7 +663,7 @@ pub(crate) fn kill_task_in_store(
         .get_task(task_id)
         .ok_or_else(|| format!("任务不存在: {task_id}"))?;
     if task_status_is_finished(task.status) {
-        admission.remove_queued_task(task_id);
+        admission.release_pending(task_id);
         return Ok(false);
     }
     let changed = store
@@ -681,7 +681,7 @@ pub(crate) fn kill_task_in_store(
     {
         return Err(format!("终止任务 {task_id} 时当前任务租约已失效"));
     }
-    admission.remove_queued_task(task_id);
+    admission.release_pending(task_id);
     Ok(changed)
 }
 

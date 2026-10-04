@@ -106,6 +106,8 @@ pub struct SpawnedChildExecution {
     pub execution_chain_ref: String,
     /// 计划绑定在同一注册事务内完成后的新快照。调用方只负责发布事件，不再重复绑定。
     pub plan: Option<SessionPlan>,
+    /// 注册时预占执行名额失败的原因；为空表示已预占、会立即开始。
+    pub queue_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,10 +190,6 @@ impl TaskExecutionRegistry {
             .read()
             .expect("agent spawn preflight runtime lock poisoned")
             .clone()
-    }
-
-    pub fn admission_preview(&self, session_id: Option<&SessionId>, role: &str) -> Option<String> {
-        self.execution_admission.preview(session_id, role)
     }
 
     pub fn insert(
@@ -672,11 +670,18 @@ impl TaskExecutionRegistry {
             }
         };
 
+        // 所有注册步骤成功后才预占执行名额，失败回滚路径不需要释放名额。
+        let queue_reason = self.execution_admission.reserve(
+            child_task.task_id.clone(),
+            Some(session_id.clone()),
+            role,
+        );
         Ok(SpawnedChildExecution {
             worker_id,
             thread_id,
             execution_chain_ref,
             plan: plan_binding.map(|(_, updated)| updated),
+            queue_reason,
         })
     }
 }

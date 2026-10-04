@@ -1053,10 +1053,8 @@ impl BuiltinToolName {
                 - 能力 id 以 tool_catalog 返回的目标角色 capability_ids 为准，不要使用其他角色或全局清单推测\n\
                 - 能识别专业领域时必须选择对应能力；跨领域任务可以同时激活多项\n\
                 - general_engineering 只用于确实无法归类的通用工程工作，不能替代明确的专业能力\n\n\
-                # 并发上限\n\
-                - 每个代理角色同一时刻最多运行 5 个活跃实例；不设置会话级代理总数下限或额外总人数上限\n\
-                - 不同角色容量彼此独立；达到角色上限时返回 role、active_role_agent_count 与 max_active_agents_per_role\n\
-                - 先 agent_wait 收集该角色已运行代理，有实例退出活跃状态后再继续创建同角色实例\n\n\
+                # 执行容量\n\
+                - 容量上限以系统提示中的“执行容量”说明为准；超出时返回 queued，代理已创建并会在有名额后自动开始\n\n\
                 # 访问模式\n\
                 - 子代理继承当前主线由用户选择的访问模式，模型和角色不能自行降级或升级权限\n\
                 - 只读调查、审查和探索要求写入 goal，由代理按任务语义约束行为，不再创建第二套权限状态\n\n\
@@ -1081,7 +1079,7 @@ impl BuiltinToolName {
                 - 不要在依赖代理结果的情况下直接给最终答复；必须先调用 `agent_wait`\n\
                 - agent_wait 返回 `child_status=completed` 时，`result.final_text` 是该代理的最终答复，`assignment.goal` 是你派给它的原始目标，`activity` 是运行时记录的实际执行事实\n\
                 - 同一轮多个代理返回后，先按任务合并结论、证据、风险与缺口，再生成主线最终答复；不要把多个代理输出原样拼贴给用户\n\
-                - 返回 `status=degraded` 时代表代理不可用但主线必须继续：改派其他合适角色，或由主线基于已有上下文直接推进\n\
+                - agent_wait 回执 `status=degraded` 时代表代理不可用但主线必须继续：改派其他合适角色，或由主线基于已有上下文直接推进\n\
                 - 返回 `status=failed` 时先判断是否可补救；能补救就重派或改派，只有真实阻断时才向用户说明失败"
             }
             Self::AgentSend => {
