@@ -1,8 +1,7 @@
 use magi_core::{ExecutionResultStatus, SessionId, TaskId, UtcMillis};
 use magi_session_store::SessionStore;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 
 /// 用户审批的最长等待时间。过期后不会执行原始工具调用，也不会写入拒绝记忆；
@@ -44,29 +43,7 @@ fn fingerprint_for(request: &PendingToolApproval, arguments: &str) -> SessionToo
         turn_id: request.turn_id.clone(),
         tool_name: magi_tool_runtime::canonical_builtin_tool_name(&request.tool_name)
             .unwrap_or_else(|| request.tool_name.trim().to_ascii_lowercase()),
-        normalized_arguments: normalize_arguments(arguments),
-    }
-}
-
-fn normalize_arguments(arguments: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
-        return arguments.trim().to_string();
-    };
-    serde_json::to_string(&canonicalize_json(&value))
-        .unwrap_or_else(|_| arguments.trim().to_string())
-}
-
-fn canonicalize_json(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
-        Value::Object(object) => {
-            let sorted = object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonicalize_json(value)))
-                .collect::<BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
-        }
-        _ => value.clone(),
+        normalized_arguments: crate::tool_result_utils::normalized_tool_arguments(arguments),
     }
 }
 

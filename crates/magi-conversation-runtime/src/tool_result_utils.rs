@@ -101,6 +101,46 @@ pub fn non_retryable_tool_failure(
     })
 }
 
+/// 单轮对话允许的模型调用轮数上限；任务轮次与对话轮次共用。
+pub(crate) const MAX_MODEL_ROUNDS_PER_TURN: usize = 200;
+/// 没有任务策略时同一失败调用允许的重试次数（共尝试 retry + 1 次）。
+pub(crate) const DEFAULT_TOOL_RETRY_LIMIT: u32 = 1;
+
+/// 达到轮数上限时以明确原因结束本轮，避免模型陷入无限循环。
+pub(crate) fn model_round_limit_failure(round: usize) -> Option<DeterministicToolFailure> {
+    (round >= MAX_MODEL_ROUNDS_PER_TURN).then(|| DeterministicToolFailure {
+        summary: format!("本轮已达到 {MAX_MODEL_ROUNDS_PER_TURN} 次模型调用上限，已停止继续执行。"),
+        detail: format!(
+            "本轮已连续进行 {MAX_MODEL_ROUNDS_PER_TURN} 次模型调用仍未完成，可能陷入了重复操作。请检查进展后拆分任务或补充说明再继续。"
+        ),
+    })
+}
+
+/// 工具参数的规范形式：JSON 按键排序、去除空白差异；无法解析时取去除首尾空白的原文。
+pub(crate) fn normalized_tool_arguments(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.trim().to_string();
+    };
+    serde_json::to_string(&canonicalize_json(&value))
+        .unwrap_or_else(|_| arguments.trim().to_string())
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+/// 重复失败检测：按“工具 + 规范化参数 + 错误”计数。其他调用的成功不会清零计数；
+/// 只有同一调用本身成功才说明它不再失败。
 #[derive(Clone, Debug, Default)]
 pub struct DeterministicToolFailureTracker {
     observations: BTreeMap<String, usize>,
@@ -115,9 +155,13 @@ impl DeterministicToolFailureTracker {
         status: ExecutionResultStatus,
         retry_limit: u32,
     ) -> Option<DeterministicToolFailure> {
+        let call_key = format!(
+            "{tool_name}\u{1f}{}\u{1f}",
+            normalized_tool_arguments(arguments)
+        );
         if status == ExecutionResultStatus::Succeeded {
-            let prefix = format!("{tool_name}\u{1f}");
-            self.observations.retain(|key, _| !key.starts_with(&prefix));
+            self.observations
+                .retain(|key, _| !key.starts_with(&call_key));
             return None;
         }
         if !matches!(
@@ -141,7 +185,7 @@ impl DeterministicToolFailureTracker {
             .and_then(|payload| payload.get("access_profile"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let key = format!("{tool_name}\u{1f}{arguments}\u{1f}{error_code}\u{1f}{access_profile}");
+        let key = format!("{call_key}{error_code}\u{1f}{access_profile}");
         let observations = self.observations.entry(key).or_default();
         *observations = observations.saturating_add(1);
         let max_attempts = retry_limit.saturating_add(1) as usize;
@@ -898,6 +942,56 @@ mod tests {
             .expect("任务 retry_limit=1 时第二次相同失败必须止损");
         assert!(failure.summary.contains("连续失败 2 次"));
         assert!(failure.detail.contains("browser_navigation_failed"));
+    }
+
+    #[test]
+    fn repeated_failure_is_counted_by_normalized_arguments_and_not_reset_by_other_successes() {
+        let mut tracker = DeterministicToolFailureTracker::default();
+        let failed = r#"{"status":"failed","error_code":"shell_exit_nonzero","error":"exit 1"}"#;
+        assert!(
+            tracker
+                .observe(
+                    "shell_exec",
+                    r#"{"command":"npm test"}"#,
+                    failed,
+                    ExecutionResultStatus::Failed,
+                    1,
+                )
+                .is_none()
+        );
+        // 同名工具的另一条命令成功，不能清零 npm test 的失败计数。
+        assert!(
+            tracker
+                .observe(
+                    "shell_exec",
+                    r#"{"command":"ls"}"#,
+                    r#"{"status":"succeeded"}"#,
+                    ExecutionResultStatus::Succeeded,
+                    1,
+                )
+                .is_none()
+        );
+        // 只改了空白的相同调用仍算重复失败。
+        assert!(
+            tracker
+                .observe(
+                    "shell_exec",
+                    r#"{ "command" : "npm test" }"#,
+                    failed,
+                    ExecutionResultStatus::Failed,
+                    1,
+                )
+                .is_some(),
+            "相同调用的重复失败必须在上限内停止"
+        );
+    }
+
+    #[test]
+    fn model_round_limit_stops_turn_at_shared_cap() {
+        assert!(model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN - 1).is_none());
+        let failure = model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN)
+            .expect("达到轮数上限必须以明确原因结束本轮");
+        assert!(failure.summary.contains("模型调用上限"));
     }
 
     #[test]

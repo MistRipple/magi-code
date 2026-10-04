@@ -54,7 +54,7 @@ use crate::{
         invalid_tool_result_message, non_retryable_tool_call_failure, validate_tool_call_batch,
     },
     tool_execution_ledger::ToolExecutionLedger,
-    tool_result_utils::DeterministicToolFailure,
+    tool_result_utils::{DeterministicToolFailure, model_round_limit_failure},
     tool_surface_state::{
         BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput,
         activate_skill_tool_definitions, build_browser_tool_surface,
@@ -1379,39 +1379,44 @@ fn run_session_turn_execution_inner(
             }
         }
         context_budget_recheck_required = false;
-        let streamed_content = match stream_session_turn_round(
-            SessionTurnRoundRuntime {
-                client,
-                event_bus,
-                session_store,
-                tool_approval_registry: conversation_registry.tool_approvals(),
-                plan_store,
-                settings_store,
-                safety_gate,
-                snapshot_manager,
-                request: &request,
-                usage_binding: &usage_binding,
-                prompt: &prompt,
-                tools: round_tools,
-                browser_capability_snapshot,
-                messages: &mut messages,
-                completed_required_tool_names: &completed_required_tool_names,
-                required_tool_chain: &required_tool_chain,
-                pre_output_invocation_recovery_attempts,
-                stream_interruption_recovery_attempts,
-                round,
-                context_window_tokens: effective_context_window,
-                orchestrator_thread_id: &orchestrator_thread_id,
-                orchestrator_mission_id: &orchestrator_mission_id,
-                persist_session_state,
-                tool_execution_ledger: &mut tool_execution_ledger,
-                web_engine,
-            },
-            tool_registry,
-            skill_runtime,
-            skill_dispatch_runtime,
-            active_skill_name.as_deref(),
-        ) {
+        // 轮数上限与任务轮次共用：达到上限时按终止失败收口，不再继续调用模型。
+        let round_result = match model_round_limit_failure(round) {
+            Some(failure) => Err(SessionTurnRoundError::TerminalToolFailure(failure)),
+            None => stream_session_turn_round(
+                SessionTurnRoundRuntime {
+                    client,
+                    event_bus,
+                    session_store,
+                    tool_approval_registry: conversation_registry.tool_approvals(),
+                    plan_store,
+                    settings_store,
+                    safety_gate,
+                    snapshot_manager,
+                    request: &request,
+                    usage_binding: &usage_binding,
+                    prompt: &prompt,
+                    tools: round_tools,
+                    browser_capability_snapshot,
+                    messages: &mut messages,
+                    completed_required_tool_names: &completed_required_tool_names,
+                    required_tool_chain: &required_tool_chain,
+                    pre_output_invocation_recovery_attempts,
+                    stream_interruption_recovery_attempts,
+                    round,
+                    context_window_tokens: effective_context_window,
+                    orchestrator_thread_id: &orchestrator_thread_id,
+                    orchestrator_mission_id: &orchestrator_mission_id,
+                    persist_session_state,
+                    tool_execution_ledger: &mut tool_execution_ledger,
+                    web_engine,
+                },
+                tool_registry,
+                skill_runtime,
+                skill_dispatch_runtime,
+                active_skill_name.as_deref(),
+            ),
+        };
+        let streamed_content = match round_result {
             Ok(output) => output,
             Err(SessionTurnRoundError::StreamInterruptedRecovered) => {
                 stream_interruption_recovery_attempts += 1;

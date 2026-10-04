@@ -18,7 +18,10 @@ use serde_json::Value;
 use crate::{
     canonical_tool_call_name,
     context_authority::CurrentFileFact,
-    tool_result_utils::{infer_tool_call_status, tool_result_is_interrupted_not_started},
+    tool_result_utils::{
+        DeterministicToolFailure, DeterministicToolFailureTracker, infer_tool_call_status,
+        normalized_tool_arguments, tool_result_is_interrupted_not_started,
+    },
 };
 
 #[derive(Clone, Debug, Default)]
@@ -30,6 +33,8 @@ pub(crate) struct ToolExecutionLedger {
     interrupted_non_idempotent_calls: BTreeMap<ToolCallFingerprint, String>,
     executed_call_counts: BTreeMap<String, usize>,
     explicit_call_budgets: BTreeMap<String, usize>,
+    /// 本轮重复失败检测；任务轮次与对话轮次共用同一账本，因此共用同一刹车。
+    failure_tracker: DeterministicToolFailureTracker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -332,6 +337,19 @@ impl ToolExecutionLedger {
         }
     }
 
+    /// 记录一次工具结果；同一调用（规范化参数）以相同错误连续失败达到上限时返回终止原因。
+    pub(crate) fn observe_tool_result(
+        &mut self,
+        tool_name: &str,
+        arguments: &str,
+        result: &str,
+        status: ExecutionResultStatus,
+        retry_limit: u32,
+    ) -> Option<DeterministicToolFailure> {
+        self.failure_tracker
+            .observe(tool_name, arguments, result, status, retry_limit)
+    }
+
     pub(crate) fn execute_batch_with(
         &mut self,
         tool_calls: &[ChatToolCall],
@@ -602,35 +620,12 @@ fn tool_call_fingerprint(
     tool_call: &ChatToolCall,
     canonical_name: &str,
 ) -> Option<ToolCallFingerprint> {
-    let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments).ok()?;
+    // 只对可解析的 JSON 参数去重；规范形式与审批、重复失败检测共用。
+    serde_json::from_str::<Value>(&tool_call.function.arguments).ok()?;
     Some(ToolCallFingerprint {
         tool_name: canonical_name.to_string(),
-        canonical_arguments: canonical_json(&arguments),
+        canonical_arguments: normalized_tool_arguments(&tool_call.function.arguments),
     })
-}
-
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Object(object) => {
-            let mut entries = object.iter().collect::<Vec<_>>();
-            entries.sort_by_key(|(key, _)| *key);
-            let rendered = entries
-                .into_iter()
-                .map(|(key, value)| format!("{}:{}", serde_json::json!(key), canonical_json(value)))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{rendered}}}")
-        }
-        Value::Array(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        _ => value.to_string(),
-    }
 }
 
 fn is_idempotent_read_tool(tool_name: &str, tool_registry: Option<&ToolRegistry>) -> bool {

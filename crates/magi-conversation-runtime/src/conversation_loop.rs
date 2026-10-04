@@ -27,9 +27,9 @@ use crate::tool_call_validation::{
 };
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
-    DeterministicToolFailureTracker, bound_model_visible_tool_history, infer_tool_call_status,
-    model_visible_tool_history_budget_bytes, model_visible_tool_result, non_retryable_tool_failure,
-    summarize_tool_result, tool_interrupted_before_execution_payload,
+    DEFAULT_TOOL_RETRY_LIMIT, bound_model_visible_tool_history, infer_tool_call_status,
+    model_round_limit_failure, model_visible_tool_history_budget_bytes, model_visible_tool_result,
+    non_retryable_tool_failure, summarize_tool_result, tool_interrupted_before_execution_payload,
     tool_payload_is_awaiting_approval, tool_result_is_awaiting_approval,
     turn_item_status_for_tool_result,
 };
@@ -1196,7 +1196,6 @@ fn run_conversation_loop_inner(
         Vec::new()
     };
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
-    let mut deterministic_tool_failure_tracker = DeterministicToolFailureTracker::default();
     let mut tool_execution_ledger = if recovery_history {
         ToolExecutionLedger::from_thread_history(
             &task.goal,
@@ -1363,6 +1362,21 @@ fn run_conversation_loop_inner(
 
     let mut pre_output_invocation_recovery_attempts = 0usize;
     'conversation_round: for round in 0usize.. {
+        if let Some(failure) = model_round_limit_failure(round) {
+            let error = match append_task_error_turn_item(
+                turn_writeback_context,
+                &failure.summary,
+                streaming_entry_id,
+                None,
+                None,
+            ) {
+                Ok(()) => failure.detail,
+                Err(writeback_error) => {
+                    format!("{}；失败事实写回失败：{writeback_error}", failure.detail)
+                }
+            };
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
         append_task_runtime_signals(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
@@ -2875,7 +2889,7 @@ fn run_conversation_loop_inner(
                 }
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
-            if let Some(failure) = deterministic_tool_failure_tracker.observe(
+            if let Some(failure) = tool_execution_ledger.observe_tool_result(
                 &canonical_tool_name,
                 &tool_call.function.arguments,
                 &result,
@@ -2883,7 +2897,7 @@ fn run_conversation_loop_inner(
                 task.policy_snapshot
                     .as_ref()
                     .map(|policy| policy.retry_limit)
-                    .unwrap_or(1),
+                    .unwrap_or(DEFAULT_TOOL_RETRY_LIMIT),
             ) {
                 deterministic_tool_failure.get_or_insert(failure);
             }

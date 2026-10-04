@@ -1974,6 +1974,15 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         {
             terminal_failure.get_or_insert(failure);
         }
+        if let Some(failure) = tool_execution_ledger.observe_tool_result(
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+            &tool_result,
+            tool_status,
+            crate::tool_result_utils::DEFAULT_TOOL_RETRY_LIMIT,
+        ) {
+            terminal_failure.get_or_insert(failure);
+        }
     }
     SessionToolCallBatchOutcome {
         completed: true,
