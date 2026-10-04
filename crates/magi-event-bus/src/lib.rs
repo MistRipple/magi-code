@@ -7,8 +7,10 @@ pub mod task_events;
 pub use bus::InMemoryEventBus;
 pub use events::{EventCategory, EventContext, EventEnvelope, EventStreamSnapshot};
 pub use ledger::{
-    AUDIT_USAGE_LEDGER_SCHEMA_VERSION, AuditUsageLedgerEntry, AuditUsageLedgerError,
-    AuditUsageLedgerSnapshot, AuditUsageLedgerStatus,
+    AUDIT_USAGE_LEDGER_RETENTION_MILLIS, AUDIT_USAGE_LEDGER_SCHEMA_VERSION,
+    AUDIT_USAGE_LEDGER_SEGMENT_MAX_BYTES, AuditUsageLedgerAppend, AuditUsageLedgerEntry,
+    AuditUsageLedgerError, AuditUsageLedgerSnapshot, AuditUsageLedgerStatus,
+    USAGE_STATS_RESET_EVENT_TYPE,
 };
 pub use read_model::{
     AssignmentRuntimeSummaryEntry, DispatchRuntimeSummary, EventCategoryCounts,

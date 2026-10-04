@@ -1706,7 +1706,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     let workspace_root = temp_workspace_absolute_path("runtime-maintenance-workspace");
     let blocking_parent = state_root.join("blocking-parent");
     fs::write(&blocking_parent, b"blocker").expect("blocking parent file should be writable");
-    let invalid_ledger_path = blocking_parent.join("audit-usage-ledger.json");
+    let invalid_ledger_path = blocking_parent.join("audit-usage-ledger");
     let valid_ledger_path = repository.audit_usage_ledger_path();
     event_bus.set_audit_usage_ledger_persistence(invalid_ledger_path);
 
@@ -1901,7 +1901,7 @@ fn runtime_maintenance_reports_failed_ledger_refresh_when_persistence_is_blocked
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let blocking_parent = state_root.join("blocking-parent");
     fs::write(&blocking_parent, b"blocker").expect("blocking parent file should be writable");
-    let invalid_ledger_path = blocking_parent.join("audit-usage-ledger.json");
+    let invalid_ledger_path = blocking_parent.join("audit-usage-ledger");
     event_bus.set_audit_usage_ledger_persistence(invalid_ledger_path);
     let _ = event_bus.publish(EventEnvelope::usage(
         EventId::new("usage-failed"),

@@ -12,7 +12,9 @@ use magi_conversation_runtime::model_context_window::{
     MODEL_CONTEXT_WINDOWS_SECTION, model_context_windows_with_update, set_model_context_window,
 };
 use magi_core::{AccessProfile, EventId, SessionId, UtcMillis};
-use magi_event_bus::{EventContext, EventEnvelope};
+use magi_event_bus::{
+    AuditUsageLedgerEntry, EventContext, EventEnvelope, USAGE_STATS_RESET_EVENT_TYPE,
+};
 use magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UrlMode, UsageAuthority, UsageCallIdentity,
@@ -2476,10 +2478,23 @@ async fn execution_stats(
 }
 
 fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
-    let ledger = state.event_bus.audit_usage_ledger_snapshot();
+    state
+        .event_bus
+        .with_audit_usage_ledger(|ledger| usage_authority_from_usage_entries(&ledger.usage_entries))
+}
+
+/// 执行统计只计入最后一次 `usage.stats.reset` 之后的用量条目；账本本身只追加，重置不删除历史。
+fn usage_authority_from_usage_entries(usage_entries: &[AuditUsageLedgerEntry]) -> UsageAuthority {
+    let reset_through = usage_entries
+        .iter()
+        .rev()
+        .find(|entry| entry.event_type == USAGE_STATS_RESET_EVENT_TYPE)
+        .map_or(0, |entry| entry.sequence);
+    let entries =
+        &usage_entries[usage_entries.partition_point(|entry| entry.sequence <= reset_through)..];
     let mut authority = UsageAuthority::new();
     let mut recorded_image_call_ids = HashSet::new();
-    for entry in &ledger.usage_entries {
+    for entry in entries {
         if entry.event_type != "model.usage.recorded" {
             continue;
         }
@@ -2490,7 +2505,7 @@ fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
         }
     }
 
-    for entry in &ledger.usage_entries {
+    for entry in entries {
         if entry.event_type != "model.usage.recorded" {
             continue;
         }
@@ -2512,7 +2527,7 @@ fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
         authority.append_call_record(input);
     }
 
-    for entry in &ledger.usage_entries {
+    for entry in entries {
         let payload = &entry.payload;
         let is_image_tool = entry.event_type == "tool.usage.recorded"
             && payload
@@ -2658,11 +2673,11 @@ async fn reset_stats(
     State(state): State<ApiState>,
     Json(_request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut snapshot = state.event_bus.audit_usage_ledger_snapshot();
-    snapshot
-        .usage_entries
-        .retain(|entry| entry.event_type != "model.usage.recorded");
-    state.event_bus.import_audit_usage_ledger_snapshot(snapshot);
+    state.event_bus.publish(EventEnvelope::usage(
+        EventId::new(format!("usage-stats-reset-{}", UtcMillis::now().0)),
+        USAGE_STATS_RESET_EVENT_TYPE,
+        json!({}),
+    ));
     state
         .event_bus
         .refresh_audit_usage_ledger_persistence()
@@ -6539,7 +6554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_stats_removes_all_recorded_model_usage() {
+    async fn reset_stats_counts_only_usage_after_reset_marker() {
         let state = test_state();
         for (event_id, context, input_tokens, output_tokens, call_id, timestamp) in [
             (
@@ -6602,12 +6617,41 @@ mod tests {
             .0;
         assert_eq!(after_reset["totals"]["totalTokens"], serde_json::json!(0));
 
+        // 账本只追加：重置以标记事件表达，历史条目保留，标记之后的新用量重新计入。
         let ledger_snapshot = state.event_bus.audit_usage_ledger_snapshot();
-        assert_eq!(ledger_snapshot.usage_entries.len(), 1);
-        assert_eq!(ledger_snapshot.usage_entries[0].event_id, "usage-other");
         assert_eq!(
-            ledger_snapshot.usage_entries[0].event_type,
-            "tool.usage.recorded"
+            ledger_snapshot
+                .usage_entries
+                .last()
+                .map(|entry| entry.event_type.as_str()),
+            Some(USAGE_STATS_RESET_EVENT_TYPE)
+        );
+        assert!(
+            ledger_snapshot
+                .usage_entries
+                .iter()
+                .any(|entry| entry.event_type == "model.usage.recorded")
+        );
+        state.event_bus.publish(EventEnvelope::usage(
+            EventId::new("usage-after-reset"),
+            "model.usage.recorded",
+            model_usage_payload(
+                "usage-after-reset",
+                "workspace-stats",
+                "session-stats",
+                "call-after-reset",
+                200,
+                4,
+                1,
+            ),
+        ));
+        let after_new_usage = execution_stats(State(state.clone()))
+            .await
+            .expect("global stats should build after new usage")
+            .0;
+        assert_eq!(
+            after_new_usage["totals"]["totalTokens"],
+            serde_json::json!(5)
         );
     }
 

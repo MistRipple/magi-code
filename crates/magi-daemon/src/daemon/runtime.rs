@@ -2386,7 +2386,7 @@ impl DaemonRuntime {
     ) -> Result<(), DaemonError> {
         let audit_usage_ledger = state_repository.load_audit_usage_ledger()?;
         let ledger_path = state_repository.audit_usage_ledger_path();
-        event_bus.import_audit_usage_ledger_snapshot(audit_usage_ledger);
+        event_bus.restore_persisted_audit_usage_ledger(audit_usage_ledger);
         event_bus.set_audit_usage_ledger_persistence(ledger_path.clone());
         if !ledger_path.exists()
             && let Err(error) = event_bus.refresh_audit_usage_ledger_persistence()
@@ -3621,13 +3621,13 @@ done
         assert!(runtime.workspace_store.snapshots().is_empty());
         assert!(state_root.join("workspaces.json").exists());
         assert!(!state_root.join("workspace-recovery-sidecars.json").exists());
-        assert!(state_root.join("audit-usage-ledger.json").exists());
+        assert!(state_root.join("audit-usage-ledger").is_dir());
 
-        let ledger = serde_json::from_slice::<AuditUsageLedgerSnapshot>(
-            &fs::read(state_root.join("audit-usage-ledger.json"))
-                .expect("audit usage ledger should be readable"),
+        let ledger = AuditUsageLedgerSnapshot::load_from_dir(
+            &state_root.join("audit-usage-ledger"),
+            magi_core::UtcMillis::now(),
         )
-        .expect("audit usage ledger should deserialize");
+        .expect("audit usage ledger should load");
         assert!(ledger.audit_entries.is_empty());
         assert!(ledger.usage_entries.is_empty());
     }
@@ -3654,7 +3654,7 @@ done
         })
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         .expect("fixture should persist a session projection");
-        let ledger_path = state_root.join("audit-usage-ledger.json");
+        let ledger_path = state_root.join("audit-usage-ledger");
         let projection_modified = fs::metadata(&projection_path)
             .expect("session projection metadata should exist")
             .modified()

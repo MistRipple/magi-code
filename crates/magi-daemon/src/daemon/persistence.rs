@@ -3661,12 +3661,59 @@ impl StateRepository {
         self.write_json_atomically(self.workspace_recovery_sidecars_path(), state)
     }
 
+    /// 审计/用量账本的追加写段目录（见 docs/durable-log-compaction-design.md §1）。
     pub(crate) fn audit_usage_ledger_path(&self) -> PathBuf {
-        self.state_root.join("audit-usage-ledger.json")
+        self.state_root.join("audit-usage-ledger")
     }
 
     pub(crate) fn load_audit_usage_ledger(&self) -> Result<AuditUsageLedgerSnapshot, DaemonError> {
-        self.read_json_or_default(self.audit_usage_ledger_path())
+        self.migrate_whole_file_audit_usage_ledger()?;
+        AuditUsageLedgerSnapshot::load_from_dir(
+            &self.audit_usage_ledger_path(),
+            magi_core::UtcMillis::now(),
+        )
+        .map_err(|error| {
+            DaemonError::internal(format!(
+                "审计/用量账本损坏，拒绝以空账本继续 {}: {error}",
+                self.audit_usage_ledger_path().display()
+            ))
+        })
+    }
+
+    /// 一次性迁移：把旧版整本重写的 `audit-usage-ledger.json` 先写入暂存目录，
+    /// 原子改名为段目录后再删除旧文件。段目录只由这次改名产生，且账本加载先于任何
+    /// 新写入，所以旧文件与段目录并存只可能是改名后、删除前崩溃，此时完成删除即可。
+    fn migrate_whole_file_audit_usage_ledger(&self) -> Result<(), DaemonError> {
+        let legacy_path = self.state_root.join("audit-usage-ledger.json");
+        if !legacy_path.exists() {
+            return Ok(());
+        }
+        let segment_dir = self.audit_usage_ledger_path();
+        if segment_dir.exists() {
+            fs::remove_file(&legacy_path)?;
+            return Ok(());
+        }
+        let legacy: AuditUsageLedgerSnapshot = self.read_json_strict(&legacy_path)?;
+        legacy
+            .validate_schema()
+            .map_err(|error| DaemonError::internal(error.to_string()))?;
+        let legacy = legacy.normalize();
+        let staging_dir = self.state_root.join("audit-usage-ledger.migrating");
+        if staging_dir.exists() {
+            fs::remove_dir_all(&staging_dir)?;
+        }
+        if let Some(append) = legacy
+            .append_after(0)
+            .map_err(|error| DaemonError::internal(error.to_string()))?
+        {
+            AuditUsageLedgerSnapshot::append_to_dir(&staging_dir, &append)
+                .map_err(|error| DaemonError::internal(error.to_string()))?;
+        } else {
+            fs::create_dir_all(&staging_dir)?;
+        }
+        fs::rename(&staging_dir, &segment_dir)?;
+        fs::remove_file(&legacy_path)?;
+        Ok(())
     }
 
     pub(crate) fn knowledge_state_path(&self) -> PathBuf {
@@ -4165,6 +4212,45 @@ mod tests {
         TimelineEntryKind,
     };
     use std::{collections::HashMap, thread};
+
+    #[test]
+    fn whole_file_audit_usage_ledger_migrates_to_segments_once() {
+        let state_root = unique_temp_dir("magi-ledger-migration");
+        let repository = StateRepository::new(state_root.clone());
+        let mut legacy = AuditUsageLedgerSnapshot::default();
+        let mut usage = magi_event_bus::EventEnvelope::usage(
+            magi_core::EventId::new("usage-legacy"),
+            "model.usage.recorded",
+            serde_json::json!({}),
+        );
+        usage.sequence = 41;
+        legacy.record_event(&usage);
+        fs::write(
+            state_root.join("audit-usage-ledger.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = repository
+            .load_audit_usage_ledger()
+            .expect("migrate ledger");
+        assert_eq!(migrated.usage_count(), 1);
+        assert_eq!(migrated.next_sequence, 42);
+        assert!(!state_root.join("audit-usage-ledger.json").exists());
+        assert!(repository.audit_usage_ledger_path().is_dir());
+        assert!(!state_root.join("audit-usage-ledger.migrating").exists());
+
+        // 改名后、删除旧文件前崩溃：再次加载只完成删除，以段目录为准。
+        fs::write(
+            state_root.join("audit-usage-ledger.json"),
+            serde_json::to_vec(&AuditUsageLedgerSnapshot::default()).unwrap(),
+        )
+        .unwrap();
+        let reloaded = repository.load_audit_usage_ledger().expect("reload ledger");
+        assert_eq!(reloaded.usage_count(), 1);
+        assert!(!state_root.join("audit-usage-ledger.json").exists());
+        let _ = fs::remove_dir_all(state_root);
+    }
 
     #[test]
     fn semantic_json_comparison_accepts_numeric_representation_changes() {

@@ -3,7 +3,7 @@ use crate::{
     EventStreamSnapshot, RecoveryReadModelInput, RuntimeLedgerSummary, RuntimeReadModelInput,
 };
 use magi_core::UtcMillis;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -20,7 +20,8 @@ pub struct InMemoryEventBus {
     audit_usage_ledger_last_error: Arc<RwLock<Option<String>>>,
     audit_usage_ledger_pending_flush: Arc<RwLock<bool>>,
     audit_usage_ledger_last_persisted_at: Arc<RwLock<Option<UtcMillis>>>,
-    audit_usage_ledger_persist_lock: Arc<Mutex<()>>,
+    /// 已落盘的最大 sequence，同时充当刷盘互斥锁：增量追加必须串行推进水位。
+    audit_usage_ledger_flushed_through: Arc<Mutex<u64>>,
     retain_limit: usize,
 }
 
@@ -36,7 +37,7 @@ impl InMemoryEventBus {
             audit_usage_ledger_last_error: Arc::new(RwLock::new(None)),
             audit_usage_ledger_pending_flush: Arc::new(RwLock::new(false)),
             audit_usage_ledger_last_persisted_at: Arc::new(RwLock::new(None)),
-            audit_usage_ledger_persist_lock: Arc::new(Mutex::new(())),
+            audit_usage_ledger_flushed_through: Arc::new(Mutex::new(0)),
             retain_limit: capacity,
         }
     }
@@ -178,32 +179,22 @@ impl InMemoryEventBus {
         })
     }
 
-    pub fn export_audit_usage_ledger_json(&self) -> Result<String, AuditUsageLedgerError> {
-        self.audit_usage_ledger_snapshot().export_json()
-    }
-
-    pub fn import_audit_usage_ledger_json(&self, value: &str) -> Result<(), AuditUsageLedgerError> {
-        let snapshot = AuditUsageLedgerSnapshot::import_json(value)?;
-        let next_sequence = snapshot.next_sequence;
-        let mut ledger = self
-            .audit_usage_ledger
-            .write()
-            .expect("event bus audit/usage ledger write lock poisoned");
-        *ledger = snapshot;
-        self.advance_sequence_from_ledger(next_sequence);
-        self.clear_audit_usage_ledger_error();
-        self.mark_audit_usage_ledger_clean(None);
-        Ok(())
-    }
-
-    pub fn import_audit_usage_ledger_snapshot(&self, snapshot: AuditUsageLedgerSnapshot) {
+    /// 装载从段目录恢复的账本。这些条目已经在磁盘上，水位推进到其最大 sequence，
+    /// 之后的刷盘只追加新条目。
+    pub fn restore_persisted_audit_usage_ledger(&self, snapshot: AuditUsageLedgerSnapshot) {
         let snapshot = snapshot.normalize();
         let next_sequence = snapshot.next_sequence;
+        let persisted_through = snapshot.last_sequence();
+        let mut flushed_through = self
+            .audit_usage_ledger_flushed_through
+            .lock()
+            .expect("event bus audit/usage ledger flush watermark poisoned");
         let mut ledger = self
             .audit_usage_ledger
             .write()
             .expect("event bus audit/usage ledger write lock poisoned");
         *ledger = snapshot;
+        *flushed_through = persisted_through;
         self.advance_sequence_from_ledger(next_sequence);
         self.clear_audit_usage_ledger_error();
         self.mark_audit_usage_ledger_clean(None);
@@ -217,18 +208,6 @@ impl InMemoryEventBus {
             .fetch_max(next_sequence.saturating_sub(1), Ordering::SeqCst);
     }
 
-    pub fn reset_audit_usage_ledger(&self) {
-        {
-            let mut ledger = self
-                .audit_usage_ledger
-                .write()
-                .expect("event bus audit/usage ledger write lock poisoned");
-            *ledger = AuditUsageLedgerSnapshot::default();
-        }
-        self.clear_audit_usage_ledger_error();
-        self.mark_audit_usage_ledger_dirty();
-    }
-
     pub fn set_audit_usage_ledger_persistence(&self, path: impl Into<PathBuf>) {
         let mut target = self
             .audit_usage_ledger_path
@@ -238,39 +217,15 @@ impl InMemoryEventBus {
     }
 
     pub fn refresh_audit_usage_ledger_persistence(&self) -> Result<(), AuditUsageLedgerError> {
-        match self.persist_audit_usage_ledger_if_configured() {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub fn persist_audit_usage_ledger(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<(), AuditUsageLedgerError> {
-        self.audit_usage_ledger_snapshot().persist_to_path(path)
-    }
-
-    pub fn restore_audit_usage_ledger(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<(), AuditUsageLedgerError> {
-        let snapshot = AuditUsageLedgerSnapshot::load_from_path(path)?;
-        let mut ledger = self
-            .audit_usage_ledger
-            .write()
-            .expect("event bus audit/usage ledger write lock poisoned");
-        *ledger = snapshot;
-        self.clear_audit_usage_ledger_error();
-        Ok(())
+        self.persist_audit_usage_ledger_if_configured()
     }
 
     fn persist_audit_usage_ledger_if_configured(&self) -> Result<(), AuditUsageLedgerError> {
-        let _persist_guard = self
-            .audit_usage_ledger_persist_lock
+        let mut flushed_through = self
+            .audit_usage_ledger_flushed_through
             .lock()
-            .expect("event bus audit/usage ledger persist lock poisoned");
-        let Some(path) = self
+            .expect("event bus audit/usage ledger flush watermark poisoned");
+        let Some(dir) = self
             .audit_usage_ledger_path
             .read()
             .expect("event bus audit/usage ledger path read lock poisoned")
@@ -279,19 +234,22 @@ impl InMemoryEventBus {
             return Ok(());
         };
 
-        // 刷盘发生在回合进行中，账本是数万条、数十 MB 的负载：不能整本克隆再序列化（瞬时内存翻几倍，
-        // 还会把 daemon 拖到心跳超时）。在读锁内直接导出紧凑 JSON，再无锁落盘。
+        // 只在读锁内编码水位之后的增量，再无锁追加到活动段；刷盘成本与历史总量无关。
         let persisted = self
-            .with_audit_usage_ledger(|ledger| ledger.export_json())
-            .and_then(|json| {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                magi_core::fs_atomic::write_atomic(&path, json.as_bytes())?;
-                Ok(())
+            .with_audit_usage_ledger(|ledger| ledger.append_after(*flushed_through))
+            .and_then(|append| {
+                let Some(append) = append else {
+                    std::fs::create_dir_all(&dir)?;
+                    return Ok(None);
+                };
+                AuditUsageLedgerSnapshot::append_to_dir(&dir, &append)?;
+                Ok(Some(append.last_sequence))
             });
         match persisted {
-            Ok(()) => {
+            Ok(last_sequence) => {
+                if let Some(last_sequence) = last_sequence {
+                    *flushed_through = last_sequence;
+                }
                 self.clear_audit_usage_ledger_error();
                 self.mark_audit_usage_ledger_clean(Some(UtcMillis::now()));
                 Ok(())
@@ -448,7 +406,7 @@ mod tests {
             magi_core::UtcMillis::now().0
         ));
         fs::create_dir_all(&base).expect("create temp dir");
-        let path = base.join("audit-usage-ledger.json");
+        let path = base.join("audit-usage-ledger");
 
         bus.set_audit_usage_ledger_persistence(path.clone());
         bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1));
@@ -459,7 +417,8 @@ mod tests {
         bus.refresh_audit_usage_ledger_persistence()
             .expect("refresh ledger");
 
-        let restored = AuditUsageLedgerSnapshot::load_from_path(&path).expect("restore ledger");
+        let restored = AuditUsageLedgerSnapshot::load_from_dir(&path, UtcMillis::now())
+            .expect("restore ledger");
         let status = bus.audit_usage_ledger_status();
 
         assert_eq!(restored.audit_count(), 1);
@@ -530,7 +489,7 @@ mod tests {
         fs::create_dir_all(&base).expect("create temp dir");
         let blocker = base.join("blocker");
         fs::write(&blocker, b"blocker").expect("create blocker file");
-        let path = blocker.join("audit-usage-ledger.json");
+        let path = blocker.join("audit-usage-ledger");
 
         bus.set_audit_usage_ledger_persistence(path);
         bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1));
@@ -603,7 +562,7 @@ mod tests {
         assert_eq!(restored_snapshot.next_sequence, 2);
 
         let restored = InMemoryEventBus::new(8);
-        restored.import_audit_usage_ledger_snapshot(restored_snapshot);
+        restored.restore_persisted_audit_usage_ledger(restored_snapshot);
         let next_sequence = restored.publish(event(EventCategory::Usage, "ledger.usage.after", 0));
 
         assert_eq!(next_sequence, 2);
@@ -618,6 +577,53 @@ mod tests {
     }
 
     #[test]
+    fn 恢复后的刷盘只追加新条目不重写已落盘历史() {
+        let base = std::env::temp_dir().join(format!(
+            "magi-event-bus-ledger-restore-append-{}-{}",
+            std::process::id(),
+            magi_core::UtcMillis::now().0
+        ));
+        let dir = base.join("audit-usage-ledger");
+        let original = InMemoryEventBus::new(8);
+        original.set_audit_usage_ledger_persistence(dir.clone());
+        original.publish(event(EventCategory::Usage, "ledger.usage.before", 1));
+        original.publish(event(EventCategory::Audit, "ledger.audit.before", 2));
+        original
+            .refresh_audit_usage_ledger_persistence()
+            .expect("first flush");
+        let line_count = |dir: &std::path::Path| {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| {
+                    fs::read_to_string(entry.unwrap().path())
+                        .unwrap()
+                        .lines()
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(line_count(&dir), 2);
+
+        let restored = InMemoryEventBus::new(8);
+        restored.restore_persisted_audit_usage_ledger(
+            AuditUsageLedgerSnapshot::load_from_dir(&dir, UtcMillis::now()).expect("load"),
+        );
+        restored.set_audit_usage_ledger_persistence(dir.clone());
+        restored
+            .refresh_audit_usage_ledger_persistence()
+            .expect("idle flush");
+        assert_eq!(line_count(&dir), 2);
+        restored.publish(event(EventCategory::Usage, "ledger.usage.after", 3));
+        restored
+            .refresh_audit_usage_ledger_persistence()
+            .expect("incremental flush");
+        assert_eq!(line_count(&dir), 3);
+        let reloaded = AuditUsageLedgerSnapshot::load_from_dir(&dir, UtcMillis::now()).unwrap();
+        assert_eq!(reloaded.usage_count(), 2);
+        assert_eq!(reloaded.last_sequence(), 3);
+    }
+
+    #[test]
     fn runtime_read_model应反映账本持久化失败状态() {
         let bus = InMemoryEventBus::new(8);
         let _receiver = bus.subscribe();
@@ -629,7 +635,7 @@ mod tests {
         fs::create_dir_all(&base).expect("create temp dir");
         let blocker = base.join("blocker");
         fs::write(&blocker, b"blocker").expect("create blocker file");
-        let path = blocker.join("audit-usage-ledger.json");
+        let path = blocker.join("audit-usage-ledger");
 
         bus.set_audit_usage_ledger_persistence(path);
         bus.publish(event(EventCategory::Usage, "ledger.usage.recorded", 1));
