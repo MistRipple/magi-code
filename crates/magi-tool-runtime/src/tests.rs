@@ -2127,6 +2127,102 @@ fn process_launch_does_not_block_followup_shell_in_same_session() {
     assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
 }
 
+#[cfg(unix)]
+#[test]
+fn blocked_process_write_does_not_hold_the_process_table() {
+    let root = unique_temp_dir("magi-tool-process-write-blocked");
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry = ToolRegistry::new(governance, event_bus);
+    tool_registry.register_default_builtins();
+    let context = ToolExecutionContext {
+        worker_id: None,
+        task_id: Some(TaskId::new("task-process-write-blocked")),
+        session_id: Some(SessionId::new("session-process-write-blocked")),
+        workspace_id: Some(WorkspaceId::new("workspace-process-write-blocked")),
+        access_profile: magi_core::AccessProfile::Restricted,
+        working_directory: None,
+        browser_capability_snapshot: None,
+        browser_execution_id: None,
+    };
+    let run = |tool: BuiltinToolName, call: &str, input: Value| {
+        tool_registry.execute_internal_builtin_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new(call),
+                tool_name: tool.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: input.to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &full_access_policy(),
+        )
+    };
+    // sleep 不读 stdin：超过管道缓冲区的写入会一直阻塞。
+    let launch = run(
+        BuiltinToolName::ProcessLaunch,
+        "tool-call-write-blocked-launch",
+        serde_json::json!({
+            "command": "sleep 30",
+            "cwd": root.to_string_lossy(),
+            "access_mode": "maybe_write"
+        }),
+    );
+    assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+    let terminal_id =
+        serde_json::from_str::<Value>(&launch.payload).expect("launch payload")["terminal_id"]
+            .as_u64()
+            .expect("terminal id");
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            run(
+                BuiltinToolName::ProcessWrite,
+                "tool-call-write-blocked-write",
+                serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "input": "x".repeat(4 * 1024 * 1024),
+                }),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        let read = run(
+            BuiltinToolName::ProcessRead,
+            "tool-call-write-blocked-read",
+            serde_json::json!({ "terminal_id": terminal_id }),
+        );
+        assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "被阻塞的写入不能占住全局进程表，其他进程工具必须立即返回"
+        );
+
+        let write_started = Instant::now();
+        let write = writer.join().expect("writer thread should finish");
+        assert!(
+            write_started.elapsed() < Duration::from_secs(10),
+            "子进程不读输入时写入必须在上限内返回"
+        );
+        assert_ne!(write.status, ExecutionResultStatus::Succeeded);
+        assert!(write.payload.contains("没有读取输入"), "{}", write.payload);
+
+        let kill = run(
+            BuiltinToolName::ProcessKill,
+            "tool-call-write-blocked-kill",
+            serde_json::json!({ "terminal_id": terminal_id }),
+        );
+        assert_eq!(
+            kill.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            kill.payload
+        );
+    });
+}
+
 #[test]
 fn process_launch_rejects_blank_json_command() {
     let governance = Arc::new(GovernanceService::default());

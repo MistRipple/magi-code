@@ -29,6 +29,8 @@ const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 const MIN_SHELL_TIMEOUT_MS: u64 = 1_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 1_800_000;
 const SHELL_TIMEOUT_POLL_MS: u64 = 20;
+/// process_write 等待子进程读取输入的上限。
+const PROCESS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 主进程结束后等待输出管道关闭的上限。超过它说明有后台进程继承了管道。
 const SHELL_PIPE_DRAIN_GRACE_MS: u64 = 1_500;
 const DEFAULT_FILE_READ_MAX_BYTES: usize = 64 * 1024;
@@ -115,6 +117,8 @@ struct ManagedProcess {
     cwd: String,
     scope: ProcessExecutionScope,
     child: ManagedChild,
+    /// 子进程 stdin 单独加锁：写入可能因子进程不读而阻塞，绝不能在持有全局进程表锁时进行。
+    stdin: Option<Arc<Mutex<std::process::ChildStdin>>>,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     started_at_ms: u64,
@@ -1612,6 +1616,7 @@ fn execute_process_launch_with_surface(
     let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
     spawn_managed_process_reader(child.take_stdout(), Arc::clone(&stdout_buffer));
     spawn_managed_process_reader(child.take_stderr(), Arc::clone(&stderr_buffer));
+    let stdin = child.take_stdin().map(|stdin| Arc::new(Mutex::new(stdin)));
     let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
     let process = ManagedProcess {
         terminal_id,
@@ -1619,6 +1624,7 @@ fn execute_process_launch_with_surface(
         cwd: cwd.display().to_string(),
         scope: ProcessExecutionScope::from_context(context),
         child,
+        stdin,
         stdout: stdout_buffer,
         stderr: stderr_buffer,
         started_at_ms: UtcMillis::now().0,
@@ -1733,25 +1739,49 @@ fn execute_process_write_with_surface(
         return error;
     }
     let content = field_string(&request, &["input"]).unwrap_or_default();
-    let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
-    let Some(process) = table.get_mut(&(terminal_id as u64)) else {
-        return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
+    let stdin = {
+        let table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+        let Some(process) = table.get(&(terminal_id as u64)) else {
+            return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
+        };
+        if !process_belongs_to_context(process, context) {
+            return builtin_error(surface_tool, "进程不属于当前 session/workspace");
+        }
+        let Some(stdin) = process.stdin.clone() else {
+            return builtin_error(surface_tool, format!("进程 #{terminal_id} 不接受输入"));
+        };
+        stdin
     };
-    if !process_belongs_to_context(process, context) {
-        return builtin_error(surface_tool, "进程不属于当前 session/workspace");
+    // 进程表锁已释放；写入在独立线程里进行并设上限：子进程不读输入时本次调用按超时
+    // 返回，不会一直占着工具执行，其他进程工具、中断与关机都不受影响。辅助线程在进程
+    // 退出、写端收到断管错误后自行结束。
+    let bytes = content.clone().into_bytes();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = stdin.lock().expect("process stdin lock poisoned");
+        let result = stdin.write_all(&bytes).and_then(|()| stdin.flush());
+        let _ = result_tx.send(result);
+    });
+    match result_rx.recv_timeout(PROCESS_WRITE_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return builtin_runtime_error(
+                surface_tool,
+                PROCESS_WRITE_PUBLIC_ERROR,
+                "写入后台进程失败",
+                error,
+            );
+        }
+        Err(_) => {
+            return builtin_error(
+                surface_tool,
+                format!(
+                    "进程 #{terminal_id} 在 {} 秒内没有读取输入，写入已放弃等待；请确认进程确实在等待输入，或结束该进程",
+                    PROCESS_WRITE_TIMEOUT.as_secs()
+                ),
+            );
+        }
     }
-    let Some(stdin) = process.child.stdin_mut() else {
-        return builtin_error(surface_tool, format!("进程 #{terminal_id} 不接受输入"));
-    };
-    if let Err(error) = stdin.write_all(content.as_bytes()) {
-        return builtin_runtime_error(
-            surface_tool,
-            PROCESS_WRITE_PUBLIC_ERROR,
-            "写入后台进程失败",
-            error,
-        );
-    }
-    let _ = stdin.flush();
     let mut payload = serde_json::json!({
         "tool": surface_tool,
         "status": "succeeded",
