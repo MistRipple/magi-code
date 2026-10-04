@@ -1655,6 +1655,7 @@ mod tests {
                     tool_name: "file_write".to_string(),
                     reason: "magi.fs.write: a.txt".to_string(),
                     requested_at: magi_core::UtcMillis::now(),
+                    agent: None,
                 },
                 "{}",
             )

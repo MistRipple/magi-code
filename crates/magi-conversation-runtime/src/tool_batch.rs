@@ -2337,7 +2337,7 @@ fn execute_task_tool_call(
         if decision.status == ExecutionResultStatus::NeedsApproval {
             match await_task_tool_approval(
                 event_bus,
-                conversation_registry.tool_approvals(),
+                conversation_registry,
                 task_store,
                 session_store,
                 task,
@@ -2570,7 +2570,7 @@ fn execute_task_tool_call(
         };
         match await_task_tool_approval(
             event_bus,
-            conversation_registry.tool_approvals(),
+            conversation_registry,
             task_store,
             session_store,
             task,
@@ -2593,7 +2593,7 @@ fn execute_task_tool_call(
 #[allow(clippy::too_many_arguments)]
 fn await_task_tool_approval(
     event_bus: &InMemoryEventBus,
-    registry: &crate::ToolApprovalRegistry,
+    conversation_registry: &ConversationRegistry,
     task_store: &TaskStore,
     session_store: &SessionStore,
     task: &magi_core::Task,
@@ -2621,6 +2621,7 @@ fn await_task_tool_approval(
             ExecutionResultStatus::Cancelled,
         ));
     };
+    let registry = conversation_registry.tool_approvals();
     let approval_id = format!("tool-approval-{}-{}", task.task_id, tool_call.id);
     let reason = serde_json::from_str::<serde_json::Value>(&decision.payload)
         .ok()
@@ -2640,6 +2641,7 @@ fn await_task_tool_approval(
         tool_name: tool_call.function.name.clone(),
         reason: reason.clone(),
         requested_at: UtcMillis::now(),
+        agent: crate::tool_approval::ApprovalRequestAgent::for_task(task),
     };
     let waiter =
         match registry.request_with_arguments(request.clone(), &tool_call.function.arguments) {
@@ -2704,6 +2706,30 @@ fn await_task_tool_approval(
             ..EventContext::default()
         }),
     );
+
+    // 子代理等待审批时主线并不知情：通知父任务，让它的 agent_wait 立即返回
+    // attention_required，而不是等到超时才发现子代理卡在审批上。
+    if let Some(parent_task_id) = task.parent_task_id.as_ref() {
+        let signal = RuntimeSignal {
+            author: MailboxAuthor::Child(task.task_id.to_string()),
+            kind: MailboxKind::Message,
+            trigger_turn: true,
+            payload: serde_json::json!({
+                "type": "agent_awaiting_approval",
+                "child_task_id": task.task_id,
+                "tool_name": tool_call.function.name,
+                "reason": reason,
+                "approval_id": approval_id,
+            }),
+            enqueued_at: UtcMillis::now(),
+        };
+        if conversation_registry
+            .enqueue_task_signal(session_id, parent_task_id, signal)
+            .is_ok()
+        {
+            task_store.notify_runtime_change();
+        }
+    }
 
     loop {
         match waiter
@@ -5567,11 +5593,20 @@ mod tests {
         CanonicalTurnEventSink::for_store(&session_store, None)
             .set_status_domain(&session_id, Some(turn_id), "running")
             .expect("approval disconnect Turn running status should persist");
-        let task = test_task("task-approval-disconnect", "task-approval-disconnect", None);
+        // 由子代理发起审批：父任务应收到 agent_awaiting_approval 信号。
+        let parent_task_id = TaskId::new("task-approval-parent");
+        let mut task = test_task(
+            "task-approval-disconnect",
+            "task-approval-parent",
+            Some(parent_task_id.clone()),
+        );
+        task.executor_binding = Some(TaskExecutorBinding::for_role("executor"));
+        task.title = "构建修复代理".to_string();
         task_store
             .insert_task(task.clone())
             .expect("task should be inserted");
-        let registry = crate::ToolApprovalRegistry::default();
+        conversation_registry.open_task_signal_channel(&session_id, &parent_task_id);
+        let registry = conversation_registry.tool_approvals();
         let workspace_id = None;
         let tool_call = ChatToolCall {
             id: "call-task-approval-disconnect".to_string(),
@@ -5590,7 +5625,7 @@ mod tests {
             let waiter = scope.spawn(|| {
                 await_task_tool_approval(
                     &event_bus,
-                    &registry,
+                    &conversation_registry,
                     &task_store,
                     &session_store,
                     &task,
@@ -5605,6 +5640,14 @@ mod tests {
             loop {
                 if let Some(pending) = registry.pending_for_session(&session_id).into_iter().next()
                 {
+                    assert_eq!(
+                        pending.agent,
+                        Some(crate::ApprovalRequestAgent {
+                            role: "executor".to_string(),
+                            title: "构建修复代理".to_string(),
+                        }),
+                        "审批请求应带上发起代理的身份"
+                    );
                     registry.cancel(&pending.approval_id);
                     break;
                 }
@@ -5624,6 +5667,14 @@ mod tests {
         assert_eq!(
             parsed["approval_id"],
             "tool-approval-task-approval-disconnect-call-task-approval-disconnect"
+        );
+        let signals = conversation_registry.drain_task_signals(&session_id, &parent_task_id);
+        assert!(
+            signals.iter().any(|signal| {
+                signal.payload["type"] == "agent_awaiting_approval"
+                    && signal.payload["child_task_id"] == "task-approval-disconnect"
+            }),
+            "父任务应被通知子代理正在等待审批：{signals:?}"
         );
     }
 

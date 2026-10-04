@@ -27,6 +27,8 @@ export interface ToolApprovalPayload {
   toolName: string;
   reason: string;
   requestedAt?: number;
+  /** 由子代理发起时的代理身份；主线请求为空。 */
+  agent?: { role: string; title: string } | null;
 }
 
 export function parseToolPayloadRecord(content: unknown): Record<string, unknown> | null {
@@ -99,6 +101,12 @@ export function parseToolApprovalPayload(content: unknown): ToolApprovalPayload 
   const requestedAt = typeof approval.requestedAt === 'number' && Number.isFinite(approval.requestedAt)
     ? approval.requestedAt
     : undefined;
+  const agentRecord = approval.agent && typeof approval.agent === 'object' && !Array.isArray(approval.agent)
+    ? approval.agent as Record<string, unknown>
+    : null;
+  const agent = agentRecord && (readString(agentRecord.role) || readString(agentRecord.title))
+    ? { role: readString(agentRecord.role), title: readString(agentRecord.title) }
+    : null;
   return {
     approvalId,
     sessionId,
@@ -108,6 +116,7 @@ export function parseToolApprovalPayload(content: unknown): ToolApprovalPayload 
     toolName: readString(approval.toolName) || readString(approval.tool_name) || readString(payload.tool),
     reason: readString(approval.reason) || readString(payload.error),
     requestedAt,
+    agent,
   };
 }
 

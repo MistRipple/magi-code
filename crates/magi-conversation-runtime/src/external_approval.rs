@@ -125,6 +125,7 @@ fn run_approval(
         tool_name: request.tool_name.to_string(),
         reason: request.summary.to_string(),
         requested_at: UtcMillis::now(),
+        agent: None,
     };
     let waiter = match registry.request_with_arguments(pending, request.arguments_json) {
         Ok(ToolApprovalRequestOutcome::Pending(waiter)) => waiter,

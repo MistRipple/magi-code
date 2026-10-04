@@ -2694,6 +2694,7 @@ fn await_session_tool_approval(
         tool_name: tool_call.function.name.clone(),
         reason: reason.clone(),
         requested_at: UtcMillis::now(),
+        agent: None,
     };
     let waiter =
         match registry.request_with_arguments(request.clone(), &tool_call.function.arguments) {

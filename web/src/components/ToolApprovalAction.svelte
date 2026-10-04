@@ -43,6 +43,13 @@
     <Icon name="shield" size={14} />
     <span>{i18n.t('toolCall.approval.title')}</span>
   </div>
+  {#if approval.agent}
+    <div class="tool-approval-agent">
+      {i18n.t('toolCall.approval.requestedByAgent', {
+        agent: [approval.agent.role, approval.agent.title].filter(Boolean).join(' · '),
+      })}
+    </div>
+  {/if}
   <p>{approval.reason || i18n.t('toolCall.approval.description')}</p>
   <div class="tool-approval-actions">
     <button
@@ -59,7 +66,7 @@
       disabled={Boolean(resolving) || resolved || !approvalIsActive}
       onclick={() => void resolve('allow_for_turn')}
     >
-      {resolving === 'allow_for_turn' ? i18n.t('toolCall.approval.processing') : i18n.t('toolCall.approval.allowForTurn')}
+      {resolving === 'allow_for_turn' ? i18n.t('toolCall.approval.processing') : i18n.t(approval.agent ? 'toolCall.approval.allowForTurnAgent' : 'toolCall.approval.allowForTurn')}
     </button>
     <button
       type="button"
@@ -106,6 +113,12 @@
   .tool-approval-heading :global(svg),
   .tool-approval-status :global(svg) {
     color: var(--foreground-muted);
+  }
+
+  .tool-approval-agent {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
   }
 
   .tool-approval p {

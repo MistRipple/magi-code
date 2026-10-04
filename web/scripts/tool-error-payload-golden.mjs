@@ -46,5 +46,28 @@ await withGoldenViteServer(async (server) => {
     'error_code normalization must stay stable',
   );
 
+  const agentApproval = toolErrors.parseToolApprovalPayload(JSON.stringify({
+    tool: 'shell_exec',
+    status: 'awaiting_approval',
+    approval_id: 'approval-agent',
+    approval: {
+      approvalId: 'approval-agent',
+      sessionId: 'session-1',
+      taskId: 'task-child',
+      reason: '需要执行命令',
+      agent: { role: 'executor', title: '构建修复代理' },
+    },
+  }));
+  assert.deepEqual(
+    agentApproval?.agent,
+    { role: 'executor', title: '构建修复代理' },
+    'sub-agent approval must keep the requesting agent identity',
+  );
+  const mainlineApproval = toolErrors.parseToolApprovalPayload(JSON.stringify({
+    status: 'awaiting_approval',
+    approval: { approvalId: 'approval-main', sessionId: 'session-1' },
+  }));
+  assert.equal(mainlineApproval?.agent, null, 'mainline approval has no agent identity');
+
   console.log('tool error payload golden replay passed');
 });

@@ -6199,6 +6199,7 @@ mod tests {
             tool_name: "file_write".to_string(),
             reason: "需要写入文件".to_string(),
             requested_at: UtcMillis::now(),
+            agent: None,
         };
         let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = state
             .conversation_registry
@@ -6302,6 +6303,7 @@ mod tests {
             tool_name: "file_write".to_string(),
             reason: "需要写入文件".to_string(),
             requested_at: UtcMillis::now(),
+            agent: None,
         };
         let approval_id = pending.approval_id.clone();
         let registry = state.conversation_registry.tool_approvals();

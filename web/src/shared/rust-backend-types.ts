@@ -226,6 +226,8 @@ export interface PendingToolApprovalDto {
   toolName: string;
   reason: string;
   requestedAt: number;
+  /** 由子代理发起时的代理身份；主线请求不返回该字段。 */
+  agent?: { role: string; title: string } | null;
 }
 
 export interface SessionToolApprovalRequestDto {

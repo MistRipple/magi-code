@@ -27,12 +27,41 @@ pub struct PendingToolApproval {
     pub tool_name: String,
     pub reason: String,
     pub requested_at: UtcMillis,
+    /// 由子代理发起时的代理身份，供审批界面说明是谁在请求；主线请求为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ApprovalRequestAgent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequestAgent {
+    pub role: String,
+    pub title: String,
+}
+
+impl ApprovalRequestAgent {
+    /// 子代理任务的身份；主线任务返回 `None`。
+    pub fn for_task(task: &magi_core::Task) -> Option<Self> {
+        task.parent_task_id.as_ref()?;
+        Some(Self {
+            role: task
+                .executor_binding_target_role()
+                .unwrap_or("agent")
+                .to_string(),
+            title: task.title.clone(),
+        })
+    }
+}
+
+/// “本轮允许/拒绝”的作用域：同一会话、同一轮、同一执行者（task）、同一工具与参数。
+///
+/// 每个子代理有独立的执行根（worktree），同一相对路径在不同代理中指向不同文件，
+/// 因此授权不能跨 task 复用。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SessionToolCallFingerprint {
     session_id: SessionId,
     turn_id: String,
+    task_id: TaskId,
     tool_name: String,
     normalized_arguments: String,
 }
@@ -41,6 +70,7 @@ fn fingerprint_for(request: &PendingToolApproval, arguments: &str) -> SessionToo
     SessionToolCallFingerprint {
         session_id: request.session_id.clone(),
         turn_id: request.turn_id.clone(),
+        task_id: request.task_id.clone(),
         tool_name: magi_tool_runtime::canonical_builtin_tool_name(&request.tool_name)
             .unwrap_or_else(|| request.tool_name.trim().to_ascii_lowercase()),
         normalized_arguments: crate::tool_result_utils::normalized_tool_arguments(arguments),
@@ -412,6 +442,7 @@ mod tests {
             tool_name: "file_write".to_string(),
             reason: "需要写入文件".to_string(),
             requested_at: UtcMillis::now(),
+            agent: None,
         }
     }
 
@@ -669,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_for_turn_releases_matching_pending_calls_across_tasks() {
+    fn turn_grants_and_denials_do_not_cross_tasks() {
         let registry = ToolApprovalRegistry::default();
         let ToolApprovalRequestOutcome::Pending(first) = registry
             .request(request("approval-first"))
@@ -680,8 +711,9 @@ mod tests {
         let mut sibling_request = request("approval-sibling");
         sibling_request.task_id = TaskId::new("task-sibling");
         sibling_request.tool_call_id = "call-sibling".to_string();
-        let ToolApprovalRequestOutcome::Pending(sibling) =
-            registry.request(sibling_request).expect("sibling approval")
+        let ToolApprovalRequestOutcome::Pending(sibling) = registry
+            .request(sibling_request.clone())
+            .expect("sibling approval")
         else {
             panic!("sibling request must initially wait");
         };
@@ -698,14 +730,50 @@ mod tests {
             first.decision_rx.recv().expect("first decision"),
             ToolApprovalDecision::AllowForTurn
         );
-        assert_eq!(
-            sibling.decision_rx.recv().expect("sibling decision"),
-            ToolApprovalDecision::AllowForTurn
-        );
         assert!(
+            sibling
+                .decision_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "对一个代理的“本轮允许”不能放行另一个代理的同参数调用"
+        );
+        assert_eq!(
             registry
                 .pending_for_session(&SessionId::new("session-approval"))
-                .is_empty()
+                .len(),
+            1
+        );
+
+        registry
+            .resolve(
+                &SessionId::new("session-approval"),
+                "approval-sibling",
+                ToolApprovalDecision::Deny,
+            )
+            .expect("deny sibling");
+        let mut first_again = request("approval-first-again");
+        first_again.tool_call_id = "call-first-again".to_string();
+        assert!(
+            matches!(
+                registry.request(first_again).expect("first task again"),
+                ToolApprovalRequestOutcome::AlreadyAllowed
+            ),
+            "同一 task 的同参数调用仍沿用本轮允许"
+        );
+        let mut sibling_again = sibling_request;
+        sibling_again.approval_id = "approval-sibling-again".to_string();
+        assert!(matches!(
+            registry.request(sibling_again).expect("sibling again"),
+            ToolApprovalRequestOutcome::PreviouslyDenied
+        ));
+        let mut third = request("approval-third");
+        third.task_id = TaskId::new("task-third");
+        assert!(
+            matches!(
+                registry.request(third).expect("third task"),
+                ToolApprovalRequestOutcome::Pending(_)
+            ),
+            "对另一个代理的拒绝不影响第三个代理"
         );
     }
 
