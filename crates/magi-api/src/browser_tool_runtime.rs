@@ -1255,46 +1255,25 @@ impl BrowserToolRuntimeDependencies {
             &mut magi_browser_authority::BrowserAuthority,
         ) -> Result<T, magi_browser_authority::BrowserAuthorityError>,
     ) -> Result<T, BrowserToolError> {
-        if !self
-            .state_writable
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(BrowserToolError::new(
-                "browser_state_not_writable",
-                "浏览器状态当前不可持久化",
-            ));
-        }
-        let _write_guard = self.write_lock.lock().expect("browser write lock poisoned");
-        let mut candidate = self
-            .authority
-            .lock()
-            .expect("browser authority lock poisoned")
-            .clone();
-        let value = mutation(&mut candidate).map_err(browser_authority_tool_error)?;
-        if let Some(persistence) = self.persistence.as_ref() {
-            let state_root = persistence.state_root().ok_or_else(|| {
-                BrowserToolError::new(
-                    "browser_state_persist_failed",
-                    "浏览器状态持久化根目录不可用",
-                )
-            })?;
-            persistence
-                .save_json(
-                    &state_root.join("browser/state.json"),
-                    &candidate.durable_state(),
-                )
-                .map_err(|error| {
-                    BrowserToolError::new(
-                        "browser_state_persist_failed",
-                        format!("浏览器状态持久化失败: {error:?}"),
-                    )
-                })?;
-        }
-        *self
-            .authority
-            .lock()
-            .expect("browser authority lock poisoned") = candidate;
-        Ok(value)
+        crate::state::commit_browser_authority_mutation(
+            &self.authority,
+            &self.write_lock,
+            &self.state_writable,
+            self.persistence.as_deref(),
+            mutation,
+        )
+        .map_err(|error| match error {
+            crate::state::BrowserAuthorityCommitError::NotWritable => {
+                BrowserToolError::new("browser_state_not_writable", "浏览器状态当前不可持久化")
+            }
+            crate::state::BrowserAuthorityCommitError::Rejected(error) => {
+                browser_authority_tool_error(error)
+            }
+            crate::state::BrowserAuthorityCommitError::Persist(error) => BrowserToolError::new(
+                "browser_state_persist_failed",
+                format!("浏览器状态持久化失败: {error:?}"),
+            ),
+        })
     }
 
     fn apply_page_state(

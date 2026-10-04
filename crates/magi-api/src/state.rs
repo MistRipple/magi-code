@@ -1729,6 +1729,47 @@ fn strip_transient_web_model_tabs(mut durable: BrowserDurableState) -> (BrowserD
     (durable, true)
 }
 
+pub(crate) enum BrowserAuthorityCommitError {
+    NotWritable,
+    Rejected(BrowserAuthorityError),
+    Persist(ApiError),
+}
+
+/// BrowserAuthority 的唯一提交路径（API 路由与浏览器工具共用）：在副本上执行变更，
+/// 持久化快照确有变化时才写盘，成功后再替换内存中的权威状态。
+pub(crate) fn commit_browser_authority_mutation<T>(
+    authority: &Mutex<BrowserAuthority>,
+    write_lock: &Mutex<()>,
+    state_writable: &AtomicBool,
+    persistence: Option<&RuntimeStatePersistence>,
+    mutation: impl FnOnce(&mut BrowserAuthority) -> Result<T, BrowserAuthorityError>,
+) -> Result<T, BrowserAuthorityCommitError> {
+    if !state_writable.load(Ordering::Acquire) {
+        return Err(BrowserAuthorityCommitError::NotWritable);
+    }
+    let _write_guard = write_lock
+        .lock()
+        .expect("browser authority write lock poisoned");
+    let mut candidate = authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .clone();
+    let before = browser_durable_state_for_persistence(&candidate);
+    let output = mutation(&mut candidate).map_err(BrowserAuthorityCommitError::Rejected)?;
+    let after = browser_durable_state_for_persistence(&candidate);
+    // 租约、当前 Tab 等运行态变化不进入持久化快照，不必重写 state.json。
+    if after != before
+        && let Some(persistence) = persistence
+        && let Some(state_root) = persistence.state_root()
+    {
+        persistence
+            .save_json(&state_root.join("browser/state.json"), &after)
+            .map_err(BrowserAuthorityCommitError::Persist)?;
+    }
+    *authority.lock().expect("browser authority lock poisoned") = candidate;
+    Ok(output)
+}
+
 fn browser_durable_state_for_persistence(authority: &BrowserAuthority) -> BrowserDurableState {
     strip_transient_web_model_tabs(authority.durable_state()).0
 }
@@ -3496,35 +3537,20 @@ impl ApiState {
         &self,
         mutation: impl FnOnce(&mut BrowserAuthority) -> Result<T, BrowserAuthorityError>,
     ) -> Result<T, ApiError> {
-        if !self.browser_state_writable.load(Ordering::Acquire) {
-            return Err(ApiError::Conflict(
-                "浏览器状态文件无效，修复前不能修改浏览器状态".to_string(),
-            ));
-        }
-        let _write_guard = self
-            .browser_write_lock
-            .lock()
-            .expect("browser authority write lock poisoned");
-        let current = self
-            .browser_authority
-            .lock()
-            .expect("browser authority lock poisoned")
-            .clone();
-        let mut candidate = current;
-        let output = mutation(&mut candidate).map_err(browser_authority_api_error)?;
-        if let Some(persistence) = &self.runtime_persistence
-            && let Some(state_root) = persistence.state_root()
-        {
-            persistence.save_json(
-                &state_root.join("browser/state.json"),
-                &candidate.durable_state(),
-            )?;
-        }
-        *self
-            .browser_authority
-            .lock()
-            .expect("browser authority lock poisoned") = candidate;
-        Ok(output)
+        commit_browser_authority_mutation(
+            &self.browser_authority,
+            &self.browser_write_lock,
+            &self.browser_state_writable,
+            self.runtime_persistence.as_deref(),
+            mutation,
+        )
+        .map_err(|error| match error {
+            BrowserAuthorityCommitError::NotWritable => {
+                ApiError::Conflict("浏览器状态文件无效，修复前不能修改浏览器状态".to_string())
+            }
+            BrowserAuthorityCommitError::Rejected(error) => browser_authority_api_error(error),
+            BrowserAuthorityCommitError::Persist(error) => error,
+        })
     }
 
     pub fn restore_regular_session_turn_queues(&self) -> Result<usize, ApiError> {

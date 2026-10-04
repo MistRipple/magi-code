@@ -469,6 +469,54 @@ fn closing_an_agent_tab_marks_it_closed_instead_of_retargeting_and_detects_other
 }
 
 #[test]
+fn terminal_leases_are_pruned_to_a_bounded_history() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+    for index in 0..300u64 {
+        let lease_id = BrowserLeaseId::new(format!("lease-{index}"));
+        authority
+            .acquire_lease(AcquireBrowserLease {
+                lease_id: lease_id.clone(),
+                tab_id: tab_id.clone(),
+                surface_id: surface_id(),
+                owner: owner(),
+                turn_id: "turn-1".to_string(),
+                goal_binding: None,
+                acquired_at: at(10 + index * 2),
+                expires_at: at(10_000),
+            })
+            .expect("lease should acquire");
+        authority
+            .revoke_lease(
+                &lease_id,
+                BrowserLeaseEndReason::TurnStopped,
+                at(11 + index * 2),
+            )
+            .expect("lease should revoke");
+    }
+    assert_eq!(
+        authority.snapshot_lease_count_for_test(),
+        256,
+        "已结束租约必须有界保留"
+    );
+    assert!(
+        authority
+            .lease_for_test(&BrowserLeaseId::new("lease-299"))
+            .is_some()
+    );
+    assert!(
+        authority
+            .lease_for_test(&BrowserLeaseId::new("lease-0"))
+            .is_none()
+    );
+}
+
+#[test]
 fn user_takeover_hold_blocks_agent_lease_until_user_hands_back() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);

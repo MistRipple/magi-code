@@ -18,6 +18,8 @@ use crate::{
 pub const MAX_BROWSER_TABS_PER_SESSION: usize = 32;
 /// 所有 Magi 会话共享的逻辑 Browser Tab 总容量。
 pub const MAX_BROWSER_TABS_TOTAL: usize = 64;
+/// 内存中保留的已结束租约数量上限。
+const MAX_RETAINED_TERMINAL_LEASES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct CreateBrowserSession {
@@ -108,7 +110,7 @@ pub struct BrowserAuthoritySnapshot {
     pub annotations: Vec<BrowserAnnotation>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrowserDurableState {
     pub schema_version: u16,
     pub revision: u64,
@@ -119,7 +121,7 @@ pub struct BrowserDurableState {
 }
 
 /// 浏览器 Tab 的持久部分。Surface、viewport、焦点和控制 Lease 均由桌面运行态持有。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrowserDurableTab {
     pub tab_id: BrowserTabId,
     pub browser_session_id: BrowserSessionId,
@@ -2055,9 +2057,43 @@ impl BrowserAuthority {
         lease.end_reason = Some(reason);
         lease.ended_at = Some(now);
         let lease = lease.clone();
+        self.prune_terminal_leases();
         self.bump_session_revision(&browser_session_id, now);
         self.bump_revision();
         Ok(lease)
+    }
+
+    /// 已结束的租约只为迟到的写请求提供“为何失效”的诊断，保留最近一批即可，
+    /// 否则长期运行时会无限增长并让每次提交的状态副本越来越大。
+    #[cfg(test)]
+    pub(crate) fn snapshot_lease_count_for_test(&self) -> usize {
+        self.leases.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lease_for_test(&self, lease_id: &BrowserLeaseId) -> Option<&BrowserControlLease> {
+        self.leases.get(lease_id)
+    }
+
+    fn prune_terminal_leases(&mut self) {
+        let mut terminal = self
+            .leases
+            .values()
+            .filter(|lease| lease.lifecycle.is_terminal())
+            .map(|lease| (lease.ended_at, lease.lease_id.clone()))
+            .collect::<Vec<_>>();
+        if terminal.len() <= MAX_RETAINED_TERMINAL_LEASES {
+            return;
+        }
+        terminal.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+        });
+        let excess = terminal.len() - MAX_RETAINED_TERMINAL_LEASES;
+        for (_, lease_id) in terminal.into_iter().take(excess) {
+            self.leases.remove(&lease_id);
+        }
     }
 
     fn advance_surface_fence(&mut self, tab_id: &BrowserTabId, surface_id: &str) -> u64 {
