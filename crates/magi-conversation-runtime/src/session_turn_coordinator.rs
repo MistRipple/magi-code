@@ -128,6 +128,10 @@ pub enum CoordinatorError {
     },
     AlreadyTerminal,
     NoActiveTurn,
+    /// 只有对话轮次会在模型轮次之间读取引导；任务轮次不提供引导。
+    SteerUnsupported {
+        profile: ExecutionProfile,
+    },
 }
 
 impl fmt::Display for CoordinatorError {
@@ -153,6 +157,9 @@ impl fmt::Display for CoordinatorError {
             }
             Self::AlreadyTerminal => f.write_str("Turn 已经进入终态"),
             Self::NoActiveTurn => f.write_str("session 没有活动 Turn"),
+            Self::SteerUnsupported { profile } => {
+                write!(f, "{profile:?} 轮次不支持引导当前回复")
+            }
         }
     }
 }
@@ -322,6 +329,12 @@ impl SessionTurnCoordinator {
             }
             TurnCommand::Steer { attempt, .. } => {
                 self.validate_attempt(session_id, &attempt)?;
+                let current = self.current_attempt(session_id, &attempt.turn_id)?;
+                if current.profile != ExecutionProfile::Conversation {
+                    return Err(CoordinatorError::SteerUnsupported {
+                        profile: current.profile,
+                    });
+                }
                 Ok(CoordinatorCommandResult::Attempt(attempt))
             }
             TurnCommand::Continue {
@@ -895,6 +908,20 @@ impl SessionTurnCoordinator {
         true
     }
 
+    /// 当前活动轮次是否接受引导（只有对话轮次接受）。
+    pub fn active_turn_accepts_steer(&self, session_id: &SessionId) -> bool {
+        self.state
+            .lock()
+            .expect("turn coordinator state poisoned")
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.active.as_ref())
+            .is_some_and(|active| {
+                !active.status.is_terminal()
+                    && active.admission.profile == ExecutionProfile::Conversation
+            })
+    }
+
     pub fn current_attempt(
         &self,
         session_id: &SessionId,
@@ -1170,6 +1197,44 @@ mod tests {
             coordinator.accept(&session, admission("turn-replayed", "request-1", "fp-1")),
             Ok(CoordinatorAdmission::Replay(replayed)) if replayed.turn_id == "turn-1"
         ));
+    }
+
+    #[test]
+    fn task_turn_rejects_steer_and_reports_no_steer_support() {
+        let coordinator = SessionTurnCoordinator::new();
+        let session = SessionId::new("session-task-steer");
+        let attempt = match coordinator
+            .execute_command(
+                &session,
+                TurnCommand::Start(TurnAdmission {
+                    turn_id: "turn-task-1".to_string(),
+                    request_id: "request-task-1".to_string(),
+                    request_fingerprint: "fp-task-1".to_string(),
+                    profile: ExecutionProfile::Task,
+                }),
+            )
+            .expect("Start command should be accepted")
+        {
+            CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
+            other => panic!("unexpected Start result: {other:?}"),
+        };
+
+        assert!(!coordinator.active_turn_accepts_steer(&session));
+        assert_eq!(
+            coordinator
+                .execute_command(
+                    &session,
+                    TurnCommand::Steer {
+                        attempt,
+                        request_id: "steer-task-1".to_string(),
+                    },
+                )
+                .unwrap_err(),
+            CoordinatorError::SteerUnsupported {
+                profile: ExecutionProfile::Task
+            },
+            "任务轮次不读取引导，必须明确拒绝而不是静默吞掉"
+        );
     }
 
     #[test]

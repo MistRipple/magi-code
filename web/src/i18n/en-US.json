@@ -396,7 +396,7 @@
   "input.queue.header": "Pending · {count}",
   "input.queue.guide": "Guide",
   "input.queue.guideTitle": "Send now as guidance for the current response",
-  "input.queue.guideStructuredUnavailable": "Messages with skills, goals, images, or context cannot become guidance",
+  "input.queue.guideUnavailable": "Only plain-text messages can become guidance, and only while a chat reply is running; task mode does not accept guidance",
   "input.queue.guideSuccess": "Sent as guidance for the current response",
   "input.queue.edit": "Edit message",
   "input.queue.delete": "Delete message",

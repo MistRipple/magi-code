@@ -396,7 +396,7 @@
   "input.queue.header": "待处理 {count} 条",
   "input.queue.guide": "引导",
   "input.queue.guideTitle": "立即作为当前回复的引导发送",
-  "input.queue.guideStructuredUnavailable": "包含技能、目标、图片或上下文的消息不能转为引导",
+  "input.queue.guideUnavailable": "只有纯文字消息、且当前是对话回复时可以转为引导；任务模式不支持引导",
   "input.queue.guideSuccess": "已作为当前回复的引导发送",
   "input.queue.edit": "编辑消息",
   "input.queue.delete": "删除消息",

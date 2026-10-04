@@ -1762,7 +1762,7 @@
 
   function guideQueuedMessageTitle(queued: QueuedMessage): string {
     if (queued.canGuide !== true) {
-      return i18n.t('input.queue.guideStructuredUnavailable');
+      return i18n.t('input.queue.guideUnavailable');
     }
     return i18n.t('input.queue.guideTitle');
   }

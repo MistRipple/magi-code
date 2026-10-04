@@ -391,13 +391,18 @@ fn session_turn_queue_response(
     state: &ApiState,
     session_id: &SessionId,
 ) -> SessionTurnQueueResponseDto {
+    // 能否把排队消息转为引导取决于当前活动轮次：任务轮次不读取引导。
+    let active_turn_accepts_steer = state
+        .turn_coordinator()
+        .active_turn_accepts_steer(session_id);
     let queued_turns = state
         .queued_regular_session_turns(session_id)
         .into_iter()
         .enumerate()
         .map(|(index, queued)| {
             let text = queued.request.trimmed_text();
-            let can_guide = session_turn_request_is_plain_text(&queued.request);
+            let can_guide =
+                active_turn_accepts_steer && session_turn_request_is_plain_text(&queued.request);
             QueuedSessionTurnDto {
                 queue_id: queued.queue_id,
                 queue_position: index + 1,
@@ -1016,13 +1021,6 @@ async fn submit_steer_current_turn_after_turn_commit(
             }
             other => ApiError::Conflict(other.to_string()),
         })?;
-    if coordinator_attempt.profile != ExecutionProfile::Conversation
-        && coordinator_attempt.profile != ExecutionProfile::Task
-    {
-        return Err(ApiError::Conflict(
-            "当前 Turn 的 execution profile 无效".to_string(),
-        ));
-    }
     if !session_turn_request_is_plain_text(request) {
         return Err(ApiError::InvalidInput(
             "引导当前回复仅支持文字输入".to_string(),
@@ -1061,7 +1059,16 @@ async fn submit_steer_current_turn_after_turn_commit(
                     .expect("steer request id should be normalized"),
             },
         )
-        .map_err(|error| ApiError::Conflict(format!("steer Turn 命令校验失败: {error}")))?;
+        .map_err(|error| match error {
+            magi_conversation_runtime::CoordinatorError::SteerUnsupported { .. } => {
+                ApiError::turn_conflict(
+                    "steer_unsupported",
+                    Some(expected_turn_id.clone()),
+                    "任务模式不支持引导当前回复，消息会在当前任务结束后执行",
+                )
+            }
+            other => ApiError::Conflict(format!("steer Turn 命令校验失败: {other}")),
+        })?;
     let (user_message_item_id, mut user_message_item) =
         build_user_message_turn_item(UserMessageTurnItemInput {
             accepted_at,
