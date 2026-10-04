@@ -33,7 +33,6 @@ members = [
   "crates/magi-safety-gate",
   "crates/magi-plan",
   "crates/magi-project-memory",
-  "crates/magi-mission-metrics",
   "crates/magi-snapshot",
 ]
 

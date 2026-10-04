@@ -1153,7 +1153,6 @@ dependencies = [
  "magi-knowledge-store",
  "magi-mcp-server",
  "magi-memory-store",
- "magi-mission-metrics",
  "magi-orchestrator",
  "magi-permissions",
  "magi-plan",
@@ -1273,7 +1272,6 @@ dependencies = [
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
- "magi-mission-metrics",
  "magi-orchestrator",
  "magi-permissions",
  "magi-plan",
@@ -1444,30 +1442,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "magi-mission-metrics"
-version = "3.0.51"
-dependencies = [
- "magi-core",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "magi-orchestrator"
 version = "3.0.51"
 dependencies = [
  "magi-agent-role",
- "magi-bridge-client",
  "magi-context-runtime",
  "magi-core",
- "magi-event-bus",
- "magi-governance",
- "magi-knowledge-store",
  "magi-memory-store",
- "magi-process",
- "magi-skill-runtime",
- "magi-tool-runtime",
  "magi-worker-runtime",
  "serde",
  "serde_json",
@@ -1642,15 +1623,8 @@ dependencies = [
 name = "magi-worker-runtime"
 version = "3.0.51"
 dependencies = [
- "magi-bridge-client",
  "magi-core",
- "magi-event-bus",
- "magi-governance",
- "magi-process",
- "magi-skill-runtime",
- "magi-tool-runtime",
  "serde",
- "serde_json",
 ]
 
 [[package]]

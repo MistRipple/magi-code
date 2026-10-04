@@ -63,7 +63,7 @@ pub trait CanonicalTurnEventWriter: Send + Sync {
 /// Session 首次接收 user 输入时通过 `ensure_session_mission` 创建 mission
 /// 并 spawn 一条 `role_id = ORCHESTRATOR_ROLE_ID` 的常驻 thread，作为"主线
 /// 对话"身份锚点。与 worker role 体系正交 —— 这是产品级的主干角色，
-/// 不会被 `DynamicWorkerCatalog` 识别为可派发 worker。
+/// 不会进入 worker catalog 成为可派发 worker。
 pub const ORCHESTRATOR_ROLE_ID: &str = "orchestrator";
 pub const SESSION_TITLE_MAX_CHARS: usize = 40;
 const MAX_INCIDENT_NOTIFICATION_RECORDS: usize = 1_000;

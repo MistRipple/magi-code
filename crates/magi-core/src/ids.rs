@@ -84,7 +84,7 @@ define_id!(BrowserLeaseId);
 define_id!(BrowserCommandId);
 define_id!(BrowserAnnotationId);
 // P6 Thread 原语（Y 方案）：同 mission + 同 role 持续存在的执行 thread。
-// 一个 Thread 跨多个 task 累积上下文，由 DynamicWorkerCatalog 绑定到
+// 一个 Thread 跨多个 task 累积上下文，由 worker catalog 绑定到
 // 具体的 worker 实例（WorkerId）。Thread 生命周期随 mission 结束而终止。
 define_id!(ThreadId);
 

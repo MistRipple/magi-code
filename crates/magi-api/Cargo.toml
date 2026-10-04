@@ -25,7 +25,6 @@ magi-appearance = { path = "../magi-appearance" }
 magi-agent-role = { path = "../magi-agent-role" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-safety-gate = { path = "../magi-safety-gate" }
-magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }

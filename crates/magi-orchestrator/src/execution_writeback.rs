@@ -59,14 +59,6 @@ impl ExecutionWritebackPlans {
         }
     }
 
-    pub fn from_optional_memory_extraction(request: Option<MemoryExtractionApplyRequest>) -> Self {
-        let plans = request
-            .into_iter()
-            .map(ExecutionWritebackPlan::MemoryExtraction)
-            .collect();
-        Self { plans }
-    }
-
     pub fn from_continue_checkpoint_input(input: &RecoveryResumeInput) -> Self {
         let Some(session_id) = input.ownership.session_id.clone() else {
             return Self::default();
@@ -155,7 +147,7 @@ fn session_action_memory_id(
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchMemoryExtractionInput, ExecutionWritebackPlans};
+    use super::{DispatchMemoryExtractionInput, ExecutionWritebackPlan, ExecutionWritebackPlans};
     use magi_core::{ExecutionOwnership, RecoveryResumeInput, SessionId, UtcMillis, WorkspaceId};
     use magi_memory_store::{
         ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore,
@@ -177,21 +169,23 @@ mod tests {
     #[test]
     fn memory_extraction_writeback_plan_applies_closed_loop_record() {
         let store = MemoryStore::new();
-        let plans = ExecutionWritebackPlans::from_optional_memory_extraction(Some(
-            MemoryExtractionApplyRequest {
-                extraction_id: "extract-1".to_string(),
-                session_id: SessionId::new("session-1"),
-                source_ref: Some("timeline://entry-1".to_string()),
-                summary: "loopback extraction".to_string(),
-                memories: vec![ExtractedMemory {
-                    memory_id: "mem-1".to_string(),
-                    layer: MemoryLayer::Durable,
-                    content: "hello world".to_string(),
+        let plans = ExecutionWritebackPlans {
+            plans: vec![ExecutionWritebackPlan::MemoryExtraction(
+                MemoryExtractionApplyRequest {
+                    extraction_id: "extract-1".to_string(),
+                    session_id: SessionId::new("session-1"),
+                    source_ref: Some("timeline://entry-1".to_string()),
+                    summary: "loopback extraction".to_string(),
+                    memories: vec![ExtractedMemory {
+                        memory_id: "mem-1".to_string(),
+                        layer: MemoryLayer::Durable,
+                        content: "hello world".to_string(),
+                        created_at: UtcMillis(42),
+                    }],
                     created_at: UtcMillis(42),
-                }],
-                created_at: UtcMillis(42),
-            },
-        ));
+                },
+            )],
+        };
 
         plans.apply(&store);
 

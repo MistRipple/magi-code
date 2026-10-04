@@ -69,7 +69,7 @@ session 专属 branch + worktree，不能允许它们并行共享 live worktree�
 - `ReadOnly` 子代理：`git worktree add --detach <path> <base_head>`；
 - 可写子代理：从同一 `base_head` 创建唯一 `magi/agent/*` branch 与独立 worktree；
 - 工具的 `working_directory` 指向代理 worktree；
-- ProjectMemory、MissionMetrics 与 session snapshot 仍以主 workspace identity root 归档；
+- ProjectMemory 与 session snapshot 仍以主 workspace identity root 归档；
 - 子代理模型调用终止后立刻把分配标为 inactive：干净 worktree 自动安全移除，
   writable branch 保留供主对话 merge；dirty/conflict worktree 保留目录和 context，
   绝不使用 `--force` 丢失代理产物；

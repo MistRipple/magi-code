@@ -73,7 +73,7 @@
 | --- | --- | --- |
 | H8-1 | `magi-worker-runtime` / `magi-orchestrator` 中的执行循环、review/verify/repair 状态机、`verification_runner`、`local_worker_executor` 只被测试调用 | 删除，并清理只为它们存在的类型和测试 |
 | H8-2 | `magi-mission-metrics` 只写不读，与 usage-authority 重复记账 | 删除 crate 及写入点 |
-| H8-3 | `SessionPlan.task_statuses` 镜像 TaskStore 状态 | 改为读取时从 TaskStore 计算 |
+| H8-3 | `SessionPlan.task_statuses` 镜像 TaskStore 状态 | 暂缓：SessionPlan 持久化格式带 deny_unknown_fields，删字段需迁移；“已绑定计划但尚未写入 TaskStore”的任务应视为活跃还是不活跃需先定义；session-store 不能依赖 TaskStore，需由调用方注入状态查询（约 27 处）。状态目前由 daemon 状态回调单向同步 |
 
 ## H9 重启恢复
 
@@ -92,5 +92,5 @@
 | H5 | 已完成 | 见 git log（H5） |
 | H6 | 已完成 | 见 git log（H6） |
 | H7 | 已完成 | 见 git log（H7） |
-| H8 | 未开始 | |
+| H8 | H8-1、H8-2 已完成；H8-3 暂缓（见下） | 见 git log（H8） |
 | H9 | 未开始 | |

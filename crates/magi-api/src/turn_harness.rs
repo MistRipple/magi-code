@@ -30,12 +30,11 @@ use magi_core::{AccessProfile, SessionId, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_memory_store::MemoryStore;
-use magi_orchestrator::{OrchestratorService, task_store::TaskStore};
+use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
 use magi_session_store::{
     ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItemKind, SessionStore, TimelineEntryInput,
     TimelineEntryKind,
 };
-use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::{ExternalMcpToolExecutor, ExternalToolCatalogSnapshot, ToolRegistry};
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
@@ -999,16 +998,7 @@ impl MagiTurnHarness {
             tool_registry = tool_registry.with_external_mcp_tool_executor(executor);
         }
         tool_registry.register_default_builtins();
-        let skill_dispatch_runtime = SkillDispatchRuntime::new(
-            tool_registry.clone(),
-            magi_bridge_client::BridgeDispatchRuntime::new(),
-        );
-        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
-        let mut execution_runtime = orchestrator.execution_runtime(
-            WorkerRuntime::new(Arc::clone(&event_bus)),
-            tool_registry.clone(),
-            skill_dispatch_runtime,
-        );
+        let mut execution_runtime = OrchestratedExecutionRuntime::new(WorkerRuntime::new());
         if let Some(task_store) = task_store.as_ref() {
             execution_runtime = execution_runtime.with_task_store(Arc::clone(&task_store));
         }
@@ -1056,7 +1046,6 @@ impl MagiTurnHarness {
         let mut dispatcher_builder = LlmTaskDispatcher::new(
             Arc::clone(&event_bus),
             ExecutionPipeline {
-                orchestrator,
                 execution_runtime,
                 memory_store: MemoryStore::new(),
             },

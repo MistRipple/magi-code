@@ -53,10 +53,9 @@ use magi_core::{
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_memory_store::{ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore};
-use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans, OrchestratedExecutionRuntime,
-    OrchestratorService, task_worker_catalog::WorkerInfo,
+    task_worker_catalog::WorkerInfo,
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_settings_store::SettingsStore;
@@ -76,7 +75,6 @@ use crate::session_turn_execution::run_session_turn_execution_for_test;
 
 #[derive(Clone)]
 pub struct ExecutionPipeline {
-    pub orchestrator: OrchestratorService,
     pub execution_runtime: OrchestratedExecutionRuntime,
     pub memory_store: MemoryStore,
 }
@@ -181,10 +179,6 @@ pub struct LlmTaskDispatcher {
     /// `memory_write` 工具新增/删除项目记忆条目；每次 Turn 起始把 MEMORY.md 视图注入
     /// system prompt，跨 conversation 复用。
     project_memory_registry: Arc<magi_project_memory::ProjectMemoryRegistry>,
-    /// codex goal 桥：mission 维度记账 registry。dispatch 时按 workspace 拿对应
-    /// store，conversation_loop 中每轮 LLM 调用后调用一次 `record_mission_turn`
-    /// 累加 token / 时间。daemon bootstrap 未注入时为 `None`，行为退回到不记账。
-    mission_metrics_registry: Arc<MissionMetricsRegistry>,
 }
 
 pub struct LlmTaskDispatcherDependencies {
@@ -575,11 +569,8 @@ impl LlmTaskDispatcher {
             conversation_registry,
             agent_role_registry,
             project_memory_registry: Arc::new(
-                magi_project_memory::ProjectMemoryRegistry::with_home(mission_state_root.clone()),
+                magi_project_memory::ProjectMemoryRegistry::with_home(mission_state_root),
             ),
-            mission_metrics_registry: Arc::new(MissionMetricsRegistry::with_home(
-                mission_state_root.clone(),
-            )),
         }
     }
 
@@ -699,15 +690,6 @@ impl LlmTaskDispatcher {
     pub fn with_snapshot_manager(mut self, manager: Arc<magi_snapshot::SnapshotManager>) -> Self {
         self.snapshot_manager = Some(manager);
         self
-    }
-
-    pub fn with_mission_metrics_registry(mut self, registry: Arc<MissionMetricsRegistry>) -> Self {
-        self.mission_metrics_registry = registry;
-        self
-    }
-
-    pub fn mission_metrics_registry(&self) -> Arc<MissionMetricsRegistry> {
-        self.mission_metrics_registry.clone()
     }
 
     pub fn with_project_memory_registry(
@@ -2548,22 +2530,6 @@ impl LlmTaskDispatcher {
                 }
             }
         });
-        let mission_metrics = if let Some(path) = workspace_identity_root_path.as_ref() {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.mission_metrics_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        workspace_root = %path.display(),
-                        "MissionMetrics: 打开失败，本次 Turn 不写记账（accounting 失败不阻断主流程）"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let snapshot_session = self.snapshot_manager.as_ref().and_then(|manager| {
             workspace_identity_root_path
                 .as_ref()
@@ -2586,7 +2552,6 @@ impl LlmTaskDispatcher {
             safety_gate: safety_gate.as_ref(),
             plan_store: &plan_store,
             project_memory: project_memory.as_deref(),
-            mission_metrics: mission_metrics.as_ref(),
             task: &execution_task,
             task_id,
             lease_id,
@@ -3493,18 +3458,9 @@ mod tests {
         tool_registry: ToolRegistry,
         state_label: &str,
     ) -> LlmTaskDispatcher {
-        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
-        let skill_runtime = magi_skill_runtime::SkillDispatchRuntime::new(
-            tool_registry.clone(),
-            magi_bridge_client::BridgeDispatchRuntime::new(),
-        );
-        let execution_runtime = orchestrator.execution_runtime(
-            magi_worker_runtime::WorkerRuntime::new(Arc::clone(&event_bus)),
-            tool_registry.clone(),
-            skill_runtime,
-        );
+        let execution_runtime =
+            OrchestratedExecutionRuntime::new(magi_worker_runtime::WorkerRuntime::new());
         let pipeline = ExecutionPipeline {
-            orchestrator,
             execution_runtime,
             memory_store: MemoryStore::new(),
         };

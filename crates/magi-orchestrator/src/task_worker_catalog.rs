@@ -15,10 +15,8 @@ pub struct WorkerInfo {
     /// Role-specific system prompt template injected at LLM invocation (design 8.1).
     pub system_prompt_template: Option<String>,
 }
-use std::collections::HashMap;
-use std::sync::RwLock;
 
-/// 任务系统：role / prompt 经 `AgentRoleRegistry` 解析；本模块只保留动态目录查询。
+/// 任务系统：role / prompt 经 `AgentRoleRegistry` 解析；本模块只保留目录构造与角色解析。
 pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     match kind {
         TaskKind::LocalAgent => Some("executor"),
@@ -39,14 +37,6 @@ pub fn resolve_task_role<'a>(task: &'a Task, registry: &AgentRoleRegistry) -> Op
             .then_some(role);
     }
     default_task_role_for_kind(task.kind)
-}
-
-pub fn supported_kinds_for_role(registry: &AgentRoleRegistry, role: &str) -> Vec<TaskKind> {
-    registry.supported_task_kinds(role)
-}
-
-pub fn role_supports_task_kind(registry: &AgentRoleRegistry, role: &str, kind: TaskKind) -> bool {
-    registry.role_supports_task_kind(role, kind)
 }
 
 pub fn build_worker_info_for_role(
@@ -90,106 +80,6 @@ where
     }
     workers
 }
-// --- 动态 Worker 目录：支持运行时注册/注销/查询
-
-pub struct DynamicWorkerCatalog {
-    workers: RwLock<HashMap<String, WorkerInfo>>,
-}
-
-impl DynamicWorkerCatalog {
-    pub fn new() -> Self {
-        Self {
-            workers: RwLock::new(HashMap::new()),
-        }
-    }
-
-    /// 由注册表中所有 role 一次性填充。启动路径调用 `AgentRoleRegistry::load_default()`
-    /// 拿到注册表后再传入这里，DynamicWorkerCatalog 自此不再持有硬编码 role 列表。
-    pub fn with_registry(registry: &AgentRoleRegistry) -> Self {
-        let catalog = Self::new();
-        for role in registry.all() {
-            if let Some(worker) = build_worker_info_for_role(registry, &role.id) {
-                catalog.register(worker);
-            }
-        }
-        catalog
-    }
-
-    pub fn register(&self, worker: WorkerInfo) {
-        let mut workers = self.workers.write().expect("catalog write lock poisoned");
-        workers.insert(worker.worker_id.to_string(), worker);
-    }
-
-    pub fn register_custom(
-        &self,
-        worker_id: WorkerId,
-        role: String,
-        supported_kinds: Vec<TaskKind>,
-        parallelism_limit: Option<u32>,
-        system_prompt_template: Option<String>,
-    ) {
-        self.register(WorkerInfo {
-            worker_id,
-            role,
-            supported_kinds,
-            parallelism_limit,
-            system_prompt_template,
-        });
-    }
-
-    pub fn deregister(&self, worker_id: &WorkerId) -> Option<WorkerInfo> {
-        let mut workers = self.workers.write().expect("catalog write lock poisoned");
-        workers.remove(worker_id.as_str())
-    }
-
-    pub fn get(&self, worker_id: &WorkerId) -> Option<WorkerInfo> {
-        let workers = self.workers.read().expect("catalog read lock poisoned");
-        workers.get(worker_id.as_str()).cloned()
-    }
-
-    pub fn find_by_role(&self, role: &str) -> Vec<WorkerInfo> {
-        let workers = self.workers.read().expect("catalog read lock poisoned");
-        workers
-            .values()
-            .filter(|w| w.role == role)
-            .cloned()
-            .collect()
-    }
-
-    pub fn find_for_task(&self, task: &Task, registry: &AgentRoleRegistry) -> Vec<WorkerInfo> {
-        let required_role = resolve_task_role(task, registry);
-        if task.executor_binding_target_role().is_some() && required_role.is_none() {
-            return Vec::new();
-        }
-        let workers = self.workers.read().expect("catalog read lock poisoned");
-        workers
-            .values()
-            .filter(|w| {
-                let kind_match = w.supported_kinds.contains(&task.kind);
-                required_role
-                    .map(|role| w.role == role && kind_match)
-                    .unwrap_or(kind_match)
-            })
-            .cloned()
-            .collect()
-    }
-
-    pub fn all_workers(&self) -> Vec<WorkerInfo> {
-        let workers = self.workers.read().expect("catalog read lock poisoned");
-        workers.values().cloned().collect()
-    }
-
-    pub fn worker_count(&self) -> usize {
-        let workers = self.workers.read().expect("catalog read lock poisoned");
-        workers.len()
-    }
-}
-
-impl Default for DynamicWorkerCatalog {
-    fn default() -> Self {
-        Self::with_registry(&AgentRoleRegistry::load_default())
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -197,75 +87,6 @@ mod tests {
 
     fn registry() -> AgentRoleRegistry {
         AgentRoleRegistry::load_default()
-    }
-
-    #[test]
-    fn default_catalog_has_workers() {
-        let catalog = DynamicWorkerCatalog::default();
-        assert!(catalog.worker_count() >= 4);
-    }
-
-    #[test]
-    fn register_and_deregister() {
-        let catalog = DynamicWorkerCatalog::new();
-        assert_eq!(catalog.worker_count(), 0);
-
-        let worker = WorkerInfo {
-            worker_id: WorkerId::new("custom-1"),
-            role: "ml-engineer".to_string(),
-            supported_kinds: vec![TaskKind::LocalAgent],
-            parallelism_limit: Some(2),
-            system_prompt_template: None,
-        };
-        catalog.register(worker);
-        assert_eq!(catalog.worker_count(), 1);
-        assert!(catalog.get(&WorkerId::new("custom-1")).is_some());
-
-        let removed = catalog.deregister(&WorkerId::new("custom-1"));
-        assert!(removed.is_some());
-        assert_eq!(catalog.worker_count(), 0);
-    }
-
-    #[test]
-    fn find_by_role() {
-        let catalog = DynamicWorkerCatalog::with_registry(&registry());
-        let architects = catalog.find_by_role("architect");
-        assert!(!architects.is_empty());
-        assert!(architects.iter().all(|w| w.role == "architect"));
-    }
-
-    #[test]
-    fn find_for_task() {
-        let reg = registry();
-        let catalog = DynamicWorkerCatalog::with_registry(&reg);
-        let task = Task {
-            task_id: magi_core::TaskId::new("t-1"),
-            mission_id: magi_core::MissionId::new("m-1"),
-            root_task_id: magi_core::TaskId::new("t-1"),
-            parent_task_id: None,
-            kind: TaskKind::LocalAgent,
-            title: "test".to_string(),
-            goal: "test".to_string(),
-            status: magi_core::TaskStatus::Pending,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            completion_contract: magi_core::TaskCompletionContract::default(),
-            recovery_checkpoint: None,
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: magi_core::UtcMillis::now(),
-            updated_at: magi_core::UtcMillis::now(),
-        };
-        let candidates = catalog.find_for_task(&task, &reg);
-        assert!(!candidates.is_empty());
     }
 
     #[test]
@@ -299,16 +120,11 @@ mod tests {
         };
 
         assert_eq!(resolve_task_role(&task, &reg), Some("tester"));
-        let catalog = DynamicWorkerCatalog::with_registry(&reg);
-        let candidates = catalog.find_for_task(&task, &reg);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].role, "tester");
     }
 
     #[test]
-    fn coordinator_task_only_matches_coordinator_worker() {
+    fn coordinator_task_resolves_to_coordinator_worker() {
         let reg = registry();
-        let catalog = DynamicWorkerCatalog::with_registry(&reg);
         let mut task = Task {
             task_id: magi_core::TaskId::new("t-coordinator"),
             mission_id: magi_core::MissionId::new("m-coordinator"),
@@ -337,29 +153,11 @@ mod tests {
         };
         task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
 
-        let candidates = catalog.find_for_task(&task, &reg);
+        let role = resolve_task_role(&task, &reg).expect("coordinator role should resolve");
+        let candidates = build_worker_catalog_for_roles(&reg, [role]);
 
+        assert_eq!(role, "coordinator");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].role, "coordinator");
-    }
-
-    #[test]
-    fn register_custom_worker() {
-        let catalog = DynamicWorkerCatalog::new();
-        catalog.register_custom(
-            WorkerId::new("gpu-worker-1"),
-            "ml-engineer".to_string(),
-            vec![TaskKind::LocalAgent, TaskKind::LocalAgent],
-            Some(4),
-            Some("GPU 加速机器学习工程师提示词".to_string()),
-        );
-        let w = catalog.get(&WorkerId::new("gpu-worker-1")).unwrap();
-        assert_eq!(w.role, "ml-engineer");
-        assert_eq!(w.parallelism_limit, Some(4));
-        assert_eq!(w.supported_kinds.len(), 2);
-        assert_eq!(
-            w.system_prompt_template,
-            Some("GPU 加速机器学习工程师提示词".to_string())
-        );
     }
 }

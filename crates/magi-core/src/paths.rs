@@ -1,15 +1,13 @@
-//! 跨 Tier 4 store + project-memory 共享的文件系统布局工具。
+//! workspace 级持久化共享的文件系统布局工具。
 //!
-//! 八个 store（Charter / Plan / KG / Validation / Workspace / Checkpoint /
-//! HumanCheckpoint / ProjectMemory）共享 `<magi_home>/projects/<slug>/` 前缀，
+//! 按 workspace 归档的 store 共享 `<magi_home>/projects/<slug>/` 前缀，
 //! 必须使用同一个 slug 函数——否则同一 workspace 在不同 store 会落到不同目录。
 //! 本模块把规则收敛到唯一来源。
 //!
 //! 物理布局：
-//! - mission stores：`<magi_home>/projects/<slug>/missions/<mission_id>/<artifact>`
 //! - project memory：`<magi_home>/projects/<slug>/memory/<entry>`
 
-use crate::{MissionId, WorkspaceRootPath};
+use crate::WorkspaceRootPath;
 use std::path::{Path, PathBuf};
 
 /// 把 workspace 绝对路径映射为目录名安全的 slug。
@@ -45,20 +43,6 @@ pub fn workspace_slug(absolute_path: &str) -> String {
 pub fn project_root(magi_home: &Path, workspace_root: &WorkspaceRootPath) -> PathBuf {
     let slug = workspace_slug(workspace_root.as_str());
     magi_home.join("projects").join(slug)
-}
-
-/// `<magi_home>/projects/<slug>/missions` —— 单个 workspace 下所有 mission 的根。
-pub fn missions_root(magi_home: &Path, workspace_root: &WorkspaceRootPath) -> PathBuf {
-    project_root(magi_home, workspace_root).join("missions")
-}
-
-/// 指定 mission 的目录：`<magi_home>/projects/<slug>/missions/<mission_id>`。
-pub fn mission_dir(
-    magi_home: &Path,
-    workspace_root: &WorkspaceRootPath,
-    mission_id: &MissionId,
-) -> PathBuf {
-    missions_root(magi_home, workspace_root).join(mission_id.as_str())
 }
 
 /// `<magi_home>/projects/<slug>/memory` —— project memory 根目录。
@@ -116,27 +100,6 @@ mod tests {
         assert_eq!(
             project_root(&home, &root),
             PathBuf::from("/tmp/.magi/projects/-Users-x-proj")
-        );
-    }
-
-    #[test]
-    fn missions_root_composes_projects_slug_missions() {
-        let home = PathBuf::from("/tmp/.magi");
-        let root = WorkspaceRootPath::from("/Users/x/proj");
-        assert_eq!(
-            missions_root(&home, &root),
-            PathBuf::from("/tmp/.magi/projects/-Users-x-proj/missions")
-        );
-    }
-
-    #[test]
-    fn mission_dir_appends_mission_id() {
-        let home = PathBuf::from("/tmp/.magi");
-        let root = WorkspaceRootPath::from("/Users/x/proj");
-        let mission = MissionId::new("M-001");
-        assert_eq!(
-            mission_dir(&home, &root, &mission),
-            PathBuf::from("/tmp/.magi/projects/-Users-x-proj/missions/M-001")
         );
     }
 

@@ -60,7 +60,7 @@ fn test_sidecar_persistence(
         repository,
         session_store,
         workspace_store,
-        WorkerRuntime::new_compare(Arc::new(InMemoryEventBus::new(64))),
+        WorkerRuntime::new(),
     )
 }
 
@@ -663,7 +663,7 @@ fn runtime_sidecar_flush_hook_persists_dirty_worker_runtime_snapshot() {
     let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
-    let worker_runtime = WorkerRuntime::new_compare(Arc::new(InMemoryEventBus::new(64)));
+    let worker_runtime = WorkerRuntime::new();
     let persistence = test_sidecar_persistence_with_worker_runtime(
         repository.clone(),
         session_store,
@@ -725,7 +725,7 @@ fn maintenance_tick_flushes_worker_snapshot_even_when_sidecars_are_clean() {
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
-    let worker_runtime = WorkerRuntime::new_compare(Arc::new(InMemoryEventBus::new(64)));
+    let worker_runtime = WorkerRuntime::new();
     let persistence = test_sidecar_persistence_with_worker_runtime(
         repository.clone(),
         session_store.clone(),

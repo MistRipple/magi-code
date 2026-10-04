@@ -48,7 +48,7 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
-use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
+use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
 use magi_process::ManagedProcessGroup;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
 use magi_settings_store::SettingsStore;
@@ -1053,7 +1053,7 @@ impl DaemonRuntime {
             state_repository.load_knowledge_state()?,
         ));
         let event_bus = Arc::new(InMemoryEventBus::new(2048));
-        let worker_runtime = WorkerRuntime::new(event_bus.clone());
+        let worker_runtime = WorkerRuntime::new();
         worker_runtime.restore_durable_snapshot(state_repository.load_worker_runtime_snapshot()?);
         let runtime_persistence = RuntimeSidecarPersistence::new(
             state_repository.clone(),
@@ -1332,7 +1332,6 @@ impl DaemonRuntime {
         bridge_env: &[(&str, &str)],
         model_bridge_override: Option<Arc<dyn magi_bridge_client::ModelBridgeClient>>,
     ) -> Result<ApiState, DaemonError> {
-        let orchestrator = OrchestratorService::new(self.event_bus.clone());
         let mcp_connections = Arc::new(RwLock::new(HashMap::new()));
         let model_transport = Self::bridge_loopback_transport_with_env(
             "model_bridge_loopback",
@@ -1404,7 +1403,7 @@ impl DaemonRuntime {
             FileSummaryStore::default(),
             ProjectRecentTurnStore::default(),
         );
-        let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
+        let context_runtime_for_dispatcher = Arc::new(context_runtime);
         let runtime_capability_dependency_provider =
             build_runtime_capability_dependency_provider(true);
         let image_generation_executor: ImageGenerationExecutor = {
@@ -1618,7 +1617,7 @@ impl DaemonRuntime {
             .with_mcp_client(Arc::new(settings_backed_mcp_client));
         let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
         let worker_runtime = self.worker_runtime.clone();
-        let tool_registry_for_dispatcher = tool_registry.clone();
+        let tool_registry_for_dispatcher = tool_registry;
         let task_store_projection_path = self.state_repository.task_store_projection_path();
         let event_bus_for_task_store = self.event_bus.clone();
         let session_store_for_task_status = self.session_store.clone();
@@ -1811,9 +1810,8 @@ impl DaemonRuntime {
         } else {
             accepted_submission_repository.prune_accepted_submissions()?;
         }
-        // 单一事实源：dispatch summary（execution_runtime）与 prompt 注入（LlmTaskDispatcher）
-        // 使用同一份 ContextBudget。max_memory ≥ 一批 session-memory 的 slice 数（=5），
-        // 否则辅助模型提取的 5 条 slice 会被预算切断、只投放前两条进 prompt。
+        // LlmTaskDispatcher 的 context 摘要与 prompt 注入共用该 ContextBudget。max_memory ≥ 一批
+        // session-memory 的 slice 数（=5），否则辅助模型提取的 5 条 slice 会被预算切断、只投放前两条进 prompt。
         let context_budget = ContextBudget {
             max_turns: 8,
             max_knowledge: 6,
@@ -1821,16 +1819,8 @@ impl DaemonRuntime {
             max_shared_items: 4,
             max_file_summaries: 4,
         };
-        let execution_runtime = orchestrator
-            .execution_runtime(worker_runtime.clone(), tool_registry, skill_runtime.clone())
-            .with_task_store(Arc::clone(&task_store))
-            .with_context_runtime(
-                context_runtime,
-                ExecutionContextConfig {
-                    budget: context_budget.clone(),
-                    project_key: None,
-                },
-            );
+        let execution_runtime = OrchestratedExecutionRuntime::new(worker_runtime.clone())
+            .with_task_store(Arc::clone(&task_store));
 
         let session_checkpoint_persistence = RuntimeSidecarPersistence::new(
             self.state_repository.clone(),
@@ -1917,7 +1907,7 @@ impl DaemonRuntime {
         })
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
-        .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
+        .with_execution_pipeline(execution_runtime, memory_store);
         browser_automation_dependencies
             .set(state.browser_tool_runtime_dependencies())
             .map_err(|_| DaemonError::internal("重复装配 Browser 工具运行时依赖"))?;

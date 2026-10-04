@@ -6,7 +6,7 @@
 
 use magi_core::{
     ExecutionOwnership, RecoveryResumeInput, SessionId, TaskCompletionAttempt, TaskStatus,
-    TerminationReason, UtcMillis,
+    UtcMillis,
 };
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
@@ -97,34 +97,8 @@ pub fn active_execution_branch_is_continue_recoverable(
         && task_status_is_continue_recoverable(&task.status)
 }
 
-fn terminal_status_for_branch(
-    worker_runtime: Option<&WorkerRuntime>,
-    branch: &ActiveExecutionBranch,
-) -> Option<TaskStatus> {
-    let runtime = worker_runtime?;
-    let reports = runtime.reports();
-    reports
-        .iter()
-        .rev()
-        .find(|report| {
-            report.worker_id == branch.worker_id
-                && report.task_id == branch.task_id
-                && report.stage == WorkerStage::Finish
-        })
-        .map(|report| match report.termination_reason {
-            Some(TerminationReason::Failed) => TaskStatus::Failed,
-            Some(TerminationReason::Cancelled) => TaskStatus::Killed,
-            Some(TerminationReason::Blocked) => TaskStatus::Failed,
-            Some(TerminationReason::Completed) | None => TaskStatus::Completed,
-        })
-        .or_else(|| {
-            branch_runtime_snapshot_is_terminal(worker_runtime, branch)
-                .then_some(TaskStatus::Completed)
-        })
-}
-
-/// 收敛 chain 中所有"已经在 worker runtime 里跑到 Finish 但 task_store 还停留在
-/// 非终态"的 branch：把它们落盘成 `TaskStatus::Completed/Failed/Cancelled`。
+/// 收敛 chain 中所有"branch stage 或 worker runtime 分支快照已到 Finish 但 task_store
+/// 还停留在非终态"的 branch：凭其执行租约落盘成 `TaskStatus::Completed`。
 /// 用于会话中断与执行链续跑入口的统一护栏。
 ///
 /// `Result::Err(String)`：上层 magi-api 用
@@ -154,46 +128,26 @@ pub fn finalize_terminal_worker_branches(
         if !task_status_needs_terminal_branch_finalization(&task.status) {
             continue;
         }
-        let terminal_status =
-            terminal_status_for_branch(worker_runtime, branch).unwrap_or(TaskStatus::Completed);
-        if matches!(terminal_status, TaskStatus::Completed) {
-            let lease_id = branch.lease_id.as_ref().ok_or_else(|| {
-                format!(
-                    "恢复 branch {} 缺少执行租约，拒绝无 lease 完成提交",
-                    branch.task_id
-                )
-            })?;
-            let final_response = task.output_refs.join("\n\n");
-            let attempt = TaskCompletionAttempt {
-                output_refs: task.output_refs.clone(),
-                final_response: Some(final_response),
-                evidence: Vec::new(),
-            };
-            if !task_store
-                .complete_lease_and_task(&branch.task_id, &chain.root_task_id, lease_id, attempt)
-                .map_err(|error| error.to_string())?
-            {
-                return Err(format!(
-                    "恢复 branch {} 的执行租约已失效，未提交完成事实",
-                    branch.task_id
-                ));
-            }
-        } else {
-            let changed = task_store
-                .revoke_lease_and_set_task_terminal(
-                    &branch.task_id,
-                    &chain.root_task_id,
-                    branch.lease_id.as_ref(),
-                    terminal_status,
-                    Vec::new(),
-                )
-                .map_err(|error| error.to_string())?;
-            if !changed {
-                return Err(format!(
-                    "恢复 branch {} 的执行租约已失效，未提交终止事实",
-                    branch.task_id
-                ));
-            }
+        let lease_id = branch.lease_id.as_ref().ok_or_else(|| {
+            format!(
+                "恢复 branch {} 缺少执行租约，拒绝无 lease 完成提交",
+                branch.task_id
+            )
+        })?;
+        let final_response = task.output_refs.join("\n\n");
+        let attempt = TaskCompletionAttempt {
+            output_refs: task.output_refs.clone(),
+            final_response: Some(final_response),
+            evidence: Vec::new(),
+        };
+        if !task_store
+            .complete_lease_and_task(&branch.task_id, &chain.root_task_id, lease_id, attempt)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "恢复 branch {} 的执行租约已失效，未提交完成事实",
+                branch.task_id
+            ));
         }
         finalized_count += 1;
     }

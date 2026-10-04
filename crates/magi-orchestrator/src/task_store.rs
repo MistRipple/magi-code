@@ -1,8 +1,8 @@
 use magi_core::{
     AccessProfile, AgentContextAccessRecord, AgentContextPackage, AgentContextSupplement,
     AgentRunProjection, DomainError, DomainResult, LeaseId, MissionId, ProgressSummary, Task,
-    TaskCompletionAttempt, TaskId, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier,
-    UtcMillis, WorkerId,
+    TaskCompletionAttempt, TaskId, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier, UtcMillis,
+    WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
@@ -589,46 +589,6 @@ impl TaskStore {
             .collect()
     }
 
-    /// 迁移任务到新的父节点，同时修正 children 索引。
-    pub fn reparent_task(&self, task_id: &TaskId, new_parent_id: &TaskId) -> DomainResult<()> {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
-        let old_parent = tasks
-            .get(task_id)
-            .ok_or(DomainError::NotFound { entity: "Task" })?
-            .parent_task_id
-            .clone();
-        let was_required = old_parent.as_ref().is_some_and(|parent_id| {
-            tasks
-                .get(parent_id)
-                .is_some_and(|parent| parent.required_children.contains(task_id))
-        });
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or(DomainError::NotFound { entity: "Task" })?;
-        task.parent_task_id = Some(new_parent_id.clone());
-        task.updated_at = UtcMillis::now();
-        if let Some(old_parent_id) = old_parent.clone()
-            && let Some(parent) = tasks.get_mut(&old_parent_id)
-        {
-            parent.required_children.retain(|id| id != task_id);
-            parent.updated_at = UtcMillis::now();
-        }
-
-        if was_required
-            && let Some(parent) = tasks.get_mut(new_parent_id)
-            && !parent.required_children.iter().any(|id| id == task_id)
-        {
-            parent.required_children.push(task_id.clone());
-            parent.updated_at = UtcMillis::now();
-        }
-        *self.tasks.write().expect("tasks write lock poisoned") = tasks;
-        Ok(())
-    }
-
     /// 更新任务状态，带状态迁移合法性校验。
     /// 普通状态更新只允许写入非终态；终态必须使用对应的原子提交接口。
     pub fn update_status_checked(
@@ -865,55 +825,6 @@ impl TaskStore {
         )
     }
 
-    pub fn append_input_ref(&self, task_id: &TaskId, input_ref: String) -> DomainResult<()> {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or(DomainError::NotFound { entity: "Task" })?;
-        task.input_refs.push(input_ref);
-        task.updated_at = UtcMillis::now();
-        Ok(())
-    }
-
-    /// 为子代理写入唯一的结构化上下文包。该操作覆盖旧包但保留已有访问审计，适用于
-    /// 创建阶段的原子注册与显式重建；普通运行期补充必须使用
-    /// `append_agent_context_supplement` 递增 revision。
-    pub fn set_agent_context_package(
-        &self,
-        task_id: &TaskId,
-        package: AgentContextPackage,
-    ) -> DomainResult<()> {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or(DomainError::NotFound { entity: "Task" })?;
-        let dirty_root_id = task.root_task_id.clone();
-        let accesses = match &mut task.runtime_payload {
-            TaskRuntimePayload::AgentContext { accesses, .. } => std::mem::take(accesses),
-            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => Vec::new(),
-        };
-        task.runtime_payload = TaskRuntimePayload::AgentContext {
-            package: Box::new(package),
-            accesses,
-        };
-        task.updated_at = UtcMillis::now();
-        let leases = self.leases.read().expect("leases read lock poisoned");
-        let snapshot =
-            Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![dirty_root_id]);
-        self.fire_checkpoint(&snapshot)?;
-        *self.tasks.write().expect("tasks write lock poisoned") = tasks;
-        self.notify_status_change();
-        Ok(())
-    }
-
     pub fn append_agent_context_access(
         &self,
         task_id: &TaskId,
@@ -976,26 +887,6 @@ impl TaskStore {
         Ok(package)
     }
 
-    pub fn append_required_child(
-        &self,
-        task_id: &TaskId,
-        child_task_id: &TaskId,
-    ) -> DomainResult<()> {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or(DomainError::NotFound { entity: "Task" })?;
-        if !task.required_children.iter().any(|id| id == child_task_id) {
-            task.required_children.push(child_task_id.clone());
-            task.updated_at = UtcMillis::now();
-        }
-        Ok(())
-    }
-
     pub fn update_task_goal(&self, task_id: &TaskId, goal: String) -> DomainResult<()> {
         let _mutation_guard = self
             .mutation_lock
@@ -1008,19 +899,6 @@ impl TaskStore {
         task.goal = goal;
         task.updated_at = UtcMillis::now();
         Ok(())
-    }
-
-    /// 递增任务的 retry_count。
-    pub fn increment_retry_count(&self, task_id: &TaskId) {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.retry_count += 1;
-            task.updated_at = UtcMillis::now();
-        }
     }
 
     /// BFS 收集以 root_id 为根的整棵子树中所有任务 ID。
@@ -1045,18 +923,6 @@ impl TaskStore {
                 .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
         });
         children
-    }
-
-    pub fn has_validation_dependent(&self, task_id: &TaskId) -> bool {
-        self.tasks
-            .read()
-            .expect("tasks read lock poisoned")
-            .values()
-            .any(|task| {
-                task.kind == TaskKind::LocalAgent
-                    && (task.parent_task_id.as_ref() == Some(task_id)
-                        || task.dependency_ids.iter().any(|dep_id| dep_id == task_id))
-            })
     }
 
     /// 获取根任务下所有处于 Pending 状态且依赖已满足的叶子任务。
@@ -1232,26 +1098,6 @@ impl TaskStore {
             self.notify_status_change();
         }
         Ok(removed)
-    }
-
-    /// 清除所有任务、租约及索引。
-    pub fn clear_all(&self) {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        self.tasks
-            .write()
-            .expect("tasks write lock poisoned")
-            .clear();
-        self.leases
-            .write()
-            .expect("leases write lock poisoned")
-            .clear();
-        self.mission_index
-            .write()
-            .expect("mission_index write lock poisoned")
-            .clear();
     }
 
     /// 获取指定任务的所有任务。
@@ -1469,57 +1315,6 @@ impl TaskStore {
             .cloned()
     }
 
-    /// 校验 worker report 继续使用的执行租约仍是同一轮、同一任务的活跃租约。
-    ///
-    /// `false` 表示租约已不存在或已经失效，调用方必须丢弃迟到 report；合同字段
-    /// 不一致则返回错误，避免把另一轮执行的事实误认成当前执行结果。
-    #[cfg(test)]
-    pub(crate) fn validate_active_lease_contract(
-        &self,
-        task_id: &TaskId,
-        root_task_id: &TaskId,
-        lease_id: &LeaseId,
-        worker_id: &WorkerId,
-    ) -> DomainResult<bool> {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let tasks = self.tasks.read().expect("tasks read lock poisoned");
-        let Some(lease) = self
-            .leases
-            .read()
-            .expect("leases read lock poisoned")
-            .get(lease_id)
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        if lease.lease_status != TaskLeaseState::Active {
-            return Ok(false);
-        }
-        if lease.task_id != *task_id {
-            return Err(DomainError::InvalidState {
-                message: format!("租约 {} 不属于任务 {}", lease_id, task_id),
-            });
-        }
-        if lease.root_task_id != *root_task_id {
-            return Err(DomainError::InvalidState {
-                message: format!("租约 {} 不属于 root task {}", lease_id, root_task_id),
-            });
-        }
-        if lease.worker_id != *worker_id {
-            return Err(DomainError::InvalidState {
-                message: format!(
-                    "租约 {} 属于 worker {}，不能由 worker {} 提交结果",
-                    lease_id, lease.worker_id, worker_id
-                ),
-            });
-        }
-        Self::validate_lease_contract(&tasks, &lease)?;
-        Ok(true)
-    }
-
     /// 为任务授予新的执行租约。如果任务已有活跃租约则返回 None。
     pub fn grant_lease(
         &self,
@@ -1658,27 +1453,6 @@ impl TaskStore {
             "conversation response timing"
         );
         Ok(Some(lease))
-    }
-
-    /// 标记活跃租约为已完成。找不到匹配的活跃租约时返回 false。
-    pub fn complete_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let tasks = self.tasks.read().expect("tasks read lock poisoned");
-        let mut leases = self.leases.write().expect("leases write lock poisoned");
-        let Some(lease) = leases.get_mut(lease_id) else {
-            return false;
-        };
-        if lease.task_id != *task_id
-            || lease.lease_status != TaskLeaseState::Active
-            || Self::validate_lease_contract(&tasks, lease).is_err()
-        {
-            return false;
-        }
-        lease.lease_status = TaskLeaseState::Completed;
-        true
     }
 
     /// 撤销活跃租约。
@@ -2130,16 +1904,6 @@ impl TaskStore {
         Ok((active_leases.len(), failed_count))
     }
 
-    /// 获取指定 worker 的所有活跃租约。
-    pub fn get_leases_by_worker(&self, worker_id: &WorkerId) -> Vec<TaskLease> {
-        let leases = self.leases.read().expect("leases read lock poisoned");
-        leases
-            .values()
-            .filter(|l| l.worker_id == *worker_id && l.lease_status == TaskLeaseState::Active)
-            .cloned()
-            .collect()
-    }
-
     // ------------------------------------------------------------------
     // Checkpoint / Restore
     // ------------------------------------------------------------------
@@ -2185,48 +1949,6 @@ impl TaskStore {
     // G8.5: Dynamic dependency management
     // ------------------------------------------------------------------
 
-    /// 运行时添加依赖关系。不允许自依赖或对已完成任务的依赖。
-    pub fn add_dependency(&self, task_id: &TaskId, dependency_id: &TaskId) -> DomainResult<()> {
-        if task_id == dependency_id {
-            return Err(DomainError::InvalidState {
-                message: format!("任务 {} 不能依赖自身", task_id),
-            });
-        }
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or_else(|| DomainError::InvalidState {
-                message: format!("任务 {} 不存在", task_id),
-            })?;
-        if task.dependency_ids.contains(dependency_id) {
-            return Ok(());
-        }
-        task.dependency_ids.push(dependency_id.clone());
-        task.updated_at = UtcMillis::now();
-        Ok(())
-    }
-
-    /// 运行时移除依赖关系。
-    pub fn remove_dependency(&self, task_id: &TaskId, dependency_id: &TaskId) -> DomainResult<()> {
-        let _mutation_guard = self
-            .mutation_lock
-            .lock()
-            .expect("task mutation lock poisoned");
-        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or_else(|| DomainError::InvalidState {
-                message: format!("任务 {} 不存在", task_id),
-            })?;
-        task.dependency_ids.retain(|id| id != dependency_id);
-        task.updated_at = UtcMillis::now();
-        Ok(())
-    }
-
     /// 获取指定任务的所有依赖。
     pub fn get_dependencies(&self, task_id: &TaskId) -> Vec<TaskId> {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
@@ -2239,32 +1961,6 @@ impl TaskStore {
     // ------------------------------------------------------------------
     // G8: Graph structural validation (design 3.2 / 4.x)
     // ------------------------------------------------------------------
-
-    /// Insert a task with structural validation: checks for cycles and
-    /// legal parent-child kind relationships.
-    pub fn insert_task_validated(&self, task: Task) -> DomainResult<()> {
-        // Validate parent-child kind hierarchy.
-        if let Some(ref parent_id) = task.parent_task_id
-            && let Some(parent) = self.get_task(parent_id)
-            && !is_valid_parent_child_kind(parent.kind, task.kind)
-        {
-            return Err(DomainError::InvalidState {
-                message: format!(
-                    "非法父子关系: {:?} 不能包含 {:?} 子节点",
-                    parent.kind, task.kind
-                ),
-            });
-        }
-        // Check for dependency cycles.
-        for dep_id in &task.dependency_ids {
-            if *dep_id == task.task_id {
-                return Err(DomainError::InvalidState {
-                    message: format!("任务 {} 不能依赖自身", task.task_id),
-                });
-            }
-        }
-        self.insert_task(task)
-    }
 
     /// 将同一内存快照写入一个不可变 generation，最后以 manifest 原子切换作为唯一提交点。
     pub fn checkpoint_to_projection_directory(&self, dir: &Path) -> io::Result<usize> {
@@ -3127,15 +2823,12 @@ fn is_terminal_status(status: TaskStatus) -> bool {
     )
 }
 
-/// TaskStore 不再限制固定父子层级，具体编排约束交给 Coordinator。
-fn is_valid_parent_child_kind(_parent: TaskKind, _child: TaskKind) -> bool {
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{TaskCompletionEvidence, TaskEvidenceRequirement, TaskExecutorBinding};
+    use magi_core::{
+        TaskCompletionEvidence, TaskEvidenceRequirement, TaskExecutorBinding, TaskKind,
+    };
     use serde_json::json;
     use std::sync::{Arc, Barrier, Mutex};
 

@@ -533,7 +533,7 @@ mod tests {
     use magi_core::{AbsolutePath, MissionId, SessionId, UtcMillis, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_orchestrator::{OrchestratorService, task_store::TaskStore};
+    use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
     use magi_session_store::{GoalRevisionExpectation, SessionStore};
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
@@ -612,24 +612,13 @@ mod tests {
         .with_task_store(Arc::clone(&task_store));
         let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
-        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
-        let skill_dispatch_runtime = magi_skill_runtime::SkillDispatchRuntime::new(
-            tool_registry.clone(),
-            magi_bridge_client::BridgeDispatchRuntime::new(),
-        );
-        let execution_runtime = orchestrator
-            .execution_runtime(
-                WorkerRuntime::new(Arc::clone(&event_bus)),
-                tool_registry.clone(),
-                skill_dispatch_runtime,
-            )
+        let execution_runtime = OrchestratedExecutionRuntime::new(WorkerRuntime::new())
             .with_task_store(Arc::clone(&task_store));
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
         let dispatcher = Arc::new(
             LlmTaskDispatcher::new(
                 event_bus,
                 ExecutionPipeline {
-                    orchestrator,
                     execution_runtime,
                     memory_store: magi_memory_store::MemoryStore::new(),
                 },

@@ -18,7 +18,6 @@ magi-safety-gate = { path = "../magi-safety-gate" }
 magi-plan = { path = "../magi-plan" }
 magi-project-memory = { path = "../magi-project-memory" }
 magi-memory-store = { path = "../magi-memory-store" }
-magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-governance = { path = "../magi-governance" }
 magi-git = { path = "../magi-git" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }

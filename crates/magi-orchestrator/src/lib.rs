@@ -1,99 +1,13 @@
-#![recursion_limit = "256"]
-
-pub mod auto_learning;
-#[cfg(test)]
-mod execution_overview;
-#[cfg(test)]
-mod execution_runtime;
 mod execution_writeback;
-pub mod risk_policy;
 pub mod task_store;
 pub mod task_worker_catalog;
-pub mod verification_policy;
-pub mod verification_runner;
 
-#[cfg(test)]
-use magi_bridge_client::BridgeBindingDispatchPlan;
-use magi_context_runtime::{ContextAssemblyResult, ContextBudget, ContextRuntime};
-#[cfg(test)]
-use magi_core::{
-    AssignmentId, EventId, MissionId, SessionId, TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
-    WorkspaceId,
-};
-use magi_event_bus::InMemoryEventBus;
-#[cfg(test)]
-use magi_event_bus::{EventCategory, EventContext, EventEnvelope};
-use magi_skill_runtime::SkillDispatchRuntime;
-#[cfg(test)]
-use magi_skill_runtime::{SkillToolRoutingSummary, SkillToolRuntimePlan};
-use magi_tool_runtime::ToolRegistry;
-#[cfg(test)]
-use magi_tool_runtime::{ToolExecutionPolicy, ToolExecutionSummary};
+use magi_context_runtime::ContextAssemblyResult;
 use magi_worker_runtime::WorkerRuntime;
-#[cfg(test)]
-use magi_worker_runtime::{
-    SkillDispatchSummary, WorkerExecutionBindingScope, WorkerExecutionIntent,
-    WorkerExecutionProfile, WorkerExecutionReusePolicy, WorkerExecutorRequest,
-    WorkerGovernanceSummary, WorkerLoopOutcome, WorkerRuntimeSummary, WorkerStage,
-};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub use execution_writeback::{DispatchMemoryExtractionInput, ExecutionWritebackPlans};
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum OrchestratorCommandError {
-    MissionNotFound {
-        mission_id: MissionId,
-    },
-    AssignmentNotFound {
-        mission_id: MissionId,
-        assignment_id: AssignmentId,
-    },
-    TaskNotFound {
-        task_id: TaskId,
-    },
-    TaskStateViolation {
-        task_id: TaskId,
-        message: String,
-    },
-    NoDispatchTarget {
-        mission_id: MissionId,
-    },
-    GovernanceTargetMissing {
-        reason: String,
-    },
-    WorkerExecutorUnavailable {
-        reason: String,
-    },
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExecutionRuntimeSnapshot {
-    pub mission_id: MissionId,
-    pub total_assignments: usize,
-    pub total_tasks: usize,
-    pub completed_tasks: usize,
-    pub failed_tasks: usize,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExecutionOverview {
-    pub runtime_snapshot: ExecutionRuntimeSnapshot,
-    pub running_task_ids: Vec<TaskId>,
-    pub worker_summary: WorkerRuntimeSummary,
-    pub tool_summary: ToolExecutionSummary,
-    pub governance_summary: WorkerGovernanceSummary,
-    pub skill_dispatch_summary: ExecutionSkillDispatchSummary,
-    pub context_summary: Option<ExecutionContextSummary>,
-    pub assignment_governance_summaries: Vec<AssignmentGovernanceSummary>,
-    pub task_governance_summaries: Vec<TaskGovernanceSummary>,
-    pub assignment_skill_dispatch_summaries: Vec<AssignmentSkillDispatchSummary>,
-    pub task_skill_dispatch_summaries: Vec<TaskSkillDispatchSummary>,
-}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExecutionContextSummary {
@@ -251,274 +165,26 @@ impl ExecutionContextSummary {
     }
 }
 
-#[cfg(test)]
-pub type ExecutionSkillDispatchSummary = SkillDispatchSummary;
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AssignmentGovernanceSummary {
-    pub assignment_id: AssignmentId,
-    pub mission_id: MissionId,
-    pub governance_summary: WorkerGovernanceSummary,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TaskGovernanceSummary {
-    pub task_id: TaskId,
-    pub mission_id: MissionId,
-    pub assignment_id: AssignmentId,
-    pub governance_summary: WorkerGovernanceSummary,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AssignmentSkillDispatchSummary {
-    pub assignment_id: AssignmentId,
-    pub mission_id: MissionId,
-    pub skill_dispatch_summary: ExecutionSkillDispatchSummary,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TaskSkillDispatchSummary {
-    pub task_id: TaskId,
-    pub mission_id: MissionId,
-    pub assignment_id: AssignmentId,
-    pub skill_dispatch_summary: ExecutionSkillDispatchSummary,
-}
-
-#[derive(Clone)]
-pub struct OrchestratorService {
-    #[cfg(test)]
-    event_bus: Arc<InMemoryEventBus>,
-}
-
+/// 执行管线持有的运行时句柄：任务事实由 `TaskStore` 拥有，分支检查点由 `WorkerRuntime` 拥有。
 #[derive(Clone)]
 pub struct OrchestratedExecutionRuntime {
-    #[cfg(test)]
-    service: OrchestratorService,
     task_store: Arc<task_store::TaskStore>,
     worker_runtime: WorkerRuntime,
-    #[cfg(test)]
-    tool_registry: ToolRegistry,
-    #[cfg(test)]
-    skill_dispatch_runtime: SkillDispatchRuntime,
-    context_runtime: Option<ContextRuntime>,
-    context_config: Option<ExecutionContextConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExecutionContextConfig {
-    pub budget: ContextBudget,
-    pub project_key: Option<String>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DispatchExecutionResult {
-    pub target: TaskExecutionTarget,
-    pub intent: WorkerExecutionIntent,
-    pub outcome: WorkerLoopOutcome,
-    pub overview: ExecutionOverview,
-}
-
-#[cfg(test)]
-pub(crate) struct DispatchWritebackRequest {
-    pub target: TaskExecutionTarget,
-    pub worker_id: WorkerId,
-    pub session_id: Option<SessionId>,
-    pub workspace_id: Option<WorkspaceId>,
-    pub skill_plan: Option<SkillToolRuntimePlan>,
-    pub memory_store: magi_memory_store::MemoryStore,
-    pub writebacks: ExecutionWritebackPlans,
-}
-
-impl OrchestratorService {
-    pub fn new(event_bus: Arc<InMemoryEventBus>) -> Self {
-        let _ = &event_bus;
-        Self {
-            #[cfg(test)]
-            event_bus,
-        }
-    }
-
-    pub fn execution_runtime(
-        &self,
-        worker_runtime: WorkerRuntime,
-        tool_registry: ToolRegistry,
-        skill_dispatch_runtime: SkillDispatchRuntime,
-    ) -> OrchestratedExecutionRuntime {
-        let _ = (&tool_registry, &skill_dispatch_runtime);
-        OrchestratedExecutionRuntime {
-            #[cfg(test)]
-            service: self.clone(),
-            task_store: Arc::new(task_store::TaskStore::new()),
-            worker_runtime,
-            #[cfg(test)]
-            tool_registry,
-            #[cfg(test)]
-            skill_dispatch_runtime,
-            context_runtime: None,
-            context_config: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn derive_execution_profile(
-        &self,
-        session_id: &Option<SessionId>,
-        workspace_id: &Option<WorkspaceId>,
-    ) -> WorkerExecutionProfile {
-        let binding_scope = if workspace_id.is_some() {
-            WorkerExecutionBindingScope::Workspace
-        } else if session_id.is_some() {
-            WorkerExecutionBindingScope::Session
-        } else {
-            WorkerExecutionBindingScope::None
-        };
-        WorkerExecutionProfile {
-            reuse_policy: if binding_scope == WorkerExecutionBindingScope::None {
-                WorkerExecutionReusePolicy::NotRequired
-            } else {
-                WorkerExecutionReusePolicy::Preferred
-            },
-            binding_scope,
-            lease_state: if binding_scope == WorkerExecutionBindingScope::None {
-                magi_worker_runtime::WorkerExecutionLeaseState::None
-            } else {
-                magi_worker_runtime::WorkerExecutionLeaseState::Requested
-            },
-            binding_lifecycle: if binding_scope == WorkerExecutionBindingScope::None {
-                magi_worker_runtime::WorkerExecutionBindingLifecycle::None
-            } else {
-                magi_worker_runtime::WorkerExecutionBindingLifecycle::Requested
-            },
-            process_lifecycle: magi_worker_runtime::WorkerExecutionProcessLifecycle::OneShot,
-            requested_process_model: None,
-            requested_parallelism: 1,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finalize_execution_profile(
-        &self,
-        profile: &WorkerExecutionProfile,
-        probe: &magi_worker_runtime::WorkerExecutorProbe,
-    ) -> WorkerExecutionProfile {
-        let mut effective_profile = profile.clone();
-        if effective_profile.requested_process_model.is_none() {
-            effective_profile.requested_process_model =
-                Some(probe.capability.descriptor.process_model);
-        }
-        effective_profile.process_lifecycle = match probe.capability.descriptor.process_model {
-            magi_worker_runtime::LocalProcessExecutorProcessModel::PersistentProcess => {
-                magi_worker_runtime::WorkerExecutionProcessLifecycle::Persistent
-            }
-            _ => magi_worker_runtime::WorkerExecutionProcessLifecycle::OneShot,
-        };
-        if probe.capability.descriptor.reuse_scope
-            != magi_worker_runtime::WorkerExecutionBindingScope::None
-        {
-            effective_profile.binding_lifecycle =
-                magi_worker_runtime::WorkerExecutionBindingLifecycle::Bound;
-            effective_profile.lease_state = magi_worker_runtime::WorkerExecutionLeaseState::Active;
-        }
-        effective_profile
-    }
-
-    #[cfg(test)]
-    pub(crate) fn derive_executor_request(
-        &self,
-        intent: &WorkerExecutionIntent,
-        request_source: &str,
-    ) -> WorkerExecutorRequest {
-        intent.executor_request(WorkerStage::Execute, request_source.to_string())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn build_execution_overview_from_task_projection(
-        &self,
-        task_store: &task_store::TaskStore,
-        input: execution_overview::ExecutionOverviewProjectionInput<'_>,
-    ) -> Option<ExecutionOverview> {
-        let session_id = input.session_id.clone();
-        let workspace_id = input.workspace_id.clone();
-        let root_task_id = input.target.root_task_id.clone();
-        let overview =
-            execution_overview::build_execution_overview_from_task_projection(task_store, input)?;
-        self.publish_with_category(
-            "mission.execution.overview",
-            EventCategory::Audit,
-            EventContext {
-                workspace_id: workspace_id.clone(),
-                session_id: session_id.clone(),
-                mission_id: Some(overview.runtime_snapshot.mission_id.clone()),
-                task_id: Some(root_task_id),
-                ..EventContext::default()
-            },
-            scoped_execution_payload(
-                execution_overview::build_execution_overview_payload(&overview),
-                session_id.as_ref(),
-                workspace_id.as_ref(),
-            ),
-        );
-        Some(overview)
-    }
-
-    #[cfg(test)]
-    fn publish_with_category(
-        &self,
-        event_type: &str,
-        category: EventCategory,
-        context: EventContext,
-        payload: serde_json::Value,
-    ) {
-        let base = match category {
-            EventCategory::Domain => {
-                EventEnvelope::domain(EventId::unique(event_type), event_type, payload)
-            }
-            EventCategory::Audit => {
-                EventEnvelope::audit(EventId::unique(event_type), event_type, payload)
-            }
-            EventCategory::Usage => {
-                EventEnvelope::usage(EventId::unique(event_type), event_type, payload)
-            }
-            EventCategory::Projection => {
-                EventEnvelope::projection(EventId::unique(event_type), event_type, payload)
-            }
-            EventCategory::System => {
-                EventEnvelope::system(EventId::unique(event_type), event_type, payload)
-            }
-        };
-        let _ = self.event_bus.publish(base.with_context(context));
-    }
-}
-
-#[cfg(test)]
-fn scoped_execution_payload(
-    mut payload: serde_json::Value,
-    session_id: Option<&SessionId>,
-    workspace_id: Option<&WorkspaceId>,
-) -> serde_json::Value {
-    if let Some(object) = payload.as_object_mut() {
-        if let Some(session_id) = session_id {
-            object.insert(
-                "session_id".to_string(),
-                serde_json::Value::String(session_id.to_string()),
-            );
-        }
-        if let Some(workspace_id) = workspace_id {
-            object.insert(
-                "workspace_id".to_string(),
-                serde_json::Value::String(workspace_id.to_string()),
-            );
-        }
-    }
-    payload
 }
 
 impl OrchestratedExecutionRuntime {
+    pub fn new(worker_runtime: WorkerRuntime) -> Self {
+        Self {
+            task_store: Arc::new(task_store::TaskStore::new()),
+            worker_runtime,
+        }
+    }
+
+    pub fn with_task_store(mut self, task_store: Arc<task_store::TaskStore>) -> Self {
+        self.task_store = task_store;
+        self
+    }
+
     pub fn worker_runtime(&self) -> &WorkerRuntime {
         &self.worker_runtime
     }
@@ -526,67 +192,6 @@ impl OrchestratedExecutionRuntime {
     pub fn task_store(&self) -> &task_store::TaskStore {
         &self.task_store
     }
-}
-
-impl OrchestratedExecutionRuntime {
-    pub fn with_task_store(mut self, task_store: Arc<task_store::TaskStore>) -> Self {
-        self.task_store = task_store;
-        self
-    }
-
-    pub fn with_context_runtime(
-        mut self,
-        context_runtime: ContextRuntime,
-        context_config: ExecutionContextConfig,
-    ) -> Self {
-        self.context_runtime = Some(context_runtime);
-        self.context_config = Some(context_config);
-        self
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DispatchContextDescriptor {
-    pub mission_title: Option<String>,
-    pub assignment_title: Option<String>,
-    pub task_title: Option<String>,
-}
-
-#[cfg(test)]
-fn default_builtin_skill_plan(tool_name: &str) -> SkillToolRuntimePlan {
-    SkillToolRuntimePlan {
-        skill_ids: vec!["test-skill".to_string()],
-        tool_policy: ToolExecutionPolicy::default(),
-        routing: SkillToolRoutingSummary {
-            requested_builtin_tools: vec![tool_name.to_string()],
-            requested_bridge_tool_names: Vec::new(),
-            requested_bridge_binding_ids: Vec::new(),
-            denied_requested_tools: Vec::new(),
-        },
-        prompt_injections: Vec::new(),
-        custom_tool_bindings: Vec::new(),
-        bridge_dispatch_plan: BridgeBindingDispatchPlan {
-            source_skill_ids: vec!["test-skill".to_string()],
-            bindings: Vec::new(),
-        },
-    }
-}
-
-#[cfg(test)]
-fn resolve_skill_tool_name(plan: &SkillToolRuntimePlan) -> String {
-    plan.routing
-        .requested_bridge_tool_names
-        .first()
-        .cloned()
-        .or_else(|| {
-            plan.bridge_dispatch_plan
-                .bindings
-                .first()
-                .map(|binding| binding.tool_name.clone())
-        })
-        .or_else(|| plan.routing.requested_builtin_tools.first().cloned())
-        .unwrap_or_else(|| "process_inspect".to_string())
 }
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
-    OrchestratedExecutionRuntime, OrchestratorService,
+    OrchestratedExecutionRuntime,
     task_store::{TaskStore, TaskStoreSnapshot},
     task_worker_catalog::{WorkerInfo, build_worker_catalog_for_roles},
 };
@@ -2456,12 +2456,10 @@ impl ApiState {
 
     pub fn with_execution_pipeline(
         mut self,
-        orchestrator: OrchestratorService,
         execution_runtime: OrchestratedExecutionRuntime,
         memory_store: MemoryStore,
     ) -> Self {
         self.execution_pipeline = Some(ExecutionPipeline {
-            orchestrator,
             execution_runtime,
             memory_store,
         });

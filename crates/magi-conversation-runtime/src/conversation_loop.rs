@@ -67,9 +67,8 @@ use crate::{
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         account_active_goal_usage, publish_model_usage_record_for_turn,
-        publish_model_usage_record_for_turn_with_context_window, record_mission_turn,
-        resolved_model_for_usage_binding, resolved_provider_for_usage_binding,
-        vision_model_usage_binding,
+        publish_model_usage_record_for_turn_with_context_window, resolved_model_for_usage_binding,
+        resolved_provider_for_usage_binding, vision_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -138,11 +137,6 @@ pub struct ConversationLoopRequest<'a> {
     /// 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
     /// 也不允许 `memory_write` 工具调用成功。
     pub project_memory: Option<&'a magi_project_memory::ProjectMemoryStore>,
-    /// codex goal 桥：mission 维度记账 sidecar 句柄。`None` 表示当前 task 未绑定
-    /// workspace 或 dispatcher 未注入 metrics，此时不做记账写入。
-    /// 设计上每轮 LLM 调用后调用一次 `record_mission_turn`，与 `publish_model_usage_record`
-    /// 并列收口；失败仅 warn，不阻断主轮次。
-    pub mission_metrics: Option<&'a Arc<magi_mission_metrics::MissionMetricsStore>>,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -738,7 +732,6 @@ fn run_conversation_loop_inner(
         safety_gate,
         plan_store,
         project_memory,
-        mission_metrics,
         task,
         task_id,
         lease_id,
@@ -1469,7 +1462,6 @@ fn run_conversation_loop_inner(
         let stream_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let thinking_publish_gate =
             std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
-        let round_started_at = UtcMillis::now();
         let round_goal_id = session_store
             .active_goal_for_execution_owner(session_id, task_id.as_str())
             .map(|goal| goal.goal_id);
@@ -2438,15 +2430,6 @@ fn run_conversation_loop_inner(
             usage_goal_id.as_ref(),
             parsed.usage.as_ref(),
         );
-        if let Some(metrics_store) = mission_metrics {
-            record_mission_turn(
-                metrics_store.as_ref(),
-                &task.mission_id,
-                parsed.usage.as_ref(),
-                round_started_at,
-                UtcMillis::now(),
-            );
-        }
 
         let assistant_history_content = parsed
             .content
@@ -6195,7 +6178,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -6373,7 +6355,6 @@ mod tests {
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -6574,7 +6555,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -6739,7 +6719,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -7250,7 +7229,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -7326,7 +7304,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -7422,7 +7399,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -7653,7 +7629,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -7752,7 +7727,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -7977,7 +7951,6 @@ mod tests {
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -8125,7 +8098,6 @@ mod tests {
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -8239,7 +8211,6 @@ mod tests {
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -8372,7 +8343,6 @@ mod tests {
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: Some(&project_memory),
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -8663,7 +8633,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -8881,7 +8850,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -9011,7 +8979,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -9138,7 +9105,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -9284,7 +9250,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -9463,7 +9428,6 @@ mod tests {
             safety_gate: None,
             plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -9674,7 +9638,6 @@ mod tests {
             safety_gate: None,
             plan_store: &plan_store,
             project_memory: None,
-            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
