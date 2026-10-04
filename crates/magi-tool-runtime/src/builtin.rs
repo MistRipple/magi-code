@@ -29,6 +29,8 @@ const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 const MIN_SHELL_TIMEOUT_MS: u64 = 1_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 1_800_000;
 const SHELL_TIMEOUT_POLL_MS: u64 = 20;
+/// 主进程结束后等待输出管道关闭的上限。超过它说明有后台进程继承了管道。
+const SHELL_PIPE_DRAIN_GRACE_MS: u64 = 1_500;
 const DEFAULT_FILE_READ_MAX_BYTES: usize = 64 * 1024;
 const FILE_READ_MAX_BYTES: usize = 1024 * 1024;
 const SHELL_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
@@ -71,6 +73,8 @@ struct ShellExecOutput {
     stderr_truncated: bool,
     timed_out: bool,
     cancelled: bool,
+    /// 主进程退出后仍有后台进程占着输出管道，已被连同进程组一起终止。
+    background_pipe_holders_terminated: bool,
 }
 
 #[derive(Clone, Default)]
@@ -873,6 +877,12 @@ fn execute_shell_exec(
         "stderr_truncated": output.stderr_truncated,
         "summary": summary,
     });
+    if output.background_pipe_holders_terminated {
+        payload["background_processes_terminated"] = serde_json::Value::Bool(true);
+        payload["hint"] = serde_json::Value::String(
+            "命令结束后仍有后台进程占用输出，已连同进程组一起终止。需要长期运行的服务请使用 shell_exec(background=true) 启动。".to_string(),
+        );
+    }
     if let Some(executable) = missing_executable {
         payload["error_code"] =
             serde_json::Value::String("shell_exec_command_not_found".to_string());
@@ -1141,18 +1151,21 @@ fn execute_shell_command_with_timeout(
     let timeout = Duration::from_millis(timeout_ms);
     let mut timed_out = false;
     let mut cancelled = false;
+    // 读取线程不放进 scope：脱离进程组的后代可能永远不关闭管道，此时只能分离
+    // 读取线程而不能无限等待它。
+    let stdout_state = Arc::clone(&progress_state);
+    let stdout_reader = thread::spawn(move || {
+        read_child_pipe_with_progress(stdout, ShellProgressStream::Stdout, stdout_state)
+    });
+    let stderr_state = Arc::clone(&progress_state);
+    let stderr_reader = thread::spawn(move || {
+        read_child_pipe_with_progress(stderr, ShellProgressStream::Stderr, stderr_state)
+    });
+    let mut background_pipe_holders_terminated = false;
     let status = thread::scope(|scope| {
         let progress_publisher = progress.map(|(tool_call_id, on_progress)| {
             let publisher_state = Arc::clone(&progress_state);
             scope.spawn(move || publish_shell_progress(tool_call_id, on_progress, publisher_state))
-        });
-        let stdout_state = Arc::clone(&progress_state);
-        let stdout_reader = scope.spawn(move || {
-            read_child_pipe_with_progress(stdout, ShellProgressStream::Stdout, stdout_state)
-        });
-        let stderr_state = Arc::clone(&progress_state);
-        let stderr_reader = scope.spawn(move || {
-            read_child_pipe_with_progress(stderr, ShellProgressStream::Stderr, stderr_state)
         });
         let status = loop {
             let wait_state = {
@@ -1184,8 +1197,23 @@ fn execute_shell_command_with_timeout(
                 None => thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS)),
             }
         };
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
+        let readers = [stdout_reader, stderr_reader];
+        if !wait_for_shell_pipe_readers(&readers) {
+            // 主进程已结束但管道仍被后台进程持有（例如 `npm run dev &`）：终止整个
+            // 进程组让管道关闭，避免工具调用和整轮对话被无限挂住。
+            background_pipe_holders_terminated = true;
+            let _ = terminate_shell_child(&child);
+            if !wait_for_shell_pipe_readers(&readers) {
+                tracing::warn!(
+                    "shell 后台进程脱离进程组后仍持有输出管道，读取线程将随其退出而结束"
+                );
+            }
+        }
+        for reader in readers {
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
+        }
         progress_state
             .lock()
             .expect("shell progress state lock poisoned")
@@ -1208,7 +1236,22 @@ fn execute_shell_command_with_timeout(
         stderr_truncated: progress_state.stderr_truncated,
         timed_out,
         cancelled,
+        background_pipe_holders_terminated,
     })
+}
+
+/// 在宽限期内等待输出读取线程结束；返回 false 表示管道仍被其他进程持有。
+fn wait_for_shell_pipe_readers(readers: &[thread::JoinHandle<()>]) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(SHELL_PIPE_DRAIN_GRACE_MS);
+    loop {
+        if readers.iter().all(thread::JoinHandle::is_finished) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS));
+    }
 }
 
 fn read_child_pipe_with_progress<T: Read>(

@@ -573,6 +573,42 @@ fn shell_exec_silent_command_completes_without_being_treated_as_timeout() {
 
 #[cfg(unix)]
 #[test]
+fn shell_exec_returns_when_background_child_keeps_output_pipe_open() {
+    let registry = make_registry();
+    let started = Instant::now();
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-shell-background-pipe"),
+            BuiltinToolName::ShellExec.as_str(),
+            serde_json::json!({
+                "command": "sleep 20 & echo started",
+                "timeout_ms": 60_000,
+            })
+            .to_string(),
+        ),
+        test_workspace_context(),
+        &full_access_policy(),
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "后台子进程占着输出管道时，shell_exec 不能等它退出（实际耗时 {:?}）",
+        started.elapsed()
+    );
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload should parse");
+    assert_eq!(payload["stdout"], "started\n");
+    assert_eq!(payload["exit_code"], 0);
+    assert_eq!(payload["background_processes_terminated"], true);
+    assert!(
+        payload["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("background=true")),
+        "结果必须建议改用 background=true：{payload}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn shell_exec_explicit_timeout_is_reported_as_timeout_not_cancellation() {
     let registry = make_registry();
     let output = registry.execute_with_policy(
