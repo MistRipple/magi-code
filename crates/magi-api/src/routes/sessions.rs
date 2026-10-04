@@ -608,6 +608,26 @@ pub(crate) async fn submit_session_turn_internal(
         )
         .await;
     }
+    // 引导已在上面分流，这里的提交都会创建或继续一个 Turn。只有创建新 session 的
+    // 提交需要保护全局 current 指针；已有 session 的 Turn 事实由 per-session Turn 锁
+    // 保护，不能因为后台执行阻塞其他 session 导航。新 session 尚未有 session_id，因此
+    // 在 resolve_dispatch_session 创建并提交首条消息的短控制面事务内持有导航锁，失败时
+    // 由同一边界执行回滚。
+    let _navigation_guard = if request.requested_session_id().is_none() {
+        Some(state.lock_session_navigation().await)
+    } else {
+        None
+    };
+    let session_turn_guard = match request.requested_session_id() {
+        Some(session_id) => Some(state.lock_session_turn(&session_id).await),
+        None => None,
+    };
+    // requestId 判重必须在加锁后、路由决策前：已受理的请求原样返回原 Turn 或排队位置，
+    // 不能因为会话状态变化后重新决策而得到不同结果或失败。
+    if let Some(replay) = replay_existing_submission(&state, &request, &request_fingerprint, true)?
+    {
+        return Ok(replay);
+    }
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
     let canonical_goal_mode = decision.reason_code.as_deref() == Some("goal_mode_request");
     // 文本明确表达“目标模式”时也必须进入同一个结构化执行契约；否则队列、
@@ -623,40 +643,6 @@ pub(crate) async fn submit_session_turn_internal(
         return Err(ApiError::InvalidInput(
             "编辑上一条消息必须开始新的对话轮次".to_string(),
         ));
-    }
-    // 只有创建新 session 的主线提交需要保护全局 current 指针。已有 session 的
-    // Turn 事实由 per-session Turn 锁保护，不能因为后台执行阻塞其他 session 导航。
-    // 新 session 尚未有 session_id，因此在 resolve_dispatch_session 创建并提交首条
-    // 消息的短控制面事务内持有导航锁，失败时由同一边界执行回滚。
-    let _navigation_guard = if matches!(
-        decision.route,
-        SessionTurnRouteDto::Chat
-            | SessionTurnRouteDto::Execute
-            | SessionTurnRouteDto::Task
-            | SessionTurnRouteDto::Continue
-    ) && request.requested_session_id().is_none()
-    {
-        Some(state.lock_session_navigation().await)
-    } else {
-        None
-    };
-    let session_turn_guard = if matches!(
-        decision.route,
-        SessionTurnRouteDto::Chat
-            | SessionTurnRouteDto::Execute
-            | SessionTurnRouteDto::Task
-            | SessionTurnRouteDto::Continue
-    ) {
-        match request.requested_session_id() {
-            Some(session_id) => Some(state.lock_session_turn(&session_id).await),
-            None => None,
-        }
-    } else {
-        None
-    };
-    if let Some(replay) = replay_existing_submission(&state, &request, &request_fingerprint, true)?
-    {
-        return Ok(replay);
     }
     if matches!(
         decision.route,
@@ -10373,7 +10359,8 @@ mod tests {
         assert_eq!(payload["queuedTurns"][0]["queueId"], "queue-route-a");
         assert_eq!(payload["queuedTurns"][0]["queuePosition"], 1);
         assert_eq!(payload["queuedTurns"][0]["text"], "queued queue-route-a");
-        assert_eq!(payload["queuedTurns"][0]["canGuide"], true);
+        // 会话没有运行中的轮次，排队消息没有可引导的对象。
+        assert_eq!(payload["queuedTurns"][0]["canGuide"], false);
 
         let (status, payload) = post_json(
             state.clone(),
