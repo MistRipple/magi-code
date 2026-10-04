@@ -60,7 +60,7 @@ struct BrowserToolCallScope<'a> {
 pub struct BrowserToolRuntimeDependencies {
     pub authority: Arc<Mutex<magi_browser_authority::BrowserAuthority>>,
     pub write_lock: Arc<Mutex<()>>,
-    pub control_lock: Arc<tokio::sync::Mutex<()>>,
+    pub control_locks: crate::state::BrowserControlLocks,
     pub state_writable: Arc<std::sync::atomic::AtomicBool>,
     pub host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
     pub host_client: Arc<RwLock<Option<BrowserHostClient>>>,
@@ -263,7 +263,7 @@ impl BrowserToolRuntimeDependencies {
             "browser_viewport" => {
                 let action = string_arg(arguments, "action")?;
                 if action == "get" {
-                    let _control_guard = self.control_lock.lock().await;
+                    let _control_guard = self.control_locks.lock_tab(&tab.tab_id).await;
                     let reply = client
                         .request(BrowserHostCommand::GetLogicalViewport {
                             tab_id: tab.tab_id.clone(),
@@ -339,7 +339,7 @@ impl BrowserToolRuntimeDependencies {
                     ));
                 };
                 if mode == "auto" {
-                    let _control_guard = self.control_lock.lock().await;
+                    let _control_guard = self.control_locks.lock_tab(&tab.tab_id).await;
                     let tab = tab_in_session(self, &browser_session, &tab.tab_id)?;
                     let reply = client
                         .request(BrowserHostCommand::SetLogicalViewport {
@@ -392,7 +392,7 @@ impl BrowserToolRuntimeDependencies {
                         "device_type 与 width 不一致：320-600 必须为 mobile，601 以上必须为 desktop",
                     ));
                 }
-                let _control_guard = self.control_lock.lock().await;
+                let _control_guard = self.control_locks.lock_tab(&tab.tab_id).await;
                 let tab = tab_in_session(self, &browser_session, &tab.tab_id)?;
                 let viewport = BrowserViewport {
                     width,
@@ -1045,7 +1045,7 @@ impl BrowserToolRuntimeDependencies {
         tab: &magi_browser_authority::BrowserTab,
         scope: BrowserToolCallScope<'_>,
     ) -> Result<BrowserHostControl, BrowserToolError> {
-        let _control_guard = self.control_lock.lock().await;
+        let _control_guard = self.control_locks.lock_tab(&tab.tab_id).await;
         // Control is scoped to one physical Surface. There is no session-wide
         // control mode to reclaim; acquiring the target Surface lease below is
         // the only authority transition required for an Agent write.
@@ -2842,7 +2842,7 @@ mod tests {
         let runtime = BrowserToolRuntimeDependencies {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
-            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control_locks: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -2906,7 +2906,7 @@ mod tests {
         let runtime = BrowserToolRuntimeDependencies {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
-            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control_locks: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -3017,7 +3017,7 @@ mod tests {
         let runtime = BrowserToolRuntimeDependencies {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
-            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control_locks: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -3071,7 +3071,7 @@ mod tests {
         let runtime = BrowserToolRuntimeDependencies {
             authority: Arc::new(Mutex::new(BrowserAuthority::new())),
             write_lock: Arc::new(Mutex::new(())),
-            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control_locks: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -3310,7 +3310,7 @@ mod tests {
         let runtime = BrowserToolRuntimeDependencies {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
-            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control_locks: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status,
             host_client,
@@ -3752,7 +3752,7 @@ mod tests {
         let runtime = BrowserToolRuntimeDependencies {
             authority: Arc::new(Mutex::new(BrowserAuthority::new())),
             write_lock: Arc::new(Mutex::new(())),
-            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control_locks: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),

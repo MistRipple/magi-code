@@ -40,6 +40,14 @@ type HostWebSocket = WebSocketStream<Box<dyn DesktopControlStream>>;
 type HostWebSocketSink = SplitSink<HostWebSocket, Message>;
 type PendingResponse =
     tokio::sync::oneshot::Sender<Result<BrowserHostCommandReply, BrowserHostClientError>>;
+type PendingRequests = Arc<Mutex<HashMap<BrowserCommandId, PendingSlot>>>;
+
+/// 已发出请求的等待状态。超时且取消宽限期内仍无回复的请求被放弃：只结束这一次调用，
+/// 迟到的回复按请求身份精确丢弃，共享连接继续服务其他会话。
+enum PendingSlot {
+    Waiting(PendingResponse),
+    Abandoned,
+}
 
 const DEFAULT_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // 页面导航自身允许使用 60 秒，并且 Host 还需要在导航失败后停止加载、
@@ -76,7 +84,7 @@ pub struct BrowserHostConnection {
 #[derive(Clone)]
 pub struct BrowserHostClient {
     sink: Arc<tokio::sync::Mutex<HostWebSocketSink>>,
-    pending: Arc<Mutex<HashMap<BrowserCommandId, PendingResponse>>>,
+    pending: PendingRequests,
     events: broadcast::Sender<BrowserHostIncomingEvent>,
     command_sequence: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
@@ -218,7 +226,7 @@ impl BrowserHostClient {
         self.pending
             .lock()
             .expect("browser Host pending response lock poisoned")
-            .insert(request_id.clone(), sender);
+            .insert(request_id.clone(), PendingSlot::Waiting(sender));
         let send_result = self
             .sink
             .lock()
@@ -267,12 +275,20 @@ impl BrowserHostClient {
                 }
                 match tokio::time::timeout(CANCEL_GRACE_TIMEOUT, &mut receiver).await {
                     Ok(Ok(result)) => result,
-                    Ok(Err(_)) | Err(_) => {
-                        self.pending
+                    Ok(Err(_)) => Err(lost_after_send(
+                        BrowserHostClientError::Disconnected,
+                        request_id,
+                    )),
+                    Err(_) => {
+                        // 只放弃这一个请求，不关闭共享连接：一条慢命令不能让所有会话重连。
+                        if let Some(slot) = self
+                            .pending
                             .lock()
                             .expect("browser Host pending response lock poisoned")
-                            .remove(&request_id);
-                        self.close().await;
+                            .get_mut(&request_id)
+                        {
+                            *slot = PendingSlot::Abandoned;
+                        }
                         Err(BrowserHostClientError::RequestIndeterminate(request_id))
                     }
                 }
@@ -381,7 +397,7 @@ fn request_timeout_for(command: &BrowserHostCommand, default: Duration) -> Durat
 async fn read_host_messages(
     mut source: futures_util::stream::SplitStream<HostWebSocket>,
     sink: Arc<tokio::sync::Mutex<HostWebSocketSink>>,
-    pending: Arc<Mutex<HashMap<BrowserCommandId, PendingResponse>>>,
+    pending: PendingRequests,
     events: broadcast::Sender<BrowserHostIncomingEvent>,
     closed: Arc<AtomicBool>,
     mut handshake_sender: Option<
@@ -434,7 +450,7 @@ async fn read_host_messages(
 
 fn handle_text_message(
     text: &str,
-    pending: &Arc<Mutex<HashMap<BrowserCommandId, PendingResponse>>>,
+    pending: &PendingRequests,
     events: &broadcast::Sender<BrowserHostIncomingEvent>,
     binary_queue: &mut VecDeque<PendingBinary>,
     handshake_sender: &mut Option<
@@ -445,14 +461,24 @@ fn handle_text_message(
     if value.get("request_id").is_some() {
         let response: BrowserHostResponseEnvelope = serde_json::from_value(value)?;
         ensure_protocol(response.protocol_version)?;
-        let sender = pending
+        let slot = pending
             .lock()
             .expect("browser Host pending response lock poisoned")
             .remove(&response.request_id);
-        let Some(sender) = sender else {
-            return Err(BrowserHostClientError::UnexpectedResponse(
-                response.request_id,
-            ));
+        let sender = match slot {
+            Some(PendingSlot::Waiting(sender)) => sender,
+            // 已放弃请求的迟到回复：精确丢弃，附带的二进制帧随后同样丢弃。
+            Some(PendingSlot::Abandoned) => {
+                if let Some(metadata) = response_binary_metadata(&response) {
+                    binary_queue.push_back(PendingBinary::Discard { metadata });
+                }
+                return Ok(());
+            }
+            None => {
+                return Err(BrowserHostClientError::UnexpectedResponse(
+                    response.request_id,
+                ));
+            }
         };
         if let Some(metadata) = response_binary_metadata(&response) {
             binary_queue.push_back(PendingBinary::Response {
@@ -514,6 +540,7 @@ fn handle_binary_message(
                 binary: Some(bytes),
             });
         }
+        PendingBinary::Discard { .. } => {}
     }
     Ok(())
 }
@@ -528,12 +555,16 @@ enum PendingBinary {
         envelope: Box<BrowserHostEventEnvelope>,
         metadata: BrowserHostBinaryPayload,
     },
+    /// 已放弃请求的迟到二进制负载，校验后丢弃以保持帧序对齐。
+    Discard { metadata: BrowserHostBinaryPayload },
 }
 
 impl PendingBinary {
     fn metadata(&self) -> &BrowserHostBinaryPayload {
         match self {
-            Self::Response { metadata, .. } | Self::Event { metadata, .. } => metadata,
+            Self::Response { metadata, .. }
+            | Self::Event { metadata, .. }
+            | Self::Discard { metadata } => metadata,
         }
     }
 }
@@ -586,17 +617,16 @@ fn ensure_protocol(received: BrowserHostProtocolVersion) -> Result<(), BrowserHo
     Ok(())
 }
 
-fn fail_pending(
-    pending: &Arc<Mutex<HashMap<BrowserCommandId, PendingResponse>>>,
-    error: BrowserHostClientError,
-) {
+fn fail_pending(pending: &PendingRequests, error: BrowserHostClientError) {
     let pending = std::mem::take(
         &mut *pending
             .lock()
             .expect("browser Host pending response lock poisoned"),
     );
-    for (_, sender) in pending {
-        let _ = sender.send(Err(error.clone()));
+    for (_, slot) in pending {
+        if let PendingSlot::Waiting(sender) = slot {
+            let _ = sender.send(Err(error.clone()));
+        }
     }
 }
 
@@ -1097,5 +1127,98 @@ mod tests {
             ),
             "只读命令断连仍是普通断连：{error:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoned_request_does_not_close_the_shared_connection() {
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::accept_async;
+
+        let temp_dir = tempfile::tempdir().expect("create temporary socket directory");
+        let socket_path = temp_dir.path().join("desktop-control.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind Desktop control socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept Desktop client");
+            let mut websocket = accept_async(stream)
+                .await
+                .expect("upgrade Desktop control websocket");
+            let ready = BrowserHostEventEnvelope {
+                protocol_version: BrowserHostProtocolVersion::CURRENT,
+                sequence: 1,
+                event: BrowserHostEvent::Ready(handshake()),
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&ready).expect("ready").into(),
+                ))
+                .await
+                .expect("send ready event");
+            let read_request = |message: Option<Result<Message, _>>| -> BrowserHostRequestEnvelope {
+                let Message::Text(text) = message.expect("message").expect("read") else {
+                    panic!("expected text request");
+                };
+                serde_json::from_str(text.as_str()).expect("decode request")
+            };
+            let slow = read_request(websocket.next().await);
+            let _cancel = read_request(websocket.next().await);
+            // 慢命令在取消宽限期之后才迟到回复。
+            tokio::time::sleep(CANCEL_GRACE_TIMEOUT + Duration::from_millis(200)).await;
+            let reply = |request_id| BrowserHostResponseEnvelope {
+                request_id,
+                protocol_version: BrowserHostProtocolVersion::CURRENT,
+                outcome: BrowserHostCommandOutcome::Succeeded(Box::new(
+                    BrowserHostCommandResult::Pong {
+                        monotonic_millis: 7,
+                    },
+                )),
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&reply(slow.request_id))
+                        .expect("late")
+                        .into(),
+                ))
+                .await
+                .expect("send late reply");
+            let next = read_request(websocket.next().await);
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&reply(next.request_id))
+                        .expect("next")
+                        .into(),
+                ))
+                .await
+                .expect("send next reply");
+        });
+
+        let connection = BrowserHostClient::connect_desktop_socket(
+            socket_path.to_str().expect("UTF-8 socket path"),
+            "test-token",
+            "desktop-epoch",
+            42,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("connect Desktop client");
+        let client = connection
+            .client
+            .with_request_timeout(Duration::from_millis(20));
+
+        assert!(matches!(
+            client.request(BrowserHostCommand::Ping).await,
+            Err(BrowserHostClientError::RequestIndeterminate(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let client = client.with_request_timeout(Duration::from_secs(2));
+        let reply = client
+            .request(BrowserHostCommand::Ping)
+            .await
+            .expect("放弃单个慢请求后共享连接必须继续可用");
+        assert!(matches!(
+            reply.response.outcome,
+            BrowserHostCommandOutcome::Succeeded(_)
+        ));
+        server.await.expect("join Desktop control server");
     }
 }

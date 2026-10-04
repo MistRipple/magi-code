@@ -1313,7 +1313,7 @@ pub struct ApiState {
     tool_registry: Option<ToolRegistry>,
     pub browser_authority: Arc<Mutex<BrowserAuthority>>,
     browser_write_lock: Arc<Mutex<()>>,
-    pub(crate) browser_control_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) browser_control_locks: BrowserControlLocks,
     app_server_request_locks: Arc<Mutex<HashMap<String, AppServerRequestLockEntry>>>,
     browser_state_writable: Arc<AtomicBool>,
     browser_host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
@@ -1729,6 +1729,45 @@ fn strip_transient_web_model_tabs(mut durable: BrowserDurableState) -> (BrowserD
     (durable, true)
 }
 
+/// 浏览器物理控制的串行化按 Tab 进行：同一页面上的接管、导航、关闭与代理控制同步
+/// 互斥，不同页面互不阻塞，一条慢的 Host 命令不会拖住其他会话。
+#[derive(Clone, Default)]
+pub struct BrowserControlLocks {
+    locks: Arc<Mutex<HashMap<BrowserTabId, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl BrowserControlLocks {
+    fn lock_handle(&self, tab_id: &BrowserTabId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().expect("browser control locks poisoned");
+        // 没有持有者的锁可以回收，登记表规模只取决于正在被控制的页面数。
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(
+            locks
+                .entry(tab_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    pub async fn lock_tab(&self, tab_id: &BrowserTabId) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_handle(tab_id).lock_owned().await
+    }
+
+    /// 同时控制多个 Tab 时按固定顺序加锁，避免互相等待。
+    pub async fn lock_tabs(
+        &self,
+        tab_ids: &[BrowserTabId],
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut ordered = tab_ids.to_vec();
+        ordered.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        ordered.dedup();
+        let mut guards = Vec::with_capacity(ordered.len());
+        for tab_id in &ordered {
+            guards.push(self.lock_tab(tab_id).await);
+        }
+        guards
+    }
+}
+
 pub(crate) enum BrowserAuthorityCommitError {
     NotWritable,
     Rejected(BrowserAuthorityError),
@@ -2002,7 +2041,6 @@ impl ApiState {
     ) -> Self {
         let browser_authority = Arc::new(Mutex::new(BrowserAuthority::new()));
         let browser_write_lock = Arc::new(Mutex::new(()));
-        let browser_control_lock = Arc::new(tokio::sync::Mutex::new(()));
         let browser_host_client = Arc::new(RwLock::new(None));
         let execution_resources = ExecutionResourceCoordinator::new(
             Arc::clone(&browser_authority),
@@ -2057,7 +2095,7 @@ impl ApiState {
             tool_registry: None,
             browser_authority,
             browser_write_lock,
-            browser_control_lock,
+            browser_control_locks: BrowserControlLocks::default(),
             app_server_request_locks: Arc::new(Mutex::new(HashMap::new())),
             browser_state_writable: Arc::new(AtomicBool::new(true)),
             browser_host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
@@ -2772,7 +2810,14 @@ impl ApiState {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<BrowserSession>, ApiError> {
-        let _control_guard = self.browser_control_lock.lock().await;
+        let tab_ids = self
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .session_for_magi_session(session_id)
+            .map(|session| session.tab_ids.clone())
+            .unwrap_or_default();
+        let _control_guards = self.browser_control_locks.lock_tabs(&tab_ids).await;
         let browser_session = self
             .browser_authority
             .lock()
@@ -2875,7 +2920,7 @@ impl ApiState {
         crate::BrowserToolRuntimeDependencies {
             authority: Arc::clone(&self.browser_authority),
             write_lock: Arc::clone(&self.browser_write_lock),
-            control_lock: Arc::clone(&self.browser_control_lock),
+            control_locks: self.browser_control_locks.clone(),
             state_writable: Arc::clone(&self.browser_state_writable),
             host_status: Arc::clone(&self.browser_host_status),
             host_client: Arc::clone(&self.browser_host_client),

@@ -628,9 +628,17 @@ async fn reclaim_browser_resources(
 
     // 回收属于跨 Host/Authority 的资源操作。先串行化它与页面关闭、激活、
     // 导航等物理控制，避免用户在确认后又把同一 Page 重新物化。
-    let _control_guard = state.browser_control_lock.lock().await;
-    let current_resources = browser_resources_response(&state);
     let requested_ids = requested_ids.into_iter().collect::<Vec<_>>();
+    let _control_guards = state
+        .browser_control_locks
+        .lock_tabs(
+            &requested_ids
+                .iter()
+                .map(|tab_id| BrowserTabId::new(tab_id.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    let current_resources = browser_resources_response(&state);
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
     for tab_id in &requested_ids {
@@ -2602,10 +2610,10 @@ async fn create_annotation(
         ));
     }
     // 用户接管可能需要中断当前 Session Turn。该异步操作必须在取得全局
-    // browser_control_lock 之前完成，否则会与 close_session 的
-    // session_turn_lock -> browser_control_lock 顺序形成反向等待。
+    // Tab 控制锁之前完成，否则会与 close_session 的
+    // session_turn_lock -> Tab 控制锁顺序形成反向等待。
     ensure_user_control_for_ui(&state, &session, &tab_id).await?;
-    let _control_guard = state.browser_control_lock.lock().await;
+    let _control_guard = state.browser_control_locks.lock_tab(&tab_id).await;
     // 获得控制锁后重新读取权威 Tab；请求等待期间可能已完成面板调整或导航。
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
     let (kind, navigation_revision, hit_x, hit_y, region) = match request.selection {
@@ -2944,7 +2952,10 @@ async fn update_annotation_status(
         .ok_or_else(|| ApiError::not_found("浏览器标记不存在", annotation_id.as_str()))?;
     let (_tab, session) = browser_tab_scope(&state, &annotation.tab_id)?;
     ensure_user_control_for_ui(&state, &session, &annotation.tab_id).await?;
-    let _control_guard = state.browser_control_lock.lock().await;
+    let _control_guard = state
+        .browser_control_locks
+        .lock_tab(&annotation.tab_id)
+        .await;
     let updated = state.mutate_browser_authority(|authority| {
         authority.update_annotation_status(&annotation_id, request.status, UtcMillis::now())
     })?;
@@ -2986,7 +2997,10 @@ async fn update_annotation_comment(
         .ok_or_else(|| ApiError::not_found("浏览器标记不存在", annotation_id.as_str()))?;
     let (_tab, session) = browser_tab_scope(&state, &annotation.tab_id)?;
     ensure_user_control_for_ui(&state, &session, &annotation.tab_id).await?;
-    let _control_guard = state.browser_control_lock.lock().await;
+    let _control_guard = state
+        .browser_control_locks
+        .lock_tab(&annotation.tab_id)
+        .await;
     let updated = state.mutate_browser_authority(|authority| {
         authority.update_annotation_comment(&annotation_id, comment, UtcMillis::now())
     })?;
@@ -3222,7 +3236,7 @@ pub(crate) async fn close_browser_tab(
     tab_id: &BrowserTabId,
 ) -> Result<(), ApiError> {
     let (tab, session) = browser_tab_scope(state, tab_id)?;
-    let _control_guard = state.browser_control_lock.lock().await;
+    let _control_guard = state.browser_control_locks.lock_tab(tab_id).await;
     state.mutate_browser_authority(|authority| {
         authority.transition_tab(tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
     })?;
@@ -3327,7 +3341,7 @@ async fn navigate_tab(
             let fence = ensure_user_control_for_ui(&state, &session, &tab_id)
                 .await?
                 .fence;
-            let _control_guard = state.browser_control_lock.lock().await;
+            let _control_guard = state.browser_control_locks.lock_tab(&tab_id).await;
             require_host_success(
                 require_browser_host(&state)?
                     .request(BrowserHostCommand::Navigate {
@@ -3601,10 +3615,10 @@ async fn ensure_user_control_for_ui(
     require_session_scope(session)?;
     ensure_browser_ui_ready(state)?;
     // Authority 的短临界区与 Session/Host 的异步等待分开。这里不能由调用方
-    // 先持有 browser_control_lock 再进入 interrupt_session_turn，否则关闭
+    // 先持有 Tab 控制锁再进入 interrupt_session_turn，否则关闭
     // 会话的固定顺序（session turn -> browser control）会与用户接管互锁。
     let (control, revoked) = {
-        let _control_guard = state.browser_control_lock.lock().await;
+        let _control_guard = state.browser_control_locks.lock_tab(tab_id).await;
         state.mutate_browser_authority(|authority| {
             let surface_id = authority
                 .primary_surface(tab_id)
@@ -3634,7 +3648,7 @@ async fn ensure_user_control_for_ui(
             );
         }
         if let Some(client) = state.browser_host_client() {
-            let _control_guard = state.browser_control_lock.lock().await;
+            let _control_guard = state.browser_control_locks.lock_tab(tab_id).await;
             require_host_success(
                 client
                     .request(BrowserHostCommand::UpdateControl {
