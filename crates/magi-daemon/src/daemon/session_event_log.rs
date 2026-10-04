@@ -14,6 +14,30 @@ use std::{
 };
 
 const EVENT_TRANSACTION_SCHEMA_VERSION: u32 = 1;
+const EVENT_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+/// 自上一个检查点以来累计这么多个事务后，写入新检查点并截断被覆盖的事务文件。
+const CHECKPOINT_TRANSACTION_INTERVAL: usize = 128;
+const CHECKPOINT_FILE_PREFIX: &str = "checkpoint-";
+
+/// 事件目录内部的压缩形式：重放到 `last_event_seq`（总是某个事务末尾）后的完整结果。
+/// 事件目录仍是唯一权威源，检查点只替代被它覆盖的那段事务（见
+/// docs/durable-log-compaction-design.md §2）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalEventCheckpoint {
+    schema_version: u32,
+    session_id: SessionId,
+    last_event_seq: u64,
+    canonical_turns: Vec<CanonicalTurn>,
+    accepted_submissions: Vec<AcceptedSubmissionRecord>,
+}
+
+/// 事务与检查点共有的会话身份字段；读取归属时不解析整份内容。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventFileSessionIdentity {
+    session_id: SessionId,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,6 +71,8 @@ pub(crate) struct SessionConversationProjection {
     released: bool,
     /// 最近一次使用的单调序号，用于只让最近活跃的少数会话保持驻留。
     last_touched: u64,
+    /// 最近检查点之后已提交的事务数，达到阈值时写入新检查点。
+    transactions_since_checkpoint: usize,
 }
 
 static TOUCH_CLOCK: AtomicU64 = AtomicU64::new(1);
@@ -69,14 +95,14 @@ impl SessionConversationProjection {
                 event_root.display()
             ))
         })?;
-        let transaction: CanonicalEventTransaction = serde_json::from_slice(&fs::read(path)?)
-            .map_err(|error| {
+        let identity: EventFileSessionIdentity =
+            serde_json::from_slice(&fs::read(path)?).map_err(|error| {
                 DaemonError::internal(format!(
-                    "解析 canonical event transaction 失败 {}: {error}",
+                    "解析 canonical event 文件归属失败 {}: {error}",
                     path.display()
                 ))
             })?;
-        Ok(transaction.session_id)
+        Ok(identity.session_id)
     }
 
     pub(crate) fn load(event_root: &Path, session_id: &SessionId) -> Result<Self, DaemonError> {
@@ -88,14 +114,41 @@ impl SessionConversationProjection {
             return Ok(projection);
         }
 
-        let mut paths = fs::read_dir(event_root)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?;
-        paths.retain(|path| path.extension().and_then(|value| value.to_str()) == Some("json"));
-        paths.sort();
+        let (checkpoint_paths, transaction_paths) = event_file_paths(event_root)?;
+        let mut checkpoint_seq = 0;
+        if let Some(path) = checkpoint_paths.last() {
+            let checkpoint: CanonicalEventCheckpoint = serde_json::from_slice(&fs::read(path)?)
+                .map_err(|error| {
+                    DaemonError::internal(format!(
+                        "解析 canonical event checkpoint 失败 {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            if checkpoint.schema_version != EVENT_CHECKPOINT_SCHEMA_VERSION
+                || &checkpoint.session_id != session_id
+                || checkpoint.last_event_seq == 0
+                || path.file_name() != checkpoint_file_name(checkpoint.last_event_seq).file_name()
+            {
+                return Err(DaemonError::internal(format!(
+                    "canonical event checkpoint 不合法: {}",
+                    path.display()
+                )));
+            }
+            for turn in &checkpoint.canonical_turns {
+                validate_turn(turn, session_id)?;
+            }
+            checkpoint_seq = checkpoint.last_event_seq;
+            projection.last_event_seq = checkpoint.last_event_seq;
+            projection.canonical_turns = checkpoint.canonical_turns;
+            projection.accepted_submissions = checkpoint.accepted_submissions;
+        }
 
         let mut seen_event_ids = HashSet::new();
-        for path in paths {
+        for (last_event_seq, path) in transaction_paths {
+            // 截断中途崩溃会留下已被检查点覆盖的事务；它们的事实已在检查点内，直接跳过。
+            if last_event_seq <= checkpoint_seq {
+                continue;
+            }
             let transaction: CanonicalEventTransaction = serde_json::from_slice(&fs::read(&path)?)
                 .map_err(|error| {
                     DaemonError::internal(format!(
@@ -122,6 +175,7 @@ impl SessionConversationProjection {
                 }
                 projection.accepted_submissions.push(acceptance.clone());
             }
+            projection.transactions_since_checkpoint += 1;
         }
         projection.touch();
         Ok(projection)
@@ -159,7 +213,7 @@ impl SessionConversationProjection {
         mutations: &[CanonicalTurnMutation],
         acceptance: Option<AcceptedSubmissionRecord>,
     ) -> Result<Self, DaemonError> {
-        let (next, transaction) =
+        let (mut next, transaction) =
             self.plan_transaction_inner(event_root, session_id, mutations, acceptance)?;
         let Some(transaction) = transaction else {
             return Ok(next);
@@ -188,8 +242,61 @@ impl SessionConversationProjection {
                 &path,
                 serde_json::to_vec_pretty(&transaction).map_err(DaemonError::from)?,
             )?;
+            next.transactions_since_checkpoint += 1;
+        }
+        if next.transactions_since_checkpoint >= CHECKPOINT_TRANSACTION_INTERVAL {
+            // 事务已经提交；检查点只是压缩，失败时保留计数，下一次提交再试。
+            match next.write_checkpoint(event_root, session_id) {
+                Ok(()) => next.transactions_since_checkpoint = 0,
+                Err(error) => tracing::warn!(
+                    %session_id,
+                    error = %error,
+                    "写入 canonical event checkpoint 失败，保留事务文件待下次压缩"
+                ),
+            }
         }
         Ok(next)
+    }
+
+    /// 原子写入覆盖到 `last_event_seq` 的检查点，再删除被它覆盖的事务与旧检查点。
+    ///
+    /// 检查点先于删除落盘，任意时刻崩溃都不丢事实；删除失败的遗留文件在加载时被
+    /// 跳过，并在下一次检查点时清理。
+    fn write_checkpoint(
+        &self,
+        event_root: &Path,
+        session_id: &SessionId,
+    ) -> Result<(), DaemonError> {
+        let checkpoint = CanonicalEventCheckpoint {
+            schema_version: EVENT_CHECKPOINT_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            last_event_seq: self.last_event_seq,
+            canonical_turns: self.canonical_turns.clone(),
+            accepted_submissions: self.accepted_submissions.clone(),
+        };
+        magi_core::fs_atomic::write_atomic(
+            &event_root.join(checkpoint_file_name(self.last_event_seq)),
+            serde_json::to_vec(&checkpoint).map_err(DaemonError::from)?,
+        )?;
+        let (checkpoint_paths, transaction_paths) = event_file_paths(event_root)?;
+        let covered = transaction_paths
+            .into_iter()
+            .filter(|(last_event_seq, _)| *last_event_seq <= self.last_event_seq)
+            .map(|(_, path)| path);
+        let superseded = checkpoint_paths.into_iter().filter(|path| {
+            path.file_name() != checkpoint_file_name(self.last_event_seq).file_name()
+        });
+        for path in covered.chain(superseded) {
+            if let Err(error) = fs::remove_file(&path) {
+                tracing::warn!(
+                    %session_id,
+                    path = %path.display(),
+                    error = %error,
+                    "删除已被检查点覆盖的 canonical event 文件失败"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 只规划 canonical event segment，不直接写盘。
@@ -819,6 +926,50 @@ fn transaction_file_name(first: u64, last: u64) -> PathBuf {
     PathBuf::from(format!("{first:020}-{last:020}.json"))
 }
 
+fn checkpoint_file_name(last_event_seq: u64) -> PathBuf {
+    PathBuf::from(format!("{CHECKPOINT_FILE_PREFIX}{last_event_seq:020}.json"))
+}
+
+/// 列出事件目录中的检查点（按序号排序）与事务（`(last_event_seq, path)`，按首序号排序）。
+/// 其余文件名一律视为目录损坏。
+fn event_file_paths(event_root: &Path) -> Result<(Vec<PathBuf>, Vec<(u64, PathBuf)>), DaemonError> {
+    let mut checkpoints = Vec::new();
+    let mut transactions = Vec::new();
+    for entry in fs::read_dir(event_root)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if let Some(seq) = stem.strip_prefix(CHECKPOINT_FILE_PREFIX) {
+            if seq.len() != 20 || seq.parse::<u64>().is_err() {
+                return Err(DaemonError::internal(format!(
+                    "canonical event checkpoint 文件名不合法: {}",
+                    path.display()
+                )));
+            }
+            checkpoints.push(path);
+            continue;
+        }
+        let last = stem
+            .split_once('-')
+            .filter(|(first, last)| first.len() == 20 && last.len() == 20)
+            .and_then(|(first, last)| first.parse::<u64>().ok().and(last.parse::<u64>().ok()))
+            .ok_or_else(|| {
+                DaemonError::internal(format!(
+                    "canonical event transaction 文件名不合法: {}",
+                    path.display()
+                ))
+            })?;
+        transactions.push((last, path));
+    }
+    checkpoints.sort();
+    transactions.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok((checkpoints, transactions))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +1058,147 @@ mod tests {
         let replayed = SessionConversationProjection::load(temp.path(), &session_id)
             .expect("events should replay");
         assert_eq!(replayed.canonical_turns(), &[completed]);
+    }
+
+    fn running_turn_with_items(session_id: &SessionId, assistant_items: usize) -> CanonicalTurn {
+        let mut running = turn(session_id, CanonicalTurnStatus::Running);
+        running.items.truncate(1);
+        for index in 0..assistant_items {
+            running.items.push(item(
+                session_id,
+                &format!("assistant-{index}"),
+                index + 2,
+                CanonicalTurnItemKind::AssistantText,
+                "chunk",
+            ));
+        }
+        running
+    }
+
+    /// 逐个事务追加 assistant item，返回最终投影。
+    fn append_item_transactions(
+        root: &Path,
+        session_id: &SessionId,
+        transactions: usize,
+    ) -> SessionConversationProjection {
+        let mut projection = SessionConversationProjection::default();
+        let mut previous = None;
+        for index in 0..transactions {
+            let next = running_turn_with_items(session_id, index);
+            projection = projection
+                .append_transaction(
+                    root,
+                    session_id,
+                    &[CanonicalTurnMutation {
+                        previous: previous.clone(),
+                        next: next.clone(),
+                    }],
+                )
+                .expect("transaction should append");
+            previous = Some(next);
+        }
+        projection
+    }
+
+    fn event_file_names(root: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn checkpoint_replaces_covered_transactions_and_replays_identically() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let session_id = SessionId::new("session-checkpoint");
+        let projection =
+            append_item_transactions(temp.path(), &session_id, CHECKPOINT_TRANSACTION_INTERVAL);
+        let checkpoint_seq = projection.last_event_seq();
+        assert_eq!(
+            event_file_names(temp.path()),
+            vec![checkpoint_file_name(checkpoint_seq).display().to_string()],
+            "达到阈值后只保留检查点"
+        );
+        assert_eq!(projection.transactions_since_checkpoint, 0);
+
+        let replayed = SessionConversationProjection::load(temp.path(), &session_id)
+            .expect("checkpoint should load");
+        assert_eq!(replayed.last_event_seq(), checkpoint_seq);
+        assert_eq!(replayed.canonical_turns(), projection.canonical_turns());
+        assert_eq!(
+            SessionConversationProjection::read_session_id_from_root(temp.path()).unwrap(),
+            session_id
+        );
+
+        // 检查点之后的增量事务照常追加，加载时只重放这一段。
+        let previous = projection.canonical_turns()[0].clone();
+        let next = running_turn_with_items(&session_id, CHECKPOINT_TRANSACTION_INTERVAL);
+        let advanced = replayed
+            .append_transaction(
+                temp.path(),
+                &session_id,
+                &[CanonicalTurnMutation {
+                    previous: Some(previous),
+                    next,
+                }],
+            )
+            .expect("append after checkpoint");
+        assert_eq!(event_file_names(temp.path()).len(), 2);
+        let reloaded = SessionConversationProjection::load(temp.path(), &session_id)
+            .expect("checkpoint plus tail should load");
+        assert_eq!(reloaded.canonical_turns(), advanced.canonical_turns());
+        assert_eq!(reloaded.transactions_since_checkpoint, 1);
+    }
+
+    #[test]
+    fn transactions_left_by_interrupted_truncation_are_skipped() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let session_id = SessionId::new("session-checkpoint-leftover");
+        let full = tempfile::tempdir().expect("tempdir should create");
+        // 同样的提交在另一目录不截断地保留全部事务，用来模拟删除前崩溃的遗留文件。
+        let projection =
+            append_item_transactions(temp.path(), &session_id, CHECKPOINT_TRANSACTION_INTERVAL);
+        append_item_transactions(
+            full.path(),
+            &session_id,
+            CHECKPOINT_TRANSACTION_INTERVAL - 1,
+        );
+        for name in event_file_names(full.path()) {
+            fs::copy(full.path().join(&name), temp.path().join(&name)).unwrap();
+        }
+
+        let replayed = SessionConversationProjection::load(temp.path(), &session_id)
+            .expect("covered leftovers should be skipped");
+        assert_eq!(replayed.canonical_turns(), projection.canonical_turns());
+    }
+
+    #[test]
+    fn transaction_straddling_checkpoint_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let session_id = SessionId::new("session-checkpoint-straddle");
+        // 首个事务包含 turn_started 与 item 多个事件；检查点落在它中间即为跨界。
+        append_item_transactions(temp.path(), &session_id, 3);
+        assert!(event_file_names(temp.path())[0].starts_with(&format!("{:020}-", 1)));
+        assert!(!event_file_names(temp.path())[0].ends_with(&format!("{:020}.json", 1)));
+        SessionConversationProjection::load(temp.path(), &session_id)
+            .expect("without checkpoint the log is valid");
+        let checkpoint = CanonicalEventCheckpoint {
+            schema_version: EVENT_CHECKPOINT_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            last_event_seq: 1,
+            canonical_turns: Vec::new(),
+            accepted_submissions: Vec::new(),
+        };
+        fs::write(
+            temp.path().join(checkpoint_file_name(1)),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+        let error = SessionConversationProjection::load(temp.path(), &session_id)
+            .expect_err("事务跨越检查点边界必须拒绝");
+        assert!(error.to_string().contains("transaction 不合法"), "{error}");
     }
 
     #[test]
