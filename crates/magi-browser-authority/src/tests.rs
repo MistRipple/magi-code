@@ -6,12 +6,12 @@ use magi_core::{
 };
 
 use crate::{
-    AcquireBrowserLease, BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor,
-    BrowserAnnotationKind, BrowserAuthority, BrowserDeviceType, BrowserDurableState,
-    BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserProfile, BrowserProfileKind,
-    BrowserSessionLifecycle, BrowserSessionOwner, BrowserSurfaceBinding, BrowserTabLifecycle,
-    BrowserViewport, CreateBrowserSession, CreateBrowserTab, GoalControlBinding,
-    MAX_BROWSER_TABS_TOTAL, ValidateBrowserNodeSelection, ValidateBrowserWrite,
+    AcquireBrowserLease, AgentTabTarget, BrowserAnnotation, BrowserAnnotationAnchor,
+    BrowserAnnotationAuthor, BrowserAnnotationKind, BrowserAuthority, BrowserDeviceType,
+    BrowserDurableState, BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserProfile,
+    BrowserProfileKind, BrowserSessionLifecycle, BrowserSessionOwner, BrowserSurfaceBinding,
+    BrowserTabLifecycle, BrowserViewport, CreateBrowserSession, CreateBrowserTab,
+    GoalControlBinding, MAX_BROWSER_TABS_TOTAL, ValidateBrowserNodeSelection, ValidateBrowserWrite,
 };
 
 fn at(value: u64) -> UtcMillis {
@@ -394,6 +394,61 @@ fn lease_is_scoped_to_one_tab_and_surface() {
         Some(BrowserLeaseEndReason::UserTakeover)
     );
     assert_eq!(revoked[0].lifecycle, BrowserLeaseLifecycle::Revoked);
+}
+
+#[test]
+fn closing_an_agent_tab_marks_it_closed_instead_of_retargeting_and_detects_other_executor() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let agent_tab = ready_tab(&mut authority, &browser_session_id);
+    let _user_tab = ready_tab_with_id(&mut authority, &browser_session_id, "browser-tab-user");
+    authority
+        .set_primary_surface(binding(&agent_tab, &surface_id(), 1), at(6))
+        .expect("surface should bind");
+    let main_task = magi_core::TaskId::new("task-main");
+    let child_task = magi_core::TaskId::new("task-child");
+    let mut main_owner = owner();
+    main_owner.task_id = Some(main_task.clone());
+    authority
+        .acquire_lease(AcquireBrowserLease {
+            lease_id: BrowserLeaseId::new("lease-main"),
+            tab_id: agent_tab.clone(),
+            surface_id: surface_id(),
+            owner: main_owner,
+            turn_id: "turn-1".to_string(),
+            goal_binding: None,
+            acquired_at: at(7),
+            expires_at: at(100),
+        })
+        .expect("main agent lease should acquire");
+
+    assert!(
+        authority.tab_controlled_by_other_executor(&agent_tab, Some(&child_task), at(8)),
+        "子代理必须识别出主代理正在控制该标签页"
+    );
+    assert!(!authority.tab_controlled_by_other_executor(&agent_tab, Some(&main_task), at(8)));
+
+    authority.set_agent_tab(
+        &browser_session_id,
+        "task:task-main",
+        AgentTabTarget::Tab(agent_tab.clone()),
+    );
+    authority
+        .transition_tab(&agent_tab, BrowserTabLifecycle::Closed, at(9))
+        .expect("agent tab should close");
+    assert_eq!(
+        authority.agent_tab(&browser_session_id, "task:task-main"),
+        Some(&AgentTabTarget::Closed(agent_tab)),
+        "代理的标签页被关闭后不能悄悄换成用户的其他标签页"
+    );
+
+    authority.forget_agent_tabs("task:task-main");
+    assert!(
+        authority
+            .agent_tab(&browser_session_id, "task:task-main")
+            .is_none()
+    );
 }
 
 #[test]

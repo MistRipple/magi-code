@@ -9,7 +9,7 @@ mod host_protocol;
 mod navigation;
 
 pub use authority::{
-    AcquireBrowserLease, BROWSER_DURABLE_STATE_SCHEMA_VERSION, BrowserAuthority,
+    AcquireBrowserLease, AgentTabTarget, BROWSER_DURABLE_STATE_SCHEMA_VERSION, BrowserAuthority,
     BrowserAuthoritySnapshot, BrowserDurableState, BrowserDurableTab, BrowserPrimarySurface,
     BrowserSurfaceControlSnapshot, CreateBrowserSession, CreateBrowserTab,
     MAX_BROWSER_TABS_PER_SESSION, MAX_BROWSER_TABS_TOTAL, ValidateBrowserNodeSelection,

@@ -2445,6 +2445,24 @@ impl ApiState {
         .total()
     }
 
+    /// 任务（含子任务）进入终态：释放它自己的进程、浏览器租约与默认浏览器目标，
+    /// 不等整轮结束，避免子代理结束后仍占着页面阻塞主代理。
+    pub fn release_finished_task_resources(&self, session_id: &SessionId, task_id: &TaskId) {
+        self.cancel_execution_resources(
+            Some(session_id),
+            None,
+            Some(task_id),
+            BrowserLeaseEndReason::TaskFinished,
+        );
+        let executor = crate::browser_tool_runtime::browser_executor_key_for_task(task_id);
+        if let Err(error) = self.mutate_browser_authority(|authority| {
+            authority.forget_agent_tabs(&executor);
+            Ok(())
+        }) {
+            tracing::warn!(%session_id, %task_id, ?error, "清理任务浏览器默认目标失败");
+        }
+    }
+
     pub fn cancel_execution_resources(
         &self,
         session_id: Option<&SessionId>,

@@ -9,13 +9,13 @@ use std::{
 };
 
 use magi_browser_authority::{
-    AcquireBrowserLease, BeforeUnloadAction, BrowserCapabilitySnapshot, BrowserDeviceType,
-    BrowserHostClient, BrowserHostClientError, BrowserHostCommand, BrowserHostCommandError,
-    BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
-    BrowserHostControlUpdate, BrowserHostSnapshot, BrowserLeaseEndReason, BrowserNavigation,
-    BrowserSnapshotNode, BrowserSnapshotTarget, BrowserSurfaceBinding, BrowserToolAccess,
-    BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession, CreateBrowserTab,
-    GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
+    AcquireBrowserLease, AgentTabTarget, BeforeUnloadAction, BrowserCapabilitySnapshot,
+    BrowserDeviceType, BrowserHostClient, BrowserHostClientError, BrowserHostCommand,
+    BrowserHostCommandError, BrowserHostCommandOutcome, BrowserHostCommandResult,
+    BrowserHostControl, BrowserHostControlUpdate, BrowserHostSnapshot, BrowserLeaseEndReason,
+    BrowserNavigation, BrowserSnapshotNode, BrowserSnapshotTarget, BrowserSurfaceBinding,
+    BrowserToolAccess, BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession,
+    CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
 };
 use magi_core::{
     BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, ExecutionOwnership,
@@ -232,8 +232,15 @@ impl BrowserToolRuntimeDependencies {
         let navigation = (tool_name == "browser_navigate")
             .then(|| parse_browser_navigation(arguments))
             .transpose()?;
+        let executor = browser_executor_key(scope.context);
         let tab = self
-            .ensure_tab(&browser_session, arguments, &client)
+            .ensure_tab(
+                &browser_session,
+                arguments,
+                &client,
+                &executor,
+                scope.context,
+            )
             .await?;
         // ensure_tab 只完成逻辑 Tab 的创建或恢复；真实 Chromium guest
         // 由右栏 Renderer 异步注册。所有需要访问页面的工具必须先通过
@@ -775,6 +782,8 @@ impl BrowserToolRuntimeDependencies {
         session: &magi_browser_authority::BrowserSession,
         arguments: &Map<String, Value>,
         client: &BrowserHostClient,
+        executor: &str,
+        context: &magi_tool_runtime::ToolExecutionContext,
     ) -> Result<magi_browser_authority::BrowserTab, BrowserToolError> {
         let requested_tab_id = optional_string(arguments, "tab_id").map(BrowserTabId::new);
         let initial_url = "about:blank".to_string();
@@ -812,23 +821,63 @@ impl BrowserToolRuntimeDependencies {
                 }
                 Some(tab.clone())
             } else {
-                authority
-                    .active_tab(&session.browser_session_id)
-                    .into_iter()
-                    .chain(session.tab_ids.iter())
-                    .find_map(|id| authority.tab(id).cloned())
-                    .filter(|tab| {
-                        matches!(
-                            tab.lifecycle,
-                            magi_browser_authority::BrowserTabLifecycle::Ready
-                                | magi_browser_authority::BrowserTabLifecycle::Suspended
-                                | magi_browser_authority::BrowserTabLifecycle::Crashed
-                        )
-                    })
+                let usable = |tab: &magi_browser_authority::BrowserTab| {
+                    matches!(
+                        tab.lifecycle,
+                        magi_browser_authority::BrowserTabLifecycle::Ready
+                            | magi_browser_authority::BrowserTabLifecycle::Suspended
+                            | magi_browser_authority::BrowserTabLifecycle::Crashed
+                    )
+                };
+                match authority
+                    .agent_tab(&session.browser_session_id, executor)
+                    .cloned()
+                {
+                    // 执行者自己的 Tab 是唯一默认目标。
+                    Some(AgentTabTarget::Tab(id)) => {
+                        authority.tab(&id).filter(|tab| usable(tab)).cloned()
+                    }
+                    // 执行者使用的 Tab 被关闭：明确告知，绝不悄悄换到用户的其他 Tab。
+                    Some(AgentTabTarget::Closed(_)) => {
+                        drop(authority);
+                        self.mutate(|authority| {
+                            authority.set_agent_tab(
+                                &session.browser_session_id,
+                                executor,
+                                AgentTabTarget::NewTabRequired,
+                            );
+                            Ok(())
+                        })?;
+                        return Err(BrowserToolError::new(
+                            "browser_agent_tab_closed",
+                            "你之前使用的浏览器标签页已被用户关闭。不要操作用户的其他标签页；如仍需浏览器，再次调用浏览器工具会为你新开一个标签页。",
+                        ));
+                    }
+                    Some(AgentTabTarget::NewTabRequired) => None,
+                    // 首次使用：沿用用户当前选中的 Tab；若它正被其他代理控制，则为自己新开 Tab。
+                    None => authority
+                        .active_tab(&session.browser_session_id)
+                        .into_iter()
+                        .chain(session.tab_ids.iter())
+                        .find_map(|id| authority.tab(id).cloned())
+                        .filter(|tab| usable(tab))
+                        .filter(|tab| {
+                            !authority.tab_controlled_by_other_executor(
+                                &tab.tab_id,
+                                context.task_id.as_ref(),
+                                UtcMillis::now(),
+                            )
+                        }),
+                }
             }
         };
         if let Some(tab) = tab {
             self.mutate(|authority| {
+                authority.set_agent_tab(
+                    &session.browser_session_id,
+                    executor,
+                    AgentTabTarget::Tab(tab.tab_id.clone()),
+                );
                 authority.set_active_tab(&session.browser_session_id, &tab.tab_id)
             })?;
             return self.materialize_tab(tab, client).await;
@@ -846,6 +895,11 @@ impl BrowserToolRuntimeDependencies {
                 now: UtcMillis::now(),
             })?;
             authority.set_active_tab(&session.browser_session_id, &tab_id)?;
+            authority.set_agent_tab(
+                &session.browser_session_id,
+                executor,
+                AgentTabTarget::Tab(tab_id.clone()),
+            );
             Ok(created)
         })?;
         self.publish_tab_event("browser.tab.created", &created);
@@ -1136,7 +1190,7 @@ impl BrowserToolRuntimeDependencies {
             } else {
                 return Err(BrowserToolError::new(
                     "browser_control_lease_conflict",
-                    "当前浏览器 Surface 正由另一个执行者控制",
+                    "这个浏览器标签页正由另一个代理控制。不要等待或重试同一标签页：省略 tab_id 让系统为你新开标签页，或指定其他 tab_id。",
                 ));
             }
         }
@@ -2141,6 +2195,19 @@ impl BrowserToolError {
             },
         }
     }
+}
+
+/// 浏览器默认目标按执行者区分：子任务各自独立，主线（无任务上下文）跨轮共用。
+pub(crate) fn browser_executor_key(context: &magi_tool_runtime::ToolExecutionContext) -> String {
+    context
+        .task_id
+        .as_ref()
+        .map(browser_executor_key_for_task)
+        .unwrap_or_else(|| "session-main".to_string())
+}
+
+pub(crate) fn browser_executor_key_for_task(task_id: &magi_core::TaskId) -> String {
+    format!("task:{task_id}")
 }
 
 fn failure(tool: &str, code: &str, message: &str) -> (String, ExecutionResultStatus) {

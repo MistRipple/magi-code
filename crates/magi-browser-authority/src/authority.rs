@@ -212,6 +212,19 @@ pub struct BrowserAuthority {
     /// 用户在页面上直接操作而接管的 Tab。接管期间代理不能重新获取控制权，
     /// 必须由用户显式交还；运行态事实，不进入 durable state。
     user_control_holds: HashSet<BrowserTabId>,
+    /// 每个执行者（主线或某个子任务）在浏览器会话里自己的当前 Tab；运行态事实。
+    /// 执行者之间不共享默认目标，避免子代理与主代理争用同一页面。
+    agent_tabs: HashMap<(BrowserSessionId, String), AgentTabTarget>,
+}
+
+/// 执行者的默认浏览器目标。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentTabTarget {
+    Tab(BrowserTabId),
+    /// 执行者使用的 Tab 已被关闭；下一次需要浏览器时必须先明确告知，不能悄悄换到别的 Tab。
+    Closed(BrowserTabId),
+    /// 已告知关闭，之后为该执行者新开 Tab。
+    NewTabRequired,
 }
 
 impl BrowserAuthority {
@@ -952,6 +965,45 @@ impl BrowserAuthority {
         Ok(())
     }
 
+    pub fn agent_tab(
+        &self,
+        browser_session_id: &BrowserSessionId,
+        executor: &str,
+    ) -> Option<&AgentTabTarget> {
+        self.agent_tabs
+            .get(&(browser_session_id.clone(), executor.to_string()))
+    }
+
+    pub fn set_agent_tab(
+        &mut self,
+        browser_session_id: &BrowserSessionId,
+        executor: &str,
+        target: AgentTabTarget,
+    ) {
+        self.agent_tabs
+            .insert((browser_session_id.clone(), executor.to_string()), target);
+    }
+
+    /// 执行者结束后忘记它的默认目标。
+    pub fn forget_agent_tabs(&mut self, executor: &str) {
+        self.agent_tabs.retain(|(_, key), _| key != executor);
+    }
+
+    /// Tab 当前是否由指定执行者之外的代理持有有效控制租约。
+    pub fn tab_controlled_by_other_executor(
+        &self,
+        tab_id: &BrowserTabId,
+        task_id: Option<&magi_core::TaskId>,
+        now: UtcMillis,
+    ) -> bool {
+        self.leases.values().any(|lease| {
+            lease.tab_id == *tab_id
+                && lease.lifecycle == BrowserLeaseLifecycle::Held
+                && lease.expires_at > now
+                && lease.owner.task_id.as_ref() != task_id
+        })
+    }
+
     pub fn active_tab(&self, browser_session_id: &BrowserSessionId) -> Option<&BrowserTabId> {
         self.active_tabs.get(browser_session_id)
     }
@@ -995,6 +1047,11 @@ impl BrowserAuthority {
             );
             self.primary_surfaces.remove(tab_id);
             self.user_control_holds.remove(tab_id);
+            for target in self.agent_tabs.values_mut() {
+                if *target == AgentTabTarget::Tab(tab_id.clone()) {
+                    *target = AgentTabTarget::Closed(tab_id.clone());
+                }
+            }
             let session = self
                 .sessions
                 .get_mut(&browser_session_id)
