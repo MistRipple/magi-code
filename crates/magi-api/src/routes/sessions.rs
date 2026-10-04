@@ -3409,6 +3409,16 @@ fn schedule_conversation_execution(
         state
             .turn_coordinator()
             .close_session_turn_input(&session_id, &turn_id);
+        if canonical_changed {
+            // 对话轮次的进程与浏览器租约没有任务归属，只按会话归属；本轮结束即释放，
+            // 与任务轮次在终态释放根任务资源保持一致。
+            state.cancel_execution_resources(
+                Some(&session_id),
+                None,
+                None,
+                magi_browser_authority::BrowserLeaseEndReason::TaskFinished,
+            );
+        }
         // canonical mutation 已经在 terminal guard 内完成；只有本次执行真正写入了
         // 当前 Turn，Coordinator 才收口同一 attempt。取消或新 Turn 先提交时，迟到
         // 的执行结果不会再次触碰 Coordinator。

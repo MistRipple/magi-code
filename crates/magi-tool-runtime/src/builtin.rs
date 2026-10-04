@@ -31,6 +31,8 @@ const MAX_SHELL_TIMEOUT_MS: u64 = 1_800_000;
 const SHELL_TIMEOUT_POLL_MS: u64 = 20;
 /// process_write 等待子进程读取输入的上限。
 const PROCESS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 进程表中保留的已退出后台进程数量上限。
+const MAX_RETAINED_EXITED_PROCESSES: usize = 32;
 /// 主进程结束后等待输出管道关闭的上限。超过它说明有后台进程继承了管道。
 const SHELL_PIPE_DRAIN_GRACE_MS: u64 = 1_500;
 const DEFAULT_FILE_READ_MAX_BYTES: usize = 64 * 1024;
@@ -1481,6 +1483,25 @@ pub(crate) fn cancel_all_active_processes() -> usize {
     cancelled_count
 }
 
+/// 已退出的后台进程只为查看输出保留最近一批，避免进程表随长期使用无限增长。
+fn prune_exited_processes(table: &mut HashMap<u64, ManagedProcess>) {
+    let mut exited = table
+        .values_mut()
+        .filter_map(|process| {
+            matches!(process.child.try_wait(), Ok(Some(_)))
+                .then_some((process.started_at_ms, process.terminal_id))
+        })
+        .collect::<Vec<_>>();
+    if exited.len() < MAX_RETAINED_EXITED_PROCESSES {
+        return;
+    }
+    exited.sort_unstable();
+    let excess = exited.len() + 1 - MAX_RETAINED_EXITED_PROCESSES;
+    for (_, terminal_id) in exited.into_iter().take(excess) {
+        table.remove(&terminal_id);
+    }
+}
+
 fn take_managed_processes(predicate: impl Fn(&ManagedProcess) -> bool) -> Vec<ManagedProcess> {
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let terminal_ids = table
@@ -1629,10 +1650,11 @@ fn execute_process_launch_with_surface(
         stderr: stderr_buffer,
         started_at_ms: UtcMillis::now().0,
     };
-    PROCESS_TABLE
-        .lock()
-        .expect("process table lock poisoned")
-        .insert(terminal_id, process);
+    {
+        let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+        prune_exited_processes(&mut table);
+        table.insert(terminal_id, process);
+    }
 
     let mut payload = serde_json::json!({
         "tool": surface_tool,

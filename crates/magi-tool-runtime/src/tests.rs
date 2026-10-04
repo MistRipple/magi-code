@@ -2223,6 +2223,73 @@ fn blocked_process_write_does_not_hold_the_process_table() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn exited_background_processes_are_pruned_from_the_process_table() {
+    let root = unique_temp_dir("magi-tool-process-prune");
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry = ToolRegistry::new(governance, event_bus);
+    tool_registry.register_default_builtins();
+    let context = ToolExecutionContext {
+        worker_id: None,
+        task_id: Some(TaskId::new("task-process-prune")),
+        session_id: Some(SessionId::new("session-process-prune")),
+        workspace_id: Some(WorkspaceId::new("workspace-process-prune")),
+        access_profile: magi_core::AccessProfile::Restricted,
+        working_directory: None,
+        browser_capability_snapshot: None,
+        browser_execution_id: None,
+    };
+    let run = |tool: BuiltinToolName, call: String, input: Value| {
+        tool_registry.execute_internal_builtin_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new(call),
+                tool_name: tool.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: input.to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &full_access_policy(),
+        )
+    };
+    for index in 0..40 {
+        let launch = run(
+            BuiltinToolName::ProcessLaunch,
+            format!("tool-call-prune-{index}"),
+            serde_json::json!({
+                "command": "true",
+                "cwd": root.to_string_lossy(),
+                "access_mode": "maybe_write"
+            }),
+        );
+        assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let last = run(
+        BuiltinToolName::ProcessLaunch,
+        "tool-call-prune-last".to_string(),
+        serde_json::json!({
+            "command": "true",
+            "cwd": root.to_string_lossy(),
+            "access_mode": "maybe_write"
+        }),
+    );
+    assert_eq!(last.status, ExecutionResultStatus::Succeeded);
+    let list = run(
+        BuiltinToolName::ProcessList,
+        "tool-call-prune-list".to_string(),
+        serde_json::json!({}),
+    );
+    let listed = serde_json::from_str::<Value>(&list.payload).expect("list payload")["processes"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+    assert!(listed <= 33, "已退出的进程必须有界保留，实际 {listed} 个");
+}
+
 #[test]
 fn process_launch_rejects_blank_json_command() {
     let governance = Arc::new(GovernanceService::default());
