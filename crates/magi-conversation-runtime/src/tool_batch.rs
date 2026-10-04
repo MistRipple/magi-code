@@ -57,7 +57,7 @@ use crate::{
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
     tool_result_utils::{
         approval_resume_contract_failure, approval_resume_is_safe, safety_gate_public_error,
-        tool_execution_failed_result,
+        tool_execution_failed_result, tool_interrupted_before_execution_result,
     },
 };
 use crate::{
@@ -282,6 +282,99 @@ fn execute_task_tool_call_batch_unchecked(
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
 ) -> Vec<(String, ExecutionResultStatus)> {
+    let hook_contexts = tool_calls
+        .iter()
+        .map(|tool_call| ToolHookCtx {
+            tool_call_id: tool_call.id.clone(),
+            worker_id: worker_id.map(ToString::to_string),
+            execution_group_id: execution_group_id.clone(),
+            declared_paths: derive_declared_paths(tool_call),
+        })
+        .collect::<Vec<_>>();
+    // 任务一旦进入终态（被中断为 Killed、租约失效收口为 Failed 等），执行权已不再属于
+    // 本次 Runner，剩余调用不得继续产生副作用。
+    let execution_allowed = || {
+        !task_store.get_task(&task.task_id).is_some_and(|current| {
+            matches!(
+                current.status,
+                magi_core::TaskStatus::Completed
+                    | magi_core::TaskStatus::Failed
+                    | magi_core::TaskStatus::Killed
+            )
+        })
+    };
+    let results = run_tool_call_batches(tool_calls, &execution_allowed, &|tool_index| {
+        let mut hook_ctx = hook_contexts[tool_index].clone();
+        if let Some(snapshot) = snapshot_session.as_deref() {
+            snapshot.before_tool(&hook_ctx);
+        }
+        let tool_call = &tool_calls[tool_index];
+        let result = execute_task_tool_call_with_lifecycle(
+            TaskToolLifecycleContext {
+                event_bus,
+                task,
+                session_id,
+                workspace_id,
+                worker_id,
+                execution_group_id: execution_group_id.as_deref(),
+            },
+            tool_call,
+            || {
+                execute_task_tool_call(
+                    event_bus,
+                    tool_registry,
+                    agent_role_registry,
+                    skill_runtime,
+                    skill_dispatch_runtime,
+                    skill_name,
+                    task_store,
+                    session_store,
+                    execution_registry,
+                    conversation_registry,
+                    spawn_graph,
+                    safety_gate,
+                    plan_store,
+                    project_memory,
+                    task,
+                    session_id,
+                    workspace_id,
+                    workspace_root_path,
+                    worker_id,
+                    browser_capability_snapshot.clone(),
+                    tool_call,
+                    on_progress,
+                )
+            },
+        );
+        append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
+        if let Some(snapshot) = snapshot_session.as_deref() {
+            snapshot.after_tool(&hook_ctx);
+        }
+        result
+    });
+    if let Some(snapshot) = snapshot_session.as_deref()
+        && let Err(err) = snapshot.reconcile()
+    {
+        tracing::warn!(
+            session_id = %session_id.as_str(),
+            task_id = %task.task_id.as_str(),
+            error = %err,
+            "snapshot reconcile after task tool batch failed"
+        );
+    }
+    results
+}
+
+/// 按并发分区执行一批已经通过账本规划的工具调用。
+///
+/// 任务轮次与对话轮次共用这里唯一的中断检查点：串行调用逐个检查，并发分区在启动前
+/// 检查。`execution_allowed` 一旦返回 false，本批剩余调用全部以“中断、未执行”收口，
+/// 不再产生任何副作用。`execute_one` 负责单个调用的完整生命周期（含 panic 收口）。
+pub(crate) fn run_tool_call_batches(
+    tool_calls: &[ChatToolCall],
+    execution_allowed: &(dyn Fn() -> bool + Sync),
+    execute_one: &(dyn Fn(usize) -> (String, ExecutionResultStatus) + Sync),
+) -> Vec<(String, ExecutionResultStatus)> {
     let parsed_arguments = tool_calls
         .iter()
         .map(|tool_call| {
@@ -297,147 +390,47 @@ fn execute_task_tool_call_batch_unchecked(
         })
         .collect::<Vec<_>>();
     let mut results = vec![None; tool_calls.len()];
-    let hook_contexts = tool_calls
-        .iter()
-        .map(|tool_call| ToolHookCtx {
-            tool_call_id: tool_call.id.clone(),
-            worker_id: worker_id.map(ToString::to_string),
-            execution_group_id: execution_group_id.clone(),
-            declared_paths: derive_declared_paths(tool_call),
-        })
-        .collect::<Vec<_>>();
+    let mut interrupted = false;
 
     for batch in partition_tool_calls_with_inputs(&tool_inputs) {
         match batch.kind {
             ToolBatchKind::Serial => {
                 for tool_index in batch.tool_indices {
-                    let mut hook_ctx = hook_contexts[tool_index].clone();
-                    if let Some(snapshot) = snapshot_session.as_deref() {
-                        snapshot.before_tool(&hook_ctx);
-                    }
-                    let tool_call = &tool_calls[tool_index];
-                    let browser_capability_snapshot = browser_capability_snapshot.clone();
-                    let result = execute_task_tool_call_with_lifecycle(
-                        TaskToolLifecycleContext {
-                            event_bus,
-                            task,
-                            session_id,
-                            workspace_id,
-                            worker_id,
-                            execution_group_id: execution_group_id.as_deref(),
-                        },
-                        tool_call,
-                        || {
-                            execute_task_tool_call(
-                                event_bus,
-                                tool_registry,
-                                agent_role_registry,
-                                skill_runtime,
-                                skill_dispatch_runtime,
-                                skill_name,
-                                task_store,
-                                session_store,
-                                execution_registry,
-                                conversation_registry,
-                                spawn_graph,
-                                safety_gate,
-                                plan_store,
-                                project_memory,
-                                task,
-                                session_id,
-                                workspace_id,
-                                workspace_root_path,
-                                worker_id,
-                                browser_capability_snapshot.clone(),
-                                tool_call,
-                                on_progress,
-                            )
-                        },
-                    );
-                    append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
-                    if let Some(snapshot) = snapshot_session.as_deref() {
-                        snapshot.after_tool(&hook_ctx);
-                    }
-                    results[tool_index] = Some(result);
+                    interrupted = interrupted || !execution_allowed();
+                    results[tool_index] = Some(if interrupted {
+                        tool_interrupted_before_execution_result(
+                            &tool_calls[tool_index].function.name,
+                        )
+                    } else {
+                        execute_one(tool_index)
+                    });
                 }
             }
             ToolBatchKind::Concurrent => {
+                interrupted = interrupted || !execution_allowed();
+                if interrupted {
+                    for tool_index in batch.tool_indices {
+                        results[tool_index] = Some(tool_interrupted_before_execution_result(
+                            &tool_calls[tool_index].function.name,
+                        ));
+                    }
+                    continue;
+                }
                 thread::scope(|scope| {
                     let handles = batch
                         .tool_indices
                         .iter()
                         .copied()
                         .map(|tool_index| {
-                            let tool_call = &tool_calls[tool_index];
-                            let mut hook_ctx = hook_contexts[tool_index].clone();
-                            let snapshot_session = snapshot_session.clone();
-                            let execution_group_id_for_lifecycle = execution_group_id.clone();
-                            let browser_capability_snapshot = browser_capability_snapshot.clone();
-                            (
-                                tool_index,
-                                scope.spawn(move || {
-                                    if let Some(snapshot) = snapshot_session.as_deref() {
-                                        snapshot.before_tool(&hook_ctx);
-                                    }
-                                    let result = execute_task_tool_call_with_lifecycle(
-                                        TaskToolLifecycleContext {
-                                            event_bus,
-                                            task,
-                                            session_id,
-                                            workspace_id,
-                                            worker_id,
-                                            execution_group_id: execution_group_id_for_lifecycle
-                                                .as_deref(),
-                                        },
-                                        tool_call,
-                                        || {
-                                            execute_task_tool_call(
-                                                event_bus,
-                                                tool_registry,
-                                                agent_role_registry,
-                                                skill_runtime,
-                                                skill_dispatch_runtime,
-                                                skill_name,
-                                                task_store,
-                                                session_store,
-                                                execution_registry,
-                                                conversation_registry,
-                                                spawn_graph,
-                                                safety_gate,
-                                                plan_store,
-                                                project_memory,
-                                                task,
-                                                session_id,
-                                                workspace_id,
-                                                workspace_root_path,
-                                                worker_id,
-                                                browser_capability_snapshot.clone(),
-                                                tool_call,
-                                                on_progress,
-                                            )
-                                        },
-                                    );
-                                    append_result_declared_paths(
-                                        &mut hook_ctx.declared_paths,
-                                        &result.0,
-                                    );
-                                    if let Some(snapshot) = snapshot_session.as_deref() {
-                                        snapshot.after_tool(&hook_ctx);
-                                    }
-                                    result
-                                }),
-                            )
+                            (tool_index, scope.spawn(move || execute_one(tool_index)))
                         })
                         .collect::<Vec<_>>();
-
                     for (tool_index, handle) in handles {
                         let result = handle.join().unwrap_or_else(|_| {
                             tracing::warn!(
                                 tool_name = %tool_calls[tool_index].function.name,
                                 tool_call_id = %tool_calls[tool_index].id,
-                                task_id = %task.task_id.as_str(),
-                                session_id = %session_id.as_str(),
-                                "task tool execution thread panicked"
+                                "tool execution thread panicked"
                             );
                             tool_execution_failed_result(&tool_calls[tool_index].function.name)
                         });
@@ -446,16 +439,6 @@ fn execute_task_tool_call_batch_unchecked(
                 });
             }
         }
-    }
-    if let Some(snapshot) = snapshot_session.as_deref()
-        && let Err(err) = snapshot.reconcile()
-    {
-        tracing::warn!(
-            session_id = %session_id.as_str(),
-            task_id = %task.task_id.as_str(),
-            error = %err,
-            "snapshot reconcile after task tool batch failed"
-        );
     }
 
     results
@@ -3733,6 +3716,50 @@ mod tests {
         }
     }
 
+    /// 执行时模拟用户中断：把当前任务收口为 Killed，相当于 kill_task 在工具运行中生效。
+    struct InterruptingBuiltinTool {
+        name: &'static str,
+        task_store: Arc<TaskStore>,
+        task_id: TaskId,
+    }
+
+    impl magi_tool_runtime::BuiltinTool for InterruptingBuiltinTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(
+            &self,
+            _tool_call_id: &ToolCallId,
+            _input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            self.task_store
+                .revoke_active_lease_and_set_task_terminal(
+                    &self.task_id,
+                    &self.task_id,
+                    TaskStatus::Killed,
+                    Vec::new(),
+                )
+                .expect("task should be killed");
+            serde_json::json!({
+                "tool": self.name,
+                "status": "failed",
+                "error": "process killed by interrupt",
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> magi_tool_runtime::BuiltinToolSpec {
+            magi_tool_runtime::BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: magi_core::RiskLevel::Low,
+                approval_requirement: magi_core::ApprovalRequirement::None,
+            }
+        }
+    }
+
     impl magi_tool_runtime::BuiltinTool for CountingBuiltinTool {
         fn name(&self) -> &'static str {
             self.name
@@ -5851,6 +5878,99 @@ mod tests {
                 && payload["status"] == "running"
                 && payload["stdout"] == "first"
         }));
+    }
+
+    #[test]
+    fn task_interrupt_during_serial_tool_skips_remaining_calls_in_batch() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = Arc::new(TaskStore::new());
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let plan_store = crate::test_plan_store("test-plan");
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let task = test_task("task-interrupt-batch", "task-interrupt-batch", None);
+        task_store.insert_task(task.clone()).expect("任务应插入");
+        let side_effects = Arc::new(AtomicUsize::new(0));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(InterruptingBuiltinTool {
+            name: "interrupted_shell_probe",
+            task_store: Arc::clone(&task_store),
+            task_id: task.task_id.clone(),
+        }));
+        for name in ["write_probe", "remove_probe"] {
+            tool_registry.register_builtin(Arc::new(CountingBuiltinTool {
+                name,
+                executions: Arc::clone(&side_effects),
+            }));
+        }
+        let tool_calls = ["interrupted_shell_probe", "write_probe", "remove_probe"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ChatToolCall {
+                id: format!("call-interrupt-{index}"),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut ledger = ToolExecutionLedger::default();
+
+        let results = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &SessionId::new("session-interrupt-batch"),
+            &Some(WorkspaceId::new("workspace-interrupt-batch")),
+            None,
+            None,
+            None,
+            &tool_calls,
+            &mut ledger,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            side_effects.load(Ordering::SeqCst),
+            0,
+            "中断后同批剩余的写操作不得执行"
+        );
+        for (result, status) in &results[1..] {
+            assert_eq!(*status, ExecutionResultStatus::Cancelled);
+            let payload: serde_json::Value =
+                serde_json::from_str(result).expect("result should be json");
+            assert_eq!(payload["status"], "interrupted");
+            assert_eq!(payload["execution"], "not_started");
+        }
+        let replanned = ledger.plan(&tool_calls[1..], Some(&tool_registry));
+        assert!(
+            replanned.iter().all(|decision| matches!(
+                decision,
+                crate::tool_execution_ledger::ToolCallExecutionDecision::Execute { .. }
+            )),
+            "未执行的调用不能被账本记为已执行，恢复后应可正常重新执行"
+        );
     }
 
     #[test]

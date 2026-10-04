@@ -16,8 +16,9 @@ use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use serde_json::Value;
 
 use crate::{
-    canonical_tool_call_name, context_authority::CurrentFileFact,
-    tool_result_utils::infer_tool_call_status,
+    canonical_tool_call_name,
+    context_authority::CurrentFileFact,
+    tool_result_utils::{infer_tool_call_status, tool_result_is_interrupted_not_started},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -347,7 +348,9 @@ impl ToolExecutionLedger {
             else {
                 unreachable!("only execute decisions are dispatched");
             };
-            self.record_execution(&tool_calls[*execution_index], fingerprint.as_ref(), &result);
+            if !tool_result_is_interrupted_not_started(&result.0) {
+                self.record_execution(&tool_calls[*execution_index], fingerprint.as_ref(), &result);
+            }
             results[*execution_index] = Some(result);
         }
 
@@ -394,7 +397,9 @@ impl ToolExecutionLedger {
                 else {
                     unreachable!("only failed duplicate calls are retried");
                 };
-                self.record_execution(&tool_calls[index], Some(fingerprint), &result);
+                if !tool_result_is_interrupted_not_started(&result.0) {
+                    self.record_execution(&tool_calls[index], Some(fingerprint), &result);
+                }
                 results[index] = Some(result);
             }
         }
@@ -692,19 +697,11 @@ fn interrupted_call_result(tool_name: &str) -> String {
 }
 
 fn tool_result_is_interrupted_unknown(result: &str) -> bool {
-    tool_result_has_interrupted_execution(result, "unknown")
-}
-
-fn tool_result_is_interrupted_not_started(result: &str) -> bool {
-    tool_result_has_interrupted_execution(result, "not_started")
-}
-
-fn tool_result_has_interrupted_execution(result: &str, execution: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(result) else {
         return false;
     };
     value.get("status").and_then(Value::as_str) == Some("interrupted")
-        && value.get("execution").and_then(Value::as_str) == Some(execution)
+        && value.get("execution").and_then(Value::as_str) == Some("unknown")
 }
 
 fn tool_result_is_interrupted(result: &str) -> bool {

@@ -20,13 +20,13 @@ use crate::{
     parse_skill_custom_tool_name,
     tool_batch::{
         SafetyEvaluationAuditContext, access_profile_tool_decision, execute_goal_tool,
-        publish_safety_evaluation_audit, safety_gate_tool_decision, select_preflight_decision,
+        publish_safety_evaluation_audit, run_tool_call_batches, safety_gate_tool_decision,
+        select_preflight_decision,
     },
     tool_execution_policy_scope,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ModelRetryRuntimeEvent, ModelRetryRuntimePhase,
-    tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_browser_authority::BrowserCapabilitySnapshot;
 use magi_core::{
@@ -50,6 +50,8 @@ use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionProgress, ToolRegistry,
 };
 use serde_json::Value;
+#[cfg(test)]
+use std::thread;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -57,7 +59,6 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    thread,
 };
 
 pub type SessionStatePersistCallback = dyn Fn(&str) -> Result<(), String> + Send + Sync;
@@ -1673,7 +1674,7 @@ fn append_session_tool_call_items_batch(
     context: SessionToolCallBatchTestContext<'_>,
     tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
-    write_allowed: impl Fn() -> bool,
+    write_allowed: impl Fn() -> bool + Sync,
 ) -> SessionToolCallBatchOutcome {
     let SessionToolCallBatchTestContext {
         session_store,
@@ -1759,7 +1760,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
     context: SessionToolCallBatchContext<'_>,
     tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
-    write_allowed: impl Fn() -> bool,
+    write_allowed: impl Fn() -> bool + Sync,
 ) -> SessionToolCallBatchOutcome {
     let SessionToolCallBatchContext {
         session_store,
@@ -1872,6 +1873,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
                 execution_calls,
                 snapshot_session.as_ref(),
                 &hook_contexts,
+                &write_allowed,
             )
         });
 
@@ -1900,8 +1902,20 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
     let mut succeeded_tool_names = Vec::new();
     let mut activated_skill_id = None;
     let mut terminal_failure = None;
-    for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results) {
+    for (index, (tool_call, (tool_result, tool_status))) in tool_calls
+        .iter()
+        .zip(tool_results.iter().cloned())
+        .enumerate()
+    {
         if !write_allowed() {
+            // Turn 已被中断收口，剩余结果事实不能再写入该 Turn；但模型历史仍必须拿到每个
+            // 调用的真实结局（被终止的结果或“中断、未执行”），否则恢复时会把未执行的
+            // 调用误判为可能已生效。
+            push_session_tool_result_messages(
+                &tool_calls[index..],
+                &tool_results[index..],
+                messages,
+            );
             return SessionToolCallBatchOutcome::default();
         }
         if is_session_goal_write_tool(&tool_call.function.name)
@@ -1967,6 +1981,23 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         activated_skill_id,
         terminal_failure,
         writeback_error: None,
+    }
+}
+
+fn push_session_tool_result_messages(
+    tool_calls: &[ChatToolCall],
+    tool_results: &[(String, ExecutionResultStatus)],
+    messages: &mut Vec<ChatMessage>,
+) {
+    for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results) {
+        messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: Some(model_visible_tool_result(tool_result, *tool_status)),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call.id.clone()),
+            provider_context: Vec::new(),
+        });
     }
 }
 
@@ -2200,126 +2231,32 @@ fn execute_session_turn_tool_call_batch(
     tool_calls: &[ChatToolCall],
     snapshot_session: Option<&Arc<SnapshotSession>>,
     hook_contexts: &[ToolHookCtx],
+    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(String, ExecutionResultStatus)> {
-    let parsed_arguments = tool_calls
-        .iter()
-        .map(|tool_call| {
-            serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).ok()
-        })
-        .collect::<Vec<_>>();
-    let tool_inputs = tool_calls
-        .iter()
-        .zip(parsed_arguments.iter())
-        .map(|(tool_call, arguments)| ToolConcurrencyInput {
-            tool_name: tool_call.function.name.as_str(),
-            arguments: arguments.as_ref(),
-        })
-        .collect::<Vec<_>>();
-    let mut results = vec![None; tool_calls.len()];
-
-    for batch in partition_tool_calls_with_inputs(&tool_inputs) {
-        match batch.kind {
-            ToolBatchKind::Serial => {
-                for tool_index in batch.tool_indices {
-                    let mut hook_ctx = hook_contexts[tool_index].clone();
-                    if let Some(snapshot) = snapshot_session {
-                        snapshot.before_tool(&hook_ctx);
-                    }
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute_session_turn_tool_call_scoped(
-                            context.clone(),
-                            &tool_calls[tool_index],
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        tracing::warn!(
-                            tool_name = %tool_calls[tool_index].function.name,
-                            tool_call_id = %tool_calls[tool_index].id,
-                            session_id = %context.session_id.as_str(),
-                            "session turn tool execution panicked"
-                        );
-                        tool_execution_failed_result(&tool_calls[tool_index].function.name)
-                    });
-                    append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
-                    if let Some(snapshot) = snapshot_session {
-                        snapshot.after_tool(&hook_ctx);
-                    }
-                    results[tool_index] = Some(result);
-                }
-            }
-            ToolBatchKind::Concurrent => {
-                thread::scope(|scope| {
-                    let handles = batch
-                        .tool_indices
-                        .iter()
-                        .copied()
-                        .map(|tool_index| {
-                            let tool_call = &tool_calls[tool_index];
-                            let mut hook_ctx = hook_contexts[tool_index].clone();
-                            let snapshot_session = snapshot_session.cloned();
-                            let execution_context = context.clone();
-                            (
-                                tool_index,
-                                scope.spawn(move || {
-                                    if let Some(snapshot) = snapshot_session.as_deref() {
-                                        snapshot.before_tool(&hook_ctx);
-                                    }
-                                    let result = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| {
-                                            execute_session_turn_tool_call_scoped(
-                                                execution_context.clone(),
-                                                tool_call,
-                                            )
-                                        }),
-                                    );
-                                    let result = result.unwrap_or_else(|_| {
-                                        tracing::warn!(
-                                            tool_name = %tool_call.function.name,
-                                            tool_call_id = %tool_call.id,
-                                            session_id = %execution_context.session_id.as_str(),
-                                            "session turn tool execution panicked"
-                                        );
-                                        tool_execution_failed_result(&tool_call.function.name)
-                                    });
-                                    append_result_declared_paths(
-                                        &mut hook_ctx.declared_paths,
-                                        &result.0,
-                                    );
-                                    if let Some(snapshot) = snapshot_session.as_deref() {
-                                        snapshot.after_tool(&hook_ctx);
-                                    }
-                                    result
-                                }),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-
-                    for (tool_index, handle) in handles {
-                        let result = handle.join().unwrap_or_else(|_| {
-                            tracing::warn!(
-                                tool_name = %tool_calls[tool_index].function.name,
-                                tool_call_id = %tool_calls[tool_index].id,
-                                session_id = %context.session_id.as_str(),
-                                "session turn tool execution thread panicked"
-                            );
-                            tool_execution_failed_result(&tool_calls[tool_index].function.name)
-                        });
-                        results[tool_index] = Some(result);
-                    }
-                });
-            }
+    run_tool_call_batches(tool_calls, execution_allowed, &|tool_index| {
+        let tool_call = &tool_calls[tool_index];
+        let mut hook_ctx = hook_contexts[tool_index].clone();
+        if let Some(snapshot) = snapshot_session {
+            snapshot.before_tool(&hook_ctx);
         }
-    }
-
-    results
-        .into_iter()
-        .enumerate()
-        .map(|(tool_index, result)| {
-            result.unwrap_or_else(|| {
-                tool_execution_failed_result(&tool_calls[tool_index].function.name)
-            })
-        })
-        .collect()
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_session_turn_tool_call_scoped(context.clone(), tool_call)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                tool_name = %tool_call.function.name,
+                tool_call_id = %tool_call.id,
+                session_id = %context.session_id.as_str(),
+                "session turn tool execution panicked"
+            );
+            tool_execution_failed_result(&tool_call.function.name)
+        });
+        append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
+        if let Some(snapshot) = snapshot_session {
+            snapshot.after_tool(&hook_ctx);
+        }
+        result
+    })
 }
 
 #[cfg(test)]
@@ -3696,6 +3633,155 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingMcpClient {
         calls: Arc<Mutex<Vec<McpToolCallRequest>>>,
+    }
+
+    /// 执行时模拟用户中断，并统计本批真正执行过的工具数。
+    struct InterruptRecordingTool {
+        name: &'static str,
+        interrupts: bool,
+        interrupted: Arc<std::sync::atomic::AtomicBool>,
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl BuiltinTool for InterruptRecordingTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(
+            &self,
+            _tool_call_id: &ToolCallId,
+            _input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            if self.interrupts {
+                self.interrupted.store(true, Ordering::SeqCst);
+            }
+            serde_json::json!({
+                "tool": self.name,
+                "status": if self.interrupts { "failed" } else { "succeeded" },
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> BuiltinToolSpec {
+            BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: RiskLevel::Low,
+                approval_requirement: ApprovalRequirement::None,
+            }
+        }
+    }
+
+    #[test]
+    fn session_turn_interrupt_skips_remaining_serial_calls_and_keeps_model_history() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(16);
+        let session_id = SessionId::new("session-turn-interrupt-batch");
+        let workspace_id = Some(WorkspaceId::new("workspace-turn-interrupt-batch"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "interrupt batch session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-interrupt-batch".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                status: "running".to_string(),
+                user_message: Some("执行后中断".to_string()),
+                items: Vec::new(),
+                completed_at: None,
+            },
+        );
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        for (name, interrupts) in [
+            ("interrupted_shell_probe", true),
+            ("write_probe", false),
+            ("remove_probe", false),
+        ] {
+            tool_registry.register_builtin(Arc::new(InterruptRecordingTool {
+                name,
+                interrupts,
+                interrupted: Arc::clone(&interrupted),
+                executions: Arc::clone(&executions),
+            }));
+        }
+        let tool_calls = ["interrupted_shell_probe", "write_probe", "remove_probe"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ChatToolCall {
+                id: format!("tool-call-interrupt-{index}"),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+
+        let outcome = append_session_tool_call_items_batch(
+            SessionToolCallBatchTestContext {
+                session_store: &session_store,
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::FullAccess,
+                browser_capability_snapshot: None,
+                snapshot_session: None,
+                execution_group_id: None,
+                source_thread_id: &ThreadId::new("thread-interrupt-batch"),
+                persist_session_state: None,
+            },
+            &tool_calls,
+            &mut messages,
+            || !interrupted.load(Ordering::SeqCst),
+        );
+
+        assert!(!outcome.completed);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "中断后同批剩余调用不得执行"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("tool-call-interrupt-0"),
+                Some("tool-call-interrupt-1"),
+                Some("tool-call-interrupt-2"),
+            ],
+            "中断后模型历史仍需保留每个调用的真实结局"
+        );
+        for message in &messages[1..] {
+            let content = message.content.as_deref().unwrap_or_default();
+            assert!(
+                content.contains(r#""execution":"not_started""#),
+                "未执行调用必须标记为未执行：{content}"
+            );
+        }
     }
 
     impl ProbeBuiltinTool {

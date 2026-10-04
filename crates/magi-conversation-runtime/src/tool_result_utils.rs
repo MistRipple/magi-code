@@ -220,6 +220,38 @@ pub fn safety_gate_public_error(status: ExecutionResultStatus) -> PublicToolErro
     }
 }
 
+/// 工具调用在实际执行前因中断而放弃时的唯一结果合同。
+///
+/// 批次执行器在中断后跳过剩余调用、恢复历史为缺失结果补齐时都使用这份 payload；
+/// 执行账本按 `execution: not_started` 识别它，不把它计为已执行或可能已生效。
+pub(crate) fn tool_interrupted_before_execution_payload(tool_name: &str) -> String {
+    serde_json::json!({
+        "tool": tool_name,
+        "status": "interrupted",
+        "execution": "not_started",
+        "reason": "task_interrupted_before_tool_execution_started",
+        "message": "本次工具调用在实际执行前已中断，尚未产生外部副作用；如仍有必要，可以重新调用。",
+    })
+    .to_string()
+}
+
+pub(crate) fn tool_interrupted_before_execution_result(
+    tool_name: &str,
+) -> (String, ExecutionResultStatus) {
+    (
+        tool_interrupted_before_execution_payload(tool_name),
+        ExecutionResultStatus::Cancelled,
+    )
+}
+
+pub(crate) fn tool_result_is_interrupted_not_started(result: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(result) else {
+        return false;
+    };
+    value.get("status").and_then(Value::as_str) == Some("interrupted")
+        && value.get("execution").and_then(Value::as_str) == Some("not_started")
+}
+
 pub fn tool_execution_failed_result(tool_name: &str) -> (String, ExecutionResultStatus) {
     (
         serde_json::json!({

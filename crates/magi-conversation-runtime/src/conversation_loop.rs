@@ -29,7 +29,8 @@ use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
     DeterministicToolFailureTracker, bound_model_visible_tool_history, infer_tool_call_status,
     model_visible_tool_history_budget_bytes, model_visible_tool_result, non_retryable_tool_failure,
-    summarize_tool_result, turn_item_status_for_tool_result,
+    summarize_tool_result, tool_interrupted_before_execution_payload,
+    turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
     BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput, activate_skill_tool_definitions,
@@ -292,26 +293,21 @@ fn interrupted_tool_result_message(
     tool_call: &ThreadChatToolCall,
     execution_started: bool,
 ) -> ThreadChatMessage {
+    let content = if execution_started {
+        serde_json::json!({
+            "tool": tool_call.function.name,
+            "status": "interrupted",
+            "execution": "unknown",
+            "reason": "task_interrupted_before_tool_result_persisted",
+            "message": "本次工具调用在会话中断前没有保存结果。不要假设它成功或失败：只读操作可按需重新读取；写入、命令和外部操作必须先检查当前状态，再决定是否重新执行。",
+        })
+        .to_string()
+    } else {
+        tool_interrupted_before_execution_payload(&tool_call.function.name)
+    };
     ThreadChatMessage {
         role: "tool".to_string(),
-        content: Some(
-            serde_json::json!({
-                "tool": tool_call.function.name,
-                "status": "interrupted",
-                "execution": if execution_started { "unknown" } else { "not_started" },
-                "reason": if execution_started {
-                    "task_interrupted_before_tool_result_persisted"
-                } else {
-                    "task_interrupted_before_tool_execution_started"
-                },
-                "message": if execution_started {
-                    "本次工具调用在会话中断前没有保存结果。不要假设它成功或失败：只读操作可按需重新读取；写入、命令和外部操作必须先检查当前状态，再决定是否重新执行。"
-                } else {
-                    "本次工具调用在实际执行前已中断，尚未产生外部副作用；如仍有必要，可以重新调用。"
-                },
-            })
-            .to_string(),
-        ),
+        content: Some(content),
         images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_call.id.clone()),
