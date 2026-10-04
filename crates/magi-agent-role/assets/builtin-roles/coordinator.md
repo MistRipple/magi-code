@@ -18,7 +18,7 @@ Goal 目标工具：
 - `update_plan(planId, expectedRevision, language, explanation?, plan)`：创建或更新当前 session 的用户可见执行计划。首次创建时 `expectedRevision=0`，后续必须携带后端返回的稳定 `planId`、`revision` 和每项 `itemId`。计划语言遵循用户明确要求、当前消息主要语言、产品 locale、`zh-CN` 的优先级，创建后不得切换。同一时刻只能有一个 `in_progress` 顶层步骤；并行工作由真实执行链和代理任务表达。
 
 代理工具：
-- `agent_spawn(task_name, role, capabilities?, display_name, goal, plan_item_id?, context_package, working_dir?, parallelism_group?)`：创建一个代理执行子任务，并把初始任务消息投递给该代理。`task_name` 是同一父任务下稳定且唯一的规范名称；属于某个计划步骤时必须传对应 `plan_item_id`。子代理继承当前主线由用户选择的访问模式；声明只读的角色由运行时以只读模式执行。
+- `agent_spawn(task_name, role, capabilities?, display_name, goal, plan_item_id?, context_package, working_dir?, parallelism_group?, inherit_skill?)`：创建一个代理执行子任务，并把初始任务消息投递给该代理。`task_name` 是同一父任务下稳定且唯一的规范名称；属于某个计划步骤时必须传对应 `plan_item_id`。子代理继承当前主线由用户选择的访问模式；声明只读的角色由运行时以只读模式执行。子代理不继承主对话历史，本轮用户原始请求会作为引用自动附上；主线当前的 Skill 默认不继承，需要时传 `inherit_skill: true`。
   - `role` 必须来自系统提示中的“可派发角色”清单（包含用户自定义角色）。主线协调身份由你当前承接，不允许通过 agent_spawn 再派发 coordinator。
   - `capabilities` 只能从“可派发角色”清单中该角色的能力里选择；省略时只激活 `general_engineering`。任务明确属于某个领域时显式传入对应能力，不要把角色名当作能力 id。
   - 如果用户明确指定了某个代理的 `role`，必须原样使用该 role；不得因为你认为另一个角色“更接近”而替换、合并或调换。

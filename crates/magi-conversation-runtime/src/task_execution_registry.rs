@@ -96,6 +96,8 @@ pub struct SpawnedChildExecutionRequest<'a> {
     pub plan_item_id: Option<PlanItemId>,
     /// 可选的已通过预检的执行目录。为空时继承父任务计划中的目录。
     pub execution_root: Option<PathBuf>,
+    /// 子代理是否沿用父任务当前激活的 Skill。
+    pub inherit_skill: bool,
     pub now: UtcMillis,
 }
 
@@ -333,6 +335,7 @@ impl TaskExecutionRegistry {
             plan_store,
             plan_item_id,
             execution_root,
+            inherit_skill,
             now,
         } = request;
         let _registration_guard = self.registration_lock.lock().map_err(|error| {
@@ -482,9 +485,13 @@ impl TaskExecutionRegistry {
             now,
         );
         let thread_id = thread.thread_id.clone();
-        let inherited_skill_name = parent_plan.as_ref().and_then(|plan| match plan {
-            TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
-        });
+        let inherited_skill_name =
+            parent_plan
+                .as_ref()
+                .filter(|_| inherit_skill)
+                .and_then(|plan| match plan {
+                    TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
+                });
         let inherited_execution_root = execution_root.or_else(|| {
             parent_plan.as_ref().and_then(|plan| match plan {
                 TaskExecutionPlan::Dispatch { execution_root, .. } => execution_root.clone(),
@@ -926,6 +933,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: true,
                 now,
             })
             .expect("spawned child runtime registration should succeed");
@@ -1013,6 +1021,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now,
             })
             .expect_err("重复注册子任务必须被拒绝");
@@ -1063,6 +1072,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now,
             })
             .expect_err("仅执行注册表中已有的任务也必须被拒绝");
@@ -1119,6 +1129,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now,
             })
             .expect_err("未结束子代理达到上限时必须拒绝注册");
@@ -1162,9 +1173,16 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now,
             })
             .expect("已结束的子代理不应占用父任务名额");
+        match registry.get(&fanout_child.task_id).expect("执行计划应注册") {
+            TaskExecutionPlan::Dispatch { skill_name, .. } => assert_eq!(
+                skill_name, None,
+                "未声明 inherit_skill 时子代理不继承主线 Skill"
+            ),
+        }
     }
 
     #[test]
@@ -1191,6 +1209,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now,
             })
         };
@@ -1340,6 +1359,7 @@ mod tests {
                         plan_store: None,
                         plan_item_id: None,
                         execution_root: None,
+                        inherit_skill: false,
                         now: UtcMillis(now.0 + (role_index * 5 + instance_index) as u64 + 1),
                     })
                     .expect("默认容量应允许每个角色同时运行五个代理实例");
@@ -1363,6 +1383,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now: UtcMillis(now.0 + 10),
             })
             .expect_err("同一角色的第六个并发代理应被角色实例上限拒绝");
@@ -1406,6 +1427,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now: UtcMillis(now.0 + 11),
             })
             .expect("同角色已有实例完成后，第六个代理应能占用释放的名额");
@@ -1473,6 +1495,7 @@ mod tests {
                 plan_store: Some(&plan_store),
                 plan_item_id: Some(magi_core::PlanItemId::new("missing-item")),
                 execution_root: None,
+                inherit_skill: false,
                 now,
             })
             .expect_err("计划绑定失败时必须回滚整次注册");
@@ -1536,6 +1559,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now,
             })
             .expect("第一个 canonical task name 应注册成功");
@@ -1561,6 +1585,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now: UtcMillis(now.0 + 1),
             })
             .expect_err("重复 canonical task name 必须被拒绝");
@@ -1692,6 +1717,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now: UtcMillis(now.0 + 1),
             })
             .expect("并发上限为 1 时应允许第一个实例");
@@ -1713,6 +1739,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now: UtcMillis(now.0 + 2),
             })
             .expect_err("并发上限为 1 时不应允许第二个活跃实例");
@@ -1750,6 +1777,7 @@ mod tests {
                 plan_store: None,
                 plan_item_id: None,
                 execution_root: None,
+                inherit_skill: false,
                 now: UtcMillis(now.0 + 3),
             })
             .expect("前一个受限实例完成后应允许下一个实例");
@@ -1772,6 +1800,7 @@ mod tests {
                     plan_store: None,
                     plan_item_id: None,
                     execution_root: None,
+                    inherit_skill: false,
                     now: UtcMillis(now.0 + 4 + index as u64),
                 })
                 .expect("None 应表示不设置角色级并发上限");

@@ -735,6 +735,7 @@ fn execute_agent_spawn(
             plan_store: preflight.plan_item_id.as_ref().map(|_| plan_store),
             plan_item_id: plan_item_id.clone(),
             execution_root: preflight.working_dir.clone(),
+            inherit_skill: preflight.inherit_skill,
             now,
         },
     ) {
@@ -1385,6 +1386,19 @@ fn execute_context_request(
             context_tool_failure(tool, "context_audit_failed", error)
         }
     }
+}
+
+/// 子代理 context_read 能够解析的引用 ID（会话消息、同一执行链的任务输出与证据）。
+pub(crate) fn context_reference_ids(
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+) -> std::collections::HashSet<String> {
+    collect_context_candidates(task_store, session_store, task, session_id)
+        .into_iter()
+        .map(|candidate| candidate.reference_id)
+        .collect()
 }
 
 fn collect_context_candidates(

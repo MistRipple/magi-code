@@ -1769,7 +1769,7 @@ impl BuiltinToolName {
                             "expected_output": { "type": "string", "minLength": 1, "description": "子代理最终必须交付的结果形态和验收标准。" },
                             "references": {
                                 "type": "array",
-                                "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。每项的 kind 和 source_ref 必须是直接的 JSON string；title 是可选展示名，省略时系统使用 source_ref 作为标题。若提供 title，它也必须是直接的 JSON string；例如 {\"kind\":\"file\",\"source_ref\":\"path:Cargo.toml\",\"title\":\"配置文件\"}。",
+                                "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。引用必须指向真实事实：会话消息用 turn:<entry_id>，任务输出用 task:<task_id>:output:<n>，文件用工作区内存在的路径；不存在的引用会在派发前被拒绝。本轮用户原始请求由运行时自动附上。每项的 kind 和 source_ref 必须是直接的 JSON string；title 是可选展示名，省略时系统使用 source_ref 作为标题。若提供 title，它也必须是直接的 JSON string；例如 {\"kind\":\"file\",\"source_ref\":\"path:Cargo.toml\",\"title\":\"配置文件\"}。",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -1785,7 +1785,8 @@ impl BuiltinToolName {
                         "required": ["summary", "constraints", "expected_output", "references"]
                     },
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
-                    "parallelism_group": { "type": "string", "description": "可选的并行组名；同一父任务下相同组名的子 agent 互斥执行" }
+                    "parallelism_group": { "type": "string", "description": "可选的并行组名；同一父任务下相同组名的子 agent 互斥执行" },
+                    "inherit_skill": { "type": "boolean", "description": "可选。为 true 时子代理沿用主线当前激活的 Skill；默认不继承，避免 Skill 与角色职责冲突" }
                 },
                 "required": ["task_name", "role", "display_name", "goal", "context_package"]
             }),

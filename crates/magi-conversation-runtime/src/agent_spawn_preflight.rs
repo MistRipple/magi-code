@@ -42,6 +42,7 @@ const AGENT_SPAWN_FIELDS: &[&str] = &[
     "context",
     "working_dir",
     "parallelism_group",
+    "inherit_skill",
 ];
 
 const GENERAL_ENGINEERING_CAPABILITY: &str = "general_engineering";
@@ -95,6 +96,8 @@ pub(crate) struct AgentSpawnPreflight {
     pub(crate) plan_item_id: Option<magi_core::PlanItemId>,
     pub(crate) parallelism_group: Option<String>,
     pub(crate) working_dir: Option<PathBuf>,
+    /// 是否让子代理沿用主线当前激活的 Skill；默认不继承，避免 Skill 与角色职责冲突。
+    pub(crate) inherit_skill: bool,
     pub(crate) child_policy_snapshot: TaskPolicy,
     pub(crate) child_access_profile: AccessProfile,
     pub(crate) child_dependency_ids: Vec<TaskId>,
@@ -260,7 +263,18 @@ pub(crate) fn preflight_agent_spawn(
 
     let parallelism_group = optional_nonempty_string(object, "parallelism_group")?;
     let working_dir = parse_working_dir(object)?;
-    let context_package = parse_agent_context_package(parsed, &parent_task.task_id, now, sequence)
+    let inherit_skill = match object.get("inherit_skill") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(AgentSpawnPreflightError::input(
+                "invalid_arguments",
+                "agent_spawn inherit_skill 必须是布尔值",
+                "需要子代理沿用主线当前 Skill 时传 true，否则省略。",
+            ));
+        }
+    };
+    let mut context_package = parse_agent_context_package(parsed, &parent_task.task_id, now, sequence)
         .map_err(|message| {
             AgentSpawnPreflightError::input(
                 "invalid_context_package",
@@ -286,7 +300,7 @@ pub(crate) fn preflight_agent_spawn(
         &role,
         session_id,
     )?;
-    preflight_workspace_and_git(
+    let workspace_root = preflight_workspace_and_git(
         execution_registry,
         parent_task,
         session_id,
@@ -294,6 +308,21 @@ pub(crate) fn preflight_agent_spawn(
         working_dir.as_ref(),
         &runtime,
     )?;
+    validate_context_references(
+        &context_package,
+        task_store,
+        session_store,
+        parent_task,
+        session_id,
+        workspace_root.as_deref(),
+    )?;
+    attach_user_request_reference(
+        &mut context_package,
+        session_store,
+        session_id,
+        now,
+        sequence,
+    );
 
     let child_policy_snapshot =
         child_policy_for_role(parent_task.policy_snapshot.as_ref(), &role_definition);
@@ -316,6 +345,7 @@ pub(crate) fn preflight_agent_spawn(
         plan_item_id,
         parallelism_group,
         working_dir,
+        inherit_skill,
         child_policy_snapshot,
         child_access_profile,
         child_dependency_ids,
@@ -672,7 +702,7 @@ fn preflight_workspace_and_git(
     workspace_id: &Option<WorkspaceId>,
     working_dir: Option<&PathBuf>,
     runtime: &crate::task_execution_registry::AgentSpawnPreflightRuntime,
-) -> Result<(), AgentSpawnPreflightError> {
+) -> Result<Option<PathBuf>, AgentSpawnPreflightError> {
     let parent_root = execution_registry
         .get(&parent_task.task_id)
         .and_then(|plan| match plan {
@@ -777,7 +807,106 @@ fn preflight_workspace_and_git(
             ));
         }
     }
+    Ok(workspace_root)
+}
+
+/// 引用必须指向真实存在的事实：会话消息、同一执行链的任务输出/证据必须能被子代理的
+/// context_read 解析；文件引用必须存在。坏引用在创建代理前拒绝，而不是让子代理读到
+/// 主线写的预览文字。
+fn validate_context_references(
+    package: &AgentContextPackage,
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    parent_task: &Task,
+    session_id: &magi_core::SessionId,
+    workspace_root: Option<&std::path::Path>,
+) -> Result<(), AgentSpawnPreflightError> {
+    let mut resolvable = None;
+    for reference in &package.references {
+        let missing = match reference.kind {
+            AgentContextReferenceKind::ConversationTurn
+            | AgentContextReferenceKind::TaskOutput
+            | AgentContextReferenceKind::TaskEvidence => !resolvable
+                .get_or_insert_with(|| {
+                    crate::tool_batch::context_reference_ids(
+                        task_store,
+                        session_store,
+                        parent_task,
+                        session_id,
+                    )
+                })
+                .contains(&reference.source_ref),
+            AgentContextReferenceKind::File => {
+                let raw = reference.source_ref.trim();
+                let path = PathBuf::from(raw.strip_prefix("path:").unwrap_or(raw));
+                let path = match workspace_root {
+                    Some(root) if path.is_relative() => root.join(path),
+                    _ => path,
+                };
+                !path.exists()
+            }
+            AgentContextReferenceKind::Knowledge | AgentContextReferenceKind::Other => false,
+        };
+        if missing {
+            return Err(AgentSpawnPreflightError::input(
+                "context_reference_not_found",
+                format!(
+                    "context_package 引用不存在: {}（{}）",
+                    reference.source_ref, reference.title
+                ),
+                "会话消息引用使用 turn:<entry_id>，任务输出使用 task:<task_id>:output:<n>，文件引用使用工作区内存在的路径；无法确定时把要点写进 summary，不要编造引用。",
+            ));
+        }
+    }
     Ok(())
+}
+
+/// 子代理不继承主对话历史；把本轮用户原始请求作为引用附在上下文包中，子代理需要时
+/// 可以读取原文，而不是只能依赖主线的转述。
+fn attach_user_request_reference(
+    package: &mut AgentContextPackage,
+    session_store: &SessionStore,
+    session_id: &magi_core::SessionId,
+    now: UtcMillis,
+    sequence: u64,
+) {
+    let Some(dispatch) = session_store
+        .active_execution_chain(session_id)
+        .map(|chain| chain.dispatch_context)
+    else {
+        return;
+    };
+    let Some(text) = dispatch
+        .trimmed_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let source_ref = format!("turn:{}", dispatch.entry_id);
+    if package
+        .references
+        .iter()
+        .any(|reference| reference.source_ref == source_ref)
+    {
+        return;
+    }
+    let preview = text
+        .chars()
+        .take(AGENT_CONTEXT_PREVIEW_MAX_CHARS)
+        .collect::<String>();
+    package.references.insert(
+        0,
+        AgentContextReference {
+            reference_id: format!("ctxref-user-request-{}-{sequence}", now.0),
+            kind: AgentContextReferenceKind::ConversationTurn,
+            title: "用户原始请求".to_string(),
+            source_ref,
+            estimated_tokens: estimate_text_tokens(&preview),
+            preview,
+        },
+    );
 }
 
 pub(crate) fn valid_agent_task_name(task_name: &str) -> bool {
@@ -1067,6 +1196,98 @@ mod tests {
             AccessProfile::ReadOnly,
             "角色不能放宽用户选择的只读模式"
         );
+    }
+
+    fn package_with_references(references: serde_json::Value) -> AgentContextPackage {
+        parse_agent_context_package(
+            &serde_json::json!({
+                "context_package": {
+                    "summary": "验证引用",
+                    "constraints": [],
+                    "expected_output": "结论",
+                    "references": references,
+                }
+            }),
+            &TaskId::new("task-root-ref"),
+            UtcMillis(10),
+            1,
+        )
+        .expect("package should parse")
+    }
+
+    #[test]
+    fn context_references_must_point_to_existing_facts() {
+        let session_id = SessionId::new("session-ref");
+        let session_store = SessionStore::default();
+        let task_store = TaskStore::new();
+        let root = Task {
+            task_id: TaskId::new("task-root-ref"),
+            mission_id: MissionId::new("mission-ref"),
+            root_task_id: TaskId::new("task-root-ref"),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "根任务".to_string(),
+            goal: "验证引用".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: vec!["已有输出".to_string()],
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::None,
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        };
+        task_store.insert_task(root.clone()).expect("root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("present.rs"), "fn a() {}").expect("file");
+
+        let valid = package_with_references(serde_json::json!([
+            {"kind": "task_output", "title": "根任务输出", "source_ref": "task:task-root-ref:output:0", "preview": ""},
+            {"kind": "file", "title": "源码", "source_ref": "present.rs", "preview": ""},
+            {"kind": "file", "title": "源码", "source_ref": "path:present.rs", "preview": ""},
+            {"kind": "knowledge", "title": "知识", "source_ref": "kb:anything", "preview": ""},
+        ]));
+        validate_context_references(
+            &valid,
+            &task_store,
+            &session_store,
+            &root,
+            &session_id,
+            Some(workspace.path()),
+        )
+        .expect("existing references should pass");
+
+        for (kind, source_ref) in [
+            ("task_output", "task:task-root-ref:output:9"),
+            ("conversation_turn", "turn:missing-entry"),
+            ("file", "missing.rs"),
+        ] {
+            let package = package_with_references(serde_json::json!([
+                {"kind": kind, "title": "坏引用", "source_ref": source_ref, "preview": "编造的内容"},
+            ]));
+            let error = validate_context_references(
+                &package,
+                &task_store,
+                &session_store,
+                &root,
+                &session_id,
+                Some(workspace.path()),
+            )
+            .expect_err("missing reference must be rejected before spawn");
+            assert_eq!(
+                error.error_code, "context_reference_not_found",
+                "{source_ref}"
+            );
+        }
     }
 
     #[test]
