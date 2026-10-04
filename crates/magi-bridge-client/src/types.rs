@@ -523,6 +523,8 @@ pub enum BridgeClientError {
         code: Option<i64>,
         http_status: u16,
         message: String,
+        /// 服务商通过 Retry-After 要求的等待时间；重试必须遵守。
+        retry_after: Option<std::time::Duration>,
     },
     #[error("无效的宿主桥接目标: binding={binding_id}, target={bridge_target}")]
     InvalidBindingTarget {
@@ -721,6 +723,7 @@ mod context_overflow_tests {
             code: Some(400),
             http_status: 400,
             message: "maximum context length is 262144 tokens, requested 300000".to_string(),
+            retry_after: None,
         };
         assert_eq!(
             error.context_overflow(),
@@ -738,6 +741,7 @@ mod context_overflow_tests {
             code: Some(400),
             http_status: 400,
             message: "invalid temperature".to_string(),
+            retry_after: None,
         };
         assert_eq!(error.context_overflow(), None);
     }

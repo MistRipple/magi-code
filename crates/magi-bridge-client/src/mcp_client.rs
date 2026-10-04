@@ -988,6 +988,7 @@ fn ensure_mcp_http_success(response: &McpHttpResponse) -> Result<(), BridgeClien
                 .map(|value| format!("; WWW-Authenticate: {value}"))
                 .unwrap_or_default()
         ),
+        retry_after: None,
     })
 }
 
@@ -1268,11 +1269,13 @@ fn enrich_mcp_process_error(
             code,
             http_status,
             message,
+            retry_after,
         } => BridgeClientError::HttpStatusFailed {
             layer,
             code,
             http_status,
             message: format!("{message}{context}"),
+            retry_after,
         },
         other => other,
     }

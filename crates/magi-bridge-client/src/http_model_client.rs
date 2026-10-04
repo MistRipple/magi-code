@@ -585,11 +585,36 @@ fn record_forced_tool_choice_capability(
         .insert(provider_key, capability);
 }
 
-fn retry_delay(attempt: usize, _provider_key: &str) -> Duration {
+/// 退避表中第 `attempt` 次重试的基础等待时间。
+fn base_retry_delay(attempt: usize) -> Duration {
     let index = attempt
         .saturating_sub(1)
         .min(MODEL_PROVIDER_RETRY_DELAYS_MILLIS.len().saturating_sub(1));
     Duration::from_millis(MODEL_PROVIDER_RETRY_DELAYS_MILLIS[index])
+}
+
+/// 服务商重试等待的唯一计算（流式与非流式共用）：优先遵守服务商给出的 Retry-After；
+/// 否则按退避表并加入 ±25% 随机抖动，避免多个子代理在同一时刻集中重试。
+fn provider_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    if let Some(retry_after) = retry_after {
+        return retry_after;
+    }
+    let base = base_retry_delay(attempt).as_millis() as u64;
+    let spread = base / 2;
+    let jitter = if spread == 0 {
+        0
+    } else {
+        retry_jitter_seed() % (spread + 1)
+    };
+    Duration::from_millis(base - base / 4 + jitter)
+}
+
+fn retry_jitter_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
 }
 
 fn empty_stream_retry_delay(attempt: usize) -> Duration {
@@ -669,8 +694,8 @@ fn provider_stream_idle_timeout() -> Duration {
     )
 }
 
-fn sleep_before_retry(provider_key: &str, retry_attempt: usize) {
-    sleep_retry_delay(retry_delay(retry_attempt, provider_key));
+fn sleep_before_retry(retry_attempt: usize) {
+    sleep_retry_delay(provider_retry_delay(retry_attempt, None));
 }
 
 fn sleep_retry_delay(delay: Duration) {
@@ -910,7 +935,7 @@ fn execute_cancellable_http_post_with_retries(
                 if retryable_http_status(status) && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
                 retries += 1;
-                let delay = retry_after.unwrap_or_else(|| retry_delay(retries, &provider_key));
+                let delay = provider_retry_delay(retries, retry_after);
                 if !sleep_retry_delay_cancellable(delay, is_cancelled) {
                     return Err(model_invocation_cancelled_error());
                 }
@@ -919,7 +944,7 @@ fn execute_cancellable_http_post_with_retries(
                 if retryable_bridge_error(&error) && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
                 retries += 1;
-                if !sleep_retry_delay_cancellable(retry_delay(retries, &provider_key), is_cancelled)
+                if !sleep_retry_delay_cancellable(provider_retry_delay(retries, None), is_cancelled)
                 {
                     return Err(model_invocation_cancelled_error());
                 }
@@ -948,16 +973,14 @@ fn execute_http_post_with_retries(
                 if retryable_http_status(status) && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
                 retries += 1;
-                sleep_retry_delay(
-                    retry_after.unwrap_or_else(|| retry_delay(retries, &provider_key)),
-                );
+                sleep_retry_delay(provider_retry_delay(retries, retry_after));
                 continue;
             }
             Err(error)
                 if retryable_bridge_error(&error) && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
                 retries += 1;
-                sleep_before_retry(&provider_key, retries);
+                sleep_before_retry(retries);
                 continue;
             }
             other => return other,
@@ -1240,7 +1263,7 @@ fn execute_streaming_http_post_with_retries(
                 let delay = if is_empty_stream {
                     empty_stream_retry_delay(retries)
                 } else {
-                    retry_delay(retries, &provider_key)
+                    provider_retry_delay(retries, provider_error_retry_after(&error))
                 };
                 let max_attempts = if is_empty_stream {
                     MODEL_PROVIDER_EMPTY_STREAM_RETRIES
@@ -1379,7 +1402,11 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
             code: Some(-32005),
             message: format!("reading error response body failed: {error}"),
         })?;
-        return Err(provider_http_status_error(status, &response_body));
+        return Err(provider_http_status_error(
+            status,
+            &response_body,
+            retry_after,
+        ));
     }
 
     // 流式读取 SSE 事件
@@ -1538,7 +1565,6 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
             message: "provider response invalid: empty stream response".to_string(),
         });
     }
-    let _ = retry_after;
     Ok(adapted.into())
 }
 
@@ -1554,7 +1580,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
         let http_request = self.build_http_request(&request, false)?;
 
-        let (accepted_request, status, response_body, _retry_after, fallback_capability) =
+        let (accepted_request, status, response_body, retry_after, fallback_capability) =
             execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
                 execute_http_post_with_retries(
                     self.provider_request_key(),
@@ -1565,7 +1591,11 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             })?;
 
         if !(200..300).contains(&status) {
-            return Err(provider_http_status_error(status, &response_body));
+            return Err(provider_http_status_error(
+                status,
+                &response_body,
+                retry_after,
+            ));
         }
 
         if let Some(capability) = fallback_capability.or_else(|| {
@@ -1640,7 +1670,7 @@ impl HttpModelBridgeClient {
         }
         let http_request =
             self.build_http_request_with_output_limit(&request, false, max_output_tokens)?;
-        let (accepted_request, status, response_body, _retry_after, fallback_capability) =
+        let (accepted_request, status, response_body, retry_after, fallback_capability) =
             execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
                 execute_cancellable_http_post_with_retries(
                     self.provider_request_key(),
@@ -1652,7 +1682,11 @@ impl HttpModelBridgeClient {
             })?;
 
         if !(200..300).contains(&status) {
-            return Err(provider_http_status_error(status, &response_body));
+            return Err(provider_http_status_error(
+                status,
+                &response_body,
+                retry_after,
+            ));
         }
         if let Some(capability) = fallback_capability.or_else(|| {
             capability_from_accepted_tool_choice_request(&accepted_request, self.provider_family())
@@ -2023,7 +2057,18 @@ fn provider_non_sse_stream_message(body: &str) -> String {
     )
 }
 
-fn provider_http_status_error(status: u16, response_body: &str) -> BridgeClientError {
+fn provider_error_retry_after(error: &BridgeClientError) -> Option<Duration> {
+    match error {
+        BridgeClientError::HttpStatusFailed { retry_after, .. } => *retry_after,
+        _ => None,
+    }
+}
+
+fn provider_http_status_error(
+    status: u16,
+    response_body: &str,
+    retry_after: Option<Duration>,
+) -> BridgeClientError {
     let message = if let Some(message) = provider_error_message(response_body) {
         format!("provider rejected request: {message}")
     } else {
@@ -2037,6 +2082,7 @@ fn provider_http_status_error(status: u16, response_body: &str) -> BridgeClientE
         code: Some(-32006),
         http_status: status,
         message,
+        retry_after,
     }
 }
 
@@ -3304,6 +3350,7 @@ mod tests {
         let error = provider_http_status_error(
             429,
             r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#,
+            None,
         );
 
         assert_eq!(error.layer(), Some(BridgeErrorLayer::RemoteBusiness));
@@ -5111,11 +5158,35 @@ mod tests {
     #[test]
     fn model_retry_policy_uses_short_exponential_backoff() {
         assert_eq!(MODEL_PROVIDER_MAX_RETRIES, 5);
-        assert_eq!(retry_delay(1, "provider"), Duration::from_millis(200));
-        assert_eq!(retry_delay(2, "provider"), Duration::from_millis(400));
-        assert_eq!(retry_delay(3, "provider"), Duration::from_millis(800));
-        assert_eq!(retry_delay(4, "provider"), Duration::from_millis(1_600));
-        assert_eq!(retry_delay(5, "provider"), Duration::from_millis(3_200));
+        assert_eq!(base_retry_delay(1), Duration::from_millis(200));
+        assert_eq!(base_retry_delay(2), Duration::from_millis(400));
+        assert_eq!(base_retry_delay(3), Duration::from_millis(800));
+        assert_eq!(base_retry_delay(4), Duration::from_millis(1_600));
+        assert_eq!(base_retry_delay(5), Duration::from_millis(3_200));
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_and_jitters_backoff() {
+        assert_eq!(
+            provider_retry_delay(1, Some(Duration::from_secs(7))),
+            Duration::from_secs(7),
+            "服务商给出 Retry-After 时必须遵守"
+        );
+        let delays = (0..64)
+            .map(|_| provider_retry_delay(3, None))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            delays.len() > 1,
+            "退避必须带随机抖动，避免多个子代理同步重试"
+        );
+        assert!(delays.iter().all(|delay| {
+            (Duration::from_millis(600)..=Duration::from_millis(1_000)).contains(delay)
+        }));
+        let error = provider_http_status_error(429, "{}", Some(Duration::from_secs(3)));
+        assert_eq!(
+            provider_error_retry_after(&error),
+            Some(Duration::from_secs(3))
+        );
     }
 
     #[test]
@@ -5163,14 +5234,18 @@ mod tests {
             )
             .expect("retry should recover");
 
+        let mut events = events.into_inner();
+        // 退避带 ±25% 抖动：首轮 200ms 的基础等待落在 150..=250ms。
+        let scheduled_delay = events[0].delay_ms.take().expect("scheduled retry delay");
+        assert!((150..=250).contains(&scheduled_delay), "{scheduled_delay}");
         assert_eq!(
-            events.into_inner(),
+            events,
             vec![
                 ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Scheduled,
                     attempt: 1,
                     max_attempts: 5,
-                    delay_ms: Some(200),
+                    delay_ms: None,
                 },
                 ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::AttemptStarted,
@@ -5392,6 +5467,7 @@ mod tests {
                 code,
                 http_status,
                 message,
+                ..
             } => {
                 assert_eq!(layer, BridgeErrorLayer::RemoteBusiness);
                 assert_eq!(code, Some(-32006));
