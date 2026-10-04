@@ -72,6 +72,11 @@ pub fn non_retryable_tool_failure(
         .get("error_code")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("tool_policy_rejected");
+    // 用户拒绝或授权过期是本次调用的结局，不是策略阻止：结果交给模型改用其他方式
+    // 继续，相同调用由拒绝记忆拦截，不应让整轮失败。
+    if crate::tool_approval::is_tool_approval_decision_code(error_code) {
+        return None;
+    }
     let access_profile = payload
         .get("access_profile")
         .and_then(serde_json::Value::as_str)

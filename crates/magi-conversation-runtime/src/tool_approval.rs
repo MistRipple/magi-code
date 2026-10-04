@@ -370,6 +370,14 @@ impl ToolApprovalRegistry {
     }
 }
 
+const TOOL_APPROVAL_DENIED: &str = "tool_approval_denied";
+const TOOL_APPROVAL_EXPIRED: &str = "tool_approval_expired";
+
+/// 结果是否来自用户的授权决定（拒绝或授权窗口过期）。
+pub(crate) fn is_tool_approval_decision_code(error_code: &str) -> bool {
+    matches!(error_code, TOOL_APPROVAL_DENIED | TOOL_APPROVAL_EXPIRED)
+}
+
 pub(crate) fn rejected_tool_approval_result(
     tool_name: &str,
     approval_id: &str,
@@ -379,7 +387,7 @@ pub(crate) fn rejected_tool_approval_result(
         serde_json::json!({
             "tool": tool_name,
             "status": "rejected",
-            "error_code": "tool_approval_denied",
+            "error_code": TOOL_APPROVAL_DENIED,
             "error": if repeated {
                 "用户已拒绝相同的工具操作，本轮不会再次请求授权"
             } else {
@@ -402,7 +410,7 @@ pub(crate) fn expired_tool_approval_result(
         serde_json::json!({
             "tool": tool_name,
             "status": "rejected",
-            "error_code": "tool_approval_expired",
+            "error_code": TOOL_APPROVAL_EXPIRED,
             "error": "工具授权请求已过期，原始操作未执行",
             "approval_id": approval_id,
             "retryable_with_same_arguments": false,
@@ -625,6 +633,20 @@ mod tests {
             registry.request(next_turn).expect("next turn request"),
             ToolApprovalRequestOutcome::Pending(_)
         ));
+    }
+
+    #[test]
+    fn denied_or_expired_approval_does_not_terminate_the_turn() {
+        for (result, status) in [
+            rejected_tool_approval_result("shell_exec", "approval-denied", false),
+            expired_tool_approval_result("shell_exec", "approval-expired"),
+        ] {
+            assert!(
+                crate::tool_result_utils::non_retryable_tool_failure("shell_exec", &result, status)
+                    .is_none(),
+                "用户拒绝或授权过期应交给模型继续，而不是让整轮失败：{result}"
+            );
+        }
     }
 
     #[test]

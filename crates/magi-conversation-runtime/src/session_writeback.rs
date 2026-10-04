@@ -5776,7 +5776,10 @@ mod tests {
         });
 
         assert!(outcome.completed);
-        assert!(outcome.terminal_failure.is_some());
+        assert!(
+            outcome.terminal_failure.is_none(),
+            "授权过期只结束这次调用，结果交给模型继续，不能让整轮失败"
+        );
         assert!(outcome.succeeded_tool_names.is_empty());
         assert!(!target.exists(), "过期审批不得执行原始工具");
         let model_visible_result: serde_json::Value = serde_json::from_str(

@@ -9198,8 +9198,9 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        // 授权过期是这次调用的结局，交给模型改用其他方式继续，不再让整轮失败。
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert_eq!(current_git_branch(&workspace_root), "main");
         assert!(turn.items.iter().any(|item| {
             item.kind == CanonicalTurnItemKind::ToolCall
@@ -9218,7 +9219,7 @@ done
                 .count(),
             0
         );
-        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
         record_git_approval_matrix_row(
             &turn,
             "expiry",
@@ -9228,8 +9229,8 @@ done
             true,
             false,
             non_classifier_provider_request_count(&harness),
-            "failed",
-            "failed",
+            "completed",
+            "completed",
             "branch_unchanged",
         );
         let _ = fs::remove_dir_all(workspace_root);
@@ -9764,8 +9765,9 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        // 授权过期只结束这次调用：模型拿到过期结果后继续完成本轮。
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert!(!target.exists(), "过期审批不得产生文件副作用");
         assert!(
             turn.items.iter().any(|item| {
