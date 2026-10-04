@@ -3279,37 +3279,13 @@ fn schedule_conversation_execution(
             return;
         }
         let Some(dispatcher) = state.session_turn_dispatcher().cloned() else {
-            let _terminal_guard = state.lock_session_turn_commit(&session_id).await;
-            ensure_conversation_failure_item(
+            fail_conversation_turn_before_execution(
                 &state,
-                &session_id,
-                &turn_id,
                 &request,
-                &magi_conversation_runtime::session_turn_execution::SessionTurnExecutionError::runtime_invalid_state_with_message(
-                    "conversation dispatcher 未配置",
-                ),
-            );
-            let changed = settle_conversation_turn(&state, &session_id, &turn_id, "failed");
-            if changed {
-                if let Err(error) = coordinator.execute_command(
-                    &session_id,
-                    TurnCommand::Finish {
-                        attempt: attempt.clone(),
-                        status: CoordinatorTurnStatus::Failed,
-                    },
-                ) {
-                    tracing::error!(
-                        session_id = %session_id,
-                        turn_id = %turn_id,
-                        %error,
-                        "conversation dispatcher 缺失时 Coordinator 终态收口失败"
-                    );
-                }
-            }
-            state
-                .turn_coordinator()
-                .close_session_turn_input(&session_id, &turn_id);
-            schedule_next_queued_regular_session_turn(state, session_id, None);
+                &attempt,
+                "conversation dispatcher 未配置",
+            )
+            .await;
             return;
         };
         if coordinator
@@ -3334,10 +3310,11 @@ fn schedule_conversation_execution(
         {
             Ok(Some(_)) => {}
             Ok(None) => {
-                tracing::error!(
+                // 当前 canonical Turn 已不是本轮（被中断或已被新轮次取代），终态由取代方负责。
+                tracing::warn!(
                     session_id = %session_id,
                     turn_id = %turn_id,
-                    "conversation Turn 进入 running 时未找到当前 canonical Turn"
+                    "conversation Turn 进入 running 时已不是当前 canonical Turn"
                 );
                 return;
             }
@@ -3348,6 +3325,13 @@ fn schedule_conversation_execution(
                     %error,
                     "conversation Turn running 状态写回失败"
                 );
+                fail_conversation_turn_before_execution(
+                    &state,
+                    &request,
+                    &attempt,
+                    &format!("conversation Turn running 状态写回失败: {error}"),
+                )
+                .await;
                 return;
             }
         }
@@ -3451,6 +3435,50 @@ fn schedule_conversation_execution(
         );
         schedule_next_queued_regular_session_turn(state, session_id, None);
     });
+}
+
+/// 执行器启动前失败的唯一收口：Turn 标记失败、Coordinator 释放占位、关闭输入通道，
+/// 再让排队消息继续执行，避免会话永远停在等待状态。
+async fn fail_conversation_turn_before_execution(
+    state: &ApiState,
+    request: &SessionTurnExecutionRequest,
+    attempt: &magi_conversation_runtime::TurnAttempt,
+    reason: &str,
+) {
+    let session_id = &request.session_id;
+    let turn_id = &request.turn_id;
+    {
+        let _terminal_guard = state.lock_session_turn_commit(session_id).await;
+        ensure_conversation_failure_item(
+            state,
+            session_id,
+            turn_id,
+            request,
+            &magi_conversation_runtime::session_turn_execution::SessionTurnExecutionError::runtime_invalid_state_with_message(
+                reason.to_string(),
+            ),
+        );
+        if settle_conversation_turn(state, session_id, turn_id, "failed")
+            && let Err(error) = state.turn_coordinator().execute_command(
+                session_id,
+                TurnCommand::Finish {
+                    attempt: attempt.clone(),
+                    status: CoordinatorTurnStatus::Failed,
+                },
+            )
+        {
+            tracing::error!(
+                session_id = %session_id,
+                turn_id = %turn_id,
+                %error,
+                "conversation Turn 启动前失败时 Coordinator 终态收口失败"
+            );
+        }
+    }
+    state
+        .turn_coordinator()
+        .close_session_turn_input(session_id, turn_id);
+    schedule_next_queued_regular_session_turn(state.clone(), session_id.clone(), None);
 }
 
 /// 将 Conversation 执行结果写入 canonical Turn 的唯一终态。
