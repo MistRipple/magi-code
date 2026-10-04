@@ -181,12 +181,36 @@ struct FinishedTurn {
     attempt: TurnAttempt,
     status: CoordinatorTurnStatus,
     turn_seq: u64,
+    /// 会话内的完成顺序，用于只保留最近的一批幂等回放记录。
+    finished_order: u64,
 }
+
+/// 每个会话保留的已结束 Turn 回放记录上限。
+const MAX_RECENT_FINISHED_TURNS: usize = 64;
 
 #[derive(Debug, Default)]
 struct SessionState {
     active: Option<ActiveTurn>,
     recent: HashMap<String, FinishedTurn>,
+    next_finished_order: u64,
+}
+
+impl SessionState {
+    /// 记录已结束 Turn 的唯一入口：超过上限时淘汰最早完成的记录，长期运行不再无限增长。
+    fn record_finished(&mut self, request_id: String, mut finished: FinishedTurn) {
+        finished.finished_order = self.next_finished_order;
+        self.next_finished_order = self.next_finished_order.saturating_add(1);
+        self.recent.insert(request_id, finished);
+        if self.recent.len() > MAX_RECENT_FINISHED_TURNS
+            && let Some(oldest) = self
+                .recent
+                .iter()
+                .min_by_key(|(_, finished)| finished.finished_order)
+                .map(|(request_id, _)| request_id.clone())
+        {
+            self.recent.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -622,10 +646,9 @@ impl SessionTurnCoordinator {
             attempt: finished_attempt,
             status,
             turn_seq: active.turn_seq,
+            finished_order: 0,
         };
-        session
-            .recent
-            .insert(active.admission.request_id.clone(), finished);
+        session.record_finished(active.admission.request_id.clone(), finished);
         Ok(true)
     }
 
@@ -845,13 +868,14 @@ impl SessionTurnCoordinator {
             {
                 session.active = None;
             }
-            session.recent.insert(
+            session.record_finished(
                 admission.request_id.clone(),
                 FinishedTurn {
                     admission,
                     attempt: finished_attempt,
                     status,
                     turn_seq,
+                    finished_order: 0,
                 },
             );
             return true;
@@ -1196,6 +1220,55 @@ mod tests {
         assert!(matches!(
             coordinator.accept(&session, admission("turn-replayed", "request-1", "fp-1")),
             Ok(CoordinatorAdmission::Replay(replayed)) if replayed.turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
+    fn finished_turn_replay_records_are_bounded_per_session() {
+        let coordinator = SessionTurnCoordinator::new();
+        let session = SessionId::new("session-recent-bounded");
+        for index in 0..(MAX_RECENT_FINISHED_TURNS + 10) {
+            let attempt = match coordinator
+                .accept(
+                    &session,
+                    admission(
+                        &format!("turn-{index}"),
+                        &format!("request-{index}"),
+                        &format!("fp-{index}"),
+                    ),
+                )
+                .expect("turn should be accepted")
+            {
+                CoordinatorAdmission::Accepted(attempt) => attempt,
+                CoordinatorAdmission::Replay(_) => panic!("new request must be accepted"),
+            };
+            coordinator
+                .finish(&session, &attempt, CoordinatorTurnStatus::Completed)
+                .expect("turn should finish");
+        }
+        let recent_len = coordinator
+            .state
+            .lock()
+            .expect("state")
+            .sessions
+            .get(&session)
+            .map(|state| state.recent.len())
+            .unwrap_or_default();
+        assert_eq!(
+            recent_len, MAX_RECENT_FINISHED_TURNS,
+            "回放记录必须有界保留"
+        );
+        let last = MAX_RECENT_FINISHED_TURNS + 9;
+        assert!(matches!(
+            coordinator.accept(
+                &session,
+                admission(
+                    &format!("turn-replay-{last}"),
+                    &format!("request-{last}"),
+                    &format!("fp-{last}"),
+                ),
+            ),
+            Ok(CoordinatorAdmission::Replay(_))
         ));
     }
 
