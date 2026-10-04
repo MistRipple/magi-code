@@ -964,6 +964,14 @@ pub(crate) fn schedule_restored_session_task_dispatches(state: ApiState) {
                         %error,
                         "无法恢复 accepted Turn 的完整派发请求"
                     );
+                    // 不能让无法恢复的 accepted Turn 永远占住会话：标记失败并释放执行链。
+                    fail_accepted_task_turn(
+                        &state,
+                        &sidecar.session_id,
+                        &chain.root_task_id,
+                        &turn.turn_id,
+                        &format!("重启后无法恢复本轮请求，请重新发送：{error}"),
+                    );
                     return None;
                 }
             };
@@ -1011,19 +1019,37 @@ fn fail_accepted_task_submission(
     accepted: &DispatchSubmissionAccepted,
     direct_error: &str,
 ) {
+    fail_accepted_task_turn(
+        state,
+        &accepted.session_id,
+        &accepted.root_task_id,
+        &accepted.turn_id,
+        direct_error,
+    );
+}
+
+/// 已 durable accepted 的主线 Turn 无法开始执行时的唯一失败收口：根任务写入 Failed，
+/// 再由统一终态入口收口 Turn 并释放执行链。
+fn fail_accepted_task_turn(
+    state: &ApiState,
+    session_id: &SessionId,
+    root_task_id: &magi_core::TaskId,
+    turn_id: &str,
+    direct_error: &str,
+) {
     let mut direct_error = public_runtime_excerpt(direct_error, 4096);
     let Some(task_store) = state.task_store() else {
         tracing::error!(
-            session_id = %accepted.session_id,
-            root_task_id = %accepted.root_task_id,
+            session_id = %session_id,
+            root_task_id = %root_task_id,
             "accepted task 启动失败时 task_store 未配置，无法写入失败事实"
         );
         return;
     };
-    let Some(task) = task_store.get_task(&accepted.root_task_id) else {
+    let Some(task) = task_store.get_task(root_task_id) else {
         tracing::error!(
-            session_id = %accepted.session_id,
-            root_task_id = %accepted.root_task_id,
+            session_id = %session_id,
+            root_task_id = %root_task_id,
             "accepted task 启动失败时根任务不存在，无法写入失败事实"
         );
         return;
@@ -1032,18 +1058,18 @@ fn fail_accepted_task_submission(
         && let Err(error) = cleanup_materialized_dispatch_submission_if_not_started(
             &state.session_store,
             state.task_execution_registry(),
-            &accepted.session_id,
-            &accepted.root_task_id,
-            &accepted.turn_id,
+            session_id,
+            root_task_id,
+            turn_id,
         )
     {
         direct_error = format!("{direct_error}；清理未启动执行资源失败: {error}");
     }
     let lease_id = task_store
-        .get_active_lease(&accepted.root_task_id)
+        .get_active_lease(root_task_id)
         .map(|lease| lease.lease_id);
     let terminalized = match task_store.revoke_lease_and_set_task_terminal(
-        &accepted.root_task_id,
+        root_task_id,
         &task.root_task_id,
         lease_id.as_ref(),
         TaskStatus::Failed,
@@ -1052,48 +1078,46 @@ fn fail_accepted_task_submission(
         Ok(changed) => changed,
         Err(error) => {
             tracing::error!(
-                session_id = %accepted.session_id,
-                root_task_id = %accepted.root_task_id,
+                session_id = %session_id,
+                root_task_id = %root_task_id,
                 ?error,
                 "accepted task 启动失败时写入 Failed 终态失败，等待 durable accepted 状态恢复"
             );
             return;
         }
     };
-    let already_terminal = task_store
-        .get_task(&accepted.root_task_id)
-        .is_some_and(|current| {
-            matches!(
-                current.status,
-                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
-            )
-        });
+    let already_terminal = task_store.get_task(root_task_id).is_some_and(|current| {
+        matches!(
+            current.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+        )
+    });
     if !(terminalized || already_terminal) {
         tracing::error!(
-            session_id = %accepted.session_id,
-            root_task_id = %accepted.root_task_id,
+            session_id = %session_id,
+            root_task_id = %root_task_id,
             "accepted task 启动失败未能提交根任务终态，等待恢复"
         );
         return;
     }
     match crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
         state,
-        &accepted.session_id,
-        &accepted.root_task_id,
+        session_id,
+        root_task_id,
         "error",
-        Some(&accepted.turn_id),
+        Some(turn_id),
     ) {
         Ok(true) => {}
         Ok(false) => tracing::error!(
-            session_id = %accepted.session_id,
-            root_task_id = %accepted.root_task_id,
-            turn_id = %accepted.turn_id,
+            session_id = %session_id,
+            root_task_id = %root_task_id,
+            turn_id = %turn_id,
             "accepted task 已进入终态，但当前 Turn 未能完成统一收口，等待恢复"
         ),
         Err(error) => tracing::error!(
-            session_id = %accepted.session_id,
-            root_task_id = %accepted.root_task_id,
-            turn_id = %accepted.turn_id,
+            session_id = %session_id,
+            root_task_id = %root_task_id,
+            turn_id = %turn_id,
             %error,
             "accepted task 终态 Turn 统一收口失败，等待恢复"
         ),
