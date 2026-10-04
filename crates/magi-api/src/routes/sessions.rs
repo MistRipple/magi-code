@@ -2962,7 +2962,8 @@ async fn submit_conversation_session_turn(
         ) {
         Ok(result) => result,
         Err(error) => {
-            state.turn_coordinator().clear_session(&session_id);
+            // 只撤销本次 attempt；同一会话其他请求的去重与重放记录必须保留。
+            abort_conversation_attempt(&state, &session_id, &attempt);
             if created_session {
                 let _ = state
                     .rollback_created_session_after_navigation_lock(
@@ -2984,7 +2985,13 @@ async fn submit_conversation_session_turn(
         .turn_coordinator()
         .begin_session_turn_input(session_id.clone(), turn_id.clone())
     {
-        state.turn_coordinator().clear_session(&session_id);
+        // canonical Turn 已经受理，不能留下没有执行者的 accepted Turn：标记失败并只撤销
+        // 本次 attempt，同 requestId 的重放记录保持不变。
+        {
+            let _terminal_guard = state.lock_session_turn_commit(&session_id).await;
+            settle_conversation_turn(&state, &session_id, &turn_id, "failed");
+        }
+        abort_conversation_attempt(&state, &session_id, &attempt);
         return Err(ApiError::Conflict(format!(
             "建立 conversation Turn 输入通道失败: {error}"
         )));
@@ -3435,6 +3442,21 @@ fn schedule_conversation_execution(
         );
         schedule_next_queued_regular_session_turn(state, session_id, None);
     });
+}
+
+fn abort_conversation_attempt(
+    state: &ApiState,
+    session_id: &SessionId,
+    attempt: &magi_conversation_runtime::TurnAttempt,
+) {
+    if let Err(error) = state.turn_coordinator().execute_command(
+        session_id,
+        TurnCommand::Abort {
+            attempt: attempt.clone(),
+        },
+    ) {
+        tracing::warn!(session_id = %session_id, %error, "撤销 conversation Turn attempt 失败");
+    }
 }
 
 /// 执行器启动前失败的唯一收口：Turn 标记失败、Coordinator 释放占位、关闭输入通道，
