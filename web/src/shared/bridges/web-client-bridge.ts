@@ -1100,44 +1100,59 @@ function startEventStreamIdleCheck(): void {
   }
   stopEventStreamIdleCheck();
   markEventStreamActive();
-  eventStreamIdleCheckTimer = window.setInterval(() => {
-    if (activeEventStreamState !== 'open') {
-      return;
-    }
-    if (recoveryInFlight || recoveryTimer !== null) {
-      return;
-    }
-    const idleMs = Date.now() - lastEventStreamActivityAt;
-    const isTunnelAccess = isPublicTunnelAccess();
-    const runtimeBusy = bridgeRuntimeIsBusy();
-    if (
-      isTunnelAccess
-      && runtimeBusy
-      && idleMs >= EVENT_STREAM_TUNNEL_BUSY_REFRESH_INTERVAL_MS
-    ) {
-      markEventStreamActive();
-      syncTunnelRuntimeForSilentEventStream(
-        'event_stream_tunnel_busy_snapshot',
-        new Error(`Tunnel SSE 静默刷新：${Math.round(idleMs / 1000)}s`),
-      );
-      return;
-    }
-    const timeoutMs = currentEventStreamIdleTimeoutMs();
-    if (idleMs < timeoutMs) {
-      return;
-    }
-    // SSE 握手仍 open，但超过容错窗口没收到任何事件（含 keep-alive），判定静默断流。
-    // 重置活跃时间戳避免 recovery 调度期间重复触发，由 recovery 完成后的 ensureEventStream
-    // 重新建连或 closeEventStream 停止检测。
+  eventStreamIdleCheckTimer = window.setInterval(
+    () => checkEventStreamLiveness(currentEventStreamIdleTimeoutMs()),
+    currentEventStreamIdleCheckIntervalMs(),
+  );
+}
+
+/**
+ * 判定 SSE 是否已静默断流：超过 `timeoutMs` 没收到任何事件（含 keep-alive）即触发恢复。
+ *
+ * 周期检查使用稳定的容错窗口；休眠唤醒、页面重新可见或网络恢复时立即检查，此时
+ * 漏掉两次 keep-alive 就足以确定连接已失效，不必再等完整窗口。
+ */
+function checkEventStreamLiveness(timeoutMs: number): void {
+  if (activeEventStreamState !== 'open') {
+    return;
+  }
+  if (recoveryInFlight || recoveryTimer !== null) {
+    return;
+  }
+  const idleMs = Date.now() - lastEventStreamActivityAt;
+  const isTunnelAccess = isPublicTunnelAccess();
+  const runtimeBusy = bridgeRuntimeIsBusy();
+  if (
+    isTunnelAccess
+    && runtimeBusy
+    && idleMs >= EVENT_STREAM_TUNNEL_BUSY_REFRESH_INTERVAL_MS
+  ) {
     markEventStreamActive();
-    const reason = runtimeBusy ? 'event_stream_active_idle' : 'event_stream_idle';
-    const error = new Error(`SSE 静默超时：${Math.round(idleMs / 1000)}s`);
-    if (isTunnelAccess) {
-      refreshBootstrapForSilentEventStream(reason, error);
-      return;
-    }
-    scheduleRecovery(reason, error, true);
-  }, currentEventStreamIdleCheckIntervalMs());
+    syncTunnelRuntimeForSilentEventStream(
+      'event_stream_tunnel_busy_snapshot',
+      new Error(`Tunnel SSE 静默刷新：${Math.round(idleMs / 1000)}s`),
+    );
+    return;
+  }
+  if (idleMs < timeoutMs) {
+    return;
+  }
+  // SSE 握手仍 open，但超过容错窗口没收到任何事件（含 keep-alive），判定静默断流。
+  // 重置活跃时间戳避免 recovery 调度期间重复触发，由 recovery 完成后的 ensureEventStream
+  // 重新建连或 closeEventStream 停止检测。
+  markEventStreamActive();
+  const reason = runtimeBusy ? 'event_stream_active_idle' : 'event_stream_idle';
+  const error = new Error(`SSE 静默超时：${Math.round(idleMs / 1000)}s`);
+  if (isTunnelAccess) {
+    refreshBootstrapForSilentEventStream(reason, error);
+    return;
+  }
+  scheduleRecovery(reason, error, true);
+}
+
+/** 休眠唤醒或网络恢复后立即检查事件流，而不是等下一次完整的静默窗口。 */
+function checkEventStreamAfterResume(): void {
+  checkEventStreamLiveness(EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS * 2);
 }
 
 function ensureWindowListener(): void {
@@ -1172,6 +1187,14 @@ function ensureWindowListener(): void {
   window.addEventListener('pagehide', () => {
     flushPersistedWebviewState();
   });
+  window.addEventListener('online', checkEventStreamAfterResume);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        checkEventStreamAfterResume();
+      }
+    });
+  }
   window.addEventListener('beforeunload', () => {
     flushPersistedWebviewState();
   });
