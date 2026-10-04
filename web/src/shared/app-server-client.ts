@@ -320,6 +320,8 @@ export class AppServerClient {
   #initializeResult: InitializeResult | null = null;
   #subscription: EventSubscribeParams | null;
   #lastSequence = 0;
+  /** 最近一次握手的 daemon 运行代际；跨重连保留，用于判断事件序号是否仍然可比。 */
+  #lastRuntimeEpoch: string | null = null;
   #heartbeatTimer: number | null = null;
   #heartbeatInFlight = false;
 
@@ -437,6 +439,13 @@ export class AppServerClient {
         connection,
       );
       this.assertCurrentConnection(connection);
+      // 事件序号只在同一 daemon 运行代际内单调。重连后代际变化说明 daemon 已重启，
+      // 旧序号不再可比：丢弃游标从头订阅，由服务端下发新代际的完整快照。
+      if (this.#lastRuntimeEpoch && this.#lastRuntimeEpoch !== initialize.runtimeEpoch) {
+        this.#lastSequence = 0;
+        if (this.#subscription) this.#subscription = { ...this.#subscription, afterSequence: 0 };
+      }
+      this.#lastRuntimeEpoch = initialize.runtimeEpoch;
       this.#initializeResult = initialize;
       this.sendNotification('initialized', {}, connection);
       if (this.#subscription) {

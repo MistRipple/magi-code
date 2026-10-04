@@ -263,6 +263,50 @@ await withGoldenViteServer(async (server) => {
   }
 
   {
+    // daemon 重启后事件序号重新计数：重连发现 runtimeEpoch 变化时必须丢弃旧游标，
+    // 否则带着更大的 afterSequence 订阅会把新代际的事件全部过滤掉。
+    const { client, socket: oldSocket } = await connectReady(AppServerClient, {
+      reconnect: true,
+      reconnectBaseDelayMs: 0,
+      reconnectMaxDelayMs: 0,
+      subscription: { sessionId: 'session-golden', afterSequence: 0 },
+    });
+    oldSocket.message({
+      jsonrpc: '2.0',
+      method: 'event/session.turn.updated',
+      params: {
+        sequence: 42,
+        event: {
+          event_id: 'event-before-restart',
+          event_type: 'session.turn.updated',
+          category: 'domain',
+          occurred_at: 1,
+          sequence: 42,
+          payload: {},
+        },
+      },
+    });
+    assert.equal(client.lastSequence, 42);
+    oldSocket.close();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const restartedSocket = FakeWebSocket.instances.at(-1);
+    assert.notEqual(restartedSocket, oldSocket);
+    restartedSocket.open();
+    await Promise.resolve();
+    reply(restartedSocket, lastRequest(restartedSocket, 'initialize'), initializeResult('runtime-golden-restarted'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const resubscribe = lastRequest(restartedSocket, 'events/subscribe');
+    assert.ok(resubscribe, 'reconnect must resubscribe');
+    assert.equal(
+      resubscribe.params.afterSequence,
+      0,
+      'daemon 重启后必须从新代际的起点订阅',
+    );
+    assert.equal(client.lastSequence, 0);
+    client.close();
+  }
+
+  {
     const { client, socket } = await connectReady(AppServerClient);
     const listPromise = client.request('browser/tools/list', {});
     await Promise.resolve();
