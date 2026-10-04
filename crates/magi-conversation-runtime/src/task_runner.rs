@@ -467,7 +467,16 @@ impl TaskRunner {
                 Vec::new(),
             )
             .map_err(|error| format!("任务 {task_id} 取消收口失败: {error}"))?;
-        if !changed {
+        // 未改变说明任务在读取与收口之间已经由自身执行结束；只要它已处于终态，
+        // 终止目标就已达成，不能把这种竞态报告成失败。
+        if !changed
+            && !self.store.get_task(task_id).is_some_and(|current| {
+                matches!(
+                    current.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+                )
+            })
+        {
             return Err(format!("终止任务 {task_id} 时当前任务租约已失效"));
         }
         self.execution_admission.remove_queued_task(task_id);
@@ -475,11 +484,19 @@ impl TaskRunner {
         Ok(())
     }
 
+    /// 尽力终止整棵任务树：单个任务收口失败不会阻止其余任务被终止，
+    /// 所有失败在全部尝试之后合并返回。
     pub fn kill_tree(&self, root_task_id: &TaskId) -> Result<(), String> {
-        for task_id in self.collect_subtree_ids(root_task_id) {
-            self.kill_task(&task_id)?;
+        let errors = self
+            .collect_subtree_ids(root_task_id)
+            .iter()
+            .filter_map(|task_id| self.kill_task(task_id).err())
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("；"))
         }
-        Ok(())
     }
 
     pub fn resume_task(&self, task_id: &TaskId) -> Result<(), String> {
@@ -734,6 +751,52 @@ mod tests {
             runtime_payload: TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    #[test]
+    fn kill_tree_keeps_terminating_remaining_tasks_after_one_failure() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task("task-root-kill", "task-root-kill", None);
+        root.status = TaskStatus::Running;
+        // 归属事实损坏的子任务会让它自己的收口失败；它下面的孙任务仍必须被终止。
+        let mut broken_child = test_task(
+            "task-broken-child",
+            "task-root-kill",
+            Some(root.task_id.clone()),
+        );
+        broken_child.status = TaskStatus::Running;
+        broken_child.mission_id = MissionId::new("mission-mismatched");
+        let mut grandchild = test_task(
+            "task-grandchild",
+            "task-root-kill",
+            Some(broken_child.task_id.clone()),
+        );
+        grandchild.status = TaskStatus::Running;
+        for task in [root.clone(), broken_child.clone(), grandchild.clone()] {
+            store.insert_task(task).expect("任务应插入");
+        }
+        let runner = TaskRunner::with_test_result_receiver(
+            Arc::clone(&store),
+            Vec::new(),
+            Arc::new(RejectingDispatcher),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+
+        let result = runner.kill_tree(&root.task_id);
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("task-broken-child")),
+            "失败的子任务必须被报告：{result:?}"
+        );
+        for task_id in [&root.task_id, &grandchild.task_id] {
+            assert_eq!(
+                store.get_task(task_id).expect("任务应存在").status,
+                TaskStatus::Killed,
+                "{task_id} 必须被终止"
+            );
         }
     }
 

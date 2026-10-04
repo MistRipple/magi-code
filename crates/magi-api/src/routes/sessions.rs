@@ -4799,12 +4799,18 @@ async fn interrupt_session_turn(
             .map_err(|error| ApiError::internal_assembly("中断 session turn 失败", error))?
             .and_then(|sidecar| sidecar.current_turn)
             .and_then(|turn| turn.items.last().map(|item| item.item_id.clone()));
+        // Turn 已经进入中断终态，后续资源清理必须全部执行；任务树终止失败只记录，
+        // 不能短路进程、浏览器租约和协调器的收口。
         if let Some(root_task_id) = active_root_task_id.as_ref()
             && let Some(manager) = runner_manager
+            && let Err(error) = manager.kill_tree(root_task_id.as_str())
         {
-            manager
-                .kill_tree(root_task_id.as_str())
-                .map_err(|error| ApiError::internal_assembly("中断活动任务树失败", error))?;
+            tracing::error!(
+                session_id = %session_id,
+                task_id = %root_task_id,
+                %error,
+                "中断时终止任务树未完全成功，继续清理执行资源"
+            );
         }
         cancelled_tool_process_count = state
             .cancel_execution_resources(

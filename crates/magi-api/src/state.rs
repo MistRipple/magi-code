@@ -890,9 +890,9 @@ impl RunnerManager {
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
         self.signal_stop_if_present(root_task_id);
-        self.build_task_runner(None).kill_tree(&tid)?;
+        let result = self.build_task_runner(None).kill_tree(&tid);
         self.set_runner_status_if_present(root_task_id, "killed");
-        Ok(())
+        result
     }
 
     pub fn kill_task(&self, task_id: &str) -> Result<(), String> {
