@@ -322,6 +322,9 @@ pub struct DispatchSubmissionRequest {
     pub orchestrator_session_config: Option<serde_json::Value>,
     pub entry_id: String,
     pub timeline_message: String,
+    /// 图片只随用户消息条目的 `images` 元数据持久化一份；pendingDispatch 不再重复
+    /// 保存 base64，重启恢复时从该元数据重建。
+    #[serde(skip)]
     pub images: Vec<SessionTurnImage>,
     pub context_references: Vec<SessionContextReference>,
     /// 已由 Magi API 的 BrowserAuthority 解析并校验的页面标记引用。
@@ -391,17 +394,20 @@ pub struct PendingDispatchSubmission {
 pub fn recover_dispatch_submission_request(
     sidecar: &SessionRuntimeSidecar,
 ) -> Result<DispatchSubmissionRequest, String> {
-    let pending_dispatch = sidecar
+    let item = sidecar
         .current_turn
         .as_ref()
         .and_then(|turn| {
             turn.items
                 .iter()
-                .find_map(|item| item.metadata.get("pendingDispatch"))
+                .find(|item| item.metadata.contains_key("pendingDispatch"))
         })
         .ok_or_else(|| "accepted Turn 缺少 pendingDispatch 请求事实".to_string())?;
-    serde_json::from_value(pending_dispatch.clone())
-        .map_err(|error| format!("解析 accepted Turn 的 pendingDispatch 请求失败: {error}"))
+    let mut request: DispatchSubmissionRequest =
+        serde_json::from_value(item.metadata["pendingDispatch"].clone())
+            .map_err(|error| format!("解析 accepted Turn 的 pendingDispatch 请求失败: {error}"))?;
+    request.images = crate::session_images::session_turn_images_from_metadata(&item.metadata);
+    Ok(request)
 }
 
 pub struct DispatchSubmissionRuntime<'a> {
@@ -1869,6 +1875,59 @@ mod tests {
             images: Vec::new(),
             execution_settings_snapshot: None,
         }
+    }
+
+    #[test]
+    fn pending_dispatch_does_not_duplicate_images_and_recovery_restores_them_from_metadata() {
+        let session_id = SessionId::new("session-pending-dispatch-images");
+        let mut request = rollback_test_request(session_id.clone(), UtcMillis(3_000), "executor");
+        request.images = vec![
+            crate::session_images::SessionTurnImage::from_data_url(
+                "paste.png",
+                "data:image/png;base64,AAAA",
+            )
+            .expect("image should parse"),
+        ];
+        let pending_dispatch = serde_json::to_value(&request).expect("request should serialize");
+        assert!(
+            pending_dispatch.get("images").is_none(),
+            "pendingDispatch 不能再保存一份 base64 图片"
+        );
+        let mut metadata = crate::session_images::session_turn_images_metadata(&request.images);
+        metadata.insert("pendingDispatch".to_string(), pending_dispatch);
+        let mut item = crate::session_writeback::session_turn_item(
+            "user_message",
+            "completed",
+            None,
+            Some("带图片的消息".to_string()),
+            Some("turn-item-user-images".to_string()),
+            magi_core::ThreadId::new("thread-pending-dispatch-images"),
+        );
+        item.metadata = metadata;
+        let sidecar = SessionRuntimeSidecar {
+            session_id,
+            ownership: Default::default(),
+            recovery_id: None,
+            current_turn: Some(ActiveExecutionTurn {
+                turn_id: "turn-pending-dispatch-images".to_string(),
+                turn_seq: 3_000,
+                accepted_at: UtcMillis(3_000),
+                completed_at: None,
+                status: "accepted".to_string(),
+                user_message: Some("带图片的消息".to_string()),
+                items: vec![item],
+            }),
+            active_execution_chain: None,
+            status: Default::default(),
+            updated_at: UtcMillis(3_000),
+        };
+
+        let recovered =
+            recover_dispatch_submission_request(&sidecar).expect("pending dispatch should recover");
+        assert_eq!(
+            recovered.images, request.images,
+            "恢复时必须从唯一的图片元数据重建"
+        );
     }
 
     #[test]

@@ -57,6 +57,16 @@ pub fn session_turn_image_sources(images: &[SessionTurnImage]) -> Vec<ImageSourc
 }
 
 pub fn image_sources_from_metadata(metadata: &HashMap<String, Value>) -> Vec<ImageSource> {
+    session_turn_images_from_metadata(metadata)
+        .into_iter()
+        .map(|image| image.source)
+        .collect()
+}
+
+/// 从用户消息条目的 `images` 元数据重建图片；这是图片唯一的持久化位置。
+pub fn session_turn_images_from_metadata(
+    metadata: &HashMap<String, Value>,
+) -> Vec<SessionTurnImage> {
     metadata
         .get("images")
         .and_then(Value::as_array)
@@ -70,7 +80,6 @@ pub fn image_sources_from_metadata(metadata: &HashMap<String, Value>) -> Vec<Ima
                         data_url,
                     )
                     .ok()
-                    .map(|image| image.source)
                 })
                 .collect()
         })
