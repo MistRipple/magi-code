@@ -1642,18 +1642,22 @@ mod tests {
         let waiter = match state
             .conversation_registry
             .tool_approvals()
-            .request(magi_conversation_runtime::PendingToolApproval {
-                approval_id: "approval-1".to_string(),
-                session_id: session_id.clone(),
-                task_id: magi_conversation_runtime::external_approval::external_approval_task_id(
-                    &token_id,
-                ),
-                turn_id: "external:t:c".to_string(),
-                tool_call_id: "c".to_string(),
-                tool_name: "file_write".to_string(),
-                reason: "magi.fs.write: a.txt".to_string(),
-                requested_at: magi_core::UtcMillis::now(),
-            })
+            .request_with_arguments(
+                magi_conversation_runtime::PendingToolApproval {
+                    approval_id: "approval-1".to_string(),
+                    session_id: session_id.clone(),
+                    task_id:
+                        magi_conversation_runtime::external_approval::external_approval_task_id(
+                            &token_id,
+                        ),
+                    turn_id: "external:t:c".to_string(),
+                    tool_call_id: "c".to_string(),
+                    tool_name: "file_write".to_string(),
+                    reason: "magi.fs.write: a.txt".to_string(),
+                    requested_at: magi_core::UtcMillis::now(),
+                },
+                "{}",
+            )
             .unwrap()
         {
             magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) => waiter,

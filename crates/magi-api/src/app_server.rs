@@ -2227,9 +2227,8 @@ mod tests {
     use magi_event_bus::EventCategory;
     use magi_governance::GovernanceService;
     use magi_session_store::{
-        ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnItem,
-        CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
-        CanonicalTurnVisibility, SessionStore, TimelineEntryInput, TimelineEntryKind,
+        ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore, TimelineEntryInput,
+        TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
     use std::collections::HashMap;

@@ -6217,7 +6217,7 @@ mod tests {
         let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = state
             .conversation_registry
             .tool_approvals()
-            .request(pending)
+            .request_with_arguments(pending, "{}")
             .expect("approval should become pending")
         else {
             panic!("first approval request must wait");
@@ -6320,7 +6320,7 @@ mod tests {
         let approval_id = pending.approval_id.clone();
         let registry = state.conversation_registry.tool_approvals();
         let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = registry
-            .request(pending)
+            .request_with_arguments(pending, "{}")
             .expect("approval should become pending")
         else {
             panic!("first approval request must wait");
