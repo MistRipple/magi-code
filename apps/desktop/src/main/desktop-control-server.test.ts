@@ -381,6 +381,75 @@ test("交互命令合并动作后的页面状态与 Worker 报告的作用元素
   }
 });
 
+test("交互动作完成后读取页面状态失败时报告结果未确认，不能被当成可重试失败", async () => {
+  const worker = {
+    execute: async () => ({
+      outcome: {
+        status: "succeeded",
+        payload: { type: "action_target", payload: { role: "button", name: "提交订单" } },
+      },
+    }),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    recordForBinding: () => {
+      throw new Error("browser_surface_not_found");
+    },
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(client, (message) => message.request_id === "click-after-action");
+    client.send(JSON.stringify(request("click-after-action", {
+      type: "click",
+      payload: {
+        tab_id: binding.tab_id,
+        control: { mode: "user", fence: 1 },
+        target: { element_ref: "e:1:submit" },
+      },
+    })));
+    const response = await responsePromise;
+    const outcome = response.outcome as { status: string; payload: Record<string, unknown> };
+    assert.equal(outcome.status, "indeterminate");
+    assert.equal(outcome.payload.side_effect_started, true);
+    assert.equal(outcome.payload.recoverable, false);
+    assert.equal(outcome.payload.code, "browser_surface_not_found");
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
+test("交互动作交给 Worker 之前失败时仍报告普通失败", async () => {
+  const worker = {
+    execute: async () => {
+      throw new Error("browser_worker_failed");
+    },
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker);
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(client, (message) => message.request_id === "click-before-action");
+    client.send(JSON.stringify(request("click-before-action", {
+      type: "click",
+      payload: {
+        tab_id: binding.tab_id,
+        control: { mode: "user", fence: 1 },
+        target: { element_ref: "e:1:submit" },
+      },
+    })));
+    const response = await responsePromise;
+    const outcome = response.outcome as { status: string; payload: Record<string, unknown> };
+    assert.equal(outcome.status, "failed");
+    assert.equal(outcome.payload.side_effect_started, false);
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("新建 Browser Page 只物化 WebContents，不等待可见内容槽", async () => {
   const worker = {
     execute: async () => failedOutcome("unused"),

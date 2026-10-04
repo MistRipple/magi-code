@@ -207,6 +207,7 @@ impl BrowserHostClient {
             self.command_sequence.fetch_add(1, Ordering::Relaxed)
         ));
         let request_timeout = request_timeout_for(&command, self.request_timeout);
+        let side_effecting = command.is_side_effecting();
         let envelope = BrowserHostRequestEnvelope {
             request_id: request_id.clone(),
             protocol_version: BrowserHostProtocolVersion::CURRENT,
@@ -232,9 +233,26 @@ impl BrowserHostClient {
             return Err(BrowserHostClientError::Transport(error.to_string()));
         }
         let mut receiver = receiver;
+        // 请求已经发出：写命令此后失去响应时 Desktop 可能已经执行了动作，只能报告
+        // 结果未确认；只读命令仍按普通断连/超时处理。
+        let lost_after_send = |error: BrowserHostClientError, request_id: BrowserCommandId| {
+            if side_effecting {
+                BrowserHostClientError::RequestIndeterminate(request_id)
+            } else {
+                error
+            }
+        };
         match tokio::time::timeout(request_timeout, &mut receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(BrowserHostClientError::Disconnected),
+            Ok(Ok(result)) => result.map_err(|error| match error {
+                BrowserHostClientError::Disconnected | BrowserHostClientError::Transport(_) => {
+                    lost_after_send(error, request_id)
+                }
+                other => other,
+            }),
+            Ok(Err(_)) => Err(lost_after_send(
+                BrowserHostClientError::Disconnected,
+                request_id,
+            )),
             Err(_) => {
                 if self.send_cancel(&request_id).await.is_err() {
                     self.pending
@@ -242,7 +260,10 @@ impl BrowserHostClient {
                         .expect("browser Host pending response lock poisoned")
                         .remove(&request_id);
                     self.close().await;
-                    return Err(BrowserHostClientError::RequestTimeout(request_id));
+                    return Err(lost_after_send(
+                        BrowserHostClientError::RequestTimeout(request_id.clone()),
+                        request_id,
+                    ));
                 }
                 match tokio::time::timeout(CANCEL_GRACE_TIMEOUT, &mut receiver).await {
                     Ok(Ok(result)) => result,
@@ -996,5 +1017,85 @@ mod tests {
             Err(BrowserHostClientError::Disconnected)
         ));
         server.await.expect("join Desktop control server");
+    }
+
+    /// Desktop 收到请求后不回复就断开连接。
+    #[cfg(unix)]
+    async fn request_lost_after_send(command: BrowserHostCommand) -> BrowserHostClientError {
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::accept_async;
+
+        let temp_dir = tempfile::tempdir().expect("create temporary socket directory");
+        let socket_path = temp_dir.path().join("desktop-control.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind Desktop control socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept Desktop client");
+            let mut websocket = accept_async(stream)
+                .await
+                .expect("upgrade Desktop control websocket");
+            let ready = BrowserHostEventEnvelope {
+                protocol_version: BrowserHostProtocolVersion::CURRENT,
+                sequence: 1,
+                event: BrowserHostEvent::Ready(handshake()),
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&ready)
+                        .expect("serialize ready event")
+                        .into(),
+                ))
+                .await
+                .expect("send ready event");
+            websocket
+                .next()
+                .await
+                .expect("receive request")
+                .expect("read request");
+            drop(websocket);
+        });
+        let connection = BrowserHostClient::connect_desktop_socket(
+            socket_path.to_str().expect("UTF-8 socket path"),
+            "test-token",
+            "desktop-epoch",
+            42,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("connect Desktop client");
+        let error = connection
+            .client
+            .request(command)
+            .await
+            .expect_err("connection drops before any response");
+        server.await.expect("join Desktop control server");
+        error
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_command_lost_after_send_is_indeterminate() {
+        let error = request_lost_after_send(BrowserHostCommand::Press {
+            tab_id: magi_core::BrowserTabId::new("tab-lost-write"),
+            control: crate::BrowserHostControl::User { fence: 1 },
+            key: "Enter".to_string(),
+        })
+        .await;
+        assert!(
+            matches!(error, BrowserHostClientError::RequestIndeterminate(_)),
+            "写命令发出后断连必须是结果未确认，而不是可重试的断连：{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_command_lost_after_send_stays_disconnected() {
+        let error = request_lost_after_send(BrowserHostCommand::Ping).await;
+        assert!(
+            matches!(
+                error,
+                BrowserHostClientError::Disconnected | BrowserHostClientError::Transport(_)
+            ),
+            "只读命令断连仍是普通断连：{error:?}"
+        );
     }
 }

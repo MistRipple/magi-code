@@ -26,6 +26,7 @@ import {
   parseBrowserHostResponse,
 } from "@magi/desktop-browser-contracts/validation";
 import { WebSocket, WebSocketServer } from "ws";
+import { BrowserSideEffectStartedError } from "./browser-side-effect.js";
 import type { AutomationWorker } from "./automation-worker.js";
 import type {
   BrowserSurfaceActivationInput,
@@ -626,7 +627,7 @@ export class DesktopControlServer {
       if (!command.connection.closed && !command.cancellationRequested) {
         this.sendEnvelope(
           command.connection,
-          failedResponse(command.request.request_id, failure),
+          errorResponse(command.request.request_id, failure),
         );
       }
     } finally {
@@ -763,7 +764,7 @@ export class DesktopControlServer {
       };
     } catch (cause) {
       return {
-        envelope: failedResponse(request.request_id, normalizeError(cause)),
+        envelope: errorResponse(request.request_id, normalizeError(cause)),
       };
     }
   }
@@ -973,45 +974,60 @@ export class DesktopControlServer {
         if (!tabId) throw new Error("browser_tab_id_missing");
         const binding = await this.requireRenderablePrimaryBinding(tabId);
         const executed = await this.#worker.execute(binding, command, signal);
-        // 交互命令在 Worker 内可能由多个 CDP 输入事件组成。动作中的
-        // keyDown/click 可能已经触发导航，因此不能把 Worker 发送前的
-        // binding 当作动作结果的页面状态。由 Main 在动作完成后读取同一
-        // WebContents 的最新地址、标题和 navigation revision，与 Worker
-        // 报告的实际作用元素合并为 Rust 工具层的 Interaction 结果。
-        if (
-          executed.outcome.status === "succeeded" &&
-          isInteractionCommand(command)
-        ) {
-          if (executed.outcome.payload.type !== "action_target") {
-            throw new Error("browser_worker_interaction_result_invalid");
-          }
-          const currentBinding =
-            await this.requireRenderablePrimaryBinding(tabId);
-          const contents =
-            this.#surfaceManager.recordForBinding(currentBinding);
-          return {
-            outcome: {
-              status: "succeeded",
-              payload: {
-                type: "interaction",
-                payload: {
-                  page_state: {
-                    tab_id: currentBinding.tab_id,
-                    url: contents.getURL() || "about:blank",
-                    origin: safeOrigin(contents.getURL()),
-                    title: contents.getTitle() || "",
-                    navigation_revision: currentBinding.navigation_revision,
-                  },
-                  target: executed.outcome.payload.payload,
-                },
-              },
-            },
-            ...(executed.binary ? { binary: executed.binary } : {}),
-          };
+        try {
+          return await this.completeWorkerCommand(tabId, command, executed);
+        } catch (cause) {
+          // Worker 已经报告动作完成；此后读取页面状态等失败不能否认动作已生效。
+          throw isInteractionCommand(command) && executed.outcome.status === "succeeded"
+            ? new BrowserSideEffectStartedError(cause)
+            : cause;
         }
-        return executed;
       }
     }
+  }
+
+  private async completeWorkerCommand(
+    tabId: string,
+    command: BrowserHostCommand,
+    executed: { outcome: BrowserCommandOutcome; binary?: Buffer },
+  ): Promise<{ outcome: BrowserCommandOutcome; binary?: Buffer }> {
+    // 交互命令在 Worker 内可能由多个 CDP 输入事件组成。动作中的
+    // keyDown/click 可能已经触发导航，因此不能把 Worker 发送前的
+    // binding 当作动作结果的页面状态。由 Main 在动作完成后读取同一
+    // WebContents 的最新地址、标题和 navigation revision，与 Worker
+    // 报告的实际作用元素合并为 Rust 工具层的 Interaction 结果。
+    if (
+      executed.outcome.status === "succeeded" &&
+      isInteractionCommand(command)
+    ) {
+      if (executed.outcome.payload.type !== "action_target") {
+        throw new Error("browser_worker_interaction_result_invalid");
+      }
+      const currentBinding =
+        await this.requireRenderablePrimaryBinding(tabId);
+      const contents =
+        this.#surfaceManager.recordForBinding(currentBinding);
+      return {
+        outcome: {
+          status: "succeeded",
+          payload: {
+            type: "interaction",
+            payload: {
+              page_state: {
+                tab_id: currentBinding.tab_id,
+                url: contents.getURL() || "about:blank",
+                origin: safeOrigin(contents.getURL()),
+                title: contents.getTitle() || "",
+                navigation_revision: currentBinding.navigation_revision,
+              },
+              target: executed.outcome.payload.payload,
+            },
+          },
+        },
+        ...(executed.binary ? { binary: executed.binary } : {}),
+      };
+    }
+    return executed;
   }
 
   private recordAnnotationProjection(
@@ -1378,6 +1394,19 @@ function failedResponse(
   };
 }
 
+/** 动作已经开始后的失败报告为结果未确认，其余失败报告为普通失败。 */
+function errorResponse(
+  requestId: string,
+  error: BrowserCommandError,
+): BrowserHostResponseEnvelope {
+  if (!error.side_effect_started) return failedResponse(requestId, error);
+  return {
+    request_id: requestId,
+    protocol_version: DESKTOP_BROWSER_PROTOCOL_VERSION,
+    outcome: { status: "indeterminate", payload: error },
+  };
+}
+
 function indeterminateResponse(requestId: string): BrowserHostResponseEnvelope {
   return {
     request_id: requestId,
@@ -1425,14 +1454,16 @@ function closeHttpServer(server: Server): Promise<void> {
 function normalizeError(cause: unknown): BrowserCommandError {
   const source = cause instanceof Error ? cause : new Error(String(cause));
   const code = source.message.split(":", 1)[0];
+  // 写命令交给 Chromium 之后的失败：动作可能已经生效，不能让调用方安全重试。
+  const sideEffectStarted = source instanceof BrowserSideEffectStartedError;
   return {
     code:
       code?.startsWith("browser_") || code?.startsWith("desktop_")
         ? code
         : "browser_desktop_control_failed",
     message: source.message,
-    recoverable: true,
-    side_effect_started: false,
+    recoverable: !sideEffectStarted,
+    side_effect_started: sideEffectStarted,
     diagnostic: source.stack ?? null,
   };
 }

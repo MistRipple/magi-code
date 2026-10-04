@@ -9,6 +9,7 @@ import {
 import type { UtilityProcess } from "electron";
 import type { BrowserSurfaceManager } from "./browser-surface-manager.js";
 import { AutomationWorker } from "./automation-worker.js";
+import { BrowserSideEffectStartedError } from "./browser-side-effect.js";
 
 const binding: BrowserSurfaceBinding = {
   desktop_epoch: "desktop-test",
@@ -107,6 +108,41 @@ test("正常 ready 完成重绑并释放命令 waiter", async () => {
   assert.ok(child.messages.some((message) => message.type === "worker_rebind"));
   assert.equal(child.killed, false);
   await worker.stop();
+});
+
+test("写命令交给 Worker 后进程崩溃时标记为动作可能已生效，只读命令不受影响", async () => {
+  for (const [command, sideEffectStarted] of [
+    [
+      {
+        type: "click",
+        payload: {
+          tab_id: binding.tab_id,
+          control: { mode: "user", fence: 1 },
+          target: { element_ref: "e:1:submit" },
+        },
+      },
+      true,
+    ],
+    [{ type: "ping" }, false],
+  ] as const) {
+    const child = new FakeUtilityProcess();
+    const worker = createWorker(() => child);
+    const execution = worker.execute(binding, command);
+    child.emitReady(worker.workerEpoch);
+    await waitFor(() => child.messages.some((message) => message.type === "worker_command"));
+    child.emit("exit", 1);
+
+    const error = await execution.then(
+      () => assert.fail("崩溃的 Worker 不能返回成功"),
+      (cause: unknown) => cause,
+    );
+    assert.equal(
+      error instanceof BrowserSideEffectStartedError,
+      sideEffectStarted,
+      `${command.type} 崩溃后的错误分类不正确：${String(error)}`,
+    );
+    await worker.stop();
+  }
 });
 
 test("start 只会在 Worker 握手和重绑完成后返回", async () => {

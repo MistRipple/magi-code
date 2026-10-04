@@ -13,6 +13,10 @@ import {
 import * as electron from "electron";
 import type { UtilityProcess } from "electron";
 import type { BrowserSurfaceManager, BrowserSurfaceEvent } from "./browser-surface-manager.js";
+import {
+  BrowserSideEffectStartedError,
+  isSideEffectingBrowserCommand,
+} from "./browser-side-effect.js";
 
 interface PendingCommand {
   child: UtilityProcess;
@@ -24,6 +28,8 @@ interface PendingCommand {
   timer: NodeJS.Timeout;
   signalCleanup: (() => void) | null;
   cancelSent: boolean;
+  /** 写命令已经交给 Worker；此后的失败都可能发生在动作生效之后。 */
+  sideEffectDispatched: boolean;
 }
 
 interface PendingCdpRequest {
@@ -247,6 +253,7 @@ export class AutomationWorker {
         timer,
         signalCleanup: null,
         cancelSent: false,
+        sideEffectDispatched: false,
       };
       this.#pending.set(callId, pending);
       if (signal) {
@@ -257,6 +264,7 @@ export class AutomationWorker {
       }
       try {
         this.postMessage(child, message);
+        pending.sideEffectDispatched = isSideEffectingBrowserCommand(command);
       } catch (cause) {
         this.#pending.delete(callId);
         this.cleanupPending(pending);
@@ -482,7 +490,7 @@ export class AutomationWorker {
       this.#pending.delete(message.call_id);
       this.cleanupPending(pending);
       if (!samePhysicalBinding(pending.binding, message.binding)) {
-        pending.reject(new Error("browser_surface_stale"));
+        rejectPending(pending, new Error("browser_surface_stale"));
         return;
       }
       pending.resolve({
@@ -565,7 +573,7 @@ export class AutomationWorker {
   private failPending(error: Error): void {
     for (const pending of this.#pending.values()) {
       this.cleanupPending(pending);
-      pending.reject(error);
+      rejectPending(pending, error);
     }
     this.#pending.clear();
     for (const pending of this.#pendingCdp.values()) pending.controller.abort();
@@ -768,6 +776,12 @@ function samePhysicalBinding(left: BrowserSurfaceBinding, right: BrowserSurfaceB
     && left.target_id === right.target_id
     && left.browser_context_id === right.browser_context_id
     && left.navigation_revision === right.navigation_revision;
+}
+
+function rejectPending(pending: PendingCommand, error: Error): void {
+  pending.reject(
+    pending.sideEffectDispatched ? new BrowserSideEffectStartedError(error) : error,
+  );
 }
 
 function workerTimeout(command: BrowserHostCommand): number {

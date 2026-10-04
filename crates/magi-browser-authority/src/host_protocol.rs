@@ -315,6 +315,51 @@ pub enum BrowserHostCommand {
     Shutdown,
 }
 
+impl BrowserHostCommand {
+    /// 命令是否会在页面上产生用户可见、不可安全重放的副作用。
+    ///
+    /// 这类命令一旦已经发给 Desktop，之后无论连接断开还是结果丢失，都只能判定为
+    /// “结果未确认”，不能报告成可安全重试的失败。新增命令必须在这里显式归类。
+    pub fn is_side_effecting(&self) -> bool {
+        match self {
+            Self::Navigate { .. }
+            | Self::Click { .. }
+            | Self::Type { .. }
+            | Self::Press { .. }
+            | Self::Scroll { .. }
+            | Self::WebWriteText { .. }
+            | Self::WebSubmit { .. }
+            | Self::WebCancelGeneration { .. }
+            | Self::WebConfigureConnector { .. } => true,
+            Self::Ping
+            | Self::Cancel { .. }
+            | Self::CreatePage { .. }
+            | Self::RestorePage { .. }
+            | Self::EnsureSurface { .. }
+            | Self::SetLogicalViewport { .. }
+            | Self::GetLogicalViewport { .. }
+            | Self::SetAnnotations { .. }
+            | Self::InspectStart(_)
+            | Self::InspectStop(_)
+            | Self::ClosePage { .. }
+            | Self::StopNavigation { .. }
+            | Self::Snapshot { .. }
+            | Self::Devtools { .. }
+            | Self::Screenshot { .. }
+            | Self::HitTest { .. }
+            | Self::UpdateControl { .. }
+            | Self::WebModelProbe { .. }
+            | Self::WebObserve { .. }
+            | Self::WebTurnState { .. }
+            | Self::WebSavedConversations { .. }
+            | Self::WebSavedMessages { .. }
+            | Self::WebReadImage { .. }
+            | Self::WebConnectorStatus { .. }
+            | Self::Shutdown => false,
+        }
+    }
+}
+
 /// `WebWriteText` 的写入模式：整段替换或追加到现有文本之后。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
