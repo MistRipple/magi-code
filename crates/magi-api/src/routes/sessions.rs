@@ -1852,24 +1852,11 @@ async fn submit_conversation_session_turn(
         prompt: request.trimmed_text().unwrap_or_else(|| message.clone()),
         images,
         context_references,
-        use_tools: false,
         access_profile: request.requested_access_profile(),
         skill_name,
         request_id: Some(request_id),
         user_message_id: Some(user_message_id.clone()),
         placeholder_message_id: request.placeholder_message_id(),
-        forced_tool_name: None,
-        required_tool_chain: Vec::new(),
-        goal_turn_mode:
-            magi_conversation_runtime::session_turn_execution::SessionGoalTurnMode::None,
-        product_locale: request
-            .locale
-            .clone()
-            .unwrap_or_else(|| "zh-CN".to_string()),
-        workspace_root_path: workspace_id
-            .as_ref()
-            .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
-            .map(|path| path.to_string_lossy().into_owned()),
         command: request.command.as_ref().map(|command| match command {
             magi_app_server_protocol::SessionTurnCommand::Compact => {
                 SessionTurnCommand::CompactContext {

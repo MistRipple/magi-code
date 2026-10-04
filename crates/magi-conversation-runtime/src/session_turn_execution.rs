@@ -6,8 +6,7 @@
 
 use crate::context_authority::{
     ContextAuthority, ContextCompactionMode, ContextCompactionTerminal, ContextPrepareRequest,
-    PreparedThreadHistory, current_session_file_facts, estimate_chat_messages_tokens,
-    estimate_tool_definition_tokens,
+    PreparedThreadHistory, estimate_chat_messages_tokens,
 };
 #[cfg(test)]
 use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
@@ -15,13 +14,11 @@ use crate::model_context_window::{
     conservative_context_limit_recovery_window, resolve_model_context_window_with_override,
 };
 use crate::{
-    ConversationRegistry, GoalModeLifecycleState, SessionTurnInputBoundary, UserSignal,
+    ConversationRegistry, SessionTurnInputBoundary, UserSignal,
     conversation_loop::{
         append_thread_messages_checkpoint, chat_message_to_thread_chat_message,
         insert_interrupted_tool_result_messages, thread_chat_message_to_chat_message,
     },
-    goal_mode_required_tool_chain, goal_mode_requires_terminalization,
-    goal_mode_tool_batch_violation,
     model_config::{resolve_orchestrator_model_config, resolve_vision_execution_config},
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
@@ -31,35 +28,22 @@ use crate::{
     },
     prompt_utils::{
         PromptFragmentKind, current_access_profile_prompt, current_turn_context_priority_prompt,
-        dynamic_skill_prompt_message, normalize_model_stream_preview_content,
-        normalize_model_visible_content, skill_prompt_message, system_prompt_fragment_message,
-        workspace_context_system_prompt,
+        normalize_model_stream_preview_content, normalize_model_visible_content,
+        system_prompt_fragment_message,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
         CanonicalTurnEventSink, ContextCompactionWritebackContext, SessionStatePersistCallback,
-        SessionTurnStreamPublishGate, append_session_tool_call_items_batch_with_context,
-        append_session_turn_error_item, append_session_turn_error_item_without_terminal_commit,
-        append_session_turn_item_for_turn, apply_model_response_round,
-        new_context_compaction_item_id, persist_session_state_checkpoint,
-        publish_current_session_turn_item_event, publish_model_retry_runtime_event,
-        publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
-        session_turn_stream_update, upsert_context_compaction_completed_notice,
-        upsert_context_compaction_progress_notice, upsert_session_turn_item_for_turn,
+        SessionTurnStreamPublishGate, append_session_turn_error_item,
+        append_session_turn_error_item_without_terminal_commit, append_session_turn_item_for_turn,
+        apply_model_response_round, new_context_compaction_item_id,
+        persist_session_state_checkpoint, publish_current_session_turn_item_event,
+        publish_model_retry_runtime_event, publish_session_turn_item_event,
+        publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
+        upsert_context_compaction_completed_notice, upsert_context_compaction_progress_notice,
+        upsert_session_turn_item_for_turn,
     },
-    strict_goal_mode_tool_definitions_for_round,
-    task_helpers::canonical_tool_call_name,
-    tool_call_validation::{
-        ToolCallFailureDiagnostic, ToolCallValidationIssue, ToolCallValidationTracker,
-        invalid_tool_result_message, non_retryable_tool_call_failure, validate_tool_call_batch,
-    },
-    tool_execution_ledger::ToolExecutionLedger,
     tool_result_utils::{DeterministicToolFailure, model_round_limit_failure},
-    tool_surface_state::{
-        BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput,
-        activate_skill_tool_definitions, build_browser_tool_surface,
-        refresh_live_mcp_tool_definitions_with_mode,
-    },
     turn_stream_buffer::TurnStreamBuffer,
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
@@ -70,18 +54,15 @@ use crate::{
     },
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolChoice, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
-    ModelProviderContext, ModelResponseStatus, ModelStreamingDelta,
+    ChatMessage, ModelBridgeClient, ModelInvocationRequest, ModelProviderContext,
+    ModelResponseStatus, ModelStreamingDelta,
 };
-use magi_browser_authority::BrowserCapabilitySnapshot;
 use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{CanonicalTurnItemKind, SessionStore, ThreadChatMessage};
 use magi_settings_store::SettingsStore;
-use magi_snapshot::SnapshotManager;
-use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
-use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::BTreeSet, fmt, sync::Arc, time::Instant};
 
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
@@ -104,24 +85,6 @@ fn mark_turn_timing(
     );
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SessionGoalTurnMode {
-    #[default]
-    None,
-    Start,
-    Continuation,
-}
-
-impl SessionGoalTurnMode {
-    pub fn is_goal_driven(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    pub fn allows_goal_creation(self) -> bool {
-        !matches!(self, Self::Continuation)
-    }
-}
-
 /// 用户显式发起的会话命令。命令与普通对话共用 Turn 接纳、队列、取消和终态链路，
 /// 只替换执行器内的模型调用阶段。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,17 +101,11 @@ pub struct SessionTurnExecutionRequest {
     pub prompt: String,
     pub images: Vec<SessionTurnImage>,
     pub context_references: Vec<crate::context_reference::SessionContextReference>,
-    pub use_tools: bool,
     pub access_profile: AccessProfile,
     pub skill_name: Option<String>,
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
-    pub forced_tool_name: Option<String>,
-    pub required_tool_chain: Vec<String>,
-    pub goal_turn_mode: SessionGoalTurnMode,
-    pub product_locale: String,
-    pub workspace_root_path: Option<String>,
     /// 非空时本轮执行该命令，不调用主模型生成回复。
     pub command: Option<SessionTurnCommand>,
 }
@@ -206,10 +163,8 @@ pub enum SessionTurnFailureReason {
     ModelInvocationFailed,
     ModelStreamInterrupted,
     ModelEmptyResponse,
-    ModelEmptyResponseAfterTools,
     ModelResponseInvalid,
     ModelImageInvocationFailed,
-    ToolCallProtocolFailed,
     ToolPolicyRejected,
     ContextCompactionFailed,
     RuntimeInvalidState,
@@ -221,10 +176,8 @@ impl SessionTurnFailureReason {
             Self::ModelInvocationFailed => "model_invocation_failed",
             Self::ModelStreamInterrupted => "model_stream_interrupted",
             Self::ModelEmptyResponse => "model_empty_response",
-            Self::ModelEmptyResponseAfterTools => "model_empty_response_after_tools",
             Self::ModelResponseInvalid => "model_response_invalid",
             Self::ModelImageInvocationFailed => "model_image_invocation_failed",
-            Self::ToolCallProtocolFailed => "tool_arguments_invalid",
             Self::ToolPolicyRejected => "tool_policy_rejected",
             Self::ContextCompactionFailed => "context_compaction_failed",
             Self::RuntimeInvalidState => "session_turn_runtime_invalid_state",
@@ -238,7 +191,6 @@ pub struct SessionTurnExecutionError {
     pub diagnostic_code: String,
     pub public_message: String,
     pub model_failure: Option<Box<ModelFailureDiagnostic>>,
-    pub(crate) tool_call_failure: Option<Box<ToolCallFailureDiagnostic>>,
 }
 
 impl SessionTurnExecutionError {
@@ -248,7 +200,6 @@ impl SessionTurnExecutionError {
             diagnostic_code: reason.code().to_string(),
             public_message: public_message.into(),
             model_failure: None,
-            tool_call_failure: None,
         }
     }
 
@@ -261,21 +212,11 @@ impl SessionTurnExecutionError {
             diagnostic_code: model_failure.code.clone(),
             public_message: model_failure.summary.clone(),
             model_failure: Some(Box::new(model_failure)),
-            tool_call_failure: None,
         }
     }
 
-    fn from_tool_call_failure(tool_call_failure: ToolCallFailureDiagnostic) -> Self {
-        Self {
-            reason: SessionTurnFailureReason::ToolCallProtocolFailed,
-            diagnostic_code: tool_call_failure.code.clone(),
-            public_message: tool_call_failure.summary.clone(),
-            model_failure: None,
-            tool_call_failure: Some(Box::new(tool_call_failure)),
-        }
-    }
-
-    fn from_terminal_tool_failure(failure: DeterministicToolFailure) -> Self {
+    /// 轮数上限沿用任务轮次的确定性失败语义与诊断码。
+    fn from_round_limit_failure(failure: DeterministicToolFailure) -> Self {
         Self::new(
             SessionTurnFailureReason::ToolPolicyRejected,
             failure.summary,
@@ -317,16 +258,6 @@ fn apply_request_aliases(
     item.request_id = request.request_id.clone();
     item.user_message_id = request.user_message_id.clone();
     item.placeholder_message_id = request.placeholder_message_id.clone();
-}
-
-fn apply_goal_turn_intermediate_visibility(
-    item: &mut magi_session_store::ActiveExecutionTurnItem,
-    request: &SessionTurnExecutionRequest,
-) {
-    if request.goal_turn_mode.is_goal_driven() {
-        item.metadata
-            .insert("renderable".to_string(), serde_json::Value::Bool(false));
-    }
 }
 
 fn current_turn_status_is_writable(status: &str) -> bool {
@@ -564,11 +495,7 @@ fn build_session_turn_messages_with_runtime(
         safety_gate,
         skill_runtime,
     } = input;
-    let mut messages = if request.use_tools {
-        workspace_context_messages(request)
-    } else {
-        Vec::new()
-    };
+    let mut messages = Vec::new();
     let user_rules = settings_store.map(|store| {
         crate::prompt_utils::user_rules_from_settings(&store.get_section("userRules"))
     });
@@ -598,19 +525,6 @@ fn build_session_turn_messages_with_runtime(
         PromptFragmentKind::CurrentTurnPriority,
         current_turn_context_priority_prompt(),
     ));
-    if request.goal_turn_mode.is_goal_driven()
-        || session_store
-            .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
-            .is_some()
-    {
-        messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::CurrentTurnPriority,
-            format!(
-                "计划语言规则：用户明确指定的语言优先，其次当前用户消息的主要语言，再次产品 locale={}，最后默认 zh-CN。调用 update_plan 时必须将最终选择写入 language，计划创建后不得切换；存在未完成 Goal 时，必须使用本轮 get_goal 或 create_goal 返回的 goalId 与 controlRevision 作为 expectedGoalId 与 expectedGoalControlRevision。",
-                request.product_locale
-            ),
-        ));
-    }
     if let Some(execution_state) =
         session_execution_state_prompt(session_store, &request.session_id, &request.turn_id)
     {
@@ -748,22 +662,6 @@ fn model_identity_prompt_for_request(user_prompt: &str, configured_model: &str) 
     Some(rules.join("\n"))
 }
 
-fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<ChatMessage> {
-    let Some(root_path) = request
-        .workspace_root_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Vec::new();
-    };
-
-    vec![system_prompt_fragment_message(
-        PromptFragmentKind::WorkspaceContext,
-        workspace_context_system_prompt(root_path),
-    )]
-}
-
 struct RebuildMessagesForContextWindowInput<'a> {
     client: &'a dyn ModelBridgeClient,
     event_bus: &'a InMemoryEventBus,
@@ -776,10 +674,7 @@ struct RebuildMessagesForContextWindowInput<'a> {
     messages: &'a mut Vec<ChatMessage>,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
     settings_store: Option<&'a Arc<SettingsStore>>,
-    tools: Option<&'a [ChatToolDefinition]>,
     skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
-    initial_skill_name: Option<&'a str>,
-    active_skill_name: Option<&'a str>,
     persist_checkpoint: bool,
 }
 
@@ -798,13 +693,10 @@ fn rebuild_messages_for_context_window(
         messages,
         persist_session_state,
         settings_store,
-        tools,
         skill_runtime,
-        initial_skill_name,
-        active_skill_name,
         persist_checkpoint,
     } = input;
-    let mut fixed_messages =
+    let fixed_messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,
             request,
@@ -815,11 +707,6 @@ fn rebuild_messages_for_context_window(
             safety_gate: None,
             skill_runtime,
         });
-    if let Some(skill_message) =
-        dynamic_skill_prompt_message(skill_runtime, initial_skill_name, active_skill_name)
-    {
-        fixed_messages.insert(fixed_messages.len().saturating_sub(2), skill_message);
-    }
     let compaction_item_id =
         new_context_compaction_item_id(&request.turn_id, thread_id, "context_limit_recovery");
     let compaction_writeback = ContextCompactionWritebackContext {
@@ -853,8 +740,7 @@ fn rebuild_messages_for_context_window(
         recovery_history: Vec::new(),
         phase: "context_limit_recovery",
         context_window_tokens: context_window,
-        additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
-            .saturating_add(estimate_tool_definition_tokens(tools)),
+        additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages),
         persist_checkpoint,
         model_identity: None,
         mode: ContextCompactionMode::Recovery,
@@ -885,11 +771,6 @@ fn rebuild_messages_for_context_window(
             safety_gate: None,
             skill_runtime,
         });
-    if let Some(skill_message) =
-        dynamic_skill_prompt_message(skill_runtime, initial_skill_name, active_skill_name)
-    {
-        messages.insert(messages.len().saturating_sub(2), skill_message);
-    }
     Ok(compacted)
 }
 
@@ -901,15 +782,10 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub plan_store: &'a magi_plan::PlanStore,
     pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
-    pub tool_registry: Option<&'a ToolRegistry>,
     pub skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
-    pub skill_dispatch_runtime: Option<&'a magi_skill_runtime::SkillDispatchRuntime>,
-    pub skill_name: Option<String>,
-    pub snapshot_manager: Option<&'a Arc<SnapshotManager>>,
     pub request: SessionTurnExecutionRequest,
     pub prompt: String,
     pub knowledge_context_prompt: Option<String>,
-    pub tools: Option<Vec<ChatToolDefinition>>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
     pub live_settings_store: Option<Arc<SettingsStore>>,
 }
@@ -990,18 +866,13 @@ fn run_session_turn_execution_inner(
         event_bus,
         session_store,
         conversation_registry,
-        plan_store,
+        plan_store: _,
         settings_store,
         safety_gate,
-        tool_registry,
         skill_runtime,
-        skill_dispatch_runtime,
-        skill_name,
-        snapshot_manager,
         request,
         prompt,
         knowledge_context_prompt,
-        tools,
         persist_session_state,
         live_settings_store: _live_settings_store,
     } = runtime;
@@ -1018,7 +889,6 @@ fn run_session_turn_execution_inner(
         .orchestrator_thread_for_session(&request.session_id)
         .ok_or_else(SessionTurnExecutionError::runtime_invalid_state)?;
     let orchestrator_thread_id = orchestrator_thread.thread_id;
-    let orchestrator_mission_id = orchestrator_thread.mission_id;
 
     normalize_interrupted_session_tool_history(
         session_store,
@@ -1069,7 +939,7 @@ fn run_session_turn_execution_inner(
     let usage_binding = if vision_execution_config.is_some() {
         vision_model_usage_binding()
     } else {
-        session_turn_model_usage_binding(request.use_tools)
+        session_turn_model_usage_binding(false)
     };
     let mut effective_context_window = resolve_model_context_window_with_override(
         settings_store.map(Arc::as_ref),
@@ -1141,8 +1011,7 @@ fn run_session_turn_execution_inner(
             recovery_history,
             phase: compaction_phase,
             context_window_tokens: effective_context_window,
-            additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
-                .saturating_add(estimate_tool_definition_tokens(tools.as_deref())),
+            additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages),
             persist_checkpoint: vision_execution_config.is_none(),
             model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
                 vision_execution_config
@@ -1184,7 +1053,6 @@ fn run_session_turn_execution_inner(
         // 不调用主模型，也不把命令本身写入模型可见历史。
         return Ok(SessionTurnExecutionOutput::completed(String::new()));
     }
-    let mut proactive_context_compaction_completed = prepared_history.compaction.is_some();
     let mut messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,
@@ -1236,209 +1104,33 @@ fn run_session_turn_execution_inner(
     let mut final_item_id: Option<String> = None;
     let mut final_model_round: Option<usize> = None;
     let mut main_timeline_entry_id: Option<String> = None;
-    let mut had_tool_calls = false;
-    let initial_skill_name = skill_name.clone();
-    let mut active_skill_name = skill_name;
-    let mut active_tools = tools.unwrap_or_default();
-    let mut deferred_mcp_tools_loaded = false;
-    let mut tool_execution_ledger = ToolExecutionLedger::from_thread_history(
-        &request.prompt,
-        &session_store.thread_message_history(&orchestrator_thread_id),
-        tool_registry,
-    )
-    .with_current_file_facts(
-        &current_session_file_facts(session_store, &request.session_id),
-        request
-            .workspace_root_path
-            .as_deref()
-            .map(std::path::Path::new),
-    );
-    let mut completed_required_tool_names: Vec<String> = Vec::new();
-    let mut goal_creation_required = request.goal_turn_mode.is_goal_driven()
-        && request.goal_turn_mode.allows_goal_creation()
-        && session_store
-            .current_unfinished_goal(&request.session_id)
-            .is_none();
-    let mut required_tool_chain = session_required_tool_chain(
-        &request,
-        goal_creation_required,
-        goal_mode_requires_terminalization(session_store, &request.session_id),
-    );
-    let mut context_budget_recheck_required = false;
     let mut empty_response_recovery_attempts = 0usize;
     let mut pre_output_invocation_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut context_limit_recovery_attempted = false;
-    let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
     let mut last_response_observation: Option<String> = None;
     let mut round = 0usize;
     loop {
-        // 浏览器可用性每轮重新判断：桌面端恰好在重连时，不能让整轮都失去浏览器工具。
-        let mut browser_capability_snapshot = if request.use_tools {
-            tool_registry.and_then(|registry| registry.browser_capability_snapshot())
-        } else {
-            None
-        };
-        if request.use_tools
-            && let Some(registry) = tool_registry
-        {
-            let browser_surface = build_browser_tool_surface(
-                active_tools,
-                registry,
-                BrowserToolSurfaceContext::new(
-                    skill_runtime,
-                    active_skill_name.as_deref(),
-                    None,
-                    &[],
-                ),
-                browser_capability_snapshot.clone(),
-            );
-            active_tools = browser_surface.definitions;
-            browser_capability_snapshot = browser_surface.capability;
-            active_tools =
-                refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
-                    definitions: active_tools,
-                    tool_registry: registry,
-                    skill_runtime,
-                    active_skill_id: active_skill_name.as_deref(),
-                    access_profile: request.access_profile,
-                    allowed_tools: None,
-                    denied_tools: &[],
-                    include_external: deferred_mcp_tools_loaded,
-                });
-        }
-        let strict_goal_mode_round = request.goal_turn_mode.is_goal_driven();
-        if strict_goal_mode_round {
-            if session_store
-                .current_unfinished_goal(&request.session_id)
-                .is_some()
-                || completed_required_tool_names
-                    .iter()
-                    .any(|tool_name| tool_name == "create_goal")
-            {
-                goal_creation_required = false;
-            }
-            required_tool_chain = session_required_tool_chain(
-                &request,
-                goal_creation_required,
-                goal_mode_requires_terminalization(session_store, &request.session_id),
-            );
-            completed_required_tool_names.retain(|tool_name| {
-                required_tool_chain
-                    .iter()
-                    .any(|required| required == tool_name)
-            });
-        }
-        if strict_goal_mode_round
-            && (!request.goal_turn_mode.allows_goal_creation()
-                || !required_tool_chain
-                    .iter()
-                    .any(|tool_name| tool_name == "create_goal")
-                || completed_required_tool_names
-                    .iter()
-                    .any(|tool_name| tool_name == "create_goal"))
-        {
-            active_tools.retain(|definition| definition.function.name != "create_goal");
-        }
-        let round_tool_definitions = if strict_goal_mode_round {
-            strict_goal_mode_tool_definitions_for_round(
-                &active_tools,
-                &required_tool_chain,
-                &completed_required_tool_names,
-            )
-        } else {
-            active_tools.clone()
-        };
-        let round_tools = (request.use_tools && !round_tool_definitions.is_empty())
-            .then_some(round_tool_definitions);
-        if strict_goal_mode_round
-            && let Some(next_required_tool) = required_tool_chain.iter().find(|tool_name| {
-                !completed_required_tool_names
-                    .iter()
-                    .any(|completed| completed == *tool_name)
-            })
-            && !round_tools.as_ref().is_some_and(|tools| {
-                tools
-                    .iter()
-                    .any(|definition| definition.function.name == *next_required_tool)
-            })
-        {
-            return Err(SessionTurnExecutionError::new(
-                SessionTurnFailureReason::RuntimeInvalidState,
-                format!(
-                    "严格目标模式要求调用工具 {next_required_tool}，但当前工具面未提供该工具；拒绝绕过 Goal/Plan 生命周期。"
-                ),
-            ));
-        }
-        if context_budget_recheck_required && !proactive_context_compaction_completed {
-            let rebuild_result =
-                rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
-                    client,
-                    event_bus,
-                    session_store,
-                    request: &request,
-                    thread_id: &orchestrator_thread_id,
-                    prompt: &prompt,
-                    knowledge_context_prompt: knowledge_context_prompt.as_deref(),
-                    context_window: effective_context_window,
-                    messages: &mut messages,
-                    persist_session_state,
-                    settings_store,
-                    tools: round_tools.as_deref(),
-                    skill_runtime,
-                    initial_skill_name: initial_skill_name.as_deref(),
-                    active_skill_name: active_skill_name.as_deref(),
-                    persist_checkpoint: vision_execution_config.is_none(),
-                });
-            match rebuild_result {
-                Ok(compacted) => {
-                    proactive_context_compaction_completed |= compacted;
-                }
-                Err(ContextCompactionTerminal::Cancelled) => {
-                    return Ok(SessionTurnExecutionOutput::interrupted());
-                }
-                Err(ContextCompactionTerminal::Failed) => {
-                    return Err(SessionTurnExecutionError::context_compaction_failed());
-                }
-            }
-        }
-        context_budget_recheck_required = false;
         // 轮数上限与任务轮次共用：达到上限时按终止失败收口，不再继续调用模型。
         let round_result = match model_round_limit_failure(round, false) {
-            Some(failure) => Err(SessionTurnRoundError::TerminalToolFailure(failure)),
-            None => stream_session_turn_round(
-                SessionTurnRoundRuntime {
-                    client,
-                    event_bus,
-                    session_store,
-                    tool_approval_registry: conversation_registry.tool_approvals(),
-                    plan_store,
-                    settings_store,
-                    safety_gate,
-                    snapshot_manager,
-                    request: &request,
-                    usage_binding: &usage_binding,
-                    prompt: &prompt,
-                    tools: round_tools,
-                    browser_capability_snapshot,
-                    messages: &mut messages,
-                    completed_required_tool_names: &completed_required_tool_names,
-                    required_tool_chain: &required_tool_chain,
-                    pre_output_invocation_recovery_attempts,
-                    stream_interruption_recovery_attempts,
-                    round,
-                    context_window_tokens: effective_context_window,
-                    orchestrator_thread_id: &orchestrator_thread_id,
-                    orchestrator_mission_id: &orchestrator_mission_id,
-                    persist_session_state,
-                    tool_execution_ledger: &mut tool_execution_ledger,
-                    web_engine,
-                },
-                tool_registry,
-                skill_runtime,
-                skill_dispatch_runtime,
-                active_skill_name.as_deref(),
-            ),
+            Some(failure) => Err(SessionTurnRoundError::RoundLimitReached(failure)),
+            None => stream_session_turn_round(SessionTurnRoundRuntime {
+                client,
+                event_bus,
+                session_store,
+                settings_store,
+                request: &request,
+                usage_binding: &usage_binding,
+                prompt: &prompt,
+                messages: &mut messages,
+                pre_output_invocation_recovery_attempts,
+                stream_interruption_recovery_attempts,
+                round,
+                context_window_tokens: effective_context_window,
+                orchestrator_thread_id: &orchestrator_thread_id,
+                persist_session_state,
+                web_engine,
+            }),
         };
         let streamed_content = match round_result {
             Ok(output) => output,
@@ -1456,12 +1148,11 @@ fn run_session_turn_execution_inner(
                 tracing::error!(%error, "会话 Turn 运行事实写回失败");
                 return Err(SessionTurnExecutionError::runtime_invalid_state());
             }
-            Err(SessionTurnRoundError::TerminalToolFailure(failure)) => {
+            Err(SessionTurnRoundError::RoundLimitReached(failure)) => {
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
-                let execution_error =
-                    SessionTurnExecutionError::from_terminal_tool_failure(failure);
+                let execution_error = SessionTurnExecutionError::from_round_limit_failure(failure);
                 if let Err(writeback_error) = append_session_turn_error_for_policy(
                     terminal_policy,
                     event_bus,
@@ -1475,7 +1166,6 @@ fn run_session_turn_execution_inner(
                         placeholder_message_id: request.placeholder_message_id.as_deref(),
                         error_text: &execution_error.public_message,
                         model_failure: None,
-                        tool_call_failure: None,
                         streaming_entry_id: main_timeline_entry_id.as_deref(),
                         source_thread_id: orchestrator_thread_id.clone(),
                         persist_session_state,
@@ -1508,7 +1198,6 @@ fn run_session_turn_execution_inner(
                         placeholder_message_id: request.placeholder_message_id.as_deref(),
                         error_text: &execution_error.public_message,
                         model_failure: execution_error.model_failure.as_deref(),
-                        tool_call_failure: None,
                         streaming_entry_id: main_timeline_entry_id.as_deref(),
                         source_thread_id: orchestrator_thread_id.clone(),
                         persist_session_state,
@@ -1535,9 +1224,7 @@ fn run_session_turn_execution_inner(
                     empty_response_recovery_attempts += 1;
                     messages.push(ChatMessage {
                         role: "user".to_string(),
-                        content: Some(
-                            model_empty_response_recovery_prompt(had_tool_calls).to_string(),
-                        ),
+                        content: Some(model_empty_response_recovery_prompt(false).to_string()),
                         images: Vec::new(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -1548,7 +1235,6 @@ fn run_session_turn_execution_inner(
                         round,
                         attempt = empty_response_recovery_attempts,
                         max_attempts = MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
-                        after_tool_calls = had_tool_calls,
                         "模型桥接空响应，追加用户可见答复约束后继续会话"
                     );
                     round = round.saturating_add(1);
@@ -1574,10 +1260,7 @@ fn run_session_turn_execution_inner(
                             messages: &mut messages,
                             persist_session_state,
                             settings_store,
-                            tools: Some(active_tools.as_slice()),
                             skill_runtime,
-                            initial_skill_name: initial_skill_name.as_deref(),
-                            active_skill_name: active_skill_name.as_deref(),
                             persist_checkpoint: vision_execution_config.is_none(),
                         },
                     ) {
@@ -1590,7 +1273,6 @@ fn run_session_turn_execution_inner(
                         }
                     };
                     if compacted {
-                        proactive_context_compaction_completed = true;
                         continue;
                     }
                 }
@@ -1599,12 +1281,7 @@ fn run_session_turn_execution_inner(
                     + empty_response_recovery_attempts
                     + usize::from(non_stream_recovery_attempted);
                 let execution_error = if classification.code == "model_empty_response" {
-                    session_turn_empty_response_error(
-                        &request,
-                        had_tool_calls,
-                        retry_attempts,
-                        Some(&error),
-                    )
+                    session_turn_empty_response_error(&request, retry_attempts, Some(&error))
                 } else {
                     session_turn_model_error(&request, &error, retry_attempts)
                 };
@@ -1621,12 +1298,6 @@ fn run_session_turn_execution_inner(
                         placeholder_message_id: request.placeholder_message_id.as_deref(),
                         error_text: &execution_error.public_message,
                         model_failure: execution_error.model_failure.as_deref(),
-                        tool_call_failure: execution_error.tool_call_failure.as_ref().map(
-                            |failure| {
-                                serde_json::to_value(failure)
-                                    .expect("tool call failure diagnostic must serialize")
-                            },
-                        ),
                         streaming_entry_id: main_timeline_entry_id.as_deref(),
                         source_thread_id: orchestrator_thread_id.clone(),
                         persist_session_state,
@@ -1642,212 +1313,15 @@ fn run_session_turn_execution_inner(
         if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
         }
-        deferred_mcp_tools_loaded |= streamed_content.mcp_tools_loaded;
         if let Some(observation) = streamed_content.response_observation.as_ref() {
             last_response_observation = Some(observation.clone());
         }
         let response_provider_context = streamed_content.provider_context.clone();
-        if let Some(tool_call_failure) = streamed_content
-            .invalid_tool_calls
-            .iter()
-            .find_map(non_retryable_tool_call_failure)
-        {
-            let execution_error =
-                SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
-            if let Err(writeback_error) = append_session_turn_error_for_policy(
-                terminal_policy,
-                event_bus,
-                session_store,
-                crate::session_writeback::SessionTurnErrorInput {
-                    session_id: &request.session_id,
-                    workspace_id: &request.workspace_id,
-                    task_id: None,
-                    request_id: request.request_id.as_deref(),
-                    user_message_id: request.user_message_id.as_deref(),
-                    placeholder_message_id: request.placeholder_message_id.as_deref(),
-                    error_text: &execution_error.public_message,
-                    model_failure: None,
-                    tool_call_failure: execution_error.tool_call_failure.as_ref().map(|failure| {
-                        serde_json::to_value(failure)
-                            .expect("tool call failure diagnostic must serialize")
-                    }),
-                    streaming_entry_id: main_timeline_entry_id.as_deref(),
-                    source_thread_id: orchestrator_thread_id.clone(),
-                    persist_session_state,
-                    expected_turn_id: Some(&request.turn_id),
-                },
-            ) {
-                tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
-                return Err(SessionTurnExecutionError::runtime_invalid_state());
-            }
-            return Err(execution_error);
-        }
-        let repeated_tool_call_failure = if streamed_content.invalid_tool_calls.is_empty() {
-            tool_call_validation_tracker.record_valid_round();
-            None
-        } else {
-            let attempts = tool_call_validation_tracker.record_round();
-            if attempts >= 2 {
-                streamed_content.invalid_tool_calls.first().map(|issue| {
-                    ToolCallFailureDiagnostic::repeated(issue, attempts.saturating_sub(1))
-                })
-            } else {
-                for issue in &streamed_content.invalid_tool_calls {
-                    tracing::warn!(
-                        session_id = %request.session_id,
-                        round,
-                        tool = %issue.tool_name,
-                        reason_code = %issue.reason_code,
-                        "模型提交了无效工具调用，已拒绝执行并请求模型修正"
-                    );
-                }
-                None
-            }
-        };
-        if let Some(tool_call_failure) = repeated_tool_call_failure {
-            let execution_error =
-                SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
-            if let Err(writeback_error) = append_session_turn_error_for_policy(
-                terminal_policy,
-                event_bus,
-                session_store,
-                crate::session_writeback::SessionTurnErrorInput {
-                    session_id: &request.session_id,
-                    workspace_id: &request.workspace_id,
-                    task_id: None,
-                    request_id: request.request_id.as_deref(),
-                    user_message_id: request.user_message_id.as_deref(),
-                    placeholder_message_id: request.placeholder_message_id.as_deref(),
-                    error_text: &execution_error.public_message,
-                    model_failure: None,
-                    tool_call_failure: execution_error.tool_call_failure.as_ref().map(|failure| {
-                        serde_json::to_value(failure)
-                            .expect("tool call failure diagnostic must serialize")
-                    }),
-                    streaming_entry_id: main_timeline_entry_id.as_deref(),
-                    source_thread_id: orchestrator_thread_id.clone(),
-                    persist_session_state,
-                    expected_turn_id: Some(&request.turn_id),
-                },
-            ) {
-                tracing::error!(?writeback_error, "会话 Turn 失败事实写回失败");
-                return Err(SessionTurnExecutionError::runtime_invalid_state());
-            }
-            return Err(execution_error);
-        }
         if main_timeline_entry_id.is_none() {
             main_timeline_entry_id = streamed_content.timeline_entry_id.clone();
         }
-        had_tool_calls |= streamed_content.encountered_tool_calls;
-        context_budget_recheck_required |= streamed_content.encountered_tool_calls;
-        record_completed_required_tools(
-            &mut completed_required_tool_names,
-            &required_tool_chain,
-            &streamed_content.tool_call_names,
-        );
-        if strict_goal_mode_round {
-            if session_store
-                .current_unfinished_goal(&request.session_id)
-                .is_some()
-                || completed_required_tool_names
-                    .iter()
-                    .any(|tool_name| tool_name == "create_goal")
-            {
-                goal_creation_required = false;
-            }
-            required_tool_chain = session_required_tool_chain(
-                &request,
-                goal_creation_required,
-                goal_mode_requires_terminalization(session_store, &request.session_id),
-            );
-            completed_required_tool_names.retain(|tool_name| {
-                required_tool_chain
-                    .iter()
-                    .any(|required| required == tool_name)
-            });
-        }
-
-        if let Some(skill_id) = streamed_content.activated_skill_id.as_deref()
-            && active_skill_name.as_deref() != Some(skill_id)
-            && let Some(runtime) = skill_runtime
-        {
-            let preserved_goal_tools = if request.goal_turn_mode.is_goal_driven() {
-                ["get_goal", "create_goal", "update_goal", "update_plan"].as_slice()
-            } else {
-                [].as_slice()
-            };
-            active_tools = activate_skill_tool_definitions(
-                active_tools,
-                runtime,
-                skill_id,
-                request.access_profile,
-                preserved_goal_tools,
-            );
-            active_skill_name = Some(skill_id.to_string());
-            if let Some(skill_message) = skill_prompt_message(runtime, skill_id) {
-                messages.push(skill_message);
-            }
-        }
 
         if let Some(content) = streamed_content.final_content {
-            if !required_tool_chain_is_complete(
-                &required_tool_chain,
-                &completed_required_tool_names,
-            ) {
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some(content),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: response_provider_context.clone(),
-                });
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(required_tool_chain_recovery_prompt(
-                        &required_tool_chain,
-                        &completed_required_tool_names,
-                    )),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                let steers = conversation_registry
-                    .turn_coordinator()
-                    .drain_session_turn_steers(&request.session_id, &request.turn_id);
-                append_session_turn_steers_to_messages(&mut messages, steers);
-                round = round.saturating_add(1);
-                continue;
-            }
-            if session_store
-                .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
-                .is_some()
-                && plan_store.requires_execution_follow_up()
-            {
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some(content),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: response_provider_context.clone(),
-                });
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: plan_store.render_execution_follow_up_prompt(),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                let steers = conversation_registry
-                    .turn_coordinator()
-                    .drain_session_turn_steers(&request.session_id, &request.turn_id);
-                append_session_turn_steers_to_messages(&mut messages, steers);
-                round = round.saturating_add(1);
-                continue;
-            }
             match conversation_registry
                 .turn_coordinator()
                 .take_session_turn_steers_or_close(&request.session_id, &request.turn_id)
@@ -1872,53 +1346,29 @@ fn run_session_turn_execution_inner(
             final_content = Some(content);
             break;
         }
-        if streamed_content.content_recovery_needed {
-            if !response_provider_context.is_empty() {
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: None,
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: response_provider_context,
-                });
-            }
-            if !required_tool_chain_is_complete(
-                &required_tool_chain,
-                &completed_required_tool_names,
-            ) {
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(required_tool_chain_recovery_prompt(
-                        &required_tool_chain,
-                        &completed_required_tool_names,
-                    )),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-            } else if empty_response_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
-            {
-                empty_response_recovery_attempts += 1;
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-            } else {
-                break;
-            }
-            round = round.saturating_add(1);
-            continue;
+        // 本轮没有可见正文：按空响应恢复补一次答复约束，耗尽后按空响应失败收口。
+        if empty_response_recovery_attempts >= MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS {
+            break;
         }
-        let steers = conversation_registry
-            .turn_coordinator()
-            .drain_session_turn_steers(&request.session_id, &request.turn_id);
-        append_session_turn_steers_to_messages(&mut messages, steers);
+        if !response_provider_context.is_empty() {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: response_provider_context,
+            });
+        }
+        empty_response_recovery_attempts += 1;
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(model_empty_response_recovery_prompt(false).to_string()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_context: Vec::new(),
+        });
         round = round.saturating_add(1);
     }
 
@@ -1930,7 +1380,6 @@ fn run_session_turn_execution_inner(
         }
         let failure = session_turn_empty_response_error(
             &request,
-            had_tool_calls,
             empty_response_recovery_attempts,
             last_response_observation.as_deref(),
         );
@@ -1947,10 +1396,6 @@ fn run_session_turn_execution_inner(
                 placeholder_message_id: request.placeholder_message_id.as_deref(),
                 error_text: &failure.public_message,
                 model_failure: failure.model_failure.as_deref(),
-                tool_call_failure: failure.tool_call_failure.as_ref().map(|failure| {
-                    serde_json::to_value(failure)
-                        .expect("tool call failure diagnostic must serialize")
-                }),
                 streaming_entry_id: main_timeline_entry_id.as_deref(),
                 source_thread_id: orchestrator_thread_id.clone(),
                 persist_session_state,
@@ -2045,7 +1490,6 @@ fn session_turn_model_error(
 
 fn session_turn_empty_response_error(
     request: &SessionTurnExecutionRequest,
-    after_tool_calls: bool,
     retry_attempts: usize,
     response_observation: Option<&str>,
 ) -> SessionTurnExecutionError {
@@ -2060,18 +1504,9 @@ fn session_turn_empty_response_error(
             ),
         );
     }
-    let reason = if after_tool_calls {
-        SessionTurnFailureReason::ModelEmptyResponseAfterTools
-    } else {
-        SessionTurnFailureReason::ModelEmptyResponse
-    };
     SessionTurnExecutionError::from_model_failure(
-        reason,
-        ModelFailureDiagnostic::empty_response(
-            after_tool_calls,
-            retry_attempts,
-            response_observation,
-        ),
+        SessionTurnFailureReason::ModelEmptyResponse,
+        ModelFailureDiagnostic::empty_response(false, retry_attempts, response_observation),
     )
 }
 
@@ -2079,28 +1514,18 @@ struct SessionTurnRoundRuntime<'a> {
     client: &'a dyn ModelBridgeClient,
     event_bus: &'a InMemoryEventBus,
     session_store: &'a SessionStore,
-    tool_approval_registry: &'a crate::ToolApprovalRegistry,
-    plan_store: &'a magi_plan::PlanStore,
     settings_store: Option<&'a Arc<SettingsStore>>,
-    safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
-    snapshot_manager: Option<&'a Arc<SnapshotManager>>,
     request: &'a SessionTurnExecutionRequest,
     usage_binding: &'a ModelUsageBinding,
     prompt: &'a str,
-    tools: Option<Vec<ChatToolDefinition>>,
-    browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     messages: &'a mut Vec<ChatMessage>,
-    completed_required_tool_names: &'a [String],
-    required_tool_chain: &'a [String],
     pre_output_invocation_recovery_attempts: usize,
     stream_interruption_recovery_attempts: usize,
     round: usize,
     context_window_tokens: u64,
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
-    orchestrator_mission_id: &'a magi_core::MissionId,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
-    tool_execution_ledger: &'a mut ToolExecutionLedger,
     /// GPT Web 引擎自己维护网页上下文：Magi 不为它做上下文占用跟踪。
     web_engine: bool,
 }
@@ -2109,15 +1534,22 @@ struct SessionTurnRoundOutput {
     final_content: Option<String>,
     final_item_id: Option<String>,
     timeline_entry_id: Option<String>,
-    encountered_tool_calls: bool,
-    tool_call_names: Vec<String>,
-    activated_skill_id: Option<String>,
-    content_recovery_needed: bool,
-    invalid_tool_calls: Vec<ToolCallValidationIssue>,
     response_observation: Option<String>,
     provider_context: Vec<ModelProviderContext>,
-    mcp_tools_loaded: bool,
     interrupted: bool,
+}
+
+impl SessionTurnRoundOutput {
+    fn interrupted(response_observation: Option<String>) -> Self {
+        Self {
+            final_content: None,
+            final_item_id: None,
+            timeline_entry_id: None,
+            response_observation,
+            provider_context: Vec::new(),
+            interrupted: true,
+        }
+    }
 }
 
 /// 单轮流式调用的失败语义。仅在未交付可见内容时才能重放请求；已交付片段时必须续写。
@@ -2129,101 +1561,10 @@ enum SessionTurnRoundError {
         non_stream_recovery_attempted: bool,
     },
     InvalidResponse(Box<ModelFailureDiagnostic>),
-    TerminalToolFailure(DeterministicToolFailure),
+    RoundLimitReached(DeterministicToolFailure),
     PreOutputInvocationRecovered,
     StreamInterruptedRecovered,
     WritebackFailed(String),
-}
-
-fn record_completed_required_tools(
-    completed: &mut Vec<String>,
-    required_tool_chain: &[String],
-    tool_call_names: &[String],
-) {
-    for tool_name in tool_call_names {
-        if !required_tool_chain
-            .iter()
-            .any(|required| required == tool_name)
-        {
-            continue;
-        }
-        if !completed
-            .iter()
-            .any(|completed_name| completed_name == tool_name)
-        {
-            completed.push(tool_name.clone());
-        }
-    }
-}
-
-fn session_required_tool_chain(
-    request: &SessionTurnExecutionRequest,
-    goal_creation_required: bool,
-    goal_terminalization_required: bool,
-) -> Vec<String> {
-    let mut required = if request.goal_turn_mode.is_goal_driven() {
-        goal_mode_required_tool_chain(
-            GoalModeLifecycleState {
-                goal_creation_required,
-                goal_terminalization_required,
-            },
-            &request.required_tool_chain,
-        )
-    } else {
-        request.required_tool_chain.clone()
-    };
-    if let Some(forced_tool_name) = request
-        .forced_tool_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        && !required.iter().any(|name| name == forced_tool_name)
-    {
-        if request.goal_turn_mode.is_goal_driven() {
-            // 目标模式的生命周期顺序由运行时拥有；只允许在生命周期之后追加业务工具。
-            if !matches!(
-                forced_tool_name,
-                "get_goal" | "create_goal" | "update_plan" | "update_goal"
-            ) {
-                required.push(forced_tool_name.to_string());
-            }
-        } else {
-            required.insert(0, forced_tool_name.to_string());
-        }
-    }
-    required
-}
-
-fn required_tool_chain_is_complete(required_tool_chain: &[String], completed: &[String]) -> bool {
-    required_tool_chain.iter().all(|required| {
-        completed
-            .iter()
-            .any(|completed_name| completed_name == required)
-    })
-}
-
-fn required_tool_chain_recovery_prompt(
-    required_tool_chain: &[String],
-    completed: &[String],
-) -> String {
-    let missing = required_tool_chain
-        .iter()
-        .filter(|required| {
-            !completed
-                .iter()
-                .any(|completed_name| completed_name == *required)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    format!(
-        "上一轮提前给出了文字回复，但用户明确要求调用的内置工具链尚未完成。已完成：{}。仍需继续调用：{}。请继续调用下一个缺失工具，不要总结。",
-        if completed.is_empty() {
-            "无".to_string()
-        } else {
-            completed.join(", ")
-        },
-        missing.join(", ")
-    )
 }
 
 fn apply_provider_context_metadata(
@@ -2240,36 +1581,22 @@ fn apply_provider_context_metadata(
 
 fn stream_session_turn_round(
     runtime: SessionTurnRoundRuntime<'_>,
-    tool_registry: Option<&ToolRegistry>,
-    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
-    skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
-    skill_name: Option<&str>,
 ) -> Result<SessionTurnRoundOutput, SessionTurnRoundError> {
     let SessionTurnRoundRuntime {
         client,
         event_bus,
         session_store,
-        tool_approval_registry,
-        plan_store,
         settings_store,
-        safety_gate,
-        snapshot_manager,
         request,
         usage_binding,
         prompt,
-        tools,
-        browser_capability_snapshot,
         messages,
-        completed_required_tool_names,
-        required_tool_chain,
         pre_output_invocation_recovery_attempts,
         stream_interruption_recovery_attempts,
         round,
         context_window_tokens,
         orchestrator_thread_id,
-        orchestrator_mission_id,
         persist_session_state,
-        tool_execution_ledger,
         web_engine,
     } = runtime;
 
@@ -2318,8 +1645,7 @@ fn stream_session_turn_round(
             .unwrap_or_default();
     let resolved_provider =
         resolved_provider_for_usage_binding(settings_store, usage_binding, &request.session_id);
-    let prefill_tokens = estimate_chat_messages_tokens(messages)
-        .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
+    let prefill_tokens = estimate_chat_messages_tokens(messages);
     let context_usage_tracker = (usage_binding.tracks_active_context() && !web_engine).then(|| {
         ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
             event_bus,
@@ -2504,13 +1830,6 @@ fn stream_session_turn_round(
         }
     };
 
-    let tool_choice = forced_tool_choice_for_round(
-        request,
-        required_tool_chain,
-        tools.as_ref(),
-        round,
-        completed_required_tool_names,
-    );
     let round_goal_id = session_store
         .active_goal_for_execution_owner(&request.session_id, &request.turn_id)
         .map(|goal| goal.goal_id);
@@ -2528,8 +1847,8 @@ fn stream_session_turn_round(
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt: prompt.to_string(),
         messages: Some(messages.clone()),
-        tools: tools.clone(),
-        tool_choice,
+        tools: None,
+        tool_choice: None,
     };
     let non_stream_recovery_template = invocation_request.clone();
     let response = match client.invoke_streaming_with_cancellation(
@@ -2541,20 +1860,7 @@ fn stream_session_turn_round(
         Ok(response) => response,
         Err(error) => {
             if !request_turn_is_writable(session_store, request) {
-                return Ok(SessionTurnRoundOutput {
-                    final_content: None,
-                    final_item_id: None,
-                    timeline_entry_id: None,
-                    encountered_tool_calls: false,
-                    tool_call_names: Vec::new(),
-                    activated_skill_id: None,
-                    content_recovery_needed: false,
-                    invalid_tool_calls: Vec::new(),
-                    response_observation: None,
-                    provider_context: Vec::new(),
-                    mcp_tools_loaded: false,
-                    interrupted: true,
-                });
+                return Ok(SessionTurnRoundOutput::interrupted(None));
             }
             let raw_error = error.to_string();
             let classification = classify_model_invocation_error(&raw_error);
@@ -2610,7 +1916,6 @@ fn stream_session_turn_round(
                 );
                 apply_request_aliases(&mut thinking_item, request);
                 apply_model_response_round(&mut thinking_item, round);
-                apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
                 let published = match upsert_session_turn_item_for_turn(
                     session_store,
                     &request.session_id,
@@ -2651,7 +1956,6 @@ fn stream_session_turn_round(
                 );
                 apply_request_aliases(&mut stream_item, request);
                 apply_model_response_round(&mut stream_item, round);
-                apply_goal_turn_intermediate_visibility(&mut stream_item, request);
                 let published = match upsert_session_turn_item_for_turn(
                     session_store,
                     &request.session_id,
@@ -2772,13 +2076,11 @@ fn stream_session_turn_round(
         parsed.thinking.as_deref().map(str::len).unwrap_or(0),
         parsed.tool_calls.len(),
     ));
-    let tool_validation =
-        validate_tool_call_batch(&parsed.tool_calls, tools.as_deref().unwrap_or_default());
+    // 对话轮次不向模型提供工具；模型若仍返回工具调用，只按正文处理，不解析也不执行。
     let has_actionable_output = parsed
         .content
         .as_deref()
-        .is_some_and(|content| !content.trim().is_empty())
-        || !tool_validation.valid_calls.is_empty();
+        .is_some_and(|content| !content.trim().is_empty());
     let response_contract_failure = match parsed.status {
         ModelResponseStatus::Incomplete => Some(ModelFailureDiagnostic::incomplete_response(
             parsed.finish_reason.as_deref(),
@@ -2809,13 +2111,6 @@ fn stream_session_turn_round(
             assignment_id: None,
             error_code: if let Some(failure) = response_contract_failure.as_ref() {
                 Some(failure.code.clone())
-            } else if !tool_validation.invalid_calls.is_empty()
-                && tool_validation.valid_calls.is_empty()
-            {
-                tool_validation
-                    .invalid_calls
-                    .first()
-                    .map(|invalid| invalid.issue.code.clone())
             } else {
                 (!has_actionable_output).then(|| "model_empty_response".to_string())
             },
@@ -2832,20 +2127,9 @@ fn stream_session_turn_round(
         return Err(SessionTurnRoundError::WritebackFailed(error));
     }
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
-        return Ok(SessionTurnRoundOutput {
-            final_content: None,
-            final_item_id: None,
-            timeline_entry_id: timeline_entry_id.clone(),
-            encountered_tool_calls: false,
-            tool_call_names: Vec::new(),
-            activated_skill_id: None,
-            content_recovery_needed: false,
-            invalid_tool_calls: Vec::new(),
-            response_observation: response_observation.clone(),
-            provider_context: Vec::new(),
-            mcp_tools_loaded: false,
-            interrupted: true,
-        });
+        return Ok(SessionTurnRoundOutput::interrupted(
+            response_observation.clone(),
+        ));
     }
     let streamed_content = streamed_content.into_inner();
     let streamed_thinking = streamed_thinking.into_inner();
@@ -2858,20 +2142,9 @@ fn stream_session_turn_round(
         .or_else(|| (!streamed_thinking.trim().is_empty()).then_some(streamed_thinking));
     if let Some(thinking) = final_thinking {
         if !request_turn_is_writable(session_store, request) {
-            return Ok(SessionTurnRoundOutput {
-                final_content: None,
-                final_item_id: None,
-                timeline_entry_id: timeline_entry_id.clone(),
-                encountered_tool_calls: false,
-                tool_call_names: Vec::new(),
-                activated_skill_id: None,
-                content_recovery_needed: false,
-                invalid_tool_calls: Vec::new(),
-                response_observation: response_observation.clone(),
-                provider_context: Vec::new(),
-                mcp_tools_loaded: false,
-                interrupted: true,
-            });
+            return Ok(SessionTurnRoundOutput::interrupted(
+                response_observation.clone(),
+            ));
         }
         let mut thinking_item = session_turn_item(
             "assistant_thinking",
@@ -2883,7 +2156,6 @@ fn stream_session_turn_round(
         );
         apply_request_aliases(&mut thinking_item, request);
         apply_model_response_round(&mut thinking_item, round);
-        apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
         let published = match upsert_session_turn_item_for_turn(
             session_store,
             &request.session_id,
@@ -2925,20 +2197,9 @@ fn stream_session_turn_round(
     };
     if let Some(completed_stream_content) = completed_stream_content.as_ref() {
         if !request_turn_is_writable(session_store, request) {
-            return Ok(SessionTurnRoundOutput {
-                final_content: None,
-                final_item_id: None,
-                timeline_entry_id: timeline_entry_id.clone(),
-                encountered_tool_calls: false,
-                tool_call_names: Vec::new(),
-                activated_skill_id: None,
-                content_recovery_needed: false,
-                invalid_tool_calls: Vec::new(),
-                response_observation: response_observation.clone(),
-                provider_context: Vec::new(),
-                mcp_tools_loaded: false,
-                interrupted: true,
-            });
+            return Ok(SessionTurnRoundOutput::interrupted(
+                response_observation.clone(),
+            ));
         }
         let mut stream_item = session_turn_item(
             "assistant_stream",
@@ -2950,7 +2211,6 @@ fn stream_session_turn_round(
         );
         apply_request_aliases(&mut stream_item, request);
         apply_model_response_round(&mut stream_item, round);
-        apply_goal_turn_intermediate_visibility(&mut stream_item, request);
         apply_provider_context_metadata(&mut stream_item, &parsed.provider_context);
         let published = match upsert_session_turn_item_for_turn(
             session_store,
@@ -2993,7 +2253,7 @@ fn stream_session_turn_round(
             .clone()
             .or_else(|| completed_stream_content.clone()),
         images: Vec::new(),
-        tool_calls: parsed.tool_calls.clone(),
+        tool_calls: Vec::new(),
         tool_call_id: None,
         provider_context: parsed.provider_context.clone(),
     };
@@ -3001,7 +2261,6 @@ fn stream_session_turn_round(
         .content
         .as_deref()
         .is_some_and(|content| !content.trim().is_empty())
-        || !assistant_response_message.tool_calls.is_empty()
         || !assistant_response_message.provider_context.is_empty()
     {
         append_thread_messages_checkpoint(
@@ -3020,151 +2279,6 @@ fn stream_session_turn_round(
         return Err(SessionTurnRoundError::InvalidResponse(Box::new(failure)));
     }
 
-    if !parsed.tool_calls.is_empty() {
-        if !request_turn_is_writable(session_store, request) {
-            return Ok(SessionTurnRoundOutput {
-                final_content: None,
-                final_item_id: None,
-                timeline_entry_id: timeline_entry_id.clone(),
-                encountered_tool_calls: false,
-                tool_call_names: Vec::new(),
-                activated_skill_id: None,
-                content_recovery_needed: false,
-                invalid_tool_calls: Vec::new(),
-                response_observation: response_observation.clone(),
-                provider_context: Vec::new(),
-                mcp_tools_loaded: false,
-                interrupted: true,
-            });
-        }
-        messages.push(assistant_response_message);
-        let tool_result_history_start = messages.len();
-        let invalid_tool_calls = tool_validation.invalid_calls;
-        for invalid in &invalid_tool_calls {
-            messages.push(invalid_tool_result_message(invalid));
-        }
-        // 任意无效调用都会使整个模型批次失效，不能让同一批次的合法调用继续产生
-        // 副作用；模型修正后再由下一轮重新提交完整批次。
-        let valid_tool_calls = if invalid_tool_calls.is_empty() {
-            tool_validation.valid_calls
-        } else {
-            Vec::new()
-        };
-        if request.goal_turn_mode.is_goal_driven()
-            && !valid_tool_calls.is_empty()
-            && let Some(failure) = goal_mode_tool_batch_violation(
-                required_tool_chain,
-                completed_required_tool_names,
-                &valid_tool_calls,
-            )
-        {
-            return Err(SessionTurnRoundError::Failed {
-                error: failure,
-                context_overflow: None,
-                non_stream_recovery_attempted: false,
-            });
-        }
-        let snapshot_session = snapshot_manager.and_then(|mgr| {
-            request
-                .workspace_root_path
-                .as_deref()
-                .map(PathBuf::from)
-                .and_then(|root| mgr.get_session_for_workspace(request.session_id.as_str(), &root))
-        });
-        let execution_group_id = format!("turn:{}", request.turn_id);
-        let tool_batch = (!valid_tool_calls.is_empty()).then(|| {
-            append_session_tool_call_items_batch_with_context(
-                crate::session_writeback::SessionToolCallBatchContext {
-                    session_store,
-                    event_bus,
-                    tool_registry,
-                    skill_runtime,
-                    skill_dispatch_runtime,
-                    skill_name,
-                    safety_gate,
-                    tool_approval_registry,
-                    plan_store,
-                    mission_id: orchestrator_mission_id,
-                    session_id: &request.session_id,
-                    workspace_id: &request.workspace_id,
-                    workspace_root_path: request.workspace_root_path.as_deref().map(PathBuf::from),
-                    context_references: &request.context_references,
-                    access_profile: request.access_profile,
-                    browser_capability_snapshot,
-                    browser_execution_id: Some(&request.turn_id),
-                    snapshot_session,
-                    execution_group_id: Some(execution_group_id),
-                    source_thread_id: orchestrator_thread_id,
-                    persist_session_state,
-                    expected_turn_id: Some(&request.turn_id),
-                    tool_execution_ledger,
-                },
-                &valid_tool_calls,
-                messages,
-                || request_turn_is_writable(session_store, request),
-            )
-        });
-        append_thread_messages_checkpoint(
-            session_store,
-            orchestrator_thread_id,
-            messages[tool_result_history_start..]
-                .iter()
-                .map(chat_message_to_thread_chat_message)
-                .collect(),
-            persist_session_state,
-            "session_turn_thread_tool_results",
-        )
-        .map_err(SessionTurnRoundError::WritebackFailed)?;
-        if let Some(failure) = tool_batch
-            .as_ref()
-            .and_then(|batch| batch.terminal_failure.clone())
-        {
-            return Err(SessionTurnRoundError::TerminalToolFailure(failure));
-        }
-        if !request_turn_is_writable(session_store, request) {
-            return Ok(SessionTurnRoundOutput {
-                final_content: None,
-                final_item_id: None,
-                timeline_entry_id: timeline_entry_id.clone(),
-                encountered_tool_calls: false,
-                tool_call_names: Vec::new(),
-                activated_skill_id: None,
-                content_recovery_needed: false,
-                invalid_tool_calls: Vec::new(),
-                response_observation: response_observation.clone(),
-                provider_context: Vec::new(),
-                mcp_tools_loaded: false,
-                interrupted: true,
-            });
-        }
-        let mcp_tools_loaded = tool_batch.as_ref().is_some_and(|batch| {
-            batch
-                .succeeded_tool_names
-                .iter()
-                .any(|name| canonical_tool_call_name(name) == "tool_catalog")
-        });
-        return Ok(SessionTurnRoundOutput {
-            final_content: None,
-            final_item_id: None,
-            timeline_entry_id: timeline_entry_id.clone(),
-            encountered_tool_calls: !valid_tool_calls.is_empty(),
-            tool_call_names: tool_batch
-                .as_ref()
-                .map(|batch| batch.succeeded_tool_names.clone())
-                .unwrap_or_default(),
-            activated_skill_id: tool_batch.and_then(|batch| batch.activated_skill_id),
-            content_recovery_needed: false,
-            invalid_tool_calls: invalid_tool_calls
-                .into_iter()
-                .map(|invalid| invalid.issue)
-                .collect(),
-            response_observation: response_observation.clone(),
-            provider_context: Vec::new(),
-            mcp_tools_loaded,
-            interrupted: false,
-        });
-    }
-
     let final_content = parsed
         .content
         .clone()
@@ -3176,62 +2290,15 @@ fn stream_session_turn_round(
     let final_item_id = final_content
         .as_ref()
         .and_then(|_| completed_stream_content.map(|_| stream_item_id));
-    let content_recovery_needed = final_content.is_none();
 
     Ok(SessionTurnRoundOutput {
         final_content,
         final_item_id,
         timeline_entry_id,
-        encountered_tool_calls: false,
-        tool_call_names: Vec::new(),
-        activated_skill_id: None,
-        content_recovery_needed,
-        invalid_tool_calls: Vec::new(),
         response_observation,
         provider_context: parsed.provider_context.clone(),
-        mcp_tools_loaded: false,
         interrupted: false,
     })
-}
-
-fn forced_tool_choice_for_round(
-    request: &SessionTurnExecutionRequest,
-    required_tool_chain: &[String],
-    tools: Option<&Vec<ChatToolDefinition>>,
-    round: usize,
-    completed_required_tool_names: &[String],
-) -> Option<ChatToolChoice> {
-    if !request.use_tools {
-        return None;
-    }
-    let forced_tool_name = if request.goal_turn_mode.is_goal_driven() {
-        required_tool_chain
-            .iter()
-            .cloned()
-            .into_iter()
-            .find(|tool_name| {
-                !completed_required_tool_names
-                    .iter()
-                    .any(|completed| completed == tool_name)
-            })?
-    } else {
-        (round == 0)
-            .then_some(request.forced_tool_name.as_deref())
-            .flatten()?
-            .trim()
-            .to_string()
-    };
-    if forced_tool_name.is_empty() {
-        return None;
-    }
-    let tool_is_available = tools
-        .map(|definitions| {
-            definitions
-                .iter()
-                .any(|definition| definition.function.name == forced_tool_name)
-        })
-        .unwrap_or(false);
-    tool_is_available.then(|| ChatToolChoice::force_function(forced_tool_name))
 }
 
 fn append_session_turn_error_for_policy(
@@ -3284,13 +2351,6 @@ fn append_final_item(
     apply_request_aliases(&mut final_item, request);
     if let Some(model_round) = model_round {
         apply_model_response_round(&mut final_item, model_round);
-    }
-    if request.goal_turn_mode.is_goal_driven()
-        && session_store.active_goal(&request.session_id).is_some()
-    {
-        final_item
-            .metadata
-            .insert("renderable".to_string(), serde_json::Value::Bool(false));
     }
     let final_item_id = final_item.item_id.clone();
     let _published = if has_requested_final_item_id {
@@ -3705,11 +2765,6 @@ mod tests {
 
     struct RetryEventModelBridgeClient;
 
-    struct RepeatedInvalidShellModelBridgeClient {
-        calls: AtomicUsize,
-        requests: Mutex<Vec<ModelInvocationRequest>>,
-    }
-
     struct SemanticContextCompactionModelBridgeClient {
         requests: Mutex<Vec<ModelInvocationRequest>>,
     }
@@ -3882,44 +2937,6 @@ mod tests {
                 thinking: String::new(),
                 tool_calls: Vec::new(),
             });
-            self.invoke(request)
-        }
-    }
-
-    impl ModelBridgeClient for RepeatedInvalidShellModelBridgeClient {
-        fn invoke(
-            &self,
-            request: ModelInvocationRequest,
-        ) -> Result<ModelResponse, BridgeClientError> {
-            let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            self.requests
-                .lock()
-                .expect("requests mutex poisoned")
-                .push(request);
-            let arguments = if call_number == 1 {
-                "{}"
-            } else {
-                r#"{"command":" "}"#
-            };
-            Ok(model_response(serde_json::json!({
-                "content": null,
-                "finish_reason": "tool_calls",
-                "tool_calls": [{
-                    "id": format!("call-invalid-shell-{call_number}"),
-                    "type": "function",
-                    "function": {
-                        "name": "shell_exec",
-                        "arguments": arguments
-                    }
-                }]
-            })))
-        }
-
-        fn invoke_streaming(
-            &self,
-            request: ModelInvocationRequest,
-            _on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -4097,11 +3114,7 @@ mod tests {
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request: SessionTurnExecutionRequest {
                 session_id,
                 turn_id,
@@ -4109,22 +3122,15 @@ mod tests {
                 prompt: "停止测试".to_string(),
                 images: Vec::new(),
                 context_references: Vec::new(),
-                use_tools: false,
                 access_profile: AccessProfile::Restricted,
                 skill_name: None,
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,
-                forced_tool_name: None,
-                required_tool_chain: Vec::new(),
-                goal_turn_mode: SessionGoalTurnMode::None,
-                product_locale: "zh-CN".to_string(),
-                workspace_root_path: None,
                 command: None,
             },
             prompt: "停止测试".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         })
@@ -4237,15 +3243,6 @@ mod tests {
             calls: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
         };
-        let tools = vec![ChatToolDefinition {
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunctionDefinition {
-                name: "inspect_table".to_string(),
-                description: "检查表格".to_string(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
-            },
-            origin: magi_bridge_client::ChatToolOrigin::Builtin,
-        }];
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
             turn_id,
@@ -4256,17 +3253,11 @@ mod tests {
                     .expect("识图接管测试图片必须有效"),
             ],
             context_references: Vec::new(),
-            use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: Some("request-vision-takeover".to_string()),
             user_message_id: Some("user-vision-takeover".to_string()),
             placeholder_message_id: Some("assistant-vision-takeover".to_string()),
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -4278,15 +3269,10 @@ mod tests {
             plan_store: &plan_store,
             settings_store: Some(&settings),
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request,
             prompt: "结合图片继续处理".to_string(),
             knowledge_context_prompt: None,
-            tools: Some(tools),
             persist_session_state: None,
             live_settings_store: Some(settings.clone()),
         })
@@ -4303,7 +3289,6 @@ mod tests {
         assert!(serialized.contains("已确认历史约束"));
         assert!(serialized.contains("结合图片继续处理"));
         assert!(serialized.contains("data:image/png;base64,AAA"));
-        assert!(serialized.contains("inspect_table"));
         assert!(
             vision_request_receiver.try_recv().is_err(),
             "识图接管不得先识图再调用第二次模型"
@@ -4354,17 +3339,11 @@ mod tests {
             prompt: "继续说明刚才的结论".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: Some("request-after-vision-takeover".to_string()),
             user_message_id: Some("user-after-vision-takeover".to_string()),
             placeholder_message_id: Some("assistant-after-vision-takeover".to_string()),
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let follow_up_output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
@@ -4375,15 +3354,10 @@ mod tests {
             plan_store: &plan_store,
             settings_store: Some(&settings),
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request: follow_up_request,
             prompt: "继续说明刚才的结论".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: Some(settings.clone()),
         })
@@ -4635,17 +3609,11 @@ mod tests {
             prompt: "请给出完整方案".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: Some("request-runtime-steer".to_string()),
             user_message_id: Some("user-runtime-steer".to_string()),
             placeholder_message_id: Some("assistant-runtime-steer".to_string()),
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -4657,15 +3625,10 @@ mod tests {
             plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request,
             prompt: "请给出完整方案".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         })
@@ -4702,123 +3665,6 @@ mod tests {
                 }),
             "主会话 thread 必须持久化提供方签名上下文"
         );
-    }
-
-    #[test]
-    fn unfinished_plan_continues_beyond_prior_follow_up_limit() {
-        let session_id = SessionId::new("session-plan-follow-up");
-        let turn_id = "turn-plan-follow-up".to_string();
-        let store = Arc::new(SessionStore::new());
-        store
-            .create_session(session_id.clone(), "plan follow up")
-            .expect("session should be creatable");
-        let (_mission_id, orchestrator_thread_id) =
-            store.ensure_session_mission(&session_id, ts(900), || {
-                magi_core::MissionId::new("mission-plan-follow-up")
-            });
-        let registry = ConversationRegistry::new();
-        seed_conversation_turn(
-            &store,
-            &session_id,
-            registry.turn_coordinator(),
-            ActiveExecutionTurn {
-                turn_id: turn_id.clone(),
-                turn_seq: 1,
-                accepted_at: ts(1_000),
-                completed_at: None,
-                status: "running".to_string(),
-                user_message: Some("完成全部计划".to_string()),
-                items: vec![session_turn_item(
-                    "user_message",
-                    "completed",
-                    None,
-                    Some("完成全部计划".to_string()),
-                    Some("user-plan-follow-up".to_string()),
-                    orchestrator_thread_id,
-                )],
-            },
-        );
-        registry
-            .turn_coordinator()
-            .begin_session_turn_input(session_id.clone(), turn_id.clone())
-            .expect("turn input should begin");
-        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
-        plan_store
-            .update(magi_plan::UpdatePlanInput {
-                plan_id: None,
-                expected_revision: Some(0),
-                expected_goal_id: None,
-                expected_goal_control_revision: None,
-                language: "zh-CN".to_string(),
-                explanation: None,
-                plan: vec![magi_plan::UpdatePlanItemInput {
-                    item_id: Some("implement".to_string()),
-                    step: "完成实现".to_string(),
-                    status: magi_core::PlanItemStatus::InProgress,
-                }],
-            })
-            .expect("plan should create");
-        let client = PlanFollowUpModelBridgeClient {
-            plan_store: plan_store.clone(),
-            calls: AtomicUsize::new(0),
-            requests: std::sync::Mutex::new(Vec::new()),
-        };
-        let output = run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
-            client: &client,
-            event_bus: &InMemoryEventBus::new(16),
-            session_store: store.as_ref(),
-            conversation_registry: &registry,
-            plan_store: &plan_store,
-            settings_store: None,
-            safety_gate: None,
-            tool_registry: None,
-            skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
-            request: SessionTurnExecutionRequest {
-                session_id,
-                turn_id,
-                workspace_id: None,
-                prompt: "完成全部计划".to_string(),
-                images: Vec::new(),
-                context_references: Vec::new(),
-                use_tools: false,
-                access_profile: AccessProfile::Restricted,
-                skill_name: None,
-                request_id: None,
-                user_message_id: None,
-                placeholder_message_id: None,
-                forced_tool_name: None,
-                required_tool_chain: Vec::new(),
-                goal_turn_mode: SessionGoalTurnMode::None,
-                product_locale: "zh-CN".to_string(),
-                workspace_root_path: None,
-                command: None,
-            },
-            prompt: "完成全部计划".to_string(),
-            knowledge_context_prompt: None,
-            tools: None,
-            persist_session_state: None,
-            live_settings_store: None,
-        })
-        .expect("plan turn should complete");
-
-        assert_eq!(output.final_content, "全部计划完成");
-        assert_eq!(client.calls.load(Ordering::SeqCst), 40);
-        let requests = client.requests.lock().expect("request log lock");
-        let last_messages = requests[39]
-            .messages
-            .as_ref()
-            .expect("follow-up request should include messages");
-        assert!(last_messages.iter().any(|message| {
-            message.role == "user"
-                && message
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| content.contains("当前执行计划仍未完成"))
-        }));
-        assert!(!plan_store.requires_execution_follow_up());
     }
 
     #[test]
@@ -4920,11 +3766,7 @@ mod tests {
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request: SessionTurnExecutionRequest {
                 session_id,
                 turn_id: ordinary_turn_id,
@@ -4932,22 +3774,15 @@ mod tests {
                 prompt: "执行普通任务".to_string(),
                 images: Vec::new(),
                 context_references: Vec::new(),
-                use_tools: false,
                 access_profile: AccessProfile::Restricted,
                 skill_name: None,
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,
-                forced_tool_name: None,
-                required_tool_chain: Vec::new(),
-                goal_turn_mode: SessionGoalTurnMode::None,
-                product_locale: "zh-CN".to_string(),
-                workspace_root_path: None,
                 command: None,
             },
             prompt: "执行普通任务".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         })
@@ -5034,214 +3869,6 @@ mod tests {
     }
 
     #[test]
-    fn forced_tool_choice_only_applies_to_available_first_round_tool() {
-        let request = SessionTurnExecutionRequest {
-            session_id: SessionId::new("session-force-tool-choice"),
-            turn_id: "turn-force-tool-choice".to_string(),
-            workspace_id: None,
-            prompt: "画一个流程图".to_string(),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: true,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: Some("diagram_render".to_string()),
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
-            command: None,
-        };
-        let tools = vec![ChatToolDefinition {
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunctionDefinition {
-                name: "diagram_render".to_string(),
-                description: "render diagram".to_string(),
-                parameters: serde_json::json!({ "type": "object" }),
-            },
-            origin: magi_bridge_client::ChatToolOrigin::Builtin,
-        }];
-
-        let choice = forced_tool_choice_for_round(
-            &request,
-            &request.required_tool_chain,
-            Some(&tools),
-            0,
-            &[],
-        )
-        .expect("first round should force diagram_render");
-        assert_eq!(choice.function.name, "diagram_render");
-        assert!(
-            forced_tool_choice_for_round(
-                &request,
-                &request.required_tool_chain,
-                Some(&tools),
-                1,
-                &[]
-            )
-            .is_none()
-        );
-
-        let mut unavailable_request = request;
-        unavailable_request.forced_tool_name = Some("missing_tool".to_string());
-        assert!(
-            forced_tool_choice_for_round(
-                &unavailable_request,
-                &unavailable_request.required_tool_chain,
-                Some(&tools),
-                0,
-                &[],
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn forced_tool_is_recovered_when_provider_only_supports_automatic_choice() {
-        let request = SessionTurnExecutionRequest {
-            session_id: SessionId::new("session-forced-tool-recovery"),
-            turn_id: "turn-forced-tool-recovery".to_string(),
-            workspace_id: None,
-            prompt: "生成一张图片".to_string(),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: true,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: Some("image_generate".to_string()),
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
-            command: None,
-        };
-
-        assert_eq!(
-            session_required_tool_chain(&request, false, false),
-            vec!["image_generate".to_string()]
-        );
-    }
-
-    #[test]
-    fn goal_turn_required_tool_chain_is_lifecycle_ordered() {
-        let request = SessionTurnExecutionRequest {
-            session_id: SessionId::new("session-goal-lifecycle-order"),
-            turn_id: "turn-goal-lifecycle-order".to_string(),
-            workspace_id: None,
-            prompt: "推进目标".to_string(),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: true,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: vec![
-                "create_goal".to_string(),
-                "shell_exec".to_string(),
-                "update_plan".to_string(),
-            ],
-            goal_turn_mode: SessionGoalTurnMode::Start,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
-            command: None,
-        };
-
-        assert_eq!(
-            session_required_tool_chain(&request, true, false),
-            ["get_goal", "create_goal", "update_plan", "shell_exec"]
-        );
-
-        let continuation = SessionTurnExecutionRequest {
-            goal_turn_mode: SessionGoalTurnMode::Continuation,
-            ..request
-        };
-        assert_eq!(
-            session_required_tool_chain(&continuation, false, false),
-            ["get_goal", "update_plan", "shell_exec"]
-        );
-    }
-
-    #[test]
-    fn required_tool_chain_uses_recovery_without_provider_specific_forcing() {
-        let request = SessionTurnExecutionRequest {
-            session_id: SessionId::new("session-required-tool-chain"),
-            turn_id: "turn-required-tool-chain".to_string(),
-            workspace_id: None,
-            prompt: "依次调用 shell_exec、file_write、file_read".to_string(),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: true,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: vec![
-                "shell_exec".to_string(),
-                "file_write".to_string(),
-                "file_read".to_string(),
-            ],
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
-            command: None,
-        };
-        let tools = ["shell_exec", "file_write", "file_read"]
-            .into_iter()
-            .map(|name| ChatToolDefinition {
-                kind: "function".to_string(),
-                function: magi_bridge_client::ChatToolFunctionDefinition {
-                    name: name.to_string(),
-                    description: format!("{name} tool"),
-                    parameters: serde_json::json!({ "type": "object" }),
-                },
-                origin: magi_bridge_client::ChatToolOrigin::Builtin,
-            })
-            .collect::<Vec<_>>();
-
-        assert!(
-            forced_tool_choice_for_round(
-                &request,
-                &request.required_tool_chain,
-                Some(&tools),
-                0,
-                &[],
-            )
-            .is_none()
-        );
-        assert!(
-            forced_tool_choice_for_round(
-                &request,
-                &request.required_tool_chain,
-                Some(&tools),
-                1,
-                &["shell_exec".to_string()],
-            )
-            .is_none()
-        );
-        assert!(
-            forced_tool_choice_for_round(
-                &request,
-                &request.required_tool_chain,
-                Some(&tools),
-                2,
-                &["shell_exec".to_string(), "file_write".to_string()],
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
     fn runtime_invalid_state_pauses_active_plan() {
         let session_id = SessionId::new("session-runtime-invalid-state");
         let store = Arc::new(SessionStore::new());
@@ -5296,11 +3923,7 @@ mod tests {
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request: SessionTurnExecutionRequest {
                 session_id: session_id.clone(),
                 turn_id: "turn-runtime-invalid-state".to_string(),
@@ -5308,22 +3931,15 @@ mod tests {
                 prompt: "继续处理".to_string(),
                 images: Vec::new(),
                 context_references: Vec::new(),
-                use_tools: false,
                 access_profile: AccessProfile::Restricted,
                 skill_name: None,
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,
-                forced_tool_name: None,
-                required_tool_chain: Vec::new(),
-                goal_turn_mode: SessionGoalTurnMode::None,
-                product_locale: "zh-CN".to_string(),
-                workspace_root_path: None,
                 command: None,
             },
             prompt: "继续处理".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         });
@@ -5400,17 +4016,11 @@ mod tests {
             prompt: "请回复一句话".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -5422,15 +4032,10 @@ mod tests {
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request,
             prompt: "请回复一句话".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         }) {
@@ -5481,148 +4086,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_invalid_shell_call_stops_without_creating_tool_cards() {
-        let session_id = SessionId::new("session-invalid-shell-call");
-        let store = Arc::new(SessionStore::new());
-        store
-            .create_session(session_id.clone(), "invalid shell call")
-            .expect("session should be creatable");
-        let (_mission_id, orchestrator_thread_id) =
-            store.ensure_session_mission(&session_id, ts(910), || {
-                magi_core::MissionId::new("mission-invalid-shell-call")
-            });
-        let conversation_registry = Arc::new(ConversationRegistry::new());
-        seed_conversation_turn(
-            store.as_ref(),
-            &session_id,
-            conversation_registry.turn_coordinator(),
-            ActiveExecutionTurn {
-                turn_id: "turn-invalid-shell-call".to_string(),
-                turn_seq: 1,
-                accepted_at: ts(1_000),
-                completed_at: None,
-                status: "running".to_string(),
-                user_message: Some("检查项目".to_string()),
-                items: vec![session_turn_item(
-                    "user_message",
-                    "completed",
-                    None,
-                    Some("检查项目".to_string()),
-                    Some("user-invalid-shell-call".to_string()),
-                    orchestrator_thread_id,
-                )],
-            },
-        );
-        let client = RepeatedInvalidShellModelBridgeClient {
-            calls: AtomicUsize::new(0),
-            requests: Mutex::new(Vec::new()),
-        };
-        let event_bus = InMemoryEventBus::new(16);
-        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
-        let request = SessionTurnExecutionRequest {
-            session_id: session_id.clone(),
-            turn_id: "turn-invalid-shell-call".to_string(),
-            workspace_id: None,
-            prompt: "检查项目".to_string(),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: true,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
-            command: None,
-        };
-        let tools = vec![ChatToolDefinition {
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunctionDefinition {
-                name: "shell_exec".to_string(),
-                description: "执行 Shell 命令".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": []
-                }),
-            },
-            origin: magi_bridge_client::ChatToolOrigin::Builtin,
-        }];
-
-        let error = match run_session_turn_execution_for_test(SessionTurnExecutionRuntime {
-            client: &client,
-            event_bus: &event_bus,
-            session_store: store.as_ref(),
-            conversation_registry: conversation_registry.as_ref(),
-            plan_store: &plan_store,
-            settings_store: None,
-            safety_gate: None,
-            tool_registry: None,
-            skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
-            request,
-            prompt: "检查项目".to_string(),
-            knowledge_context_prompt: None,
-            tools: Some(tools),
-            persist_session_state: None,
-            live_settings_store: None,
-        }) {
-            Ok(_) => panic!("repeated invalid shell call should fail the turn"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error.reason,
-            SessionTurnFailureReason::ToolCallProtocolFailed
-        );
-        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
-        let requests = client.requests.lock().expect("requests mutex poisoned");
-        let second_messages = requests[1]
-            .messages
-            .as_ref()
-            .expect("messages should exist");
-        assert!(second_messages.iter().any(|message| {
-            message.role == "tool"
-                && message.content.as_deref().is_some_and(|content| {
-                    content.contains("tool-call-validation.v1") && content.contains("command")
-                })
-        }));
-        let turn = store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("failed turn should remain visible");
-        assert_eq!(turn.status, "failed");
-        assert!(
-            turn.items.iter().all(|item| {
-                item.kind != "tool_call_started" && item.kind != "tool_call_result"
-            })
-        );
-        let error_item = turn
-            .items
-            .iter()
-            .find(|item| item.kind == "assistant_error")
-            .expect("tool call validation failure should be visible");
-        assert_eq!(
-            error_item.metadata["toolCallFailure"]["code"],
-            "tool_arguments_invalid"
-        );
-        assert_eq!(
-            error_item.metadata["toolCallFailure"]["toolName"],
-            "shell_exec"
-        );
-        assert_eq!(
-            error_item.metadata["toolCallFailure"]["argumentsPreview"],
-            r#"{"command":" "}"#
-        );
-    }
-
-    #[test]
     fn session_turn_retries_empty_stream_before_output() {
         let session_id = SessionId::new("session-empty-stream-recovery");
         let store = Arc::new(SessionStore::new());
@@ -5667,17 +4130,11 @@ mod tests {
             prompt: "请回复一句话".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -5689,15 +4146,10 @@ mod tests {
             plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request,
             prompt: "请回复一句话".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         })
@@ -5764,17 +4216,11 @@ mod tests {
             prompt: "请输出长回复".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -5786,15 +4232,10 @@ mod tests {
             plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request,
             prompt: "请输出长回复".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         }) {
@@ -5886,17 +4327,11 @@ mod tests {
             prompt: "请输出完整回复".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -5908,15 +4343,10 @@ mod tests {
             plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request,
             prompt: "请输出完整回复".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         })
@@ -6000,17 +4430,11 @@ mod tests {
                     .expect("image should parse"),
             ],
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -6022,15 +4446,10 @@ mod tests {
             plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
-            tool_registry: None,
             skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
             request,
             prompt: "请识别这张图片".to_string(),
             knowledge_context_prompt: None,
-            tools: None,
             persist_session_state: None,
             live_settings_store: None,
         }) {
@@ -6067,7 +4486,7 @@ mod tests {
         store
             .create_session(session_id.clone(), "placeholder reuse")
             .expect("session should be creatable");
-        let (mission_id, orchestrator_thread_id) =
+        let (_, orchestrator_thread_id) =
             store.ensure_session_mission(&session_id, ts(900), || {
                 magi_core::MissionId::new("mission-placeholder-reuse")
             });
@@ -6107,17 +4526,11 @@ mod tests {
             prompt: "请只回复一句话".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: Some("request-placeholder-reuse".to_string()),
             user_message_id: Some("user-placeholder-reuse".to_string()),
             placeholder_message_id: Some("assistant-placeholder-reuse".to_string()),
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
@@ -6129,41 +4542,24 @@ mod tests {
             tool_call_id: None,
             provider_context: Vec::new(),
         }];
-        let mut tool_execution_ledger = ToolExecutionLedger::default();
 
-        let output = stream_session_turn_round(
-            SessionTurnRoundRuntime {
-                client: &client,
-                event_bus: &event_bus,
-                session_store: &store,
-                tool_approval_registry: &crate::ToolApprovalRegistry::default(),
-                plan_store: &crate::test_plan_store("test-plan"),
-                settings_store: None,
-                safety_gate: None,
-                request: &request,
-                usage_binding: &usage_binding,
-                prompt: &request.prompt,
-                tools: None,
-                browser_capability_snapshot: None,
-                messages: &mut messages,
-                completed_required_tool_names: &[],
-                required_tool_chain: &[],
-                pre_output_invocation_recovery_attempts: 0,
-                stream_interruption_recovery_attempts: 0,
-                snapshot_manager: None,
-                round: 0,
-                context_window_tokens: 256_000,
-                orchestrator_thread_id: &orchestrator_thread_id,
-                orchestrator_mission_id: &mission_id,
-                persist_session_state: None,
-                tool_execution_ledger: &mut tool_execution_ledger,
-                web_engine: false,
-            },
-            None,
-            None,
-            None,
-            None,
-        )
+        let output = stream_session_turn_round(SessionTurnRoundRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            settings_store: None,
+            request: &request,
+            usage_binding: &usage_binding,
+            prompt: &request.prompt,
+            messages: &mut messages,
+            pre_output_invocation_recovery_attempts: 0,
+            stream_interruption_recovery_attempts: 0,
+            round: 0,
+            context_window_tokens: 256_000,
+            orchestrator_thread_id: &orchestrator_thread_id,
+            persist_session_state: None,
+            web_engine: false,
+        })
         .expect("round should stream");
 
         assert_eq!(
@@ -6214,7 +4610,7 @@ mod tests {
         store
             .create_session(session_id.clone(), "model retry runtime")
             .expect("session should be creatable");
-        let (mission_id, orchestrator_thread_id) =
+        let (_, orchestrator_thread_id) =
             store.ensure_session_mission(&session_id, ts(900), || {
                 magi_core::MissionId::new("mission-model-retry-runtime")
             });
@@ -6248,17 +4644,11 @@ mod tests {
             prompt: "请继续".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: Some("assistant-model-retry-runtime".to_string()),
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
@@ -6270,41 +4660,24 @@ mod tests {
             tool_call_id: None,
             provider_context: Vec::new(),
         }];
-        let mut tool_execution_ledger = ToolExecutionLedger::default();
 
-        stream_session_turn_round(
-            SessionTurnRoundRuntime {
-                client: &RetryEventModelBridgeClient,
-                event_bus: &event_bus,
-                session_store: &store,
-                tool_approval_registry: &crate::ToolApprovalRegistry::default(),
-                plan_store: &crate::test_plan_store("test-plan"),
-                settings_store: None,
-                safety_gate: None,
-                request: &request,
-                usage_binding: &usage_binding,
-                prompt: &request.prompt,
-                tools: None,
-                browser_capability_snapshot: None,
-                messages: &mut messages,
-                completed_required_tool_names: &[],
-                required_tool_chain: &[],
-                pre_output_invocation_recovery_attempts: 0,
-                stream_interruption_recovery_attempts: 0,
-                snapshot_manager: None,
-                round: 0,
-                context_window_tokens: 256_000,
-                orchestrator_thread_id: &orchestrator_thread_id,
-                orchestrator_mission_id: &mission_id,
-                persist_session_state: None,
-                tool_execution_ledger: &mut tool_execution_ledger,
-                web_engine: false,
-            },
-            None,
-            None,
-            None,
-            None,
-        )
+        stream_session_turn_round(SessionTurnRoundRuntime {
+            client: &RetryEventModelBridgeClient,
+            event_bus: &event_bus,
+            session_store: &store,
+            settings_store: None,
+            request: &request,
+            usage_binding: &usage_binding,
+            prompt: &request.prompt,
+            messages: &mut messages,
+            pre_output_invocation_recovery_attempts: 0,
+            stream_interruption_recovery_attempts: 0,
+            round: 0,
+            context_window_tokens: 256_000,
+            orchestrator_thread_id: &orchestrator_thread_id,
+            persist_session_state: None,
+            web_engine: false,
+        })
         .expect("round should complete after retry");
 
         let retry_events = event_bus
@@ -6475,17 +4848,11 @@ mod tests {
             prompt: "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let history = canonical_session_turn_history(&store, &request);
@@ -6896,17 +5263,11 @@ mod tests {
             prompt: "只回复停止后恢复正常".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -7054,17 +5415,11 @@ mod tests {
             prompt: "最早的上下文标记是什么？".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -7078,72 +5433,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|content| content.contains("银杏-7429-海盐"))
         }));
-    }
-
-    #[test]
-    fn build_session_turn_messages_injects_workspace_context() {
-        let session_id = SessionId::new("session-workspace-context");
-        let store = SessionStore::new();
-        store
-            .create_session(session_id.clone(), "workspace context")
-            .expect("session should be created");
-        let coordinator = SessionTurnCoordinator::new();
-        seed_conversation_turn(
-            &store,
-            &session_id,
-            &coordinator,
-            ActiveExecutionTurn {
-                turn_id: "turn-workspace-context".to_string(),
-                turn_seq: 1,
-                accepted_at: ts(1000),
-                completed_at: None,
-                status: "running".to_string(),
-                user_message: Some("分析一下当前项目".to_string()),
-                items: Vec::new(),
-            },
-        );
-        let request = SessionTurnExecutionRequest {
-            session_id,
-            turn_id: "turn-workspace-context".to_string(),
-            workspace_id: Some(WorkspaceId::new("workspace-context")),
-            prompt: "分析一下当前项目".to_string(),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: true,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: Some("/tmp/current-project".to_string()),
-            command: None,
-        };
-
-        let history = canonical_session_turn_history(&store, &request);
-        let messages =
-            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
-
-        assert_eq!(messages[0].role, "developer");
-        let context = messages[0].content.as_deref().unwrap_or_default();
-        assert!(context.contains("/tmp/current-project"));
-        assert!(context.contains("不要要求用户手动粘贴项目结构"));
-        assert_eq!(
-            messages
-                .last()
-                .and_then(|message| message.content.as_deref()),
-            Some("分析一下当前项目")
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.content.as_deref().is_some_and(|content| {
-                    content.contains("上下文优先级") && content.contains("ProjectMemory")
-                }))
-        );
     }
 
     #[test]
@@ -7161,20 +5450,14 @@ mod tests {
             images: Vec::new(),
             context_references: vec![crate::context_reference::SessionContextReference {
                 kind: crate::context_reference::SessionContextReferenceKind::Directory,
-                path: PathBuf::from("/tmp/external-reference"),
+                path: std::path::PathBuf::from("/tmp/external-reference"),
                 name: "external-reference".to_string(),
             }],
-            use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: Some("/tmp/current-project".to_string()),
             command: None,
         };
 
@@ -7210,17 +5493,11 @@ mod tests {
             prompt: "为什么采用单一事实源架构？".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: Some("/tmp/current-project".to_string()),
             command: None,
         };
 
@@ -7288,17 +5565,11 @@ mod tests {
                     .expect("image should parse"),
             ],
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -7315,7 +5586,7 @@ mod tests {
     }
 
     #[test]
-    fn build_session_turn_messages_does_not_inject_workspace_context_without_tools() {
+    fn build_session_turn_messages_only_contains_conversation_fragments() {
         let session_id = SessionId::new("session-workspace-chat");
         let store = SessionStore::new();
         store
@@ -7343,17 +5614,11 @@ mod tests {
             prompt: "解释一下当前状态".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: Some("/tmp/current-project".to_string()),
             command: None,
         };
 
@@ -7375,36 +5640,7 @@ mod tests {
                     .as_deref()
                     .is_some_and(|content| content.contains("上下文优先级"))
         }));
-        assert!(
-            !messages[0]
-                .content
-                .as_deref()
-                .unwrap_or_default()
-                .contains("/tmp/current-project")
-        );
         assert_eq!(messages[3].content.as_deref(), Some("解释一下当前状态"));
-
-        let goal_request = SessionTurnExecutionRequest {
-            goal_turn_mode: SessionGoalTurnMode::Start,
-            ..request
-        };
-        let goal_history = canonical_session_turn_history(&store, &goal_request);
-        let goal_messages = build_session_turn_messages(
-            &store,
-            &goal_request,
-            &goal_request.prompt,
-            None,
-            &goal_history,
-        );
-        assert!(
-            goal_messages.iter().any(|message| {
-                message.role == "developer"
-                    && message.content.as_deref().is_some_and(|content| {
-                        content.contains("计划语言规则") && content.contains("locale=zh-CN")
-                    })
-            }),
-            "目标模式才应注入计划语言规则"
-        );
     }
 
     #[test]
@@ -7441,17 +5677,11 @@ mod tests {
             prompt: "请调用工具后回答".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: Some("request-post-tool-final-item".to_string()),
             user_message_id: Some("user-post-tool-final-item".to_string()),
             placeholder_message_id: Some("placeholder-post-tool-final-item".to_string()),
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 
@@ -7611,17 +5841,11 @@ mod tests {
             prompt: "继续对话".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let item_id = new_context_compaction_item_id(&request.turn_id, &thread_id, "pre_turn");
@@ -7790,17 +6014,11 @@ mod tests {
             prompt: "继续".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let client = SemanticContextCompactionModelBridgeClient {
@@ -7819,10 +6037,7 @@ mod tests {
             messages: &mut messages,
             persist_session_state: None,
             settings_store: None,
-            tools: None,
             skill_runtime: None,
-            initial_skill_name: None,
-            active_skill_name: None,
             persist_checkpoint: true,
         });
 
@@ -7899,17 +6114,11 @@ mod tests {
             prompt: "继续".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let client = FailingContextCompactionModelBridgeClient {
@@ -7930,10 +6139,7 @@ mod tests {
             messages: &mut messages,
             persist_session_state: None,
             settings_store: None,
-            tools: None,
             skill_runtime: None,
-            initial_skill_name: None,
-            active_skill_name: None,
             persist_checkpoint: true,
         });
 
@@ -8006,17 +6212,11 @@ mod tests {
             prompt: "继续".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
         let client = CancellingContextCompactionModelBridgeClient {
@@ -8038,10 +6238,7 @@ mod tests {
             messages: &mut messages,
             persist_session_state: None,
             settings_store: None,
-            tools: None,
             skill_runtime: None,
-            initial_skill_name: None,
-            active_skill_name: None,
             persist_checkpoint: true,
         });
 
@@ -8101,17 +6298,11 @@ mod tests {
             prompt: "请回答".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
             request_id: Some("request-terminal-duration".to_string()),
             user_message_id: Some("user-terminal-duration".to_string()),
             placeholder_message_id: Some("placeholder-terminal-duration".to_string()),
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         };
 

@@ -1254,7 +1254,7 @@ impl LlmTaskDispatcher {
 
     fn build_tool_definitions(
         &self,
-        task: Option<&magi_core::Task>,
+        task: &magi_core::Task,
         skill_name: Option<&str>,
         access_profile: AccessProfile,
         workspace_id: Option<&WorkspaceId>,
@@ -1277,7 +1277,7 @@ impl LlmTaskDispatcher {
                 .insert(cache_key, definitions.clone());
             definitions
         };
-        let task_policy = task.and_then(|task| task.policy_snapshot.as_ref());
+        let task_policy = task.policy_snapshot.as_ref();
         let Some(registry) = self.tool_registry.as_ref() else {
             return definitions;
         };
@@ -1299,7 +1299,7 @@ impl LlmTaskDispatcher {
 
     fn build_base_tool_definitions(
         &self,
-        task: Option<&magi_core::Task>,
+        task: &magi_core::Task,
         skill_name: Option<&str>,
         access_profile: AccessProfile,
         workspace_id: Option<&WorkspaceId>,
@@ -1308,13 +1308,14 @@ impl LlmTaskDispatcher {
             return Vec::new();
         };
         if task
-            .and_then(|task| task.policy_snapshot.as_ref())
+            .policy_snapshot
+            .as_ref()
             .is_some_and(|policy| policy.command_mode.eq_ignore_ascii_case("no_tools"))
         {
             return Vec::new();
         }
         let tool_surface_access_profile = tool_surface_access_profile(task, access_profile);
-        let registry = if let Some(policy) = task.and_then(|task| task.policy_snapshot.as_ref()) {
+        let registry = if let Some(policy) = task.policy_snapshot.as_ref() {
             registry.filtered_clone(&policy.allowed_tools, &policy.denied_tools)
         } else {
             registry.clone()
@@ -1333,11 +1334,10 @@ impl LlmTaskDispatcher {
                     BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
                         |tool| {
                             task_can_see_builtin_tool(
-                                task,
+                                Some(task),
                                 Some(self.agent_role_registry.as_ref()),
                                 tool,
-                            ) && (task.is_some() || session_turn_can_execute_builtin_tool(tool))
-                                && (workspace_id.is_some() || !tool.requires_workspace_context())
+                            ) && (workspace_id.is_some() || !tool.requires_workspace_context())
                                 && builtin_tool_visible_in_access_profile(
                                     tool,
                                     tool_surface_access_profile,
@@ -1375,101 +1375,26 @@ impl LlmTaskDispatcher {
         }
         definitions
     }
-
-    fn build_session_turn_tool_definitions(
-        &self,
-        skill_name: Option<&str>,
-        access_profile: AccessProfile,
-        goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode,
-        workspace_id: Option<&WorkspaceId>,
-    ) -> Vec<ChatToolDefinition> {
-        let mut definitions =
-            self.build_tool_definitions(None, skill_name, access_profile, workspace_id);
-        if goal_turn_mode.is_goal_driven()
-            && let Some(registry) = self.tool_registry.as_ref()
-        {
-            for definition in
-                public_builtin_tool_definitions(registry, self.agent_role_registry.as_ref())
-                    .into_iter()
-                    .filter(|definition| {
-                        BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
-                            |tool| {
-                                is_session_goal_tool(tool)
-                                    && task_can_see_builtin_tool(
-                                        None,
-                                        Some(self.agent_role_registry.as_ref()),
-                                        tool,
-                                    )
-                                    && builtin_tool_visible_in_access_profile(tool, access_profile)
-                            },
-                        )
-                    })
-            {
-                if definitions
-                    .iter()
-                    .all(|existing| existing.function.name != definition.function.name)
-                {
-                    definitions.push(definition);
-                }
-            }
-        }
-        session_goal_tool_surface(definitions, goal_turn_mode)
-    }
-}
-
-fn is_session_goal_tool(tool: BuiltinToolName) -> bool {
-    matches!(
-        tool,
-        BuiltinToolName::GetGoal
-            | BuiltinToolName::CreateGoal
-            | BuiltinToolName::UpdateGoal
-            | BuiltinToolName::UpdatePlan
-    )
-}
-
-fn session_turn_can_execute_builtin_tool(tool: BuiltinToolName) -> bool {
-    !tool.is_runtime_internal_tool_call()
-        || matches!(
-            tool,
-            BuiltinToolName::GetGoal
-                | BuiltinToolName::CreateGoal
-                | BuiltinToolName::UpdateGoal
-                | BuiltinToolName::UpdatePlan
-        )
 }
 
 fn tool_definition_cache_key(
-    task: Option<&magi_core::Task>,
+    task: &magi_core::Task,
     skill_name: Option<&str>,
     access_profile: AccessProfile,
     workspace_id: Option<&WorkspaceId>,
 ) -> String {
-    let (task_kind, role_id, allowed_tools, denied_tools, command_mode) = task
-        .map(|task| {
-            let policy = task.policy_snapshot.as_ref();
-            (
-                format!("{:?}", task.kind),
-                task_role_id(Some(task)).map(ToString::to_string),
-                policy
-                    .map(|policy| policy.allowed_tools.clone())
-                    .unwrap_or_default(),
-                policy
-                    .map(|policy| policy.denied_tools.clone())
-                    .unwrap_or_default(),
-                policy
-                    .map(|policy| policy.command_mode.clone())
-                    .unwrap_or_default(),
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                "session".to_string(),
-                None,
-                Vec::new(),
-                Vec::new(),
-                String::new(),
-            )
-        });
+    let policy = task.policy_snapshot.as_ref();
+    let task_kind = format!("{:?}", task.kind);
+    let role_id = task_role_id(Some(task)).map(ToString::to_string);
+    let allowed_tools = policy
+        .map(|policy| policy.allowed_tools.clone())
+        .unwrap_or_default();
+    let denied_tools = policy
+        .map(|policy| policy.denied_tools.clone())
+        .unwrap_or_default();
+    let command_mode = policy
+        .map(|policy| policy.command_mode.clone())
+        .unwrap_or_default();
     serde_json::json!({
         "task_kind": task_kind,
         "role_id": role_id,
@@ -1547,10 +1472,10 @@ where
 }
 
 fn tool_surface_access_profile(
-    task: Option<&magi_core::Task>,
+    task: &magi_core::Task,
     access_profile: AccessProfile,
 ) -> AccessProfile {
-    let Some(policy) = task.and_then(|task| task.policy_snapshot.as_ref()) else {
+    let Some(policy) = task.policy_snapshot.as_ref() else {
         return access_profile;
     };
     policy.effective_access_profile()
@@ -2457,25 +2382,11 @@ impl LlmTaskDispatcher {
                     model_failure: Some(Box::new(
                         crate::model_error::ModelFailureDiagnostic::configuration_unavailable(),
                     )),
-                    tool_call_failure: None,
                 });
             }
         };
 
-        let active_skill_name = self.resolve_registered_skill_id(request.skill_name.as_deref());
         let prompt = request.prompt.clone();
-
-        let tools = if request.use_tools {
-            let tool_defs = self.build_session_turn_tool_definitions(
-                active_skill_name.as_deref(),
-                request.access_profile,
-                request.goal_turn_mode,
-                request.workspace_id.as_ref(),
-            );
-            (!tool_defs.is_empty()).then_some(tool_defs)
-        } else {
-            None
-        };
         let safety_gate = self.build_safety_gate(execution_settings);
         let knowledge_context_prompt = self.context_runtime.as_ref().and_then(|runtime| {
             let selection = runtime.select_knowledge_on_demand(KnowledgeContextRequest {
@@ -2507,15 +2418,10 @@ impl LlmTaskDispatcher {
             plan_store: &plan_store,
             settings_store: execution_settings,
             safety_gate: safety_gate.as_ref(),
-            tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
-            skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
-            skill_name: active_skill_name,
-            snapshot_manager: self.snapshot_manager.as_ref(),
             request,
             prompt,
             knowledge_context_prompt,
-            tools,
             persist_session_state: self.session_state_persist_callback.as_deref(),
             live_settings_store: self.settings_store.clone(),
         })
@@ -2616,7 +2522,7 @@ impl LlmTaskDispatcher {
                 .map(magi_core::TaskPolicy::effective_access_profile)
                 .unwrap_or_default();
             let tool_defs = self.build_tool_definitions(
-                Some(&execution_task),
+                &execution_task,
                 skill_name.as_deref(),
                 access_profile,
                 workspace_id.as_ref(),
@@ -2827,16 +2733,6 @@ impl LlmTaskDispatcher {
 
         Ok(())
     }
-}
-
-fn session_goal_tool_surface(
-    mut definitions: Vec<ChatToolDefinition>,
-    goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode,
-) -> Vec<ChatToolDefinition> {
-    if !goal_turn_mode.allows_goal_creation() {
-        definitions.retain(|definition| definition.function.name != "create_goal");
-    }
-    definitions
 }
 
 fn recent_turn_source_label(source: RecentTurnSource) -> &'static str {
@@ -4109,17 +4005,11 @@ mod tests {
             prompt: "继续执行".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
-            use_tools: true,
             access_profile: magi_core::AccessProfile::Restricted,
             skill_name: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
             command: None,
         });
 
@@ -4667,7 +4557,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                Some(&task),
+                &task,
                 None,
                 magi_core::AccessProfile::Restricted,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -4716,7 +4606,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                Some(&task),
+                &task,
                 None,
                 magi_core::AccessProfile::FullAccess,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -4735,7 +4625,7 @@ mod tests {
         let dispatcher = dispatcher_with_default_tool_surface();
         let task = task_with_role("coordinator", TaskTier::ExecutionChain);
         let definitions = dispatcher.build_tool_definitions(
-            Some(&task),
+            &task,
             None,
             magi_core::AccessProfile::Restricted,
             Some(&WorkspaceId::new("test-workspace")),
@@ -4772,7 +4662,7 @@ mod tests {
                 .access_profile = access_profile;
             let coordinator_names = dispatcher
                 .build_tool_definitions(
-                    Some(&coordinator),
+                    &coordinator,
                     None,
                     access_profile,
                     Some(&WorkspaceId::new("test-workspace")),
@@ -4793,7 +4683,7 @@ mod tests {
                 .access_profile = access_profile;
             let worker_names = dispatcher
                 .build_tool_definitions(
-                    Some(&worker),
+                    &worker,
                     None,
                     access_profile,
                     Some(&WorkspaceId::new("test-workspace")),
@@ -4821,7 +4711,7 @@ mod tests {
         let worker = task_with_role("executor", TaskTier::ExecutionChain);
         let names = dispatcher
             .build_tool_definitions(
-                Some(&worker),
+                &worker,
                 None,
                 magi_core::AccessProfile::Restricted,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -4854,12 +4744,7 @@ mod tests {
         let dispatcher = dispatcher_with_ready_browser_tool_surface();
         let task = task_with_role("executor", TaskTier::ExecutionChain);
         let names = dispatcher
-            .build_tool_definitions(
-                Some(&task),
-                None,
-                magi_core::AccessProfile::Restricted,
-                None,
-            )
+            .build_tool_definitions(&task, None, magi_core::AccessProfile::Restricted, None)
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -4877,134 +4762,6 @@ mod tests {
     }
 
     #[test]
-    fn read_only_session_tool_surface_hides_write_tools_without_task_policy() {
-        let dispatcher = dispatcher_with_default_tool_surface();
-
-        let names = dispatcher
-            .build_tool_definitions(
-                None,
-                None,
-                magi_core::AccessProfile::ReadOnly,
-                Some(&WorkspaceId::new("test-workspace")),
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-
-        assert!(names.iter().any(|name| name == "file_read"));
-        assert!(names.iter().any(|name| name == "shell_exec"));
-        assert!(!names.iter().any(|name| name == "file_write"));
-        assert!(!names.iter().any(|name| name == "apply_patch"));
-        assert!(!names.iter().any(|name| name == "memory_write"));
-        for internal in ["get_goal", "create_goal", "update_goal", "update_plan"] {
-            assert!(
-                names.iter().any(|name| name == internal),
-                "只读主会话仍应能维护内部目标与任务清单 {internal}: {names:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn session_tool_surface_only_exposes_runtime_internal_tools_it_can_execute() {
-        let dispatcher = dispatcher_with_default_tool_surface();
-
-        let names = dispatcher
-            .build_tool_definitions(
-                None,
-                None,
-                magi_core::AccessProfile::Restricted,
-                Some(&WorkspaceId::new("test-workspace")),
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-
-        for expected in ["get_goal", "create_goal", "update_goal", "update_plan"] {
-            assert!(
-                names.iter().any(|name| name == expected),
-                "session 主线必须暴露可执行的内部工具 {expected}: {names:?}"
-            );
-        }
-        for hidden in ["agent_spawn", "agent_wait", "memory_write"] {
-            assert!(
-                !names.iter().any(|name| name == hidden),
-                "session 主线不能暴露当前执行入口不可达的内部工具 {hidden}: {names:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn session_turn_surface_hides_workspace_tools_without_workspace() {
-        let dispatcher = dispatcher_with_ready_browser_tool_surface();
-
-        let names = dispatcher
-            .build_session_turn_tool_definitions(
-                None,
-                magi_core::AccessProfile::Restricted,
-                crate::session_turn_execution::SessionGoalTurnMode::None,
-                None,
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-
-        for hidden in [
-            "file_read",
-            "shell_exec",
-            "git_status",
-            "search_text",
-            "process_inspect",
-        ] {
-            assert!(
-                !names.iter().any(|name| name == hidden),
-                "无 workspace 的 session turn 不能暴露 {hidden}: {names:?}"
-            );
-        }
-        assert!(
-            names.iter().any(|name| name == "browser_navigate"),
-            "无 workspace 的 session turn 必须保留 browser_navigate: {names:?}"
-        );
-        for expected in ["get_goal", "create_goal", "update_goal", "update_plan"] {
-            assert!(
-                names.iter().any(|name| name == expected),
-                "无 workspace 的 session turn 必须保留会话内部工具 {expected}: {names:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn goal_continuation_tool_surface_cannot_create_a_second_goal() {
-        let dispatcher = dispatcher_with_default_tool_surface();
-        let definitions = dispatcher.build_tool_definitions(
-            None,
-            None,
-            magi_core::AccessProfile::Restricted,
-            Some(&WorkspaceId::new("test-workspace")),
-        );
-
-        let continuation_names = session_goal_tool_surface(
-            definitions.clone(),
-            crate::session_turn_execution::SessionGoalTurnMode::Continuation,
-        )
-        .into_iter()
-        .map(|definition| definition.function.name)
-        .collect::<Vec<_>>();
-        assert!(!continuation_names.iter().any(|name| name == "create_goal"));
-        for expected in ["get_goal", "update_goal", "update_plan"] {
-            assert!(continuation_names.iter().any(|name| name == expected));
-        }
-
-        let start_names = session_goal_tool_surface(
-            definitions,
-            crate::session_turn_execution::SessionGoalTurnMode::Start,
-        )
-        .into_iter()
-        .map(|definition| definition.function.name)
-        .collect::<Vec<_>>();
-        assert!(start_names.iter().any(|name| name == "create_goal"));
-    }
-
-    #[test]
     fn read_only_command_mode_hides_write_tools_even_with_full_access_profile() {
         let dispatcher = dispatcher_with_default_tool_surface();
         let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
@@ -5014,7 +4771,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                Some(&task),
+                &task,
                 None,
                 magi_core::AccessProfile::FullAccess,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -5058,7 +4815,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                Some(&task),
+                &task,
                 Some("code-review"),
                 magi_core::AccessProfile::Restricted,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -5085,47 +4842,6 @@ mod tests {
     }
 
     #[test]
-    fn goal_mode_keeps_goal_tools_available_with_restrictive_active_skill() {
-        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
-            let registry = magi_skill_runtime::SkillRegistry::new();
-            registry.register(magi_skill_runtime::SkillDefinition {
-                skill_id: "goal-method".to_string(),
-                title: "目标执行方法".to_string(),
-                instruction: "按该方法推进目标。".to_string(),
-                metadata: magi_skill_runtime::SkillMetadata {
-                    category: "workflow".to_string(),
-                    tags: vec!["goal".to_string()],
-                },
-                restrict_standard_tools: true,
-                allowed_tools: vec![],
-                custom_tool_bindings: vec![],
-                prompt_priority: 50,
-            });
-            magi_skill_runtime::SkillRuntime::new(registry)
-        }));
-
-        let names = dispatcher
-            .build_session_turn_tool_definitions(
-                Some("goal-method"),
-                magi_core::AccessProfile::Restricted,
-                crate::session_turn_execution::SessionGoalTurnMode::Start,
-                None,
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-
-        for expected in ["get_goal", "create_goal", "update_goal", "update_plan"] {
-            assert!(
-                names.iter().any(|name| name == expected),
-                "Goal + Skill 联合引用必须保留目标生命周期工具 {expected}: {names:?}"
-            );
-        }
-        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
-        assert!(!names.iter().any(|name| name == "file_read"));
-    }
-
-    #[test]
     fn active_skill_is_injected_directly_without_reexposing_skill_apply() {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
@@ -5147,7 +4863,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                None,
+                &task_with_role("coordinator", TaskTier::ExecutionChain),
                 Some("direct-skill"),
                 magi_core::AccessProfile::Restricted,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -5191,7 +4907,7 @@ mod tests {
         dispatcher.tool_registry = Some(registry);
 
         let definitions = dispatcher.build_tool_definitions(
-            None,
+            &task_with_role("coordinator", TaskTier::ExecutionChain),
             None,
             magi_core::AccessProfile::Restricted,
             Some(&WorkspaceId::new("test-workspace")),
@@ -5248,7 +4964,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                None,
+                &task_with_role("coordinator", TaskTier::ExecutionChain),
                 Some("prompt-only"),
                 magi_core::AccessProfile::Restricted,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -5332,7 +5048,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                Some(&task),
+                &task,
                 Some("mixed-skill"),
                 magi_core::AccessProfile::ReadOnly,
                 Some(&WorkspaceId::new("test-workspace")),
@@ -5378,7 +5094,7 @@ mod tests {
 
         let names = dispatcher
             .build_tool_definitions(
-                Some(&task),
+                &task,
                 Some("read-only-skill"),
                 magi_core::AccessProfile::Restricted,
                 Some(&WorkspaceId::new("test-workspace")),
