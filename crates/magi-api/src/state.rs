@@ -3435,7 +3435,16 @@ impl ApiState {
             match fs::read(&path) {
                 Ok(bytes) => {
                     match serde_json::from_slice::<Vec<magi_git::SessionCodeContext>>(&bytes) {
-                        Ok(contexts) => self.session_code_contexts.replace_all(contexts),
+                        Ok(contexts) => {
+                            let released =
+                                self.session_code_contexts.restore_after_restart(contexts);
+                            if released > 0 {
+                                tracing::info!(
+                                    released,
+                                    "已释放上次运行遗留的子代理 worktree 占用标记"
+                                );
+                            }
+                        }
                         Err(error) => tracing::warn!(
                             path = %path.display(),
                             error = %error,

@@ -221,17 +221,32 @@ impl SessionCodeContextRegistry {
         contexts
     }
 
-    pub fn replace_all(&self, contexts: Vec<SessionCodeContext>) {
+    /// daemon 启动时载入持久化的上下文。上一个进程里的子代理不可能仍在运行，
+    /// 因此所有 worktree 的“占用中”标记都已失效：统一改为非占用并移出运行期工作区根，
+    /// 否则主线的 Git 写操作会以“仍有子代理在执行”为由被永久拒绝。目录与产出记录保留。
+    pub fn restore_after_restart(&self, contexts: Vec<SessionCodeContext>) -> usize {
+        let mut released = 0;
         let mut target = self
             .contexts
             .write()
             .expect("session code context write lock poisoned");
         target.clear();
-        target.extend(
-            contexts
-                .into_iter()
-                .map(|context| (context.session_id.clone(), context)),
-        );
+        for mut context in contexts {
+            for worktree in context
+                .agent_worktrees
+                .iter_mut()
+                .filter(|worktree| worktree.active)
+            {
+                worktree.active = false;
+                let path = worktree.path.clone();
+                context
+                    .runtime_workspace_roots
+                    .retain(|root| !same_path(root, &path));
+                released += 1;
+            }
+            target.insert(context.session_id.clone(), context);
+        }
+        released
     }
 
     pub fn remove(&self, session_id: &str) -> Option<SessionCodeContext> {
@@ -2391,6 +2406,51 @@ mod tests {
             "fn feature() {}\n"
         );
         assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn restore_after_restart_releases_stale_agent_worktree_occupancy() {
+        let repo = repository();
+        let service = GitService::new();
+        let observation = service.observe(repo.path()).await.expect("observe");
+        let registry = SessionCodeContextRegistry::default();
+        registry.accept("session-restart", "workspace-restart", vec![], &observation);
+        let agent_path = repo.path().join("agent-restart");
+        registry
+            .register_agent_worktree(
+                "session-restart",
+                AgentWorktreeContext {
+                    task_id: "task-running-before-restart".to_string(),
+                    lease_id: Some("lease-old-process".to_string()),
+                    worker_id: "worker-executor".to_string(),
+                    path: agent_path.clone(),
+                    mode: AgentWorktreeMode::Writable,
+                    base_head: observation.head.clone().expect("base head"),
+                    branch: Some("magi/agent/restart".to_string()),
+                    active: true,
+                    result_head: None,
+                    changed_paths: Vec::new(),
+                    applied: false,
+                },
+            )
+            .expect("register worktree");
+        let persisted = registry.all();
+        assert!(persisted[0].agent_worktrees[0].active);
+
+        let restored = SessionCodeContextRegistry::default();
+        assert_eq!(restored.restore_after_restart(persisted), 1);
+        let context = restored.get("session-restart").expect("context restored");
+        assert!(
+            !context.agent_worktrees[0].active,
+            "重启后不能再有占用中的 worktree"
+        );
+        assert!(
+            !context
+                .runtime_workspace_roots
+                .iter()
+                .any(|root| same_path(root, &agent_path))
+        );
+        assert_eq!(context.agent_worktrees[0].path, agent_path, "分配记录保留");
     }
 
     #[tokio::test]
