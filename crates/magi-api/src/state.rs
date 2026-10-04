@@ -1248,6 +1248,30 @@ impl WebModelProbeSnapshot {
     }
 }
 
+/// 在后台执行一段需要 session Turn 锁的异步工作。
+///
+/// TaskStore 状态回调可能运行在普通的提交后线程上，不能在没有 runtime 的线程里直接
+/// `tokio::spawn`：有 runtime 时挂到当前 runtime，否则在独立线程里驱动。
+pub(crate) fn spawn_session_turn_work(
+    thread_name: &str,
+    work: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(work);
+    } else if let Err(error) = std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("session turn work runtime should build");
+            runtime.block_on(work);
+        })
+    {
+        tracing::error!(?error, thread_name, "启动 session Turn 后台线程失败");
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub service_info: ServiceInfo,

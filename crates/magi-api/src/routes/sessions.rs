@@ -3794,23 +3794,7 @@ pub(crate) fn schedule_next_queued_regular_session_turn(
             schedule_goal_continuation_turn_if_idle(state, session_id, workspace_id).await;
         }
     };
-    // TaskStore status callbacks may run on a plain post-commit thread.  Do not
-    // call `tokio::spawn` without an entered runtime: terminal completion must
-    // remain safe when it is delivered outside an HTTP request task.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(work);
-    } else if let Err(error) = std::thread::Builder::new()
-        .name("magi-session-turn-queue".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("session turn queue runtime should build");
-            runtime.block_on(work);
-        })
-    {
-        tracing::error!(?error, "启动 session turn queue 调度线程失败");
-    }
+    crate::state::spawn_session_turn_work("magi-session-turn-queue", work);
 }
 
 pub(crate) fn record_active_goal_turn_success(

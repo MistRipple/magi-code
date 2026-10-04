@@ -2070,21 +2070,13 @@ impl DaemonRuntime {
                 TaskStatus::Killed => "killed",
                 _ => return,
             };
-            if let Err(error) = magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
-                &completion_state,
-                session_id,
-                &notification.root_task_id,
+            magi_api::task_turn_finalize::schedule_background_session_task_turn_finalize(
+                completion_state.clone(),
+                session_id.clone(),
+                notification.root_task_id.clone(),
                 runner_status,
-                Some(turn_id),
-            ) {
-                tracing::error!(
-                    %session_id,
-                    turn_id,
-                    root_task_id = %notification.root_task_id,
-                    %error,
-                    "主动 Task completion 通知未能收口 Session Turn"
-                );
-            }
+                turn_id.to_string(),
+            );
         });
 
         if let Some(probe_config) = direct_http_probe_config {

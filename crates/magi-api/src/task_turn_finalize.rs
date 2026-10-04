@@ -244,6 +244,53 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
     )
 }
 
+/// Task 完成通知的收口入口。
+///
+/// 收口与提交新消息、中断共用同一把 session Turn 锁：否则在 canonical Turn 已进入
+/// 终态、Coordinator 尚未释放占位的窗口里提交的新消息会被 409 拒绝而丢失。
+pub fn schedule_background_session_task_turn_finalize(
+    state: ApiState,
+    session_id: SessionId,
+    root_task_id: TaskId,
+    runner_status: &'static str,
+    turn_id: String,
+) {
+    crate::state::spawn_session_turn_work("magi-session-task-finalize", async move {
+        let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
+        let finalize_state = state.clone();
+        let finalize_session_id = session_id.clone();
+        let finalize_root_task_id = root_task_id.clone();
+        let finalize_turn_id = turn_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            finalize_background_session_task_turn_if_root_terminal_for_turn(
+                &finalize_state,
+                &finalize_session_id,
+                &finalize_root_task_id,
+                runner_status,
+                Some(&finalize_turn_id),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::error!(
+                %session_id,
+                turn_id,
+                root_task_id = %root_task_id,
+                %error,
+                "主动 Task completion 通知未能收口 Session Turn"
+            ),
+            Err(error) => tracing::error!(
+                %session_id,
+                turn_id,
+                root_task_id = %root_task_id,
+                ?error,
+                "Session Turn 收口线程异常退出"
+            ),
+        }
+    });
+}
+
 pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
     state: &ApiState,
     session_id: &SessionId,
