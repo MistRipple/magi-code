@@ -593,55 +593,20 @@ pub(crate) async fn submit_session_turn_internal(
         )?
     };
     let workspace_id = scope.workspace_id();
-    // canonical accepted 事实优先于进程内 Coordinator。这样 daemon 重启或响应在
-    // 网络层丢失后，同一个 requestId 仍返回原 Turn，而不会再次创建任务/执行链。
-    if let Some(request_id) = request.request_id()
-        && let Some(existing_turn) = state
-            .session_store
-            .canonical_turn_for_request_id(&request_id)
-    {
-        let stored_fingerprint = existing_turn
-            .metadata
-            .get("requestFingerprint")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                existing_turn.items.iter().find_map(|item| {
-                    item.metadata
-                        .get("requestFingerprint")
-                        .and_then(Value::as_str)
-                })
-            });
-        if stored_fingerprint != Some(request_fingerprint.as_str()) {
-            return Err(ApiError::Conflict(
-                "requestId 已绑定另一份 Turn，请为新请求生成新的 requestId".to_string(),
-            ));
-        }
-        return canonical_turn_replay_response(&state, existing_turn);
-    }
-    // 排队中的请求尚未拥有 canonical Turn，但 requestId 仍然必须保持幂等；
-    // 否则网络重试会把同一条用户消息复制到队列，并在队首 drain 时执行两次。
-    if let Some(request_id) = request.request_id()
-        && let Some((queued, queue_position)) =
-            state.queued_regular_session_turn_for_request_id(&request_id)
-    {
-        let stored_fingerprint = queued
-            .request_fingerprint
-            .clone()
-            .or_else(|| queued.request.request_fingerprint().ok());
-        if stored_fingerprint.as_deref() != Some(request_fingerprint.as_str()) {
-            return Err(ApiError::Conflict(
-                "requestId 已绑定另一条排队消息，请为新请求生成新的 requestId".to_string(),
-            ));
-        }
-        return queued_turn_replay_response(&state, &queued, queue_position);
-    }
     if request.steer_current_turn && session_turn_requests_explicit_goal_mode(&request) {
         return Err(ApiError::InvalidInput(
             "目标模式必须作为独立执行轮次提交，不能作为当前轮引导".to_string(),
         ));
     }
     if request.steer_current_turn {
-        return submit_steer_current_turn(&state, &request, &scope, accepted_at).await;
+        return submit_steer_current_turn(
+            &state,
+            &request,
+            &scope,
+            accepted_at,
+            &request_fingerprint,
+        )
+        .await;
     }
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
     let canonical_goal_mode = decision.reason_code.as_deref() == Some("goal_mode_request");
@@ -689,6 +654,10 @@ pub(crate) async fn submit_session_turn_internal(
     } else {
         None
     };
+    if let Some(replay) = replay_existing_submission(&state, &request, &request_fingerprint, true)?
+    {
+        return Ok(replay);
+    }
     if matches!(
         decision.route,
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task
@@ -985,10 +954,74 @@ async fn submit_steer_current_turn(
     request: &SessionTurnRequestDto,
     scope: &SessionScope,
     accepted_at: UtcMillis,
+    request_fingerprint: &str,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
     let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
+    // 引导不进入排队，只需按 canonical 事实判重；必须在锁内判断，否则并发重复的
+    // 引导会被模型看到两次。
+    if let Some(replay) = replay_existing_submission(state, request, request_fingerprint, false)? {
+        return Ok(replay);
+    }
     submit_steer_current_turn_after_turn_commit(state, request, scope, accepted_at).await
+}
+
+/// requestId 幂等的唯一判定：返回同一请求已有的 canonical Turn 或排队位置。
+///
+/// 必须在持有 session Turn 锁（新会话为导航锁）之后调用：锁外判断会让两个并发的相同
+/// 请求同时通过，产生重复 Turn 或重复引导。canonical accepted 事实优先，daemon 重启或
+/// 响应丢失后同一 requestId 仍返回原 Turn。
+fn replay_existing_submission(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    request_fingerprint: &str,
+    include_queue: bool,
+) -> Result<Option<SessionTurnResponseDto>, ApiError> {
+    let Some(request_id) = request.request_id() else {
+        return Ok(None);
+    };
+    if let Some(existing_turn) = state
+        .session_store
+        .canonical_turn_for_request_id(&request_id)
+    {
+        let stored_fingerprint = existing_turn
+            .metadata
+            .get("requestFingerprint")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                existing_turn.items.iter().find_map(|item| {
+                    item.metadata
+                        .get("requestFingerprint")
+                        .and_then(Value::as_str)
+                })
+            });
+        if stored_fingerprint != Some(request_fingerprint) {
+            return Err(ApiError::Conflict(
+                "requestId 已绑定另一份 Turn，请为新请求生成新的 requestId".to_string(),
+            ));
+        }
+        return canonical_turn_replay_response(state, existing_turn).map(Some);
+    }
+    if !include_queue {
+        return Ok(None);
+    }
+    // 排队中的请求尚未拥有 canonical Turn，但 requestId 仍然必须保持幂等；
+    // 否则网络重试会把同一条用户消息复制到队列，并在队首 drain 时执行两次。
+    if let Some((queued, queue_position)) =
+        state.queued_regular_session_turn_for_request_id(&request_id)
+    {
+        let stored_fingerprint = queued
+            .request_fingerprint
+            .clone()
+            .or_else(|| queued.request.request_fingerprint().ok());
+        if stored_fingerprint.as_deref() != Some(request_fingerprint) {
+            return Err(ApiError::Conflict(
+                "requestId 已绑定另一条排队消息，请为新请求生成新的 requestId".to_string(),
+            ));
+        }
+        return queued_turn_replay_response(state, &queued, queue_position).map(Some);
+    }
+    Ok(None)
 }
 
 /// 调用方已经持有 `navigation -> session Turn` 时提交 steer。
